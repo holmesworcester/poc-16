@@ -289,12 +289,19 @@ provisioning is the one deployment act outside the protocol). Eviction
 reaches the keyring only as an app-layer reaction to a synced fact.
 Snapshot and keyring are the opposite edges of the fact layer:
 downstream projection (serialized at commit, convergent, rebuildable)
-vs upstream root of trust (non-derivable, per-node). **Accepted debt**:
-the keyring forgoes the fact layer's concurrency story — a member's
-other devices do not learn of a new workspace through facts; each joins
-by its own invite. If multi-device keyring sync ever matters, the
-lineage answer is an event DAG for it (a personal meta-workspace) —
-deferred. Transport ACLs are never finer than
+vs upstream root of trust (non-derivable, per-node). **Deferred, not rejected —
+the personal meta-workspace**: as built, the keyring forgoes the fact
+layer's concurrency story (a member's other devices do not learn of a
+new workspace through facts). The designed future: a **person is a
+workspace** whose members are your devices and whose facts are keyring
+events. A join fact carries the credential a sibling device needs to
+join by itself, so every store stays sealed — no cross-store reads —
+while joins and removals propagate to all devices as ordinary sync.
+Device linking becomes person-centered: a device links to your person
+once, and the person's DAG links workspaces monotonically. The keyring
+then collapses to a projection of the personal workspace plus this
+device's private keys, and the bootstrap edge shrinks to exactly one:
+link-device. Transport ACLs are never finer than
 membership — grants cover whole keys and pages interleave channels — so
 sub-workspace confidentiality is the encryption layer (epochs), never
 the grant.
