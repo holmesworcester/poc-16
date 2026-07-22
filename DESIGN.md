@@ -1,7 +1,8 @@
 # Passive-Store Reconciliation — POC-16 Design
 
 Design of record; no code yet. The staged plan is at the end, and every
-number here is an estimate until `bench/` replaces it.
+number here is an estimate until `bench/` replaces it. [MODEL.md](MODEL.md)
+carries the performance model and the loop math behind the numbers.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
 counterpart that executes no code?** The counterpart is a dumb object store
@@ -22,7 +23,9 @@ encryption (all stores hold ciphertext).
 
 **P1 — efficient sync from the treap.** A client with an arbitrary subset
 converges in O(d · log n) transfer and O(log_B n) sequential rounds.
-Litmus: 10^6 facts, 10^2 diff ⇒ ≤ 4 rounds, ≤ low hundreds of KB.
+Litmus: 10^6 facts, 10^2 recent-clustered diff ⇒ ≤ 4 rounds, ≤ low
+hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
+(MODEL.md).
 
 **P2 — efficient compaction.** An engine takes `(raw pile, valid treap)` to
 `(valid new treap)` — signatures, membership, 5–10 dep lookups per fact.
@@ -51,7 +54,10 @@ content-addressed pages (64–256 KB, thousands of entries). Interior record:
 `(range, fingerprint, count, child refs)`. Leaf record: `(ts, fid, author,
 seq, auth digest)` — existence and validation without fetching bodies.
 Paging is load-bearing: node-per-object storage means ~20 sequential GETs
-per lookup and sinks the design. Paged depth is 2–3.
+per lookup and sinks the design. Paged depth is 2–3. Interior records also
+carry k sub-fingerprints per child (and the manifest carries the root's
+own), so a walker ranged-GETs 8 KB slices instead of whole pages —
+load-bearing for scattered diffs (MODEL.md).
 
 **Manifest.** The one mutable object: root page, auth snapshot, generation.
 Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
@@ -233,5 +239,11 @@ Proofs first; no transport work until both numbers exist.
   delete is undesigned.
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages (candidate: cut at treap priority thresholds).
+- Fresh log: a validated, deduped, CAS'd staging tier between pile and
+  treap — validate on a fast cadence, fold into the treap at ~one leaf
+  page. MODEL.md's math favors it strongly (~9× reader cost, ~200× less
+  page churn); adopting it rewrites The Pile and The Engine and adds a
+  second mutable object.
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
-  findings, hash-list slices not bao).
+  findings, hash-list slices not bao); bulk join wants leaf-aligned body
+  bundles (MODEL.md — fresh join is request-bound, not byte-bound).
