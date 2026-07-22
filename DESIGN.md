@@ -27,52 +27,68 @@ Litmus: 10^6 facts, 10^2 recent-clustered diff ⇒ ≤ 4 rounds, ≤ low
 hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 (MODEL.md).
 
-**P2 — efficient compaction.** An engine takes `(raw pile, valid treap)` to
-`(valid new treap)` — signatures, membership, 5–10 dep lookups per fact.
-Litmus: ≥ 300 facts/s in a warm 1 GB Lambda against real S3; thousands/s
-against a local store.
+**P2 — efficient engine.** Two loops. *Validate* takes `(raw piles, WAL,
+valid treap)` to `(valid new WAL)` on every pile arrival — signatures,
+membership, 5–10 dep lookups per fact. *Fold* takes a full WAL into the
+treap. Litmus: ≥ 300 facts/s validated in a warm 1 GB Lambda against real
+S3; thousands/s against a local store.
 
 Everything else is scaffolding around these two.
 
 ## The Store
 
 **Facts.** Content-addressed, self-certifying (signature and chain refs in
-the payload — the compaction engine is the only validator), bodies encrypted.
+the payload — the engine is the only validator), bodies encrypted.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
 refuse to pay for. This is a fact-format constraint.
 
-**Treap.** The validated set lives in a treap keyed `(ts, fid)`, priority
+**Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
 from the fid hash — history-independent, so the same set gives the same
 shape, fingerprints, and pages on every node. That is what makes one-sided
-comparison possible: aligned subtrees, plain Merkle fingerprints, no
-boundary negotiation. No homomorphic sums — they exist to compare unaligned
-ranges (useless here) and invite Wagner's attack.
+comparison possible: aligned ranges, plain Merkle fingerprints, no
+boundary negotiation. It is math, not layout — on disk it is realized as
+the sorted run + fence hierarchy below. No homomorphic sums — they exist
+to compare unaligned ranges (useless here) and invite Wagner's attack.
 
-**Pages.** The treap is cut deterministically into fat immutable
-content-addressed pages (64–256 KB, thousands of entries). Interior record:
-`(range, fingerprint, count, child refs)`. Leaf record: `(ts, fid, author,
-seq, auth digest)` — existence and validation without fetching bodies.
-Paging is load-bearing: node-per-object storage means ~20 sequential GETs
-per lookup and sinks the design. Paged depth is 2–3. Interior records also
-carry k sub-fingerprints per child (and the manifest carries the root's
-own), so a walker ranged-GETs 8 KB slices instead of whole pages —
-load-bearing for scattered diffs (MODEL.md).
+**Pages and fences.** The validated set serializes as one key-sorted run
+of fixed-size leaf records `(ts, fid, author, seq, auth digest)` —
+existence and validation without fetching bodies — cut deterministically
+into fat immutable content-addressed pages (64–256 KB), addressable in
+8 KB slices by ranged GET. Above it sit **fence runs**: one fence per
+slice, `(separator key, fingerprint, count, page ref)`, suffix-truncated
+and delta-coded (~28 B), itself sorted, cut, and fingerprinted by the same
+rule; the top run (a few KB) rides inside the manifest. The treap never
+exists as a pointer structure — priorities are only the cut function, and
+the fence hierarchy is its fingerprint aggregation. Retrieval is one
+uniform operation: binary-search cached fences, then **any key range is
+one contiguous ranged GET per level** (fixed-size sorted records make
+offsets arithmetic) — walk descent, dep probes, and bulk fetches are all
+instances. Fences are load-bearing: node-per-object storage (~20
+sequential GETs per lookup) or whole-page fetches on scattered diffs would
+sink the design. Run depth is 2–3 (MODEL.md).
 
-**Manifest.** The one mutable object: root page, auth snapshot, generation.
-Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
-rename). Everything it references is immutable, so one conditional GET
-revalidates a node's whole cached world, and readers get snapshot isolation
-free. Unreferenced pages are GC'd after a grace period.
+**Manifest.** The root mutable object: root page, auth snapshot,
+generation. Changes only by CAS (S3 conditional PUT / SQLite transaction /
+atomic rename). Everything it references is immutable, so one conditional
+GET revalidates a node's whole cached world, and readers get snapshot
+isolation free. Unreferenced pages are GC'd after a grace period. The WAL
+index below is the only other mutable object.
 
-**Pile.** `pile/<member>/<hash>` — write path and quarantine. Puts are
+**Pile.** `pile/<member>/<hash>` — ingress and quarantine. Puts are
 content-addressed, hence idempotent; the member prefix comes from the grant,
-so attribution, rate limits, and blame are the same code in every world.
-The pile is the WAL: a put is durable and visible (readers scan tree +
-pile), so the put response is the writer's confirmation. Treap = validated,
-pile = quarantine; fingerprints only ever cover validated facts, so a
-hostile writer can litter but never poison. Clients validate pulled pile
-entries like any wire input.
+so attribution, rate limits, and blame are the same code in every world. A
+put is durable, so the put response is the writer's confirmation. Only the
+engine reads raw piles: a hostile writer can litter but never poison, and
+litter costs readers zero bandwidth.
+
+**WAL.** `wal` — the validated log: admitted-but-unfolded facts as one
+CAS'd, deduped, `(ts, fid)`-sorted index (capped at one leaf page's worth,
+~128 KB) plus body bundles `walblob/<gen>`. This is what readers poll for
+news: one conditional GET, no LIST, no litter. Treap = folded history,
+WAL = validated news, pile = quarantine; fingerprints only ever cover the
+treap. The WAL is literally the next leaf page accumulating in public —
+its size cap and the fold threshold coincide.
 
 **ObjectStore trait.** Every node stores through one S3-shaped trait:
 
@@ -82,7 +98,8 @@ cas(key, etag, bytes)   # manifest only
 delete(key)             # GC, pile retirement
 ```
 
-Layout: `root`, `page/<hash>`, `blob/<hash>`, `pile/<member>/<hash>`.
+Layout: `root`, `wal`, `page/<hash>`, `blob/<hash>`, `walblob/<gen>`,
+`pile/<member>/<hash>`.
 Drivers: s3 (also R2/MinIO/Garage), sqlite (peer default), fs, mem (tests).
 One named asymmetry: in the cloud the store *is* the server (presigned,
 no daemon in the byte path); in a peer the daemon fronts the store.
@@ -90,12 +107,13 @@ no daemon in the byte path); in a peer the daemon fronts the store.
 ## The Walk (P1)
 
 ```text
-manifest <- conditional GET root      # unchanged ⇒ done
-compare(local, remote):
+manifest <- conditional GET root      # unchanged ⇒ wal check only; top fences inline
+compare(local, remote) per fence:
   equal fingerprint  -> prune
-  huge count gap     -> bulk fetch / bulk push the range
-  else               -> fetch page, recurse unequal children
-then: scan pile; pull what I lack; push what it lacks into its pile
+  huge count gap     -> bulk fetch / bulk push (any range = contiguous GETs)
+  else               -> ranged GET the covered fence/leaf slices, recurse
+then: conditional GET wal; pull unseen entries (bundle GETs);
+      push what it lacks into its pile
 ```
 
 The count heuristic is advisory (adds and deletes cancel); depth is capped.
@@ -113,39 +131,49 @@ rounds at 10^6 facts.
 
 ## The Engine (P2)
 
-One body of code; only the trigger and store driver differ by deployment.
+One body of code, two loops; only the trigger and store driver differ by
+deployment.
 
 ```text
-auth  <- manifest.auth_snapshot          # O(members), one object
-deps  <- batch's (ts, fid) refs, sorted
-have  <- merge-join deps vs leaf pages   # after intra-batch + recent window
-admit <- sig valid ∧ author live ∧ deps in have
-park  <- missing deps stay in pile
-emit pages -> CAS manifest -> delete covered pile entries
+validate:                  # every pile arrival; peers: also before serving /wal
+  auth  <- manifest.auth_snapshot ∪ WAL    # O(members), one object
+  facts <- LIST + GET piles
+  deps  <- sorted (ts, fid) refs; resolve intra-batch, then WAL,
+           then merge-join vs leaf slices
+  admit <- sig valid ∧ author live ∧ deps resolved
+  park  <- missing deps stay in pile
+  put bodies + bundle -> CAS wal (append, dedup) -> delete promoted pile keys
+
+fold:                      # when |wal| ≥ ~one leaf page, or age ≥ τ_max
+  emit pages + fences from wal             # the wal IS the next leaf page
+  CAS manifest -> CAS wal (drop folded)
 ```
 
-**Publish then delete** — an item is briefly in both pile and treap (dedup
-makes that harmless), never in neither.
+**Publish then swap** at every promotion — a fact is briefly in two tiers
+(dedup by fid makes that harmless), never in none.
 
-Trigger: cloud S3→SQS(batch window)→Lambda; peer in-process debounce. A
-lease keeps compaction single-flight for cache locality; the CAS keeps it
-safe regardless.
+Trigger: cloud S3→SQS(batch window)→Lambda on arrival; a peer validates
+in-process, draining piles before answering `/wal` — "the requester always
+gets the latest" is literal on a peer and arrival-cadence-approximate on a
+store that cannot compute on read. A lease keeps the engine single-flight
+for cache locality; the CASes keep it safe regardless.
 
 Auth state is materialized, never re-derived: the snapshot (member keys,
 chain heads, epochs) is a small object referenced by the manifest, rewritten
-each compaction. Validation is a shallow check against it (POC-10 split);
-no chain walks. Revocation is enforced here: an evicted member's grant can
-litter the pile until expiry, but the next compaction rejects the facts.
+at each fold; between folds the live auth state is snapshot ∪ WAL.
+Validation is a shallow check against it (POC-10 split); no chain walks.
+Revocation is enforced here: an evicted member's grant can litter the pile
+until expiry, but the next validation rejects the facts.
 
 Performance: merge-join, not per-fact lookups; resolve intra-batch and
-recent-window first. A messaging dep graph is a tiny universally-hot auth
+the WAL first. A messaging dep graph is a tiny universally-hot auth
 core plus cold message leaves — steady state resolves almost everything from
 memory. Estimates: GET 10–30 ms, ~100 in flight ⇒ 3–5k GET/s; Ed25519
 ~50–100 µs, never the bottleneck; ~500–1,000 facts/s point-lookup,
 thousands merge-join. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
-— the single-flight compactor wrote the current pages itself last run.
+— the single-flight engine wrote the current pages itself last run.
 
 ## Auth
 
@@ -165,13 +193,14 @@ isomorphic. Transport identity is never an integrity input.
 |---|---|---|---|
 | mint | `POST /mint` | Lambda URL | handshake endpoint |
 | root | `GET /root` | S3 conditional GET | serve manifest |
+| wal | `GET /wal` (+ bundles) | S3 conditional GET | drain piles, then serve |
 | page | `GET /page/{hash}` (+ blob) | S3 GET | serve blob |
 | put | `PUT /pile/{member}/{hash}` | presigned PUT | grant-checked append |
 | list | `GET /pile/` | S3 LIST | list pile |
 
 HTTP is the protocol: ETag revalidation on root, h2/h3 streams for parallel
 page fetches, and any static HTTPS host is a read-only replica with zero
-code. Peers may offer long-poll on `/root` as a liveness hint; cadence
+code. Peers may offer long-poll on `/wal` as a liveness hint; cadence
 remains the correctness mechanism (POC-13's rule).
 
 Two dialers behind one client, picked by URL scheme: `https://` (WebPKI —
@@ -207,19 +236,20 @@ rebuild from its store.
 
 ## Deployments
 
-| | store | serving | compacts | initiates |
+| | store | serving | engine | initiates |
 |---|---|---|---|---|
 | cloud node | s3 | presigned (store is server) | S3→SQS→Lambda | never |
-| peer | sqlite | daemon | debounce | cadence + news |
-| home server | sqlite or s3 | daemon | debounce | never |
+| peer | sqlite | daemon | on read + debounce | cadence + news |
+| home server | sqlite or s3 | daemon | on read + debounce | never |
 | static mirror | any HTTPS host | files | no | never |
 
 ## Staged Plan
 
 Proofs first; no transport work until both numbers exist.
 
-1. **Core** — treap, deterministic page cut, codec; trait with mem + sqlite
-   drivers; manifest CAS. Property test: same set ⇒ same page hashes.
+1. **Core** — leaf run + fence runs, deterministic cut, codec; trait with
+   mem + sqlite drivers; manifest + WAL CAS. Property test: same set ⇒
+   same page hashes.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
@@ -239,11 +269,6 @@ Proofs first; no transport work until both numbers exist.
   delete is undesigned.
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages (candidate: cut at treap priority thresholds).
-- Fresh log: a validated, deduped, CAS'd staging tier between pile and
-  treap — validate on a fast cadence, fold into the treap at ~one leaf
-  page. MODEL.md's math favors it strongly (~9× reader cost, ~200× less
-  page churn); adopting it rewrites The Pile and The Engine and adds a
-  second mutable object.
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
   findings, hash-list slices not bao); bulk join wants leaf-aligned body
   bundles (MODEL.md — fresh join is request-bound, not byte-bound).
