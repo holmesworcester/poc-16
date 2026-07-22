@@ -140,6 +140,7 @@ amplification cost (rewriting a bundle costs B_l·F ≈ 1 MB).
 on new local fact f:                       # eager path — news latency
   for each counterpart store s with a grant:
     PUT s/pile/<me>/<hash(f)>              # idempotent; 200 = durably delivered
+  POST s/poke after the batch              # cloud: wake the engine; peer: implicit
 
 at walk end:                               # anti-entropy backstop
   push <- local entries in differing ranges ⊖ remote entries(fetched slices)
@@ -159,7 +160,7 @@ fold — see The WAL below — which changes cadence and write amplification,
 not the per-fact costs.)
 
 ```text
-on S3→SQS batch / in-process debounce, under lease:
+on request (peer drain-on-read / cloud POST /poke), under lease:
   m     <- GET root (cond)                 # warm: cached
   snap  <- GET auth snapshot               # warm: cached; O(members)
   keys  <- LIST pile                       # ceil(pile/1000) reqs
@@ -251,7 +252,7 @@ manifest + pages        folded history                    (unchanged)
 ```
 
 ```text
-validate (every arrival; peers also drain-on-read, same lease):
+validate (on request: peers drain-on-read, cloud on poke; same lease):
   facts <- LIST + par GET pile; verify; dep-resolve vs treap+wal+batch
   PUT blob/<hash> each; PUT walblob/<gen> bundle
   CAS wal index (append admitted, dedup by fid)
@@ -286,7 +287,7 @@ Comparison at λ = 10^4/day, c = 60 s, validate cadence 30 s:
 | treap page PUTs/day | ~7,200 (1,440 folds) | **~25** (~5 folds) |
 | page bytes rewritten/day | ~550 MB | **~2.5 MB** |
 | manifest generations/day | 1,440 (walker caches churn) | ~5 (caches warm for hours) |
-| news visibility | ~c (if readers LIST-poll fast) | validator cadence (5–30 s cloud, ms peer) |
+| news visibility | ~c (if readers LIST-poll fast) | writer poke→validate (~seconds cloud, ms peer) |
 | per-fact validate cost | 1 GET + verify + writes | same — conserved |
 
 The conservation law: each fact must be fetched, verified, and written
@@ -307,10 +308,15 @@ reads the last committed snapshot, and every admitted fact is in ≥1 of
 {pile, wal, treap} at all times. Peers long-poll `/wal` instead of
 `/root`.
 
-Adopted (2026-07-22): DESIGN.md names the tier the WAL; validate runs on
-every pile arrival, and on peers also before serving `/wal`, making
-"requester always gets the latest" literal p2p and
-arrival-cadence-approximate on a store that cannot compute on read.
+Adopted (2026-07-22): DESIGN.md names the tier the WAL; validate runs
+**on request** — a peer drains piles before serving `/wal` (the request
+pauses milliseconds), and cloud clients make the request explicit with
+`POST /poke` on the mint Lambda (writers after pushing; walkers on a slow
+backstop cadence, ~10–15 min, so no-work pokes stay rare — each costs one
+LIST). Arrival triggers (S3 events) were rejected: most ObjectStore
+drivers can't signal on put, so the trigger must live in the protocol.
+"Requester always gets the latest" is literal p2p, one poke away in the
+cloud; a writer that dies before poking is caught by cadence.
 
 ## Where the Platform Binds
 
@@ -345,7 +351,7 @@ arrival-cadence-approximate on a store that cannot compute on read.
    from compaction; batch toward λτ ≈ B_l/4..B_l.
 5. **LIST is the reader poll tax**; the follower tier (manifest-only
    freshness) exists in the cost model as the cheap class.
-6. **The WAL tier was adopted** (section below): validate every pile
-   arrival into a CAS'd validated log served to readers; fold into the
-   treap at ~one leaf page. DESIGN.md's Pile and Engine sections now say
-   this.
+6. **The WAL tier was adopted** (section below): validate piles into a
+   CAS'd validated log served to readers — on request, never on a timer
+   (peers drain-on-read; cloud via POST /poke) — and fold into the treap
+   at ~one leaf page. DESIGN.md's Pile and Engine sections now say this.

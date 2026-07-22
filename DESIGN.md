@@ -6,7 +6,7 @@ carries the performance model and the loop math behind the numbers.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
 counterpart that executes no code?** The counterpart is a dumb object store
-(S3, a peer's disk behind five HTTP routes, a static file host) holding a
+(S3, a peer's disk behind seven HTTP routes, a static file host) holding a
 materialized summary of the validated set. The active side does the whole
 reconciliation itself by fetching immutable pages. If it works, a cloud node
 stops being a sync participant and becomes an artifact peers sync against —
@@ -28,7 +28,7 @@ hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 (MODEL.md).
 
 **P2 — efficient engine.** Two loops. *Validate* takes `(raw piles, WAL,
-valid treap)` to `(valid new WAL)` on every pile arrival — signatures,
+valid treap)` to `(valid new WAL)` on request — signatures,
 membership, 5–10 dep lookups per fact. *Fold* takes a full WAL into the
 treap. Litmus: ≥ 300 facts/s validated in a warm 1 GB Lambda against real
 S3; thousands/s against a local store.
@@ -121,8 +121,8 @@ The count heuristic is advisory (adds and deletes cancel); depth is capped.
 The walk computes the *symmetric* difference, so push is the tail of the
 same walk: **one dial converges both sides; the responder runs zero sync
 logic.** Eager delivery still exists — put your own new facts into known
-piles at write time — and the walk is the anti-entropy backstop (the Dynamo
-split).
+piles at write time, then poke — and the walk is the anti-entropy backstop
+(the Dynamo split).
 
 Round trips: interactive negentropy descends two levels per round trip, the
 one-sided walk one — bought back by fat fanout (256-way pages match 16-way
@@ -135,7 +135,7 @@ One body of code, two loops; only the trigger and store driver differ by
 deployment.
 
 ```text
-validate:                  # every pile arrival; peers: also before serving /wal
+validate:                  # on request — peers drain before serving /wal; cloud on POST /poke
   auth  <- manifest.auth_snapshot ∪ WAL    # O(members), one object
   facts <- LIST + GET piles
   deps  <- sorted (ts, fid) refs; resolve intra-batch, then WAL,
@@ -152,11 +152,18 @@ fold:                      # when |wal| ≥ ~one leaf page, or age ≥ τ_max
 **Publish then swap** at every promotion — a fact is briefly in two tiers
 (dedup by fid makes that harmless), never in none.
 
-Trigger: cloud S3→SQS(batch window)→Lambda on arrival; a peer validates
-in-process, draining piles before answering `/wal` — "the requester always
-gets the latest" is literal on a peer and arrival-cadence-approximate on a
-store that cannot compute on read. A lease keeps the engine single-flight
-for cache locality; the CASes keep it safe regardless.
+Trigger: **on request, in both worlds** — the engine has no timers and no
+event plumbing. A peer drains its piles before answering `/wal`; the
+request pauses (milliseconds) so the requester always gets the latest. The
+cloud store cannot compute on read, so the request is explicit: `POST
+/poke` on the mint Lambda — writers poke after pushing, walkers poke on a
+slow backstop cadence, a writer that dies before poking is caught by
+cadence (POC-13's rule). Arrival triggers (S3 events) are rejected on
+isomorphism grounds: most ObjectStore drivers (sqlite, fs, MinIO, a static
+host) cannot signal on put, so the engine's trigger must live in the
+protocol, not the backend. A lease keeps the engine single-flight for
+cache locality — concurrent pokes coalesce — and the CASes keep it safe
+regardless.
 
 Auth state is materialized, never re-derived: the snapshot (member keys,
 chain heads, epochs) is a small object referenced by the manifest, rewritten
@@ -192,6 +199,7 @@ isomorphic. Transport identity is never an integrity input.
 | verb | route | cloud | peer daemon |
 |---|---|---|---|
 | mint | `POST /mint` | Lambda URL | handshake endpoint |
+| poke | `POST /poke` | mint Lambda | implicit (drain-on-read) |
 | root | `GET /root` | S3 conditional GET | serve manifest |
 | wal | `GET /wal` (+ bundles) | S3 conditional GET | drain piles, then serve |
 | page | `GET /page/{hash}` (+ blob) | S3 GET | serve blob |
@@ -209,7 +217,7 @@ the key, so dialing authenticates; hole-punching and relays included). iroh
 is dumb pipes only — no iroh-docs/blobs/gossip, bao stays retired — and
 pre-1.0, so the connector module is its containment boundary.
 
-Every node = a **responder half** (five verbs over its store, zero sync
+Every node = a **responder half** (seven verbs over its store, zero sync
 logic) + optional **initiator half** (walk on cadence + eager push). Roles
 are per-session, fixed by dial direction. Any peer may dial — news-driven
 sends stay fast, and the pair gets the better of the two cadences.
@@ -238,9 +246,9 @@ rebuild from its store.
 
 | | store | serving | engine | initiates |
 |---|---|---|---|---|
-| cloud node | s3 | presigned (store is server) | S3→SQS→Lambda | never |
-| peer | sqlite | daemon | on read + debounce | cadence + news |
-| home server | sqlite or s3 | daemon | on read + debounce | never |
+| cloud node | s3 | presigned (store is server) | Lambda on poke | never |
+| peer | sqlite | daemon | on request | cadence + news |
+| home server | sqlite or s3 | daemon | on request | never |
 | static mirror | any HTTPS host | files | no | never |
 
 ## Staged Plan
@@ -253,7 +261,7 @@ Proofs first; no transport work until both numbers exist.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
-4. **Protocol** — daemon (five routes) + the one HTTP client with grant
+4. **Protocol** — daemon (seven routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
 5. **iroh** — h3-over-iroh connector; same conformance suite.
