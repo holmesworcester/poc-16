@@ -174,7 +174,7 @@ at walk end:                               # anti-entropy backstop
   re-sends, no receipt protocol. Content-addressed PUT makes retries free.
 - Cost: one PUT per fact per cloud store ($5e-6); zero per peer. Rate:
   3,500 PUT/s on the member's own prefix ≫ λ.
-- The walk after the PUT is latency, not correctness: admission never
+- The walk after the PUT is latency, not correctness: validation never
   blocks on deps, so a lone fact cannot wedge — the walk just gets the
   closure to consumers' validators sooner; nearly free (one conditional
   GET) when in sync.
@@ -199,7 +199,7 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
            ceil(b/B_l)+D pages + annexes, PUT If-None-Match
            spilled bodies -> blob/; PUT globals′ if changed
   CAS root                                 # the commit point
-  batch DELETE pile keys                   # admitted and rejected alike; ceil(b/1000) reqs
+  batch DELETE pile keys                   # valid and rejected alike; ceil(b/1000) reqs
 ```
 
 **Throughput.** With w = 100 GETs in flight at in-region R_l:
@@ -236,7 +236,7 @@ rewrites between promotions churn up to ~1.2 MB per drain, but PUT bytes
 are ingress-free — milliseconds of Lambda upload, not dollars. CAS
 contention ≈ 0 under the lease; the CAS is only the safety net.
 
-**No parked scan.** Every drain empties the pile — admitted or deleted,
+**No parked scan.** Every drain empties the pile — merged or deleted,
 nothing waits — so a drain costs O(arrivals), never O(backlog).
 Closure-complete piles (auth model C) make parking impossible by
 construction, store-side and consumer-side alike: a receiver never
@@ -244,7 +244,7 @@ holds a fact it lacks the means to judge.
 
 ## Dollars
 
-Per admitted fact (S3): 1 client PUT + 1 engine GET + amortized page
+Per valid fact (S3): 1 client PUT + 1 engine GET + amortized page
 PUTs + 1/1000 DELETE ≈ **$6/M facts** written — the per-fact COPY died
 with packing. Storage at 10^6 facts ≈ 0.6 GB ≈ $0.014/mo.
 
@@ -297,7 +297,7 @@ manifest + pages        the rest of the set              (unchanged)
 ```text
 validate (on request: peers drain-on-read, cloud on poke; same lease):
   facts <- LIST + par GET pile; gate (sig + author known; no dep I/O)
-  tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
+  tail' <- tail ∪ valid (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # cut rule fires
   PUT tail', any promoted pages, spilled bodies -> blob/
   CAS manifest                         # the single commit point
@@ -349,7 +349,7 @@ pages for history, the tail range for fan-out, promotion on threshold.
 **"Requester always gets the latest, pauses on rebuild":** no pause
 exists or is needed. Every tier is publish-then-swap (tail and pages
 PUT before the index CAS that references them), so a requester always
-reads the last committed snapshot, and every admitted fact is in ≥1 of
+reads the last committed snapshot, and every valid fact is in ≥1 of
 {pile, set} at all times — the tail is part of the set, and validation
 and promotion share one CAS, so there is no multi-object ordering. Peers
 long-poll `/root`.
@@ -453,7 +453,7 @@ and the gate are untouched.
   clear envelopes alone, hence equally canonical. This *replaces* the
   writer-declared pile hints from the design thread: the clear-envelope
   decision (2026-07-22) made them redundant — the engine reads dep refs
-  straight off admitted facts, so no trust, cap, or blame machinery.
+  straight off valid facts, so no trust, cap, or blame machinery.
 - Counts only grow (appends and splits), so homes migrate one way:
   upward, ≤ L_a times per fact ever. Honest need sets are suffix-shaped
   (deps point backward; a hub is needed by everything after it), which

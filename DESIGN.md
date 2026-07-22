@@ -130,7 +130,7 @@ boundary negotiation. It is math, not layout — on disk it is realized as
 the sorted run + fence hierarchy below. No homomorphic sums — they exist
 to compare unaligned ranges (useless here) and invite Wagner's attack.
 
-**Pages and fences.** The admitted set serializes as one key-sorted run
+**Pages and fences.** The valid set serializes as one key-sorted run
 of fixed-size leaf records `(ts, fid, author, auth digest, body offset)`
 — existence and authorship without fetching bodies — cut
 deterministically into fat immutable content-addressed **packed pages**
@@ -201,12 +201,12 @@ and CASes the manifest — the root covers the news naturally, and because
 the tail's fences are in the top run, no fence pages are rewritten: no
 path rebuild. So "did anything change" is one conditional GET for the
 whole set, and fetching news is the same fence walk as deep sync. History
-ranges = promoted, tail range = admitted news, pile = ingress;
-fingerprints cover the whole admitted set, never the pile. The tail is
+ranges = promoted, tail range = valid news, pile = ingress;
+fingerprints cover the whole valid set, never the pile. The tail is
 the next few leaf pages accumulating in public — when it fills,
 promotion (the cut rule firing) freezes it into ~⌈B_t/B_l⌉ ≈ 5 immutable
 pages in the same commit; the B_t cap is the straggler guard-window
-knob, deliberately decoupled from page size. A fact admitted *below* the
+knob, deliberately decoupled from page size. A valid fact landing *below* the
 tail's range boundary (late ts:
 offline devices, clock skew) takes an immediate mini-fold of
 the page it lands in — same commit, ~2–3 extra PUTs, rare because the
@@ -249,7 +249,7 @@ same walk: **one dial converges both sides; the responder runs zero sync
 logic.** Eager delivery still exists — put your own new facts into known
 piles at write time, then poke — and the walk is the anti-entropy backstop
 (the Dynamo split). Ending a write with a walk is a latency nicety, not
-a correctness rule: admission never blocks on deps, so a lone PUT cannot
+a correctness rule: validation never blocks on deps, so a lone PUT cannot
 wedge — the walk just delivers the fact's closure promptly for the
 consumers' validators, and costs one conditional GET when already in
 sync.
@@ -361,7 +361,7 @@ across all honest replicas for all time, so verdicts stay
 order-independent; time-varying context (globals) remains quarantined
 to ephemeral handlers. Persistent-family handlers
 never see globals — validity is a function of the pile alone, which is
-what keeps admission order-independent; only ephemeral-family handlers
+what keeps validation order-independent; only ephemeral-family handlers
 read them, safe because their verdicts never enter the set. In
 evaluate mode there is nothing a handler could persist, and nothing is
 lost by it: whatever the store lacked arrives with the next closed
@@ -402,7 +402,7 @@ drain:                     # put + poke (cloud); any verb (peer); under lease
   if tail' full: promote stable prefix to pages + fences + annexes  # the cut rule fires
   put tail' + tail-annex', promoted pages + annexes, spilled blobs, globals′ if changed
   CAS manifest                           # the single commit point
-  delete pile keys                       # admitted and rejected alike
+  delete pile keys                       # valid and rejected alike
 ```
 
 **Publish, CAS, delete** — every new object is written first, one manifest
@@ -447,10 +447,11 @@ the old auth snapshot held is gone: certification is proved inside
 each pile, invites live in the invite blob (Auth), and epoch heads are
 content facts like any other.
 
-**Admission is dep-pure validation** — integrity plus the family
-handler over the fact's in-pile context (POC-13's validator signature,
+**There is no admission — semi-untrusted piles go straight to
+validation**: integrity plus the family handler over the fact's
+in-pile context (POC-13's validator signature,
 `valid(fact, context) → bool`, with the waiting removed), nothing
-else. RBSR still gets what it forces: the verdict is a function of the
+else, and the valid facts merge. RBSR still gets what it forces: the verdict is a function of the
 fact and its immutable closure — no ambient state, no clock, no
 arrival order — so membership is monotone and order-independent, and
 the union of two honest stores is always valid. The treap is the
@@ -474,7 +475,7 @@ a fact must judge identically however and whenever it arrives. Consumers stay tr
 pull, closures always in hand — but nothing parks anywhere: piles are
 closed by format, syncs arrive closed by P3. Anything needing negative
 or global knowledge (uniqueness, latest-wins) stays a projection-time
-verdict, deterministic from the set — never an admission input.
+verdict, deterministic from the set — never a validation input.
 
 **Atoms — needs and offers.** The relationship grammar in this
 prototype is exactly two: an atom either **offers** — publishes a
@@ -537,10 +538,10 @@ fully closed pile in the canonical codec, sometimes encrypted.
 **Request facts are an ephemeral family.** The auth payload on any verb
 is a fact — authored by the requesting device key, deps on the auth
 facts that entitle it, body carrying verb, scope, and a loose expiry —
-evaluated in evaluate mode, never admitted. Ephemerality is structural,
+evaluated in evaluate mode, never persisted. Ephemerality is structural,
 for three reasons: the set must not grow with reads; mints must not
 churn fingerprints into phantom walk diffs; and read patterns must not
-become replicated data. A request family has no admit semantics, so a
+become replicated data. A request family has no persistence semantics, so a
 stray request fact in a pile is litter and the drain deletes it. For a
 request fact, acceptance is the grant.
 
@@ -744,8 +745,8 @@ Proofs first; no transport work until both numbers exist.
   the one feature that needs set-level verdicts. Tombstones weaken the
   count heuristic; content confidentiality via key destruction (POC-14);
   the reconciliation-visible shape of a delete is undesigned.
-- (Dead weight: resolved 2026-07-22 — admission is dep-pure validation
-  again, so facts that never validate never enter the set.)
+- (Dead weight: resolved 2026-07-22 — piles go straight to dep-pure
+  validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages, and it must be **split-monotone** — boundaries
   refine, never move — because the aug fallback's level ladder is built
