@@ -316,6 +316,30 @@ reads the last committed snapshot, and every admitted fact is in ≥1 of
 and promotion share one CAS, so there is no multi-object ordering. Peers
 long-poll `/root`.
 
+**Stragglers — why old facts are treaped, not dumped in the tail.** The
+alternative (tail as a *set overlay* holding any-ts validated facts)
+would make the layout depend on arrival order: two stores holding the
+same set would carry different fences and fingerprints, breaking
+history-independence — mirrors would see false diffs, and the stage-1
+property test dies. Determinism forces the range semantics; the mini-fold
+is its price. The price:
+
+- The promotion boundary is **content-determined**: the highest cut point
+  with fewer than one leaf page of entries above it. The whole layout —
+  pages, fences, tail — stays a pure function of the set.
+- Guard window before a late fact straggles = the tail's time depth,
+  B_l/λ — **self-scaling**: ~5 h at λ = 10^4/day, ~2 days at 10^3/day,
+  ~30 min at 10^5/day. Busy groups have short windows and present
+  members; quiet groups get days.
+- A straggler batch (a device reconnecting past the window) clusters by
+  ts, so it lands in 1–2 leaf pages: ~2–3 extra PUTs (~$1.5e-5, ~400 KB
+  rewritten), committed by the same manifest CAS as the batch's tail
+  update. Not a separate round trip, not a separate commit.
+- Worst case (every fact a straggler) degenerates to the pre-WAL
+  per-batch compaction model (~120× WA at b = 50) — i.e., **the tail is
+  pure upside for the ts-sorted common case and is never worse than the
+  baseline already costed.**
+
 Adopted (2026-07-22), second revision same day: the WAL dissolved **into
 the treap** as its rightmost range — content-addressed tail page, fences
 inlined in the manifest, one mutable object, one CAS commit point for

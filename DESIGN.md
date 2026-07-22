@@ -100,8 +100,12 @@ fingerprints cover the whole validated set, never the pile. The tail is
 literally the next leaf page accumulating in public — when it fills,
 promotion (the cut rule firing) freezes it into immutable pages in the
 same commit. A fact validated *below* the tail's range boundary (late ts:
-parked deps, clock skew) is rare and takes an immediate mini-fold of the
-page it lands in.
+parked deps, offline devices, clock skew) takes an immediate mini-fold of
+the page it lands in — same commit, ~2–3 extra PUTs, rare because the
+boundary's guard window is the tail's time depth (B_l/λ: hours busy, days
+quiet). The boundary itself is content-determined (the highest cut point
+with less than a leaf page above it), so the whole layout — tail included
+— is a pure function of the set (MODEL.md, Stragglers).
 
 **ObjectStore trait.** Every node stores through one S3-shaped trait:
 
@@ -273,7 +277,7 @@ Proofs first; no transport work until both numbers exist.
 
 1. **Core** — leaf run + fence runs, deterministic cut, codec; trait with
    mem + sqlite drivers; manifest CAS. Property test: same set ⇒
-   same page hashes.
+   same layout — pages, fences, and tail.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
