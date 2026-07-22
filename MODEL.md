@@ -405,15 +405,16 @@ revision (2026-07-22): **packed pages** — pages and tail carry their
 bodies (spill > 8 KB to `blob/`), `bundle/` deleted, promotion threshold
 B_t decoupled from page size.
 
-## Closure — Any Range Plus Its Recursive Deps (the closure augmentation — now the FALLBACK; embed annexes adopted as primary 2026-07-22, DESIGN.md)
+## Closure — Any Range Plus Its Recursive Deps (the closure augmentation — NOT the plan; superseded by embed annexes 2026-07-22, DESIGN.md)
 
 *Status note:* the closed-pile design made embed annexes
 (`closure(range) ∖ range` as a per-range object, built by aggregating
-pile-embedded copies) the primary P3 mechanism — no engine closure
-work at all. This section's ref-based aug is retained as the fallback
-if annex duplication measures pathological on a real corpus; stage 4
-is the bake-off. The split-monotone page-cut requirement survives
-either outcome.
+pile-embedded copies) the P3 mechanism — no engine closure work at
+all — and the ref-based aug analyzed below was dropped from the
+design: its count propagation is transitive-closure work in the
+engine, the one thing the closed-pile design otherwise eliminates.
+The section is retained as analysis only (the rounds/bytes math and
+the δ′ parameter still calibrate what annexes must beat).
 
 Target semantics: sync an arbitrary `(ts, fid)` range Q — last 3 days,
 last 4 weeks, or any mid-history window — and receive it

@@ -91,7 +91,7 @@ piles validate in parallel.
 `(ts, fid)` range Q *plus every recursive dependency of every fact in
 it*, in the walk's own shape. Litmus: ≤ D + 2 rounds (+1 per
 out-of-window frontier hop); ref + fence overhead ≤ 10% of context body
-bytes; identical sets ⇒ identical aug bytes; a cold 3-day partial join
+bytes; identical sets ⇒ identical annex bytes; a cold 3-day partial join
 at 10^6 ≈ 4 rounds / ~18 MB, projectable on arrival (MODEL.md, Closure).
 
 Everything else is scaffolding around these three.
@@ -153,8 +153,7 @@ sequential GETs per lookup) or whole-page fetches on scattered diffs would
 sink the design. Run depth is 2–3 (MODEL.md).
 
 **Manifest.** The **only** mutable object besides the piles: generation,
-the inlined top fence runs (history + tail fences, fact and aug runs
-alike), removal set. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
+the inlined top fence runs (history + tail fences), removal set. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
 rename) — the single commit point for validation and promotion alike.
 Everything it references is immutable and content-addressed, so one
 conditional GET revalidates a node's whole cached world, readers get
@@ -367,16 +366,6 @@ assumption: the annex *is* the context. A cold partial join stays
 ~4 rounds and tens of MB — the context's own bodies are the floor no
 protocol beats — and every fact projects on arrival (MODEL.md,
 Closure).
-
-**Fallback — the dep aug** (MODEL.md, Closure): the ref-based
-augmentation (level ladder, k_ℓ homing, two sort orders, aug tail)
-that makes ranges closable *on demand* instead of closed *at rest* —
-leaner at rest, but its count propagation is transitive-closure work
-in the engine, the one thing the closed-pile design otherwise
-eliminates. Retained as the fallback if annex duplication measures
-pathological on a real corpus; stage 4 is the bake-off. The
-split-monotone constraint it exports to the page-cut rule stays either
-way.
 
 ## The Engine (P2)
 
@@ -764,8 +753,8 @@ Proofs first; no transport work until both numbers exist.
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
 4. **P3 bench** — annex build at promotion + closure walk; measure
-   annex duplication vs the aug fallback on a real corpus (the
-   bake-off); sweep window sizes.
+   annex duplication (hub copies, δ′) on a real corpus; sweep window
+   sizes.
 5. **Protocol** — daemon (seven routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
@@ -782,10 +771,7 @@ Proofs first; no transport work until both numbers exist.
 - (Dead weight: resolved 2026-07-22 — piles go straight to dep-pure
   validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
-  ⇒ few changed pages, and it must be **split-monotone** — boundaries
-  refine, never move — because the aug fallback's level ladder is built
-  from the same rule family (the priority-threshold candidate
-  qualifies).
+  ⇒ few changed pages (the priority-threshold candidate qualifies).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
   findings, hash-list slices not bao). (Bulk-join body bundles: resolved
   2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)
