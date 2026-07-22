@@ -315,12 +315,15 @@ tables**, and two rules make one implementation serve every context.
 one check: **every ref resolves among the already-valid facts behind
 the cursor, or the unit rejects.** That single check is closedness,
 ordering, and dep resolution at once — no reorder buffer, no pending
-state, no topo sort in the kernel. Order is the serializer's job:
-`close()` emits **canonical-topo order** — among ready facts, always
-the smallest `(ts, fid)`; deterministic, retry-idempotent, and
-identical to key order whenever clocks were sane — so a closed pile
-validates in a single forward pass, RAM bounded by the working db,
-judging bytes as they arrive. **The system orders only at the writing
+state, no topo sort in the kernel. Order is the serializer's job,
+and it is free: **canonical-topo order is the closure walk's own
+completion order** — news in key order, refs in envelope order, emit
+each fact when its deps have emitted, dedup by fid. Emit-on-completion
+is deps-first by construction (reversed *discovery* order is not —
+shared deps break it), deterministic, retry-idempotent; the walk that
+gathers the closure *is* the serializer. So a closed pile validates in
+a single forward pass, RAM bounded by the working db, judging bytes as
+they arrive. **The system orders only at the writing
 edge**; readers never sort, never wait.
 **The caller injects the db connection**: `:memory:` when unstated, a
 tmp on-disk file when the caller knows better (replay, iOS) — never a
