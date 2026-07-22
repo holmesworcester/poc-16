@@ -290,10 +290,20 @@ read them, safe because their verdicts never enter the set. In
 evaluate mode there is nothing a handler could persist, and nothing is
 lost by it: whatever the store lacked arrives with the next closed
 pile anyway. Each kernel invocation is **closed in/out with its own
-tables** — ephemeral SQLite by connection string, `:memory:` normally,
-on-disk temp for the big cases (replay is just the whole-history pile;
-iOS bounds RAM) — so independent piles validate in parallel across
-cores.
+tables**, and two rules make one implementation serve every context.
+**Input is a stream**: the canonical codec's `(ts, fid)` order is a
+topological order — deps point backward, so a closed pile validates in
+a single forward pass (same-ts ties buffered), RAM bounded by the
+working db, and the kernel can run while bytes are still arriving.
+**The caller injects the db connection**: `:memory:` when unstated, a
+tmp on-disk file when the caller knows better (replay, iOS) — never a
+flag, because policy belongs to the caller and the kernel stays
+context-free; disposal, placement (an NSE uses the app-group
+container), and parallelism (one connection per invocation, across
+cores) are the caller's too. Replay then costs nothing to build: the
+treap's at-rest pages in key order *are* the kernel's input format —
+replay is `cat pages → kernel` with a disk db, and a windowed replay
+streams annex ∪ range, still deps-first.
 
 ```text
 drain:                     # put + poke (cloud); any verb (peer); under lease
@@ -562,12 +572,12 @@ rebuild from its store.
   facts) is bounded by the gate's-closure criterion and doubles as a WA
   budget — a chatty family on the list breaks the mode (MODEL.md,
   Cloud-Mode DB).
-- Engine and kernel working state is ephemeral SQLite by connection
-  string: `:memory:` normally, on-disk temp where RAM is tight (iOS)
-  or the input is huge (replay = the whole-history pile). Each kernel
-  invocation gets its own tables — closed in/out, no shared state —
-  which is what lets invocations run in parallel. Discarded after
-  every run.
+- Engine and kernel working state is ephemeral SQLite by
+  **caller-injected connection**: `:memory:` normally, on-disk temp
+  where RAM is tight (iOS) or the input is huge (replay = the
+  whole-history pile streamed in key order). Each kernel invocation
+  gets its own tables — closed in/out, no shared state — which is what
+  lets invocations run in parallel. Discarded after every run.
 - A peer's persistent SQLite holds two separate schemas: the sqlite
   ObjectStore driver (canonical layout) and the app read model (API
   queries), rebuilt by replay when its generation trails.
