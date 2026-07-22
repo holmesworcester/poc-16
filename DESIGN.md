@@ -276,7 +276,25 @@ which workspaces an endpoint belongs to — the one irreducibly node-local
 state, since private keys are never fact-derived — and cross-workspace
 identities stay unlinkable by construction. A node syncs its workspaces
 (~20 max) round-robin from the keyring; an idle workspace costs one
-conditional GET per cadence. Transport ACLs are never finer than
+conditional GET per cadence.
+
+The keyring is written only at the bootstrap edges — **create-workspace
+and accept-invite** — since an entry must exist before the node can mint
+or sync at all, and replay can never reconstruct private keys (recovery
+is re-invite). Both edges are still fact-layer **commands** in code
+organization: create-workspace generates the id and keypair, writes the
+keyring entry, and authors the genesis facts (workspace, founder, device
+cert, first epoch — ordinary facts through the ordinary author; store
+provisioning is the one deployment act outside the protocol). Eviction
+reaches the keyring only as an app-layer reaction to a synced fact.
+Snapshot and keyring are the opposite edges of the fact layer:
+downstream projection (serialized at commit, convergent, rebuildable)
+vs upstream root of trust (non-derivable, per-node). **Accepted debt**:
+the keyring forgoes the fact layer's concurrency story — a member's
+other devices do not learn of a new workspace through facts; each joins
+by its own invite. If multi-device keyring sync ever matters, the
+lineage answer is an event DAG for it (a personal meta-workspace) —
+deferred. Transport ACLs are never finer than
 membership — grants cover whole keys and pages interleave channels — so
 sub-workspace confidentiality is the encryption layer (epochs), never
 the grant.
