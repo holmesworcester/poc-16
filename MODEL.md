@@ -23,7 +23,7 @@ Records and pages (fixed-size records; ts leads the key):
 
 | sym | meaning | canonical value |
 |---|---|---|
-| E_l | leaf record `(ts, fid, author, seq, auth digest)` | 64 B |
+| E_l | leaf record `(ts, fid, author, auth digest)` | 64 B |
 | E_i | interior child record `(bound, fp, count, child hash)` | 96 B + 16·k |
 | P | page byte target | 128 KB (64–256 elastic) |
 | B_l = P/E_l | entries per leaf page | 2,048 |

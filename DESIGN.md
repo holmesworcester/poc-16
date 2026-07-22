@@ -53,7 +53,7 @@ the sorted run + fence hierarchy below. No homomorphic sums — they exist
 to compare unaligned ranges (useless here) and invite Wagner's attack.
 
 **Pages and fences.** The validated set serializes as one key-sorted run
-of fixed-size leaf records `(ts, fid, author, seq, auth digest)` —
+of fixed-size leaf records `(ts, fid, author, auth digest)` —
 existence and validation without fetching bodies — cut deterministically
 into fat immutable content-addressed pages (64–256 KB), addressable in
 8 KB slices by ranged GET. Above it sit **fence runs**: one fence per
@@ -185,13 +185,21 @@ protocol, not the backend. A lease keeps the engine single-flight for
 cache locality — concurrent pokes coalesce — and the CASes keep it safe
 regardless.
 
-Auth state is materialized, never re-derived: the snapshot (member keys,
-chain heads, epochs) is a small object referenced by the manifest, rewritten
-in the same commit whenever auth facts are admitted — always current, no
-union to compute. Validation is a shallow check against it (POC-10
-split); no chain walks.
+Auth state is materialized, never re-derived: the snapshot is a small
+object referenced by the manifest, rewritten in the same commit whenever
+auth facts are admitted — always current, no union to compute. Structure:
+fixed-size records sorted by **device pubkey** (what a mint challenge and
+a fact signature prove control of — distinct from the device id,
+`H(device_fact)`): pubkey → member, device id, scope/status; plus member
+status and KDF epoch heads. No per-author seq tracking for now:
+completeness is the walk's job, not counters, so validation is a shallow
+check against the snapshot (POC-10 split) — signed by a certified key,
+deps resolved — the engine keeps no per-author cursor, and ordinary
+facts never touch the snapshot.
 Revocation is enforced here: an evicted member's grant can litter the pile
-until expiry, but the next validation rejects the facts.
+until expiry, but the next validation rejects the facts; revocation
+ordering is by ts (a revoked key's backdated window is the accepted gap
+for now).
 
 Performance: merge-join, not per-fact lookups; resolve intra-batch and
 the tail first. A messaging dep graph is a tiny universally-hot auth
@@ -217,6 +225,15 @@ content-addressed, and the session's first walk starts a round trip ahead.
 Over iroh the mint feels vestigial (the channel proved the key) but stays —
 it is load-bearing in the cloud world and keeping it keeps the worlds
 isomorphic. Transport identity is never an integrity input.
+
+A **workspace is a store** — root, treap, piles, snapshot, each derived
+only from its own facts; the same device pubkey in two workspaces is two
+independent certifications. The mint is the one multi-tenant piece:
+`/mint` names the workspace, reads that store's root, and the grant
+scopes to that store's prefix. Transport ACLs are never finer than
+membership — grants cover whole keys and pages interleave channels — so
+sub-workspace confidentiality is the encryption layer (epochs), never
+the grant.
 
 ## Protocol and Transports
 
