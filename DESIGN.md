@@ -9,7 +9,9 @@ counterpart that executes almost no code?** The counterpart is a dumb object
 store (S3, a peer's disk behind seven HTTP routes, a static file host)
 holding a materialized summary of the validated set. The active side does
 the whole reconciliation itself by fetching immutable pages — the only code
-left on the passive side is the auth fence checking grants at the door. If
+left on the passive side is the auth fence checking grants at the door
+(one exception: invite blobs are public reads — unguessable ids,
+encrypted under a secret in the link). If
 it works, a cloud node stops being a sync participant and becomes an
 artifact peers sync against — which dissolves the POC-13 cloud blocker
 (sync coverage == residency).
@@ -55,8 +57,9 @@ union globals, one CAS, delete piles. Runs only on request, under a
 lease. Access is a handshake: the requester sends a small closed
 pile — a request fact plus its auth closure — and the mint, a pure
 function, runs the same kernel over it and returns a grant encrypted
-to the author's key. Invites are encrypted blobs at
-unguessable ids — a link is a URL plus a 32-byte seed.
+to the author's key. Invites are the one ungated read — **public**
+blobs at unguessable ids (LIST denied), encrypted under a secret
+carried in the link: a link is a URL plus a 32-byte seed.
 
 **Consumers.** Trustless: re-kernel whatever they pull, in any order,
 streaming — a fresh join's inbox is usable in seconds. `Valid<Fact>`
