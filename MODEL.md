@@ -144,8 +144,11 @@ scattered only because of fence-granular slicing: whole-page fetches
 would be ~90 packed pages ≈ **23 MB**, a 20× miss. Fences are
 load-bearing for P1, not an optimization.
 
-**Fresh join** is bandwidth-bound under packed pages: ~2.2 k page GETs,
-0.57 GB ≈ **3 min at 25 Mbps** (45 s at 100), $0.001 of requests. The
+**Fresh join** is bandwidth-bound under packed pages: ~2.2 k page GETs
+(+ annexes), 0.57 GB ≈ **3 min at 25 Mbps** (45 s at 100), $0.001 of
+requests — and the bulk decision is made in round 1 (count gap at the
+root), units stream through the kernel newest-first, so the inbox is
+usable in seconds while history backfills. The
 pre-packing layout — a blob per fact — was request-bound instead: 10^6
 GETs ≈ 5.5 min and $0.40 no matter the bandwidth. That asymmetry is why
 packing was adopted; the same collapse rescues every windowed fetch

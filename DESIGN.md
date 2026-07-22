@@ -235,14 +235,26 @@ no daemon in the byte path); in a peer the daemon fronts the store.
 
 ```text
 manifest <- conditional GET root      # 304 ⇒ NOTHING changed, done; top fences inline
-compare(local, remote) per fence:     # tail fences are just the rightmost fences
-  equal fingerprint  -> prune
-  huge count gap     -> bulk fetch / bulk push (any range = contiguous GETs)
-  else               -> ranged GET the covered fence/leaf/tail slices, recurse
-then: bodies ride the fetched pages (news = tail heap suffix; spilled via blob/); push what it lacks into its pile
+per fence, compare fingerprint + count:   # tail fences are just the rightmost fences
+  equal fp      -> prune
+  local ≈ empty -> BULK: fetch range + annex units (closed piles),
+                   stream-kernel on arrival, newest-first
+  else          -> EXACT: ranged GET fence/leaf/tail slices, recurse; diff records
+then (exact): bodies via page heaps / tail suffix / blob spills — context local, no annex
+then (both):  push what the responder lacks, as closed piles, into its pile prefix
 ```
 
-The count heuristic is advisory (adds and deletes cancel); depth is capped.
+**Decide with hashes, converge with piles.** Exact mode is the
+near-sync path — byte-minimal, ~20 KB per cadence, context already
+local so no closure machinery. Bulk mode is onboarding and catchup —
+the fetch unit is the closed pile, judgeable the moment it lands.
+The mode boundary is per-fence, advisory (adds and deletes cancel),
+and mischoosing costs bytes, never correctness. Descent is **read
+planning, not negotiation**: the responder is passive, counts ride
+every fence, and the inline top run means a cold or far-behind client
+decides *in round one* which subtrees to take whole — bootstrap
+collapses to root → one fence-run read (enumeration) → parallel unit
+fetches, streaming through the kernel as they arrive.
 
 The walk computes the *symmetric* difference, so push is the tail of the
 same walk: **one dial converges both sides; the responder runs zero sync
