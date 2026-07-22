@@ -169,7 +169,12 @@ on new local fact f:                       # eager path — news latency
 
 at walk end:                               # anti-entropy backstop
   push <- local entries in differing ranges ⊖ remote entries(fetched slices)
-  par PUT pile/<me>/<hash> for push        # full fact objects: envelope + body
+                                           # exact only now — slices carry the
+                                           # responder's complete in-range entries
+  close(push) -> one closed pile; PUT pile/<me>/<hash>; poke
+                                           # one close(): shared closure embedded once
+  bulk ranges: PUT copies of own range+annex / tail+tail-annex units
+                                           # already closed piles; merge dedups by fid
 ```
 
 - The fetched slices contain the responder's *complete* entry list inside

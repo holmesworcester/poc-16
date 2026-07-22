@@ -238,7 +238,12 @@ per fence, compare fingerprint + count:   # tail fences are just the rightmost f
                    stream-kernel on arrival, newest-first
   else          -> EXACT: ranged GET fence/leaf/tail slices, recurse; diff records
 then (exact): bodies via page heaps / tail suffix / blob spills — context local, no annex
-then (both):  push what the responder lacks, as closed piles, into its pile prefix
+then, at walk end — the push tail:
+  exact -> push set completes only now (leaf slices carry the responder's
+           full in-range entries); one close() over it -> one closed pile,
+           PUT into own pile prefix + poke
+  bulk  -> PUT copies of own promoted range+annex / tail+tail-annex units —
+           already closed piles; no assembly, receiver's merge dedups by fid
 ```
 
 **Decide with hashes, converge with piles.** Exact mode is the
@@ -252,6 +257,24 @@ every fence, and the inline top run means a cold or far-behind client
 decides *in round one* which subtrees to take whole — bootstrap
 collapses to root → one fence-run read (enumeration) → parallel unit
 fetches, streaming through the kernel as they arrive.
+
+**The push tail is collect-then-close, never per-leaf.** In exact mode
+the push set is not even knowable per-leaf — the subtraction needs the
+responder's complete entry list inside each differing range, which
+arrives with the leaf slices — and one `close()` over the collected
+set embeds the shared closure (auth chains, hot deps) once, where
+per-leaf piles would re-embed it per leaf: exactly the duplication the
+no-size-cap rule exists to avoid. In bulk mode there is no assembly at
+all: the pusher's own promoted range + annex and tail + tail-annex
+units are already closed piles, so push is copying bytes it already
+holds, and over-pushing is harmless because the receiver's merge
+dedups by fid. The walker's cross-round state is three entry sets —
+descent frontier, pull set, push accumulator — records only, never
+bodies; `close()` streams bodies from the local store once, at the
+end. Chunking a large push for transport retry is legal, but each
+chunk must close independently (splitting duplicates closures), which
+is why one pile is the default. Piles are transient ingress, never
+canonical: push granularity cannot perturb "same set, same bytes."
 
 The walk computes the *symmetric* difference, so push is the tail of the
 same walk: **one dial converges both sides; the responder runs zero sync
