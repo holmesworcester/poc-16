@@ -19,16 +19,19 @@ Set and workload:
 | ρ | fraction of diff in the recent ts range | ≈1 live; <1 for old edits/late arrivals |
 | F | fact object (envelope + ciphertext body) | 0.5 KB (attachments excluded) |
 
-Records and pages (fixed-size records; ts leads the key):
+Records and pages (fixed-size records; ts leads the key; **packed pages
+adopted 2026-07-22** — bodies live in their page's heap, not in per-fact
+blobs):
 
 | sym | meaning | canonical value |
 |---|---|---|
-| E_l | leaf record `(ts, fid, author, auth digest)` | 64 B |
-| E_i | interior child record `(bound, fp, count, child hash)` | 96 B + 16·k |
-| P | page byte target | 128 KB (64–256 elastic) |
-| B_l = P/E_l | entries per leaf page | 2,048 |
-| k | slices (fences) per page | 16 |
-| P/k | slice — the ranged-GET unit | 8 KB / 128 entries |
+| E_l | leaf record `(ts, fid, author, auth digest, body off)` | 72 B |
+| E_f | fence record `(separator, fp, count, page ref)` | ~28 B |
+| P | page byte target — record section + body heap | 256 KB |
+| B_l = P/(E_l+F) | facts per page | ~450 |
+| S | slice — the ranged-GET unit, 8 KB of record run | ~113 records |
+| B_t | tail promotion threshold (entries) — the guard-window knob | 2,048 |
+| — | body spill threshold (bigger ⇒ own `blob/`; attachments always) | 8 KB |
 
 Platform (us-east 2026; R2 in parentheses where it differs):
 
@@ -49,8 +52,10 @@ Platform (us-east 2026; R2 in parentheses where it differs):
 ## Geometry — Fence Runs
 
 The set serializes as one key-sorted run of fixed-size leaf records, cut
-into pages addressable in 8 KB slices; above it sit **fence runs** — one
-fence per slice, sorted, cut, and fingerprinted by the same rule. The
+into packed pages — record section first, then a body heap holding the
+facts' bodies in record order (offsets in the records, lengths implicit);
+above the record run sit **fence runs** — one fence per 8 KB record
+slice, sorted, cut, and fingerprinted by the same rule. The
 treap never exists as a pointer structure: priorities are only the
 deterministic cut function, and the fence hierarchy is its fingerprint
 aggregation.
@@ -58,10 +63,17 @@ aggregation.
 - Fence record `(separator, fp, count, page ref)`: 16 B fp + 2 B count +
   suffix-truncated separator (~8 B) + run-length-shared page ref (~2 B) ≈
   **28 B** encoded.
-- Sizes at 10^6: leaf run 64 MB, ~500 pages / 7.8 k slices; L1 fence run
-  7.8 k · 28 B ≈ 220 KB (2 pages); top run ~28 fences ≈ 1 KB — inlined in
-  the manifest. At 10^9: one more level (L2 ≈ 750 KB), top ≈ 3 KB. Run
-  depth **D = 2** at 10^6, **3** at 10^9.
+- Sizes at 10^6: record run 72 MB + ~500 MB of bodies in ~2.2 k packed
+  pages / 9 k slices; L1 fence run 9 k · 28 B ≈ 250 KB; top run ~32
+  fences ≈ 1 KB — inlined in the manifest. At 10^9: one more level
+  (L2 ≈ 0.9 MB), top ≈ 3.5 KB. Run depth **D = 2** at 10^6, **3** at 10^9.
+- **Packed pages.** A body over 8 KB — and every attachment — spills to
+  its own `blob/<hash>`; the record keeps the ref. Otherwise there is no
+  per-fact object: a dep probe is one ranged GET at the record's offset,
+  a bulk fetch takes whole pages, and the walk touches record sections
+  only — record and body bytes never mix in a fetch. `bundle/` is gone:
+  the tail page carries its bodies like any page, and news bodies are
+  its heap's suffix.
 - **Manifest** (~2 KB): `{generation, top fence run inline — history
   fences + tail-slice fences, auth ref}` — one conditional GET prices the
   whole validated set (news included) *and* locates every top-level
@@ -91,8 +103,10 @@ every c seconds, or on news hint:
   ls <- ranged GET leaf slices under
         differing fences                   # 3 | L(d) | 8 KB each
   diff <- entries(ls) ⊖ local entries      # exact, in BOTH directions
-  bodies <- par GET blob/<fid> I lack      # 4 | d_pull | d_pull·F
-  news bodies via bundle/<hash>            # 4 (concurrent) | ~1 | Δ·F
+  bodies <- ranged GET body heaps of the
+        touched pages, coalesced per page;
+        spilled bodies via blob/<hash>     # 4 | ≤ pages touched | d_pull·F
+  news bodies: tail heap suffix            # 4 (concurrent) | 1 | Δ·F
   (tail slices arrived via the same fence walk — no separate news path)
   validate pulled facts; apply; then send-loop tail
 ```
@@ -105,36 +119,37 @@ fresh session skips round 1: the mint response carries the current root
 **Transfer.**
 
 ```text
-T(d) ≈ 1.5 KB + (F1 + L(d))·(P/k) + d_pull·F
-L(d) ≈ ρ·ceil(d / (B_l/k)) + (1−ρ)·d     leaf slices (birthday-corrected)
-F1   ≈ fence slices covering L(d)        (≤ whole L1 run, 220 KB, scattered)
+T(d) ≈ 1.5 KB + (F1 + L(d))·S + d_pull·F
+L(d) ≈ ρ·ceil(d / 113) + (1−ρ)·d         leaf slices (birthday-corrected)
+F1   ≈ fence slices covering L(d)        (≤ whole L1 run, 250 KB, scattered)
 ```
 
 Locality is the whole game: ts leads the key, so live diffs land in the
-rightmost slices (`ρ→1`) and `L(d) ≈ d/128`. Scattered diffs (old edits,
+rightmost slices (`ρ→1`) and `L(d) ≈ d/113`. Scattered diffs (old edits,
 late arrivals) pay one slice each. Worst-case transfer is
-`O((d + D)·P/k)` — the "log n" of P1's O(d·log n) claim lives in D, and
+`O((d + D)·S)` — the "log n" of P1's O(d·log n) claim lives in D, and
 the constant is the slice size, not the page size.
 
-Three regimes at n = 10^6, k = 16:
+Three regimes at n = 10^6:
 
 | regime | rounds | bytes | notes |
 |---|---|---|---|
 | steady repeat, λc = 50, clustered | ≤4 | ~20 KB + bodies | manifest + 1 fence slice + 1 leaf slice |
 | cold cache, d = 100 scattered | 4 | ~1 MB | L1 run 220 KB + ~100 leaf slices + bodies |
-| fresh join | bw-bound | n·(E_l+F) ≈ 0.6 GB | see below |
+| fresh join | bw-bound | 0.57 GB, ~2.2 k page GETs | see below |
 
 **Litmus check.** "≤4 rounds, ≤ low hundreds of KB" holds for the
 recent-clustered case — which ts-keying makes the live case — and holds
-scattered only because of fence-granular slicing: page-granularity fetches
-would be ~90 pages ≈ **11.6 MB**, a 40× miss. Fences are load-bearing for
-P1, not an optimization.
+scattered only because of fence-granular slicing: whole-page fetches
+would be ~90 packed pages ≈ **23 MB**, a 20× miss. Fences are
+load-bearing for P1, not an optimization.
 
-**Fresh join** is body-request-bound, not byte-bound: 10^6 individual
-`blob/` GETs ≈ 5.5 min at 3 k GET/s (and $0.40). Metadata is fine (489
-pages, one round). If joins matter, the fix is body bundles aligned to
-leaf pages — folded into the blob open question, with its own write
-amplification cost (rewriting a bundle costs B_l·F ≈ 1 MB).
+**Fresh join** is bandwidth-bound under packed pages: ~2.2 k page GETs,
+0.57 GB ≈ **3 min at 25 Mbps** (45 s at 100), $0.001 of requests. The
+pre-packing layout — a blob per fact — was request-bound instead: 10^6
+GETs ≈ 5.5 min and $0.40 no matter the bandwidth. That asymmetry is why
+packing was adopted; the same collapse rescues every windowed fetch
+(Closure below).
 
 **Time.** `t ≈ R_w·R + T/W`. Steady repeat over WAN: 4·50 ms + ~20 KB at
 25 Mbps ≈ **0.2 s**. Same shape over iroh; only R changes.
@@ -178,8 +193,9 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
   facts <- par GET pile objects            # b reqs | b·F
   admit <- well-formed ∧ verify sig ∧ author known   # b·t_v CPU; no dep I/O
   fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer
-  emit  <- rewrite ceil(b/B_l)+D pages, PUT If-None-Match
-           COPY pile→blob ×b; PUT snapshot′ if changed
+  emit  <- rewrite tail (records + bodies); on promotion
+           ceil(b/B_l)+D pages, PUT If-None-Match
+           spilled bodies -> blob/; PUT snapshot′ if changed
   CAS root                                 # the commit point
   batch DELETE pile keys                   # admitted and rejected alike; ceil(b/1000) reqs
 ```
@@ -189,28 +205,31 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
 ```text
 t(b) ≈ b·R_l/w        pile GETs
      + b·t_v/v        verify (v = vCPU share)
-     + b·R_l/w        pile→blob copies
-     + (D + b/B_l + 2)·R_l   emit + CAS
+     + (D + b/B_l + 2)·R_l   emit + CAS   (no per-fact copies — bodies ride the pages)
 ```
 
-b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 180 + 60 ms ≈
-0.53 s ⇒ **~1,900 facts/s** against real S3 — 6× over the 300/s litmus,
-margin absorbed by tail latency and cache misses. Against a local sqlite
-store the loop is verify-bound: **6–10 k facts/s**. Bottleneck order:
-per-fact pile GETs ≈ copies > verify > emit. Note vCPU scales
+b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 95 ms ≈
+0.39 s ⇒ **~2,600 facts/s** against real S3 — 8× over the 300/s litmus,
+margin absorbed by tail latency and cache misses (packing deleted the
+per-fact `COPY pile→blob`, previously a co-leading cost). Against a
+local sqlite store the loop is verify-bound: **6–10 k facts/s**.
+Bottleneck order: per-fact pile GETs > verify > emit; uploading a ~1 MB
+packed tail adds 10–20 ms, noise. Note vCPU scales
 with Lambda memory — 1,769 MB doubles the verify rate.
 
 **Write amplification.**
 
 ```text
-WA = (ceil(b/B_l) + D) · P / (b·E_l)
+WA = (ceil(b/B_l) + D) · P / (b·(E_l + F))
 ```
 
-b = 50 ⇒ ~120×; b = 2,048 ⇒ ~3×. Batching divides WA — and the pile makes
-batching free: **facts are visible in the pile the moment they're PUT, so
-compaction cadence τ is a pure cost knob, not a delivery-latency knob.**
-Choose λτ ≈ B_l/4..B_l where λ allows. CAS contention ≈ 0 under the
-lease; the CAS is only the safety net.
+b = 50 ⇒ ~27×; b = B_t = 2,048 ⇒ ~1.5×. Batching divides WA — and the
+pile makes batching free: **facts are visible in the pile the moment
+they're PUT, so compaction cadence τ is a pure cost knob, not a
+delivery-latency knob.** Choose λτ ≈ B_t/4..B_t where λ allows. Tail
+rewrites between promotions churn up to ~1.2 MB per drain, but PUT bytes
+are ingress-free — milliseconds of Lambda upload, not dollars. CAS
+contention ≈ 0 under the lease; the CAS is only the safety net.
 
 **No parked scan.** The shallow gate ended it: every drain empties the
 pile — admitted or deleted, nothing waits — so a drain costs
@@ -220,15 +239,15 @@ store object.
 
 ## Dollars
 
-Per admitted fact (S3): 1 client PUT + 1 engine GET + 1 COPY + amortized
-page PUTs + 1/1000 DELETE ≈ **$11/M facts** written. Storage at 10^6
-facts ≈ 0.6 GB ≈ $0.014/mo.
+Per admitted fact (S3): 1 client PUT + 1 engine GET + amortized page
+PUTs + 1/1000 DELETE ≈ **$6/M facts** written — the per-fact COPY died
+with packing. Storage at 10^6 facts ≈ 0.6 GB ≈ $0.014/mo.
 
 Per active reader per day (adopted tail-range design), c = 60 s,
 λ = 10^4/day:
 
 ```text
-(86400/c)·(cond GET root) + news polls·(tail slice + bundle GETs)
+(86400/c)·(cond GET root) + news polls·(tail slice + tail-heap ranged GETs)
 = 1440·$0.4e-6 + ~700·2·$0.4e-6        ≈ $0.0012
 + egress ~6 MB·$0.09/GB                ≈ $0.0006   (R2: 0)
 ≈ $0.002/day  (~$0.06/mo)
@@ -241,8 +260,9 @@ Levers: cadence c (linear), a *follower tier* that polls the manifest only
 (τ-fresh, ~$0.001/day), long-poll on peers (poll cost → 0), R2 (egress → 0).
 
 Group per day (20 active readers, λ = 10^4, c = 60): writers $0.05 +
-engine $0.06 (Lambda ~$0.01 + copies $0.05) + readers $0.04 ≈ **$0.15/day**
-— per-fact write costs now dominate; the reader side is solved.
+engine ~$0.01 (Lambda; page PUTs are noise — copies are gone) + readers
+$0.04 ≈ **$0.10/day** — the writers' own pile PUTs now dominate; engine
+and reader sides are solved.
 
 Lambda memory: hot set = auth snapshot + right-edge pages + recent window
 ≈ tens of MB ≪ 1 GB. RAM bills only during execution (~pennies/day at
@@ -261,11 +281,11 @@ both:
 ```text
 pile/<member>/<hash>    raw, per-member ingress          (unchanged)
 tail page               the WAL: validated, deduped,
-                        (ts,fid)-sorted, ≤ B_l entries —
+                        (ts,fid)-sorted, ≤ B_t entries,
+                        records + bodies packed —
                         the treap's rightmost range,
                         content-addressed, its fences
                         inlined in the manifest top run  (new)
-bundle/<hash>           news body bundles                (new)
 manifest + pages        the rest of the set              (unchanged)
 ```
 
@@ -274,23 +294,25 @@ validate (on request: peers drain-on-read, cloud on poke; same lease):
   facts <- LIST + par GET pile; gate (sig + author known; no dep I/O)
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # cut rule fires
-  PUT blob/<hash> each, bundle, tail', any promoted pages
+  PUT tail', any promoted pages, spilled bodies -> blob/
   CAS manifest                         # the single commit point
   batch DELETE covered pile keys       # pile empties every drain
 ```
 
 The WAL is the engine's recent window made durable and public — and
-since it is (ts,fid)-sorted and capped at B_l entries, **it is literally
-the next leaf page, accumulating in public**; promotion freezes it. The
-B_l cap (128 KB, one GET) and the promotion threshold coincide — "the
-size where serving a flat list becomes impractical" is exactly "one leaf
-page". Because its per-slice fences ride in the manifest's top run,
-updating it touches no fence pages: no path rebuild.
+since it is (ts,fid)-sorted and capped at B_t = 2,048 entries (~1.2 MB
+packed), **it is the next few leaf pages, accumulating in public**;
+promotion freezes it into ⌈B_t/B_l⌉ ≈ 5 pages. B_t is deliberately
+larger than one page: the cap is the straggler guard-window knob
+(B_t/λ), decoupled from page size. Because the tail's per-slice fences
+ride in the manifest's top run, updating it touches no fence pages: no
+path rebuild.
 
 Reader poll is **one conditional GET of the manifest** — the root
 fingerprint covers news too, so "did anything change" has a single
 answer, and fetching news is the ordinary fence walk (usually one changed
-tail slice + one bundle). No LIST, no per-fact GETs, no raw litter ever
+tail slice + one ranged GET of new tail bodies). No LIST, no per-fact
+GETs, no raw litter ever
 reaching readers (signature checks stay on ingest as defense in depth,
 but litter costs readers zero bandwidth). Between promotions the tail is
 mostly-append, so the changed-slice diff is usually the last slice; and
@@ -302,8 +324,8 @@ Comparison at λ = 10^4/day, c = 60 s, validate cadence 30 s:
 | | two-tier (pile→treap) | three-tier (pile→WAL→treap) |
 |---|---|---|
 | reader $/day | $0.012 (LIST tax + per-fact GETs) | **~$0.002** (5–9×, burstiness-dependent) |
-| treap page PUTs/day | ~7,200 (1,440 compactions) | **~25** (~5 promotions) |
-| page bytes rewritten/day | ~550 MB | **~2.5 MB** |
+| treap page PUTs/day | ~7,200 (1,440 compactions) | **~30** (~5 promotions × ~5 pages) |
+| page bytes rewritten/day | ~550 MB | **~8 MB** promoted (+ tail churn — bytes free) |
 | manifest generations/day | 1,440 (walker caches churn) | ~5 (caches warm for hours) |
 | news visibility | ~c (if readers LIST-poll fast) | writer poke→validate (~seconds cloud, ms peer) |
 | per-fact validate cost | 1 GET + verify + writes | same — conserved |
@@ -314,13 +336,13 @@ pays on the read path and how often treap pages churn — and that is where
 the money was.
 
 **Is the treap fast enough to fan out from directly?** Updating it is
-cheap (~4 PUTs, ~$2.5e-5 per promotion) — but per-batch promotion was never the
+cheap (~8 PUTs, ~$4e-5 per promotion) — but per-batch promotion was never the
 binding cost; making every reader poll raw piles was. Conversely the
 treap alone can't serve news cheaper than τ-freshness. So: immutable
 pages for history, the tail range for fan-out, promotion on threshold.
 
 **"Requester always gets the latest, pauses on rebuild":** no pause
-exists or is needed. Every tier is publish-then-swap (bundle and pages
+exists or is needed. Every tier is publish-then-swap (tail and pages
 PUT before the index CAS that references them), so a requester always
 reads the last committed snapshot, and every admitted fact is in ≥1 of
 {pile, set} at all times — the tail is part of the set, and validation
@@ -336,15 +358,15 @@ property test dies. Determinism forces the range semantics; the mini-fold
 is its price. The price:
 
 - The promotion boundary is **content-determined**: the highest cut point
-  with fewer than one leaf page of entries above it. The whole layout —
+  with fewer than B_t entries above it. The whole layout —
   pages, fences, tail — stays a pure function of the set.
 - Guard window before a late fact straggles = the tail's time depth,
-  B_l/λ — **self-scaling**: ~5 h at λ = 10^4/day, ~2 days at 10^3/day,
+  B_t/λ — **self-scaling**: ~5 h at λ = 10^4/day, ~2 days at 10^3/day,
   ~30 min at 10^5/day. Busy groups have short windows and present
   members; quiet groups get days.
 - A straggler batch (a device reconnecting past the window) clusters by
-  ts, so it lands in 1–2 leaf pages: ~2–3 extra PUTs (~$1.5e-5, ~400 KB
-  rewritten), committed by the same manifest CAS as the batch's tail
+  ts, so it lands in 1–2 leaf pages: ~2–3 extra PUTs (~$1.5e-5, ~0.5–0.8
+  MB rewritten — bodies ride along), committed by the same manifest CAS as the batch's tail
   update. Not a separate round trip, not a separate commit.
 - Worst case (every fact a straggler) degenerates to the pre-WAL
   per-batch compaction model (~120× WA at b = 50) — i.e., **the tail is
@@ -365,9 +387,12 @@ backstop cadence, ~10–15 min, so no-work pokes stay rare — each costs one
 LIST). Arrival triggers (S3 events) were rejected: most ObjectStore
 drivers can't signal on put, so the trigger must live in the protocol.
 "Requester always gets the latest" is literal p2p, one poke away in the
-cloud; a writer that dies before poking is caught by cadence.
+cloud; a writer that dies before poking is caught by cadence. Third
+revision (2026-07-22): **packed pages** — pages and tail carry their
+bodies (spill > 8 KB to `blob/`), `bundle/` deleted, promotion threshold
+B_t decoupled from page size.
 
-## Closure — Any Range Plus Its Recursive Deps (dep aug; proposed 2026-07-22, not yet in DESIGN.md)
+## Closure — Any Range Plus Its Recursive Deps (dep aug; adopted into DESIGN.md 2026-07-22)
 
 Target semantics: sync an arbitrary `(ts, fid)` range Q — last 3 days,
 last 4 weeks, or any mid-history window — and receive it
@@ -386,8 +411,8 @@ and the gate are untouched.
   REQUIREMENT exported to the page-cut open question: the rule must be
   **split-monotone** (boundaries refine, never move; the
   priority-threshold candidate qualifies). At λ = 10^4/day the ladder is
-  a time-scale stratification: page ≈ 5 h, L1 ≈ 3.3 d, L2 ≈ 52 d.
-  L_a = 3 levels above pages at 10^6, 5 at 10^9.
+  a time-scale stratification: page ≈ 1.1 h, L1 ≈ 17 h, L2 ≈ 12 d, L3 =
+  the whole set at 10^6. L_a = 3 levels above pages at 10^6, 6 at 10^9.
 - k_ℓ(f) = number of level-ℓ ranges whose **promoted** facts
   transitively depend on f. Nesting makes k_ℓ non-increasing in ℓ and
   the root gives k = 1, so **home(f) = lowest level with k_ℓ(f) ≤ h**
@@ -431,7 +456,7 @@ Parameters:
 |---|---|---|
 | h | hoist cap — max ranges holding a ref before it homes higher | 8 |
 | β | level-ladder arity (priority thresholds) | 16 |
-| L_a | ladder levels above leaf pages | 3 at 10^6, 5 at 10^9 |
+| L_a | ladder levels above leaf pages | 3 at 10^6, 6 at 10^9 |
 | E_a | aug record: target (ts, fid), delta-coded | 40 B |
 | δ' | distinct out-of-page targets per fact after elision + hub homing | ≈1 (0.5–3) |
 | χ(Q) | context size: closure(Q) ∖ Q | workload; ~10^3 for a 3-day suffix |
@@ -439,7 +464,8 @@ Parameters:
 
 **Storage.** Records ≈ δ'·n plus hoisted copies (≤ h per fact, and only
 for the popular minority) ≈ n at canonical δ': 40 MB per sort order,
-80 MB for both — ~13% of the 10^6-group store; bodies (500 MB) dominate
+80 MB for both — ~12% of the 10^6-group store; bodies (~500 MB, packed
+in the pages) dominate
 as always. Degenerate no-locality bound (every ref random-old, elision
 never fires): δ' → δ gives ~560 MB, body-scale — the aug's
 affordability rests on temporal locality, and **δ' is the one workload
@@ -447,18 +473,20 @@ parameter to bench on real corpora before trusting this section.**
 
 **The closure walk.** Q quantizes outward to leaf-page cuts (elision
 scope is the page, so sub-page closure is undefined; the quantum is
-~5 h at canonical λ). Annotated `[round | requests | bytes]`; aug
+~1.1 h at canonical λ). Annotated `[round | requests | bytes]`; aug
 fetches ride the walk's rounds:
 
 ```text
 closure_sync(Q):                             # Q snapped to page cuts
   m   <- GET /root                           # 1 | 1 | ~3 KB   top fences now include aug + aug-tail
   f1  <- fact + aug L1 fence slices over Q   # 2 | few | 8 KB each
-  ls  <- leaf slices of Q                    # 3 | ~1 ranged GET/level | |Q|·E_l  (suffix ⇒ contiguous)
+  ls  <- leaf slices of Q — whole packed
+         pages when cold (bodies ride along) # 3 | ~|Q|/B_l pages | |Q|·(E_l+F) cold
   aug <- per cover range, the escape prefix: # 3 (same round) | r_esc | ≤8 KB each
          records with target < Q.start       #   within a range, refs sort by target ⇒
          (+ aug tail slice if Q meets tail)  #   out-of-Q targets are a computable prefix
-  bodies <- blob/bundle for (Q ∪ targets) I lack   # 4 | pulls | ·F
+  bodies <- context bodies via per-page
+         coalesced ranged GETs (spill: blob/) # 4 | ≤ χ probes | χ_pull·F
   trim (optional): chase envelope refs from Q over the fetched set
          ⇒ exact closure locally; slop is boundary ranges only (≤2/level)
 ```
@@ -474,19 +502,20 @@ paid it on every hop of every join.
 **Transfer.**
 
 ```text
-T_cl(Q) ≈ T_walk(Q) + χ·E_a + r_esc·(P/k) + χ_pull·F
+T_cl(Q) ≈ T_walk(Q) + χ·E_a + r_esc·S + χ_pull·F
 r_esc   = cover ranges with ≥1 escaping ref (slice-rounding term)
 ```
 
-| regime (n = 10^6, λ = 10^4/day) | rounds | metadata + aug | bodies |
+| regime (n = 10^6, λ = 10^4/day) | rounds | requests | bytes |
 |---|---|---|---|
-| 3-day suffix, cold (partial join) | 4 | 1.9 MB + ~0.15 MB | 15.2 MB, ~30.5 k GETs |
-| 4-week suffix, cold | 4 | 17.9 MB + ~0.3 MB | ~140 MB |
-| single page (~5 h) | 4 | 128 KB + ~40 KB | ~1.2 MB |
+| 3-day suffix, cold (partial join) | 4 | ~66 pages + ~25 aug/fence + ~800 context probes | ~18 MB |
+| 4-week suffix, cold | 4 | ~620 pages + ~1 k context probes | ~161 MB |
+| single page (~1.1 h) | 4 | 1 page + ~5 aug + ~10^2 probes | ~0.4 MB |
 | maintained window, steady | 1 (304) – 4 | plain-reader costs | + escapee bodies ~0.1 MB/day |
 
-The 3-day partial join lands in ~15–20 s for ~$0.014 — vs 5.5 min and
-$0.40 for the fresh join — and every fact in it projects immediately.
+The 3-day partial join lands in ~6 s at 25 Mbps for ~$0.002 — vs ~3 min
+and 0.57 GB for the fresh join — and every fact in it projects
+immediately.
 Ref bytes run ≤ E_a/F ≈ 8% of context body bytes even at 100% slop:
 **precision is nearly free, so the aug's whole job is rounds, and
 χ_pull·F is the floor no protocol beats** — the context must be
@@ -499,16 +528,16 @@ written anyway:
 - The owner range leads the forward key, and new promoted ranges are the
   rightmost, so **aug writes are right-spine appends** — the same
   locality as fact writes. `WA_aug = (⌈b·δ'/B_a⌉ + D)·P/(b·δ'·E_a)`,
-  B_a = P/E_a ≈ 3,276: at b = 2,048 about one aug leaf page + fences,
-  so promotion PUTs roughly double (~25 → ~50/day; ~+$1e-4/day, noise).
+  B_a = P/E_a ≈ 6,550 (aug pages carry no body heap): at b = B_t about
+  one aug page + fences per promotion (~30 → ~45 PUTs/day; noise).
 - Counts maintain by pruned propagation: "A hits y" implies "A hits all
   of closure(y)", so the walk from a new fact's direct refs stops at
   already-hit targets. Each (target, new-hit-range) pair is processed
   once ever — output-sensitive, amortized O(1) per aug record; per batch
   ≈ b·δ ≈ 14 k row probes, ≪ verify. Cold probes hit the inverted run by
   ranged GET (the standard retrieval op); at a 5% cold rate that is
-  ~700 GETs ≈ +0.1 s/batch ⇒ engine ~1,900 → ~1,600 facts/s vs S3,
-  still >5× the P2 litmus.
+  ~700 GETs ≈ +0.1 s/batch ⇒ engine ~2,600 → ~2,100 facts/s vs S3,
+  still ~7× the P2 litmus.
 - Migrations (a target crossing h): suffix-shaped hit sets make them one
   contiguous delete + one insert (~2 page touches); scattered need sets
   pay up to ~2h touches; ≤ L_a migrations per fact lifetime. A
@@ -534,7 +563,7 @@ fact rewrites O(dependent-spread) pages); per-fact inline closure lists
 (O(closure) envelope blowup); server-side closure computation (there is
 no server). Spidering survives as the fallback rung, not the plan.
 
-**If adopted, DESIGN.md gains:** dep refs in the signed clear envelope
+**Adopted 2026-07-22 — DESIGN.md now carries:** dep refs in the signed clear envelope
 (decided 2026-07-22 — bodies confidential, topology store-visible); the
 split-monotone constraint on the page-cut rule; the aug run family and
 aug tail riding the manifest (six verbs unchanged — aug is pages and
@@ -571,8 +600,9 @@ comfortable to ~50k principals.
   clears 1,000/req.
 - **Conditional PUT is native** on S3 (and R2/MinIO/Garage), so manifest
   CAS and `put_if_absent` port everywhere the trait goes.
-- **Egress**: at F = 0.5 KB request costs dominate egress; attachments
-  flip that — R2 (zero egress) is the default bucket.
+- **Egress**: packed pages make bulk fetches egress-bound (a fresh join
+  is 0.57 GB but $0.001 of requests) — R2 (zero egress) is the default
+  bucket; requests only matter for steady-state polling.
 - **p2p**: request-$ and egress vanish; only R, W remain. Same loops,
   smaller c, long-poll instead of LIST polling.
 
@@ -583,15 +613,15 @@ comfortable to ~50k principals.
    key-sorted run indexed by per-slice fence runs, with the top run inlined
    in the manifest. Any key range is one contiguous ranged GET per level —
    walk descent, dep probes, and bulk fetches are the same operation.
-   Without 8 KB fence-granular fetches, scattered d = 100 costs ~11.6 MB
-   and the litmus fails outside the clustered case.
+   Without 8 KB fence-granular fetches, scattered d = 100 costs ~23 MB
+   in whole packed pages and the litmus fails outside the clustered case.
 2. **P1 litmus restated** with its locality assumption: clustered (live)
    diffs ⇒ ≤4 rounds, tens-of-KB steady state; scattered ⇒ ~1 MB; worst
-   case O((d + D)·P/k) transfer.
-3. **Fresh join is request-bound** (per-fact body GETs); leaf-aligned body
-   bundles are the candidate fix, filed under the blob open question.
+   case O((d + D)·S) transfer.
+3. **Fresh join was request-bound** (a blob per fact ⇒ 10^6 GETs);
+   resolved by packed pages (item 8) — now bandwidth-bound.
 4. **τ is a cost knob, not a latency knob** — the pile decouples delivery
-   from compaction; batch toward λτ ≈ B_l/4..B_l.
+   from compaction; batch toward λτ ≈ B_t/4..B_t.
 5. **LIST is the reader poll tax**; the follower tier (manifest-only
    freshness) exists in the cost model as the cheap class.
 6. **The WAL tier was adopted** (section below): validate piles into a
@@ -603,3 +633,11 @@ comfortable to ~50k principals.
    mutable object (`root` ∪ `pile/*` is the whole mutable surface), one
    CAS for validation and promotion alike, one "did anything change" GET,
    one fetch function; `GET /wal` deleted; torn tail reads impossible.
+8. **Packed pages adopted (2026-07-22).** Page = 256 KB record section +
+   body heap; E_l grows to 72 B (body offset); bodies > 8 KB and
+   attachments spill to `blob/`; `bundle/` and the engine's per-fact
+   COPY are deleted; the tail packs bodies, with the promotion threshold
+   B_t = 2,048 entries decoupled from page size (guard window
+   unchanged). Bulk fetches collapse from per-fact GETs to whole pages:
+   fresh join 10^6 → ~2.2 k requests, per-fact cost $11 → $6/M, engine
+   ~1,900 → ~2,600 facts/s.

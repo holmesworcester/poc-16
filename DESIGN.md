@@ -29,18 +29,28 @@ hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 
 **P2 — efficient engine.** *Drain* takes `(raw piles, admitted set)` to
 `(admitted set′)` on request — well-formedness, signature, author known;
-no dep I/O — by rewriting the treap's tail range; *promotion* (the cut rule
-freezing a full tail into immutable pages) rides the same commit. Litmus:
+no dep I/O at the gate — by rewriting the treap's tail range; *promotion*
+(the cut rule freezing a full tail into immutable pages) and aug
+placement (Closure Walk) ride the same commit. Litmus:
 ≥ 300 facts/s validated in a warm 1 GB Lambda against real S3;
 thousands/s against a local store.
 
-Everything else is scaffolding around these two.
+**P3 — closure-complete range sync.** `closure_sync(Q)` returns any
+`(ts, fid)` range Q *plus every recursive dependency of every fact in
+it*, in the walk's own shape. Litmus: ≤ D + 2 rounds (+1 per
+out-of-window frontier hop); ref + fence overhead ≤ 10% of context body
+bytes; identical sets ⇒ identical aug bytes; a cold 3-day partial join
+at 10^6 ≈ 4 rounds / ~18 MB, projectable on arrival (MODEL.md, Closure).
+
+Everything else is scaffolding around these three.
 
 ## The Store
 
-**Facts.** Content-addressed, self-certifying (signature and dep refs in
-the payload — the gate checks a fact against nothing but itself and the
-snapshot), bodies encrypted.
+**Facts.** Content-addressed, self-certifying, bodies encrypted; the
+signature and dep refs live in the **signed clear envelope** (decided
+2026-07-22): the gate checks a fact against nothing but itself and the
+snapshot, and the engine derives the dep aug from envelopes alone — dep
+topology is store-visible, content never is.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
 refuse to pay for. This is a fact-format constraint.
@@ -54,10 +64,18 @@ the sorted run + fence hierarchy below. No homomorphic sums — they exist
 to compare unaligned ranges (useless here) and invite Wagner's attack.
 
 **Pages and fences.** The admitted set serializes as one key-sorted run
-of fixed-size leaf records `(ts, fid, author, auth digest)` —
-existence and authorship without fetching bodies — cut deterministically
-into fat immutable content-addressed pages (64–256 KB), addressable in
-8 KB slices by ranged GET. Above it sit **fence runs**: one fence per
+of fixed-size leaf records `(ts, fid, author, auth digest, body offset)`
+— existence and authorship without fetching bodies — cut
+deterministically into fat immutable content-addressed **packed pages**
+(~256 KB, adopted 2026-07-22): record section first, addressable in 8 KB
+slices by ranged GET, then a body heap holding the facts' bodies in
+record order (lengths implicit from the next offset). A body over ~8 KB
+— and every attachment — spills to its own `blob/<hash>`; the record
+keeps the ref. Otherwise there is no per-fact object: a dep probe is one
+ranged GET at the record's offset, bulk fetches take whole pages (a
+fresh join is ~2.2 k GETs, bandwidth-bound — MODEL.md), and the walk
+touches record sections only. Above the record run sit **fence runs**:
+one fence per
 slice, `(separator key, fingerprint, count, page ref)`, suffix-truncated
 and delta-coded (~28 B), itself sorted, cut, and fingerprinted by the same
 rule; the top run (a few KB) rides inside the manifest. The treap never
@@ -71,8 +89,8 @@ sequential GETs per lookup) or whole-page fetches on scattered diffs would
 sink the design. Run depth is 2–3 (MODEL.md).
 
 **Manifest.** The **only** mutable object besides the piles: generation,
-the inlined top fence run (history fences + tail fences), auth snapshot
-ref. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
+the inlined top fence runs (history + tail fences, fact and aug runs
+alike), auth snapshot ref. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
 rename) — the single commit point for validation and promotion alike.
 Everything it references is immutable and content-addressed, so one
 conditional GET revalidates a node's whole cached world, readers get
@@ -94,23 +112,26 @@ re-offered by its home store's walk after the certifying facts land.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
-(deduped, `(ts, fid)`-sorted, capped at one leaf page, ~128 KB) whose
-per-slice fences sit in the manifest's top run beside the history fences,
-plus news body bundles `bundle/<hash>`. Every drain rewrites the tail
+(deduped, `(ts, fid)`-sorted, records + bodies packed, capped at
+B_t = 2,048 entries ≈ 1.2 MB) whose per-slice fences sit in the
+manifest's top run beside the history fences; news bodies are the tail
+heap's suffix — there is no separate bundle object. Every drain rewrites the tail
 and CASes the manifest — the root covers the news naturally, and because
 the tail's fences are in the top run, no fence pages are rewritten: no
 path rebuild. So "did anything change" is one conditional GET for the
 whole set, and fetching news is the same fence walk as deep sync. History
 ranges = promoted, tail range = admitted news, pile = ingress;
 fingerprints cover the whole admitted set, never the pile. The tail is
-literally the next leaf page accumulating in public — when it fills,
-promotion (the cut rule firing) freezes it into immutable pages in the
-same commit. A fact admitted *below* the tail's range boundary (late ts:
+the next few leaf pages accumulating in public — when it fills,
+promotion (the cut rule firing) freezes it into ~⌈B_t/B_l⌉ ≈ 5 immutable
+pages in the same commit; the B_t cap is the straggler guard-window
+knob, deliberately decoupled from page size. A fact admitted *below* the
+tail's range boundary (late ts:
 offline devices, clock skew) takes an immediate mini-fold of
 the page it lands in — same commit, ~2–3 extra PUTs, rare because the
-boundary's guard window is the tail's time depth (B_l/λ: hours busy, days
+boundary's guard window is the tail's time depth (B_t/λ: hours busy, days
 quiet). The boundary itself is content-determined (the highest cut point
-with less than a leaf page above it), so the whole layout — tail included
+with fewer than B_t entries above it), so the whole layout — tail included
 — is a pure function of the set (MODEL.md, Stragglers).
 
 **ObjectStore trait.** Every node stores through one S3-shaped trait:
@@ -121,9 +142,9 @@ cas(key, etag, bytes)   # manifest only
 delete(key)             # GC, pile retirement
 ```
 
-Layout: `root`, `page/<hash>`, `blob/<hash>`, `bundle/<hash>`,
-`pile/<member>/<hash>` — everything but `root` and the piles is immutable
-and content-addressed.
+Layout: `root`, `page/<hash>`, `blob/<hash>` (spilled bodies +
+attachments), `pile/<member>/<hash>` — everything but `root` and the
+piles is immutable and content-addressed.
 Drivers: s3 (also R2/MinIO/Garage), sqlite (peer default), fs, mem (tests).
 One named asymmetry: in the cloud the store *is* the server (presigned,
 no daemon in the byte path); in a peer the daemon fronts the store.
@@ -136,7 +157,7 @@ compare(local, remote) per fence:     # tail fences are just the rightmost fence
   equal fingerprint  -> prune
   huge count gap     -> bulk fetch / bulk push (any range = contiguous GETs)
   else               -> ranged GET the covered fence/leaf/tail slices, recurse
-then: bodies via bundles (news) or blobs; push what it lacks into its pile
+then: bodies ride the fetched pages (news = tail heap suffix; spilled via blob/); push what it lacks into its pile
 ```
 
 The count heuristic is advisory (adds and deletes cancel); depth is capped.
@@ -156,6 +177,71 @@ one-sided walk one — bought back by fat fanout (256-way pages match 16-way
 interactive round-for-round) and parallel subtree fetches. 2–3 sequential
 rounds at 10^6 facts.
 
+## The Closure Walk (P3)
+
+**Any range, closure-complete.** `closure_sync(Q)` returns an arbitrary
+`(ts, fid)` window — last 3 days, any mid-history slice — plus every
+recursive dependency of every fact in it. That is what makes a partial
+replica *projectable* (dep-pure handlers never park), what a residency
+pin-set means for a bounded peer, and what turns POC-14's join pathology
+(dep-DAG-depth spider rounds) into the same walk shape as P1. Queries
+quantize outward to leaf-page cuts (~1 h of facts at canonical λ).
+
+**The aug** is one new run family on the existing skeleton — sorted
+fixed-size records (~40 B: target `(ts, fid)`, delta-coded), own fence
+runs, top fences inline in the manifest, ordinary `page/` objects,
+committed by the same CAS. Fact pages, the gate, and the six verbs are
+untouched. Above the leaf pages sits a **level ladder** of ranges from
+priority-threshold cuts at arity β ≈ 16 — the page-cut rule family,
+which must therefore be **split-monotone** (boundaries refine, never
+move). For each fact f, k_ℓ(f) counts the level-ℓ ranges whose promoted
+facts transitively need f; k_ℓ only falls with ℓ and reaches 1 at the
+root, so **home(f) — the lowest level with k_ℓ(f) ≤ h — always exists**
+(hoist cap h = 8). The aug stores one ref record per hit range at
+home(f), eliding targets that live in their own leaf page. Coverage:
+any leaf that needs f has f's ref on its root-to-leaf path, recursion
+included ("needs" is transitive) — and cutting expansion at popular
+facts is sound because **popularity is monotone along dep edges**: a
+dep is at least as needed as any of its dependents. Two sort orders are
+published — forward `(level, range, target)` for the walk, inverted
+`(target, level, range)` for maintenance and, later, deletion cascades.
+The canonical scope is the promoted prefix; for the tail the engine
+publishes an **aug tail**: the deduped pre-tail direct targets of tail
+facts, derived from clear envelopes alone, equally canonical.
+
+```text
+closure_sync(Q):                        # Q snapped to page cuts; aug rides the walk's rounds
+  root + fence slices over Q, fact and aug   # rounds 1–2, as P1
+  leaf slices of Q (whole packed pages cold — bodies ride along)   # round 3
+  aug escape prefixes per cover range        # round 3, same round — refs sort by
+                                             #   target, so out-of-Q targets are a prefix
+  context bodies, coalesced per page (spill via blob/)             # round 4
+  trim (optional): chase envelope refs over the fetched set ⇒ exact closure
+```
+
+`R_cl = D + 2` — 4 rounds at 10^6 — whenever the context lies on Q's
+cover paths, the common case for suffix queries; a frontier target
+outside the cover costs +1 round per escaping hop, so spidering
+survives only on out-of-window chains, where POC-14 paid it on every
+hop of every join. A cold 3-day partial join is ~18 MB, ~6 s at
+25 Mbps, ~$0.002 — vs 3 min and 0.57 GB for the fresh join — and every
+fact projects on arrival. Ref bytes stay ≤ ~8% of context bodies:
+precision is nearly free, the aug's whole job is rounds, and the
+context's own bodies are the floor no protocol beats.
+
+**Write side.** Placement is computed at promotion and is a right-spine
+append like the facts themselves (~one aug page per promotion). Counts
+maintain by pruned propagation — "A hits y" implies "A hits
+closure(y)", so each (target, range) pair is processed once ever;
+engine ~2,600 → ~2,100 facts/s vs S3, still ~7× the P2 litmus. Homes
+migrate only upward, ≤ L_a times per fact lifetime; the worst case (a
+hub promoted after its dependents) is one deterministic cascade bounded
+by inverted-run fan-in. Identical sets ⇒ byte-identical aug runs — the
+stage-1 property test extends verbatim. **The one workload assumption
+is δ′ ≈ 1** (distinct out-of-page targets per fact after elision and
+homing): at δ′ ≳ 3 the aug stays correct but its storage stops being
+noise — bench on a real corpus before trusting it (MODEL.md, Closure).
+
 ## The Engine (P2)
 
 One body of code, two loops; only the trigger and store driver differ by
@@ -169,7 +255,7 @@ validate:                  # on any compute-touched request — peers: every ver
   fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer; intra-batch first
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # the cut rule fires
-  put bodies, bundle, tail', promoted pages, snapshot′ if changed
+  put tail' (records + bodies), promoted pages, spilled blobs, snapshot′ if changed
   CAS manifest                             # the single commit point
   delete pile keys                         # admitted and rejected alike
 ```
@@ -313,7 +399,7 @@ the grant.
 | mint | `POST /mint` → grant + current root | Lambda URL | handshake endpoint |
 | poke | `POST /poke` | mint Lambda | implicit (drain-on-read) |
 | root | `GET /root` | S3 conditional GET | drain piles, then serve |
-| page | `GET /page/{hash}` (+ blob, bundle) | S3 GET | serve blob |
+| page | `GET /page/{hash}` (+ blob) | S3 GET | serve blob |
 | put | `PUT /pile/{member}/{hash}` | presigned PUT | grant-checked append |
 | list | `GET /pile/` | S3 LIST | list pile |
 
@@ -402,11 +488,14 @@ Proofs first; no transport work until both numbers exist.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
-4. **Protocol** — daemon (six routes) + the one HTTP client with grant
+4. **P3 bench** — aug build at promotion + closure walk; sweep window
+   sizes; measure δ′ on a real corpus (the aug's one workload
+   assumption).
+5. **Protocol** — daemon (six routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
-5. **iroh** — h3-over-iroh connector; same conformance suite.
-6. **Auth** — real gate + auth fold, snapshot format, eviction test,
+6. **iroh** — h3-over-iroh connector; same conformance suite.
+7. **Auth** — real gate + auth fold, snapshot format, eviction test,
    mint over both transports.
 
 ## Open Questions
@@ -419,7 +508,9 @@ Proofs first; no transport work until both numbers exist.
   (certified authors only, blameable); if it ever matters, deterministic
   suppression rides the deletion design.
 - Page cut: needs a precise deterministic definition that keeps small diffs
-  ⇒ few changed pages (candidate: cut at treap priority thresholds).
+  ⇒ few changed pages, and it must be **split-monotone** — boundaries
+  refine, never move — because the aug's level ladder is built from the
+  same rule family (the priority-threshold candidate qualifies).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
-  findings, hash-list slices not bao); bulk join wants leaf-aligned body
-  bundles (MODEL.md — fresh join is request-bound, not byte-bound).
+  findings, hash-list slices not bao). (Bulk-join body bundles: resolved
+  2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)
