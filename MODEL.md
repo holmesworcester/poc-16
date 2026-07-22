@@ -146,6 +146,8 @@ on new local fact f:                       # eager path — news latency
   for each counterpart store s with a grant:
     PUT s/pile/<me>/<hash(f)>              # idempotent; 200 = durably delivered
   POST s/poke after the batch              # cloud: wake the engine; peer: implicit
+  then walk s                              # closure guarantee: the exact diff
+                                           # carries deps/chain the PUT alone lacks
 
 at walk end:                               # anti-entropy backstop
   push <- local entries in differing ranges ⊖ remote entries(fetched slices)
@@ -157,6 +159,11 @@ at walk end:                               # anti-entropy backstop
   re-sends, no receipt protocol. Content-addressed PUT makes retries free.
 - Cost: one PUT per fact per cloud store ($5e-6); zero per peer. Rate:
   3,500 PUT/s on the member's own prefix ≫ λ.
+- Creation triggers the walk, not just the PUT: under seq a lone fact
+  parks behind any chain gap at the receiver, and parked is TTL'd — so
+  the eager path ends with a full walk per counterparty, nearly free
+  (one conditional GET) when in sync and exactly the closure-bearing
+  transfer when not.
 
 ## The Engine — compaction loop (P2)
 
@@ -208,6 +215,19 @@ compaction cadence τ is a pure cost knob, not a delivery-latency knob.**
 Choose λτ ≈ B_l/4..B_l where λ allows; floor τ at the parked-dep re-check
 interval. CAS contention ≈ 0 under the lease; the CAS is only the safety
 net.
+
+**Parked scan.** Parked facts stay in the pile and are re-examined every
+drain: P parked ⇒ P GETs + ~P/100 · 20 ms of drain latency (dep-check
+before sig re-verify keeps CPU negligible). At per-minute drains:
+P = 100 ⇒ ~$0.06/day, +20 ms — fine; P = 10^3 ⇒ ~$0.6/day, +200 ms —
+the drain-latency promise strains; P = 10^4 ⇒ ~$6/day, +2 s — broken.
+**The knee is P ≈ 10^3.** Three things keep P ≈ 0: treap pulls arrive
+dep- and prefix-closed (only interrupted transfers park), walk-on-create
+keeps honest parking transient, and the TTL caps hostile accumulation at
+rate·TTL per member (100/day litter × 3-day TTL ⇒ 300, well under the
+knee). Escape hatch if ever needed: publish a parked index (key →
+awaited dep) at commit and re-GET only unblocked entries — O(arrivals),
+not O(P).
 
 ## Dollars
 

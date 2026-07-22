@@ -82,9 +82,17 @@ period. Mutable surface of the whole store: `root` ∪ `pile/*`.
 **Pile.** `pile/<member>/<hash>` — ingress and quarantine. Puts are
 content-addressed, hence idempotent; the member prefix comes from the grant,
 so attribution, rate limits, and blame are the same code in every world. A
-put is durable, so the put response is the writer's confirmation. Only the
-engine reads raw piles: a hostile writer can litter but never poison, and
-litter costs readers zero bandwidth.
+put is durable — the response is a *delivery* receipt — but *acceptance*
+is appearance in the treap, and the walk's exact two-way diff re-offers
+anything that fell short. Only the engine reads raw piles: a hostile
+writer can litter but never poison, and litter costs readers zero
+bandwidth. **Parked facts are TTL'd** (age = the store's LastModified,
+already in every LIST; the purge rides the drain's delete batch): a
+healthy parked set is ~empty, because treap pulls arrive dep-closed and
+prefix-closed — only interrupted transfers and in-flight races park — so
+a long-parked fact is a permanent hole or litter. Purging is safe
+because piles are not the durability layer, treaps are: anything valid
+in any treap comes back with its closure via the walk.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
@@ -139,7 +147,13 @@ The walk computes the *symmetric* difference, so push is the tail of the
 same walk: **one dial converges both sides; the responder runs zero sync
 logic.** Eager delivery still exists — put your own new facts into known
 piles at write time, then poke — and the walk is the anti-entropy backstop
-(the Dynamo split).
+(the Dynamo split). **Creating content escalates the backstop to now**: a
+blind PUT delivers one fact, but its *closure* is whatever the
+counterparty is missing — under seq a new fact parks behind any gap in
+its chain, and parked TTLs out — so a new local fact ends with a full
+walk against each counterparty store; the exact diff carries the closure
+with it, and it is nearly free (one conditional GET) when already in
+sync.
 
 Round trips: interactive negentropy descends two levels per round trip, the
 one-sided walk one — bought back by fat fanout (256-way pages match 16-way
@@ -158,7 +172,7 @@ validate:                  # on any compute-touched request — peers: every ver
   deps  <- sorted (ts, fid) refs; resolve intra-batch, then tail,
            then merge-join vs leaf slices
   admit <- sig valid ∧ author live ∧ seq = cursor+1 ∧ deps resolved
-  park  <- missing deps and chain gaps stay in pile
+  park  <- missing deps and chain gaps stay in pile (TTL'd)
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # the cut rule fires
   put bodies, bundle, tail', promoted pages, cursors, snapshot if changed
