@@ -28,14 +28,14 @@ hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 (MODEL.md).
 
 **P2 — efficient engine.** *Drain* takes `(raw piles, valid set)` to
-`(valid set′)` on request — signature plus dep-pure handler over each
-fact's closure, deps resolved from pile ∪ treap (frontier probes only;
-the closure arrives with the pile) — by rewriting the treap's tail
-range; *promotion*
-(the cut rule freezing a full tail into immutable pages) and aug
-placement (Closure Walk) ride the same commit. Litmus:
-≥ 300 facts/s validated in a warm 1 GB Lambda against real S3;
-thousands/s against a local store.
+`(valid set′)` on request — hash-verify each pile, run
+`kernel(pile) → (valid, new globals)`, a pure predicate over fully
+closed piles with **zero store reads**, then k-way-merge the canonical
+runs into the treap's tail range; *promotion* (the cut rule freezing a
+full tail into immutable pages) and annex placement (Closure Walk)
+ride the same commit. Litmus: ≥ 300 facts/s validated in a warm 1 GB
+Lambda against real S3; thousands/s per core locally — independent
+piles validate in parallel.
 
 **P3 — closure-complete range sync.** `closure_sync(Q)` returns any
 `(ts, fid)` range Q *plus every recursive dependency of every fact in
@@ -108,14 +108,23 @@ put is durable — the response is a *delivery* receipt — but *acceptance*
 is appearance in the treap, and the walk's exact two-way diff re-offers
 anything that fell short. Only the engine reads raw piles: a hostile
 writer can litter but never poison, and litter costs readers zero
-bandwidth. **Piles are closure-complete or rejected**: pile ∪ treap must
-be dep-closed — the sender just walked, so it knows the gap exactly and
-ships it; the drain verifies with frontier probes (dep ∈ treap,
-record-level merge-join). **Nothing parks**: every drain empties the
-pile — valid facts into the tail, the rest (malformed, bad signature,
-invalid, closure-incomplete) deleted on the spot; anything valid that
-sank with a bad batch comes back with its closure on the sender's next
-walk.
+bandwidth. **A pile is a fully closed set in the canonical mini-run
+codec** — sorted records + packed bodies + mini-fences, the same
+serialization as tail and pages: an unpromoted leaf range. Closed
+means closed absolutely: every dep ref resolves *inside the pile*,
+auth chains down to genesis included, embedded and deduped per pile
+(~1–3 KB per author) — even deps the receiver already holds, because
+dedup at merge by fid is free and it is what keeps validation
+stateless. No size cap: splitting duplicates closures, and the merge
+streams. **All-or-nothing**: the kernel judges a pile as a unit;
+rejects (malformed, bad hash, unresolved ref, invalid) are deleted on
+the spot, blame lands on the pusher's own prefix, and anything valid
+that sank with a bad batch comes back on the sender's next walk.
+Byte-level layout never composes across concurrent piles — the engine
+re-cuts, because **recomputation is the verification** — but
+record-level merge does, associatively: history-independence makes any
+arrival grouping converge to identical bytes. Nothing parks; every
+drain empties the pile.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
@@ -195,60 +204,46 @@ pin-set means for a bounded peer, and what turns POC-14's join pathology
 (dep-DAG-depth spider rounds) into the same walk shape as P1. Queries
 quantize outward to leaf-page cuts (~1 h of facts at canonical λ).
 
-**The aug** is one new run family on the existing skeleton — sorted
-fixed-size records (~40 B: target `(ts, fid)`, delta-coded), own fence
-runs, top fences inline in the manifest, ordinary `page/` objects,
-committed by the same CAS. Fact pages, the gate, and the verbs are
-untouched. Above the leaf pages sits a **level ladder** of ranges from
-priority-threshold cuts at arity β ≈ 16 — the page-cut rule family,
-which must therefore be **split-monotone** (boundaries refine, never
-move). For each fact f, k_ℓ(f) counts the level-ℓ ranges whose promoted
-facts transitively need f; k_ℓ only falls with ℓ and reaches 1 at the
-root, so **home(f) — the lowest level with k_ℓ(f) ≤ h — always exists**
-(hoist cap h = 8). The aug stores one ref record per hit range at
-home(f), eliding targets that live in their own leaf page. Coverage:
-any leaf that needs f has f's ref on its root-to-leaf path, recursion
-included ("needs" is transitive) — and cutting expansion at popular
-facts is sound because **popularity is monotone along dep edges**: a
-dep is at least as needed as any of its dependents. Two sort orders are
-published — forward `(level, range, target)` for the walk, inverted
-`(target, level, range)` for maintenance and, later, deletion cascades.
-The canonical scope is the promoted prefix; for the tail the engine
-publishes an **aug tail**: the deduped pre-tail direct targets of tail
-facts, derived from clear envelopes alone, equally canonical.
+**Primary mechanism — closed ranges with embed annexes.** Diffing and
+closing live at different granularities: fingerprints stay
+slice-granular (P1 untouched), while closedness is a property of the
+*fetch unit*. Each promoted range gets an **annex** —
+`closure(range) ∖ range`, deduped, canonically sorted, its own
+content-addressed object beside the page — so range + annex is a fully
+closed set, judgeable by the same kernel predicate as any pile. The
+annex is a pure set function (identical sets ⇒ identical annex bytes),
+and the engine builds it **by aggregation, never by search**: piles
+arrive fully closed, so every copy an annex will ever need came in
+with some pile; at promotion each ref is classified in one pass
+(in-range, else annex) and sufficiency is the same syntactic
+resolution check the gate already ran. Fat ranges swallow the common
+context; hot hubs (genesis, certs, channels) cost one copy per range —
+~20 copies at 10^6 under fat ranges. Storage pays the duplication;
+nobody ever chases a graph.
 
 ```text
-closure_sync(Q):                        # Q snapped to page cuts; aug rides the walk's rounds
-  root + fence slices over Q, fact and aug   # rounds 1–2, as P1
-  leaf slices of Q (whole packed pages cold — bodies ride along)   # round 3
-  aug escape prefixes per cover range        # round 3, same round — refs sort by
-                                             #   target, so out-of-Q targets are a prefix
-  context bodies, coalesced per page (spill via blob/)             # round 4
-  trim (optional): chase envelope refs over the fetched set ⇒ exact closure
+closure_sync(Q):                        # Q snapped to range cuts
+  root + fence slices over Q            # rounds 1–2, as P1
+  leaf slices / whole packed pages of Q # round 3 — bodies ride along
+  annexes of Q's cover ranges           # round 3, same round
+  spilled bodies via blob/              # round 4
 ```
 
-`R_cl = D + 2` — 4 rounds at 10^6 — whenever the context lies on Q's
-cover paths, the common case for suffix queries; a frontier target
-outside the cover costs +1 round per escaping hop, so spidering
-survives only on out-of-window chains, where POC-14 paid it on every
-hop of every join. A cold 3-day partial join is ~18 MB, ~6 s at
-25 Mbps, ~$0.002 — vs 3 min and 0.57 GB for the fresh join — and every
-fact projects on arrival. Ref bytes stay ≤ ~8% of context bodies:
-precision is nearly free, the aug's whole job is rounds, and the
-context's own bodies are the floor no protocol beats.
+`R_cl = D + 2` — 4 rounds at 10^6, no escape hops, no workload
+assumption: the annex *is* the context. A cold partial join stays
+~4 rounds and tens of MB — the context's own bodies are the floor no
+protocol beats — and every fact projects on arrival (MODEL.md,
+Closure).
 
-**Write side.** Placement is computed at promotion and is a right-spine
-append like the facts themselves (~one aug page per promotion). Counts
-maintain by pruned propagation — "A hits y" implies "A hits
-closure(y)", so each (target, range) pair is processed once ever;
-engine ~2,600 → ~2,100 facts/s vs S3, still ~7× the P2 litmus. Homes
-migrate only upward, ≤ L_a times per fact lifetime; the worst case (a
-hub promoted after its dependents) is one deterministic cascade bounded
-by inverted-run fan-in. Identical sets ⇒ byte-identical aug runs — the
-stage-1 property test extends verbatim. **The one workload assumption
-is δ′ ≈ 1** (distinct out-of-page targets per fact after elision and
-homing): at δ′ ≳ 3 the aug stays correct but its storage stops being
-noise — bench on a real corpus before trusting it (MODEL.md, Closure).
+**Fallback — the dep aug** (MODEL.md, Closure): the ref-based
+augmentation (level ladder, k_ℓ homing, two sort orders, aug tail)
+that makes ranges closable *on demand* instead of closed *at rest* —
+leaner at rest, but its count propagation is transitive-closure work
+in the engine, the one thing the closed-pile design otherwise
+eliminates. Retained as the fallback if annex duplication measures
+pathological on a real corpus; stage 4 is the bake-off. The
+split-monotone constraint it exports to the page-cut rule stays either
+way.
 
 ## The Engine (P2)
 
@@ -256,25 +251,32 @@ One body of code, two loops; only the trigger and store driver differ by
 deployment.
 
 The kernel runs in **two modes, and the verb picks**: `drain` —
-evaluate and persist through the commit (put + poke in the cloud; any
-verb at a peer) — and `evaluate` — verdict only, structurally
-side-effect-free (mint, dial handshake). In evaluate mode there is
-nothing a handler could persist, and nothing is lost by it: whatever
-the store lacked arrives with the next closure-complete pile anyway.
+`kernel(pile) → (valid, new globals)`, persisted through the commit
+(put + poke in the cloud; any verb at a peer) — and `evaluate` —
+`kernel(payload, globals) → valid`, verdict only, structurally
+side-effect-free (mint, dial handshake). Persistent-family handlers
+never see globals — validity is a function of the pile alone, which is
+what keeps admission order-independent; only ephemeral-family handlers
+read them, safe because their verdicts never enter the set. In
+evaluate mode there is nothing a handler could persist, and nothing is
+lost by it: whatever the store lacked arrives with the next closed
+pile anyway. Each kernel invocation is **closed in/out with its own
+tables** — ephemeral SQLite by connection string, `:memory:` normally,
+on-disk temp for the big cases (replay is just the whole-history pile;
+iOS bounds RAM) — so independent piles validate in parallel across
+cores.
 
 ```text
 drain:                     # put + poke (cloud); any verb (peer); under lease
-  facts <- LIST + GET piles
-  admit <- signature ∧ dep-pure handler over the closure    # deps from pile ∪ treap;
-           (frontier probes: dep ∈ treap, merge-join; intra-batch first)
-  reject<- invalid or closure-incomplete — deleted with the drain
-  fold  <- eviction facts ⇒ removal set′   # the one store-side projection
-  tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
-  if tail' full: promote stable prefix to pages + fences   # the cut rule fires
-  put tail' (records + bodies), promoted pages, spilled blobs, aug,
-      removal set′ if changed
-  CAS manifest                             # the single commit point
-  delete pile keys                         # admitted and rejected alike
+  piles <- LIST + GET piles; hash-verify mini-run structure  # cheapest checks first
+  kernel(pile) per pile, in parallel ⇒ (valid?, new globals) # pure predicate; zero store reads
+  reject invalid piles whole             # deleted with the drain; blame by prefix
+  globals′ <- globals ∪ new globals      # associative union; removal set today
+  tail' <- k-way merge(tail, valid piles), dedup by fid; stragglers mini-fold
+  if tail' full: promote stable prefix to pages + fences + annexes  # the cut rule fires
+  put tail', promoted pages + annexes, spilled blobs, globals′ if changed
+  CAS manifest                           # the single commit point
+  delete pile keys                       # admitted and rejected alike
 ```
 
 **Publish, CAS, delete** — every new object is written first, one manifest
@@ -301,31 +303,42 @@ protocol, not the backend. A lease keeps the engine single-flight for
 cache locality — concurrent pokes coalesce — and the CASes keep it safe
 regardless.
 
-Store-side auth state is one object: the **removal set** — a monotone
-projection of eviction facts, O(removals), riding the manifest,
-rewritten in the commit that admits them. It is a gate input only:
-**handlers never read the removal set** — the moment a validity handler
-consults it, verdicts become time-dependent and order-independence
-collapses. Fact validity is forever; removal only closes doors.
-Authoring an eviction requires proving admin status and non-removal,
-and **mutual removals remove each other** — monotone, no ordering
-question to answer. Everything the old auth snapshot held is gone:
-certification is proved by each fact's own closure, invites live in the
-invite blob (Auth), and epoch heads are content facts like any other.
+Store-side auth state is one object family: **globals** — monotone
+semilattice projections the kernel itself emits, published as
+canonical sorted records riding the manifest, rewritten in the commit
+that changes them. Today globals is the **removal set**: the union of
+targets of valid eviction facts, extracted per pile by the kernel —
+order-free, because per-pile extraction composes as union. Eviction
+validity is removal-blind (valid iff the author's chain shows admin),
+so **mutual removals remove each other** — monotone, no ordering
+question to answer; "non-removal" is enforced at the connection, never
+in fact validity. Globals are read **only by ephemeral-family
+handlers**: a persistent-family handler that consulted them would make
+verdicts time-dependent and collapse order-independence. Fact validity
+is forever; removal only closes doors. When deletion returns, its
+suppress-if set is the second occupant of the globals slot. Everything
+the old auth snapshot held is gone: certification is proved inside
+each pile, invites live in the invite blob (Auth), and epoch heads are
+content facts like any other.
 
 **Admission is dep-pure validation** — signature plus the family
-handler over the fact's closure, nothing else. RBSR still gets what it
-forces: the verdict is a function of the fact and its immutable closure
-— no ambient state, no clock, no arrival order — so membership is
-monotone and order-independent, and the union of two honest stores is
-always valid. The treap is the **valid, dep-closed set**: membership
-certifies the transitive closure, and the closure walk serves it.
-Consumers stay trustless — they re-verify what they pull, closures
-always in hand — but nothing parks anywhere: piles arrive
-closure-complete by the pile rule, syncs arrive closure-complete by
-P3. Anything needing negative or global knowledge (uniqueness,
-latest-wins) stays a projection-time verdict, deterministic from the
-set — never an admission input.
+handler over the fact's in-pile context (POC-13's validator signature,
+`valid(fact, context) → bool`, with the waiting removed), nothing
+else. RBSR still gets what it forces: the verdict is a function of the
+fact and its immutable closure — no ambient state, no clock, no
+arrival order — so membership is monotone and order-independent, and
+the union of two honest stores is always valid. The treap is the
+**valid, dep-closed set**: membership certifies the transitive
+closure, and the closure walk serves it. The kernel is
+**workspace-agnostic**: chains bottom out at a self-signed genesis and
+the workspace id is `H(genesis)`, so the kernel needs zero
+configuration — the *gate* pins which genesis this store accepts,
+checks scope, and supplies globals. Kernel is truth; gate is
+jurisdiction. Consumers stay trustless — they re-verify what they
+pull, closures always in hand — but nothing parks anywhere: piles are
+closed by format, syncs arrive closed by P3. Anything needing negative
+or global knowledge (uniqueness, latest-wins) stays a projection-time
+verdict, deterministic from the set — never an admission input.
 **Removal is terminal and monotonic at the connection level**: eviction
 kills the mint — no grants, so no reads and no writes — and it is the
 *pusher's* liveness transport checks, never the author's. Facts that
@@ -336,10 +349,10 @@ its last consumer). Deletion, the one feature that genuinely needs
 set-level verdicts, follows POC-13's suppress-if relation + death key
 when it returns — deliberately out of this proto (Open Questions).
 
-Performance: closures arrive with the pile, so dep I/O is frontier
-probes only — the drain stays transfer- and verify-bound: GET 10–30 ms,
-~100 in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs; ~1,600–2,100 facts/s
-vs S3 with aug upkeep (MODEL.md), ≥ 5× the litmus. Memory beats lookups: Lambda RAM bills only while
+Performance: piles are fully closed, so validation does **zero store
+reads** — the drain is transfer- and verify-bound: GET 10–30 ms, ~100
+in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs, parallel across cores;
+~2,400+ facts/s vs S3 (MODEL.md), ≥ 8× the litmus. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
 — the single-flight engine wrote the current pages itself last run.
@@ -347,9 +360,13 @@ set is tens of MB, and immutable pages mean the cache needs no invalidation
 ## Auth
 
 One evaluator, everywhere: **the kernel judges content, auth, and
-access alike**. A store executes a request iff the kernel validates its
-request fact and the gate finds none of the closure's keys in the
-removal set.
+access alike**. A store executes a request iff
+`kernel(payload, globals)` says valid — the request fact's chain
+proves entitlement and survives the removal set — and the gate
+confirms jurisdiction: genesis fid = this store's workspace id, scope
+fits the verb. **One object serves four roles**: ordinary pile,
+notification pile, request payload, and invite blob are all the same
+fully closed pile in the canonical codec, sometimes encrypted.
 
 **Request facts are an ephemeral family.** The auth payload on any verb
 is a fact — authored by the requesting device key, deps on the auth
@@ -361,10 +378,9 @@ become replicated data. A request family has no admit semantics, so a
 stray request fact in a pile is litter and the drain deletes it. For a
 request fact, acceptance is the grant.
 
-**The mint is a pure function.** Verify the request fact — deps resolve
-against the payload and the treap; the aug makes a closure fetch a few
-ranged GETs — apply the removal set, return a grant
-`{member, scope, expiry}`: presigned URLs in the cloud, a bearer
+**The mint is a pure function.** The request payload is a closed pile,
+so verification reads nothing — run the kernel with globals, return a
+grant `{member, scope, expiry}`: presigned URLs in the cloud, a bearer
 capability from a peer daemon; to the client an opaque request
 decorator, the only per-backend seam. **The grant is encrypted to the
 request fact's author pubkey**, so a captured request replays into
@@ -385,7 +401,8 @@ control) — encrypted under a link secret, with `id = KDF(seed, "id")`
 and `k = KDF(seed, "key")`, so the whole invite link is *store URL +
 ~32-byte seed*. The blob holds whatever the link must prove — the
 invite fact, its full admin closure, an epoch-key box, welcome
-metadata — so redemption is self-contained: no race with the inviter's
+metadata — and is itself a closed pile in the canonical codec,
+encrypted; redemption is self-contained: no race with the inviter's
 push, no dependence on treap state. If it can connect, it can join.
 The chain inside is frozen at creation but evaluated fresh at mint
 (inviting admin since removed ⇒ refused). Unclaimed invites are
@@ -473,14 +490,14 @@ projection stamped with the manifest generation it reflects**; the commit
 point is always the manifest CAS. Any node can delete its SQLite and
 rebuild from its store.
 
-- The removal set is a manifest-riding object, not a local file — the
-  Lambda wakes, conditional-GETs the manifest, works, publishes. No EFS,
-  no /tmp durability.
+- Globals (the removal set today) are manifest-riding objects, not
+  local files — the Lambda wakes, conditional-GETs the manifest, works,
+  publishes. No EFS, no /tmp durability.
 - **Rows in memory, records on the store.** Fact handlers write ordinary
   SQLite rows into the engine's ephemeral db — identical code in both
   worlds, since that db is already connection-string-abstracted. At
-  commit the engine emits the removal set as canonical sorted records,
-  and the manifest CAS publishes it; the next run loads records back
+  commit the engine emits globals as canonical sorted records,
+  and the manifest CAS publishes them; the next run loads records back
   into rows (a warm peer daemon skips the reload by generation stamp).
   Publishing the `.db` itself is rejected:
   SQLite bytes are write-history artifacts — the store holds canonical
@@ -504,9 +521,12 @@ rebuild from its store.
   facts) is bounded by the gate's-closure criterion and doubles as a WA
   budget — a chatty family on the list breaks the mode (MODEL.md,
   Cloud-Mode DB).
-- Engine processing state is ephemeral SQLite by connection string:
-  `:memory:` in the Lambda, on-disk temp where RAM is tight. Discarded
-  after every run.
+- Engine and kernel working state is ephemeral SQLite by connection
+  string: `:memory:` normally, on-disk temp where RAM is tight (iOS)
+  or the input is huge (replay = the whole-history pile). Each kernel
+  invocation gets its own tables — closed in/out, no shared state —
+  which is what lets invocations run in parallel. Discarded after
+  every run.
 - A peer's persistent SQLite holds two separate schemas: the sqlite
   ObjectStore driver (canonical layout) and the app read model (API
   queries), projected from the treap, rebuilt by replay when its generation
@@ -520,6 +540,7 @@ rebuild from its store.
 | peer | sqlite | daemon | on request | cadence + news |
 | home server | sqlite or s3 | daemon | on request | never |
 | static mirror | any HTTPS host | files | no | never |
+| iOS NSE | fs pile in app group | no | validate-only; hands off to app | never |
 
 ## Staged Plan
 
@@ -531,14 +552,14 @@ Proofs first; no transport work until both numbers exist.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
-4. **P3 bench** — aug build at promotion + closure walk; sweep window
-   sizes; measure δ′ on a real corpus (the aug's one workload
-   assumption).
+4. **P3 bench** — annex build at promotion + closure walk; measure
+   annex duplication vs the aug fallback on a real corpus (the
+   bake-off); sweep window sizes.
 5. **Protocol** — daemon (seven routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
 6. **iroh** — h3-over-iroh connector; same conformance suite.
-7. **Auth** — request-fact families + evaluate mode, removal set,
+7. **Auth** — request-fact families + evaluate mode, globals,
    invite blob, eviction test, mint over both transports.
 
 ## Open Questions
@@ -551,8 +572,9 @@ Proofs first; no transport work until both numbers exist.
   again, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages, and it must be **split-monotone** — boundaries
-  refine, never move — because the aug's level ladder is built from the
-  same rule family (the priority-threshold candidate qualifies).
+  refine, never move — because the aug fallback's level ladder is built
+  from the same rule family (the priority-threshold candidate
+  qualifies).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
   findings, hash-list slices not bao). (Bulk-join body bundles: resolved
   2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)

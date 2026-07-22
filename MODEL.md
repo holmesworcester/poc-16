@@ -188,15 +188,16 @@ amplification, not the per-fact costs.)
 ```text
 on request (peer drain-on-read / cloud POST /poke), under lease:
   m     <- GET root (cond)                 # warm: cached
-  rm    <- GET removal set                 # warm: cached; O(removals)
+  gl    <- GET globals                     # warm: cached; O(removals)
   keys  <- LIST pile                       # ceil(pile/1000) reqs
-  facts <- par GET pile objects            # b reqs | b·F
-  admit <- verify sig ∧ dep-pure handler over closure   # b·t_v CPU
-           frontier probes: dep ∈ treap, merge-join     # C_p ranged GETs, cold only
-  fold  <- eviction facts ⇒ removal set′
-  emit  <- rewrite tail (records + bodies); on promotion
-           ceil(b/B_l)+D pages + aug, PUT If-None-Match
-           spilled bodies -> blob/; PUT removal set′ if changed
+  piles <- par GET pile objects            # b reqs | b·F
+  hash-verify mini-run structure           # cheapest checks first
+  kernel(pile) per pile, in parallel
+        ⇒ (valid?, new globals)            # b·t_v CPU; ZERO store reads (piles fully closed)
+  globals′ <- globals ∪ new globals        # associative union
+  emit  <- k-way merge into tail; on promotion
+           ceil(b/B_l)+D pages + annexes, PUT If-None-Match
+           spilled bodies -> blob/; PUT globals′ if changed
   CAS root                                 # the commit point
   batch DELETE pile keys                   # admitted and rejected alike; ceil(b/1000) reqs
 ```
@@ -205,18 +206,19 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
 
 ```text
 t(b) ≈ b·R_l/w        pile GETs
-     + b·t_v/v        verify (v = vCPU share)
-     + C_p·R_l/w      cold frontier probes (closures ride the pile ⇒ C_p small)
+     + b·t_v/v        verify (v = vCPU share; parallel across piles)
      + (D + b/B_l + 2)·R_l   emit + CAS   (no per-fact copies — bodies ride the pages)
 ```
 
-b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + ~30 + 95 ms ≈
-0.42 s ⇒ **~2,400 facts/s** against real S3 (~2,000 with aug upkeep,
-Closure below) — 7–8× over the 300/s litmus,
-margin absorbed by tail latency and cache misses (packing deleted the
-per-fact `COPY pile→blob`, previously a co-leading cost). Against a
-local sqlite store the loop is verify-bound: **6–10 k facts/s**.
-Bottleneck order: per-fact pile GETs > verify > probes > emit; uploading
+b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 95 ms ≈
+0.39 s ⇒ **~2,600 facts/s** against real S3 — 8× over the 300/s
+litmus, margin absorbed by tail latency and cache misses (packing
+deleted the per-fact `COPY pile→blob`; fully closed piles deleted the
+frontier-probe term — validation does zero store reads, and annex
+assembly at promotion is in-memory ref classification, noise). Against
+a local sqlite store the loop is verify-bound: **6–10 k facts/s per
+core**, and closed-in/out kernel invocations scale across cores.
+Bottleneck order: per-fact pile GETs > verify > emit; uploading
 a ~1 MB packed tail adds 10–20 ms, noise. Note vCPU scales
 with Lambda memory — 1,769 MB doubles the verify rate.
 
@@ -395,7 +397,15 @@ revision (2026-07-22): **packed pages** — pages and tail carry their
 bodies (spill > 8 KB to `blob/`), `bundle/` deleted, promotion threshold
 B_t decoupled from page size.
 
-## Closure — Any Range Plus Its Recursive Deps (dep aug; adopted into DESIGN.md 2026-07-22)
+## Closure — Any Range Plus Its Recursive Deps (the closure augmentation — now the FALLBACK; embed annexes adopted as primary 2026-07-22, DESIGN.md)
+
+*Status note:* the closed-pile design made embed annexes
+(`closure(range) ∖ range` as a per-range object, built by aggregating
+pile-embedded copies) the primary P3 mechanism — no engine closure
+work at all. This section's ref-based aug is retained as the fallback
+if annex duplication measures pathological on a real corpus; stage 4
+is the bake-off. The split-monotone page-cut requirement survives
+either outcome.
 
 Target semantics: sync an arbitrary `(ts, fid)` range Q — last 3 days,
 last 4 weeks, or any mid-history window — and receive it
