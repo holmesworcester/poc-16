@@ -367,6 +367,200 @@ drivers can't signal on put, so the trigger must live in the protocol.
 "Requester always gets the latest" is literal p2p, one poke away in the
 cloud; a writer that dies before poking is caught by cadence.
 
+## Closure — Any Range Plus Its Recursive Deps (dep aug; proposed 2026-07-22, not yet in DESIGN.md)
+
+Target semantics: sync an arbitrary `(ts, fid)` range Q — last 3 days,
+last 4 weeks, or any mid-history window — and receive it
+**closure-complete**: Q plus every recursive dependency of every fact in
+Q. Closure-complete is what makes a partial replica *projectable* —
+dep-pure handlers never park — and is what a residency pin-set means for
+a bounded peer. Without an index this costs dep-DAG-depth spider rounds
+(poc-14's join pathology); the aug makes it the same walk shape as P1.
+
+**Construction.** One new run family on the same skeleton; fact pages
+and the gate are untouched.
+
+- Level ladder: the leaf range is the leaf page; above it, ranges come
+  from priority-threshold cuts at arity β ≈ 16 — the same rule family as
+  the page cut, so the ladder is a pure function of the set.
+  REQUIREMENT exported to the page-cut open question: the rule must be
+  **split-monotone** (boundaries refine, never move; the
+  priority-threshold candidate qualifies). At λ = 10^4/day the ladder is
+  a time-scale stratification: page ≈ 5 h, L1 ≈ 3.3 d, L2 ≈ 52 d.
+  L_a = 3 levels above pages at 10^6, 5 at 10^9.
+- k_ℓ(f) = number of level-ℓ ranges whose **promoted** facts
+  transitively depend on f. Nesting makes k_ℓ non-increasing in ℓ and
+  the root gives k = 1, so **home(f) = lowest level with k_ℓ(f) ≤ h**
+  always exists (hoist cap h = 8). Store one ref record per hit range at
+  home(f); elide a ref only when the target lives in the same leaf page.
+- Coverage: if leaf L needs f, L's ancestor at home(f) is a hit range,
+  so f's ref sits on L's root-to-leaf path. Fetching the aug of every
+  range on Q's cover paths yields a **closure-complete superset** of
+  refs in one descent — recursion included, because "needs" is
+  transitive. (Sound to cut at popular facts because popularity is
+  monotone along dep edges: a dep is at least as needed as any of its
+  dependents.)
+- Two published sort orders of the same records — forward
+  `(level, range, target ts, fid)` for the walk, inverted
+  `(target, level, range)` for maintenance and, later, deletion
+  cascades. E_a ≈ 40 B (8 ts + 32 fid; owner implicit in position, ts
+  delta-coded). Own fence runs, cut by the same rule, top fences inline
+  in the manifest; run depth matches D, so aug fetches ride the walk's
+  existing rounds — the ladder depth L_a affects *placement*, never
+  round count.
+- Tail: the canonical scope is the promoted prefix (its boundary is
+  content-determined, so the aug stays a pure function of the set). For
+  the tail range the engine publishes an **aug tail**: the deduped
+  pre-tail direct targets of tail facts, (ts, fid)-sorted — derived from
+  clear envelopes alone, hence equally canonical. This *replaces* the
+  writer-declared pile hints from the design thread: the clear-envelope
+  decision (2026-07-22) made them redundant — the engine reads dep refs
+  straight off admitted facts, so no trust, cap, or blame machinery.
+- Counts only grow (appends and splits), so homes migrate one way:
+  upward, ≤ L_a times per fact ever. Honest need sets are suffix-shaped
+  (deps point backward; a hub is needed by everything after it), which
+  keeps hit ranges contiguous. When deletion returns, counts stay
+  defined over the DELIVERED set to preserve monotonicity.
+- Privacy: the aug is derivable from clear envelopes, so it adds no new
+  information class to the store (decided 2026-07-22: dep topology
+  store-visible, bodies confidential).
+
+Parameters:
+
+| sym | meaning | canonical value |
+|---|---|---|
+| h | hoist cap — max ranges holding a ref before it homes higher | 8 |
+| β | level-ladder arity (priority thresholds) | 16 |
+| L_a | ladder levels above leaf pages | 3 at 10^6, 5 at 10^9 |
+| E_a | aug record: target (ts, fid), delta-coded | 40 B |
+| δ' | distinct out-of-page targets per fact after elision + hub homing | ≈1 (0.5–3) |
+| χ(Q) | context size: closure(Q) ∖ Q | workload; ~10^3 for a 3-day suffix |
+| H | root-homed hubs (channels, members, epochs) | 10^2–10^3 |
+
+**Storage.** Records ≈ δ'·n plus hoisted copies (≤ h per fact, and only
+for the popular minority) ≈ n at canonical δ': 40 MB per sort order,
+80 MB for both — ~13% of the 10^6-group store; bodies (500 MB) dominate
+as always. Degenerate no-locality bound (every ref random-old, elision
+never fires): δ' → δ gives ~560 MB, body-scale — the aug's
+affordability rests on temporal locality, and **δ' is the one workload
+parameter to bench on real corpora before trusting this section.**
+
+**The closure walk.** Q quantizes outward to leaf-page cuts (elision
+scope is the page, so sub-page closure is undefined; the quantum is
+~5 h at canonical λ). Annotated `[round | requests | bytes]`; aug
+fetches ride the walk's rounds:
+
+```text
+closure_sync(Q):                             # Q snapped to page cuts
+  m   <- GET /root                           # 1 | 1 | ~3 KB   top fences now include aug + aug-tail
+  f1  <- fact + aug L1 fence slices over Q   # 2 | few | 8 KB each
+  ls  <- leaf slices of Q                    # 3 | ~1 ranged GET/level | |Q|·E_l  (suffix ⇒ contiguous)
+  aug <- per cover range, the escape prefix: # 3 (same round) | r_esc | ≤8 KB each
+         records with target < Q.start       #   within a range, refs sort by target ⇒
+         (+ aug tail slice if Q meets tail)  #   out-of-Q targets are a computable prefix
+  bodies <- blob/bundle for (Q ∪ targets) I lack   # 4 | pulls | ·F
+  trim (optional): chase envelope refs from Q over the fetched set
+         ⇒ exact closure locally; slop is boundary ranges only (≤2/level)
+```
+
+`R_cl = D + 2` — **4 rounds at 10^6** — whenever the context lies on Q's
+cover paths, which suffix queries make the common case (tail refs point
+recent, and recent pages are in Q). A frontier target outside the cover
+(a tail fact referencing a pre-Q unpopular fact) costs +1 round: fetch
+its path aug in parallel with its body. Chains that keep escaping cost
++1 each — spidering survives only on out-of-window chains, where poc-14
+paid it on every hop of every join.
+
+**Transfer.**
+
+```text
+T_cl(Q) ≈ T_walk(Q) + χ·E_a + r_esc·(P/k) + χ_pull·F
+r_esc   = cover ranges with ≥1 escaping ref (slice-rounding term)
+```
+
+| regime (n = 10^6, λ = 10^4/day) | rounds | metadata + aug | bodies |
+|---|---|---|---|
+| 3-day suffix, cold (partial join) | 4 | 1.9 MB + ~0.15 MB | 15.2 MB, ~30.5 k GETs |
+| 4-week suffix, cold | 4 | 17.9 MB + ~0.3 MB | ~140 MB |
+| single page (~5 h) | 4 | 128 KB + ~40 KB | ~1.2 MB |
+| maintained window, steady | 1 (304) – 4 | plain-reader costs | + escapee bodies ~0.1 MB/day |
+
+The 3-day partial join lands in ~15–20 s for ~$0.014 — vs 5.5 min and
+$0.40 for the fresh join — and every fact in it projects immediately.
+Ref bytes run ≤ E_a/F ≈ 8% of context body bytes even at 100% slop:
+**precision is nearly free, so the aug's whole job is rounds, and
+χ_pull·F is the floor no protocol beats** — the context must be
+transferred. If χ(Q) → n the *semantics* demand a join; the aug still
+delivers it in 4 rounds, body-request-bound like any join.
+
+**Write side.** Placement is computed at promotion, riding pages being
+written anyway:
+
+- The owner range leads the forward key, and new promoted ranges are the
+  rightmost, so **aug writes are right-spine appends** — the same
+  locality as fact writes. `WA_aug = (⌈b·δ'/B_a⌉ + D)·P/(b·δ'·E_a)`,
+  B_a = P/E_a ≈ 3,276: at b = 2,048 about one aug leaf page + fences,
+  so promotion PUTs roughly double (~25 → ~50/day; ~+$1e-4/day, noise).
+- Counts maintain by pruned propagation: "A hits y" implies "A hits all
+  of closure(y)", so the walk from a new fact's direct refs stops at
+  already-hit targets. Each (target, new-hit-range) pair is processed
+  once ever — output-sensitive, amortized O(1) per aug record; per batch
+  ≈ b·δ ≈ 14 k row probes, ≪ verify. Cold probes hit the inverted run by
+  ranged GET (the standard retrieval op); at a 5% cold rate that is
+  ~700 GETs ≈ +0.1 s/batch ⇒ engine ~1,900 → ~1,600 facts/s vs S3,
+  still >5× the P2 litmus.
+- Migrations (a target crossing h): suffix-shaped hit sets make them one
+  contiguous delete + one insert (~2 page touches); scattered need sets
+  pay up to ~2h touches; ≤ L_a migrations per fact lifetime. A
+  straggler-induced split recounts only the split range's homes,
+  amortized against the mini-fold the straggler already pays. The worst
+  case is the late-arriving hub — promoted after many dependents — one
+  wide deterministic count cascade bounded by reverse-index fan-in,
+  which is exactly the scan the inverted order exists for.
+- Mirrors diff aug pages by fence fp like everything else; identical
+  sets ⇒ byte-identical aug runs, so the stage-1 property test extends
+  verbatim. Migration churn is the only extra diff traffic, bounded
+  above.
+
+**Litmus (P3, proposed).** Closure sync must cost the range walk plus
+the context's own bodies: `R_cl ≤ D + 2` (+1 per out-of-window frontier
+hop); ref + fence overhead ≤ 10% of body bytes; identical sets ⇒
+identical aug bytes. Open empirical: δ' ≈ 1 — at δ' ≳ 3 the aug stays
+correct but its storage stops being noise.
+
+**Rejected alternatives**, for the record: re-keying the treap by
+"related to range" (breaks RBSR's disjoint-partition algebra; one new
+fact rewrites O(dependent-spread) pages); per-fact inline closure lists
+(O(closure) envelope blowup); server-side closure computation (there is
+no server). Spidering survives as the fallback rung, not the plan.
+
+**If adopted, DESIGN.md gains:** dep refs in the signed clear envelope
+(decided 2026-07-22 — bodies confidential, topology store-visible); the
+split-monotone constraint on the page-cut rule; the aug run family and
+aug tail riding the manifest (six verbs unchanged — aug is pages and
+root like everything else); closure queries quantized to leaf pages; P3
+as a third proof obligation. Writer-declared pile closure hints are
+dropped before birth — clear envelopes made them redundant.
+
+## Cloud-Mode DB (option)
+
+The engine's scoped working db — whitelisted auth families' facts,
+their projections, and the parked/block-unblock relations — round-trips
+through the store instead of living on a disk. At 10k users: ~50k auth
+facts (invite + join + 2–3 device certs + 10–20% churn) × ~300 B ≈
+15 MB of facts, **30–50 MB as SQLite**. Cold load: one GET at
+~100 MB/s ≈ 0.3–0.5 s, then `sqlite3_deserialize` ≈ memcpy; warm runs
+(the common case under the lease + container reuse) skip it by
+generation stamp. Validating a new auth fact: µs-scale in-memory
+lookups + one Ed25519 verify ⇒ ~10k auth facts/s CPU-side — a typical
+drain carries 0–2, so it is noise. The real cost is write-back:
+serialize + PUT 30–50 MB ≈ 300–600 ms, paid only on drains that changed
+whitelisted state; content-only drains never open the db. WA is the
+number to watch: ~10^5× per auth change is fine at join/evict rates,
+which makes the whitelist a WA budget. Growth is O(principals): 100k
+users ≈ 300–500 MB — the mode strains (load time + Lambda RAM);
+comfortable to ~50k principals.
+
 ## Where the Platform Binds
 
 - **`root` is the single hot key**: N readers polling every c seconds

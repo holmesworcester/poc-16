@@ -362,6 +362,19 @@ rebuild from its store.
   same ObjectStore primitive, never the engine's live rows. Facts
   influence auth solely by being processed and serialized; the commit is
   the only channel between the layers.
+- **Option — cloud mode: persist the working db itself.** The `.db`
+  rejection above is scoped to *consumed* artifacts — canonical records
+  other parties read. A private working state has no readers: under the
+  single-flight lease the engine may round-trip its scoped SQLite
+  (whitelisted auth families' facts + projections + parked/block-unblock
+  relations) through the store as an opaque content-addressed blob —
+  load → work → serialize → PUT → CAS, GC'd like superseded tails. One
+  kernel implementation in both worlds, with the kernel's existing
+  parked/wake machinery intact; cloud mode differs only in where the db
+  sleeps between runs. The whitelist (declarable in genesis config
+  facts) is bounded by the gate's-closure criterion and doubles as a WA
+  budget — a chatty family on the list breaks the mode (MODEL.md,
+  Cloud-Mode DB).
 - Engine processing state is ephemeral SQLite by connection string:
   `:memory:` in the Lambda, on-disk temp where RAM is tight. Discarded
   after every run.
