@@ -268,7 +268,15 @@ A **workspace is a store** — root, treap, piles, snapshot, each derived
 only from its own facts; the same device pubkey in two workspaces is two
 independent certifications. The mint is the one multi-tenant piece:
 `/mint` names the workspace, reads that store's root, and the grant
-scopes to that store's prefix. Transport ACLs are never finer than
+scopes to that store's prefix — but it holds no workspace registry (a
+store's existence is the workspace's existence; IAM bounds what a
+deployment serves) and mints **one workspace per call**. Only the
+client's **keyring** (workspace → device key, store address, grant) knows
+which workspaces an endpoint belongs to — the one irreducibly node-local
+state, since private keys are never fact-derived — and cross-workspace
+identities stay unlinkable by construction. A node syncs its workspaces
+(~20 max) round-robin from the keyring; an idle workspace costs one
+conditional GET per cadence. Transport ACLs are never finer than
 membership — grants cover whole keys and pages interleave channels — so
 sub-workspace confidentiality is the encryption layer (epochs), never
 the grant.
@@ -296,7 +304,8 @@ is dumb pipes only — no iroh-docs/blobs/gossip, bao stays retired — and
 pre-1.0, so the connector module is its containment boundary.
 
 Every node = a **responder half** (six verbs over its store, zero sync
-logic) + optional **initiator half** (walk on cadence + eager push). Roles
+logic) + optional **initiator half** (per-workspace walk on cadence,
+round-robin from the keyring + eager push). Roles
 are per-session, fixed by dial direction. Any peer may dial — news-driven
 sends stay fast, and the pair gets the better of the two cadences.
 Simultaneous opens: lower node id survives. Always-on public nodes never
