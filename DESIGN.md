@@ -544,8 +544,17 @@ rebuild from its store.
   every run.
 - A peer's persistent SQLite holds two separate schemas: the sqlite
   ObjectStore driver (canonical layout) and the app read model (API
-  queries), projected from the treap, rebuilt by replay when its generation
-  trails.
+  queries), rebuilt by replay when its generation trails.
+  **Projectors consume kernel-valid facts only** — no validity logic,
+  no scope checks; they accept a `Valid<Fact>` type only the kernel
+  can construct, so the split is compile-time, not discipline. One
+  read model spans all workspaces, rows tagged with the workspace id —
+  safe because every fact entered through its own store's anchor'd
+  kernel — so cross-workspace queries (a unified inbox) are ordinary
+  read-side joins over certified provenance. The safety asymmetry is
+  the design: the kernel is small and frozen (its mistakes are
+  forever); projectors are big and evolvable (their mistakes replay
+  away).
 
 ## Deployments
 
