@@ -251,10 +251,14 @@ One body of code, two loops; only the trigger and store driver differ by
 deployment.
 
 The kernel runs in **two modes, and the verb picks**: `drain` —
-`kernel(pile) → (valid, new globals)`, persisted through the commit
-(put + poke in the cloud; any verb at a peer) — and `evaluate` —
-`kernel(payload, globals) → valid`, verdict only, structurally
-side-effect-free (mint, dial handshake). Persistent-family handlers
+`kernel(pile, anchor) → (valid, new globals)`, persisted through the
+commit (put + poke in the cloud; any verb at a peer) — and `evaluate` —
+`kernel(payload, anchor, globals) → valid`, verdict only, structurally
+side-effect-free (mint, dial handshake). The **anchor** is the
+workspace's genesis fid — a constant, fixed at creation and identical
+across all honest replicas for all time, so verdicts stay
+order-independent; time-varying context (globals) remains quarantined
+to ephemeral handlers. Persistent-family handlers
 never see globals — validity is a function of the pile alone, which is
 what keeps admission order-independent; only ephemeral-family handlers
 read them, safe because their verdicts never enter the set. In
@@ -269,7 +273,7 @@ cores.
 ```text
 drain:                     # put + poke (cloud); any verb (peer); under lease
   piles <- LIST + GET piles; hash-verify mini-run structure  # cheapest checks first
-  kernel(pile) per pile, in parallel ⇒ (valid?, new globals) # pure predicate; zero store reads
+  kernel(pile, anchor) per pile, in parallel ⇒ (valid?, new globals)  # pure predicate; zero store reads
   reject invalid piles whole             # deleted with the drain; blame by prefix
   globals′ <- globals ∪ new globals      # associative union; removal set today
   tail' <- k-way merge(tail, valid piles), dedup by fid; stragglers mini-fold
@@ -329,12 +333,22 @@ fact and its immutable closure — no ambient state, no clock, no
 arrival order — so membership is monotone and order-independent, and
 the union of two honest stores is always valid. The treap is the
 **valid, dep-closed set**: membership certifies the transitive
-closure, and the closure walk serves it. The kernel is
-**workspace-agnostic**: chains bottom out at a self-signed genesis and
-the workspace id is `H(genesis)`, so the kernel needs zero
-configuration — the *gate* pins which genesis this store accepts,
-checks scope, and supplies globals. Kernel is truth; gate is
-jurisdiction. Consumers stay trustless — they re-verify what they
+closure, and the closure walk serves it. **The kernel enforces
+workspace scope on every fact** via the anchor: chains bottom out at a
+self-signed genesis, the workspace id is `H(genesis)`, and each
+fact's chain must bottom at *the* anchor — so cross-workspace
+contamination rejects inside the predicate, even on a shared bucket
+with botched prefixes. The kernel *code* stays workspace-agnostic (the
+anchor is data, not configuration), and the gate stops checking
+anything at all: it is a **parameter supplier**, currying anchor +
+globals into the one judge. The anchor's authentic source is the
+invite link → keyring on a peer, deployment identity in the cloud
+(the bucket is the workspace); the store may repeat it but is never
+the authority — a fresh reader trusts its link, not the thing it is
+about to verify. What a pile can never do is bind *validity* to its
+own delivery: **validity binds to the workspace through the chain;
+delivery binds to the pusher through the grant; the two never mix** —
+a fact must judge identically however and whenever it arrives. Consumers stay trustless — they re-verify what they
 pull, closures always in hand — but nothing parks anywhere: piles are
 closed by format, syncs arrive closed by P3. Anything needing negative
 or global knowledge (uniqueness, latest-wins) stays a projection-time
@@ -361,10 +375,10 @@ set is tens of MB, and immutable pages mean the cache needs no invalidation
 
 One evaluator, everywhere: **the kernel judges content, auth, and
 access alike**. A store executes a request iff
-`kernel(payload, globals)` says valid — the request fact's chain
-proves entitlement and survives the removal set — and the gate
-confirms jurisdiction: genesis fid = this store's workspace id, scope
-fits the verb. **One object serves four roles**: ordinary pile,
+`kernel(payload, anchor, globals)` says valid — the request fact's
+chain proves entitlement at this workspace's anchor, its scope covers
+the verb, and it survives the removal set; the gate's only job is
+supplying the parameters. **One object serves four roles**: ordinary pile,
 notification pile, request payload, and invite blob are all the same
 fully closed pile in the canonical codec, sometimes encrypted.
 
@@ -379,8 +393,8 @@ stray request fact in a pile is litter and the drain deletes it. For a
 request fact, acceptance is the grant.
 
 **The mint is a pure function.** The request payload is a closed pile,
-so verification reads nothing — run the kernel with globals, return a
-grant `{member, scope, expiry}`: presigned URLs in the cloud, a bearer
+so verification reads nothing — run the kernel with anchor + globals,
+return a grant `{member, scope, expiry}`: presigned URLs in the cloud, a bearer
 capability from a peer daemon; to the client an opaque request
 decorator, the only per-backend seam. **The grant is encrypted to the
 request fact's author pubkey**, so a captured request replays into
@@ -417,7 +431,8 @@ independent certifications. The mint is the one multi-tenant piece:
 scopes to that store's prefix — but it holds no workspace registry (a
 store's existence is the workspace's existence; IAM bounds what a
 deployment serves) and mints **one workspace per call**. Only the
-client's **keyring** (workspace → device key, store address, grant) knows
+client's **keyring** (workspace → anchor, device key, store address,
+grant) knows
 which workspaces an endpoint belongs to — the one irreducibly node-local
 state, since private keys are never fact-derived — and cross-workspace
 identities stay unlinkable by construction. A node syncs its workspaces

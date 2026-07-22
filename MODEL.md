@@ -192,7 +192,7 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
   keys  <- LIST pile                       # ceil(pile/1000) reqs
   piles <- par GET pile objects            # b reqs | b·F
   hash-verify mini-run structure           # cheapest checks first
-  kernel(pile) per pile, in parallel
+  kernel(pile, anchor) per pile, in parallel
         ⇒ (valid?, new globals)            # b·t_v CPU; ZERO store reads (piles fully closed)
   globals′ <- globals ∪ new globals        # associative union
   emit  <- k-way merge into tail; on promotion
