@@ -188,14 +188,15 @@ amplification, not the per-fact costs.)
 ```text
 on request (peer drain-on-read / cloud POST /poke), under lease:
   m     <- GET root (cond)                 # warm: cached
-  snap  <- GET auth snapshot               # warm: cached; O(principals)
+  rm    <- GET removal set                 # warm: cached; O(removals)
   keys  <- LIST pile                       # ceil(pile/1000) reqs
   facts <- par GET pile objects            # b reqs | b·F
-  admit <- well-formed ∧ verify sig ∧ author known   # b·t_v CPU; no dep I/O
-  fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer
+  admit <- verify sig ∧ dep-pure handler over closure   # b·t_v CPU
+           frontier probes: dep ∈ treap, merge-join     # C_p ranged GETs, cold only
+  fold  <- eviction facts ⇒ removal set′
   emit  <- rewrite tail (records + bodies); on promotion
-           ceil(b/B_l)+D pages, PUT If-None-Match
-           spilled bodies -> blob/; PUT snapshot′ if changed
+           ceil(b/B_l)+D pages + aug, PUT If-None-Match
+           spilled bodies -> blob/; PUT removal set′ if changed
   CAS root                                 # the commit point
   batch DELETE pile keys                   # admitted and rejected alike; ceil(b/1000) reqs
 ```
@@ -205,16 +206,18 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
 ```text
 t(b) ≈ b·R_l/w        pile GETs
      + b·t_v/v        verify (v = vCPU share)
+     + C_p·R_l/w      cold frontier probes (closures ride the pile ⇒ C_p small)
      + (D + b/B_l + 2)·R_l   emit + CAS   (no per-fact copies — bodies ride the pages)
 ```
 
-b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 95 ms ≈
-0.39 s ⇒ **~2,600 facts/s** against real S3 — 8× over the 300/s litmus,
+b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + ~30 + 95 ms ≈
+0.42 s ⇒ **~2,400 facts/s** against real S3 (~2,000 with aug upkeep,
+Closure below) — 7–8× over the 300/s litmus,
 margin absorbed by tail latency and cache misses (packing deleted the
 per-fact `COPY pile→blob`, previously a co-leading cost). Against a
 local sqlite store the loop is verify-bound: **6–10 k facts/s**.
-Bottleneck order: per-fact pile GETs > verify > emit; uploading a ~1 MB
-packed tail adds 10–20 ms, noise. Note vCPU scales
+Bottleneck order: per-fact pile GETs > verify > probes > emit; uploading
+a ~1 MB packed tail adds 10–20 ms, noise. Note vCPU scales
 with Lambda memory — 1,769 MB doubles the verify rate.
 
 **Write amplification.**
@@ -231,11 +234,11 @@ rewrites between promotions churn up to ~1.2 MB per drain, but PUT bytes
 are ingress-free — milliseconds of Lambda upload, not dollars. CAS
 contention ≈ 0 under the lease; the CAS is only the safety net.
 
-**No parked scan.** The shallow gate ended it: every drain empties the
-pile — admitted or deleted, nothing waits — so a drain costs
-O(arrivals), never O(backlog). Missing-dep parking moved into each
-consumer's own projection state, where it is a local SQL row, not a
-store object.
+**No parked scan.** Every drain empties the pile — admitted or deleted,
+nothing waits — so a drain costs O(arrivals), never O(backlog).
+Closure-complete piles (auth model C) make parking impossible by
+construction, store-side and consumer-side alike: a receiver never
+holds a fact it lacks the means to judge.
 
 ## Dollars
 

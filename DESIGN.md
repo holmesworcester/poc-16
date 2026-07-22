@@ -6,7 +6,7 @@ carries the performance model and the loop math behind the numbers.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
 counterpart that executes no code?** The counterpart is a dumb object store
-(S3, a peer's disk behind six HTTP routes, a static file host) holding a
+(S3, a peer's disk behind seven HTTP routes, a static file host) holding a
 materialized summary of the validated set. The active side does the whole
 reconciliation itself by fetching immutable pages. If it works, a cloud node
 stops being a sync participant and becomes an artifact peers sync against —
@@ -27,9 +27,11 @@ Litmus: 10^6 facts, 10^2 recent-clustered diff ⇒ ≤ 4 rounds, ≤ low
 hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 (MODEL.md).
 
-**P2 — efficient engine.** *Drain* takes `(raw piles, admitted set)` to
-`(admitted set′)` on request — well-formedness, signature, author known;
-no dep I/O at the gate — by rewriting the treap's tail range; *promotion*
+**P2 — efficient engine.** *Drain* takes `(raw piles, valid set)` to
+`(valid set′)` on request — signature plus dep-pure handler over each
+fact's closure, deps resolved from pile ∪ treap (frontier probes only;
+the closure arrives with the pile) — by rewriting the treap's tail
+range; *promotion*
 (the cut rule freezing a full tail into immutable pages) and aug
 placement (Closure Walk) ride the same commit. Litmus:
 ≥ 300 facts/s validated in a warm 1 GB Lambda against real S3;
@@ -48,8 +50,8 @@ Everything else is scaffolding around these three.
 
 **Facts.** Content-addressed, self-certifying, bodies encrypted; the
 signature and dep refs live in the **signed clear envelope** (decided
-2026-07-22): the gate checks a fact against nothing but itself and the
-snapshot, and the engine derives the dep aug from envelopes alone — dep
+2026-07-22): the kernel judges a fact against nothing but itself and its
+closure, and the engine derives the dep aug from envelopes alone — dep
 topology is store-visible, content never is.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
@@ -90,13 +92,14 @@ sink the design. Run depth is 2–3 (MODEL.md).
 
 **Manifest.** The **only** mutable object besides the piles: generation,
 the inlined top fence runs (history + tail fences, fact and aug runs
-alike), auth snapshot ref. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
+alike), removal set. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
 rename) — the single commit point for validation and promotion alike.
 Everything it references is immutable and content-addressed, so one
 conditional GET revalidates a node's whole cached world, readers get
 snapshot isolation free, and a ranged GET can never tear across an update.
 Unreferenced objects (superseded tails included) are GC'd after a grace
-period. Mutable surface of the whole store: `root` ∪ `pile/*`.
+period. Mutable surface of the whole store: `root` ∪ `pile/*` ∪
+`invite/*`.
 
 **Pile.** `pile/<member>/<hash>` — pure ingress. Puts are
 content-addressed, hence idempotent; the member prefix comes from the grant,
@@ -105,10 +108,14 @@ put is durable — the response is a *delivery* receipt — but *acceptance*
 is appearance in the treap, and the walk's exact two-way diff re-offers
 anything that fell short. Only the engine reads raw piles: a hostile
 writer can litter but never poison, and litter costs readers zero
-bandwidth. **Nothing parks**: every drain empties the pile — self-valid
-facts into the tail, the rest (malformed, bad signature, unknown author)
-deleted on the spot; a fact whose author is unknown *this* drain is
-re-offered by its home store's walk after the certifying facts land.
+bandwidth. **Piles are closure-complete or rejected**: pile ∪ treap must
+be dep-closed — the sender just walked, so it knows the gap exactly and
+ships it; the drain verifies with frontier probes (dep ∈ treap,
+record-level merge-join). **Nothing parks**: every drain empties the
+pile — valid facts into the tail, the rest (malformed, bad signature,
+invalid, closure-incomplete) deleted on the spot; anything valid that
+sank with a bad batch comes back with its closure on the sender's next
+walk.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
@@ -143,8 +150,9 @@ delete(key)             # GC, pile retirement
 ```
 
 Layout: `root`, `page/<hash>`, `blob/<hash>` (spilled bodies +
-attachments), `pile/<member>/<hash>` — everything but `root` and the
-piles is immutable and content-addressed.
+attachments), `pile/<member>/<hash>`, `invite/<id>` (encrypted invite
+blobs; the only publicly readable prefix, LIST denied) — everything but
+`root`, the piles, and the invites is immutable and content-addressed.
 Drivers: s3 (also R2/MinIO/Garage), sqlite (peer default), fs, mem (tests).
 One named asymmetry: in the cloud the store *is* the server (presigned,
 no daemon in the byte path); in a peer the daemon fronts the store.
@@ -190,7 +198,7 @@ quantize outward to leaf-page cuts (~1 h of facts at canonical λ).
 **The aug** is one new run family on the existing skeleton — sorted
 fixed-size records (~40 B: target `(ts, fid)`, delta-coded), own fence
 runs, top fences inline in the manifest, ordinary `page/` objects,
-committed by the same CAS. Fact pages, the gate, and the six verbs are
+committed by the same CAS. Fact pages, the gate, and the verbs are
 untouched. Above the leaf pages sits a **level ladder** of ranges from
 priority-threshold cuts at arity β ≈ 16 — the page-cut rule family,
 which must therefore be **split-monotone** (boundaries refine, never
@@ -247,15 +255,24 @@ noise — bench on a real corpus before trusting it (MODEL.md, Closure).
 One body of code, two loops; only the trigger and store driver differ by
 deployment.
 
+The kernel runs in **two modes, and the verb picks**: `drain` —
+evaluate and persist through the commit (put + poke in the cloud; any
+verb at a peer) — and `evaluate` — verdict only, structurally
+side-effect-free (mint, dial handshake). In evaluate mode there is
+nothing a handler could persist, and nothing is lost by it: whatever
+the store lacked arrives with the next closure-complete pile anyway.
+
 ```text
-validate:                  # on any compute-touched request — peers: every verb; cloud: mint + poke
-  auth  <- manifest.auth_snapshot          # O(principals), always current
+drain:                     # put + poke (cloud); any verb (peer); under lease
   facts <- LIST + GET piles
-  admit <- well-formed ∧ signed by a snapshot-known author   # no dep I/O
-  fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer; intra-batch first
+  admit <- signature ∧ dep-pure handler over the closure    # deps from pile ∪ treap;
+           (frontier probes: dep ∈ treap, merge-join; intra-batch first)
+  reject<- invalid or closure-incomplete — deleted with the drain
+  fold  <- eviction facts ⇒ removal set′   # the one store-side projection
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # the cut rule fires
-  put tail' (records + bodies), promoted pages, spilled blobs, snapshot′ if changed
+  put tail' (records + bodies), promoted pages, spilled blobs, aug,
+      removal set′ if changed
   CAS manifest                             # the single commit point
   delete pile keys                         # admitted and rejected alike
 ```
@@ -269,11 +286,11 @@ only copy: a pile key deleted before its CAS landed would silently drop
 a delivered fact until some walk re-offers it.
 
 Trigger: **on request, in both worlds** — the engine has no timers and no
-event plumbing. Every request that reaches compute drains the piles
-first: a peer drains before answering any verb; in the cloud that is
-mint and poke, since presigned reads cannot compute. The request pauses
-(milliseconds) so the requester always gets the latest — in particular
-an invitee's first mint sees an invite fact still sitting in a pile.
+event plumbing. Every ingest request drains the piles: a peer drains
+before answering any verb; in the cloud that is **poke alone** — the
+mint runs in evaluate mode and needs no drain, since its payload proves
+itself. The request pauses (milliseconds) so the requester always gets
+the latest.
 For the passive cloud data path the request is explicit: `POST
 /poke` on the mint Lambda — writers poke after pushing, walkers poke on a
 slow backstop cadence, a writer that dies before poking is caught by
@@ -284,38 +301,31 @@ protocol, not the backend. A lease keeps the engine single-flight for
 cache locality — concurrent pokes coalesce — and the CASes keep it safe
 regardless.
 
-Auth state is materialized, never re-derived: the snapshot is a small
-object referenced by the manifest, rewritten in the same commit whenever
-auth facts are admitted — always current, no union to compute. Structure:
-fixed-size records sorted by **device pubkey** (what a mint challenge and
-a fact signature prove control of — distinct from the device id,
-`H(device_fact)`): pubkey → member, device id, scope/status; plus member
-status and KDF epoch heads. **Invite pubkeys are records of the same
-shape** — pubkey → invite fact id, provisional scope, expiry — so an
-invitee can mint before joining; the join fact consumes the invite.
-Expiry is enforced at mint time (expired ⇒ ignored) and expired records
-are purged free on the next auth-fact rewrite — no clock-driven
-rewrites, every snapshot write is fact-driven. There is no hot half: the
-snapshot is the only published projection, O(principals) and never
-O(facts) — which is exactly why the mint folds auth facts and nothing
-else.
+Store-side auth state is one object: the **removal set** — a monotone
+projection of eviction facts, O(removals), riding the manifest,
+rewritten in the commit that admits them. It is a gate input only:
+**handlers never read the removal set** — the moment a validity handler
+consults it, verdicts become time-dependent and order-independence
+collapses. Fact validity is forever; removal only closes doors.
+Authoring an eviction requires proving admin status and non-removal,
+and **mutual removals remove each other** — monotone, no ordering
+question to answer. Everything the old auth snapshot held is gone:
+certification is proved by each fact's own closure, invites live in the
+invite blob (Auth), and epoch heads are content facts like any other.
 
-**Admission is self-validation only** — POC-13's rule, and RBSR forces
-it: set membership must be monotone and order-independent, or two honest
-stores admit different sets and every walk re-diffs the gap forever. The
-gate checks well-formedness and a signature by a snapshot-known author —
-member device or unexpired invite, dead or alive ("ever certified" is
-monotone; refusing a removed author's already-delivered facts would
-livelock the walk). No dep check, no chain check, no bodies. The treap
-is the **delivered** set: it certifies authorship, integrity, and
-delivery — never semantic truth. Validity is each consumer's
-deterministic downstream computation: fact handlers run at projection
-time and are **dep-pure** — functions of the fact body and its declared
-deps' bodies, no ambient state, no reordering footguns — parking
-missing-dep facts in their own processing state (a processing status,
-not a sync status; the deps arrive by walk). The auth fold is the one
-dep-ordered consumer in the store's own compute, and it folds only auth
-facts.
+**Admission is dep-pure validation** — signature plus the family
+handler over the fact's closure, nothing else. RBSR still gets what it
+forces: the verdict is a function of the fact and its immutable closure
+— no ambient state, no clock, no arrival order — so membership is
+monotone and order-independent, and the union of two honest stores is
+always valid. The treap is the **valid, dep-closed set**: membership
+certifies the transitive closure, and the closure walk serves it.
+Consumers stay trustless — they re-verify what they pull, closures
+always in hand — but nothing parks anywhere: piles arrive
+closure-complete by the pile rule, syncs arrive closure-complete by
+P3. Anything needing negative or global knowledge (uniqueness,
+latest-wins) stays a projection-time verdict, deterministic from the
+set — never an admission input.
 **Removal is terminal and monotonic at the connection level**: eviction
 kills the mint — no grants, so no reads and no writes — and it is the
 *pusher's* liveness transport checks, never the author's. Facts that
@@ -326,31 +336,64 @@ its last consumer). Deletion, the one feature that genuinely needs
 set-level verdicts, follows POC-13's suppress-if relation + death key
 when it returns — deliberately out of this proto (Open Questions).
 
-Performance: the gate does no dep I/O, so the drain is transfer- and
-verify-bound — GET 10–30 ms, ~100 in flight ⇒ 3–5k GET/s; Ed25519
-~50–100 µs ⇒ thousands of facts/s. Memory beats lookups: Lambda RAM bills only while
+Performance: closures arrive with the pile, so dep I/O is frontier
+probes only — the drain stays transfer- and verify-bound: GET 10–30 ms,
+~100 in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs; ~1,600–2,100 facts/s
+vs S3 with aug upkeep (MODEL.md), ≥ 5× the litmus. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
 — the single-flight engine wrote the current pages itself last run.
 
 ## Auth
 
-Two layers, never mixed. **Integrity**: the gate — authorship and
-well-formedness, checked only by the engine, gating only the treap, the
-same boundary in every deployment; semantic validity is computed
-downstream by every consumer, never enforced by the store.
-**Transport**: the mint. Prove control of a sigchain-certified device key,
-get a grant `{member, scope, expiry}` — presigned URLs in the cloud, a
-bearer/signed-URL capability from a peer daemon. To the client a grant is an
-opaque request decorator: the only per-backend seam. Renewal is re-mint.
-The mint response also carries the current root (bytes + ETag) as a
+One evaluator, everywhere: **the kernel judges content, auth, and
+access alike**. A store executes a request iff the kernel validates its
+request fact and the gate finds none of the closure's keys in the
+removal set.
+
+**Request facts are an ephemeral family.** The auth payload on any verb
+is a fact — authored by the requesting device key, deps on the auth
+facts that entitle it, body carrying verb, scope, and a loose expiry —
+evaluated in evaluate mode, never admitted. Ephemerality is structural,
+for three reasons: the set must not grow with reads; mints must not
+churn fingerprints into phantom walk diffs; and read patterns must not
+become replicated data. A request family has no admit semantics, so a
+stray request fact in a pile is litter and the drain deletes it. For a
+request fact, acceptance is the grant.
+
+**The mint is a pure function.** Verify the request fact — deps resolve
+against the payload and the treap; the aug makes a closure fetch a few
+ranged GETs — apply the removal set, return a grant
+`{member, scope, expiry}`: presigned URLs in the cloud, a bearer
+capability from a peer daemon; to the client an opaque request
+decorator, the only per-backend seam. **The grant is encrypted to the
+request fact's author pubkey**, so a captured request replays into
+ciphertext — no server nonces, no clock strictness, no per-request
+state; renewal is a fresh request fact. No writes, no lease: mints
+parallelize freely, and the drain trigger shrinks to poke alone. The
+mint response also carries the current root (bytes + ETag) as a
 freebie: auth hands you the top node, every id below it is
 content-addressed, and the session's first walk starts a round trip ahead.
 Over iroh the mint feels vestigial (the channel proved the key) but stays —
 it is load-bearing in the cloud world and keeping it keeps the worlds
 isomorphic. Transport identity is never an integrity input.
 
-A **workspace is a store** — root, treap, piles, snapshot, each derived
+**The invite blob is the bootstrap edge.** An invite is a blob at
+`invite/<id>` — the **only publicly readable prefix in the design: GET
+without a grant, LIST denied absolutely** (unguessability is the access
+control) — encrypted under a link secret, with `id = KDF(seed, "id")`
+and `k = KDF(seed, "key")`, so the whole invite link is *store URL +
+~32-byte seed*. The blob holds whatever the link must prove — the
+invite fact, its full admin closure, an epoch-key box, welcome
+metadata — so redemption is self-contained: no race with the inviter's
+push, no dependence on treap state. If it can connect, it can join.
+The chain inside is frozen at creation but evaluated fresh at mint
+(inviting admin since removed ⇒ refused). Unclaimed invites are
+revocable by delete and TTL-GC'd; a static mirror can serve them. The
+credential a meta-workspace join fact carries for sibling devices is
+exactly this link.
+
+A **workspace is a store** — root, treap, piles, removal set, each derived
 only from its own facts; the same device pubkey in two workspaces is two
 independent certifications. The mint is the one multi-tenant piece:
 `/mint` names the workspace, reads that store's root, and the grant
@@ -402,6 +445,7 @@ the grant.
 | page | `GET /page/{hash}` (+ blob) | S3 GET | serve blob |
 | put | `PUT /pile/{member}/{hash}` | presigned PUT | grant-checked append |
 | list | `GET /pile/` | S3 LIST | list pile |
+| invite | `GET /invite/{id}` | S3 public GET (LIST denied) | ungated read |
 
 HTTP is the protocol: ETag revalidation on root, h2/h3 streams for parallel
 page fetches, and any static HTTPS host is a read-only replica with zero
@@ -414,7 +458,7 @@ the key, so dialing authenticates; hole-punching and relays included). iroh
 is dumb pipes only — no iroh-docs/blobs/gossip, bao stays retired — and
 pre-1.0, so the connector module is its containment boundary.
 
-Every node = a **responder half** (six verbs over its store, zero sync
+Every node = a **responder half** (seven verbs over its store, zero sync
 logic) + optional **initiator half** (per-workspace walk on cadence,
 round-robin from the keyring + eager push). Roles
 are per-session, fixed by dial direction. Any peer may dial — news-driven
@@ -429,21 +473,20 @@ projection stamped with the manifest generation it reflects**; the commit
 point is always the manifest CAS. Any node can delete its SQLite and
 rebuild from its store.
 
-- The auth snapshot is a manifest-referenced object, not a local file — the
-  Lambda wakes, conditional-GETs the manifest, fetches the snapshot on cache
-  miss, works, publishes. No EFS, no /tmp durability.
+- The removal set is a manifest-riding object, not a local file — the
+  Lambda wakes, conditional-GETs the manifest, works, publishes. No EFS,
+  no /tmp durability.
 - **Rows in memory, records on the store.** Fact handlers write ordinary
   SQLite rows into the engine's ephemeral db — identical code in both
   worlds, since that db is already connection-string-abstracted. At
-  commit the engine emits the snapshot as canonical sorted records
-  (`SELECT … ORDER BY pubkey`), and the manifest CAS publishes it; the
-  next run loads records back into rows (a warm peer daemon skips the
-  reload by generation stamp). Publishing the `.db` itself is rejected:
+  commit the engine emits the removal set as canonical sorted records,
+  and the manifest CAS publishes it; the next run loads records back
+  into rows (a warm peer daemon skips the reload by generation stamp).
+  Publishing the `.db` itself is rejected:
   SQLite bytes are write-history artifacts — the store holds canonical
-  records and SQLite is always the rebuildable working form — and the
-  mint path stays SQLite-free, a binary search over the records.
+  records and SQLite is always the rebuildable working form.
   **Serialization after a fact-processing run is the boundary between
-  facts and the auth gate**: the mint — Lambda or peer daemon, same
+  facts and the auth gate**: evaluate mode — Lambda or peer daemon, same
   code — reads only the objects the last commit published, through the
   same ObjectStore primitive, never the engine's live rows. Facts
   influence auth solely by being processed and serialized; the commit is
@@ -491,12 +534,12 @@ Proofs first; no transport work until both numbers exist.
 4. **P3 bench** — aug build at promotion + closure walk; sweep window
    sizes; measure δ′ on a real corpus (the aug's one workload
    assumption).
-5. **Protocol** — daemon (six routes) + the one HTTP client with grant
+5. **Protocol** — daemon (seven routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
 6. **iroh** — h3-over-iroh connector; same conformance suite.
-7. **Auth** — real gate + auth fold, snapshot format, eviction test,
-   mint over both transports.
+7. **Auth** — request-fact families + evaluate mode, removal set,
+   invite blob, eviction test, mint over both transports.
 
 ## Open Questions
 
@@ -504,9 +547,8 @@ Proofs first; no transport work until both numbers exist.
   the one feature that needs set-level verdicts. Tombstones weaken the
   count heuristic; content confidentiality via key destruction (POC-14);
   the reconciliation-visible shape of a delete is undesigned.
-- Dead weight: the delivered set accretes facts that never validate
-  (certified authors only, blameable); if it ever matters, deterministic
-  suppression rides the deletion design.
+- (Dead weight: resolved 2026-07-22 — admission is dep-pure validation
+  again, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages, and it must be **split-monotone** — boundaries
   refine, never move — because the aug's level ladder is built from the
