@@ -235,6 +235,17 @@ are derived sidecars, content-addressed beside their pages and
 **outside the fingerprinted set** — the treap reconciles facts only,
 so copies never perturb the walk's diff algebra.
 
+**Every fetchable unit is a closed pile.** Ingress pile, tail +
+tail-annex, promoted range + annex, request payload, invite blob —
+one codec, one predicate, no other context ever needed. So sync is a
+stream of independently judgeable units: a consumer kernels and
+projects each range as it lands, in any order, parallel across cores —
+fetch ts-descending and a fresh join's inbox is usable in seconds
+while history backfills behind it. Hub copies re-arriving across
+ranges cost no re-verification: verdicts are immutable, so a
+consumer's fid-keyed verdict cache is append-only and each hub
+verifies once per device lifetime.
+
 ```text
 closure_sync(Q):                        # Q snapped to range cuts
   root + fence slices over Q            # rounds 1–2, as P1
