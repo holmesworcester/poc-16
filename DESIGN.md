@@ -59,7 +59,14 @@ refuse to pay for. **ts is causal**: an author stamps
 `ts = max(wall clock, max dep ts + 1)` and the kernel checks
 `ts > every dep's ts` as well-formedness — the Lamport rule, free at
 authoring, and it makes `(ts, fid)` a **strict topological order along
-dep edges**. Both are fact-format constraints.
+dep edges**. Both are fact-format constraints. **ts is a witness of
+dep order, never a trusted clock**: the topo property rests on the
+checkable constraint alone; validity never reads ts as time (the only
+wall-clock comparisons anywhere are grant/invite expiry, at the gate,
+against the checker's own clock); the wall seed buys locality only —
+skew cannot break correctness, it can only price a fact as a straggler
+— and a windowed reader can never lose a backdated dep, because the
+annex delivers context by closure, not by window.
 
 **Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
 from the fid hash — history-independent, so the same set gives the same
