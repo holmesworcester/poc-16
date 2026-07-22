@@ -16,14 +16,14 @@ Set and workload:
 | d | symmetric difference at walk time | 10^2 |
 | λ | new-fact arrival rate | 10^4/day/group (~0.12/s) |
 | δ | dependency refs per fact | 5–10 |
-| ρ | fraction of diff in the recent ts range | ≈1 live; <1 for parked/edited |
+| ρ | fraction of diff in the recent ts range | ≈1 live; <1 for old edits/late arrivals |
 | F | fact object (envelope + ciphertext body) | 0.5 KB (attachments excluded) |
 
 Records and pages (fixed-size records; ts leads the key):
 
 | sym | meaning | canonical value |
 |---|---|---|
-| E_l | leaf record `(ts, fid, author, seq, auth digest)` | 64 B |
+| E_l | leaf record `(ts, fid, author, auth digest)` | 64 B |
 | E_i | interior child record `(bound, fp, count, child hash)` | 96 B + 16·k |
 | P | page byte target | 128 KB (64–256 elastic) |
 | B_l = P/E_l | entries per leaf page | 2,048 |
@@ -112,7 +112,7 @@ F1   ≈ fence slices covering L(d)        (≤ whole L1 run, 220 KB, scattered)
 
 Locality is the whole game: ts leads the key, so live diffs land in the
 rightmost slices (`ρ→1`) and `L(d) ≈ d/128`. Scattered diffs (old edits,
-parked facts arriving late) pay one slice each. Worst-case transfer is
+late arrivals) pay one slice each. Worst-case transfer is
 `O((d + D)·P/k)` — the "log n" of P1's O(d·log n) claim lives in D, and
 the constant is the slice size, not the page size.
 
@@ -146,8 +146,8 @@ on new local fact f:                       # eager path — news latency
   for each counterpart store s with a grant:
     PUT s/pile/<me>/<hash(f)>              # idempotent; 200 = durably delivered
   POST s/poke after the batch              # cloud: wake the engine; peer: implicit
-  then walk s                              # closure guarantee: the exact diff
-                                           # carries deps/chain the PUT alone lacks
+  then walk s                              # latency nicety: the exact diff
+                                           # delivers the closure promptly
 
 at walk end:                               # anti-entropy backstop
   push <- local entries in differing ranges ⊖ remote entries(fetched slices)
@@ -159,11 +159,10 @@ at walk end:                               # anti-entropy backstop
   re-sends, no receipt protocol. Content-addressed PUT makes retries free.
 - Cost: one PUT per fact per cloud store ($5e-6); zero per peer. Rate:
   3,500 PUT/s on the member's own prefix ≫ λ.
-- Creation triggers the walk, not just the PUT: under seq a lone fact
-  parks behind any chain gap at the receiver, and parked is TTL'd — so
-  the eager path ends with a full walk per counterparty, nearly free
-  (one conditional GET) when in sync and exactly the closure-bearing
-  transfer when not.
+- The walk after the PUT is latency, not correctness: admission never
+  blocks on deps, so a lone fact cannot wedge — the walk just gets the
+  closure to consumers' validators sooner; nearly free (one conditional
+  GET) when in sync.
 
 ## The Engine — compaction loop (P2)
 
@@ -174,16 +173,15 @@ amplification, not the per-fact costs.)
 ```text
 on request (peer drain-on-read / cloud POST /poke), under lease:
   m     <- GET root (cond)                 # warm: cached
-  snap  <- GET auth snapshot + cursors     # warm: cached; O(members + devices)
+  snap  <- GET auth snapshot               # warm: cached; O(principals)
   keys  <- LIST pile                       # ceil(pile/1000) reqs
   facts <- par GET pile objects            # b reqs | b·F
-  verify signatures                        # b·t_v CPU
-  deps sorted; resolve intra-batch → recent window (mem) → merge-join leaf pages
-  admit / park                             # parked stay in pile
+  admit <- well-formed ∧ verify sig ∧ author known   # b·t_v CPU; no dep I/O
+  fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer
   emit  <- rewrite ceil(b/B_l)+D pages, PUT If-None-Match
-           COPY pile→blob ×b; PUT cursors (~50 B/device), snapshot if changed
+           COPY pile→blob ×b; PUT snapshot′ if changed
   CAS root                                 # the commit point
-  batch DELETE admitted pile keys          # ceil(b/1000) reqs
+  batch DELETE pile keys                   # admitted and rejected alike; ceil(b/1000) reqs
 ```
 
 **Throughput.** With w = 100 GETs in flight at in-region R_l:
@@ -191,16 +189,15 @@ on request (peer drain-on-read / cloud POST /poke), under lease:
 ```text
 t(b) ≈ b·R_l/w        pile GETs
      + b·t_v/v        verify (v = vCPU share)
-     + C_p·R_l/w      cold dep pages (C_p = distinct pages, merge-join)
      + b·R_l/w        pile→blob copies
      + (D + b/B_l + 2)·R_l   emit + CAS
 ```
 
-b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 30 + 180 + 60 ms ≈
-0.6 s ⇒ **~1,600 facts/s** against real S3 — 5× over the 300/s litmus,
+b = 1,000, R_l = 15 ms, 1 GB (0.57 vCPU): 150 + 140 + 180 + 60 ms ≈
+0.53 s ⇒ **~1,900 facts/s** against real S3 — 6× over the 300/s litmus,
 margin absorbed by tail latency and cache misses. Against a local sqlite
 store the loop is verify-bound: **6–10 k facts/s**. Bottleneck order:
-per-fact pile GETs ≈ copies > verify > dep pages > emit. Note vCPU scales
+per-fact pile GETs ≈ copies > verify > emit. Note vCPU scales
 with Lambda memory — 1,769 MB doubles the verify rate.
 
 **Write amplification.**
@@ -212,22 +209,14 @@ WA = (ceil(b/B_l) + D) · P / (b·E_l)
 b = 50 ⇒ ~120×; b = 2,048 ⇒ ~3×. Batching divides WA — and the pile makes
 batching free: **facts are visible in the pile the moment they're PUT, so
 compaction cadence τ is a pure cost knob, not a delivery-latency knob.**
-Choose λτ ≈ B_l/4..B_l where λ allows; floor τ at the parked-dep re-check
-interval. CAS contention ≈ 0 under the lease; the CAS is only the safety
-net.
+Choose λτ ≈ B_l/4..B_l where λ allows. CAS contention ≈ 0 under the
+lease; the CAS is only the safety net.
 
-**Parked scan.** Parked facts stay in the pile and are re-examined every
-drain: P parked ⇒ P GETs + ~P/100 · 20 ms of drain latency (dep-check
-before sig re-verify keeps CPU negligible). At per-minute drains:
-P = 100 ⇒ ~$0.06/day, +20 ms — fine; P = 10^3 ⇒ ~$0.6/day, +200 ms —
-the drain-latency promise strains; P = 10^4 ⇒ ~$6/day, +2 s — broken.
-**The knee is P ≈ 10^3.** Three things keep P ≈ 0: treap pulls arrive
-dep- and prefix-closed (only interrupted transfers park), walk-on-create
-keeps honest parking transient, and the TTL caps hostile accumulation at
-rate·TTL per member (100/day litter × 3-day TTL ⇒ 300, well under the
-knee). Escape hatch if ever needed: publish a parked index (key →
-awaited dep) at commit and re-GET only unblocked entries — O(arrivals),
-not O(P).
+**No parked scan.** The shallow gate ended it: every drain empties the
+pile — admitted or deleted, nothing waits — so a drain costs
+O(arrivals), never O(backlog). Missing-dep parking moved into each
+consumer's own projection state, where it is a local SQL row, not a
+store object.
 
 ## Dollars
 
@@ -270,7 +259,7 @@ small batches, and WA at b = 50 is ~120×. Splitting the engine into
 both:
 
 ```text
-pile/<member>/<hash>    raw, per-member quarantine       (unchanged)
+pile/<member>/<hash>    raw, per-member ingress          (unchanged)
 tail page               the WAL: validated, deduped,
                         (ts,fid)-sorted, ≤ B_l entries —
                         the treap's rightmost range,
@@ -282,12 +271,12 @@ manifest + pages        the rest of the set              (unchanged)
 
 ```text
 validate (on request: peers drain-on-read, cloud on poke; same lease):
-  facts <- LIST + par GET pile; verify; dep-resolve vs set + batch
+  facts <- LIST + par GET pile; gate (sig + author known; no dep I/O)
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # cut rule fires
   PUT blob/<hash> each, bundle, tail', any promoted pages
   CAS manifest                         # the single commit point
-  batch DELETE covered pile keys       # pile holds only unvalidated + parked
+  batch DELETE covered pile keys       # pile empties every drain
 ```
 
 The WAL is the engine's recent window made durable and public — and
@@ -384,7 +373,7 @@ cloud; a writer that dies before poking is caught by cadence.
   hit 5,500 GET/s at N ≈ 5,500·c (330 k at c = 60). Past that: CDN in
   front of it, or fan-out copies.
 - **LIST pages at 1,000 keys**: pile must stay well under 1,000 live
-  entries (λτ + parked) or listing goes multi-request. Batch DELETE
+  entries (λτ) or listing goes multi-request. Batch DELETE
   clears 1,000/req.
 - **Conditional PUT is native** on S3 (and R2/MinIO/Garage), so manifest
   CAS and `put_if_absent` port everywhere the trait goes.

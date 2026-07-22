@@ -27,9 +27,9 @@ Litmus: 10^6 facts, 10^2 recent-clustered diff ⇒ ≤ 4 rounds, ≤ low
 hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 (MODEL.md).
 
-**P2 — efficient engine.** *Validate* takes `(raw piles, valid set)` to
-`(valid set′)` on request — signatures, membership, 5–10 dep lookups per
-fact — by rewriting the treap's tail range; *promotion* (the cut rule
+**P2 — efficient engine.** *Drain* takes `(raw piles, admitted set)` to
+`(admitted set′)` on request — well-formedness, signature, author known;
+no dep I/O — by rewriting the treap's tail range; *promotion* (the cut rule
 freezing a full tail into immutable pages) rides the same commit. Litmus:
 ≥ 300 facts/s validated in a warm 1 GB Lambda against real S3;
 thousands/s against a local store.
@@ -38,8 +38,9 @@ Everything else is scaffolding around these two.
 
 ## The Store
 
-**Facts.** Content-addressed, self-certifying (signature and chain refs in
-the payload — the engine is the only validator), bodies encrypted.
+**Facts.** Content-addressed, self-certifying (signature and dep refs in
+the payload — the gate checks a fact against nothing but itself and the
+snapshot), bodies encrypted.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
 refuse to pay for. This is a fact-format constraint.
@@ -52,9 +53,9 @@ boundary negotiation. It is math, not layout — on disk it is realized as
 the sorted run + fence hierarchy below. No homomorphic sums — they exist
 to compare unaligned ranges (useless here) and invite Wagner's attack.
 
-**Pages and fences.** The validated set serializes as one key-sorted run
-of fixed-size leaf records `(ts, fid, author, seq, auth digest)` —
-existence and validation without fetching bodies — cut deterministically
+**Pages and fences.** The admitted set serializes as one key-sorted run
+of fixed-size leaf records `(ts, fid, author, auth digest)` —
+existence and authorship without fetching bodies — cut deterministically
 into fat immutable content-addressed pages (64–256 KB), addressable in
 8 KB slices by ranged GET. Above it sit **fence runs**: one fence per
 slice, `(separator key, fingerprint, count, page ref)`, suffix-truncated
@@ -79,36 +80,33 @@ snapshot isolation free, and a ranged GET can never tear across an update.
 Unreferenced objects (superseded tails included) are GC'd after a grace
 period. Mutable surface of the whole store: `root` ∪ `pile/*`.
 
-**Pile.** `pile/<member>/<hash>` — ingress and quarantine. Puts are
+**Pile.** `pile/<member>/<hash>` — pure ingress. Puts are
 content-addressed, hence idempotent; the member prefix comes from the grant,
 so attribution, rate limits, and blame are the same code in every world. A
 put is durable — the response is a *delivery* receipt — but *acceptance*
 is appearance in the treap, and the walk's exact two-way diff re-offers
 anything that fell short. Only the engine reads raw piles: a hostile
 writer can litter but never poison, and litter costs readers zero
-bandwidth. **Parked facts are TTL'd** (age = the store's LastModified,
-already in every LIST; the purge rides the drain's delete batch): a
-healthy parked set is ~empty, because treap pulls arrive dep-closed and
-prefix-closed — only interrupted transfers and in-flight races park — so
-a long-parked fact is a permanent hole or litter. Purging is safe
-because piles are not the durability layer, treaps are: anything valid
-in any treap comes back with its closure via the walk.
+bandwidth. **Nothing parks**: every drain empties the pile — self-valid
+facts into the tail, the rest (malformed, bad signature, unknown author)
+deleted on the spot; a fact whose author is unknown *this* drain is
+re-offered by its home store's walk after the certifying facts land.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
 (deduped, `(ts, fid)`-sorted, capped at one leaf page, ~128 KB) whose
 per-slice fences sit in the manifest's top run beside the history fences,
-plus news body bundles `bundle/<hash>`. Every validation rewrites the tail
+plus news body bundles `bundle/<hash>`. Every drain rewrites the tail
 and CASes the manifest — the root covers the news naturally, and because
 the tail's fences are in the top run, no fence pages are rewritten: no
 path rebuild. So "did anything change" is one conditional GET for the
 whole set, and fetching news is the same fence walk as deep sync. History
-ranges = promoted, tail range = validated news, pile = quarantine;
-fingerprints cover the whole validated set, never the pile. The tail is
+ranges = promoted, tail range = admitted news, pile = ingress;
+fingerprints cover the whole admitted set, never the pile. The tail is
 literally the next leaf page accumulating in public — when it fills,
 promotion (the cut rule firing) freezes it into immutable pages in the
-same commit. A fact validated *below* the tail's range boundary (late ts:
-parked deps, offline devices, clock skew) takes an immediate mini-fold of
+same commit. A fact admitted *below* the tail's range boundary (late ts:
+offline devices, clock skew) takes an immediate mini-fold of
 the page it lands in — same commit, ~2–3 extra PUTs, rare because the
 boundary's guard window is the tail's time depth (B_l/λ: hours busy, days
 quiet). The boundary itself is content-determined (the highest cut point
@@ -147,12 +145,10 @@ The walk computes the *symmetric* difference, so push is the tail of the
 same walk: **one dial converges both sides; the responder runs zero sync
 logic.** Eager delivery still exists — put your own new facts into known
 piles at write time, then poke — and the walk is the anti-entropy backstop
-(the Dynamo split). **Creating content escalates the backstop to now**: a
-blind PUT delivers one fact, but its *closure* is whatever the
-counterparty is missing — under seq a new fact parks behind any gap in
-its chain, and parked TTLs out — so a new local fact ends with a full
-walk against each counterparty store; the exact diff carries the closure
-with it, and it is nearly free (one conditional GET) when already in
+(the Dynamo split). Ending a write with a walk is a latency nicety, not
+a correctness rule: admission never blocks on deps, so a lone PUT cannot
+wedge — the walk just delivers the fact's closure promptly for the
+consumers' validators, and costs one conditional GET when already in
 sync.
 
 Round trips: interactive negentropy descends two levels per round trip, the
@@ -167,26 +163,24 @@ deployment.
 
 ```text
 validate:                  # on any compute-touched request — peers: every verb; cloud: mint + poke
-  auth  <- manifest.auth_snapshot + cursors  # O(members + devices), always current
+  auth  <- manifest.auth_snapshot          # O(principals), always current
   facts <- LIST + GET piles
-  deps  <- sorted (ts, fid) refs; resolve intra-batch, then tail,
-           then merge-join vs leaf slices
-  admit <- sig valid ∧ author live ∧ seq = cursor+1 ∧ deps resolved
-  park  <- missing deps and chain gaps stay in pile (TTL'd)
+  admit <- well-formed ∧ signed by a snapshot-known author   # no dep I/O
+  fold  <- auth facts ⇒ snapshot′          # the one dep-ordered consumer; intra-batch first
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # the cut rule fires
-  put bodies, bundle, tail', promoted pages, cursors, snapshot if changed
+  put bodies, bundle, tail', promoted pages, snapshot′ if changed
   CAS manifest                             # the single commit point
-  delete covered pile keys
+  delete pile keys                         # admitted and rejected alike
 ```
 
 **Publish, CAS, delete** — every new object is written first, one manifest
 CAS commits them all, covered pile keys are deleted after. A fact is
 briefly in both pile and set (dedup by fid makes that harmless), never in
 neither; validation and promotion commit through the same CAS, so there is
-no multi-object ordering to reason about. With seq the order is
-correctness, not economy: a single-copy fact deleted before its CAS
-landed would wedge its device's chain for good.
+no multi-object ordering to reason about. The order still guards the
+only copy: a pile key deleted before its CAS landed would silently drop
+a delivered fact until some walk re-offers it.
 
 Trigger: **on request, in both worlds** — the engine has no timers and no
 event plumbing. Every request that reaches compute drains the piles
@@ -215,44 +209,50 @@ shape** — pubkey → invite fact id, provisional scope, expiry — so an
 invitee can mint before joining; the join fact consumes the invite.
 Expiry is enforced at mint time (expired ⇒ ignored) and expired records
 are purged free on the next auth-fact rewrite — no clock-driven
-rewrites, every snapshot write is fact-driven. The snapshot's **hot half
-is its own object**: per-device chain cursors (device → last admitted
-seq, ~40–50 B each), rewritten every commit — while the cold
-device/invite object the mint reads changes only on auth facts.
+rewrites, every snapshot write is fact-driven. There is no hot half: the
+snapshot is the only published projection, O(principals) and never
+O(facts) — which is exactly why the mint folds auth facts and nothing
+else.
 
-**Seq.** Facts chain per device: admission requires `seq = cursor + 1`,
-so validation stays a shallow check against snapshot + cursors (POC-10
-split) — signed by a certified key, next in chain, deps resolved. Chain
-gaps park in the pile like missing deps, giving the invariant: **every
-store's set holds a gapless prefix of each device's chain**, so the
-union of two honest stores is always valid — the walk can never
-manufacture an invalid state. Cursors are a pure projection (max
-admitted seq per device): rebuildable, the store stays the sole source
-of truth. Seq does not prevent forks, it converts them into evidence:
-two signed facts at the same seq with different fids are both admitted
-(the set only grows) and the collision itself deterministically marks
-the device invalid from the fork point on — every store computes the
-same verdict.
-Revocation is enforced here and names a **seq cutoff**: facts at
-seq ≤ k stay valid, seq > k are dead regardless of ts — no backdate
-window, because the valid range is already occupied and reusing a seq is
-equivocation. An evicted member's grant can litter the pile until
-expiry, but the next validation rejects the facts.
+**Admission is self-validation only** — POC-13's rule, and RBSR forces
+it: set membership must be monotone and order-independent, or two honest
+stores admit different sets and every walk re-diffs the gap forever. The
+gate checks well-formedness and a signature by a snapshot-known author —
+member device or unexpired invite, dead or alive ("ever certified" is
+monotone; refusing a removed author's already-delivered facts would
+livelock the walk). No dep check, no chain check, no bodies. The treap
+is the **delivered** set: it certifies authorship, integrity, and
+delivery — never semantic truth. Validity is each consumer's
+deterministic downstream computation: fact handlers run at projection
+time and are **dep-pure** — functions of the fact body and its declared
+deps' bodies, no ambient state, no reordering footguns — parking
+missing-dep facts in their own processing state (a processing status,
+not a sync status; the deps arrive by walk). The auth fold is the one
+dep-ordered consumer in the store's own compute, and it folds only auth
+facts.
+**Removal is terminal and monotonic at the connection level**: eviction
+kills the mint — no grants, so no reads and no writes — and it is the
+*pusher's* liveness transport checks, never the author's. Facts that
+made it into any treap before the door shut stay visible everywhere; a
+compromised key's leakage window is its grant expiry. No fact-level
+death — no seq cutoffs, no fork verdicts (seq left the leaf record with
+its last consumer). Deletion, the one feature that genuinely needs
+set-level verdicts, follows POC-13's suppress-if relation + death key
+when it returns — deliberately out of this proto (Open Questions).
 
-Performance: merge-join, not per-fact lookups; resolve intra-batch and
-the tail first. A messaging dep graph is a tiny universally-hot auth
-core plus cold message leaves — steady state resolves almost everything from
-memory. Estimates: GET 10–30 ms, ~100 in flight ⇒ 3–5k GET/s; Ed25519
-~50–100 µs, never the bottleneck; ~500–1,000 facts/s point-lookup,
-thousands merge-join. Memory beats lookups: Lambda RAM bills only while
+Performance: the gate does no dep I/O, so the drain is transfer- and
+verify-bound — GET 10–30 ms, ~100 in flight ⇒ 3–5k GET/s; Ed25519
+~50–100 µs ⇒ thousands of facts/s. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
 — the single-flight engine wrote the current pages itself last run.
 
 ## Auth
 
-Two layers, never mixed. **Integrity**: payload sigchains, checked only by
-the engine, gating only the treap — the same boundary in every deployment.
+Two layers, never mixed. **Integrity**: the gate — authorship and
+well-formedness, checked only by the engine, gating only the treap, the
+same boundary in every deployment; semantic validity is computed
+downstream by every consumer, never enforced by the store.
 **Transport**: the mint. Prove control of a sigchain-certified device key,
 get a grant `{member, scope, expiry}` — presigned URLs in the cloud, a
 bearer/signed-URL capability from a peer daemon. To the client a grant is an
@@ -393,16 +393,18 @@ Proofs first; no transport work until both numbers exist.
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.
 5. **iroh** — h3-over-iroh connector; same conformance suite.
-6. **Auth** — real sigchain validation, snapshot format, eviction test,
+6. **Auth** — real gate + auth fold, snapshot format, eviction test,
    mint over both transports.
 
 ## Open Questions
 
-- Orphan policy: pile facts whose deps never arrive need a TTL; re-ask
-  POC-13's eviction lessons here.
-- Deletion: tombstones weaken the count heuristic; content confidentiality
-  via key destruction (POC-14), but the reconciliation-visible shape of a
-  delete is undesigned.
+- Deletion: POC-13's suppress-if relation + death key is the direction —
+  the one feature that needs set-level verdicts. Tombstones weaken the
+  count heuristic; content confidentiality via key destruction (POC-14);
+  the reconciliation-visible shape of a delete is undesigned.
+- Dead weight: the delivered set accretes facts that never validate
+  (certified authors only, blameable); if it ever matters, deterministic
+  suppression rides the deletion design.
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages (candidate: cut at treap priority thresholds).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
