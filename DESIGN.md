@@ -55,18 +55,16 @@ closure, and the engine derives the dep aug from envelopes alone — dep
 topology is store-visible, content never is.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
-refuse to pay for. **ts is causal**: an author stamps
-`ts = max(wall clock, max dep ts + 1)` and the kernel checks
-`ts > every dep's ts` as well-formedness — the Lamport rule, free at
-authoring, and it makes `(ts, fid)` a **strict topological order along
-dep edges**. Both are fact-format constraints. **ts is a witness of
-dep order, never a trusted clock**: the topo property rests on the
-checkable constraint alone; validity never reads ts as time (the only
+refuse to pay for. This is a fact-format constraint. **ts carries no
+correctness weight at all**: causality lives in the dep refs alone,
+order lives in each unit's serialization, and ts is an uninterpreted
+locality key — wall clock by convention, so live diffs land rightmost
+and humans see plausible times, but validity never reads it (the only
 wall-clock comparisons anywhere are grant/invite expiry, at the gate,
-against the checker's own clock); the wall seed buys locality only —
-skew cannot break correctness, it can only price a fact as a straggler
-— and a windowed reader can never lose a backdated dep, because the
-annex delivers context by closure, not by window.
+against the checker's own clock). Skew cannot break anything; it can
+only price a fact as a straggler, and a windowed reader can never
+lose a skewed dep, because the annex delivers context by closure, not
+by window.
 
 **Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
 from the fid hash — history-independent, so the same set gives the same
@@ -219,9 +217,11 @@ quantize outward to leaf-page cuts (~1 h of facts at canonical λ).
 closing live at different granularities: fingerprints stay
 slice-granular (P1 untouched), while closedness is a property of the
 *fetch unit*. Each promoted range gets an **annex** —
-`closure(range) ∖ range`, deduped, canonically sorted, its own
-content-addressed object beside the page — so range + annex is a fully
-closed set, judgeable by the same kernel predicate as any pile. The
+`closure(range) ∖ range` plus copies of in-range skew-inversion
+targets, deduped, canonical-topo-serialized, its own content-addressed
+object beside the page — so range + annex is a fully closed set,
+judgeable by the same kernel predicate, same single streaming check,
+as any pile. The
 annex is a pure set function (identical sets ⇒ identical annex bytes),
 and the engine builds it **by aggregation, never by search**: piles
 arrive fully closed, so every copy an annex will ever need came in
@@ -248,12 +248,16 @@ so copies never perturb the walk's diff algebra.
 
 **Every fetchable unit is a closed pile.** Ingress pile, tail +
 tail-annex, promoted range + annex, request payload, invite blob —
-one codec, one predicate, no other context ever needed. Within any
-unit the sort itself is the schedule: context keys strictly precede
-what needs them (causal ts), so an annex is a **literal prefix** of
-its range — annex ∪ range is concatenation, not a merge — and
-"context first, then news" is a consequence of the order, not a
-format section. So sync is a
+one codec, one predicate, one streaming invariant: every ref resolves
+behind the cursor. Writer-built units satisfy it by canonical-topo
+serialization; at-rest ranges stay key-ordered (fingerprints demand
+it) and the **annex restores the invariant** — serialized
+canonical-topo, holding the out-of-range closure plus copies of any
+in-range facts that are dep targets of earlier-keyed in-range facts
+(skew inversions: rare, deterministic, deduped by the seen-set). The
+annex is a **literal prefix** of its range — annex ∪ range is
+concatenation, not a merge — so "context first, then news" holds for
+every unit by construction. So sync is a
 stream of independently judgeable units: a consumer kernels and
 projects each range as it lands, in any order, parallel across cores —
 fetch ts-descending and a fresh join's inbox is usable in seconds
@@ -307,22 +311,26 @@ evaluate mode there is nothing a handler could persist, and nothing is
 lost by it: whatever the store lacked arrives with the next closed
 pile anyway. Each kernel invocation is **closed in/out with its own
 tables**, and two rules make one implementation serve every context.
-**Input is a stream**: the canonical codec's `(ts, fid)` order is a
-strict topological order (the causal-ts rule — no ties along dep
-edges), so a closed pile validates in a single forward pass, RAM
-bounded by the working db, and the kernel can run while bytes are
-still arriving. **The system sorts only at the edges**: `close()`
-sorts a writer's new facts once, where the state is; everything
-downstream merges sorted runs or concatenates — no reader ever sorts.
+**Input is a stream**, and the kernel's entire streaming contract is
+one check: **every ref resolves among the already-valid facts behind
+the cursor, or the unit rejects.** That single check is closedness,
+ordering, and dep resolution at once — no reorder buffer, no pending
+state, no topo sort in the kernel. Order is the serializer's job:
+`close()` emits **canonical-topo order** — among ready facts, always
+the smallest `(ts, fid)`; deterministic, retry-idempotent, and
+identical to key order whenever clocks were sane — so a closed pile
+validates in a single forward pass, RAM bounded by the working db,
+judging bytes as they arrive. **The system orders only at the writing
+edge**; readers never sort, never wait.
 **The caller injects the db connection**: `:memory:` when unstated, a
 tmp on-disk file when the caller knows better (replay, iOS) — never a
 flag, because policy belongs to the caller and the kernel stays
 context-free; disposal, placement (an NSE uses the app-group
 container), and parallelism (one connection per invocation, across
-cores) are the caller's too. Replay then costs nothing to build: the
-treap's at-rest pages in key order *are* the kernel's input format —
-replay is `cat pages → kernel` with a disk db, and a windowed replay
-streams annex ∪ range, still deps-first.
+cores) are the caller's too. Replay then costs nothing to build: full and
+windowed replay alike are the store's own range + annex units streamed
+through the kernel with a disk db — every unit closed, a cumulative
+seen-set deduping the hub copies.
 
 ```text
 drain:                     # put + poke (cloud); any verb (peer); under lease
@@ -330,7 +338,7 @@ drain:                     # put + poke (cloud); any verb (peer); under lease
   kernel(pile, anchor) per pile, in parallel ⇒ (valid?, new globals)  # pure predicate; zero store reads
   reject invalid piles whole             # deleted with the drain; blame by prefix
   globals′ <- globals ∪ new globals      # associative union; removal set today
-  tail' <- k-way merge(tail, valid piles), dedup by fid; stragglers mini-fold
+  tail' <- merge valid facts by key (the working db emits sorted), dedup by fid; stragglers mini-fold
   tail-annex' <- tail-annex ∪ embedded copies of tail's out-refs   # aggregation
   if tail' full: promote stable prefix to pages + fences + annexes  # the cut rule fires
   put tail' + tail-annex', promoted pages + annexes, spilled blobs, globals′ if changed
