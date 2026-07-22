@@ -52,8 +52,10 @@ removal set — removal is connection-level, mutual removals both land).
 **The engine.** Semantics-free: hash-verify, kernel, merge by key into
 the tail, promote by the cut rule into write-once pages + annexes,
 union globals, one CAS, delete piles. Runs only on request, under a
-lease. The mint is a pure function: judge the request payload, return
-a grant encrypted to the author's key. Invites are encrypted blobs at
+lease. Access is a handshake: the requester sends a small closed
+pile — a request fact plus its auth closure — and the mint, a pure
+function, runs the same kernel over it and returns a grant encrypted
+to the author's key. Invites are encrypted blobs at
 unguessable ids — a link is a URL plus a 32-byte seed.
 
 **Consumers.** Trustless: re-kernel whatever they pull, in any order,
@@ -552,9 +554,11 @@ become replicated data. A request family has no persistence semantics, so a
 stray request fact in a pile is litter and the drain deletes it. For a
 request fact, acceptance is the grant.
 
-**The mint is a pure function.** The request payload is a closed pile,
-so verification reads nothing — run the kernel with anchor + globals,
-return a grant `{member, scope, expiry}`: presigned URLs in the cloud, a bearer
+**The mint is a pure function.** The handshake is a small closed
+pile — the request fact plus the chain that entitles it, a few KB — so
+verification reads nothing: the mint's whole job is one kernel call,
+`kernel(payload, anchor, globals)`, and a valid verdict returns a grant
+`{member, scope, expiry}`: presigned URLs in the cloud, a bearer
 capability from a peer daemon; to the client an opaque request
 decorator, the only per-backend seam. **The grant is encrypted to the
 request fact's author pubkey**, so a captured request replays into
