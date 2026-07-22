@@ -5,21 +5,14 @@ number here is an estimate until `bench/` replaces it. [MODEL.md](MODEL.md)
 carries the performance model and the loop math behind the numbers.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
-counterpart that executes no code?** The counterpart is a dumb object store
-(S3, a peer's disk behind seven HTTP routes, a static file host) holding a
-materialized summary of the validated set. The active side does the whole
-reconciliation itself by fetching immutable pages. If it works, a cloud node
-stops being a sync participant and becomes an artifact peers sync against —
-which dissolves the POC-13 cloud blocker (sync coverage == residency).
-
-Lineage: POC-13 built interactive RBSR and proved liveness by cadence.
-POC-14 kept the blind store but retired RBSR for head-spidering. POC-16 is
-the unexplored quadrant: RBSR semantics over a blind store, as a
-**one-sided walk**. It reuses POC-13's treap, cadence rule, and atom
-fact model (needs/offers — with parking deleted from the grammar);
-POC-14's blind-store discipline; POC-10's authenticator split
-(dissolved into offer emission); and POC-8's KDF-tree encryption (all
-stores hold ciphertext).
+counterpart that executes almost no code?** The counterpart is a dumb object
+store (S3, a peer's disk behind seven HTTP routes, a static file host)
+holding a materialized summary of the validated set. The active side does
+the whole reconciliation itself by fetching immutable pages — the only code
+left on the passive side is the auth fence checking grants at the door. If
+it works, a cloud node stops being a sync participant and becomes an
+artifact peers sync against — which dissolves the POC-13 cloud blocker
+(sync coverage == residency).
 
 ## The System in One Page
 
@@ -27,7 +20,8 @@ A workspace is a dumb object store — S3, a peer's disk, a static
 host — holding a materialized, canonical arrangement of a fact set.
 Nothing server-side understands the data; readers do all sync
 themselves by fetching immutable pages (one-sided RBSR), and one
-Lambda-or-daemon runs the only compute: a kernel that judges bytes.
+Lambda-or-daemon runs the only compute: a kernel that judges bytes and
+gates access to authorized users.
 
 **The set.** Facts are content-addressed: a type tag, a ts, and a
 canonical set of atoms carrying needs, offers, and dep refs in the
@@ -37,7 +31,8 @@ weight. The valid, dep-closed set serializes as a canonical
 `(ts, fid)`-sorted run of packed pages (records + body heap) under
 fence runs, topped by one CAS'd manifest — same set, same bytes,
 everywhere. Diffing is fence-fingerprint comparison plus ranged GETs:
-O(d·log n), ~4 rounds, against a counterpart that executes no code.
+O(d·log n), ~4 rounds, against a counterpart that executes almost no
+code.
 
 **The unit.** *Every fetchable unit is a closed pile*: ingress pile,
 tail + annex, range + annex, request payload, invite blob — one codec,
