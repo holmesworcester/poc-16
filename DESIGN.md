@@ -211,6 +211,9 @@ the engine, gating only the treap — the same boundary in every deployment.
 get a grant `{member, scope, expiry}` — presigned URLs in the cloud, a
 bearer/signed-URL capability from a peer daemon. To the client a grant is an
 opaque request decorator: the only per-backend seam. Renewal is re-mint.
+The mint response also carries the current root (bytes + ETag) as a
+freebie: auth hands you the top node, every id below it is
+content-addressed, and the session's first walk starts a round trip ahead.
 Over iroh the mint feels vestigial (the channel proved the key) but stays —
 it is load-bearing in the cloud world and keeping it keeps the worlds
 isomorphic. Transport identity is never an integrity input.
@@ -219,7 +222,7 @@ isomorphic. Transport identity is never an integrity input.
 
 | verb | route | cloud | peer daemon |
 |---|---|---|---|
-| mint | `POST /mint` | Lambda URL | handshake endpoint |
+| mint | `POST /mint` → grant + current root | Lambda URL | handshake endpoint |
 | poke | `POST /poke` | mint Lambda | implicit (drain-on-read) |
 | root | `GET /root` | S3 conditional GET | drain piles, then serve |
 | page | `GET /page/{hash}` (+ blob, bundle) | S3 GET | serve blob |

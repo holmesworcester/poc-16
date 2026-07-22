@@ -98,7 +98,9 @@ every c seconds, or on news hint:
 ```
 
 **Rounds.** `R_w = D + 2` sequential (manifest, root slices, leaf slices,
-bodies): **4 at 10^6, 5 at 10^9**. Steady state is usually 1 (304).
+bodies): **4 at 10^6, 5 at 10^9**. Steady state is usually 1 (304). A
+fresh session skips round 1: the mint response carries the current root
+(bytes + ETag) as a handshake freebie.
 
 **Transfer.**
 
