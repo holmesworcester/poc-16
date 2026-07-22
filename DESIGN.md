@@ -55,7 +55,11 @@ closure, and the engine derives the dep aug from envelopes alone — dep
 topology is store-visible, content never is.
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
-refuse to pay for. This is a fact-format constraint.
+refuse to pay for. **ts is causal**: an author stamps
+`ts = max(wall clock, max dep ts + 1)` and the kernel checks
+`ts > every dep's ts` as well-formedness — the Lamport rule, free at
+authoring, and it makes `(ts, fid)` a **strict topological order along
+dep edges**. Both are fact-format constraints.
 
 **Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
 from the fid hash — history-independent, so the same set gives the same
@@ -237,7 +241,12 @@ so copies never perturb the walk's diff algebra.
 
 **Every fetchable unit is a closed pile.** Ingress pile, tail +
 tail-annex, promoted range + annex, request payload, invite blob —
-one codec, one predicate, no other context ever needed. So sync is a
+one codec, one predicate, no other context ever needed. Within any
+unit the sort itself is the schedule: context keys strictly precede
+what needs them (causal ts), so an annex is a **literal prefix** of
+its range — annex ∪ range is concatenation, not a merge — and
+"context first, then news" is a consequence of the order, not a
+format section. So sync is a
 stream of independently judgeable units: a consumer kernels and
 projects each range as it lands, in any order, parallel across cores —
 fetch ts-descending and a fresh join's inbox is usable in seconds
@@ -292,9 +301,12 @@ lost by it: whatever the store lacked arrives with the next closed
 pile anyway. Each kernel invocation is **closed in/out with its own
 tables**, and two rules make one implementation serve every context.
 **Input is a stream**: the canonical codec's `(ts, fid)` order is a
-topological order — deps point backward, so a closed pile validates in
-a single forward pass (same-ts ties buffered), RAM bounded by the
-working db, and the kernel can run while bytes are still arriving.
+strict topological order (the causal-ts rule — no ties along dep
+edges), so a closed pile validates in a single forward pass, RAM
+bounded by the working db, and the kernel can run while bytes are
+still arriving. **The system sorts only at the edges**: `close()`
+sorts a writer's new facts once, where the state is; everything
+downstream merges sorted runs or concatenates — no reader ever sorts.
 **The caller injects the db connection**: `:memory:` when unstated, a
 tmp on-disk file when the caller knows better (replay, iOS) — never a
 flag, because policy belongs to the caller and the kernel stays
