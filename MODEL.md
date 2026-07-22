@@ -62,9 +62,12 @@ aggregation.
   7.8 k · 28 B ≈ 220 KB (2 pages); top run ~28 fences ≈ 1 KB — inlined in
   the manifest. At 10^9: one more level (L2 ≈ 750 KB), top ≈ 3 KB. Run
   depth **D = 2** at 10^6, **3** at 10^9.
-- **Manifest** (~1.5 KB): `{generation, top fence run inline, auth ref,
-  wal ref}` — one conditional GET prices the whole tree *and* locates
-  every top-level range.
+- **Manifest** (~2 KB): `{generation, top fence run inline — history
+  fences + tail-slice fences, auth ref}` — one conditional GET prices the
+  whole validated set (news included) *and* locates every top-level
+  range. Mutable surface of the store: `root` ∪ `pile/*`; the tail page
+  is content-addressed like any page, so a ranged GET can never tear
+  across a concurrent update.
 - **Retrieval is one operation**: binary-search cached fences, then any
   key range = one contiguous ranged GET per level (fixed-size sorted
   records make offsets arithmetic). Walk descent, dep probes, and bulk
@@ -80,7 +83,7 @@ parallel (≤100 in flight, far under per-prefix limits).
 
 ```text
 every c seconds, or on news hint:
-  m  <- GET /root If-None-Match etag       # 1 | 1 | 1.5 KB   top fences inline; 304 ⇒ wal check only
+  m  <- GET /root If-None-Match etag       # 1 | 1 | ~2 KB   history+tail fences inline; 304 ⇒ done
   f1 <- ranged GET L1 fence slices under
         top fences with fp ≠ local        # 2 | F1 | 8 KB each
      count gap huge ⇒ bulk fetch/push (any range = contiguous GETs)
@@ -89,8 +92,8 @@ every c seconds, or on news hint:
         differing fences                   # 3 | L(d) | 8 KB each
   diff <- entries(ls) ⊖ local entries      # exact, in BOTH directions
   bodies <- par GET blob/<fid> I lack      # 4 | d_pull | d_pull·F
-  wal <- cond GET index (tail range)
-         + unseen bundles                  # 4 (concurrent) | ~2 | ΔKB + Δ·F
+  news bodies via bundle/<hash>            # 4 (concurrent) | ~1 | Δ·F
+  (tail slices arrived via the same fence walk — no separate news path)
   validate pulled facts; apply; then send-loop tail
 ```
 
@@ -155,9 +158,9 @@ at walk end:                               # anti-entropy backstop
 
 ## The Engine — compaction loop (P2)
 
-(Modeled here as one pass; the adopted design splits it into validate +
-fold — see The WAL below — which changes cadence and write amplification,
-not the per-fact costs.)
+(Modeled here as one pass; the adopted design is validate-with-inline-
+promotion — see The WAL below — which changes cadence and write
+amplification, not the per-fact costs.)
 
 ```text
 on request (peer drain-on-read / cloud POST /poke), under lease:
@@ -210,13 +213,14 @@ Per admitted fact (S3): 1 client PUT + 1 engine GET + 1 COPY + amortized
 page PUTs + 1/1000 DELETE ≈ **$11/M facts** written. Storage at 10^6
 facts ≈ 0.6 GB ≈ $0.014/mo.
 
-Per active reader per day (adopted WAL design), c = 60 s, λ = 10^4/day:
+Per active reader per day (adopted tail-range design), c = 60 s,
+λ = 10^4/day:
 
 ```text
-(86400/c)·(cond GET root + cond GET wal) + news polls·(tail + bundle GETs)
-= 1440·2·$0.4e-6 + ~700·2·$0.4e-6      ≈ $0.0017
+(86400/c)·(cond GET root) + news polls·(tail slice + bundle GETs)
+= 1440·$0.4e-6 + ~700·2·$0.4e-6        ≈ $0.0012
 + egress ~6 MB·$0.09/GB                ≈ $0.0006   (R2: 0)
-≈ $0.002/day  (~$0.07/mo)
+≈ $0.002/day  (~$0.06/mo)
 ```
 
 The two-tier baseline was $0.013/day: **LIST was the poll tax** — 12.5× a
@@ -234,57 +238,60 @@ Lambda memory: hot set = auth snapshot + right-edge pages + recent window
 this cadence) — "memory beats lookups" survives contact with the loop
 numbers.
 
-## The WAL — Two-Stage Engine (adopted)
+## The WAL — the Treap's Tail Range (adopted)
 
 The model above pins two costs to one decision — that the raw pile is the
 only sub-τ tier. Read side: every poll pays LIST + per-fact pile GETs and
 readers chew raw litter. Write side: compacting on a fast cadence means
 small batches, and WA at b = 50 is ~120×. Splitting the engine into
-**validate** (fast cadence) and **fold** (threshold-triggered) removes
+**validate** (on request) and **promotion** (threshold-triggered) removes
 both:
 
 ```text
-pile/<member>/<hash>    raw, per-member quarantine        (unchanged)
-wal                     CAS'd index: validated, deduped,
-                        (ts,fid)-sorted, ≤ B_l entries    (new)
-walblob/<gen>           body bundles for wal entries      (new)
-manifest + pages        folded history                    (unchanged)
+pile/<member>/<hash>    raw, per-member quarantine       (unchanged)
+tail page               the WAL: validated, deduped,
+                        (ts,fid)-sorted, ≤ B_l entries —
+                        the treap's rightmost range,
+                        content-addressed, its fences
+                        inlined in the manifest top run  (new)
+bundle/<hash>           news body bundles                (new)
+manifest + pages        the rest of the set              (unchanged)
 ```
 
 ```text
 validate (on request: peers drain-on-read, cloud on poke; same lease):
-  facts <- LIST + par GET pile; verify; dep-resolve vs treap+wal+batch
-  PUT blob/<hash> each; PUT walblob/<gen> bundle
-  CAS wal index (append admitted, dedup by fid)
-  batch DELETE promoted pile keys      # pile holds only unvalidated + parked
-
-fold (when |wal| ≥ B_l or age ≥ τ_max):
-  emit pages + fences from wal         # ~1 leaf + fence rewrite PUTs
-  CAS manifest
-  CAS wal index (drop folded)          # briefly in both, never in neither
+  facts <- LIST + par GET pile; verify; dep-resolve vs set + batch
+  tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
+  if tail' full: promote stable prefix to pages + fences   # cut rule fires
+  PUT blob/<hash> each, bundle, tail', any promoted pages
+  CAS manifest                         # the single commit point
+  batch DELETE covered pile keys       # pile holds only unvalidated + parked
 ```
 
 The WAL is the engine's recent window made durable and public — and
 since it is (ts,fid)-sorted and capped at B_l entries, **it is literally
-the next leaf page, accumulating in public**; the fold freezes it and
-rewrites the fences. The B_l cap (128 KB, one GET) and the fold threshold
-coincide — "the size where serving a flat list becomes impractical" is
-exactly "one leaf page".
+the next leaf page, accumulating in public**; promotion freezes it. The
+B_l cap (128 KB, one GET) and the promotion threshold coincide — "the
+size where serving a flat list becomes impractical" is exactly "one leaf
+page". Because its per-slice fences ride in the manifest's top run,
+updating it touches no fence pages: no path rebuild.
 
-Reader poll becomes conditional GET `wal` (+ manifest): no LIST, one
-bundle GET per news batch instead of per-fact GETs, no raw litter ever
+Reader poll is **one conditional GET of the manifest** — the root
+fingerprint covers news too, so "did anything change" has a single
+answer, and fetching news is the ordinary fence walk (usually one changed
+tail slice + one bundle). No LIST, no per-fact GETs, no raw litter ever
 reaching readers (signature checks stay on ingest as defense in depth,
-but litter costs readers zero bandwidth). Between folds the index is
-mostly-append, so readers ranged-GET its tail from their last-seen
-offset; a header fingerprint detects the rare mid-run insert (late ts)
-and forces a full ≤128 KB re-GET.
+but litter costs readers zero bandwidth). Between promotions the tail is
+mostly-append, so the changed-slice diff is usually the last slice; and
+being content-addressed, a ranged tail GET can never tear across a
+concurrent CAS — a latent hazard of the mutable-key variant, now gone.
 
 Comparison at λ = 10^4/day, c = 60 s, validate cadence 30 s:
 
 | | two-tier (pile→treap) | three-tier (pile→WAL→treap) |
 |---|---|---|
 | reader $/day | $0.012 (LIST tax + per-fact GETs) | **~$0.002** (5–9×, burstiness-dependent) |
-| treap page PUTs/day | ~7,200 (1,440 folds) | **~25** (~5 folds) |
+| treap page PUTs/day | ~7,200 (1,440 compactions) | **~25** (~5 promotions) |
 | page bytes rewritten/day | ~550 MB | **~2.5 MB** |
 | manifest generations/day | 1,440 (walker caches churn) | ~5 (caches warm for hours) |
 | news visibility | ~c (if readers LIST-poll fast) | writer poke→validate (~seconds cloud, ms peer) |
@@ -296,20 +303,27 @@ pays on the read path and how often treap pages churn — and that is where
 the money was.
 
 **Is the treap fast enough to fan out from directly?** Updating it is
-cheap (~4 PUTs, ~$2.5e-5 per fold) — but per-batch folding was never the
+cheap (~4 PUTs, ~$2.5e-5 per promotion) — but per-batch promotion was never the
 binding cost; making every reader poll raw piles was. Conversely the
-treap alone can't serve news cheaper than τ-freshness. So: treap for
-history, WAL for fan-out, fold on threshold.
+treap alone can't serve news cheaper than τ-freshness. So: immutable
+pages for history, the tail range for fan-out, promotion on threshold.
 
 **"Requester always gets the latest, pauses on rebuild":** no pause
 exists or is needed. Every tier is publish-then-swap (bundle and pages
 PUT before the index CAS that references them), so a requester always
 reads the last committed snapshot, and every admitted fact is in ≥1 of
-{pile, wal, treap} at all times. Peers long-poll `/wal` instead of
-`/root`.
+{pile, set} at all times — the tail is part of the set, and validation
+and promotion share one CAS, so there is no multi-object ordering. Peers
+long-poll `/root`.
 
-Adopted (2026-07-22): DESIGN.md names the tier the WAL; validate runs
-**on request** — a peer drains piles before serving `/wal` (the request
+Adopted (2026-07-22), second revision same day: the WAL dissolved **into
+the treap** as its rightmost range — content-addressed tail page, fences
+inlined in the manifest, one mutable object, one CAS commit point for
+validation and promotion alike, `GET /wal` deleted (tail and bundles ride
+the page/blob routes; protocol back to six verbs), auth snapshot always
+current (rewritten in the same commit), stragglers below the tail
+boundary mini-fold immediately (rare by ts-keying). Validate runs **on
+request** — a peer drains piles before serving any read (the request
 pauses milliseconds), and cloud clients make the request explicit with
 `POST /poke` on the mint Lambda (writers after pushing; walkers on a slow
 backstop cadence, ~10–15 min, so no-work pokes stay rare — each costs one
@@ -320,9 +334,9 @@ cloud; a writer that dies before poking is caught by cadence.
 
 ## Where the Platform Binds
 
-- **`root` and `wal` are single keys** (one prefix each): N readers
-  polling every c seconds hit 5,500 GET/s at N ≈ 5,500·c (330 k at
-  c = 60). Past that: CDN in front of them, or fan-out copies.
+- **`root` is the single hot key**: N readers polling every c seconds
+  hit 5,500 GET/s at N ≈ 5,500·c (330 k at c = 60). Past that: CDN in
+  front of it, or fan-out copies.
 - **LIST pages at 1,000 keys**: pile must stay well under 1,000 live
   entries (λτ + parked) or listing goes multi-request. Batch DELETE
   clears 1,000/req.
@@ -352,6 +366,11 @@ cloud; a writer that dies before poking is caught by cadence.
 5. **LIST is the reader poll tax**; the follower tier (manifest-only
    freshness) exists in the cost model as the cheap class.
 6. **The WAL tier was adopted** (section below): validate piles into a
-   CAS'd validated log served to readers — on request, never on a timer
-   (peers drain-on-read; cloud via POST /poke) — and fold into the treap
-   at ~one leaf page. DESIGN.md's Pile and Engine sections now say this.
+   validated log served to readers — on request, never on a timer (peers
+   drain-on-read; cloud via POST /poke) — promoted into immutable pages
+   at ~one leaf page.
+7. **The WAL then dissolved into the treap** as its rightmost range:
+   content-addressed tail page, fences inlined in the manifest ⇒ one
+   mutable object (`root` ∪ `pile/*` is the whole mutable surface), one
+   CAS for validation and promotion alike, one "did anything change" GET,
+   one fetch function; `GET /wal` deleted; torn tail reads impossible.
