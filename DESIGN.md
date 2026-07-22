@@ -15,9 +15,62 @@ which dissolves the POC-13 cloud blocker (sync coverage == residency).
 Lineage: POC-13 built interactive RBSR and proved liveness by cadence.
 POC-14 kept the blind store but retired RBSR for head-spidering. POC-16 is
 the unexplored quadrant: RBSR semantics over a blind store, as a
-**one-sided walk**. It reuses POC-13's treap and cadence rule, POC-14's
-blind-store discipline, POC-10's authenticator split, and POC-8's KDF-tree
-encryption (all stores hold ciphertext).
+**one-sided walk**. It reuses POC-13's treap, cadence rule, and atom
+fact model (needs/offers — with parking deleted from the grammar);
+POC-14's blind-store discipline; POC-10's authenticator split
+(dissolved into offer emission); and POC-8's KDF-tree encryption (all
+stores hold ciphertext).
+
+## The System in One Page
+
+A workspace is a dumb object store — S3, a peer's disk, a static
+host — holding a materialized, canonical arrangement of a fact set.
+Nothing server-side understands the data; readers do all sync
+themselves by fetching immutable pages (one-sided RBSR), and one
+Lambda-or-daemon runs the only compute: a kernel that judges bytes.
+
+**The set.** Facts are content-addressed: a type tag, a ts, and a
+canonical set of atoms carrying needs, offers, and dep refs in the
+clear envelope, values encrypted in the body. Causality lives in refs
+alone; ts is an uninterpreted locality key with zero correctness
+weight. The valid, dep-closed set serializes as a canonical
+`(ts, fid)`-sorted run of packed pages (records + body heap) under
+fence runs, topped by one CAS'd manifest — same set, same bytes,
+everywhere. Diffing is fence-fingerprint comparison plus ranged GETs:
+O(d·log n), ~4 rounds, against a counterpart that executes no code.
+
+**The unit.** *Every fetchable unit is a closed pile*: ingress pile,
+tail + annex, range + annex, request payload, invite blob — one codec,
+serialized in canonical-topo order (the closure walk's completion
+order), carrying its full closure down to genesis.
+
+**The kernel.** One judge for content, auth, and access:
+`kernel(stream, anchor, [globals]) → (valid, new globals)`. One
+streaming invariant — every need matches an offer already emitted
+behind the cursor, or the unit rejects — then per-fact integrity and
+the family handler, workspace scope via the anchor (genesis fid;
+workspace id = `H(genesis)`). Zero store reads; caller-injected SQLite
+working state; parallel invocations. Validity is forever and
+globals-blind; only ephemeral request facts read globals (the monotone
+removal set — removal is connection-level, mutual removals both land).
+
+**The engine.** Semantics-free: hash-verify, kernel, merge by key into
+the tail, promote by the cut rule into write-once pages + annexes,
+union globals, one CAS, delete piles. Runs only on request, under a
+lease. The mint is a pure function: judge the request payload, return
+a grant encrypted to the author's key. Invites are encrypted blobs at
+unguessable ids — a link is a URL plus a 32-byte seed.
+
+**Consumers.** Trustless: re-kernel whatever they pull, in any order,
+streaming — a fresh join's inbox is usable in seconds. `Valid<Fact>`
+flows to projectors with no validity logic, into workspace-tagged read
+models; replay is the store's own units through the same kernel. One
+body of code across cloud, peer, home server, mirror, and iOS NSE; the
+keyring (workspace → anchor, device key, address, grant) is the only
+irreducible local state.
+
+**To prove:** P1 walk efficiency, P2 engine throughput, P3
+closure-complete range sync.
 
 ## What POC-16 Must Prove
 
@@ -48,11 +101,14 @@ Everything else is scaffolding around these three.
 
 ## The Store
 
-**Facts.** Content-addressed, self-certifying, bodies encrypted; the
-signature and dep refs live in the **signed clear envelope** (decided
-2026-07-22): the kernel judges a fact against nothing but itself and its
-closure, and the engine derives the dep aug from envelopes alone — dep
-topology is store-visible, content never is.
+**Facts.** A fact is a type tag, a ts, and a canonical set of
+**atoms** that adopt both (POC-13's atom model); `fid` hashes that
+canonical form. Atoms carry the fact's needs, offers, and dep refs in
+the **clear envelope**; encrypted values ride the body — **matching
+reads addresses, never values** — so dep topology and the offer
+vocabulary are store-visible while content never is, and the engine
+derives the annexes from envelopes alone. Signatures are not envelope
+fields but their own offering facts (Atoms, below).
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
 refuse to pay for. This is a fact-format constraint. **ts carries no
@@ -391,7 +447,7 @@ the old auth snapshot held is gone: certification is proved inside
 each pile, invites live in the invite blob (Auth), and epoch heads are
 content facts like any other.
 
-**Admission is dep-pure validation** — signature plus the family
+**Admission is dep-pure validation** — integrity plus the family
 handler over the fact's in-pile context (POC-13's validator signature,
 `valid(fact, context) → bool`, with the waiting removed), nothing
 else. RBSR still gets what it forces: the verdict is a function of the
@@ -419,6 +475,36 @@ pull, closures always in hand — but nothing parks anywhere: piles are
 closed by format, syncs arrive closed by P3. Anything needing negative
 or global knowledge (uniqueness, latest-wins) stays a projection-time
 verdict, deterministic from the set — never an admission input.
+
+**Atoms — needs and offers.** The relationship grammar in this
+prototype is exactly two: an atom either **offers** — publishes a
+named, scoped assertion — or **needs** — demands a match. Validation
+is matching: a fact's needs must match offers already emitted by
+valid facts behind the cursor — the seen-set rule generalized from
+"ref resolves" to "need met" — and an unmet need rejects the unit.
+**Parking is deleted from the grammar**: POC-13's Require parked on
+zero matches; closed units mean the closer either shipped the
+providers or authored a broken pile. Pinned dep refs and needs
+compose: refs say *where* (exact `(ts, fid)` providers, keeping
+closure and annexes deterministic), needs say *what* (the assertion
+the provider must offer). Offers are the **version interlingua** —
+the reason the model earns its weight: facts of different versions in
+one pile never read each other's schemas; each version's handler
+decodes only its own bytes and emits normalized offers, consumers
+need the offers, and a new version is a new handler, not a migration
+(POC-10's adapt layer, dissolved into offer emission).
+
+**Signature is a fact type that offers.** The kernel's built-in
+judgment shrinks to integrity — `fid` = hash of canonical bytes,
+grammar, the streaming match — and everything semantic, crypto
+included, is family handlers: a signature fact verifies its Ed25519
+once and offers authorship; certs offer membership; content facts
+need both. Heavier — authorization becomes facts beside the content —
+but piles make it cheap: signature facts ride the same units, dedup
+by fid, and verify once into the offer table. Negative knowledge
+(POC-13's SuppressIf) stays out of the grammar by design — it is
+globals' job, and it returns with deletion.
+
 **Removal is terminal and monotonic at the connection level**: eviction
 kills the mint — no grants, so no reads and no writes — and it is the
 *pusher's* liveness transport checks, never the author's. Facts that
