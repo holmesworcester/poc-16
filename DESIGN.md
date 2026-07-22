@@ -221,6 +221,20 @@ context; hot hubs (genesis, certs, channels) cost one copy per range —
 ~20 copies at 10^6 under fat ranges. Storage pays the duplication;
 nobody ever chases a graph.
 
+**Write path.** Between promotions the tail keeps its own annex — the
+deduped embedded copies covering the tail's out-refs, aggregated from
+each valid pile and rewritten with the tail. At promotion the engine
+classifies refs with everything in hand (tail facts + tail annex) and
+distributes copies into the new ranges' annexes. **Promoted range +
+annex pairs are write-once**: deps point backward, so `closure(R)` is
+fixed by R's immutable contents the moment it freezes — no reverse
+index, no count maintenance, nothing to touch when later facts arrive.
+The only reopen is a straggler's mini-fold, which recomputes that one
+range's annex from copies the straggler's own pile carried. Annexes
+are derived sidecars, content-addressed beside their pages and
+**outside the fingerprinted set** — the treap reconciles facts only,
+so copies never perturb the walk's diff algebra.
+
 ```text
 closure_sync(Q):                        # Q snapped to range cuts
   root + fence slices over Q            # rounds 1–2, as P1
@@ -277,8 +291,9 @@ drain:                     # put + poke (cloud); any verb (peer); under lease
   reject invalid piles whole             # deleted with the drain; blame by prefix
   globals′ <- globals ∪ new globals      # associative union; removal set today
   tail' <- k-way merge(tail, valid piles), dedup by fid; stragglers mini-fold
+  tail-annex' <- tail-annex ∪ embedded copies of tail's out-refs   # aggregation
   if tail' full: promote stable prefix to pages + fences + annexes  # the cut rule fires
-  put tail', promoted pages + annexes, spilled blobs, globals′ if changed
+  put tail' + tail-annex', promoted pages + annexes, spilled blobs, globals′ if changed
   CAS manifest                           # the single commit point
   delete pile keys                       # admitted and rejected alike
 ```
