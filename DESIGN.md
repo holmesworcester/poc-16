@@ -152,7 +152,7 @@ One body of code, two loops; only the trigger and store driver differ by
 deployment.
 
 ```text
-validate:                  # on request — peers drain before serving; cloud on POST /poke
+validate:                  # on any compute-touched request — peers: every verb; cloud: mint + poke
   auth  <- manifest.auth_snapshot          # O(members), one object, always current
   facts <- LIST + GET piles
   deps  <- sorted (ts, fid) refs; resolve intra-batch, then tail,
@@ -173,9 +173,12 @@ neither; validation and promotion commit through the same CAS, so there is
 no multi-object ordering to reason about.
 
 Trigger: **on request, in both worlds** — the engine has no timers and no
-event plumbing. A peer drains its piles before answering any read; the
-request pauses (milliseconds) so the requester always gets the latest. The
-cloud store cannot compute on read, so the request is explicit: `POST
+event plumbing. Every request that reaches compute drains the piles
+first: a peer drains before answering any verb; in the cloud that is
+mint and poke, since presigned reads cannot compute. The request pauses
+(milliseconds) so the requester always gets the latest — in particular
+an invitee's first mint sees an invite fact still sitting in a pile.
+For the passive cloud data path the request is explicit: `POST
 /poke` on the mint Lambda — writers poke after pushing, walkers poke on a
 slow backstop cadence, a writer that dies before poking is caught by
 cadence (POC-13's rule). Arrival triggers (S3 events) are rejected on
@@ -191,7 +194,13 @@ auth facts are admitted — always current, no union to compute. Structure:
 fixed-size records sorted by **device pubkey** (what a mint challenge and
 a fact signature prove control of — distinct from the device id,
 `H(device_fact)`): pubkey → member, device id, scope/status; plus member
-status and KDF epoch heads. No per-author seq tracking for now:
+status and KDF epoch heads. **Invite pubkeys are records of the same
+shape** — pubkey → invite fact id, provisional scope, expiry — so an
+invitee can mint before joining; the join fact consumes the invite.
+Expiry is enforced at mint time (expired ⇒ ignored) and expired records
+are purged free on the next auth-fact rewrite — no clock-driven
+rewrites, every snapshot write is fact-driven. No per-author seq
+tracking for now:
 completeness is the walk's job, not counters, so validation is a shallow
 check against the snapshot (POC-10 split) — signed by a certified key,
 deps resolved — the engine keeps no per-author cursor, and ordinary
@@ -274,6 +283,16 @@ rebuild from its store.
 - The auth snapshot is a manifest-referenced object, not a local file — the
   Lambda wakes, conditional-GETs the manifest, fetches the snapshot on cache
   miss, works, publishes. No EFS, no /tmp durability.
+- **Rows in memory, records on the store.** Fact handlers write ordinary
+  SQLite rows into the engine's ephemeral db — identical code in both
+  worlds, since that db is already connection-string-abstracted. At
+  commit the engine emits the snapshot as canonical sorted records
+  (`SELECT … ORDER BY pubkey`), and the manifest CAS publishes it; the
+  next run loads records back into rows (a warm peer daemon skips the
+  reload by generation stamp). Publishing the `.db` itself is rejected:
+  SQLite bytes are write-history artifacts — the store holds canonical
+  records and SQLite is always the rebuildable working form — and the
+  mint path stays SQLite-free, a binary search over the records.
 - Engine processing state is ephemeral SQLite by connection string:
   `:memory:` in the Lambda, on-disk temp where RAM is tight. Discarded
   after every run.
