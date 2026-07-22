@@ -23,7 +23,7 @@ Records and pages (fixed-size records; ts leads the key):
 
 | sym | meaning | canonical value |
 |---|---|---|
-| E_l | leaf record `(ts, fid, author, auth digest)` | 64 B |
+| E_l | leaf record `(ts, fid, author, seq, auth digest)` | 64 B |
 | E_i | interior child record `(bound, fp, count, child hash)` | 96 B + 16·k |
 | P | page byte target | 128 KB (64–256 elastic) |
 | B_l = P/E_l | entries per leaf page | 2,048 |
@@ -167,14 +167,14 @@ amplification, not the per-fact costs.)
 ```text
 on request (peer drain-on-read / cloud POST /poke), under lease:
   m     <- GET root (cond)                 # warm: cached
-  snap  <- GET auth snapshot               # warm: cached; O(members)
+  snap  <- GET auth snapshot + cursors     # warm: cached; O(members + devices)
   keys  <- LIST pile                       # ceil(pile/1000) reqs
   facts <- par GET pile objects            # b reqs | b·F
   verify signatures                        # b·t_v CPU
   deps sorted; resolve intra-batch → recent window (mem) → merge-join leaf pages
   admit / park                             # parked stay in pile
   emit  <- rewrite ceil(b/B_l)+D pages, PUT If-None-Match
-           COPY pile→blob ×b; PUT snapshot
+           COPY pile→blob ×b; PUT cursors (~50 B/device), snapshot if changed
   CAS root                                 # the commit point
   batch DELETE admitted pile keys          # ceil(b/1000) reqs
 ```

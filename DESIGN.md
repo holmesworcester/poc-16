@@ -53,7 +53,7 @@ the sorted run + fence hierarchy below. No homomorphic sums — they exist
 to compare unaligned ranges (useless here) and invite Wagner's attack.
 
 **Pages and fences.** The validated set serializes as one key-sorted run
-of fixed-size leaf records `(ts, fid, author, auth digest)` —
+of fixed-size leaf records `(ts, fid, author, seq, auth digest)` —
 existence and validation without fetching bodies — cut deterministically
 into fat immutable content-addressed pages (64–256 KB), addressable in
 8 KB slices by ranged GET. Above it sit **fence runs**: one fence per
@@ -153,15 +153,15 @@ deployment.
 
 ```text
 validate:                  # on any compute-touched request — peers: every verb; cloud: mint + poke
-  auth  <- manifest.auth_snapshot          # O(members), one object, always current
+  auth  <- manifest.auth_snapshot + cursors  # O(members + devices), always current
   facts <- LIST + GET piles
   deps  <- sorted (ts, fid) refs; resolve intra-batch, then tail,
            then merge-join vs leaf slices
-  admit <- sig valid ∧ author live ∧ deps resolved
-  park  <- missing deps stay in pile
+  admit <- sig valid ∧ author live ∧ seq = cursor+1 ∧ deps resolved
+  park  <- missing deps and chain gaps stay in pile
   tail' <- tail ∪ admitted (dedup by fid); stragglers mini-fold their page
   if tail' full: promote stable prefix to pages + fences   # the cut rule fires
-  put bodies, bundle, tail', promoted pages, snapshot if changed
+  put bodies, bundle, tail', promoted pages, cursors, snapshot if changed
   CAS manifest                             # the single commit point
   delete covered pile keys
 ```
@@ -170,7 +170,9 @@ validate:                  # on any compute-touched request — peers: every ver
 CAS commits them all, covered pile keys are deleted after. A fact is
 briefly in both pile and set (dedup by fid makes that harmless), never in
 neither; validation and promotion commit through the same CAS, so there is
-no multi-object ordering to reason about.
+no multi-object ordering to reason about. With seq the order is
+correctness, not economy: a single-copy fact deleted before its CAS
+landed would wedge its device's chain for good.
 
 Trigger: **on request, in both worlds** — the engine has no timers and no
 event plumbing. Every request that reaches compute drains the piles
@@ -199,16 +201,29 @@ shape** — pubkey → invite fact id, provisional scope, expiry — so an
 invitee can mint before joining; the join fact consumes the invite.
 Expiry is enforced at mint time (expired ⇒ ignored) and expired records
 are purged free on the next auth-fact rewrite — no clock-driven
-rewrites, every snapshot write is fact-driven. No per-author seq
-tracking for now:
-completeness is the walk's job, not counters, so validation is a shallow
-check against the snapshot (POC-10 split) — signed by a certified key,
-deps resolved — the engine keeps no per-author cursor, and ordinary
-facts never touch the snapshot.
-Revocation is enforced here: an evicted member's grant can litter the pile
-until expiry, but the next validation rejects the facts; revocation
-ordering is by ts (a revoked key's backdated window is the accepted gap
-for now).
+rewrites, every snapshot write is fact-driven. The snapshot's **hot half
+is its own object**: per-device chain cursors (device → last admitted
+seq, ~40–50 B each), rewritten every commit — while the cold
+device/invite object the mint reads changes only on auth facts.
+
+**Seq.** Facts chain per device: admission requires `seq = cursor + 1`,
+so validation stays a shallow check against snapshot + cursors (POC-10
+split) — signed by a certified key, next in chain, deps resolved. Chain
+gaps park in the pile like missing deps, giving the invariant: **every
+store's set holds a gapless prefix of each device's chain**, so the
+union of two honest stores is always valid — the walk can never
+manufacture an invalid state. Cursors are a pure projection (max
+admitted seq per device): rebuildable, the store stays the sole source
+of truth. Seq does not prevent forks, it converts them into evidence:
+two signed facts at the same seq with different fids are both admitted
+(the set only grows) and the collision itself deterministically marks
+the device invalid from the fork point on — every store computes the
+same verdict.
+Revocation is enforced here and names a **seq cutoff**: facts at
+seq ≤ k stay valid, seq > k are dead regardless of ts — no backdate
+window, because the valid range is already occupied and reusing a seq is
+equivocation. An evicted member's grant can litter the pile until
+expiry, but the next validation rejects the facts.
 
 Performance: merge-join, not per-fact lookups; resolve intra-batch and
 the tail first. A messaging dep graph is a tiny universally-hot auth
@@ -293,6 +308,12 @@ rebuild from its store.
   SQLite bytes are write-history artifacts — the store holds canonical
   records and SQLite is always the rebuildable working form — and the
   mint path stays SQLite-free, a binary search over the records.
+  **Serialization after a fact-processing run is the boundary between
+  facts and the auth gate**: the mint — Lambda or peer daemon, same
+  code — reads only the objects the last commit published, through the
+  same ObjectStore primitive, never the engine's live rows. Facts
+  influence auth solely by being processed and serialized; the commit is
+  the only channel between the layers.
 - Engine processing state is ephemeral SQLite by connection string:
   `:memory:` in the Lambda, on-disk temp where RAM is tight. Discarded
   after every run.
