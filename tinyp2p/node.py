@@ -141,21 +141,23 @@ class Node:
                 if ok:
                     valids += vs
                     blobs.update(u[1])
-            fresh = self.merge(ws, valids)
+            fresh, newfids = self.merge(ws, valids)
             for bh, b in blobs.items():
                 st.put_if_absent("obj/" + bh, b)
-            self.commit(ws)
+            self.commit(ws, newfids)
             self.materialize(ws, fresh)
             for k in piles:
                 st.delete(k)  # retire ingress after the CAS, rejects included
             return fresh
 
     def merge(self, ws, valids):
-        idx, out = self.idx(ws), []
+        idx, out, newfids = self.idx(ws), [], []
         for v in valids:
             f = v.fact
             if f.t in EPHEMERAL:
                 continue  # judged, never persisted: litter drains away
+            if idx.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone() is None:
+                newfids.append(f.fid)  # what changed this drain — drives incremental layout
             idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
                         (f.fid, f.ts, f.t, json.dumps(f.to_json())))
             for name, a0, a1 in f.offers():
@@ -163,9 +165,23 @@ class Node:
                             (name, a0, a1, f.fid))
             out.append(v)
         idx.commit()
-        return out
+        return out, newfids
 
-    def commit(self, ws):
+    def _shadows(self, ws, newfids):
+        """Could a fact added this drain shift an existing range's resolved
+        deps? Only a new member/admin/author offer for an address that now has
+        more than one provider can — then min-src may move under a frozen
+        range, so the incremental reuse is unsound and the memo is dropped."""
+        idx = self.idx(ws)
+        for fid in newfids:
+            for name, a0, a1 in self.fact_of(ws, fid).offers():
+                if name in ("member", "admin", "author") and idx.execute(
+                        "SELECT COUNT(*) FROM offers WHERE name=? AND a0=? AND a1=?",
+                        (name, a0, a1)).fetchone()[0] > 1:
+                    return True
+        return False
+
+    def commit(self, ws, newfids=()):
         st, idx = self.store(ws), self.idx(ws)
         cache = {}
 
@@ -174,9 +190,13 @@ class Node:
                 cache[fid] = resolve_deps(self.fact_of(ws, fid), idx) or []
             return cache[fid]
 
+        memo = None
+        prev = st.get("root")
+        if prev and not self._shadows(ws, newfids):
+            memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         removal = [r for (r,) in idx.execute("SELECT DISTINCT a0 FROM offers WHERE name='removed'")]
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
-                              deps_of, ws, removal)
+                              deps_of, ws, removal, memo)
         for key, b in objects.items():
             if not st.has(key):
                 st.put(key, b)
@@ -239,5 +259,5 @@ class Node:
                         stream += decode_pile(st.get("obj/" + oh))[0]
             ok, valids, _ = kernel(stream, ws)
             assert ok, "own store failed its own kernel"
-            self.materialize(ws, self.merge(ws, valids))
+            self.materialize(ws, self.merge(ws, valids)[0])
             self._stamp(ws)

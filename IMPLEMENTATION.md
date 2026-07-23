@@ -67,18 +67,33 @@ The four mutation paths are then one argument:
   is independently judgeable (I3), so any order works — reproducing the same
   set, hence (I4) the identical root.
 
-Efficiency of updates is the content addressing: recompute is O(n) at toy
-scale (the pure function *is* the spec), but writes are O(changed chunks) —
-unchanged pages hash to objects the store already has. `test_efficient_updates`
-pins it: one post writes ≤ 8 objects against a 60-fact store. The
-incremental-compute version is a mechanical memoization (page bytes depend
-only on the range; annex bytes only on range + closure) precisely *because*
-the function is pure.
+**Incremental updates, not full rebuild.** Three things stay cheap as the set
+grows. *Validation* is incremental — a turn kernels only the new piles and
+merges by id; the whole set is never re-judged (`rebuild()` re-validates only
+on an index wipe, never on the pile path). *Writes* are incremental via
+content addressing — a commit PUTs only objects the store lacks
+(`test_efficient_updates`: one post writes ≤ 8 objects against a 60-fact
+store). And *layout compute* is now incremental too: `commit()` passes the
+prior manifest's fences to `layout()` as a memo, and any promoted range whose
+`(hi, fp)` is unchanged is reused verbatim — its facts are never loaded, its
+page and annex never rebuilt (`test_incremental_reuses_work`: a post into a
+promoted store touches under half the facts). This is byte-identical to a full
+recompute because a page depends only on its range's immutable fids and an
+annex only on those plus their resolved deps, which are fixed *as long as every
+offer address has one provider* (so `min-src` cannot move). The one way that
+breaks — a duplicate `member`/`admin`/`author` offer (a re-join or re-sign) —
+is caught by a shadow guard (`Node._shadows`) that drops the memo for that
+turn and recomputes fully. `test_incremental_equals_full` asserts
+incremental == full at every step across promotions, a straggler, a new
+member, and an eviction; `test_shadow_guard_keeps_identity` exercises the
+guard. The residual O(n) is the body-free key scan and per-range fingerprint;
+removing that needs a persistent fence tree (byte-format work, out of scope).
 
 Tested in `tests/test_props.py`: `test_leaves_are_piles` (every published
 unit passes the kernel from empty), `test_history_independence` (random pile
 groupings × random orders × random turn batching ⇒ byte-identical roots),
-`test_rebuild`, `test_straggler_minifold`.
+`test_rebuild`, `test_straggler_minifold`, `test_incremental_equals_full`,
+`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`.
 
 **Litter, never poison.** The design's "a hostile writer can litter but never
 poison" is enforced at two layers: `from_json` validates atom shape at the

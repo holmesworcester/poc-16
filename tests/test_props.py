@@ -123,6 +123,76 @@ def test_efficient_updates(world):
     assert total > 20  # against a store big enough to make the bound mean something
 
 
+def full_manifest(n, ws):
+    """The manifest a from-scratch full recompute (memo disabled) would write."""
+    from tinyp2p.kernel import resolve_deps
+    from tinyp2p.layout import layout
+    idx, cache = n.idx(ws), {}
+
+    def deps_of(fid):
+        if fid not in cache:
+            cache[fid] = resolve_deps(n.fact_of(ws, fid), idx) or []
+        return cache[fid]
+
+    removal = [r for (r,) in idx.execute("SELECT DISTINCT a0 FROM offers WHERE name='removed'")]
+    man, _ = layout(n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of, ws, removal, None)
+    return man
+
+
+def test_incremental_equals_full(tmp_path):
+    """The incremental commit is byte-identical to a full recompute at every
+    step — across promotions, a straggler, a new member, and an eviction."""
+    n = Node(str(tmp_path / "a"))
+    ws = cmds.create(n, "alice")
+    assert n.store(ws).get("root") == full_manifest(n, ws)
+    t0 = now_ms()
+    bsk, bpk, _ = add_member(n, ws, "bob", t0 + 1)
+    assert n.store(ws).get("root") == full_manifest(n, ws)
+    for i in range(60):  # enough to promote several ranges out of the tail
+        who = (n.sk, n.pk) if i % 2 else (bsk, bpk)
+        author_msg(n, ws, *who, f"m{i}", t0 + 10 + i)
+        assert n.store(ws).get("root") == full_manifest(n, ws)
+    cmds.send_file(n, ws, "general", "f.bin", b"x" * 20_000)
+    assert n.store(ws).get("root") == full_manifest(n, ws)
+    author_msg(n, ws, n.sk, n.pk, "straggler", t0 + 5)  # lands deep in history
+    assert n.store(ws).get("root") == full_manifest(n, ws)
+    cmds.evict(n, ws, "bob")
+    assert n.store(ws).get("root") == full_manifest(n, ws)
+
+
+def test_incremental_reuses_work(world):
+    """Reuse is real: a post into a promoted store loads only the tail's few
+    facts, not the whole set — the O(changed) compute win, not just O(1) IO."""
+    n, ws = world
+    total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    loads = []
+    orig = n.fact_of
+    n.fact_of = lambda w, fid: (loads.append(fid), orig(w, fid))[1]
+    try:
+        cmds.post(n, ws, "general", "incremental")
+    finally:
+        n.fact_of = orig
+    assert total > 30
+    assert len(set(loads)) < total // 2, \
+        f"loaded {len(set(loads))} of {total} facts — reuse isn't skipping ranges"
+
+
+def test_shadow_guard_keeps_identity(world):
+    """A duplicate offer (a re-sign by the same key) could shift a frozen
+    range's min-src; the shadow guard falls back to a full recompute, which
+    must stay byte-identical to a clean full build."""
+    from tinyp2p import fact as F
+    from tinyp2p.close import encode_pile
+    n, ws = world
+    m = author_msg(n, ws, n.sk, n.pk, "dup-target", now_ms())  # alice's own msg
+    s2 = F.sig_for(n.sk, n.pk, m, now_ms() + 1000)  # a SECOND alice sig over it
+    deliver(n, ws, encode_pile([s2]))
+    n.turn(ws)  # commit's shadow guard drops the memo -> full recompute
+    assert s2.fid in all_fids(n, ws)  # the duplicate sig validated and merged
+    assert n._shadows(ws, [s2.fid]) is True  # (author, m, alice) now has two providers
+    assert n.store(ws).get("root") == full_manifest(n, ws)  # still byte-identical
+
+
 def test_removal_set_in_manifest(world):
     n, ws = world
     man = json.loads(n.store(ws).get("root"))
