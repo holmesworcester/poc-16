@@ -823,6 +823,17 @@ Proofs first; no transport work until both numbers exist.
   validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
   ⇒ few changed pages (the priority-threshold candidate qualifies).
+  **Tiered cut (prototyped, `layout.COLD_CUT` + benched):** decouple the guard
+  window B_t from the cut density — seal history older than a B_t-deep watermark
+  into coarse ~1 MB cold pages, keep the recent window fine. Pure in the set
+  (split = last coarse boundary ≤ len−B_t), so leaves-are-piles/byte-identity
+  hold. Measured 8× catchup throughput and 2.7× less bandwidth (redundancy
+  3.3→1.4×) with steady writes unchanged; the cost is stragglers (an old-ts
+  write re-ships a whole cold page). Generalization: scale the cold size as
+  `∝ √N` on a **dyadic ladder** (2:1 merges, never a re-cut) for O(log N)
+  amortized write-amplification — safe because the cut stays a pure function of
+  the set; scaling bounds the fence-run length, not the redundancy (which the
+  membership-closure size already caps).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
   findings, hash-list slices not bao). (Bulk-join body bundles: resolved
   2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)

@@ -24,11 +24,40 @@ eliminating it needs a persistent fence tree (byte-format work, out of scope).
 from .close import close, encode_pile
 from .crypto import h
 
-CUT = 8  # E[facts per page]: a fact is a page boundary iff hash prio % CUT == 0
+CUT = 8          # warm/fine density: a fact is a fine boundary iff prio % CUT == 0
+COLD_CUT = None  # if set, everything older than the guard watermark seals into
+                 # coarse cold pages of ~COLD_CUT facts; the recent window stays fine
+GUARD = 256      # B_t: keep at least this many recent facts in the fine warm zone
 
 
-def boundary(fid):
-    return int(fid[:8], 16) % CUT == 0
+def boundary(fid, cut=None):
+    return int(fid[:8], 16) % (cut or CUT) == 0
+
+
+def _cut_positions(fids):
+    """Boundary positions that partition the sorted run into leaves.
+
+    One fine density (CUT) unless COLD_CUT is set — then the split is the last
+    coarse boundary at or before len-GUARD: below it, history seals into big
+    cold pages cut at COLD_CUT (each amortizes its membership annex over
+    ~COLD_CUT facts, so catchup redundancy → 1); above it, the recent GUARD+
+    window stays fine (CUT), so a write re-cuts only a small warm page. Pure in
+    the set — split is a function of the fids alone — so RBSR/history-
+    independence and leaves-are-piles are untouched. When len-GUARD crosses a
+    coarse boundary the newly-sealed cold page is written once (the compaction:
+    each fact ends up written ~twice over its life, warm then cold)."""
+    if not COLD_CUT:
+        return [i + 1 for i, fid in enumerate(fids) if boundary(fid)]
+    n = len(fids)
+    cold = [i + 1 for i, fid in enumerate(fids) if boundary(fid, COLD_CUT)]
+    split = 0
+    for c in cold:
+        if c <= n - GUARD:
+            split = c
+        else:
+            break
+    return [c for c in cold if c <= split] + \
+           [i + 1 for i, fid in enumerate(fids) if i + 1 > split and boundary(fid)]
 
 
 def fingerprint(keys):
@@ -69,7 +98,7 @@ def layout(keys, fact_of, deps_of, anchor, globals_, memo=None):
     """
     from .fact import canon  # local import to avoid cycle
     fids = [k.split(":", 1)[1] for k in keys]
-    cuts = [i + 1 for i, fid in enumerate(fids) if boundary(fid)]
+    cuts = _cut_positions(fids)
     tailstart = cuts[-1] if cuts else 0
     objects, fences = {}, []
 

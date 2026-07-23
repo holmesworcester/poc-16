@@ -360,9 +360,94 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
         L.CUT = orig
 
 
+def check_leaves(seed, ws):
+    """Every published unit (page ++ annex) still judges alone from empty —
+    the leaves-are-piles invariant, under whatever cut the layout used."""
+    st = seed.store(ws)
+    man = json.loads(st.get("root"))
+    n = 0
+    for fen in man["fences"] + [man["tail"]]:
+        stream = []
+        for oh in (fen.get("annex"), fen.get("page")):
+            if oh:
+                stream += decode_pile(st.get("obj/" + oh))[0]
+        if stream:
+            ok, _, _ = kernel(stream, ws)
+            assert ok, "a leaf failed the kernel"
+            n += 1
+    return n
+
+
+def measure_write_cost(node_dir, scale, posts=200):
+    """Build a promoted seed, then size the obj bytes each post rewrites.
+    STEADY posts land at the hot end (ts after every seed fact) — the normal
+    append. STRAGGLER posts land deep in sealed history (old ts) — the
+    re-cut-a-whole-cold-page case. Seeds spread ts into the future, so ts must
+    be chosen explicitly or a 'post' is an accidental straggler."""
+    import statistics as S
+    shutil.rmtree(node_dir, ignore_errors=True)
+    seed, ws, _ = build_seed(node_dir, scale)
+    lo, hi = seed.idx(ws).execute("SELECT MIN(ts), MAX(ts) FROM facts").fetchone()
+    st = seed.store(ws)
+    acc = {"b": 0}
+    orig = st.put
+    st.put = lambda k, b: (acc.__setitem__("b", acc["b"] + (len(b) if k.startswith("obj/") else 0)), orig(k, b))[1]
+
+    def one(text, ts):
+        acc["b"] = 0
+        cmds.post(seed, ws, "general", text, ts=ts)
+        return acc["b"]
+
+    steady = [one(f"h{i}", hi + 1 + i) for i in range(posts)]      # hot-end append
+    strag = [one(f"s{i}", lo + 10 + i) for i in range(5)]          # into sealed cold
+    st.put = orig
+    del seed
+    gc.collect()
+    ss = sorted(steady)
+    return {"mean_kb": S.mean(steady) / 1024, "p50_kb": ss[len(ss) // 2] / 1024,
+            "p90_kb": ss[int(len(ss) * .9)] / 1024, "max_kb": max(steady) / 1024,
+            "straggler_kb": S.mean(strag) / 1024, "posts": posts}
+
+
+def run_tier(scale, cold_cut=3072, guard=256):
+    """Flat CUT=8 vs a tiered layout: coarse ~1 MB cold pages sealed below a
+    fine GUARD-deep tail. Measures catchup (bytes/throughput/redundancy) and
+    steady-state per-post write cost for each."""
+    import tinyp2p.layout as L
+    print(f"\n=== TIERED vs FLAT — {scale} facts "
+          f"(cold pages ~{cold_cut} facts ≈ 1 MB, guard {guard}) ===\n")
+    print("  {:>14} {:>7} {:>7} {:>7} {:>8} {:>7}   {:>10} {:>8} {:>10}"
+          .format("layout", "pages", "dl_MB", "redund", "facts/s", "leaves",
+                  "wr_steady", "wr_p90", "wr_stragl"))
+    try:
+        for name, cc in (("flat CUT=8", None), (f"tiered {cold_cut}", cold_cut)):
+            L.COLD_CUT, L.GUARD = cc, guard
+            d = os.path.join(WORK, f"tier_{scale}_{cc}")
+            shutil.rmtree(d, ignore_errors=True)
+            seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
+            leaves = check_leaves(seed, ws)
+            cat = catchup(seed, ws, os.path.join(d, "fresh"))
+            assert cat["match"], "catchup did not converge to the seed root"
+            del seed
+            gc.collect()
+            wr = measure_write_cost(os.path.join(d, "wseed"), scale)
+            shutil.rmtree(d, ignore_errors=True)
+            print("  {:>14} {:>7} {:>7.1f} {:>6.1f}x {:>8.0f} {:>7}   "
+                  "{:>8.1f}KB {:>6.1f}KB {:>8.1f}KB".format(
+                      name, cat["pages"], cat["dl_bytes"] / 1e6,
+                      cat["streamed"] / cat["facts"], cat["facts"] / cat["ingest_s"],
+                      leaves, wr["mean_kb"], wr["p90_kb"], wr["straggler_kb"]))
+            sys.stdout.flush()
+    finally:
+        L.COLD_CUT, L.GUARD = None, guard
+
+
 def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     os.makedirs(WORK, exist_ok=True)
+    if "tier" in sys.argv:
+        run_tier(args[0] if args else 50000)
+        return
     if "cut" in sys.argv:
         run_cut_sweep(args[0] if args else 50000)
         return

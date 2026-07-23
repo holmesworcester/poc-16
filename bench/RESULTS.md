@@ -102,7 +102,49 @@ bigger — the byte-economy tradeoff DESIGN.md flagged, now quantified.
   closures the puller has already accepted this session. Left as future work;
   the honest as-built numbers are above.
 
+## 4. Tiered layout — big cold pages, small hot tail (`layout.COLD_CUT`)
+
+The CUT sweep made *everything* big, which taxes writes. The tiered layout
+instead decouples the guard window (`GUARD` = B_t) from the cut density: history
+older than the `GUARD`-deep watermark seals into coarse ~1 MB cold pages
+(`COLD_CUT ≈ 3072` facts), while the recent window stays fine (`CUT = 8`). It is
+opt-in and pure in the set — the split is the last coarse boundary at or before
+`len − GUARD` — so leaves-are-piles and byte-identity are untouched, and the
+default path (`COLD_CUT = None`) is unchanged (30 tests green).
+
+50k facts, cold pages ~1 MB, guard 256:
+
+| layout | pages | dl MB | redund | catchup facts/s | leaves judge alone | steady write | p90 | straggler write |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| flat CUT=8 | 6,234 | 65.1 | 3.3× | 1,097 | 6,235 | 4.0 KB | 7.9 KB | 7.0 KB |
+| **tiered ~1 MB** | 79 | **24.4** | **1.4×** | **9,048** | 80 | 9.7 KB | 7.1 KB | **695 KB** |
+
+- Catchup **8.2× faster** (1,097 → 9,048 facts/s — now at the `rec/s` ceiling)
+  and **2.7× less bandwidth** (65 → 24 MB); redundancy 3.3 → 1.4×.
+- **Leaves-are-piles holds** — all 80 units, including the ~15 one-megabyte cold
+  pages, judge alone from an empty kernel.
+- **Steady-state writes stay cheap** — ~7 KB p90, same class as flat; the mean
+  (9.7 KB) is only nudged up by the occasional compaction (a cold page sealing),
+  amortized ~one ~1 MB write per `COLD_CUT`/2 posts.
+- **The cost is stragglers**: a write with an old ts lands in sealed cold history
+  and re-ships its whole ~1 MB page — **695 KB vs flat's 7 KB (~100×)**. Exactly
+  the predicted trade: big frozen pages make the common case (append + catchup)
+  cheap and the rare case (old-ts write into cold) expensive. Slices let RBSR
+  still *diff* a big cold page at sub-page granularity, but re-*ship* on change is
+  whole-object.
+
+**Proportionate to N.** A fixed 1 MB `COLD_CUT` is a manual sample of the ideal
+`COLD_CUT ∝ √N` curve (√N cold pages of √N facts — balances fence-run length
+against page size). Scaling it is safe for correctness (still a pure function of
+the set) but must climb a **dyadic ladder** (`{C, 2C, 4C, …}`) so growth *merges*
+adjacent pages 2:1 rather than re-cutting all of history — that keeps
+write-amplification at O(log N) amortized. The reason to scale it with N is to
+bound the *number* of cold pages (fence-run length), not to cut redundancy
+further — the tax → 1 as soon as a page exceeds the membership closure, which
+grows with the group, not with N.
+
 ---
 *Reproduce:* `python3 bench/bench_sync.py` (5k–100k catchup + bidi),
 `python3 bench/bench_sync.py 500000` (add 500k), `python3 bench/bench_sync.py cut`
-(CUT sweep). Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
+(CUT sweep), `python3 bench/bench_sync.py tier` (tiered vs flat).
+Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
