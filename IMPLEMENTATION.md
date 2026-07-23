@@ -27,6 +27,13 @@ piles all land in `pile/<member>/<hash>` and go through the same `turn()`.
 Independent piles validate in parallel (each kernel call gets its own
 `:memory:` scratchpad); handlers and projectors only ever
 `INSERT OR IGNORE` by id, so replays and races are harmless by construction.
+This holds *because validity is globals-blind* — a pure function of each
+pile's closure. An operation whose verdict depends on a global that can change
+concurrently (e.g. set-valued deletion — deleting a whole channel, not one
+named target) is **not** race-safe here: it needs optimistic
+rollback-and-retry on the globals, or a serial singleton with full state
+awareness rather than closure alone. See DESIGN.md → Open Questions
+("set-valued verdicts break parallel validation").
 
 ## The POC-16 fact contract
 

@@ -802,6 +802,23 @@ Proofs first; no transport work until both numbers exist.
   the one feature that needs set-level verdicts. Tombstones weaken the
   count heuristic; content confidentiality via key destruction (POC-14);
   the reconciliation-visible shape of a delete is undesigned.
+- **Set-valued verdicts break parallel validation — a singleton, or
+  optimistic retry.** Order-free parallel drain holds only while validity is a
+  pure function of a fact's closure (the globals-blind rule): independent
+  piles, independent scratchpads, no cross-pile visibility. An operation whose
+  verdict depends on a **global that can move under it** is unsafe in this
+  model without optimistic concurrency — snapshot the globals the run reads,
+  validate, and at the commit CAS re-check they have not changed since the run
+  began; if they have, roll back and retry (CAS/STM on the globals slot).
+  Single-target deletion needs none of this: the fact names its one target, so
+  the verdict is closure-local. Multi-target does — deleting a **channel**
+  suppresses every fact, present and future, with `chan = X`, so "is X
+  deleted?" is a global predicate, a deleted-channel marker must live in
+  globals, and validate/project must consult it. That composes only under
+  **full state awareness, not closure alone**: a singleton serial pass, which
+  the cloud node hosts naturally (single-writer per workspace under the
+  lease/CAS) but parallel peer validation cannot without the retry loop.
+  Further work; POC-16 builds only the single-target, closure-local path.
 - (Dead weight: resolved 2026-07-22 — piles go straight to dep-pure
   validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
