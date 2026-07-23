@@ -130,6 +130,40 @@ def test_removal_set_in_manifest(world):
     assert man["removal"] == carol
 
 
+def test_poison_pile_is_litter_not_poison(world):
+    """A hostile writer can litter but never poison: hash-consistent but
+    malformed facts must reject and retire, never wedge the drain."""
+    from tinyp2p import fact as F
+    from tinyp2p.close import encode_pile
+    n, ws = world
+    before = len(cmds.msgs(n, ws))
+    poisons = [
+        F.Fact("msg", now_ms(), [["offer"]], {"pk": n.pk, "chan": "c", "text": "x"}),
+        F.Fact("msg", now_ms(), [[]], {"pk": n.pk, "chan": "c", "text": "x"}),
+        F.Fact("sig", now_ms(), [["offer", "author", "de", n.pk]], {}),  # passes door, crashes v_sig
+        F.Fact("genesis", now_ms(), [["offer", "member", n.pk]], {}),    # missing 'sig'/'pk'
+    ]
+    for p in poisons:
+        deliver(n, ws, encode_pile([p]))
+        n.turn(ws)  # must not raise
+        assert p.fid not in all_fids(n, ws)
+    assert n.store(ws).list("pile/") == []  # all retired
+    cmds.post(n, ws, "general", "still alive")  # workspace still works
+    assert len(cmds.msgs(n, ws)) == before + 1
+
+
+def test_poison_alongside_honest(world):
+    """An honest pile in the same drain still lands; poison doesn't sink it."""
+    from tinyp2p import fact as F
+    from tinyp2p.close import encode_pile
+    n, ws = world
+    deliver(n, ws, encode_pile([F.Fact("sig", now_ms(), [["offer", "author", "de", n.pk]], {})]),
+            member="poison0poison00")
+    fid = cmds.post(n, ws, "general", "survivor")  # own ingress + turn
+    assert fid in all_fids(n, ws)
+    assert "survivor" in [m["text"] for m in cmds.msgs(n, ws)]
+
+
 def test_ephemeral_never_persists(world):
     """A stray request fact in a pile is litter: the drain deletes it."""
     from tinyp2p import fact as F

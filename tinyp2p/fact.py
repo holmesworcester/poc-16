@@ -46,8 +46,31 @@ class Fact:
         return {"e": self.env, "b": self.body}
 
 
+def _atoms_ok(atoms) -> bool:
+    """Atom shape, checked at the door so refs()/offers() cannot crash the
+    kernel — a malformed atom is litter, never poison."""
+    if not isinstance(atoms, list):
+        return False
+    for a in atoms:
+        if not (isinstance(a, list) and a):
+            return False
+        if a[0] == "ref":
+            if len(a) != 3:
+                return False
+        elif a[0] == "offer":
+            if len(a) not in (3, 4):
+                return False
+        else:
+            return False
+    return True
+
+
 def from_json(o) -> Fact:
-    e = o["e"]
+    e = o.get("e") if isinstance(o, dict) else None
+    if not (isinstance(e, dict) and isinstance(e.get("t"), str)
+            and isinstance(e.get("ts"), int) and isinstance(o.get("b"), dict)
+            and _atoms_ok(e.get("a"))):
+        raise ValueError("fact shape")
     f = Fact(e["t"], e["ts"], e["a"], o["b"])
     if f.fid != h(canon(e)) or f.bh != e["bh"]:
         raise ValueError("fact integrity")

@@ -80,6 +80,17 @@ unit passes the kernel from empty), `test_history_independence` (random pile
 groupings × random orders × random turn batching ⇒ byte-identical roots),
 `test_rebuild`, `test_straggler_minifold`.
 
+**Litter, never poison.** The design's "a hostile writer can litter but never
+poison" is enforced at two layers: `from_json` validates atom shape at the
+decode door (a malformed atom rejects the whole unit there), and the kernel's
+per-fact judgment is wrapped so that *any* exception — a missing body field, a
+crashing validator — becomes a whole-unit reject rather than an escaped error.
+Either way the drain retires the pile, so a hash-consistent but malformed pile
+cannot wedge a workspace (`test_poison_pile_is_litter_not_poison`,
+`test_poison_alongside_honest`). This was the one critical defect the
+adversarial review surfaced; the fix keeps the kernel the sole security
+boundary — a judge that crashes on a hostile exhibit is a broken judge.
+
 ## Deviations from DESIGN.md (all scale/packaging, no semantics)
 
 - **JSON units instead of packed byte runs.** Fixed-size records, 8 KB
@@ -102,8 +113,25 @@ groupings × random orders × random turn batching ⇒ byte-identical roots),
   secretbox invite blobs, KDF'd link seeds).
 - **Tail guard window couples to page cadence** (tail = everything after the
   last boundary fact); the design's decoupled B_t cap is a scale knob.
+- **Drain-on-read on root and poke only** — the design's "a peer drains
+  before answering any verb" narrows to the walk's entry point; `page`
+  objects are immutable and `list` is unused by the walk.
 - Not built (per the staged plan): S3 driver + presigned flow, iroh
   connector, GC/invite-TTL purge, the personal meta-workspace, deletion.
+
+**Known gap for the designer to rule on (removal ⇒ invite redemption).**
+DESIGN.md promises an invite blob is "evaluated fresh at mint (inviting admin
+since removed ⇒ refused)." Here invites are redeemed as *drained join facts*,
+and drains are globals-blind by design (history-independence), so a join whose
+inviting admin was removed after the invite was minted still confers
+membership, and that fresh member then mints normally. The only reachable
+trigger in this PoC is a founder self-eviction (the founder is the sole admin —
+there is no admin-promotion command), so it is minor. The faithful fix gates
+the *mint*, not the drain: refuse a grant when the requester's entitling edge
+traces through a removed key. That is a real policy choice — immediate-inviter
+only (refuse just the removed admin's direct invitees) vs. full-chain (removal
+cascades to everyone downstream) — which the design should settle before it is
+coded, so it is left as a flagged gap rather than a unilateral choice.
 
 ## Running it
 

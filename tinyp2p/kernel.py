@@ -120,12 +120,16 @@ def kernel(stream, anchor, globals_=None, db=None):
     for f in stream:
         if con.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone():
             continue  # dedup by fid — free, and what keeps validation stateless
-        ok = (f.t in VALIDATORS
-              and all(name in ALLOWED[f.t] for name, _, _ in f.offers())
-              and all(con.execute("SELECT 1 FROM facts WHERE fid=?", (rfid,)).fetchone()
-                      for _, rfid in f.refs()))  # the seen-set rule
-        deps = resolve_deps(f, con) if ok else None
-        if deps is None or not VALIDATORS[f.t](f, con, anchor, globals_):
+        try:
+            ok = (f.t in VALIDATORS
+                  and all(name in ALLOWED[f.t] for name, _, _ in f.offers())
+                  and all(con.execute("SELECT 1 FROM facts WHERE fid=?", (rfid,)).fetchone()
+                          for _, rfid in f.refs()))  # the seen-set rule
+            deps = resolve_deps(f, con) if ok else None
+            good = deps is not None and VALIDATORS[f.t](f, con, anchor, globals_)
+        except Exception:
+            good = False  # a fact that crashes the judge is a reject, never poison
+        if not good:
             con.rollback()
             return False, [], set()  # all-or-nothing: the unit rejects whole
         con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
