@@ -61,7 +61,7 @@ def prefix_set(fids_in_key_order, deps_of):
     return P
 
 
-def layout(keys, fact_of, deps_of, anchor, removal, memo=None):
+def layout(keys, fact_of, deps_of, anchor, globals_, memo=None):
     """keys: sorted '<ts>:<fid>' strings of the whole valid set.
     memo: {hi: prior fence dict} to reuse unchanged promoted ranges, or None
     for a full recompute. Returns (manifest_bytes, {objkey: bytes}) —
@@ -104,5 +104,5 @@ def layout(keys, fact_of, deps_of, anchor, removal, memo=None):
     else:
         tail = {"fp": fingerprint([]), "n": 0, "page": None, "annex": None}
     manifest = canon({"anchor": anchor, "fences": fences, "tail": tail,
-                      "removal": sorted(removal)})
+                      "globals": sorted([list(row) for row in globals_])})
     return manifest, objects

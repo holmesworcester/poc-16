@@ -11,9 +11,10 @@ import json
 import urllib.error
 import urllib.request
 
-from . import fact as F
+from . import facts as families
 from .close import close, decode_pile, encode_pile
 from .crypto import h, unseal
+from .facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .layout import fingerprint
 from .node import now_ms
@@ -53,15 +54,7 @@ class Peer:
         n = self.node
         with n.lock:
             ts = now_ms()
-            rq = F.req(n.pk, "sync", ts + 120_000, ts)
-            sg = F.sig_for(n.sk, n.pk, rq, ts)
-            src = n.member_src(self.ws)
-            newmap = {rq.fid: rq, sg.fid: sg}
-            deps = {rq.fid: [sg.fid] + ([src] if src else []), sg.fid: []}
-            facts = close([sg, rq],
-                          lambda fid: deps.get(fid) if fid in deps else
-                          (resolve_deps(n.fact_of(self.ws, fid), n.idx(self.ws)) or []),
-                          lambda fid: newmap.get(fid) or n.fact_of(self.ws, fid))
+            facts = auth_request.payload(n, self.ws, "sync", ts + 120_000, ts)
         body = json.dumps({"ws": self.ws,
                            "pile": base64.b64encode(encode_pile(facts)).decode()}).encode()
         _, resp, _ = self._http("POST", "/mint", body, auth=False)
@@ -134,8 +127,9 @@ def walk(node, ws, url):
                           lambda fid: node.fact_of(ws, fid))
             st, blobs = node.store(ws), {}
             for f in facts:
-                bh = f.body.get("blob")
-                if bh and st.has("obj/" + bh):
+                for bh in families.blob_refs(f):
+                    if not st.has("obj/" + bh):
+                        continue
                     blobs[bh] = st.get("obj/" + bh)
             b = encode_pile(facts, blobs)
         peer.put_pile(b)
@@ -151,8 +145,9 @@ def _fetch_blobs(node, ws, peer):
     accepted file facts reference and we lack."""
     st = node.store(ws)
     with node.lock:
-        rows = node.app.execute("SELECT blob FROM files WHERE ws=?", (ws,)).fetchall()
-    for (bh,) in rows:
+        refs = {blob for (fid,) in node.idx(ws).execute("SELECT fid FROM facts")
+                for blob in families.blob_refs(node.fact_of(ws, fid))}
+    for bh in refs:
         if not st.has("obj/" + bh):
             b = peer.obj(bh)
             if b and h(b) == bh:

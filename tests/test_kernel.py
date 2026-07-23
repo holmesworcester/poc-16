@@ -1,29 +1,35 @@
 """Adversarial kernel tests: the judge rejects what it must, whole units."""
 import pytest
 
-from tinyp2p import fact as F
-from tinyp2p.crypto import keypair
-from tinyp2p.kernel import kernel
+from tinyp2p.crypto import keypair, sign
+from tinyp2p.fact import Fact
+from tinyp2p.facts.auth.genesis import genesis
+from tinyp2p.facts.auth.invite import invite
+from tinyp2p.facts.auth.join import join
+from tinyp2p.facts.auth.removal import removal
+from tinyp2p.facts.auth.request import request
+from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.content.message import message
+from tinyp2p.kernel import Global, drain, evaluate, validate
 from tinyp2p.node import now_ms
 
 
 @pytest.fixture
 def anchor_chain():
     sk, pk = keypair()
-    g = F.genesis(sk, pk, "alice", now_ms())
+    g = genesis(sk, pk, "alice", now_ms())
     return sk, pk, g
 
 
 def judge(facts, anchor, g=None):
-    ok, valids, removed = kernel(facts, anchor, globals_=g)
-    return ok
+    return validate(facts, anchor) if g is None else evaluate(facts, anchor, g)
 
 
 def test_genesis_and_msg(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = F.msg(pk, "c", "hi", ts)
-    s = F.sig_for(sk, pk, m, ts)
+    m = message(pk, "c", "hi", ts)
+    s = signature(sk, pk, m, ts)
     assert judge([g, s, m], g.fid)
 
 
@@ -36,10 +42,10 @@ def test_wrong_anchor_rejects(anchor_chain):
 def test_bad_sig_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = F.msg(pk, "c", "hi", ts)
-    other_sk, other_pk = keypair()
-    forged = F.Fact("sig", ts, [["offer", "author", m.fid, pk]],
-                    {"sig": F.sign(other_sk, m.fid)})
+    m = message(pk, "c", "hi", ts)
+    other_sk, _ = keypair()
+    forged = Fact("sig", ts, [["offer", "author", m.fid, pk]],
+                  {"sig": sign(other_sk, m.fid)})
     assert not judge([g, forged, m], g.fid)
 
 
@@ -47,16 +53,16 @@ def test_nonmember_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     esk, epk = keypair()
     ts = now_ms()
-    m = F.msg(epk, "c", "intruder", ts)
-    s = F.sig_for(esk, epk, m, ts)
+    m = message(epk, "c", "intruder", ts)
+    s = signature(esk, epk, m, ts)
     assert not judge([g, s, m], g.fid)
 
 
 def test_unresolved_ref_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    dangling = F.Fact("join", ts, [["ref", ts, "f" * 64], ["offer", "member", pk]],
-                      {"name": "x", "pk": pk, "countersig": "00"})
+    dangling = Fact("join", ts, [["ref", ts, "f" * 64], ["offer", "member", pk]],
+                    {"name": "x", "pk": pk, "countersig": "00"})
     assert not judge([g, dangling], g.fid)
 
 
@@ -65,8 +71,9 @@ def test_offer_smuggling_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     esk, epk = keypair()
     ts = now_ms()
-    evil = F.Fact("msg", ts, [["offer", "admin", epk]], {"pk": pk, "chan": "c", "text": "x"})
-    s = F.sig_for(sk, pk, evil, ts)
+    evil = Fact("msg", ts, [["offer", "admin", epk]],
+                {"pk": pk, "chan": "c", "text": "x"})
+    s = signature(sk, pk, evil, ts)
     assert not judge([g, s, evil], g.fid)
 
 
@@ -74,26 +81,26 @@ def test_all_or_nothing(anchor_chain):
     """A valid fact sinks with its bad batch; it returns on the next walk."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    good = F.msg(pk, "c", "good", ts)
-    sg = F.sig_for(sk, pk, good, ts)
+    good = message(pk, "c", "good", ts)
+    sg = signature(sk, pk, good, ts)
     esk, epk = keypair()
-    bad = F.msg(epk, "c", "bad", ts)
-    sb = F.sig_for(esk, epk, bad, ts)
-    ok, valids, _ = kernel([g, sg, good, sb, bad], g.fid)
-    assert not ok and valids == []
+    bad = message(epk, "c", "bad", ts)
+    sb = signature(esk, epk, bad, ts)
+    result = drain([g, sg, good, sb, bad], g.fid)
+    assert not result.ok and result.valids == ()
 
 
 def test_evict_needs_admin(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
     isk, ipk = keypair()
-    inv = F.invite(pk, ipk, ts)
-    si = F.sig_for(sk, pk, inv, ts)
+    inv = invite(pk, ipk, ts)
+    si = signature(sk, pk, inv, ts)
     bsk, bpk = keypair()
-    j = F.join(inv, isk, bpk, "bob", ts)
-    sj = F.sig_for(bsk, bpk, j, ts)
-    ev = F.evict(bpk, pk, ts)  # bob (mere member) tries to evict alice
-    se = F.sig_for(bsk, bpk, ev, ts)
+    j = join(inv, isk, bpk, "bob", ts)
+    sj = signature(bsk, bpk, j, ts)
+    ev = removal(bpk, pk, ts)  # bob (mere member) tries to evict alice
+    se = signature(bsk, bpk, ev, ts)
     assert judge([g, si, inv, sj, j], g.fid)
     assert not judge([g, si, inv, sj, j, se, ev], g.fid)
 
@@ -102,20 +109,31 @@ def test_removal_gates_requests_only(anchor_chain):
     """Validity is globals-blind; only the ephemeral family reads removal."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = F.msg(pk, "c", "still valid", ts)
-    s = F.sig_for(sk, pk, m, ts)
-    rq = F.req(pk, "sync", ts + 9999, ts)
-    sr = F.sig_for(sk, pk, rq, ts)
-    removal = {pk}
-    assert judge([g, s, m], g.fid, g=removal)          # persistent: globals-blind
-    assert not judge([g, sr, rq], g.fid, g=removal)    # ephemeral: refused
+    m = message(pk, "c", "still valid", ts)
+    s = signature(sk, pk, m, ts)
+    rq = request(pk, "sync", ts + 9999, ts)
+    sr = signature(sk, pk, rq, ts)
+    globals_ = {Global("removal", pk)}
+    assert validate([g, s, m], g.fid)                  # persistent: globals-blind
+    assert not judge([g, sr, rq], g.fid, g=globals_)   # ephemeral: refused
     assert judge([g, sr, rq], g.fid, g=set())
+
+
+def test_drain_emits_removal_global_only(anchor_chain):
+    sk, pk, g = anchor_chain
+    ts = now_ms()
+    ev = removal(pk, pk, ts)
+    se = signature(sk, pk, ev, ts)
+    result = drain([g, se, ev], g.fid)
+    assert result.ok
+    assert result.globals == {Global("removal", pk)}
+    assert isinstance(validate([g, se, ev], g.fid), bool)
 
 
 def test_order_matters_seen_set(anchor_chain):
     """The seen-set rule: providers must precede dependents in the stream."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = F.msg(pk, "c", "hi", ts)
-    s = F.sig_for(sk, pk, m, ts)
+    m = message(pk, "c", "hi", ts)
+    s = signature(sk, pk, m, ts)
     assert not judge([g, m, s], g.fid)  # sig after its dependent: unmet need

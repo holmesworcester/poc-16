@@ -18,7 +18,8 @@ from urllib.parse import parse_qs, urlparse
 from . import cmds
 from .close import decode_pile
 from .crypto import h, seal_to
-from .kernel import kernel
+from .facts.auth import request
+from .kernel import evaluate
 from .node import Node, now_ms
 from .walk import walk
 
@@ -167,10 +168,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400)
         with self.node.lock:
-            removal = {r for (r,) in self.node.idx(ws).execute(
-                "SELECT DISTINCT a0 FROM offers WHERE name='removed'")}
-        ok, valids, _ = kernel(facts, ws, globals_=removal)
-        rq = [v.fact for v in valids if v.fact.t == "req"]
+            globals_ = self.node.globals(ws)
+        ok = evaluate(facts, ws, globals_)
+        rq = [fact for fact in facts if fact.t == request.TAG]
         if not ok or len(rq) != 1 or rq[0].body["exp"] < now_ms():
             return self._send(403)
         token = make_token(self.secret, rq[0].body["pk"][:16], ws)

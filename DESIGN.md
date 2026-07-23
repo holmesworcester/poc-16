@@ -530,6 +530,37 @@ by fid, and verify once into the offer table. Negative knowledge
 (POC-13's SuppressIf) stays out of the grammar by design — it is
 globals' job, and it returns with deletion.
 
+### Fact-family boundary
+
+The POC-13 core/facts split still applies, but a POC-16 family no longer
+returns a mixed projection verdict. Core files stay at package root and route
+into `facts/auth/` and `facts/content/`; there is no connection scope because
+the transport is not modeled as durable facts. One `somefact.py` owns these
+parts, in order:
+
+1. **SHAPE** — exact canonical constructors and the family's atom vocabulary.
+2. **NEEDS** — normalized offer addresses, combined by core with envelope refs.
+3. **VALIDATE** — `validate(fact, context) → bool`, where context is only the
+   already-valid in-pile prefix and the fixed workspace anchor. No waiting,
+   node, projection database, clock, mode, or globals enter this function.
+4. **MODE** — durable versus ephemeral, immutable object references, drain-only
+   monotone global rows, and (only for an ephemeral family) an optional
+   `evaluate(fact, globals) → bool` gate. Thus removal validity is timeless;
+   its global row is emitted in drain mode and consumed by request facts only
+   in evaluate mode.
+5. **MATERIALIZE** — projection of a kernel-minted `Valid<Fact>` into a read
+   model, with no repeated validity policy.
+6. **COMMANDS** — local authoring and ingress. Workspace creation/acceptance
+   also records the trusted anchor in the keyring: that local trust choice
+   cannot be derived from the store it is about to check.
+7. **QUERIES** — observations over materialized rows.
+
+The root command module may remain a stable façade over family commands. The
+kernel supplies three explicit views of the same forward pass: validation is
+boolean-only, drain additionally returns valid facts plus new global rows, and
+evaluate applies ephemeral global gates but is again boolean-only. Every input
+is already canonical-topological, so none of these paths sorts.
+
 **Removal is terminal and monotonic at the connection level**: eviction
 kills the mint — no grants, so no reads and no writes — and it is the
 *pusher's* liveness transport checks, never the author's. Facts that

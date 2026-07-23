@@ -1,14 +1,13 @@
-"""Facts: type tag + ts + canonical atom set; fid hashes the canonical envelope.
+"""Canonical facts: the family-neutral value and wire codec.
 
 Atoms carry the clear envelope's refs and offers ("refs say where, offers say
-what"). Needs are family-declared functions of the fact (kernel.NEEDS) because
-a fact cannot name its own fid in its atoms. The authors below are the sole
-construction chokepoint — callers pass parameters, never build atoms.
+what").  Concrete shapes and all meaning live under :mod:`tinyp2p.facts`;
+this module only gives those families one canonical value to construct.
 """
 import json
 from dataclasses import dataclass, field
 
-from .crypto import h, sign
+from .crypto import h
 
 
 def canon(o) -> bytes:
@@ -75,43 +74,3 @@ def from_json(o) -> Fact:
     if f.fid != h(canon(e)) or f.bh != e["bh"]:
         raise ValueError("fact integrity")
     return f
-
-
-def presig(t, ts, atoms) -> str:
-    return h(canon([t, ts, atoms]))
-
-
-# ---- authors: one constructor per family ------------------------------------
-
-def genesis(sk, pk, name, ts) -> Fact:
-    atoms = [["offer", "member", pk], ["offer", "admin", pk]]
-    return Fact("genesis", ts, atoms, {"name": name, "pk": pk, "sig": sign(sk, presig("genesis", ts, atoms))})
-
-
-def sig_for(sk, pk, target: Fact, ts) -> Fact:
-    return Fact("sig", ts, [["offer", "author", target.fid, pk]], {"sig": sign(sk, target.fid)})
-
-
-def invite(pk, invite_pk, ts) -> Fact:
-    return Fact("invite", ts, [["offer", "invitee", invite_pk]], {"pk": pk})
-
-
-def join(invite_fact: Fact, invite_sk, pk, name, ts) -> Fact:
-    atoms = [["ref", invite_fact.ts, invite_fact.fid], ["offer", "member", pk]]
-    return Fact("join", ts, atoms, {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)})
-
-
-def msg(pk, chan, text, ts) -> Fact:
-    return Fact("msg", ts, [], {"pk": pk, "chan": chan, "text": text})
-
-
-def file_fact(pk, chan, name, size, blob, ts) -> Fact:
-    return Fact("file", ts, [], {"pk": pk, "chan": chan, "name": name, "size": size, "blob": blob})
-
-
-def evict(pk, target_pk, ts) -> Fact:
-    return Fact("evict", ts, [["offer", "removed", target_pk]], {"pk": pk})
-
-
-def req(pk, verb, exp, ts) -> Fact:
-    return Fact("req", ts, [], {"pk": pk, "verb": verb, "exp": exp})

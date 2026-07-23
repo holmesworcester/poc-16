@@ -2,7 +2,7 @@
 
 One serial loop — turn() — is the only mutator of a workspace:
 
-    drain piles -> kernel each (parallel, own scratchpads) -> merge valid
+    drain piles -> kernel each (parallel, own scratchpads) -> merge valid/globals
     -> spill blobs -> commit (pure layout -> put objects -> CAS root)
     -> materialize (projectors consume Valid only) -> retire piles
 
@@ -17,10 +17,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import facts
 from .close import close, decode_pile, encode_pile
 from .crypto import h, keypair, load_sk
 from .fact import Fact, from_json
-from .kernel import EPHEMERAL, kernel, offer_src, resolve_deps
+from .kernel import Judgment, drain, resolve_deps
 from .layout import fingerprint, layout
 from .store import FsStore
 
@@ -28,16 +29,11 @@ IDX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
+CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
+                                   PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-APP_SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages(fid TEXT PRIMARY KEY, ws TEXT, chan TEXT,
-                                    pk TEXT, text TEXT, ts INT);
-CREATE TABLE IF NOT EXISTS members(ws TEXT, pk TEXT, name TEXT, role TEXT,
-                                   evicted INT DEFAULT 0, PRIMARY KEY(ws, pk));
-CREATE TABLE IF NOT EXISTS files(fid TEXT PRIMARY KEY, ws TEXT, chan TEXT,
-                                 name TEXT, size INT, blob TEXT, pk TEXT, ts INT);
-"""
+INDEX_VERSION = "family-contract-v1"
 
 
 def now_ms():
@@ -60,7 +56,7 @@ class Node:
         self.sk = load_sk(self.keyring["sk"])
         self.pk = self.sk.verify_key.encode().hex()
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
-        self.app.executescript(APP_SCHEMA)
+        self.app.executescript(facts.APP_SCHEMA)
         self._stores, self._idx = {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
@@ -77,6 +73,13 @@ class Node:
 
     def workspaces(self):
         return list(self.keyring["workspaces"])
+
+    def add_workspace(self, workspace, name, peers):
+        """Record the locally trusted anchor before its first pile is opened."""
+        with self.lock:
+            self.keyring["workspaces"][workspace] = {
+                "peers": list(peers), "name": name}
+            self.save_keyring()
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -97,13 +100,18 @@ class Node:
         reflects; a mismatched stamp means rebuild from the store."""
         etag = self.store(ws).etag("root")
         row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
-        if etag and (row is None or row[0] != etag):
+        version = self.idx(ws).execute(
+            "SELECT v FROM meta WHERE k='index-version'").fetchone()
+        if etag and (row is None or row[0] != etag
+                     or version is None or version[0] != INDEX_VERSION):
             self.rebuild(ws)
 
     def _stamp(self, ws):
         idx = self.idx(ws)
         idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
                     (self.store(ws).etag("root"),))
+        idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
+                    (INDEX_VERSION,))
         idx.commit()
 
     def fact_of(self, ws, fid) -> Fact:
@@ -114,8 +122,9 @@ class Node:
         return [f"{ts:015d}:{fid}" for ts, fid in
                 self.idx(ws).execute("SELECT ts, fid FROM facts ORDER BY ts, fid")]
 
-    def member_src(self, ws, role="member"):
-        return offer_src(self.idx(ws), role, self.pk)
+    def globals(self, ws):
+        return frozenset(self.idx(ws).execute(
+            "SELECT name, value FROM globals ORDER BY name, value").fetchall())
 
     # ---- the turn ------------------------------------------------------------
 
@@ -133,15 +142,19 @@ class Node:
                     units.append(None)  # malformed: rejected on the spot
             if len(units) > 1:  # independent piles judge in parallel
                 with ThreadPoolExecutor(max_workers=8) as ex:
-                    results = list(ex.map(lambda u: kernel(u[0], ws) if u else (False, [], set()), units))
+                    results = list(ex.map(
+                        lambda u: drain(u[0], ws) if u else Judgment(False, (), frozenset()),
+                        units))
             else:
-                results = [kernel(u[0], ws) if u else (False, [], set()) for u in units]
-            valids, blobs = [], {}
-            for u, (ok, vs, _) in zip(units, results):
+                results = [drain(u[0], ws) if u else Judgment(False, (), frozenset())
+                           for u in units]
+            valids, new_globals, blobs = [], set(), {}
+            for u, (ok, vs, global_rows) in zip(units, results):
                 if ok:
                     valids += vs
+                    new_globals.update(global_rows)
                     blobs.update(u[1])
-            fresh, newfids = self.merge(ws, valids)
+            fresh, newfids = self.merge(ws, valids, new_globals)
             for bh, b in blobs.items():
                 st.put_if_absent("obj/" + bh, b)
             self.commit(ws, newfids)
@@ -150,11 +163,11 @@ class Node:
                 st.delete(k)  # retire ingress after the CAS, rejects included
             return fresh
 
-    def merge(self, ws, valids):
+    def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
         for v in valids:
             f = v.fact
-            if f.t in EPHEMERAL:
+            if not facts.handler_for(f.t).DURABLE:
                 continue  # judged, never persisted: litter drains away
             if idx.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone() is None:
                 newfids.append(f.fid)  # what changed this drain — drives incremental layout
@@ -164,18 +177,19 @@ class Node:
                 idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                             (name, a0, a1, f.fid))
             out.append(v)
+        idx.executemany("INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
         idx.commit()
         return out, newfids
 
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
-        deps? Only a new member/admin/author offer for an address that now has
-        more than one provider can — then min-src may move under a frozen
-        range, so the incremental reuse is unsound and the memo is dropped."""
+        deps? Any new offer for an address that now has more than one provider
+        might move min-src under a frozen range, so the generic core drops the
+        memo rather than knowing which offer names families consume."""
         idx = self.idx(ws)
         for fid in newfids:
             for name, a0, a1 in self.fact_of(ws, fid).offers():
-                if name in ("member", "admin", "author") and idx.execute(
+                if idx.execute(
                         "SELECT COUNT(*) FROM offers WHERE name=? AND a0=? AND a1=?",
                         (name, a0, a1)).fetchone()[0] > 1:
                     return True
@@ -194,9 +208,8 @@ class Node:
         prev = st.get("root")
         if prev and not self._shadows(ws, newfids):
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
-        removal = [r for (r,) in idx.execute("SELECT DISTINCT a0 FROM offers WHERE name='removed'")]
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
-                              deps_of, ws, removal, memo)
+                              deps_of, ws, self.globals(ws), memo)
         for key, b in objects.items():
             if not st.has(key):
                 st.put(key, b)
@@ -207,19 +220,7 @@ class Node:
     def materialize(self, ws, valids):
         db = self.app
         for v in valids:
-            f, b = v.fact, v.fact.body
-            if f.t == "msg":
-                db.execute("INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?)",
-                           (f.fid, ws, b["chan"], b["pk"], b["text"], f.ts))
-            elif f.t == "file":
-                db.execute("INSERT OR IGNORE INTO files VALUES(?,?,?,?,?,?,?,?)",
-                           (f.fid, ws, b["chan"], b["name"], b["size"], b["blob"], b["pk"], f.ts))
-            elif f.t in ("genesis", "join"):
-                db.execute("INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
-                           (ws, b["pk"], b["name"], "admin" if f.t == "genesis" else "member"))
-            elif f.t == "evict":
-                db.execute("UPDATE members SET evicted=1 WHERE ws=? AND pk=?",
-                           (ws, f.atoms[0][2]))
+            facts.materialize(db, ws, v)
         db.commit()
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
@@ -246,7 +247,7 @@ class Node:
     def rebuild(self, ws):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
-            idx.executescript("DELETE FROM facts; DELETE FROM offers;")
+            idx.executescript("DELETE FROM facts; DELETE FROM offers; DELETE FROM globals;")
             idx.commit()
             man = st.get("root")
             if not man:
@@ -257,7 +258,7 @@ class Node:
                 for oh in (f.get("annex"), f.get("page")):
                     if oh:
                         stream += decode_pile(st.get("obj/" + oh))[0]
-            ok, valids, _ = kernel(stream, ws)
-            assert ok, "own store failed its own kernel"
-            self.materialize(ws, self.merge(ws, valids)[0])
+            result = drain(stream, ws)
+            assert result.ok, "own store failed its own kernel"
+            self.materialize(ws, self.merge(ws, result.valids, result.globals)[0])
             self._stamp(ws)

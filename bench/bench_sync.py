@@ -34,10 +34,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tinyp2p import cmds, fact as F
+from tinyp2p import cmds
 from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.fact import from_json
-from tinyp2p.kernel import kernel, resolve_deps
+from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.content.message import message
+from tinyp2p.kernel import drain, resolve_deps
 from tinyp2p.layout import fingerprint
 from tinyp2p.node import Node, now_ms
 
@@ -82,8 +84,8 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
     for i in range(n_msgs):
         sk, pk = rng.choice(members)
         ts = first_ts + rng.randrange(window)
-        f = F.msg(pk, "general", f"{tag}m{i}", ts)
-        _insert(idx, F.sig_for(sk, pk, f, ts))
+        f = message(pk, "general", f"{tag}m{i}", ts)
+        _insert(idx, signature(sk, pk, f, ts))
         _insert(idx, f)
     idx.commit()
 
@@ -142,9 +144,9 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
         buf = []
 
         def flush(bb):
-            for ok, vs, _ in ex.map(lambda u: kernel(u, ws), bb):
+            for ok, vs, global_rows in ex.map(lambda u: drain(u, ws), bb):
                 assert ok, "a published unit failed the kernel"
-                out, _ = node.merge(ws, vs)
+                out, _ = node.merge(ws, vs, global_rows)
                 node.materialize(ws, out)
 
         for u in units:

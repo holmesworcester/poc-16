@@ -1,6 +1,6 @@
 # tinyp2p — the POC-16 implementation
 
-A working build of [DESIGN.md](DESIGN.md) in ~1,400 lines of Python (stdlib +
+A working build of [DESIGN.md](DESIGN.md) in ~2,000 lines of Python (stdlib +
 pynacl), proving the semantics before any byte-format or Rust work. Alice,
 bob, and carol run real daemons, join by invite link, converge continuously,
 move multi-MB files, survive stragglers, eviction, and restarts —
@@ -10,14 +10,15 @@ move multi-MB files, survive stragglers, eviction, and restarts —
 
 | DESIGN.md | module | notes |
 |---|---|---|
-| facts, atoms, authors | `fact.py` | canonical JSON envelope; fid = sha256; the authors are the construction chokepoint |
-| the kernel | `kernel.py` | one streaming judge, own SQLite scratchpad per invocation, seen-set rule, all-or-nothing; `Valid` constructed here only |
+| canonical fact value | `fact.py` | family-neutral JSON envelope and codec; fid = sha256 |
+| auth and content families | `facts/auth/`, `facts/content/` | one module per wire family; exact shape, needs, bool validation, mode effects, materialization, commands, and queries |
+| the kernel | `kernel.py` | family-routed streaming judge; separate `validate → bool`, `drain → Judgment`, and `evaluate → bool` paths; `Valid` constructed here only |
 | close(), the unit codec | `close.py` | completion-order serializer; one codec for pile/page/annex/tail/request/invite |
 | treap, pages, fences, annexes, manifest | `layout.py` | **one pure function of the set**; promotion, mini-fold, and rebuild are the same code path; incrementality = content addressing |
 | ObjectStore | `store.py` | mem + fs drivers; CAS by etag; `obj/` holds every immutable object |
-| the engine, turn-based runtime | `node.py` | `turn()` = drain → judge (parallel) → merge → spill → commit → materialize → retire; the only mutator |
+| the engine, turn-based runtime | `node.py` | `turn()` = drain → judge (parallel) → merge facts/globals → spill → commit → routed materialize → retire; the only mutator |
 | the walk, push tail | `walk.py` | conditional root GET, fingerprint pruning, pull closed units into own ingress, collect-then-close push + poke |
-| commands ⇒ facts | `cmds.py` | create/invite/join/post/send/evict; each closes a pile into its own ingress and kicks the syncer |
+| command façade | `cmds.py` | stable control API pointing into family-owned commands and queries |
 | seven verbs + gate + cadence | `daemon.py` | responder half (zero sync logic) + initiator half (`Syncer`); mint = one kernel call in evaluate mode |
 | CLI | `cli.py` | drives a daemon over its control plane — the black-box seam |
 
@@ -26,6 +27,44 @@ piles all land in `pile/<member>/<hash>` and go through the same `turn()`.
 Independent piles validate in parallel (each kernel call gets its own
 `:memory:` scratchpad); handlers and projectors only ever
 `INSERT OR IGNORE` by id, so replays and races are harmless by construction.
+
+## The POC-16 fact contract
+
+The POC-13 family boundary survives, but its projector contract does not fit a
+closed-pile kernel. Every concrete module under `facts/auth/` or
+`facts/content/` therefore has these sections, in this order:
+
+- **SHAPE** constructs the exact canonical fact. Existing short fact tags are
+  preserved, so this packaging refactor does not rename stored facts.
+- **NEEDS** declares normalized offer addresses. The generic resolver combines
+  them with envelope refs and chooses the canonical minimum-fid provider.
+- **VALIDATE** is exactly `validate(fact, context) -> bool`. Context contains
+  only the immutable in-pile offer table and workspace anchor; globals, the
+  node, projection databases, and waiting are unavailable.
+- **MODE** declares durability, immutable-object refs, and drain-only global
+  rows. An optional `evaluate(fact, globals) -> bool` is permitted only on an
+  ephemeral family. Today `auth.removal` emits `("removal", pk)` during drain,
+  and `auth.request` consumes committed removal rows during evaluate.
+- **MATERIALIZE** receives a kernel-minted `Valid`, so it only writes the read
+  model; it repeats no validity or scope policy.
+- **COMMANDS** owns local authoring. Workspace create/accept also call the
+  core's keyring seam because the locally trusted anchor cannot be derived from
+  the store being checked.
+- **QUERIES** reads the family's materialized rows.
+
+There is deliberately no connection scope: access requests are ephemeral auth
+facts, while HTTP remains transport. `facts/__init__.py` is the root route;
+`fact.py`, `kernel.py`, `node.py`, `layout.py`, `walk.py`, and `cmds.py` remain
+at package root and dispatch inward. `tests/test_fact_contract.py` pins the
+source shape and routing boundary.
+
+The three kernel entry points share one internal forward pass. Inputs are
+already canonical-topological closed piles, so none sorts: `validate` returns
+only a boolean for trustless consumers, `drain` additionally exposes `Valid`
+values and new monotone global rows, and `evaluate` applies ephemeral gates but
+returns only a boolean. The index stores globals generically as `(name, value)`
+rows and the manifest publishes their canonical sorted records; neither the
+node nor layout knows what `removal` means.
 
 ## Treap leaves are piles — the confirmation
 
@@ -121,7 +160,8 @@ boundary — a judge that crashes on a hostile exhibit is a broken judge.
   namespace); the `/page/{hash}` route serves them all.
 - **Needs are family-declared functions**, not explicit atoms — a fact
   cannot name its own fid, so "authored-by my pk" and "author is a member"
-  live in `resolve_deps`. Offers, refs, and the matching rule are as
+  are declared beside the family and resolved generically by `resolve_deps`.
+  Offers, refs, and the matching rule are as
   designed (addresses, never values).
 - **Bodies are plaintext** — epochs/body encryption are out of scope; the
   crypto that carries auth *is* real (Ed25519 sig facts, sealed-box grants,
