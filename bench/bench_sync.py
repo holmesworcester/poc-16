@@ -34,12 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tinyp2p import cmds
+from tinyp2p import cmds, fact as F
 from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.fact import from_json
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import drain, resolve_deps
+from tinyp2p.kernel import kernel, resolve_deps
 from tinyp2p.layout import fingerprint
 from tinyp2p.node import Node, now_ms
 
@@ -84,8 +82,8 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
     for i in range(n_msgs):
         sk, pk = rng.choice(members)
         ts = first_ts + rng.randrange(window)
-        f = message(pk, "general", f"{tag}m{i}", ts)
-        _insert(idx, signature(sk, pk, f, ts))
+        f = F.msg(pk, "general", f"{tag}m{i}", ts)
+        _insert(idx, F.sig_for(sk, pk, f, ts))
         _insert(idx, f)
     idx.commit()
 
@@ -144,9 +142,9 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
         buf = []
 
         def flush(bb):
-            for ok, vs, global_rows in ex.map(lambda u: drain(u, ws), bb):
+            for ok, vs, _ in ex.map(lambda u: kernel(u, ws), bb):
                 assert ok, "a published unit failed the kernel"
-                out, _ = node.merge(ws, vs, global_rows)
+                out, _ = node.merge(ws, vs)
                 node.materialize(ws, out)
 
         for u in units:
@@ -327,10 +325,46 @@ def run_bidi(scales):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
+    """Same fact set, different page size. CUT=8 (E[8] facts/page) re-ships
+    each range's membership-closure annex over and over on a full catchup;
+    bigger pages amortize it, so redundancy falls and useful facts/s climbs
+    toward the raw judge rate (rec/s)."""
+    import tinyp2p.layout as L
+    print(f"\n=== CUT SWEEP: catchup at {scale} facts, varying page size ===")
+    print("    same fact set each row; only E[facts/page] changes\n")
+    hdr = ("CUT", "facts", "pages", "dl_MB", "streamed", "redund",
+           "ingest_s", "facts/s", "rec/s", "ok")
+    print("  {:>4} {:>8} {:>7} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}".format(*hdr))
+    orig = L.CUT
+    try:
+        for cut in cuts:
+            L.CUT = cut
+            d = os.path.join(WORK, f"cut_{cut}")
+            shutil.rmtree(d, ignore_errors=True)
+            seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
+            r = catchup(seed, ws, os.path.join(d, "fresh"))
+            print("  {:>4} {:>8} {:>7} {:>7.1f} {:>9} {:>5.1f}x {:>9.2f} "
+                  "{:>8.0f} {:>8.0f} {:>3}".format(
+                      cut, r["facts"], r["pages"], mb(r["dl_bytes"]),
+                      r["streamed"], r["streamed"] / r["facts"], r["ingest_s"],
+                      r["facts"] / r["ingest_s"], r["streamed"] / r["ingest_s"],
+                      "y" if r["match"] else "N"))
+            sys.stdout.flush()
+            del seed
+            gc.collect()
+            shutil.rmtree(d, ignore_errors=True)
+    finally:
+        L.CUT = orig
+
+
 def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
-    scales = args or [5000, 10000, 50000, 100000]
     os.makedirs(WORK, exist_ok=True)
+    if "cut" in sys.argv:
+        run_cut_sweep(args[0] if args else 50000)
+        return
+    scales = args or [5000, 10000, 50000, 100000]
     run_catchup(scales)
     run_bidi([s for s in scales if s <= 200000] or scales)
     print()
