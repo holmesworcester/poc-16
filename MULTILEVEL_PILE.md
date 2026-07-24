@@ -217,6 +217,15 @@ What the numbers say (and the two things the earlier drafts got wrong):
   invite and its sig onto the admitted member collapses the tax to **~37**, with
   only **~9 facts genuinely global** (led by genesis). `LO/ML` crosses 1 at **~11
   leaves** and a below-crossover 1-leaf pull wastes only **11** facts, not 397.
+  (The `ts` *secondary* key matters too: it co-locates each msg with its
+  same-timestamp sig, lowering leaf-only `ρ` on its own — the whole sort key, not
+  just its primary, shapes the blocks.)
+- **Caveat — the fixture is a depth-1 delegation star.** `add_member` always
+  invites via genesis, so every member is one hop from the root; here
+  "beneficiary grouping" and "DFS of the delegation tree" coincide and cannot be
+  told apart. Deep, chained delegation (A invites B invites C) is *untested* — it
+  is where DFS-preorder should matter beyond simple beneficiary grouping, and it
+  needs a chained-invite seed to measure.
 - **A small residual remains, from the tree *shape*.** Over-inclusion falls
   3.08→**69%** under delegation order but not to zero: the treap shape is
   hash-random, so a semantically-contiguous span can still settle at an `LCA` node
@@ -233,6 +242,17 @@ invites never co-located. Rebuilt via joins, delegation order behaves as above.)
 judge-ops, incremental fold `= O(touched)` (§A.6, B.1). The key-order question
 governs only the range-sync tax — a catastrophe under timestamp order, a ~dozen-leaf
 crossover with a tiny penalty under delegation order.
+
+**What this means for the headline claim.** A good key order lowers *leaf-only*
+`ρ` too (3.08→1.63), while multi-level's full-sync cost is order-**invariant**
+(always `|V|`). So hoisting's redundancy *advantage* over leaf-only shrinks from
+**67.5%** (under the shipped `ts` order) to **~38%** (aligned) — much of the
+headline "two-thirds saved" is the timestamp order inflating *leaf-only* to `3×`,
+not an intrinsic property of hoisting. Fix the order and leaf-only is already
+~1.6×. Hoisting's **durable, order-independent** payoff is therefore not raw byte
+redundancy but the **closed-path / verify-once** property (§A.2, B.1):
+validate-as-you-descend, judge each fact exactly once. That is the win to lead
+with; the redundancy number is real but is largely a symptom of key order.
 
 ## A.6 Incremental fold (blind, bounded ripple)
 
