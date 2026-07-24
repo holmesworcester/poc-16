@@ -270,9 +270,10 @@ def mb(b):
 
 
 def run_catchup(scales):
+    import tinyp2p.layout as L
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          f"workers, CUT=8\n")
+          f"workers, shipped default (COLD_CUT={L.COLD_CUT}, tail CUT={L.CUT})\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -324,11 +325,12 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
     toward the raw judge rate (rec/s)."""
     import tinyp2p.layout as L
     print(f"\n=== CUT SWEEP: catchup at {scale} facts, varying page size ===")
-    print("    same fact set each row; only E[facts/page] changes\n")
+    print("    flat (COLD_CUT=None) each row; only E[facts/page] changes\n")
     hdr = ("CUT", "facts", "pages", "dl_MB", "streamed", "redund",
            "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>4} {:>8} {:>7} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}".format(*hdr))
-    orig = L.CUT
+    orig, orig_cold = L.CUT, L.COLD_CUT
+    L.COLD_CUT = None  # pin flat so the sweep isolates the fine-cut redundancy
     try:
         for cut in cuts:
             L.CUT = cut
@@ -347,7 +349,7 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
             gc.collect()
             shutil.rmtree(d, ignore_errors=True)
     finally:
-        L.CUT = orig
+        L.CUT, L.COLD_CUT = orig, orig_cold
 
 
 def check_leaves(seed, ws):
@@ -395,13 +397,13 @@ def measure_write_cost(node_dir, scale, posts=200):
             "straggler_kb": S.mean(strag) / 1024, "posts": posts}
 
 
-def run_tier(scale, cold_cut=3072, guard=256):
-    """Flat CUT=8 vs a tiered layout: coarse ~1 MB cold pages sealed below a
-    fine GUARD-deep tail. Measures catchup (bytes/throughput/redundancy) and
-    steady-state per-post write cost for each."""
+def run_tier(scale, cold_cut=4096, guard=256):
+    """Flat CUT=8 vs the shipped tiered layout: coarse ~1.5 MB cold pages sealed
+    below a fine GUARD-deep tail. Measures catchup (bytes/throughput/redundancy)
+    and steady-state per-post write cost for each."""
     import tinyp2p.layout as L
     print(f"\n=== TIERED vs FLAT — {scale} facts "
-          f"(cold pages ~{cold_cut} facts ≈ 1 MB, guard {guard}) ===\n")
+          f"(cold pages ~{cold_cut} facts ≈ 1.5 MB, guard {guard}) ===\n")
     print("  {:>14} {:>7} {:>7} {:>7} {:>8} {:>7}   {:>10} {:>8} {:>10}"
           .format("layout", "pages", "dl_MB", "redund", "facts/s", "leaves",
                   "wr_steady", "wr_p90", "wr_stragl"))
