@@ -3,11 +3,15 @@
 Three orders over the SAME facts (only the sort prefix changes; fid, deps,
 closure, tree shape-by-hash are all unchanged):
   ts     : key = ts (the shipped order) -> each member's facts scattered over 3y
-  author : group each fact by its signer pk, then ts -> joins/msgs/sigs contiguous
-  deleg  : DFS preorder of the invite tree; invites grouped by INVITEE -> each
-           member's whole downstream delegation subtree contiguous
+  author : group each fact by its signer pk, then ts -> joins/msgs/sigs contiguous,
+           but invites+invite-sigs stay high (signed by inviter, needed by invitee)
+  deleg  : DFS preorder of the delegation tree, built via JOINS (an invite names an
+           ephemeral invitee key, so member<->invite is the join's ref, not the
+           invite's invitee field); each invite and its sig re-homed onto the member
+           it admitted -> a member's whole downstream subtree is contiguous.
 For each: leaf-only rho, ML full-sync redundancy, and the range-sync tax +
 LO/ML redundancy at a 1-leaf / small / large subtree, plus global over-inclusion.
+Result: ts tax ~4x members (flat); author ~halves it; deleg collapses it ~10x.
 """
 import os, shutil, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -133,13 +137,22 @@ def measure(scale, order, fids, fact_of, deps_of, rank):
 
 def build_orders(fids, fact_of):
     facts = {f: fact_of(f) for f in fids}
-    # delegation tree from invites
-    parent, invitees = {}, {}
+    # delegation tree via JOINS, not invites: the invite names an ephemeral
+    # invitee key, but the member joins with a different operating key, linked
+    # only by the join's ref to the invite fid. So member = join.pk, its inviter
+    # = the pk on the invite that join refs, and that invite's beneficiary member
+    # is this join.pk (used to re-home the invite + its sig onto the member).
+    parent, invben = {}, {}
     for f, fo in facts.items():
-        if fo.t == "invite":
-            inv = invitee_of(fo)
-            invitees[f] = inv
-            parent[inv] = author_of(fo)          # invitee_pk -> inviter_pk
+        if fo.t == "join":
+            member = fo.body.get("pk")
+            rf = fo.refs()
+            inv_fid = rf[0][1] if rf else None
+            if inv_fid is not None:
+                invben[inv_fid] = member                       # invite -> beneficiary
+                inviter = facts[inv_fid].body.get("pk") if inv_fid in facts else None
+                if inviter:
+                    parent[member] = inviter
     members = {author_of(fo) for fo in facts.values()}
     founders = [m for m in members if m not in parent]
     kids = {}
@@ -161,9 +174,21 @@ def build_orders(fids, fact_of):
     def member_author(f):
         return author_of(facts[f])
 
+    memo = {}
+
     def member_deleg(f):
+        if f in memo:
+            return memo[f]
         fo = facts[f]
-        return invitee_of(fo) if fo.t == "invite" else author_of(fo)
+        memo[f] = author_of(fo)          # break cycles / default
+        if fo.t == "invite":
+            memo[f] = invben.get(f, author_of(fo))   # the member this invite admitted
+        elif fo.t == "sig":              # a sig's only dependent is its target
+            for name, target, pk in fo.offers():
+                if name == "author" and target in facts:
+                    memo[f] = member_deleg(target)
+                    break
+        return memo[f]
 
     ts = {f: facts[f].ts for f in fids}
     rank_ts = {f: i for i, f in enumerate(sorted(fids, key=lambda f: (ts[f], f)))}
