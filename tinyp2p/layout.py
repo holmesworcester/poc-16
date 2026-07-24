@@ -34,8 +34,12 @@ from .close import close, encode_pile
 from .crypto import h
 
 CUT = 8          # warm/fine density: a fact is a fine boundary iff prio % CUT == 0
-COLD_CUT = None  # if set, everything older than the guard watermark seals into
-                 # coarse cold pages of ~COLD_CUT facts; the recent window stays fine
+COLD_CUT = 4096  # everything older than the guard watermark seals into coarse
+                 # cold pages of ~COLD_CUT facts (~1.5 MB); the recent window
+                 # stays fine. 4096 is the calibrated one-size-fits-most target:
+                 # it buries the membership annex (which saturates at the ~Dunbar
+                 # active-writer core, not at total members) under ~15% redundancy
+                 # flat from 100 to 10,000 members. See MODEL.md "Leaf Sizing".
 GUARD = 256      # B_t: keep at least this many recent facts in the fine warm zone
 
 

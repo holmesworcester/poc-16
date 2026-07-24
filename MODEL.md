@@ -405,6 +405,81 @@ revision (2026-07-22): **packed pages** — pages and tail carry their
 bodies (spill > 8 KB to `blob/`), `bundle/` deleted, promotion threshold
 B_t decoupled from page size.
 
+## Leaf Sizing — the Cold-Page Target (calibrated 2026-07-24)
+
+The layout's one free geometric knob is the leaf size B (in-range facts per
+leaf; `layout.CUT` sets E[B] in the fine zone, `COLD_CUT` the cold-page
+target). Two costs pull opposite ways:
+
+- **Catchup redundancy falls with B.** Every leaf is a closed pile, so it
+  carries the membership closure of its authors and validates alone; a fresh
+  catchup ships every leaf and re-pays that closure each time.
+  `R(B) = streamed/facts = 1 + annex(B)/B → 1` as B grows.
+- **Straggler / incremental cost rises with B.** An old-ts write re-ships its
+  whole sealed leaf: `B·F` bytes (measured 695 KB at B=3072 vs ~7 KB for a hot
+  append). The tiered split — `COLD_CUT` cold pages under a fine `CUT=8` guard
+  window — keeps the common append cheap, so the question is only *how big the
+  cold pages should be*.
+
+**The annex.** A member's membership proof is its root-path up the delegation
+forest (device-by-device, admin-by-admin; each hop ≈ 4 facts: invite +
+invite-sig + join + join-sig). A leaf's annex is the union of its authors'
+paths = their spanning subtree:
+
+    annex(K) ≈ A₀ + a·h̄·K
+
+K = distinct authors among the leaf's ~B/2 messages; a ≈ 3.5 auth facts/author
+(measured; the union nets out the shared genesis); h̄ = mean delegation depth
+(1 for a flat invite-from-founder tree, 1.5–3 with real admin/device chains —
+sharing near the root caps it); A₀ ≈ 3 backbone. F ≈ 0.4 KB/fact on the wire
+(measured).
+
+Calibration against the measured CUT sweep (100 uniform members, `bench/`),
+`R(B) = 1 + (A₀ + a·M(1−e^{−B/2M}))/B`, a=3.5, A₀=3:
+
+| B | model K | meas authors | meas closure | model R | meas R |
+|--:|--:|--:|--:|--:|--:|
+| 8 | 3.9 | 3.9 | 17 | 3.13× | 3.08× |
+| 64 | 27 | 26 | 104 | 2.55× | 2.50× |
+| 512 | 92 | 71 | 284 | 1.62× | 1.50× |
+| 3072 | ~100 | 90 | 347 | 1.11× | 1.13× |
+
+**Distinct authors K(q) is where concentration lives.**
+`K(q) = Σᵢ(1−(1−pᵢ)^q)`. Uniform over M ⇒ K→M. Zipf over *all* M members does
+**not** self-limit: measured 372 authors (s=1.0) / 273 (s=1.2) in a 3072-leaf at
+M=1000, i.e. R = 1.38× / 1.31×. What bounds the annex is an **active-writer
+core** — only ~Dunbar members ever author (participation inequality), Zipf
+*within* the core — giving K→min(W, q)=W, independent of M.
+
+**Optimum.** In the saturated regime `R∞(B) = 1 + a·h̄·W/B`, so for a target
+redundancy 1+ε:
+
+    B* = a·h̄·W / ε
+
+M-free because W_dunbar ≈ 150 is. With a=3.5, W=150: B* ≈ 3,500 (ε=0.15, h̄=1)
+to ~5,300 (h̄=1.5). Bounded above by the straggler tolerance (B ≤ C/F ≈ 5,000
+facts at a 2-MB budget) and, for fence-run length, B ~ √n (≈3,000 at n=10⁷).
+**All three land in 3,000–5,000 facts / 1–2 MB.**
+
+**One size fits most.** A single fixed cold leaf holds redundancy flat across
+the member scales (fixed B=3072, Dunbar core W=150, s=1.2, leaves
+kernel-verified):
+
+| M | active | redund |
+|--:|--:|:--:|
+| 100 | 100 | 1.11× |
+| 1,000 | 150 | 1.16× |
+| 10,000 | 150 | 1.12× |
+
+**Adopted:** `COLD_CUT = 4096` (~1.5 MB; upper end of the band to absorb h̄>1),
+hot tail `CUT = 8`. Regimes where the fixed size is wrong: (1) no active-core
+concentration at large M — annex ∝ M, fixed by a shared-verified-set catchup
+fast-path, not a bigger leaf; (2) deep low-sharing delegation chains (B* ∝ h̄);
+(3) n < B* (whole set is one leaf — fine); (4) high back-edit / straggler rate
+(each costs B·F — shrink B or widen the guard); (5) media-heavy bodies (size by
+bytes, not facts); (6) always-warm p2p (keep everything fine for the finest
+incremental diff). Full analysis + reproduction: `bench/RESULTS.md §3–4`.
+
 ## Closure — Any Range Plus Its Recursive Deps (the closure augmentation — NOT the plan; superseded by embed annexes 2026-07-22, DESIGN.md)
 
 *Status note:* the closed-pile design made embed annexes

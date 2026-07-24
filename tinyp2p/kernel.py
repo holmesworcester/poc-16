@@ -22,6 +22,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
+-- src-leading covering index: offers_from() matches on (src, name), which the
+-- PK index (src last) can't serve, so without this it full-scans the offers
+-- table per lookup -> O(joins * offers) rebuild/validate. We have a db; seek.
+CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
 """
 
 DRAIN = "drain"

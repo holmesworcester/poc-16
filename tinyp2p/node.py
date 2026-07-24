@@ -29,6 +29,7 @@ IDX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
+CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
