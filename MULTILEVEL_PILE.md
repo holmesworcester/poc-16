@@ -13,7 +13,11 @@ tree. The result:
 - every **root-to-node path is a closed set** (not just leaves) — you can validate
   as you descend;
 - full-sync download and verification drop to **one copy of each fact** (`ρ → 1`);
-- the multiplicative redundancy becomes an **additive `O(log n)` path tax**.
+- for **full sync** the multiplicative redundancy collapses to `1×`; for **range
+  sync** it becomes a *flat shared-core tax* (≈ 4×members) that can **lose** to
+  leaf-only piles for small pulls unless the key order is dependency-aligned — an
+  earlier draft claimed an `O(log n)` tax here; it is measured and corrected in
+  A.4–A.5.
 
 Part A works out how the tree is built deterministically with minimal steps.
 Part B works out the "fancy" version: validation down branching paths.
@@ -129,25 +133,33 @@ Each fact is **closed and serialised exactly once**, against the redundant
 fewer than once, so `|V|` object-volume is the floor — the leaf-only scheme sits a
 factor `ρ` above it.
 
-## A.4 What it costs — redundancy becomes a path tax
+## A.4 What it costs — full-sync wins, a flat shared-core tax on range sync
 
 | | leaf-only pile | multi-level pile |
 |---|---|---|
 | stored fact-copies | `Σ_f N(f) = ρ·\|V\|` | `\|V\|` (once each) |
-| full-sync download | `ρ×` | **`1×`** |
-| range sync (subtree of `s` leaves) | `s` piles, each `+annex` | subtree facts `+ O(log n)` ancestor payloads |
-| single-leaf random fetch | 1 object | the `O(log n)` path |
-| redundancy form | **multiplicative** `ρ` | **additive** `O(log n)` |
+| full-sync download | `ρ×` | **`1×`** (the floor) |
+| range sync (subtree of `s` leaves) | `s` piles, each carrying its full closure | subtree facts `+` the **hoisted shared-core** (≈ 4×members), **flat in `s`** |
+| single-leaf random fetch | 1 object | the root→leaf path |
+| redundancy form | **multiplicative** `ρ` | **additive, = the shared-core size** (not `O(log n)`) |
 
-The only two residuals:
+Two residuals — and the first is bigger than the earlier draft admitted
+(measured in A.5):
 
-- **Over-inclusion.** If `N(f)` is non-contiguous in key order — needed by leaf 1
-  and leaf 6000, nobody between — `f` settles at their LCA (near root) and rides
-  the path of every leaf under it. Bounded by how scattered a fact's dependents
-  are; membership (needed nearly everywhere) barely over-includes, and a
-  needed-by-exactly-two-far-apart-leaves fact is the pathological rarity.
+- **Over-inclusion is not small.** A fact settles at `LCA(N(f))`, which rides
+  *every* leaf under that node — tight only when `N(f)` is **contiguous in key
+  order**. Under the shipped **timestamp** order it is badly non-contiguous: each
+  member posts across the whole 3-year window, so that member's membership is
+  needed by ~1% of leaves *scattered end to end* → `LCA(N(f)) = root` → it rides
+  nearly all paths. The shared core (≈ 4×members: genesis + per-member
+  invite/join/sigs) hoists to the root and over-includes ~92% of the paths it
+  rides — only *genesis* is genuinely near-universal. So the range-sync tax is a
+  **flat ≈ 4×members**, independent of subtree size, and it makes multi-level
+  **lose to leaf-only for small range syncs** (below a crossover of a few dozen
+  leaves). A.5 measures how much a dependency-aligned key order recovers — and how
+  much it does *not*.
 - **Single-leaf access is now a path, not an object.** Sync walks paths anyway, so
-  it is free there; only random single-leaf fetch pays the `log n`.
+  it is free there; only random single-leaf fetch pays the depth.
 
 ## A.5 Measured — the redundancy hoisting removes
 
@@ -161,13 +173,51 @@ The only two residuals:
 `ρ` reproduces RESULTS.md §3's flat 3.1×. The shape of the win: **86–93% of facts
 are needed by their own leaf only** and never move; a **tiny shared core** (led by
 the genesis membership, in ~92% of all leaves) is what inflates the total to `3×`.
-Hoisting moves only that core and deletes **two-thirds** of the stored/shipped/
-verified volume — `ρ → 1` with an `O(log n)` residual.
+Hoisting moves only that core and deletes **two-thirds** of the *full-sync*
+stored/shipped/verified volume — `ρ → 1`. But the moved core is exactly the
+**range-sync tax** of A.4, and it is *not* small — measured next.
 
-This is why hoisting makes `COLD_CUT` page-inflation unnecessary *for redundancy*:
-big cold pages exist only to amortise this shared core, and the multi-level pile
-amortises it structurally. (Large leaves would still help object-count / round-trip
-count — a separate axis.)
+This is why hoisting makes `COLD_CUT` page-inflation unnecessary *for full-sync
+redundancy*: big cold pages exist only to amortise this shared core, and the
+multi-level pile amortises it structurally. (Large leaves would still help
+object-count / round-trip count — a separate axis.)
+
+### Range-sync tax and the key-order question (`bench/bench_order.py`, 50k)
+
+The shared core hoists to the root, so a range syncer pulling a small subtree pays
+it in full. Three key orders over the *same* facts — timestamp (shipped),
+author-contiguous, and delegation-DFS (invite tree, invites grouped by invitee).
+`LO/ML` = facts leaf-only ships vs multi-level (`>1` ⇒ multi-level wins):
+
+| order | leaf-only `ρ` | tax (facts above a leaf) | LO/ML @1 leaf | @~100 leaves | @full |
+|---|--:|--:|--:|--:|--:|
+| timestamp (shipped) | 3.08× | **397** | 0.01× | 2.08× | 3.08× |
+| author-contiguous | 1.63× | 120 | 0.09× | 1.35× | 1.63× |
+| delegation-DFS | 1.63× | 117 | 0.09× | 1.42× | 1.63× |
+
+What the numbers say, and where the draft above was wrong:
+
+- **The tax is real and flat.** ≈ 397 facts (= 4×members) hoist above *every* leaf
+  under timestamp order — a 1-leaf range sync costs 397 vs leaf-only's 5, so
+  multi-level is ~40–80× *worse* for tiny pulls and only overtakes leaf-only past a
+  few dozen leaves. The "`O(log n)` path tax" of the original A.4 was wrong.
+- **Dependency-aligned order helps — but does not rescue small range sync.**
+  Co-locating each member's facts cuts the tax ≈3× (397→120) *and* halves
+  leaf-only `ρ` (3.08→1.63). But leaf-only benefits from the alignment too, so the
+  `LO/ML` crossover barely moves — multi-level still loses for small subtrees. The
+  alignment's real payoff is that it nearly halves leaf-only's *own* redundancy.
+- **Full delegation-DFS ≈ author-grouping** at this scale (117 vs 120): once a
+  member's own facts are contiguous, ordering the invite tree on top adds little
+  (at 5k it helped more — the extra win is not robust across scale).
+- **A floor set by the tree *shape*, not the order.** Over-inclusion stays ~92%
+  under every order because the treap shape is hash-random, not aligned to the
+  dependency hierarchy: even a semantically-contiguous span settles at an `LCA`
+  node covering extra leaves. Truly tight hoisting would need the *boundaries* to
+  follow the dependency structure too — a bigger change than reordering.
+
+**Robust regardless of order:** full-sync `= |V|` (the floor), verify-once `= |V|`
+judge-ops, incremental fold `= O(touched)` (§A.6, B.1). The key-order question
+governs only the range-sync tax — which remains a genuine loss for small pulls.
 
 ## A.6 Incremental fold (blind, bounded ripple)
 
@@ -261,16 +311,22 @@ node's hash and re-invites the pull, and the closure rides down with it.
   history-independent, computable in `O(V + E)` + an `O(log P)` placement descent.
 - It makes **every root-to-node path a closed set**, so you can download and
   validate as you descend.
-- It stores/ships/verifies **each fact once** (`ρ ≈ 3× → 1×`, measured 66–68%
-  saved), converting the multiplicative closure redundancy into an additive
-  `O(log n)` path tax — and makes `COLD_CUT` page-inflation unnecessary for
-  redundancy control.
+- For **full sync** it stores/ships/verifies **each fact once** (`ρ ≈ 3× → 1×`,
+  measured 66–68% saved) — the floor, order-independent — and makes `COLD_CUT`
+  page-inflation unnecessary for *full-sync* redundancy.
+- For **range sync** the cost is a **flat shared-core tax** (≈ 4×members), *not*
+  the `O(log n)` an earlier draft claimed: multi-level **loses to leaf-only for
+  small pulls** (a 1-leaf sync is ~40–80× worse), overtaking only past a few dozen
+  leaves. A dependency-aligned key order cuts the tax ≈3× and halves leaf-only `ρ`
+  but does **not** move the crossover much (leaf-only gains too); a floor remains
+  from the hash-random tree *shape*. Measured in A.5.
 - Folds stay **blind and bounded** (`A` leaves + spine + the batch's rising deps;
   append-cheap).
 - The fancy version verifies **once per fact** at `O(depth)` memory and, on a diff,
   **only the changed payloads** — the same `ρ→1` win on the Ed25519 floor.
 
-Residuals: over-inclusion when a fact's needers are scattered non-contiguously in
-key order, and single-leaf random access costs its `O(log n)` path (free for sync,
-which walks paths anyway). Next step, if wanted: prototype the hoisting build +
-verify-once descent and measure the range-sync path tax against these `ρ` figures.
+Net: the wins that hold unconditionally are **full-sync `ρ→1`, verify-once, and
+`O(touched)` incremental fold**. The **range-sync** story is order-dependent and, for
+small pulls, a loss — surfaced by the prototype (`tinyp2p/hoist.py`,
+`bench/bench_hoist_sync.py`, `bench/bench_order.py`), which is now built and
+measured rather than assumed.
