@@ -354,11 +354,152 @@ def report(r):
     sys.stdout.flush()
 
 
+# ---- key-order comparison: does an author/delegation order collapse the tax? --
+
+def owners(fids, fact_of):
+    """Two ways to name the member a fact 'belongs to'.
+
+      A = creator   — who signed it (msg/its sig -> author; join/its sig ->
+                      joiner; invite/its sig -> the INVITER).
+      B = beneficiary — whose membership it serves (an invite + its sig -> the
+                      INVITED member, traced invite->join->pk).
+
+    They differ only for invites/invite-sigs: created by the inviter but needed
+    by the invited member's messages. In this fixture every member is invited
+    directly by genesis (a depth-1 star), so ordering by beneficiary IS a DFS of
+    the delegation tree — the two coincide here; a deep invite chain would need
+    the real DFS."""
+    import collections
+    A, B, sig_tgt, inv_member = {}, {}, {}, {}
+    for fid in fids:
+        f = fact_of(fid)
+        if f.t == "sig":
+            _, tgt, pk = f.offers()[0]
+            sig_tgt[fid], A[fid] = tgt, pk
+        elif f.t == "join":
+            A[fid] = f.body["pk"]
+            inv_member[f.refs()[0][1]] = f.body["pk"]   # invite_fid -> joined member
+        else:                                            # invite / msg / genesis
+            A[fid] = f.body["pk"]
+    for fid in fids:
+        f = fact_of(fid)
+        if f.t == "invite":
+            B[fid] = inv_member.get(fid, f.body["pk"])
+        elif f.t != "sig":
+            B[fid] = f.body["pk"]
+    for fid in fids:                                     # a sig belongs to its target
+        if fid in sig_tgt:
+            B[fid] = B.get(sig_tgt[fid], A[fid])
+    return A, B
+
+
+def keys_for(order, fids, fact_of):
+    """Build the sort keys 'prefix:fid' for the requested linearization. `ts`
+    reproduces production (primary=timestamp). `author`/`deleg` group a member's
+    facts contiguously by creator / beneficiary."""
+    if order == "ts":
+        return sorted(f"{fact_of(fid).ts:015d}:{fid}" for fid in fids)
+    A, Bm = owners(fids, fact_of)
+    own = A if order.startswith("author") else Bm
+    if order.endswith("+ts"):   # secondary = ts, so a msg sits next to its sig
+        return sorted(f"{own[fid]}{fact_of(fid).ts:015d}:{fid}" for fid in fids)
+    return sorted(f"{own[fid]}:{fid}" for fid in fids)
+
+
+def profile(keys, fact_of, deps_of):
+    """Light metrics for one key order (no verify/fold): leaf-only rho, the
+    range-tax rows, over-inclusion, and what still settles high."""
+    import collections
+    fids = [_fid(k) for k in keys]
+    V = len(fids)
+    root, objects = hoist.build(keys, fact_of, deps_of)
+    assert_closed(root, deps_of)
+    assert_once(root, fids)
+    leaves = [nd for nd in hoist.walk(root) if nd["leaf"] and (nd["b"] - nd["a"]) > 0]
+    leaf_fids = [[fids[i] for i in range(nd["a"], nd["b"])] for nd in leaves]
+    leaf_clen, leaf_cbytes, cnt = [], [], {}
+    for lf in leaf_fids:
+        cl = _closure(lf, deps_of)
+        leaf_clen.append(len(cl))
+        leaf_cbytes.append(len(encode_pile(close([fact_of(f) for f in lf], deps_of, fact_of))))
+        for f in cl:
+            cnt[f] = cnt.get(f, 0) + 1
+    leaf_total = sum(leaf_clen)
+    P = annotate(root, objects, leaf_clen, leaf_cbytes)
+    rows = range_tax(root, P)
+    oi = over_inclusion(root, cnt)
+    settle_nl = {}
+    for nd in hoist.walk(root):
+        for f in nd["pay"]:
+            settle_nl[f] = nd["nl"]
+    hi = [f for f, z in settle_nl.items() if z >= P / 2]
+
+    def at(sz):
+        c = [r for r in rows if r[0] >= sz]
+        return c[0] if c else rows[-1]
+
+    return {
+        "V": V, "P": P, "rho": leaf_total / V, "leaf_total": leaf_total,
+        "ml_save": 1 - V / leaf_total, "rows": rows, "oi": oi,
+        "root_core": len(root["pay"]),
+        "root_types": dict(collections.Counter(fact_of(f).t for f in root["pay"])),
+        "hi_core": len(hi),
+        "hi_types": dict(collections.Counter(fact_of(f).t for f in hi)),
+        "one": rows[0], "small": at(20), "large": at(max(1, P // 4)),
+    }
+
+
+def compare_orders(scale):
+    d, seed, ws, fact_of, deps_of = _ctx(scale)
+    fids = [_fid(k) for k in seed.keys(ws)]
+    orders = [("ts (production)", "ts"), ("author (creator)", "author"),
+              ("deleg (beneficiary)", "deleg"), ("deleg+ts (DAG)", "deleg+ts")]
+    profs = [(name, profile(keys_for(o, fids, fact_of), fact_of, deps_of))
+             for name, o in orders]
+    V, P = profs[0][1]["V"], profs[0][1]["P"]
+    print(f"\n############  KEY-ORDER COMPARISON  —  {V} facts (~{P} leaves), "
+          f"100 members, star delegation  ############")
+
+    print("\n  SUMMARY  (redund = leaf-only facts / multi-level facts; >1 ML wins, "
+          "<1 ML loses)")
+    print("    {:<20} {:>7} {:>8} {:>10} {:>10} {:>10} {:>9} {:>10} {:>10}".format(
+        "order", "leaf-rho", "ML-save", "1leaf-red", "~20lf-red", "large-red",
+        "over-lw", "root-core", "hi>=P/2"))
+    for name, p in profs:
+        print("    {:<20} {:>6.2f}x {:>7.1f}% {:>9.2f}x {:>9.2f}x {:>9.2f}x {:>8.1f}% "
+              "{:>10} {:>10}".format(
+                  name, p["rho"], 100 * p["ml_save"], p["one"][6], p["small"][6],
+                  p["large"][6], 100 * p["oi"]["leaf_weighted"],
+                  p["root_core"], p["hi_core"]))
+
+    for name, p in profs:
+        print(f"\n  --- {name} ---   root-core {p['root_core']} facts {p['root_types']}"
+              f"   |   settle>=P/2: {p['hi_core']} facts {p['hi_types']}")
+        print("    {:>7} {:>5} | {:>9} | {:>7} {:>7} {:>9} {:>7} | {:>9} {:>9}".format(
+            "leaves", "nodes", "LO_facts", "ML_in", "tax", "ML_tot", "redund",
+            "LO_KB", "ML_KB"))
+        for (nl, n, loF, mIn, tax, mT, red, loB, mB) in p["rows"]:
+            print("    {:>7.0f} {:>5} | {:>9.0f} | {:>7.0f} {:>7.1f} {:>9.0f} {:>6.2f}x "
+                  "| {:>9.1f} {:>9.1f}".format(
+                      nl, n, loF, mIn, tax, mT, red, loB / 1024, mB / 1024))
+        print("    {:>7} {:>5} | {:>9} | {:>7} {:>7} {:>9} {:>6.2f}x | {:>9} {:>9}"
+              .format("FULL", 1, p["leaf_total"], p["V"], 0, p["V"], p["rho"],
+                      "-", "-"))
+    del seed
+    shutil.rmtree(d, ignore_errors=True)
+    sys.stdout.flush()
+
+
 def main():
-    args = [int(a) for a in sys.argv[1:] if a.isdigit()]
-    scales = args or [5000, 50000]
     L.COLD_CUT = None
     os.makedirs(WORK, exist_ok=True)
+    args = [int(a) for a in sys.argv[1:] if a.isdigit()]
+    if "order" in sys.argv:
+        for s in (args or [50000]):
+            compare_orders(s)
+        print()
+        return
+    scales = args or [5000, 50000]
     for s in scales:
         report(measure(s))
     print()
