@@ -36,10 +36,17 @@ everywhere. Diffing is fence-fingerprint comparison plus ranged GETs:
 O(d·log n), ~4 rounds, against a counterpart that executes almost no
 code.
 
-**The unit.** *Every fetchable unit is a closed pile*: ingress pile,
-tail + annex, range + annex, request payload, invite blob — one codec,
-serialized in canonical-topo order (the closure walk's completion
-order), carrying its full closure down to genesis.
+**The unit.** *Every fetchable unit is a closed pile* — a topo-sorted,
+closed set of facts, full stop: ingress pile, leaf pile, tail pile,
+request payload, invite blob — one codec, serialized in canonical-topo
+order (the closure walk's completion order), carrying its full closure
+down to genesis. A leaf is `close` of its in-range leaves; the size
+limit counts only those, and the closure the pile drags in rides along,
+uncounted. There is no separate "annex" object: because the pile is
+topo-sorted, every dependency precedes its dependent, so no dep is ever
+copied to fix ordering — the only duplication across piles is the
+genuinely shared closure (auth/membership), which is bounded and
+amortizes as the leaf grows.
 
 **The kernel.** One judge for content, auth, and access:
 `kernel(stream, anchor, [globals]) → (valid, new globals)`. One
@@ -52,7 +59,7 @@ globals-blind; only ephemeral request facts read globals (the monotone
 removal set — removal is connection-level, mutual removals both land).
 
 **The engine.** Semantics-free: hash-verify, kernel, merge by key into
-the tail, promote by the cut rule into write-once pages + annexes,
+the tail, promote by the cut rule into write-once leaf piles,
 union globals, one CAS, delete piles. Runs only on request, under a
 lease. Access is a handshake: the requester sends a small closed
 pile — a request fact plus its auth closure — and the mint, a pure
@@ -85,8 +92,8 @@ hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
 `kernel(pile) → (valid, new globals)`, a pure predicate over fully
 closed piles with **zero store reads**, then k-way-merge the canonical
 runs into the treap's tail range; *promotion* (the cut rule freezing a
-full tail into immutable pages) and annex placement (Closure Walk)
-ride the same commit. Litmus: ≥ 300 facts/s validated in a warm 1 GB
+full tail into immutable leaf piles, each closed by the Closure Walk)
+rides the same commit. Litmus: ≥ 300 facts/s validated in a warm 1 GB
 Lambda against real S3; thousands/s per core locally — independent
 piles validate in parallel.
 
@@ -94,7 +101,7 @@ piles validate in parallel.
 `(ts, fid)` range Q *plus every recursive dependency of every fact in
 it*, in the walk's own shape. Litmus: ≤ D + 2 rounds (+1 per
 out-of-window frontier hop); ref + fence overhead ≤ 10% of context body
-bytes; identical sets ⇒ identical annex bytes; a cold 3-day partial join
+bytes; identical sets ⇒ identical leaf-pile bytes; a cold 3-day partial join
 at 10^6 ≈ 4 rounds / ~18 MB, projectable on arrival (MODEL.md, Closure).
 
 Everything else is scaffolding around these three.
@@ -107,7 +114,7 @@ canonical form. Atoms carry the fact's needs, offers, and dep refs in
 the **clear envelope**; encrypted values ride the body — **matching
 reads addresses, never values** — so dep topology and the offer
 vocabulary are store-visible while content never is, and the engine
-derives the annexes from envelopes alone. Signatures are not envelope
+derives each leaf's closure from envelopes alone. Signatures are not envelope
 fields but their own offering facts (Atoms, below).
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
@@ -119,7 +126,7 @@ and humans see plausible times, but validity never reads it (the only
 wall-clock comparisons anywhere are grant/invite expiry, at the gate,
 against the checker's own clock). Skew cannot break anything; it can
 only price a fact as a straggler, and a windowed reader can never
-lose a skewed dep, because the annex delivers context by closure, not
+lose a skewed dep, because the leaf pile delivers context by closure, not
 by window.
 
 **Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
@@ -234,59 +241,52 @@ no daemon in the byte path); in a peer the daemon fronts the store.
 
 ```text
 manifest <- conditional GET root      # 304 ⇒ NOTHING changed, done; top fences inline
-per fence, compare fingerprint + count:   # tail fences are just the rightmost fences
-  equal fp      -> prune
-  local ≈ empty -> BULK: fetch range + annex units (closed piles),
-                   stream-kernel on arrival, newest-first
-  else          -> EXACT: ranged GET fence/leaf/tail slices, recurse; diff records
-then (exact): bodies via page heaps / tail suffix / blob spills — context local, no annex
-then, at walk end — the push tail:
-  exact -> push set completes only now (leaf slices carry the responder's
-           full in-range entries); one close() over it -> one closed pile,
-           PUT into own pile prefix + poke
-  bulk  -> PUT copies of own promoted range+annex / tail+tail-annex units —
-           already closed piles; no assembly, receiver's merge dedups by fid
+per fence, compare fingerprint over its in-range leaves:
+  equal fp -> prune
+  else     -> GET the leaf pile (one immutable object, a closed set on arrival)
+              PULL it into own ingress if it holds in-range leaves we lack
+              PUSH reactively: close() our in-range leaves it lacks into one
+                 pile, PUT it — the mirror of the pull; responder drains on receipt
 ```
 
-**Decide with hashes, converge with piles.** Exact mode is the
-near-sync path — byte-minimal, ~20 KB per cadence, context already
-local so no closure machinery. Bulk mode is onboarding and catchup —
-the fetch unit is the closed pile, judgeable the moment it lands.
-The mode boundary is per-fence, advisory (adds and deletes cancel),
-and mischoosing costs bytes, never correctness. Descent is **read
-planning, not negotiation**: the responder is passive, counts ride
-every fence, and the inline top run means a cold or far-behind client
-decides *in round one* which subtrees to take whole — bootstrap
-collapses to root → one fence-run read (enumeration) → parallel unit
-fetches, streaming through the kernel as they arrive.
+**Decide with hashes, converge with piles.** A fence's fingerprint is over its
+in-range leaves; an equal fingerprint prunes the range. For a differing range
+the fetch unit is the whole leaf pile — one immutable, content-addressed
+object, judgeable the moment it lands. Descent is **read planning, not
+negotiation**: the responder is passive, counts ride every fence, and the
+inline top run means a cold or far-behind client decides *in round one* which
+leaves to take — bootstrap collapses to root → one fence-run read → parallel
+leaf fetches, streaming through the kernel as they arrive.
 
-**The push tail is collect-then-close, never per-leaf.** In exact mode
-the push set is not even knowable per-leaf — the subtraction needs the
-responder's complete entry list inside each differing range, which
-arrives with the leaf slices — and one `close()` over the collected
-set embeds the shared closure (auth chains, hot deps) once, where
-per-leaf piles would re-embed it per leaf: exactly the duplication the
-no-size-cap rule exists to avoid. In bulk mode there is no assembly at
-all: the pusher's own promoted range + annex and tail + tail-annex
-units are already closed piles, so push is copying bytes it already
-holds, and over-pushing is harmless because the receiver's merge
-dedups by fid. The walker's cross-round state is three entry sets —
-descent frontier, pull set, push accumulator — records only, never
-bodies; `close()` streams bodies from the local store once, at the
-end. Chunking a large push for transport retry is legal, but each
-chunk must close independently (splitting duplicates closures), which
-is why one pile is the default. Piles are transient ingress, never
-canonical: push granularity cannot perturb "same set, same bytes."
+**Whole-leaf fetch; intra-leaf slicing deferred.** The unit is the whole leaf,
+so a range differing by one fact still pulls the whole leaf. Content addressing
+buys immutability, fid-dedup, and CDN/static-mirror serving for free; the cost
+is over-fetch on diffs scattered into big cold leaves — the uncommon shape,
+since divergence clusters in the recent tail. It is reversible with no
+structural change: sub-fingerprints in the fence plus a `Range` GET *within* the
+same immutable leaf object reintroduce byte-minimal slicing as a pure
+optimization, if a profile ever demands it.
 
-The walk computes the *symmetric* difference, so push is the tail of the
-same walk: **one dial converges both sides; the responder runs zero sync
-logic.** Eager delivery still exists — put your own new facts into known
-piles at write time, then poke — and the walk is the anti-entropy backstop
-(the Dynamo split). Ending a write with a walk is a latency nicety, not
-a correctness rule: validation never blocks on deps, so a lone PUT cannot
-wedge — the walk just delivers the fact's closure promptly for the
-consumers' validators, and costs one conditional GET when already in
-sync.
+**Push is reactive — the mirror of the pull.** For each differing range where
+we hold in-range leaves the responder lacks, we `close()` them into one pile and
+PUT it: no collect-at-end, no assembly step to reason about. Each range's pile
+re-embeds its shared closure, which the receiver dedups by fid, so the cost is
+bounded transferred bytes, never correctness — and in the common case (ahead
+only in the recent tail) it is a single pile anyway. Ideally the push copies the
+pusher's own already-built leaves verbatim, so over-pushing is just copying
+bytes it holds. The responder **drains on receipt** — a pushed pile lands in its
+ingress and the same PUT handler turns it into the treap — so a peer push needs
+no poke. (The presigned-cloud path, whose write goes straight to S3 with no
+handler to hook, keeps the explicit poke; and the mint that authorizes any read
+already drains before it responds.)
+
+The walk computes the *symmetric* difference, so **one dial converges both
+sides; the responder runs zero sync logic.** Eager delivery still exists — put
+your own new facts into a known peer's ingress at write time — and the walk is
+the anti-entropy backstop (the Dynamo split). Ending a write with a walk is a
+latency nicety, not a correctness rule: validation never blocks on deps, so a
+lone PUT cannot wedge — it just delivers the fact's closure promptly for the
+consumers' validators, and costs one conditional GET when already in sync.
 
 Round trips: interactive negentropy descends two levels per round trip, the
 one-sided walk one — bought back by fat fanout (256-way pages match 16-way
@@ -303,69 +303,61 @@ pin-set means for a bounded peer, and what turns POC-14's join pathology
 (dep-DAG-depth spider rounds) into the same walk shape as P1. Queries
 quantize outward to leaf-page cuts (~1 h of facts at canonical λ).
 
-**Primary mechanism — closed ranges with embed annexes.** Diffing and
-closing live at different granularities: fingerprints stay
-slice-granular (P1 untouched), while closedness is a property of the
-*fetch unit*. Each promoted range gets an **annex** —
-`closure(range) ∖ range` plus copies of in-range skew-inversion
-targets, deduped, canonical-topo-serialized, its own content-addressed
-object beside the page — so range + annex is a fully closed set,
-judgeable by the same kernel predicate, same single streaming check,
-as any pile. The
-annex is a pure set function (identical sets ⇒ identical annex bytes),
-and the engine builds it **by aggregation, never by search**: piles
-arrive fully closed, so every copy an annex will ever need came in
-with some pile; at promotion each ref is classified in one pass
-(in-range, else annex) and sufficiency is the same syntactic
-resolution check the gate already ran. Fat ranges swallow the common
-context; hot hubs (genesis, certs, channels) cost one copy per range —
-~20 copies at 10^6 under fat ranges. Storage pays the duplication;
-nobody ever chases a graph.
+**The leaf pile is its own closure.** Diffing and closing live at different
+granularities: fingerprints stay over the in-range leaves (P1 untouched), while
+closedness is a property of the *fetch unit*. Each leaf is `close` of its
+in-range leaves — those leaves plus `closure ∖ in-range`, topo-sorted
+(deps-first) into one content-addressed object — so the leaf is a fully closed
+set, judgeable by the same kernel predicate as any pile. **Nothing is copied to
+fix ordering**: topo-sort places every dependency before its dependent, so the
+old "annex" of in-range skew-inversion copies is gone by construction; the only
+facts a leaf carries beyond its in-range leaves are the genuinely out-of-range
+**shared closure** (auth/membership). That closure is a pure set function
+(identical sets ⇒ identical bytes), built **by aggregation, never by search**:
+piles arrive fully closed, so every copy a leaf needs came in with some pile; at
+promotion each ref is classified in one pass (in-range, else shared closure).
+Fat leaves swallow the common context; hot hubs (genesis, certs) cost one copy
+per leaf, amortized away as leaves grow. Storage pays the duplication; nobody
+chases a graph.
 
-**Write path.** Between promotions the tail keeps its own annex — the
-deduped embedded copies covering the tail's out-refs, aggregated from
-each valid pile and rewritten with the tail. At promotion the engine
-classifies refs with everything in hand (tail facts + tail annex) and
-distributes copies into the new ranges' annexes. **Promoted range +
-annex pairs are write-once**: deps point backward, so `closure(R)` is
-fixed by R's immutable contents the moment it freezes — no reverse
-index, no count maintenance, nothing to touch when later facts arrive.
-The only reopen is a straggler's mini-fold, which recomputes that one
-range's annex from copies the straggler's own pile carried. Annexes
-are derived sidecars, content-addressed beside their pages and
-**outside the fingerprinted set** — the treap reconciles facts only,
-so copies never perturb the walk's diff algebra.
+**Sizing is by content; the closure rides free.** The size limit counts only
+the in-range leaves — the closure a leaf drags in is attached, not counted. So a
+leaf's size is a principled *content* choice (bytes, or the cold-tier scheme
+below), and the duplication it incurs is whatever the shared closure happens to
+be: bounded, because it saturates at the active membership, and amortized as the
+leaf grows. Measured on a messaging corpus, catchup duplication falls **3.3× →
+~1.4×** as history seals into ~1 MB cold leaves, and toward **~1.0×** once the
+topo-sort removes the skew copies and leaves clear the membership closure.
 
-**Every fetchable unit is a closed pile.** Ingress pile, tail +
-tail-annex, promoted range + annex, request payload, invite blob —
-one codec, one predicate, one streaming invariant: every ref resolves
-behind the cursor. Writer-built units satisfy it by canonical-topo
-serialization; at-rest ranges stay key-ordered (fingerprints demand
-it) and the **annex restores the invariant** — serialized
-canonical-topo, holding the out-of-range closure plus copies of any
-in-range facts that are dep targets of earlier-keyed in-range facts
-(skew inversions: rare, deterministic, deduped by the seen-set). The
-annex is a **literal prefix** of its range — annex ∪ range is
-concatenation, not a merge — so "context first, then news" holds for
-every unit by construction. So sync is a
-stream of independently judgeable units: a consumer kernels and
-projects each range as it lands, in any order, parallel across cores —
-fetch ts-descending and a fresh join's inbox is usable in seconds
-while history backfills behind it. Hub copies re-arriving across
-ranges cost no re-verification: verdicts are immutable, so a
-consumer's fid-keyed verdict cache is append-only and each hub
-verifies once per device lifetime.
+**Write path.** Between promotions the tail carries its own closure, aggregated
+from each valid pile. At promotion the engine classifies refs with everything in
+hand and each new leaf `close`s its in-range leaves. **Promoted leaves are
+write-once**: deps point backward, so a leaf's closure is fixed by its immutable
+in-range contents the moment it freezes — no reverse index, no count
+maintenance, nothing to touch when later facts arrive. The only reopen is a
+straggler's mini-fold, which recomputes that one leaf. The shared-closure copies
+sit **outside the fingerprinted set** — the treap reconciles in-range leaves
+only, so copies never perturb the walk's diff algebra.
+
+**Every fetchable unit is a closed pile.** Ingress pile, leaf pile, tail pile,
+request payload, invite blob — one codec, one predicate, one streaming
+invariant: every ref resolves behind the cursor, satisfied by canonical-topo
+serialization. So sync is a stream of independently judgeable units: a consumer
+kernels and projects each leaf as it lands, in any order, parallel across
+cores — fetch ts-descending and a fresh join's inbox is usable in seconds while
+history backfills behind it. Shared-closure copies re-arriving across leaves
+cost no re-verification: verdicts are immutable, so a consumer's fid-keyed
+verdict cache is append-only and each hub verifies once per device lifetime.
 
 ```text
-closure_sync(Q):                        # Q snapped to range cuts
+closure_sync(Q):                        # Q snapped to leaf cuts
   root + fence slices over Q            # rounds 1–2, as P1
-  leaf slices / whole packed pages of Q # round 3 — bodies ride along
-  annexes of Q's cover ranges           # round 3, same round
+  the leaf piles covering Q             # round 3 — each pile carries its closure
   spilled bodies via blob/              # round 4
 ```
 
 `R_cl = D + 2` — 4 rounds at 10^6, no escape hops, no workload
-assumption: the annex *is* the context. A cold partial join stays
+assumption: the leaf pile *is* the context. A cold partial join stays
 ~4 rounds and tens of MB — the context's own bodies are the floor no
 protocol beats — and every fact projects on arrival (MODEL.md,
 Closure).
@@ -411,8 +403,8 @@ flag, because policy belongs to the caller and the kernel stays
 context-free; disposal, placement (an NSE uses the app-group
 container), and parallelism (one connection per invocation, across
 cores) are the caller's too. Replay then costs nothing to build: full and
-windowed replay alike are the store's own range + annex units streamed
-through the kernel with a disk db — every unit closed, a cumulative
+windowed replay alike are the store's own leaf piles streamed
+through the kernel with a disk db — every pile closed, a cumulative
 seen-set deduping the hub copies.
 
 ```text
@@ -422,9 +414,8 @@ drain:                     # put + poke (cloud); any verb (peer); under lease
   reject invalid piles whole             # deleted with the drain; blame by prefix
   globals′ <- globals ∪ new globals      # associative union; removal set today
   tail' <- merge valid facts by key (the working db emits sorted), dedup by fid; stragglers mini-fold
-  tail-annex' <- tail-annex ∪ embedded copies of tail's out-refs   # aggregation
-  if tail' full: promote stable prefix to pages + fences + annexes  # the cut rule fires
-  put tail' + tail-annex', promoted pages + annexes, spilled blobs, globals′ if changed
+  if tail' full: promote stable prefix -> leaf piles (each = close of its in-range leaves) + fences
+  put tail pile (close of the tail) + promoted leaf piles, spilled blobs, globals′ if changed
   CAS manifest                           # the single commit point
   delete pile keys                       # valid and rejected alike
 ```
@@ -439,10 +430,12 @@ a delivered fact until some walk re-offers it.
 
 Trigger: **on request, in both worlds** — the engine has no timers and no
 event plumbing. Every ingest request drains the piles: a peer drains
-before answering any verb; in the cloud that is **poke alone** — the
-mint runs in evaluate mode and needs no drain, since its payload proves
-itself. The request pauses (milliseconds) so the requester always gets
-the latest.
+before answering any verb — including the PUT that delivered a pushed
+pile, so a **peer push drains on receipt and needs no poke**; in the
+cloud the trigger is **poke alone** — the mint runs in evaluate mode and
+needs no drain, since its payload proves itself (though the mint that
+authorizes any read still drains before responding). The request pauses
+(milliseconds) so the requester always gets the latest.
 For the passive cloud data path the request is explicit: `POST
 /poke` on the mint Lambda — writers poke after pushing, walkers poke on a
 slow backstop cadence, a writer that dies before poking is caught by
@@ -511,7 +504,7 @@ valid facts behind the cursor — the seen-set rule generalized from
 zero matches; closed units mean the closer either shipped the
 providers or authored a broken pile. Pinned dep refs and needs
 compose: refs say *where* (exact `(ts, fid)` providers, keeping
-closure and annexes deterministic), needs say *what* (the assertion
+each leaf's closure deterministic), needs say *what* (the assertion
 the provider must offer). Offers are the **version interlingua** —
 the reason the model earns its weight: facts of different versions in
 one pile never read each other's schemas; each version's handler
@@ -786,9 +779,10 @@ Proofs first; no transport work until both numbers exist.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
-4. **P3 bench** — annex build at promotion + closure walk; measure
-   annex duplication (hub copies, δ′) on a real corpus; sweep window
-   sizes.
+4. **P3 bench** — leaf-pile close at promotion + closure walk; measure
+   shared-closure duplication (hub copies) on a real corpus; sweep leaf
+   sizes. (Done: `bench/RESULTS.md` — 3.3× at CUT=8 → ~1.0× with 1 MB
+   cold leaves and topo-order sig placement.)
 5. **Protocol** — daemon (seven routes) + the one HTTP client with grant
    decorators + s3 driver/presigned flow; conformance suite green against
    daemon and S3+Lambda.

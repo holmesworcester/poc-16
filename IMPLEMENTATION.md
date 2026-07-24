@@ -13,11 +13,11 @@ move multi-MB files, survive stragglers, eviction, and restarts —
 | canonical fact value | `fact.py` | family-neutral JSON envelope and codec; fid = sha256 |
 | auth and content families | `facts/auth/`, `facts/content/` | one module per wire family; exact shape, needs, bool validation, mode effects, materialization, commands, and queries |
 | the kernel | `kernel.py` | family-routed streaming judge; separate `validate → bool`, `drain → Judgment`, and `evaluate → bool` paths; `Valid` constructed here only |
-| close(), the unit codec | `close.py` | completion-order serializer; one codec for pile/page/annex/tail/request/invite |
-| treap, pages, fences, annexes, manifest | `layout.py` | **one pure function of the set**; promotion, mini-fold, and rebuild are the same code path; incrementality = content addressing |
+| close(), the unit codec | `close.py` | completion-order serializer; one codec for every pile — ingress, leaf, tail, request, invite |
+| treap, leaf piles, fences, manifest | `layout.py` | **one pure function of the set**; each leaf = `close` of its in-range leaves (no annex); promotion, mini-fold, and rebuild are the same code path; incrementality = content addressing |
 | ObjectStore | `store.py` | mem + fs drivers; CAS by etag; `obj/` holds every immutable object |
 | the engine, turn-based runtime | `node.py` | `turn()` = drain → judge (parallel) → merge facts/globals → spill → commit → routed materialize → retire; the only mutator |
-| the walk, push tail | `walk.py` | conditional root GET, fingerprint pruning, pull closed units into own ingress, collect-then-close push + poke |
+| the walk | `walk.py` | conditional root GET, fingerprint pruning, pull the peer's leaf pile verbatim into own ingress, reactive per-range push; responder drains on receipt |
 | command façade | `cmds.py` | stable control API pointing into family-owned commands and queries |
 | seven verbs + gate + cadence | `daemon.py` | responder half (zero sync logic) + initiator half (`Syncer`); mint = one kernel call in evaluate mode |
 | CLI | `cli.py` | drives a daemon over its control plane — the black-box seam |
@@ -89,15 +89,15 @@ Four invariants carry it:
   (`resolve_deps` against the cumulative offers table, min-src tiebreak),
   never remembered from validation history. Two nodes with the same set
   derive the same edges, whatever order things arrived in.
-- **I3 — the annex restores the stream invariant.** `prefix_set(R)` takes
-  every out-of-range dep (transitively), every in-range dep of a prefix
-  member (a prefix precedes the whole range, so those must be copied), and
-  every in-range skew inversion (a dep keyed after its dependent); the
-  result is dep-closed by construction and `close()` serializes it
-  deps-first. Hence annex ++ key-ordered(range) always satisfies the
-  seen-set rule from an empty scratchpad.
-- **I4 — layout is a pure function.** `layout(keys, deps)` recomputes pages,
-  fences, annexes, tail, and manifest from nothing but the set. Same set ⇒
+- **I3 — topo-sort makes each leaf a closed pile.** A leaf is `close` of its
+  in-range leaves: those leaves plus their full recursive closure, emitted
+  deps-first. Every dependency therefore precedes its dependent, so the pile
+  satisfies the seen-set rule from an empty scratchpad — no separate annex
+  object, no skew copies to construct. The out-of-range closure rides in the
+  pile but sits outside the fingerprinted set (which is over the in-range
+  leaves only), so copies never perturb the diff algebra.
+- **I4 — layout is a pure function.** `layout(keys, deps)` recomputes leaf
+  piles, fences, tail, and manifest from nothing but the set. Same set ⇒
   same bytes, on every node.
 
 The four mutation paths are then one argument:
@@ -106,7 +106,7 @@ The four mutation paths are then one argument:
 - **Promotion** is not an operation: a new boundary fact simply changes
   where the pure function cuts. Nothing to get wrong.
 - **Straggler mini-fold**: an old-ts fact lands in some promoted chunk; only
-  that chunk's page and annex bytes change (boundary-ness is a per-fact
+  that chunk's leaf-pile bytes change (boundary-ness is a per-fact
   property, so all other cuts are stable), and its closure already arrived
   in its own pile.
 - **Rebuild** replays the store's own units through the kernel — each unit
@@ -122,10 +122,10 @@ content addressing — a commit PUTs only objects the store lacks
 store). And *layout compute* is now incremental too: `commit()` passes the
 prior manifest's fences to `layout()` as a memo, and any promoted range whose
 `(hi, fp)` is unchanged is reused verbatim — its facts are never loaded, its
-page and annex never rebuilt (`test_incremental_reuses_work`: a post into a
+pile never rebuilt (`test_incremental_reuses_work`: a post into a
 promoted store touches under half the facts). This is byte-identical to a full
-recompute because a page depends only on its range's immutable fids and an
-annex only on those plus their resolved deps, which are fixed *as long as every
+recompute because a leaf pile depends only on its in-range fids and their
+resolved deps, which are fixed *as long as every
 offer address has one provider* (so `min-src` cannot move). The one way that
 breaks — a duplicate `member`/`admin`/`author` offer (a re-join or re-sign) —
 is caught by a shadow guard (`Node._shadows`) that drops the memo for that
@@ -157,12 +157,15 @@ boundary — a judge that crashes on a hostile exhibit is a broken judge.
 - **JSON units instead of packed byte runs.** Fixed-size records, 8 KB
   slices, delta-coded 28 B fences, and body heaps are byte-economy for 10^6
   facts; units here are canonical-JSON objects. Fences still carry
-  (hi, fp, count, page, annex) and pruning still works range-by-range.
+  (hi, fp, count, pile) and pruning still works range-by-range.
 - **Fence hierarchy depth 1** — the manifest holds the single fence run;
   2–3-level runs are a 10^5+ concern.
-- **Exact/bulk walk modes collapse**: with whole-object units there are no
-  record slices, so both modes fetch the range's closed unit; the push tail
-  is exactly the design's collect-then-close (one `close()`, one pile, poke).
+- **Whole-leaf fetch**: with whole-object units there are no record slices, so
+  the walk fetches each differing leaf's pile whole; intra-leaf slicing is the
+  deferred, reversible optimization (a `Range` GET within the immutable
+  object). The push is **reactive per range** — `close` the leaves the peer
+  lacks and PUT, the mirror of the pull — and the responder **drains on
+  receipt**, so there is no poke on the p2p path.
 - **`page/`+`blob/` collapse to `obj/`** (one immutable content-addressed
   namespace); the `/page/{hash}` route serves them all.
 - **Needs are family-declared functions**, not explicit atoms — a fact
@@ -173,11 +176,14 @@ boundary — a judge that crashes on a hostile exhibit is a broken judge.
 - **Bodies are plaintext** — epochs/body encryption are out of scope; the
   crypto that carries auth *is* real (Ed25519 sig facts, sealed-box grants,
   secretbox invite blobs, KDF'd link seeds).
-- **Tail guard window couples to page cadence** (tail = everything after the
-  last boundary fact); the design's decoupled B_t cap is a scale knob.
-- **Drain-on-read on root and poke only** — the design's "a peer drains
-  before answering any verb" narrows to the walk's entry point; `page`
-  objects are immutable and `list` is unused by the walk.
+- **Tail guard couples to cut density by default** (tail = everything after
+  the last boundary); the tiered layout (`layout.COLD_CUT`) restores the
+  design's decoupled B_t guard — history seals into coarse cold leaves below a
+  GUARD-deep watermark while the recent window stays fine (`bench/RESULTS.md`).
+- **Drain-on-receipt at root, poke, and PUT** — the design's "a peer drains
+  before answering any verb" is realized at the walk's entry point (root GET),
+  on poke, and on the PUT that delivers a pushed pile (so a peer push needs no
+  poke); `page` objects are immutable and `list` is unused by the walk.
 - Not built (per the staged plan): S3 driver + presigned flow, iroh
   connector, GC/invite-TTL purge, the personal meta-workspace, deletion.
 

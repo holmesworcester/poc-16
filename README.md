@@ -7,8 +7,8 @@ treap's tail range on request; promotion rides the same commit). [MODEL.md](MODE
 the send/receive/compaction loop math.
 
 **tinyp2p** (`tinyp2p/`) is the working build: ~2,000 lines of Python
-implementing the whole semantic stack — kernel, closed piles, pure treap
-layout with annexes, one-sided walk, seven-verb daemon, invite links,
+implementing the whole semantic stack — kernel, closed piles (each leaf a
+topo-sorted closed set), pure treap layout, one-sided walk, seven-verb daemon, invite links,
 eviction, and routed `facts/auth` + `facts/content` families — with black-box
 multi-daemon tests. [IMPLEMENTATION.md](IMPLEMENTATION.md)
 maps design to code, records the deviations, and carries the
