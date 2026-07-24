@@ -123,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("If-None-Match") == etag:
                 return self._send(304)
             return self._send(200, b, etag=etag)
-        if parts[0] == "page" and len(parts) == 2:  # pages, annexes, blobs alike
+        if parts[0] == "page" and len(parts) == 2:  # leaf piles and blobs alike
             b = self.node.store(ws).get("obj/" + parts[1])
             return self._send(200, b, "application/octet-stream") if b else self._send(404)
         if parts[0] == "pile":
@@ -141,6 +141,7 @@ class Handler(BaseHTTPRequestHandler):
             if h(b) != parts[2]:
                 return self._send(400)
             self.node.store(ws).put(f"pile/{m}/{parts[2]}", b)
+            self.node.turn(ws)  # drain on receipt — a pushed pile needs no poke
             return self._send(204)  # delivery receipt; acceptance is the treap
         self._send(403)
 

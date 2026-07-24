@@ -1,6 +1,6 @@
 """close(): the canonical-topo serializer, and the one unit codec.
 
-Every fetchable unit — ingress pile, page, annex, tail, request payload,
+Every fetchable unit — ingress pile, leaf pile, tail, request payload,
 invite blob — is the same codec: an ordered fact list (+ attached blobs)
 that satisfies the kernel's seen-set rule when streamed front to back.
 close() emits the closure walk's own completion order: news in key order,

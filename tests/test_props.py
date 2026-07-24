@@ -2,7 +2,7 @@
 
 P-history-independence: same set, same bytes — any pile grouping, any
 arrival order, any number of turns converges to an identical root.
-P-leaves-are-piles: every published unit (page+annex, tail+annex) passes
+P-leaves-are-piles: every published leaf pile (a topo-sorted closed set) passes
 the kernel from an empty scratchpad.
 P-rebuild: wipe the derived index, replay the store's own units, get the
 identical root back.
@@ -45,12 +45,8 @@ def world(tmp_path):
 def units_of(store):
     man = json.loads(store.get("root"))
     for fen in man["fences"] + [man["tail"]]:
-        stream = []
-        for oh in (fen.get("annex"), fen.get("page")):
-            if oh:
-                stream += decode_pile(store.get("obj/" + oh))[0]
-        if stream:
-            yield fen, stream
+        if fen.get("pile"):
+            yield fen, decode_pile(store.get("obj/" + fen["pile"]))[0]
 
 
 def test_leaves_are_piles(world):

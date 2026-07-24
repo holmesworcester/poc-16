@@ -1,7 +1,7 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
 Layout: root (the CAS'd manifest, only mutable key besides piles/invites),
-obj/<hash> (pages, annexes, tails, blobs — immutable, content-addressed),
+obj/<hash> (leaf piles, tails, blobs — immutable, content-addressed),
 pile/<member>/<hash> (ingress), invite/<id> (public reads).
 """
 import os

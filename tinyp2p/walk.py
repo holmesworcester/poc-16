@@ -2,9 +2,10 @@
 
 Decide with hashes, converge with piles. The initiator fetches the manifest
 (one conditional GET in steady state), prunes ranges whose fingerprints
-match, pulls differing ranges as closed units into its own ingress pile,
-and at walk end pushes the symmetric difference — collect-then-close, one
-pile, PUT + poke. The responder runs zero sync logic.
+match, and for each differing range pulls the peer's leaf pile verbatim into
+its own ingress and reactively pushes back the leaves the peer lacks — one
+close-and-PUT per range, the mirror of the pull. The responder drains on
+receipt and runs zero sync logic; no poke, no collect-at-end.
 """
 import base64
 import json
@@ -76,11 +77,11 @@ class Peer:
         self._http("POST", "/poke", data=b"", auth=False)
 
 
-EMPTY = {"fences": [], "tail": {"fp": fingerprint([]), "n": 0, "page": None, "annex": None}}
+EMPTY = {"fences": [], "tail": {"fp": fingerprint([]), "n": 0, "pile": None}}
 
 
 def walk(node, ws, url):
-    """One dial converges both sides. Returns (pulled_units, pushed_facts)."""
+    """One dial converges both sides. Returns (pulled, pushed)."""
     peer = Peer(node, ws, url)
     cache = peer.cache
     got = peer.root(cache.get("etag"))
@@ -101,43 +102,46 @@ def walk(node, ws, url):
     with node.lock:
         lkeys = node.keys(ws)
     lfids = {k.split(":", 1)[1] for k in lkeys}
-    pulled, push_fids = 0, []
+    pulled = pushed = 0
     for lo, hi, fen in ranges:
         mine = [k for k in lkeys if lo < k <= hi]
         if fen["fp"] == fingerprint(mine):
-            continue  # prune: equal fingerprint, equal range
-        page = decode_pile(peer.obj(fen["page"]))[0] if fen.get("page") else []
-        rfids = {f.fid for f in page}  # the responder's full in-range entries
-        if any(fid not in lfids for fid in rfids):
-            annex = decode_pile(peer.obj(fen["annex"]))[0] if fen.get("annex") else []
-            b = encode_pile(annex + page)  # already a closed unit
-            node.store(ws).put(f"pile/{node.member}/{h(b)}", b)
+            continue  # equal fingerprint, equal range — prune
+        raw = peer.obj(fen["pile"]) if fen.get("pile") else None
+        theirs = decode_pile(raw)[0] if raw else []
+        rfids = {f.fid for f in theirs if lo < f.key <= hi}  # their in-range leaves
+        if any(fid not in lfids for fid in rfids):  # pull the leaf pile verbatim
+            node.store(ws).put(f"pile/{node.member}/{fen['pile']}", raw)
             pulled += 1
-        push_fids += [k.split(":", 1)[1] for k in mine if k.split(":", 1)[1] not in rfids]
+        push = [k.split(":", 1)[1] for k in mine if k.split(":", 1)[1] not in rfids]
+        if push:  # reactive push, the mirror of the pull; peer drains on receipt
+            _push(node, ws, peer, push)
+            pushed += len(push)
+            retag = None  # remote root will move; re-read next walk
 
     if pulled:
-        node.turn(ws)
+        node.turn(ws)  # ingest the pulled leaves in one drain
         _fetch_blobs(node, ws, peer)
 
-    if push_fids:  # the push tail: collect-then-close, one pile
-        with node.lock:
-            idx = node.idx(ws)
-            news = [node.fact_of(ws, fid) for fid in push_fids]
-            facts = close(news, lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or [],
-                          lambda fid: node.fact_of(ws, fid))
-            st, blobs = node.store(ws), {}
-            for f in facts:
-                for bh in families.blob_refs(f):
-                    if not st.has("obj/" + bh):
-                        continue
-                    blobs[bh] = st.get("obj/" + bh)
-            b = encode_pile(facts, blobs)
-        peer.put_pile(b)
-        peer.poke()
-        retag = None  # remote root moved; re-read next walk
-
     cache.update({"etag": retag, "man": man_bytes, "local": node.store(ws).etag("root")})
-    return pulled, len(push_fids)
+    return pulled, pushed
+
+
+def _push(node, ws, peer, push_fids):
+    """Close one range's push set into a pile and PUT it — the mirror of a
+    pull. The responder drains on receipt, so there is no poke."""
+    with node.lock:
+        idx = node.idx(ws)
+        facts = close([node.fact_of(ws, fid) for fid in push_fids],
+                      lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or [],
+                      lambda fid: node.fact_of(ws, fid))
+        st, blobs = node.store(ws), {}
+        for f in facts:
+            for bh in families.blob_refs(f):
+                if st.has("obj/" + bh):
+                    blobs[bh] = st.get("obj/" + bh)
+        b = encode_pile(facts, blobs)
+    peer.put_pile(b)
 
 
 def _fetch_blobs(node, ws, peer):

@@ -255,9 +255,8 @@ class Node:
             m = json.loads(man)
             stream = []
             for f in m["fences"] + [m["tail"]]:
-                for oh in (f.get("annex"), f.get("page")):
-                    if oh:
-                        stream += decode_pile(st.get("obj/" + oh))[0]
+                if f.get("pile"):
+                    stream += decode_pile(st.get("obj/" + f["pile"]))[0]
             result = drain(stream, ws)
             assert result.ok, "own store failed its own kernel"
             self.materialize(ws, self.merge(ws, result.valids, result.globals)[0])

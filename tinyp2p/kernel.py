@@ -77,7 +77,7 @@ def resolve_deps(f: Fact, db):
     """Resolve refs and family needs to deterministic provider ids.
 
     ``None`` means an unmet need or unknown family.  The same resolver is used
-    during judgment and by the closure/layout paths, so annex edges are a pure
+    during judgment and by the closure/layout paths, so closure edges are a pure
     function of the accepted set.
     """
     handler = facts.handler_for(f.t)

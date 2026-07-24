@@ -4,7 +4,7 @@ Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
             "download + ingestion" number: decode every published unit
-            (annex ++ page), judge each through the kernel (parallel, own
+            (one leaf pile), judge each through the kernel (parallel, own
             scratchpads — exactly what turn() does), merge by id, then one
             layout commit. facts/s here is directly comparable to the
             2000-5000 facts/s poc-7..13 have gotten.
@@ -115,24 +115,16 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 
 def manifest_objs(store):
     man = json.loads(store.get("root"))
-    ohs = set()
-    for fen in man["fences"] + [man["tail"]]:
-        for oh in (fen.get("annex"), fen.get("page")):
-            if oh:
-                ohs.add(oh)
+    ohs = {fen["pile"] for fen in man["fences"] + [man["tail"]] if fen.get("pile")}
     return man, ohs
 
 
 def seed_units(store, man):
-    """Every published unit as the closed pile a walk would deliver:
-    annex ++ page, in that (dep-first) order."""
+    """Every published leaf pile a walk would deliver: a topo-sorted closed
+    set (in-range leaves plus their closure)."""
     for fen in man["fences"] + [man["tail"]]:
-        facts = []
-        for oh in (fen.get("annex"), fen.get("page")):
-            if oh:
-                facts += decode_pile(store.get("obj/" + oh))[0]
-        if facts:
-            yield facts
+        if fen.get("pile"):
+            yield decode_pile(store.get("obj/" + fen["pile"]))[0]
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -214,14 +206,12 @@ def reconcile(A, B, ws):
         mine = [k for k in lkeys if lo < k <= hi]
         if fen["fp"] == fingerprint(mine):
             continue  # equal fingerprint, equal range — prune
-        pageb = bstore.get("obj/" + fen["page"]) if fen.get("page") else None
-        page = decode_pile(pageb)[0] if pageb else []
-        rfids = {f.fid for f in page}
+        raw = bstore.get("obj/" + fen["pile"]) if fen.get("pile") else None
+        theirs = decode_pile(raw)[0] if raw else []
+        rfids = {f.fid for f in theirs if lo < f.key <= hi}
         if any(fid not in lfids for fid in rfids):
-            annexb = bstore.get("obj/" + fen["annex"]) if fen.get("annex") else None
-            annex = decode_pile(annexb)[0] if annexb else []
-            pull_bytes += (len(pageb) if pageb else 0) + (len(annexb) if annexb else 0)
-            pulled.append(annex + page)
+            pull_bytes += len(raw)
+            pulled.append(theirs)
         push_fids += [k.split(":", 1)[1] for k in mine
                       if k.split(":", 1)[1] not in rfids]
 
@@ -329,7 +319,7 @@ def run_bidi(scales):
 
 def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
     """Same fact set, different page size. CUT=8 (E[8] facts/page) re-ships
-    each range's membership-closure annex over and over on a full catchup;
+    each range's shared closure over and over on a full catchup;
     bigger pages amortize it, so redundancy falls and useful facts/s climbs
     toward the raw judge rate (rec/s)."""
     import tinyp2p.layout as L
@@ -361,18 +351,14 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
 
 
 def check_leaves(seed, ws):
-    """Every published unit (page ++ annex) still judges alone from empty —
+    """Every published leaf pile still judges alone from empty —
     the leaves-are-piles invariant, under whatever cut the layout used."""
     st = seed.store(ws)
     man = json.loads(st.get("root"))
     n = 0
     for fen in man["fences"] + [man["tail"]]:
-        stream = []
-        for oh in (fen.get("annex"), fen.get("page")):
-            if oh:
-                stream += decode_pile(st.get("obj/" + oh))[0]
-        if stream:
-            ok, _, _ = kernel(stream, ws)
+        if fen.get("pile"):
+            ok, _, _ = kernel(decode_pile(st.get("obj/" + fen["pile"]))[0], ws)
             assert ok, "a leaf failed the kernel"
             n += 1
     return n
