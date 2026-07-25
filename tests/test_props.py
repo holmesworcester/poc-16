@@ -18,12 +18,13 @@ from tinyp2p import cmds
 from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.crypto import keypair
 from tinyp2p.fact import Fact
+from tinyp2p.facts.auth.request import payload as request_payload
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import drain, resolve_deps
+from tinyp2p.kernel import drain, evaluate, resolve_deps
 from tinyp2p.node import Node, now_ms
 
 from .util import (
@@ -175,33 +176,73 @@ def test_failed_turn_restores_authoritative_state_before_return(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    ts = now_ms()
+    proof = request_payload(
+        node, workspace, "sync", ts + 60_000, ts)
+    node.bind_identity(workspace, founder)
+    assert evaluate(
+        proof,
+        workspace,
+        node.globals(workspace),
+        canonical_db=node.idx(workspace),
+    )
+
     old_root = node.store(workspace).etag("root")
-    original_commit = node.commit
+    store = node.store(workspace)
+    original_cas = store.cas
 
-    def fail_before_manifest(*args, **kwargs):
-        raise RuntimeError("simulated pre-manifest failure")
+    def fail_manifest_cas(*args, **kwargs):
+        raise RuntimeError("simulated pre-manifest CAS failure")
 
-    monkeypatch.setattr(node, "commit", fail_before_manifest)
-    with pytest.raises(RuntimeError, match="simulated pre-manifest failure"):
-        cmds.post(node, workspace, "general", "live retry", ts=2)
+    monkeypatch.setattr(store, "cas", fail_manifest_cas)
+    with pytest.raises(RuntimeError, match="pre-manifest CAS failure"):
+        cmds.evict(node, workspace, bob)
 
-    # The daemon may catch the error and continue serving. Before turn() gives
-    # up its lock, both local projections must already reflect the old root.
+    # The daemon catches command failures and keeps serving. Before turn()
+    # releases its lock, the old root must again govern mint, globals, and app.
     assert node.store(workspace).etag("root") == old_root
+    assert evaluate(
+        proof,
+        workspace,
+        node.globals(workspace),
+        canonical_db=node.idx(workspace),
+    )
+    assert ("removal", bob) not in node.globals(workspace)
+    assert next(
+        member for member in cmds.members(node, workspace)
+        if member["pk"] == bob
+    )["evicted"] is False
     assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts").fetchone() == (1,)
+        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (0,)
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (old_root,)
     assert node.app.execute(
-        "SELECT COUNT(*) FROM messages WHERE ws=?",
-        (workspace,)).fetchone() == (0,)
+        "SELECT root FROM projection_meta WHERE ws=?",
+        (workspace,)).fetchone() == (old_root,)
+    assert not node.idx(workspace).in_transaction
+    assert not node.app.in_transaction
     assert node.store(workspace).list("pile/")
 
-    monkeypatch.setattr(node, "commit", original_commit)
+    monkeypatch.setattr(store, "cas", original_cas)
     node.turn(workspace)
 
-    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
-        == ["live retry"]
+    assert not evaluate(
+        proof,
+        workspace,
+        node.globals(workspace),
+        canonical_db=node.idx(workspace),
+    )
+    assert ("removal", bob) in node.globals(workspace)
+    assert next(
+        member for member in cmds.members(node, workspace)
+        if member["pk"] == bob
+    )["evicted"] is True
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (1,)
     assert node.store(workspace).list("pile/") == []
     root = node.store(workspace).etag("root")
     assert node.idx(workspace).execute(
