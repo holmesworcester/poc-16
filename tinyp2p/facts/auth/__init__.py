@@ -1,7 +1,7 @@
 """Auth fact-family table of contents."""
-from . import genesis, invite, join, removal, request, signature
+from . import removal, request, signature, user, user_invite, workspace
 
-MODULES = (genesis, signature, invite, join, removal, request)
+MODULES = (workspace, signature, user_invite, user, removal, request)
 
 APP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS members(ws TEXT, pk TEXT, name TEXT, role TEXT,

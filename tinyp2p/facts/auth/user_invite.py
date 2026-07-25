@@ -1,4 +1,4 @@
-"""facts/auth/invite.py — an admin-signed bearer invitation."""
+"""facts/auth/user_invite.py — an admin-signed bearer invitation."""
 import base64
 import os
 
@@ -7,11 +7,11 @@ from ...fact import Fact, canon
 from .._commands import closer, offer_source
 from . import signature
 
-TAG = "invite"
+TAG = "user_invite"
 
 
 # SHAPE
-def invite(pk, invite_pk, ts):
+def user_invite(pk, invite_pk, ts):
     return Fact(TAG, ts, [["offer", "invitee", invite_pk]], {"pk": pk})
 
 
@@ -28,7 +28,7 @@ def validate(f, ctx):
             return False
         name, invite_pk, empty = f.offers()[0]
         return name == "invitee" and empty == "" \
-            and f == invite(f.body["pk"], invite_pk, f.ts)
+            and f == user_invite(f.body["pk"], invite_pk, f.ts)
     except Exception:
         return False
 
@@ -58,7 +58,7 @@ def make(node, workspace):
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()
     ts = now_ms()
-    item = invite(node.pk, invite_pk, ts)
+    item = user_invite(node.pk, invite_pk, ts)
     sig = signature.signature(node.sk, node.pk, item, ts)
     admin = offer_source(node, workspace, "admin", node.pk)
     with node.lock:

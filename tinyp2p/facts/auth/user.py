@@ -1,4 +1,4 @@
-"""facts/auth/join.py — invite redemption and workspace membership."""
+"""facts/auth/user.py — invite redemption and workspace membership."""
 import base64
 import json
 import urllib.request
@@ -6,13 +6,13 @@ import urllib.request
 from ...close import encode_pile
 from ...crypto import box_decrypt, h, kdf, load_sk, sign, verify
 from ...fact import Fact, from_json
-from . import invite, signature
+from . import signature, user_invite
 
-TAG = "join"
+TAG = "user"
 
 
 # SHAPE
-def join(invite_fact, invite_sk, pk, name, ts):
+def user(invite_fact, invite_sk, pk, name, ts):
     atoms = [["ref", invite_fact.ts, invite_fact.fid], ["offer", "member", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)})
@@ -75,9 +75,9 @@ def accept(node, link, name):
         f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15).read()
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
     bootstrap = [from_json(item) for item in blob["pile"]]
-    invitation = [fact for fact in bootstrap if fact.t == invite.TAG][-1]
+    invitation = [fact for fact in bootstrap if fact.t == user_invite.TAG][-1]
     ts = now_ms()
-    member = join(invitation, load_sk(blob["isk"]), node.pk, name, ts)
+    member = user(invitation, load_sk(blob["isk"]), node.pk, name, ts)
     sig = signature.signature(node.sk, node.pk, member, ts)
     node.add_workspace(workspace, name, peers=[url])
     pile = encode_pile(bootstrap + [sig, member])  # bootstrap is already closed/topo

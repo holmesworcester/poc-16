@@ -3,9 +3,9 @@ import random
 
 from tinyp2p.close import close, encode_pile
 from tinyp2p.crypto import h, keypair
-from tinyp2p.facts.auth.invite import invite
-from tinyp2p.facts.auth.join import join
 from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.auth.user import user
+from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.content.message import message
 from tinyp2p.kernel import resolve_deps
 from tinyp2p.node import Node, now_ms
@@ -15,10 +15,10 @@ def add_member(n, ws, name, ts=None):
     """Invite + join without the HTTP blob dance: returns (sk, pk, join_fact)."""
     ts = ts or now_ms()
     isk, ipk = keypair()
-    inv = invite(n.pk, ipk, ts)
+    inv = user_invite(n.pk, ipk, ts)
     si = signature(n.sk, n.pk, inv, ts)
     bsk, bpk = keypair()
-    j = join(inv, isk, bpk, name, ts)
+    j = user(inv, isk, bpk, name, ts)
     sj = signature(bsk, bpk, j, ts)
     with n.lock:
         from tinyp2p.kernel import offer_src

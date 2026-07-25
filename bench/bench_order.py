@@ -144,7 +144,7 @@ def build_orders(fids, fact_of):
     # is this join.pk (used to re-home the invite + its sig onto the member).
     parent, invben = {}, {}
     for f, fo in facts.items():
-        if fo.t == "join":
+        if fo.t == "user":
             member = fo.body.get("pk")
             rf = fo.refs()
             inv_fid = rf[0][1] if rf else None
@@ -181,9 +181,9 @@ def build_orders(fids, fact_of):
             return memo[f]
         fo = facts[f]
         memo[f] = author_of(fo)          # break cycles / default
-        if fo.t == "invite":
+        if fo.t == "user_invite":
             memo[f] = invben.get(f, author_of(fo))   # the member this invite admitted
-        elif fo.t == "sig":              # a sig's only dependent is its target
+        elif fo.t == "signature":        # a signature's only dependent is its target
             for name, target, pk in fo.offers():
                 if name == "author" and target in facts:
                     memo[f] = member_deleg(target)

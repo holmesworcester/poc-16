@@ -224,8 +224,8 @@ def test_poison_pile_is_litter_not_poison(world):
     poisons = [
         Fact("msg", now_ms(), [["offer"]], {"pk": n.pk, "chan": "c", "text": "x"}),
         Fact("msg", now_ms(), [[]], {"pk": n.pk, "chan": "c", "text": "x"}),
-        Fact("sig", now_ms(), [["offer", "author", "de", n.pk]], {}),
-        Fact("genesis", now_ms(), [["offer", "member", n.pk]], {}),
+        Fact("signature", now_ms(), [["offer", "author", "de", n.pk]], {}),
+        Fact("workspace", now_ms(), [["offer", "member", n.pk]], {}),
     ]
     for p in poisons:
         deliver(n, ws, encode_pile([p]))
@@ -241,7 +241,7 @@ def test_poison_alongside_honest(world):
     from tinyp2p.close import encode_pile
     n, ws = world
     deliver(n, ws, encode_pile(
-        [Fact("sig", now_ms(), [["offer", "author", "de", n.pk]], {})]),
+        [Fact("signature", now_ms(), [["offer", "author", "de", n.pk]], {})]),
             member="poison0poison00")
     fid = cmds.post(n, ws, "general", "survivor")  # own ingress + turn
     assert fid in all_fids(n, ws)

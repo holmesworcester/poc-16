@@ -3,9 +3,9 @@
 Family modules own authoring, materialization, and read-model queries.  This
 root module remains the small control-plane API used by the daemon and tests.
 """
-from .facts.auth.genesis import create
-from .facts.auth.invite import make as make_invite
-from .facts.auth.join import accept as join, members
+from .facts.auth.user import accept as join, members
+from .facts.auth.user_invite import make as make_invite
+from .facts.auth.workspace import create
 from .facts.auth.removal import evict
 from .facts.content.file import bytes_for as file_bytes
 from .facts.content.file import files, send as send_file

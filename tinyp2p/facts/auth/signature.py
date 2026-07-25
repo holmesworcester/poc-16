@@ -2,7 +2,7 @@
 from ...crypto import sign, verify
 from ...fact import Fact
 
-TAG = "sig"
+TAG = "signature"
 
 
 # SHAPE

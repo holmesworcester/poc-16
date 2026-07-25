@@ -3,12 +3,12 @@ import pytest
 
 from tinyp2p.crypto import keypair, sign
 from tinyp2p.fact import Fact
-from tinyp2p.facts.auth.genesis import genesis
-from tinyp2p.facts.auth.invite import invite
-from tinyp2p.facts.auth.join import join
 from tinyp2p.facts.auth.removal import removal
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.auth.user import user
+from tinyp2p.facts.auth.user_invite import user_invite
+from tinyp2p.facts.auth.workspace import workspace
 from tinyp2p.facts.content.message import message
 from tinyp2p.kernel import Global, drain, evaluate, validate
 from tinyp2p.node import now_ms
@@ -17,7 +17,7 @@ from tinyp2p.node import now_ms
 @pytest.fixture
 def anchor_chain():
     sk, pk = keypair()
-    g = genesis(sk, pk, "alice", now_ms())
+    g = workspace(sk, pk, "alice", now_ms())
     return sk, pk, g
 
 
@@ -44,7 +44,7 @@ def test_bad_sig_rejects(anchor_chain):
     ts = now_ms()
     m = message(pk, "c", "hi", ts)
     other_sk, _ = keypair()
-    forged = Fact("sig", ts, [["offer", "author", m.fid, pk]],
+    forged = Fact("signature", ts, [["offer", "author", m.fid, pk]],
                   {"sig": sign(other_sk, m.fid)})
     assert not judge([g, forged, m], g.fid)
 
@@ -61,7 +61,7 @@ def test_nonmember_rejects(anchor_chain):
 def test_unresolved_ref_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    dangling = Fact("join", ts, [["ref", ts, "f" * 64], ["offer", "member", pk]],
+    dangling = Fact("user", ts, [["ref", ts, "f" * 64], ["offer", "member", pk]],
                     {"name": "x", "pk": pk, "countersig": "00"})
     assert not judge([g, dangling], g.fid)
 
@@ -94,10 +94,10 @@ def test_evict_needs_admin(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
     isk, ipk = keypair()
-    inv = invite(pk, ipk, ts)
+    inv = user_invite(pk, ipk, ts)
     si = signature(sk, pk, inv, ts)
     bsk, bpk = keypair()
-    j = join(inv, isk, bpk, "bob", ts)
+    j = user(inv, isk, bpk, "bob", ts)
     sj = signature(bsk, bpk, j, ts)
     ev = removal(bpk, pk, ts)  # bob (mere member) tries to evict alice
     se = signature(bsk, bpk, ev, ts)

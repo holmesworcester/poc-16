@@ -64,4 +64,4 @@ def evict(node, workspace, target):
                    signature.signature(node.sk, node.pk, item, ts), role="admin")
 
 
-# QUERIES — member status is exposed by auth.join.members.
+# QUERIES — member status is exposed by auth.user.members.
