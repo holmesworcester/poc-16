@@ -11,7 +11,8 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
   - **`poc-16-808`** — simplification. The one tree engine, one kernel judge,
     pure mint, cursored pump, source-keyed projectors, and confluence laws are
     landed (`.1`–`.8`). Production settle-node placement is `.9`. Plan:
-    `docs/SIMPLIFY.md`.
+    `docs/SIMPLIFY.md`. The original signature skeletons remain on branch
+    `simplify-skeleton`.
   - **`poc-16-jbg`** — FaaS concurrency + Cloudflare Workers, coordination-free. Notes
     in `DESIGN.md` §Concurrency & FaaS and `docs/WORKSPACES.md` §9. Fat nodes and
     two-root fold are landed; current entries are `.2`, `.3`, `.7`, and the
@@ -20,6 +21,12 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
     `docs/DELETION_CLOSURE.md`. Death-key extraction is landed; P1 entries are `.2`,
     `.9`, and the publication-isolation regression `.13`; optional P2 `.5` is
     also claimable.
+  - **`poc-16-9fc`** — versioning: offers as the release interlingua, replay as
+    the upgrade. Nothing landed yet; entries are `.1` (FAMILY/VERSION constants),
+    `.5` (the `unreadable` outcome — a live bug: an unknown tag rejects a whole
+    unit, so the range never converges), and `.9`, a steer that blocks `.6`.
+    Plan: `docs/VERSIONING.md`. Model: `DESIGN.md` §Versioning. Skeletons on
+    branch `versioning-skeleton`.
   - **`poc-16-zgj`** — poc-13 auth port + chained-seed hoisting measurement.
     Closed; plan and hand-back: `docs/CHAINED_AUTH_PLAN.md` / `docs/MULTILEVEL_PILE.md`.
 
