@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 INDEX_VERSION = "family-contract-v3"
 
 
+class _CanonicalProofConflict(ValueError):
+    """The candidate merge would invalidate an accepted authority proof."""
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -189,24 +193,37 @@ class Node:
 
     def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
-        for v in valids:
-            f = v.fact
-            if not facts.handler_for(f.t).DURABLE:
-                continue  # judged, never persisted: litter drains away
-            if idx.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone() is None:
-                newfids.append(f.fid)  # what changed this drain — drives incremental layout
-            idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
-                        (f.fid, f.ts, f.t, json.dumps(f.to_json())))
-            for name, a0, a1 in f.offers():
-                idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-                            (name, a0, a1, f.fid))
-            out.append(v)
-        idx.executemany("INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
-        idx.commit()
-        if newfids:
-            shadows = self._shadows(ws, newfids)
-            self._update_proofs(ws, newfids, shadows)
-        return out, newfids
+        idx.execute("BEGIN")
+        try:
+            for v in valids:
+                f = v.fact
+                if not facts.handler_for(f.t).DURABLE:
+                    continue  # judged, never persisted: litter drains away
+                if idx.execute(
+                        "SELECT 1 FROM facts WHERE fid=?",
+                        (f.fid,)).fetchone() is None:
+                    # What changed this drain — drives incremental layout.
+                    newfids.append(f.fid)
+                idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
+                            (f.fid, f.ts, f.t, json.dumps(f.to_json())))
+                for name, a0, a1 in f.offers():
+                    idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
+                                (name, a0, a1, f.fid))
+                out.append(v)
+            idx.executemany(
+                "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
+            if newfids:
+                shadows = self._shadows(ws, newfids)
+                self._update_proofs(ws, newfids, shadows)
+            idx.commit()
+            return out, newfids
+        except _CanonicalProofConflict:
+            # A pile can be valid by itself yet introduce a canonical shadow
+            # that removes the finite proof of an already accepted fact. The
+            # whole merge batch is litter in that case: retain the prior
+            # accepted set and let turn() retire its ingress pile.
+            idx.rollback()
+            return [], []
 
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
@@ -229,9 +246,8 @@ class Node:
             self.idx(ws), lambda fid: self.fact_of(ws, fid))
         if unresolved:
             sample = ", ".join(sorted(unresolved)[:3])
-            raise ValueError(
+            raise _CanonicalProofConflict(
                 f"authority facts have no finite canonical proof: {sample}")
-        self.idx(ws).commit()
 
     def _update_proofs(self, ws, newfids, shadows):
         """Rank the ordinary append-only case without rescanning history."""
@@ -251,16 +267,20 @@ class Node:
             idx, missing, lambda fid: self.fact_of(ws, fid))
         if unresolved:
             sample = ", ".join(sorted(unresolved)[:3])
-            raise ValueError(
+            raise _CanonicalProofConflict(
                 f"authority facts have no finite canonical proof: {sample}")
-        idx.commit()
 
     def commit(self, ws, newfids=()):
         st, idx = self.store(ws), self.idx(ws)
         shadows = self._shadows(ws, newfids)
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
-        self._update_proofs(ws, newfids, shadows)
+        try:
+            self._update_proofs(ws, newfids, shadows)
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
         cache = {}
 
         def deps_of(fid):

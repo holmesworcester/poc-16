@@ -62,11 +62,21 @@ def materialize(db, workspace, valid):
 
 
 def reconcile(db, workspace, index, fact_of, valids):
-    """Project the same canonical device-key winners used by the kernel."""
-    if not any(
-            name == "device_key"
-            for valid in valids
-            for name, _, _ in valid.fact.offers()):
+    """Project the same canonical device-key winners used by the kernel.
+
+    A duplicate offer in any family forces a proof rebuild and can change an
+    existing device claim's rank, even when this batch has no new device fact.
+    """
+    offered = [
+        offer
+        for valid in valids
+        for offer in valid.fact.offers()
+    ]
+    if not any(name == "device_key" for name, _, _ in offered) \
+            and not any(index.execute(
+                "SELECT COUNT(*) FROM offers "
+                "WHERE name=? AND a0=? AND a1=?",
+                offer).fetchone()[0] > 1 for offer in offered):
         return
     rows = index.execute(
         "SELECT o.a0, o.src FROM offers o "

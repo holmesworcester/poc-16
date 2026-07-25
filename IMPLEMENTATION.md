@@ -135,7 +135,11 @@ recompute because a leaf pile depends only on its in-range fids and their
 resolved deps. A duplicate offer can change the shortest-proof winner, so a
 shadow guard (`Node._shadows`) drops the memo for that turn, recomputes proof
 ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
-only their new offer sources and keep the incremental path.
+only their new offer sources and keep the incremental path. Fact, offer,
+global, and proof writes share one SQLite transaction: if a shadow would leave
+an already accepted authority fact without a finite canonical proof, the
+candidate batch rolls back as litter and later turns continue from the intact
+workspace.
 `test_incremental_equals_full` asserts
 incremental == full at every step across promotions, a straggler, a new
 member, and an eviction; `test_shadow_guard_keeps_identity` exercises the

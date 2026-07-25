@@ -388,8 +388,8 @@ node's hash and re-invites the pull, and the closure rides down with it.
   loses to leaf-only for small pulls. A **delegation-aligned** order (invite tree
   via users, each invite+signature re-homed onto the member it admitted) changes
   semantic-subtree overhead from member-bounded to **path-bounded**: star mean
-  tax 399→35, shallow-wide 399→46, random 399→67, and a length-99 chain 399→286.
-  On that chain, depth-99/90/50 suffixes cost 397/379/212 extra facts—about four
+  tax 399→36, shallow-wide 399→48, random 399→57, and a length-99 chain 399→275.
+  On that chain, depth-99/90/50 suffixes cost 401/361/197 extra facts—about four
   auth facts per ancestor—rather than 49k/45k/25k under timestamp scatter.
   Measured in A.5.
 - Folds stay **blind and bounded** (`A` leaves + spine + the batch's rising deps;
