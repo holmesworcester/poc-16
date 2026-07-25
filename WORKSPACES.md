@@ -403,6 +403,36 @@ dependency), and no single point of contention or failure. A Durable Object stay
 *per-workspace opt-in* — for instant-fresh reads or folding-suppression on a hot workspace — but
 is **never the default**.
 
+**Structure & prior art.** With **fat B-tree Merkle nodes** — each node carrying its children's
+`(hash, fingerprint)` — the tree is self-describing and shallow (log_B N levels, ~2–3 at scale),
+so the **flat manifest is unnecessary**: walk the fat root, prune children by fingerprint, fetch
+the differing subtrees in parallel. A `Range` read of a node's fingerprint region trims bytes,
+and because one fat node holds *all* its children's fingerprints, one fetch prunes many children
+— round-trips drop too. Trade vs. the flat manifest: a 2–3-level fat walk instead of one manifest
+GET, bought with structural sharing on writes and unbounded scale (the flat manifest itself grew
+with page count); keep a cached top node as a manifest-equivalent only if single-fetch full
+catch-up matters. None of this is novel — it is the **Merkle Search Tree** (Auvolat & Taïani,
+SRDS 2019) / **prolly tree** (Noms → **Dolt**, which `bd` runs on) line: history-independent,
+content-addressed, content-defined chunking (à la **LBFS**, SOSP 2001). Reconciliation is
+**Range-Based Set Reconciliation** (Meyer 2023; Willow/Earthstar), with **Dynamo** Merkle
+anti-entropy (SOSP 2007) as the binary special case; **CPISync** (Minsky et al. 2003) and
+**IBLT / "What's the Difference?"** (Eppstein et al., SIGCOMM 2011) are the O(diff)-communication
+alternatives without ordered scans. The **static-source** enabler is baking **precomputed
+fingerprints into the immutable nodes**, so a dumb store supports a reader-driven pruned walk with
+only GETs — exactly git's **"dumb HTTP"** over a Merkle object DAG.
+
+**Consistency verdict.** The tree is a **state-based CRDT (CvRDT)**: roots form a join-semilattice
+under set-union, `merge` is the deterministic O(diff) tree-join, every update is monotone (MSTs
+are *defined* as state-based CRDTs). So we get **Strong Eventual Consistency** (Shapiro et al.):
+two participants that have observed the same set of updates hold a **bit-identical root** — "same
+state" is one hash compare — with no conflict resolution, no divergence, only staleness that
+self-heals on the next merge. The sole mutable state is a **32-byte root hash per workspace**, and
+even that is optional (state ≡ `⊔(all published roots)`, computable by anyone). Convergence is
+bounded by **anti-entropy cadence** (events/gossip/poll), not store lag. Client-tunable on top:
+**read-your-writes** (merge your write locally), **monotonic reads** (merge, never replace; track
+a watermark), and **causal** consistency free from dep-closure. Only linearizability needs a
+per-workspace serialization opt-in (DO/CAS); everything up to causal + SEC is coordination-free.
+
 What you deliberately forgo — and never need: a global total order of piles, synchronized
 delivery, or a lock. Transient divergence (lambdas mid-catch-up) is **stale, never wrong**, and
 self-heals as each absorbs the rest of the pile set.
