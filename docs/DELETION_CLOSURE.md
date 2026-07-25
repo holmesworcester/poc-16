@@ -272,6 +272,19 @@ traversal, zero SQL**, mirroring `bench/bench_sync.py` and the `hoist` prototype
    size, and report `T_supp`'s storage / write-amp overhead (~×2 index nodes;
    leaves dedup by content).
 
+**Landed proof (`tests/test_suppression_proof.py`).** The deterministic seed has
+2,001 suppression participants plus one shared authority fact. The selected
+primary-tree interval contains the deletion and one same-channel target, while
+missing twenty more same-channel targets placed at the two timestamp extremes.
+The T_supp walk returns exactly those 22 group members, separately from its
+dependency-closed, topologically ordered transport unit. An instrumented store
+asserts batched object reads remain below both a match-plus-depth bound and
+one tenth of the stored objects, with `sqlite3.connect` and the store's SQL
+surface armed to fail. A shuffled build has byte-identical root metadata.
+Separately validated deletion-only and target-only roots merge in either order
+to the full-build root; targets are live before that merge and masked after it,
+while the deletion itself remains effective.
+
 This is the literal proof the task asks for: *out-of-range deletion-offering
 facts surfaced into the closure by tree traversal alone, no database.*
 
