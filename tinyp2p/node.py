@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v4"
+INDEX_VERSION = "family-contract-v5"
 
 
 def now_ms():
@@ -130,9 +130,10 @@ class Node:
         row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
         version = self.idx(ws).execute(
             "SELECT v FROM meta WHERE k='index-version'").fetchone()
+        semantic_upgrade = version is None or version[0] != INDEX_VERSION
         if etag and (row is None or row[0] != etag
-                     or version is None or version[0] != INDEX_VERSION):
-            self.rebuild(ws)
+                     or semantic_upgrade):
+            self.rebuild(ws, republish=semantic_upgrade)
 
     def _stamp(self, ws):
         idx = self.idx(ws)
@@ -382,7 +383,7 @@ class Node:
             return self._prune_unresolved(ws), restored
         return set(), restored
 
-    def commit(self, ws, newfids=()):
+    def commit(self, ws, newfids=(), *, reuse=True):
         st, idx = self.store(ws), self.idx(ws)
         shadows = self._shadows(ws, newfids)
         # Bulk benchmark builders write the derived index directly, while the
@@ -408,7 +409,7 @@ class Node:
 
         memo = None
         prev = st.get("root")
-        if prev and not shadows and not pruned and not restored:
+        if reuse and prev and not shadows and not pruned and not restored:
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
                               deps_of, ws, self.globals(ws), memo)
@@ -484,7 +485,7 @@ class Node:
 
     # ---- rebuild: the store's own units through the same kernel --------------
 
-    def rebuild(self, ws):
+    def rebuild(self, ws, *, republish=False):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
             idx.executescript(
@@ -505,4 +506,10 @@ class Node:
             assert result.ok, "own store failed its own kernel"
             fresh = self.merge(ws, result.valids, result.globals)[0]
             self.materialize(ws, fresh)
-            self._stamp(ws)
+            if republish:
+                # A semantic index upgrade can select different canonical
+                # providers for the same fact ids. Fingerprints cover ids, not
+                # closure edges, so old fences are deliberately not memoized.
+                self.commit(ws, reuse=False)
+            else:
+                self._stamp(ws)

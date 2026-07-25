@@ -52,6 +52,15 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     laptop_secret, laptop = keypair()
     node.keychain.add_identity(laptop_secret)
     first = grant(node, workspace, user, laptop, "laptop")
+    granted = node.fact_of(workspace, first)
+    dependencies = [
+        node.fact_of(workspace, fid)
+        for fid in resolve_deps(granted, node.idx(workspace))
+    ]
+    assert {fact.t for fact in dependencies} \
+        == {"signature", "workspace", "device"}
+    assert granted.ts == next(
+        fact.ts for fact in dependencies if fact.t == "device")
     facts_after_first = node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0]
     assert grant(node, workspace, user, laptop, "laptop") == first
@@ -68,6 +77,26 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     node.bind_identity(workspace, laptop)
     fid = cmds.post(node, workspace, "general", "authored by laptop")
     assert node.fact_of(workspace, fid).body["pk"] == laptop
+
+
+def test_direct_grant_retry_after_restart_reconstructs_the_same_fact(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice")
+    bind(node, workspace, "phone")
+    user = node.pk
+    laptop_secret, laptop = keypair()
+    node.keychain.add_identity(laptop_secret)
+
+    first = grant(node, workspace, user, laptop, "laptop")
+    fact_count = node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0]
+    node.idx(workspace).close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert grant(reopened, workspace, user, laptop, "laptop") == first
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
 
 
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):

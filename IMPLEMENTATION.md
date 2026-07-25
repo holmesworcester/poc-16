@@ -47,7 +47,8 @@ closed-pile kernel. Every concrete module under `facts/auth/` or
   judgeable during upgrade and rebuild, while every new command emits only the
   current tags.
 - **NEEDS** declares normalized offer addresses. The generic resolver combines
-  them with envelope refs and chooses the canonical minimum-fid provider.
+  them with envelope refs and chooses the canonical provider by shortest
+  finite authority proof, then source id.
 - **VALIDATE** is exactly `validate(fact, context) -> bool`. Context contains
   only the immutable in-pile offer table and workspace anchor; globals, the
   node, projection databases, and waiting are unavailable.
@@ -211,19 +212,14 @@ usable for delegation chains deeper than Python's call-stack limit.
 - Not built (per the staged plan): S3 driver + presigned flow, iroh
   connector, GC/invite-TTL purge, the personal meta-workspace, deletion.
 
-**Known gap for the designer to rule on (removal ⇒ invite redemption).**
-DESIGN.md promises an invite blob is "evaluated fresh at mint (inviting admin
-since removed ⇒ refused)." Here invites are redeemed as *drained join facts*,
-and drains are globals-blind by design (history-independence), so a join whose
-inviting admin was removed after the invite was minted still confers
-membership, and that fresh member then mints normally. The only reachable
-trigger in this PoC is a founder self-eviction (the founder is the sole admin —
-there is no admin-promotion command), so it is minor. The faithful fix gates
-the *mint*, not the drain: refuse a grant when the requester's entitling edge
-traces through a removed key. That is a real policy choice — immediate-inviter
-only (refuse just the removed admin's direct invitees) vs. full-chain (removal
-cascades to everyone downstream) — which the design should settle before it is
-coded, so it is left as a flagged gap rather than a unilateral choice.
+**Deferred revocation boundary.** Request evaluation now rejects a removed
+requester and any presented membership closure signed by a removed issuer, so
+a freshly delegated user, device, or admin cannot launder a mint. Durable
+facts remain globals-blind, however: an active peer can still relay facts
+signed by an evicted identity, and removal projection currently depends on
+membership materialization order. Those broader remove-wins semantics are
+tracked in `poc-16-gxz` and `poc-16-up4`, gated by the global suppression-tree
+review in `poc-16-yez.9`; they are intentionally not claimed as solved here.
 
 ## Running it
 

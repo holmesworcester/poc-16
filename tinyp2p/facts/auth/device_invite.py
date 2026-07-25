@@ -4,8 +4,7 @@ A device-set peer names a known sibling key and immediately declares it both a
 device and workspace member. There is no bearer secret or follow-up join; the
 poc-13 two-family flow collapses to the direct-key form settled for poc-16.
 """
-from ...crypto import h
-from ...fact import Fact, canon
+from ...fact import Fact
 from .._commands import offer_source
 from . import signature
 
@@ -90,29 +89,27 @@ def grant(node, workspace, user, device_pk, label):
     """Idempotently fill one ``(workspace, admitting key, device)`` cell."""
     with node.lock:
         secret, public = node.identity(workspace)
-        # The timestamp is identity material for a Fact. Deriving it from the
-        # logical reconciliation cell makes a lost-response retry byte-for-byte
-        # identical instead of minting an unbounded series of near-duplicates.
-        ts = int(h(canon([
-            "device-grant", workspace, public, user, device_pk,
-        ]))[:12], 16)
-        item = device_invite(public, user, device_pk, label, ts)
-        if node.fact_of(workspace, item.fid) is not None:
-            return item.fid
-
-        signed = signature.signature(secret, public, item, ts)
         member = offer_source(node, workspace, "member", public)
         device_source = offer_source(
             node, workspace, "device_key", public,
             requires=(("device", user, public),))
+        if member is None or device_source is None:
+            raise ValueError("local identity is not a device-set member")
+        # Timestamps order facts but do not establish causality. Reuse the
+        # canonical device-authority fact's timestamp so this logical grant
+        # has stable bytes; refs/needs and close() carry the actual relation.
+        ts = node.fact_of(workspace, device_source).ts
+        item = device_invite(public, user, device_pk, label, ts)
+        if node.fact_of(workspace, item.fid) is not None:
+            return item.fid
+
         target_member = offer_source(
             node, workspace, "member", device_pk)
         existing = offer_source(
             node, workspace, "device_key", device_pk)
-        if member is None or device_source is None:
-            raise ValueError("local identity is not a device-set member")
         if target_member is not None or existing is not None:
             raise ValueError("device key is already enrolled")
+        signed = signature.signature(secret, public, item, ts)
         deps = {
             item.fid: [signed.fid, member, device_source],
             signed.fid: [],
