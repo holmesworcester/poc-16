@@ -15,7 +15,7 @@ import pytest
 
 from core import cmds, tree
 from core.close import close, decode_pile, encode_pile
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.fact import Fact
 from facts.auth.request import payload as request_payload
 from facts.auth.request import request
@@ -25,8 +25,9 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import Judgment, drain, evaluate, resolve_deps
 from core.node import Node, now_ms
-from core.shape import FACT
+from core.shape import FACT, SUPP, SUPP_INDEX
 
+from . import util as test_util
 from .util import (
     add_member,
     all_fids,
@@ -40,11 +41,23 @@ from .util import (
 
 
 @pytest.fixture
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
     """Alice's node with a workspace: 3 members, messages, a file, an evict."""
-    n = Node(str(tmp_path / "alice"))
-    ws = cmds.create(n, "alice")
-    t0 = now_ms()
+    # Pin identity and time so path-cost laws never depend on random partitions.
+    monkeypatch.setattr("core.node.now_ms", lambda: 2_000_000)
+    identities = iter(range(2, 10))
+
+    def keypair():
+        secret = load_sk(f"{next(identities):064x}")
+        return secret, secret.verify_key.encode().hex()
+
+    monkeypatch.setattr(test_util, "keypair", keypair)
+    n = Node(
+        str(tmp_path / "alice"),
+        initial_secret=load_sk(f"{1:064x}"),
+    )
+    ws = cmds.create(n, "alice", ts=1_000_000)
+    t0 = 1_000_010
     bsk, bpk, _ = add_member(n, ws, "bob", t0 + 1)
     csk, cpk, _ = add_member(n, ws, "carol", t0 + 2)
     rng = random.Random(16)
@@ -518,7 +531,8 @@ def test_efficient_updates(world):
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
-    assert len(objs) <= 8, f"a single post rewrote {len(objs)} objects"
+    # Two indexes rewrite two bounded paths; fact bodies remain shared.
+    assert len(objs) <= 12, f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
 
@@ -543,7 +557,12 @@ def full_manifest(n, ws):
         n.keys(ws), FACT, tree.FAT,
         lambda fid: n.fact_of(ws, fid), deps_of, emit,
     )
-    return tree.encode_root(tree.Root(view, ws, n.globals(ws)))
+    supp = tree.build(
+        n.keys(ws, SUPP), SUPP, tree.FAT,
+        lambda fid: n.fact_of(ws, fid), deps_of, emit,
+    )
+    return tree.encode_root(tree.Root(
+        view, ws, n.globals(ws), ((SUPP_INDEX, supp),)))
 
 
 def test_incremental_equals_full(tmp_path):
@@ -644,14 +663,20 @@ def test_incremental_reuses_work(world):
     facts, not the whole set — the O(changed) compute win, not just O(1) IO."""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    loads = []
-    orig = n.fact_of
+    loads, scans = [], []
+    orig, keys, backfill = n.fact_of, n.keys, n._backfill_supp
     n.fact_of = lambda w, fid: (loads.append(fid), orig(w, fid))[1]
+    n.keys = lambda *args: (scans.append("keys"), keys(*args))[1]
+    n._backfill_supp = lambda *args: (
+        scans.append("backfill"), backfill(*args))[1]
     try:
-        cmds.post(n, ws, "general", "incremental")
+        cmds.post(n, ws, "general", "incremental", ts=3_000_000)
     finally:
         n.fact_of = orig
+        n.keys = keys
+        n._backfill_supp = backfill
     assert total > 30
+    assert scans == []
     assert len(set(loads)) < total // 2, \
         f"loaded {len(set(loads))} of {total} facts — reuse isn't skipping ranges"
 

@@ -90,10 +90,17 @@ def _fat_config_version(value, mark):
 
 @dataclass(frozen=True)
 class Root:
-    """Root metadata needed by stateless readers and mint."""
+    """Atomic workspace manifest: primary view plus named secondary indexes."""
     view: View
     anchor: str
     globals_: frozenset
+    indexes: tuple = ()
+
+    def index(self, name):
+        for candidate, view in self.indexes:
+            if candidate == name:
+                return view
+        return None
 
 
 def _summary(view):
@@ -251,6 +258,8 @@ def encode_root(root):
 
     view = root.view
     if view.kind == "flat":
+        if root.indexes:
+            raise ValueError("flat root indexes")
         fences = [
             {"fp": child.fp, "hi": child.sep, "n": child.n,
              "pile": child.oid}
@@ -267,30 +276,27 @@ def encode_root(root):
             "globals": sorted([list(row) for row in root.globals_]),
             "tail": tail,
         })
-    return canon({
+    indexes = dict(root.indexes)
+    if len(indexes) != len(root.indexes) or not all(
+            isinstance(name, str) and name
+            for name in indexes):
+        raise ValueError("root indexes")
+    body = {
         "anchor": root.anchor,
         "globals": sorted([list(row) for row in root.globals_]),
         "tree": _root_tree(view),
-        "v": 1,
-    })
+        "v": 2 if indexes else 1,
+    }
+    if indexes:
+        body["indexes"] = {
+            name: _root_tree(indexes[name])
+            for name in sorted(indexes)
+        }
+    return canon(body)
 
 
-def decode_root(raw):
-    """Decode either the engine root or the legacy-compatible flat manifest."""
-    obj = json.loads(raw)
-    globals_ = frozenset(tuple(row) for row in obj.get("globals", ()))
-    if "tree" not in obj:
-        children = [
-            View(fence["fp"], fence["pile"], fence["hi"], fence["n"], ())
-            for fence in obj.get("fences", ())
-        ]
-        tail = obj.get("tail", {})
-        if tail.get("pile"):
-            children.append(View(
-                tail["fp"], tail["pile"], "~", tail["n"], ()))
-        view = _flat_view(children, len(obj.get("fences", ())))
-        return Root(view, obj["anchor"], globals_)
-    view = _from_root_tree(obj["tree"])
+def _decode_root_tree(obj):
+    view = _from_root_tree(obj)
     if view.kind == "fat":
         version = _fat_config_version(view.config, view.mark)
         if view.level:
@@ -301,7 +307,40 @@ def decode_root(raw):
                 or view.oid != h(b"") or view.sep \
                 or view.pay or view.pn:
             raise ValueError("tree node shape")
-    return Root(view, obj["anchor"], globals_)
+    return view
+
+
+def decode_root(raw):
+    """Decode either the engine root or the legacy-compatible flat manifest."""
+    obj = json.loads(raw)
+    globals_ = frozenset(tuple(row) for row in obj.get("globals", ()))
+    if "tree" not in obj:
+        if obj.get("indexes"):
+            raise ValueError("flat root indexes")
+        children = [
+            View(fence["fp"], fence["pile"], fence["hi"], fence["n"], ())
+            for fence in obj.get("fences", ())
+        ]
+        tail = obj.get("tail", {})
+        if tail.get("pile"):
+            children.append(View(
+                tail["fp"], tail["pile"], "~", tail["n"], ()))
+        view = _flat_view(children, len(obj.get("fences", ())))
+        return Root(view, obj["anchor"], globals_)
+    encoded_indexes = obj.get("indexes", {})
+    if not isinstance(encoded_indexes, dict) or not all(
+            isinstance(name, str) and name
+            and isinstance(encoded, dict)
+            for name, encoded in encoded_indexes.items()):
+        raise ValueError("root indexes")
+    if obj.get("v") != (2 if encoded_indexes else 1):
+        raise ValueError("root version")
+    indexes = tuple(
+        (name, _decode_root_tree(encoded_indexes[name]))
+        for name in sorted(encoded_indexes)
+    )
+    return Root(
+        _decode_root_tree(obj["tree"]), obj["anchor"], globals_, indexes)
 
 
 def _emit(raw, emit):

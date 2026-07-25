@@ -95,7 +95,7 @@ def walk(node, ws, url):
 
 
 def _push(node, ws, peer, push_fids):
-    """Close one range's push set into a pile and PUT it — the mirror of a
+    """Close one dial's push set into a pile and PUT it — the mirror of a
     pull. The responder drains on receipt, so there is no poke."""
     with node.lock:
         idx = node.idx(ws)
@@ -109,6 +109,7 @@ def _push(node, ws, peer, push_fids):
                     blobs[bh] = st.get("obj/" + bh)
         b = encode_pile(facts, blobs)
     peer.put_pile(b)
+    return tuple(fact.fid for fact in facts)
 
 
 def _fetch_blobs(node, ws, peer):

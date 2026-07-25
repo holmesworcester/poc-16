@@ -3,7 +3,7 @@
 One serial loop — turn() — is the only mutator of a workspace:
 
     drain piles -> kernel each (parallel, own scratchpads) -> merge valid/globals
-    -> spill blobs -> commit (pure tree fold -> put objects -> CAS root)
+    -> spill blobs -> commit (pure index folds -> put objects -> CAS manifest)
     -> pump projection log -> retire piles
 
 Everything enters through a pile: local commands, pulled units, pushed
@@ -41,7 +41,7 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import FACT, key_parts
+from .shape import FACT, SUPP, SUPP_INDEX, key_parts
 from .store import FsStore
 from .suppression import victims
 
@@ -51,11 +51,12 @@ CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
+CREATE TABLE IF NOT EXISTS supp(fid TEXT PRIMARY KEY, k TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v11-shared-fact-bodies"
+INDEX_VERSION = "family-contract-v12-suppression-root"
 APP_VERSION = 3
 
 
@@ -182,7 +183,20 @@ class Node:
             idx.rollback()
             raise
 
-    def commit_index(self, ws):
+    def _backfill_supp(self, ws):
+        """Index direct/bulk fact-table writes that bypass :meth:`merge`."""
+        idx = self.idx(ws)
+        missing = idx.execute(
+            "SELECT f.fid, f.j FROM facts f "
+            "LEFT JOIN supp s ON s.fid=f.fid WHERE s.fid IS NULL"
+        ).fetchall()
+        idx.executemany(
+            "INSERT INTO supp VALUES(?,?)",
+            ((fid, SUPP.key(from_json(json.loads(raw))))
+             for fid, raw in missing),
+        )
+
+    def commit_index(self, ws, *, backfill=True):
         """Commit direct derived-index writes as ahead of the manifest.
 
         The live merge path and bulk benchmark builders share this boundary so
@@ -191,6 +205,8 @@ class Node:
         """
         idx = self.idx(ws)
         try:
+            if backfill:
+                self._backfill_supp(ws)
             idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
         except Exception:
@@ -201,9 +217,22 @@ class Node:
         row = self.idx(ws).execute("SELECT j FROM facts WHERE fid=?", (fid,)).fetchone()
         return from_json(json.loads(row[0])) if row else None
 
-    def keys(self, ws):
-        return [key_parts(ts, fid) for ts, fid in
-                self.idx(ws).execute("SELECT ts, fid FROM facts ORDER BY ts, fid")]
+    def keys(self, ws, projection=FACT):
+        if projection is FACT:
+            return [
+                key_parts(ts, fid) for ts, fid in
+                self.idx(ws).execute(
+                    "SELECT ts, fid FROM facts ORDER BY ts, fid")
+            ]
+        if projection is SUPP:
+            return [
+                key for (key,) in self.idx(ws).execute(
+                    "SELECT k FROM supp WHERE k IS NOT NULL ORDER BY k")
+            ]
+        return sorted(filter(None, (
+            projection.key(self.fact_of(ws, fid))
+            for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
+        )))
 
     def globals(self, ws):
         return frozenset(self.idx(ws).execute(
@@ -344,6 +373,9 @@ class Node:
                     newfids.append(f.fid)
                 idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
                             (f.fid, f.ts, f.t, json.dumps(f.to_json())))
+                idx.execute(
+                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                    (f.fid, SUPP.key(f)))
                 for name, a0, a1 in f.offers():
                     idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                                 (name, a0, a1, f.fid))
@@ -443,6 +475,9 @@ class Node:
             idx.execute(
                 "INSERT INTO facts VALUES(?,?,?,?)",
                 (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
+            idx.execute(
+                "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                (fact.fid, SUPP.key(fact)))
             for name, a0, a1 in fact.offers():
                 idx.execute(
                     "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
@@ -476,6 +511,9 @@ class Node:
                 ((fid,) for fid in unresolved))
             idx.executemany(
                 "DELETE FROM proofs WHERE fid=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
+                "DELETE FROM supp WHERE fid=?",
                 ((fid,) for fid in unresolved))
             idx.executemany(
                 "DELETE FROM facts WHERE fid=?",
@@ -532,8 +570,8 @@ class Node:
                     set(pruned) - restored, True)
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
-            # Also covers supported direct/bulk writers which bypass merge().
-            self.commit_index(ws)
+            # merge() and the direct/bulk boundary have already indexed keys.
+            self.commit_index(ws, backfill=False)
             if restored:
                 self._invalidate_sync_cache(ws)
         except Exception:
@@ -558,30 +596,42 @@ class Node:
         previous = tree.decode_root(prev) if prev else None
         if previous is not None and previous.anchor != ws:
             raise ValueError("root anchor")
-        prior = previous.view if previous else None
+        stable = reuse and not shadows and not pruned and not restored
+        fetch = lambda oid: st.get("obj/" + oid)
+        fact_of = lambda fid: self.fact_of(ws, fid)
+
+        def layout(old, count, keys, delta, projection):
+            if stable and old is not None \
+                    and old.kind == tree.FAT.kind \
+                    and old.config == tree.config(tree.FAT, projection) \
+                    and old.n + len(delta) == count:
+                return tree.fold(
+                    old, delta, projection, tree.FAT,
+                    fact_of, deps_of, fetch, emit,
+                )
+            return tree.build(
+                keys(), projection, tree.FAT,
+                fact_of, deps_of, emit,
+            )
+
+        newfacts = [fact_of(fid) for fid in newfids]
         fact_count = idx.execute(
             "SELECT COUNT(*) FROM facts").fetchone()[0]
-        incremental = reuse and prior is not None \
-            and prior.kind == tree.FAT.kind \
-            and prior.config == tree.config(tree.FAT, FACT) \
-            and prior.n + len(newfids) == fact_count \
-            and not shadows and not pruned and not restored
-        if incremental:
-            delta = [
-                key_parts(self.fact_of(ws, fid).ts, fid)
-                for fid in newfids
-            ]
-            view = tree.fold(
-                prior, delta, FACT, tree.FAT,
-                lambda fid: self.fact_of(ws, fid), deps_of,
-                lambda oid: st.get("obj/" + oid), emit,
-            )
-        else:
-            view = tree.build(
-                self.keys(ws), FACT, tree.FAT,
-                lambda fid: self.fact_of(ws, fid), deps_of, emit,
-            )
-        root = tree.encode_root(tree.Root(view, ws, self.globals(ws)))
+        supp_count = idx.execute(
+            "SELECT COUNT(k) FROM supp").fetchone()[0]
+        view = layout(
+            previous.view if previous else None,
+            fact_count, lambda: self.keys(ws),
+            [FACT.key(fact) for fact in newfacts], FACT,
+        )
+        supp = layout(
+            previous.index(SUPP_INDEX) if previous else None,
+            supp_count, lambda: self.keys(ws, SUPP),
+            [key for fact in newfacts if (key := SUPP.key(fact))],
+            SUPP,
+        )
+        root = tree.encode_root(tree.Root(
+            view, ws, self.globals(ws), ((SUPP_INDEX, supp),)))
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
         self._stamp(ws)
@@ -631,6 +681,8 @@ class Node:
                 root = tree.decode_root(man)
                 if root.anchor != ws:
                     raise ValueError("root anchor")
+                if any(name != SUPP_INDEX for name, _ in root.indexes):
+                    raise ValueError("root indexes")
                 fetch = lambda oid: st.get("obj/" + oid)
                 try:
                     stream = list(tree.validate_view(
@@ -641,13 +693,30 @@ class Node:
                 committed = {fact.fid for fact in stream}
                 if ws not in committed:
                     raise ValueError("tree fact set")
+                supp = root.index(SUPP_INDEX)
+                if supp is not None:
+                    try:
+                        supp_stream = tree.validate_view(
+                            supp, SUPP, tree.FAT, fetch)
+                        supp_keys = tree.leaf_keys(supp, fetch, SUPP)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"invalid suppression tree: {exc}") from exc
+                    expected = sorted(filter(None, (
+                        SUPP.key(fact) for fact in stream
+                    )))
+                    if supp_keys != expected or any(
+                            fact.fid not in committed
+                            for fact in supp_stream):
+                        raise ValueError("suppression tree fact set")
                 result = drain_committed(
                     stream, ws, root.globals_)
                 if not result.ok:
                     raise ValueError("invalid tree facts")
             idx.execute("BEGIN")
             try:
-                for table in ("facts", "offers", "proofs", "globals"):
+                for table in (
+                        "facts", "offers", "proofs", "supp", "globals"):
                     idx.execute(f"DELETE FROM {table}")
                 idx.execute("DROP TABLE IF EXISTS log")
                 idx.execute(LOG_SCHEMA)

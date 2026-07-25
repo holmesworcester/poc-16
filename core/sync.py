@@ -2,14 +2,24 @@
 from . import tree
 from .close import encode_pile
 from .crypto import h
-from .shape import FACT
+from .shape import FACT, SUPP, SUPP_INDEX
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
 
 
-def _empty():
+def _empty(shape):
     return tree.View(
-        FACT.fingerprint([]), h(b""), "", 0, (), kind="flat")
+        shape.fingerprint([]), h(b""), "", 0, (), kind="flat")
+
+
+def _union(units):
+    """Deduplicate closed topological streams without disturbing their order."""
+    out, seen = [], set()
+    for fact in (fact for unit in units for fact in unit):
+        if fact.fid not in seen:
+            seen.add(fact.fid)
+            out.append(fact)
+    return tuple(out)
 
 
 def sync(node, ws, url):
@@ -30,8 +40,25 @@ def sync(node, ws, url):
     other = tree.decode_root(remote_root) if remote_root else None
     if any(root.anchor != ws for root in (local, other) if root):
         raise ValueError("root anchor")
-    mine = local.view if local else _empty()
-    theirs = other.view if other else _empty()
+    if any(
+            name != SUPP_INDEX
+            for root in (local, other) if root
+            for name, _ in root.indexes):
+        raise ValueError("root indexes")
+    local_supp = local.index(SUPP_INDEX) if local else None
+    remote_supp = other.index(SUPP_INDEX) if other else None
+    indexes = (
+        (
+            SUPP,
+            local_supp or _empty(SUPP),
+            remote_supp or _empty(SUPP),
+        ),
+        (
+            FACT,
+            local.view if local else _empty(FACT),
+            other.view if other else _empty(FACT),
+        ),
+    )
 
     remote_objects = {}
 
@@ -51,32 +78,43 @@ def sync(node, ws, url):
 
     fetch_remote.many = fetch_many
     fetch_local = lambda oid: node.store(ws).get("obj/" + oid)
-    pull_ranges, missing_fids, pushed_fids = [], set(), set()
-    for lo, hi, my_keys, their_leaf in tree.diff(
-            mine, theirs, FACT, fetch_local, fetch_remote):
-        their_keys = set(tree.range_keys(
-            their_leaf, lo, hi, FACT, fetch_remote))
-        mine_keys = set(my_keys)
-        missing = {FACT.fid_of(key) for key in their_keys - mine_keys}
-        if missing:
-            pull_ranges.append((lo, hi))
-            missing_fids.update(missing)
-        outgoing = [
-            FACT.fid_of(key) for key in mine_keys - their_keys
-            if FACT.fid_of(key) not in pushed_fids
-        ]
-        if outgoing:
-            push(node, ws, peer, outgoing)
-            pushed_fids.update(outgoing)
-            retag = None
+    pull_units, pushed_fids = [], set()
+    for projection, mine, theirs in indexes:
+        pull_ranges, missing_fids = [], set()
+        for lo, hi, my_keys, their_leaf in tree.diff(
+                mine, theirs, projection, fetch_local, fetch_remote):
+            their_keys = set(tree.range_keys(
+                their_leaf, lo, hi, projection, fetch_remote))
+            mine_keys = set(my_keys)
+            missing = {
+                projection.fid_of(key)
+                for key in their_keys - mine_keys
+            }
+            if missing:
+                pull_ranges.append((lo, hi))
+                missing_fids.update(missing)
+            local_only = {
+                projection.fid_of(key)
+                for key in mine_keys - their_keys
+            }
+            pushed_fids.update(local_only)
+        if pull_ranges:
+            stream = tree.range_facts(
+                theirs, pull_ranges, fetch_remote, projection)
+            if not missing_fids.issubset(
+                    fact.fid for fact in stream):
+                raise ValueError("remote range is missing committed facts")
+            pull_units.append(stream)
+
+    if pushed_fids:
+        sent = set(push(node, ws, peer, sorted(pushed_fids)))
+        if not pushed_fids <= sent:
+            raise ValueError("local range is missing committed facts")
+        retag = None
 
     pulled = 0
-    if pull_ranges:
-        stream = tree.range_facts(
-            theirs, pull_ranges, fetch_remote, FACT)
-        if not missing_fids.issubset(
-                fact.fid for fact in stream):
-            raise ValueError("remote range is missing committed facts")
+    if pull_units:
+        stream = _union(pull_units)
         raw = encode_pile(stream)
         pull(node, ws, h(raw), raw)
         pulled = 1
@@ -97,5 +135,5 @@ def pull(node, ws, oid, raw):
 
 
 def push(node, ws, peer, fids):
-    """Close one range's local-only facts and deliver it."""
-    _push(node, ws, peer, fids)
+    """Close this dial's local-only union and deliver it once."""
+    return _push(node, ws, peer, fids)

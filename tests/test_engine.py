@@ -9,13 +9,13 @@ import pytest
 
 from core import hoist, layout, shape, sync as sync_module, treap, tree
 from core import cmds
-from core.close import close, encode_pile
+from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact, canon
 from facts.auth.signature import signature
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
-from core.kernel import Scratchpad, resolve_deps
+from core.kernel import Scratchpad, drain, resolve_deps
 from core.node import Node
 from core.suppression import (
     atom, close_deletions, deathkey, is_deletion, supp_walk, suppkey,
@@ -213,6 +213,37 @@ def test_fat_root_is_self_describing_and_shallow(engine_world):
     wire["tree"]["c"][0]["f"] = "forged"
     with pytest.raises(ValueError, match="tree"):
         tree.decode_root(canon(wire))
+
+
+def test_root_round_trips_named_secondary_indexes():
+    participants = [
+        Fact("sample", ts, [atom("group")], {"ordinal": ts})
+        for ts in range(3)
+    ]
+    items = {fact.fid: fact for fact in participants}
+    driver = Driver()
+    primary = tree.build(
+        [fact.key for fact in participants],
+        shape.FACT, tree.fat(2), items.__getitem__,
+        lambda fid: (), driver.emit,
+    )
+    secondary = tree.build(
+        [shape.SUPP.key(fact) for fact in participants],
+        shape.SUPP, tree.fat(2), items.__getitem__,
+        lambda fid: (), driver.emit,
+    )
+
+    encoded = tree.encode_root(tree.Root(
+        primary, "workspace", frozenset(),
+        ((shape.SUPP_INDEX, secondary),)))
+    decoded = tree.decode_root(encoded)
+
+    assert json.loads(encoded)["v"] == 2
+    assert decoded.index("absent") is None
+    assert tree.leaf_keys(
+        decoded.index(shape.SUPP_INDEX), driver.fetch, shape.SUPP
+    ) == sorted(shape.SUPP.key(fact) for fact in participants)
+    assert tree.encode_root(decoded) == encoded
 
 
 def test_v3_decoder_uses_node_validation_at_every_level(engine_world):
@@ -1151,6 +1182,63 @@ def test_fat_fold_matches_full_build_for_dependent_stragglers(
 
 # ---- closure-only secondary-index adapter (poc-16-yez.15) -------------------
 
+def test_node_publishes_one_atomic_primary_and_suppression_manifest(
+        tmp_path, monkeypatch):
+    node, workspace, _, _ = suppression_world(
+        tmp_path / "node", monkeypatch)
+    store = node.store(workspace)
+    root = tree.decode_root(store.get("root"))
+    fetch = lambda oid: store.get("obj/" + oid)
+    supp = root.index(shape.SUPP_INDEX)
+    expected = node.keys(workspace, shape.SUPP)
+
+    assert supp is not None
+    stream = tree.validate_view(
+        supp, shape.SUPP, tree.FAT, fetch)
+    body_oids = {
+        h(canon(fact.to_json())) for fact in stream
+    }
+
+    assert tree.leaf_keys(supp, fetch, shape.SUPP) == expected
+    assert body_oids <= (
+        tree.live_oids(root.view, fetch)
+        & tree.live_oids(supp, fetch)
+    )
+
+
+def test_rebuild_rejects_a_suppression_root_that_omits_a_participant(
+        tmp_path, monkeypatch):
+    node, workspace, _, _ = suppression_world(
+        tmp_path / "node", monkeypatch)
+    store = node.store(workspace)
+    root = tree.decode_root(store.get("root"))
+    idx = node.idx(workspace)
+    items = {
+        fid: node.fact_of(workspace, fid)
+        for fid in all_fids(node, workspace)
+    }
+    deps = {
+        fid: tuple(resolve_deps(fact, idx) or ())
+        for fid, fact in items.items()
+    }
+    keys = node.keys(workspace, shape.SUPP)
+
+    def emit(raw):
+        oid = h(raw)
+        store.put("obj/" + oid, raw)
+        return oid
+
+    incomplete = tree.build(
+        keys[:-1], shape.SUPP, tree.FAT,
+        items.__getitem__, deps.__getitem__, emit,
+    )
+    store.put("root", tree.encode_root(replace(
+        root, indexes=((shape.SUPP_INDEX, incomplete),))))
+
+    with pytest.raises(ValueError, match="suppression tree fact set"):
+        node.rebuild(workspace)
+
+
 def test_secondary_paths_include_and_validate_closure_only_facts(
         tmp_path, monkeypatch):
     items, deps, secondary, keys = suppression_tree_world(
@@ -1533,8 +1621,9 @@ def test_fact_body_refs_reject_missing_or_corrupt_objects(body):
         tree.facts(cold(root), fetch, shape.FACT)
 
 
+@pytest.mark.parametrize("primary_walk", (True, False))
 def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, primary_walk):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice")
     destination = Node(str(tmp_path / "destination"))
@@ -1549,6 +1638,16 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
             ts=source.fact_of(workspace, workspace).ts + ordinal + 1,
         )
     individual, batches = [], []
+    actual_diff, walked = tree.diff, []
+
+    def selected_diff(*args, **kwargs):
+        projection = args[2]
+        walked.append(projection)
+        if not primary_walk and projection is shape.FACT:
+            return iter(())
+        return actual_diff(*args, **kwargs)
+
+    monkeypatch.setattr(tree, "diff", selected_diff)
 
     class LocalPeer:
         def __init__(self, node, ws, url):
@@ -1580,6 +1679,7 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
         destination, workspace, "local://source")
 
     assert (pulled, pushed) == (1, 0)
+    assert walked == [shape.SUPP, shape.FACT]
     body_oids = {
         h(canon(source.fact_of(workspace, fid).to_json()))
         for fid in all_fids(source, workspace)
@@ -1587,6 +1687,62 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
     assert batches
     assert body_oids.isdisjoint(individual)
     assert all_fids(destination, workspace) == all_fids(source, workspace)
+    assert destination.store(workspace).get("root") \
+        == source.store(workspace).get("root")
+
+
+def test_sync_deduplicates_closure_facts_across_index_pushes(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    destination = Node(str(tmp_path / "destination"))
+    deliver(
+        destination, workspace,
+        closed_subset(source, workspace, [workspace]),
+    )
+    destination.turn(workspace)
+    for ordinal in range(3):
+        cmds.post(
+            source, workspace, "general", f"message {ordinal}",
+            ts=10 + ordinal,
+        )
+    before = set(all_fids(destination, workspace))
+    piles = []
+
+    class LocalPeer:
+        def __init__(self, node, ws, url):
+            self.node, self.ws = node, ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            raw = destination.store(self.ws).get("root")
+            return raw, destination.store(self.ws).etag("root")
+
+        def obj(self, oid):
+            return destination.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+        def put_pile(self, raw):
+            piles.append(decode_pile(raw)[0])
+            deliver(destination, self.ws, raw)
+            destination.turn(self.ws)
+
+    monkeypatch.setattr(sync_module, "Peer", LocalPeer)
+    pulled, pushed = sync_module.sync(
+        source, workspace, "local://destination")
+
+    seen = set()
+    for unit in piles:
+        fids = {fact.fid for fact in unit}
+        assert drain(unit, workspace).ok
+        assert seen.isdisjoint(fids)
+        seen.update(fids)
+
+    assert pulled == 0
+    assert pushed == len(set(all_fids(source, workspace)) - before)
+    assert len(piles) == 1
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")
 

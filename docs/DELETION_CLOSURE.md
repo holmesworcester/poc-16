@@ -109,6 +109,10 @@ see the facts a node already has; **syncing the index is *how* out-of-range fact
 surface**. Every consumer runs the *same* `T_supp` augmentation at its own call
 site:
 
+- **Landed publication/sync seam.** Root wire v2 carries `T_supp` as the named
+  `supp` index beside the primary view; one manifest CAS publishes both. The
+  ordinary sync driver walks `supp` first and `T_fact` second, unions their
+  closed streams into one ingress pile, and deduplicates pushes by fact id.
 - **Sync walk** — reconcile `T_supp`'s root like `T_fact`'s; pulling a differing
   leaf pulls the co-resident deletion+targets, so ordinary sync surfaces matches.
 - **Kernel / validation** — resolve a **suppression closure edge**: for a fact

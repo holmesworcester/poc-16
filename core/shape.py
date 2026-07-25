@@ -135,6 +135,7 @@ def _supp_key(fact):
 SUPP = Shape(
     _supp_key, fid_of, boundary, priority, fingerprint,
     stable_cut_positions, leaf_cut)
+SUPP_INDEX = "supp"
 
 
 def supp_shape():
