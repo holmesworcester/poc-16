@@ -1,4 +1,4 @@
-"""Acceptance laws for the stateless mint (SIMPLIFY.md §4)."""
+"""Acceptance laws for the pure mint (SIMPLIFY.md §4)."""
 import base64
 import inspect
 
@@ -143,10 +143,9 @@ def test_mint_writes_nothing(world):
     assert after == before
 
 
-def test_stateless_mint_from_root_only(world):
-    """The λ path: mint from (root bytes, pile) alone — anchor + globals via
-    mint.root_globals (they ride the root node after jbg.1); no app.db is
-    ever built."""
+def test_conflict_free_mint_uses_root_metadata_without_app(world):
+    """Root metadata is enough only without a committed authority conflict;
+    even that path never builds app.db."""
     node, workspace, now, _, pile = world
     root = node.store(workspace).get("root")
     node.idx(workspace).close()

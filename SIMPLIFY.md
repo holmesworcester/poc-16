@@ -1,18 +1,21 @@
 # Simplification plan — one engine, one kernel, mint = evaluate, cursored pump
 
-**Status:** plan (2026-07-24). Tracked by a bead epic — see `bd dep tree` for the
-epic naming this doc. Companion to `TREAP_PROTOTYPE.md` (cost model),
+**Status (2026-07-25):** stages S1–S7 landed on the integration line: one
+parameterized tree engine, one kernel judge, pure mint, cursored pump,
+source-keyed projectors, the confluence suite, and design foldback. Production
+settle-node placement remains `poc-16-808.9`. Companion to
+`TREAP_PROTOTYPE.md` (cost model),
 `MULTILEVEL_PILE.md` (hoisting), `DELETION_CLOSURE.md` (suppression treap),
-`DESIGN.md` §Concurrency & FaaS (fat nodes, non-serialized roots). Plan only —
-each bead names its section here.
+`DESIGN.md` §Concurrency & FaaS (fat nodes, non-serialized roots).
 
-**Skeletons:** branch `simplify-skeleton` holds stub modules
+**Historical skeleton:** branch `simplify-skeleton` preserves the original stub
+modules
 (`tinyp2p/shape.py`, `tree.py`, `sync.py`, `mint.py`, `pump.py`, plus
 `kernel.Scratchpad` and `store.RemoteStore` stubs) and skip-marked acceptance
 tests (`tests/test_engine.py`, `test_eset.py`, `test_mint.py`,
-`test_pump.py`) — final names, signatures, laws, and test names, bodies
-unwritten. Implementing a bead = replacing its `NotImplementedError` bodies
-and unskipping its test section; the suite stays green throughout.
+`test_pump.py`). The integration line replaces those bodies. The sole
+skip-marked gate-mask test belongs to the pending `poc-16-yez.9` decision, not
+the simplification suite.
 
 The thesis: the codebase already contains ONE recursion written five times, and
 two more copies are scheduled (fat-node fold, T_supp walk). Extract the engine
@@ -166,9 +169,10 @@ mint(pile) = decode → evaluate(pile, anchor, globals ∪ {("now", now_ms())})
   `evaluate`. Rule: a mint pile contains exactly one `DURABLE=False` fact.
 - The challenge is already ephemeral (never persisted); replay is harmless
   because the grant is sealed to the requester's pk.
-- Stateless Worker/λ mint = GET root (anchor + globals ride it, §2) →
-  `evaluate` → presign. **The λ never builds app.db** — kernel + tree + gate is
-  its entire world, which is what licenses §5 being a leaf-client concern.
+- A peer passes its root-stamped canonical offer/proof view into `evaluate`, so
+  omitted incompatible authority winners cannot revive quarantined chains.
+  A Worker/λ must derive the equivalent view from the root/tree before
+  presigning. **Neither path reads app.db**; §5 remains a leaf-client concern.
 - gxz (evicted-signer relay by an active member): the candidate seam is the
   gate mask — screen the *whole submitted closure* against S at mint/ingress,
   not just the requester — plus suppression of post-removal authority via the
@@ -206,10 +210,11 @@ fold±(delivery order over D) = fold(canonical order over E)      (the theorem)
   target's join). Fix inside the contract: insert-only removals row + a view
   for the `evicted` display flag. That flag is member display data, not fact
   suppression — S never lives in app.db.
-- **Rebuild** is the clean side of the theorem: replay computes S first (it's
-  in T_supp / the root), folds over E in canonical order, zero retractions
-  fire. Live nodes fold over D with occasional `−` events. The equivalence is
-  the headline property test.
+- **Rebuild** is the clean side of the theorem: today it scans valid
+  single-target deletion facts to compute S first, folds over E in canonical
+  order, and fires zero retractions. Synced T_supp replaces that scan later.
+  Live nodes fold over D with occasional `−` events. The equivalence is the
+  headline property test.
 
 ## 6. Tests
 

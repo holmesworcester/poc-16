@@ -1,5 +1,11 @@
 # Blind incremental tree update — cost analysis + prototype
 
+**Status (2026-07-25): absorbed by the engine.** The cost floor and
+measurements remain the design record; `tinyp2p/tree.py` now implements the
+sans-I/O fold once for binary, flat-compatibility, and production fat
+packings. `tinyp2p/treap.py` is a golden compatibility façade, not a second
+production engine.
+
 Branch `treap-merkle-prototype`. Prototype: `tinyp2p/treap.py`; measurement:
 `bench/bench_treap.py`. This note shows, with a cost model and a lower-bound
 argument backed by measurement, that folding incoming piles into the tree

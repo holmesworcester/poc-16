@@ -1,5 +1,11 @@
 # The multi-level pile — hoisting closure up the tree
 
+**Status (2026-07-25): absorbed by the engine.** The placement math and
+measurements remain authoritative. `tinyp2p/tree.py` owns the tree walk and
+`kernel.Scratchpad` owns verify-once path context; the old `hoist.py` judge is
+only a compatibility/measurement façade. Production settle-node payload
+placement is the remaining `poc-16-808.9` step.
+
 Companion to `TREAP_PROTOTYPE.md`. The prototype stores a **closed pile at every
 leaf**: leaf `ℓ`'s object carries `C(ℓ) = closure(K(ℓ))`, its in-range facts plus
 their full dependency closure. A fact needed by `k` leaves is therefore stored

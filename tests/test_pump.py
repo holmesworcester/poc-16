@@ -449,8 +449,7 @@ def test_removal_join_confluence(tmp_path):
 
 def test_fold_pm_over_d_equals_fold_over_e(tmp_path, monkeypatch):
     """Live: fold± over random delivery orders of D. Rebuild: fold over E in
-    canonical order. Identical app.db (dump compare), for every world in the
-    suppression corpus."""
+    canonical order. Identical logical app state for every suppression world."""
     source, workspace, _, _ = suppression_world(
         tmp_path / "source", monkeypatch)
     expected = projection_state(source)
@@ -463,8 +462,7 @@ def test_fold_pm_over_d_equals_fold_over_e(tmp_path, monkeypatch):
 
 
 def test_rebuild_fires_zero_retractions(tmp_path, monkeypatch):
-    """Replay computes S first (T_supp / the root), folds over E: the '−'
-    path never runs; the retraction counter stays 0."""
+    """Replay scans valid deletions for S first, then folds E without '−'."""
     import tinyp2p.pump as pump_module
 
     node, workspace, targets, _ = suppression_world(

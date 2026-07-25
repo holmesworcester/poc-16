@@ -1,13 +1,13 @@
-"""PLAN SKELETON (poc-16-808.5/.6, stages S4–S5) — read models as a cursored
-pure fold. SIMPLIFY.md §5.
+"""Read models as a cursored pure fold (SIMPLIFY.md §5).
 
     app.db = fold(step, ∅, log)      exactly-once, resumable, order-robust
     fold±(delivery order over D) == fold(canonical order over E)   THE theorem
                                                        (tests/test_pump.py)
 
 The λ path never touches this module: read models are a leaf-client concern.
-Rebuild is the clean side of the theorem: replay computes S first (T_supp /
-the root), folds over E in canonical order, and zero retractions fire.
+Rebuild is the clean side of the theorem: replay computes today's
+single-target S from valid deletion facts first, folds over E in canonical
+order, and fires zero retractions. The synced T_supp replaces that scan later.
 """
 from . import facts
 from .close import close

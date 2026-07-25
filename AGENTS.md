@@ -8,30 +8,33 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
   `MODEL.md` + `DESIGN.md` (the passive-store RBSR + hoisting core). `MULTILEVEL_PILE.md`
   has the hoisting math + measurements.
 - **Current epics** (`bd ready` for the claimable frontier):
-  - **`poc-16-zgj`** — port poc-13 auth + test hoisting on chained seeds. Plan:
-    `CHAINED_AUTH_PLAN.md`. (Phases 0–3 landed; only the hand-back bead remains.)
+  - **`poc-16-808`** — simplification. The one tree engine, one kernel judge,
+    pure mint, cursored pump, source-keyed projectors, and confluence laws are
+    landed (`.1`–`.8`). Production settle-node placement is `.9`. Plan:
+    `SIMPLIFY.md`.
   - **`poc-16-jbg`** — FaaS concurrency + Cloudflare Workers, coordination-free. Notes
-    in `DESIGN.md` §Concurrency & FaaS and `WORKSPACES.md` §9. Entry: `.1` / `.7`.
+    in `DESIGN.md` §Concurrency & FaaS and `WORKSPACES.md` §9. Fat nodes and
+    two-root fold are landed; current entries are `.2`, `.3`, `.7`, and the
+    stateless canonical-mint fix `.10`.
   - **`poc-16-yez`** — global 1:N deletion closure (suppression-key treap). Plan:
-    `DELETION_CLOSURE.md`. Entry: `.1`. Proof bead is `.6` (surface out-of-range
-    victims by treap traversal, no DB).
+    `DELETION_CLOSURE.md`. Death-key extraction is landed; P1 entries are `.2`,
+    `.9`, and the publication-isolation regression `.13`; optional P2 `.5` is
+    also claimable.
+  - **`poc-16-zgj`** — poc-13 auth port + chained-seed hoisting measurement.
+    Closed; plan and hand-back: `CHAINED_AUTH_PLAN.md` / `MULTILEVEL_PILE.md`.
 
 ## bd workflow
 - `bd prime` — load full workflow context (run first).
 - `bd ready` — claimable work (no active blockers).
-- `bd show <id>` — read a bead, e.g. `bd show poc-16-zgj.1`.
+- `bd show <id>` — read a bead, e.g. `bd show poc-16-808.9`.
 - `bd update <id> --claim` — take a bead before starting it.
 - `bd close <id>` — mark done; releases its blocked dependents.
-- `bd dep tree poc-16-zgj` — the whole graph.
+- `bd dep tree poc-16-808` — the dependency graph.
 
-The beads mirror `CHAINED_AUTH_PLAN.md` section-by-section; each bead names its plan section.
-
-- **`poc-16-zgj.1` (the rename) is phase 0 and blocks everything** — do it first, keep it green.
-- `.2`–`.6` are **phase 1**, the must-have hoisting measurement (member-can-invite → chained
-  seed → `bench_order` by depth → green guard).
-- `.7`–`.10` are **optional** phases 2–3 (keychain, device split, admin).
-- `.11`–`.12` are the **writeup + hand-back** (update `MULTILEVEL_PILE.md` §A.5, deliver the
-  verdict).
+Each implementation bead names its plan section and dependencies. The closed
+`poc-16-zgj` graph remains the section-by-section record for
+`CHAINED_AUTH_PLAN.md`; do not reopen or replay its phase ordering when
+starting current work.
 
 ## Style
 Keep poc-13 code idioms: one file per family under `tinyp2p/facts/auth/`, the

@@ -1,8 +1,13 @@
 # Passive-Store Reconciliation — POC-16 Design
 
-Design of record; no code yet. The staged plan is at the end, and every
-number here is an estimate until `bench/` replaces it. [MODEL.md](MODEL.md)
-carries the performance model and the loop math behind the numbers.
+Design of record. The Engine, Auth, Node State, and Concurrency sections mark
+landed behavior versus remaining beads; where earlier System/Store/Walk prose
+still describes the pre-S1 flat manifest, those sections are historical
+motivation and the later foldback takes precedence. [SIMPLIFY.md](SIMPLIFY.md)
+maps the landed core and remaining production step. Unreplaced numbers remain
+estimates until `bench/`
+supersedes them; [MODEL.md](MODEL.md) carries the performance model and loop
+math.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
 counterpart that executes almost no code?** The counterpart is a dumb object
@@ -364,14 +369,26 @@ Closure).
 
 ## The Engine (P2)
 
-One body of code, two loops; only the trigger and store driver differ by
-deployment.
+The landed core has **one pure tree engine, one kernel forward pass, and one
+workspace mutator**. `shape.py` owns key, cut, priority, and fingerprint
+policy. `tree.py` owns `View` plus `build`, `fold`, `diff`, `merge`, and
+verification, parameterized by physical `Packing`. Binary treap and flat
+manifest packings remain golden compatibility fixtures; production uses
+shallow content-defined fat nodes. The engine takes `fetch(oid)` and
+`emit(bytes) -> oid` callbacks and knows nothing about files, HTTP, S3, or R2.
+Within a packing, a set and tree-format configuration determine byte-identical
+nodes; `fold(view, delta)` path-copies changed branches and is byte-identical
+to a full build of the union. The root is `Root(view, anchor, globals_)`, so
+anchor and canonical global rows ride the tree rather than a separate flat
+manifest. This absorbs the old `treap.py` / `layout.py` algorithms and the
+fat-node and two-root-fold work (`jbg.1` / `jbg.4`) into one implementation.
 
-The kernel runs in **two modes, and the verb picks**: `drain` —
-`kernel(pile, anchor) → (valid, new globals)`, persisted through the
-commit (put + poke in the cloud; any verb at a peer) — and `evaluate` —
-`kernel(payload, anchor, globals) → valid`, verdict only, structurally
-side-effect-free (mint, dial handshake). The **anchor** is the
+The public kernel verbs — `validate`, `drain`, and `evaluate` — share one
+internal judge loop. `validate` returns a boolean; `drain` additionally returns
+kernel-minted `Valid` values and monotone global rows; `evaluate` applies
+optional ephemeral-family gates and again returns only a boolean. Tree-path
+verification uses that same judge through `kernel.Scratchpad`, whose push/pop
+context absorbed the copy formerly in `hoist.py`. The **anchor** is the
 workspace's genesis fid — a constant, fixed at creation and identical
 across all honest replicas for all time, so verdicts stay
 order-independent; time-varying context (globals) remains quarantined
@@ -402,53 +419,40 @@ tmp on-disk file when the caller knows better (replay, iOS) — never a
 flag, because policy belongs to the caller and the kernel stays
 context-free; disposal, placement (an NSE uses the app-group
 container), and parallelism (one connection per invocation, across
-cores) are the caller's too. Replay then costs nothing to build: full and
-windowed replay alike are the store's own leaf piles streamed
-through the kernel with a disk db — every pile closed, a cumulative
-seen-set deduping the hub copies.
+cores) are the caller's too. Replay then costs nothing new to design: full and
+windowed replay alike are the store's own leaf piles streamed through the same
+judge. Persistent proof ranks are retained for every offer source and
+explicit-ref target, keeping canonical dependency choice stable across
+incremental admission and index rebuild.
 
 ```text
-drain:                     # put + poke (cloud); any verb (peer); under lease
-  piles <- LIST + GET piles; hash-verify mini-run structure  # cheapest checks first
-  kernel(pile, anchor) per pile, in parallel ⇒ (valid?, new globals)  # pure predicate; zero store reads
-  reject invalid piles whole             # deleted with the drain; blame by prefix
-  globals′ <- globals ∪ new globals      # associative union; removal set today
-  tail' <- merge valid facts by key (the working db emits sorted), dedup by fid; stragglers mini-fold
-  if tail' full: promote stable prefix -> leaf piles (each = close of its in-range leaves) + fences
-  put tail pile (close of the tail) + promoted leaf piles, spilled blobs, globals′ if changed
-  CAS manifest                           # the single commit point
-  delete pile keys                       # valid and rejected alike
+turn(workspace):                         # the only workspace mutator
+  LIST + decode ingress piles
+  drain each pile independently, in parallel
+  merge durable Valid facts, offers, proofs, globals, and +/− log rows
+  PUT immutable blobs and tree.fold/build output
+  CAS root                               # the publication point
+  pump projection log + cursor atomically
+  delete ingress piles
 ```
 
-**Publish, CAS, delete** — every new object is written first, one manifest
-CAS commits them all, covered pile keys are deleted after. A fact is
-briefly in both pile and set (dedup by fid makes that harmless), never in
-neither; validation and promotion commit through the same CAS, so there is
-no multi-object ordering to reason about. The order still guards the
-only copy: a pile key deleted before its CAS landed would silently drop
-a delivered fact until some walk re-offers it.
+**Publish, CAS, pump, retire** is the crash discipline. Immutable objects land
+before the root CAS; ingress survives until after it. The idx transaction is
+deliberately stamped “ahead of root” while a turn is in flight. A failure
+before publication discards and rebuilds that derived state from the old root
+and leaves the retained pile retryable. A failure after publication rebuilds or
+resumes from the new root and projection cursor. No unpublished fact, proof,
+global, or read-model row is observable after the workspace lock is released.
 
-Trigger: **on request, in both worlds** — the engine has no timers and no
-event plumbing. Every ingest request drains the piles: a peer drains
-before answering any verb — including the PUT that delivered a pushed
-pile, so a **peer push drains on receipt and needs no poke**; in the
-cloud the trigger is **poke alone** — the mint runs in evaluate mode and
-needs no drain, since its payload proves itself (though the mint that
-authorizes any read still drains before responding). The request pauses
-(milliseconds) so the requester always gets the latest.
-For the passive cloud data path the request is explicit: `POST
-/poke` on the mint Lambda — writers poke after pushing, walkers poke on a
-slow backstop cadence, a writer that dies before poking is caught by
-cadence (POC-13's rule). Arrival triggers (S3 events) are rejected on
-isomorphism grounds: most ObjectStore drivers (sqlite, fs, MinIO, a static
-host) cannot signal on put, so the engine's trigger must live in the
-protocol, not the backend. A lease keeps the engine single-flight for
-cache locality — concurrent pokes coalesce — and the CASes keep it safe
-regardless.
+Peer triggers are request-driven: ingress PUT drains on receipt and root GET
+drains before serving. Mint runs in evaluate mode and never drains. The
+stateless cloud trigger and coordination-free root publication are deployment
+policy in §Concurrency & FaaS; the pure tree and kernel do not assume a lease
+or a particular driver.
 
 Store-side auth state is one object family: **globals** — monotone
 semilattice projections the kernel itself emits, published as
-canonical sorted records riding the manifest, rewritten in the commit
+canonical sorted records riding the root, rewritten in the commit
 that changes them. Today globals is the **removal set**: the union of
 targets of valid eviction facts, extracted per pile by the kernel —
 order-free, because per-pile extraction composes as union. Eviction
@@ -458,11 +462,22 @@ question to answer; "non-removal" is enforced at the connection, never
 in fact validity. Globals are read **only by ephemeral-family
 handlers**: a persistent-family handler that consulted them would make
 verdicts time-dependent and collapse order-independence. Fact validity
-is forever; removal only closes doors. When deletion returns, its
-suppress-if set is the second occupant of the globals slot. Everything
-the old auth snapshot held is gone: certification is proved inside
-each pile, invites live in the invite blob (Auth), and epoch heads are
-content facts like any other.
+is forever; removal only closes doors.
+
+Single-target deletion is a separate post-validity layer:
+
+```text
+V(D) = kernel-valid facts
+S(D) = explicit non-deletion targets of valid deletion facts
+E(D) = V(D) ∖ S(D)
+```
+
+Live projection folds `+fid` and `−target` in delivery order; a clean rebuild
+computes `S` first and folds canonical `E`, firing no retractions. Both yield
+the same logical app state for every pile partition, delivery order, and turn
+batching. Global 1:N matching, its synced `T_supp`, and suppression closure
+remain the `poc-16-yez` work; they extend this seam without making the kernel
+or family materializers read `S`.
 
 **There is no admission — semi-untrusted piles go straight to
 validation**: integrity plus the family handler over the fact's
@@ -494,12 +509,12 @@ closed by format, syncs arrive closed by P3. Anything needing negative
 or global knowledge (uniqueness, latest-wins) stays a projection-time
 verdict, deterministic from the set — never a validation input.
 
-**Atoms — needs and offers.** The relationship grammar in this
-prototype is exactly two: an atom either **offers** — publishes a
-named, scoped assertion — or **needs** — demands a match. Validation
-is matching: a fact's needs must match offers already emitted by
-valid facts behind the cursor — the seen-set rule generalized from
-"ref resolves" to "need met" — and an unmet need rejects the unit.
+**Needs and offers.** The relationship grammar is exactly two. Clear-envelope
+offer atoms publish named, scoped assertions; the consuming family declares
+normalized needs beside its validator. Validation matches those needs against
+offers already emitted by valid facts behind the cursor — the seen-set rule
+generalized from "ref resolves" to "need met" — and an unmet need rejects the
+unit.
 **Parking is deleted from the grammar**: POC-13's Require parked on
 zero matches; closed units mean the closer either shipped the
 providers or authored a broken pile. Pinned dep refs and needs
@@ -519,9 +534,9 @@ included, is family handlers: a signature fact verifies its Ed25519
 once and offers authorship; certs offer membership; content facts
 need both. Heavier — authorization becomes facts beside the content —
 but piles make it cheap: signature facts ride the same units, dedup
-by fid, and verify once into the offer table. Negative knowledge
-(POC-13's SuppressIf) stays out of the grammar by design — it is
-globals' job, and it returns with deletion.
+by fid, and verify once into the offer table. Suppression markers are inert
+clear-envelope indexes: they never enter the matching grammar or stable
+validity and are interpreted only by the post-validity suppression layer.
 
 ### Fact-family boundary
 
@@ -541,8 +556,10 @@ parts, in order:
    `evaluate(fact, globals) → bool` gate. Thus removal validity is timeless;
    its global row is emitted in drain mode and consumed by request facts only
    in evaluate mode.
-5. **MATERIALIZE** — projection of a kernel-minted `Valid<Fact>` into a read
-   model, with no repeated validity policy.
+5. **MATERIALIZE** — insert-only projection of a kernel-minted `Valid<Fact>`
+   into source-keyed raw rows, with no repeated validity or suppression policy.
+   Every family declares its `TABLES`; aggregate-shaped results are views, and
+   the generic pump retracts a source across that inventory.
 6. **COMMANDS** — local authoring and ingress. Workspace creation/acceptance
    also records the trusted anchor in the keyring: that local trust choice
    cannot be derived from the store it is about to check.
@@ -560,9 +577,9 @@ kills the mint — no grants, so no reads and no writes — and it is the
 made it into any treap before the door shut stay visible everywhere; a
 compromised key's leakage window is its grant expiry. No fact-level
 death — no seq cutoffs, no fork verdicts (seq left the leaf record with
-its last consumer). Deletion, the one feature that genuinely needs
-set-level verdicts, follows POC-13's suppress-if relation + death key
-when it returns — deliberately out of this proto (Open Questions).
+its last consumer). Deletion is the distinct content-suppression path:
+single-target retraction is landed, while global 1:N matching and closure are
+tracked by `poc-16-yez`.
 
 Performance: piles are fully closed, so validation does **zero store
 reads** — the drain is transfer- and verify-bound: GET 10–30 ms, ~100
@@ -570,22 +587,20 @@ in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs, parallel across cores;
 ~2,400+ facts/s vs S3 (MODEL.md), ≥ 8× the litmus. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
-— the single-flight engine wrote the current pages itself last run.
+— a warm worker can reuse any content-addressed page it already fetched.
 
 ## Auth
 
-One evaluator, everywhere: **the kernel judges content, auth, and
-access alike**. A store executes a request iff
-`kernel(payload, anchor, globals)` says valid — the request fact's
-chain proves entitlement at this workspace's anchor, its scope covers
-the verb, and it survives the removal set; the gate's only job is
-supplying the parameters. **One object serves four roles**: ordinary pile,
-notification pile, request payload, and invite blob are all the same
-fully closed pile in the canonical codec, sometimes encrypted.
+One evaluator, everywhere: **the kernel judges content, auth, and access
+alike**. `request.payload` authors one ephemeral request and closes it over its
+signature and current membership proof. The resulting bytes use the same
+canonical pile codec as ingress, sync leaves, and invites. Conceptually,
+`mint = evaluate ∘ close({request})`: the caller closes once; the mint only
+decodes and evaluates.
 
 **Request facts are an ephemeral family.** The auth payload on any verb
 is a fact — authored by the requesting device key, deps on the auth
-facts that entitle it, body carrying verb, scope, and a loose expiry —
+facts that entitle it, body carrying public key, verb, and loose expiry —
 evaluated in evaluate mode, never persisted. Ephemerality is structural,
 for three reasons: the set must not grow with reads; mints must not
 churn fingerprints into phantom walk diffs; and read patterns must not
@@ -593,20 +608,27 @@ become replicated data. A request family has no persistence semantics, so a
 stray request fact in a pile is litter and the drain deletes it. For a
 request fact, acceptance is the grant.
 
-**The mint is a pure function.** The handshake is a small closed
-pile — the request fact plus the chain that entitles it, a few KB — so
-verification reads nothing: the mint's whole job is one kernel call,
-`kernel(payload, anchor, globals)`, and a valid verdict returns a grant
-`{member, scope, expiry}`: presigned URLs in the cloud, a bearer
-capability from a peer daemon; to the client an opaque request
-decorator, the only per-backend seam. **The grant is encrypted to the
-request fact's author pubkey**, so a captured request replays into
-ciphertext — no server nonces, no clock strictness, no per-request
-state; renewal is a fresh request fact. No writes, no lease: mints
-parallelize freely, and the drain trigger shrinks to poke alone. The
-mint response also carries the current root (bytes + ETag) as a
-freebie: auth hands you the top node, every id below it is
-content-addressed, and the session's first walk starts a round trip ahead.
+**The mint is a pure function.** `mint.mint` decodes the pile, requires exactly
+one `DURABLE=False` fact, obtains the candidate `(public key, verb)` through the
+family’s `grant` hook, and calls `kernel.evaluate` with the root's anchor and
+globals plus the supplied current time. A peer also supplies its root-stamped
+canonical offer/proof index: evaluation compares each already-known need with
+the committed winner, so a stale closure cannot omit an incompatible authority
+conflict and revive a quarantined chain. The request family owns tag, verb,
+expiry, removal, and removed-issuer policy; the daemon parses no fact body.
+Failure returns no grant. Success returns the family grant for
+`Handler.mint` to seal to the requester's public key and pair with the current
+root bytes and ETag. The path drains nothing, writes nothing, and never reads
+`app.db`; its canonical authority view is a read-only input. Replay only
+produces ciphertext for the same requester. The landed peer holds its
+workspace lock while snapshotting root plus canonical idx, then releases it
+after evaluation. A stateless deployment can evaluate snapshots in parallel;
+constructing those snapshots is the `poc-16-jbg.10` FaaS boundary.
+
+The cloud target returns presigned URLs; the landed peer daemon returns a
+bearer token. To the client either is an opaque request decorator, the only
+per-backend seam. Auth hands the walk its root at the same time, putting the
+session one round trip ahead.
 Over iroh the mint feels vestigial (the channel proved the key) but stays —
 it is load-bearing in the cloud world and keeping it keeps the worlds
 isomorphic. Transport identity is never an integrity input.
@@ -703,61 +725,45 @@ initiate.
 
 ## Node State and SQLite
 
-The store is the sole source of truth; **every SQLite is a derived
-projection stamped with the manifest generation it reflects**; the commit
-point is always the manifest CAS. Any node can delete its SQLite and
-rebuild from its store.
+The store is the sole source of truth. Every SQLite is a derived projection;
+the publication point is the root CAS. A peer keeps two databases with
+different jobs, and either can be deleted and rebuilt.
 
-- Globals (the removal set today) are manifest-riding objects, not
-  local files — the Lambda wakes, conditional-GETs the manifest, works,
-  publishes. No EFS, no /tmp durability.
-- **Rows in memory, records on the store.** Fact handlers write ordinary
-  SQLite rows into the engine's ephemeral db — identical code in both
-  worlds, since that db is already connection-string-abstracted. At
-  commit the engine emits globals as canonical sorted records,
-  and the manifest CAS publishes them; the next run loads records back
-  into rows (a warm peer daemon skips the reload by generation stamp).
-  Publishing the `.db` itself is rejected:
-  SQLite bytes are write-history artifacts — the store holds canonical
-  records and SQLite is always the rebuildable working form.
-  **Serialization after a fact-processing run is the boundary between
-  facts and the auth gate**: evaluate mode — Lambda or peer daemon, same
-  code — reads only the objects the last commit published, through the
-  same ObjectStore primitive, never the engine's live rows. Facts
-  influence auth solely by being processed and serialized; the commit is
-  the only channel between the layers.
-- **Option — cloud mode: persist the working db itself.** The `.db`
-  rejection above is scoped to *consumed* artifacts — canonical records
-  other parties read. A private working state has no readers: under the
-  single-flight lease the engine may round-trip its scoped SQLite
-  (whitelisted auth families' facts + projections + parked/block-unblock
-  relations) through the store as an opaque content-addressed blob —
-  load → work → serialize → PUT → CAS, GC'd like superseded tails. One
-  kernel implementation in both worlds, with the kernel's existing
-  parked/wake machinery intact; cloud mode differs only in where the db
-  sleeps between runs. The whitelist (declarable in genesis config
-  facts) is bounded by the gate's-closure criterion and doubles as a WA
-  budget — a chatty family on the list breaks the mode (MODEL.md,
-  Cloud-Mode DB).
+- **`idx.db` is the root-stamped engine projection.** It contains accepted
+  fact bytes, offers, persistent proof ranks, monotone globals, metadata, and
+  the append-only projection log. A semantic index-version change or a root
+  ETag mismatch rebuilds it by streaming the root's own closed leaves through
+  `drain`. The index is intentionally marked dirty before publication, so an
+  interrupted pre-CAS turn cannot masquerade as current state.
 - Engine and kernel working state is ephemeral SQLite by
   **caller-injected connection**: `:memory:` normally, on-disk temp
   where RAM is tight (iOS) or the input is huge (replay = the
   whole-history pile streamed in key order). Each kernel invocation
   gets its own tables — closed in/out, no shared state — which is what
   lets invocations run in parallel. Discarded after every run.
-- A peer's persistent SQLite holds two separate schemas: the sqlite
-  ObjectStore driver (canonical layout) and the app read model (API
-  queries), rebuilt by replay when its generation trails.
-  **Projectors consume kernel-valid facts only** — no validity logic,
-  no scope checks; they accept a `Valid<Fact>` type only the kernel
-  can construct, so the split is compile-time, not discipline. One
-  read model spans all workspaces, rows tagged with the workspace id —
-  safe because every fact entered through its own store's anchor'd
-  kernel — so cross-workspace queries (a unified inbox) are ordinary
-  read-side joins over certified provenance. The safety asymmetry is
-  the design: the kernel is small and frozen (its mistakes are
-  forever); projectors are big and evolvable (their mistakes replay
-  away).
+- **`app.db` is a cursored fold of `idx.log`.** The generic `projected`
+  ledger records `(workspace, source fid, family, rank)`; family tables retain
+  insert-only source-keyed candidates, and views select aggregate winners.
+  Applying rows and advancing `(workspace, projector)` share one transaction,
+  so a crash is either invisible or resumes at the next sequence. A missing
+  cursor or reproject marker clears that workspace and folds canonical `E`
+  from scratch; an app schema-version change replaces the database and does
+  that for every workspace.
+- **Projectors consume kernel-valid facts only.** They repeat no validity,
+  scope, or suppression logic. Retraction is generic: find the source's
+  family, then delete that source from every table in its declared `TABLES`.
+  One app database spans workspaces, with every raw row workspace-tagged, so
+  cross-workspace queries remain ordinary read-side joins over certified
+  provenance. The kernel is small and frozen; projector mistakes replay away.
+
+Root bytes carry tree view, anchor, and canonical globals, but not the expanded
+offer/proof view. A peer mint reads that view from its root-stamped `idx.db`;
+`app.db` is never involved. A Worker or Lambda must derive an equivalent
+canonical authority view from the root/tree before it can enforce the same
+conflict checks. Root metadata plus a request pile is sufficient only in the
+conflict-free case, not full production parity. The derived view's SQLite byte
+format is not part of the protocol; cloud publication remains §Concurrency &
+FaaS work.
 
 ## Deployments
 
@@ -772,10 +778,10 @@ rebuild from its store.
 
 ## Concurrency & FaaS
 
-Many stateless workers — Lambda, **Cloudflare Workers** — run the engine
-concurrently over one store, **coordination-free**. Non-serialized is the
-default; the single-writer lease and the one CAS'd manifest of §The System in
-One Page / §The Engine are the *optional* linearizable path, not a requirement.
+**Deployment target:** many stateless workers — Lambda, **Cloudflare Workers**
+— run the engine concurrently over one store, coordination-free. The landed
+peer runtime's one CAS'd root is the linearized local path; append-only roots
+and amortized merge remain `jbg.3`.
 
 **It is a CRDT.** Piles and tree nodes are immutable and content-addressed:
 concurrent PUTs are idempotent and commutative, and the arrangement is a
@@ -847,27 +853,14 @@ Proofs first; no transport work until both numbers exist.
 
 ## Open Questions
 
-- Deletion: POC-13's suppress-if relation + death key is the direction —
-  the one feature that needs set-level verdicts. Tombstones weaken the
-  count heuristic; content confidentiality via key destruction (POC-14);
-  the reconciliation-visible shape of a delete is undesigned.
-- **Set-valued verdicts break parallel validation — a singleton, or
-  optimistic retry.** Order-free parallel drain holds only while validity is a
-  pure function of a fact's closure (the globals-blind rule): independent
-  piles, independent scratchpads, no cross-pile visibility. An operation whose
-  verdict depends on a **global that can move under it** is unsafe in this
-  model without optimistic concurrency — snapshot the globals the run reads,
-  validate, and at the commit CAS re-check they have not changed since the run
-  began; if they have, roll back and retry (CAS/STM on the globals slot).
-  Single-target deletion needs none of this: the fact names its one target, so
-  the verdict is closure-local. Multi-target does — deleting a **channel**
-  suppresses every fact, present and future, with `chan = X`, so "is X
-  deleted?" is a global predicate, a deleted-channel marker must live in
-  globals, and validate/project must consult it. That composes only under
-  **full state awareness, not closure alone**: a singleton serial pass, which
-  the cloud node hosts naturally (single-writer per workspace under the
-  lease/CAS) but parallel peer validation cannot without the retry loop.
-  Further work; POC-16 builds only the single-target, closure-local path.
+- **Global deletion is resolved architecturally, not yet fully landed.**
+  Stable validity remains globals-blind and parallel. Clear-envelope death keys
+  index a second `T_supp`; its one-sided surfacing walk contributes
+  out-of-range victims to closure, and projection masks them after judgment.
+  No validator or materializer consults mutable S, so no singleton or
+  optimistic validation retry is required. The current engine implements the
+  single-target seam; global 1:N construction, sync, surfacing, and closure are
+  tracked by `poc-16-yez` (`DELETION_CLOSURE.md`).
 - (Dead weight: resolved 2026-07-22 — piles go straight to dep-pure
   validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs

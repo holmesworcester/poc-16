@@ -1,24 +1,20 @@
-"""PLAN SKELETON (poc-16-808.4, stage S3) — mint = evaluate ∘ close({request}).
+"""Pure mint: decode → family grant hook + kernel evaluate.
 
-SIMPLIFY.md §4. daemon.Handler.mint thins to: decode → mint() → seal; its
-hand-rolled checks (tag filter, arity, expiry) move into the request family's
-evaluate hook, next to the rest of the policy. Rule: a mint pile contains
-exactly ONE DURABLE=False fact.
+The caller has already closed one ephemeral request over its authority proof.
+The request family owns tag, verb, expiry, and removal policy; the daemon only
+supplies root metadata, a canonical authority view, and sealing.
 
-The two-predicate frame, stated once (feeds yez.9's matrix and the gxz seam):
+Stable validity never reads suppression:
 
     valid(f) = pred(f, closure(f))   immutable, globals-blind, per-fact
     S(D)     = targets of valid suppression facts     monotone semilattice
     E(D)     = V(D) ∖ S(D)           a difference of monotone sets
                                      => order-independent, no linearization
 
-Verdicts never read S — suppression masks AFTER judgment, at exactly three
-places: the gate (here), the closure edge (yez.11 resolve_supp), the pump
-(pump.py). Never the kernel, never the tree.
-
-Family hooks to add in facts/auth/request.py:
-    grant(f)         -> (pk, verb)   the sealed grant's subject
-    evaluate(f, g)   -> bool         absorbs tag/arity/exp; g has ("now", ms)
+Suppression masks only after judgment. A peer also passes its root-stamped idx
+so evaluate can reject omitted incompatible authority winners. A stateless
+runtime must derive the equivalent view from the root/tree (poc-16-jbg.10);
+root metadata alone covers only conflict-free requests.
 """
 from . import facts as families
 from . import tree
@@ -30,7 +26,8 @@ def mint(pile_bytes, anchor, globals_, now, canonical_db=None):
     """decode → kernel.evaluate(facts, anchor, globals ∪ {("now", now)}) →
     grant_of. Returns (pk, verb) to seal, or None to refuse. The challenge is
     ephemeral (never persisted); replay is harmless because the grant is
-    sealed to the requester's pk."""
+    sealed to the requester's pk. ``canonical_db`` binds already-known needs
+    to the committed authority winners."""
     try:
         facts, _ = decode_pile(pile_bytes)
         grant = grant_of(facts)
@@ -70,9 +67,10 @@ def screen(facts, supp):
 
 
 def root_globals(root_bytes):
-    """(anchor, globals) read off the root object — they ride the root node
-    once jbg.1 drops the manifest (tree.Root). The stateless Worker/λ mint is
-    GET root → mint() → presign: kernel + tree + gate is its entire world; it
-    NEVER builds app.db (SIMPLIFY.md §4)."""
+    """Read root-riding metadata, not the canonical authority projection.
+
+    Mint never needs app.db. Peers pass idx.db separately; stateless runtimes
+    must derive an equivalent view from the tree before production use.
+    """
     root = tree.decode_root(root_bytes)
     return root.anchor, root.globals_
