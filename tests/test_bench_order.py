@@ -1,5 +1,5 @@
 """Behavioral tests for delegation-aware key-order measurement."""
-import tinyp2p.layout as layout
+import tinyp2p.shape as tree_shape
 
 from bench.bench_order import benchmark, delegation_topology
 from tinyp2p.crypto import keypair
@@ -12,14 +12,14 @@ from tinyp2p.facts.auth.workspace import workspace
 
 
 def run_benchmark(tmp_path, shape, *, scale=1023, devices_per_user=1):
-    old_cold_cut = layout.COLD_CUT
-    layout.COLD_CUT = None
+    old_cold_cut = tree_shape.COLD_CUT
+    tree_shape.COLD_CUT = None
     try:
         return benchmark(
             str(tmp_path / shape), scale, shape=shape, n_members=32, seed=16,
             devices_per_user=devices_per_user)
     finally:
-        layout.COLD_CUT = old_cold_cut
+        tree_shape.COLD_CUT = old_cold_cut
 
 
 def test_reconstruction_uses_user_refs_not_ephemeral_invitee_keys(tmp_path):

@@ -30,17 +30,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.layout as L
+import tinyp2p.shape as shape
 from tinyp2p import hoist
 from tinyp2p.close import close, encode_pile
 from tinyp2p.kernel import kernel, resolve_deps
+from tinyp2p.shape import fid_of
 
 from bench.bench_sync import WORK, YEARS, build_seed, bulk_author
-
-
-def _fid(k):
-    return k.split(":", 1)[1]
-
 
 def _closure(kfids, deps_of):
     seen, stack = set(), list(kfids)
@@ -210,7 +206,7 @@ def over_inclusion(root, cnt):
 def measure(scale):
     d, seed, ws, fact_of, deps_of = _ctx(scale)
     keys = sorted(seed.keys(ws))
-    fids = [_fid(k) for k in keys]
+    fids = [fid_of(k) for k in keys]
     V = len(fids)
 
     root, objects = hoist.build(keys, fact_of, deps_of)
@@ -273,7 +269,7 @@ def measure(scale):
     bulk_author(seed, ws, [(seed.sk, seed.pk)], 250, lo_ts, window,
                 random.Random(99), "d")
     new_keys = sorted(seed.keys(ws))
-    new_fids = [_fid(k) for k in new_keys]
+    new_fids = [fid_of(k) for k in new_keys]
     B = len(new_fids) - V
     root2, objs2 = hoist.build(new_keys, fact_of, deps_of)
     shuf2 = new_keys[:]
@@ -304,7 +300,7 @@ def measure(scale):
 def report(r):
     V, P = r["V"], r["P"]
     print(f"\n================  {V} facts, {P} leaves, {r['n_nodes']} nodes  "
-          f"(CUT={L.CUT}, flat)  ================")
+          f"(CUT={shape.CUT}, flat)  ================")
     print(f"  rho (leaf-only) = {r['rho']:.2f}x   avg facts/leaf = {r['avg_leaf']:.1f}   "
           f"maxN = {r['maxN']} ({100*r['maxN']/P:.0f}% of leaves)   "
           f"facts->root = {r['to_root']}")
@@ -410,7 +406,7 @@ def profile(keys, fact_of, deps_of):
     """Light metrics for one key order (no verify/fold): leaf-only rho, the
     range-tax rows, over-inclusion, and what still settles high."""
     import collections
-    fids = [_fid(k) for k in keys]
+    fids = [fid_of(k) for k in keys]
     V = len(fids)
     root, objects = hoist.build(keys, fact_of, deps_of)
     assert_closed(root, deps_of)
@@ -451,7 +447,7 @@ def profile(keys, fact_of, deps_of):
 
 def compare_orders(scale):
     d, seed, ws, fact_of, deps_of = _ctx(scale)
-    fids = [_fid(k) for k in seed.keys(ws)]
+    fids = [fid_of(k) for k in seed.keys(ws)]
     orders = [("ts (production)", "ts"), ("author (creator)", "author"),
               ("deleg (beneficiary)", "deleg"), ("deleg+ts (DAG)", "deleg+ts")]
     profs = [(name, profile(keys_for(o, fids, fact_of), fact_of, deps_of))
@@ -491,7 +487,7 @@ def compare_orders(scale):
 
 
 def main():
-    L.COLD_CUT = None
+    shape.COLD_CUT = None
     os.makedirs(WORK, exist_ok=True)
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     if "order" in sys.argv:

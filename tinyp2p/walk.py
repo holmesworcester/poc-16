@@ -17,8 +17,8 @@ from .close import close, decode_pile, encode_pile
 from .crypto import h, unseal
 from .facts.auth import request as auth_request
 from .kernel import resolve_deps
-from .layout import fingerprint
 from .node import now_ms
+from .shape import fid_of, fingerprint
 
 
 class Peer:
@@ -104,7 +104,7 @@ def walk(node, ws, url):
 
     with node.lock:
         lkeys = node.keys(ws)
-    lfids = {k.split(":", 1)[1] for k in lkeys}
+    lfids = {fid_of(k) for k in lkeys}
     pulled = pushed = 0
     for lo, hi, fen in ranges:
         mine = [k for k in lkeys if lo < k <= hi]
@@ -117,7 +117,7 @@ def walk(node, ws, url):
             node.store(ws).put(
                 f"pile/{node.member_for(ws)}/{fen['pile']}", raw)
             pulled += 1
-        push = [k.split(":", 1)[1] for k in mine if k.split(":", 1)[1] not in rfids]
+        push = [fid_of(k) for k in mine if fid_of(k) not in rfids]
         if push:  # reactive push, the mirror of the pull; peer drains on receipt
             _push(node, ws, peer, push)
             pushed += len(push)

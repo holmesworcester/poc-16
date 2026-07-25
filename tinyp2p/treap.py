@@ -32,27 +32,16 @@ import sys
 
 from .close import close, encode_pile
 from .crypto import h
-from .layout import CUT, boundary  # same fine boundary density as the flat layout
+from .shape import boundary, fid_of, priority
 
 sys.setrecursionlimit(200000)  # random-treap depth is O(log n); headroom for tails
-
-
-def _fid(key):
-    return key.split(":", 1)[1]
-
-
-def priority(fid):
-    """Treap priority for a boundary key: its full content hash as an int.
-    Uniform and ≈unique, so the max-priority boundary in any range is roughly
-    centrally placed ⇒ an expected-balanced tree over the chunks."""
-    return int(fid, 16)
 
 
 def _emit_leaf(ks, fact_of, deps_of, objects):
     """One closed pile: the chunk's in-range facts plus their closure, exactly
     as the flat layout's emit_range — so a chunk with the same fids hashes to
     the same object on both."""
-    pile = close([fact_of(_fid(k)) for k in ks], deps_of, fact_of)
+    pile = close([fact_of(fid_of(k)) for k in ks], deps_of, fact_of)
     pb = encode_pile(pile)
     hh = h(pb)
     objects[hh] = pb
@@ -65,7 +54,10 @@ def build(keys, fact_of, deps_of):
     keys = list(keys)
     objects = {}
     # priority per position, -1 for non-boundary keys (never chosen as separator)
-    prio = [priority(f) if boundary(f) else -1 for f in (_fid(k) for k in keys)]
+    prio = [
+        priority(fid) if boundary(fid) else -1
+        for fid in map(fid_of, keys)
+    ]
 
     def rec(a, b):
         # separator = highest-priority boundary strictly inside [a, b) (exclude
@@ -106,8 +98,11 @@ def update(node, delta, fact_of, deps_of, objects):
     # rotate-up: a new boundary key out-ranks this separator ⇒ the canonical
     # shape here changes, so rebuild this subtree from its own leaves + delta
     # (bounded to the subtree; still blind to everything outside it).
-    maxp = max((priority(_fid(k)) for k in delta if boundary(_fid(k))), default=-1)
-    if maxp > priority(_fid(sep)):
+    maxp = max(
+        (priority(fid_of(k)) for k in delta if boundary(fid_of(k))),
+        default=-1,
+    )
+    if maxp > priority(fid_of(sep)):
         sub, objs = build(sorted(_leaf_keys(node) + delta), fact_of, deps_of)
         objects.update(objs)
         return sub

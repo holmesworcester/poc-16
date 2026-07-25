@@ -30,17 +30,9 @@ from . import facts as _fam
 from .close import encode_pile
 from .crypto import h
 from .kernel import SCHEMA, Context, proof_rank, resolve_deps
-from .layout import CUT, boundary  # same fine boundary density as treap.py
+from .shape import boundary, fid_of, priority
 
 sys.setrecursionlimit(200000)
-
-
-def _fid(key):
-    return key.split(":", 1)[1]
-
-
-def priority(fid):
-    return int(fid, 16)
 
 
 # ---- Part A: the build ------------------------------------------------------
@@ -148,7 +140,7 @@ def build(keys, fact_of, deps_of):
     {ph: payload bytes} for every non-empty settle node. Pure function of
     (keys, deps): keys are sorted here, so input order is irrelevant."""
     keys = sorted(keys)
-    fids = [_fid(k) for k in keys]
+    fids = [fid_of(k) for k in keys]
     pos = {f: i for i, f in enumerate(fids)}
     prio = [priority(f) if boundary(f) else -1 for f in fids]
     root = _shape(keys, prio)

@@ -31,7 +31,8 @@ from .kernel import (
     rebuild_proofs,
     resolve_deps,
 )
-from .layout import fingerprint, layout
+from .layout import layout
+from .shape import key_parts
 from .store import FsStore
 
 IDX_SCHEMA = """
@@ -148,7 +149,7 @@ class Node:
         return from_json(json.loads(row[0])) if row else None
 
     def keys(self, ws):
-        return [f"{ts:015d}:{fid}" for ts, fid in
+        return [key_parts(ts, fid) for ts, fid in
                 self.idx(ws).execute("SELECT ts, fid FROM facts ORDER BY ts, fid")]
 
     def globals(self, ws):

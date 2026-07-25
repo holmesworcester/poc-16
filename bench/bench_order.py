@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.layout as L
+import tinyp2p.shape as tree_shape
 from bench.bench_sync import WORK
 from bench.seed_chain import SHAPES, build_seed
 from tinyp2p import hoist as H
@@ -368,7 +368,7 @@ def benchmark(node_dir, scale, *, shape="random", n_members=100, seed=16,
             deps_cache[fid] = resolve_deps(fact_of(fid), index) or []
         return deps_cache[fid]
 
-    fids = [key.split(":", 1)[1] for key in seed_node.keys(workspace)]
+    fids = [tree_shape.fid_of(key) for key in seed_node.keys(workspace)]
     ranks, topology = build_orders(fids, fact_of)
     expected_parent = {
         member: inviter
@@ -453,8 +453,8 @@ def main():
          if argument.startswith("devices=")),
         1,
     )
-    old_cold_cut = L.COLD_CUT
-    L.COLD_CUT = None
+    old_cold_cut = tree_shape.COLD_CUT
+    tree_shape.COLD_CUT = None
     try:
         for shape in shapes:
             directory = os.path.join(WORK, f"order_{shape}_{scale}")
@@ -465,7 +465,7 @@ def main():
             print_results(stats, results)
             shutil.rmtree(directory, ignore_errors=True)
     finally:
-        L.COLD_CUT = old_cold_cut
+        tree_shape.COLD_CUT = old_cold_cut
 
 
 if __name__ == "__main__":

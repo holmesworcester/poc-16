@@ -11,8 +11,9 @@ from tinyp2p.facts.auth.legacy_signature import legacy_signature
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.layout import boundary, layout
+from tinyp2p.layout import layout
 from tinyp2p.node import INDEX_VERSION, Node
+from tinyp2p.shape import boundary
 
 from .util import (
     add_member,

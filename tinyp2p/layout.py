@@ -31,49 +31,7 @@ fingerprint — cheap, body-free; eliminating it needs a persistent fence tree
 """
 from .close import close, encode_pile
 from .crypto import h
-
-CUT = 8          # warm/fine density: a fact is a fine boundary iff prio % CUT == 0
-COLD_CUT = 4096  # everything older than the guard watermark seals into coarse
-                 # cold pages of ~COLD_CUT facts (~1.5 MB); the recent window
-                 # stays fine. 4096 is the calibrated one-size-fits-most target:
-                 # it buries the membership annex (which saturates at the ~Dunbar
-                 # active-writer core, not at total members) under ~15% redundancy
-                 # flat from 100 to 10,000 members. See MODEL.md "Leaf Sizing".
-GUARD = 256      # B_t: keep at least this many recent facts in the fine warm zone
-
-
-def boundary(fid, cut=None):
-    return int(fid[:8], 16) % (cut or CUT) == 0
-
-
-def _cut_positions(fids):
-    """Boundary positions that partition the sorted run into leaves.
-
-    One fine density (CUT) unless COLD_CUT is set — then the split is the last
-    coarse boundary at or before len-GUARD: below it, history seals into big
-    cold pages cut at COLD_CUT (each amortizes its shared closure over
-    ~COLD_CUT in-range leaves, so catchup duplication → 1); above it, the recent GUARD+
-    window stays fine (CUT), so a write re-cuts only a small warm page. Pure in
-    the set — split is a function of the fids alone — so RBSR/history-
-    independence and leaves-are-piles are untouched. When len-GUARD crosses a
-    coarse boundary the newly-sealed cold page is written once (the compaction:
-    each fact ends up written ~twice over its life, warm then cold)."""
-    if not COLD_CUT:
-        return [i + 1 for i, fid in enumerate(fids) if boundary(fid)]
-    n = len(fids)
-    cold = [i + 1 for i, fid in enumerate(fids) if boundary(fid, COLD_CUT)]
-    split = 0
-    for c in cold:
-        if c <= n - GUARD:
-            split = c
-        else:
-            break
-    return [c for c in cold if c <= split] + \
-           [i + 1 for i, fid in enumerate(fids) if i + 1 > split and boundary(fid)]
-
-
-def fingerprint(keys):
-    return h("|".join(keys).encode())
+from .shape import cut_positions, fid_of, fingerprint
 
 
 def layout(keys, fact_of, deps_of, anchor, globals_, memo=None):
@@ -83,8 +41,8 @@ def layout(keys, fact_of, deps_of, anchor, globals_, memo=None):
     everything content-addressed; only recomputed ranges appear in objects.
     """
     from .fact import canon  # local import to avoid cycle
-    fids = [k.split(":", 1)[1] for k in keys]
-    cuts = _cut_positions(fids)
+    fids = [fid_of(k) for k in keys]
+    cuts = cut_positions(fids)
     tailstart = cuts[-1] if cuts else 0
     objects, fences = {}, []
 

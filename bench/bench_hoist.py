@@ -21,7 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.layout as L
+import tinyp2p.shape as shape
 from tinyp2p import treap as T
 from tinyp2p.kernel import resolve_deps
 
@@ -64,13 +64,13 @@ def measure(scale):
     def _collect(node):
         if node["leaf"]:
             if node["n"]:
-                leaves.append([k.split(":", 1)[1] for k in node["ks"]])
+                leaves.append([shape.fid_of(k) for k in node["ks"]])
         else:
             _collect(node["L"])
             _collect(node["R"])
     _collect(root)
 
-    V = len({k.split(":", 1)[1] for k in keys})     # distinct facts
+    V = len({shape.fid_of(k) for k in keys})     # distinct facts
     P = len(leaves)                                   # leaves
     # N(f) and settle span [min,max] leaf index, via one pass over leaf closures
     cnt, lo, hi = {}, {}, {}
@@ -105,9 +105,10 @@ def measure(scale):
 def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     scales = args or [50000]
-    L.COLD_CUT = None    # flat fine leaves, so rho matches RESULTS.md sec.3
+    shape.COLD_CUT = None  # flat fine leaves, so rho matches RESULTS.md sec.3
     os.makedirs(WORK, exist_ok=True)
-    print(f"\n=== closure redundancy the multi-level pile removes  (CUT={L.CUT}, flat) ===\n")
+    print("\n=== closure redundancy the multi-level pile removes  "
+          f"(CUT={shape.CUT}, flat) ===\n")
     print("  {:>7} {:>7} {:>6} {:>6} {:>10} {:>9} {:>8} {:>8} {:>9}".format(
         "facts", "leaves", "avg/lf", "rho", "leafTotal", "own-leaf%", "toRoot", "maxN", "hoist-save"))
     for s in scales:

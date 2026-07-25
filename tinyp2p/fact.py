@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass, field
 
 from .crypto import h
+from .shape import key
 
 
 def canon(o) -> bytes:
@@ -33,7 +34,7 @@ class Fact:
 
     @property
     def key(self) -> str:
-        return f"{self.ts:015d}:{self.fid}"
+        return key(self)
 
     def refs(self):
         return [(a[1], a[2]) for a in self.atoms if a[0] == "ref"]

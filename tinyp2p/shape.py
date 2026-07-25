@@ -1,4 +1,4 @@
-"""PLAN SKELETON (poc-16-808.1, stage S1) — the key discipline as engine parameters.
+"""The pure key discipline shared by every tree packing.
 
 Everything the tree engine needs to know about WHERE a key lives — key format,
 chunk boundaries, treap priority, cut tiers, range fingerprint — and nothing
@@ -15,10 +15,11 @@ The engine (tree.py) is parametric over a Shape. Two planned instantiations:
                     tag=0 so a group's deletion sorts at its head
                     (DELETION_CLOSURE.md §3; production bead poc-16-yez.10)
 
-Every body is unwritten on purpose: signatures + docstrings are the contract;
-tests/test_engine.py names the acceptance criteria.
 """
 from dataclasses import dataclass
+from typing import Callable
+
+from .crypto import h
 
 CUT = 8          # fine/warm boundary density (canonical home after S1)
 COLD_CUT = 4096  # coarse cold-page density below the guard watermark
@@ -27,31 +28,55 @@ GUARD = 256      # keep >= this many recent facts in the fine warm zone
 
 def key(fact):
     """Canonical sort key "<ts:015d>:<fid>" (today inline in node.keys)."""
-    raise NotImplementedError("poc-16-808.1")
+    return key_parts(fact.ts, fact.fid)
+
+
+def key_parts(ts, fid):
+    """Canonical key from an index row, without loading the fact body."""
+    return f"{ts:015d}:{fid}"
 
 
 def fid_of(k):
     """Inverse projection: the fid inside a key (treap._fid / hoist._fid)."""
-    raise NotImplementedError("poc-16-808.1")
+    return k.rsplit(":", 1)[1]
 
 
 def boundary(fid, cut=None):
     """A key ends a chunk iff its own hash mod cut == 0 (layout.boundary).
     Reads only the key's own hash => history independence."""
-    raise NotImplementedError("poc-16-808.1")
+    return int(fid[:8], 16) % (cut or CUT) == 0
 
 
 def priority(fid):
     """Treap priority of a boundary key: its full content hash as an int —
     uniform, ~unique => expected-balanced shape (treap.priority)."""
-    raise NotImplementedError("poc-16-808.1")
+    return int(fid, 16)
 
 
 def cut_positions(fids):
     """Boundary positions partitioning the sorted run into leaves, tiered:
     COLD_CUT pages below the last coarse boundary <= len-GUARD, the fine CUT
     window above it (layout._cut_positions, semantics verbatim)."""
-    raise NotImplementedError("poc-16-808.1")
+    if not COLD_CUT:
+        return [
+            index + 1
+            for index, fid in enumerate(fids)
+            if boundary(fid)
+        ]
+    cold = [
+        index + 1
+        for index, fid in enumerate(fids)
+        if boundary(fid, COLD_CUT)
+    ]
+    split = max(
+        (position for position in cold if position <= len(fids) - GUARD),
+        default=0,
+    )
+    return [position for position in cold if position <= split] + [
+        index + 1
+        for index, fid in enumerate(fids)
+        if index + 1 > split and boundary(fid)
+    ]
 
 
 def fingerprint(keys):
@@ -59,18 +84,18 @@ def fingerprint(keys):
     The closure lives in the pile but outside the fingerprinted set: fp is
     what the walk prunes on, oid (h(pile bytes)) is what you fetch by.
     Never conflate the two (SIMPLIFY.md §0)."""
-    raise NotImplementedError("poc-16-808.1")
+    return h("|".join(keys).encode())
 
 
 @dataclass(frozen=True)
 class Shape:
     """The bundle tree.py is parametric over. All five are pure functions of
     key/fid bytes — no store, no db, no globals."""
-    key: callable
-    fid_of: callable
-    boundary: callable
-    priority: callable
-    fingerprint: callable
+    key: Callable
+    fid_of: Callable
+    boundary: Callable
+    priority: Callable
+    fingerprint: Callable
 
 
 FACT = Shape(key, fid_of, boundary, priority, fingerprint)

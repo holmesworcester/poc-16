@@ -40,8 +40,8 @@ from tinyp2p.fact import from_json
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.content.message import message
 from tinyp2p.kernel import extend_proofs, kernel, resolve_deps
-from tinyp2p.layout import fingerprint
 from tinyp2p.node import Node, now_ms
+from tinyp2p.shape import fid_of, fingerprint
 
 from tests.util import add_member, all_fids
 
@@ -211,7 +211,7 @@ def reconcile(A, B, ws):
     ranges.append((lo, "~", man["tail"]))
 
     lkeys = A.keys(ws)
-    lfids = {k.split(":", 1)[1] for k in lkeys}
+    lfids = {fid_of(k) for k in lkeys}
 
     t0 = perf()
     pulled, push_fids, pull_bytes = [], [], 0
@@ -225,8 +225,7 @@ def reconcile(A, B, ws):
         if any(fid not in lfids for fid in rfids):
             pull_bytes += len(raw)
             pulled.append(theirs)
-        push_fids += [k.split(":", 1)[1] for k in mine
-                      if k.split(":", 1)[1] not in rfids]
+        push_fids += [fid_of(k) for k in mine if fid_of(k) not in rfids]
 
     push_bytes = 0
     if push_fids:
@@ -299,10 +298,11 @@ def mb(b):
 
 
 def run_catchup(scales):
-    import tinyp2p.layout as L
+    import tinyp2p.shape as shape
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          f"workers, shipped default (COLD_CUT={L.COLD_CUT}, tail CUT={L.CUT})\n")
+          f"workers, shipped default (COLD_CUT={shape.COLD_CUT}, "
+          f"tail CUT={shape.CUT})\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -352,17 +352,17 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
     each range's shared closure over and over on a full catchup;
     bigger pages amortize it, so redundancy falls and useful facts/s climbs
     toward the raw judge rate (rec/s)."""
-    import tinyp2p.layout as L
+    import tinyp2p.shape as shape
     print(f"\n=== CUT SWEEP: catchup at {scale} facts, varying page size ===")
     print("    flat (COLD_CUT=None) each row; only E[facts/page] changes\n")
     hdr = ("CUT", "facts", "pages", "dl_MB", "streamed", "redund",
            "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>4} {:>8} {:>7} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}".format(*hdr))
-    orig, orig_cold = L.CUT, L.COLD_CUT
-    L.COLD_CUT = None  # pin flat so the sweep isolates the fine-cut redundancy
+    orig, orig_cold = shape.CUT, shape.COLD_CUT
+    shape.COLD_CUT = None  # pin flat so the sweep isolates fine-cut redundancy
     try:
         for cut in cuts:
-            L.CUT = cut
+            shape.CUT = cut
             d = os.path.join(WORK, f"cut_{cut}")
             shutil.rmtree(d, ignore_errors=True)
             seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
@@ -378,7 +378,7 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
             gc.collect()
             shutil.rmtree(d, ignore_errors=True)
     finally:
-        L.CUT, L.COLD_CUT = orig, orig_cold
+        shape.CUT, shape.COLD_CUT = orig, orig_cold
 
 
 def check_leaves(seed, ws):
@@ -458,15 +458,16 @@ def run_tier(scale, cold_cut=4096, guard=256):
     """Flat CUT=8 vs the shipped tiered layout: coarse ~1.5 MB cold pages sealed
     below a fine GUARD-deep tail. Measures catchup (bytes/throughput/redundancy)
     and steady-state per-post write cost for each."""
-    import tinyp2p.layout as L
+    import tinyp2p.shape as shape
     print(f"\n=== TIERED vs FLAT — {scale} facts "
           f"(cold pages ~{cold_cut} facts ≈ 1.5 MB, guard {guard}) ===\n")
     print("  {:>14} {:>7} {:>7} {:>7} {:>8} {:>7}   {:>10} {:>8} {:>10}"
           .format("layout", "pages", "dl_MB", "redund", "facts/s", "leaves",
                   "wr_steady", "wr_p90", "wr_stragl"))
+    original = shape.COLD_CUT, shape.GUARD
     try:
         for name, cc in (("flat CUT=8", None), (f"tiered {cold_cut}", cold_cut)):
-            L.COLD_CUT, L.GUARD = cc, guard
+            shape.COLD_CUT, shape.GUARD = cc, guard
             d = os.path.join(WORK, f"tier_{scale}_{cc}")
             shutil.rmtree(d, ignore_errors=True)
             seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
@@ -484,7 +485,7 @@ def run_tier(scale, cold_cut=4096, guard=256):
                       leaves, wr["mean_kb"], wr["p90_kb"], wr["straggler_kb"]))
             sys.stdout.flush()
     finally:
-        L.COLD_CUT, L.GUARD = None, guard
+        shape.COLD_CUT, shape.GUARD = original
 
 
 def main():

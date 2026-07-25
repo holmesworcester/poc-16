@@ -27,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.layout as L
+import tinyp2p.shape as shape
 from tinyp2p import treap as T
 from tinyp2p.kernel import resolve_deps
 from tinyp2p.layout import layout
@@ -125,9 +125,10 @@ def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     scales = args or [5000, 20000, 50000]
     batch = 250  # 250 msgs -> 500 scattered facts folded in
-    L.COLD_CUT = None  # flat leaves == treap leaves
+    shape.COLD_CUT = None  # flat leaves == treap leaves
     os.makedirs(WORK, exist_ok=True)
-    print(f"\n=== TREAP (binary Merkle) vs FLAT layout — CUT={L.CUT}, COLD_CUT=None ===")
+    print("\n=== TREAP (binary Merkle) vs FLAT layout — "
+          f"CUT={shape.CUT}, COLD_CUT=None ===")
     print(f"    100 members / {YEARS}y / fold batch = {batch} scattered msgs "
           f"({batch * 2} facts)\n")
     cols = ("facts", "P", "flatBuild", "treapBuild", "leaves=",
