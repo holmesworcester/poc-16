@@ -1,0 +1,255 @@
+{
+    "schema": "poc-16.key-hierarchy.v1",
+    "decision": {
+        "primary": "independent-nonexportable-recipient-generations",
+        "portable_fallback": "independent-random-software-generations",
+        "software_recipient_suite": "X25519",
+        "stable_content_root": "rejected-in-v1",
+        "first_frontier_only_rotation": "rejected-in-v1",
+        "steady_handle_count": 2,
+        "transition_peak_handle_count": 3,
+        "parent_claim_link": "explicit-claim-id",
+        "next_claim_requires_finalized_predecessor": true,
+        "writer_lease_generation": "caller-supplied-exact",
+        "generation_identity": "immutable-suite-and-public-key",
+        "generation_position_identity": "opaque-id-bound-to-monotonic-position-on-claim",
+        "unclaimed_generation_discard": "fresh-id-at-same-position",
+        "provider_epoch_binding": "protected-lineage-and-suite-qualified-public-keys",
+        "provider_open_revalidates_generation": true,
+        "restore_revalidates_live_handles": true,
+        "cover_expected_context": "separate-authoritative-record",
+        "duplicate_operation_refs": "canonical-set",
+        "empty_retirement_batch": "rejected-before-claim-cas",
+        "protected_claim_before_rollbackable_mirror": true,
+        "protected_claim_includes_manifest": true,
+        "protected_fence_phase_required": true,
+        "protected_live_position_required": true,
+        "destroy_revalidates_survivors": true,
+        "retirement_validation": "serialized-post-open-record-and-handle-recheck",
+        "migration_proof": "exact-survivor-id-secret-commitment-and-context-set",
+        "migration_proof_cas": "protected-first-immutable",
+        "retirement_order": "protected-disable-before-handle-delete",
+        "protected_retirement_evidence": "exact-transition-and-migration-proof",
+        "lower_tier_destruction_intent": "exact-before-delete",
+        "wrap_eligibility": "live-active-staged-public-commitments",
+        "promotion_projection": "retirement-backed-and-replayable",
+        "finalization_revalidates_parent_claim": true,
+        "finalization_projection": "protected-completion-first-replayable-mirrors",
+        "recipient_generations": [
+            "P",
+            "S",
+            "T",
+            "U",
+            "V"
+        ],
+        "transition_batches": [
+            {
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "purge_operations": [
+                    "purge-node-a"
+                ]
+            },
+            {
+                "predecessor": "S",
+                "successor": "T",
+                "next": "U",
+                "purge_operations": [
+                    "purge-node-b",
+                    "purge-node-c"
+                ]
+            },
+            {
+                "predecessor": "T",
+                "successor": "U",
+                "next": "V",
+                "purge_operations": [
+                    "purge-node-d"
+                ]
+            }
+        ],
+        "purge_operation_targets": {
+            "purge-node-a": [
+                "retained-node-a"
+            ],
+            "purge-node-b": [
+                "retained-node-b"
+            ],
+            "purge-node-c": [
+                "absent-node-c"
+            ],
+            "purge-node-d": [
+                "absent-node-d"
+            ],
+            "conflicting-purge-operation": [
+                "conflicting-node"
+            ],
+            "forked-purge-operation": [
+                "forked-node"
+            ]
+        }
+    },
+    "cover_context": {
+        "version": 1,
+        "provider_suite": "X25519",
+        "recipient_lineage_id": "device-a-content-lineage",
+        "content_scope_id": "workspace-a",
+        "frontier_id": "frontier-a",
+        "recovery_policy_ref": "standard-generation-sealed-v1"
+    },
+    "cover_records": [
+        {
+            "id": "frontier-root",
+            "secret_kind": "FrontierRoot",
+            "range_start": 0,
+            "range_width": 0,
+            "bit_depth": 0,
+            "event_id_prefix": "0000000000000000000000000000000000000000000000000000000000000000",
+            "source_secret_ref": "0000000000000000000000000000000000000000000000000000000000000000",
+            "tombstone_context": "0000000000000000000000000000000000000000000000000000000000000000",
+            "secret_commitment": "1d899af7ade508268fecad380dc8a9126a4cc690f6a2dc9926af9539493ff75c",
+            "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        },
+        {
+            "id": "retained-node-a",
+            "secret_kind": "HistoryNode",
+            "range_start": 1700000,
+            "range_width": 1,
+            "bit_depth": 12,
+            "event_id_prefix": "0010000000000000000000000000000000000000000000000000000000000000",
+            "source_secret_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "tombstone_context": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "secret_commitment": "40807f6bd42e9c15b5b89a15e78788e8a4799a85329949431fefebbec4153ba5",
+            "plaintext_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        },
+        {
+            "id": "retained-node-b",
+            "secret_kind": "HistoryNode",
+            "range_start": 1700001,
+            "range_width": 1,
+            "bit_depth": 16,
+            "event_id_prefix": "4041000000000000000000000000000000000000000000000000000000000000",
+            "source_secret_ref": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "tombstone_context": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "secret_commitment": "36fe0c2110fdedb071027e74da3c10c4cb12ae5a5d264047d7599e898b438422",
+            "plaintext_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+        }
+    ],
+    "guarantee_tiers": [
+        {
+            "name": "normal-disk",
+            "nonexportable_private_key": false,
+            "deleted_keyblob_replay_blocked": false,
+            "old_claim_replay_blocked": false,
+            "snapshot_erasure_claim": false
+        },
+        {
+            "name": "hardware-isolated",
+            "nonexportable_private_key": true,
+            "deleted_keyblob_replay_blocked": false,
+            "old_claim_replay_blocked": false,
+            "snapshot_erasure_claim": false
+        },
+        {
+            "name": "rollback-resistant",
+            "nonexportable_private_key": true,
+            "deleted_keyblob_replay_blocked": true,
+            "old_claim_replay_blocked": true,
+            "snapshot_erasure_claim": true
+        }
+    ],
+    "hierarchy_candidates": [
+        {
+            "name": "independent-generation-handles",
+            "selected": true,
+            "stable_root": false,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "accepted"
+        },
+        {
+            "name": "stable-device-box-wraps-all-generations",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": true,
+            "status": "rejected"
+        },
+        {
+            "name": "deterministic-forward-schedule-without-monotonic-state",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": true,
+            "old_position_operation_possible": true,
+            "status": "rejected"
+        },
+        {
+            "name": "tpm-root-gated-by-exact-monotonic-position",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "deferred-provider-extension"
+        },
+        {
+            "name": "independent-node-keys-first-frontier-only",
+            "selected": false,
+            "stable_root": false,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "rejected-in-v1"
+        }
+    ],
+    "platforms": [
+        {
+            "name": "apple-security-framework-secure-enclave",
+            "key_agreement_suite": "P-256",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "hardware-isolated",
+            "notes": "ThisDeviceOnly is device-bound but same-device restore is documented; no rollback-resistant tier is claimed from the cited public API.",
+            "sources": [
+                "https://developer.apple.com/documentation/Security/protecting-keys-with-the-secure-enclave",
+                "https://developer.apple.com/documentation/Security/restricting-keychain-item-accessibility"
+            ]
+        },
+        {
+            "name": "android-keystore-or-strongbox",
+            "key_agreement_suite": "provider-advertised-and-attested",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "hardware-isolated",
+            "notes": "StrongBox alone is not treated as proof of rollback-resistant deletion. A provider may claim the stronger tier only when KeyMint rollback resistance is actually requested, verified, and capacity-tested.",
+            "sources": [
+                "https://developer.android.com/privacy-and-security/keystore",
+                "https://source.android.com/docs/security/features/keystore/implementer-ref"
+            ]
+        },
+        {
+            "name": "tpm-2-policy-nv-provider",
+            "key_agreement_suite": "provider-advertised",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "retirement_counter_available": true,
+            "protected_claim_digest_cas_required": true,
+            "maximum_default_tier": "hardware-isolated",
+            "conditional_tier": "rollback-resistant-after-reviewed-claim-cas",
+            "notes": "PolicyNV plus an NV counter can retire old positions but does not itself serialize claims while P remains usable. The stronger tier additionally requires a protected claim-digest CAS committed before acceptance, with authorization preventing reset or replacement.",
+            "sources": [
+                "https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-1-Version-184_pub.pdf",
+                "https://trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-2-Structures-00.99.pdf",
+                "https://trustedcomputinggroup.org/wp-content/uploads/TPM-2.0-1.83-Part-3-Commands.pdf"
+            ]
+        },
+        {
+            "name": "software-only",
+            "key_agreement_suite": "X25519",
+            "hardware_isolation": false,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "normal-disk",
+            "notes": "Independent random generations preserve protocol shape, but backups, clones, and filesystem snapshots can resurrect retired private material and one-time claims.",
+            "sources": []
+        }
+    ]
+}
