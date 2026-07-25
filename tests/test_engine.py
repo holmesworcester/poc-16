@@ -58,6 +58,13 @@ def leaf_ranges(view, driver):
     return list(tree.leaf_ranges(view, driver.fetch))
 
 
+def internal_boundary(keys):
+    return next(
+        key for key in keys[1:-1]
+        if shape.boundary(shape.fid_of(key))
+    )
+
+
 # ---- golden gates: the extraction changes nothing ---------------------------
 
 def test_binary_packing_reproduces_treap_bytes(engine_world):
@@ -238,6 +245,35 @@ def test_flat_fold_promotes_a_boundary_terminated_tail(engine_world):
             expected, "workspace", frozenset()))
 
 
+def test_binary_fold_promotes_the_former_tail_boundary(monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 4)
+    facts = [
+        Fact("sample", ts, [], {"c": 4, "i": ts})
+        for ts in range(90)
+    ]
+    by_fid = {fact.fid: fact for fact in facts}
+    keys = sorted(fact.key for fact in facts)
+    base = [
+        keys[index]
+        for index in (1, 11, 13, 15, 23, 42, 45, 49,
+                      52, 58, 61, 66, 73, 85)
+    ]
+    added = keys[86]
+    driver = Driver()
+    before = build(base, by_fid, tree.BINARY, driver)
+
+    actual = tree.fold(
+        before, [added], shape.FACT, tree.BINARY,
+        by_fid.__getitem__, lambda fid: (),
+        driver.fetch, driver.emit,
+    )
+    expected = build(base + [added], by_fid, tree.BINARY, driver)
+
+    assert shape.boundary(shape.fid_of(before.sep))
+    assert not shape.boundary(shape.fid_of(added))
+    assert actual.oid == expected.oid
+
+
 def test_diff_partitions_symmetric_difference(engine_world):
     keys, by_fid = engine_world
     rng = random.Random(17)
@@ -259,10 +295,7 @@ def test_diff_partitions_symmetric_difference(engine_world):
 
 def test_diff_aligns_across_a_promoted_leaf_boundary(engine_world):
     keys, by_fid = engine_world
-    promoted = next(
-        key for key in keys[1:-1]
-        if shape.boundary(shape.fid_of(key))
-    )
+    promoted = internal_boundary(keys)
     driver = Driver()
     packing = tree.fat(8)
     mine = cold(build(
@@ -283,6 +316,62 @@ def test_diff_aligns_across_a_promoted_leaf_boundary(engine_world):
     assert symmetric == {promoted}
     assert len(set(driver.reads)) <= mine.level + theirs.level + 2
     assert len(set(driver.reads)) < leaf_count
+
+
+def test_merge_one_delta_reads_and_writes_only_spines(engine_world):
+    keys, by_fid = engine_world
+    promoted = internal_boundary(keys)
+    driver = Driver()
+    packing = tree.fat(8)
+    mine = cold(build(
+        [key for key in keys if key != promoted],
+        by_fid, packing, driver,
+    ))
+    theirs = cold(build(keys, by_fid, packing, driver))
+    leaf_count = len(leaf_ranges(theirs, driver))
+    driver.reads.clear()
+    driver.writes.clear()
+
+    merged = tree.merge(
+        mine, theirs, shape.FACT, packing,
+        driver.fetch, driver.emit,
+    )
+
+    assert (merged.fp, merged.oid, merged.n) == \
+        (theirs.fp, theirs.oid, theirs.n)
+    assert len(set(driver.reads)) <= mine.level + theirs.level + 2
+    assert len(set(driver.reads)) < leaf_count
+    assert len(set(driver.writes)) <= 2 * (mine.level + 1)
+
+
+def test_merge_height_change_still_reads_only_spines(monkeypatch):
+    """A rare high-tier boundary may wrap the root, but not scan its siblings."""
+    monkeypatch.setattr(shape, "CUT", 2)
+    monkeypatch.setattr(shape, "COLD_CUT", None)
+    facts = [
+        Fact("sample", ts, [], {"n": ts})
+        for ts in range(30_000)
+    ]
+    by_fid = {fact.fid: fact for fact in facts}
+    keys = sorted(fact.key for fact in facts)
+    driver = Driver()
+    packing = tree.FAT
+    mine = cold(build(
+        keys[:29_800] + keys[29_801:], by_fid, packing, driver))
+    theirs = cold(build(keys, by_fid, packing, driver))
+    driver.reads.clear()
+    driver.writes.clear()
+
+    merged = tree.merge(
+        mine, theirs, shape.FACT, packing,
+        driver.fetch, driver.emit,
+    )
+
+    spines = mine.level + theirs.level
+    assert mine.level != theirs.level
+    assert (merged.fp, merged.oid) == (theirs.fp, theirs.oid)
+    assert len(set(driver.reads)) <= 2 * spines
+    assert len(set(driver.writes)) <= 2 * spines
 
 
 @pytest.mark.parametrize("packing", [tree.BINARY, tree.FLAT, tree.fat(8)])

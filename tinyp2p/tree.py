@@ -428,11 +428,14 @@ def _fold_binary(
         return _binary_view(leaves, shape)
     left, right = view.children
     separator = left.sep
-    promoted = max(
-        (shape.priority(shape.fid_of(key)) for key in delta
-         if shape.boundary(shape.fid_of(key))),
-        default=-1,
-    )
+    promotions = [
+        shape.priority(shape.fid_of(key)) for key in delta
+        if shape.boundary(shape.fid_of(key))
+    ]
+    if delta[-1] > view.sep \
+            and shape.boundary(shape.fid_of(view.sep)):
+        promotions.append(shape.priority(shape.fid_of(view.sep)))
+    promoted = max(promotions, default=-1)
     if promoted > shape.priority(shape.fid_of(separator)):
         old = leaf_keys(view, fetch, shape, use_warm)
         leaves, _ = _leaf_views(
@@ -585,11 +588,8 @@ def diff(
         lo, hi = max(left_lo, right_lo), min(left_hi, right_hi)
         if lo >= hi:
             return
-        if left_lo == right_lo and left_hi == right_hi \
-                and left.fp == right.fp and left.n == right.n:
+        if left.fp == right.fp and left.n == right.n:
             return
-        left = resolve(left, fetch_mine, left_nodes)
-        right = resolve(right, fetch_theirs, right_nodes)
         if left.level == right.level == 0:
             mine = keys(
                 left, left_lo, left_hi, fetch_mine, left_keys)
@@ -608,19 +608,43 @@ def diff(
                     )
                 yield lo, hi, tuple(mine), remote
             return
-        left_parts = parts(
-            left, left_lo, left_hi, fetch_mine, left_nodes)
-        right_parts = parts(
-            right, right_lo, right_hi, fetch_theirs, right_nodes)
-        i = j = 0
-        while i < len(left_parts) and j < len(right_parts):
-            llo, lhi, lview = left_parts[i]
-            rlo, rhi, rview = right_parts[j]
-            yield from rec(lview, llo, lhi, rview, rlo, rhi)
-            if lhi <= rhi:
-                i += 1
-            if rhi <= lhi:
-                j += 1
+        if left_lo == right_lo and left_hi == right_hi \
+                and left.level == right.level:
+            left_parts = parts(
+                left, left_lo, left_hi, fetch_mine, left_nodes)
+            right_parts = parts(
+                right, right_lo, right_hi, fetch_theirs, right_nodes)
+            i = j = 0
+            while i < len(left_parts) and j < len(right_parts):
+                llo, lhi, lview = left_parts[i]
+                rlo, rhi, rview = right_parts[j]
+                yield from rec(
+                    lview, llo, lhi, rview, rlo, rhi)
+                if lhi <= rhi:
+                    i += 1
+                if rhi <= lhi:
+                    j += 1
+            return
+        left_contains = left_lo <= right_lo and right_hi <= left_hi
+        right_contains = right_lo <= left_lo and left_hi <= right_hi
+        if left.level == 0:
+            split_left = False
+        elif right.level == 0:
+            split_left = True
+        elif left_contains != right_contains:
+            split_left = left_contains
+        else:
+            split_left = left.level >= right.level
+        if split_left:
+            for llo, lhi, lview in parts(
+                    left, left_lo, left_hi, fetch_mine, left_nodes):
+                yield from rec(
+                    lview, llo, lhi, right, right_lo, right_hi)
+        else:
+            for rlo, rhi, rview in parts(
+                    right, right_lo, right_hi, fetch_theirs, right_nodes):
+                yield from rec(
+                    left, left_lo, left_hi, rview, rlo, rhi)
 
     left_hi, right_hi = mine.sep, theirs.sep
     if left_hi and right_hi:
