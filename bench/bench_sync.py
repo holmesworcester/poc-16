@@ -239,19 +239,31 @@ def reconcile(A, B, ws):
             "facts": total, "match": match}
 
 
-def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS):
+def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
+         shape=None, seed=16):
     A = Node(os.path.join(base_dir, "A"))
     ws = cmds.create(A, "alice")
     base_ts = now_ms()
     window = years * 365 * 24 * 3600 * 1000
-    members = build_members(A, ws, n_members, base_ts)
+    depth = None
+    if shape is None:
+        members = build_members(A, ws, n_members, base_ts)
+    else:
+        from bench.seed_chain import grow_tree
+        root_ts = A.fact_of(ws, ws).ts
+        members, _, depths, _ = grow_tree(
+            A, ws, n_members, root_ts + 1, random.Random(seed), shape=shape)
+        depth = {
+            "min": min(depths.values()),
+            "max": max(depths.values()),
+        }
     membership = all_fids(A, ws)
 
     B = Node(os.path.join(base_dir, "B"))
     copy_facts(B, ws, A, membership)
 
     per_side = max(1, (total_facts - len(membership)) // 4)  # msgs per side
-    first = base_ts + n_members + 1
+    first = A.idx(ws).execute("SELECT MAX(ts) FROM facts").fetchone()[0] + 1
     bulk_author(A, ws, members, per_side, first, window, random.Random(1), "A")
     bulk_author(B, ws, members, per_side, first, window, random.Random(2), "B")
     A.commit(ws)
@@ -259,7 +271,8 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS):
     a_facts = A.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     b_facts = B.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     st = reconcile(A, B, ws)
-    st.update({"a_before": a_facts, "b_before": b_facts})
+    st.update({"a_before": a_facts, "b_before": b_facts,
+               "shape": shape or "star", "depth": depth})
     return st
 
 
@@ -366,6 +379,34 @@ def check_leaves(seed, ws):
     return n
 
 
+def chained_guard(scale, base_dir, shapes=("star", "wide", "random", "chain"),
+                  n_members=MEMBERS):
+    """Exercise catchup, bidi reconciliation, and every leaf on chained seeds."""
+    from bench.seed_chain import build_seed as build_chained_seed
+
+    results = {}
+    for shape in shapes:
+        directory = os.path.join(base_dir, shape)
+        shutil.rmtree(directory, ignore_errors=True)
+        seed, ws, stats = build_chained_seed(
+            os.path.join(directory, "seed"), scale,
+            n_members=n_members, shape=shape)
+        leaves = check_leaves(seed, ws)
+        caught = catchup(seed, ws, os.path.join(directory, "fresh"))
+        reconciled = bidi(
+            scale, os.path.join(directory, "bidi"),
+            n_members=n_members, shape=shape)
+        assert caught["match"], f"{shape} catchup did not match"
+        assert reconciled["match"], f"{shape} bidi did not converge"
+        results[shape] = {
+            "depth": stats["depth"],
+            "leaves": leaves,
+            "catchup": caught,
+            "bidi": reconciled,
+        }
+    return results
+
+
 def measure_write_cost(node_dir, scale, posts=200):
     """Build a promoted seed, then size the obj bytes each post rewrites.
     STEADY posts land at the hot end (ts after every seed fact) — the normal
@@ -433,6 +474,19 @@ def run_tier(scale, cold_cut=4096, guard=256):
 def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     os.makedirs(WORK, exist_ok=True)
+    if "chain" in sys.argv:
+        scale = args[0] if args else 5000
+        results = chained_guard(
+            scale, os.path.join(WORK, f"chained_guard_{scale}"))
+        print("\n=== CHAINED SEED GREEN GUARD ===")
+        for shape, result in results.items():
+            depth = result["depth"]
+            print(
+                f"  {shape:6} depth={depth['min']}/{depth['median']:g}/"
+                f"{depth['max']} leaves={result['leaves']} "
+                f"catchup={'y' if result['catchup']['match'] else 'N'} "
+                f"bidi={'y' if result['bidi']['match'] else 'N'}")
+        return
     if "tier" in sys.argv:
         run_tier(args[0] if args else 50000)
         return

@@ -11,22 +11,34 @@ from tinyp2p.kernel import resolve_deps
 from tinyp2p.node import Node, now_ms
 
 
-def add_member(n, ws, name, ts=None):
-    """Invite + join without the HTTP blob dance: returns (sk, pk, join_fact)."""
-    ts = ts or now_ms()
-    isk, ipk = keypair()
-    inv = user_invite(n.pk, ipk, ts)
-    si = signature(n.sk, n.pk, inv, ts)
-    bsk, bpk = keypair()
-    j = user(inv, isk, bpk, name, ts)
-    sj = signature(bsk, bpk, j, ts)
+def add_member(n, ws, name, ts=None, inviter=None):
+    """Add a user through an existing member and return ``(sk, pk, user)``.
+
+    ``inviter`` is that member's ``(sk, pk)`` identity and defaults to the
+    workspace founder. ``ts`` is the invite timestamp; the user follows one
+    tick later so every delegation edge is strictly forward in time.
+    """
+    inviter_sk, inviter_pk = inviter or n.identity(ws)
     with n.lock:
         from tinyp2p.kernel import offer_src
-        asrc = offer_src(n.idx(ws), "admin", n.pk)
-    deps = {inv.fid: [si.fid, asrc], si.fid: [],
-            j.fid: [inv.fid, sj.fid], sj.fid: []}
-    n.ingest_new(ws, [si, inv, sj, j], deps)
-    return bsk, bpk, j
+        member_source = offer_src(n.idx(ws), "member", inviter_pk)
+        if member_source is None:
+            raise ValueError("inviter is not a workspace member")
+        member_ts = n.fact_of(ws, member_source).ts
+    invite_ts = max(now_ms(), member_ts + 1) if ts is None else ts
+    if invite_ts <= member_ts:
+        raise ValueError("invite timestamp must follow the inviter's membership")
+    user_ts = invite_ts + 1
+    isk, ipk = keypair()
+    inv = user_invite(inviter_pk, ipk, invite_ts)
+    si = signature(inviter_sk, inviter_pk, inv, invite_ts)
+    bsk, bpk = keypair()
+    joined = user(inv, isk, bpk, name, user_ts)
+    joined_sig = signature(bsk, bpk, joined, user_ts)
+    deps = {inv.fid: [si.fid, member_source], si.fid: [],
+            joined.fid: [inv.fid, joined_sig.fid], joined_sig.fid: []}
+    n.ingest_new(ws, [si, inv, joined_sig, joined], deps)
+    return bsk, bpk, joined
 
 
 def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):

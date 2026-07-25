@@ -59,7 +59,8 @@ def materialize(db, workspace, valid):
 def create(node, name):
     from ...node import now_ms
 
-    root = workspace(node.sk, node.pk, name, now_ms())
+    secret, public = node.identity()
+    root = workspace(secret, public, name, now_ms())
     workspace_id = root.fid
     node.add_workspace(workspace_id, name, peers=[])
     node.ingest_new(workspace_id, [root], {root.fid: []})

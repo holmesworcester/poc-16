@@ -19,8 +19,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import facts
 from .close import close, decode_pile, encode_pile
-from .crypto import h, keypair, load_sk
+from .crypto import h
 from .fact import Fact, from_json
+from .keychain import Keychain
 from .kernel import Judgment, drain, resolve_deps
 from .layout import fingerprint, layout
 from .store import FsStore
@@ -48,14 +49,9 @@ class Node:
         self.lock = threading.RLock()
         self.url = None  # the daemon sets its advertised base URL
         self._kr_path = os.path.join(dir, "keyring.json")
-        if os.path.exists(self._kr_path):
-            self.keyring = json.load(open(self._kr_path))
-        else:
-            sk, _ = keypair()
-            self.keyring = {"sk": sk.encode().hex(), "workspaces": {}}
-            self.save_keyring()
-        self.sk = load_sk(self.keyring["sk"])
-        self.pk = self.sk.verify_key.encode().hex()
+        self.keychain = Keychain(self._kr_path)
+        self.keyring = self.keychain.data
+        self.sk, self.pk = self.keychain.default()
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
         self.app.executescript(facts.APP_SCHEMA)
         self._stores, self._idx = {}, {}
@@ -66,21 +62,38 @@ class Node:
     # ---- node-local state ----------------------------------------------------
 
     def save_keyring(self):
-        json.dump(self.keyring, open(self._kr_path, "w"))
+        self.keychain.save()
 
     @property
     def member(self):
         return self.pk[:16]
 
+    def identity(self, workspace=None):
+        return self.keychain.default() if workspace is None \
+            else self.keychain.for_workspace(workspace)
+
+    def identity_id(self, workspace=None):
+        return self.identity(workspace)[1]
+
+    def member_for(self, workspace):
+        return self.identity_id(workspace)[:16]
+
     def workspaces(self):
         return list(self.keyring["workspaces"])
 
-    def add_workspace(self, workspace, name, peers):
+    def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
         with self.lock:
+            identity = identity or self.keychain.default_id()
+            self.keychain.identity(identity)
             self.keyring["workspaces"][workspace] = {
-                "peers": list(peers), "name": name}
+                "peers": list(peers), "name": name,
+                "identity": identity}
             self.save_keyring()
+
+    def bind_identity(self, workspace, identity):
+        with self.lock:
+            self.keychain.bind(workspace, identity)
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -240,7 +253,7 @@ class Node:
                 return resolve_deps(fact_of(fid), idx) or []
 
             b = encode_pile(close(news, deps_of, fact_of), blobs)
-            self.store(ws).put(f"pile/{self.member}/{h(b)}", b)
+            self.store(ws).put(f"pile/{self.member_for(ws)}/{h(b)}", b)
             return self.turn(ws)
 
     # ---- rebuild: the store's own units through the same kernel --------------

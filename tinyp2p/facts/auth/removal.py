@@ -59,9 +59,10 @@ def evict(node, workspace, target):
     if not row:
         raise ValueError(f"no member {target!r}")
     ts = now_ms()
-    item = removal(node.pk, row[0], ts)
+    secret, public = node.identity(workspace)
+    item = removal(public, row[0], ts)
     return publish(node, workspace, item,
-                   signature.signature(node.sk, node.pk, item, ts), role="admin")
+                   signature.signature(secret, public, item, ts), role="admin")
 
 
 # QUERIES — member status is exposed by auth.user.members.

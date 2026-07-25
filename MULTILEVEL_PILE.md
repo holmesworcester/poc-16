@@ -151,14 +151,16 @@ Two residuals — and the first is bigger than the earlier draft admitted
   order**. Under the shipped **timestamp** order it is badly non-contiguous: each
   member posts across the whole 3-year window, so that member's membership is
   needed by ~1% of leaves *scattered end to end* → `LCA(N(f)) = root` → it rides
-  nearly all paths. The shared core (≈ 4×members: genesis + per-member
-  invite/join/sigs) hoists to the root and over-includes ~92% of the paths it
-  rides — only *genesis* is genuinely near-universal. So the range-sync tax is a
-  **flat ≈ 4×members**, independent of subtree size, and it makes multi-level
-  **lose to leaf-only for small range syncs** (below a crossover of a few dozen
-  leaves) — *under the shipped timestamp order*. A.5 measures how a
-  dependency-aligned key order collapses this ~10× (tax 397→37, crossover ~40→~11
-  leaves): the tax is an order artifact, not an intrinsic cost.
+  nearly all paths. The shared core (≈ 4×members: workspace root + per-user
+  user_invite/user/signatures) hoists to the root and over-includes ~92% of the
+  paths it rides — only the *workspace root* is genuinely near-universal. So
+  the range-sync tax is a **flat ≈ 4×members**, independent of subtree size, and
+  it makes multi-level
+  **lose to leaf-only for small range syncs** — *under the shipped timestamp
+  order*. A.5 now measures actual depth-1, shallow-wide, random, and length-99
+  delegation trees. A delegation-DFS order turns the semantic-subtree overhead
+  into a path cost (about four auth facts per ancestor, plus a small
+  hash-boundary residual): an order artifact bounded by depth, not members.
 - **Single-leaf access is now a path, not an object.** Sync walks paths anyway, so
   it is free there; only random single-leaf fetch pays the depth.
 
@@ -173,7 +175,7 @@ Two residuals — and the first is bigger than the earlier draft admitted
 
 `ρ` reproduces RESULTS.md §3's flat 3.1×. The shape of the win: **86–93% of facts
 are needed by their own leaf only** and never move; a **tiny shared core** (led by
-the genesis membership, in ~92% of all leaves) is what inflates the total to `3×`.
+the workspace membership, in ~92% of all leaves) is what inflates the total to `3×`.
 Hoisting moves only that core and deletes **two-thirds** of the *full-sync*
 stored/shipped/verified volume — `ρ → 1`. But the moved core is exactly the
 **range-sync tax** of A.4, and it is *not* small — measured next.
@@ -183,76 +185,104 @@ redundancy*: big cold pages exist only to amortise this shared core, and the
 multi-level pile amortises it structurally. (Large leaves would still help
 object-count / round-trip count — a separate axis.)
 
-### Range-sync tax and the key-order question (`bench/bench_order.py`, 50k)
+### Range-sync tax and real delegation depth (`bench/bench_order.py`, 49,999)
 
 The shared core hoists to the root, so a range syncer pulling a small subtree pays
-it in full — but **how big that core is depends entirely on the key order**. The
-tightness rule is the same one that governs applicability/global facts: a fact
-settles tightly only when the leaves that need it are **contiguous in key order**,
-and closure follows **authorship + delegation**, not time. Three orders over the
-*same* facts — timestamp (shipped); author-contiguous (group by signer); and
-delegation-DFS (the invite tree built via **joins**, with each invite and its sig
-re-homed onto the member it admitted). `tax` = mean facts on a leaf's ancestor
-path; `≥50%` = facts settling across ≥ half the leaves (the "genuinely global"
-count); crossover = subtree size past which multi-level ships less than leaf-only:
+it in full — but **how big that core is depends on key order and actual delegation
+depth**. The benchmark now bulk-builds the same 100-user fact set in four shapes,
+with messages uniform over three years and flat leaves (`COLD_CUT=None`):
 
-| order | leaf-only `ρ` | tax (mean/leaf) | facts ≥50% | ML beats leaf-only from | 1-leaf ML cost |
+| shape | realized depth histogram (depth:users) | min / median / max |
+|---|---|---:|
+| star | `0:1, 1:99` | 0 / 1 / 1 |
+| shallow-wide (8 inviters) | `0:1, 1:8, 2:91` | 0 / 2 / 2 |
+| random recursive | `0:1, 1:7, 2:11, 3:19, 4:19, 5:25, 6:14, 7:3, 8:1` | 0 / 4 / 8 |
+| chain | every depth `0…99:1` | 0 / 49.5 / 99 |
+
+The tree is reconstructed via **users**, never the ephemeral invitee key:
+`user -> referenced user_invite -> invite signer`. Each invite and its signature
+are then re-homed onto the user it admitted. `mean tax` is the mean ancestor
+payload above a layout leaf; `≥50%` counts facts whose settle node rides at least
+half the leaves. `crossover` is the first observed hash-shaped layout subtree
+where multi-level ships no more than leaf-only, so it is boundary-sample-sensitive:
+
+| shape | order | leaf-only `ρ` | mean tax | facts ≥50% | crossover (leaves) |
+|---|---|--:|--:|--:|--:|
+| star | timestamp | 3.08× | 399.0 | 397 | 16 |
+|  | author | 1.64× | 155.4 | 113 | 21 |
+|  | **delegation DFS** | **1.64×** | **35.3** | **13** | **3** |
+| shallow-wide | timestamp | 4.33× | 398.9 | 397 | 8 |
+|  | author | 2.06× | 170.7 | 151 | 7 |
+|  | **delegation DFS** | **2.05×** | **45.9** | **17** | **2** |
+| random | timestamp | 6.61× | 398.9 | 397 | 3 |
+|  | author | 2.98× | 241.7 | 257 | 6 |
+|  | **delegation DFS** | **2.97×** | **67.3** | **37** | **2** |
+| chain | timestamp | 34.50× | 398.9 | 397 | 1 |
+|  | author | 23.95× | 391.2 | 391 | 1 |
+|  | **delegation DFS** | **23.85×** | **285.7** | **249** | **1** |
+
+The new depth test pulls the key range containing one *semantic delegation
+subtree*. Here `tax = ML facts fetched − that subtree's own facts`, so it counts
+both ancestor context and unrelated facts dragged in by scatter:
+
+| shape / target | depth | users | timestamp tax | author tax | **DFS tax** |
 |---|--:|--:|--:|--:|--:|
-| timestamp (shipped) | 3.08× | **399** | 397 (= 4×members) | ~40 leaves | 397 |
-| author-contiguous | 1.63× | 184 | 169 | ~13 leaves | 72 |
-| **delegation-DFS** | 1.62× | **37** | **21** (~9 real) | **~11 leaves** | **11** |
+| star leaf | 1 | 1 | 49,478 | 35,689 | **28** |
+| shallow-wide leaf | 2 | 1 | 49,248 | 5,080 | **59** |
+| shallow-wide branch | 1 | 12 | 43,909 | 35,868 | **19** |
+| random leaf | 8 | 1 | 49,491 | 20,749 | **75** |
+| random branch | 4 | 10 | 45,075 | 39,686 | **96** |
+| chain suffix | 99 | 1 | 49,429 | 10,411 | **397** |
+| chain suffix | 90 | 10 | 45,155 | 42,725 | **379** |
+| chain suffix | 50 | 50 | 25,113 | 24,625 | **212** |
 
-What the numbers say (and the two things the earlier drafts got wrong):
+What the numbers say:
 
-- **The timestamp tax is real and flat.** ≈ 397 facts (= 4×members) hoist above
-  *every* leaf, because each member posts across the whole window so its membership
-  is needed by ~1% of leaves scattered end to end → `LCA = root`. A 1-leaf sync
-  costs 397 vs leaf-only's 5. The original A.4 "`O(log n)` path tax" was wrong.
-- **Dependency-aligned order collapses the tax ~10×.** Grouping by **author**
-  already halves leaf-only `ρ` (3.08→1.63) and drops the tax to ~184 — but it
-  leaves **invites + invite-sigs high** (169 facts still ≥50%): an invite is signed
-  by the *inviter* yet needed by the *invitee*'s block, so author-order can't
-  co-locate it. Building the **delegation tree** (via joins — the invite names an
-  ephemeral key, so the member↔invite link is the join's ref) and re-homing each
-  invite and its sig onto the admitted member collapses the tax to **~37**, with
-  only **~9 facts genuinely global** (led by genesis). `LO/ML` crosses 1 at **~11
-  leaves** and a below-crossover 1-leaf pull wastes only **11** facts, not 397.
-  (The `ts` *secondary* key matters too: it co-locates each msg with its
-  same-timestamp sig, lowering leaf-only `ρ` on its own — the whole sort key, not
-  just its primary, shapes the blocks.)
-- **Caveat — the fixture is a depth-1 delegation star.** `add_member` always
-  invites via genesis, so every member is one hop from the root; here
-  "beneficiary grouping" and "DFS of the delegation tree" coincide and cannot be
-  told apart. Deep, chained delegation (A invites B invites C) is *untested* — it
-  is where DFS-preorder should matter beyond simple beneficiary grouping, and it
-  needs a chained-invite seed to measure.
-- **A small residual remains, from the tree *shape*.** Over-inclusion falls
-  3.08→**69%** under delegation order but not to zero: the treap shape is
-  hash-random, so a semantically-contiguous span can still settle at an `LCA` node
-  covering some extra leaves. Truly tight hoisting would additionally align the
-  *boundaries* to the delegation hierarchy — a further step, not needed for the
-  ~10× the order alone buys.
+- **Timestamp tax is still the flat control.** Every shape has mean tax ≈399
+  and 397 facts riding at least half the leaves: the `1 + 4×99` workspace/user
+  auth core, scattered by three years of content. This reproduces the old star
+  result and confirms depth does not rescue a time order.
+- **DFS makes semantic-subtree tax path-bounded.** On the deliberately clean
+  chain the prediction is visible directly: depth 99 costs 397
+  (`4×99 + 1`), depth 90 costs 379, and depth 50 costs 212. The remaining
+  tens-of-facts wobble is the hash-derived leaf boundary covering neighboring
+  facts, not an `N` term. The same fixed boundary residual dominates the much
+  shorter wide/random paths (for example 59 at depth 2 and 75 at depth 8).
+- **It matters most in the realistic shallow-wide case, not only the stress
+  chain.** Wide mean tax falls 399→46 (8.7×) and random falls 399→67 (5.9×);
+  both also beat flat author grouping by 3.6–3.7×. In the adversarial chain,
+  `depth = Θ(N)`, so the worst-case asymptotic advantage necessarily vanishes
+  and mean tax falls only 399→286. Even there the aligned semantic suffix avoids
+  scatter: the deepest one-user pull pays 397 rather than 49,429.
+- **Real depth raises leaf-only closure cost.** Chain `ρ=23.85×` even under DFS
+  because a deep author's *actual required authority path* is long; this is not
+  ordering over-inclusion. Multi-level full sync remains exactly `1×`, so
+  verify-once/ship-once becomes more valuable as honest closure depth grows.
+- **Treap-shape residual remains.** DFS makes semantic spans contiguous, but a
+  hash-random boundary can cover neighboring facts. Aligning boundaries to the
+  delegation hierarchy could remove that last fixed residual; it is not needed
+  for the `O(members) -> O(depth)` result.
 
-*(An earlier revision of this section reported delegation ≈ author with a ~92%
-over-inclusion "floor"; that was a bug — the delegation tree was built from the
-invite's ephemeral invitee key, which never matches the member's operating key, so
-invites never co-located. Rebuilt via joins, delegation order behaves as above.)*
+With three devices per user, flat device-author grouping and user grouping
+finally diverge. On a 4,999-fact random seed, roster-aware user DFS lowers
+leaf-only `ρ` **4.13×→3.56×**, mean tax **872→90**, and facts riding ≥50% of
+leaves **817→35**; every sampled user subtree has no greater tax. This is why
+the keychain/device layer matters to ordering rather than merely vocabulary.
 
 **Robust regardless of order:** full-sync `= |V|` (the floor), verify-once `= |V|`
 judge-ops, incremental fold `= O(touched)` (§A.6, B.1). The key-order question
-governs only the range-sync tax — a catastrophe under timestamp order, a ~dozen-leaf
-crossover with a tiny penalty under delegation order.
+governs only the range-sync tax — an `N`-scale catastrophe under timestamp
+scatter and a depth-scale path cost under delegation order.
 
-**What this means for the headline claim.** A good key order lowers *leaf-only*
-`ρ` too (3.08→1.63), while multi-level's full-sync cost is order-**invariant**
-(always `|V|`). So hoisting's redundancy *advantage* over leaf-only shrinks from
-**67.5%** (under the shipped `ts` order) to **~38%** (aligned) — much of the
-headline "two-thirds saved" is the timestamp order inflating *leaf-only* to `3×`,
-not an intrinsic property of hoisting. Fix the order and leaf-only is already
-~1.6×. Hoisting's **durable, order-independent** payoff is therefore not raw byte
-redundancy but the **closed-path / verify-once** property (§A.2, B.1):
-validate-as-you-descend, judge each fact exactly once. That is the win to lead
-with; the redundancy number is real but is largely a symptom of key order.
+**What this means for the headline claim.** In the star, a good key order lowers
+*leaf-only* `ρ` too (3.08→1.64), while multi-level's full-sync cost is
+order-**invariant** (always `|V|`). So much of the old "two-thirds saved" headline
+was timestamp scatter. In a deep chain, however, aligned leaf-only remains
+23.85× because the required authority paths themselves are long; multi-level
+still ships and verifies each fact once. Hoisting's durable payoff is therefore
+the **closed-path / verify-once** property (§A.2, B.1), with the redundancy gain
+ranging from modest on a shallow aligned star to enormous on honest deep
+closures.
 
 ## A.6 Incremental fold (blind, bounded ripple)
 
@@ -270,7 +300,7 @@ Why it stays cheap:
 - **Append** (new facts at the tip, depending on recent facts): the touched deps
   live near the tip; rises are short.
 - **Widely-shared deps are already near the root** — adding one more dependent to
-  the genesis membership does not move it (it already covers the tree). The facts
+  the workspace membership does not move it (it already covers the tree). The facts
   expensive to move are exactly the ones already high, which almost never move.
 
 So the fold touches `A` leaves + spine + `{deps of the batch that actually rise}` —
@@ -352,12 +382,13 @@ node's hash and re-invites the pull, and the closure rides down with it.
 - For **range sync** the cost is a **shared-core tax**, *not* the `O(log n)` an
   earlier draft claimed — and it is **an artifact of key order, not intrinsic**.
   Under the shipped **timestamp** order it is a flat ≈ 4×members and multi-level
-  **loses to leaf-only for small pulls** (1-leaf ~40–80× worse, crossover ~40
-  leaves). A **delegation-aligned** order (invite tree via joins, each invite+sig
-  re-homed onto the member it admitted) collapses it ~10× — tax 397→**37**, only
-  ~9 facts genuinely global, crossover **~11 leaves**, a below-crossover pull
-  wasting ~11 facts not 397. Aligning also halves leaf-only `ρ` (so ML's full-sync
-  edge narrows to ~1.6×). Measured in A.5.
+  loses to leaf-only for small pulls. A **delegation-aligned** order (invite tree
+  via users, each invite+signature re-homed onto the member it admitted) changes
+  semantic-subtree overhead from member-bounded to **path-bounded**: star mean
+  tax 399→35, shallow-wide 399→46, random 399→67, and a length-99 chain 399→286.
+  On that chain, depth-99/90/50 suffixes cost 397/379/212 extra facts—about four
+  auth facts per ancestor—rather than 49k/45k/25k under timestamp scatter.
+  Measured in A.5.
 - Folds stay **blind and bounded** (`A` leaves + spine + the batch's rising deps;
   append-cheap).
 - The fancy version verifies **once per fact** at `O(depth)` memory and, on a diff,

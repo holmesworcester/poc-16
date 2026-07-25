@@ -15,10 +15,11 @@ import pytest
 
 from tinyp2p import cmds
 from tinyp2p.close import decode_pile
+from tinyp2p.crypto import keypair
 from tinyp2p.fact import Fact
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
-from tinyp2p.kernel import drain
+from tinyp2p.kernel import drain, resolve_deps
 from tinyp2p.node import Node, now_ms
 
 from .util import add_member, all_fids, author_msg, closed_subset, deliver
@@ -174,6 +175,31 @@ def test_incremental_equals_full(tmp_path):
     assert n.store(ws).get("root") == full_manifest(n, ws)
     cmds.evict(n, ws, "bob")
     assert n.store(ws).get("root") == full_manifest(n, ws)
+
+
+def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
+    """The direct fixture helper follows the real member-authority spine."""
+    n = Node(str(tmp_path / "chain"))
+    ws = cmds.create(n, "alice")
+    ts = now_ms()
+    bob_sk, bob_pk, bob = add_member(n, ws, "bob", ts=ts + 1)
+    _, _, carol = add_member(
+        n, ws, "carol", inviter=(bob_sk, bob_pk), ts=ts + 3)
+
+    invite_fid = carol.refs()[0][1]
+    invitation = n.fact_of(ws, invite_fid)
+    deps = resolve_deps(invitation, n.idx(ws))
+    assert bob.fid in deps
+    assert bob.ts < invitation.ts < carol.ts
+
+    pile, _ = decode_pile(closed_subset(n, ws, [carol.fid]))
+    assert drain(pile, ws).ok
+
+    outsider = keypair()
+    with pytest.raises(ValueError, match="not a workspace member"):
+        add_member(n, ws, "mallory", inviter=outsider, ts=ts + 5)
+    with pytest.raises(ValueError, match="must follow"):
+        add_member(n, ws, "late-bob", inviter=(bob_sk, bob_pk), ts=bob.ts)
 
 
 def test_incremental_reuses_work(world):

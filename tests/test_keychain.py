@@ -1,0 +1,81 @@
+"""The node-local plural identity holder and workspace bindings."""
+import json
+
+import pytest
+
+from tinyp2p import cmds
+from tinyp2p.crypto import keypair
+from tinyp2p.node import Node, now_ms
+
+from .util import add_member
+
+
+def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    default_secret, default_id = node.keychain.default()
+    other_id = node.keychain.add_identity()
+    other_secret, other_public = node.keychain.identity(other_id)
+
+    assert default_secret.verify_key.encode().hex() == default_id == node.pk
+    assert other_secret.verify_key.encode().hex() == other_public == other_id
+    assert set(node.keyring) == {"keys", "workspaces"}
+
+    workspace = cmds.create(node, "alice")
+    assert node.identity_id(workspace) == default_id
+    node.bind_identity(workspace, other_id)
+    assert node.identity_id(workspace) == other_id
+
+    reopened = Node(node.dir)
+    assert reopened.identity_id(workspace) == other_id
+    assert set(reopened.keyring["keys"]) == {default_id, other_id}
+    with pytest.raises(KeyError, match="unknown identity"):
+        reopened.add_workspace(
+            "b" * 64, "bad", peers=[], identity="not-a-key")
+
+
+def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
+    directory = tmp_path / "legacy"
+    directory.mkdir()
+    secret, public = keypair()
+    workspace = "a" * 64
+    (directory / "keyring.json").write_text(json.dumps({
+        "sk": secret.encode().hex(),
+        "workspaces": {
+            workspace: {"name": "old", "peers": ["http://peer"]},
+        },
+    }))
+
+    node = Node(str(directory))
+
+    assert node.pk == public
+    assert node.identity_id(workspace) == public
+    assert node.keyring == {
+        "keys": {public: secret.encode().hex()},
+        "workspaces": {
+            workspace: {
+                "name": "old",
+                "peers": ["http://peer"],
+                "identity": public,
+            },
+        },
+    }
+    persisted = json.loads((directory / "keyring.json").read_text())
+    assert "sk" not in persisted
+    assert persisted == node.keyring
+
+
+def test_commands_author_with_the_workspace_bound_identity(tmp_path):
+    node = Node(str(tmp_path / "bound"))
+    workspace = cmds.create(node, "alice")
+    invite_ts = now_ms() + 1
+    member_secret, member_public, _ = add_member(
+        node, workspace, "bob", ts=invite_ts)
+    assert node.keychain.add_identity(member_secret) == member_public
+    node.bind_identity(workspace, member_public)
+
+    fid = cmds.post(node, workspace, "general", "from the bound device")
+    fact = node.fact_of(workspace, fid)
+
+    assert node.pk != member_public
+    assert fact.body["pk"] == member_public
+    assert cmds.msgs(node, workspace)[-1]["text"] == "from the bound device"

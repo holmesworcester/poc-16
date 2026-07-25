@@ -1,0 +1,87 @@
+"""Realistic checks for the chained benchmark seed."""
+import pytest
+
+from bench.seed_chain import build_seed
+from bench.bench_sync import bidi, catchup, check_leaves
+from tinyp2p.close import decode_pile
+from tinyp2p.kernel import drain, resolve_deps
+
+from .util import closed_subset
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_max"),
+    [("star", 1), ("wide", 2), ("chain", 23)],
+)
+def test_seed_shapes_have_the_claimed_depth(tmp_path, shape, expected_max):
+    node, workspace, stats = build_seed(
+        str(tmp_path / shape), 127, n_members=24, shape=shape,
+        wide_inviters=4)
+
+    assert stats["facts"] == 127
+    assert stats["depth"]["max"] == expected_max
+    assert sum(stats["depth"]["histogram"].values()) == 24
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='user'").fetchone()[0] == 23
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='user_invite'").fetchone()[0] == 23
+
+
+def test_random_seed_is_deep_and_its_leaf_closes_over_the_real_path(tmp_path):
+    node, workspace, stats = build_seed(
+        str(tmp_path / "random"), 255, n_members=48, shape="random", seed=16)
+
+    assert stats["depth"]["median"] > 1
+    deepest_pk = max(stats["depth_by_member"],
+                     key=stats["depth_by_member"].get)
+    user_fid = stats["user_by_member"][deepest_pk]
+    user_fact = node.fact_of(workspace, user_fid)
+    invite_fid = user_fact.refs()[0][1]
+    inviter_pk = stats["parents"][deepest_pk]
+    inviter_user = stats["user_by_member"][inviter_pk]
+    assert inviter_user in resolve_deps(
+        node.fact_of(workspace, invite_fid), node.idx(workspace))
+
+    stream, _ = decode_pile(closed_subset(node, workspace, [user_fid]))
+    assert drain(stream, workspace).ok
+
+
+def test_seed_rejects_unknown_shapes(tmp_path):
+    with pytest.raises(ValueError, match="shape must be one of"):
+        build_seed(str(tmp_path / "bad"), 10, shape="broom")
+
+
+def test_multi_device_seed_groups_equal_author_keys_by_user(tmp_path):
+    node, workspace, stats = build_seed(
+        str(tmp_path / "devices"), 255, n_members=12, shape="random",
+        devices_per_user=3)
+
+    assert stats["devices_per_user"] == 3
+    assert all(len(group) == 3 for group in stats["devices_by_user"].values())
+    assert len(stats["device_to_user"]) == 36
+    assert set(stats["device_to_user"]) <= set(node.keyring["keys"])
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='device'").fetchone()[0] == 12
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='device_invite'").fetchone()[0] == 24
+    assert check_leaves(node, workspace) > 1
+
+
+def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
+    node, workspace, _ = build_seed(
+        str(tmp_path / "seed"), 511, n_members=24, shape="random")
+
+    assert check_leaves(node, workspace) > 1
+    result = catchup(node, workspace, str(tmp_path / "fresh"))
+    assert result["match"]
+    assert result["facts"] == 511
+
+
+def test_chained_bidirectional_reconciliation_converges(tmp_path):
+    result = bidi(
+        511, str(tmp_path / "bidi"), n_members=24, shape="chain", seed=16)
+
+    assert result["match"]
+    assert result["shape"] == "chain"
+    assert result["depth"]["max"] == 23
+    assert result["facts"] > result["a_before"]

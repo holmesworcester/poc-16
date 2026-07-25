@@ -53,9 +53,10 @@ def materialize(db, workspace, valid):
 
 # COMMANDS — build the already-topological request + auth closure for a mint.
 def payload(node, workspace, verb, exp, ts):
-    item = request(node.pk, verb, exp, ts)
-    sig = signature.signature(node.sk, node.pk, item, ts)
-    member = offer_source(node, workspace, "member", node.pk)
+    secret, public = node.identity(workspace)
+    item = request(public, verb, exp, ts)
+    sig = signature.signature(secret, public, item, ts)
+    member = offer_source(node, workspace, "member", public)
     newmap = {item.fid: item, sig.fid: sig}
     deps = {item.fid: [sig.fid] + ([member] if member else []), sig.fid: []}
     with node.lock:

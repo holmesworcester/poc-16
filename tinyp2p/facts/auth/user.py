@@ -77,11 +77,13 @@ def accept(node, link, name):
     bootstrap = [from_json(item) for item in blob["pile"]]
     invitation = [fact for fact in bootstrap if fact.t == user_invite.TAG][-1]
     ts = now_ms()
-    member = user(invitation, load_sk(blob["isk"]), node.pk, name, ts)
-    sig = signature.signature(node.sk, node.pk, member, ts)
-    node.add_workspace(workspace, name, peers=[url])
+    secret, public = node.identity()
+    member = user(invitation, load_sk(blob["isk"]), public, name, ts)
+    sig = signature.signature(secret, public, member, ts)
+    node.add_workspace(
+        workspace, name, peers=[url], identity=node.keychain.default_id())
     pile = encode_pile(bootstrap + [sig, member])  # bootstrap is already closed/topo
-    node.store(workspace).put(f"pile/{node.member}/{h(pile)}", pile)
+    node.store(workspace).put(f"pile/{node.member_for(workspace)}/{h(pile)}", pile)
     node.turn(workspace)
     walk(node, workspace, url)
     return workspace

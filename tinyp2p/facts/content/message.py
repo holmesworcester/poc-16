@@ -52,9 +52,10 @@ def post(node, workspace, channel, text, ts=None):
     from ...node import now_ms
 
     ts = ts or now_ms()
-    item = message(node.pk, channel, text, ts)
+    secret, public = node.identity(workspace)
+    item = message(public, channel, text, ts)
     return publish(node, workspace, item,
-                   signature.signature(node.sk, node.pk, item, ts))
+                   signature.signature(secret, public, item, ts))
 
 
 # QUERIES

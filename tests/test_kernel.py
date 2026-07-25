@@ -3,6 +3,8 @@ import pytest
 
 from tinyp2p.crypto import keypair, sign
 from tinyp2p.fact import Fact
+from tinyp2p.facts.auth.device import device
+from tinyp2p.facts.auth.device_invite import device_invite
 from tinyp2p.facts.auth.removal import removal
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
@@ -103,6 +105,59 @@ def test_evict_needs_admin(anchor_chain):
     se = signature(bsk, bpk, ev, ts)
     assert judge([g, si, inv, sj, j], g.fid)
     assert not judge([g, si, inv, sj, j, se, ev], g.fid)
+
+
+def test_member_can_invite_but_nonmember_cannot(anchor_chain):
+    """A joined member extends authority; an unrelated signer cannot."""
+    founder_sk, founder_pk, root = anchor_chain
+    ts = now_ms()
+    first_invite_sk, first_invite_pk = keypair()
+    first_invite = user_invite(founder_pk, first_invite_pk, ts + 1)
+    first_invite_sig = signature(
+        founder_sk, founder_pk, first_invite, ts + 1)
+    member_sk, member_pk = keypair()
+    member = user(
+        first_invite, first_invite_sk, member_pk, "bob", ts + 2)
+    member_sig = signature(member_sk, member_pk, member, ts + 2)
+    base = [root, first_invite_sig, first_invite, member_sig, member]
+
+    _, next_invite_pk = keypair()
+    member_invite = user_invite(member_pk, next_invite_pk, ts + 3)
+    member_invite_sig = signature(
+        member_sk, member_pk, member_invite, ts + 3)
+    assert judge(base + [member_invite_sig, member_invite], root.fid)
+
+    outsider_sk, outsider_pk = keypair()
+    _, forged_invite_pk = keypair()
+    forged = user_invite(outsider_pk, forged_invite_pk, ts + 3)
+    forged_sig = signature(outsider_sk, outsider_pk, forged, ts + 3)
+    assert not judge(base + [forged_sig, forged], root.fid)
+
+
+def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
+    founder_sk, founder_pk, root = anchor_chain
+    ts = now_ms()
+    primary = device(founder_pk, "phone", ts + 1)
+    primary_sig = signature(founder_sk, founder_pk, primary, ts + 1)
+
+    sibling_sk, sibling_pk = keypair()
+    sibling = device_invite(
+        founder_pk, founder_pk, sibling_pk, "laptop", ts + 2)
+    sibling_sig = signature(founder_sk, founder_pk, sibling, ts + 2)
+    first = [root, primary_sig, primary, sibling_sig, sibling]
+    assert judge(first, root.fid)
+
+    _, third_pk = keypair()
+    third = device_invite(
+        sibling_pk, founder_pk, third_pk, "tablet", ts + 3)
+    third_sig = signature(sibling_sk, sibling_pk, third, ts + 3)
+    assert judge(first + [third_sig, third], root.fid)
+
+    outsider_sk, outsider_pk = keypair()
+    forged = device_invite(
+        outsider_pk, founder_pk, third_pk, "forged", ts + 3)
+    forged_sig = signature(outsider_sk, outsider_pk, forged, ts + 3)
+    assert not judge(first + [forged_sig, forged], root.fid)
 
 
 def test_removal_gates_requests_only(anchor_chain):
