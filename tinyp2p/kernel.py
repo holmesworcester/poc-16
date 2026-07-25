@@ -68,6 +68,12 @@ class Context:
             "SELECT a0, a1 FROM offers WHERE src=? AND name=? ORDER BY a0, a1",
             (source, name)).fetchall()
 
+    def has_offer_value(self, name, value):
+        """Whether any accepted in-pile offer has ``value`` in its a1 slot."""
+        return self.db.execute(
+            "SELECT 1 FROM offers WHERE name=? AND a1=? LIMIT 1",
+            (name, value)).fetchone() is not None
+
 
 def offer_src(db, name, a0, a1=None, requires=()):
     """Canonical finite-proof provider for an offer address, or ``None``.
@@ -155,21 +161,28 @@ def proof_rank(db, deps):
 
 
 def extend_proofs(db, fids, fact_of):
-    """Add shortest authority proofs without repeatedly scanning deep chains.
+    """Add shortest authority proofs with work proportional to ``fids``.
 
-    A fact becomes a candidate exactly when all of its references have ranks
-    and every offer address it needs has acquired a ranked provider.  Providers
-    that become ready together are installed as one rank wave, so an address is
-    activated only after all of its equal-rank candidates can participate in
-    the canonical ``(rank, fid)`` choice.
+    Existing proofs and offers are consulted by indexed point/range lookups;
+    they are never materialized wholesale on the append path.  A fact becomes
+    a candidate exactly when all of its references have ranks and each family
+    need has a ranked canonical provider.  Providers that become ready
+    together are installed as one rank wave, so equal-rank conflicts
+    participate in the canonical ``(rank, fid)`` choice before dependents run.
     """
-    ranked = {
-        fid for (fid,) in db.execute("SELECT fid FROM proofs")
-    }
+    ranked = {}
+
+    def has_proof(fid):
+        if fid not in ranked:
+            ranked[fid] = db.execute(
+                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone() \
+                is not None
+        return ranked[fid]
+
     unresolved, pending = {}, list(fids)
     while pending:
         fid = pending.pop()
-        if fid in unresolved or fid in ranked:
+        if fid in unresolved or has_proof(fid):
             continue
         fact = fact_of(fid)
         if fact is None:
@@ -177,36 +190,39 @@ def extend_proofs(db, fids, fact_of):
         unresolved[fid] = fact
         pending.extend(ref for _, ref in fact.refs())
 
-    active_offers = set()
-    for name, a0, a1 in db.execute(
-            "SELECT DISTINCT o.name, o.a0, o.a1 "
-            "FROM offers o JOIN proofs p ON p.fid=o.src"):
-        active_offers.add((name, a0, a1))
-        active_offers.add((name, a0, None))
+    ref_waiters, offer_waiters = {}, {}
+    missing, candidates = {}, set()
 
-    waiters, missing, candidates = {}, {}, set()
+    def wait_for_offer(fid, condition):
+        _, name, a0, a1, _ = condition
+        offer_waiters.setdefault((name, a0, a1), set()).add(
+            (fid, condition))
+
     for fid, fact in unresolved.items():
         conditions = {
             ("ref", ref)
             for _, ref in fact.refs()
-            if ref not in ranked
+            if not has_proof(ref)
         }
         try:
             handler = facts.handler_for(fact.t)
             if handler is None:
                 continue
             for need in handler.needs(fact):
-                name, a0, a1, _ = _need_parts(need)
-                address = (name, a0, a1)
-                if address not in active_offers:
-                    conditions.add(("offer", *address))
+                name, a0, a1, requires = _need_parts(need)
+                if offer_src(db, name, a0, a1, requires) is None:
+                    conditions.add(
+                        ("offer", name, a0, a1, requires))
         except Exception:
             continue
         missing[fid] = conditions
         if not conditions:
             candidates.add(fid)
         for condition in conditions:
-            waiters.setdefault(condition, set()).add(fid)
+            if condition[0] == "ref":
+                ref_waiters.setdefault(condition[1], set()).add(fid)
+            else:
+                wait_for_offer(fid, condition)
 
     while candidates:
         ready = []
@@ -218,26 +234,37 @@ def extend_proofs(db, fids, fact_of):
         if not ready:
             break
         db.executemany("INSERT OR REPLACE INTO proofs VALUES(?,?)", ready)
-        newly_satisfied = set()
+        candidates = set()
         for fid, _ in ready:
-            ranked.add(fid)
-            newly_satisfied.add(("ref", fid))
+            ranked[fid] = True
+            for dependent in ref_waiters.pop(fid, ()):
+                if dependent not in unresolved or dependent not in missing:
+                    continue
+                missing[dependent].discard(("ref", fid))
+                if not missing[dependent]:
+                    candidates.add(dependent)
             for name, a0, a1 in unresolved[fid].offers():
                 for address in ((name, a0, a1), (name, a0, None)):
-                    if address not in active_offers:
-                        active_offers.add(address)
-                        newly_satisfied.add(("offer", *address))
+                    waiting = tuple(offer_waiters.get(address, ()))
+                    for dependent, condition in waiting:
+                        if dependent not in unresolved \
+                                or dependent not in missing:
+                            offer_waiters[address].discard(
+                                (dependent, condition))
+                            continue
+                        _, needed_name, needed_a0, needed_a1, requires = \
+                            condition
+                        if offer_src(
+                                db, needed_name, needed_a0, needed_a1,
+                                requires) is None:
+                            continue
+                        missing[dependent].discard(condition)
+                        offer_waiters[address].discard(
+                            (dependent, condition))
+                        if not missing[dependent]:
+                            candidates.add(dependent)
             unresolved.pop(fid)
             missing.pop(fid, None)
-
-        candidates = set()
-        for condition in newly_satisfied:
-            for fid in waiters.pop(condition, ()):
-                if fid not in unresolved or fid not in missing:
-                    continue
-                missing[fid].discard(condition)
-                if not missing[fid]:
-                    candidates.add(fid)
     return frozenset(unresolved)
 
 
@@ -292,7 +319,7 @@ def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
             deps = resolve_deps(f, con) if handler is not None and refs_seen else None
             good = deps is not None and handler.validate(f, ctx) is True
             if good and mode == EVALUATE and hasattr(handler, "evaluate"):
-                good = handler.evaluate(f, supplied) is True
+                good = handler.evaluate(f, supplied, ctx) is True
         except Exception:
             good = False  # hostile family bytes are litter, never poison
         if not good:

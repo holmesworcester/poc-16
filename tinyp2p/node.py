@@ -363,17 +363,19 @@ class Node:
         idx = self.idx(ws)
         restored = self._restore_quarantine(ws) \
             if shadows or not newfids else set()
+        if shadows or restored or not newfids:
+            return self._prune_unresolved(ws), restored
+        # A healthy index has proofs for every old offer source.  On the
+        # conflict-free append path only new offer sources can be missing, so
+        # do not anti-join the complete offers/proofs tables on every post.
         missing = {
-            fid for (fid,) in idx.execute(
-                "SELECT DISTINCT o.src FROM offers o "
-                "LEFT JOIN proofs p ON p.fid=o.src "
-                "WHERE p.fid IS NULL")
+            fid for fid in newfids
+            if (fact := self.fact_of(ws, fid)) is not None and fact.offers()
+            and idx.execute(
+                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone() is None
         }
         if not missing:
-            return set(), restored
-        if shadows or restored or not newfids \
-                or not missing <= set(newfids):
-            return self._prune_unresolved(ws), restored
+            return set(), set()
         unresolved = extend_proofs(
             idx, missing, lambda fid: self.fact_of(ws, fid))
         if unresolved:

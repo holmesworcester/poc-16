@@ -9,6 +9,24 @@ def offer_source(node, workspace, name, a0, a1=None, requires=()):
             node.idx(workspace), name, a0, a1, requires)
 
 
+def member_key(node, workspace, target):
+    """Resolve a command target: exact public key first, unique name second."""
+    with node.lock:
+        exact = node.app.execute(
+            "SELECT pk FROM members WHERE ws=? AND pk=?",
+            (workspace, target)).fetchone()
+        if exact is not None:
+            return exact[0]
+        named = node.app.execute(
+            "SELECT pk FROM members WHERE ws=? AND name=? ORDER BY pk",
+            (workspace, target)).fetchall()
+    if not named:
+        raise ValueError(f"no member {target!r}")
+    if len(named) != 1:
+        raise ValueError(f"ambiguous member name {target!r}")
+    return named[0][0]
+
+
 def closer(node, workspace, newmap, deps):
     from ..close import close
     from ..kernel import resolve_deps

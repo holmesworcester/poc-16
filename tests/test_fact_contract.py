@@ -76,3 +76,5 @@ def test_only_ephemeral_families_have_evaluate_hooks():
     evaluators = [module for module in facts.MODULES if hasattr(module, "evaluate")]
     assert evaluators
     assert all(module.DURABLE is False for module in evaluators)
+    assert all(module.evaluate.__code__.co_argcount == 3
+               for module in evaluators)

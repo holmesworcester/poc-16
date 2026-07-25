@@ -2,6 +2,7 @@
 import pytest
 
 from tinyp2p import cmds
+from tinyp2p.crypto import keypair
 from tinyp2p.facts.auth.admin import admins
 from tinyp2p.node import Node, now_ms
 
@@ -37,3 +38,31 @@ def test_only_an_admin_can_grant_and_grants_delegate(tmp_path):
     removal = node.fact_of(workspace, removal_fid)
     assert removal.body["pk"] == carol
     assert ("removal", bob) in node.globals(workspace)
+
+
+def test_admin_target_prefers_exact_key_and_rejects_ambiguous_names(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice")
+    spoof_identity, victim_identity = sorted(
+        (keypair(), keypair()), key=lambda identity: identity[1])
+    _, victim, _ = add_member(
+        node, workspace, "victim", member_identity=victim_identity)
+    _, spoof, _ = add_member(
+        node, workspace, victim, member_identity=spoof_identity)
+    assert spoof < victim
+
+    grant_fid = cmds.grant_admin(node, workspace, victim)
+    assert node.fact_of(workspace, grant_fid).body["target"] == victim
+    assert {row["pk"] for row in admins(node, workspace)} \
+        == {node.pk, victim}
+    assert spoof not in {row["pk"] for row in admins(node, workspace)}
+
+    add_member(node, workspace, "duplicate")
+    add_member(node, workspace, "duplicate")
+    before = node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0]
+    with pytest.raises(ValueError, match="ambiguous member name"):
+        cmds.grant_admin(node, workspace, "duplicate")
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == before

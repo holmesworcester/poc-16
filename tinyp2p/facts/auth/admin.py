@@ -5,7 +5,7 @@ admin embedded in the workspace root. This follows the poc-13 admin edge while
 making its authority recursively usable in poc-16's offers-and-needs kernel.
 """
 from ...fact import Fact
-from .._commands import offer_source
+from .._commands import member_key, offer_source
 from . import signature
 
 TAG = "admin"
@@ -67,13 +67,7 @@ def materialize(db, workspace, valid):
 def grant(node, workspace, target):
     from ...node import now_ms
 
-    with node.lock:
-        row = node.app.execute(
-            "SELECT pk FROM members WHERE ws=? AND (pk=? OR name=?)",
-            (workspace, target, target)).fetchone()
-    if row is None:
-        raise ValueError(f"no member {target!r}")
-    target_pk = row[0]
+    target_pk = member_key(node, workspace, target)
     secret, public = node.identity(workspace)
     signer_admin = offer_source(node, workspace, "admin", public)
     target_member = offer_source(node, workspace, "member", target_pk)

@@ -11,12 +11,14 @@ from tinyp2p.kernel import resolve_deps
 from tinyp2p.node import Node, now_ms
 
 
-def add_member(n, ws, name, ts=None, inviter=None):
+def add_member(
+        n, ws, name, ts=None, inviter=None, member_identity=None):
     """Add a user through an existing member and return ``(sk, pk, user)``.
 
     ``inviter`` is that member's ``(sk, pk)`` identity and defaults to the
-    workspace founder. ``ts`` is the invite timestamp; the user follows one
-    tick later so every delegation edge is strictly forward in time.
+    workspace founder. ``member_identity`` can pin the joining key in
+    adversarial fixtures. ``ts`` is the invite timestamp; the user follows
+    one tick later so every delegation edge is strictly forward in time.
     """
     inviter_sk, inviter_pk = inviter or n.identity(ws)
     with n.lock:
@@ -32,7 +34,7 @@ def add_member(n, ws, name, ts=None, inviter=None):
     isk, ipk = keypair()
     inv = user_invite(inviter_pk, ipk, invite_ts)
     si = signature(inviter_sk, inviter_pk, inv, invite_ts)
-    bsk, bpk = keypair()
+    bsk, bpk = member_identity or keypair()
     joined = user(inv, isk, bpk, name, user_ts)
     joined_sig = signature(bsk, bpk, joined, user_ts)
     deps = {inv.fid: [si.fid, member_source], si.fid: [],

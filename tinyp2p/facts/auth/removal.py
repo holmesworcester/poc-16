@@ -1,6 +1,6 @@
 """facts/auth/removal.py — admin-signed, monotone connection removal."""
 from ...fact import Fact
-from .._commands import publish
+from .._commands import member_key, publish
 from . import signature
 
 TAG = "evict"
@@ -52,15 +52,10 @@ def materialize(db, workspace, valid):
 def evict(node, workspace, target):
     from ...node import now_ms
 
-    with node.lock:
-        row = node.app.execute(
-            "SELECT pk FROM members WHERE ws=? AND (pk=? OR name=?)",
-            (workspace, target, target)).fetchone()
-    if not row:
-        raise ValueError(f"no member {target!r}")
+    target_pk = member_key(node, workspace, target)
     ts = now_ms()
     secret, public = node.identity(workspace)
-    item = removal(public, row[0], ts)
+    item = removal(public, target_pk, ts)
     return publish(node, workspace, item,
                    signature.signature(secret, public, item, ts), role="admin")
 

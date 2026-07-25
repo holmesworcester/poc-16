@@ -5,6 +5,7 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
+from tinyp2p import cmds
 from tinyp2p import kernel as kernel_module
 from tinyp2p.close import close, decode_pile
 from tinyp2p.kernel import drain, resolve_deps
@@ -166,6 +167,35 @@ def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
     assert calls["count"] <= membership_facts
     assert index.execute("SELECT MAX(rank) FROM proofs").fetchone()[0] \
         == 2 * (members - 1)
+
+
+def test_ordinary_append_does_not_scan_all_proofs_or_offers(tmp_path):
+    node, workspace, _ = build_seed(
+        str(tmp_path / "incremental-proof"), 2047,
+        n_members=48, shape="random", seed=16)
+    statements = []
+    index = node.idx(workspace)
+    index.set_trace_callback(statements.append)
+    try:
+        cmds.post(
+            node, workspace, "general", "one conflict-free live append")
+    finally:
+        index.set_trace_callback(None)
+
+    normalized = [" ".join(statement.lower().split())
+                  for statement in statements]
+    forbidden = (
+        "select fid from proofs",
+        "select distinct o.name, o.a0, o.a1 from offers",
+        "left join proofs p on p.fid=o.src",
+    )
+    assert not [
+        statement for statement in normalized
+        if any(fragment in statement for fragment in forbidden)
+    ]
+    assert any(
+        statement.startswith("select 1 from proofs where fid=")
+        for statement in normalized)
 
 
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):

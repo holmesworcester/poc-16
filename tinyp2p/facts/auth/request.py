@@ -37,9 +37,10 @@ def global_rows(f):
     return ()
 
 
-def evaluate(f, globals_):
+def evaluate(f, globals_, ctx):
     removed = {value for name, value in globals_ if name == "removal"}
-    return f.body["pk"] not in removed
+    return f.body["pk"] not in removed and not any(
+        ctx.has_offer_value("author", public) for public in removed)
 
 
 def blob_refs(f):

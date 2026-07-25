@@ -288,6 +288,89 @@ def test_removal_gates_requests_only(anchor_chain):
     assert judge([g, sr, rq], g.fid, g=set())
 
 
+def test_removed_member_cannot_launder_a_mint_through_a_fresh_user(
+        anchor_chain):
+    founder_secret, founder, root = anchor_chain
+    ts = now_ms()
+
+    bob_invite_secret, bob_invite_public = keypair()
+    bob_invite = user_invite(founder, bob_invite_public, ts + 1)
+    bob_invite_sig = signature(
+        founder_secret, founder, bob_invite, ts + 1)
+    bob_secret, bob = keypair()
+    bob_user = user(
+        bob_invite, bob_invite_secret, bob, "bob", ts + 2)
+    bob_user_sig = signature(bob_secret, bob, bob_user, ts + 2)
+
+    carol_invite_secret, carol_invite_public = keypair()
+    carol_invite = user_invite(bob, carol_invite_public, ts + 3)
+    carol_invite_sig = signature(
+        bob_secret, bob, carol_invite, ts + 3)
+    carol_secret, carol = keypair()
+    carol_user = user(
+        carol_invite, carol_invite_secret, carol, "carol", ts + 4)
+    carol_user_sig = signature(
+        carol_secret, carol, carol_user, ts + 4)
+    access = request(carol, "sync", ts + 10_000, ts + 5)
+    access_sig = signature(carol_secret, carol, access, ts + 5)
+    stream = [
+        root,
+        bob_invite_sig,
+        bob_invite,
+        bob_user_sig,
+        bob_user,
+        carol_invite_sig,
+        carol_invite,
+        carol_user_sig,
+        carol_user,
+        access_sig,
+        access,
+    ]
+
+    assert validate(stream, root.fid)
+    assert not evaluate(
+        stream, root.fid, {Global("removal", bob)})
+    _, unrelated = keypair()
+    assert evaluate(
+        stream, root.fid, {Global("removal", unrelated)})
+
+
+def test_removed_device_issuer_invalidates_its_descendant_mint(
+        anchor_chain):
+    founder_secret, founder, root = anchor_chain
+    ts = now_ms()
+    primary = device(founder, "phone", ts + 1)
+    primary_sig = signature(founder_secret, founder, primary, ts + 1)
+
+    laptop_secret, laptop = keypair()
+    laptop_grant = device_invite(
+        founder, founder, laptop, "laptop", ts + 2)
+    laptop_grant_sig = signature(
+        founder_secret, founder, laptop_grant, ts + 2)
+    tablet_secret, tablet = keypair()
+    tablet_grant = device_invite(
+        laptop, founder, tablet, "tablet", ts + 3)
+    tablet_grant_sig = signature(
+        laptop_secret, laptop, tablet_grant, ts + 3)
+    access = request(tablet, "sync", ts + 10_000, ts + 4)
+    access_sig = signature(tablet_secret, tablet, access, ts + 4)
+    stream = [
+        root,
+        primary_sig,
+        primary,
+        laptop_grant_sig,
+        laptop_grant,
+        tablet_grant_sig,
+        tablet_grant,
+        access_sig,
+        access,
+    ]
+
+    assert validate(stream, root.fid)
+    assert not evaluate(
+        stream, root.fid, {Global("removal", laptop)})
+
+
 def test_drain_emits_removal_global_only(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()

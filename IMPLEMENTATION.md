@@ -52,9 +52,12 @@ closed-pile kernel. Every concrete module under `facts/auth/` or
   only the immutable in-pile offer table and workspace anchor; globals, the
   node, projection databases, and waiting are unavailable.
 - **MODE** declares durability, immutable-object refs, and drain-only global
-  rows. An optional `evaluate(fact, globals) -> bool` is permitted only on an
-  ephemeral family. Today `auth.removal` emits `("removal", pk)` during drain,
-  and `auth.request` consumes committed removal rows during evaluate.
+  rows. An optional `evaluate(fact, globals, context) -> bool` is confined to
+  ephemeral families, so it never changes stable validation or drain.
+  `auth.removal` emits `("removal", pk)` during drain; `auth.request` rejects
+  both that key and any request closure carrying a signature from a removed
+  issuer, so access cannot be laundered through a fresh user, device, or admin
+  key.
 - **MATERIALIZE** receives a kernel-minted `Valid`, so it only writes the read
   model; it repeats no validity or scope policy.
 - **COMMANDS** owns local authoring. Workspace create/accept also call the
