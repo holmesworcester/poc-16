@@ -309,3 +309,66 @@ projection. Control workspaces are ordinary workspaces; their families are ordin
    lambda case makes per-ws threads untenable.
 5. **Does `infra_offer` require the node already be an (auth-only) participant to self-present,
    or is self-presentation an out-of-band application first?** (Bootstrap ordering of step 1.)
+
+---
+
+## 9. Concurrency & confluence — many lambdas, one store
+
+Many lambdas can process the pipeline concurrently with **no coordination and no lock**, because
+the authoritative state is an **append-only, content-addressed set of piles** and the tree is a
+**deterministic fold** of it. The convergence is by construction, not by luck.
+
+- **Everything is content-addressed, so there is no write race on data.** Every pile and every
+  treap node is named by its own hash and names its children by theirs; putting an object is
+  idempotent, and two lambdas writing the same or different objects never conflict.
+  Double-processing a pile is a no-op (the seen-set dedups).
+- **Authoritative state = the grow-only pile set** — a CRDT: conflict-free, order- and
+  timing-independent. That is *why* lambdas converge. The same accepted set yields a
+  **byte-identical root** whatever order or subset each lambda saw it in — *given the same layout
+  params/version* (CUT/COLD_CUT/GUARD); a config roll diverges roots transiently until all are
+  on it.
+- **The tree is a derived cache, not authoritative.** A lambda's root is a checkpoint of a pure
+  function of the pile set; a stale or clobbered root loses **nothing** — anyone recomputes it.
+- **No manifest of the *tree* is needed.** The structure lives entirely in the content-addressed
+  child hashes; the whole state is one **root hash** (a git-HEAD-like ref). The shipped flat
+  fence manifest is a *tiered-sync optimization* (O(log n) range fingerprints for the paged
+  cold/tail layout), not a requirement — the pure treap needs none. The only set you must be able
+  to enumerate is the **incoming piles**, and that is just the store's hash-named keyspace, not a
+  written manifest.
+- **The "current root" pointer is the only mutable cell, and it is optional.** It is a cache of a
+  deterministic function: **CAS** it (read → fold → compare-and-swap) to avoid redundant
+  re-folding, or drop it and let readers fold from the pile set. Losing a root update costs
+  *work, never data*.
+
+**On S3 (the target store) this is strong, not eventual.** Same-region GET/PUT/DELETE/LIST have
+been strongly read-after-write consistent since Dec 2020, so a `LIST` of `pile/` sees every pile
+`PUT` before it — the divergence window is your poll/event cadence (S3 Event Notifications fire in
+~seconds), not store lag. Single-key **CAS is native**: `PUT root` with `If-Match: <etag>` (or
+`If-None-Match: *` for write-if-absent) returns `412` on a losing race — the root-pointer CAS
+above, with no external lock or DynamoDB. The only async surface left is **cross-region
+replication** (seconds–minutes) and any CDN in front; S3-compatible stores without conditional
+writes fall back to strongly-consistent last-writer-wins, which is safe here because the root is a
+derived cache.
+
+**On Cloudflare (R2 + Workers) the story is the same, with a nicer coordinator.** R2 gives strong
+read-after-write on objects and native conditional writes (`If-Match` / `onlyIf: {etagMatches}`),
+so the pile set is strongly consistent and single-key CAS on `root` works as above. The
+difference: **Durable Objects** — a per-workspace, single-threaded, strongly-consistent actor —
+can *serialize* root updates (and hold the in-memory fold + transactional storage), replacing
+CAS-retry with a clean linearizable point that S3 lacks. Workers are the stateless compute
+(≈ lambdas), triggered by **R2 event notifications → Queues** (~seconds). Watch-outs: **Workers KV
+is eventually consistent (~60 s) — never put `root` in KV**; R2 is largely single-location per
+bucket (location hints, no built-in cross-region replication lag); Worker CPU limits (~30 s) mean
+big cold folds belong in a Durable Object or chunked. Bonus: R2 has **zero egress** — a real win
+for infra nodes serving pile bytes to members.
+
+So the additive path is safe and convergent for free. **The one real hazard is GC**, and it is
+exactly Merkle-store reachability GC (git gc): never delete an object still reachable from a root
+anyone may use, and never delete an incoming pile before its facts are folded into a reachable
+tree. Drive GC from *committed/converged* state, never a lambda's partial view — the
+residency ⊇ coverage / evict-before-flush discipline (poc-13 memory-limiting lineage). Removals
+converge too, because tombstones are monotone (remove-wins), independent of order.
+
+What you deliberately forgo — and never need: a global total order of piles, synchronized
+delivery, or a lock. Transient divergence (lambdas mid-catch-up) is **stale, never wrong**, and
+self-heals as each absorbs the rest of the pile set.
