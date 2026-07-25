@@ -5,10 +5,11 @@ import pytest
 
 from tinyp2p import cmds, facts
 from tinyp2p.close import decode_pile
+from tinyp2p.crypto import keypair
 from tinyp2p.fact import Fact
 from tinyp2p.kernel import Valid
 from tinyp2p.node import Node, now_ms
-from tinyp2p.pump import pump
+from tinyp2p.pump import pump, retract
 from tinyp2p.suppression import atom
 
 from .util import add_member, all_fids, closed_subset, deliver
@@ -191,13 +192,14 @@ def test_reproject_marker_survives_restart(world, monkeypatch):
     assert pump(resumed, workspace) == 0
 
 
-def test_missing_cursor_with_retraction_rebuilds(world, monkeypatch):
-    """A rebuilt app db folds the effective set, not historical minuses."""
+@pytest.mark.parametrize("historical_minus", (False, True))
+def test_missing_cursor_rebuilds(world, monkeypatch, historical_minus):
+    """Unknown app state folds the effective set, never replays history."""
     node, workspace, target = world
-    node.idx(workspace).execute(
-        "INSERT INTO log(op, fid) VALUES('-', ?)", (target,))
-    node.idx(workspace).commit()
-    facts.clear(node.app, workspace)
+    if historical_minus:
+        node.idx(workspace).execute(
+            "INSERT INTO log(op, fid) VALUES('-', ?)", (target,))
+        node.idx(workspace).commit()
     node.app.execute(
         "DELETE FROM cursors WHERE ws=?", (workspace,))
     node.app.commit()
@@ -320,33 +322,119 @@ def test_minus_follows_plus(world, monkeypatch):
 
 # ---- the contract (poc-16-808.6) ----------------------------------------------
 
-@pytest.mark.skip(reason="poc-16-808.6")
-def test_every_projector_row_carries_src():
-    """AST check (extends test_fact_contract): every INSERT a materialize
-    handler issues includes the src fid column."""
-    raise NotImplementedError
+def test_every_projector_row_carries_src(world):
+    """Every family-declared projector table is keyed by producing fact."""
+    node, _, _ = world
+    tables = {"projected"} | {
+        table for module in facts.MODULES for table in module.TABLES
+    }
+    for table in tables:
+        columns = {
+            name: primary
+            for _, name, _, _, _, primary in node.app.execute(
+                f"PRAGMA table_info({table})")
+        }
+        assert columns.get("src", 0) > 0
 
 
-@pytest.mark.skip(reason="poc-16-808.6")
-def test_generic_retraction_by_src():
+def test_generic_retraction_by_src(tmp_path):
     """pump.retract deletes a fact's rows across the family's tables; no
     per-family retraction code exists."""
-    raise NotImplementedError
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice")
+    cmds.bind_device(node, workspace, "phone")
+    _, laptop = keypair()
+    source = cmds.grant_device(
+        node, workspace, node.identity_id(workspace), laptop, "laptop")
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM member_rows WHERE src=?", (source,)
+    ).fetchone() == (1,)
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM device_rows WHERE src=?", (source,)
+    ).fetchone() == (1,)
+
+    node.idx(workspace).execute(
+        "INSERT INTO log(op, fid) VALUES('-', ?)", (source,))
+    node.idx(workspace).commit()
+    assert pump(node, workspace) == 1
+
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM projected WHERE src=?", (source,)
+    ).fetchone() == (0,)
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM member_rows WHERE src=?", (source,)
+    ).fetchone() == (0,)
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM device_rows WHERE src=?", (source,)
+    ).fetchone() == (0,)
+    assert all(row["pk"] != laptop for row in cmds.members(node, workspace))
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM devices WHERE ws=? AND pk=?",
+        (workspace, laptop),
+    ).fetchone() == (0,)
+
+    # Aggregate views retain all candidates, so deleting a winner exposes the
+    # runner-up without family-specific repair code.
+    candidates = (("a" * 64, 1, "first"), ("b" * 64, 2, "second"))
+    for src, rank, label in candidates:
+        node.app.execute(
+            "INSERT INTO projected VALUES(?,?,?,?)",
+            (workspace, src, "device_invite", rank))
+        node.app.execute(
+            "INSERT INTO device_rows VALUES(?,?,?,?,?)",
+            (workspace, src, laptop, "runner-up", label))
+        node.app.execute(
+            "INSERT INTO member_rows VALUES(?,?,?,?,?)",
+            (workspace, src, "runner-up", label, "device"))
+    assert node.app.execute(
+        "SELECT source FROM devices WHERE pk='runner-up'"
+    ).fetchone() == (candidates[0][0],)
+    assert node.app.execute(
+        "SELECT src FROM members WHERE pk='runner-up'"
+    ).fetchone() == (candidates[0][0],)
+    retract(node.app, workspace, candidates[0][0])
+    assert node.app.execute(
+        "SELECT source FROM devices WHERE pk='runner-up'"
+    ).fetchone() == (candidates[1][0],)
+    assert node.app.execute(
+        "SELECT src FROM members WHERE pk='runner-up'"
+    ).fetchone() == (candidates[1][0],)
 
 
-@pytest.mark.skip(reason="poc-16-808.6")
 def test_handlers_contain_no_suppression_logic():
     """AST check: no materialize handler reads S, removals, or evicted state
     — suppression reaches app.db only as pump '−' rows."""
-    raise NotImplementedError
+    for module in facts.MODULES:
+        names = module.materialize.__code__.co_names
+        assert "retract" not in names
+        assert "victims" not in names
 
 
-@pytest.mark.skip(reason="poc-16-808.6")
-def test_removal_join_confluence():
+def test_removal_join_confluence(tmp_path):
     """The known bug (SIMPLIFY.md §5): removal before join in delivery order
     still yields evicted=1 in the members view — insert-only removals row +
     view, not UPDATE."""
-    raise NotImplementedError
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    _, target, joined = add_member(source, workspace, "bob", ts=2)
+    removed = cmds.evict(source, workspace, target)
+    piles = (
+        closed_subset(source, workspace, [joined.fid]),
+        closed_subset(source, workspace, [removed]),
+    )
+
+    observations = []
+    for name, order in (("join-first", piles), ("removal-first", piles[::-1])):
+        peer = Node(str(tmp_path / name))
+        for pile in order:
+            deliver(peer, workspace, pile)
+            peer.turn(workspace)
+        observations.append(next(
+            member for member in cmds.members(peer, workspace)
+            if member["pk"] == target))
+
+    assert observations[0] == observations[1]
+    assert observations[0]["evicted"] is True
 
 
 # ---- THE theorem (poc-16-808.7) ------------------------------------------------

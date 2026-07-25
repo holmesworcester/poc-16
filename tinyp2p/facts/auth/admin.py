@@ -9,6 +9,7 @@ from .._commands import member_key, offer_source
 from . import signature
 
 TAG = "admin"
+TABLES = ("admin_rows",)
 
 
 # SHAPE
@@ -57,10 +58,9 @@ def blob_refs(f):
 
 # MATERIALIZE
 def materialize(db, workspace, valid):
-    target = valid.fact.body["target"]
     db.execute(
-        "UPDATE members SET role='admin' WHERE ws=? AND pk=?",
-        (workspace, target))
+        "INSERT INTO admin_rows VALUES(?,?,?)",
+        (workspace, valid.fact.fid, valid.fact.body["target"]))
 
 
 # COMMANDS — build a fact, admit it, stop.

@@ -6,6 +6,7 @@ from .._commands import publish
 from ..auth import signature
 
 TAG = "file"
+TABLES = ("file_rows",)
 
 
 # SHAPE
@@ -53,9 +54,10 @@ def blob_refs(f):
 # MATERIALIZE
 def materialize(db, workspace, valid):
     f, body = valid.fact, valid.fact.body
-    db.execute("INSERT OR IGNORE INTO files VALUES(?,?,?,?,?,?,?,?)",
-               (f.fid, workspace, body["chan"], body["name"], body["size"],
-                body["blob"], body["pk"], f.ts))
+    db.execute(
+        "INSERT INTO file_rows VALUES(?,?,?,?,?,?,?,?)",
+        (workspace, f.fid, body["chan"], body["name"], body["size"],
+         body["blob"], body["pk"], f.ts))
 
 
 # COMMANDS

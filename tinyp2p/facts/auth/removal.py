@@ -4,6 +4,7 @@ from .._commands import member_key, publish
 from . import signature
 
 TAG = "evict"
+TABLES = ("removal_rows",)
 
 
 # SHAPE
@@ -43,9 +44,10 @@ def blob_refs(f):
 
 # MATERIALIZE
 def materialize(db, workspace, valid):
-    target = valid.fact.offers()[0][1]
-    db.execute("UPDATE members SET evicted=1 WHERE ws=? AND pk=?",
-               (workspace, target))
+    fact = valid.fact
+    db.execute(
+        "INSERT INTO removal_rows VALUES(?,?,?)",
+        (workspace, fact.fid, fact.offers()[0][1]))
 
 
 # COMMANDS

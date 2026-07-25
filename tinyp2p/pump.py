@@ -68,11 +68,9 @@ def pump(node, ws, projector="app"):
         ).fetchone()
         rebuilding = ws in node._reproject \
             or marker is not None and marker[0] > cursor \
-            or any(op == "-" for _, op, _ in rows)
+            or row is None
         if not rows and not rebuilding:
             return 0
-
-        valids = []
 
         def valid(fid):
             fact = node.fact_of(ws, fid)
@@ -80,6 +78,18 @@ def pump(node, ws, projector="app"):
             if deps is None:
                 raise ValueError("projection log references an absent fact")
             return Valid(fact, tuple(deps))
+
+        def materialize(item):
+            rank = idx.execute(
+                "SELECT rank FROM proofs WHERE fid=?",
+                (item.fact.fid,),
+            ).fetchone()
+            app.execute(
+                "INSERT INTO projected VALUES(?,?,?,?)",
+                (ws, item.fact.fid, item.fact.t,
+                 rank[0] if rank else None),
+            )
+            facts.materialize(app, ws, item)
 
         app.execute("BEGIN")
         try:
@@ -94,22 +104,18 @@ def pump(node, ws, projector="app"):
                     lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or (),
                     lambda fid: node.fact_of(ws, fid),
                 )
-                valids = [valid(fact.fid) for fact in ordered]
-                for item in valids:
-                    facts.materialize(app, ws, item)
+                for item in (valid(fact.fid) for fact in ordered):
+                    materialize(item)
                 end = idx.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
             else:
                 for seq, op, fid in rows:
                     if op == "+":
                         item = valid(fid)
-                        facts.materialize(app, ws, item)
-                        valids.append(item)
+                        materialize(item)
                     else:
                         retract(app, ws, fid)
                 end = rows[-1][0]
-            facts.reconcile(
-                app, ws, idx, lambda fid: node.fact_of(ws, fid), valids)
             app.execute(
                 "INSERT INTO cursors VALUES(?,?,?) "
                 "ON CONFLICT(ws, projector) DO UPDATE SET seq=excluded.seq",
@@ -128,7 +134,21 @@ def retract(app, ws, fid):
     """THE generic retraction — one pump operation, zero per-family code:
     DELETE FROM <table> WHERE src=? across the family's declared tables. No
     materialize handler ever sees suppression."""
-    raise NotImplementedError("poc-16-808.6")
+    row = app.execute(
+        "SELECT family FROM projected WHERE ws=? AND src=?",
+        (ws, fid),
+    ).fetchone()
+    if row is None:
+        return
+    for table in tables_of(row[0]):
+        app.execute(
+            f"DELETE FROM {table} WHERE ws=? AND src=?",
+            (ws, fid),
+        )
+    app.execute(
+        "DELETE FROM projected WHERE ws=? AND src=?",
+        (ws, fid),
+    )
 
 
 def tables_of(family):
@@ -138,4 +158,13 @@ def tables_of(family):
     anything aggregate-shaped. Known fix bundled here: removal's
     `UPDATE members SET evicted=1` becomes an insert-only removals row + a
     view — display data, not fact suppression; S never lives in app.db."""
-    raise NotImplementedError("poc-16-808.6")
+    handler = facts.handler_for(family) \
+        if isinstance(family, str) else family
+    if handler is None:
+        raise ValueError(f"unknown fact family {family!r}")
+    tables = handler.TABLES
+    if not isinstance(tables, tuple) or not all(
+            isinstance(table, str) and table.isidentifier()
+            for table in tables):
+        raise TypeError(f"bad projector tables for {handler.TAG!r}")
+    return tables

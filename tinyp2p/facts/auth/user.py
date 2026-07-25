@@ -9,6 +9,7 @@ from ...fact import Fact, from_json
 from . import legacy_invite, signature, user_invite
 
 TAG = "user"
+TABLES = ("member_rows",)
 
 
 # SHAPE
@@ -57,13 +58,10 @@ def blob_refs(f):
 
 # MATERIALIZE
 def materialize(db, workspace, valid):
-    body = valid.fact.body
+    fact, body = valid.fact, valid.fact.body
     db.execute(
-        "INSERT INTO members VALUES(?,?,?,?,0) "
-        "ON CONFLICT(ws, pk) DO UPDATE SET "
-        "name=excluded.name, role=excluded.role "
-        "WHERE members.role='device'",
-        (workspace, body["pk"], body["name"], "member"))
+        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
+        (workspace, fact.fid, body["pk"], body["name"], "member"))
 
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.

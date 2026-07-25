@@ -9,6 +9,7 @@ from .._commands import offer_source
 from . import signature
 
 TAG = "device_invite"
+TABLES = ("device_rows", "member_rows")
 
 
 # SHAPE
@@ -68,20 +69,11 @@ def materialize(db, workspace, valid):
     fact = valid.fact
     body = fact.body
     db.execute(
-        "INSERT INTO devices VALUES(?,?,?,?,?) "
-        "ON CONFLICT(ws, pk) DO UPDATE SET "
-        "user=excluded.user, label=excluded.label, source=excluded.source "
-        "WHERE excluded.source < devices.source",
-        (workspace, body["user"], body["device"], body["label"], fact.fid))
-    winner = db.execute(
-        "SELECT source FROM devices WHERE ws=? AND pk=?",
-        (workspace, body["device"])).fetchone()
-    if winner and winner[0] == fact.fid:
-        db.execute(
-            "INSERT INTO members VALUES(?,?,?,?,0) "
-            "ON CONFLICT(ws, pk) DO UPDATE SET name=excluded.name "
-            "WHERE members.role='device'",
-            (workspace, body["device"], body["label"], "device"))
+        "INSERT INTO device_rows VALUES(?,?,?,?,?)",
+        (workspace, fact.fid, body["user"], body["device"], body["label"]))
+    db.execute(
+        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
+        (workspace, fact.fid, body["device"], body["label"], "device"))
 
 
 # COMMANDS — build a fact, admit it, stop.

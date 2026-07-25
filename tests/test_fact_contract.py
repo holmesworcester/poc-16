@@ -1,6 +1,7 @@
 """Source and routing contract for the POC-16 fact-family boundary."""
 import ast
 import pathlib
+import sqlite3
 
 from tinyp2p import fact as core_fact
 from tinyp2p import facts
@@ -41,6 +42,10 @@ def test_every_family_has_the_new_contract_in_order():
         assert isinstance(assignments.get("TAG"), ast.Constant), path
         assert isinstance(assignments.get("DURABLE"), ast.Constant), path
         assert isinstance(assignments["DURABLE"].value, bool), path
+        assert isinstance(assignments.get("TABLES"), ast.Tuple), path
+        assert all(isinstance(item, ast.Constant)
+                   and isinstance(item.value, str)
+                   for item in assignments["TABLES"].elts), path
 
         validation_names = {node.id for node in ast.walk(functions["validate"])
                             if isinstance(node, ast.Name)}
@@ -48,6 +53,33 @@ def test_every_family_has_the_new_contract_in_order():
         for returned in (node for node in ast.walk(functions["validate"])
                          if isinstance(node, ast.Return)):
             assert not isinstance(returned.value, (ast.Tuple, ast.Dict, ast.Set)), path
+
+
+def test_projector_tables_are_source_keyed_and_handlers_are_insert_only():
+    db = sqlite3.connect(":memory:")
+    db.executescript(facts.APP_SCHEMA)
+    tables = {"projected"} | {
+        table for module in facts.MODULES for table in module.TABLES
+    }
+    for table in tables:
+        columns = {
+            name: primary
+            for _, name, _, _, _, primary in db.execute(
+                f"PRAGMA table_info({table})")
+        }
+        assert columns.get("src", 0) > 0, table
+
+    for path in family_files():
+        tree = ast.parse(path.read_text())
+        materialize = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "materialize")
+        sql = " ".join(
+            node.value.upper() for node in ast.walk(materialize)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str))
+        assert "UPDATE " not in sql and "DELETE " not in sql, path
 
 
 def test_router_covers_each_family_once():

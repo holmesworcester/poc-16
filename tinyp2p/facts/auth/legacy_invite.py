@@ -6,6 +6,7 @@ New ``user_invite`` facts use the member-can-invite rule.
 from ...fact import Fact
 
 TAG = "invite"
+TABLES = ()
 
 
 # SHAPE

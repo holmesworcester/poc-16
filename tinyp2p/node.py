@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
 INDEX_VERSION = "family-contract-v7-pump"
+APP_VERSION = 1
 
 
 def now_ms():
@@ -68,8 +69,16 @@ class Node:
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
-        self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
-        self.app.executescript(facts.APP_SCHEMA + CURSOR_SCHEMA)
+        app_path = os.path.join(dir, "app.db")
+        self.app = sqlite3.connect(app_path, check_same_thread=False)
+        if self.app.execute("PRAGMA user_version").fetchone()[0] \
+                != APP_VERSION:
+            self.app.close()  # app.db is derived; rebuild beats migration
+            os.remove(app_path)
+            self.app = sqlite3.connect(app_path, check_same_thread=False)
+        self.app.executescript(
+            facts.APP_SCHEMA + CURSOR_SCHEMA
+            + f"PRAGMA user_version={APP_VERSION};")
         self._stores, self._idx = {}, {}
         self._reproject = set()
         self._quarantine_offer_cache = {}
@@ -277,7 +286,7 @@ class Node:
                 out.append(v)
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
-            pruned, restored = set(), set()
+            pruned, restored, shadows = set(), set(), False
             admitted = set(newfids)
             if newfids:
                 shadows = self._shadows(ws, newfids)
@@ -288,14 +297,16 @@ class Node:
             if pruned or restored:
                 if restored:
                     self._invalidate_sync_cache(ws)
-                self._reproject.add(ws)
                 out = [valid for valid in out
                        if valid.fact.fid not in pruned]
                 newfids = sorted(
                     (set(newfids) | restored) - pruned)
+            reproject = shadows or bool(pruned or restored)
+            if reproject:
+                self._reproject.add(ws)
             self._log_projection(
                 ws, newfids, set(pruned) - admitted - restored,
-                bool(pruned or restored))
+                reproject)
             idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
             return out, newfids

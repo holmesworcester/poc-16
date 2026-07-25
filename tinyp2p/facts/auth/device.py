@@ -9,6 +9,7 @@ from .._commands import offer_source, publish
 from . import signature
 
 TAG = "device"
+TABLES = ("device_rows",)
 
 
 # SHAPE
@@ -54,51 +55,8 @@ def materialize(db, workspace, valid):
     fact = valid.fact
     body = fact.body
     db.execute(
-        "INSERT INTO devices VALUES(?,?,?,?,?) "
-        "ON CONFLICT(ws, pk) DO UPDATE SET "
-        "user=excluded.user, label=excluded.label, source=excluded.source "
-        "WHERE excluded.source < devices.source",
-        (workspace, body["pk"], body["pk"], body["label"], fact.fid))
-
-
-def reconcile(db, workspace, index, fact_of, valids):
-    """Project the same canonical device-key winners used by the kernel.
-
-    A duplicate offer in any family forces a proof rebuild and can change an
-    existing device claim's rank, even when this batch has no new device fact.
-    """
-    offered = [
-        offer
-        for valid in valids
-        for offer in valid.fact.offers()
-    ]
-    if not any(name == "device_key" for name, _, _ in offered) \
-            and not any(index.execute(
-                "SELECT COUNT(*) FROM offers "
-                "WHERE name=? AND a0=? AND a1=?",
-                offer).fetchone()[0] > 1 for offer in offered):
-        return
-    rows = index.execute(
-        "SELECT o.a0, o.src FROM offers o "
-        "JOIN proofs p ON p.fid=o.src "
-        "WHERE o.name='device_key' "
-        "ORDER BY o.a0, p.rank, o.src"
-    ).fetchall()
-    winners = {}
-    for device_pk, source in rows:
-        winners.setdefault(device_pk, source)
-
-    db.execute("DELETE FROM devices WHERE ws=?", (workspace,))
-    for device_pk, source in winners.items():
-        body = fact_of(source).body
-        user = body.get("user", body["pk"])
-        db.execute(
-            "INSERT INTO devices VALUES(?,?,?,?,?)",
-            (workspace, user, device_pk, body["label"], source))
-        db.execute(
-            "UPDATE members SET name=? "
-            "WHERE ws=? AND pk=? AND role='device'",
-            (body["label"], workspace, device_pk))
+        "INSERT INTO device_rows VALUES(?,?,?,?,?)",
+        (workspace, fact.fid, body["pk"], body["pk"], body["label"]))
 
 
 # COMMANDS — build a fact, admit it, stop.

@@ -3,6 +3,7 @@ from ...crypto import sign, verify
 from ...fact import Fact
 
 TAG = "signature"
+TABLES = ()
 
 
 # SHAPE

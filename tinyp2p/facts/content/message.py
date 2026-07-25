@@ -5,6 +5,7 @@ from .._commands import publish
 from ..auth import signature
 
 TAG = "msg"
+TABLES = ("message_rows",)
 
 
 # SHAPE
@@ -47,8 +48,9 @@ def blob_refs(f):
 # MATERIALIZE
 def materialize(db, workspace, valid):
     f, body = valid.fact, valid.fact.body
-    db.execute("INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?)",
-               (f.fid, workspace, body["chan"], body["pk"], body["text"], f.ts))
+    db.execute(
+        "INSERT INTO message_rows VALUES(?,?,?,?,?,?)",
+        (workspace, f.fid, body["chan"], body["pk"], body["text"], f.ts))
 
 
 # COMMANDS

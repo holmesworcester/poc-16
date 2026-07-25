@@ -4,6 +4,7 @@ from .._commands import closer, offer_source
 from . import signature
 
 TAG = "req"
+TABLES = ()
 VERBS = frozenset({"sync"})
 
 

@@ -11,7 +11,11 @@ assert len(ROUTES) == len(MODULES), "duplicate fact tag"
 assert all(not hasattr(module, "evaluate") or not module.DURABLE for module in MODULES), \
     "only ephemeral families may inspect evaluate-mode globals"
 
-APP_SCHEMA = auth.APP_SCHEMA + content.APP_SCHEMA
+APP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projected(
+    ws TEXT NOT NULL, src TEXT NOT NULL, family TEXT NOT NULL, rank INT,
+    PRIMARY KEY(ws, src));
+""" + auth.APP_SCHEMA + content.APP_SCHEMA
 
 
 def handler_for(tag):
@@ -23,17 +27,12 @@ def materialize(db, workspace, valid):
     ROUTES[valid.fact.t].materialize(db, workspace, valid)
 
 
-def reconcile(db, workspace, index, fact_of, valids):
-    """Let families reconcile projections that use canonical offer winners."""
-    for module in MODULES:
-        if hasattr(module, "reconcile"):
-            module.reconcile(db, workspace, index, fact_of, valids)
-
-
 def clear(db, workspace):
     """Clear every family scope before rebuilding one workspace projection."""
-    auth.clear(db, workspace)
-    content.clear(db, workspace)
+    tables = {table for module in MODULES for table in module.TABLES}
+    for table in sorted(tables):
+        db.execute(f"DELETE FROM {table} WHERE ws=?", (workspace,))
+    db.execute("DELETE FROM projected WHERE ws=?", (workspace,))
 
 
 def blob_refs(fact):

@@ -13,6 +13,7 @@ from .._commands import closer, offer_source
 from . import signature
 
 TAG = "user_invite"
+TABLES = ()
 
 
 # SHAPE

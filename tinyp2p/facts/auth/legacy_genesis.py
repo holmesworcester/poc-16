@@ -7,6 +7,7 @@ from ...crypto import h, sign, verify
 from ...fact import Fact, canon
 
 TAG = "genesis"
+TABLES = ("member_rows",)
 
 
 # SHAPE
@@ -55,10 +56,10 @@ def blob_refs(f):
 
 # MATERIALIZE
 def materialize(db, workspace, valid):
-    body = valid.fact.body
+    fact, body = valid.fact, valid.fact.body
     db.execute(
-        "INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
-        (workspace, body["pk"], body["name"], "admin"))
+        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
+        (workspace, fact.fid, body["pk"], body["name"], "admin"))
 
 
 # COMMANDS — compatibility handler only; new roots use auth.workspace.

@@ -3,6 +3,7 @@ from ...crypto import h, sign, verify
 from ...fact import Fact, canon
 
 TAG = "workspace"
+TABLES = ("member_rows",)
 
 
 # SHAPE — constructors are the only place this family's atoms are chosen.
@@ -51,8 +52,9 @@ def blob_refs(f):
 # MATERIALIZE — receives only kernel-minted Valid values.
 def materialize(db, workspace, valid):
     f, body = valid.fact, valid.fact.body
-    db.execute("INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
-               (workspace, body["pk"], body["name"], "admin"))
+    db.execute(
+        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
+        (workspace, f.fid, body["pk"], body["name"], "admin"))
 
 
 # COMMANDS — workspace bootstrap necessarily records its anchor in the keyring.

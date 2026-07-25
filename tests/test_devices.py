@@ -23,6 +23,14 @@ from tinyp2p.node import Node, now_ms
 from .util import add_member, all_fids, closed_subset, deliver, member_src
 
 
+def _materialize(db, workspace, valid):
+    """Unit-test seam for the pump-owned source/rank ledger."""
+    db.execute(
+        "INSERT INTO projected VALUES(?,?,?,0)",
+        (workspace, valid.fact.fid, valid.fact.t))
+    facts.materialize(db, workspace, valid)
+
+
 def _inject_device_claim(
         node, workspace, secret, public, user, target, label, ts):
     """Author a valid claim directly, bypassing command-side duplicate checks."""
@@ -166,10 +174,9 @@ def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
 
     normalized = [" ".join(statement.lower().split())
                   for statement in statements]
-    assert not [
-        statement for statement in normalized
-        if statement.startswith("delete from devices")
-    ]
+    assert not any(statement.startswith(
+        ("delete from device_rows", "delete from member_rows"))
+        for statement in normalized)
     assert {row["pk"] for row in devices(node, workspace, founder)} \
         == {founder, laptop}
 
@@ -224,7 +231,7 @@ def test_duplicate_device_projection_uses_the_smallest_fact_id():
         db = sqlite3.connect(":memory:")
         db.executescript(facts.APP_SCHEMA)
         for valid in result.valids:
-            facts.materialize(db, root.fid, valid)
+            _materialize(db, root.fid, valid)
         observed.append(db.execute(
             "SELECT user, pk, label, source FROM devices").fetchall())
         db.close()
@@ -262,7 +269,7 @@ def test_bearer_user_precedes_device_role_in_every_arrival_order():
         db = sqlite3.connect(":memory:")
         db.executescript(facts.APP_SCHEMA)
         for valid in result.valids:
-            facts.materialize(db, root.fid, valid)
+            _materialize(db, root.fid, valid)
         observed.append(db.execute(
             "SELECT name, role FROM members WHERE ws=? AND pk=?",
             (root.fid, bob)).fetchone())

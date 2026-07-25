@@ -85,6 +85,7 @@ def test_legacy_auth_store_upgrades_rebuilds_and_accepts_new_facts(tmp_path):
         ("family-contract-v1",))
     index.commit()
     index.close()
+    node.app.execute("PRAGMA user_version=0")
     node.app.close()
 
     upgraded = Node(node.dir)
@@ -99,7 +100,7 @@ def test_legacy_auth_store_upgrades_rebuilds_and_accepts_new_facts(tmp_path):
         upgraded, workspace, "general", "authored after upgrade")
     assert upgraded.fact_of(workspace, current_message).t == "msg"
 
-    upgraded.app.execute("DELETE FROM members WHERE ws=?", (workspace,))
+    facts.clear(upgraded.app, workspace)
     upgraded.app.commit()
     upgraded.idx(workspace).executescript(
         "DELETE FROM facts; DELETE FROM offers; DELETE FROM globals; "

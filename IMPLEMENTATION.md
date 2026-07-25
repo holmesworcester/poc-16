@@ -67,8 +67,12 @@ closed-pile kernel. Every concrete module under `facts/auth/` or
   both that key and any request closure carrying a signature from a removed
   issuer, so access cannot be laundered through a fresh user, device, or admin
   key.
-- **MATERIALIZE** receives a kernel-minted `Valid`, so it only writes the read
-  model; it repeats no validity or scope policy.
+- **MATERIALIZE** receives a kernel-minted `Valid` and inserts rows keyed by
+  that fact's `src`; it repeats no validity, scope, or suppression policy.
+  Aggregate-shaped `members` and `devices` are views over retained candidates,
+  so removing a source exposes its runner-up without a family repair path.
+  The pump performs the only retraction: delete that `src` from the tables the
+  family declares.
 - **COMMANDS** owns local authoring. Workspace create/accept also call the
   core's keyring seam because the locally trusted anchor cannot be derived from
   the store being checked.
@@ -230,10 +234,10 @@ usable for delegation chains deeper than Python's call-stack limit.
 requester and any presented membership closure signed by a removed issuer, so
 a freshly delegated user, device, or admin cannot launder a mint. Durable
 facts remain globals-blind, however: an active peer can still relay facts
-signed by an evicted identity, and removal projection currently depends on
-membership materialization order. Those broader remove-wins semantics are
-tracked in `poc-16-gxz` and `poc-16-up4`, gated by the global suppression-tree
-review in `poc-16-yez.9`; they are intentionally not claimed as solved here.
+signed by an evicted identity. Read-model removal is now order-independent,
+but those broader remove-wins semantics are tracked in `poc-16-gxz` and
+`poc-16-up4`, gated by the global suppression-tree review in
+`poc-16-yez.9`; they are intentionally not claimed as solved here.
 
 ## Running it
 
