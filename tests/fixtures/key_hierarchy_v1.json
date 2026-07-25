@@ -13,9 +13,14 @@
         "writer_lease_generation": "caller-supplied-exact",
         "cover_expected_context": "separate-authoritative-record",
         "duplicate_operation_refs": "canonical-set",
+        "protected_claim_before_rollbackable_mirror": true,
+        "protected_claim_includes_manifest": true,
         "protected_fence_phase_required": true,
         "destroy_revalidates_survivors": true,
-        "migration_proof": "exact-survivor-id-set",
+        "migration_proof": "exact-survivor-id-and-secret-commitment-set",
+        "migration_proof_cas": "protected-first-immutable",
+        "retirement_order": "protected-disable-before-handle-delete",
+        "wrap_eligibility": "live-active-staged-public-commitments",
         "finalization_revalidates_parent_claim": true,
         "recipient_generations": [
             "P",
@@ -90,6 +95,7 @@
             "event_id_prefix": "0000000000000000000000000000000000000000000000000000000000000000",
             "source_secret_ref": "0000000000000000000000000000000000000000000000000000000000000000",
             "tombstone_context": "0000000000000000000000000000000000000000000000000000000000000000",
+            "secret_commitment": "1d899af7ade508268fecad380dc8a9126a4cc690f6a2dc9926af9539493ff75c",
             "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
         },
         {
@@ -101,6 +107,7 @@
             "event_id_prefix": "0010000000000000000000000000000000000000000000000000000000000000",
             "source_secret_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "tombstone_context": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "secret_commitment": "40807f6bd42e9c15b5b89a15e78788e8a4799a85329949431fefebbec4153ba5",
             "plaintext_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
         },
         {
@@ -112,6 +119,7 @@
             "event_id_prefix": "4041000000000000000000000000000000000000000000000000000000000000",
             "source_secret_ref": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "tombstone_context": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "secret_commitment": "36fe0c2110fdedb071027e74da3c10c4cb12ae5a5d264047d7599e898b438422",
             "plaintext_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
         }
     ],

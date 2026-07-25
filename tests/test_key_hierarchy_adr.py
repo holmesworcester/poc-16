@@ -6,6 +6,7 @@ against its real provider API.
 """
 
 import hashlib
+import hmac
 import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -81,15 +82,25 @@ class CoverRecord:
     """Authoritative local metadata kept separately from the envelope."""
 
     expected_context: CoverContext
+    secret_commitment: str
     envelope: Envelope
+
+
+@dataclass(frozen=True)
+class MigrationProof:
+    successor: str
+    manifest: frozenset
+    survivor_commitments: frozenset
 
 
 @dataclass(frozen=True)
 class ProviderSnapshot:
     disk: dict
     handles: dict
-    hardware_claims: dict
+    generation_publics: dict
+    protected_transitions: dict
     protected_fences: set
+    protected_migrations: dict
     hardware_floor: int
 
 
@@ -102,6 +113,12 @@ class TransitionClaim:
     next_suite: str
     next_public: bytes
     retirement_batch_commitment: str
+
+
+@dataclass(frozen=True)
+class AcceptedTransition:
+    claim: TransitionClaim
+    manifest: frozenset
 
 
 @dataclass(frozen=True)
@@ -156,6 +173,30 @@ def transition_claim_id(predecessor, claim):
     return hashlib.sha256(b"poc16-transition-claim-v1\0" + canonical).hexdigest()
 
 
+def local_secret_commitment(cover_id, context, plaintext):
+    """Generation-independent id of one canonical local cover secret."""
+    canonical = json.dumps(
+        {
+            "cover_id": cover_id,
+            "recipient_lineage_id": context.recipient_lineage_id,
+            "content_scope_id": context.content_scope_id,
+            "frontier_id": context.frontier_id,
+            "secret_kind": context.secret_kind,
+            "range_start": context.range_start,
+            "range_width": context.range_width,
+            "bit_depth": context.bit_depth,
+            "event_id_prefix": context.event_id_prefix,
+            "source_secret_ref": context.source_secret_ref,
+            "tombstone_context": context.tombstone_context,
+            "recovery_policy_ref": context.recovery_policy_ref,
+            "plaintext_hex": plaintext.hex(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(b"poc16-local-cover-secret-v1\0" + canonical).hexdigest()
+
+
 class ProviderModel:
     """Small provider state machine with a privileged snapshot attacker.
 
@@ -169,8 +210,10 @@ class ProviderModel:
         self.capacity = capacity
         self.rollback_resistant = rollback_resistant
         self._handles = {}
-        self._hardware_claims = {}
+        self._generation_publics = {}
+        self._protected_transitions = {}
         self._protected_fences = set()
+        self._protected_migrations = {}
         self._hardware_floor = 0
         self.peak_handles = 0
         self.disk = {
@@ -206,11 +249,14 @@ class ProviderModel:
 
     @property
     def wrap_eligible(self):
+        schedule_matches = self._active_pair_matches_parent_claim()
         return {
             generation
             for generation in self.disk["wrap_eligible"]
-            if not self._is_retired(generation)
-            and generation in self._handles
+            if generation == self.active
+            and schedule_matches
+            and not self._is_retired(generation)
+            and self._handle_matches_generation_commitment(generation)
         }
 
     def _is_retired(self, generation):
@@ -221,7 +267,12 @@ class ProviderModel:
             return "already-generated"
         if self.handle_count >= self.capacity:
             return "capacity-failure-before-predecessor-destruction"
-        self._handles[generation] = bytes(public.PrivateKey.generate())
+        private_bytes = bytes(public.PrivateKey.generate())
+        self._handles[generation] = private_bytes
+        self._generation_publics.setdefault(
+            generation,
+            bytes(public.PrivateKey(private_bytes).public_key),
+        )
         self.peak_handles = max(self.peak_handles, self.handle_count)
         return "generated"
 
@@ -262,6 +313,23 @@ class ProviderModel:
         except KeyError as error:
             raise CryptoError("recipient generation handle is unavailable") from error
 
+    def _handle_matches_public(self, generation, expected_public):
+        private_bytes = self._handles.get(generation)
+        if private_bytes is None:
+            return False
+        actual_public = bytes(public.PrivateKey(private_bytes).public_key)
+        return (
+            actual_public == expected_public
+            and self._generation_publics.get(generation) == expected_public
+        )
+
+    def _handle_matches_generation_commitment(self, generation):
+        expected_public = self._generation_publics.get(generation)
+        return (
+            expected_public is not None
+            and self._handle_matches_public(generation, expected_public)
+        )
+
     def _claim_handles_match(self, claim):
         if (
             claim.successor_suite != RECIPIENT_SUITE
@@ -273,28 +341,34 @@ class ProviderModel:
             (claim.next_generation, claim.next_public),
         )
         for generation, expected_public in expected:
-            private_bytes = self._handles.get(generation)
-            if private_bytes is None:
-                return False
-            actual_public = bytes(
-                public.PrivateKey(private_bytes).public_key
-            )
-            if actual_public != expected_public:
+            if not self._handle_matches_public(generation, expected_public):
                 return False
         return True
 
+    def _accepted_transition(self, predecessor):
+        """Return only the immutable transition for this exact predecessor."""
+        if self.rollback_resistant:
+            return self._protected_transitions.get(predecessor)
+        claim = self.disk["claims"].get(predecessor)
+        manifest = self.disk["manifests"].get(predecessor)
+        if claim is None or manifest is None:
+            return None
+        return AcceptedTransition(claim, manifest)
+
     def _accepted_claim(self, predecessor):
-        """Return only the immutable claim for this exact predecessor."""
-        protected = self._hardware_claims.get(predecessor)
-        if protected is not None:
-            return protected
-        return self.disk["claims"].get(predecessor)
+        accepted = self._accepted_transition(predecessor)
+        return None if accepted is None else accepted.claim
 
     def _active_pair_matches_parent_claim(self):
         """Validate the causal P/S/T chain without selecting a latest key."""
         parent_ref = self.disk["parent_claim_refs"].get(self.active)
         if self.active == GENERATIONS[0]:
-            return parent_ref is None
+            return (
+                parent_ref is None
+                and self.staged == GENERATIONS[1]
+                and self._handle_matches_generation_commitment(self.active)
+                and self._handle_matches_generation_commitment(self.staged)
+            )
         if parent_ref is None:
             return False
         parent = self._accepted_claim(parent_ref.predecessor)
@@ -316,27 +390,21 @@ class ProviderModel:
             (self.staged, parent.next_public),
         )
         for generation, expected_public in expected:
-            private_bytes = self._handles.get(generation)
-            if private_bytes is None:
-                return False
-            actual_public = bytes(
-                public.PrivateKey(private_bytes).public_key
-            )
-            if actual_public != expected_public:
+            if not self._handle_matches_public(generation, expected_public):
                 return False
         return True
 
     def claim(self, prepared):
         predecessor = prepared.predecessor
         claim = prepared.claim
-        prior = self._accepted_claim(predecessor)
+        try:
+            manifest = purge_targets_for_operations(prepared.operations)
+        except ValueError:
+            return "invalid-purge-operation"
+        prior = self._accepted_transition(predecessor)
         if prior is not None:
-            if prior != claim:
+            if prior != AcceptedTransition(claim, manifest):
                 return "conflict"
-            try:
-                manifest = purge_targets_for_operations(prepared.operations)
-            except ValueError:
-                return "invalid-purge-operation"
             # Rehydrate rollbackable metadata from the exact caller-supplied
             # prepared state after a hardware claim survived disk rollback.
             self.disk["claims"][predecessor] = claim
@@ -360,24 +428,23 @@ class ProviderModel:
             return "recursive-commitment-mismatch"
         if not self._claim_handles_match(claim):
             return "prepared-key-mismatch"
-        try:
-            manifest = purge_targets_for_operations(prepared.operations)
-        except ValueError:
-            return "invalid-purge-operation"
-
+        if self.rollback_resistant:
+            # This is the provider-protected compare-and-set. It is the
+            # authority; rollbackable mirrors are written only after it commits.
+            self._protected_transitions[predecessor] = AcceptedTransition(
+                claim,
+                manifest,
+            )
         self.disk["claims"][predecessor] = claim
         self.disk["manifests"][predecessor] = manifest
-        if self.rollback_resistant:
-            self._hardware_claims[predecessor] = claim
         return "accepted"
 
     def acquire_writer_lease(self, writer, generation):
         if (
             generation != self.active
             or self._is_retired(generation)
-            or generation not in self._handles
+            or generation not in self.wrap_eligible
             or self._fence_closed(generation)
-            or generation not in self.disk["finalized"]
         ):
             return "rejected"
         self.disk["leases"][writer] = generation
@@ -425,20 +492,25 @@ class ProviderModel:
             recovery_policy_ref=COVER_CONTEXT["recovery_policy_ref"],
         )
 
-    def _cover_aad(self, cover_id, context):
+    def _cover_aad(self, cover_id, context, secret_commitment):
         return b"poc16-cover-envelope\0" + json.dumps(
             {
                 "cover_id": cover_id,
+                "secret_commitment": secret_commitment,
                 **asdict(context),
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
 
-    def _seal(self, generation, cover_id, plaintext):
+    def _seal(self, generation, cover_id, plaintext, secret_commitment):
         context = self._cover_context(cover_id, generation)
         key = public.PrivateKey(self._usable_private(generation)).public_key
-        bound_plaintext = self._cover_aad(cover_id, context) + b"\0" + plaintext
+        bound_plaintext = (
+            self._cover_aad(cover_id, context, secret_commitment)
+            + b"\0"
+            + plaintext
+        )
         return Envelope(
             context,
             bytes(public.SealedBox(key).encrypt(bound_plaintext)),
@@ -446,22 +518,57 @@ class ProviderModel:
 
     def _record(self, generation, cover_id, plaintext):
         expected_context = self._cover_context(cover_id, generation)
+        secret_commitment = local_secret_commitment(
+            cover_id,
+            expected_context,
+            plaintext,
+        )
         return CoverRecord(
             expected_context,
-            self._seal(generation, cover_id, plaintext),
+            secret_commitment,
+            self._seal(
+                generation,
+                cover_id,
+                plaintext,
+                secret_commitment,
+            ),
         )
 
-    def _open(self, cover_id, expected_context, envelope):
+    def _open(
+        self,
+        cover_id,
+        expected_context,
+        expected_secret_commitment,
+        envelope,
+    ):
         if envelope.context != expected_context:
             raise CryptoError("cover context does not match authoritative record")
         key = public.PrivateKey(
             self._usable_private(expected_context.generation)
         )
         bound_plaintext = public.SealedBox(key).decrypt(envelope.ciphertext)
-        prefix = self._cover_aad(cover_id, expected_context) + b"\0"
+        prefix = (
+            self._cover_aad(
+                cover_id,
+                expected_context,
+                expected_secret_commitment,
+            )
+            + b"\0"
+        )
         if not bound_plaintext.startswith(prefix):
             raise CryptoError("cover context mismatch")
-        return bound_plaintext[len(prefix) :]
+        plaintext = bound_plaintext[len(prefix) :]
+        actual_commitment = local_secret_commitment(
+            cover_id,
+            expected_context,
+            plaintext,
+        )
+        if not hmac.compare_digest(
+            actual_commitment,
+            expected_secret_commitment,
+        ):
+            raise CryptoError("cover secret commitment mismatch")
+        return plaintext
 
     def seed_cover(self, cover_id, plaintext):
         assert self.active in self.wrap_eligible
@@ -474,7 +581,7 @@ class ProviderModel:
         if (
             generation is None
             or self._is_retired(generation)
-            or generation not in self._handles
+            or generation not in self.wrap_eligible
             or self._fence_closed(generation)
         ):
             return "rejected"
@@ -488,6 +595,7 @@ class ProviderModel:
         return self._open(
             cover_id,
             record.expected_context,
+            record.secret_commitment,
             record.envelope,
         )
 
@@ -521,19 +629,30 @@ class ProviderModel:
             del self.disk["leases"][writer]
         return "fenced", aborted
 
+    def _accepted_migration(self, predecessor):
+        if self.rollback_resistant:
+            return self._protected_migrations.get(predecessor)
+        return self.disk["migrated"].get(predecessor)
+
+    @staticmethod
+    def _survivor_commitments(covers):
+        return frozenset(
+            (cover_id, record.secret_commitment)
+            for cover_id, record in covers.items()
+        )
+
     def migrate(self, predecessor, successor, purge_cover_ids):
-        if predecessor not in self.disk["fenced"]:
+        if not self._fence_closed(predecessor):
             return "writer-fence-required"
-        claim = self.disk["claims"].get(predecessor)
-        if claim is None:
+        accepted = self._accepted_transition(predecessor)
+        if accepted is None:
             return "transition-claim-required"
+        claim = accepted.claim
         if claim.successor != successor:
             return "claim-successor-mismatch"
         if not self._claim_handles_match(claim):
             return "prepared-key-mismatch"
-        manifest = self.disk["manifests"].get(predecessor)
-        if manifest is None:
-            return "retirement-manifest-required"
+        manifest = accepted.manifest
         if frozenset(purge_cover_ids) != manifest:
             return "retirement-manifest-mismatch"
         migrated = {}
@@ -546,6 +665,7 @@ class ProviderModel:
             plaintext = self._open(
                 cover_id,
                 record.expected_context,
+                record.secret_commitment,
                 record.envelope,
             )
             if generation == successor:
@@ -556,32 +676,47 @@ class ProviderModel:
                     cover_id,
                     plaintext,
                 )
-        self.disk["covers"] = migrated
-        self.disk["migrated"][predecessor] = (
+        proof = MigrationProof(
             successor,
             manifest,
-            frozenset(migrated),
+            self._survivor_commitments(migrated),
         )
-        return "migrated"
+        prior = self._accepted_migration(predecessor)
+        if prior is not None and prior != proof:
+            return "migration-proof-mismatch"
+        if self.rollback_resistant and prior is None:
+            # Freeze the exact survivor identities and plaintext commitments in
+            # protected state before replacing rollbackable cover storage.
+            self._protected_migrations[predecessor] = proof
+        self.disk["covers"] = migrated
+        self.disk["migrated"][predecessor] = proof
+        return "coalesced" if prior is not None else "migrated"
 
     def destroy(self, predecessor, successor):
-        claim = self.disk["claims"].get(predecessor)
-        if claim is None:
+        accepted = self._accepted_transition(predecessor)
+        if accepted is None:
             return "transition-claim-required"
+        claim = accepted.claim
         if claim.successor != successor:
             return "claim-successor-mismatch"
         if not self._claim_handles_match(claim):
             return "prepared-key-mismatch"
-        manifest = self.disk["manifests"].get(predecessor)
-        migration_proof = self.disk["migrated"].get(predecessor)
+        manifest = accepted.manifest
+        migration_proof = self._accepted_migration(predecessor)
         if (
             migration_proof is None
-            or migration_proof[:2] != (successor, manifest)
+            or migration_proof.successor != successor
+            or migration_proof.manifest != manifest
         ):
             return "migration-required"
-        expected_survivors = migration_proof[2]
-        if frozenset(self.disk["covers"]) != expected_survivors:
+        current_survivors = self._survivor_commitments(self.disk["covers"])
+        expected_survivors = migration_proof.survivor_commitments
+        if {cover_id for cover_id, _ in current_survivors} != {
+            cover_id for cover_id, _ in expected_survivors
+        }:
             return "survivor-set-mismatch"
+        if current_survivors != expected_survivors:
+            return "survivor-commitment-mismatch"
         if any(cover_id in self.disk["covers"] for cover_id in manifest):
             return "purge-target-remains"
         if any(
@@ -594,61 +729,71 @@ class ProviderModel:
                 self._open(
                     cover_id,
                     record.expected_context,
+                    record.secret_commitment,
                     record.envelope,
                 )
         except CryptoError:
             return "successor-cover-validation-failed"
         prior = self.disk["destroyed"].get(predecessor)
+        if prior is not None and prior != successor:
+            return "destruction-successor-conflict"
+        if self.rollback_resistant:
+            if self._protected_transitions.get(predecessor) != accepted:
+                return "protected-claim-required"
+            retirement_was_committed = (
+                generation_index(successor) <= self._hardware_floor
+            )
+            if not retirement_was_committed:
+                # Advancing the protected floor is the irreversible operation:
+                # it disables P even if power fails before physical cleanup.
+                self._hardware_floor = generation_index(successor)
+            self._delete_retired_handle(predecessor)
+            self.disk["destroyed"][predecessor] = successor
+            return (
+                "already-destroyed"
+                if retirement_was_committed or prior is not None
+                else "destroyed"
+            )
         if prior is not None:
-            if prior != successor:
-                return "destruction-successor-conflict"
-            if self.rollback_resistant:
-                self._hardware_floor = max(
-                    self._hardware_floor, generation_index(claim.successor)
-                )
             return "already-destroyed"
         if predecessor not in self._handles:
-            if (
-                self.rollback_resistant
-                and self._hardware_claims.get(predecessor) == claim
-                and generation_index(claim.successor) <= self._hardware_floor
-            ):
-                self.disk["destroyed"][predecessor] = claim.successor
-                return "already-destroyed"
             return "missing-handle-without-destruction-evidence"
-        del self._handles[predecessor]
+        self._delete_retired_handle(predecessor)
         self.disk["destroyed"][predecessor] = successor
-        if self.rollback_resistant:
-            self._hardware_floor = max(
-                self._hardware_floor, generation_index(claim.successor)
-            )
         return "destroyed"
+
+    def _delete_retired_handle(self, predecessor):
+        self._handles.pop(predecessor, None)
 
     def promote(self, prepared):
         predecessor = prepared.predecessor
         successor = prepared.successor
         next_generation = prepared.next_generation
         expected = prepared.claim
-        if self.disk["claims"].get(predecessor) != expected:
+        accepted = self._accepted_transition(predecessor)
+        if accepted is None or accepted.claim != expected:
             return "claim-mismatch"
         prior = self.disk["promoted"].get(predecessor)
         if prior is not None:
             return "already-promoted" if prior == expected else "promotion-conflict"
         if self.disk["destroyed"].get(predecessor) != successor:
             return "destruction-required"
-        migration_proof = self.disk["migrated"].get(predecessor)
+        migration_proof = self._accepted_migration(predecessor)
         if (
             migration_proof is None
-            or migration_proof[:2]
-            != (
-                successor,
-                self.disk["manifests"].get(predecessor),
-            )
-            or migration_proof[2] != frozenset(self.disk["covers"])
+            or migration_proof.successor != successor
+            or migration_proof.manifest != accepted.manifest
+            or migration_proof.survivor_commitments
+            != self._survivor_commitments(self.disk["covers"])
         ):
             return "migration-required"
         if self.active != predecessor:
             return "active-predecessor-mismatch"
+        if predecessor in self._handles or (
+            self.rollback_resistant
+            and self._hardware_floor < generation_index(successor)
+        ):
+            return "destruction-required"
         if self._is_retired(successor):
             return "successor-already-retired"
         if not self._claim_handles_match(expected):
@@ -667,9 +812,10 @@ class ProviderModel:
         return "promoted-without-allocation"
 
     def finalize(self, predecessor, successor):
-        claim = self.disk["claims"].get(predecessor)
-        if claim is None or claim.successor != successor:
+        accepted = self._accepted_transition(predecessor)
+        if accepted is None or accepted.claim.successor != successor:
             return "completion-evidence-required"
+        claim = accepted.claim
         expected_parent_ref = ParentClaimRef(
             predecessor,
             transition_claim_id(predecessor, claim),
@@ -681,8 +827,6 @@ class ProviderModel:
             != expected_parent_ref
         ):
             return "completion-evidence-required"
-        if successor in self.disk["finalized"]:
-            return "already-finalized"
         if (
             self.active != successor
             or self.staged != claim.next_generation
@@ -690,6 +834,8 @@ class ProviderModel:
             or not self._claim_handles_match(claim)
         ):
             return "completion-evidence-required"
+        if successor in self.disk["finalized"]:
+            return "already-finalized"
         self.disk["finalized"].add(successor)
         self.disk["wrap_eligible"] = {successor}
         return "finalized"
@@ -698,8 +844,10 @@ class ProviderModel:
         return ProviderSnapshot(
             deepcopy(self.disk),
             deepcopy(self._handles),
-            deepcopy(self._hardware_claims),
+            deepcopy(self._generation_publics),
+            deepcopy(self._protected_transitions),
             deepcopy(self._protected_fences),
+            deepcopy(self._protected_migrations),
             self._hardware_floor,
         )
 
@@ -707,8 +855,14 @@ class ProviderModel:
         self.disk = deepcopy(snapshot.disk)
         if not self.rollback_resistant:
             self._handles = deepcopy(snapshot.handles)
-            self._hardware_claims = deepcopy(snapshot.hardware_claims)
+            self._generation_publics = deepcopy(snapshot.generation_publics)
+            self._protected_transitions = deepcopy(
+                snapshot.protected_transitions
+            )
             self._protected_fences = deepcopy(snapshot.protected_fences)
+            self._protected_migrations = deepcopy(
+                snapshot.protected_migrations
+            )
             self._hardware_floor = snapshot.hardware_floor
 
     def reconcile_status(self):
@@ -787,6 +941,31 @@ def cover_fixture():
     }
 
 
+def forge_cover_record(
+    provider,
+    cover_id,
+    generation,
+    plaintext,
+    secret_commitment,
+):
+    """Use only public material, as an attacker who can replace disk records."""
+    context = provider._cover_context(cover_id, generation)
+    key = public.PrivateKey(provider._usable_private(generation)).public_key
+    bound_plaintext = (
+        provider._cover_aad(cover_id, context, secret_commitment)
+        + b"\0"
+        + plaintext
+    )
+    return CoverRecord(
+        context,
+        secret_commitment,
+        Envelope(
+            context,
+            bytes(public.SealedBox(key).encrypt(bound_plaintext)),
+        ),
+    )
+
+
 def test_adr_selects_bounded_independent_generations_and_explicit_tiers():
     decision = FIXTURE["decision"]
     assert decision["primary"] == "independent-nonexportable-recipient-generations"
@@ -805,7 +984,21 @@ def test_adr_selects_bounded_independent_generations_and_explicit_tiers():
     assert decision["duplicate_operation_refs"] == "canonical-set"
     assert decision["protected_fence_phase_required"] is True
     assert decision["destroy_revalidates_survivors"] is True
-    assert decision["migration_proof"] == "exact-survivor-id-set"
+    assert (
+        decision["migration_proof"]
+        == "exact-survivor-id-and-secret-commitment-set"
+    )
+    assert decision["protected_claim_before_rollbackable_mirror"] is True
+    assert decision["protected_claim_includes_manifest"] is True
+    assert decision["migration_proof_cas"] == "protected-first-immutable"
+    assert (
+        decision["retirement_order"]
+        == "protected-disable-before-handle-delete"
+    )
+    assert (
+        decision["wrap_eligibility"]
+        == "live-active-staged-public-commitments"
+    )
     assert decision["finalization_revalidates_parent_claim"] is True
 
     tiers = {tier["name"]: tier for tier in FIXTURE["guarantee_tiers"]}
@@ -815,6 +1008,69 @@ def test_adr_selects_bounded_independent_generations_and_explicit_tiers():
     assert tiers["rollback-resistant"]["deleted_keyblob_replay_blocked"] is True
     assert tiers["rollback-resistant"]["old_claim_replay_blocked"] is True
     assert tiers["rollback-resistant"]["snapshot_erasure_claim"] is True
+
+
+def test_fixture_pins_generation_independent_local_secret_commitments():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    for item in FIXTURE["cover_records"]:
+        cover_id = item["id"]
+        plaintext = bytes.fromhex(item["plaintext_hex"])
+        p_context = provider._cover_context(cover_id, "P")
+        s_context = provider._cover_context(cover_id, "S")
+        expected = item["secret_commitment"]
+
+        assert local_secret_commitment(cover_id, p_context, plaintext) == expected
+        assert local_secret_commitment(cover_id, s_context, plaintext) == expected
+        assert provider._record("P", cover_id, plaintext).secret_commitment == (
+            expected
+        )
+
+
+def test_local_secret_commitment_binds_semantics_but_not_recipient_generation():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    cover_id = "retained-node-a"
+    plaintext = cover_fixture()[cover_id]
+    context = provider._cover_context(cover_id, "P")
+    commitment = local_secret_commitment(cover_id, context, plaintext)
+    mutations = {
+        "recipient_lineage_id": "other-lineage",
+        "content_scope_id": "other-workspace",
+        "frontier_id": "other-frontier",
+        "secret_kind": "FrontierRoot",
+        "range_start": context.range_start + 1,
+        "range_width": context.range_width + 1,
+        "bit_depth": context.bit_depth + 1,
+        "event_id_prefix": "ff" * 32,
+        "source_secret_ref": "ee" * 32,
+        "tombstone_context": "dd" * 32,
+        "recovery_policy_ref": "other-policy",
+    }
+    for field, value in mutations.items():
+        assert local_secret_commitment(
+            cover_id,
+            replace(context, **{field: value}),
+            plaintext,
+        ) != commitment
+
+    assert local_secret_commitment(
+        "other-cover",
+        context,
+        plaintext,
+    ) != commitment
+    assert local_secret_commitment(
+        cover_id,
+        context,
+        plaintext[:-1] + bytes([plaintext[-1] ^ 1]),
+    ) != commitment
+    for field, value in {
+        "generation": "S",
+        "provider_suite": "P-256",
+    }.items():
+        assert local_secret_commitment(
+            cover_id,
+            replace(context, **{field: value}),
+            plaintext,
+        ) == commitment
 
 
 def test_three_recursive_transitions_are_unique_and_return_to_two_handles():
@@ -1002,7 +1258,12 @@ def test_cover_envelope_authenticates_every_context_field():
             context=replace(envelope.context, **{field: value}),
         )
         with pytest.raises(CryptoError, match="context|decrypt"):
-            provider._open(cover_id, envelope.context, relabeled)
+            provider._open(
+                cover_id,
+                envelope.context,
+                provider.cover_record(cover_id).secret_commitment,
+                relabeled,
+            )
 
     transplanted_context = provider._cover_context(
         "transplanted-record", "P"
@@ -1011,6 +1272,7 @@ def test_cover_envelope_authenticates_every_context_field():
         provider._open(
             "transplanted-record",
             transplanted_context,
+            provider.cover_record(cover_id).secret_commitment,
             envelope,
         )
     tampered = replace(
@@ -1019,7 +1281,12 @@ def test_cover_envelope_authenticates_every_context_field():
         + bytes([envelope.ciphertext[-1] ^ 1]),
     )
     with pytest.raises(CryptoError):
-        provider._open(cover_id, envelope.context, tampered)
+        provider._open(
+            cover_id,
+            envelope.context,
+            provider.cover_record(cover_id).secret_commitment,
+            tampered,
+        )
 
 
 def test_cover_open_rejects_valid_ciphertext_for_self_described_foreign_context():
@@ -1032,8 +1299,13 @@ def test_cover_open_rejects_valid_ciphertext_for_self_described_foreign_context(
         frontier_id="other-frontier",
     )
     key = public.PrivateKey(provider._usable_private("P")).public_key
+    commitment = local_secret_commitment(
+        cover_id,
+        foreign,
+        b"foreign secret",
+    )
     bound = (
-        provider._cover_aad(cover_id, foreign)
+        provider._cover_aad(cover_id, foreign, commitment)
         + b"\0"
         + b"foreign secret"
     )
@@ -1043,7 +1315,7 @@ def test_cover_open_rejects_valid_ciphertext_for_self_described_foreign_context(
     )
 
     with pytest.raises(CryptoError, match="authoritative record"):
-        provider._open(cover_id, expected, envelope)
+        provider._open(cover_id, expected, commitment, envelope)
 
 
 def test_cover_open_does_not_take_expected_generation_from_envelope():
@@ -1052,8 +1324,13 @@ def test_cover_open_does_not_take_expected_generation_from_envelope():
     expected = provider._cover_context(cover_id, "P")
     self_described = provider._cover_context(cover_id, "S")
     key = public.PrivateKey(provider._usable_private("S")).public_key
+    commitment = local_secret_commitment(
+        cover_id,
+        self_described,
+        b"staged plaintext",
+    )
     bound = (
-        provider._cover_aad(cover_id, self_described)
+        provider._cover_aad(cover_id, self_described, commitment)
         + b"\0"
         + b"staged plaintext"
     )
@@ -1063,7 +1340,7 @@ def test_cover_open_does_not_take_expected_generation_from_envelope():
     )
 
     with pytest.raises(CryptoError, match="authoritative record"):
-        provider._open(cover_id, expected, envelope)
+        provider._open(cover_id, expected, commitment, envelope)
 
 
 def test_migration_reopens_successor_labeled_records_before_destroying_p():
@@ -1153,6 +1430,84 @@ def test_destroy_revalidates_each_successor_record_after_migration(
     assert provider.disk["destroyed"] == {}
 
 
+@pytest.mark.parametrize(
+    ("replace_commitment", "open_succeeds", "destroy_result"),
+    (
+        (False, False, "successor-cover-validation-failed"),
+        (True, True, "survivor-commitment-mismatch"),
+    ),
+)
+def test_destroy_rejects_public_key_forgery_of_a_survivor_secret(
+    replace_commitment,
+    open_succeeds,
+    destroy_result,
+):
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    cover_id = "frontier-root"
+    provider.seed_cover(cover_id, b"canonical survivor")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+
+    canonical_record = provider.cover_record(cover_id)
+    attacker_plaintext = b"attacker replacement"
+    commitment = canonical_record.secret_commitment
+    if replace_commitment:
+        commitment = local_secret_commitment(
+            cover_id,
+            canonical_record.expected_context,
+            attacker_plaintext,
+        )
+    provider.disk["covers"][cover_id] = forge_cover_record(
+        provider,
+        cover_id,
+        "S",
+        attacker_plaintext,
+        commitment,
+    )
+
+    if open_succeeds:
+        # The forged record is internally consistent, but it cannot change the
+        # immutable commitment map captured by migration.
+        assert provider.open_cover(cover_id) == attacker_plaintext
+    else:
+        # Keeping the canonical commitment exposes the changed plaintext.
+        with pytest.raises(CryptoError, match="secret commitment"):
+            provider.open_cover(cover_id)
+    assert provider.destroy("P", "S") == destroy_result
+    assert "P" in provider._handles
+    assert provider._hardware_floor == generation_index("P")
+    assert provider.disk["destroyed"] == {}
+
+
+def test_migration_retry_cannot_shrink_the_first_survivor_proof():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"first survivor")
+    provider.seed_cover("retained-node-b", b"second survivor")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+    frozen = provider._accepted_migration("P")
+    assert {
+        cover_id for cover_id, _ in frozen.survivor_commitments
+    } == {"frontier-root", "retained-node-b"}
+
+    del provider.disk["covers"]["retained-node-b"]
+    assert provider.migrate("P", "S", manifest) == "migration-proof-mismatch"
+    assert provider._accepted_migration("P") == frozen
+    assert provider.destroy("P", "S") == "survivor-set-mismatch"
+    assert "P" in provider._handles
+    assert provider._hardware_floor == generation_index("P")
+
+
 def test_transition_steps_reject_unclaimed_successors_and_changed_manifest():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     covers = cover_fixture()
@@ -1178,6 +1533,12 @@ def test_transition_steps_reject_unclaimed_successors_and_changed_manifest():
     assert provider.migrate("P", "S", set()) == "retirement-manifest-mismatch"
     assert provider.open_cover("retained-node-a") == covers["retained-node-a"]
     assert provider.migrate("P", "S", manifest) == "migrated"
+
+    provider.disk["destroyed"]["P"] = "S"
+    assert provider.promote(prepared) == "destruction-required"
+    assert provider.active == "P"
+    assert "P" in provider._handles
+    del provider.disk["destroyed"]["P"]
 
     floor_before = provider._hardware_floor
     assert provider.destroy("P", "T") == "claim-successor-mismatch"
@@ -1243,6 +1604,74 @@ def test_duplicate_operation_refs_have_one_canonical_batch_commitment():
     assert provider.claim(duplicate_retry) == "coalesced"
 
 
+def test_claim_repairs_disk_only_partial_write_before_preventing_a_fork():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    before_claim = provider.snapshot()
+    prepared = prepared_transition(provider, transition)
+    manifest = purge_targets_for_operations(prepared.operations)
+
+    # Model the unsafe legacy crash boundary: rollbackable mirrors exist but
+    # the protected compare-and-set did not happen.
+    provider.disk["claims"]["P"] = prepared.claim
+    provider.disk["manifests"]["P"] = manifest
+    assert provider._protected_transitions == {}
+
+    # A disk-only value is not mistaken for an accepted claim. The exact retry
+    # first commits the protected authority, then repairs the mirrors.
+    assert provider.claim(prepared) == "accepted"
+    assert provider._protected_transitions["P"] == AcceptedTransition(
+        prepared.claim,
+        manifest,
+    )
+    assert provider.disk["claims"]["P"] == prepared.claim
+
+    provider.restore(before_claim)
+    forked = replace(
+        prepared,
+        operations=("forked-purge-operation",),
+    )
+    assert provider.claim(forked) == "conflict"
+    assert provider.claim(prepared) == "coalesced"
+    assert provider.disk["claims"]["P"] == prepared.claim
+    assert provider.disk["manifests"]["P"] == manifest
+
+
+def test_migration_uses_protected_claim_and_manifest_not_tampered_mirrors():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"survivor")
+    provider.seed_cover("retained-node-a", b"purge target")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    protected = provider._accepted_transition("P")
+    assert provider.fence_and_drain("P")[0] == "fenced"
+
+    provider.disk["claims"]["P"] = replace(
+        prepared.claim,
+        retirement_batch_commitment="00" * 32,
+    )
+    provider.disk["manifests"]["P"] = frozenset({"frontier-root"})
+
+    assert provider.migrate(
+        "P",
+        "S",
+        {"frontier-root"},
+    ) == "retirement-manifest-mismatch"
+    assert provider._accepted_transition("P") == protected
+    assert provider.open_cover("frontier-root") == b"survivor"
+    assert provider.open_cover("retained-node-a") == b"purge target"
+
+    assert provider.migrate(
+        "P",
+        "S",
+        protected.manifest,
+    ) == "migrated"
+    assert set(provider.disk["covers"]) == {"frontier-root"}
+
+
 @pytest.mark.parametrize("replace_before_prepare", (True, False))
 def test_next_transition_rejects_replacement_of_committed_staged_key(
     replace_before_prepare,
@@ -1250,7 +1679,7 @@ def test_next_transition_rejects_replacement_of_committed_staged_key(
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     first = FIXTURE["decision"]["transition_batches"][0]
     complete_transition(provider, first)
-    committed_t_public = provider._hardware_claims["P"].next_public
+    committed_t_public = provider._accepted_claim("P").next_public
     second = FIXTURE["decision"]["transition_batches"][1]
 
     if not replace_before_prepare:
@@ -1269,11 +1698,51 @@ def test_next_transition_rejects_replacement_of_committed_staged_key(
         assert provider.disk["claims"].get("S") is None
 
 
+def test_replaced_genesis_handle_is_never_wrap_or_writer_eligible():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    assert provider.acquire_writer_lease("existing-writer", "P") == "accepted"
+    original_public = provider.public_key("P")
+
+    del provider._handles["P"]
+    assert provider._generate("P") == "generated"
+    assert provider.public_key("P") != original_public
+
+    assert provider.wrap_eligible == set()
+    assert provider.acquire_writer_lease("new-writer", "P") == "rejected"
+    assert provider.commit_cover(
+        "existing-writer",
+        "forged-generation-cover",
+        b"must not commit",
+    ) == "rejected"
+    assert provider.prepare_next("T") == "recursive-commitment-mismatch"
+
+
+def test_replaced_finalized_handle_invalidates_wraps_and_existing_leases():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    complete_transition(provider, transition)
+    assert provider.acquire_writer_lease("existing-writer", "S") == "accepted"
+    committed_public = provider._accepted_claim("P").successor_public
+
+    del provider._handles["S"]
+    assert provider._generate("S") == "generated"
+    assert provider.public_key("S") != committed_public
+
+    assert provider.wrap_eligible == set()
+    assert provider.acquire_writer_lease("new-writer", "S") == "rejected"
+    assert provider.commit_cover(
+        "existing-writer",
+        "forged-generation-cover",
+        b"must not commit",
+    ) == "rejected"
+    assert provider.finalize("P", "S") == "completion-evidence-required"
+
+
 def test_recursive_schedule_uses_persisted_explicit_parent_claim_ref():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     first = FIXTURE["decision"]["transition_batches"][0]
     complete_transition(provider, first)
-    claim = provider._hardware_claims["P"]
+    claim = provider._accepted_claim("P")
     expected_ref = ParentClaimRef("P", transition_claim_id("P", claim))
 
     assert provider.disk["parent_claim_refs"]["S"] == expected_ref
@@ -1381,6 +1850,46 @@ def test_destroy_retry_rehydrates_evidence_from_protected_retirement_state():
     assert provider.promote(prepared) == "promoted-without-allocation"
     assert provider.finalize("P", "S") == "finalized"
     assert provider.open_cover("frontier-root") == b"survivor"
+
+
+def test_retirement_is_protected_before_physical_handle_cleanup():
+    class SimulatedPowerLoss(Exception):
+        pass
+
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"survivor")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+    before_destruction = provider.snapshot()
+    real_delete = provider._delete_retired_handle
+
+    def lose_power_before_physical_cleanup(predecessor):
+        assert predecessor == "P"
+        assert provider._hardware_floor == generation_index("S")
+        with pytest.raises(CryptoError, match="hardware floor"):
+            provider._usable_private("P")
+        raise SimulatedPowerLoss
+
+    provider._delete_retired_handle = lose_power_before_physical_cleanup
+    with pytest.raises(SimulatedPowerLoss):
+        provider.destroy("P", "S")
+    assert "P" in provider._handles
+    assert provider._hardware_floor == generation_index("S")
+    assert provider.disk["destroyed"] == {}
+
+    provider.restore(before_destruction)
+    provider._delete_retired_handle = real_delete
+    assert provider.reconcile_status() == "stale-snapshot-fail-closed"
+    assert provider.destroy("P", "S") == "already-destroyed"
+    assert "P" not in provider._handles
+    assert provider.disk["destroyed"] == {"P": "S"}
+    assert provider.promote(prepared) == "promoted-without-allocation"
+    assert provider.finalize("P", "S") == "finalized"
 
 
 def test_rollback_resistant_restore_cannot_revive_p_or_fork_its_claim():
