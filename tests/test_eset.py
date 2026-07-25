@@ -1,15 +1,22 @@
 """E = V minus S stays independent of delivery history."""
+import base64
+import threading
+
 import pytest
 
-from core.close import decode_pile
+from core import cmds, daemon, tree
+from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
+from core.shape import SUPP, SUPP_INDEX
 from core.suppression import victims
+from facts.auth.request import payload as request_payload
 
 from .util import (
     all_fids,
     channel_delete,
     closed_subset,
+    invoke_mint,
     projection_state,
     replay_random,
     suppression_world,
@@ -112,3 +119,137 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
         "SELECT 1 FROM projected WHERE ws=? AND src=?",
         (workspace, target),
     ).fetchone() is None
+
+
+@pytest.mark.parametrize("restart", (False, True))
+def test_suppression_stays_behind_the_manifest_commit(
+        tmp_path, monkeypatch, restart):
+    """An ahead T_supp row is invisible until the shared root CAS succeeds."""
+    node, workspace, _, _ = suppression_world(
+        tmp_path / "node", monkeypatch)
+    target_fid = cmds.post(
+        node, workspace, "unpublished", "target", ts=300)
+    target = node.fact_of(workspace, target_fid)
+    deletion = channel_delete(target.fid, "unpublished", 301)
+    store = node.store(workspace)
+    old_root = store.get("root")
+
+    def projected():
+        return node.app.execute(
+            "SELECT 1 FROM projected WHERE ws=? AND src=?",
+            (workspace, target.fid)).fetchone() is not None
+
+    def published_fids(raw):
+        root = tree.decode_root(raw)
+        supp = root.index(SUPP_INDEX)
+        return {
+            SUPP.fid_of(key)
+            for key in tree.leaf_keys(
+                supp, lambda oid: store.get("obj/" + oid), SUPP)
+        }
+
+    assert target.fid in published_fids(old_root)
+    assert deletion.fid not in published_fids(old_root)
+    assert projected()
+    now = daemon.now_ms()
+    request = encode_pile(request_payload(
+        node, workspace, "sync", now + 60_000, now))
+    canonical_observed = []
+    original_mint = daemon.gate.mint
+
+    def observe_canonical(*args, **kwargs):
+        canonical_observed.append(kwargs["canonical_db"].execute(
+            "SELECT COUNT(*) FROM supp WHERE fid=?",
+            (deletion.fid,)).fetchone()[0])
+        return original_mint(*args, **kwargs)
+
+    monkeypatch.setattr(daemon.gate, "mint", observe_canonical)
+
+    release_reader = threading.Event()
+    reader_waiting = threading.Event()
+    observed = []
+
+    def read_like_mint():
+        release_reader.wait()
+        reader_waiting.set()
+        _, (code, body) = invoke_mint(node, workspace, request)
+        observed.append((
+            code,
+            base64.b64decode(body["root"]) if body else None,
+        ))
+
+    reader = threading.Thread(target=read_like_mint, daemon=True)
+    reader.start()
+    candidate = []
+    original_cas = store.cas
+
+    def fail_before_publish(key, etag, raw):
+        candidate.append(raw)
+        assert key == "root"
+        assert store.get("root") == old_root
+        assert node.idx(workspace).execute(
+            "SELECT k FROM supp WHERE fid=?",
+            (deletion.fid,)).fetchone() == (SUPP.key(deletion),)
+        release_reader.set()
+        assert reader_waiting.wait(timeout=5)
+        raise RuntimeError("suppression manifest CAS failed")
+
+    monkeypatch.setattr(store, "cas", fail_before_publish)
+    with pytest.raises(RuntimeError, match="manifest CAS failed"):
+        node.ingest_new(
+            workspace, [deletion], {deletion.fid: [target.fid]})
+    reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert len(candidate) == 1
+    assert deletion.fid in published_fids(candidate[0])
+    assert store.get("root") == old_root
+    assert node.fact_of(workspace, deletion.fid) is None
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM supp WHERE fid=?",
+        (deletion.fid,)).fetchone() is None
+    assert observed == [(200, old_root)]
+    assert canonical_observed == [0]
+    assert projected()
+    assert store.list("pile/")
+
+    if restart:
+        index = node.idx(workspace)
+        index.executescript(
+            "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
+            "DELETE FROM supp; DELETE FROM globals; DELETE FROM meta;")
+        index.commit()
+        index.close()
+        node.app.execute("PRAGMA user_version=0")
+        node.app.commit()
+        node.app.close()
+        node = Node(node.dir)
+        store = node.store(workspace)
+    else:
+        monkeypatch.setattr(store, "cas", original_cas)
+
+    assert node.fact_of(workspace, deletion.fid) is None
+    assert store.get("root") == old_root
+    assert projected()
+    retry_cas = store.cas
+    retried = []
+
+    def observe_retry(key, etag, raw):
+        retried.append(raw)
+        return retry_cas(key, etag, raw)
+
+    monkeypatch.setattr(store, "cas", observe_retry)
+    node.turn(workspace)
+
+    assert retried == candidate
+    assert store.get("root") == candidate[0]
+    assert node.fact_of(workspace, deletion.fid) == deletion
+    assert deletion.fid in published_fids(store.get("root"))
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM supp WHERE fid=?",
+        (deletion.fid,)).fetchone() == (1,)
+    assert not projected()
+    assert store.list("pile/") == []
+    _, (code, body) = invoke_mint(node, workspace, request)
+    assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
+    assert canonical_observed == [0, 1]

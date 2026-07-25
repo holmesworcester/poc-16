@@ -18,7 +18,12 @@ from facts.auth.signature import signature
 from core.node import Node, now_ms
 from core.shape import FACT
 
-from .util import add_member, inject_device_claim, mismatched_tree_key
+from .util import (
+    add_member,
+    inject_device_claim,
+    invoke_mint,
+    mismatched_tree_key,
+)
 
 
 @pytest.fixture
@@ -62,18 +67,6 @@ def root_with(node, workspace, extra):
     )
     return tree.encode_root(tree.Root(
         view, workspace, result.globals))
-
-
-def invoke(node, workspace, pile):
-    handler = object.__new__(daemon.Handler)
-    handler.node, handler.secret = node, b"mint-test-secret"
-    handler._known = lambda candidate: candidate == workspace
-    handler._send = lambda code, *args, **kwargs: (code, None)
-    handler._json = lambda code, body: (code, body)
-    return handler, handler.mint({
-        "ws": workspace,
-        "pile": base64.b64encode(pile).decode(),
-    })
 
 
 def conflict_world(path, seed):
@@ -126,7 +119,7 @@ def conflict_world(path, seed):
 
 def test_mint_rejects_malformed_requests(world):
     node, workspace, _, _, pile = world
-    handler, _ = invoke(node, workspace, pile)
+    handler, _ = invoke_mint(node, workspace, pile)
 
     for body in (
             None, [], {}, {"ws": []}, {"ws": workspace},
@@ -193,7 +186,7 @@ def test_grant_sealed_to_requester_pk(world):
     """The grant unseals only with the requester's sk; replaying the
     challenge yields nothing to anyone else."""
     node, workspace, _, _, pile = world
-    handler, (code, body) = invoke(node, workspace, pile)
+    handler, (code, body) = invoke_mint(node, workspace, pile)
     token = unseal(
         node.sk, base64.b64decode(body["grant"])).decode()
 
@@ -217,7 +210,7 @@ def test_mint_writes_nothing(world):
     )
     node.globals = lambda _: pytest.fail("mint read the derived index")
 
-    code, _ = invoke(node, workspace, pile)[1]
+    code, _ = invoke_mint(node, workspace, pile)[1]
     after = (
         store.list(""),
         tuple(node.idx(workspace).iterdump()),
@@ -318,7 +311,7 @@ def test_root_metadata_cannot_omit_an_eviction(tmp_path):
     with pytest.raises(ValueError, match="invalid authority tree"):
         mint.Authority.from_root(forged, fetch)
     assert mint.stateless(pile, forged, fetch, now) is None
-    assert invoke(node, workspace, pile)[1][0] == 403
+    assert invoke_mint(node, workspace, pile)[1][0] == 403
     with pytest.raises(ValueError, match="invalid tree facts"):
         node.rebuild(workspace)
 
@@ -354,7 +347,7 @@ def test_published_authority_rejects_ephemeral_facts_at_every_boundary(
 
     store.put("root", rogue_bytes)
     assert mint.stateless(pile, rogue_bytes, fetch, now) is None
-    assert invoke(node, workspace, pile)[1][0] == 403
+    assert invoke_mint(node, workspace, pile)[1][0] == 403
     with pytest.raises(ValueError, match="invalid tree facts"):
         node.rebuild(workspace)
 
@@ -408,7 +401,7 @@ def test_published_roots_require_canonical_settle_placement(tmp_path):
 
     store.put("root", wrong_bytes)
     assert mint.stateless(pile, wrong_bytes, fetch, now) is None
-    assert invoke(node, workspace, pile)[1][0] == 403
+    assert invoke_mint(node, workspace, pile)[1][0] == 403
     with pytest.raises(ValueError, match="tree placement"):
         node.rebuild(workspace)
 
@@ -466,7 +459,7 @@ def test_every_mint_path_matches_randomized_canonical_conflicts(
                 pile, root,
                 lambda _: pytest.fail("cached mint fetched the tree"),
                 now, projection) == expected
-            assert invoke(node, workspace, pile)[1][0] \
+            assert invoke_mint(node, workspace, pile)[1][0] \
                 == (200 if expected else 403)
 
 
