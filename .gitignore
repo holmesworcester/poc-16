@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+target/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

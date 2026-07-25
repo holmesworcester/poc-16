@@ -2,8 +2,8 @@
 
 P-history-independence: same set, same bytes — any pile grouping, any
 arrival order, any number of turns converges to an identical root.
-P-leaves-are-piles: every published leaf pile (a topo-sorted closed set) passes
-the kernel from an empty scratchpad.
+P-paths-are-piles: every published root-to-leaf path union (a topo-sorted
+closed set) passes the kernel from an empty scratchpad.
 P-rebuild: wipe the derived index, replay the store's own units, get the
 identical root back.
 P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
@@ -15,7 +15,7 @@ import pytest
 
 from core import cmds, tree
 from core.close import close, decode_pile, encode_pile
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.fact import Fact
 from facts.auth.request import payload as request_payload
 from facts.auth.request import request
@@ -23,10 +23,11 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
-from core.kernel import drain, evaluate, resolve_deps
+from core.kernel import Judgment, drain, evaluate, resolve_deps
 from core.node import Node, now_ms
-from core.shape import FACT
+from core.shape import FACT, SUPP, SUPP_INDEX
 
+from . import util as test_util
 from .util import (
     add_member,
     all_fids,
@@ -34,15 +35,29 @@ from .util import (
     closed_subset,
     deliver,
     member_src,
+    mismatched_tree_key,
+    send_bytes,
 )
 
 
 @pytest.fixture
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
     """Alice's node with a workspace: 3 members, messages, a file, an evict."""
-    n = Node(str(tmp_path / "alice"))
-    ws = cmds.create(n, "alice")
-    t0 = now_ms()
+    # Pin identity and time so path-cost laws never depend on random partitions.
+    monkeypatch.setattr("core.node.now_ms", lambda: 2_000_000)
+    identities = iter(range(2, 10))
+
+    def keypair():
+        secret = load_sk(f"{next(identities):064x}")
+        return secret, secret.verify_key.encode().hex()
+
+    monkeypatch.setattr(test_util, "keypair", keypair)
+    n = Node(
+        str(tmp_path / "alice"),
+        initial_secret=load_sk(f"{1:064x}"),
+    )
+    ws = cmds.create(n, "alice", ts=1_000_000)
+    t0 = 1_000_010
     bsk, bpk, _ = add_member(n, ws, "bob", t0 + 1)
     csk, cpk, _ = add_member(n, ws, "carol", t0 + 2)
     rng = random.Random(16)
@@ -50,7 +65,7 @@ def world(tmp_path):
     for i in range(40):
         sk, pk = rng.choice(actors)
         author_msg(n, ws, sk, pk, f"m{i}", t0 + 10 + i)
-    cmds.send_file(n, ws, "general", "blob.bin", rng.randbytes(30_000))
+    send_bytes(n, ws, "blob.bin", rng.randbytes(30_000))
     cmds.evict(n, ws, "carol")
     return n, ws
 
@@ -58,13 +73,14 @@ def world(tmp_path):
 def units_of(store):
     root = tree.decode_root(store.get("root"))
     fetch = lambda oid: store.get("obj/" + oid)
-    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
+    for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
         if leaf.n:
-            yield leaf, decode_pile(fetch(leaf.oid))[0]
+            yield leaf, tree.range_facts(
+                root.view, (lo, hi), fetch, FACT)
 
 
-def test_leaves_are_piles(world):
-    """Treap leaves are closed piles: each unit judges alone, from nothing."""
+def test_paths_are_piles(world):
+    """Every hoisted root-to-leaf path judges alone, from nothing."""
     n, ws = world
     count = 0
     for fen, stream in units_of(n.store(ws)):
@@ -113,17 +129,108 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     root_bytes = st.get("root")
     root = tree.decode_root(root_bytes)
     fetch = lambda oid: st.get("obj/" + oid)
-    leaf = next(
-        leaf for _, _, leaf in tree.leaf_ranges(root.view, fetch)
-        if leaf.n
+    payload = next(
+        oid for oid in tree.live_oids(root.view, fetch)
+        if b'"refs"' in st.get("obj/" + oid)
     )
-    st.put("obj/" + leaf.oid, encode_pile([]))
+    st.put("obj/" + payload, encode_pile([]))
 
-    with pytest.raises(ValueError, match="leaf integrity"):
+    with pytest.raises(ValueError, match="payload integrity"):
         n.rebuild(ws)
 
     assert st.get("root") == root_bytes
     assert all_fids(n, ws) == before
+
+
+def test_rebuild_rejects_payload_leaf_key_mismatch(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    store = node.store(workspace)
+    before = all_fids(node, workspace)
+
+    def emit(raw):
+        oid = h(raw)
+        store.put("obj/" + oid, raw)
+        return oid
+
+    root = store.get("root")
+    fetch = lambda oid: store.get("obj/" + oid)
+    store.put("root", mismatched_tree_key(root, fetch, emit))
+
+    with pytest.raises(ValueError, match="tree fact set"):
+        node.rebuild(workspace)
+
+    assert all_fids(node, workspace) == before
+
+
+def test_rebuild_rejects_hidden_fact_in_a_legacy_leaf(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    store = node.store(workspace)
+    anchor = node.fact_of(workspace, workspace)
+    hidden = Fact("sample", 0, [], {"hidden": True})
+    indexed = Fact("sample", 2, [], {"indexed": True})
+
+    def leaf(facts, key):
+        raw = encode_pile(facts)
+        oid = h(raw)
+        store.put("obj/" + oid, raw)
+        return tree.View(
+            FACT.fingerprint([key]), oid, key, 1, (), (key,))
+
+    view = tree._flat_view(
+        (leaf([anchor], anchor.key),
+         leaf([hidden, indexed], indexed.key)),
+        1,
+        FACT,
+    )
+    root_bytes = tree.encode_root(tree.Root(
+        view, workspace, frozenset()))
+    root = tree.decode_root(root_bytes)
+    fetch = lambda oid: store.get("obj/" + oid)
+
+    assert len({fact.fid for fact in tree.facts(
+        root.view, fetch, FACT)}) == root.view.n + 1
+    store.put("root", root_bytes)
+    with pytest.raises(ValueError, match="tree fact set"):
+        node.rebuild(workspace)
+
+
+def test_rebuild_uses_an_explicit_kernel_validity_gate(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    before = all_fids(node, workspace)
+    monkeypatch.setattr(
+        "core.node.drain_committed",
+        lambda stream, anchor, globals_: Judgment(
+            False, (), frozenset()),
+    )
+
+    with pytest.raises(ValueError, match="invalid tree facts"):
+        node.rebuild(workspace)
+
+    assert all_fids(node, workspace) == before
+
+
+def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    before = all_fids(node, workspace)
+    empty = tree.build(
+        [], FACT, tree.FAT,
+        lambda fid: None, lambda fid: (), lambda raw: h(raw),
+    )
+    node.store(workspace).put(
+        "root",
+        tree.encode_root(tree.Root(empty, workspace, frozenset())),
+    )
+
+    with pytest.raises(ValueError, match="tree fact set"):
+        node.rebuild(workspace)
+
+    assert all_fids(node, workspace) == before
 
 
 def test_pre_manifest_crash_replays_from_the_authoritative_root(
@@ -424,7 +531,8 @@ def test_efficient_updates(world):
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
-    assert len(objs) <= 8, f"a single post rewrote {len(objs)} objects"
+    # Two indexes rewrite two bounded paths; fact bodies remain shared.
+    assert len(objs) <= 12, f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
 
@@ -449,7 +557,12 @@ def full_manifest(n, ws):
         n.keys(ws), FACT, tree.FAT,
         lambda fid: n.fact_of(ws, fid), deps_of, emit,
     )
-    return tree.encode_root(tree.Root(view, ws, n.globals(ws)))
+    supp = tree.build(
+        n.keys(ws, SUPP), SUPP, tree.FAT,
+        lambda fid: n.fact_of(ws, fid), deps_of, emit,
+    )
+    return tree.encode_root(tree.Root(
+        view, ws, n.globals(ws), ((SUPP_INDEX, supp),)))
 
 
 def test_incremental_equals_full(tmp_path):
@@ -465,7 +578,7 @@ def test_incremental_equals_full(tmp_path):
         who = (n.sk, n.pk) if i % 2 else (bsk, bpk)
         author_msg(n, ws, *who, f"m{i}", t0 + 10 + i)
         assert n.store(ws).get("root") == full_manifest(n, ws)
-    cmds.send_file(n, ws, "general", "f.bin", b"x" * 20_000)
+    send_bytes(n, ws, "f.bin", b"x" * 20_000)
     assert n.store(ws).get("root") == full_manifest(n, ws)
     author_msg(n, ws, n.sk, n.pk, "straggler", t0 + 5)  # lands deep in history
     assert n.store(ws).get("root") == full_manifest(n, ws)
@@ -550,14 +663,20 @@ def test_incremental_reuses_work(world):
     facts, not the whole set — the O(changed) compute win, not just O(1) IO."""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    loads = []
-    orig = n.fact_of
+    loads, scans = [], []
+    orig, keys, backfill = n.fact_of, n.keys, n._backfill_supp
     n.fact_of = lambda w, fid: (loads.append(fid), orig(w, fid))[1]
+    n.keys = lambda *args: (scans.append("keys"), keys(*args))[1]
+    n._backfill_supp = lambda *args: (
+        scans.append("backfill"), backfill(*args))[1]
     try:
-        cmds.post(n, ws, "general", "incremental")
+        cmds.post(n, ws, "general", "incremental", ts=3_000_000)
     finally:
         n.fact_of = orig
+        n.keys = keys
+        n._backfill_supp = backfill
     assert total > 30
+    assert scans == []
     assert len(set(loads)) < total // 2, \
         f"loaded {len(set(loads))} of {total} facts — reuse isn't skipping ranges"
 

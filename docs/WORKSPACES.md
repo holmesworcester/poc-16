@@ -388,9 +388,18 @@ never required for correctness — only, optionally, for freshness or to damp wa
   or blind last-writer-wins healed by the sweep.)*
 - **Folding is idempotent and multiply-triggered:** an R2 event per new pile, plus any reader's
   reconciliation (which discovers unfolded piles), plus a periodic backstop sweep. Overlapping
-  folds are safe — path-copy gives structural sharing, and two roots **merge to a unique third in
-  O(diff)** via the same RBSR descent (no re-fold from scratch). Piles are closed, so folds carry
-  no cross-pile ordering dependency.
+  folds are safe — path-copy gives structural sharing, and two roots **merge to a unique third**.
+  Untrusted roots must reproduce their byte-identical canonical dependency
+  placement before even identity/empty merge shortcuts; a full-set-only check
+  cannot prove partial paths are closed. Once roots have crossed that
+  publication boundary, the fixed-dependency case folds only the RBSR delta.
+  A provider-bearing or provider-consuming delta can
+  change the union's canonical dependency choices, so the current
+  correctness-first path rebuilds that union; `poc-16-jbg.4` owns recovering
+  the bounded merge with authenticated dependency summaries, while
+  `poc-16-jbg.3` owns amortizing the fallback across append-only roots. Closed
+  piles remain independently admissible, but canonical provider selection is
+  union-wide.
 - **Readers pick their guarantee.** Fast path: read any recent root and serve it (may lag new
   piles by ~fold latency). Authoritative path: merge the `roots/` set / reconcile against peers.
   **Read-your-writes needs no server coordination** — the writer folds its own pile locally (or
@@ -429,8 +438,9 @@ fingerprints into the immutable nodes**, so a dumb store supports a reader-drive
 only GETs — exactly git's **"dumb HTTP"** over a Merkle object DAG.
 
 **Consistency verdict.** The tree is a **state-based CRDT (CvRDT)**: roots form a join-semilattice
-under set-union, `merge` is the deterministic O(diff) tree-join, every update is monotone (MSTs
-are *defined* as state-based CRDTs). So we get **Strong Eventual Consistency** (Shapiro et al.):
+under set-union, `merge` is deterministic (bounded to the delta when dependency choices cannot
+change; canonical rebuild otherwise), and every update is monotone (MSTs are *defined* as
+state-based CRDTs). So we get **Strong Eventual Consistency** (Shapiro et al.):
 two participants that have observed the same set of updates hold a **bit-identical root** — "same
 state" is one hash compare — with no conflict resolution, no divergence, only staleness that
 self-heals on the next merge. The sole mutable state is a **32-byte root hash per workspace**, and

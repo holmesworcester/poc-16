@@ -11,6 +11,7 @@ import hashlib
 import hmac as hmaclib
 import json
 import os
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from . import cmds, mint as gate
 from .crypto import h, seal_to
 from .node import Node, now_ms
+from .store import PAGE_BATCH
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
@@ -123,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("If-None-Match") == etag:
                 return self._send(304)
             return self._send(200, b, etag=etag)
-        if parts[0] == "page" and len(parts) == 2:  # leaf piles and blobs alike
+        if parts[0] == "page" and len(parts) == 2:  # tree objects and blobs alike
             b = self.node.store(ws).get("obj/" + parts[1])
             return self._send(200, b, "application/octet-stream") if b else self._send(404)
         if parts[0] == "pile":
@@ -152,6 +154,24 @@ class Handler(BaseHTTPRequestHandler):
         ws = q.get("ws", "")
         if not self._known(ws):
             return self._send(404)
+        if parts[0] == "page":
+            if not self._member(ws):
+                return self._send(401)
+            try:
+                oids = json.loads(self._body())
+                if not isinstance(oids, list) or len(oids) > PAGE_BATCH \
+                        or not all(
+                        isinstance(oid, str) and len(oid) == 64
+                        and all(c in "0123456789abcdef" for c in oid)
+                        for oid in oids):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self._send(400)
+            store = self.node.store(ws)
+            return self._json(200, [
+                base64.b64encode(raw).decode() if raw is not None else None
+                for raw in (store.get("obj/" + oid) for oid in oids)
+            ])
         if parts[0] == "poke":
             self.node.turn(ws)
             return self._send(204)
@@ -176,10 +196,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._known(ws):
             return self._send(404)
         with self.node.lock:
-            root = self.node.store(ws).get("root")
-            if not root:
-                return self._send(403)
             try:
+                self.node._sync_index(ws)
+                root = self.node.store(ws).get("root")
+                if not root:
+                    return self._send(403)
                 anchor, globals_ = gate.root_globals(root)
             except Exception:
                 return self._send(403)
@@ -234,10 +255,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.syncer.kick()
                 return self._json(200, r)
             if parts[1] == "send":
-                r = {"fid": cmds.send_file(n, ws, o.get("chan", "general"), o["name"],
-                                           base64.b64decode(o["data"]))}
+                r = {"fid": self.send_file(n, ws, o)}
                 self.syncer.kick()
                 return self._json(200, r)
+            if parts[1] == "save":
+                return self._json(
+                    200, cmds.save_file(n, ws, o["fid"], o["out"]))
             if parts[1] == "evict":
                 r = {"fid": cmds.evict(n, ws, o["member"])}
                 self.syncer.kick()
@@ -253,6 +276,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404)
+
+    def send_file(self, node, ws, request):
+        """Use daemon-local paths for large files; spool inline control data."""
+        if request.get("path"):
+            return cmds.send_file(
+                node, ws, request.get("chan", "general"),
+                request["path"], request.get("name"))
+        handle, path = tempfile.mkstemp(prefix="poc-16-ctl-")
+        try:
+            with os.fdopen(handle, "wb") as spool:
+                spool.write(base64.b64decode(request["data"]))
+            return cmds.send_file(
+                node, ws, request.get("chan", "general"), path,
+                request.get("name") or "attachment")
+        finally:
+            os.unlink(path)
 
     def _resolve(self, ws):
         """Accept a unique workspace-id prefix on the control plane."""

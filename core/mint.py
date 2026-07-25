@@ -11,23 +11,85 @@ Stable validity never reads suppression:
     E(D)     = V(D) ∖ S(D)           a difference of monotone sets
                                      => order-independent, no linearization
 
-Suppression masks only after judgment. A peer also passes its root-stamped idx
-so evaluate can reject omitted incompatible authority winners. A stateless
-runtime must derive the equivalent view from the root/tree (poc-16-jbg.10);
-root metadata alone covers only conflict-free requests.
+Suppression masks only after judgment. A peer passes its root-stamped idx so
+evaluate can reject omitted incompatible authority winners. A stateless
+runtime builds the same read-only projection from validated tree leaves and
+may reuse it while its root ETag matches.
 """
+import sqlite3
+from dataclasses import dataclass
+
 import facts as families
 from . import tree
 from .close import decode_pile
-from .kernel import evaluate
+from .crypto import h
+from .kernel import SCHEMA, drain_committed, evaluate, unresolved_facts
+from .shape import FACT
 
 
-def mint(pile_bytes, anchor, globals_, now, canonical_db=None):
+@dataclass
+class Authority:
+    """A reusable canonical offer/proof projection for exactly one root."""
+
+    etag: str
+    root: tree.Root
+    db: sqlite3.Connection
+
+    @classmethod
+    def from_root(cls, root_bytes, fetch):
+        root = tree.decode_root(root_bytes)
+        try:
+            unit = tree.validate_view(
+                root.view, FACT, tree.FAT, fetch)
+        except ValueError as exc:
+            raise ValueError(f"invalid authority tree: {exc}") from exc
+        result = drain_committed(unit, root.anchor, root.globals_)
+        if not result.ok:
+            raise ValueError("invalid authority tree")
+        active = {fact.fid: fact for fact in unit}
+        if root.anchor not in active:
+            raise ValueError("authority projection does not match root")
+
+        db = sqlite3.connect(":memory:", check_same_thread=False)
+        try:
+            db.executescript(SCHEMA)
+            db.executemany(
+                "INSERT INTO facts VALUES(?,?,?)",
+                ((fact.fid, fact.ts, fact.t) for fact in active.values()),
+            )
+            db.executemany(
+                "INSERT INTO offers VALUES(?,?,?,?)",
+                ((*offer, fact.fid)
+                 for fact in active.values() for offer in fact.offers()),
+            )
+            unresolved = unresolved_facts(db, active.get)
+            if unresolved:
+                raise ValueError("authority root has no finite proof set")
+            db.commit()
+            db.execute("PRAGMA query_only=ON")
+            return cls(h(root_bytes), root, db)
+        except Exception:
+            db.close()
+            raise
+
+    def close(self):
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def mint(pile_bytes, anchor, globals_, now, *, canonical_db):
     """decode → kernel.evaluate(facts, anchor, globals ∪ {("now", now)}) →
     grant_of. Returns (pk, verb) to seal, or None to refuse. The challenge is
     ephemeral (never persisted); replay is harmless because the grant is
     sealed to the requester's pk. ``canonical_db`` binds already-known needs
     to the committed authority winners."""
+    if canonical_db is None:
+        return None
     try:
         facts, _ = decode_pile(pile_bytes)
         grant = grant_of(facts)
@@ -37,6 +99,24 @@ def mint(pile_bytes, anchor, globals_, now, canonical_db=None):
     except Exception:
         return None
     return grant if grant is not None and allowed else None
+
+
+def stateless(pile_bytes, root_bytes, fetch, now, projection=None):
+    """Mint from store state alone, optionally reusing a matching projection."""
+    authority, owned = projection, False
+    try:
+        if authority is None or authority.etag != h(root_bytes):
+            authority = Authority.from_root(root_bytes, fetch)
+            owned = True
+        root = authority.root
+        return mint(
+            pile_bytes, root.anchor, root.globals_, now,
+            canonical_db=authority.db)
+    except Exception:
+        return None
+    finally:
+        if owned and authority is not None:
+            authority.close()
 
 
 def grant_of(facts):
@@ -67,10 +147,6 @@ def screen(facts, supp):
 
 
 def root_globals(root_bytes):
-    """Read root-riding metadata, not the canonical authority projection.
-
-    Mint never needs app.db. Peers pass idx.db separately; stateless runtimes
-    must derive an equivalent view from the tree before production use.
-    """
+    """Read root-riding metadata; stateless production uses ``stateless``."""
     root = tree.decode_root(root_bytes)
     return root.anchor, root.globals_

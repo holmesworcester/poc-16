@@ -5,7 +5,7 @@ import pytest
 
 import facts
 
-from core import cmds
+from core import cmds, mint
 import core.sync as sync_module
 import core.walk as walk_module
 from core.close import close, encode_pile
@@ -22,6 +22,7 @@ from core.kernel import drain, evaluate, offer_src, resolve_deps
 from core.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
+from .util import inject_device_claim as _inject_device_claim
 
 
 def _materialize(db, workspace, valid):
@@ -30,29 +31,6 @@ def _materialize(db, workspace, valid):
         "INSERT INTO projected VALUES(?,?,?,0)",
         (workspace, valid.fact.fid, valid.fact.t))
     facts.materialize(db, workspace, valid)
-
-
-def _inject_device_claim(
-        node, workspace, secret, public, user, target, label, ts):
-    """Author a valid claim directly, bypassing command-side duplicate checks."""
-    item = device_invite_fact(public, user, target, label, ts)
-    signed = signature(secret, public, item, ts)
-    device_source = offer_src(
-        node.idx(workspace), "device_key", public,
-        requires=(("device", user, public),))
-    node.ingest_new(
-        workspace,
-        [signed, item],
-        {
-            signed.fid: [],
-            item.fid: [
-                signed.fid,
-                member_src(node, workspace, public),
-                device_source,
-            ],
-        },
-    )
-    return item
 
 
 def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
@@ -545,6 +523,14 @@ def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
         source.globals(workspace) | {("now", ts)},
         canonical_db=source.idx(workspace),
     )
+    source_root = source.store(workspace).get("root")
+    remote_root = remote.store(workspace).get("root")
+    assert mint.stateless(
+        encode_pile(source_request), remote_root,
+        lambda oid: remote.store(workspace).get("obj/" + oid), ts)
+    assert mint.stateless(
+        encode_pile(remote_request), source_root,
+        lambda oid: source.store(workspace).get("obj/" + oid), ts)
 
 
 def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):

@@ -1,7 +1,7 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
-Layout: root (the CAS'd fat-root metadata, only mutable key besides
-piles/invites), obj/<hash> (tree nodes, leaf piles, blobs — immutable),
+Layout: root (the CAS'd workspace/index manifest, only mutable key besides
+piles/invites), obj/<hash> (tree nodes, settle piles, blobs — immutable),
 pile/<member>/<hash> (ingress), invite/<id> (public reads), and
 quarantine/<fid> (node-local retention for a previously valid pruned fact).
 """
@@ -13,6 +13,7 @@ import threading
 from .crypto import h
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
+PAGE_BATCH = 256
 
 
 class MemStore:
@@ -134,6 +135,19 @@ class RemoteStore:
         if key.startswith("obj/"):
             return self.peer.obj(key[4:])
         return None
+
+    def get_many(self, keys):
+        """Fetch object keys in bounded batches; preserve order and misses."""
+        keys = tuple(keys)
+        if not all(key.startswith("obj/") for key in keys):
+            return tuple(self.get(key) for key in keys)
+        if not hasattr(self.peer, "objs"):
+            return tuple(self.get(key) for key in keys)
+        out = []
+        for start in range(0, len(keys), PAGE_BATCH):
+            out.extend(self.peer.objs(
+                [key[4:] for key in keys[start:start + PAGE_BATCH]]))
+        return tuple(out)
 
     def has(self, key):
         return self.get(key) is not None

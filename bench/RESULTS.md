@@ -1,17 +1,53 @@
 # Sync throughput — measured
 
-`python3 bench/bench_sync.py` against the tinyp2p engine on `main`. 100 members,
-messages spread uniformly over 3 simulated years, 8 kernel workers, on this
-desktop. Every run asserts the catching-up / reconciled nodes reach a
-**byte-identical root** (`ok = y`), so these are throughput numbers on
-provably-correct convergence, not best-effort. `rec/s` and the redundancy factor
-are steady across repeats; absolute seconds carry a few percent of machine noise.
+Current production rows and the historical baseline below were measured on the
+same desktop with 100 members, messages spread uniformly over 3 simulated years,
+and 8 kernel workers. Every run asserts that the catching-up / reconciled nodes
+reach a **byte-identical root** (`ok = y`), so these are throughput numbers on
+provably-correct convergence, not best-effort. Absolute seconds carry a few
+percent of machine noise.
 
-**Shipped default: tiered layout, `COLD_CUT = 4096`** (~1.5 MB cold pages under a
+## Production settle-node check (2026-07-25)
+
+The current fat-tree format stores each fact once at its settle node; the
+leaf-only/tiered results below are retained as the baseline it replaced.
+Post-landing real-engine runs measured:
+
+| full catchup | facts | streamed | redundancy | transfer | ingest | facts/s | converged |
+|---|--:|--:|--:|--:|--:|--:|:--:|
+| 5k | 4,999 | 4,999 | **1.00×** | 3.4 MB | 1.21 s | 4,122 | ✓ |
+| 50k | 49,999 | 49,999 | **1.00×** | 32.9 MB | 12.84 s | 3,894 | ✓ |
+
+For bidirectional range sync, “useful” is the missing set on that leg and
+“streamed” includes the shared authority path needed to judge it:
+
+| scale | union facts | useful pull / push | streamed pull / push | redundancy per leg | transfer pull / push | reconciliation | useful moved/s | converged |
+|---|--:|--:|--:|--:|--:|--:|--:|:--:|
+| 5k | 4,997 | 2,300 / 2,300 | 2,697 / 2,697 | **1.17×** | 1.8 / 0.9 MB | 1.78 s | 2,583 | ✓ |
+| 50k | 49,997 | 24,800 / 24,800 | 25,197 / 25,197 | **1.02×** | 16.6 / 8.6 MB | 19.77 s | 2,509 | ✓ |
+
+The companion prototype rerun measured flat leaf-only `ρ=2.96–2.98×`
+(14.8k fact copies for 4,999 facts), while settle storage and full verification
+were exactly 4,999 facts, a 66.5% reduction. The production catchup therefore
+hits the predicted `ρ→1` floor. A partial range still pays one flat shared-core
+tax per leg, visible as 1.17× at 5k and amortized to 1.02× at 50k.
+`bench_order.py 5000 star chain` also retained the ordering result: timestamp
+range tax is member-wide, delegation order makes it path-shaped, and deep-chain
+leaf-only full sync remains about 24× while settle full sync stays 1×.
+
+Reproduce the current path with `python3 bench/bench_sync.py 5000`; cross-check
+the model with `python3 bench/bench_hoist.py 5000`,
+`python3 bench/bench_hoist_sync.py 5000`, and
+`python3 bench/bench_order.py 5000 star chain`.
+
+## Historical leaf-only baseline
+
+**Retired default: tiered layout, `COLD_CUT = 4096`** (~1.5 MB cold pages under a
 fine `CUT = 8` guard window) — the calibrated one-size-fits-most leaf (see
-docs/MODEL.md "Leaf Sizing"). §1–2 measure that default; §3 pins flat
+docs/MODEL.md "Leaf Sizing"). Sections 1–2 measure that default; §3 pins flat
 (`COLD_CUT = None`) to show the redundancy-vs-page-size law that motivates it;
-§4 is the head-to-head.
+§4 is the head-to-head. These tables are archival measurements of the former
+leaf-closure layout; the current engine does not expose its CUT/tier sweeps.
 
 ## 1. Catchup — a fresh node ingests a whole workspace from empty
 
@@ -123,7 +159,80 @@ here.
   quadratic blowup this refresh would otherwise have hit.
 
 ---
-*Reproduce:* `python3 bench/bench_sync.py` (default catchup + bidi),
-`python3 bench/bench_sync.py 500000` (add 500k), `python3 bench/bench_sync.py cut`
-(flat CUT sweep), `python3 bench/bench_sync.py tier` (tiered vs flat).
-Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
+*Reproduce the current engine:* `python3 bench/bench_sync.py` (default catchup +
+bidi) or `python3 bench/bench_sync.py 500000` (add 500k). The historical
+`cut` and `tier` modes intentionally exit instead of presenting the retired
+leaf-layout measurements as current. Working dir defaults to a scratchpad path;
+override with `BENCH_DIR`.
+
+---
+
+# Attachments — measured
+
+`python3 bench/bench_files.py` on the same desktop. Files are Bao-rooted: one
+32-byte BLAKE3 root commits the whole file, each 256 KiB chunk carries its
+authentication path, and only verified chunks count toward progress. Every run
+reassembles on the receiver and checks that the saved bytes match the source.
+
+## 1. Self-proving overhead
+
+| MB | chunks | proof % | B/chunk | descriptor B | outboard MB | tree keys |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 6.28 | 15,704 | 656 | 0.06 | 10 |
+| 8 | 31 | 6.35 | 16,392 | 658 | 0.50 | 64 |
+| 64 | 245 | 6.42 | 16,780 | 661 | 4.00 | 492 |
+| 256 | 977 | 6.47 | 16,959 | 662 | 16.00 | 1,956 |
+
+The proof tax stays near 6.3–6.5% while the descriptor remains about 660 bytes.
+A per-slice hash list moves that cost into the descriptor and crosses the 8 KB
+body-spill threshold at roughly 20 MB of file.
+
+## 2. Author side, cold local store
+
+| MB | chunks | send s | send MB/s | save s | save MB/s | store MB | peak RSS GB | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 64 | 245 | 0.62 | 103.0 | 0.10 | 628.6 | 68.5 | 0.03 | ✓ |
+| 256 | 977 | 1.89 | 135.2 | 0.40 | 641.5 | 274.2 | 0.04 | ✓ |
+| 1024 | 3,907 | 7.48 | 136.8 | 1.55 | 661.0 | 1,097.4 | 0.08 | ✓ |
+
+Send builds the Bao tree, extracts and verifies each slice, and spills each
+proof before publishing the descriptor and chunk facts. Save re-verifies every
+slice while atomically assembling the output.
+
+## 3. Download over two real daemons
+
+| MB | chunks | send MB/s | first chunk s | download s | download MB/s | wall MB/s | RSS tx | RSS rx | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 8 | 31 | 72.4 | 0.21 | 0.26 | 30.6 | 21.5 | 0.03 | 0.04 | ✓ |
+| 64 | 245 | 99.1 | 0.31 | 0.73 | 87.9 | 46.6 | 0.03 | 0.04 | ✓ |
+| 256 | 977 | 130.7 | 1.04 | 2.71 | 94.5 | 54.9 | 0.05 | 0.05 | ✓ |
+| 1024 | 3,907 | 128.9 | 3.83 | 11.04 | 92.8 | 54.0 | 0.08 | 0.09 | ✓ |
+
+Progress becomes visible at the first verified chunk and advances while objects
+land. The sequential fetch loop is the remaining throughput ceiling.
+
+## 4. Against the replaced whole-blob path
+
+Same machine and 1 GB payload:
+
+| | whole blob | Bao chunks | |
+|---|---:|---:|---|
+| send | 78.3 MB/s | 128.9 MB/s | 1.6× faster |
+| download | 129.6 MB/s | 92.8 MB/s | 0.72× |
+| peak RSS, sender | 10.03 GB | 0.08 GB | 125× less |
+| peak RSS, receiver | 5.03 GB | 0.09 GB | 56× less |
+| progress | none | per verified chunk | |
+| resumable | no | yes | |
+
+The chunked path keeps one roughly 280 KB proof in memory at a time, making
+peak memory a function of chunk width rather than file size.
+
+The integration-line rerun after landing measured 31.4 MB/s at 8 MB and
+83.9 MB/s at 1,024 MB, byte-identical, with 0.08 GB peak receiver RSS. That is
+within the expected sequential-HTTP variance and preserves the memory result.
+
+---
+*Reproduce:* `python3 bench/bench_files.py --mode overhead 1 8 64 256`,
+`python3 bench/bench_files.py --mode send 64 256 1024`, and
+`python3 bench/bench_files.py 8 64 256 1024`. Override the scratch directory
+with `BENCH_DIR`.

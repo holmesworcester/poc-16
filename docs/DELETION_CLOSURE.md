@@ -43,7 +43,7 @@ content-addressed Merkle treap over the *same fact set*, differing only in its
 | treap    | key                    | walk yields                              |
 |----------|------------------------|------------------------------------------|
 | `T_fact` | `ts:fid`               | range `Q` + dep-ref closure (existing P3) |
-| `T_supp` | `suppkey \|\| ts:fid`  | **all facts sharing a death key, contiguous** |
+| `T_supp` | `suppkey \|\| tag \|\| ts:fid` | **all facts sharing a death key, contiguous** |
 
 `suppkey` is the fact's suppression attribute (the death-key domain, e.g.
 `chan=X`). Facts with no suppression attribute are absent from `T_supp`. A
@@ -55,11 +55,12 @@ out-of-range victims is a range walk, the *same* one-sided RBSR machinery
 no serial full-state pass.
 
 `T_supp` is a pure function of the set, exactly like `T_fact` (content-defined
-chunking + treap priority ⇒ history-independent; a new victim under `K` perturbs
-only `K`'s root-to-leaf path). So it is **built and maintained by the existing
-`treap.build` / `treap.update`, and diffed/walked by the existing RBSR** — this
-is the *"update the tree whenever we have new suppression keys"* requirement:
-maintenance is just the blind incremental `update`, no new code path.
+chunking + priority ⇒ history-independent; a new victim under `K` perturbs only
+`K`'s root-to-leaf path). The landed `shape.supp_shape()` supplies only the key
+projection; the same `tree.build` / `tree.fold` engine maintains both indexes
+and the same RBSR diff/walk reconciles them. This is the *"update the tree
+whenever we have new suppression keys"* requirement: maintenance is the
+ordinary blind incremental fold, not a second code path.
 
 ## 2. When the pass runs — a closure post-pass
 
@@ -75,6 +76,16 @@ close_deletions(closure):                       # after the dep-ref closure of Q
     closure |= victims                           # pull ALL matches, incl. out-of-range
   return closure                                 # now deletion-closed as well as dep-closed
 ```
+
+The landed `core.suppression.supp_walk` maps `K` to one open-left prefix range
+and delegates to `tree.range_facts`. Its result separates exact `facts` (the
+semantic K-group members) from `unit` (the closed, topological transport and
+judgment context, including page/ancestor padding). `close_deletions` walks
+only the sorted death keys in its input, unions exact members into `facts`, and
+deduplicates the closed units in stream order. Padding therefore neither
+becomes a semantic match nor recursively triggers an adjacent group scan. Both
+functions take only a tree view and `fetch` callback—there is no database or
+second traversal implementation.
 
 **Why after dep-closure, before project** (this is the "interesting question:
 when should the pass be", answered):
@@ -98,6 +109,10 @@ see the facts a node already has; **syncing the index is *how* out-of-range fact
 surface**. Every consumer runs the *same* `T_supp` augmentation at its own call
 site:
 
+- **Landed publication/sync seam.** Root wire v2 carries `T_supp` as the named
+  `supp` index beside the primary view; one manifest CAS publishes both. The
+  ordinary sync driver walks `supp` first and `T_fact` second, unions their
+  closed streams into one ingress pile, and deduplicates pushes by fact id.
 - **Sync walk** — reconcile `T_supp`'s root like `T_fact`'s; pulling a differing
   leaf pulls the co-resident deletion+targets, so ordinary sync surfaces matches.
 - **Kernel / validation** — resolve a **suppression closure edge**: for a fact
@@ -189,15 +204,15 @@ suppression **masks after judgment** at three places only — gate, closure edge
   D that arrived with its own closure enters S (`S(D) = targets of *valid*
   suppression facts`). Validity-closure (may D delete) stays separate from the
   suppression relation (what D deletes).
-- **`T_supp` hoists — for free, as the engine's second instance.** D's authority
-  closure is *shared* closure (one admin deletes many channels), so the ρ≈3×
-  leaf-duplication tax hits `T_supp` too. Because `T_supp` is the same engine
-  (`tree.py`/`shape.py`) keyed differently, it inherits hoisting; and closure
-  facts are content-addressed, so `T_fact` and `T_supp` reference **one shared
-  hoisted closure pool** (only index nodes are extra, ~×2). Production `T_supp`
-  must ride the hoisting engine (808.2 / jbg.1), **not** the flat per-leaf-closure
-  prototype (`layout` + per-leaf `close()`, ρ≈3× measured — `MULTILEVEL_PILE.md`);
-  the yez.6 proof may run on the prototype (SIMPLIFY §3), production must not.
+- **`T_supp` hoists through the landed explicit adapter.** D's authority closure is
+  shared closure (one admin deletes many channels), so the ρ≈3× leaf-duplication
+  tax hits `T_supp` too. `poc-16-yez.15` copies only the canonical body refs
+  for no-key authority into each settle payload that needs them and promotes
+  key-capable closure facts correctly. `T_fact` and `T_supp` therefore share
+  body objects despite different partitions; only structural refs and index
+  objects duplicate. Narrow reads never pull unrelated workspace authority.
+  Production `T_supp` can use the same engine, while the yez.6 proof may still
+  run on the prototype.
 
 ## 4. Why there is no serial pass (the advance on the Open Question)
 
@@ -231,8 +246,8 @@ traversal, zero SQL**, mirroring `bench/bench_sync.py` and the `hoist` prototype
    subset of `chan=X` facts at timestamps deliberately **outside** a chosen range
    `Q`, scattered across key space. Author one deletion fact `D`, death key
    `chan=X`, placed *inside* `Q` (or dragged in by `Q`'s dep-closure).
-2. **Build both treaps** with `treap.build`: `T_fact` (key `ts:fid`) and `T_supp`
-   (key `chan||ts:fid`), sharing the same `fact_of` / `deps_of`.
+2. **Build both trees** with the shared engine: `T_fact` (key `ts:fid`) and
+   `T_supp` (key `chan||tag||ts:fid`), sharing the same `fact_of` / `deps_of`.
 3. **Primary closure.** Run `closure_sync(Q)` against `T_fact`. **Assert it yields
    `D` but MISSES the out-of-range `chan=X` victims** — the bug the pass fixes.
    Surfacing this miss is half the proof.
@@ -260,6 +275,19 @@ traversal, zero SQL**, mirroring `bench/bench_sync.py` and the `hoist` prototype
    "pull the whole set" baseline; show the walk cost tracks match-count, not set
    size, and report `T_supp`'s storage / write-amp overhead (~×2 index nodes;
    leaves dedup by content).
+
+**Landed proof (`tests/test_suppression_proof.py`).** The deterministic seed has
+2,001 suppression participants plus one shared authority fact. The selected
+primary-tree interval contains the deletion and one same-channel target, while
+missing twenty more same-channel targets placed at the two timestamp extremes.
+The T_supp walk returns exactly those 22 group members, separately from its
+dependency-closed, topologically ordered transport unit. An instrumented store
+asserts batched object reads remain below both a match-plus-depth bound and
+one tenth of the stored objects, with `sqlite3.connect` and the store's SQL
+surface armed to fail. A shuffled build has byte-identical root metadata.
+Separately validated deletion-only and target-only roots merge in either order
+to the full-build root; targets are live before that merge and masked after it,
+while the deletion itself remains effective.
 
 This is the literal proof the task asks for: *out-of-range deletion-offering
 facts surfaced into the closure by tree traversal alone, no database.*

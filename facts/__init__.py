@@ -38,3 +38,10 @@ def clear(db, workspace):
 def blob_refs(fact):
     """Return immutable object hashes named by a fact, if that family has any."""
     return tuple(ROUTES[fact.t].blob_refs(fact))
+
+
+def received(db, workspace, valid, blob_of):
+    """Tell a spilling family that all objects named by one fact are local."""
+    handler = ROUTES[valid.fact.t]
+    if hasattr(handler, "received"):
+        handler.received(db, workspace, valid, blob_of)

@@ -1,10 +1,13 @@
 # tinyp2p — the POC-16 implementation
 
 A working build of [DESIGN.md](../DESIGN.md) in ~2,000 lines of Python (stdlib +
-pynacl), proving the semantics before any byte-format or Rust work. Alice,
+pynacl), proving the core semantics before lower-level optimization. Alice,
 bob, and carol run real daemons, join by invite link, converge continuously,
 move multi-MB files, survive stragglers, eviction, and restarts —
 `tests/test_blackbox.py` drives all of it through the CLI seam.
+The optional Bao attachment binding is vendored under `native/bao_py` and
+installed with `python3 -m pip install ./native/bao_py`; `core/bao.py` loads it
+only when attachment I/O crosses that seam.
 
 ## The map
 
@@ -13,11 +16,11 @@ move multi-MB files, survive stragglers, eviction, and restarts —
 | canonical fact value | `core/fact.py` | family-neutral JSON envelope and codec; fid = sha256 |
 | auth and content families | `facts/auth/`, `facts/content/` | one module per wire family; exact shape, needs, bool validation, mode effects, materialization, commands, and queries |
 | the kernel | `core/kernel.py` | family-routed streaming judge; separate `validate → bool`, `drain → Judgment`, and `evaluate → bool` paths; `Valid` constructed here only |
-| close(), the unit codec | `core/close.py` | completion-order serializer; one codec for every pile — ingress, leaf, tail, request, invite |
-| treap, leaf piles, fences, manifest | `core/layout.py` | **one pure function of the set**; each leaf = `close` of its in-range leaves (no annex); promotion, mini-fold, and rebuild are the same code path; incrementality = content addressing |
+| close(), the unit codec | `core/close.py` | completion-order serializer; one codec for ingress, request, and invite piles |
+| fat Merkle tree + settle manifests | `core/tree.py` | one pure `build`/`fold`/`diff`/`merge` engine; every fact body stored once behind canonical refs, every root-to-node path closed; binary/flat packings are compatibility fixtures |
 | ObjectStore | `core/store.py` | mem + fs drivers; CAS by etag; `obj/` holds every immutable object |
 | the engine, turn-based runtime | `core/node.py` | `turn()` = drain → judge (parallel) → merge facts/globals → spill → commit → routed materialize → retire; the only mutator |
-| the walk | `core/walk.py` | conditional root GET, fingerprint pruning, pull the peer's leaf pile verbatim into own ingress, reactive per-range push; responder drains on receipt |
+| the walk | `core/sync.py` | conditional root GET, fingerprint pruning, one deduplicated closed path union into ingress, reactive per-range push; responder drains on receipt |
 | command façade | `core/cmds.py` | stable control API pointing into family-owned commands and queries |
 | seven verbs + gate + cadence | `core/daemon.py` | responder half (zero sync logic) + initiator half (`Syncer`); mint = one kernel call in evaluate mode |
 | CLI | `core/cli.py` | drives a daemon over its control plane — the black-box seam |
@@ -94,93 +97,68 @@ need's exact co-offers; genuinely new addresses remain self-bootstrapping.
 Equivalent providers may differ while honest peers converge, but a caller
 cannot omit an incompatible winning conflict and revive a quarantined
 authority closure. The committed index never enters family validators.
-The index stores globals generically as `(name, value)` rows and the manifest
+The index stores globals generically as `(name, value)` rows and the root
 publishes their canonical sorted records; neither the node nor layout knows
-what `removal` means.
+what `removal` means. Rebuild and stateless authority accept a published root
+only when every committed fact belongs to a known durable family and a fresh
+drain derives exactly those global records. The live daemon synchronizes its
+root-stamped index before minting, so a root-only metadata rewrite fails closed
+instead of consulting an older valid index.
 
-## Treap leaves are piles — the confirmation
+## Fat-tree paths are piles
 
-The property the design left unproven: piles can be added to the treap so
-that **every leaf stays a closed pile** — a set of facts whose in-range and
-out-of-range needs are all present in the fetched unit — and the treap can
-be rebuilt along the same lines.
+The production `T_fact` invariant is stronger and cheaper than the old
+closed-leaf layout: each fact is serialized once at the lowest fat node
+covering its own key and all dependent keys. Dependencies therefore settle at
+an ancestor or the same node as their dependents, so every root-to-node payload
+union is a topological closed set. A full preorder is also closed and contains
+exactly the canonical set—no repeated auth annex.
 
-Four invariants carry it:
+`fp` fingerprints only in-range keys and remains the diff identity. Node `oid`
+commits structural bytes, child summaries, and a separate content-addressed
+payload hash, so moving closure never invents a set difference. Leaves store
+their explicit keys; readers obtain closure through `range_facts(root, ranges)`
+rather than opening a bare leaf. Full rebuild and stateless mint use
+`facts(root)`, which streams each payload once.
 
-- **I1 — the set is dep-closed.** A fact enters only via a closed pile that
-  the kernel accepted whole, so its full closure merges with it (or was
-  already in). Induction over drains: the index is always dep-closed.
-- **I2 — dep edges are canonical and acyclic.** Edges are *recomputed from
-  the set*. Offer sources are ordered by shortest finite authority-proof rank,
-  then source id; every selected provider therefore has lower rank than its
-  dependent. A later re-join, mutual admin grant, or reciprocal device grant
-  cannot rewire the final closure into a cycle. Two nodes with the same set
-  derive the same edges, whatever order things arrived in. A family can also
-  require co-offers from the selected source: device claims use that to make
-  one canonical `device_key` winner govern both authorization and projection.
-- **I3 — topo-sort makes each leaf a closed pile.** A leaf is `close` of its
-  in-range leaves: those leaves plus their full recursive closure, emitted
-  deps-first. Every dependency therefore precedes its dependent, so the pile
-  satisfies the seen-set rule from an empty scratchpad — no separate annex
-  object, no skew copies to construct. The out-of-range closure rides in the
-  pile but sits outside the fingerprinted set (which is over the in-range
-  leaves only), so copies never perturb the diff algebra.
-- **I4 — layout is a pure function.** `layout(keys, deps)` recomputes leaf
-  piles, fences, tail, and manifest from nothing but the set. Same set ⇒
-  same bytes, on every node.
+Incremental `fold` stores compact stable span bounds with each payload fact.
+A new batch expands only its transitive dependencies' spans; facts that rise
+are removed from their old payload and settled again while affected spines are
+path-copied. Leaf or fat-group splits rehome only the payload whose physical
+interval changed. `test_incremental_equals_full` checks every incremental root
+against a full rebuild across promotions, stragglers, membership, and eviction;
+the read/write-floor tests ensure no sibling scan.
 
-The four mutation paths are then one argument:
+Two-root `merge` validates untrusted roots before its identity/empty shortcuts:
+it derives the canonical dependency graph and rebuilds the expected v3 view in
+memory, so the supplied settle placement must be byte-identical and every
+partial path is closed. A caller that already crossed that publication boundary
+marks both inputs prevalidated and retains the bounded fold when added facts
+have neither offers nor declared needs. Either can change a canonical provider
+edge outside the differing tree ranges. Those merges therefore load both
+committed sets, rebuild proof ranks against the union, validate the resulting
+topological stream, and stage a full deterministic build. This is deliberately
+the simple correct fallback; append-only-root amortization/provider summaries
+remain `poc-16-jbg.3`.
 
-- **Drain/merge** preserves I1 (piles are closed); I2–I4 are recomputed.
-- **Promotion** is not an operation: a new boundary fact simply changes
-  where the pure function cuts. Nothing to get wrong.
-- **Straggler mini-fold**: an old-ts fact lands in some promoted chunk; only
-  that chunk's leaf-pile bytes change (boundary-ness is a per-fact
-  property, so all other cuts are stable), and its closure already arrived
-  in its own pile.
-- **Rebuild** replays the store's own units through the kernel — each unit
-  is independently judgeable (I3), so any order works — reproducing the same
-  set, hence (I4) the identical root.
+Admission canonicalizes kernel-valid facts dependency-first at `Node.merge`.
+That single boundary protects live delivery, retry, restart, sync, two-root
+merge, and rebuild from a hoisted preorder placing an independent retraction
+before its projection source. The boundary matrix in `test_pump.py` pins this.
+Production placement tests additionally pin one-copy storage, closed paths,
+`fp`/`oid` separation, dependency rehoming, and path-union sync.
 
-**Incremental updates, not full rebuild.** Three things stay cheap as the set
-grows. *Validation* is incremental — a turn kernels only the new piles and
-merges by id; the whole set is never re-judged (`rebuild()` re-validates only
-on an index wipe, never on the pile path). *Writes* are incremental via
-content addressing — a commit PUTs only objects the store lacks
-(`test_efficient_updates`: one post writes ≤ 8 objects against a 60-fact
-store). And *layout compute* is now incremental too: `commit()` passes the
-prior manifest's fences to `layout()` as a memo, and any promoted range whose
-`(hi, fp)` is unchanged is reused verbatim — its facts are never loaded, its
-pile never rebuilt (`test_incremental_reuses_work`: a post into a
-promoted store touches under half the facts). This is byte-identical to a full
-recompute because a leaf pile depends only on its in-range fids and their
-resolved deps. A duplicate offer can change the shortest-proof winner, so a
-shadow guard (`Node._shadows`) drops the memo for that turn, recomputes proof
-ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
-only their new offer sources and keep the incremental path. On a shadow, facts,
-offers, globals, and proofs share one SQLite transaction: merge first derives
-the canonical finite-proof subset of the union, prunes only facts outside that
-subset as litter, and rebuilds affected projections. A pruned fact already
-passed the kernel, so the node retains its canonical bytes under
-`quarantine/<fid>` and retries it on later authority changes. This matters
-when a conflict first orphans a downstream grant and a later shorter proof
-restores its original authority; the retry also survives a derived-index
-wipe. Once restored, the fact returns to the ordinary manifest and sync path.
-Opposite arrival orders therefore select the same set, while an unrelated
-valid pile in the same turn still lands.
-`test_incremental_equals_full` asserts
-incremental == full at every step across promotions, a straggler, a new
-member, and an eviction; `test_shadow_guard_keeps_identity` exercises the
-guard. The residual O(n) is the body-free key scan and per-range fingerprint;
-removing that needs a persistent fence tree (byte-format work, out of scope).
-
-Tested in `tests/test_props.py`: `test_leaves_are_piles` (every published
-unit passes the kernel from empty), `test_history_independence` (random pile
-groupings × random orders × random turn batching ⇒ byte-identical roots),
-`test_rebuild`, `test_straggler_minifold`, `test_incremental_equals_full`,
-`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`, and the
-recursive/mutual-authority closure regressions in `test_kernel.py` and
-`test_props.py`.
+The v3 settle format stores an ordered manifest of canonical fact-body hashes
+instead of embedding whole facts in each payload object. `T_fact` and a
+differently partitioned secondary tree therefore share every common body CAS
+object. A secondary shape may return no key for authority-only closure facts.
+Their body refs form a canonical annex beside each primary settle payload that
+needs them, keeping narrow reads and folds independent of unrelated authority;
+duplicate refs are structural bytes, while bodies remain one-copy CAS. A
+key-capable closure fact uses its deterministic key for placement even before
+that key becomes explicit. Body refs are fetched once per manifest through the
+optional batched fetch driver; HTTP sync implements it with bounded
+`POST /page` batches.
 
 **Litter, never poison.** The design's "a hostile writer can litter but never
 poison" is enforced at two layers: `from_json` validates atom shape at the
@@ -197,18 +175,12 @@ usable for delegation chains deeper than Python's call-stack limit.
 
 ## Deviations from DESIGN.md (all scale/packaging, no semantics)
 
-- **JSON units instead of packed byte runs.** Fixed-size records, 8 KB
-  slices, delta-coded 28 B fences, and body heaps are byte-economy for 10^6
-  facts; units here are canonical-JSON objects. Fences still carry
-  (hi, fp, count, pile) and pruning still works range-by-range.
-- **Fence hierarchy depth 1** — the manifest holds the single fence run;
-  2–3-level runs are a 10^5+ concern.
-- **Whole-leaf fetch**: with whole-object units there are no record slices, so
-  the walk fetches each differing leaf's pile whole; intra-leaf slicing is the
-  deferred, reversible optimization (a `Range` GET within the immutable
-  object). The push is **reactive per range** — `close` the leaves the peer
-  lacks and PUT, the mirror of the pull — and the responder **drains on
-  receipt**, so there is no poke on the p2p path.
+- **Canonical JSON objects instead of packed byte runs.** Structural fat nodes,
+  settle manifests, and individually shared fact bodies are immutable objects.
+  Fixed-size records, byte
+  slices, delta-coded fences, body heaps, and intra-object `Range` GETs remain
+  deferred byte/round-trip optimizations; the Merkle and closed-path semantics
+  do not depend on them.
 - **`page/`+`blob/` collapse to `obj/`** (one immutable content-addressed
   namespace); the `/page/{hash}` route serves them all.
 - **Needs are family-declared functions**, not explicit atoms — a fact
@@ -219,10 +191,9 @@ usable for delegation chains deeper than Python's call-stack limit.
 - **Bodies are plaintext** — epochs/body encryption are out of scope; the
   crypto that carries auth *is* real (Ed25519 sig facts, sealed-box grants,
   secretbox invite blobs, KDF'd link seeds).
-- **Tail guard couples to cut density by default** (tail = everything after
-  the last boundary); the tiered layout (`layout.COLD_CUT`) restores the
-  design's decoupled B_t guard — history seals into coarse cold leaves below a
-  GUARD-deep watermark while the recent window stays fine (`bench/RESULTS.md`).
+- **The legacy flat compatibility packing retains its tail guard.** Production
+  fat trees use monotone content cuts so incremental folds never erase an old
+  boundary.
 - **Drain-on-receipt at root, poke, and PUT** — the design's "a peer drains
   before answering any verb" is realized at the walk's entry point (root GET),
   on poke, and on the PUT that delivers a pushed pile (so a peer push needs no

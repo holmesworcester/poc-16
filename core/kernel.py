@@ -302,6 +302,18 @@ def rebuild_proofs(db, fact_of):
     )
 
 
+def unresolved_facts(db, fact_of):
+    """Rebuild proof ranks and return every fact outside the finite DAG."""
+    unresolved = set(rebuild_proofs(db, fact_of))
+    for (fid,) in db.execute("SELECT fid FROM facts ORDER BY fid"):
+        if fid in unresolved:
+            continue
+        deps = resolve_deps(fact_of(fid), db)
+        if deps is None or proof_rank(db, deps) is None:
+            unresolved.add(fid)
+    return frozenset(unresolved)
+
+
 def _globals(rows):
     """Normalize the family-neutral public ``(name, value)`` row shape."""
     return frozenset(Global(*row) for row in (rows or ()))
@@ -413,6 +425,23 @@ def validate(stream, anchor, *, db=None):
 def drain(stream, anchor, *, db=None):
     """Validate persistent ingress and expose Valid values plus global deltas."""
     return kernel(stream, anchor, mode=DRAIN, db=db)
+
+
+def drain_committed(stream, anchor, globals_):
+    """Validate a published durable stream and its derived root metadata."""
+    unit = tuple(stream)
+    handlers = tuple(facts.handler_for(fact.t) for fact in unit)
+    try:
+        expected = _globals(globals_)
+    except (TypeError, ValueError):
+        return Judgment(False, (), frozenset())
+    if any(
+            handler is None or not handler.DURABLE
+            for handler in handlers):
+        return Judgment(False, (), frozenset())
+    result = drain(unit, anchor)
+    return result if result.ok and result.globals == expected \
+        else Judgment(False, (), frozenset())
 
 
 def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):

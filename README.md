@@ -9,9 +9,28 @@ the send/receive/compaction loop math.
 
 **tinyp2p** is the working build: ~2,000 lines of Python split between the
 family-neutral `core/` runtime and routed `facts/` policy
-implementing the whole semantic stack — kernel, closed piles (each leaf a
-topo-sorted closed set), pure treap layout, one-sided walk, seven-verb daemon, invite links,
+implementing the whole semantic stack — kernel, closed piles, one-copy
+settle-node payloads (each root-to-node path is closed), a pure fat Merkle
+tree, one-sided walk, seven-verb daemon, invite links,
 eviction, and routed `facts/auth` + `facts/content` families — with black-box
 multi-daemon tests. [IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
 maps design to code, records the deviations, and carries the
-treap-leaves-are-piles argument. `pytest tests/` runs it all.
+closed-path argument. `pytest tests/` runs it all.
+
+## Setup
+
+The Python runtime needs PyNaCl:
+
+```sh
+python3 -m pip install pynacl
+```
+
+Bao attachments additionally use the vendored Rust extension. From the
+project root (with a Rust toolchain installed), build and install it with:
+
+```sh
+python3 -m pip install ./native/bao_py
+```
+
+The extension is loaded only when attachment I/O needs it; auth, messages,
+sync, and `import facts` work without this optional build.

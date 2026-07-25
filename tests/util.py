@@ -1,18 +1,23 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
+import os
 import random
+import tempfile
+from dataclasses import replace
 
 import facts
 
-from core import cmds
+from core import cmds, tree
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact
+from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
-from core.kernel import resolve_deps
+from core.kernel import offer_src, resolve_deps
 from core.node import Node, now_ms
+from core.shape import FACT
 from core.suppression import TARGET, atom, is_deletion
 
 
@@ -58,10 +63,10 @@ class DeletionFamily:
         return None
 
 
-def suppression_world(path, monkeypatch):
+def suppression_world(path, monkeypatch, initial_secret=None):
     """A valid set with targets and deletions, authored in one fixed order."""
     monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
-    node = Node(str(path))
+    node = Node(str(path), initial_secret=initial_secret)
     workspace = cmds.create(node, "alice", ts=1)
     targets = [
         cmds.post(
@@ -162,9 +167,30 @@ def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):
 
 
 def member_src(n, ws, pk):
-    from core.kernel import offer_src
     with n.lock:
         return offer_src(n.idx(ws), "member", pk)
+
+
+def inject_device_claim(
+        node, workspace, secret, public, user, target, label, ts):
+    """Author a valid direct-device claim past command duplicate checks."""
+    item = device_invite(public, user, target, label, ts)
+    signed = signature(secret, public, item, ts)
+    node.ingest_new(
+        workspace,
+        [signed, item],
+        {
+            signed.fid: [],
+            item.fid: [
+                signed.fid,
+                member_src(node, workspace, public),
+                offer_src(
+                    node.idx(workspace), "device_key", public,
+                    requires=(("device", user, public),)),
+            ],
+        },
+    )
+    return item
 
 
 def closed_subset(n, ws, fids):
@@ -183,3 +209,37 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 def all_fids(n, ws):
     return [fid for (fid,) in n.idx(ws).execute("SELECT fid FROM facts ORDER BY ts, fid")]
+
+
+def mismatched_tree_key(root_bytes, fetch, emit):
+    """Return a self-hashed one-leaf root whose payload and leaf key disagree."""
+    root = tree.decode_root(root_bytes)
+    branch = tree._resolved(root.view, fetch)
+    if branch.level != 1 or len(branch.children) != 1:
+        raise ValueError("fixture requires one leaf")
+    leaf = tree._resolved(branch.children[0], fetch)
+    if leaf.n != 1:
+        raise ValueError("fixture requires one fact")
+
+    timestamp, fid = leaf.keys[0].split(":", 1)
+    key = f"{int(timestamp) + 1:015d}:{fid}"
+    leaf = replace(
+        leaf, fp=FACT.fingerprint([key]), oid="", sep=key, keys=(key,))
+    leaf = replace(leaf, oid=emit(tree._node_bytes(leaf)))
+    branch = replace(
+        branch, fp=tree._fp("fat", branch.level, (leaf,)), oid="",
+        sep=key, children=(leaf,))
+    branch = replace(branch, oid=emit(tree._node_bytes(branch)))
+    return tree.encode_root(replace(root, view=branch))
+
+
+def send_bytes(node, workspace, name, data, channel="general", ts=None):
+    """Test adapter for the path-only attachment authoring seam."""
+    handle, path = tempfile.mkstemp(prefix="poc-16-test-")
+    try:
+        with os.fdopen(handle, "wb") as spool:
+            spool.write(data)
+        return cmds.send_file(
+            node, workspace, channel, path, name=name, ts=ts)
+    finally:
+        os.unlink(path)

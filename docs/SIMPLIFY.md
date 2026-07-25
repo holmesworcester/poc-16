@@ -1,9 +1,9 @@
 # Simplification plan — one engine, one kernel, mint = evaluate, cursored pump
 
-**Status (2026-07-25):** stages S1–S7 landed on the integration line: one
-parameterized tree engine, one kernel judge, pure mint, cursored pump,
-source-keyed projectors, the confluence suite, and design foldback. Production
-settle-node placement remains `poc-16-808.9`. Companion to
+**Status (2026-07-25):** stages S1–S7 and production settle-node placement
+landed on the integration line: one parameterized tree engine, one kernel
+judge, pure mint, cursored pump, source-keyed projectors, the confluence suite,
+and design foldback. Companion to
 `TREAP_PROTOTYPE.md` (cost model),
 `MULTILEVEL_PILE.md` (hoisting), `DELETION_CLOSURE.md` (suppression treap),
 `DESIGN.md` §Concurrency & FaaS (fat nodes, non-serialized roots).
@@ -33,7 +33,7 @@ identities agree and recurses where they differ:
 |---|---|---|---|---|
 | full build | ∅ | key set | — | all nodes |
 | fold / update (`treap.update`) | current tree | tree ∪ delta | subtree untouched by delta | path-copied nodes |
-| sync walk (`walk.py`) | my tree | their tree | fp equal | pulled leaf piles → ingress |
+| sync walk (`sync.py`) | my tree | their tree | fp equal | one closed selected-path union → ingress |
 | push (reactive) | their tree | my tree | fp equal | closed pile → their ingress |
 | two-root merge (jbg.4) | root A | root B | hash equal | root(A ∪ B) |
 | verify-once (`hoist.verify_once`) | judged baseline | new tree | hash in baseline | verdicts |
@@ -62,7 +62,10 @@ Laws the engine must satisfy (these are the property tests):
 fold(t, ∅) = t
 fold(fold(t, a), b) = build(set(t) ∪ a ∪ b)          (byte-identical, any batching)
 diff(T(A), T(B))   = A Δ B, partitioned by leaves
-merge(A, B)        = root(A ∪ B)                      (O(diff) tree-join)
+merge(A, B)        = root(A ∪ B)                      (validate untrusted placement;
+                                                       O(diff) for prevalidated
+                                                       roots when deps fixed;
+                                                       rebuild when rewired)
 reads              ≥ A(B, P) + spine                  (the TREAP_PROTOTYPE floor)
 ```
 
@@ -135,6 +138,15 @@ synced T_supp (yez.10) should instantiate the engine, not the prototype that
 jbg.1 replaces. Sequencing hazard if ignored: two epics fork the tree layer in
 opposite directions the same week.
 
+The required adapter landed in `poc-16-yez.15`. `T_supp` may omit authority
+facts that have no suppression key: each primary settle payload carries a
+canonical annex of the no-key body refs it needs. Those duplicated refs are
+structural index bytes; the named fact bodies remain one-copy CAS shared with
+`T_fact`. Key-capable closure facts retain normal settle placement before and
+after their key becomes explicit. Narrow reads and folds therefore pay only
+their selected closure, and batched body fetches preserve path-bounded network
+round trips. `yez.10` can now instantiate the same engine directly.
+
 `resolve_supp` (yez.11) is the closure edge that flags a fact suppressed
 without touching validity. The pump (§5) is its consumer on the read-model
 side; nothing in any `materialize` handler ever sees suppression directly.
@@ -171,8 +183,11 @@ mint(pile) = decode → evaluate(pile, anchor, globals ∪ {("now", now_ms())})
   because the grant is sealed to the requester's pk.
 - A peer passes its root-stamped canonical offer/proof view into `evaluate`, so
   omitted incompatible authority winners cannot revive quarantined chains.
-  A Worker/λ must derive the equivalent view from the root/tree before
-  presigning. **Neither path reads app.db**; §5 remains a leaf-client concern.
+  A Worker/λ uses `mint.Authority.from_root` to derive the equivalent read-only
+  view from a durable-only tree whose drained globals exactly match its root
+  metadata; `mint.stateless` reuses it only for the same root ETag. The peer
+  synchronizes its root-stamped index before minting. **Neither path reads
+  app.db**; §5 remains a leaf-client concern.
 - gxz (evicted-signer relay by an active member): the candidate seam is the
   gate mask — screen the *whole submitted closure* against S at mint/ingress,
   not just the requester — plus suppression of post-removal authority via the
@@ -234,8 +249,8 @@ fold±(delivery order over D) = fold(canonical order over E)      (the theorem)
 S1  shape.py + tree.py extraction under golden gates, absorbing jbg.1
     (binary + flat packings reproduce today's bytes; fat packing added third).
 S2  kernel unification: path scratchpad into kernel.py, delete hoist._judge;
-    tree verification carries it across ranges. Production sync wiring waits
-    for settle-node payloads (`808.9`); current ingress piles stay independent.
+    tree verification carries it across ranges. `808.9` then landed production
+    settle payloads and path-union sync; ingress piles remain independent.
 S3  mint reduction (§4); daemon.mint thins to decode→evaluate→seal.
 S4  log + cursor + pump (§5), single-target retraction.
 S5  projector contract + removal/join confluence fix; AST tests.

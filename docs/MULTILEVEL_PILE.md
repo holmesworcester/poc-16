@@ -1,10 +1,14 @@
 # The multi-level pile — hoisting closure up the tree
 
-**Status (2026-07-25): absorbed by the engine.** The placement math and
-measurements remain authoritative. `core/tree.py` owns the tree walk and
-`kernel.Scratchpad` owns verify-once path context; the old `hoist.py` judge is
-only a compatibility/measurement façade. Production settle-node payload
-placement is the remaining `poc-16-808.9` step.
+**Status (2026-07-25): landed for production `T_fact`.** `core/tree.py` stores
+one content-addressed payload per settle node, walks a full fact tree with every
+fact once, and assembles deduplicated closed path unions for range sync.
+`kernel.Scratchpad` owns verify-once path context; `core/hoist.py` remains only
+the binary compatibility/measurement façade. This is `poc-16-808.9`.
+The `poc-16-yez.15` adapter also landed: no-key secondary closure is a
+path-local annex of shared body refs, so unrelated authority does not enlarge
+a narrow read or fold. Settle manifests share canonical fact-body objects
+across differently partitioned indexes.
 
 Companion to `TREAP_PROTOTYPE.md`. The prototype stores a **closed pile at every
 leaf**: leaf `ℓ`'s object carries `C(ℓ) = closure(K(ℓ))`, its in-range facts plus
@@ -318,6 +322,21 @@ So the fold touches `A` leaves + spine + `{deps of the batch that actually rise}
 still `∝ what changed`, `n`-independent for append, and **blind**: rising `g` needs
 only its current `settle` node (found by descent) and the new position, so you
 rewrite the nodes on the affected paths, not the tree.
+
+The production encoding records each payload fact's exact stable low/high key
+bounds in its node (the common self-only case is encoded as just its fid).
+`fold` follows the new batch's transitive deps, expands only those bounds,
+removes the facts whose bounds changed, path-copies the affected structural
+spines, and settles them again. A leaf or fat group split similarly rehomes only
+the payload of the node whose interval changed. This metadata is what makes a
+sans-I/O two-root merge history-independent on the bounded path when both roots
+already passed publication validation and dependency edges are fixed. An
+untrusted root must reproduce the byte-identical canonical settle placement
+before any identity/empty shortcut; checking only its full fact set would miss
+an invalid partial path. A concurrent provider/consumer delta can rewire the
+union-wide canonical dependency graph; production detects that case and
+performs a full canonical rebuild rather than publishing a history-dependent
+root. `poc-16-jbg.3` owns amortizing that fallback.
 
 ---
 

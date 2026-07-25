@@ -10,6 +10,9 @@ from .crypto import h, unseal
 from facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
+from .pump import pump
+
+ARRIVAL_BATCH = 16
 
 
 class Peer:
@@ -63,6 +66,20 @@ class Peer:
         _, b, _ = self._http("GET", f"/page/{oh}")
         return b
 
+    def objs(self, oids):
+        """Fetch an ordered object batch in one authenticated request."""
+        oids = tuple(oids)
+        _, raw, _ = self._http(
+            "POST", "/page", json.dumps(oids).encode())
+        values = json.loads(raw)
+        if not isinstance(values, list) or len(values) != len(oids):
+            raise ValueError("page batch")
+        return tuple(
+            base64.b64decode(value, validate=True)
+            if value is not None else None
+            for value in values
+        )
+
     def put_pile(self, b):
         self._http(
             "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b)
@@ -78,7 +95,7 @@ def walk(node, ws, url):
 
 
 def _push(node, ws, peer, push_fids):
-    """Close one range's push set into a pile and PUT it — the mirror of a
+    """Close one dial's push set into a pile and PUT it — the mirror of a
     pull. The responder drains on receipt, so there is no poke."""
     with node.lock:
         idx = node.idx(ws)
@@ -92,17 +109,46 @@ def _push(node, ws, peer, push_fids):
                     blobs[bh] = st.get("obj/" + bh)
         b = encode_pile(facts, blobs)
     peer.put_pile(b)
+    return tuple(fact.fid for fact in facts)
 
 
 def _fetch_blobs(node, ws, peer):
-    """Spilled bodies ride blob/ (served by the same page route): fetch what
-    accepted file facts reference and we lack."""
+    """Fetch missing spilled objects and fold verified arrivals in batches."""
     st = node.store(ws)
     with node.lock:
-        refs = {blob for (fid,) in node.idx(ws).execute("SELECT fid FROM facts")
-                for blob in families.blob_refs(node.fact_of(ws, fid))}
-    for bh in refs:
-        if not st.has("obj/" + bh):
-            b = peer.obj(bh)
-            if b and h(b) == bh:
-                st.put("obj/" + bh, b)
+        notified = {
+            fid for (fid,) in node.idx(ws).execute(
+                "SELECT DISTINCT fid FROM log WHERE op='*'")
+        }
+        pending = []
+        for (fid,) in node.idx(ws).execute("SELECT fid FROM facts"):
+            refs = families.blob_refs(node.fact_of(ws, fid))
+            if refs:
+                pending.append((fid, refs))
+    landed, batch = [], []
+    for fid, refs in pending:
+        fetched = False
+        whole = True
+        for oid in refs:
+            if st.has("obj/" + oid):
+                continue
+            blob = peer.obj(oid)
+            if blob and h(blob) == oid:
+                st.put("obj/" + oid, blob)
+                fetched = True
+            else:
+                whole = False
+        if whole and (fetched or fid not in notified):
+            batch.append(fid)
+        if len(batch) >= ARRIVAL_BATCH:
+            landed += _land(node, ws, batch)
+            batch = []
+    landed += _land(node, ws, batch)
+    return landed
+
+
+def _land(node, ws, fids):
+    fids = node.log_arrivals(ws, fids, repeat=True)
+    if fids:
+        pump(node, ws)
+    return fids

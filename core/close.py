@@ -1,8 +1,9 @@
-"""close(): the canonical-topo serializer, and the one unit codec.
+"""close(): the canonical-topo serializer, and the ingress unit codec.
 
-Every fetchable unit — ingress pile, leaf pile, tail, request payload,
-invite blob — is the same codec: an ordered fact list (+ attached blobs)
-that satisfies the kernel's seen-set rule when streamed front to back.
+Ingress, request, and invite piles use the same ordered fact-list codec
+(+ attached blobs). Tree settle manifests instead reference the same
+canonical fact bodies individually, so differently partitioned indexes share
+their bytes.
 close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
