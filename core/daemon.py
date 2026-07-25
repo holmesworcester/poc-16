@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from . import cmds, mint as gate
 from .crypto import h, seal_to
 from .node import Node, now_ms
+from .store import PAGE_BATCH
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
@@ -153,6 +154,24 @@ class Handler(BaseHTTPRequestHandler):
         ws = q.get("ws", "")
         if not self._known(ws):
             return self._send(404)
+        if parts[0] == "page":
+            if not self._member(ws):
+                return self._send(401)
+            try:
+                oids = json.loads(self._body())
+                if not isinstance(oids, list) or len(oids) > PAGE_BATCH \
+                        or not all(
+                        isinstance(oid, str) and len(oid) == 64
+                        and all(c in "0123456789abcdef" for c in oid)
+                        for oid in oids):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return self._send(400)
+            store = self.node.store(ws)
+            return self._json(200, [
+                base64.b64encode(raw).decode() if raw is not None else None
+                for raw in (store.get("obj/" + oid) for oid in oids)
+            ])
         if parts[0] == "poke":
             self.node.turn(ws)
             return self._send(204)

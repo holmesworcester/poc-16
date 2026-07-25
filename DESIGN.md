@@ -841,11 +841,11 @@ then bandwidth-bound page transfer; only fat fanout makes this cheap (binary ⇒
 ~log₂n waves ⇒ keep a manifest). Precomputed fingerprints in the immutable nodes
 are what let a **dumb store** answer a reader-driven pruned walk with only GETs
 (git "dumb HTTP" over a Merkle DAG). Each node also names its optional settle
-payload pile. This is the landed `T_fact` representation. A suppression tree
-cannot reuse it unchanged: its authority closure contains facts with no
-suppression key, and differently partitioned whole-node piles do not guarantee
-cross-tree body deduplication. `poc-16-yez.15` owns stable closure-only placement
-and shared fact-body references before the synced `T_supp` root lands.
+payload manifest. The landed v3 representation names canonical fact-body
+objects individually. A suppression payload adds a canonical path-local annex
+of refs for authority facts without an index key; refs may repeat structurally,
+but bodies remain one-copy CAS and unrelated authority never enters a narrow
+read (`poc-16-yez.15`). The synced `T_supp` root can reuse the same engine.
 
 **Reads pick a guarantee.** *Fast* — walk any recent root (may lag by fold
 latency). *Authoritative* — reconcile: root-vs-`LIST` diff, or peer fingerprint

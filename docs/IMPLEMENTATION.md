@@ -16,8 +16,8 @@ only when attachment I/O crosses that seam.
 | canonical fact value | `core/fact.py` | family-neutral JSON envelope and codec; fid = sha256 |
 | auth and content families | `facts/auth/`, `facts/content/` | one module per wire family; exact shape, needs, bool validation, mode effects, materialization, commands, and queries |
 | the kernel | `core/kernel.py` | family-routed streaming judge; separate `validate → bool`, `drain → Judgment`, and `evaluate → bool` paths; `Valid` constructed here only |
-| close(), the unit codec | `core/close.py` | completion-order serializer; one codec for ingress, settle payload, request, and invite piles |
-| fat Merkle tree + settle payloads | `core/tree.py` | one pure `build`/`fold`/`diff`/`merge` engine; every fact stored once, every root-to-node path closed; binary/flat packings are compatibility fixtures |
+| close(), the unit codec | `core/close.py` | completion-order serializer; one codec for ingress, request, and invite piles |
+| fat Merkle tree + settle manifests | `core/tree.py` | one pure `build`/`fold`/`diff`/`merge` engine; every fact body stored once behind canonical refs, every root-to-node path closed; binary/flat packings are compatibility fixtures |
 | ObjectStore | `core/store.py` | mem + fs drivers; CAS by etag; `obj/` holds every immutable object |
 | the engine, turn-based runtime | `core/node.py` | `turn()` = drain → judge (parallel) → merge facts/globals → spill → commit → routed materialize → retire; the only mutator |
 | the walk | `core/sync.py` | conditional root GET, fingerprint pruning, one deduplicated closed path union into ingress, reactive per-range push; responder drains on receipt |
@@ -130,7 +130,7 @@ against a full rebuild across promotions, stragglers, membership, and eviction;
 the read/write-floor tests ensure no sibling scan.
 
 Two-root `merge` validates untrusted roots before its identity/empty shortcuts:
-it derives the canonical dependency graph and rebuilds the expected v2 view in
+it derives the canonical dependency graph and rebuilds the expected v3 view in
 memory, so the supplied settle placement must be byte-identical and every
 partial path is closed. A caller that already crossed that publication boundary
 marks both inputs prevalidated and retains the bounded fold when added facts
@@ -148,6 +148,18 @@ before its projection source. The boundary matrix in `test_pump.py` pins this.
 Production placement tests additionally pin one-copy storage, closed paths,
 `fp`/`oid` separation, dependency rehoming, and path-union sync.
 
+The v3 settle format stores an ordered manifest of canonical fact-body hashes
+instead of embedding whole facts in each payload object. `T_fact` and a
+differently partitioned secondary tree therefore share every common body CAS
+object. A secondary shape may return no key for authority-only closure facts.
+Their body refs form a canonical annex beside each primary settle payload that
+needs them, keeping narrow reads and folds independent of unrelated authority;
+duplicate refs are structural bytes, while bodies remain one-copy CAS. A
+key-capable closure fact uses its deterministic key for placement even before
+that key becomes explicit. Body refs are fetched once per manifest through the
+optional batched fetch driver; HTTP sync implements it with bounded
+`POST /page` batches.
+
 **Litter, never poison.** The design's "a hostile writer can litter but never
 poison" is enforced at two layers: `from_json` validates atom shape at the
 decode door (a malformed atom rejects the whole unit there), and the kernel's
@@ -163,8 +175,9 @@ usable for delegation chains deeper than Python's call-stack limit.
 
 ## Deviations from DESIGN.md (all scale/packaging, no semantics)
 
-- **Canonical JSON objects instead of packed byte runs.** Structural fat nodes
-  and settle payloads are whole immutable objects. Fixed-size records, byte
+- **Canonical JSON objects instead of packed byte runs.** Structural fat nodes,
+  settle manifests, and individually shared fact bodies are immutable objects.
+  Fixed-size records, byte
   slices, delta-coded fences, body heaps, and intra-object `Range` GETs remain
   deferred byte/round-trip optimizations; the Merkle and closed-path semantics
   do not depend on them.

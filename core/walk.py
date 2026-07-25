@@ -66,6 +66,20 @@ class Peer:
         _, b, _ = self._http("GET", f"/page/{oh}")
         return b
 
+    def objs(self, oids):
+        """Fetch an ordered object batch in one authenticated request."""
+        oids = tuple(oids)
+        _, raw, _ = self._http(
+            "POST", "/page", json.dumps(oids).encode())
+        values = json.loads(raw)
+        if not isinstance(values, list) or len(values) != len(oids):
+            raise ValueError("page batch")
+        return tuple(
+            base64.b64decode(value, validate=True)
+            if value is not None else None
+            for value in values
+        )
+
     def put_pile(self, b):
         self._http(
             "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b)

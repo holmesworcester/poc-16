@@ -9,13 +9,15 @@ import pytest
 
 from core import hoist, layout, shape, sync as sync_module, treap, tree
 from core import cmds
-from core.crypto import h, keypair
+from core.close import encode_pile
+from core.crypto import h, keypair, load_sk
 from core.fact import Fact, canon
 from facts.auth.signature import signature
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
 from core.kernel import Scratchpad, resolve_deps
 from core.node import Node
+from core.suppression import is_deletion, suppkey
 
 from .util import (
     all_fids,
@@ -23,6 +25,7 @@ from .util import (
     closed_subset,
     deliver,
     mismatched_tree_key,
+    suppression_world,
 )
 
 
@@ -30,6 +33,7 @@ class Driver:
     def __init__(self):
         self.objects = {}
         self.reads = []
+        self.calls = []
         self.writes = []
 
     def emit(self, raw):
@@ -40,7 +44,14 @@ class Driver:
 
     def fetch(self, oid):
         self.reads.append(oid)
+        self.calls.append((oid,))
         return self.objects[oid]
+
+    def fetch_many(self, oids):
+        oids = tuple(oids)
+        self.reads.extend(oids)
+        self.calls.append(oids)
+        return tuple(self.objects[oid] for oid in oids)
 
 
 @pytest.fixture
@@ -85,6 +96,19 @@ def legacy_fat(keys, by_fid, packing, driver):
         level += 1
 
 
+def legacy_v2(view, driver):
+    """Rewrite a v3 tree as the previous fact-embedding format."""
+    view = tree._resolved(view, driver.fetch)
+    children = tuple(legacy_v2(child, driver) for child in view.children)
+    pay = driver.emit(encode_pile(
+        tree._payload(view, driver.fetch))) if view.pn else ""
+    old = replace(
+        view, oid="", children=children, pay=pay,
+        config=view.config.replace("3:fat:", "2:fat:", 1),
+    )
+    return replace(old, oid=driver.emit(tree._node_bytes(old)))
+
+
 def cold(view, anchor="workspace", globals_=frozenset()):
     return tree.decode_root(
         tree.encode_root(tree.Root(view, anchor, globals_))).view
@@ -99,6 +123,40 @@ def internal_boundary(keys):
         key for key in keys[1:-1]
         if shape.boundary(shape.fid_of(key))
     )
+
+
+def suppression_shape():
+    """Test-only T_supp projection; production instantiation is yez.10."""
+    def key(fact):
+        group = suppkey(fact)
+        if group is None:
+            return None
+        tag = "0" if is_deletion(fact) else "1"
+        return f"{group}|{tag}|{fact.ts:015d}:{fact.fid}"
+
+    return shape.Shape(
+        key, shape.fid_of, shape.boundary, shape.priority,
+        shape.fingerprint, shape.stable_cut_positions, shape.leaf_cut,
+    )
+
+
+def suppression_tree_world(path, monkeypatch, initial_secret=None):
+    node, workspace, _, _ = suppression_world(
+        path, monkeypatch, initial_secret)
+    items = {
+        fid: node.fact_of(workspace, fid)
+        for fid in all_fids(node, workspace)
+    }
+    deps = {
+        fid: tuple(resolve_deps(fact, node.idx(workspace)) or ())
+        for fid, fact in items.items()
+    }
+    secondary = suppression_shape()
+    keys = sorted(
+        key for fact in items.values()
+        if (key := secondary.key(fact)) is not None
+    )
+    return items, deps, secondary, keys
 
 
 # ---- golden gates: the extraction changes nothing ---------------------------
@@ -168,6 +226,45 @@ def test_fat_root_is_self_describing_and_shallow(engine_world):
     wire["tree"]["c"][0]["f"] = "forged"
     with pytest.raises(ValueError, match="tree"):
         tree.decode_root(canon(wire))
+
+
+def test_v3_decoder_uses_node_validation_at_every_level(engine_world):
+    """A format bump must not send v3 leaves through v1 branch validation."""
+    keys, by_fid = engine_world
+    driver = Driver()
+    build(keys[:40], by_fid, tree.fat(8), driver)
+    nodes = [
+        (oid, raw) for oid, raw in driver.objects.items()
+        if raw.startswith(b'{"a":') and json.loads(raw).get("v") == 3
+    ]
+
+    decoded = [tree._decode_branch(raw, oid) for oid, raw in nodes]
+
+    assert {view.level == 0 for view in decoded} == {False, True}
+
+
+def test_legacy_view_validation_accepts_root_independent_leaves(monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 1)
+    monkeypatch.setattr(shape, "COLD_CUT", None)
+    secret, public = keypair()
+    anchor = workspace_fact(secret, public, "workspace", 1)
+    proofs = [
+        signature(
+            secret, public, Fact("sample", ts, [], {}), 100 + ts)
+        for ts in range(4)
+    ]
+    facts = [anchor, *proofs]
+    by_fid = {fact.fid: fact for fact in facts}
+    driver = Driver()
+    root = tree.build(
+        [fact.key for fact in facts], shape.FACT, tree.FLAT,
+        by_fid.__getitem__, lambda fid: (), driver.emit,
+    )
+
+    assert {
+        fact.fid for fact in tree.validate_view(
+            root, shape.FACT, tree.FAT, driver.fetch)
+    } == {fact.fid for fact in facts}
 
 
 @pytest.mark.parametrize("case", ("empty-child", "duplicate-separator"))
@@ -484,13 +581,13 @@ def test_diff_aligns_across_a_promoted_leaf_boundary(engine_world):
         symmetric.update(set(my_keys) ^ set(their_keys))
 
     assert symmetric == {promoted}
-    # Two extra reads authenticate the cold v2 root summaries before pruning.
+    # Two extra reads authenticate cold factored summaries before pruning.
     assert len(set(driver.reads)) <= mine.level + theirs.level + 4
     assert len(set(driver.reads)) < leaf_count
 
 
 @pytest.mark.parametrize("operation", ("diff", "merge"))
-def test_cold_v2_root_summary_is_authenticated_before_pruning(
+def test_cold_factored_root_summary_is_authenticated_before_pruning(
         engine_world, operation):
     keys, by_fid = engine_world
     driver, packing = Driver(), tree.fat(8)
@@ -530,6 +627,7 @@ def test_merge_one_delta_reads_and_writes_only_spines(engine_world):
     theirs = cold(build(keys, by_fid, packing, driver))
     leaf_count = len(leaf_ranges(theirs, driver))
     driver.reads.clear()
+    driver.calls.clear()
     driver.writes.clear()
 
     merged = tree.merge(
@@ -539,10 +637,10 @@ def test_merge_one_delta_reads_and_writes_only_spines(engine_world):
 
     assert (merged.fp, merged.oid, merged.n) == \
         (theirs.fp, theirs.oid, theirs.n)
-    # Merge reads structural spines plus their separate settle payloads.
-    assert len(set(driver.reads)) <= 2 * (
+    # Fact bodies share CAS objects and travel in one call per payload.
+    assert len(driver.calls) <= 3 * (
         mine.level + theirs.level) + 2
-    assert len(set(driver.reads)) < leaf_count
+    assert len(driver.calls) < leaf_count
     assert len(set(driver.writes)) <= 2 * (mine.level + 1)
 
 
@@ -562,6 +660,7 @@ def test_merge_height_change_still_reads_only_spines(monkeypatch):
         keys[:29_800] + keys[29_801:], by_fid, packing, driver))
     theirs = cold(build(keys, by_fid, packing, driver))
     driver.reads.clear()
+    driver.calls.clear()
     driver.writes.clear()
 
     merged = tree.merge(
@@ -572,7 +671,7 @@ def test_merge_height_change_still_reads_only_spines(monkeypatch):
     spines = mine.level + theirs.level
     assert mine.level != theirs.level
     assert (merged.fp, merged.oid) == (theirs.fp, theirs.oid)
-    assert len(set(driver.reads)) <= 2 * spines + 2
+    assert len(driver.calls) <= 3 * spines + 2
     assert len(set(driver.writes)) <= 2 * spines
 
 
@@ -600,7 +699,7 @@ def test_merge_is_root_of_union(engine_world, packing):
 @pytest.mark.parametrize("legacy_kind", ("flat", "fat-v1"))
 @pytest.mark.parametrize("reverse", (False, True))
 @pytest.mark.parametrize("case", ("overlap", "same-set", "empty-current"))
-def test_merge_normalizes_mixed_legacy_and_v2_roots(
+def test_merge_normalizes_mixed_legacy_and_current_roots(
         engine_world, legacy_kind, reverse, case):
     keys, by_fid = engine_world
     keys = keys[:40]
@@ -634,6 +733,30 @@ def test_merge_normalizes_mixed_legacy_and_v2_roots(
     assert {
         fact.fid for fact in tree.facts(actual, driver.fetch, shape.FACT)
     } == {shape.FACT.fid_of(key) for key in union}
+
+
+def test_v2_factored_root_reads_and_normalizes_to_v3(engine_world):
+    keys, by_fid = engine_world
+    keys = keys[:40]
+    driver, packing = Driver(), tree.fat(8)
+    current = build(keys, by_fid, packing, driver)
+    old = cold(legacy_v2(current, driver))
+    empty = tree.build(
+        [], shape.FACT, packing,
+        by_fid.__getitem__, lambda fid: (), driver.emit,
+    )
+
+    assert old.config.startswith("2:fat:")
+    assert {fact.key for fact in tree.facts(
+        old, driver.fetch, shape.FACT)} == set(keys)
+
+    normalized = tree.merge(
+        empty, old, shape.FACT, packing,
+        driver.fetch, driver.emit,
+    )
+
+    assert normalized.oid == current.oid
+    assert normalized.config == tree.config(packing, shape.FACT)
 
 
 @pytest.mark.parametrize(
@@ -808,6 +931,7 @@ def test_read_floor_a_b_p_plus_spine(engine_world):
     all_leaves = {leaf.oid for _, _, leaf in ranges}
     view = cold(warm)
     driver.reads.clear()
+    driver.calls.clear()
 
     tree.fold(
         view, delta, shape.FACT, tree.fat(8), by_fid.__getitem__,
@@ -816,7 +940,7 @@ def test_read_floor_a_b_p_plus_spine(engine_world):
 
     leaf_reads = set(driver.reads) & all_leaves
     assert hit <= leaf_reads
-    assert len(set(driver.reads)) <= len(hit) * (view.level + 1)
+    assert len(driver.calls) <= 3 * len(hit) * (view.level + 1)
     assert leaf_reads < all_leaves
 
 
@@ -917,6 +1041,39 @@ def test_fold_rehomes_an_existing_dependency_and_equals_full_build(
     assert [fact.fid for fact in stored].count(facts[0].fid) == 1
 
 
+def test_fold_promotes_a_bracketed_closure_fact_to_its_explicit_home(
+        monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 1)
+    facts = [
+        Fact("sample", ordinal, [], {"ordinal": ordinal})
+        for ordinal in range(32)
+    ]
+    by_fid = {fact.fid: fact for fact in facts}
+    deps = {fact.fid: () for fact in facts}
+    deps[facts[7].fid] = (facts[8].fid,)
+    deps[facts[9].fid] = (facts[8].fid,)
+    keys = [fact.key for fact in facts]
+    driver, packing = Driver(), tree.fat(2)
+    before = tree.build(
+        keys[:8] + keys[9:], shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__, driver.emit,
+    )
+    assert facts[8].key not in tree.leaf_keys(
+        before, driver.fetch, shape.FACT)
+
+    actual = tree.fold(
+        cold(before), [facts[8].key], shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__,
+        driver.fetch, driver.emit,
+    )
+    expected = tree.build(
+        keys, shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__, driver.emit,
+    )
+
+    assert actual.oid == expected.oid
+
+
 @pytest.mark.parametrize(
     "reader", ("facts", "range_facts", "key_facts"))
 def test_fat_fact_readers_reject_payload_leaf_key_mismatch(reader):
@@ -1005,6 +1162,306 @@ def test_fat_fold_matches_full_build_for_dependent_stragglers(
                 expected, "workspace", frozenset()))
 
 
+# ---- closure-only secondary-index adapter (poc-16-yez.15) -------------------
+
+def test_secondary_paths_include_and_validate_closure_only_facts(
+        tmp_path, monkeypatch):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / "node", monkeypatch)
+    driver, packing = Driver(), tree.fat(2)
+    root = tree.build(
+        keys, secondary, packing, items.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+    indexed = {secondary.fid_of(key) for key in keys}
+    closure, stack = set(), list(indexed)
+    while stack:
+        fid = stack.pop()
+        if fid not in closure:
+            closure.add(fid)
+            stack.extend(deps[fid])
+
+    assert {
+        fact.fid for fact in tree.validate_view(
+            root, secondary, packing, driver.fetch)
+    } == closure
+    for lo, hi, _ in tree.leaf_ranges(root, driver.fetch):
+        unit = tree.range_facts(
+            root, (lo, hi), driver.fetch, secondary)
+        present = {fact.fid for fact in unit}
+        assert all(set(deps[fact.fid]) <= present for fact in unit)
+        position = {fact.fid: index for index, fact in enumerate(unit)}
+        assert all(
+            position[dep] < position[fact.fid]
+            for fact in unit for dep in deps[fact.fid]
+        )
+        tree._canonical_graph((unit,), require_anchor=False)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_secondary_fold_matches_full_build_under_shuffled_promotions(
+        tmp_path, monkeypatch, seed):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / f"node-{seed}", monkeypatch)
+    rng = random.Random(seed)
+    rng.shuffle(keys)
+    driver, packing = Driver(), tree.fat(2)
+    view = tree.build(
+        [], secondary, packing, items.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+    seen = []
+    for key in keys:
+        seen.append(key)
+        view = tree.fold(
+            cold(view), [key], secondary, packing,
+            items.__getitem__, deps.__getitem__,
+            driver.fetch, driver.emit,
+        )
+        expected = tree.build(
+            seen, secondary, packing, items.__getitem__,
+            deps.__getitem__, driver.emit,
+        )
+        assert view.oid == expected.oid, (
+            len(seen), secondary.fid_of(key),
+            items[secondary.fid_of(key)].t)
+        tree.validate_view(view, secondary, packing, driver.fetch)
+
+
+def test_secondary_merge_preserves_the_explicit_key_union(
+        tmp_path, monkeypatch):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / "node", monkeypatch)
+    driver, packing = Driver(), tree.fat(2)
+    left = tree.build(
+        keys[::2], secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+    right = tree.build(
+        keys[1::2], secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+    expected = tree.build(
+        keys, secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+
+    actual = tree.merge(
+        cold(left), cold(right), secondary, packing,
+        driver.fetch, driver.emit,
+    )
+
+    assert actual.oid == expected.oid
+    assert tree.leaf_keys(actual, driver.fetch, secondary) == keys
+
+
+@pytest.mark.parametrize("prevalidated", (False, True))
+def test_secondary_merge_hydrates_v3_bodies_floated_by_repartition(
+        tmp_path, monkeypatch, prevalidated):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / str(prevalidated), monkeypatch,
+        load_sk(f"{3:064x}"),
+    )
+    left_keys = [keys[index] for index in (1, 3, 4, 6, 7, 9, 10)]
+    right_keys = [keys[index] for index in (0, 1, 6, 10)]
+    union = sorted(set(left_keys) | set(right_keys))
+    driver, packing = Driver(), tree.fat(2)
+    left = tree.build(
+        left_keys, secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+    right = tree.build(
+        right_keys, secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+    expected = tree.build(
+        union, secondary, packing,
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+
+    actual = tree.merge(
+        cold(left), cold(right), secondary, packing,
+        driver.fetch, driver.emit, prevalidated=prevalidated,
+    )
+
+    assert actual.oid == expected.oid
+
+
+def test_secondary_reuses_fact_body_objects_across_different_partitions(
+        tmp_path, monkeypatch):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / "node", monkeypatch)
+    driver, packing = Driver(), tree.fat(2)
+    primary = tree.build(
+        [fact.key for fact in items.values()],
+        shape.FACT, packing, items.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+    before = set(driver.objects)
+    secondary_root = tree.build(
+        keys, secondary, packing, items.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+    body_oids = {
+        h(canon(fact.to_json())) for fact in items.values()
+    }
+
+    assert primary.oid != secondary_root.oid
+    assert not body_oids & (set(driver.objects) - before)
+    assert body_oids <= tree.live_oids(primary, driver.fetch)
+    assert body_oids <= tree.live_oids(secondary_root, driver.fetch)
+
+
+def test_fact_body_refs_are_fetched_once_per_payload_not_once_per_fact():
+    authorities = [
+        Fact("authority", ordinal, [], {"ordinal": ordinal})
+        for ordinal in range(40)
+    ]
+    participant = Fact("participant", 100, [], {})
+    items = {fact.fid: fact for fact in authorities + [participant]}
+    deps = {
+        **{fact.fid: () for fact in authorities},
+        participant.fid: tuple(fact.fid for fact in authorities),
+    }
+
+    def secondary_key(fact):
+        return fact.key if fact.t == "participant" else None
+
+    secondary = replace(shape.FACT, key=secondary_key)
+    driver = Driver()
+    root = tree.build(
+        [participant.key], secondary, tree.fat(2),
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+
+    class Remote:
+        def __init__(self):
+            self.single, self.batches = [], []
+
+        def __call__(self, oid):
+            self.single.append(oid)
+            return driver.objects[oid]
+
+        def many(self, oids):
+            oids = tuple(oids)
+            self.batches.append(oids)
+            return tuple(driver.objects[oid] for oid in oids)
+
+    remote = Remote()
+    assert {fact.fid for fact in tree.facts(
+        cold(root), remote, secondary)} == set(items)
+    body_oids = {h(canon(fact.to_json())) for fact in items.values()}
+    assert body_oids.isdisjoint(remote.single)
+    assert sum(map(len, remote.batches)) == len(items)
+    assert len(remote.batches) < len(items)
+    assert max(map(len, remote.batches)) == len(items)
+
+
+def test_secondary_annex_cost_ignores_unrelated_authority(
+        monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 1)
+    monkeypatch.setattr(shape, "COLD_CUT", None)
+
+    def make(count):
+        authorities = [
+            Fact("authority", 2 * ordinal, [], {"ordinal": ordinal})
+            for ordinal in range(count)
+        ]
+        participants = [
+            Fact("participant", 2 * ordinal + 1, [], {"ordinal": ordinal})
+            for ordinal in range(count)
+        ]
+        items = {
+            fact.fid: fact for fact in authorities + participants
+        }
+        deps = {
+            **{fact.fid: () for fact in authorities},
+            **{
+                fact.fid: (authorities[ordinal].fid,)
+                for ordinal, fact in enumerate(participants)
+            },
+        }
+
+        def key(fact):
+            return fact.key if fact.t == "participant" else None
+
+        secondary = replace(shape.FACT, key=key)
+        driver = Driver()
+        root = tree.build(
+            [fact.key for fact in participants],
+            secondary, tree.fat(2), items.__getitem__,
+            deps.__getitem__, driver.emit,
+        )
+        return (
+            authorities, participants, items, deps,
+            secondary, driver, root,
+        )
+
+    selected_bodies, manifest_sizes = [], []
+    for count in (8, 256):
+        authorities, participants, items, deps, secondary, driver, root = \
+            make(count)
+        target = participants[0]
+
+        class Remote:
+            def __init__(self):
+                self.bodies = []
+
+            def __call__(self, oid):
+                return driver.objects[oid]
+
+            def many(self, oids):
+                self.bodies.extend(oids)
+                return tuple(driver.objects[oid] for oid in oids)
+
+        remote = Remote()
+        unit = tree.key_facts(
+            cold(root), [target.key], remote, secondary)
+        assert {fact.fid for fact in unit} == {
+            target.fid, authorities[0].fid,
+        }
+        selected_bodies.append(set(remote.bodies))
+        assert root.pn == 0
+
+        authority = Fact("authority", 10_000, [], {"new": True})
+        participant = Fact("participant", 10_001, [], {"new": True})
+        items.update({authority.fid: authority, participant.fid: participant})
+        deps.update({authority.fid: (), participant.fid: (authority.fid,)})
+        driver.writes.clear()
+        tree.fold(
+            cold(root), [participant.key], secondary, tree.fat(2),
+            items.__getitem__, deps.__getitem__,
+            driver.fetch, driver.emit,
+        )
+        manifests = [
+            driver.objects[oid] for oid in set(driver.writes)
+            if set(json.loads(driver.objects[oid])) == {"refs"}
+        ]
+        assert manifests
+        assert all(len(json.loads(raw)["refs"]) <= 2 for raw in manifests)
+        manifest_sizes.append(max(map(len, manifests)))
+
+    assert selected_bodies[0] == selected_bodies[1]
+    assert manifest_sizes[0] == manifest_sizes[1]
+
+
+@pytest.mark.parametrize("body", (None, b"corrupt"))
+def test_fact_body_refs_reject_missing_or_corrupt_objects(body):
+    fact = Fact("sample", 1, [], {})
+    driver = Driver()
+    root = tree.build(
+        [fact.key], shape.FACT, tree.fat(2),
+        lambda fid: fact, lambda fid: (), driver.emit,
+    )
+    body_oid = h(canon(fact.to_json()))
+
+    def fetch(oid):
+        return body if oid == body_oid else driver.fetch(oid)
+
+    with pytest.raises(ValueError, match="fact object integrity"):
+        tree.facts(cold(root), fetch, shape.FACT)
+
+
 def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
@@ -1020,6 +1477,7 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
             source, workspace, "general", f"message {ordinal}",
             ts=source.fact_of(workspace, workspace).ts + ordinal + 1,
         )
+    individual, batches = [], []
 
     class LocalPeer:
         def __init__(self, node, ws, url):
@@ -1031,7 +1489,16 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
             return raw, source.store(self.ws).etag("root")
 
         def obj(self, oid):
+            individual.append(oid)
             return source.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            oids = tuple(oids)
+            batches.append(oids)
+            return tuple(
+                source.store(self.ws).get("obj/" + oid)
+                for oid in oids
+            )
 
         def put_pile(self, raw):
             deliver(source, self.ws, raw)
@@ -1042,6 +1509,12 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
         destination, workspace, "local://source")
 
     assert (pulled, pushed) == (1, 0)
+    body_oids = {
+        h(canon(source.fact_of(workspace, fid).to_json()))
+        for fid in all_fids(source, workspace)
+    }
+    assert batches
+    assert body_oids.isdisjoint(individual)
     assert all_fids(destination, workspace) == all_fids(source, workspace)
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")

@@ -1,9 +1,11 @@
 """One deterministic, sans-I/O Merkle-tree engine.
 
 Binary and flat compatibility packings keep closed piles at their leaves.
-Production fat trees factor every fact into one settle-node payload: the
-deepest node covering its own key and every dependent key.  A root-to-node
-path is therefore closed, while a full preorder stream stores every fact once.
+Production fat trees factor every fact into one settle-node manifest: the
+deepest node covering its own key and every dependent key. A secondary index
+copies refs for genuinely no-key closure beside the primary payloads that need
+them; the canonical fact-body objects remain shared. A root-to-node path is
+therefore closed, while a full preorder stream returns every fact once.
 Drivers provide ``fetch(oid)`` and ``emit(bytes) -> oid``; this module knows
 nothing about files, HTTP, or R2.
 """
@@ -35,8 +37,8 @@ class View:
     kind: str = "leaf"
     mark: int = 0                 # flat root: number of promoted fence leaves
     config: str = ""
-    pay: str = ""                 # fat tree: content-addressed payload pile
-    pn: int = 0
+    pay: str = ""                 # fat tree: content-addressed settle manifest
+    pn: int = 0                   # manifest refs, including no-key annex
     spans: tuple | None = None    # (fid, low key, high key); blanks mean self
 
 
@@ -50,6 +52,7 @@ class Packing:
 BINARY = Packing(2, "binary")
 FLAT = Packing(0, "flat")
 FAT = Packing(64, "fat")
+FAT_VERSION = 3
 
 
 def fat(fanout=64):
@@ -60,15 +63,20 @@ def fat(fanout=64):
 
 def config(packing, shape):
     """Tree-format identity; configuration changes force a full rebuild."""
-    version = 2 if packing.kind == "fat" else 1
+    version = FAT_VERSION if packing.kind == "fat" else 1
     return f"{version}:{packing.kind}:{packing.fanout}:{shape.cut()}"
+
+
+def _factored(value):
+    return isinstance(value, str) and value.startswith(
+        ("2:fat:", "3:fat:"))
 
 
 def _fat_config_version(value, mark):
     if not isinstance(value, str):
         raise ValueError("tree config")
     parts = value.split(":")
-    if len(parts) != 4 or parts[0] not in ("1", "2") \
+    if len(parts) != 4 or parts[0] not in ("1", "2", "3") \
             or parts[1] != "fat":
         raise ValueError("tree config")
     try:
@@ -93,7 +101,7 @@ def _summary(view):
         "f": view.fp, "k": view.kind, "l": view.level, "n": view.n,
         "m": view.mark, "o": view.oid, "s": view.sep, "x": view.config,
     }
-    if view.config.startswith("2:fat:"):
+    if _factored(view.config):
         out.update({"p": view.pay, "q": view.pn})
     return out
 
@@ -154,7 +162,9 @@ def _node_bytes(view):
         "f": view.fp, "k": view.kind, "l": view.level,
         "m": view.mark, "n": view.n, "s": view.sep,
         "a": [_wire_span(span) for span in view.spans or ()],
-        "p": view.pay, "q": view.pn, "v": 2, "x": view.config,
+        "p": view.pay, "q": view.pn,
+        "v": _fat_config_version(view.config, view.mark),
+        "x": view.config,
     }
     if view.level == 0:
         body["y"] = list(view.keys)
@@ -194,10 +204,13 @@ def _validate_branch(view):
 
 
 def _validate_node(view):
-    if not view.config.startswith("2:fat:") \
-            or view.pn != len(view.spans or ()) \
+    version = _fat_config_version(view.config, view.mark)
+    primary = len(view.spans or ())
+    if not _factored(view.config) \
+            or (view.pn != primary if version == 2
+                else view.pn < primary) \
             or bool(view.pay) != bool(view.pn) \
-            or len({row[0] for row in view.spans or ()}) != view.pn:
+            or len({row[0] for row in view.spans or ()}) != primary:
         raise ValueError("tree node shape")
     if view.level == 0:
         if view.kind != "leaf" or view.children \
@@ -212,7 +225,7 @@ def _validate_node(view):
 def _decode_branch(raw, oid=None):
     obj = json.loads(raw)
     version = obj.get("v")
-    if version not in (1, 2) or not isinstance(obj.get("c"), list):
+    if version not in (1, 2, 3) or not isinstance(obj.get("c"), list):
         raise ValueError("tree node")
     view = View(
         obj["f"], oid or h(raw), obj["s"], obj["n"],
@@ -222,13 +235,13 @@ def _decode_branch(raw, oid=None):
         keys=tuple(obj.get("y", ())), pay=obj.get("p", ""),
         pn=obj.get("q", 0),
         spans=tuple(_span(row) for row in obj.get("a", ()))
-        if version == 2 else None,
+        if version >= 2 else None,
     )
     if oid is not None and h(raw) != oid:
         raise ValueError("tree node integrity")
     if _fat_config_version(view.config, view.mark) != version:
         raise ValueError("tree config")
-    (_validate_node if version == 2 else _validate_branch)(view)
+    (_validate_node if version >= 2 else _validate_branch)(view)
     return view
 
 
@@ -438,36 +451,52 @@ def _fat_shape(keys, packing, shape):
         level += 1
 
 
-def _closure_spans(fids, positions, deps_of):
-    """Return exact stable key bounds for every transitive need span."""
-    spans = {fid: [positions[fid], positions[fid]] for fid in fids}
-    pending = {fid: 0 for fid in fids}
-    for fid in fids:
-        for dep in deps_of(fid):
+def _closure_spans(fids, positions, deps_of, key_of):
+    """Return spans for every key-capable fact in the indexed closure."""
+    closure, stack = set(), list(fids)
+    while stack:
+        fid = stack.pop()
+        if fid in closure:
+            continue
+        closure.add(fid)
+        stack.extend(deps_of(fid))
+
+    spans = {
+        fid: [key, key] if (key := key_of(fid)) is not None
+        else [None, None]
+        for fid in closure
+    }
+    pending = {fid: 0 for fid in closure}
+    for fid in closure:
+        for dep in dict.fromkeys(deps_of(fid)):
             if dep not in pending:
                 raise ValueError("tree closure")
             pending[dep] += 1
-    ready = [fid for fid in fids if pending[fid] == 0]
+    ready = [fid for fid in closure if pending[fid] == 0]
     seen = 0
     while ready:
         fid = ready.pop()
         seen += 1
         lo, hi = spans[fid]
-        for dep in deps_of(fid):
+        if lo is None:
+            raise ValueError("tree closure")
+        for dep in dict.fromkeys(deps_of(fid)):
             target = spans[dep]
-            if lo < target[0]:
+            if target[0] is None or lo < target[0]:
                 target[0] = lo
-            if hi > target[1]:
+            if target[1] is None or hi > target[1]:
                 target[1] = hi
             pending[dep] -= 1
             if pending[dep] == 0:
                 ready.append(dep)
-    if seen != len(fids):
+    if seen != len(closure):
         raise ValueError("dependency DAG has a cycle")
     return {
         fid: (fid, "", "")
-        if lo == hi == positions[fid] else (fid, lo, hi)
+        if fid in positions and lo == hi == positions[fid]
+        else (fid, lo, hi)
         for fid, (lo, hi) in spans.items()
+        if key_of(fid) is not None
     }
 
 
@@ -508,8 +537,56 @@ def _payload_order(fids, deps_of):
     return ordered
 
 
+def _payload_bytes(facts, emit, fresh=None, annex=frozenset()):
+    """Reference canonical fact objects; differently partitioned trees share."""
+    from .fact import canon
+
+    refs = []
+    for fact in facts:
+        raw = canon(fact.to_json())
+        refs.append(
+            _emit(raw, emit)
+            if fresh is None or fact.fid in fresh or fact.fid in annex
+            else h(raw))
+    return canon({"refs": refs})
+
+
+def _closure_annex(fids, shape, fact_of, deps_of):
+    """No-key closure refs copied beside the primary facts that need them."""
+    out, stack = set(), [
+        dep for fid in fids for dep in deps_of(fid)
+    ]
+    while stack:
+        fid = stack.pop()
+        fact = fact_of(fid)
+        if shape.key(fact) is not None or fid in out:
+            continue
+        out.add(fid)
+        stack.extend(deps_of(fid))
+    return out
+
+
+def _payload_refs(raw, count):
+    obj = json.loads(raw)
+    refs = obj.get("refs") if isinstance(obj, dict) else None
+    if not isinstance(obj, dict) or set(obj) != {"refs"} \
+            or not isinstance(refs, list) or len(refs) != count \
+            or len(set(refs)) != len(refs) \
+            or not all(isinstance(oid, str) and oid for oid in refs):
+        raise ValueError("payload summary")
+    return tuple(refs)
+
+
+def _fetch_many(fetch, oids):
+    many = getattr(fetch, "many", None) or getattr(
+        getattr(fetch, "__self__", None), "fetch_many", None)
+    return tuple(many(oids)) if many is not None else tuple(
+        fetch(oid) for oid in oids)
+
+
 def _finish_fat(
-        node, assigned, moving, packing, shape, deps_of, emit, fetch=None):
+        node, assigned, moving, packing, shape, fact_of, deps_of, emit,
+        fetch=None, fresh=None):
     if isinstance(node, View):
         if assigned.get(id(node)):
             raise ValueError("settled into an unchanged node")
@@ -517,7 +594,8 @@ def _finish_fat(
 
     children = tuple(
         _finish_fat(
-            child, assigned, moving, packing, shape, deps_of, emit, fetch)
+            child, assigned, moving, packing, shape, fact_of, deps_of,
+            emit, fetch, fresh)
         for child in node.children
     )
     additions = assigned.get(id(node), ())
@@ -529,14 +607,27 @@ def _finish_fat(
     else:
         facts, records = {}, {}
         if base is not None:
-            for fact, span in zip(_payload(base, fetch), base.spans or ()):
-                if fact.fid not in moving:
-                    facts[fact.fid], records[fact.fid] = fact, span
+            records = {
+                span[0]: span for span in base.spans or ()
+                if span[0] not in moving
+            }
+            facts = {
+                fact.fid: fact for fact in _payload(base, fetch)
+                if fact.fid in records
+            }
         for fact, span in additions:
             facts[fact.fid], records[fact.fid] = fact, span
-        order = _payload_order(facts, deps_of)
-        spans = tuple(records[fid] for fid in order)
-        raw = encode_pile([facts[fid] for fid in order])
+        primary = _payload_order(facts, deps_of)
+        spans = tuple(records[fid] for fid in primary)
+        annex = _closure_annex(
+            primary, shape, fact_of, deps_of)
+        payload = {
+            **facts,
+            **{fid: fact_of(fid) for fid in annex},
+        }
+        order = _payload_order(payload, deps_of)
+        raw = _payload_bytes(
+            [payload[fid] for fid in order], emit, fresh, annex)
         pay = h(raw) if order else ""
         if order and (base is None or pay != base.pay):
             _emit(raw, emit)
@@ -582,13 +673,17 @@ def _fat_view(keys, packing, shape, fact_of, deps_of, emit):
     root = _fat_shape(keys, packing, shape)
     fids = [shape.fid_of(key) for key in keys]
     positions = dict(zip(fids, keys))
-    spans = _closure_spans(fids, positions, dependencies)
+    def index_key(fid):
+        return shape.key(fact(fid))
+
+    spans = _closure_spans(
+        fids, positions, dependencies, index_key)
     assigned = {}
     for fid, span in spans.items():
-        target = _settle(root, span, positions.__getitem__)
+        target = _settle(root, span, index_key)
         assigned.setdefault(id(target), []).append((fact(fid), span))
     return _finish_fat(
-        root, assigned, set(), packing, shape, dependencies, emit)
+        root, assigned, set(), packing, shape, fact, dependencies, emit)
 
 
 def build(keys, shape, packing, fact_of, deps_of, emit, memo=None):
@@ -606,7 +701,7 @@ def build(keys, shape, packing, fact_of, deps_of, emit, memo=None):
 def _resolved(view, fetch):
     if not view.n:
         return view
-    current = view.config.startswith("2:fat:")
+    current = _factored(view.config)
     if (current and view.spans is not None) \
             or (not current and (view.level == 0 or view.children)):
         return view
@@ -620,7 +715,7 @@ def _resolved(view, fetch):
 
 
 def _read_leaf(view, lo, hi, shape, fetch):
-    if view.config.startswith("2:fat:"):
+    if _factored(view.config):
         raise ValueError("fat leaves require their ancestor path")
     if view.n == 0:
         return (), []
@@ -640,7 +735,7 @@ def _read_leaf(view, lo, hi, shape, fetch):
 
 
 def _leaf_keys(view, lo, hi, shape, fetch, use_warm=True):
-    if view.config.startswith("2:fat:"):
+    if _factored(view.config):
         try:
             view = _resolved(view, fetch)
         except ValueError as exc:
@@ -708,38 +803,69 @@ def _payload(view, fetch):
     raw = fetch(view.pay)
     if raw is None or h(raw) != view.pay:
         raise ValueError("payload integrity")
-    stream, _ = decode_pile(raw)
-    if len(stream) != view.pn \
-            or tuple(fact.fid for fact in stream) != tuple(
-                span[0] for span in view.spans or ()):
+    if view.config.startswith(f"{FAT_VERSION}:fat:"):
+        from .fact import from_json
+
+        refs = _payload_refs(raw, view.pn)
+        bodies = _fetch_many(fetch, refs)
+        if len(bodies) != len(refs):
+            raise ValueError("payload summary")
+        stream = []
+        for oid, body in zip(refs, bodies):
+            if body is None or h(body) != oid:
+                raise ValueError("fact object integrity")
+            stream.append(from_json(json.loads(body)))
+    else:
+        stream, _ = decode_pile(raw)
+    fids = tuple(fact.fid for fact in stream)
+    primary = tuple(span[0] for span in view.spans or ())
+    malformed = (
+        len(stream) != view.pn or len(set(fids)) != len(fids)
+        or (not set(primary) <= set(fids)
+            if view.config.startswith(f"{FAT_VERSION}:fat:")
+            else fids != primary)
+    )
+    if malformed:
         raise ValueError("payload summary")
     return tuple(stream)
 
 
 def _validate_fact_keys(stream, keys, shape, *, exact):
     """Check payload facts against the explicit keys committed by leaves."""
-    actual = {shape.key(fact) for fact in stream}
     expected = set(keys)
+    indexed = [
+        key for fact in stream
+        if (key := shape.key(fact)) in expected
+    ]
+    actual = set(indexed)
     mismatch = actual != expected if exact else not expected <= actual
-    if len(actual) != len(stream) or mismatch:
+    if len({fact.fid for fact in stream}) != len(stream) \
+            or len(actual) != len(indexed) or mismatch:
         raise ValueError("tree fact set")
+
+
+def _extend_unique(out, seen, stream):
+    for fact in stream:
+        if fact.fid not in seen:
+            seen.add(fact.fid)
+            out.append(fact)
 
 
 def facts(view, fetch, shape=FACT):
     """Return the whole committed fact set once, in closed preorder."""
     if not view.n:
         return ()
-    if not view.config.startswith("2:fat:"):
+    if not _factored(view.config):
         return tuple(
             fact
             for lo, hi, leaf in leaf_ranges(view, fetch)
             for fact in leaf_facts(leaf, lo, hi, shape, fetch)
         )
-    out, keys = [], []
+    out, keys, seen = [], [], set()
 
     def rec(node, lo, hi):
         node = _resolved(node, fetch)
-        out.extend(_payload(node, fetch))
+        _extend_unique(out, seen, _payload(node, fetch))
         if not node.level:
             keys.extend(_leaf_keys(node, lo, hi, shape, fetch))
             return
@@ -766,7 +892,7 @@ def range_facts(view, ranges, fetch, shape=FACT):
         (lo, hi) for lo, hi in ranges if lo < hi)
     if not ranges or not view.n:
         return ()
-    if not view.config.startswith("2:fat:"):
+    if not _factored(view.config):
         out, seen = [], set()
         for lo, hi, leaf in leaf_ranges(view, fetch):
             if any(max(lo, start) < min(hi, stop)
@@ -777,7 +903,7 @@ def range_facts(view, ranges, fetch, shape=FACT):
                         out.append(fact)
         return tuple(out)
 
-    out, keys = [], []
+    out, keys, seen = [], [], set()
 
     def intersects(lo, hi):
         return any(max(lo, start) < min(hi, stop)
@@ -787,7 +913,7 @@ def range_facts(view, ranges, fetch, shape=FACT):
         if not intersects(lo, hi):
             return
         node = _resolved(node, fetch)
-        out.extend(_payload(node, fetch))
+        _extend_unique(out, seen, _payload(node, fetch))
         if not node.level:
             keys.extend(_leaf_keys(node, lo, hi, shape, fetch))
             return
@@ -807,7 +933,7 @@ def key_facts(view, keys, fetch, shape=FACT):
     keys = tuple(sorted(set(keys)))
     if not keys or not view.n:
         return ()
-    if not view.config.startswith("2:fat:"):
+    if not _factored(view.config):
         out, seen = [], set()
         leaves = list(leaf_ranges(view, fetch))
         highs = [hi for _, hi, _ in leaves]
@@ -823,11 +949,11 @@ def key_facts(view, keys, fetch, shape=FACT):
                         out.append(fact)
         return tuple(out)
 
-    out, leaf_keys = [], []
+    out, leaf_keys, seen = [], [], set()
 
     def rec(node, routed, lo, hi):
         node = _resolved(node, fetch)
-        out.extend(_payload(node, fetch))
+        _extend_unique(out, seen, _payload(node, fetch))
         if not node.level:
             leaf_keys.extend(_leaf_keys(node, lo, hi, shape, fetch))
             return
@@ -948,7 +1074,7 @@ def _fold_fat(
             facts_by_fid[fid] = fact_of(fid)
         return facts_by_fid[fid]
 
-    def key_of(fid):
+    def index_key(fid):
         return shape.key(fact(fid))
 
     def dependencies(fid):
@@ -961,7 +1087,7 @@ def _fold_fat(
     def locate(fid):
         if fid in locations:
             return locations[fid]
-        key, node, path = key_of(fid), view, []
+        key, node, path = index_key(fid), view, []
         while True:
             node = load(node)
             path.append(node)
@@ -969,54 +1095,77 @@ def _fold_fat(
                 (span for span in node.spans or () if span[0] == fid),
                 None,
             )
-            if record is not None or node.level == 0:
+            if record is not None or node.level == 0 or key is None:
                 locations[fid] = (record, tuple(path), node)
                 return locations[fid]
             highs = [child.sep for child in node.children]
             node = node.children[
                 min(bisect_left(highs, key), len(highs) - 1)]
 
+    def indexed(key):
+        node = view
+        while True:
+            node = load(node)
+            if node.level == 0:
+                return key in node.keys
+            highs = [child.sep for child in node.children]
+            node = node.children[
+                min(bisect_left(highs, key), len(highs) - 1)]
+
     delta_by_fid = {shape.fid_of(key): key for key in delta}
     old = {fid: locate(fid) for fid in delta_by_fid}
-    new = [fid for fid in delta_by_fid if old[fid][0] is None]
-    if not new:
+    additions = {
+        fid for fid, key in delta_by_fid.items()
+        if not indexed(key)
+    }
+    if not additions:
         return view
+    fresh = {fid for fid in additions if old[fid][0] is None}
+    delta = sorted(delta_by_fid[fid] for fid in additions)
 
     spans = {}
 
     def current_span(fid):
         if fid not in spans:
-            if fid in delta_by_fid and locate(fid)[0] is None:
-                spans[fid] = [key_of(fid), key_of(fid)]
-            else:
-                record = locate(fid)[0]
-                if record is None:
+            record = locate(fid)[0]
+            if record is None:
+                own = index_key(fid)
+                if own is None:
                     raise ValueError("tree closure")
+                spans[fid] = [own, own]
+                fresh.add(fid)
+            else:
                 spans[fid] = list(record[1:]) if record[1] else [
-                    key_of(fid), key_of(fid)]
+                    index_key(fid), index_key(fid)]
         return spans[fid]
 
     # Each new dependent position expands every transitive dependency span.
-    for origin in new:
+    for origin in additions:
+        origin_key = delta_by_fid[origin]
         stack, seen = [origin], set()
         while stack:
             fid = stack.pop()
             if fid in seen:
                 continue
             seen.add(fid)
-            span = current_span(fid)
-            if key_of(origin) < span[0]:
-                span[0] = key_of(origin)
-            if key_of(origin) > span[1]:
-                span[1] = key_of(origin)
+            if index_key(fid) is not None:
+                span = current_span(fid)
+                if origin_key < span[0]:
+                    span[0] = origin_key
+                if origin_key > span[1]:
+                    span[1] = origin_key
             stack.extend(dependencies(fid))
 
     def record_for(fid, span):
-        own = key_of(fid)
-        return (fid, "", "") if span == [own, own] \
+        own = index_key(fid)
+        return (fid, "", "") if own is not None and span == [own, own] \
             else (fid, span[0], span[1])
 
-    moving = {
+    promoted = {
+        fid for fid in additions
+        if old[fid][0] is not None
+    }
+    moving = promoted | {
         fid for fid, span in spans.items()
         if locate(fid)[0] is not None
         and record_for(fid, span) != locate(fid)[0]
@@ -1029,7 +1178,7 @@ def _fold_fat(
     rehome = {
         fid: (fact(fid), record_for(fid, span))
         for fid, span in spans.items()
-        if fid in moving or fid in new
+        if fid in moving or fid in fresh
     }
 
     def payload(node):
@@ -1038,7 +1187,9 @@ def _fold_fat(
         return payloads[node.pay]
 
     def float_payload(node):
-        for item, span in zip(payload(node), node.spans or ()):
+        items = {item.fid: item for item in payload(node)}
+        for span in node.spans or ():
+            item = items[span[0]]
             rehome.setdefault(item.fid, (item, span))
 
     def same_partition(children, old_children):
@@ -1091,10 +1242,11 @@ def _fold_fat(
     root = roots[0]
     assigned = {}
     for item, span in rehome.values():
-        target = _settle(root, span, key_of)
+        target = _settle(root, span, index_key)
         assigned.setdefault(id(target), []).append((item, span))
     return _finish_fat(
-        root, assigned, moving, packing, shape, dependencies, emit, cached)
+        root, assigned, moving, packing, shape, fact, dependencies, emit,
+        cached, fresh)
 
 
 def fold(
@@ -1129,7 +1281,7 @@ def diff(
     def resolve(view, fetch, cache):
         if not view.n:
             return view
-        current = view.config.startswith("2:fat:")
+        current = _factored(view.config)
         if (current and view.spans is not None) \
                 or (not current and (view.level == 0 or view.children)):
             return view
@@ -1229,7 +1381,7 @@ def diff(
         yield from rec(mine, "", left_hi, empty, right_hi, left_hi)
 
 
-def _canonical_graph(units):
+def _canonical_graph(units, *, require_anchor=True):
     """Return union facts and deps resolved against the whole union."""
     items = {
         fact.fid: fact
@@ -1251,7 +1403,7 @@ def _canonical_graph(units):
         fact.fid for fact in items.values()
         if fact.t in ("workspace", "genesis")
     ]
-    if not anchors:
+    if require_anchor and not anchors:
         raise ValueError("merge closure")
 
     import sqlite3
@@ -1282,7 +1434,7 @@ def _canonical_graph(units):
         db.close()
 
     ordered = close(items.values(), deps.__getitem__, items.__getitem__)
-    result = drain(ordered, min(anchors))
+    result = drain(ordered, min(anchors, default=""))
     if not result.ok or len(result.valids) != len(items):
         raise ValueError("merge closure")
     return items, {
@@ -1307,21 +1459,28 @@ def _may_rewire(fact):
 def validate_view(view, shape, packing, fetch):
     """Return facts only when closure and physical placement are canonical."""
     stream = facts(view, fetch, shape)
-    if len({fact.fid for fact in stream}) != view.n:
+    if not view.config.startswith(f"{FAT_VERSION}:fat:") \
+            and len({fact.fid for fact in stream}) != view.n:
         raise ValueError("tree fact set")
     items, deps = _canonical_graph((stream,))
-    if view.config.startswith("2:fat:"):
+    if view.config.startswith(f"{FAT_VERSION}:fat:"):
+        keys = leaf_keys(view, fetch, shape)
         canonical = build(
-            [shape.key(fact) for fact in items.values()],
+            keys,
             shape, packing, items.__getitem__, deps.__getitem__, h,
         )
         if canonical.oid != view.oid:
             raise ValueError("tree placement")
+    elif _factored(view.config):
+        for lo, hi, _ in leaf_ranges(view, fetch):
+            _canonical_graph((
+                range_facts(view, (lo, hi), fetch, shape),
+            ), require_anchor=False)
     else:
         for lo, hi, leaf in leaf_ranges(view, fetch):
             _canonical_graph((
                 leaf_facts(leaf, lo, hi, shape, fetch),
-            ))
+            ), require_anchor=False)
     return stream
 
 
@@ -1337,9 +1496,9 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
     def is_current(view):
         return view.kind == "fat" and view.config == expected
 
-    if a.n and a.config.startswith("2:fat:") and a.spans is None:
+    if a.n and _factored(a.config) and a.spans is None:
         a = _resolved(a, fetch)
-    if b.n and b.config.startswith("2:fat:") and b.spans is None:
+    if b.n and _factored(b.config) and b.spans is None:
         b = _resolved(b, fetch)
     if packing.kind == "fat":
         if not is_current(a):
@@ -1352,6 +1511,8 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
             for view in (a, b)):
         raise ValueError("tree config")
 
+    from .fact import from_json
+
     cache, items, deps = {}, {}, {}
     streams = {}
 
@@ -1360,11 +1521,13 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
             raw = cache[oid] = fetch(oid)
             if raw is not None:
                 try:
-                    stream = decode_pile(raw)[0]
+                    stream = (from_json(json.loads(raw)),)
                 except Exception:
-                    pass
-                else:
-                    items.update((fact.fid, fact) for fact in stream)
+                    try:
+                        stream = decode_pile(raw)[0]
+                    except Exception:
+                        stream = ()
+                items.update((fact.fid, fact) for fact in stream)
         return cache[oid]
 
     def validate_root(view):
@@ -1399,7 +1562,8 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
             return oid
 
         merged = build(
-            [shape.key(fact) for fact in all_items.values()],
+            set(leaf_keys(a, cached, shape))
+            | set(leaf_keys(b, cached, shape)),
             shape, packing, all_items.__getitem__,
             all_deps.__getitem__, stage,
         )
@@ -1432,8 +1596,9 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
     if any(_may_rewire(items[fid]) for fid in delta_fids):
         return rebuild()
     for unit in units:
-        _canonical_graph((unit,))
-    canonical_items, canonical_deps = _canonical_graph(units)
+        _canonical_graph((unit,), require_anchor=False)
+    canonical_items, canonical_deps = _canonical_graph(
+        units, require_anchor=False)
     items.update(canonical_items)
     deps.update(canonical_deps)
 
@@ -1450,7 +1615,11 @@ def merge(a, b, shape, packing, fetch, emit, *, prevalidated=False):
             if item is not None and not item.refs() \
                     and families.handler_for(item.t) is None:
                 deps[fid] = ()
-            else:
+            elif item is not None:
+                _, discovered = _canonical_graph(
+                    (tuple(items.values()),), require_anchor=False)
+                deps.update(discovered)
+            if fid not in deps:
                 raise ValueError("merge closure")
         return deps[fid]
 
@@ -1519,17 +1688,24 @@ def verify(root, pad, fact_of, fetch, base_hashes=None, base_phs=None):
 
 
 def live_oids(view, fetch=None):
-    """Return reachable node and settle-payload object ids.
+    """Return reachable node, settle-manifest, and fact-body object ids.
 
-    A decoded fat tree needs ``fetch`` to walk below its child summaries.
+    A nonempty v3 tree needs ``fetch`` for manifests and child summaries.
     """
     if not view.n:
         return set()
     out = {view.oid}
-    if view.config.startswith("2:fat:"):
+    if _factored(view.config):
+        if view.config.startswith(f"{FAT_VERSION}:fat:") and fetch is None:
+            raise ValueError("v3 liveness requires fetch")
         resolved = _resolved(view, fetch)
         if resolved.pay:
             out.add(resolved.pay)
+            if resolved.config.startswith(f"{FAT_VERSION}:fat:"):
+                raw = fetch(resolved.pay)
+                if raw is None or h(raw) != resolved.pay:
+                    raise ValueError("payload integrity")
+                out.update(_payload_refs(raw, resolved.pn))
         for child in resolved.children:
             out.update(live_oids(child, fetch))
         return out

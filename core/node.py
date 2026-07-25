@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v10-hoisted-tree"
+INDEX_VERSION = "family-contract-v11-shared-fact-bodies"
 APP_VERSION = 3
 
 

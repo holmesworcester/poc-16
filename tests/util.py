@@ -63,10 +63,10 @@ class DeletionFamily:
         return None
 
 
-def suppression_world(path, monkeypatch):
+def suppression_world(path, monkeypatch, initial_secret=None):
     """A valid set with targets and deletions, authored in one fixed order."""
     monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
-    node = Node(str(path))
+    node = Node(str(path), initial_secret=initial_secret)
     workspace = cmds.create(node, "alice", ts=1)
     targets = [
         cmds.post(

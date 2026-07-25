@@ -40,6 +40,16 @@ def sync(node, ws, url):
             remote_objects[oid] = remote.get("obj/" + oid)
         return remote_objects[oid]
 
+    def fetch_many(oids):
+        missing = [oid for oid in oids if oid not in remote_objects]
+        if missing:
+            remote_objects.update(zip(
+                missing,
+                remote.get_many(["obj/" + oid for oid in missing]),
+            ))
+        return tuple(remote_objects.get(oid) for oid in oids)
+
+    fetch_remote.many = fetch_many
     fetch_local = lambda oid: node.store(ws).get("obj/" + oid)
     pull_ranges, missing_fids, pushed_fids = [], set(), set()
     for lo, hi, my_keys, their_leaf in tree.diff(

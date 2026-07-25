@@ -5,8 +5,10 @@ one content-addressed payload per settle node, walks a full fact tree with every
 fact once, and assembles deduplicated closed path unions for range sync.
 `kernel.Scratchpad` owns verify-once path context; `core/hoist.py` remains only
 the binary compatibility/measurement façade. This is `poc-16-808.9`.
-Secondary indexes whose validity closure contains unindexed facts require the
-adapter tracked by `poc-16-yez.15`.
+The `poc-16-yez.15` adapter also landed: no-key secondary closure is a
+path-local annex of shared body refs, so unrelated authority does not enlarge
+a narrow read or fold. Settle manifests share canonical fact-body objects
+across differently partitioned indexes.
 
 Companion to `TREAP_PROTOTYPE.md`. The prototype stores a **closed pile at every
 leaf**: leaf `ℓ`'s object carries `C(ℓ) = closure(K(ℓ))`, its in-range facts plus

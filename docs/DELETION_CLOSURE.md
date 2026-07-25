@@ -189,16 +189,15 @@ suppression **masks after judgment** at three places only — gate, closure edge
   D that arrived with its own closure enters S (`S(D) = targets of *valid*
   suppression facts`). Validity-closure (may D delete) stays separate from the
   suppression relation (what D deletes).
-- **`T_supp` must hoist through an explicit adapter.** D's authority closure is
+- **`T_supp` hoists through the landed explicit adapter.** D's authority closure is
   shared closure (one admin deletes many channels), so the ρ≈3× leaf-duplication
-  tax hits `T_supp` too. It must use the same engine, not the flat
-  per-leaf-closure prototype, but the landed `T_fact` payload format is not
-  sufficient by itself: authority facts absent from `T_supp` have no index key
-  by which an incremental fold can find and rehome them, and whole-node payload
-  piles partition differently between the two trees. `poc-16-yez.15` therefore
-  blocks production `T_supp`: it adds stable closure-only placement and shared
-  fact-body hash references, with only structural index objects duplicated.
-  The yez.6 proof may still run on the prototype.
+  tax hits `T_supp` too. `poc-16-yez.15` copies only the canonical body refs
+  for no-key authority into each settle payload that needs them and promotes
+  key-capable closure facts correctly. `T_fact` and `T_supp` therefore share
+  body objects despite different partitions; only structural refs and index
+  objects duplicate. Narrow reads never pull unrelated workspace authority.
+  Production `T_supp` can use the same engine, while the yez.6 proof may still
+  run on the prototype.
 
 ## 4. Why there is no serial pass (the advance on the Open Question)
 

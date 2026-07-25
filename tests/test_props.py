@@ -118,7 +118,7 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     fetch = lambda oid: st.get("obj/" + oid)
     payload = next(
         oid for oid in tree.live_oids(root.view, fetch)
-        if b'"facts"' in st.get("obj/" + oid)
+        if b'"refs"' in st.get("obj/" + oid)
     )
     st.put("obj/" + payload, encode_pile([]))
 

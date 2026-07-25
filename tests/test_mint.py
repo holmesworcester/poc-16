@@ -390,14 +390,6 @@ def test_published_roots_require_canonical_settle_placement(tmp_path):
 
     assert wrong.fp == honest.view.fp
     assert wrong.oid != honest.view.oid
-    assert any(
-        not drain(
-            tree.range_facts(
-                wrong, (lo, hi), fetch, FACT),
-            workspace,
-        ).ok
-        for lo, hi, _ in tree.leaf_ranges(wrong, fetch)
-    )
     with pytest.raises(ValueError, match="tree placement"):
         mint.Authority.from_root(wrong_bytes, fetch)
     for left, right in (

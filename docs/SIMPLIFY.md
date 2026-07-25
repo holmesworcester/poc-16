@@ -138,12 +138,14 @@ synced T_supp (yez.10) should instantiate the engine, not the prototype that
 jbg.1 replaces. Sequencing hazard if ignored: two epics fork the tree layer in
 opposite directions the same week.
 
-That instantiation is not zero-adapter. `T_supp` omits authority facts that have
-no suppression key, so bounded incremental hoisting needs a stable way to find
-and rehome closure-only payload facts. Also, `T_fact` and `T_supp` partition
-whole-node payload piles differently, so a shared object namespace alone does
-not provide body deduplication. `poc-16-yez.15` blocks yez.10 and owns those two
-requirements while preserving the single engine.
+The required adapter landed in `poc-16-yez.15`. `T_supp` may omit authority
+facts that have no suppression key: each primary settle payload carries a
+canonical annex of the no-key body refs it needs. Those duplicated refs are
+structural index bytes; the named fact bodies remain one-copy CAS shared with
+`T_fact`. Key-capable closure facts retain normal settle placement before and
+after their key becomes explicit. Narrow reads and folds therefore pay only
+their selected closure, and batched body fetches preserve path-bounded network
+round trips. `yez.10` can now instantiate the same engine directly.
 
 `resolve_supp` (yez.11) is the closure edge that flags a fact suppressed
 without touching validity. The pump (§5) is its consumer on the read-model
