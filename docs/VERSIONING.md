@@ -40,31 +40,31 @@ invariants that keep it from breaking convergence.
 
 ## 0. The gap
 
-**First, a scope line.** The POC keeps **no** backwards compatibility: it has no
-installed base, so the migration story is always to break the format and rebuild
-from scratch, and a compatibility shim only costs the legibility the POC exists
-to buy. Everything below is therefore a *product* rule being designed here and
-tracked here — not a licence to grow compat code in `core/` or `facts/`. Two
-consequences worth stating up front. The `legacy_*` modules are residue slated
-for deletion, not this epic's foundation: they are cited below as evidence of
-the *shape* a version handler takes, never as something to preserve. And a
-version stamp that forces a rebuild is a dev-loop convenience, not compatibility
-— which is exactly what §8 is about, and why §8 is the part of this plan that
-pays off immediately.
+**First, a scope line.** The POC keeps **no** general backwards compatibility:
+no read-compat shims, no dual decoders, no tolerant parsers, no state
+migrations. There is no installed base, so breaking the format and rebuilding
+costs less than the legibility a shim spends. **Fact-family versioning is
+outside that rule** — it is the mechanism this epic exists to prove, not a shim
+grown to avoid a rewrite, and the POC should show it working end to end. So the
+`legacy_*` modules stay: they are per-version family handlers, which is what
+this plan is about, and §9a ships another one deliberately. The boundary is
+between *this* mechanism, which is a design under test, and compatibility code
+anywhere else, which is residue. Two smaller notes while here: a version stamp
+that forces a rebuild is a dev-loop convenience rather than compatibility, which
+is what §8 is and why §8 pays off immediately; and nothing in this plan licenses
+compat code in `core/` outside the family boundary.
 
 What already works:
 
-- - **The shape of a per-version handler, as residue.**
-  `facts/auth/legacy_genesis.py`,
+- **Per-version handlers, already working.** `facts/auth/legacy_genesis.py`,
   `legacy_signature.py`, `legacy_invite.py`, `legacy_join.py` keep the `genesis`
   / `sig` / `invite` / `join` tags judgeable beside `workspace` / `signature` /
   `user_invite` / `user`, author nothing, and are exercised by
   `tests/test_auth_upgrade.py:58`. `legacy_invite` even keeps its *old*
   authority rule (admin-only) while `user_invite` allows any member — a real
-  semantic divergence between two versions of one family, which is precisely
-  what a version handler is. These modules should be deleted under the
-  no-back-compat rule; what this plan takes from them is the shape, not the
-  code.
+  semantic divergence between two versions of one family, both staying valid —
+  precisely what this plan claims is possible, demonstrated before the plan
+  existed. They stay.
 - **Replay on a semantic bump.** `INDEX_VERSION` (`core/node.py:57`) mismatch ⇒
   `rebuild(ws, republish=True)` (`core/node.py:150-160`, `:579-619`): stream the
   store's own leaves back through `drain`, wipe and re-emit every derived table,
@@ -131,12 +131,10 @@ Each family module declares `FAMILY` and `VERSION` next to `TAG`; `TAG` remains
 the exact persisted string and is never recomputed. `facts/__init__.py` keeps
 `ROUTES` keyed by tag and adds an index by `(FAMILY, VERSION)`. A contract test
 asserts both constants exist, `(FAMILY, VERSION)` is unique, and exactly one
-version per family is *current* — the one commands author. This bead declares
-the dimension on whatever families exist when it lands; it does **not** preserve
-the `legacy_*` modules, which are removable under the no-back-compat rule and
-may well be gone by then. If they are still present, they are the family at
-their old `VERSION` — which is what they already are — and deleting them later
-is a deletion, not a versioning decision.
+version per family is *current* — the one commands author. The `legacy_*`
+modules become `<family>` at their old `VERSION`, which is what they already
+are; naming them properly is most of this bead's value, since `legacy_` reads as
+residue and the thing it labels is a version handler.
 
 Same pass fixes a family-policy leak the contract test does not cover:
 `core/tree.py:694` hard-codes `fact.t in ("workspace", "genesis")` in the merge
@@ -172,10 +170,11 @@ because each closes a hole this plan would otherwise leave open:
   payload, splitting or combining fields, and mapping an old tag into current
   semantics without touching one immutable byte.
 
-One deliberate divergence: POC-17 parks a fact whose `Require` has no match,
-while POC-16 deleted parking from the grammar — a closed unit means the closer
-either shipped the providers or authored a broken pile, so an unmet need rejects
-the unit. Take POC-17's normalization, not its parking.
+One deliberate divergence: POC-17 parks a fact whose `Require` has no match.
+POC-16 has no parking **because every pile is closed** — the closer either
+shipped the providers or authored a broken unit, so there is nothing a wait
+could resolve and an unmet need rejects. Take POC-17's normalization, not its
+parking.
 
 `Fact.offers()` survives as the envelope accessor: families still shape and
 validate their own atoms with it, and the clear-envelope vocabulary stays

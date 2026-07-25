@@ -623,14 +623,19 @@ single split governs everything below.
 
 **A family tolerates every version of its own type, and no version of anyone
 else's.** The tag names family and version; each version keeps its own handler;
-a new version is a new handler, never a migration. This is a *product* rule, and
-the distinction matters here: the POC keeps no backwards compatibility at all —
-it has no installed base, so breaking the format and rebuilding from scratch is
-always the cheaper migration, and the `legacy_*` modules on disk today are
-residue to delete rather than the design arriving early. What they do show is
-the shape, since a version handler and a compatibility shim are the same object
-seen from two eras. The rule is affordable because the obligation is
-local: N versions of my own type, borne by the family that owns them. N versions
+a new version is a new handler, never a migration. This is the one place the POC
+keeps compatibility on purpose, and the boundary is worth drawing precisely:
+everywhere else it keeps none — no read-compat shims, no dual decoders, no state
+migrations, because there is no installed base and breaking the format costs
+less than the legibility a shim spends. Fact-family versioning is not an
+exception grudgingly made; it is the mechanism under test, so the POC should
+show it working. `legacy_genesis`, `legacy_signature`, `legacy_invite`, and
+`legacy_join` already do — old tags judgeable beside `workspace`, `signature`,
+`user_invite`, and `user`, authoring nothing, `legacy_invite` still enforcing its
+own admin-only rule while `user_invite` admits any member. That is two versions
+of one family disagreeing about semantics and both staying valid, which is
+exactly what this section claims is possible. The rule is affordable because the
+obligation is local: N versions of my own type, borne by the family that owns them. N versions
 × M families is the product no release can ship, and buying it out is what the
 interlingua is for. So a release carries one version constant and no matrix of
 releases; compatibility with old retained facts lives in the owning family, and
