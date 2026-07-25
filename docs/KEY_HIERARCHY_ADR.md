@@ -111,11 +111,11 @@ The production boundary must expose operations equivalent to:
 | `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle. Track or destroy orphan allocation after failure. |
 | `open(handle, envelope, expected_context)` | Open only with the exact generation and caller-supplied authoritative context; reject a valid ciphertext whose authenticated self-description differs. Private material never leaves a non-exportable provider. |
 | `seal(public, plaintext, aad)` | Seal F or one retained-cover node to a named generation and exact context. |
-| `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, and freeze the purge-target manifest derived from that causally closed batch; identical saved-input retries coalesce and every mismatch conflicts. |
+| `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, and freeze the purge-target manifest derived from the canonical set of causally referenced operation ids; duplicate refs do not create another batch, identical saved-input retries coalesce, and every semantic mismatch conflicts. |
 | `acquire_writer_lease(P)` | Admit a caller-requested generation-bound write only while that exact P is active, finalized, and unfenced. Never replace a saved P request with the current generation. |
-| `close_and_drain(P)` | Reject new P leases and commits; drain or abort all existing leases before survivor enumeration. |
-| `migrate(P, S, manifest)` | Require S and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. |
-| `destroy(P)` | Idempotently destroy the P handle/keyblob and advance monotonic retirement state to the successor fixed by P's claim. |
+| `close_and_drain(P)` | Require P's accepted claim, persist a provider-protected closing phase before returning, reject new P leases and commits against both protected and application state, and drain or abort all existing leases before survivor enumeration. |
+| `migrate(P, S, manifest)` | Require S and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress and persist the exact survivor-id set in the migration proof. |
+| `destroy(P)` | Immediately before the first irreversible deletion, cryptographically reopen every authoritative survivor as S, then idempotently destroy the P handle/keyblob and advance monotonic retirement state to the successor fixed by P's claim. |
 | `promote(P, S, T, claim)` | Change active/staged state to S/T without allocation or dependence on a clock or lookup-selected key. |
 | `capabilities()` | Report suite, non-exportability, deletion, rollback, attestation, capacity, backup, and clone guarantees without exaggeration. |
 
@@ -141,13 +141,16 @@ TransitionClaimV1(
 )
 ```
 
-The batch commitment is over the exact causally referenced purge-operation
-fact ids. There is no timestamp in the claim. Fact authoring still captures
-“now” as required by the source contract, but refs, needs, the claim, and the
-closed pile establish every relationship. `S` and `T` mean the actual
-suite-qualified public commitments, never aliases or generation labels. A
-retry supplies the originally saved prepared tuple; the provider does not
-reconstruct it by looking up whichever handles currently occupy those labels.
+The batch commitment is over the canonical set of exact causally referenced
+purge-operation fact ids. Repeating the same ref does not add a causal
+relationship and therefore does not change the commitment; an implementation
+may equivalently reject duplicate refs at fact validation. There is no
+timestamp in the claim. Fact authoring still captures “now” as required by the
+source contract, but refs, needs, the claim, and the closed pile establish every
+relationship. `S` and `T` mean the actual suite-qualified public commitments,
+never aliases or generation labels. A retry supplies the originally saved
+prepared tuple; the provider does not reconstruct it by looking up whichever
+handles currently occupy those labels.
 
 For a predecessor P:
 
@@ -184,7 +187,10 @@ wrap inventory, and local absence are not triggers or proofs.
 3. Atomically claim `(P, S, T, batch)`.
 4. Author the non-wrap reservation and its complete dependency-first closed
    pile.
-5. Close the P writer fence. Abort or drain every P lease.
+5. Close the P writer fence in provider-protected state before reporting it
+   closed. Abort or drain every P lease. On the rollback-resistant tier, an old
+   application snapshot cannot remove that closing phase or re-enable a saved
+   P lease.
 6. Load the purge-target manifest frozen by the claim. A different or omitted
    manifest fails; exact purge targets are not copied to S.
 7. Open each live P envelope through the provider using the authoritative cover
@@ -195,17 +201,20 @@ wrap inventory, and local absence are not triggers or proofs.
    complete; an envelope cannot choose the handle by self-describing another
    live generation, and a relabeled, transplanted, or corrupt record blocks P
    destruction. Clear plaintext buffers.
-8. Verify that every survivor has an S envelope, that the live S/T handles
-   still match the exact public-key bytes in the claim, and that no committed
-   record can still be written under P.
+8. Immediately before P destruction, require the current survivor ids to equal
+   the exact set frozen in the migration proof, cryptographically reopen every
+   authoritative survivor as S, verify that the live S/T handles still match
+   the exact claim, and verify that no committed record can still be written
+   under P. A missing record, metadata labels, or an earlier completion bit
+   alone are insufficient.
 9. Durably mark migration prepared, then destroy P and advance the hardware
    retirement position where supported.
 10. Promote the already existing S/T pair. No allocation is permitted after P
     destruction.
-11. Revalidate that the live S and staged T handles still match both
-    suite-qualified public commitments in the accepted claim. Publish durable
-    completion evidence and finalized S only after that check. Only then can S
-    satisfy key-wrap, request, proactive-share, or healing needs.
+11. Revalidate that the live S and staged T handles and S's persisted parent
+    claim ref still match the accepted claim. Publish durable completion
+    evidence and finalized S only after that check. Only then can S satisfy
+    key-wrap, request, proactive-share, or healing needs.
 12. Garbage-collect superseded P metadata and ciphertext opportunistically.
     Archived P ciphertext is assumed to survive.
 
@@ -221,8 +230,8 @@ transition.
 | Before T is durable | P/S remain steady. Delete or track any orphan; do not claim or fence. |
 | After T, before claim | Retry with the same prepared T or discard T while P is still unclaimed. |
 | After claim, before fence | Resume only the identical P/S/T/batch claim. A sibling is a conflict. |
-| After fence, during migration | Keep P fenced and live. Resume the immutable manifest idempotently; do not rescan a moving set. |
-| After migration, before P destruction | Verify the S copies again, then resume destruction. P is still recoverable but no longer writable. |
+| After fence, during migration | Keep P fenced and live. On the strong tier the provider-protected fence survives application-state rollback, so restored leases still fail their commit CAS. Resume the immutable manifest idempotently; do not rescan a moving set. |
+| After migration, before P destruction | Compare the live record ids with the frozen survivor set and cryptographically reopen every authoritative S survivor again; deletion, insertion, corruption, or relabeling fails with P intact. Then resume destruction. P is still recoverable but no longer writable. |
 | After P destruction, before promotion | Retry destruction idempotently. If rollbackable destruction metadata was lost, reconstruct it only when protected retirement state contains the exact suite-qualified P/S/T/batch claim, its floor has advanced through S, and P is absent; then reconcile forward. Never allocate a replacement S or T and never restore P. |
 | After promotion, before finalization | S/T are durable but S remains ineligible for shared wraps until completion evidence closes. |
 | After finalization | Duplicate completion/finalization coalesces. Late P mismatch remains a conflict. |

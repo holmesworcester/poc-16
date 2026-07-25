@@ -12,6 +12,11 @@
         "next_claim_requires_finalized_predecessor": true,
         "writer_lease_generation": "caller-supplied-exact",
         "cover_expected_context": "separate-authoritative-record",
+        "duplicate_operation_refs": "canonical-set",
+        "protected_fence_phase_required": true,
+        "destroy_revalidates_survivors": true,
+        "migration_proof": "exact-survivor-id-set",
+        "finalization_revalidates_parent_claim": true,
         "recipient_generations": [
             "P",
             "S",

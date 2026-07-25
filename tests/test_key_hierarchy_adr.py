@@ -32,7 +32,7 @@ def generation_index(generation):
 
 def batch_commitment(operations):
     canonical = json.dumps(
-        sorted(operations), separators=(",", ":")
+        sorted(set(operations)), separators=(",", ":")
     ).encode()
     return hashlib.sha256(b"poc16-retirement-batch-v1\0" + canonical).hexdigest()
 
@@ -89,6 +89,7 @@ class ProviderSnapshot:
     disk: dict
     handles: dict
     hardware_claims: dict
+    protected_fences: set
     hardware_floor: int
 
 
@@ -169,6 +170,7 @@ class ProviderModel:
         self.rollback_resistant = rollback_resistant
         self._handles = {}
         self._hardware_claims = {}
+        self._protected_fences = set()
         self._hardware_floor = 0
         self.peak_handles = 0
         self.disk = {
@@ -374,12 +376,18 @@ class ProviderModel:
             generation != self.active
             or self._is_retired(generation)
             or generation not in self._handles
-            or generation in self.disk["fenced"]
+            or self._fence_closed(generation)
             or generation not in self.disk["finalized"]
         ):
             return "rejected"
         self.disk["leases"][writer] = generation
         return "accepted"
+
+    def _fence_closed(self, generation):
+        return (
+            generation in self.disk["fenced"]
+            or generation in self._protected_fences
+        )
 
     def _cover_context(self, cover_id, generation):
         record = next(
@@ -467,7 +475,7 @@ class ProviderModel:
             generation is None
             or self._is_retired(generation)
             or generation not in self._handles
-            or generation in self.disk["fenced"]
+            or self._fence_closed(generation)
         ):
             return "rejected"
         self.disk["covers"][cover_id] = self._record(
@@ -500,6 +508,9 @@ class ProviderModel:
             or predecessor not in self._handles
         ):
             return "inactive-predecessor", []
+        if self._accepted_claim(predecessor) is None:
+            return "transition-claim-required", []
+        self._protected_fences.add(predecessor)
         self.disk["fenced"].add(predecessor)
         aborted = sorted(
             writer
@@ -546,7 +557,11 @@ class ProviderModel:
                     plaintext,
                 )
         self.disk["covers"] = migrated
-        self.disk["migrated"][predecessor] = (successor, manifest)
+        self.disk["migrated"][predecessor] = (
+            successor,
+            manifest,
+            frozenset(migrated),
+        )
         return "migrated"
 
     def destroy(self, predecessor, successor):
@@ -558,15 +573,31 @@ class ProviderModel:
         if not self._claim_handles_match(claim):
             return "prepared-key-mismatch"
         manifest = self.disk["manifests"].get(predecessor)
-        if self.disk["migrated"].get(predecessor) != (successor, manifest):
+        migration_proof = self.disk["migrated"].get(predecessor)
+        if (
+            migration_proof is None
+            or migration_proof[:2] != (successor, manifest)
+        ):
             return "migration-required"
+        expected_survivors = migration_proof[2]
+        if frozenset(self.disk["covers"]) != expected_survivors:
+            return "survivor-set-mismatch"
         if any(cover_id in self.disk["covers"] for cover_id in manifest):
             return "purge-target-remains"
         if any(
-            record.expected_context.generation == predecessor
+            record.expected_context.generation != successor
             for record in self.disk["covers"].values()
         ):
-            return "predecessor-cover-remains"
+            return "unexpected-survivor-generation"
+        try:
+            for cover_id, record in self.disk["covers"].items():
+                self._open(
+                    cover_id,
+                    record.expected_context,
+                    record.envelope,
+                )
+        except CryptoError:
+            return "successor-cover-validation-failed"
         prior = self.disk["destroyed"].get(predecessor)
         if prior is not None:
             if prior != successor:
@@ -605,9 +636,15 @@ class ProviderModel:
             return "already-promoted" if prior == expected else "promotion-conflict"
         if self.disk["destroyed"].get(predecessor) != successor:
             return "destruction-required"
-        if self.disk["migrated"].get(predecessor) != (
-            successor,
-            self.disk["manifests"].get(predecessor),
+        migration_proof = self.disk["migrated"].get(predecessor)
+        if (
+            migration_proof is None
+            or migration_proof[:2]
+            != (
+                successor,
+                self.disk["manifests"].get(predecessor),
+            )
+            or migration_proof[2] != frozenset(self.disk["covers"])
         ):
             return "migration-required"
         if self.active != predecessor:
@@ -633,9 +670,15 @@ class ProviderModel:
         claim = self.disk["claims"].get(predecessor)
         if claim is None or claim.successor != successor:
             return "completion-evidence-required"
+        expected_parent_ref = ParentClaimRef(
+            predecessor,
+            transition_claim_id(predecessor, claim),
+        )
         if (
             self.disk["destroyed"].get(predecessor) != successor
             or self.disk["promoted"].get(predecessor) != claim
+            or self.disk["parent_claim_refs"].get(successor)
+            != expected_parent_ref
         ):
             return "completion-evidence-required"
         if successor in self.disk["finalized"]:
@@ -656,6 +699,7 @@ class ProviderModel:
             deepcopy(self.disk),
             deepcopy(self._handles),
             deepcopy(self._hardware_claims),
+            deepcopy(self._protected_fences),
             self._hardware_floor,
         )
 
@@ -664,6 +708,7 @@ class ProviderModel:
         if not self.rollback_resistant:
             self._handles = deepcopy(snapshot.handles)
             self._hardware_claims = deepcopy(snapshot.hardware_claims)
+            self._protected_fences = deepcopy(snapshot.protected_fences)
             self._hardware_floor = snapshot.hardware_floor
 
     def reconcile_status(self):
@@ -757,6 +802,11 @@ def test_adr_selects_bounded_independent_generations_and_explicit_tiers():
         decision["cover_expected_context"]
         == "separate-authoritative-record"
     )
+    assert decision["duplicate_operation_refs"] == "canonical-set"
+    assert decision["protected_fence_phase_required"] is True
+    assert decision["destroy_revalidates_survivors"] is True
+    assert decision["migration_proof"] == "exact-survivor-id-set"
+    assert decision["finalization_revalidates_parent_claim"] is True
 
     tiers = {tier["name"]: tier for tier in FIXTURE["guarantee_tiers"]}
     assert tiers["normal-disk"]["snapshot_erasure_claim"] is False
@@ -892,6 +942,37 @@ def test_saved_predecessor_writer_retry_is_not_rebound_to_successor():
     assert "retained-node-a" not in provider.disk["covers"]
 
 
+def test_protected_fence_survives_pre_destruction_snapshot_rollback():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"survivor")
+    assert provider.acquire_writer_lease(
+        "pre-fence-writer", "P"
+    ) == "accepted"
+    pre_fence_snapshot = provider.snapshot()
+
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    assert "P" in provider._protected_fences
+    assert provider._hardware_floor == 0
+
+    provider.restore(pre_fence_snapshot)
+    assert provider.disk["fenced"] == set()
+    assert provider.disk["leases"] == {"pre-fence-writer": "P"}
+    assert "P" in provider._protected_fences
+    assert provider.acquire_writer_lease(
+        "post-rollback-writer", "P"
+    ) == "rejected"
+    assert provider.commit_cover(
+        "pre-fence-writer",
+        "late-cover",
+        b"must not commit",
+    ) == "rejected"
+    assert "late-cover" not in provider.disk["covers"]
+
+
 def test_cover_envelope_authenticates_every_context_field():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     cover_id = "retained-node-a"
@@ -1011,11 +1092,79 @@ def test_migration_reopens_successor_labeled_records_before_destroying_p():
     assert provider.destroy("P", "S") == "migration-required"
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    (
+        ("ciphertext", "successor-cover-validation-failed"),
+        ("authoritative-generation", "unexpected-survivor-generation"),
+        ("envelope-generation", "successor-cover-validation-failed"),
+        ("deleted-record", "survivor-set-mismatch"),
+    ),
+)
+def test_destroy_revalidates_each_successor_record_after_migration(
+    mutation,
+    expected,
+):
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"survivor")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+
+    record = provider.cover_record("frontier-root")
+    if mutation == "deleted-record":
+        del provider.disk["covers"]["frontier-root"]
+    elif mutation == "ciphertext":
+        envelope = replace(
+            record.envelope,
+            ciphertext=record.envelope.ciphertext[:-1]
+            + bytes([record.envelope.ciphertext[-1] ^ 1]),
+        )
+        record = replace(record, envelope=envelope)
+    elif mutation == "authoritative-generation":
+        record = replace(
+            record,
+            expected_context=replace(
+                record.expected_context,
+                generation="P",
+            ),
+        )
+    else:
+        record = replace(
+            record,
+            envelope=replace(
+                record.envelope,
+                context=replace(
+                    record.envelope.context,
+                    generation="T",
+                ),
+            ),
+        )
+    if mutation != "deleted-record":
+        provider.disk["covers"]["frontier-root"] = record
+
+    assert provider.destroy("P", "S") == expected
+    assert "P" in provider._handles
+    assert provider._hardware_floor == generation_index("P")
+    assert provider.disk["destroyed"] == {}
+
+
 def test_transition_steps_reject_unclaimed_successors_and_changed_manifest():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     covers = cover_fixture()
     for cover_id, plaintext in covers.items():
         provider.seed_cover(cover_id, plaintext)
+
+    assert provider.fence_and_drain("P") == (
+        "transition-claim-required",
+        [],
+    )
+    assert provider.disk["fenced"] == set()
+    assert provider._protected_fences == set()
 
     transition = FIXTURE["decision"]["transition_batches"][0]
     operations = transition["purge_operations"]
@@ -1066,6 +1215,32 @@ def test_claim_binds_actual_public_keys_and_rejects_replaced_staged_handle():
     assert provider.migrate("P", "S", manifest) == "prepared-key-mismatch"
     assert provider.disk["destroyed"] == {}
     assert provider.open_cover("frontier-root") == b"survivor"
+
+
+def test_duplicate_operation_refs_have_one_canonical_batch_commitment():
+    operations = ("purge-node-b", "purge-node-c")
+    duplicated = (
+        "purge-node-c",
+        "purge-node-b",
+        "purge-node-b",
+        "purge-node-c",
+    )
+    assert batch_commitment(operations) == batch_commitment(duplicated)
+    assert purge_targets_for_operations(operations) == (
+        purge_targets_for_operations(duplicated)
+    )
+
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    duplicate_retry = replace(
+        prepared,
+        operations=prepared.operations + prepared.operations,
+    )
+    assert duplicate_retry.claim == prepared.claim
+    assert provider.claim(duplicate_retry) == "coalesced"
 
 
 @pytest.mark.parametrize("replace_before_prepare", (True, False))
@@ -1162,6 +1337,27 @@ def test_finalization_revalidates_both_committed_handles(
         assert provider._generate(generation) == "generated"
     assert provider.finalize("P", "S") == "completion-evidence-required"
     assert provider.wrap_eligible == set()
+
+
+def test_finalization_revalidates_explicit_parent_claim_ref():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+    assert provider.destroy("P", "S") == "destroyed"
+    assert provider.promote(prepared) == "promoted-without-allocation"
+
+    parent_ref = provider.disk["parent_claim_refs"].pop("S")
+    assert provider.finalize("P", "S") == "completion-evidence-required"
+    assert provider.wrap_eligible == set()
+
+    provider.disk["parent_claim_refs"]["S"] = parent_ref
+    assert provider.finalize("P", "S") == "finalized"
+    assert provider.wrap_eligible == {"S"}
 
 
 def test_destroy_retry_rehydrates_evidence_from_protected_retirement_state():
