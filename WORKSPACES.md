@@ -410,8 +410,11 @@ the differing subtrees in parallel. A `Range` read of a node's fingerprint regio
 and because one fat node holds *all* its children's fingerprints, one fetch prunes many children
 — round-trips drop too. Trade vs. the flat manifest: a 2–3-level fat walk instead of one manifest
 GET, bought with structural sharing on writes and unbounded scale (the flat manifest itself grew
-with page count); keep a cached top node as a manifest-equivalent only if single-fetch full
-catch-up matters. None of this is novel — it is the **Merkle Search Tree** (Auvolat & Taïani,
+with page count). **No manifest-equivalent is kept** — full catch-up is already round-trip-cheap:
+the fat tree is only ~2–3 levels (log_B with high fanout), each level fetched in parallel, then
+bandwidth-bound page transfer. A manifest would shave ~2 discovery waves (a few ms), negligible
+against the data and the ~1000-subrequest pagination that dominates a large catch-up. This holds
+only because nodes are **fat** (binary would be ~log₂N ≈ 30 waves and *would* want a manifest). None of this is novel — it is the **Merkle Search Tree** (Auvolat & Taïani,
 SRDS 2019) / **prolly tree** (Noms → **Dolt**, which `bd` runs on) line: history-independent,
 content-addressed, content-defined chunking (à la **LBFS**, SOSP 2001). Reconciliation is
 **Range-Based Set Reconciliation** (Meyer 2023; Willow/Earthstar), with **Dynamo** Merkle
