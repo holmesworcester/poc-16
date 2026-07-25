@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import facts
 from .close import close, decode_pile, encode_pile
 from .crypto import h
-from .fact import Fact, from_json
+from .fact import Fact, canon, from_json
 from .keychain import Keychain
 from .kernel import (
     Judgment,
@@ -211,18 +211,20 @@ class Node:
                 out.append(v)
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
-            pruned = set()
+            pruned, restored = set(), set()
             if newfids:
                 shadows = self._shadows(ws, newfids)
-                pruned = self._update_proofs(ws, newfids, shadows)
-                if pruned:
+                pruned, restored = self._update_proofs(
+                    ws, newfids, shadows)
+                if pruned or restored:
                     self._rebuild_globals(ws)
             idx.commit()
-            if pruned:
+            if pruned or restored:
                 self._reproject.add(ws)
                 out = [valid for valid in out
                        if valid.fact.fid not in pruned]
-                newfids = [fid for fid in newfids if fid not in pruned]
+                newfids = sorted(
+                    (set(newfids) | restored) - pruned)
             return out, newfids
         except Exception:
             idx.rollback()
@@ -231,10 +233,12 @@ class Node:
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
         deps? Any new offer for an address that now has more than one provider
-        might change its shortest-proof winner under a frozen range, so the
-        generic core drops the memo rather than knowing which offer names
-        families consume."""
+        might change its shortest-proof winner under a frozen range. A match
+        against a quarantined provider can also repair an absent proof. In
+        either case the generic core drops the memo rather than knowing which
+        offer names families consume."""
         idx = self.idx(ws)
+        quarantined = None
         for fid in newfids:
             fact = self.fact_of(ws, fid)
             if fact is None:
@@ -243,6 +247,18 @@ class Node:
                 if idx.execute(
                         "SELECT COUNT(*) FROM offers WHERE name=? AND a0=? AND a1=?",
                         (name, a0, a1)).fetchone()[0] > 1:
+                    return True
+                if quarantined is None:
+                    quarantined = set()
+                    for key in self.store(ws).list("quarantine/"):
+                        try:
+                            retained = from_json(json.loads(
+                                self.store(ws).get(key)))
+                        except Exception:
+                            continue
+                        if key == "quarantine/" + retained.fid:
+                            quarantined.update(retained.offers())
+                if (name, a0, a1) in quarantined:
                     return True
         return False
 
@@ -260,6 +276,48 @@ class Node:
                 unresolved.add(fid)
         return unresolved
 
+    def _restore_quarantine(self, ws):
+        """Reinsert previously valid facts before recomputing authority.
+
+        A canonical winner can change twice: a conflict can first orphan a
+        downstream fact, then a later shorter proof can restore its original
+        authority source. Keep pruned facts outside the published set so they
+        cannot poison a leaf, but retain them locally so that second change is
+        history-independent and survives an index rebuild.
+        """
+        idx, restored = self.idx(ws), set()
+        for key in self.store(ws).list("quarantine/"):
+            try:
+                fact = from_json(json.loads(self.store(ws).get(key)))
+            except Exception:
+                continue
+            handler = facts.handler_for(fact.t)
+            if key != "quarantine/" + fact.fid \
+                    or handler is None or not handler.DURABLE:
+                continue
+            if idx.execute(
+                    "SELECT 1 FROM facts WHERE fid=?",
+                    (fact.fid,)).fetchone() is not None:
+                continue
+            idx.execute(
+                "INSERT INTO facts VALUES(?,?,?,?)",
+                (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
+            for name, a0, a1 in fact.offers():
+                idx.execute(
+                    "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
+                    (name, a0, a1, fact.fid))
+            restored.add(fact.fid)
+        return restored
+
+    def _quarantine(self, ws, fids):
+        """Retain kernel-valid facts that are outside the current proof DAG."""
+        st = self.store(ws)
+        for fid in sorted(fids):
+            fact = self.fact_of(ws, fid)
+            if fact is not None:
+                st.put_if_absent(
+                    "quarantine/" + fid, canon(fact.to_json()))
+
     def _prune_unresolved(self, ws):
         """Derive the same finite-proof subset from any arrival order."""
         idx, pruned = self.idx(ws), set()
@@ -268,6 +326,7 @@ class Node:
             if not unresolved:
                 return pruned
             pruned.update(unresolved)
+            self._quarantine(ws, unresolved)
             idx.executemany(
                 "DELETE FROM offers WHERE src=?",
                 ((fid,) for fid in unresolved))
@@ -292,6 +351,8 @@ class Node:
     def _update_proofs(self, ws, newfids, shadows):
         """Rank an append or prune to the union's canonical finite subset."""
         idx = self.idx(ws)
+        restored = self._restore_quarantine(ws) \
+            if shadows or not newfids else set()
         missing = {
             fid for (fid,) in idx.execute(
                 "SELECT DISTINCT o.src FROM offers o "
@@ -299,14 +360,15 @@ class Node:
                 "WHERE p.fid IS NULL")
         }
         if not missing:
-            return set()
-        if shadows or not newfids or not missing <= set(newfids):
-            return self._prune_unresolved(ws)
+            return set(), restored
+        if shadows or restored or not newfids \
+                or not missing <= set(newfids):
+            return self._prune_unresolved(ws), restored
         unresolved = extend_proofs(
             idx, missing, lambda fid: self.fact_of(ws, fid))
         if unresolved:
-            return self._prune_unresolved(ws)
-        return set()
+            return self._prune_unresolved(ws), restored
+        return set(), restored
 
     def commit(self, ws, newfids=()):
         st, idx = self.store(ws), self.idx(ws)
@@ -314,11 +376,13 @@ class Node:
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
         try:
-            pruned = self._update_proofs(ws, newfids, shadows)
-            if pruned:
+            pruned, restored = self._update_proofs(
+                ws, newfids, shadows)
+            if pruned or restored:
                 self._rebuild_globals(ws)
                 self._reproject.add(ws)
-                newfids = tuple(fid for fid in newfids if fid not in pruned)
+                newfids = tuple(sorted(
+                    (set(newfids) | restored) - pruned))
             idx.commit()
         except Exception:
             idx.rollback()
@@ -332,7 +396,7 @@ class Node:
 
         memo = None
         prev = st.get("root")
-        if prev and not shadows and not pruned:
+        if prev and not shadows and not pruned and not restored:
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
                               deps_of, ws, self.globals(ws), memo)

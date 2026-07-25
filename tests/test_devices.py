@@ -429,3 +429,119 @@ def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
     assert node.app.execute(
         "SELECT user, source FROM devices WHERE ws=? AND pk=?",
         (workspace, target)).fetchone() == (deep, deep_claim.fid)
+
+
+def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
+        tmp_path):
+    """A fact that temporarily loses its device-set proof must not be lost.
+
+    The short claim first beats the deep claim and orphans its child. A later
+    direct rejoin shortens the deep proof enough to win again. Both delivery
+    orders, including an index rebuild while the child is quarantined, must
+    publish the same restored set.
+    """
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "root", ts=1)
+    root_secret, root = source.identity(workspace)
+
+    q_secret, q, _ = add_member(source, workspace, "q", ts=10)
+    short_secret, short, _ = add_member(
+        source, workspace, "short", inviter=(q_secret, q), ts=20)
+    deep_secret, deep, _ = add_member(
+        source, workspace, "d1", ts=30)
+    for ordinal, name in enumerate(("d2", "d3", "deep")):
+        deep_secret, deep, _ = add_member(
+            source, workspace, name, inviter=(deep_secret, deep),
+            ts=40 + 10 * ordinal)
+
+    for secret, public, label in (
+            (short_secret, short, "short-primary"),
+            (deep_secret, deep, "deep-primary")):
+        source.keychain.add_identity(secret)
+        source.bind_identity(workspace, public)
+        cmds.bind_device(source, workspace, label)
+
+    target_secret, target = keypair()
+    source.keychain.add_identity(target_secret)
+    deep_claim = _inject_device_claim(
+        source, workspace, deep_secret, deep, deep, target,
+        "from-deep", 200)
+    source.bind_identity(workspace, target)
+    _, child = keypair()
+    child_claim = _inject_device_claim(
+        source, workspace, target_secret, target, deep, child,
+        "child", 201)
+    deep_pile = closed_subset(
+        source, workspace, [deep_claim.fid, child_claim.fid])
+
+    short_claim = _inject_device_claim(
+        source, workspace, short_secret, short, short, target,
+        "from-short", 400)
+    short_pile = closed_subset(source, workspace, [short_claim.fid])
+    assert source.fact_of(workspace, child_claim.fid) is None
+    assert source.store(workspace).has(
+        "quarantine/" + child_claim.fid)
+
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(root, invite_public, 500)
+    invitation_sig = signature(root_secret, root, invitation, 500)
+    rejoined = user(
+        invitation, invite_secret, deep, "deep-direct", 501)
+    rejoined_sig = signature(deep_secret, deep, rejoined, 501)
+    rejoin_deps = {
+        invitation_sig.fid: [],
+        invitation.fid: [
+            invitation_sig.fid,
+            member_src(source, workspace, root),
+        ],
+        rejoined_sig.fid: [],
+        rejoined.fid: [invitation.fid, rejoined_sig.fid],
+    }
+    source.ingest_new(
+        workspace,
+        [invitation_sig, invitation, rejoined_sig, rejoined],
+        rejoin_deps,
+    )
+    rejoin_pile = closed_subset(source, workspace, [rejoined.fid])
+    assert source.fact_of(workspace, child_claim.fid) == child_claim
+
+    first = Node(str(tmp_path / "first"))
+    for ordinal, pile in enumerate((deep_pile, short_pile)):
+        deliver(
+            first, workspace, pile,
+            member=f"first{ordinal}".ljust(16, "a"))
+        first.turn(workspace)
+    assert first.fact_of(workspace, child_claim.fid) is None
+    assert first.store(workspace).has(
+        "quarantine/" + child_claim.fid)
+
+    # Both SQLite databases are derived. Rebuilding the fact index from the
+    # manifest must retain the local, previously kernel-valid quarantine.
+    first.idx(workspace).executescript(
+        "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
+        "DELETE FROM globals; DELETE FROM meta;")
+    first.idx(workspace).commit()
+    first.rebuild(workspace)
+    assert first.fact_of(workspace, child_claim.fid) is None
+    deliver(first, workspace, rejoin_pile, member="first2aaaaaaaaaa")
+    first.turn(workspace)
+
+    second = Node(str(tmp_path / "second"))
+    for ordinal, pile in enumerate(
+            (deep_pile, rejoin_pile, short_pile)):
+        deliver(
+            second, workspace, pile,
+            member=f"second{ordinal}".ljust(16, "a"))
+        second.turn(workspace)
+
+    for current in (source, first, second):
+        assert current.fact_of(workspace, child_claim.fid) == child_claim
+        assert current.app.execute(
+            "SELECT user FROM devices WHERE ws=? AND pk=?",
+            (workspace, child)).fetchone() == (deep,)
+    assert all_fids(source, workspace) \
+        == all_fids(first, workspace) \
+        == all_fids(second, workspace)
+    assert source.store(workspace).get("root") \
+        == first.store(workspace).get("root") \
+        == second.store(workspace).get("root")

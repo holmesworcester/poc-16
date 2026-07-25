@@ -138,9 +138,14 @@ ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
 only their new offer sources and keep the incremental path. On a shadow, facts,
 offers, globals, and proofs share one SQLite transaction: merge first derives
 the canonical finite-proof subset of the union, prunes only facts outside that
-subset as litter, and rebuilds affected projections. Opposite arrival orders
-therefore select the same set, while an unrelated valid pile in the same turn
-still lands.
+subset as litter, and rebuilds affected projections. A pruned fact already
+passed the kernel, so the node retains its canonical bytes under
+`quarantine/<fid>` and retries it on later authority changes. This matters
+when a conflict first orphans a downstream grant and a later shorter proof
+restores its original authority; the retry also survives a derived-index
+wipe. Once restored, the fact returns to the ordinary manifest and sync path.
+Opposite arrival orders therefore select the same set, while an unrelated
+valid pile in the same turn still lands.
 `test_incremental_equals_full` asserts
 incremental == full at every step across promotions, a straggler, a new
 member, and an eviction; `test_shadow_guard_keeps_identity` exercises the

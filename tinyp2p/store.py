@@ -2,7 +2,8 @@
 
 Layout: root (the CAS'd manifest, only mutable key besides piles/invites),
 obj/<hash> (leaf piles, tails, blobs — immutable, content-addressed),
-pile/<member>/<hash> (ingress), invite/<id> (public reads).
+pile/<member>/<hash> (ingress), invite/<id> (public reads), and
+quarantine/<fid> (node-local retention for a previously valid pruned fact).
 """
 import os
 import re
