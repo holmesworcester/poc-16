@@ -61,18 +61,12 @@ def materialize(db, workspace, valid):
         (workspace, body["pk"], body["pk"], body["label"], fact.fid))
 
 
-def reconcile(db, workspace, index, fact_of, valids, changed=None):
+def reconcile(db, workspace, index, fact_of, valids):
     """Project the same canonical device-key winners used by the kernel.
 
     A duplicate offer in any family forces a proof rebuild and can change an
     existing device claim's rank, even when this batch has no new device fact.
-    Closure replays are excluded when the engine supplies ``changed``: their
-    providers were already reflected by an earlier projection.
     """
-    if changed is not None:
-        valids = tuple(
-            valid for valid in valids
-            if valid.fact.fid in changed)
     offered = [
         offer
         for valid in valids

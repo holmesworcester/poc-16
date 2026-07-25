@@ -11,7 +11,12 @@ assert len(ROUTES) == len(MODULES), "duplicate fact tag"
 assert all(not hasattr(module, "evaluate") or not module.DURABLE for module in MODULES), \
     "only ephemeral families may inspect evaluate-mode globals"
 
-APP_SCHEMA = auth.APP_SCHEMA + content.APP_SCHEMA
+APP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projection_meta(
+    ws TEXT PRIMARY KEY,
+    root TEXT NOT NULL
+);
+""" + auth.APP_SCHEMA + content.APP_SCHEMA
 
 
 def handler_for(tag):
@@ -23,12 +28,11 @@ def materialize(db, workspace, valid):
     ROUTES[valid.fact.t].materialize(db, workspace, valid)
 
 
-def reconcile(db, workspace, index, fact_of, valids, changed=None):
+def reconcile(db, workspace, index, fact_of, valids):
     """Let families reconcile projections that use canonical offer winners."""
     for module in MODULES:
         if hasattr(module, "reconcile"):
-            module.reconcile(
-                db, workspace, index, fact_of, valids, changed=changed)
+            module.reconcile(db, workspace, index, fact_of, valids)
 
 
 def clear(db, workspace):

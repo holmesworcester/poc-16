@@ -69,6 +69,7 @@ class Node:
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
+            self._sync_projection(ws)
 
     # ---- node-local state ----------------------------------------------------
 
@@ -139,6 +140,24 @@ class Node:
                      or semantic_upgrade):
             self.rebuild(ws, republish=semantic_upgrade)
 
+    def _sync_projection(self, ws):
+        """Rebuild the app read model when it trails the committed manifest."""
+        root = self.store(ws).etag("root") or ""
+        row = self.app.execute(
+            "SELECT root FROM projection_meta WHERE ws=?",
+            (ws,),
+        ).fetchone()
+        if row is None or row[0] != root:
+            self._reproject.add(ws)
+            self.materialize(ws, ())
+
+    def _stamp_projection(self, ws):
+        """Record the manifest generation reflected by the current app txn."""
+        self.app.execute(
+            "INSERT OR REPLACE INTO projection_meta VALUES(?,?)",
+            (ws, self.store(ws).etag("root") or ""),
+        )
+
     def _stamp(self, ws):
         idx = self.idx(ws)
         idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
@@ -167,6 +186,7 @@ class Node:
             piles = st.list("pile/")
             if not piles:
                 return []  # nothing delivered; drain-on-read stays free
+            self._sync_projection(ws)
             units = []
             for k in piles:
                 try:
@@ -430,6 +450,7 @@ class Node:
 
     def materialize(self, ws, valids, changed=None):
         valids = tuple(valids)
+        changed = None if changed is None else frozenset(changed)
         db = self.app
         rebuilding = ws in self._reproject
         try:
@@ -451,12 +472,18 @@ class Node:
                     for fact in ordered
                 )
                 changed = None
+            elif changed is not None:
+                # The aligned projection already contains closure replays.
+                # Normalize once so a large batch stays O(valids + changed).
+                valids = tuple(
+                    valid for valid in valids
+                    if valid.fact.fid in changed)
             for valid in valids:
                 facts.materialize(db, ws, valid)
             facts.reconcile(
                 db, ws, self.idx(ws),
-                lambda fid: self.fact_of(ws, fid), valids,
-                changed=changed)
+                lambda fid: self.fact_of(ws, fid), valids)
+            self._stamp_projection(ws)
             db.commit()
         except Exception:
             db.rollback()
@@ -521,5 +548,7 @@ class Node:
                 # providers for the same fact ids. Fingerprints cover ids, not
                 # closure edges, so old fences are deliberately not memoized.
                 self.commit(ws, reuse=False)
+                self._stamp_projection(ws)
+                self.app.commit()
             else:
                 self._stamp(ws)

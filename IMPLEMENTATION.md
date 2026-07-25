@@ -25,8 +25,11 @@ move multi-MB files, survive stragglers, eviction, and restarts —
 Everything enters through a pile: local commands, pulled units, and pushed
 piles all land in `pile/<member>/<hash>` and go through the same `turn()`.
 Independent piles validate in parallel (each kernel call gets its own
-`:memory:` scratchpad); handlers and projectors only ever
-`INSERT OR IGNORE` by id, so replays and races are harmless by construction.
+`:memory:` scratchpad). The app projection records the manifest generation it
+reflects: a lagging generation is reprojected before ingress replay, while an
+aligned generation materializes only the newly indexed ids. Closure replays
+are therefore projection no-ops, including after the app commit but before
+the ingress pile is retired.
 This holds *because validity is globals-blind* — a pure function of each
 pile's closure. An operation whose verdict depends on a global that can change
 concurrently (e.g. set-valued deletion — deleting a whole channel, not one

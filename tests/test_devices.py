@@ -16,7 +16,7 @@ from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.auth.workspace import workspace as workspace_fact
-from tinyp2p.kernel import drain, evaluate, offer_src, resolve_deps
+from tinyp2p.kernel import Valid, drain, evaluate, offer_src, resolve_deps
 from tinyp2p.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
@@ -171,6 +171,31 @@ def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
     ]
     assert {row["pk"] for row in devices(node, workspace, founder)} \
         == {founder, laptop}
+
+
+def test_projection_normalizes_changed_ids_before_filtering(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    anchor = node.fact_of(workspace, workspace)
+
+    class ChangedIds(list):
+        def __contains__(self, item):
+            raise AssertionError("projection performed linear list membership")
+
+    # Independent piles repeat closure facts, so a bulk turn can contain many
+    # Valids for one already-known anchor. The projection boundary must build
+    # its membership index once rather than scan merge's list per Valid.
+    valids = [Valid(anchor, ())] * 128
+    changed = ChangedIds(
+        [f"{ordinal:064x}" for ordinal in range(4096)]
+        + [anchor.fid]
+    )
+    node.materialize(workspace, valids, changed=changed)
+
+    assert node.app.execute(
+        "SELECT role FROM members WHERE ws=? AND pk=?",
+        (workspace, node.identity_id(workspace)),
+    ).fetchone() == ("admin",)
 
 
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
@@ -581,7 +606,8 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
     assert node.fact_of(workspace, child_claim.fid) is None
 
 
-def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
+def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
+        tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "root")
     root_secret, root = node.identity(workspace)
@@ -603,10 +629,24 @@ def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
         cmds.bind_device(node, workspace, label)
 
     _, target = keypair()
+    deep_item = short_item = None
+    for ordinal in range(1024):
+        candidate_deep = device_invite_fact(
+            deep, deep, target, f"from-deep-{ordinal}", 200)
+        candidate_short = device_invite_fact(
+            short, short, target, f"from-short-{ordinal}", 201)
+        if candidate_short.fid < candidate_deep.fid:
+            deep_item, short_item = candidate_deep, candidate_short
+            break
+    assert deep_item is not None and short_item is not None
     deep_claim = _inject_device_claim(
-        node, workspace, deep_secret, deep, deep, target, "from-deep", 200)
+        node, workspace, deep_secret, deep, deep, target,
+        deep_item.body["label"], deep_item.ts)
     short_claim = _inject_device_claim(
-        node, workspace, short_secret, short, short, target, "from-short", 201)
+        node, workspace, short_secret, short, short, target,
+        short_item.body["label"], short_item.ts)
+    assert deep_claim == deep_item
+    assert short_claim == short_item
     assert node.app.execute(
         "SELECT user, source FROM devices WHERE ws=? AND pk=?",
         (workspace, target)).fetchone() == (short, short_claim.fid)
@@ -621,25 +661,68 @@ def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", ts + 1)
     rejoined_sig = signature(deep_secret, deep, rejoined, ts + 1)
-    fresh = node.ingest_new(
-        workspace,
-        [invitation_sig, invitation, rejoined_sig, rejoined],
-        {
-            invitation_sig.fid: [],
-            invitation.fid: [
-                invitation_sig.fid,
-                member_src(node, workspace, root),
-            ],
-            rejoined_sig.fid: [],
-            rejoined.fid: [invitation.fid, rejoined_sig.fid],
-        },
+    deps = {
+        invitation_sig.fid: [],
+        invitation.fid: [
+            invitation_sig.fid,
+            member_src(node, workspace, root),
+        ],
+        rejoined_sig.fid: [],
+        rejoined.fid: [invitation.fid, rejoined_sig.fid],
+    }
+    new = {
+        fact.fid: fact
+        for fact in (invitation_sig, invitation, rejoined_sig, rejoined)
+    }
+    stream = close(
+        list(new.values()),
+        lambda fid: deps[fid] if fid in deps else resolve_deps(
+            node.fact_of(workspace, fid), node.idx(workspace)),
+        lambda fid: new.get(fid) or node.fact_of(workspace, fid),
     )
+    pile = encode_pile(stream)
+    deliver(node, workspace, pile, member="crash00000000000")
+
+    # Model a process death after the manifest/index commit but before the app
+    # transaction. The retained ingress pile must repair the lagging projection
+    # on retry even though every fact is now already present in the index.
+    original_materialize = node.materialize
+
+    def crash_after_commit(*args, **kwargs):
+        raise RuntimeError("simulated projection crash")
+
+    monkeypatch.setattr(node, "materialize", crash_after_commit)
+    with pytest.raises(RuntimeError, match="simulated projection crash"):
+        node.turn(workspace)
+    monkeypatch.setattr(node, "materialize", original_materialize)
+
+    assert offer_src(
+        node.idx(workspace), "device_key", target) == deep_claim.fid
+    assert node.app.execute(
+        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
+        (workspace, target)).fetchone() == (short, short_claim.fid)
+    assert node.store(workspace).list("pile/")
+
+    fresh = node.turn(workspace)
 
     assert fresh
     assert not any(
         name == "device_key"
         for valid in fresh
         for name, _, _ in valid.fact.offers())
+    assert node.app.execute(
+        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
+        (workspace, target)).fetchone() == (deep, deep_claim.fid)
+
+    # A late duplicate delivery of the lower-fid but rank-losing claim is a
+    # projection no-op once this manifest generation has been materialized.
+    deliver(
+        node,
+        workspace,
+        closed_subset(node, workspace, [short_claim.fid]),
+        member="stale00000000000",
+    )
+    node.turn(workspace)
     assert node.app.execute(
         "SELECT user, source FROM devices WHERE ws=? AND pk=?",
         (workspace, target)).fetchone() == (deep, deep_claim.fid)
