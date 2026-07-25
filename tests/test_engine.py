@@ -24,6 +24,7 @@ from core.suppression import (
 from .util import (
     all_fids,
     author_msg,
+    channel_delete,
     closed_subset,
     deliver,
     mismatched_tree_key,
@@ -1743,6 +1744,78 @@ def test_sync_deduplicates_closure_facts_across_index_pushes(
     assert pulled == 0
     assert pushed == len(set(all_fids(source, workspace)) - before)
     assert len(piles) == 1
+    assert destination.store(workspace).get("root") \
+        == source.store(workspace).get("root")
+
+
+def test_sync_closes_a_primary_deletion_leaf_under_suppression(
+        tmp_path, monkeypatch):
+    source, workspace, _, _ = suppression_world(
+        tmp_path / "source", monkeypatch,
+        initial_secret=load_sk(f"{1:064x}"))
+    targets = [
+        cmds.post(
+            source, workspace, "wide", f"message {ordinal}",
+            ts=200 + ordinal,
+        )
+        for ordinal in range(32)
+    ]
+    deletion = channel_delete(targets[0], "wide", 300)
+    source.ingest_new(
+        workspace, [deletion], {deletion.fid: [targets[0]]})
+    destination = Node(str(tmp_path / "destination"))
+    existing = set(all_fids(source, workspace)) - {deletion.fid}
+    deliver(
+        destination, workspace,
+        closed_subset(source, workspace, existing),
+    )
+    destination.turn(workspace)
+    transferred, primary = [], []
+    actual_pull = sync_module.pull
+    actual_diff = tree.diff
+    actual_closure_sync = sync_module.closure_sync
+
+    def capture_pull(node, ws, oid, raw):
+        transferred.extend(decode_pile(raw)[0])
+        return actual_pull(node, ws, oid, raw)
+
+    def primary_only(*args, **kwargs):
+        return iter(()) if args[2] is shape.SUPP \
+            else actual_diff(*args, **kwargs)
+
+    def capture_primary(view, ranges, supp, fetch):
+        primary.extend(tree.range_facts(
+            view, ranges, fetch, shape.FACT))
+        return actual_closure_sync(view, ranges, supp, fetch)
+
+    class LocalPeer:
+        def __init__(self, node, ws, url):
+            self.node, self.ws = node, ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            raw = source.store(self.ws).get("root")
+            return raw, source.store(self.ws).etag("root")
+
+        def obj(self, oid):
+            return source.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+        def put_pile(self, raw):
+            pytest.fail("destination unexpectedly pushed")
+
+    monkeypatch.setattr(sync_module, "pull", capture_pull)
+    monkeypatch.setattr(sync_module, "closure_sync", capture_primary)
+    monkeypatch.setattr(sync_module, "Peer", LocalPeer)
+    monkeypatch.setattr(tree, "diff", primary_only)
+    assert sync_module.sync(
+        destination, workspace, "local://source") == (1, 0)
+
+    expected = {deletion.fid, *targets}
+    assert expected - {fact.fid for fact in primary}
+    assert expected <= {fact.fid for fact in transferred}
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")
 
