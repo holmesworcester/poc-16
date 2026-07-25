@@ -1,6 +1,7 @@
 """facts/content/file.py — a member-signed immutable blob descriptor."""
 from ...crypto import h
 from ...fact import Fact
+from ...suppression import atom as supp
 from .._commands import publish
 from ..auth import signature
 
@@ -9,9 +10,11 @@ TAG = "file"
 
 # SHAPE
 def file(pk, channel, name, size, blob, ts):
-    return Fact(TAG, ts, [],
-                {"pk": pk, "chan": channel, "name": name,
-                 "size": size, "blob": blob})
+    return Fact(
+        TAG, ts, [supp(channel)],
+        {"pk": pk, "chan": channel, "name": name,
+         "size": size, "blob": blob},
+    )
 
 
 # NEEDS

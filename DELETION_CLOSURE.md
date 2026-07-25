@@ -272,7 +272,11 @@ facts surfaced into the closure by tree traversal alone, no database.*
 - **Envelope exposure:** the death key must live in the **clear envelope** (like
   dep-refs) so `T_supp` builds from envelopes without decrypting bodies. Confirm
   the suppression attribute is envelope-visible, or add an envelope offer for it.
-  Ties to the clear-envelope / dep-refs split.
+  Ties to the clear-envelope / dep-refs split. **Phase-0 resolution:** content
+  facts carry one inert `["supp", "chan", value, "target"]` atom. This is an
+  explicit wire-shape cutover: accepting old markerless `msg`/`file` shapes
+  would also let newly signed facts bypass deletion. Preserving immutable
+  pre-cutover content therefore requires a separately versioned migration.
 - **Embed-annex placement:** MODEL.md superseded the standalone closure object
   with pile-embedded annexes; decide whether `T_supp` victims embed in the pile
   annex at promotion, or stay a read-time walk. The proof uses the read-time walk;

@@ -1,8 +1,9 @@
 """Canonical facts: the family-neutral value and wire codec.
 
-Atoms carry the clear envelope's refs and offers ("refs say where, offers say
-what").  Concrete shapes and all meaning live under :mod:`tinyp2p.facts`;
-this module only gives those families one canonical value to construct.
+Atoms carry the clear envelope's refs, offers, and inert suppression keys
+("refs say where, offers say what"). Concrete shapes and all meaning live
+under :mod:`tinyp2p.facts`; this module only gives those families one
+canonical value to construct.
 """
 import json
 from dataclasses import dataclass, field
@@ -59,6 +60,9 @@ def _atoms_ok(atoms) -> bool:
                 return False
         elif a[0] == "offer":
             if len(a) not in (3, 4):
+                return False
+        elif a[0] == "supp":
+            if len(a) != 4 or not all(isinstance(value, str) for value in a[1:]):
                 return False
         else:
             return False
