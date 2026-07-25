@@ -114,3 +114,27 @@ class FsStore:
             os.remove(self._p(key))
         except FileNotFoundError:
             pass
+
+
+# ---- PLAN SKELETON (poc-16-808.2) — remote trees through the same trait ----
+
+
+class RemoteStore:
+    """Read-only ObjectStore over a walk.Peer, so a remote tree is fetched
+    through the same interface the engine's fetch(oid) driver wraps —
+    sync.py stops special-casing 'their side' (SIMPLIFY.md §1)."""
+
+    def __init__(self, peer):
+        raise NotImplementedError("poc-16-808.2")
+
+    def get(self, key):
+        raise NotImplementedError("poc-16-808.2")
+
+    def has(self, key):
+        raise NotImplementedError("poc-16-808.2")
+
+    def etag(self, key):
+        raise NotImplementedError("poc-16-808.2")
+
+    def list(self, prefix):
+        raise NotImplementedError("poc-16-808.2")

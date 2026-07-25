@@ -360,3 +360,33 @@ def drain(stream, anchor, *, db=None):
 def evaluate(stream, anchor, globals_, *, db=None):
     """Validate an ephemeral payload against committed globals; return bool."""
     return kernel(stream, anchor, mode=EVALUATE, globals_=globals_, db=db).ok
+
+
+# ---- PLAN SKELETON (poc-16-808.3, stage S2) — the path scratchpad -----------
+# SIMPLIFY.md §1. The verified-ancestor context for tree descents becomes a
+# kernel capability, and hoist._judge/_insert/_pop are DELETED — they are this
+# loop, copy-pasted. tree.verify drives it; sync.sync carries ONE scratchpad
+# across consecutive differing ranges, which closes the catchup re-verify tax.
+
+
+class Scratchpad:
+    """Push/pop verified ancestor context (sqlite :memory:, SCHEMA) around
+    the one judge loop. Memory stays O(depth · payload)."""
+
+    def __init__(self, anchor, db=None):
+        raise NotImplementedError("poc-16-808.3")
+
+    def judge(self, stream):
+        """Judge a payload against the accumulated context and absorb it on
+        success — kernel(mode=VALIDATE) without the txn wrapper. Returns
+        (ok, accepted fids)."""
+        raise NotImplementedError("poc-16-808.3")
+
+    def context(self, stream):
+        """Materialize an already-verified payload as context without
+        re-judging (spine reuse: ph in base_phs)."""
+        raise NotImplementedError("poc-16-808.3")
+
+    def pop(self, fids):
+        """Undo one node's payload on backtrack."""
+        raise NotImplementedError("poc-16-808.3")
