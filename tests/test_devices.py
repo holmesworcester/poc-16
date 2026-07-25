@@ -334,6 +334,13 @@ def test_conflicting_authority_converges_to_one_finite_subset(
             "SELECT 1 FROM devices WHERE ws=? AND pk=?",
             (workspace, child)).fetchone() is None
         assert current.store(workspace).list("pile/") == []
+        seen = set()
+        for op, fid in current.idx(workspace).execute(
+                "SELECT op, fid FROM log ORDER BY seq"):
+            if op == "+":
+                seen.add(fid)
+            else:
+                assert fid in seen
     assert all_fids(node, workspace) == all_fids(peer, workspace)
     assert node.store(workspace).get("root") \
         == peer.store(workspace).get("root")

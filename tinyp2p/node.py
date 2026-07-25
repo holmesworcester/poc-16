@@ -4,7 +4,7 @@ One serial loop — turn() — is the only mutator of a workspace:
 
     drain piles -> kernel each (parallel, own scratchpads) -> merge valid/globals
     -> spill blobs -> commit (pure tree fold -> put objects -> CAS root)
-    -> materialize (projectors consume Valid only) -> retire piles
+    -> pump projection log -> retire piles
 
 Everything enters through a pile: local commands, pulled units, pushed
 piles. The index and app dbs are derived projections — delete either and
@@ -24,15 +24,22 @@ from .fact import Fact, canon, from_json
 from .keychain import Keychain
 from .kernel import (
     Judgment,
-    Valid,
     drain,
     extend_proofs,
     proof_rank,
     rebuild_proofs,
     resolve_deps,
 )
+from .pump import (
+    CURSOR_SCHEMA,
+    LOG_SCHEMA,
+    append_admitted,
+    append_retracted,
+    pump,
+)
 from .shape import FACT, key_parts
 from .store import FsStore
+from .suppression import victims
 
 IDX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
@@ -43,8 +50,8 @@ CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-"""
-INDEX_VERSION = "family-contract-v6-fat-tree"
+""" + LOG_SCHEMA
+INDEX_VERSION = "family-contract-v7-pump"
 
 
 def now_ms():
@@ -62,13 +69,14 @@ class Node:
         self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
-        self.app.executescript(facts.APP_SCHEMA)
+        self.app.executescript(facts.APP_SCHEMA + CURSOR_SCHEMA)
         self._stores, self._idx = {}, {}
         self._reproject = set()
         self._quarantine_offer_cache = {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
+            pump(self, ws)  # resume rows committed after the last root publish
 
     # ---- node-local state ----------------------------------------------------
 
@@ -131,8 +139,7 @@ class Node:
         version = self.idx(ws).execute(
             "SELECT v FROM meta WHERE k='index-version'").fetchone()
         semantic_upgrade = version is None or version[0] != INDEX_VERSION
-        if etag and (row is None or row[0] != etag
-                     or semantic_upgrade):
+        if row is None or row[0] != etag or semantic_upgrade:
             self.rebuild(ws, republish=semantic_upgrade)
 
     def _stamp(self, ws):
@@ -187,10 +194,25 @@ class Node:
             for bh, b in blobs.items():
                 st.put_if_absent("obj/" + bh, b)
             self.commit(ws, newfids)
-            self.materialize(ws, fresh)
+            pump(self, ws)
             for k in piles:
                 st.delete(k)  # retire ingress after the CAS, rejects included
             return fresh
+
+    def _log_projection(self, ws, admitted, retracted, reproject):
+        idx = self.idx(ws)
+        admitted = tuple(admitted)
+        retracted = set(retracted)
+        for fid in admitted:
+            retracted.update(victims(self.fact_of(ws, fid)))
+        append_admitted(idx, admitted)
+        append_retracted(idx, sorted(retracted))
+        if reproject:
+            seq = idx.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
+            idx.execute(
+                "INSERT OR REPLACE INTO meta VALUES('reproject', ?)",
+                (seq,))
 
     def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
@@ -214,19 +236,24 @@ class Node:
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
             pruned, restored = set(), set()
+            admitted = set(newfids)
             if newfids:
                 shadows = self._shadows(ws, newfids)
                 pruned, restored = self._update_proofs(
                     ws, newfids, shadows)
                 if pruned or restored:
                     self._rebuild_globals(ws)
-            idx.commit()
             if pruned or restored:
                 self._reproject.add(ws)
                 out = [valid for valid in out
                        if valid.fact.fid not in pruned]
                 newfids = sorted(
                     (set(newfids) | restored) - pruned)
+            self._log_projection(
+                ws, newfids, set(pruned) - admitted - restored,
+                bool(pruned or restored))
+            idx.execute("DELETE FROM meta WHERE k='root'")
+            idx.commit()
             return out, newfids
         except Exception:
             idx.rollback()
@@ -389,11 +416,15 @@ class Node:
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
         try:
+            idx.execute("DELETE FROM meta WHERE k='root'")
             pruned, restored = self._update_proofs(
                 ws, newfids, shadows)
             if pruned or restored:
                 self._rebuild_globals(ws)
                 self._reproject.add(ws)
+                self._log_projection(
+                    ws, sorted(set(restored) - pruned),
+                    set(pruned) - restored, True)
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
             idx.commit()
@@ -408,6 +439,7 @@ class Node:
             return cache[fid]
 
         prev = st.get("root")
+        etag = h(prev) if prev is not None else None
 
         def emit(raw):
             oid = h(raw)
@@ -442,43 +474,14 @@ class Node:
                 lambda fid: self.fact_of(ws, fid), deps_of, emit,
             )
         root = tree.encode_root(tree.Root(view, ws, self.globals(ws)))
-        st.cas("root", st.etag("root"), root)  # the single commit point
+        if st.cas("root", etag, root) is None:  # the single commit point
+            raise RuntimeError("root changed")
         self._stamp(ws)
         return root
 
-    def materialize(self, ws, valids):
-        valids = tuple(valids)
-        db = self.app
-        rebuilding = ws in self._reproject
-        try:
-            if rebuilding:
-                facts.clear(db, ws)
-                idx = self.idx(ws)
-                active = [
-                    self.fact_of(ws, fid)
-                    for (fid,) in idx.execute("SELECT fid FROM facts")
-                ]
-                ordered = close(
-                    active,
-                    lambda fid: resolve_deps(
-                        self.fact_of(ws, fid), idx) or (),
-                    lambda fid: self.fact_of(ws, fid),
-                )
-                valids = tuple(
-                    Valid(fact, tuple(resolve_deps(fact, idx) or ()))
-                    for fact in ordered
-                )
-            for valid in valids:
-                facts.materialize(db, ws, valid)
-            facts.reconcile(
-                db, ws, self.idx(ws),
-                lambda fid: self.fact_of(ws, fid), valids)
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        if rebuilding:
-            self._reproject.discard(ws)
+    def materialize(self, ws, _valids=()):
+        """Transitional benchmark API; the delivery log is authoritative."""
+        return pump(self, ws)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -527,16 +530,23 @@ class Node:
                             leaf, lo, hi, FACT, fetch)
                 result = drain(stream, ws)
                 assert result.ok, "own store failed its own kernel"
-            idx.executescript(
-                "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
-                "DELETE FROM globals;")
-            idx.commit()
+            idx.execute("BEGIN")
+            try:
+                for table in ("facts", "offers", "proofs", "globals", "log"):
+                    idx.execute(f"DELETE FROM {table}")
+                idx.execute(
+                    "DELETE FROM meta WHERE k IN ('root','reproject')")
+                idx.commit()
+            except Exception:
+                idx.rollback()
+                raise
             self._reproject.add(ws)
             if not man:
-                self.materialize(ws, ())
+                pump(self, ws)
+                self._stamp(ws)
                 return
-            fresh = self.merge(ws, result.valids, result.globals)[0]
-            self.materialize(ws, fresh)
+            self.merge(ws, result.valids, result.globals)
+            pump(self, ws)
             if republish:
                 # A semantic index upgrade can select different canonical
                 # providers for the same fact ids. Fingerprints cover ids, not

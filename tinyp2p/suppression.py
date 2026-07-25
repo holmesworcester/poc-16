@@ -38,3 +38,12 @@ def suppkey(fact):
 def deathkey(fact):
     """A deletion's suppression key, or None for targets/non-participants."""
     return suppkey(fact) if is_deletion(fact) else None
+
+
+def victims(fact):
+    """The explicit target of today's single-target deletion."""
+    if not is_deletion(fact):
+        return ()
+    targets = tuple(
+        fid for name, fid in fact.refs() if name == TARGET)
+    return targets if len(targets) == 1 else ()
