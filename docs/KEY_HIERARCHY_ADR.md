@@ -112,7 +112,7 @@ The production boundary must expose operations equivalent to:
 | `open(handle, envelope, expected_context)` | Open only with the exact generation and caller-supplied authoritative context; reject a valid ciphertext whose authenticated self-description differs. Private material never leaves a non-exportable provider. |
 | `seal(public, plaintext, aad)` | Seal F or one retained-cover node to a named generation and exact context. |
 | `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, and freeze the purge-target manifest derived from that causally closed batch; identical saved-input retries coalesce and every mismatch conflicts. |
-| `acquire_writer_lease(P)` | Admit a generation-bound write only while P is finalized and unfenced. |
+| `acquire_writer_lease(P)` | Admit a caller-requested generation-bound write only while that exact P is active, finalized, and unfenced. Never replace a saved P request with the current generation. |
 | `close_and_drain(P)` | Reject new P leases and commits; drain or abort all existing leases before survivor enumeration. |
 | `migrate(P, S, manifest)` | Require S and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. |
 | `destroy(P)` | Idempotently destroy the P handle/keyblob and advance monotonic retirement state to the successor fixed by P's claim. |
@@ -159,14 +159,16 @@ For a predecessor P:
 - finalized S must causally close over the claim, exact batch, fence/drain,
   migration, P destruction, provider completion evidence, and reader proof.
 
-At the next transition, the already committed S/T pair advances to S/T/U. The
-provider resolves the exact causal parent claim by predecessor id—not a latest
-key or time lookup—and verifies that the live S and T public keys still equal
-that claim before allocating U and again before accepting S/T/U. Replacing the
-handle currently stored under the label `T` cannot silently create a new
-schedule. A rollback-resistant provider retains enough one-time claim state
-outside rollbackable application storage to reject a second P claim after
-restoration of an older snapshot.
+Finalized S and the provider's promoted state persist an explicit ref to the
+exact P claim id/digest. At the next transition, the already committed S/T pair
+advances to S/T/U. The provider follows that ref—not generation-list order, a
+latest key, or a time lookup—and verifies that the live S and T public keys
+still equal the referenced claim before allocating U and again before
+accepting S/T/U. S must itself be finalized and wrap-eligible before its claim
+can begin. Replacing the handle currently stored under the label `T` cannot
+silently create a new schedule. A rollback-resistant provider retains enough
+one-time claim state outside rollbackable application storage to reject a
+second P claim after restoration of an older snapshot.
 
 ## Rotation and migration protocol
 
@@ -175,8 +177,10 @@ wrap inventory, and local absence are not triggers or proofs.
 
 1. Identify the exact causally committed purge batch and recovery-eligible
    secret set.
-2. Verify active/staged P/S. Generate and durably validate T. Capacity failure
-   here leaves P live and returns a retryable failure.
+2. Verify that P is the exact caller-requested active, finalized predecessor
+   and that active/staged P/S match P's explicit causal parent claim when P has
+   one. Generate and durably validate T. Capacity failure here leaves P live
+   and returns a retryable failure.
 3. Atomically claim `(P, S, T, batch)`.
 4. Author the non-wrap reservation and its complete dependency-first closed
    pile.
@@ -184,11 +188,13 @@ wrap inventory, and local absence are not triggers or proofs.
 6. Load the purge-target manifest frozen by the claim. A different or omitted
    manifest fails; exact purge targets are not copied to S.
 7. Open each live P envelope through the provider using the authoritative cover
-   record context, immediately reseal to S, and durably mark the exact record
-   complete. On restart, cryptographically reopen and context-check even a
-   record already labeled S before counting it complete; a relabeled,
-   transplanted, or corrupt record blocks P destruction. Clear plaintext
-   buffers.
+   record context stored separately from the envelope, including the expected
+   generation. Immediately reseal to S and atomically persist the new
+   authoritative context with the envelope. On restart, cryptographically
+   reopen and context-check even a record already labeled S before counting it
+   complete; an envelope cannot choose the handle by self-describing another
+   live generation, and a relabeled, transplanted, or corrupt record blocks P
+   destruction. Clear plaintext buffers.
 8. Verify that every survivor has an S envelope, that the live S/T handles
    still match the exact public-key bytes in the claim, and that no committed
    record can still be written under P.

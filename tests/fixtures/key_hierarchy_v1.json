@@ -8,6 +8,10 @@
         "first_frontier_only_rotation": "rejected-in-v1",
         "steady_handle_count": 2,
         "transition_peak_handle_count": 3,
+        "parent_claim_link": "explicit-claim-id",
+        "next_claim_requires_finalized_predecessor": true,
+        "writer_lease_generation": "caller-supplied-exact",
+        "cover_expected_context": "separate-authoritative-record",
         "recipient_generations": [
             "P",
             "S",
