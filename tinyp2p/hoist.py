@@ -29,7 +29,7 @@ import sys
 from . import facts as _fam
 from .close import encode_pile
 from .crypto import h
-from .kernel import SCHEMA, Context, resolve_deps
+from .kernel import SCHEMA, Context, proof_rank, resolve_deps
 from .layout import CUT, boundary  # same fine boundary density as treap.py
 
 sys.setrecursionlimit(200000)
@@ -209,9 +209,13 @@ def _judge(con, stream, anchor):
             good = False
         if not good:
             return False, acc
+        rank = proof_rank(con, deps)
+        if rank is None:
+            return False, acc
         con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
         for name, a0, a1 in f.offers():
             con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, f.fid))
+        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
         acc.append(f.fid)
     return True, acc
 
@@ -222,9 +226,14 @@ def _insert(con, stream):
     for f in stream:
         if con.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone():
             continue
+        deps = resolve_deps(f, con)
+        rank = proof_rank(con, deps) if deps is not None else None
+        if rank is None:
+            raise ValueError("cached payload is not dependency-closed")
         con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
         for name, a0, a1 in f.offers():
             con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, f.fid))
+        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
         n += 1
     return n
 
@@ -233,6 +242,7 @@ def _pop(con, fids):
     """Undo a node's payload on backtrack — memory stays O(depth·payload)."""
     con.executemany("DELETE FROM facts WHERE fid=?", [(f,) for f in fids])
     con.executemany("DELETE FROM offers WHERE src=?", [(f,) for f in fids])
+    con.executemany("DELETE FROM proofs WHERE fid=?", [(f,) for f in fids])
 
 
 def verify_once(root, anchor, fact_of, base_hashes=None, base_phs=None):

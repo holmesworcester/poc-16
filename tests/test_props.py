@@ -19,10 +19,19 @@ from tinyp2p.crypto import keypair
 from tinyp2p.fact import Fact
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.auth.user import user
+from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.kernel import drain, resolve_deps
 from tinyp2p.node import Node, now_ms
 
-from .util import add_member, all_fids, author_msg, closed_subset, deliver
+from .util import (
+    add_member,
+    all_fids,
+    author_msg,
+    closed_subset,
+    deliver,
+    member_src,
+)
 
 
 @pytest.fixture
@@ -202,6 +211,53 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
         add_member(n, ws, "late-bob", inviter=(bob_sk, bob_pk), ts=bob.ts)
 
 
+def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
+        tmp_path):
+    """A lower-fid recursive membership remains a valid fact, but the final
+    dependency graph keeps the shallower proof and every published leaf stays
+    independently valid."""
+    n = Node(str(tmp_path / "shadow"))
+    ws = cmds.create(n, "alice")
+    bob_secret, bob_public, original = add_member(n, ws, "bob")
+    base_ts = now_ms() + 10
+
+    # Exercise the exact adversarial ordering from review: keep trying fresh
+    # bearer capabilities until the recursive membership's id sorts first.
+    for offset in range(1000):
+        invite_secret, invite_public = keypair()
+        invitation = user_invite(
+            bob_public, invite_public, base_ts + 2 * offset)
+        recursive = user(
+            invitation, invite_secret, bob_public, "bob-again",
+            base_ts + 2 * offset + 1)
+        if recursive.fid < original.fid:
+            break
+    else:
+        raise AssertionError("could not construct a lower-fid recursive user")
+
+    invitation_sig = signature(
+        bob_secret, bob_public, invitation, invitation.ts)
+    recursive_sig = signature(
+        bob_secret, bob_public, recursive, recursive.ts)
+    n.ingest_new(
+        ws,
+        [invitation_sig, invitation, recursive_sig, recursive],
+        {
+            invitation_sig.fid: [],
+            invitation.fid: [
+                invitation_sig.fid,
+                member_src(n, ws, bob_public),
+            ],
+            recursive_sig.fid: [],
+            recursive.fid: [invitation.fid, recursive_sig.fid],
+        },
+    )
+
+    assert original.fid in resolve_deps(invitation, n.idx(ws))
+    for _, stream in units_of(n.store(ws)):
+        assert drain(stream, ws).ok
+
+
 def test_incremental_reuses_work(world):
     """Reuse is real: a post into a promoted store loads only the tail's few
     facts, not the whole set — the O(changed) compute win, not just O(1) IO."""
@@ -221,8 +277,8 @@ def test_incremental_reuses_work(world):
 
 def test_shadow_guard_keeps_identity(world):
     """A duplicate offer (a re-sign by the same key) could shift a frozen
-    range's min-src; the shadow guard falls back to a full recompute, which
-    must stay byte-identical to a clean full build."""
+    range's canonical proof winner; the shadow guard falls back to a full
+    recompute, which must stay byte-identical to a clean full build."""
     from tinyp2p.close import encode_pile
     n, ws = world
     m = author_msg(n, ws, n.sk, n.pk, "dup-target", now_ms())  # alice's own msg

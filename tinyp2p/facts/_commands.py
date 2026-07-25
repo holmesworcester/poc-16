@@ -1,21 +1,12 @@
 """Shared mechanics for family commands; no fact policy lives here."""
 
 
-def offer_source(node, workspace, name, a0, a1=None):
+def offer_source(node, workspace, name, a0, a1=None, requires=()):
     from ..kernel import offer_src
 
     with node.lock:
-        return offer_src(node.idx(workspace), name, a0, a1)
-
-
-def offer_source_by_value(node, workspace, name, a1):
-    """Canonical source for an offer selected by its second value."""
-    with node.lock:
-        row = node.idx(workspace).execute(
-            "SELECT src FROM offers WHERE name=? AND a1=? "
-            "ORDER BY src LIMIT 1",
-            (name, a1)).fetchone()
-    return row and row[0]
+        return offer_src(
+            node.idx(workspace), name, a0, a1, requires)
 
 
 def closer(node, workspace, newmap, deps):

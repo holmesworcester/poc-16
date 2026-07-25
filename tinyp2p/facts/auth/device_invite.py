@@ -4,8 +4,9 @@ A device-set peer names a known sibling key and immediately declares it both a
 device and workspace member. There is no bearer secret or follow-up join; the
 poc-13 two-family flow collapses to the direct-key form settled for poc-16.
 """
-from ...fact import Fact
-from .._commands import offer_source, offer_source_by_value
+from ...crypto import h
+from ...fact import Fact, canon
+from .._commands import offer_source
 from . import signature
 
 TAG = "device_invite"
@@ -18,6 +19,7 @@ def device_invite(pk, user, device_pk, label, ts):
     return Fact(
         TAG, ts,
         [["offer", "member", device_pk],
+         ["offer", "device_key", device_pk],
          ["offer", "device", user, device_pk]],
         {"pk": pk, "user": user, "device": device_pk, "label": label})
 
@@ -30,7 +32,10 @@ def needs(f):
     return (
         ("author", f.fid, signer),
         ("member", signer, None),
-        ("device", user, signer),
+        (
+            "device_key", signer, None,
+            (("device", user, signer),),
+        ),
     )
 
 
@@ -82,27 +87,38 @@ def materialize(db, workspace, valid):
 
 # COMMANDS — build a fact, admit it, stop.
 def grant(node, workspace, user, device_pk, label):
-    from ...node import now_ms
+    """Idempotently fill one ``(workspace, admitting key, device)`` cell."""
+    with node.lock:
+        secret, public = node.identity(workspace)
+        # The timestamp is identity material for a Fact. Deriving it from the
+        # logical reconciliation cell makes a lost-response retry byte-for-byte
+        # identical instead of minting an unbounded series of near-duplicates.
+        ts = int(h(canon([
+            "device-grant", workspace, public, user, device_pk,
+        ]))[:12], 16)
+        item = device_invite(public, user, device_pk, label, ts)
+        if node.fact_of(workspace, item.fid) is not None:
+            return item.fid
 
-    secret, public = node.identity(workspace)
-    ts = now_ms()
-    item = device_invite(public, user, device_pk, label, ts)
-    signed = signature.signature(secret, public, item, ts)
-    member = offer_source(node, workspace, "member", public)
-    device_source = offer_source(node, workspace, "device", user, public)
-    target_member = offer_source(node, workspace, "member", device_pk)
-    existing = offer_source_by_value(
-        node, workspace, "device", device_pk)
-    if member is None or device_source is None:
-        raise ValueError("local identity is not a device-set member")
-    if target_member is not None or existing is not None:
-        raise ValueError("device key is already enrolled")
-    deps = {
-        item.fid: [signed.fid, member, device_source],
-        signed.fid: [],
-    }
-    node.ingest_new(workspace, [signed, item], deps)
-    return item.fid
+        signed = signature.signature(secret, public, item, ts)
+        member = offer_source(node, workspace, "member", public)
+        device_source = offer_source(
+            node, workspace, "device_key", public,
+            requires=(("device", user, public),))
+        target_member = offer_source(
+            node, workspace, "member", device_pk)
+        existing = offer_source(
+            node, workspace, "device_key", device_pk)
+        if member is None or device_source is None:
+            raise ValueError("local identity is not a device-set member")
+        if target_member is not None or existing is not None:
+            raise ValueError("device key is already enrolled")
+        deps = {
+            item.fid: [signed.fid, member, device_source],
+            signed.fid: [],
+        }
+        node.ingest_new(workspace, [signed, item], deps)
+        return item.fid
 
 
 # QUERIES — device roster observations belong to auth.device.devices.

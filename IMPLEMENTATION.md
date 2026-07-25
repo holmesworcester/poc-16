@@ -88,10 +88,14 @@ Four invariants carry it:
 - **I1 — the set is dep-closed.** A fact enters only via a closed pile that
   the kernel accepted whole, so its full closure merges with it (or was
   already in). Induction over drains: the index is always dep-closed.
-- **I2 — dep edges are canonical.** Edges are *recomputed from the set*
-  (`resolve_deps` against the cumulative offers table, min-src tiebreak),
-  never remembered from validation history. Two nodes with the same set
-  derive the same edges, whatever order things arrived in.
+- **I2 — dep edges are canonical and acyclic.** Edges are *recomputed from
+  the set*. Offer sources are ordered by shortest finite authority-proof rank,
+  then source id; every selected provider therefore has lower rank than its
+  dependent. A later re-join, mutual admin grant, or reciprocal device grant
+  cannot rewire the final closure into a cycle. Two nodes with the same set
+  derive the same edges, whatever order things arrived in. A family can also
+  require co-offers from the selected source: device claims use that to make
+  one canonical `device_key` winner govern both authorization and projection.
 - **I3 — topo-sort makes each leaf a closed pile.** A leaf is `close` of its
   in-range leaves: those leaves plus their full recursive closure, emitted
   deps-first. Every dependency therefore precedes its dependent, so the pile
@@ -128,11 +132,11 @@ prior manifest's fences to `layout()` as a memo, and any promoted range whose
 pile never rebuilt (`test_incremental_reuses_work`: a post into a
 promoted store touches under half the facts). This is byte-identical to a full
 recompute because a leaf pile depends only on its in-range fids and their
-resolved deps, which are fixed *as long as every
-offer address has one provider* (so `min-src` cannot move). The one way that
-breaks — a duplicate `member`/`admin`/`author` offer (a re-join or re-sign) —
-is caught by a shadow guard (`Node._shadows`) that drops the memo for that
-turn and recomputes fully. `test_incremental_equals_full` asserts
+resolved deps. A duplicate offer can change the shortest-proof winner, so a
+shadow guard (`Node._shadows`) drops the memo for that turn, recomputes proof
+ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
+only their new offer sources and keep the incremental path.
+`test_incremental_equals_full` asserts
 incremental == full at every step across promotions, a straggler, a new
 member, and an eviction; `test_shadow_guard_keeps_identity` exercises the
 guard. The residual O(n) is the body-free key scan and per-range fingerprint;
@@ -142,7 +146,9 @@ Tested in `tests/test_props.py`: `test_leaves_are_piles` (every published
 unit passes the kernel from empty), `test_history_independence` (random pile
 groupings × random orders × random turn batching ⇒ byte-identical roots),
 `test_rebuild`, `test_straggler_minifold`, `test_incremental_equals_full`,
-`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`.
+`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`, and the
+recursive/mutual-authority closure regressions in `test_kernel.py` and
+`test_props.py`.
 
 **Litter, never poison.** The design's "a hostile writer can litter but never
 poison" is enforced at two layers: `from_json` validates atom shape at the

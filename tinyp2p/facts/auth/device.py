@@ -5,7 +5,7 @@ is the poc-13 device authority edge with poc-10 transport atoms omitted; all
 devices are equal peers and the fact carries no endpoint policy.
 """
 from ...fact import Fact
-from .._commands import offer_source_by_value, publish
+from .._commands import offer_source, publish
 from . import signature
 
 TAG = "device"
@@ -14,7 +14,9 @@ TAG = "device"
 # SHAPE
 def device(pk, label, ts):
     return Fact(
-        TAG, ts, [["offer", "device", pk, pk]],
+        TAG, ts,
+        [["offer", "device_key", pk],
+         ["offer", "device", pk, pk]],
         {"pk": pk, "label": label})
 
 
@@ -59,13 +61,43 @@ def materialize(db, workspace, valid):
         (workspace, body["pk"], body["pk"], body["label"], fact.fid))
 
 
+def reconcile(db, workspace, index, fact_of, valids):
+    """Project the same canonical device-key winners used by the kernel."""
+    if not any(
+            name == "device_key"
+            for valid in valids
+            for name, _, _ in valid.fact.offers()):
+        return
+    rows = index.execute(
+        "SELECT o.a0, o.src FROM offers o "
+        "JOIN proofs p ON p.fid=o.src "
+        "WHERE o.name='device_key' "
+        "ORDER BY o.a0, p.rank, o.src"
+    ).fetchall()
+    winners = {}
+    for device_pk, source in rows:
+        winners.setdefault(device_pk, source)
+
+    db.execute("DELETE FROM devices WHERE ws=?", (workspace,))
+    for device_pk, source in winners.items():
+        body = fact_of(source).body
+        user = body.get("user", body["pk"])
+        db.execute(
+            "INSERT INTO devices VALUES(?,?,?,?,?)",
+            (workspace, user, device_pk, body["label"], source))
+        db.execute(
+            "UPDATE members SET name=? "
+            "WHERE ws=? AND pk=? AND role='device'",
+            (body["label"], workspace, device_pk))
+
+
 # COMMANDS — build a fact, admit it, stop.
 def bind(node, workspace, label):
     from ...node import now_ms
 
     secret, public = node.identity(workspace)
-    if offer_source_by_value(
-            node, workspace, "device", public) is not None:
+    if offer_source(
+            node, workspace, "device_key", public) is not None:
         raise ValueError("local identity is already in a device set")
     ts = now_ms()
     item = device(public, label, ts)

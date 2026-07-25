@@ -56,11 +56,12 @@ def materialize(db, workspace, valid):
 
 
 # COMMANDS — workspace bootstrap necessarily records its anchor in the keyring.
-def create(node, name):
+def create(node, name, ts=None):
     from ...node import now_ms
 
     secret, public = node.identity()
-    root = workspace(secret, public, name, now_ms())
+    root = workspace(
+        secret, public, name, now_ms() if ts is None else ts)
     workspace_id = root.fid
     node.add_workspace(workspace_id, name, peers=[])
     node.ingest_new(workspace_id, [root], {root.fid: []})

@@ -6,7 +6,7 @@ from bench.bench_sync import bidi, catchup, check_leaves
 from tinyp2p.close import decode_pile
 from tinyp2p.kernel import drain, resolve_deps
 
-from .util import closed_subset
+from .util import all_fids, closed_subset
 
 
 @pytest.mark.parametrize(
@@ -65,6 +65,27 @@ def test_multi_device_seed_groups_equal_author_keys_by_user(tmp_path):
     assert node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts WHERE t='device_invite'").fetchone()[0] == 24
     assert check_leaves(node, workspace) > 1
+
+
+def test_same_seed_reproduces_identities_fact_ids_and_layout(tmp_path):
+    first, first_ws, first_stats = build_seed(
+        str(tmp_path / "first"), 255, n_members=16, shape="random",
+        seed=16, devices_per_user=2)
+    second, second_ws, second_stats = build_seed(
+        str(tmp_path / "second"), 255, n_members=16, shape="random",
+        seed=16, devices_per_user=2)
+    other, other_ws, _ = build_seed(
+        str(tmp_path / "other"), 255, n_members=16, shape="random",
+        seed=17, devices_per_user=2)
+
+    assert first_ws == second_ws
+    assert all_fids(first, first_ws) == all_fids(second, second_ws)
+    assert first.store(first_ws).get("root") \
+        == second.store(second_ws).get("root")
+    assert first_stats["parents"] == second_stats["parents"]
+    assert first_stats["devices_by_user"] == second_stats["devices_by_user"]
+    assert other_ws != first_ws
+    assert all_fids(other, other_ws) != all_fids(first, first_ws)
 
 
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):

@@ -191,6 +191,9 @@ The shared core hoists to the root, so a range syncer pulling a small subtree pa
 it in full — but **how big that core is depends on key order and actual delegation
 depth**. The benchmark now bulk-builds the same 100-user fact set in four shapes,
 with messages uniform over three years and flat leaves (`COLD_CUT=None`):
+the numeric seed deterministically derives the root time and every Ed25519
+identity, so repeated runs reproduce the same fact ids, treap boundaries, and
+tax measurements (only the wall-clock timing columns vary).
 
 | shape | realized depth histogram (depth:users) | min / median / max |
 |---|---|---:|
@@ -208,18 +211,18 @@ where multi-level ships no more than leaf-only, so it is boundary-sample-sensiti
 
 | shape | order | leaf-only `ρ` | mean tax | facts ≥50% | crossover (leaves) |
 |---|---|--:|--:|--:|--:|
-| star | timestamp | 3.08× | 399.0 | 397 | 16 |
-|  | author | 1.64× | 155.4 | 113 | 21 |
-|  | **delegation DFS** | **1.64×** | **35.3** | **13** | **3** |
-| shallow-wide | timestamp | 4.33× | 398.9 | 397 | 8 |
-|  | author | 2.06× | 170.7 | 151 | 7 |
-|  | **delegation DFS** | **2.05×** | **45.9** | **17** | **2** |
-| random | timestamp | 6.61× | 398.9 | 397 | 3 |
-|  | author | 2.98× | 241.7 | 257 | 6 |
-|  | **delegation DFS** | **2.97×** | **67.3** | **37** | **2** |
-| chain | timestamp | 34.50× | 398.9 | 397 | 1 |
-|  | author | 23.95× | 391.2 | 391 | 1 |
-|  | **delegation DFS** | **23.85×** | **285.7** | **249** | **1** |
+| star | timestamp | 3.09× | 398.9 | 397 | 14 |
+|  | author | 1.64× | 137.6 | 135 | 7 |
+|  | **delegation DFS** | **1.64×** | **35.7** | **13** | **2** |
+| shallow-wide | timestamp | 4.34× | 398.8 | 397 | 7 |
+|  | author | 2.07× | 181.0 | 179 | 13 |
+|  | **delegation DFS** | **2.06×** | **48.1** | **25** | **3** |
+| random | timestamp | 6.66× | 398.9 | 397 | 4 |
+|  | author | 3.03× | 250.2 | 247 | 2 |
+|  | **delegation DFS** | **3.02×** | **56.6** | **25** | **2** |
+| chain | timestamp | 34.81× | 398.8 | 397 | 1 |
+|  | author | 24.30× | 393.3 | 395 | 1 |
+|  | **delegation DFS** | **24.20×** | **274.7** | **213** | **1** |
 
 The new depth test pulls the key range containing one *semantic delegation
 subtree*. Here `tax = ML facts fetched − that subtree's own facts`, so it counts
@@ -227,14 +230,14 @@ both ancestor context and unrelated facts dragged in by scatter:
 
 | shape / target | depth | users | timestamp tax | author tax | **DFS tax** |
 |---|--:|--:|--:|--:|--:|
-| star leaf | 1 | 1 | 49,478 | 35,689 | **28** |
-| shallow-wide leaf | 2 | 1 | 49,248 | 5,080 | **59** |
-| shallow-wide branch | 1 | 12 | 43,909 | 35,868 | **19** |
-| random leaf | 8 | 1 | 49,491 | 20,749 | **75** |
-| random branch | 4 | 10 | 45,075 | 39,686 | **96** |
-| chain suffix | 99 | 1 | 49,429 | 10,411 | **397** |
-| chain suffix | 90 | 10 | 45,155 | 42,725 | **379** |
-| chain suffix | 50 | 50 | 25,113 | 24,625 | **212** |
+| star leaf | 1 | 1 | 49,119 | 16,615 | **24** |
+| shallow-wide leaf | 2 | 1 | 48,627 | 17,213 | **43** |
+| shallow-wide branch | 1 | 12 | 43,995 | 41,091 | **69** |
+| random leaf | 8 | 1 | 49,489 | 42,025 | **69** |
+| random branch | 4 | 10 | 45,071 | 41,213 | **66** |
+| chain suffix | 99 | 1 | 49,424 | 14,422 | **401** |
+| chain suffix | 90 | 10 | 45,154 | 38,775 | **361** |
+| chain suffix | 50 | 50 | 25,112 | 24,657 | **197** |
 
 What the numbers say:
 
@@ -243,18 +246,18 @@ What the numbers say:
   auth core, scattered by three years of content. This reproduces the old star
   result and confirms depth does not rescue a time order.
 - **DFS makes semantic-subtree tax path-bounded.** On the deliberately clean
-  chain the prediction is visible directly: depth 99 costs 397
-  (`4×99 + 1`), depth 90 costs 379, and depth 50 costs 212. The remaining
+  chain the prediction is visible directly: depth 99 costs 401
+  (`≈4×99 + 1`), depth 90 costs 361, and depth 50 costs 197. The remaining
   tens-of-facts wobble is the hash-derived leaf boundary covering neighboring
   facts, not an `N` term. The same fixed boundary residual dominates the much
-  shorter wide/random paths (for example 59 at depth 2 and 75 at depth 8).
+  shorter wide/random paths (for example 43 at depth 2 and 69 at depth 8).
 - **It matters most in the realistic shallow-wide case, not only the stress
-  chain.** Wide mean tax falls 399→46 (8.7×) and random falls 399→67 (5.9×);
-  both also beat flat author grouping by 3.6–3.7×. In the adversarial chain,
+  chain.** Wide mean tax falls 399→48 (8.3×) and random falls 399→57 (7.0×);
+  they beat flat author grouping by 3.8× and 4.4× respectively. In the adversarial chain,
   `depth = Θ(N)`, so the worst-case asymptotic advantage necessarily vanishes
-  and mean tax falls only 399→286. Even there the aligned semantic suffix avoids
-  scatter: the deepest one-user pull pays 397 rather than 49,429.
-- **Real depth raises leaf-only closure cost.** Chain `ρ=23.85×` even under DFS
+  and mean tax falls only 399→275. Even there the aligned semantic suffix avoids
+  scatter: the deepest one-user pull pays 401 rather than 49,424.
+- **Real depth raises leaf-only closure cost.** Chain `ρ=24.20×` even under DFS
   because a deep author's *actual required authority path* is long; this is not
   ordering over-inclusion. Multi-level full sync remains exactly `1×`, so
   verify-once/ship-once becomes more valuable as honest closure depth grows.
@@ -275,10 +278,10 @@ governs only the range-sync tax — an `N`-scale catastrophe under timestamp
 scatter and a depth-scale path cost under delegation order.
 
 **What this means for the headline claim.** In the star, a good key order lowers
-*leaf-only* `ρ` too (3.08→1.64), while multi-level's full-sync cost is
+*leaf-only* `ρ` too (3.09→1.64), while multi-level's full-sync cost is
 order-**invariant** (always `|V|`). So much of the old "two-thirds saved" headline
 was timestamp scatter. In a deep chain, however, aligned leaf-only remains
-23.85× because the required authority paths themselves are long; multi-level
+24.20× because the required authority paths themselves are long; multi-level
 still ships and verifies each fact once. Hoisting's durable payoff is therefore
 the **closed-path / verify-once** property (§A.2, B.1), with the redundancy gain
 ranging from modest on a shallow aligned star to enormous on honest deep

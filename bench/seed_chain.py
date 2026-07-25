@@ -7,6 +7,7 @@ set of prolific inviters, ``random`` is a uniform random recursive tree, and
 the finished fact set receives one layout commit.
 """
 import collections
+import hashlib
 import os
 import random
 import statistics
@@ -17,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.bench_sync import MEMBERS, YEARS, _insert, bulk_author
 from tinyp2p import cmds
-from tinyp2p.crypto import keypair
+from tinyp2p.crypto import keypair, load_sk
 from tinyp2p.facts.auth.device import device
 from tinyp2p.facts.auth.device_invite import device_invite
 from tinyp2p.facts.auth.signature import signature
@@ -26,6 +27,26 @@ from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.node import Node
 
 SHAPES = ("star", "wide", "random", "chain")
+
+
+class _SeededKeys:
+    """Stable Ed25519 identities without touching production entropy."""
+
+    def __init__(self, seed):
+        self.seed = hashlib.sha256(
+            f"poc-16/seed-chain-v0/{seed}".encode()).digest()
+        self.ordinal = 0
+
+    def next(self):
+        material = hashlib.sha256(
+            self.seed + self.ordinal.to_bytes(8, "big")).digest()
+        self.ordinal += 1
+        secret = load_sk(material.hex())
+        return secret, secret.verify_key.encode().hex()
+
+    def timestamp(self):
+        # A realistic millisecond-sized epoch whose value is stable per seed.
+        return 1_700_000_000_000 + int.from_bytes(self.seed[:4], "big")
 
 
 def _parent_index(shape, ordinal, rng, wide_inviters):
@@ -52,6 +73,7 @@ def _depth_stats(depths):
 
 
 def grow_tree(node, workspace, n_members, base_ts, rng, *,
+              keys=None,
               shape="random", wide_inviters=8):
     """Bulk-build a delegation tree and return identities plus its topology."""
     if shape not in SHAPES:
@@ -75,11 +97,11 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
             invite_ts = base_ts + 2 * ordinal - 1
             user_ts = invite_ts + 1
 
-            invite_sk, invite_pk = keypair()
+            invite_sk, invite_pk = keys.next() if keys else keypair()
             invitation = user_invite(inviter_pk, invite_pk, invite_ts)
             invitation_sig = signature(
                 inviter_sk, inviter_pk, invitation, invite_ts)
-            member_sk, member_pk = keypair()
+            member_sk, member_pk = keys.next() if keys else keypair()
             joined = user(
                 invitation, invite_sk, member_pk, f"u{ordinal - 1}", user_ts)
             joined_sig = signature(member_sk, member_pk, joined, user_ts)
@@ -99,7 +121,8 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
     return identities, parents, depths, users
 
 
-def grow_devices(node, workspace, identities, base_ts, devices_per_user):
+def grow_devices(
+        node, workspace, identities, base_ts, devices_per_user, *, keys=None):
     """Bulk-build equal-peer device sets and return all author identities."""
     if devices_per_user < 2:
         raise ValueError("grow_devices requires more than one device per user")
@@ -123,7 +146,8 @@ def grow_devices(node, workspace, identities, base_ts, devices_per_user):
 
             for device_number in range(1, devices_per_user):
                 inviter_secret, inviter_public = device_set[-1]
-                sibling_secret, sibling_public = keypair()
+                sibling_secret, sibling_public = \
+                    keys.next() if keys else keypair()
                 grant = device_invite(
                     inviter_public, user_public, sibling_public,
                     f"u{user_number}-d{device_number}", ts)
@@ -151,13 +175,15 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     if devices_per_user < 1:
         raise ValueError("devices_per_user must be positive")
     rng = random.Random(seed)
-    node = Node(node_dir)
+    keys = _SeededKeys(seed)
+    root_secret, _ = keys.next()
+    node = Node(node_dir, initial_secret=root_secret)
     started = time.perf_counter()
-    workspace = cmds.create(node, "alice")
+    workspace = cmds.create(node, "alice", ts=keys.timestamp())
     root_ts = node.fact_of(workspace, workspace).ts
     identities, parents, depths, users = grow_tree(
         node, workspace, n_members, root_ts + 1, rng,
-        shape=shape, wide_inviters=wide_inviters)
+        keys=keys, shape=shape, wide_inviters=wide_inviters)
     devices_by_user = {
         public: [public] for _, public in identities
     }
@@ -169,7 +195,8 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         first_device_ts = node.idx(workspace).execute(
             "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
         content_identities, devices_by_user, device_to_user = grow_devices(
-            node, workspace, identities, first_device_ts, devices_per_user)
+            node, workspace, identities, first_device_ts, devices_per_user,
+            keys=keys)
     membership_done = time.perf_counter()
 
     membership_facts = node.idx(workspace).execute(

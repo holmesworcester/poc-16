@@ -22,7 +22,13 @@ from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, from_json
 from .keychain import Keychain
-from .kernel import Judgment, drain, resolve_deps
+from .kernel import (
+    Judgment,
+    drain,
+    extend_proofs,
+    rebuild_proofs,
+    resolve_deps,
+)
 from .layout import fingerprint, layout
 from .store import FsStore
 
@@ -31,11 +37,12 @@ CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
+CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v2"
+INDEX_VERSION = "family-contract-v3"
 
 
 def now_ms():
@@ -43,13 +50,13 @@ def now_ms():
 
 
 class Node:
-    def __init__(self, dir):
+    def __init__(self, dir, initial_secret=None):
         self.dir = dir
         os.makedirs(dir, exist_ok=True)
         self.lock = threading.RLock()
         self.url = None  # the daemon sets its advertised base URL
         self._kr_path = os.path.join(dir, "keyring.json")
-        self.keychain = Keychain(self._kr_path)
+        self.keychain = Keychain(self._kr_path, initial_secret)
         self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
@@ -196,13 +203,17 @@ class Node:
             out.append(v)
         idx.executemany("INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
         idx.commit()
+        if newfids:
+            shadows = self._shadows(ws, newfids)
+            self._update_proofs(ws, newfids, shadows)
         return out, newfids
 
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
         deps? Any new offer for an address that now has more than one provider
-        might move min-src under a frozen range, so the generic core drops the
-        memo rather than knowing which offer names families consume."""
+        might change its shortest-proof winner under a frozen range, so the
+        generic core drops the memo rather than knowing which offer names
+        families consume."""
         idx = self.idx(ws)
         for fid in newfids:
             for name, a0, a1 in self.fact_of(ws, fid).offers():
@@ -212,8 +223,44 @@ class Node:
                     return True
         return False
 
+    def _rebuild_proofs(self, ws):
+        """Give the accepted set its canonical, history-independent proof DAG."""
+        unresolved = rebuild_proofs(
+            self.idx(ws), lambda fid: self.fact_of(ws, fid))
+        if unresolved:
+            sample = ", ".join(sorted(unresolved)[:3])
+            raise ValueError(
+                f"authority facts have no finite canonical proof: {sample}")
+        self.idx(ws).commit()
+
+    def _update_proofs(self, ws, newfids, shadows):
+        """Rank the ordinary append-only case without rescanning history."""
+        idx = self.idx(ws)
+        missing = {
+            fid for (fid,) in idx.execute(
+                "SELECT DISTINCT o.src FROM offers o "
+                "LEFT JOIN proofs p ON p.fid=o.src "
+                "WHERE p.fid IS NULL")
+        }
+        if not missing:
+            return
+        if shadows or not newfids or not missing <= set(newfids):
+            self._rebuild_proofs(ws)
+            return
+        unresolved = extend_proofs(
+            idx, missing, lambda fid: self.fact_of(ws, fid))
+        if unresolved:
+            sample = ", ".join(sorted(unresolved)[:3])
+            raise ValueError(
+                f"authority facts have no finite canonical proof: {sample}")
+        idx.commit()
+
     def commit(self, ws, newfids=()):
         st, idx = self.store(ws), self.idx(ws)
+        shadows = self._shadows(ws, newfids)
+        # Bulk benchmark builders write the derived index directly, while the
+        # live path can rank only its new offer sources in dependency order.
+        self._update_proofs(ws, newfids, shadows)
         cache = {}
 
         def deps_of(fid):
@@ -223,7 +270,7 @@ class Node:
 
         memo = None
         prev = st.get("root")
-        if prev and not self._shadows(ws, newfids):
+        if prev and not shadows:
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
                               deps_of, ws, self.globals(ws), memo)
@@ -235,9 +282,12 @@ class Node:
         return man
 
     def materialize(self, ws, valids):
+        valids = tuple(valids)
         db = self.app
         for v in valids:
             facts.materialize(db, ws, v)
+        facts.reconcile(
+            db, ws, self.idx(ws), lambda fid: self.fact_of(ws, fid), valids)
         db.commit()
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
@@ -264,7 +314,9 @@ class Node:
     def rebuild(self, ws):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
-            idx.executescript("DELETE FROM facts; DELETE FROM offers; DELETE FROM globals;")
+            idx.executescript(
+                "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
+                "DELETE FROM globals;")
             idx.commit()
             man = st.get("root")
             if not man:
@@ -276,5 +328,6 @@ class Node:
                     stream += decode_pile(st.get("obj/" + f["pile"]))[0]
             result = drain(stream, ws)
             assert result.ok, "own store failed its own kernel"
-            self.materialize(ws, self.merge(ws, result.valids, result.globals)[0])
+            fresh = self.merge(ws, result.valids, result.globals)[0]
+            self.materialize(ws, fresh)
             self._stamp(ws)

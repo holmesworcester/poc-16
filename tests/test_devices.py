@@ -16,7 +16,7 @@ from tinyp2p.facts.auth.workspace import workspace as workspace_fact
 from tinyp2p.kernel import drain
 from tinyp2p.node import Node
 
-from .util import add_member
+from .util import add_member, member_src
 
 
 def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
@@ -27,7 +27,12 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
 
     laptop_secret, laptop = keypair()
     node.keychain.add_identity(laptop_secret)
-    grant(node, workspace, user, laptop, "laptop")
+    first = grant(node, workspace, user, laptop, "laptop")
+    facts_after_first = node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert grant(node, workspace, user, laptop, "laptop") == first
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == facts_after_first
     with pytest.raises(ValueError, match="already enrolled"):
         grant(node, workspace, user, laptop, "duplicate")
 
@@ -136,3 +141,62 @@ def test_bearer_user_precedes_device_role_in_every_arrival_order():
         db.close()
 
     assert observed == [("Bob", "member"), ("Bob", "member")]
+
+
+def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice")
+    founder_secret, founder = node.identity(workspace)
+    cmds.bind_device(node, workspace, "alice-phone")
+
+    bob_secret, bob, _ = add_member(node, workspace, "bob")
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    cmds.bind_device(node, workspace, "bob-phone")
+
+    sibling_secret, sibling = keypair()
+    node.keychain.add_identity(sibling_secret)
+    grants = []
+    for ordinal, (secret, public, user) in enumerate((
+            (founder_secret, founder, founder),
+            (bob_secret, bob, bob),
+    )):
+        item = device_invite_fact(
+            public, user, sibling, f"{user[:8]}-sibling", 100 + ordinal)
+        signed = signature(secret, public, item, 100 + ordinal)
+        device_source = node.idx(workspace).execute(
+            "SELECT o.src FROM offers o JOIN proofs p ON p.fid=o.src "
+            "WHERE o.name='device_key' AND o.a0=? "
+            "ORDER BY p.rank, o.src LIMIT 1",
+            (public,),
+        ).fetchone()[0]
+        node.ingest_new(
+            workspace, [signed, item],
+            {
+                signed.fid: [],
+                item.fid: [
+                    signed.fid,
+                    member_src(node, workspace, public),
+                    device_source,
+                ],
+            },
+        )
+        grants.append(item)
+
+    projected = devices(node, workspace)
+    sibling_row = next(row for row in projected if row["pk"] == sibling)
+    assert sibling_row["user"] == founder
+
+    node.bind_identity(workspace, sibling)
+    _, another = keypair()
+    with pytest.raises(ValueError, match="not a device-set member"):
+        grant(node, workspace, bob, another, "must-not-use-losing-claim")
+
+    winner = node.idx(workspace).execute(
+        "SELECT o.src FROM offers o JOIN proofs p ON p.fid=o.src "
+        "WHERE o.name='device_key' AND o.a0=? "
+        "ORDER BY p.rank, o.src LIMIT 1",
+        (sibling,),
+    ).fetchone()[0]
+    assert winner == grants[0].fid

@@ -1,8 +1,12 @@
 """Adversarial kernel tests: the judge rejects what it must, whole units."""
+import sqlite3
+
 import pytest
 
+from tinyp2p.close import close
 from tinyp2p.crypto import keypair, sign
 from tinyp2p.fact import Fact
+from tinyp2p.facts.auth.admin import admin
 from tinyp2p.facts.auth.device import device
 from tinyp2p.facts.auth.device_invite import device_invite
 from tinyp2p.facts.auth.removal import removal
@@ -12,7 +16,14 @@ from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.auth.workspace import workspace
 from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import Global, drain, evaluate, validate
+from tinyp2p.kernel import (
+    SCHEMA,
+    Global,
+    drain,
+    evaluate,
+    resolve_deps,
+    validate,
+)
 from tinyp2p.node import now_ms
 
 
@@ -195,6 +206,72 @@ def test_authority_facts_cannot_satisfy_their_own_prerequisite(anchor_chain):
     self_admin_sig = signature(
         founder_sk, founder_pk, self_admin, ts + 2)
     assert not judge([root, self_admin_sig, self_admin], root.fid)
+
+
+def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
+        anchor_chain):
+    founder_secret, founder, root = anchor_chain
+    ts = now_ms()
+
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(founder, invite_public, ts + 1)
+    invitation_sig = signature(
+        founder_secret, founder, invitation, ts + 1)
+    bob_secret, bob = keypair()
+    joined = user(invitation, invite_secret, bob, "bob", ts + 2)
+    joined_sig = signature(bob_secret, bob, joined, ts + 2)
+    promote_bob = admin(founder, bob, ts + 3)
+    promote_bob_sig = signature(
+        founder_secret, founder, promote_bob, ts + 3)
+    promote_founder = admin(bob, founder, ts + 4)
+    promote_founder_sig = signature(
+        bob_secret, bob, promote_founder, ts + 4)
+    admin_stream = [
+        root,
+        invitation_sig,
+        invitation,
+        joined_sig,
+        joined,
+        promote_bob_sig,
+        promote_bob,
+        promote_founder_sig,
+        promote_founder,
+    ]
+
+    primary = device(founder, "phone", ts + 1)
+    primary_sig = signature(founder_secret, founder, primary, ts + 1)
+    laptop_secret, laptop = keypair()
+    laptop_grant = device_invite(
+        founder, founder, laptop, "laptop", ts + 2)
+    laptop_grant_sig = signature(
+        founder_secret, founder, laptop_grant, ts + 2)
+    founder_back_grant = device_invite(
+        laptop, founder, founder, "founder-again", ts + 3)
+    founder_back_grant_sig = signature(
+        laptop_secret, laptop, founder_back_grant, ts + 3)
+    device_stream = [
+        root,
+        primary_sig,
+        primary,
+        laptop_grant_sig,
+        laptop_grant,
+        founder_back_grant_sig,
+        founder_back_grant,
+    ]
+
+    for stream in (admin_stream, device_stream):
+        db = sqlite3.connect(":memory:")
+        db.executescript(SCHEMA)
+        result = drain(stream, root.fid, db=db)
+        assert result.ok
+        by_fid = {fact.fid: fact for fact in stream}
+        closed = close(
+            stream,
+            lambda fid: resolve_deps(by_fid[fid], db) or [],
+            by_fid.get,
+        )
+        assert drain(closed, root.fid).ok
+        db.close()
 
 
 def test_removal_gates_requests_only(anchor_chain):

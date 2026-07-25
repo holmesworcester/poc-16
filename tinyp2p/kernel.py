@@ -22,6 +22,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
+CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 -- src-leading covering index: offers_from() matches on (src, name), which the
 -- PK index (src last) can't serve, so without this it full-scans the offers
 -- table per lookup -> O(joins * offers) rebuild/validate. We have a db; seek.
@@ -68,13 +69,51 @@ class Context:
             (source, name)).fetchall()
 
 
-def offer_src(db, name, a0, a1=None):
-    """Canonical provider (minimum source id) for an offer address, or None."""
-    query, args = "SELECT src FROM offers WHERE name=? AND a0=?", [name, a0]
+def offer_src(db, name, a0, a1=None, requires=()):
+    """Canonical finite-proof provider for an offer address, or ``None``.
+
+    Providers are ordered by their shortest authority proof and then source
+    id.  Proof rank is well-founded: every dependency has a lower rank than
+    its dependent, so a later lower-fid offer cannot rewire the final graph
+    into a cycle.
+
+    ``requires`` is a family-declared tuple of co-offers that must come from
+    the selected source.  Selection happens *before* those checks.  This lets
+    a family declare one globally canonical claim (for example, ownership of
+    a key) while also checking the claim's associated value without allowing
+    a losing claimant to become authoritative.
+    """
+    query = (
+        "SELECT o.src FROM offers o "
+        "JOIN proofs p ON p.fid=o.src "
+        "WHERE o.name=? AND o.a0=?"
+    )
+    args = [name, a0]
     if a1 is not None:
-        query, args = query + " AND a1=?", args + [a1]
-    row = db.execute(query + " ORDER BY src LIMIT 1", args).fetchone()
-    return row and row[0]
+        query, args = query + " AND o.a1=?", args + [a1]
+    row = db.execute(
+        query + " ORDER BY p.rank, o.src LIMIT 1", args).fetchone()
+    if row is None:
+        return None
+    source = row[0]
+    for required_name, required_a0, required_a1 in requires:
+        if db.execute(
+                "SELECT 1 FROM offers "
+                "WHERE src=? AND name=? AND a0=? AND a1=?",
+                (source, required_name, required_a0,
+                 required_a1 or "")).fetchone() is None:
+            return None
+    return source
+
+
+def _need_parts(need):
+    """Normalize the public three-field need and its optional co-offers."""
+    if len(need) == 3:
+        return (*need, ())
+    if len(need) == 4:
+        name, a0, a1, requires = need
+        return name, a0, a1, tuple(requires)
+    raise ValueError("a need must have three fields plus optional co-offers")
 
 
 def resolve_deps(f: Fact, db):
@@ -89,14 +128,81 @@ def resolve_deps(f: Fact, db):
         return None
     deps = [fid for _, fid in f.refs()]
     try:
-        for name, a0, a1 in handler.needs(f):
-            source = offer_src(db, name, a0, a1)
+        for need in handler.needs(f):
+            name, a0, a1, requires = _need_parts(need)
+            source = offer_src(db, name, a0, a1, requires)
             if source is None:
                 return None
             deps.append(source)
     except Exception:
         return None
     return deps
+
+
+def proof_rank(db, deps):
+    """Return one plus the maximum dependency rank (or zero at a root)."""
+    if not deps:
+        return 0
+    rows = db.execute(
+        f"SELECT fid, rank FROM proofs WHERE fid IN "
+        f"({','.join('?' for _ in deps)})",
+        tuple(deps),
+    ).fetchall()
+    ranks = {fid: rank for fid, rank in rows}
+    if any(fid not in ranks for fid in deps):
+        return None
+    return 1 + max(ranks[fid] for fid in deps)
+
+
+def extend_proofs(db, fids, fact_of):
+    """Add shortest authority proofs for ``fids`` against ranked context."""
+    unresolved, pending = {}, list(fids)
+    while pending:
+        fid = pending.pop()
+        if fid in unresolved or db.execute(
+                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone():
+            continue
+        fact = fact_of(fid)
+        if fact is None:
+            continue
+        unresolved[fid] = fact
+        pending.extend(ref for _, ref in fact.refs())
+    while unresolved:
+        ready = []
+        for fid in sorted(unresolved):
+            fact = unresolved[fid]
+            deps = resolve_deps(fact, db)
+            if deps is None:
+                continue
+            rank = proof_rank(db, deps)
+            if rank is not None:
+                ready.append((fid, rank))
+        if not ready:
+            break
+        db.executemany("INSERT OR REPLACE INTO proofs VALUES(?,?)", ready)
+        for fid, _ in ready:
+            unresolved.pop(fid)
+    return frozenset(unresolved)
+
+
+def rebuild_proofs(db, fact_of):
+    """Recompute shortest authority proofs for every offer source.
+
+    Facts are admitted in rank waves.  A fact in wave ``r`` can depend only on
+    providers from earlier waves, which gives every accepted set one
+    history-independent dependency DAG even when offers shadow one another.
+    Facts that neither provide an offer nor anchor a reference cannot
+    authorize anything and need no persistent rank; the streaming kernel
+    still ranks them while judging.
+
+    Returns the source ids that have no finite proof.
+    """
+    db.execute("DELETE FROM proofs")
+    return extend_proofs(
+        db,
+        [fid for (fid,) in db.execute("SELECT DISTINCT src FROM offers")],
+        fact_of,
+    )
 
 
 def _globals(rows):
@@ -138,10 +244,17 @@ def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
             if db is None:
                 con.close()
             return Judgment(False, (), frozenset())
+        rank = proof_rank(con, deps)
+        if rank is None:
+            con.rollback()
+            if db is None:
+                con.close()
+            return Judgment(False, (), frozenset())
         con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
         for name, a0, a1 in f.offers():
             con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                         (name, a0, a1, f.fid))
+        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
         if mode == DRAIN:
             emitted.update(Global(*row) for row in handler.global_rows(f))
         valids.append(Valid(f, tuple(deps)))

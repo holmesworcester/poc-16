@@ -11,21 +11,21 @@ from .crypto import keypair, load_sk
 
 
 class Keychain:
-    def __init__(self, path):
+    def __init__(self, path, initial_secret=None):
         self.path = path
         if os.path.exists(path):
             with open(path) as source:
                 raw = json.load(source)
         else:
             raw = {}
-        self.data = self._normalize(raw)
+        self.data = self._normalize(raw, initial_secret)
         self.save()
 
     @staticmethod
     def _public_key(seed_hex):
         return load_sk(seed_hex).verify_key.encode().hex()
 
-    def _normalize(self, raw):
+    def _normalize(self, raw, initial_secret=None):
         if not isinstance(raw, dict):
             raise ValueError("keyring must be a JSON object")
         workspaces = raw.get("workspaces", {})
@@ -40,7 +40,13 @@ class Keychain:
         if legacy_seed is not None:
             keys.setdefault(self._public_key(legacy_seed), legacy_seed)
         if not keys:
-            secret, public = keypair()
+            secret = initial_secret
+            if isinstance(secret, str):
+                secret = load_sk(secret)
+            if secret is None:
+                secret, public = keypair()
+            else:
+                public = secret.verify_key.encode().hex()
             keys[public] = secret.encode().hex()
         for key_id, seed_hex in keys.items():
             if self._public_key(seed_hex) != key_id:
