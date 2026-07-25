@@ -15,3 +15,21 @@ eviction, and routed `facts/auth` + `facts/content` families — with black-box
 multi-daemon tests. [IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
 maps design to code, records the deviations, and carries the
 treap-leaves-are-piles argument. `pytest tests/` runs it all.
+
+## Setup
+
+The Python runtime needs PyNaCl:
+
+```sh
+python3 -m pip install pynacl
+```
+
+Bao attachments additionally use the vendored Rust extension. From the
+project root (with a Rust toolchain installed), build and install it with:
+
+```sh
+python3 -m pip install ./native/bao_py
+```
+
+The extension is loaded only when attachment I/O needs it; auth, messages,
+sync, and `import facts` work without this optional build.

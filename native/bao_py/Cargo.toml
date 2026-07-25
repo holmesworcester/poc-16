@@ -1,0 +1,13 @@
+[package]
+name = "tinyp2p-bao"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0 OR Apache-2.0"
+
+[lib]
+name = "tinyp2p_bao"
+crate-type = ["cdylib"]
+
+[dependencies]
+bao = "=0.13.1"
+pyo3 = { version = "=0.28.3", features = ["extension-module", "abi3-py38"] }

@@ -1,10 +1,13 @@
 # tinyp2p — the POC-16 implementation
 
 A working build of [DESIGN.md](../DESIGN.md) in ~2,000 lines of Python (stdlib +
-pynacl), proving the semantics before any byte-format or Rust work. Alice,
+pynacl), proving the core semantics before lower-level optimization. Alice,
 bob, and carol run real daemons, join by invite link, converge continuously,
 move multi-MB files, survive stragglers, eviction, and restarts —
 `tests/test_blackbox.py` drives all of it through the CLI seam.
+The optional Bao attachment binding is vendored under `native/bao_py` and
+installed with `python3 -m pip install ./native/bao_py`; `core/bao.py` loads it
+only when attachment I/O crosses that seam.
 
 ## The map
 
