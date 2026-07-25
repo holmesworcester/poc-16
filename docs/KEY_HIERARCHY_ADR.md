@@ -1,0 +1,407 @@
+# Recipient key hierarchy and purge guarantees
+
+Status: accepted ADR for `poc-16-x1o.3`. It refines the threat model and
+transition contract in
+[`PUNCTURABLE_ENCRYPTION_SOURCE.md`](PUNCTURABLE_ENCRYPTION_SOURCE.md).
+It is a provider contract and executable decision model, not a claim that a
+production hardware provider has landed.
+
+## Decision
+
+**Decision: independent, non-exportable recipient-generation handles are the
+primary hierarchy.** The portable fallback uses the same independently random
+generation shape in software and makes a weaker guarantee. Poc-16 v1 has no
+permanent content root and no deterministic generation schedule.
+
+For one device recipient lineage:
+
+- `dev_sign` is a stable signing/attestation identity. It cannot unwrap content,
+  derive recipient generations, or authorize a retired schedule position.
+- Every recipient generation is independently random. P private material
+  cannot derive S or T.
+- The provider keeps two handles at steady state: active P and P's staged
+  successor S.
+- A P-to-S transition creates and durably validates S's staged successor T
+  before destroying P. The irreversible peak is therefore three handles:
+  P, S, and T.
+- After P destruction, promotion performs no key creation and returns to
+  steady state S/T.
+- FrontierRoot and HistoryNode cover secrets are encrypted data, not hardware
+  handles. Their count may grow with the canonical puncture cover while
+  hardware handle count remains constant per recipient lineage.
+
+The v1 first-F-only mode is rejected. Standard cover records are either
+share-wrappable or generation-sealed, so purging F or any retained HistoryNode
+is recovery-eligible and rotates the recipient generation exactly once for the
+committed purge batch.
+
+The portable software provider generates the same independent P/S/T keys and
+implements the same state machine. It does not claim that filesystem backup,
+clone, or snapshot restore cannot resurrect a deleted key or one-time claim.
+
+## Why a stable root is not the answer
+
+A root reduces visible handles only by retaining a recovery operation. If a
+permanent `dev_box`, hardware root, seed, or parent can unwrap an archived P
+blob or derive P again, destroying the P alias does not purge P. If P derives S
+or T, compromise of P also crosses the intended rotation boundary.
+
+Poc-16 therefore rejects:
+
+1. a stable device-box key that wraps every recipient private key;
+2. a forward KDF in which P or a retained seed derives S or T;
+3. a permanent root that accepts an old generation number supplied by
+   rollbackable software;
+4. a saved root operation that reopens an archived cover ciphertext; and
+5. a software-only “used” bit that a disk snapshot can roll back.
+
+A future provider may retain a hardware root only if hardware enforces the
+*exact live schedule position*: after monotonic advancement, the root must be
+unable to operate at any earlier position even when given an archived keyblob
+and an old database. TPM `PolicyNV` is one possible construction. It is a
+provider extension, not the selected v1 hierarchy, and it must pass the same
+snapshot, claim-fork, and purge tests before claiming a lower handle peak.
+
+## Key and envelope layout
+
+The shared recipient fact carries a provider suite and public key. The suite is
+part of every key-wrap fact and its authenticated context; a P-256 key cannot
+be relabeled as X25519 or vice versa.
+
+- The frozen poc-10 compatibility suite remains
+  X25519 + HKDF-SHA256 + XChaCha20-Poly1305.
+- A hardware provider may advertise a different reviewed suite, such as P-256
+  ECDH where that is the platform's non-exportable key-agreement primitive.
+- Cross-suite migration decrypts with P through the provider and reseals to S
+  under S's suite. It never exports P.
+
+A local cover envelope contains:
+
+```text
+version
+provider_suite
+recipient_lineage_id
+recipient_generation_fact_id
+content_scope_id
+frontier_id
+secret_kind                  # FrontierRoot or HistoryNode
+exact time/trie coordinate
+source_secret_ref
+tombstone_context
+recovery_policy_ref
+nonce / sender public material
+ciphertext
+```
+
+Every field above is authenticated. Implementations may use randomized
+encryption and store the ciphertext in ordinary database/object storage. They
+must not place plaintext F, HistoryNode secrets, leaf keys, or recipient
+private material in facts, sync piles, logs, crash reports, or backup exports.
+
+## Provider boundary
+
+The production boundary must expose operations equivalent to:
+
+| Operation | Required behavior |
+|---|---|
+| `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle. Track or destroy orphan allocation after failure. |
+| `open(handle, envelope, aad)` | Open only with the exact generation and authenticated context. Private material never leaves a non-exportable provider. |
+| `seal(public, plaintext, aad)` | Seal F or one retained-cover node to a named generation and exact context. |
+| `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, and freeze the purge-target manifest derived from that causally closed batch; identical saved-input retries coalesce and every mismatch conflicts. |
+| `acquire_writer_lease(P)` | Admit a generation-bound write only while P is finalized and unfenced. |
+| `close_and_drain(P)` | Reject new P leases and commits; drain or abort all existing leases before survivor enumeration. |
+| `migrate(P, S, manifest)` | Require S and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. |
+| `destroy(P)` | Idempotently destroy the P handle/keyblob and advance monotonic retirement state to the successor fixed by P's claim. |
+| `promote(P, S, T, claim)` | Change active/staged state to S/T without allocation or dependence on a clock or lookup-selected key. |
+| `capabilities()` | Report suite, non-exportability, deletion, rollback, attestation, capacity, backup, and clone guarantees without exaggeration. |
+
+The stable identity provider may sign a provider attestation or shared
+completion fact. It cannot call `open` and is not the schedule authority.
+
+## Recursive one-time claim
+
+Before any destructive step, the provider commits:
+
+```text
+TransitionClaimV1(
+    content_scope_id,
+    recipient_lineage_id,
+    predecessor_recipient_fact_id = P,
+    successor_generation_fact_id,
+    successor_provider_suite,
+    successor_public_key_bytes = S,
+    successor_next_generation_fact_id,
+    successor_next_provider_suite,
+    successor_next_public_key_bytes = T,
+    retirement_batch_commitment,
+)
+```
+
+The batch commitment is over the exact causally referenced purge-operation
+fact ids. There is no timestamp in the claim. Fact authoring still captures
+“now” as required by the source contract, but refs, needs, the claim, and the
+closed pile establish every relationship. `S` and `T` mean the actual
+suite-qualified public commitments, never aliases or generation labels. A
+retry supplies the originally saved prepared tuple; the provider does not
+reconstruct it by looking up whichever handles currently occupy those labels.
+
+For a predecessor P:
+
+- the first valid whole tuple is accepted;
+- an identical retry returns the same claim;
+- different S, same S with different T, or the same P/S/T with a different
+  batch is a permanent conflict;
+- a reservation is not wrap-eligible; and
+- finalized S must causally close over the claim, exact batch, fence/drain,
+  migration, P destruction, provider completion evidence, and reader proof.
+
+At the next transition, the already committed S/T pair advances to S/T/U. A
+rollback-resistant provider retains enough one-time claim state outside
+rollbackable application storage to reject a second P claim after restoration
+of an older snapshot.
+
+## Rotation and migration protocol
+
+Key purge is the trigger. Suppression visibility, deletion timestamp, observed
+wrap inventory, and local absence are not triggers or proofs.
+
+1. Identify the exact causally committed purge batch and recovery-eligible
+   secret set.
+2. Verify active/staged P/S. Generate and durably validate T. Capacity failure
+   here leaves P live and returns a retryable failure.
+3. Atomically claim `(P, S, T, batch)`.
+4. Author the non-wrap reservation and its complete dependency-first closed
+   pile.
+5. Close the P writer fence. Abort or drain every P lease.
+6. Load the purge-target manifest frozen by the claim. A different or omitted
+   manifest fails; exact purge targets are not copied to S.
+7. Open each live P envelope through the provider, immediately reseal to S, and
+   durably mark the exact record complete. Clear plaintext buffers.
+8. Verify that every survivor has an S envelope, that the live S/T handles
+   still match the exact public-key bytes in the claim, and that no committed
+   record can still be written under P.
+9. Durably mark migration prepared, then destroy P and advance the hardware
+   retirement position where supported.
+10. Promote the already existing S/T pair. No allocation is permitted after P
+    destruction.
+11. Publish durable completion evidence and finalized S. Only then can S
+    satisfy key-wrap, request, proactive-share, or healing needs.
+12. Garbage-collect superseded P metadata and ciphertext opportunistically.
+    Archived P ciphertext is assumed to survive.
+
+Multiple recovery-eligible secrets in one batch cause one transition. An
+excluded purge operation never joins the batch by arrival order; it carries an
+explicit rebase ref to finalized S and, when eligible, drives a later S-to-T
+transition.
+
+## Crash windows
+
+| Crash point | Durable state and restart rule |
+|---|---|
+| Before T is durable | P/S remain steady. Delete or track any orphan; do not claim or fence. |
+| After T, before claim | Retry with the same prepared T or discard T while P is still unclaimed. |
+| After claim, before fence | Resume only the identical P/S/T/batch claim. A sibling is a conflict. |
+| After fence, during migration | Keep P fenced and live. Resume the immutable manifest idempotently; do not rescan a moving set. |
+| After migration, before P destruction | Verify the S copies again, then resume destruction. P is still recoverable but no longer writable. |
+| After P destruction, before promotion | Retry destruction idempotently. If rollbackable destruction metadata was lost, reconstruct it only when protected retirement state contains the exact suite-qualified P/S/T/batch claim, its floor has advanced through S, and P is absent; then reconcile forward. Never allocate a replacement S or T and never restore P. |
+| After promotion, before finalization | S/T are durable but S remains ineligible for shared wraps until completion evidence closes. |
+| After finalization | Duplicate completion/finalization coalesces. Late P mismatch remains a conflict. |
+
+An error before P destruction must leave P usable or report a precisely
+recoverable fenced state. An error after P destruction may delay availability,
+but cannot require P, allocate a new S/T pair, or report an ambiguous active
+generation.
+
+## Purging cover and recipient material
+
+For an exact or range puncture:
+
+- delete the target leaf, descend path, canonical bytes, caches, WAL/temp
+  copies covered by the selected guarantee, and any target cover envelope;
+- materialize only the canonical survivor siblings;
+- migrate each survivor to S;
+- destroy P after migration; and
+- retain only the S-encrypted canonical cover plus S/T provider state.
+
+The target is deliberately unavailable after completion. A retained sibling
+continues to derive the same leaf for every surviving coordinate. Healing can
+wrap the retained sibling but must never recreate F or a punctured path.
+
+Under the selected standard provider, a retained HistoryNode is
+generation-sealed and can also be a shared wrap source. Its purge therefore
+rotates even when no wrap is visible locally. The first-F-only mode is rejected
+because a delayed wrap or archived generation envelope would otherwise recover
+the supposedly retired node.
+
+## Guarantee tiers
+
+Every provider reports one of these; product language must name the tier.
+
+| Tier | Required property | What purge establishes | What it does not establish |
+|---|---|---|---|
+| `normal-disk` | Independently random software generations; best-effort overwrite/delete and cache cleanup. | Current ordinary storage no longer contains intentionally retained P plaintext/private state. | It does not establish that a backup, clone, forensic remanence, or restored filesystem cannot revive P or fork a claim. |
+| `hardware-isolated` | Private key is non-exportable and current live provider state no longer exposes P. | A post-purge application/storage attacker cannot call P through the current handle set; extracting S/T private material is harder. | It does not establish that replaying an archived hardware keyblob or provider database is impossible. StrongBox/Secure Enclave branding alone is not rollback proof. |
+| `rollback-resistant` | Hardware or an equally strong non-clonable witness irreversibly rejects deleted keyblobs and a second claim for each retired P. | Restoring old sealed state cannot open P material or authorize a sibling P claim; it fails closed. | It cannot make an authorized reader forget plaintext copied before purge or guarantee availability under malicious rollback. |
+
+The rollback-resistant tier is both a key-erasure and schedule-uniqueness
+claim. Supplying only one half is insufficient.
+
+## Platform mapping
+
+These are conservative ceilings, not automatic capability detection.
+
+### Apple Security framework / Secure Enclave
+
+Apple's [Secure Enclave key guide](https://developer.apple.com/documentation/Security/protecting-keys-with-the-secure-enclave)
+documents device-bound, non-plaintext private keys and P-256 signing/key
+agreement. That supports a P-256 recipient suite and the `hardware-isolated`
+tier.
+
+Apple also documents that a
+[`ThisDeviceOnly` keychain item](https://developer.apple.com/documentation/Security/restricting-keychain-item-accessibility)
+does not migrate to another device but can participate in same-device restore.
+The cited public application API does not establish a monotonic transition
+claim or rollback-resistant deletion guarantee. Therefore poc-16 does not claim
+the rollback-resistant tier on Apple from Secure Enclave + `SecItemDelete`
+alone. A future implementation needs a separately reviewed non-rollback
+primitive or witness.
+
+The stable Secure Enclave `dev_sign` key remains separate from rotating P/S/T
+P-256 key-agreement handles.
+
+### Android Keystore / StrongBox / KeyMint
+
+The [Android Keystore guide](https://developer.android.com/privacy-and-security/keystore)
+documents non-exportable keys and optional TEE/StrongBox protection. That
+supports `hardware-isolated` when the actual key's security level and
+authorizations are checked.
+
+The lower-level
+[KeyMint contract](https://source.android.com/docs/security/features/keystore/implementer-ref)
+defines `ROLLBACK_RESISTANCE`: after deletion, secure hardware prevents a
+previously captured keyblob from becoming usable again, commonly using replay
+protected memory. It can also fail creation when trusted storage is full.
+
+StrongBox alone is not treated as proof that this tag was requested, honored,
+and available to the application provider. Ordinary Android Keystore adapters
+claim at most `hardware-isolated`. A platform-specific adapter may claim
+`rollback-resistant` only after it verifies deletion replay resistance,
+one-time claim storage, attestation/security level, quota behavior, and the
+three-handle transition on each supported device class.
+
+### TPM 2.0
+
+A direct TPM provider can bind sealed generation state to an exact monotonic NV
+position. The TPM specification defines
+[`TPM2_PolicyNV`](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-1-Version-184_pub.pdf)
+as a policy assertion over NV contents, and an NV index with
+[`TPMA_NV_COUNTER`](https://trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-2-Structures-00.99.pdf)
+can only be modified with `TPM2_NV_Increment`.
+
+For the strong tier, P objects and P claim authorization are usable only at
+position `n`; completion increments to `n+1`; archived position-`n` blobs then
+fail policy. Authorization must prevent an attacker from deleting/redefining
+the counter or swapping the hierarchy. TPM clear may destroy the root and data
+availability, but must not restore an old position. NV endurance, ownership,
+multi-process coordination, and provisioning are release gates.
+
+### Software-only
+
+Generate independent X25519 generations and encrypt their local storage using
+the operating system's best available data protection. Never derive them from
+`dev_sign`, a password, P, or a stable application root. This preserves
+protocol interoperability, explicit P/S/T claims, and current-disk cleanup, but
+the provider reports `normal-disk`: a pre-purge clone or backup can contain P
+and can fork the one-time schedule.
+
+## Backup, restore, and device recovery
+
+Shared facts, content ciphertext, non-secret coordinates, and current cover
+ciphertext may be backed up. Recipient private handles, plaintext cover,
+plaintext leaf keys, and one-time schedule authority are not portable backup
+material.
+
+A new device is readmitted with a new stable device identity/recipient lineage.
+An authorized surviving reader heals still-live F or retained cover to the new
+recipient. It cannot heal a punctured secret. If no authorized reader retains
+the live cover, confidentiality wins over availability and the content is
+lost.
+
+On same-device restore:
+
+- `normal-disk` may resurrect P and fork its claim;
+- `hardware-isolated` depends on provider behavior and makes no rollback claim;
+  and
+- `rollback-resistant` compares restored metadata with monotonic hardware
+  state, rejects stale P state, and reconciles forward from S/T and shared
+  evidence. A maliciously old snapshot may lose availability, but cannot regain
+  P.
+
+Every lease, commit, open, wrap-eligibility query, promotion, and finalization
+checks the protected retirement position. Rolled-back metadata that still calls
+P active or finalized is fail-closed; it cannot admit a P writer and then
+discover retirement only during encryption.
+
+No restore path asks which key or timestamp is “latest.” It uses explicit
+generation refs and the provider's exact monotonic position.
+
+## Deferred retry-surface simplification
+
+The executable decision model keeps `claim`, `migrate`, `destroy`, `promote`,
+and `finalize` separate so this ADR can expose each required check. It proves
+idempotent retries in the active transition and the documented
+post-destruction/pre-promotion recovery window. It does not claim that an
+arbitrarily late call to an old step returns the same success result after
+later generations have retired that transition's S or T handles.
+
+`poc-16-x1o.22` tracks the runtime simplification: issue one immutable,
+suite-qualified transition token and drive it through a reconcile/advance
+state machine. Its exhaustive contract matrix will retry every operation after
+each later lifecycle state and generation. Until that lands, a historical
+retry must fail closed without mutating current state; it must never reconstruct
+arguments from a current-key or timestamp lookup.
+
+## Rejected and deferred alternatives
+
+| Alternative | Decision |
+|---|---|
+| One enclave handle per retained HistoryNode | Rejected: handle use scales with cover size and platform quotas. |
+| Stable `dev_box` wrapping all generation keys | Rejected: an archived P blob plus the surviving box revives P. |
+| P-derived forward ratchet | Rejected: P compromise derives successors; a retained seed/root can recreate retired material. |
+| Precomputed reverse chain | Rejected for v1: either precompute/storage is unbounded or a retained root remains a recovery path. |
+| Permanent root gated only by rollbackable generation metadata | Rejected: restoring metadata re-enables old operations. |
+| TPM/external root gated by non-rollback exact position | Deferred provider extension; it must prove the complete contract and any lower handle peak. |
+| Independent per-node keys with no generation binding | Rejected for v1 first-F-only mode; it changes healing/wrap policy and needs separate proof that no old recipient/root path exists. |
+| Remote serialization witness | Possible future rollback/clone tier, but it changes offline guarantees and is not part of the local v1 provider. |
+
+## Executable decision evidence
+
+The versioned fixture is
+[`tests/fixtures/key_hierarchy_v1.json`](../tests/fixtures/key_hierarchy_v1.json).
+`tests/test_key_hierarchy_adr.py` exercises a provider-shaped reference model:
+
+- three recursive transitions P/S/T, S/T/U, and T/U/V;
+- exact-claim retry and successor, next, and batch conflicts;
+- binding of those claims to actual suite-qualified public-key bytes, including
+  rejection when a staged handle is regenerated under the same label;
+- exact purge-manifest binding plus rejection of mismatched migration,
+  destruction, promotion, and finalization state;
+- independent real X25519 keys, including failure of known P material to open S
+  or T ciphertext and different keys for equal public labels across providers;
+- two steady handles, the three-handle peak, and capacity failure before
+  destruction;
+- writer fencing, survivor migration, target purge, allocation-free promotion,
+  and finalization;
+- stale-snapshot writer rejection and forward reconstruction of destruction
+  evidence from protected retirement state;
+- strong snapshot restore failing to revive P or fork its claim;
+- software snapshot restore honestly demonstrating resurrection and a sibling
+  claim;
+- rejected root/first-F candidates; and
+- conservative Apple, Android, TPM, and software capability ceilings.
+
+This model does not prove a platform implementation. `poc-16-x1o.7` must run
+the provider contract against the in-memory fault provider and each production
+adapter. `poc-16-x1o.13` owns the full copy audit, including plaintext buffers,
+caches, WAL, temp files, crash reports, backups, and provider-specific keyblob
+residue.

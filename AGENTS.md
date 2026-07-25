@@ -22,7 +22,9 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
     also claimable.
   - **`poc-16-x1o`** — puncturable content encryption and KDF history tree,
     sourced from poc-10. The frozen lineage, threat model, lifecycle contract,
-    and v1 vectors are in `docs/PUNCTURABLE_ENCRYPTION_SOURCE.md`.
+    and v1 vectors are in `docs/PUNCTURABLE_ENCRYPTION_SOURCE.md`; the selected
+    bounded recipient hierarchy and purge tiers are in
+    `docs/KEY_HIERARCHY_ADR.md`.
   - **`poc-16-zgj`** — poc-13 auth port + chained-seed hoisting measurement.
     Closed; plan and hand-back: `docs/CHAINED_AUTH_PLAN.md` / `docs/MULTILEVEL_PILE.md`.
 

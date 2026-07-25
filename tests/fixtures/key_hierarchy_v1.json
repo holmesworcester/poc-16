@@ -1,0 +1,192 @@
+{
+    "schema": "poc-16.key-hierarchy.v1",
+    "decision": {
+        "primary": "independent-nonexportable-recipient-generations",
+        "portable_fallback": "independent-random-software-generations",
+        "software_recipient_suite": "X25519",
+        "stable_content_root": "rejected-in-v1",
+        "first_frontier_only_rotation": "rejected-in-v1",
+        "steady_handle_count": 2,
+        "transition_peak_handle_count": 3,
+        "recipient_generations": [
+            "P",
+            "S",
+            "T",
+            "U",
+            "V"
+        ],
+        "transition_batches": [
+            {
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "purge_operations": [
+                    "purge-node-a"
+                ]
+            },
+            {
+                "predecessor": "S",
+                "successor": "T",
+                "next": "U",
+                "purge_operations": [
+                    "purge-node-b",
+                    "purge-node-c"
+                ]
+            },
+            {
+                "predecessor": "T",
+                "successor": "U",
+                "next": "V",
+                "purge_operations": [
+                    "purge-node-d"
+                ]
+            }
+        ],
+        "purge_operation_targets": {
+            "purge-node-a": [
+                "retained-node-a"
+            ],
+            "purge-node-b": [
+                "retained-node-b"
+            ],
+            "purge-node-c": [
+                "absent-node-c"
+            ],
+            "purge-node-d": [
+                "absent-node-d"
+            ],
+            "conflicting-purge-operation": [
+                "conflicting-node"
+            ],
+            "forked-purge-operation": [
+                "forked-node"
+            ]
+        }
+    },
+    "cover_records": [
+        {
+            "id": "frontier-root",
+            "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        },
+        {
+            "id": "retained-node-a",
+            "plaintext_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+        },
+        {
+            "id": "retained-node-b",
+            "plaintext_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+        }
+    ],
+    "guarantee_tiers": [
+        {
+            "name": "normal-disk",
+            "nonexportable_private_key": false,
+            "deleted_keyblob_replay_blocked": false,
+            "old_claim_replay_blocked": false,
+            "snapshot_erasure_claim": false
+        },
+        {
+            "name": "hardware-isolated",
+            "nonexportable_private_key": true,
+            "deleted_keyblob_replay_blocked": false,
+            "old_claim_replay_blocked": false,
+            "snapshot_erasure_claim": false
+        },
+        {
+            "name": "rollback-resistant",
+            "nonexportable_private_key": true,
+            "deleted_keyblob_replay_blocked": true,
+            "old_claim_replay_blocked": true,
+            "snapshot_erasure_claim": true
+        }
+    ],
+    "hierarchy_candidates": [
+        {
+            "name": "independent-generation-handles",
+            "selected": true,
+            "stable_root": false,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "accepted"
+        },
+        {
+            "name": "stable-device-box-wraps-all-generations",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": true,
+            "status": "rejected"
+        },
+        {
+            "name": "deterministic-forward-schedule-without-monotonic-state",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": true,
+            "old_position_operation_possible": true,
+            "status": "rejected"
+        },
+        {
+            "name": "tpm-root-gated-by-exact-monotonic-position",
+            "selected": false,
+            "stable_root": true,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "deferred-provider-extension"
+        },
+        {
+            "name": "independent-node-keys-first-frontier-only",
+            "selected": false,
+            "stable_root": false,
+            "predecessor_derives_successors": false,
+            "old_position_operation_possible": false,
+            "status": "rejected-in-v1"
+        }
+    ],
+    "platforms": [
+        {
+            "name": "apple-security-framework-secure-enclave",
+            "key_agreement_suite": "P-256",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "hardware-isolated",
+            "notes": "ThisDeviceOnly is device-bound but same-device restore is documented; no rollback-resistant tier is claimed from the cited public API.",
+            "sources": [
+                "https://developer.apple.com/documentation/Security/protecting-keys-with-the-secure-enclave",
+                "https://developer.apple.com/documentation/Security/restricting-keychain-item-accessibility"
+            ]
+        },
+        {
+            "name": "android-keystore-or-strongbox",
+            "key_agreement_suite": "provider-advertised-and-attested",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "hardware-isolated",
+            "notes": "StrongBox alone is not treated as proof of rollback-resistant deletion. A provider may claim the stronger tier only when KeyMint rollback resistance is actually requested, verified, and capacity-tested.",
+            "sources": [
+                "https://developer.android.com/privacy-and-security/keystore",
+                "https://source.android.com/docs/security/features/keystore/implementer-ref"
+            ]
+        },
+        {
+            "name": "tpm-2-policy-nv-provider",
+            "key_agreement_suite": "provider-advertised",
+            "hardware_isolation": true,
+            "rollback_resistant_transition_claim_from_public_app_api": true,
+            "maximum_default_tier": "rollback-resistant-when-provisioned",
+            "notes": "The provider owns a counter NV index and binds old sealed objects to an exact PolicyNV position; authorization must prevent counter reset or replacement.",
+            "sources": [
+                "https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-1-Version-184_pub.pdf",
+                "https://trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-2-Structures-00.99.pdf"
+            ]
+        },
+        {
+            "name": "software-only",
+            "key_agreement_suite": "X25519",
+            "hardware_isolation": false,
+            "rollback_resistant_transition_claim_from_public_app_api": false,
+            "maximum_default_tier": "normal-disk",
+            "notes": "Independent random generations preserve protocol shape, but backups, clones, and filesystem snapshots can resurrect retired private material and one-time claims.",
+            "sources": []
+        }
+    ]
+}
