@@ -373,19 +373,19 @@ def owners(fids, fact_of):
     A, B, sig_tgt, inv_member = {}, {}, {}, {}
     for fid in fids:
         f = fact_of(fid)
-        if f.t == "sig":
+        if f.t == "signature":
             _, tgt, pk = f.offers()[0]
             sig_tgt[fid], A[fid] = tgt, pk
-        elif f.t == "join":
+        elif f.t == "user":
             A[fid] = f.body["pk"]
             inv_member[f.refs()[0][1]] = f.body["pk"]   # invite_fid -> joined member
         else:                                            # invite / msg / genesis
             A[fid] = f.body["pk"]
     for fid in fids:
         f = fact_of(fid)
-        if f.t == "invite":
+        if f.t == "user_invite":
             B[fid] = inv_member.get(fid, f.body["pk"])
-        elif f.t != "sig":
+        elif f.t != "signature":
             B[fid] = f.body["pk"]
     for fid in fids:                                     # a sig belongs to its target
         if fid in sig_tgt:

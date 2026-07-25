@@ -19,9 +19,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import facts
 from .close import close, decode_pile, encode_pile
-from .crypto import h, keypair, load_sk
-from .fact import Fact, from_json
-from .kernel import Judgment, drain, resolve_deps
+from .crypto import h
+from .fact import Fact, canon, from_json
+from .keychain import Keychain
+from .kernel import (
+    Judgment,
+    Valid,
+    drain,
+    extend_proofs,
+    proof_rank,
+    rebuild_proofs,
+    resolve_deps,
+)
 from .layout import fingerprint, layout
 from .store import FsStore
 
@@ -30,11 +39,12 @@ CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
+CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v1"
+INDEX_VERSION = "family-contract-v5"
 
 
 def now_ms():
@@ -42,23 +52,20 @@ def now_ms():
 
 
 class Node:
-    def __init__(self, dir):
+    def __init__(self, dir, initial_secret=None):
         self.dir = dir
         os.makedirs(dir, exist_ok=True)
         self.lock = threading.RLock()
         self.url = None  # the daemon sets its advertised base URL
         self._kr_path = os.path.join(dir, "keyring.json")
-        if os.path.exists(self._kr_path):
-            self.keyring = json.load(open(self._kr_path))
-        else:
-            sk, _ = keypair()
-            self.keyring = {"sk": sk.encode().hex(), "workspaces": {}}
-            self.save_keyring()
-        self.sk = load_sk(self.keyring["sk"])
-        self.pk = self.sk.verify_key.encode().hex()
+        self.keychain = Keychain(self._kr_path, initial_secret)
+        self.keyring = self.keychain.data
+        self.sk, self.pk = self.keychain.default()
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
         self.app.executescript(facts.APP_SCHEMA)
         self._stores, self._idx = {}, {}
+        self._reproject = set()
+        self._quarantine_offer_cache = {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
@@ -66,21 +73,41 @@ class Node:
     # ---- node-local state ----------------------------------------------------
 
     def save_keyring(self):
-        json.dump(self.keyring, open(self._kr_path, "w"))
+        self.keychain.save()
 
     @property
     def member(self):
         return self.pk[:16]
 
+    def identity(self, workspace=None):
+        return self.keychain.default() if workspace is None \
+            else self.keychain.for_workspace(workspace)
+
+    def identity_id(self, workspace=None):
+        return self.identity(workspace)[1]
+
+    def member_for(self, workspace):
+        return self.identity_id(workspace)[:16]
+
     def workspaces(self):
         return list(self.keyring["workspaces"])
 
-    def add_workspace(self, workspace, name, peers):
+    def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
         with self.lock:
+            identity = identity or self.keychain.default_id()
+            self.keychain.identity(identity)
             self.keyring["workspaces"][workspace] = {
-                "peers": list(peers), "name": name}
+                "peers": list(peers), "name": name,
+                "identity": identity}
             self.save_keyring()
+
+    def bind_identity(self, workspace, identity):
+        with self.lock:
+            self.keychain.bind(workspace, identity)
+            for key in [
+                    key for key in self.sync_cache if key[0] == workspace]:
+                self.sync_cache.pop(key).clear()
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -103,9 +130,10 @@ class Node:
         row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
         version = self.idx(ws).execute(
             "SELECT v FROM meta WHERE k='index-version'").fetchone()
+        semantic_upgrade = version is None or version[0] != INDEX_VERSION
         if etag and (row is None or row[0] != etag
-                     or version is None or version[0] != INDEX_VERSION):
-            self.rebuild(ws)
+                     or semantic_upgrade):
+            self.rebuild(ws, republish=semantic_upgrade)
 
     def _stamp(self, ws):
         idx = self.idx(ws)
@@ -166,38 +194,212 @@ class Node:
 
     def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
-        for v in valids:
-            f = v.fact
-            if not facts.handler_for(f.t).DURABLE:
-                continue  # judged, never persisted: litter drains away
-            if idx.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone() is None:
-                newfids.append(f.fid)  # what changed this drain — drives incremental layout
-            idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
-                        (f.fid, f.ts, f.t, json.dumps(f.to_json())))
-            for name, a0, a1 in f.offers():
-                idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-                            (name, a0, a1, f.fid))
-            out.append(v)
-        idx.executemany("INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
-        idx.commit()
-        return out, newfids
+        idx.execute("BEGIN")
+        try:
+            for v in valids:
+                f = v.fact
+                if not facts.handler_for(f.t).DURABLE:
+                    continue  # judged, never persisted: litter drains away
+                if idx.execute(
+                        "SELECT 1 FROM facts WHERE fid=?",
+                        (f.fid,)).fetchone() is None:
+                    # What changed this drain — drives incremental layout.
+                    newfids.append(f.fid)
+                idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
+                            (f.fid, f.ts, f.t, json.dumps(f.to_json())))
+                for name, a0, a1 in f.offers():
+                    idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
+                                (name, a0, a1, f.fid))
+                out.append(v)
+            idx.executemany(
+                "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
+            pruned, restored = set(), set()
+            if newfids:
+                shadows = self._shadows(ws, newfids)
+                pruned, restored = self._update_proofs(
+                    ws, newfids, shadows)
+                if pruned or restored:
+                    self._rebuild_globals(ws)
+            idx.commit()
+            if pruned or restored:
+                self._reproject.add(ws)
+                out = [valid for valid in out
+                       if valid.fact.fid not in pruned]
+                newfids = sorted(
+                    (set(newfids) | restored) - pruned)
+            return out, newfids
+        except Exception:
+            idx.rollback()
+            raise
+
+    def _quarantined_offers(self, ws):
+        """Return a process-local index of offers retained outside the DAG."""
+        if ws not in self._quarantine_offer_cache:
+            retained_offers = set()
+            for key in self.store(ws).list("quarantine/"):
+                try:
+                    retained = from_json(json.loads(
+                        self.store(ws).get(key)))
+                except Exception:
+                    continue
+                if key == "quarantine/" + retained.fid:
+                    retained_offers.update(retained.offers())
+            self._quarantine_offer_cache[ws] = retained_offers
+        return self._quarantine_offer_cache[ws]
 
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
         deps? Any new offer for an address that now has more than one provider
-        might move min-src under a frozen range, so the generic core drops the
-        memo rather than knowing which offer names families consume."""
+        might change its shortest-proof winner under a frozen range. A match
+        against a quarantined provider can also repair an absent proof. In
+        either case the generic core drops the memo rather than knowing which
+        offer names families consume."""
         idx = self.idx(ws)
+        quarantined = None
         for fid in newfids:
-            for name, a0, a1 in self.fact_of(ws, fid).offers():
+            fact = self.fact_of(ws, fid)
+            if fact is None:
+                continue
+            for name, a0, a1 in fact.offers():
                 if idx.execute(
                         "SELECT COUNT(*) FROM offers WHERE name=? AND a0=? AND a1=?",
                         (name, a0, a1)).fetchone()[0] > 1:
                     return True
+                if quarantined is None:
+                    quarantined = self._quarantined_offers(ws)
+                if (name, a0, a1) in quarantined:
+                    return True
         return False
 
-    def commit(self, ws, newfids=()):
+    def _rebuild_proofs(self, ws):
+        """Return every fact outside the set's finite canonical proof DAG."""
+        idx = self.idx(ws)
+        unresolved = set(rebuild_proofs(
+            idx, lambda fid: self.fact_of(ws, fid)))
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+            if fid in unresolved:
+                continue
+            fact = self.fact_of(ws, fid)
+            deps = resolve_deps(fact, idx)
+            if deps is None or proof_rank(idx, deps) is None:
+                unresolved.add(fid)
+        return unresolved
+
+    def _restore_quarantine(self, ws):
+        """Reinsert previously valid facts before recomputing authority.
+
+        A canonical winner can change twice: a conflict can first orphan a
+        downstream fact, then a later shorter proof can restore its original
+        authority source. Keep pruned facts outside the published set so they
+        cannot poison a leaf, but retain them locally so that second change is
+        history-independent and survives an index rebuild.
+        """
+        idx, restored = self.idx(ws), set()
+        for key in self.store(ws).list("quarantine/"):
+            try:
+                fact = from_json(json.loads(self.store(ws).get(key)))
+            except Exception:
+                continue
+            handler = facts.handler_for(fact.t)
+            if key != "quarantine/" + fact.fid \
+                    or handler is None or not handler.DURABLE:
+                continue
+            if idx.execute(
+                    "SELECT 1 FROM facts WHERE fid=?",
+                    (fact.fid,)).fetchone() is not None:
+                continue
+            idx.execute(
+                "INSERT INTO facts VALUES(?,?,?,?)",
+                (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
+            for name, a0, a1 in fact.offers():
+                idx.execute(
+                    "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
+                    (name, a0, a1, fact.fid))
+            restored.add(fact.fid)
+        return restored
+
+    def _quarantine(self, ws, fids):
+        """Retain kernel-valid facts that are outside the current proof DAG."""
+        st = self.store(ws)
+        retained_offers = self._quarantined_offers(ws)
+        for fid in sorted(fids):
+            fact = self.fact_of(ws, fid)
+            if fact is not None:
+                st.put_if_absent(
+                    "quarantine/" + fid, canon(fact.to_json()))
+                retained_offers.update(fact.offers())
+
+    def _prune_unresolved(self, ws):
+        """Derive the same finite-proof subset from any arrival order."""
+        idx, pruned = self.idx(ws), set()
+        while True:
+            unresolved = self._rebuild_proofs(ws)
+            if not unresolved:
+                return pruned
+            pruned.update(unresolved)
+            self._quarantine(ws, unresolved)
+            idx.executemany(
+                "DELETE FROM offers WHERE src=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
+                "DELETE FROM proofs WHERE fid=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
+                "DELETE FROM facts WHERE fid=?",
+                ((fid,) for fid in unresolved))
+
+    def _rebuild_globals(self, ws):
+        """Reproject monotone rows after canonical pruning removes a source."""
+        idx = self.idx(ws)
+        idx.execute("DELETE FROM globals")
+        rows = set()
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+            fact = self.fact_of(ws, fid)
+            rows.update(facts.handler_for(fact.t).global_rows(fact))
+        idx.executemany(
+            "INSERT OR IGNORE INTO globals VALUES(?,?)", sorted(rows))
+
+    def _update_proofs(self, ws, newfids, shadows):
+        """Rank an append or prune to the union's canonical finite subset."""
+        idx = self.idx(ws)
+        restored = self._restore_quarantine(ws) \
+            if shadows or not newfids else set()
+        if shadows or restored or not newfids:
+            return self._prune_unresolved(ws), restored
+        # A healthy index has proofs for every old offer source.  On the
+        # conflict-free append path only new offer sources can be missing, so
+        # do not anti-join the complete offers/proofs tables on every post.
+        missing = {
+            fid for fid in newfids
+            if (fact := self.fact_of(ws, fid)) is not None and fact.offers()
+            and idx.execute(
+                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone() is None
+        }
+        if not missing:
+            return set(), set()
+        unresolved = extend_proofs(
+            idx, missing, lambda fid: self.fact_of(ws, fid))
+        if unresolved:
+            return self._prune_unresolved(ws), restored
+        return set(), restored
+
+    def commit(self, ws, newfids=(), *, reuse=True):
         st, idx = self.store(ws), self.idx(ws)
+        shadows = self._shadows(ws, newfids)
+        # Bulk benchmark builders write the derived index directly, while the
+        # live path can rank only its new offer sources in dependency order.
+        try:
+            pruned, restored = self._update_proofs(
+                ws, newfids, shadows)
+            if pruned or restored:
+                self._rebuild_globals(ws)
+                self._reproject.add(ws)
+                newfids = tuple(sorted(
+                    (set(newfids) | restored) - pruned))
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
         cache = {}
 
         def deps_of(fid):
@@ -207,7 +409,7 @@ class Node:
 
         memo = None
         prev = st.get("root")
-        if prev and not self._shadows(ws, newfids):
+        if reuse and prev and not shadows and not pruned and not restored:
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
                               deps_of, ws, self.globals(ws), memo)
@@ -219,10 +421,38 @@ class Node:
         return man
 
     def materialize(self, ws, valids):
+        valids = tuple(valids)
         db = self.app
-        for v in valids:
-            facts.materialize(db, ws, v)
-        db.commit()
+        rebuilding = ws in self._reproject
+        try:
+            if rebuilding:
+                facts.clear(db, ws)
+                idx = self.idx(ws)
+                active = [
+                    self.fact_of(ws, fid)
+                    for (fid,) in idx.execute("SELECT fid FROM facts")
+                ]
+                ordered = close(
+                    active,
+                    lambda fid: resolve_deps(
+                        self.fact_of(ws, fid), idx) or (),
+                    lambda fid: self.fact_of(ws, fid),
+                )
+                valids = tuple(
+                    Valid(fact, tuple(resolve_deps(fact, idx) or ()))
+                    for fact in ordered
+                )
+            for valid in valids:
+                facts.materialize(db, ws, valid)
+            facts.reconcile(
+                db, ws, self.idx(ws),
+                lambda fid: self.fact_of(ws, fid), valids)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        if rebuilding:
+            self._reproject.discard(ws)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -240,18 +470,32 @@ class Node:
                 return resolve_deps(fact_of(fid), idx) or []
 
             b = encode_pile(close(news, deps_of, fact_of), blobs)
-            self.store(ws).put(f"pile/{self.member}/{h(b)}", b)
-            return self.turn(ws)
+            self.store(ws).put(f"pile/{self.member_for(ws)}/{h(b)}", b)
+            fresh = self.turn(ws)
+            missing = [
+                fact.fid for fact in news
+                if facts.handler_for(fact.t).DURABLE
+                and self.fact_of(ws, fact.fid) is None
+            ]
+            if missing:
+                sample = ", ".join(sorted(missing)[:3])
+                raise ValueError(
+                    f"authored facts are outside the canonical set: {sample}")
+            return fresh
 
     # ---- rebuild: the store's own units through the same kernel --------------
 
-    def rebuild(self, ws):
+    def rebuild(self, ws, *, republish=False):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
-            idx.executescript("DELETE FROM facts; DELETE FROM offers; DELETE FROM globals;")
+            idx.executescript(
+                "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
+                "DELETE FROM globals;")
             idx.commit()
+            self._reproject.add(ws)
             man = st.get("root")
             if not man:
+                self.materialize(ws, ())
                 return
             m = json.loads(man)
             stream = []
@@ -260,5 +504,12 @@ class Node:
                     stream += decode_pile(st.get("obj/" + f["pile"]))[0]
             result = drain(stream, ws)
             assert result.ok, "own store failed its own kernel"
-            self.materialize(ws, self.merge(ws, result.valids, result.globals)[0])
-            self._stamp(ws)
+            fresh = self.merge(ws, result.valids, result.globals)[0]
+            self.materialize(ws, fresh)
+            if republish:
+                # A semantic index upgrade can select different canonical
+                # providers for the same fact ids. Fingerprints cover ids, not
+                # closure edges, so old fences are deliberately not memoized.
+                self.commit(ws, reuse=False)
+            else:
+                self._stamp(ws)

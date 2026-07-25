@@ -37,9 +37,10 @@ def global_rows(f):
     return ()
 
 
-def evaluate(f, globals_):
+def evaluate(f, globals_, ctx):
     removed = {value for name, value in globals_ if name == "removal"}
-    return f.body["pk"] not in removed
+    return f.body["pk"] not in removed and not any(
+        ctx.has_offer_value("author", public) for public in removed)
 
 
 def blob_refs(f):
@@ -53,11 +54,14 @@ def materialize(db, workspace, valid):
 
 # COMMANDS — build the already-topological request + auth closure for a mint.
 def payload(node, workspace, verb, exp, ts):
-    item = request(node.pk, verb, exp, ts)
-    sig = signature.signature(node.sk, node.pk, item, ts)
-    member = offer_source(node, workspace, "member", node.pk)
+    secret, public = node.identity(workspace)
+    item = request(public, verb, exp, ts)
+    sig = signature.signature(secret, public, item, ts)
+    member = offer_source(node, workspace, "member", public)
+    if member is None:
+        raise ValueError("local identity is not a workspace member")
     newmap = {item.fid: item, sig.fid: sig}
-    deps = {item.fid: [sig.fid] + ([member] if member else []), sig.fid: []}
+    deps = {item.fid: [sig.fid, member], sig.fid: []}
     with node.lock:
         return closer(node, workspace, newmap, deps)
 

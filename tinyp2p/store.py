@@ -2,10 +2,12 @@
 
 Layout: root (the CAS'd manifest, only mutable key besides piles/invites),
 obj/<hash> (leaf piles, tails, blobs — immutable, content-addressed),
-pile/<member>/<hash> (ingress), invite/<id> (public reads).
+pile/<member>/<hash> (ingress), invite/<id> (public reads), and
+quarantine/<fid> (node-local retention for a previously valid pruned fact).
 """
 import os
 import re
+import tempfile
 import threading
 
 from .crypto import h
@@ -73,11 +75,19 @@ class FsStore:
 
     def put(self, key, b):
         p = self._p(key)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = p + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(b)
-        os.replace(tmp, p)  # atomic
+        directory = os.path.dirname(p)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b)
+            os.replace(tmp, p)  # atomic
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
 
     def put_if_absent(self, key, b):
         if not self.has(key):

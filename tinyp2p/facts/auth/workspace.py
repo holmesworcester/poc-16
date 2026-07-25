@@ -1,8 +1,8 @@
-"""facts/auth/genesis.py — the self-signed workspace and authority root."""
+"""facts/auth/workspace.py — the self-signed workspace and authority root."""
 from ...crypto import h, sign, verify
 from ...fact import Fact, canon
 
-TAG = "genesis"
+TAG = "workspace"
 
 
 # SHAPE — constructors are the only place this family's atoms are chosen.
@@ -10,7 +10,7 @@ def _presig(ts, atoms):
     return h(canon([TAG, ts, atoms]))
 
 
-def genesis(sk, pk, name, ts):
+def workspace(sk, pk, name, ts):
     atoms = [["offer", "member", pk], ["offer", "admin", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "sig": sign(sk, _presig(ts, atoms))})
@@ -56,14 +56,16 @@ def materialize(db, workspace, valid):
 
 
 # COMMANDS — workspace bootstrap necessarily records its anchor in the keyring.
-def create(node, name):
+def create(node, name, ts=None):
     from ...node import now_ms
 
-    root = genesis(node.sk, node.pk, name, now_ms())
-    workspace = root.fid
-    node.add_workspace(workspace, name, peers=[])
-    node.ingest_new(workspace, [root], {root.fid: []})
-    return workspace
+    secret, public = node.identity()
+    root = workspace(
+        secret, public, name, now_ms() if ts is None else ts)
+    workspace_id = root.fid
+    node.add_workspace(workspace_id, name, peers=[])
+    node.ingest_new(workspace_id, [root], {root.fid: []})
+    return workspace_id
 
 
-# QUERIES — none; membership observations belong to auth.join.
+# QUERIES — none; membership observations belong to auth.user.

@@ -1,14 +1,19 @@
-"""facts/auth/signature.py — detached Ed25519 authorship evidence."""
+"""facts/auth/legacy_signature.py — read compatibility for persisted sig facts.
+
+The old and new signature families have identical meaning; only their wire tag
+differs. New commands author only ``signature``.
+"""
 from ...crypto import sign, verify
 from ...fact import Fact
 
-TAG = "signature"
+TAG = "sig"
 
 
 # SHAPE
-def signature(sk, pk, target, ts):
-    return Fact(TAG, ts, [["offer", "author", target.fid, pk]],
-                {"sig": sign(sk, target.fid)})
+def legacy_signature(sk, pk, target, ts):
+    return Fact(
+        TAG, ts, [["offer", "author", target.fid, pk]],
+        {"sig": sign(sk, target.fid)})
 
 
 # NEEDS
@@ -22,8 +27,9 @@ def validate(f, ctx):
         if set(f.body) != {"sig"} or len(f.offers()) != 1:
             return False
         name, target, pk = f.offers()[0]
-        shaped = Fact(TAG, f.ts, [["offer", "author", target, pk]],
-                      {"sig": f.body["sig"]})
+        shaped = Fact(
+            TAG, f.ts, [["offer", "author", target, pk]],
+            {"sig": f.body["sig"]})
         return name == "author" and f == shaped \
             and verify(pk, target, f.body["sig"])
     except Exception:
@@ -47,7 +53,7 @@ def materialize(db, workspace, valid):
     return None
 
 
-# COMMANDS — ``signature`` is the command helper used by signed families.
+# COMMANDS — compatibility handler only; new signatures use auth.signature.
 
 
 # QUERIES — none.

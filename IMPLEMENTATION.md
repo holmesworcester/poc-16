@@ -41,17 +41,24 @@ The POC-13 family boundary survives, but its projector contract does not fit a
 closed-pile kernel. Every concrete module under `facts/auth/` or
 `facts/content/` therefore has these sections, in this order:
 
-- **SHAPE** constructs the exact canonical fact. Existing short fact tags are
-  preserved, so this packaging refactor does not rename stored facts.
+- **SHAPE** constructs the exact canonical fact. Chained auth adopts the
+  poc-13 names (`workspace`, `signature`, `user_invite`, `user`); read-only
+  legacy handlers keep persisted `genesis`, `sig`, `invite`, and `join` facts
+  judgeable during upgrade and rebuild, while every new command emits only the
+  current tags.
 - **NEEDS** declares normalized offer addresses. The generic resolver combines
-  them with envelope refs and chooses the canonical minimum-fid provider.
+  them with envelope refs and chooses the canonical provider by shortest
+  finite authority proof, then source id.
 - **VALIDATE** is exactly `validate(fact, context) -> bool`. Context contains
   only the immutable in-pile offer table and workspace anchor; globals, the
   node, projection databases, and waiting are unavailable.
 - **MODE** declares durability, immutable-object refs, and drain-only global
-  rows. An optional `evaluate(fact, globals) -> bool` is permitted only on an
-  ephemeral family. Today `auth.removal` emits `("removal", pk)` during drain,
-  and `auth.request` consumes committed removal rows during evaluate.
+  rows. An optional `evaluate(fact, globals, context) -> bool` is confined to
+  ephemeral families, so it never changes stable validation or drain.
+  `auth.removal` emits `("removal", pk)` during drain; `auth.request` rejects
+  both that key and any request closure carrying a signature from a removed
+  issuer, so access cannot be laundered through a fresh user, device, or admin
+  key.
 - **MATERIALIZE** receives a kernel-minted `Valid`, so it only writes the read
   model; it repeats no validity or scope policy.
 - **COMMANDS** owns local authoring. Workspace create/accept also call the
@@ -85,10 +92,14 @@ Four invariants carry it:
 - **I1 — the set is dep-closed.** A fact enters only via a closed pile that
   the kernel accepted whole, so its full closure merges with it (or was
   already in). Induction over drains: the index is always dep-closed.
-- **I2 — dep edges are canonical.** Edges are *recomputed from the set*
-  (`resolve_deps` against the cumulative offers table, min-src tiebreak),
-  never remembered from validation history. Two nodes with the same set
-  derive the same edges, whatever order things arrived in.
+- **I2 — dep edges are canonical and acyclic.** Edges are *recomputed from
+  the set*. Offer sources are ordered by shortest finite authority-proof rank,
+  then source id; every selected provider therefore has lower rank than its
+  dependent. A later re-join, mutual admin grant, or reciprocal device grant
+  cannot rewire the final closure into a cycle. Two nodes with the same set
+  derive the same edges, whatever order things arrived in. A family can also
+  require co-offers from the selected source: device claims use that to make
+  one canonical `device_key` winner govern both authorization and projection.
 - **I3 — topo-sort makes each leaf a closed pile.** A leaf is `close` of its
   in-range leaves: those leaves plus their full recursive closure, emitted
   deps-first. Every dependency therefore precedes its dependent, so the pile
@@ -125,11 +136,21 @@ prior manifest's fences to `layout()` as a memo, and any promoted range whose
 pile never rebuilt (`test_incremental_reuses_work`: a post into a
 promoted store touches under half the facts). This is byte-identical to a full
 recompute because a leaf pile depends only on its in-range fids and their
-resolved deps, which are fixed *as long as every
-offer address has one provider* (so `min-src` cannot move). The one way that
-breaks — a duplicate `member`/`admin`/`author` offer (a re-join or re-sign) —
-is caught by a shadow guard (`Node._shadows`) that drops the memo for that
-turn and recomputes fully. `test_incremental_equals_full` asserts
+resolved deps. A duplicate offer can change the shortest-proof winner, so a
+shadow guard (`Node._shadows`) drops the memo for that turn, recomputes proof
+ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
+only their new offer sources and keep the incremental path. On a shadow, facts,
+offers, globals, and proofs share one SQLite transaction: merge first derives
+the canonical finite-proof subset of the union, prunes only facts outside that
+subset as litter, and rebuilds affected projections. A pruned fact already
+passed the kernel, so the node retains its canonical bytes under
+`quarantine/<fid>` and retries it on later authority changes. This matters
+when a conflict first orphans a downstream grant and a later shorter proof
+restores its original authority; the retry also survives a derived-index
+wipe. Once restored, the fact returns to the ordinary manifest and sync path.
+Opposite arrival orders therefore select the same set, while an unrelated
+valid pile in the same turn still lands.
+`test_incremental_equals_full` asserts
 incremental == full at every step across promotions, a straggler, a new
 member, and an eviction; `test_shadow_guard_keeps_identity` exercises the
 guard. The residual O(n) is the body-free key scan and per-range fingerprint;
@@ -139,7 +160,9 @@ Tested in `tests/test_props.py`: `test_leaves_are_piles` (every published
 unit passes the kernel from empty), `test_history_independence` (random pile
 groupings × random orders × random turn batching ⇒ byte-identical roots),
 `test_rebuild`, `test_straggler_minifold`, `test_incremental_equals_full`,
-`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`.
+`test_incremental_reuses_work`, `test_shadow_guard_keeps_identity`, and the
+recursive/mutual-authority closure regressions in `test_kernel.py` and
+`test_props.py`.
 
 **Litter, never poison.** The design's "a hostile writer can litter but never
 poison" is enforced at two layers: `from_json` validates atom shape at the
@@ -151,6 +174,8 @@ cannot wedge a workspace (`test_poison_pile_is_litter_not_poison`,
 `test_poison_alongside_honest`). This was the one critical defect the
 adversarial review surfaced; the fix keeps the kernel the sole security
 boundary — a judge that crashes on a hostile exhibit is a broken judge.
+The closure serializer uses an explicit DFS stack, so the same rule remains
+usable for delegation chains deeper than Python's call-stack limit.
 
 ## Deviations from DESIGN.md (all scale/packaging, no semantics)
 
@@ -187,19 +212,14 @@ boundary — a judge that crashes on a hostile exhibit is a broken judge.
 - Not built (per the staged plan): S3 driver + presigned flow, iroh
   connector, GC/invite-TTL purge, the personal meta-workspace, deletion.
 
-**Known gap for the designer to rule on (removal ⇒ invite redemption).**
-DESIGN.md promises an invite blob is "evaluated fresh at mint (inviting admin
-since removed ⇒ refused)." Here invites are redeemed as *drained join facts*,
-and drains are globals-blind by design (history-independence), so a join whose
-inviting admin was removed after the invite was minted still confers
-membership, and that fresh member then mints normally. The only reachable
-trigger in this PoC is a founder self-eviction (the founder is the sole admin —
-there is no admin-promotion command), so it is minor. The faithful fix gates
-the *mint*, not the drain: refuse a grant when the requester's entitling edge
-traces through a removed key. That is a real policy choice — immediate-inviter
-only (refuse just the removed admin's direct invitees) vs. full-chain (removal
-cascades to everyone downstream) — which the design should settle before it is
-coded, so it is left as a flagged gap rather than a unilateral choice.
+**Deferred revocation boundary.** Request evaluation now rejects a removed
+requester and any presented membership closure signed by a removed issuer, so
+a freshly delegated user, device, or admin cannot launder a mint. Durable
+facts remain globals-blind, however: an active peer can still relay facts
+signed by an evicted identity, and removal projection currently depends on
+membership materialization order. Those broader remove-wins semantics are
+tracked in `poc-16-gxz` and `poc-16-up4`, gated by the global suppression-tree
+review in `poc-16-yez.9`; they are intentionally not claimed as solved here.
 
 ## Running it
 

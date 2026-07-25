@@ -326,16 +326,16 @@ the founder; port poc-13's `admin` (member-gated by the founder root) if desired
 
 ## 8. Acceptance criteria
 
-- [ ] `invite` accepts a member-signed invite and rejects a non-member-signed one (unit test).
-- [ ] `seed_chain.py` produces a forest with **measured** median depth > 1 on the `random`
+- [x] `invite` accepts a member-signed invite and rejects a non-member-signed one (unit test).
+- [x] `seed_chain.py` produces a forest with **measured** median depth > 1 on the `random`
       shape and a long spine on the `chain` shape; depth histogram printed.
-- [ ] `bench_order.py` on the deep shape shows `deleg` tax scaling with subtree **depth**,
+- [x] `bench_order.py` on the deep shape shows `deleg` tax scaling with subtree **depth**,
       strictly below `author` and `ts`; on the `star` shape reproduces current §A.5 numbers.
-- [ ] `bench_sync` catchup/bidi and `check_leaves` still green on the chained seed.
-- [ ] (If Phase 3) a `user` order ≥ `author` order when `devices_per_user > 1`.
-- [ ] `MULTILEVEL_PILE.md` §A.5 updated: the star caveat replaced by the deep-chain result,
+- [x] `bench_sync` catchup/bidi and `check_leaves` still green on the chained seed.
+- [x] (If Phase 3) a `user` order ≥ `author` order when `devices_per_user > 1`.
+- [x] `MULTILEVEL_PILE.md` §A.5 updated: the star caveat replaced by the deep-chain result,
       stating honestly which shapes it helps and by how much (path-length vs `N`).
-- [ ] Every touched/added file passes the §2 rubric (section skeleton, docstring rule,
+- [x] Every touched/added file passes the §2 rubric (section skeleton, docstring rule,
       "build a fact, admit it, stop", one-file-per-family, router `__init__`).
 
 ## 9. What to hand back
@@ -345,3 +345,12 @@ histograms, and a one-paragraph verdict: **does aligning key order to the real d
 tree turn the range-sync tax from `O(members)` into `O(depth)`, and does it matter for the
 realistic (shallow-wide) shape or only the adversarial (deep) one?** That verdict is the
 actual point of the exercise.
+
+**Verdict.** Yes: delegation-DFS order turns semantic-subtree range tax from
+member-scale timestamp scatter into the ancestor path plus a small leaf-boundary
+residual — `O(depth)`, measured directly as 401/361/197 facts for chain depths
+99/90/50 instead of 49,424/45,154/25,112. The largest practical gain is not the
+adversarial chain, where `depth = Θ(N)`, but the realistic shallow-wide shape:
+mean tax falls 399→48 (8.3×, and 3.8× below author grouping); the chain mainly
+shows the bound and still benefits from avoiding scatter, while hoisting's
+ship-once/verify-once property remains order-independent.

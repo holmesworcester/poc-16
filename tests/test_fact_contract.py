@@ -59,7 +59,7 @@ def test_router_covers_each_family_once():
 
 def test_core_fact_module_has_no_family_authors():
     """The canonical value cannot silently grow auth/content policy again."""
-    retired = {"genesis", "sig_for", "invite", "join", "msg",
+    retired = {"workspace", "signature", "user_invite", "user", "sig_for", "msg",
                "file_fact", "evict", "req"}
     assert retired.isdisjoint(vars(core_fact))
 
@@ -68,7 +68,7 @@ def test_core_judge_and_engine_do_not_name_family_policy():
     for name in ("fact.py", "kernel.py", "node.py", "layout.py"):
         source = (ROOT / "tinyp2p" / name).read_text()
         assert '"removal"' not in source, name
-        assert '"genesis"' not in source, name
+        assert '"workspace"' not in source, name
         assert '"member"' not in source, name
 
 
@@ -76,3 +76,5 @@ def test_only_ephemeral_families_have_evaluate_hooks():
     evaluators = [module for module in facts.MODULES if hasattr(module, "evaluate")]
     assert evaluators
     assert all(module.DURABLE is False for module in evaluators)
+    assert all(module.evaluate.__code__.co_argcount == 3
+               for module in evaluators)

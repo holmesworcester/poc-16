@@ -21,14 +21,13 @@ never perturb the diff algebra.
 **Incremental compute.** With `memo` (the prior manifest's fences, keyed by
 `hi`) a promoted leaf whose `(hi, fp)` is unchanged is reused verbatim — its
 pile bytes are not recomputed and its facts are never loaded. This is
-byte-identical to a full recompute whenever dep resolution is stable, i.e.
-every offer address the set resolves has a single provider (so `min-src`
-cannot shift). The caller (`Node.commit`) guarantees that by disabling the
-memo on any turn that adds a shadowing offer, so `fp`-equality ⇒ identical
-pile: a pile depends only on its in-range fids (immutable, key order) plus
-their resolved deps (now fixed). The residual O(n) is the key scan and
-per-leaf fingerprint — cheap, body-free; eliminating it needs a persistent
-fence tree (byte-format work, out of scope).
+byte-identical to a full recompute whenever canonical proof winners are
+stable. The caller (`Node.commit`) guarantees that by disabling the memo on
+any turn that adds a shadowing offer, so `fp`-equality ⇒ identical pile: a
+pile depends only on its in-range fids (immutable, key order) plus their
+resolved deps (now fixed). The residual O(n) is the key scan and per-leaf
+fingerprint — cheap, body-free; eliminating it needs a persistent fence tree
+(byte-format work, out of scope).
 """
 from .close import close, encode_pile
 from .crypto import h

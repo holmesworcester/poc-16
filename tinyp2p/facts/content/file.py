@@ -60,9 +60,10 @@ def send(node, workspace, channel, name, data):
     from ...node import now_ms
 
     ts, blob = now_ms(), h(data)
-    item = file(node.pk, channel, name, len(data), blob, ts)
+    secret, public = node.identity(workspace)
+    item = file(public, channel, name, len(data), blob, ts)
     return publish(node, workspace, item,
-                   signature.signature(node.sk, node.pk, item, ts),
+                   signature.signature(secret, public, item, ts),
                    blobs={blob: data})
 
 

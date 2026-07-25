@@ -60,7 +60,9 @@ class Peer:
                            "pile": base64.b64encode(encode_pile(facts)).decode()}).encode()
         _, resp, _ = self._http("POST", "/mint", body, auth=False)
         o = json.loads(resp)
-        self.cache["token"] = unseal(self.node.sk, base64.b64decode(o["grant"])).decode()
+        secret, _ = self.node.identity(self.ws)
+        self.cache["token"] = unseal(
+            secret, base64.b64decode(o["grant"])).decode()
 
     def root(self, etag=None):
         status, b, hdr = self._http("GET", "/root", etag=etag)
@@ -71,7 +73,8 @@ class Peer:
         return b
 
     def put_pile(self, b):
-        self._http("PUT", f"/pile/{self.node.member}/{h(b)}", data=b)
+        self._http(
+            "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b)
 
     def poke(self):
         self._http("POST", "/poke", data=b"", auth=False)
@@ -111,7 +114,8 @@ def walk(node, ws, url):
         theirs = decode_pile(raw)[0] if raw else []
         rfids = {f.fid for f in theirs if lo < f.key <= hi}  # their in-range leaves
         if any(fid not in lfids for fid in rfids):  # pull the leaf pile verbatim
-            node.store(ws).put(f"pile/{node.member}/{fen['pile']}", raw)
+            node.store(ws).put(
+                f"pile/{node.member_for(ws)}/{fen['pile']}", raw)
             pulled += 1
         push = [k.split(":", 1)[1] for k in mine if k.split(":", 1)[1] not in rfids]
         if push:  # reactive push, the mirror of the pull; peer drains on receipt

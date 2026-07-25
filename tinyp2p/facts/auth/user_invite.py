@@ -1,4 +1,9 @@
-"""facts/auth/invite.py — an admin-signed bearer invitation."""
+"""facts/auth/user_invite.py — a member-signed bearer invitation.
+
+Any existing workspace member, including the founder member established by
+the workspace fact, may invite a user. This is the poc-13 authority rule on
+the poc-10/poc-16 offers-and-needs kernel.
+"""
 import base64
 import os
 
@@ -7,18 +12,18 @@ from ...fact import Fact, canon
 from .._commands import closer, offer_source
 from . import signature
 
-TAG = "invite"
+TAG = "user_invite"
 
 
 # SHAPE
-def invite(pk, invite_pk, ts):
+def user_invite(pk, invite_pk, ts):
     return Fact(TAG, ts, [["offer", "invitee", invite_pk]], {"pk": pk})
 
 
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("admin", pk, None))
+    return (("author", f.fid, pk), ("member", pk, None))
 
 
 # VALIDATE
@@ -28,7 +33,7 @@ def validate(f, ctx):
             return False
         name, invite_pk, empty = f.offers()[0]
         return name == "invitee" and empty == "" \
-            and f == invite(f.body["pk"], invite_pk, f.ts)
+            and f == user_invite(f.body["pk"], invite_pk, f.ts)
     except Exception:
         return False
 
@@ -58,12 +63,15 @@ def make(node, workspace):
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()
     ts = now_ms()
-    item = invite(node.pk, invite_pk, ts)
-    sig = signature.signature(node.sk, node.pk, item, ts)
-    admin = offer_source(node, workspace, "admin", node.pk)
+    secret, public = node.identity(workspace)
+    item = user_invite(public, invite_pk, ts)
+    sig = signature.signature(secret, public, item, ts)
+    member = offer_source(node, workspace, "member", public)
+    if member is None:
+        raise ValueError("local identity is not a workspace member")
     with node.lock:
         facts = closer(node, workspace, {sig.fid: sig, item.fid: item},
-                       {item.fid: [sig.fid, admin], sig.fid: []})
+                       {item.fid: [sig.fid, member], sig.fid: []})
     blob = canon({"pile": [fact.to_json() for fact in facts],
                   "isk": invite_sk.encode().hex(), "ws": workspace})
     node.store(workspace).put("invite/" + kdf(seed, "id").hex(),

@@ -23,6 +23,19 @@ def materialize(db, workspace, valid):
     ROUTES[valid.fact.t].materialize(db, workspace, valid)
 
 
+def reconcile(db, workspace, index, fact_of, valids):
+    """Let families reconcile projections that use canonical offer winners."""
+    for module in MODULES:
+        if hasattr(module, "reconcile"):
+            module.reconcile(db, workspace, index, fact_of, valids)
+
+
+def clear(db, workspace):
+    """Clear every family scope before rebuilding one workspace projection."""
+    auth.clear(db, workspace)
+    content.clear(db, workspace)
+
+
 def blob_refs(fact):
     """Return immutable object hashes named by a fact, if that family has any."""
     return tuple(ROUTES[fact.t].blob_refs(fact))
