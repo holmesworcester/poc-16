@@ -155,33 +155,89 @@ def proof_rank(db, deps):
 
 
 def extend_proofs(db, fids, fact_of):
-    """Add shortest authority proofs for ``fids`` against ranked context."""
+    """Add shortest authority proofs without repeatedly scanning deep chains.
+
+    A fact becomes a candidate exactly when all of its references have ranks
+    and every offer address it needs has acquired a ranked provider.  Providers
+    that become ready together are installed as one rank wave, so an address is
+    activated only after all of its equal-rank candidates can participate in
+    the canonical ``(rank, fid)`` choice.
+    """
+    ranked = {
+        fid for (fid,) in db.execute("SELECT fid FROM proofs")
+    }
     unresolved, pending = {}, list(fids)
     while pending:
         fid = pending.pop()
-        if fid in unresolved or db.execute(
-                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone():
+        if fid in unresolved or fid in ranked:
             continue
         fact = fact_of(fid)
         if fact is None:
             continue
         unresolved[fid] = fact
         pending.extend(ref for _, ref in fact.refs())
-    while unresolved:
-        ready = []
-        for fid in sorted(unresolved):
-            fact = unresolved[fid]
-            deps = resolve_deps(fact, db)
-            if deps is None:
+
+    active_offers = set()
+    for name, a0, a1 in db.execute(
+            "SELECT DISTINCT o.name, o.a0, o.a1 "
+            "FROM offers o JOIN proofs p ON p.fid=o.src"):
+        active_offers.add((name, a0, a1))
+        active_offers.add((name, a0, None))
+
+    waiters, missing, candidates = {}, {}, set()
+    for fid, fact in unresolved.items():
+        conditions = {
+            ("ref", ref)
+            for _, ref in fact.refs()
+            if ref not in ranked
+        }
+        try:
+            handler = facts.handler_for(fact.t)
+            if handler is None:
                 continue
-            rank = proof_rank(db, deps)
+            for need in handler.needs(fact):
+                name, a0, a1, _ = _need_parts(need)
+                address = (name, a0, a1)
+                if address not in active_offers:
+                    conditions.add(("offer", *address))
+        except Exception:
+            continue
+        missing[fid] = conditions
+        if not conditions:
+            candidates.add(fid)
+        for condition in conditions:
+            waiters.setdefault(condition, set()).add(fid)
+
+    while candidates:
+        ready = []
+        for fid in sorted(candidates):
+            deps = resolve_deps(unresolved[fid], db)
+            rank = proof_rank(db, deps) if deps is not None else None
             if rank is not None:
                 ready.append((fid, rank))
         if not ready:
             break
         db.executemany("INSERT OR REPLACE INTO proofs VALUES(?,?)", ready)
+        newly_satisfied = set()
         for fid, _ in ready:
+            ranked.add(fid)
+            newly_satisfied.add(("ref", fid))
+            for name, a0, a1 in unresolved[fid].offers():
+                for address in ((name, a0, a1), (name, a0, None)):
+                    if address not in active_offers:
+                        active_offers.add(address)
+                        newly_satisfied.add(("offer", *address))
             unresolved.pop(fid)
+            missing.pop(fid, None)
+
+        candidates = set()
+        for condition in newly_satisfied:
+            for fid in waiters.pop(condition, ()):
+                if fid not in unresolved or fid not in missing:
+                    continue
+                missing[fid].discard(condition)
+                if not missing[fid]:
+                    candidates.add(fid)
     return frozenset(unresolved)
 
 

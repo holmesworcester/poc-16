@@ -505,6 +505,34 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     rejoin_pile = closed_subset(source, workspace, [rejoined.fid])
     assert source.fact_of(workspace, child_claim.fid) == child_claim
 
+    # Quarantine bodies remain as recovery material after restoration. Normal
+    # signatures must consult the in-memory offer index, not list and decode
+    # the retained history twice per post (merge + commit).
+    retained_reads = []
+    store = source.store(workspace)
+    original_get, original_list = store.get, store.list
+
+    def tracked_get(key):
+        if key.startswith("quarantine/"):
+            retained_reads.append(("get", key))
+        return original_get(key)
+
+    def tracked_list(prefix):
+        if prefix == "quarantine/":
+            retained_reads.append(("list", prefix))
+        return original_list(prefix)
+
+    store.get, store.list = tracked_get, tracked_list
+    try:
+        ordinary = [
+            cmds.post(source, workspace, "general", f"after-restore-{ordinal}")
+            for ordinal in range(2)
+        ]
+    finally:
+        store.get, store.list = original_get, original_list
+    assert not retained_reads
+    ordinary_pile = closed_subset(source, workspace, ordinary)
+
     first = Node(str(tmp_path / "first"))
     for ordinal, pile in enumerate((deep_pile, short_pile)):
         deliver(
@@ -525,6 +553,8 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert first.fact_of(workspace, child_claim.fid) is None
     deliver(first, workspace, rejoin_pile, member="first2aaaaaaaaaa")
     first.turn(workspace)
+    deliver(first, workspace, ordinary_pile, member="first3aaaaaaaaaa")
+    first.turn(workspace)
 
     second = Node(str(tmp_path / "second"))
     for ordinal, pile in enumerate(
@@ -533,6 +563,8 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
             second, workspace, pile,
             member=f"second{ordinal}".ljust(16, "a"))
         second.turn(workspace)
+    deliver(second, workspace, ordinary_pile, member="second3aaaaaaaaa")
+    second.turn(workspace)
 
     for current in (source, first, second):
         assert current.fact_of(workspace, child_claim.fid) == child_claim

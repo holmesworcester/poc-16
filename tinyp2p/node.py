@@ -65,6 +65,7 @@ class Node:
         self.app.executescript(facts.APP_SCHEMA)
         self._stores, self._idx = {}, {}
         self._reproject = set()
+        self._quarantine_offer_cache = {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
@@ -230,6 +231,21 @@ class Node:
             idx.rollback()
             raise
 
+    def _quarantined_offers(self, ws):
+        """Return a process-local index of offers retained outside the DAG."""
+        if ws not in self._quarantine_offer_cache:
+            retained_offers = set()
+            for key in self.store(ws).list("quarantine/"):
+                try:
+                    retained = from_json(json.loads(
+                        self.store(ws).get(key)))
+                except Exception:
+                    continue
+                if key == "quarantine/" + retained.fid:
+                    retained_offers.update(retained.offers())
+            self._quarantine_offer_cache[ws] = retained_offers
+        return self._quarantine_offer_cache[ws]
+
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
         deps? Any new offer for an address that now has more than one provider
@@ -249,15 +265,7 @@ class Node:
                         (name, a0, a1)).fetchone()[0] > 1:
                     return True
                 if quarantined is None:
-                    quarantined = set()
-                    for key in self.store(ws).list("quarantine/"):
-                        try:
-                            retained = from_json(json.loads(
-                                self.store(ws).get(key)))
-                        except Exception:
-                            continue
-                        if key == "quarantine/" + retained.fid:
-                            quarantined.update(retained.offers())
+                    quarantined = self._quarantined_offers(ws)
                 if (name, a0, a1) in quarantined:
                     return True
         return False
@@ -312,11 +320,13 @@ class Node:
     def _quarantine(self, ws, fids):
         """Retain kernel-valid facts that are outside the current proof DAG."""
         st = self.store(ws)
+        retained_offers = self._quarantined_offers(ws)
         for fid in sorted(fids):
             fact = self.fact_of(ws, fid)
             if fact is not None:
                 st.put_if_absent(
                     "quarantine/" + fid, canon(fact.to_json()))
+                retained_offers.update(fact.offers())
 
     def _prune_unresolved(self, ws):
         """Derive the same finite-proof subset from any arrival order."""

@@ -193,7 +193,9 @@ depth**. The benchmark now bulk-builds the same 100-user fact set in four shapes
 with messages uniform over three years and flat leaves (`COLD_CUT=None`):
 the numeric seed deterministically derives the root time and every Ed25519
 identity, so repeated runs reproduce the same fact ids, treap boundaries, and
-tax measurements (only the wall-clock timing columns vary).
+tax measurements (only the wall-clock timing columns vary). Topology and
+content use separate deterministic RNG streams, so the random tree's parent
+draws cannot change message authors or timestamps relative to the other shapes.
 
 | shape | realized depth histogram (depth:users) | min / median / max |
 |---|---|---:|
@@ -217,9 +219,9 @@ where multi-level ships no more than leaf-only, so it is boundary-sample-sensiti
 | shallow-wide | timestamp | 4.34× | 398.8 | 397 | 7 |
 |  | author | 2.07× | 181.0 | 179 | 13 |
 |  | **delegation DFS** | **2.06×** | **48.1** | **25** | **3** |
-| random | timestamp | 6.66× | 398.9 | 397 | 4 |
-|  | author | 3.03× | 250.2 | 247 | 2 |
-|  | **delegation DFS** | **3.02×** | **56.6** | **25** | **2** |
+| random | timestamp | 6.69× | 398.8 | 397 | 4 |
+|  | author | 3.06× | 244.4 | 255 | 5 |
+|  | **delegation DFS** | **3.04×** | **86.8** | **69** | **2** |
 | chain | timestamp | 34.81× | 398.8 | 397 | 1 |
 |  | author | 24.30× | 393.3 | 395 | 1 |
 |  | **delegation DFS** | **24.20×** | **274.7** | **213** | **1** |
@@ -233,8 +235,8 @@ both ancestor context and unrelated facts dragged in by scatter:
 | star leaf | 1 | 1 | 49,119 | 16,615 | **24** |
 | shallow-wide leaf | 2 | 1 | 48,627 | 17,213 | **43** |
 | shallow-wide branch | 1 | 12 | 43,995 | 41,091 | **69** |
-| random leaf | 8 | 1 | 49,489 | 42,025 | **69** |
-| random branch | 4 | 10 | 45,071 | 41,213 | **66** |
+| random leaf | 8 | 1 | 49,505 | 42,035 | **92** |
+| random branch | 4 | 10 | 45,067 | 41,222 | **114** |
 | chain suffix | 99 | 1 | 49,424 | 14,422 | **401** |
 | chain suffix | 90 | 10 | 45,154 | 38,775 | **361** |
 | chain suffix | 50 | 50 | 25,112 | 24,657 | **197** |
@@ -250,10 +252,10 @@ What the numbers say:
   (`≈4×99 + 1`), depth 90 costs 361, and depth 50 costs 197. The remaining
   tens-of-facts wobble is the hash-derived leaf boundary covering neighboring
   facts, not an `N` term. The same fixed boundary residual dominates the much
-  shorter wide/random paths (for example 43 at depth 2 and 69 at depth 8).
+  shorter wide/random paths (for example 43 at depth 2 and 92 at depth 8).
 - **It matters most in the realistic shallow-wide case, not only the stress
-  chain.** Wide mean tax falls 399→48 (8.3×) and random falls 399→57 (7.0×);
-  they beat flat author grouping by 3.8× and 4.4× respectively. In the adversarial chain,
+  chain.** Wide mean tax falls 399→48 (8.3×) and random falls 399→87 (4.6×);
+  they beat flat author grouping by 3.8× and 2.8× respectively. In the adversarial chain,
   `depth = Θ(N)`, so the worst-case asymptotic advantage necessarily vanishes
   and mean tax falls only 399→275. Even there the aligned semantic suffix avoids
   scatter: the deepest one-user pull pays 401 rather than 49,424.
@@ -268,8 +270,8 @@ What the numbers say:
 
 With three devices per user, flat device-author grouping and user grouping
 finally diverge. On a 4,999-fact random seed, roster-aware user DFS lowers
-leaf-only `ρ` **4.13×→3.56×**, mean tax **872→90**, and facts riding ≥50% of
-leaves **817→35**; every sampled user subtree has no greater tax. This is why
+leaf-only `ρ` **4.13×→3.58×**, mean tax **862→108**, and facts riding ≥50% of
+leaves **815→55**; every sampled user subtree has no greater tax. This is why
 the keychain/device layer matters to ordering rather than merely vocabulary.
 
 **Robust regardless of order:** full-sync `= |V|` (the floor), verify-once `= |V|`
@@ -388,7 +390,7 @@ node's hash and re-invites the pull, and the closure rides down with it.
   loses to leaf-only for small pulls. A **delegation-aligned** order (invite tree
   via users, each invite+signature re-homed onto the member it admitted) changes
   semantic-subtree overhead from member-bounded to **path-bounded**: star mean
-  tax 399→36, shallow-wide 399→48, random 399→57, and a length-99 chain 399→275.
+  tax 399→36, shallow-wide 399→48, random 399→87, and a length-99 chain 399→275.
   On that chain, depth-99/90/50 suffixes cost 401/361/197 extra facts—about four
   auth facts per ancestor—rather than 49k/45k/25k under timestamp scatter.
   Measured in A.5.

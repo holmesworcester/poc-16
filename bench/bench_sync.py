@@ -39,7 +39,7 @@ from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.fact import from_json
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import kernel, resolve_deps
+from tinyp2p.kernel import extend_proofs, kernel, resolve_deps
 from tinyp2p.layout import fingerprint
 from tinyp2p.node import Node, now_ms
 
@@ -78,16 +78,29 @@ def build_members(node, ws, n_members, base_ts):
 
 def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
     """Author n_msgs (msg + sig = 2 facts each) straight into the index,
-    random member, ts uniform over `window`. No commit — caller lays out."""
+    random member, ts uniform over `window`. Rank the new signature providers
+    before returning because incremental benchmark callers resolve the batch's
+    closures without an intervening ``Node.commit()``."""
     idx = node.idx(ws)
     idx.execute("BEGIN")
-    for i in range(n_msgs):
-        sk, pk = rng.choice(members)
-        ts = first_ts + rng.randrange(window)
-        f = message(pk, "general", f"{tag}m{i}", ts)
-        _insert(idx, signature(sk, pk, f, ts))
-        _insert(idx, f)
-    idx.commit()
+    try:
+        signatures = []
+        for i in range(n_msgs):
+            sk, pk = rng.choice(members)
+            ts = first_ts + rng.randrange(window)
+            f = message(pk, "general", f"{tag}m{i}", ts)
+            signed = signature(sk, pk, f, ts)
+            _insert(idx, signed)
+            _insert(idx, f)
+            signatures.append(signed.fid)
+        unresolved = extend_proofs(
+            idx, signatures, lambda fid: node.fact_of(ws, fid))
+        if unresolved:
+            raise ValueError("bulk-authored signatures could not be ranked")
+        idx.commit()
+    except Exception:
+        idx.rollback()
+        raise
 
 
 def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):

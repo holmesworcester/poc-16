@@ -174,7 +174,8 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     """Return ``(node, workspace, stats)`` for a measured delegation shape."""
     if devices_per_user < 1:
         raise ValueError("devices_per_user must be positive")
-    rng = random.Random(seed)
+    topology_rng = random.Random(seed)
+    content_rng = random.Random(seed)
     keys = _SeededKeys(seed)
     root_secret, _ = keys.next()
     node = Node(node_dir, initial_secret=root_secret)
@@ -182,7 +183,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     workspace = cmds.create(node, "alice", ts=keys.timestamp())
     root_ts = node.fact_of(workspace, workspace).ts
     identities, parents, depths, users = grow_tree(
-        node, workspace, n_members, root_ts + 1, rng,
+        node, workspace, n_members, root_ts + 1, topology_rng,
         keys=keys, shape=shape, wide_inviters=wide_inviters)
     devices_by_user = {
         public: [public] for _, public in identities
@@ -207,7 +208,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
     bulk_author(
         node, workspace, content_identities, n_messages,
-        content_ts, window, rng)
+        content_ts, window, content_rng)
     authored = time.perf_counter()
     node.commit(workspace)
     finished = time.perf_counter()

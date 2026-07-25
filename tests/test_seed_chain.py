@@ -1,9 +1,12 @@
 """Realistic checks for the chained benchmark seed."""
+import random
+
 import pytest
 
 from bench.seed_chain import build_seed
-from bench.bench_sync import bidi, catchup, check_leaves
-from tinyp2p.close import decode_pile
+from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
+from tinyp2p import kernel as kernel_module
+from tinyp2p.close import close, decode_pile
 from tinyp2p.kernel import drain, resolve_deps
 
 from .util import all_fids, closed_subset
@@ -86,6 +89,83 @@ def test_same_seed_reproduces_identities_fact_ids_and_layout(tmp_path):
     assert first_stats["devices_by_user"] == second_stats["devices_by_user"]
     assert other_ws != first_ws
     assert all_fids(other, other_ws) != all_fids(first, first_ws)
+
+
+def test_topology_and_content_use_independent_rng_streams(tmp_path):
+    star, star_ws, star_stats = build_seed(
+        str(tmp_path / "star-content"), 255, n_members=24,
+        shape="star", seed=16)
+    random_tree, random_ws, random_stats = build_seed(
+        str(tmp_path / "random-content"), 255, n_members=24,
+        shape="random", seed=16)
+
+    def messages(node, workspace):
+        return sorted(
+            (fact.body["text"], fact.body["pk"], fact.ts)
+            for (fid,) in node.idx(workspace).execute(
+                "SELECT fid FROM facts WHERE t='msg'")
+            for fact in (node.fact_of(workspace, fid),)
+        )
+
+    assert star_stats["parents"] != random_stats["parents"]
+    assert messages(star, star_ws) == messages(random_tree, random_ws)
+
+
+def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
+    node, workspace, _ = build_seed(
+        str(tmp_path / "bulk-ranks"), 127, n_members=12,
+        shape="star", seed=16)
+    before = set(all_fids(node, workspace))
+    first_ts = node.idx(workspace).execute(
+        "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
+
+    bulk_author(
+        node, workspace, [(node.sk, node.pk)], 1,
+        first_ts, 1, random.Random(99), "delta-")
+
+    added = set(all_fids(node, workspace)) - before
+    message_fid = next(
+        fid for fid in added if node.fact_of(workspace, fid).t == "msg")
+    message = node.fact_of(workspace, message_fid)
+    deps = resolve_deps(message, node.idx(workspace))
+    assert deps is not None
+    assert {node.fact_of(workspace, fid).t for fid in deps} \
+        == {"signature", "workspace"}
+    pile = close(
+        [message],
+        lambda fid: resolve_deps(
+            node.fact_of(workspace, fid), node.idx(workspace)) or (),
+        lambda fid: node.fact_of(workspace, fid),
+    )
+    assert drain(pile, workspace).ok
+
+
+def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
+        tmp_path, monkeypatch):
+    members = 128
+    membership_facts = 1 + 4 * (members - 1)
+    node, workspace, _ = build_seed(
+        str(tmp_path / "proof-worklist"), membership_facts,
+        n_members=members, shape="chain", seed=16)
+    index = node.idx(workspace)
+    index.execute("DELETE FROM proofs")
+    index.commit()
+
+    original = kernel_module.resolve_deps
+    calls = {"count": 0}
+
+    def counted(fact, db):
+        calls["count"] += 1
+        return original(fact, db)
+
+    monkeypatch.setattr(kernel_module, "resolve_deps", counted)
+    unresolved = kernel_module.rebuild_proofs(
+        index, lambda fid: node.fact_of(workspace, fid))
+
+    assert not unresolved
+    assert calls["count"] <= membership_facts
+    assert index.execute("SELECT MAX(rank) FROM proofs").fetchone()[0] \
+        == 2 * (members - 1)
 
 
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
