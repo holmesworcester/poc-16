@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from tinyp2p.crypto import h
-from tinyp2p.store import FsStore, RemoteStore
+from core.crypto import h
+from core.store import FsStore, RemoteStore
 
 
 def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
@@ -20,7 +20,7 @@ def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
         callers.wait(timeout=5)
         replace(source, target)
 
-    monkeypatch.setattr("tinyp2p.store.os.replace", rendezvous)
+    monkeypatch.setattr("core.store.os.replace", rendezvous)
     values = (b"first", b"second")
     with ThreadPoolExecutor(max_workers=2) as pool:
         writes = [

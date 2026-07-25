@@ -1,14 +1,14 @@
 """Behavioral tests for delegation-aware key-order measurement."""
-import tinyp2p.shape as tree_shape
+import core.shape as tree_shape
 
 from bench.bench_order import benchmark, delegation_topology
-from tinyp2p.crypto import keypair
-from tinyp2p.facts.auth.device import device
-from tinyp2p.facts.auth.device_invite import device_invite
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.facts.auth.workspace import workspace
+from core.crypto import keypair
+from facts.auth.device import device
+from facts.auth.device_invite import device_invite
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from facts.auth.workspace import workspace
 
 
 def run_benchmark(tmp_path, shape, *, scale=1023, devices_per_user=1):

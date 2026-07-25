@@ -1,4 +1,4 @@
-"""Sync throughput benchmarks for tinyp2p.
+"""Sync throughput benchmarks for core.
 
 Two questions, both answered against the *real* engine paths:
 
@@ -34,14 +34,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tinyp2p import cmds, tree
-from tinyp2p.close import close, decode_pile, encode_pile
-from tinyp2p.fact import from_json
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import extend_proofs, kernel, resolve_deps
-from tinyp2p.node import Node, now_ms
-from tinyp2p.shape import FACT, fid_of
+from core import cmds, tree
+from core.close import close, decode_pile, encode_pile
+from core.fact import from_json
+from facts.auth.signature import signature
+from facts.content.message import message
+from core.kernel import extend_proofs, kernel, resolve_deps
+from core.node import Node, now_ms
+from core.shape import FACT, fid_of
 
 from tests.util import add_member, all_fids
 
@@ -313,7 +313,7 @@ def mb(b):
 
 
 def run_catchup(scales):
-    import tinyp2p.shape as shape
+    import core.shape as shape
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
           f"workers, fat tree with monotone CUT={shape.CUT}\n")
@@ -366,7 +366,7 @@ def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
     each range's shared closure over and over on a full catchup;
     bigger pages amortize it, so redundancy falls and useful facts/s climbs
     toward the raw judge rate (rec/s)."""
-    import tinyp2p.shape as shape
+    import core.shape as shape
     print(f"\n=== CUT SWEEP: catchup at {scale} facts, varying page size ===")
     print("    flat (COLD_CUT=None) each row; only E[facts/page] changes\n")
     hdr = ("CUT", "facts", "pages", "dl_MB", "streamed", "redund",

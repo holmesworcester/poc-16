@@ -13,19 +13,19 @@ import sqlite3
 
 import pytest
 
-from tinyp2p import cmds, tree
-from tinyp2p.close import close, decode_pile, encode_pile
-from tinyp2p.crypto import h, keypair
-from tinyp2p.fact import Fact
-from tinyp2p.facts.auth.request import payload as request_payload
-from tinyp2p.facts.auth.request import request
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import drain, evaluate, resolve_deps
-from tinyp2p.node import Node, now_ms
-from tinyp2p.shape import FACT
+from core import cmds, tree
+from core.close import close, decode_pile, encode_pile
+from core.crypto import h, keypair
+from core.fact import Fact
+from facts.auth.request import payload as request_payload
+from facts.auth.request import request
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from facts.content.message import message
+from core.kernel import drain, evaluate, resolve_deps
+from core.node import Node, now_ms
+from core.shape import FACT
 
 from .util import (
     add_member,
@@ -430,7 +430,7 @@ def test_efficient_updates(world):
 
 def full_manifest(n, ws):
     """The root a from-scratch full recompute would write."""
-    from tinyp2p.kernel import resolve_deps
+    from core.kernel import resolve_deps
     idx, cache = n.idx(ws), {}
 
     def deps_of(fid):
@@ -566,7 +566,7 @@ def test_shadow_guard_keeps_identity(world):
     """A duplicate offer (a re-sign by the same key) could shift a frozen
     range's canonical proof winner; the shadow guard falls back to a full
     recompute, which must stay byte-identical to a clean full build."""
-    from tinyp2p.close import encode_pile
+    from core.close import encode_pile
     n, ws = world
     m = author_msg(n, ws, n.sk, n.pk, "dup-target", now_ms())  # alice's own msg
     s2 = signature(n.sk, n.pk, m, now_ms() + 1000)  # a SECOND alice sig over it
@@ -587,7 +587,7 @@ def test_removal_set_rides_the_root(world):
 def test_poison_pile_is_litter_not_poison(world):
     """A hostile writer can litter but never poison: hash-consistent but
     malformed facts must reject and retire, never wedge the drain."""
-    from tinyp2p.close import encode_pile
+    from core.close import encode_pile
     n, ws = world
     before = len(cmds.msgs(n, ws))
     poisons = [
@@ -607,7 +607,7 @@ def test_poison_pile_is_litter_not_poison(world):
 
 def test_poison_alongside_honest(world):
     """An honest pile in the same drain still lands; poison doesn't sink it."""
-    from tinyp2p.close import encode_pile
+    from core.close import encode_pile
     n, ws = world
     deliver(n, ws, encode_pile(
         [Fact("signature", now_ms(), [["offer", "author", "de", n.pk]], {})]),
@@ -619,14 +619,14 @@ def test_poison_alongside_honest(world):
 
 def test_ephemeral_never_persists(world):
     """A stray request fact in a pile is litter: the drain deletes it."""
-    from tinyp2p.close import encode_pile
+    from core.close import encode_pile
     n, ws = world
     ts = now_ms()
     rq = request(n.pk, "sync", ts + 9999, ts)
     s = signature(n.sk, n.pk, rq, ts)
     pile = decode_pile(closed_subset(n, ws, [n.fact_of(ws, all_fids(n, ws)[0]).fid]))[0]
     with n.lock:
-        from tinyp2p.kernel import offer_src
+        from core.kernel import offer_src
         chain = decode_pile(closed_subset(
             n, ws, [offer_src(n.idx(ws), "member", n.pk)]))[0]
     deliver(n, ws, encode_pile(chain + [s, rq]))

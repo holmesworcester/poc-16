@@ -1,5 +1,5 @@
 """Prototype cost comparison: the content-defined binary Merkle treap
-(tinyp2p.treap) vs the flat fence layout (tinyp2p.layout on main).
+(core.treap) vs the flat fence layout (core.layout on main).
 
 On identical real workspaces, in FLAT mode (COLD_CUT=None) so both cut the same
 content-defined leaves, we measure:
@@ -27,10 +27,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.shape as shape
-from tinyp2p import treap as T
-from tinyp2p.kernel import resolve_deps
-from tinyp2p.layout import layout
+import core.shape as shape
+from core import treap as T
+from core.kernel import resolve_deps
+from core.layout import layout
 
 from bench.bench_sync import YEARS, WORK, build_seed, bulk_author
 

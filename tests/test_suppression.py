@@ -1,15 +1,15 @@
 """Death/suppression keys are extractable from clear envelopes alone."""
 import pytest
 
-from tinyp2p import cmds
-from tinyp2p.close import decode_pile, encode_pile
-from tinyp2p.fact import Fact, from_json
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.content.file import file
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import offer_src
-from tinyp2p.node import Node
-from tinyp2p.suppression import atom, deathkey, is_deletion, suppkey
+from core import cmds
+from core.close import decode_pile, encode_pile
+from core.fact import Fact, from_json
+from facts.auth.signature import signature
+from facts.content.file import file
+from facts.content.message import message
+from core.kernel import offer_src
+from core.node import Node
+from core.suppression import atom, deathkey, is_deletion, suppkey
 
 
 class EnvelopeOnly:

@@ -2,9 +2,9 @@
 import ast
 from pathlib import Path
 
-from tinyp2p import shape
-from tinyp2p.crypto import h
-from tinyp2p.fact import Fact
+from core import shape
+from core.crypto import h
+from core.fact import Fact
 
 ROOT = Path(__file__).parents[1]
 
@@ -45,9 +45,9 @@ def test_cut_tiers_preserve_cold_pages_and_fine_guard(monkeypatch):
 
 def test_shape_is_the_single_definition_site():
     forbidden = {
-        "tinyp2p/layout.py": {"boundary", "_cut_positions", "fingerprint"},
-        "tinyp2p/treap.py": {"_fid", "priority"},
-        "tinyp2p/hoist.py": {"_fid", "priority"},
+        "core/layout.py": {"boundary", "_cut_positions", "fingerprint"},
+        "core/treap.py": {"_fid", "priority"},
+        "core/hoist.py": {"_fid", "priority"},
     }
     for relative, names in forbidden.items():
         tree = ast.parse((ROOT / relative).read_text())

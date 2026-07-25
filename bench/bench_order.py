@@ -19,11 +19,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.shape as tree_shape
+import core.shape as tree_shape
 from bench.bench_sync import WORK
 from bench.seed_chain import SHAPES, build_seed
-from tinyp2p import hoist as H
-from tinyp2p.kernel import resolve_deps
+from core import hoist as H
+from core.kernel import resolve_deps
 
 
 def author_of(fact):

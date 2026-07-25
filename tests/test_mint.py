@@ -1,17 +1,17 @@
-"""Acceptance laws for the pure mint (SIMPLIFY.md §4)."""
+"""Acceptance laws for the pure mint (docs/SIMPLIFY.md §4)."""
 import base64
 import inspect
 
 import pytest
 from nacl.exceptions import CryptoError
 
-from tinyp2p import cmds, daemon, mint
-from tinyp2p.close import encode_pile
-from tinyp2p.crypto import keypair, unseal
-from tinyp2p.fact import Fact
-from tinyp2p.facts.auth import request
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.node import Node, now_ms
+from core import cmds, daemon, mint
+from core.close import encode_pile
+from core.crypto import keypair, unseal
+from core.fact import Fact
+from facts.auth import request
+from facts.auth.signature import signature
+from core.node import Node, now_ms
 
 
 @pytest.fixture

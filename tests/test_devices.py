@@ -3,22 +3,23 @@ import sqlite3
 
 import pytest
 
-from tinyp2p import cmds
-from tinyp2p import facts
-import tinyp2p.sync as sync_module
-import tinyp2p.walk as walk_module
-from tinyp2p.close import close, encode_pile
-from tinyp2p.crypto import keypair
-from tinyp2p.facts.auth.device import bind, device, devices
-from tinyp2p.facts.auth.device_invite import device_invite as device_invite_fact
-from tinyp2p.facts.auth.device_invite import grant
-from tinyp2p.facts.auth.request import payload as request_payload
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.facts.auth.workspace import workspace as workspace_fact
-from tinyp2p.kernel import drain, evaluate, offer_src, resolve_deps
-from tinyp2p.node import Node, now_ms
+import facts
+
+from core import cmds
+import core.sync as sync_module
+import core.walk as walk_module
+from core.close import close, encode_pile
+from core.crypto import keypair
+from facts.auth.device import bind, device, devices
+from facts.auth.device_invite import device_invite as device_invite_fact
+from facts.auth.device_invite import grant
+from facts.auth.request import payload as request_payload
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from facts.auth.workspace import workspace as workspace_fact
+from core.kernel import drain, evaluate, offer_src, resolve_deps
+from core.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
 
@@ -600,7 +601,7 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
 
 def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
         tmp_path, monkeypatch):
-    from tinyp2p import node as runtime
+    from core import node as runtime
 
     original_pump = runtime.pump
     node = Node(str(tmp_path / "node"))

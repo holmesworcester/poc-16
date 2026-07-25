@@ -7,13 +7,13 @@ from dataclasses import replace
 
 import pytest
 
-from tinyp2p import hoist, layout, shape, treap, tree
-from tinyp2p import cmds
-from tinyp2p.crypto import h
-from tinyp2p.fact import Fact, canon
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import Scratchpad, resolve_deps
-from tinyp2p.node import Node
+from core import hoist, layout, shape, treap, tree
+from core import cmds
+from core.crypto import h
+from core.fact import Fact, canon
+from facts.content.message import message
+from core.kernel import Scratchpad, resolve_deps
+from core.node import Node
 
 from .util import author_msg, closed_subset, deliver
 
@@ -573,7 +573,7 @@ def test_failed_scratchpad_judge_is_atomic(hoist_world):
 
 
 def test_single_judge_loop():
-    root = pathlib.Path(__file__).resolve().parent.parent / "tinyp2p"
+    root = pathlib.Path(__file__).resolve().parent.parent / "core"
     modules = {
         name: ast.parse((root / f"{name}.py").read_text())
         for name in ("hoist", "kernel")

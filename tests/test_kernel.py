@@ -3,20 +3,20 @@ import sqlite3
 
 import pytest
 
-from tinyp2p.close import close
-from tinyp2p.crypto import keypair, sign
-from tinyp2p.fact import Fact
-from tinyp2p.facts.auth.admin import admin
-from tinyp2p.facts.auth.device import device
-from tinyp2p.facts.auth.device_invite import device_invite
-from tinyp2p.facts.auth.removal import removal
-from tinyp2p.facts.auth.request import request
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.facts.auth.workspace import workspace
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import (
+from core.close import close
+from core.crypto import keypair, sign
+from core.fact import Fact
+from facts.auth.admin import admin
+from facts.auth.device import device
+from facts.auth.device_invite import device_invite
+from facts.auth.removal import removal
+from facts.auth.request import request
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from facts.auth.workspace import workspace
+from facts.content.message import message
+from core.kernel import (
     SCHEMA,
     Global,
     drain,
@@ -24,7 +24,7 @@ from tinyp2p.kernel import (
     resolve_deps,
     validate,
 )
-from tinyp2p.node import now_ms
+from core.node import now_ms
 
 
 @pytest.fixture

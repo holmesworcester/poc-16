@@ -16,7 +16,7 @@ import urllib.request
 
 import pytest
 
-from tinyp2p.cli import ctl
+from core.cli import ctl
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORTS = {"alice": 17311, "bob": 17312, "carol": 17313}
@@ -29,7 +29,7 @@ def url(who):
 def spawn(tmp, who):
     log = open(tmp / f"{who}.log", "w")
     p = subprocess.Popen(
-        [sys.executable, "-m", "tinyp2p", "daemon", str(tmp / who),
+        [sys.executable, "-m", "core", "daemon", str(tmp / who),
          "--port", str(PORTS[who]), "--cadence", "0.3"],
         cwd=REPO, stdout=log, stderr=log,
         env={**os.environ, "TINYP2P_GRANT_TTL": "2000", "TINYP2P_DEBUG": "1"})
@@ -152,7 +152,7 @@ def test_alice_bob_carol(tmp_path):
 
         # -- the actual CLI binary, end to end -------------------------------
         out = subprocess.run(
-            [sys.executable, "-m", "tinyp2p", "--node", url("alice"),
+            [sys.executable, "-m", "core", "--node", url("alice"),
              "msgs", "--ws", ws[:12]],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert out.returncode == 0 and "post restart" in out.stdout

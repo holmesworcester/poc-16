@@ -1,10 +1,10 @@
 """E = V minus S stays independent of delivery history."""
 import pytest
 
-from tinyp2p.close import decode_pile
-from tinyp2p.kernel import drain
-from tinyp2p.node import Node
-from tinyp2p.suppression import victims
+from core.close import decode_pile
+from core.kernel import drain
+from core.node import Node
+from core.suppression import victims
 
 from .util import (
     all_fids,

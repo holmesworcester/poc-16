@@ -3,14 +3,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from tinyp2p import cmds, facts
-from tinyp2p.close import decode_pile
-from tinyp2p.crypto import keypair
-from tinyp2p.fact import Fact
-from tinyp2p.kernel import Valid
-from tinyp2p.node import Node, now_ms
-from tinyp2p.pump import pump, retract
-from tinyp2p.suppression import atom
+import facts
+
+from core import cmds
+from core.close import decode_pile
+from core.crypto import keypair
+from core.fact import Fact
+from core.kernel import Valid
+from core.node import Node, now_ms
+from core.pump import pump, retract
+from core.suppression import atom
 
 from .util import (
     add_member,
@@ -51,7 +53,7 @@ def test_pump_crash_resume(tmp_path, monkeypatch):
     """Kill between any two rows: rerun continues cleanly — row application
     and cursor advance share ONE transaction; no handler needs
     INSERT OR IGNORE to survive it."""
-    from tinyp2p import node as runtime
+    from core import node as runtime
 
     monkeypatch.setattr(runtime, "pump", lambda *args: 0)
     node = Node(str(tmp_path / "node"))
@@ -123,7 +125,7 @@ def test_restart_discards_index_ahead_of_root(tmp_path, monkeypatch):
 
 def test_restart_resumes_rows_after_root_publish(tmp_path, monkeypatch):
     """A published root with an unadvanced cursor is pumped on startup."""
-    from tinyp2p import node as runtime
+    from core import node as runtime
 
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -230,7 +232,7 @@ def test_missing_cursor_rebuilds(world, monkeypatch, historical_minus):
 def test_dependent_facts_follow_source_at_every_projection_boundary(
         tmp_path, monkeypatch, boundary):
     """Dependent facts materialize after their source across every boundary."""
-    from tinyp2p import node as runtime
+    from core import node as runtime
 
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice")
@@ -419,7 +421,7 @@ def test_handlers_contain_no_suppression_logic():
 
 
 def test_removal_join_confluence(tmp_path):
-    """The known bug (SIMPLIFY.md §5): removal before join in delivery order
+    """The known bug (docs/SIMPLIFY.md §5): removal before join in delivery order
     still yields evicted=1 in the members view — insert-only removals row +
     view, not UPDATE."""
     source = Node(str(tmp_path / "source"))
@@ -463,7 +465,7 @@ def test_fold_pm_over_d_equals_fold_over_e(tmp_path, monkeypatch):
 
 def test_rebuild_fires_zero_retractions(tmp_path, monkeypatch):
     """Replay scans valid deletions for S first, then folds E without '−'."""
-    import tinyp2p.pump as pump_module
+    import core.pump as pump_module
 
     node, workspace, targets, _ = suppression_world(
         tmp_path / "node", monkeypatch)

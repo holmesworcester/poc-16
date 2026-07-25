@@ -1,17 +1,19 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
 import random
 
-from tinyp2p import cmds, facts
-from tinyp2p.close import close, encode_pile
-from tinyp2p.crypto import h, keypair
-from tinyp2p.fact import Fact
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.facts.content.message import message
-from tinyp2p.kernel import resolve_deps
-from tinyp2p.node import Node, now_ms
-from tinyp2p.suppression import TARGET, atom, is_deletion
+import facts
+
+from core import cmds
+from core.close import close, encode_pile
+from core.crypto import h, keypair
+from core.fact import Fact
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from facts.content.message import message
+from core.kernel import resolve_deps
+from core.node import Node, now_ms
+from core.suppression import TARGET, atom, is_deletion
 
 
 def channel_delete(target, channel, ts):
@@ -128,7 +130,7 @@ def add_member(
     """
     inviter_sk, inviter_pk = inviter or n.identity(ws)
     with n.lock:
-        from tinyp2p.kernel import offer_src
+        from core.kernel import offer_src
         member_source = offer_src(n.idx(ws), "member", inviter_pk)
         if member_source is None:
             raise ValueError("inviter is not a workspace member")
@@ -160,7 +162,7 @@ def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):
 
 
 def member_src(n, ws, pk):
-    from tinyp2p.kernel import offer_src
+    from core.kernel import offer_src
     with n.lock:
         return offer_src(n.idx(ws), "member", pk)
 

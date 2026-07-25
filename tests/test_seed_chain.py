@@ -5,10 +5,10 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from tinyp2p import cmds
-from tinyp2p import kernel as kernel_module
-from tinyp2p.close import close, decode_pile
-from tinyp2p.kernel import drain, resolve_deps
+from core import cmds
+from core import kernel as kernel_module
+from core.close import close, decode_pile
+from core.kernel import drain, resolve_deps
 
 from .util import all_fids, closed_subset
 

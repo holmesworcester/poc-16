@@ -3,11 +3,12 @@ import ast
 import pathlib
 import sqlite3
 
-from tinyp2p import fact as core_fact
-from tinyp2p import facts
+import facts
+
+from core import fact as core_fact
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FACTS = ROOT / "tinyp2p" / "facts"
+FACTS = ROOT / "facts"
 SECTIONS = ["# SHAPE", "# NEEDS", "# VALIDATE", "# MODE",
             "# MATERIALIZE", "# COMMANDS", "# QUERIES"]
 
@@ -98,7 +99,7 @@ def test_core_fact_module_has_no_family_authors():
 
 def test_core_judge_and_engine_do_not_name_family_policy():
     for name in ("fact.py", "kernel.py", "node.py", "layout.py"):
-        source = (ROOT / "tinyp2p" / name).read_text()
+        source = (ROOT / "core" / name).read_text()
         assert '"removal"' not in source, name
         assert '"workspace"' not in source, name
         assert '"member"' not in source, name

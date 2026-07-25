@@ -1,6 +1,6 @@
 """Measure the multi-level pile in action: the range-sync PATH TAX, verify-once
 judge counts, and the over-inclusion residual — against the rho figures
-MULTILEVEL_PILE.md predicts.
+docs/MULTILEVEL_PILE.md predicts.
 
 Leaf-only piles ship/judge each leaf's whole closure C(l); a fact needed by k
 leaves is paid k times (rho ~ 3x, measured). The multi-level pile stores each
@@ -30,11 +30,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.shape as shape
-from tinyp2p import hoist
-from tinyp2p.close import close, encode_pile
-from tinyp2p.kernel import kernel, resolve_deps
-from tinyp2p.shape import fid_of
+import core.shape as shape
+from core import hoist
+from core.close import close, encode_pile
+from core.kernel import kernel, resolve_deps
+from core.shape import fid_of
 
 from bench.bench_sync import WORK, YEARS, build_seed, bulk_author
 

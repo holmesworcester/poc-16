@@ -1,19 +1,21 @@
 """Upgrade coverage for workspaces persisted with the pre-rename auth tags."""
 import base64
 
-from tinyp2p import cmds, facts
-from tinyp2p.crypto import box_encrypt, kdf, keypair
-from tinyp2p.fact import canon
-from tinyp2p.facts.auth.legacy_genesis import genesis
-from tinyp2p.facts.auth.legacy_invite import invite
-from tinyp2p.facts.auth.legacy_join import join
-from tinyp2p.facts.auth.legacy_signature import legacy_signature
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.layout import layout
-from tinyp2p.node import INDEX_VERSION, Node
-from tinyp2p.shape import boundary
+import facts
+
+from core import cmds
+from core.crypto import box_encrypt, kdf, keypair
+from core.fact import canon
+from facts.auth.legacy_genesis import genesis
+from facts.auth.legacy_invite import invite
+from facts.auth.legacy_join import join
+from facts.auth.legacy_signature import legacy_signature
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from core.layout import layout
+from core.node import INDEX_VERSION, Node
+from core.shape import boundary
 
 from .util import (
     add_member,
@@ -141,7 +143,7 @@ def test_invite_link_minted_before_upgrade_redeems_after_upgrade(
 
     monkeypatch.setattr(
         "urllib.request.urlopen", lambda *args, **kwargs: Response())
-    monkeypatch.setattr("tinyp2p.walk.walk", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.walk.walk", lambda *args, **kwargs: None)
     link = base64.urlsafe_b64encode(canon({
         "u": "http://legacy-peer",
         "ws": root.fid,

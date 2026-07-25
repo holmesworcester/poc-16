@@ -17,14 +17,14 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.bench_sync import MEMBERS, YEARS, _insert, bulk_author
-from tinyp2p import cmds
-from tinyp2p.crypto import keypair, load_sk
-from tinyp2p.facts.auth.device import device
-from tinyp2p.facts.auth.device_invite import device_invite
-from tinyp2p.facts.auth.signature import signature
-from tinyp2p.facts.auth.user import user
-from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.node import Node
+from core import cmds
+from core.crypto import keypair, load_sk
+from facts.auth.device import device
+from facts.auth.device_invite import device_invite
+from facts.auth.signature import signature
+from facts.auth.user import user
+from facts.auth.user_invite import user_invite
+from core.node import Node
 
 SHAPES = ("star", "wide", "random", "chain")
 

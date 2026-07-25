@@ -3,9 +3,9 @@ import json
 
 import pytest
 
-from tinyp2p import cmds
-from tinyp2p.crypto import keypair
-from tinyp2p.node import Node, now_ms
+from core import cmds
+from core.crypto import keypair
+from core.node import Node, now_ms
 
 from .util import add_member
 

@@ -9,7 +9,7 @@ are steady across repeats; absolute seconds carry a few percent of machine noise
 
 **Shipped default: tiered layout, `COLD_CUT = 4096`** (~1.5 MB cold pages under a
 fine `CUT = 8` guard window) — the calibrated one-size-fits-most leaf (see
-MODEL.md "Leaf Sizing"). §1–2 measure that default; §3 pins flat
+docs/MODEL.md "Leaf Sizing"). §1–2 measure that default; §3 pins flat
 (`COLD_CUT = None`) to show the redundancy-vs-page-size law that motivates it;
 §4 is the head-to-head.
 
@@ -100,7 +100,7 @@ write tax — only cold history is big; the hot tail stays fine — §4.
 **Why 4096.** The annex a leaf carries is its authors' membership closure, which
 saturates at the ~Dunbar active-writer core — not at total members — so a single
 fixed cold-page size holds redundancy flat (~1.1–1.2×) from 100 to 10,000
-members (`B* = a·h̄·W/ε` ≈ 3–5k facts; cross-M measurement in MODEL.md "Leaf
+members (`B* = a·h̄·W/ε` ≈ 3–5k facts; cross-M measurement in docs/MODEL.md "Leaf
 Sizing"). 4096 sits at the upper end of the band to absorb deeper delegation
 chains. Past ~100k members you want `COLD_CUT ∝ √N` on a dyadic (2:1-merge)
 ladder to keep write-amp O(log N); a fixed 4096 is the sample point for the sizes

@@ -1,10 +1,10 @@
 """Delegated admin authority reaches the running eviction command."""
 import pytest
 
-from tinyp2p import cmds
-from tinyp2p.crypto import keypair
-from tinyp2p.facts.auth.admin import admins
-from tinyp2p.node import Node, now_ms
+from core import cmds
+from core.crypto import keypair
+from facts.auth.admin import admins
+from core.node import Node, now_ms
 
 from .util import add_member
 

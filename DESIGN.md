@@ -3,10 +3,10 @@
 Design of record. The Engine, Auth, Node State, and Concurrency sections mark
 landed behavior versus remaining beads; where earlier System/Store/Walk prose
 still describes the pre-S1 flat manifest, those sections are historical
-motivation and the later foldback takes precedence. [SIMPLIFY.md](SIMPLIFY.md)
+motivation and the later foldback takes precedence. [SIMPLIFY.md](docs/SIMPLIFY.md)
 maps the landed core and remaining production step. Unreplaced numbers remain
 estimates until `bench/`
-supersedes them; [MODEL.md](MODEL.md) carries the performance model and loop
+supersedes them; [MODEL.md](docs/MODEL.md) carries the performance model and loop
 math.
 
 POC-16 asks one question: **can range-based set reconciliation run against a
@@ -90,7 +90,7 @@ closure-complete range sync.
 converges in O(d · log n) transfer and O(log_B n) sequential rounds.
 Litmus: 10^6 facts, 10^2 recent-clustered diff ⇒ ≤ 4 rounds, ≤ low
 hundreds of KB; a fully scattered diff stays ~1 MB via slice fetches
-(MODEL.md).
+(docs/MODEL.md).
 
 **P2 — efficient engine.** *Drain* takes `(raw piles, valid set)` to
 `(valid set′)` on request — hash-verify each pile, run
@@ -107,7 +107,7 @@ piles validate in parallel.
 it*, in the walk's own shape. Litmus: ≤ D + 2 rounds (+1 per
 out-of-window frontier hop); ref + fence overhead ≤ 10% of context body
 bytes; identical sets ⇒ identical leaf-pile bytes; a cold 3-day partial join
-at 10^6 ≈ 4 rounds / ~18 MB, projectable on arrival (MODEL.md, Closure).
+at 10^6 ≈ 4 rounds / ~18 MB, projectable on arrival (docs/MODEL.md, Closure).
 
 Everything else is scaffolding around these three.
 
@@ -152,7 +152,7 @@ record order (lengths implicit from the next offset). A body over ~8 KB
 — and every attachment — spills to its own `blob/<hash>`; the record
 keeps the ref. Otherwise there is no per-fact object: a dep probe is one
 ranged GET at the record's offset, bulk fetches take whole pages (a
-fresh join is ~2.2 k GETs, bandwidth-bound — MODEL.md), and the walk
+fresh join is ~2.2 k GETs, bandwidth-bound — docs/MODEL.md), and the walk
 touches record sections only. Above the record run sit **fence runs**:
 one fence per
 slice, `(separator key, fingerprint, count, page ref)`, suffix-truncated
@@ -165,7 +165,7 @@ one contiguous ranged GET per level** (fixed-size sorted records make
 offsets arithmetic) — walk descent, dep probes, and bulk fetches are all
 instances. Fences are load-bearing: node-per-object storage (~20
 sequential GETs per lookup) or whole-page fetches on scattered diffs would
-sink the design. Run depth is 2–3 (MODEL.md).
+sink the design. Run depth is 2–3 (docs/MODEL.md).
 
 **Manifest.** The **only** mutable object besides the piles: generation,
 the inlined top fence runs (history + tail fences), removal set. Changes only by CAS (S3 conditional PUT / SQLite transaction / atomic
@@ -224,7 +224,7 @@ the page it lands in — same commit, ~2–3 extra PUTs, rare because the
 boundary's guard window is the tail's time depth (B_t/λ: hours busy, days
 quiet). The boundary itself is content-determined (the highest cut point
 with fewer than B_t entries above it), so the whole layout — tail included
-— is a pure function of the set (MODEL.md, Stragglers).
+— is a pure function of the set (docs/MODEL.md, Stragglers).
 
 **ObjectStore trait.** Every node stores through one S3-shaped trait:
 
@@ -364,7 +364,7 @@ closure_sync(Q):                        # Q snapped to leaf cuts
 `R_cl = D + 2` — 4 rounds at 10^6, no escape hops, no workload
 assumption: the leaf pile *is* the context. A cold partial join stays
 ~4 rounds and tens of MB — the context's own bodies are the floor no
-protocol beats — and every fact projects on arrival (MODEL.md,
+protocol beats — and every fact projects on arrival (docs/MODEL.md,
 Closure).
 
 ## The Engine (P2)
@@ -584,7 +584,7 @@ tracked by `poc-16-yez`.
 Performance: piles are fully closed, so validation does **zero store
 reads** — the drain is transfer- and verify-bound: GET 10–30 ms, ~100
 in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs, parallel across cores;
-~2,400+ facts/s vs S3 (MODEL.md), ≥ 8× the litmus. Memory beats lookups: Lambda RAM bills only while
+~2,400+ facts/s vs S3 (docs/MODEL.md), ≥ 8× the litmus. Memory beats lookups: Lambda RAM bills only while
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
 — a warm worker can reuse any content-addressed page it already fetched.
@@ -793,7 +793,7 @@ bit-identical root (one hash compare), no conflict resolution, self-healing.
 The only mutable cell is a 32-byte root hash per workspace, itself optional
 (state ≡ ⊔ of all published roots). This is the Merkle Search Tree
 (Auvolat–Taïani 2019) / prolly-tree (Noms → Dolt) line reconciled by RBSR
-(Meyer 2023); full treatment in WORKSPACES.md §9.
+(Meyer 2023); full treatment in docs/WORKSPACES.md §9.
 
 **Root without a lease.** Publish roots into an append-only `roots/` set; truth
 is `merge(live roots)`, never clobbered. Every fold and every authoritative
@@ -860,7 +860,7 @@ Proofs first; no transport work until both numbers exist.
   No validator or materializer consults mutable S, so no singleton or
   optimistic validation retry is required. The current engine implements the
   single-target seam; global 1:N construction, sync, surfacing, and closure are
-  tracked by `poc-16-yez` (`DELETION_CLOSURE.md`).
+  tracked by `poc-16-yez` (`docs/DELETION_CLOSURE.md`).
 - (Dead weight: resolved 2026-07-22 — piles go straight to dep-pure
   validation, so facts that never validate never enter the set.)
 - Page cut: needs a precise deterministic definition that keeps small diffs
@@ -878,4 +878,4 @@ Proofs first; no transport work until both numbers exist.
   membership-closure size already caps).
 - Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
   findings, hash-list slices not bao). (Bulk-join body bundles: resolved
-  2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)
+  2026-07-22 by packed pages — bodies live in the page objects, docs/MODEL.md.)

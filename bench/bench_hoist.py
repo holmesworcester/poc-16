@@ -10,7 +10,7 @@ content-defined leaves the flat/treap layout cuts:
 Multi-level piles store each fact exactly ONCE (at settle(f) = LCA of the leaves
 that need it), so their full-sync total is |V| and rho -> 1. This script reports
 rho, the N(f) distribution, and settle spans (in leaf-index units) on a real
-workspace, so the analytic claims in MULTILEVEL_PILE.md sit on measured ground.
+workspace, so the analytic claims in docs/MULTILEVEL_PILE.md sit on measured ground.
 
 Run:  python3 bench/bench_hoist.py            # 50k (matches RESULTS.md flat 3.1x)
       python3 bench/bench_hoist.py 5000 50000
@@ -21,9 +21,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tinyp2p.shape as shape
-from tinyp2p import treap as T
-from tinyp2p.kernel import resolve_deps
+import core.shape as shape
+from core import treap as T
+from core.kernel import resolve_deps
 
 from bench.bench_sync import WORK, build_seed
 
