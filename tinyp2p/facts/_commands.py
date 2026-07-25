@@ -8,6 +8,16 @@ def offer_source(node, workspace, name, a0, a1=None):
         return offer_src(node.idx(workspace), name, a0, a1)
 
 
+def offer_source_by_value(node, workspace, name, a1):
+    """Canonical source for an offer selected by its second value."""
+    with node.lock:
+        row = node.idx(workspace).execute(
+            "SELECT src FROM offers WHERE name=? AND a1=? "
+            "ORDER BY src LIMIT 1",
+            (name, a1)).fetchone()
+    return row and row[0]
+
+
 def closer(node, workspace, newmap, deps):
     from ..close import close
     from ..kernel import resolve_deps

@@ -5,7 +5,7 @@ is the poc-13 device authority edge with poc-10 transport atoms omitted; all
 devices are equal peers and the fact carries no endpoint policy.
 """
 from ...fact import Fact
-from .._commands import publish
+from .._commands import offer_source_by_value, publish
 from . import signature
 
 TAG = "device"
@@ -52,7 +52,10 @@ def materialize(db, workspace, valid):
     fact = valid.fact
     body = fact.body
     db.execute(
-        "INSERT OR IGNORE INTO devices VALUES(?,?,?,?,?)",
+        "INSERT INTO devices VALUES(?,?,?,?,?) "
+        "ON CONFLICT(ws, pk) DO UPDATE SET "
+        "user=excluded.user, label=excluded.label, source=excluded.source "
+        "WHERE excluded.source < devices.source",
         (workspace, body["pk"], body["pk"], body["label"], fact.fid))
 
 
@@ -61,6 +64,9 @@ def bind(node, workspace, label):
     from ...node import now_ms
 
     secret, public = node.identity(workspace)
+    if offer_source_by_value(
+            node, workspace, "device", public) is not None:
+        raise ValueError("local identity is already in a device set")
     ts = now_ms()
     item = device(public, label, ts)
     return publish(

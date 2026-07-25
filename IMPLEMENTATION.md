@@ -41,8 +41,11 @@ The POC-13 family boundary survives, but its projector contract does not fit a
 closed-pile kernel. Every concrete module under `facts/auth/` or
 `facts/content/` therefore has these sections, in this order:
 
-- **SHAPE** constructs the exact canonical fact. Existing short fact tags are
-  preserved, so this packaging refactor does not rename stored facts.
+- **SHAPE** constructs the exact canonical fact. Chained auth adopts the
+  poc-13 names (`workspace`, `signature`, `user_invite`, `user`); read-only
+  legacy handlers keep persisted `genesis`, `sig`, `invite`, and `join` facts
+  judgeable during upgrade and rebuild, while every new command emits only the
+  current tags.
 - **NEEDS** declares normalized offer addresses. The generic resolver combines
   them with envelope refs and chooses the canonical minimum-fid provider.
 - **VALIDATE** is exactly `validate(fact, context) -> bool`. Context contains

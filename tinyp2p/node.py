@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v1"
+INDEX_VERSION = "family-contract-v2"
 
 
 def now_ms():
@@ -94,6 +94,9 @@ class Node:
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
+            for key in [
+                    key for key in self.sync_cache if key[0] == workspace]:
+                self.sync_cache.pop(key).clear()
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:

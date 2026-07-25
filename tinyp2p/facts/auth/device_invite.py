@@ -5,7 +5,7 @@ device and workspace member. There is no bearer secret or follow-up join; the
 poc-13 two-family flow collapses to the direct-key form settled for poc-16.
 """
 from ...fact import Fact
-from .._commands import offer_source
+from .._commands import offer_source, offer_source_by_value
 from . import signature
 
 TAG = "device_invite"
@@ -62,11 +62,20 @@ def materialize(db, workspace, valid):
     fact = valid.fact
     body = fact.body
     db.execute(
-        "INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
-        (workspace, body["device"], body["label"], "device"))
-    db.execute(
-        "INSERT OR IGNORE INTO devices VALUES(?,?,?,?,?)",
+        "INSERT INTO devices VALUES(?,?,?,?,?) "
+        "ON CONFLICT(ws, pk) DO UPDATE SET "
+        "user=excluded.user, label=excluded.label, source=excluded.source "
+        "WHERE excluded.source < devices.source",
         (workspace, body["user"], body["device"], body["label"], fact.fid))
+    winner = db.execute(
+        "SELECT source FROM devices WHERE ws=? AND pk=?",
+        (workspace, body["device"])).fetchone()
+    if winner and winner[0] == fact.fid:
+        db.execute(
+            "INSERT INTO members VALUES(?,?,?,?,0) "
+            "ON CONFLICT(ws, pk) DO UPDATE SET name=excluded.name "
+            "WHERE members.role='device'",
+            (workspace, body["device"], body["label"], "device"))
 
 
 # COMMANDS — build a fact, admit it, stop.
@@ -79,11 +88,13 @@ def grant(node, workspace, user, device_pk, label):
     signed = signature.signature(secret, public, item, ts)
     member = offer_source(node, workspace, "member", public)
     device_source = offer_source(node, workspace, "device", user, public)
-    existing = offer_source(node, workspace, "device", user, device_pk)
+    target_member = offer_source(node, workspace, "member", device_pk)
+    existing = offer_source_by_value(
+        node, workspace, "device", device_pk)
     if member is None or device_source is None:
         raise ValueError("local identity is not a device-set member")
-    if existing is not None:
-        raise ValueError("device key is already in this device set")
+    if target_member is not None or existing is not None:
+        raise ValueError("device key is already enrolled")
     deps = {
         item.fid: [signed.fid, member, device_source],
         signed.fid: [],

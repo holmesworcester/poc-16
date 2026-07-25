@@ -1,7 +1,14 @@
 """Behavioral tests for delegation-aware key-order measurement."""
 import tinyp2p.layout as layout
 
-from bench.bench_order import benchmark
+from bench.bench_order import benchmark, delegation_topology
+from tinyp2p.crypto import keypair
+from tinyp2p.facts.auth.device import device
+from tinyp2p.facts.auth.device_invite import device_invite
+from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.auth.user import user
+from tinyp2p.facts.auth.user_invite import user_invite
+from tinyp2p.facts.auth.workspace import workspace
 
 
 def run_benchmark(tmp_path, shape):
@@ -79,3 +86,40 @@ def test_user_order_beats_device_author_order_with_plural_devices(tmp_path):
         row["tax"] <= author_rows[row["member"]]["tax"]
         for row in results["user"]["rows"]
     )
+
+
+def test_device_authored_invite_is_parented_to_its_user_set():
+    founder_secret, founder = keypair()
+    root = workspace(founder_secret, founder, "alice", 1)
+    primary = device(founder, "phone", 2)
+    primary_sig = signature(founder_secret, founder, primary, 2)
+    laptop_secret, laptop = keypair()
+    laptop_grant = device_invite(
+        founder, founder, laptop, "laptop", 3)
+    laptop_grant_sig = signature(
+        founder_secret, founder, laptop_grant, 3)
+
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(laptop, invite_public, 4)
+    invitation_sig = signature(laptop_secret, laptop, invitation, 4)
+    child_secret, child = keypair()
+    joined = user(invitation, invite_secret, child, "bob", 5)
+    joined_sig = signature(child_secret, child, joined, 5)
+    all_facts = [
+        root,
+        primary_sig,
+        primary,
+        laptop_grant_sig,
+        laptop_grant,
+        invitation_sig,
+        invitation,
+        joined_sig,
+        joined,
+    ]
+    by_id = {fact.fid: fact for fact in all_facts}
+
+    topology = delegation_topology(list(by_id), by_id.get)
+
+    assert topology["device_to_user"][laptop] == founder
+    assert topology["parent"][child] == founder
+    assert topology["depth"][child] == 1

@@ -88,6 +88,16 @@ def delegation_topology(fids, fact_of):
         for fact in facts.values()
         if fact.t in {"workspace", "user"}
     }
+    device_to_user = {member: member for member in members}
+    for fact in facts.values():
+        for name, user, device_key in fact.offers():
+            if name != "device":
+                continue
+            previous = device_to_user.get(device_key)
+            if previous is not None and previous != user:
+                raise ValueError(f"device {device_key} belongs to two users")
+            device_to_user[device_key] = user
+
     parent, invite_beneficiary = {}, {}
     for fid, fact in facts.items():
         if fact.t != "user":
@@ -97,7 +107,8 @@ def delegation_topology(fids, fact_of):
         invitation = facts.get(invite_fid)
         if invitation is None or invitation.t != "user_invite":
             raise ValueError(f"user {fid} does not reference a user_invite")
-        inviter = invitation.body["pk"]
+        inviter_key = invitation.body["pk"]
+        inviter = device_to_user.get(inviter_key, inviter_key)
         parent[member] = inviter
         invite_beneficiary[invite_fid] = member
 
@@ -146,15 +157,6 @@ def delegation_topology(fids, fact_of):
         return owner_cache[fid]
 
     owner_by_fact = {fid: owner_of(fid) for fid in fids}
-    device_to_user = {member: member for member in members}
-    for fact in facts.values():
-        for name, user, device_key in fact.offers():
-            if name != "device":
-                continue
-            previous = device_to_user.get(device_key)
-            if previous is not None and previous != user:
-                raise ValueError(f"device {device_key} belongs to two users")
-            device_to_user[device_key] = user
     user_owner_by_fact = {
         fid: device_to_user.get(owner, owner)
         for fid, owner in owner_by_fact.items()

@@ -79,3 +79,20 @@ def test_commands_author_with_the_workspace_bound_identity(tmp_path):
     assert node.pk != member_public
     assert fact.body["pk"] == member_public
     assert cmds.msgs(node, workspace)[-1]["text"] == "from the bound device"
+
+
+def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
+    node = Node(str(tmp_path / "rebind"))
+    workspace = cmds.create(node, "alice")
+    other_workspace = "f" * 64
+    replacement = node.keychain.add_identity()
+    stale = {"token": "minted-for-old-identity", "etag": "old"}
+    unrelated = {"token": "keep"}
+    node.sync_cache[(workspace, "http://peer-a")] = stale
+    node.sync_cache[(other_workspace, "http://peer-b")] = unrelated
+
+    node.bind_identity(workspace, replacement)
+
+    assert stale == {}
+    assert (workspace, "http://peer-a") not in node.sync_cache
+    assert node.sync_cache[(other_workspace, "http://peer-b")] is unrelated
