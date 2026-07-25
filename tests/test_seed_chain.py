@@ -106,3 +106,15 @@ def test_chained_bidirectional_reconciliation_converges(tmp_path):
     assert result["shape"] == "chain"
     assert result["depth"]["max"] == 23
     assert result["facts"] > result["a_before"]
+
+
+def test_chain_seed_is_stack_safe_beyond_python_recursion_depth(tmp_path):
+    members = 520
+    membership_facts = 1 + 4 * (members - 1)
+    node, workspace, stats = build_seed(
+        str(tmp_path / "deep"), membership_facts,
+        n_members=members, shape="chain", seed=16)
+
+    assert stats["facts"] == membership_facts
+    assert stats["depth"]["max"] == members - 1
+    assert check_leaves(node, workspace) > 1

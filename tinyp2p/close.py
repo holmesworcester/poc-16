@@ -15,19 +15,23 @@ from .fact import canon, from_json
 
 
 def close(news, deps_of, fact_of):
-    """Serialize `news` plus its full recursive closure, deps-first."""
+    """Serialize ``news`` plus its full closure, deps-first and stack-safe."""
     out, seen = [], set()
-
-    def emit(fid):
-        if fid in seen:
-            return
-        seen.add(fid)
-        for d in deps_of(fid):
-            emit(d)
-        out.append(fact_of(fid))
-
     for f in sorted(news, key=lambda f: f.key):
-        emit(f.fid)
+        stack = [(f.fid, False)]
+        while stack:
+            fid, expanded = stack.pop()
+            if expanded:
+                out.append(fact_of(fid))
+                continue
+            if fid in seen:
+                continue
+            seen.add(fid)
+            stack.append((fid, True))
+            stack.extend(
+                (dependency, False)
+                for dependency in reversed(tuple(deps_of(fid)))
+            )
     return out
 
 

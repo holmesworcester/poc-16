@@ -37,3 +37,9 @@ CREATE TABLE IF NOT EXISTS members(ws TEXT, pk TEXT, name TEXT, role TEXT,
 CREATE TABLE IF NOT EXISTS devices(ws TEXT, user TEXT, pk TEXT, label TEXT,
                                    source TEXT, PRIMARY KEY(ws, pk));
 """
+
+
+def clear(db, workspace):
+    """Clear this scope's derived rows before a canonical reprojection."""
+    db.execute("DELETE FROM members WHERE ws=?", (workspace,))
+    db.execute("DELETE FROM devices WHERE ws=?", (workspace,))

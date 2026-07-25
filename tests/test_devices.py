@@ -5,7 +5,7 @@ import pytest
 
 from tinyp2p import cmds
 from tinyp2p import facts
-from tinyp2p.close import close
+from tinyp2p.close import close, encode_pile
 from tinyp2p.crypto import keypair
 from tinyp2p.facts.auth.device import bind, device, devices
 from tinyp2p.facts.auth.device_invite import device_invite as device_invite_fact
@@ -17,7 +17,7 @@ from tinyp2p.facts.auth.workspace import workspace as workspace_fact
 from tinyp2p.kernel import drain, offer_src, resolve_deps
 from tinyp2p.node import Node, now_ms
 
-from .util import add_member, member_src
+from .util import add_member, all_fids, closed_subset, deliver, member_src
 
 
 def _inject_device_claim(
@@ -226,7 +226,7 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
     assert winner == grants[0].fid
 
 
-def test_shadow_that_would_orphan_existing_authority_is_rejected_atomically(
+def test_conflicting_authority_converges_to_one_finite_subset(
         tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -237,6 +237,7 @@ def test_shadow_that_would_orphan_existing_authority_is_rejected_atomically(
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
     cmds.bind_device(node, workspace, "bob-phone")
+    common = closed_subset(node, workspace, all_fids(node, workspace))
 
     target_secret, target = keypair()
     node.keychain.add_identity(target_secret)
@@ -247,16 +248,12 @@ def test_shadow_that_would_orphan_existing_authority_is_rejected_atomically(
     child_claim = _inject_device_claim(
         node, workspace, target_secret, target, bob, child, "child", 101)
     assert target_claim.fid in resolve_deps(child_claim, node.idx(workspace))
-
-    before_facts = node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts").fetchone()[0]
-    before_proofs = node.idx(workspace).execute(
-        "SELECT fid, rank FROM proofs ORDER BY fid").fetchall()
-    before_root = node.store(workspace).get("root")
+    target_chain = closed_subset(
+        node, workspace, [target_claim.fid, child_claim.fid])
 
     # This claim is independently valid and shallower than Bob's claim for
-    # target, but accepting it would make target's existing child grant lose
-    # the required (Bob, target) co-offer.
+    # target. In the union it makes target's child grant lose the required
+    # (Bob, target) co-offer.
     conflict = device_invite_fact(
         founder, founder, target, "alice-target", 102)
     conflict_sig = signature(founder_secret, founder, conflict, 102)
@@ -284,24 +281,90 @@ def test_shadow_that_would_orphan_existing_authority_is_rejected_atomically(
         lambda fid: new.get(fid) or node.fact_of(workspace, fid),
     )
     assert drain(standalone, workspace).ok
+    conflict_pile = encode_pile(standalone)
+
+    # The second peer sees the conflict first and the Bob chain second; the
+    # first peer sees them in the opposite order.
+    peer = Node(str(tmp_path / "peer"))
+    deliver(peer, workspace, common)
+    peer.turn(workspace)
+    deliver(peer, workspace, conflict_pile)
+    peer.turn(workspace)
+    deliver(peer, workspace, target_chain)
+    peer.turn(workspace)
+
     accepted = node.ingest_new(
-        workspace,
-        [conflict_sig, conflict],
-        conflict_deps,
-    )
+        workspace, [conflict_sig, conflict], conflict_deps)
+    assert any(valid.fact.fid == conflict.fid for valid in accepted)
 
-    assert accepted == []
-    assert node.fact_of(workspace, conflict.fid) is None
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts").fetchone()[0] == before_facts
-    assert node.idx(workspace).execute(
-        "SELECT fid, rank FROM proofs ORDER BY fid").fetchall() == before_proofs
-    assert node.store(workspace).get("root") == before_root
-    assert target_claim.fid in resolve_deps(child_claim, node.idx(workspace))
+    for current in (node, peer):
+        assert current.fact_of(workspace, conflict.fid) == conflict
+        assert current.fact_of(workspace, target_claim.fid) == target_claim
+        assert current.fact_of(workspace, child_claim.fid) is None
+        assert current.app.execute(
+            "SELECT 1 FROM devices WHERE ws=? AND pk=?",
+            (workspace, child)).fetchone() is None
+        assert current.store(workspace).list("pile/") == []
+    assert all_fids(node, workspace) == all_fids(peer, workspace)
+    assert node.store(workspace).get("root") \
+        == peer.store(workspace).get("root")
+
+    # Canonical pruning cannot poison later turns.
     assert node.store(workspace).list("pile/") == []
+    posted = cmds.post(node, workspace, "general", "still authorized")
+    assert node.fact_of(workspace, posted) is not None
 
-    # A rejected conflict cannot poison later turns.
-    assert cmds.post(node, workspace, "general", "still authorized")
+
+def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice")
+    founder_secret, founder = node.identity(workspace)
+    cmds.bind_device(node, workspace, "alice-phone")
+
+    bob_secret, bob, _ = add_member(node, workspace, "bob")
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    cmds.bind_device(node, workspace, "bob-phone")
+
+    target_secret, target = keypair()
+    target_claim = _inject_device_claim(
+        node, workspace, bob_secret, bob, bob, target, "target", 100)
+    _, child = keypair()
+    child_claim = _inject_device_claim(
+        node, workspace, target_secret, target, bob, child, "child", 101)
+
+    conflict = device_invite_fact(
+        founder, founder, target, "alice-target", 102)
+    conflict_sig = signature(founder_secret, founder, conflict, 102)
+    deps = {
+        conflict_sig.fid: [],
+        conflict.fid: [
+            conflict_sig.fid,
+            member_src(node, workspace, founder),
+            offer_src(
+                node.idx(workspace), "device_key", founder,
+                requires=(("device", founder, founder),)),
+        ],
+    }
+    new = {fact.fid: fact for fact in (conflict_sig, conflict)}
+    conflict_pile = encode_pile(close(
+        [conflict_sig, conflict],
+        lambda fid: deps[fid] if fid in deps else resolve_deps(
+            node.fact_of(workspace, fid), node.idx(workspace)),
+        lambda fid: new.get(fid) or node.fact_of(workspace, fid),
+    ))
+    deliver(node, workspace, conflict_pile, member="attacker00000000")
+
+    node.bind_identity(workspace, founder)
+    posted = cmds.post(
+        node, workspace, "general", "honest same turn", ts=200)
+
+    assert node.fact_of(workspace, posted) is not None
+    assert [message["text"] for message in cmds.msgs(node, workspace)] \
+        == ["honest same turn"]
+    assert node.fact_of(workspace, conflict.fid) == conflict
+    assert node.fact_of(workspace, target_claim.fid) == target_claim
+    assert node.fact_of(workspace, child_claim.fid) is None
 
 
 def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):

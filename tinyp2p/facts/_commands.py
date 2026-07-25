@@ -21,11 +21,18 @@ def closer(node, workspace, newmap, deps):
 
 def publish(node, workspace, fact, signature, role="member", blobs=None):
     """Close one signed fact with its local authority edge and ingest it."""
-    _, public_key = node.identity(workspace)
+    authors = [
+        public_key
+        for name, target, public_key in signature.offers()
+        if name == "author" and target == fact.fid
+    ]
+    if len(authors) != 1:
+        raise ValueError("signature does not author the published fact")
+    public_key = authors[0]
     src = offer_source(node, workspace, role, public_key)
     if src is None:
         raise ValueError(
-            f"local identity is not a workspace {role}")
+            f"publishing identity is not a workspace {role}")
     deps = {fact.fid: [r for _, r in fact.refs()] + [signature.fid]
             + [src], signature.fid: []}
     node.ingest_new(workspace, [signature, fact], deps, blobs)

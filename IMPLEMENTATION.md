@@ -135,11 +135,12 @@ recompute because a leaf pile depends only on its in-range fids and their
 resolved deps. A duplicate offer can change the shortest-proof winner, so a
 shadow guard (`Node._shadows`) drops the memo for that turn, recomputes proof
 ranks, and rebuilds the affected layout from scratch. Ordinary appends rank
-only their new offer sources and keep the incremental path. Fact, offer,
-global, and proof writes share one SQLite transaction: if a shadow would leave
-an already accepted authority fact without a finite canonical proof, the
-candidate batch rolls back as litter and later turns continue from the intact
-workspace.
+only their new offer sources and keep the incremental path. On a shadow, facts,
+offers, globals, and proofs share one SQLite transaction: merge first derives
+the canonical finite-proof subset of the union, prunes only facts outside that
+subset as litter, and rebuilds affected projections. Opposite arrival orders
+therefore select the same set, while an unrelated valid pile in the same turn
+still lands.
 `test_incremental_equals_full` asserts
 incremental == full at every step across promotions, a straggler, a new
 member, and an eviction; `test_shadow_guard_keeps_identity` exercises the
@@ -164,6 +165,8 @@ cannot wedge a workspace (`test_poison_pile_is_litter_not_poison`,
 `test_poison_alongside_honest`). This was the one critical defect the
 adversarial review surfaced; the fix keeps the kernel the sole security
 boundary — a judge that crashes on a hostile exhibit is a broken judge.
+The closure serializer uses an explicit DFS stack, so the same rule remains
+usable for delegation chains deeper than Python's call-stack limit.
 
 ## Deviations from DESIGN.md (all scale/packaging, no semantics)
 

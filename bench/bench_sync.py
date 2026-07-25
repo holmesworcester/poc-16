@@ -215,10 +215,6 @@ def reconcile(A, B, ws):
         push_fids += [k.split(":", 1)[1] for k in mine
                       if k.split(":", 1)[1] not in rfids]
 
-    ingest(A, ws, pulled)  # A absorbs B's half
-    if pulled:
-        A.commit(ws)
-
     push_bytes = 0
     if push_fids:
         idx = A.idx(ws)
@@ -229,6 +225,13 @@ def reconcile(A, B, ws):
         push_bytes = len(pile)
         ingest(B, ws, [decode_pile(pile)[0]])  # B absorbs A's half
         B.commit(ws)
+
+    # walk() pushes each local difference before draining its pulled ingress.
+    # Preserve that order so canonical pruning cannot remove a fact before its
+    # precomputed symmetric-difference pile reaches the peer.
+    ingest(A, ws, pulled)  # A absorbs B's half
+    if pulled:
+        A.commit(ws)
     t1 = perf()
 
     match = A.store(ws).get("root") == B.store(ws).get("root")

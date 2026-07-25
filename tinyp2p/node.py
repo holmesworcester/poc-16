@@ -24,8 +24,10 @@ from .fact import Fact, from_json
 from .keychain import Keychain
 from .kernel import (
     Judgment,
+    Valid,
     drain,
     extend_proofs,
+    proof_rank,
     rebuild_proofs,
     resolve_deps,
 )
@@ -42,11 +44,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v3"
-
-
-class _CanonicalProofConflict(ValueError):
-    """The candidate merge would invalidate an accepted authority proof."""
+INDEX_VERSION = "family-contract-v4"
 
 
 def now_ms():
@@ -66,6 +64,7 @@ class Node:
         self.app = sqlite3.connect(os.path.join(dir, "app.db"), check_same_thread=False)
         self.app.executescript(facts.APP_SCHEMA)
         self._stores, self._idx = {}, {}
+        self._reproject = set()
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
@@ -212,18 +211,22 @@ class Node:
                 out.append(v)
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
+            pruned = set()
             if newfids:
                 shadows = self._shadows(ws, newfids)
-                self._update_proofs(ws, newfids, shadows)
+                pruned = self._update_proofs(ws, newfids, shadows)
+                if pruned:
+                    self._rebuild_globals(ws)
             idx.commit()
+            if pruned:
+                self._reproject.add(ws)
+                out = [valid for valid in out
+                       if valid.fact.fid not in pruned]
+                newfids = [fid for fid in newfids if fid not in pruned]
             return out, newfids
-        except _CanonicalProofConflict:
-            # A pile can be valid by itself yet introduce a canonical shadow
-            # that removes the finite proof of an already accepted fact. The
-            # whole merge batch is litter in that case: retain the prior
-            # accepted set and let turn() retire its ingress pile.
+        except Exception:
             idx.rollback()
-            return [], []
+            raise
 
     def _shadows(self, ws, newfids):
         """Could a fact added this drain shift an existing range's resolved
@@ -233,7 +236,10 @@ class Node:
         families consume."""
         idx = self.idx(ws)
         for fid in newfids:
-            for name, a0, a1 in self.fact_of(ws, fid).offers():
+            fact = self.fact_of(ws, fid)
+            if fact is None:
+                continue
+            for name, a0, a1 in fact.offers():
                 if idx.execute(
                         "SELECT COUNT(*) FROM offers WHERE name=? AND a0=? AND a1=?",
                         (name, a0, a1)).fetchone()[0] > 1:
@@ -241,16 +247,50 @@ class Node:
         return False
 
     def _rebuild_proofs(self, ws):
-        """Give the accepted set its canonical, history-independent proof DAG."""
-        unresolved = rebuild_proofs(
-            self.idx(ws), lambda fid: self.fact_of(ws, fid))
-        if unresolved:
-            sample = ", ".join(sorted(unresolved)[:3])
-            raise _CanonicalProofConflict(
-                f"authority facts have no finite canonical proof: {sample}")
+        """Return every fact outside the set's finite canonical proof DAG."""
+        idx = self.idx(ws)
+        unresolved = set(rebuild_proofs(
+            idx, lambda fid: self.fact_of(ws, fid)))
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+            if fid in unresolved:
+                continue
+            fact = self.fact_of(ws, fid)
+            deps = resolve_deps(fact, idx)
+            if deps is None or proof_rank(idx, deps) is None:
+                unresolved.add(fid)
+        return unresolved
+
+    def _prune_unresolved(self, ws):
+        """Derive the same finite-proof subset from any arrival order."""
+        idx, pruned = self.idx(ws), set()
+        while True:
+            unresolved = self._rebuild_proofs(ws)
+            if not unresolved:
+                return pruned
+            pruned.update(unresolved)
+            idx.executemany(
+                "DELETE FROM offers WHERE src=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
+                "DELETE FROM proofs WHERE fid=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
+                "DELETE FROM facts WHERE fid=?",
+                ((fid,) for fid in unresolved))
+
+    def _rebuild_globals(self, ws):
+        """Reproject monotone rows after canonical pruning removes a source."""
+        idx = self.idx(ws)
+        idx.execute("DELETE FROM globals")
+        rows = set()
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+            fact = self.fact_of(ws, fid)
+            rows.update(facts.handler_for(fact.t).global_rows(fact))
+        idx.executemany(
+            "INSERT OR IGNORE INTO globals VALUES(?,?)", sorted(rows))
 
     def _update_proofs(self, ws, newfids, shadows):
-        """Rank the ordinary append-only case without rescanning history."""
+        """Rank an append or prune to the union's canonical finite subset."""
         idx = self.idx(ws)
         missing = {
             fid for (fid,) in idx.execute(
@@ -259,16 +299,14 @@ class Node:
                 "WHERE p.fid IS NULL")
         }
         if not missing:
-            return
+            return set()
         if shadows or not newfids or not missing <= set(newfids):
-            self._rebuild_proofs(ws)
-            return
+            return self._prune_unresolved(ws)
         unresolved = extend_proofs(
             idx, missing, lambda fid: self.fact_of(ws, fid))
         if unresolved:
-            sample = ", ".join(sorted(unresolved)[:3])
-            raise _CanonicalProofConflict(
-                f"authority facts have no finite canonical proof: {sample}")
+            return self._prune_unresolved(ws)
+        return set()
 
     def commit(self, ws, newfids=()):
         st, idx = self.store(ws), self.idx(ws)
@@ -276,7 +314,11 @@ class Node:
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
         try:
-            self._update_proofs(ws, newfids, shadows)
+            pruned = self._update_proofs(ws, newfids, shadows)
+            if pruned:
+                self._rebuild_globals(ws)
+                self._reproject.add(ws)
+                newfids = tuple(fid for fid in newfids if fid not in pruned)
             idx.commit()
         except Exception:
             idx.rollback()
@@ -290,7 +332,7 @@ class Node:
 
         memo = None
         prev = st.get("root")
-        if prev and not shadows:
+        if prev and not shadows and not pruned:
             memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
         man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
                               deps_of, ws, self.globals(ws), memo)
@@ -304,11 +346,36 @@ class Node:
     def materialize(self, ws, valids):
         valids = tuple(valids)
         db = self.app
-        for v in valids:
-            facts.materialize(db, ws, v)
-        facts.reconcile(
-            db, ws, self.idx(ws), lambda fid: self.fact_of(ws, fid), valids)
-        db.commit()
+        rebuilding = ws in self._reproject
+        try:
+            if rebuilding:
+                facts.clear(db, ws)
+                idx = self.idx(ws)
+                active = [
+                    self.fact_of(ws, fid)
+                    for (fid,) in idx.execute("SELECT fid FROM facts")
+                ]
+                ordered = close(
+                    active,
+                    lambda fid: resolve_deps(
+                        self.fact_of(ws, fid), idx) or (),
+                    lambda fid: self.fact_of(ws, fid),
+                )
+                valids = tuple(
+                    Valid(fact, tuple(resolve_deps(fact, idx) or ()))
+                    for fact in ordered
+                )
+            for valid in valids:
+                facts.materialize(db, ws, valid)
+            facts.reconcile(
+                db, ws, self.idx(ws),
+                lambda fid: self.fact_of(ws, fid), valids)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        if rebuilding:
+            self._reproject.discard(ws)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -327,7 +394,17 @@ class Node:
 
             b = encode_pile(close(news, deps_of, fact_of), blobs)
             self.store(ws).put(f"pile/{self.member_for(ws)}/{h(b)}", b)
-            return self.turn(ws)
+            fresh = self.turn(ws)
+            missing = [
+                fact.fid for fact in news
+                if facts.handler_for(fact.t).DURABLE
+                and self.fact_of(ws, fact.fid) is None
+            ]
+            if missing:
+                sample = ", ".join(sorted(missing)[:3])
+                raise ValueError(
+                    f"authored facts are outside the canonical set: {sample}")
+            return fresh
 
     # ---- rebuild: the store's own units through the same kernel --------------
 
@@ -338,8 +415,10 @@ class Node:
                 "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
                 "DELETE FROM globals;")
             idx.commit()
+            self._reproject.add(ws)
             man = st.get("root")
             if not man:
+                self.materialize(ws, ())
                 return
             m = json.loads(man)
             stream = []

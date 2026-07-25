@@ -102,3 +102,32 @@ def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
     assert stale == {}
     assert (workspace, "http://peer-a") not in node.sync_cache
     assert node.sync_cache[(other_workspace, "http://peer-b")] is unrelated
+
+
+def test_publish_keeps_the_identity_that_signed_during_a_rebind(tmp_path):
+    node = Node(str(tmp_path / "race"))
+    workspace = cmds.create(node, "alice", ts=1)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    carol_secret, carol, _ = add_member(node, workspace, "carol", ts=20)
+    node.keychain.add_identity(bob_secret)
+    node.keychain.add_identity(carol_secret)
+    node.bind_identity(workspace, bob)
+
+    original_identity = node.identity
+    calls = 0
+
+    def identity(selected_workspace=None):
+        nonlocal calls
+        calls += 1
+        captured = original_identity(selected_workspace)
+        if calls == 1:
+            node.bind_identity(workspace, carol)
+        return captured
+
+    node.identity = identity
+    fid = cmds.post(node, workspace, "general", "captured signer", ts=30)
+
+    assert calls >= 2  # ingest names its pile with the newly bound identity
+    assert node.identity_id(workspace) == carol
+    assert node.fact_of(workspace, fid).body["pk"] == bob
+    assert cmds.msgs(node, workspace)[-1]["text"] == "captured signer"
