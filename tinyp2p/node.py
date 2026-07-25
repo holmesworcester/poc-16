@@ -3,7 +3,7 @@
 One serial loop — turn() — is the only mutator of a workspace:
 
     drain piles -> kernel each (parallel, own scratchpads) -> merge valid/globals
-    -> spill blobs -> commit (pure layout -> put objects -> CAS root)
+    -> spill blobs -> commit (pure tree fold -> put objects -> CAS root)
     -> materialize (projectors consume Valid only) -> retire piles
 
 Everything enters through a pile: local commands, pulled units, pushed
@@ -17,7 +17,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import facts
+from . import facts, tree
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
@@ -31,8 +31,7 @@ from .kernel import (
     rebuild_proofs,
     resolve_deps,
 )
-from .layout import layout
-from .shape import key_parts
+from .shape import FACT, key_parts
 from .store import FsStore
 
 IDX_SCHEMA = """
@@ -45,7 +44,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-INDEX_VERSION = "family-contract-v5"
+INDEX_VERSION = "family-contract-v6-fat-tree"
 
 
 def now_ms():
@@ -125,7 +124,7 @@ class Node:
         return self._idx[ws]
 
     def _sync_index(self, ws):
-        """Every SQLite is a derived projection stamped with the manifest it
+        """Every SQLite is a derived projection stamped with the root it
         reflects; a mismatched stamp means rebuild from the store."""
         etag = self.store(ws).etag("root")
         row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
@@ -408,18 +407,44 @@ class Node:
                 cache[fid] = resolve_deps(self.fact_of(ws, fid), idx) or []
             return cache[fid]
 
-        memo = None
         prev = st.get("root")
-        if reuse and prev and not shadows and not pruned and not restored:
-            memo = {f["hi"]: f for f in json.loads(prev)["fences"]}
-        man, objects = layout(self.keys(ws), lambda fid: self.fact_of(ws, fid),
-                              deps_of, ws, self.globals(ws), memo)
-        for key, b in objects.items():
-            if not st.has(key):
-                st.put(key, b)
-        st.cas("root", st.etag("root"), man)  # the single commit point
+
+        def emit(raw):
+            oid = h(raw)
+            if not st.has("obj/" + oid):
+                st.put("obj/" + oid, raw)
+            return oid
+
+        previous = tree.decode_root(prev) if prev else None
+        if previous is not None and previous.anchor != ws:
+            raise ValueError("root anchor")
+        prior = previous.view if previous else None
+        fact_count = idx.execute(
+            "SELECT COUNT(*) FROM facts").fetchone()[0]
+        incremental = reuse and prior is not None \
+            and prior.kind == tree.FAT.kind \
+            and prior.config == tree.config(tree.FAT, FACT) \
+            and prior.n + len(newfids) == fact_count \
+            and not shadows and not pruned and not restored
+        if incremental:
+            delta = [
+                key_parts(self.fact_of(ws, fid).ts, fid)
+                for fid in newfids
+            ]
+            view = tree.fold(
+                prior, delta, FACT, tree.FAT,
+                lambda fid: self.fact_of(ws, fid), deps_of,
+                lambda oid: st.get("obj/" + oid), emit,
+            )
+        else:
+            view = tree.build(
+                self.keys(ws), FACT, tree.FAT,
+                lambda fid: self.fact_of(ws, fid), deps_of, emit,
+            )
+        root = tree.encode_root(tree.Root(view, ws, self.globals(ws)))
+        st.cas("root", st.etag("root"), root)  # the single commit point
         self._stamp(ws)
-        return man
+        return root
 
     def materialize(self, ws, valids):
         valids = tuple(valids)
@@ -489,22 +514,27 @@ class Node:
     def rebuild(self, ws, *, republish=False):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
+            man = st.get("root")
+            stream = []
+            if man:
+                root = tree.decode_root(man)
+                if root.anchor != ws:
+                    raise ValueError("root anchor")
+                fetch = lambda oid: st.get("obj/" + oid)
+                for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
+                    if leaf.n:
+                        stream += tree.leaf_facts(
+                            leaf, lo, hi, FACT, fetch)
+                result = drain(stream, ws)
+                assert result.ok, "own store failed its own kernel"
             idx.executescript(
                 "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
                 "DELETE FROM globals;")
             idx.commit()
             self._reproject.add(ws)
-            man = st.get("root")
             if not man:
                 self.materialize(ws, ())
                 return
-            m = json.loads(man)
-            stream = []
-            for f in m["fences"] + [m["tail"]]:
-                if f.get("pile"):
-                    stream += decode_pile(st.get("obj/" + f["pile"]))[0]
-            result = drain(stream, ws)
-            assert result.ok, "own store failed its own kernel"
             fresh = self.merge(ws, result.valids, result.globals)[0]
             self.materialize(ws, fresh)
             if republish:

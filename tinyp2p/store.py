@@ -1,7 +1,7 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
-Layout: root (the CAS'd manifest, only mutable key besides piles/invites),
-obj/<hash> (leaf piles, tails, blobs — immutable, content-addressed),
+Layout: root (the CAS'd fat-root metadata, only mutable key besides
+piles/invites), obj/<hash> (tree nodes, leaf piles, blobs — immutable),
 pile/<member>/<hash> (ingress), invite/<id> (public reads), and
 quarantine/<fid> (node-local retention for a previously valid pruned fact).
 """
@@ -116,7 +116,7 @@ class FsStore:
             pass
 
 
-# ---- PLAN SKELETON (poc-16-808.2) — remote trees through the same trait ----
+# ---- remote trees through the same trait ------------------------------------
 
 
 class RemoteStore:
@@ -125,16 +125,22 @@ class RemoteStore:
     sync.py stops special-casing 'their side' (SIMPLIFY.md §1)."""
 
     def __init__(self, peer):
-        raise NotImplementedError("poc-16-808.2")
+        self.peer = peer
 
     def get(self, key):
-        raise NotImplementedError("poc-16-808.2")
+        if key == "root":
+            got = self.peer.root()
+            return got[0] if got is not None else None
+        if key.startswith("obj/"):
+            return self.peer.obj(key[4:])
+        return None
 
     def has(self, key):
-        raise NotImplementedError("poc-16-808.2")
+        return self.get(key) is not None
 
     def etag(self, key):
-        raise NotImplementedError("poc-16-808.2")
+        value = self.get(key)
+        return h(value) if value is not None else None
 
     def list(self, prefix):
-        raise NotImplementedError("poc-16-808.2")
+        raise TypeError("remote tree stores do not expose LIST")

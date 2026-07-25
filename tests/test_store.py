@@ -3,7 +3,10 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from tinyp2p.store import FsStore
+import pytest
+
+from tinyp2p.crypto import h
+from tinyp2p.store import FsStore, RemoteStore
 
 
 def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
@@ -30,3 +33,23 @@ def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
     assert len(set(sources)) == 2
     assert store.get("pile/member/same") in values
     assert not tuple(tmp_path.rglob("*.tmp"))
+
+
+def test_remote_store_adapts_peer_gets_without_exposing_list():
+    root, page = b"root", b"page"
+
+    class Peer:
+        def root(self):
+            return root, h(root)
+
+        def obj(self, oid):
+            return page if oid == h(page) else None
+
+    store = RemoteStore(Peer())
+
+    assert store.get("root") == root
+    assert store.get("obj/" + h(page)) == page
+    assert store.has("obj/" + h(page))
+    assert store.etag("root") == h(root)
+    with pytest.raises(TypeError, match="LIST"):
+        store.list("obj/")

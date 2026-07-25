@@ -8,14 +8,13 @@ P-rebuild: wipe the derived index, replay the store's own units, get the
 identical root back.
 P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
 """
-import json
 import random
 
 import pytest
 
-from tinyp2p import cmds
-from tinyp2p.close import decode_pile
-from tinyp2p.crypto import keypair
+from tinyp2p import cmds, tree
+from tinyp2p.close import decode_pile, encode_pile
+from tinyp2p.crypto import h, keypair
 from tinyp2p.fact import Fact
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
@@ -23,6 +22,7 @@ from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.kernel import drain, resolve_deps
 from tinyp2p.node import Node, now_ms
+from tinyp2p.shape import FACT
 
 from .util import (
     add_member,
@@ -53,10 +53,11 @@ def world(tmp_path):
 
 
 def units_of(store):
-    man = json.loads(store.get("root"))
-    for fen in man["fences"] + [man["tail"]]:
-        if fen.get("pile"):
-            yield fen, decode_pile(store.get("obj/" + fen["pile"]))[0]
+    root = tree.decode_root(store.get("root"))
+    fetch = lambda oid: store.get("obj/" + oid)
+    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
+        if leaf.n:
+            yield leaf, decode_pile(fetch(leaf.oid))[0]
 
 
 def test_leaves_are_piles(world):
@@ -100,6 +101,26 @@ def test_rebuild(world):
     n.rebuild(ws)
     n.commit(ws)
     assert n.store(ws).etag("root") == before
+
+
+def test_rebuild_rejects_a_corrupted_leaf(world):
+    n, ws = world
+    st = n.store(ws)
+    before = all_fids(n, ws)
+    root_bytes = st.get("root")
+    root = tree.decode_root(root_bytes)
+    fetch = lambda oid: st.get("obj/" + oid)
+    leaf = next(
+        leaf for _, _, leaf in tree.leaf_ranges(root.view, fetch)
+        if leaf.n
+    )
+    st.put("obj/" + leaf.oid, encode_pile([]))
+
+    with pytest.raises(ValueError, match="leaf integrity"):
+        n.rebuild(ws)
+
+    assert st.get("root") == root_bytes
+    assert all_fids(n, ws) == before
 
 
 def test_old_index_rebuilds_generic_globals_on_open(world):
@@ -150,9 +171,8 @@ def test_efficient_updates(world):
 
 
 def full_manifest(n, ws):
-    """The manifest a from-scratch full recompute (memo disabled) would write."""
+    """The root a from-scratch full recompute would write."""
     from tinyp2p.kernel import resolve_deps
-    from tinyp2p.layout import layout
     idx, cache = n.idx(ws), {}
 
     def deps_of(fid):
@@ -160,9 +180,18 @@ def full_manifest(n, ws):
             cache[fid] = resolve_deps(n.fact_of(ws, fid), idx) or []
         return cache[fid]
 
-    man, _ = layout(n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of,
-                    ws, n.globals(ws), None)
-    return man
+    objects = {}
+
+    def emit(raw):
+        oid = h(raw)
+        objects[oid] = raw
+        return oid
+
+    view = tree.build(
+        n.keys(ws), FACT, tree.FAT,
+        lambda fid: n.fact_of(ws, fid), deps_of, emit,
+    )
+    return tree.encode_root(tree.Root(view, ws, n.globals(ws)))
 
 
 def test_incremental_equals_full(tmp_path):
@@ -290,11 +319,11 @@ def test_shadow_guard_keeps_identity(world):
     assert n.store(ws).get("root") == full_manifest(n, ws)  # still byte-identical
 
 
-def test_removal_set_in_manifest(world):
+def test_removal_set_rides_the_root(world):
     n, ws = world
-    man = json.loads(n.store(ws).get("root"))
+    root = tree.decode_root(n.store(ws).get("root"))
     carol = [m["pk"] for m in cmds.members(n, ws) if m["name"] == "carol"]
-    assert man["globals"] == [["removal", carol[0]]]
+    assert root.globals_ == frozenset({("removal", carol[0])})
 
 
 def test_poison_pile_is_litter_not_poison(world):

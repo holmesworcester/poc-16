@@ -21,9 +21,9 @@ from typing import Callable
 
 from .crypto import h
 
-CUT = 8          # fine/warm boundary density (canonical home after S1)
-COLD_CUT = 4096  # coarse cold-page density below the guard watermark
-GUARD = 256      # keep >= this many recent facts in the fine warm zone
+CUT = 8          # engine leaf density
+COLD_CUT = 4096  # legacy flat facade: coarse cold-page density
+GUARD = 256      # legacy flat facade: fine warm-zone width
 
 
 def key(fact):
@@ -54,7 +54,7 @@ def priority(fid):
 
 
 def cut_positions(fids):
-    """Boundary positions partitioning the sorted run into leaves, tiered:
+    """Legacy flat-layout positions, tiered:
     COLD_CUT pages below the last coarse boundary <= len-GUARD, the fine CUT
     window above it (layout._cut_positions, semantics verbatim)."""
     if not COLD_CUT:
@@ -79,6 +79,24 @@ def cut_positions(fids):
     ]
 
 
+def stable_cut_positions(fids):
+    """Monotone content cuts used by incremental trees.
+
+    Unlike the legacy warm/cold flat layout, adding keys never removes one of
+    these boundaries, so a fold can rebuild only the touched leaf and spine.
+    """
+    return [
+        index + 1
+        for index, fid in enumerate(fids)
+        if boundary(fid)
+    ]
+
+
+def leaf_cut():
+    """Current expected leaf width (kept callable for benchmark overrides)."""
+    return CUT
+
+
 def fingerprint(keys):
     """fp over the IN-RANGE keys in key order only — the diff identity.
     The closure lives in the pile but outside the fingerprinted set: fp is
@@ -89,16 +107,20 @@ def fingerprint(keys):
 
 @dataclass(frozen=True)
 class Shape:
-    """The bundle tree.py is parametric over. All five are pure functions of
+    """The bundle tree.py is parametric over. Every member is a pure function of
     key/fid bytes — no store, no db, no globals."""
     key: Callable
     fid_of: Callable
     boundary: Callable
     priority: Callable
     fingerprint: Callable
+    cuts: Callable = cut_positions
+    cut: Callable = leaf_cut
 
 
-FACT = Shape(key, fid_of, boundary, priority, fingerprint)
+FACT = Shape(
+    key, fid_of, boundary, priority, fingerprint, stable_cut_positions,
+    leaf_cut)
 
 
 def supp_shape():

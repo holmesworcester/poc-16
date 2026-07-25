@@ -21,7 +21,7 @@ from .crypto import h, seal_to
 from .facts.auth import request
 from .kernel import evaluate
 from .node import Node, now_ms
-from .walk import walk
+from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
 
@@ -44,7 +44,7 @@ class Syncer(threading.Thread):
             for ws in self.node.workspaces():
                 for url in self.node.keyring["workspaces"][ws]["peers"]:
                     try:
-                        walk(self.node, ws, url)
+                        sync(self.node, ws, url)
                     except Exception:
                         if os.environ.get("TINYP2P_DEBUG"):
                             import traceback
@@ -228,7 +228,7 @@ class Handler(BaseHTTPRequestHandler):
             if parts[1] == "sync":
                 for w in ([ws] if ws else n.workspaces()):
                     for url in n.keyring["workspaces"][w]["peers"]:
-                        walk(n, w, url)
+                        sync(n, w, url)
                 return self._json(200, {"ok": True})
             if parts[1] == "rebuild":
                 n.rebuild(ws)

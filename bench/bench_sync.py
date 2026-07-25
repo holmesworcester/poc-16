@@ -34,14 +34,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tinyp2p import cmds
+from tinyp2p import cmds, tree
 from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.fact import from_json
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.content.message import message
 from tinyp2p.kernel import extend_proofs, kernel, resolve_deps
 from tinyp2p.node import Node, now_ms
-from tinyp2p.shape import fid_of, fingerprint
+from tinyp2p.shape import FACT, fid_of
 
 from tests.util import add_member, all_fids
 
@@ -127,17 +127,18 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 # ---- unit streaming ----------------------------------------------------------
 
 def manifest_objs(store):
-    man = json.loads(store.get("root"))
-    ohs = {fen["pile"] for fen in man["fences"] + [man["tail"]] if fen.get("pile")}
-    return man, ohs
+    root = tree.decode_root(store.get("root"))
+    fetch = lambda oid: store.get("obj/" + oid)
+    return root, tree.live_oids(root.view, fetch)
 
 
-def seed_units(store, man):
+def seed_units(store, root):
     """Every published leaf pile a walk would deliver: a topo-sorted closed
     set (in-range leaves plus their closure)."""
-    for fen in man["fences"] + [man["tail"]]:
-        if fen.get("pile"):
-            yield decode_pile(store.get("obj/" + fen["pile"]))[0]
+    fetch = lambda oid: store.get("obj/" + oid)
+    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
+        if leaf.n:
+            yield decode_pile(fetch(leaf.oid))[0]
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -170,11 +171,11 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 def catchup(seed, ws, fresh_dir):
     fresh = Node(fresh_dir)
     src = seed.store(ws)
-    man, ohs = manifest_objs(src)
+    root, ohs = manifest_objs(src)
     dl_bytes = len(src.get("root")) + sum(len(src.get("obj/" + oh)) for oh in ohs)
 
     t0 = perf()
-    streamed = ingest(fresh, ws, seed_units(src, man))
+    streamed = ingest(fresh, ws, seed_units(src, root))
     fresh.commit(ws)
     t1 = perf()
 
@@ -182,7 +183,7 @@ def catchup(seed, ws, fresh_dir):
     match = fresh.store(ws).get("root") == src.get("root")
     return {"ingest_s": t1 - t0, "facts": total, "streamed": streamed,
             "dl_bytes": dl_bytes, "objs": len(ohs), "match": match,
-            "pages": len(man["fences"])}
+            "pages": sum(1 for _ in seed_units(src, root))}
 
 
 # ---- the bidi benchmark ------------------------------------------------------
@@ -202,30 +203,44 @@ def reconcile(A, B, ws):
     """One one-sided dial, exactly as walk(): A prunes by fingerprint, pulls
     B's differing ranges as closed units, pushes the symmetric difference as
     one closed pile that B ingests. Both sides converge."""
-    bstore = B.store(ws)
-    man = json.loads(bstore.get("root"))
-    ranges, lo = [], ""
-    for fen in man["fences"]:
-        ranges.append((lo, fen["hi"], fen))
-        lo = fen["hi"]
-    ranges.append((lo, "~", man["tail"]))
+    astore, bstore = A.store(ws), B.store(ws)
+    mine = tree.decode_root(astore.get("root")).view
+    theirs = tree.decode_root(bstore.get("root")).view
+    remote_objects = {}
 
-    lkeys = A.keys(ws)
-    lfids = {fid_of(k) for k in lkeys}
+    def fetch_remote(oid):
+        if oid not in remote_objects:
+            remote_objects[oid] = bstore.get("obj/" + oid)
+        return remote_objects[oid]
 
     t0 = perf()
-    pulled, push_fids, pull_bytes = [], [], 0
-    for lo, hi, fen in ranges:
-        mine = [k for k in lkeys if lo < k <= hi]
-        if fen["fp"] == fingerprint(mine):
-            continue  # equal fingerprint, equal range — prune
-        raw = bstore.get("obj/" + fen["pile"]) if fen.get("pile") else None
-        theirs = decode_pile(raw)[0] if raw else []
-        rfids = {f.fid for f in theirs if lo < f.key <= hi}
-        if any(fid not in lfids for fid in rfids):
-            pull_bytes += len(raw)
-            pulled.append(theirs)
-        push_fids += [fid_of(k) for k in mine if fid_of(k) not in rfids]
+    pulled, pulled_oids, push_fids, pull_bytes = [], set(), [], 0
+    for lo, hi, my_keys, remote_leaf in tree.diff(
+            mine, theirs, FACT,
+            lambda oid: astore.get("obj/" + oid), fetch_remote):
+        remote_keys = set(tree.range_keys(
+            remote_leaf, lo, hi, FACT, fetch_remote))
+        local_keys = set(my_keys)
+        missing = {fid_of(key) for key in remote_keys - local_keys}
+        candidates = (
+            [(remote_leaf.oid, fetch_remote(remote_leaf.oid))]
+            if remote_leaf.oid else remote_objects.items()
+        )
+        for oid, raw in candidates:
+            if not missing or oid in pulled_oids or raw is None:
+                continue
+            try:
+                stream = decode_pile(raw)[0]
+            except Exception:
+                continue
+            if missing.intersection(fact.fid for fact in stream):
+                pull_bytes += len(raw)
+                pulled.append(stream)
+                pulled_oids.add(oid)
+        push_fids += [
+            fid_of(key) for key in local_keys - remote_keys
+            if fid_of(key) not in push_fids
+        ]
 
     push_bytes = 0
     if push_fids:
@@ -301,8 +316,7 @@ def run_catchup(scales):
     import tinyp2p.shape as shape
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          f"workers, shipped default (COLD_CUT={shape.COLD_CUT}, "
-          f"tail CUT={shape.CUT})\n")
+          f"workers, fat tree with monotone CUT={shape.CUT}\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -385,11 +399,12 @@ def check_leaves(seed, ws):
     """Every published leaf pile still judges alone from empty —
     the leaves-are-piles invariant, under whatever cut the layout used."""
     st = seed.store(ws)
-    man = json.loads(st.get("root"))
+    root = tree.decode_root(st.get("root"))
+    fetch = lambda oid: st.get("obj/" + oid)
     n = 0
-    for fen in man["fences"] + [man["tail"]]:
-        if fen.get("pile"):
-            ok, _, _ = kernel(decode_pile(st.get("obj/" + fen["pile"]))[0], ws)
+    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
+        if leaf.n:
+            ok, _, _ = kernel(decode_pile(fetch(leaf.oid))[0], ws)
             assert ok, "a leaf failed the kernel"
             n += 1
     return n
@@ -454,40 +469,6 @@ def measure_write_cost(node_dir, scale, posts=200):
             "straggler_kb": S.mean(strag) / 1024, "posts": posts}
 
 
-def run_tier(scale, cold_cut=4096, guard=256):
-    """Flat CUT=8 vs the shipped tiered layout: coarse ~1.5 MB cold pages sealed
-    below a fine GUARD-deep tail. Measures catchup (bytes/throughput/redundancy)
-    and steady-state per-post write cost for each."""
-    import tinyp2p.shape as shape
-    print(f"\n=== TIERED vs FLAT — {scale} facts "
-          f"(cold pages ~{cold_cut} facts ≈ 1.5 MB, guard {guard}) ===\n")
-    print("  {:>14} {:>7} {:>7} {:>7} {:>8} {:>7}   {:>10} {:>8} {:>10}"
-          .format("layout", "pages", "dl_MB", "redund", "facts/s", "leaves",
-                  "wr_steady", "wr_p90", "wr_stragl"))
-    original = shape.COLD_CUT, shape.GUARD
-    try:
-        for name, cc in (("flat CUT=8", None), (f"tiered {cold_cut}", cold_cut)):
-            shape.COLD_CUT, shape.GUARD = cc, guard
-            d = os.path.join(WORK, f"tier_{scale}_{cc}")
-            shutil.rmtree(d, ignore_errors=True)
-            seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
-            leaves = check_leaves(seed, ws)
-            cat = catchup(seed, ws, os.path.join(d, "fresh"))
-            assert cat["match"], "catchup did not converge to the seed root"
-            del seed
-            gc.collect()
-            wr = measure_write_cost(os.path.join(d, "wseed"), scale)
-            shutil.rmtree(d, ignore_errors=True)
-            print("  {:>14} {:>7} {:>7.1f} {:>6.1f}x {:>8.0f} {:>7}   "
-                  "{:>8.1f}KB {:>6.1f}KB {:>8.1f}KB".format(
-                      name, cat["pages"], cat["dl_bytes"] / 1e6,
-                      cat["streamed"] / cat["facts"], cat["facts"] / cat["ingest_s"],
-                      leaves, wr["mean_kb"], wr["p90_kb"], wr["straggler_kb"]))
-            sys.stdout.flush()
-    finally:
-        shape.COLD_CUT, shape.GUARD = original
-
-
 def main():
     args = [int(a) for a in sys.argv[1:] if a.isdigit()]
     os.makedirs(WORK, exist_ok=True)
@@ -505,8 +486,8 @@ def main():
                 f"bidi={'y' if result['bidi']['match'] else 'N'}")
         return
     if "tier" in sys.argv:
-        run_tier(args[0] if args else 50000)
-        return
+        raise SystemExit(
+            "tier mode measured the retired moving-boundary flat layout")
     if "cut" in sys.argv:
         run_cut_sweep(args[0] if args else 50000)
         return

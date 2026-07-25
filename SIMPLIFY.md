@@ -115,6 +115,13 @@ Golden gates for the extraction: byte-identical roots *within* a packing across
 insert orders and fold batchings (the existing treap byte-identity check,
 generalized); identical leaf sets *across* packings.
 
+The engine packings use the monotone fine-cut policy: adding a key can split a
+leaf but never erase an existing boundary, which is what makes a blind
+path-copying fold possible. The compatibility-only flat facade retains the old
+moving warm/cold cuts for byte reproduction. Fat spine nodes replace the flat
+manifest's scaling role; closure-copy reduction moves to the hoisting stage
+(`808.9`) instead of relying on boundary deletion at a moving watermark.
+
 ## 3. Coordination with the deletion epic (poc-16-yez)
 
 `T_supp` is the engine's second instantiation: same `tree.py`, key

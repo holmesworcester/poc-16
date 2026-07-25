@@ -1,24 +1,15 @@
-"""The walk: one-sided reconciliation against a passive responder.
-
-Decide with hashes, converge with piles. The initiator fetches the manifest
-(one conditional GET in steady state), prunes ranges whose fingerprints
-match, and for each differing range pulls the peer's leaf pile verbatim into
-its own ingress and reactively pushes back the leaves the peer lacks — one
-close-and-PUT per range, the mirror of the pull. The responder drains on
-receipt and runs zero sync logic; no poke, no collect-at-end.
-"""
+"""HTTP peer and pile-transfer helpers for the engine sync driver."""
 import base64
 import json
 import urllib.error
 import urllib.request
 
 from . import facts as families
-from .close import close, decode_pile, encode_pile
+from .close import close, encode_pile
 from .crypto import h, unseal
 from .facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
-from .shape import fid_of, fingerprint
 
 
 class Peer:
@@ -80,55 +71,10 @@ class Peer:
         self._http("POST", "/poke", data=b"", auth=False)
 
 
-EMPTY = {"fences": [], "tail": {"fp": fingerprint([]), "n": 0, "pile": None}}
-
-
 def walk(node, ws, url):
-    """One dial converges both sides. Returns (pulled, pushed)."""
-    peer = Peer(node, ws, url)
-    cache = peer.cache
-    got = peer.root(cache.get("etag"))
-    if got is None:  # 304: nothing remote changed
-        if node.store(ws).etag("root") == cache.get("local"):
-            return 0, 0  # steady state costs one conditional GET
-        man_bytes, retag = cache.get("man"), cache.get("etag")
-    else:
-        man_bytes, retag = got
-    m = json.loads(man_bytes) if man_bytes else EMPTY
-
-    ranges, lo = [], ""
-    for fen in m["fences"]:
-        ranges.append((lo, fen["hi"], fen))
-        lo = fen["hi"]
-    ranges.append((lo, "~", m["tail"]))  # ranges partition the whole keyspace
-
-    with node.lock:
-        lkeys = node.keys(ws)
-    lfids = {fid_of(k) for k in lkeys}
-    pulled = pushed = 0
-    for lo, hi, fen in ranges:
-        mine = [k for k in lkeys if lo < k <= hi]
-        if fen["fp"] == fingerprint(mine):
-            continue  # equal fingerprint, equal range — prune
-        raw = peer.obj(fen["pile"]) if fen.get("pile") else None
-        theirs = decode_pile(raw)[0] if raw else []
-        rfids = {f.fid for f in theirs if lo < f.key <= hi}  # their in-range leaves
-        if any(fid not in lfids for fid in rfids):  # pull the leaf pile verbatim
-            node.store(ws).put(
-                f"pile/{node.member_for(ws)}/{fen['pile']}", raw)
-            pulled += 1
-        push = [fid_of(k) for k in mine if fid_of(k) not in rfids]
-        if push:  # reactive push, the mirror of the pull; peer drains on receipt
-            _push(node, ws, peer, push)
-            pushed += len(push)
-            retag = None  # remote root will move; re-read next walk
-
-    if pulled:
-        node.turn(ws)  # ingest the pulled leaves in one drain
-        _fetch_blobs(node, ws, peer)
-
-    cache.update({"etag": retag, "man": man_bytes, "local": node.store(ws).etag("root")})
-    return pulled, pushed
+    """Compatibility name for the shared engine diff driver."""
+    from .sync import sync
+    return sync(node, ws, url)
 
 
 def _push(node, ws, peer, push_fids):
