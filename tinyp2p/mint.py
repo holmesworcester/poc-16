@@ -20,6 +20,10 @@ Family hooks to add in facts/auth/request.py:
     grant(f)         -> (pk, verb)   the sealed grant's subject
     evaluate(f, g)   -> bool         absorbs tag/arity/exp; g has ("now", ms)
 """
+from . import facts as families
+from . import tree
+from .close import decode_pile
+from .kernel import evaluate
 
 
 def mint(pile_bytes, anchor, globals_, now):
@@ -27,13 +31,32 @@ def mint(pile_bytes, anchor, globals_, now):
     grant_of. Returns (pk, verb) to seal, or None to refuse. The challenge is
     ephemeral (never persisted); replay is harmless because the grant is
     sealed to the requester's pk."""
-    raise NotImplementedError("poc-16-808.4")
+    try:
+        facts, _ = decode_pile(pile_bytes)
+        grant = grant_of(facts)
+        allowed = evaluate(
+            facts, anchor, frozenset(globals_) | {("now", now)})
+    except Exception:
+        return None
+    return grant if grant is not None and allowed else None
 
 
 def grant_of(facts):
     """The one request fact's (pk, verb) via the family hook — the daemon
     stops parsing fact bodies."""
-    raise NotImplementedError("poc-16-808.4")
+    ephemeral = [
+        (fact, handler)
+        for fact in facts
+        if (handler := families.handler_for(fact.t)) is not None
+        and not handler.DURABLE
+    ]
+    if len(ephemeral) != 1:
+        return None
+    fact, handler = ephemeral[0]
+    try:
+        return handler.grant(fact)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def screen(facts, supp):
@@ -50,4 +73,5 @@ def root_globals(root_bytes):
     once jbg.1 drops the manifest (tree.Root). The stateless Worker/λ mint is
     GET root → mint() → presign: kernel + tree + gate is its entire world; it
     NEVER builds app.db (SIMPLIFY.md §4)."""
-    raise NotImplementedError("poc-16-808.4")
+    root = tree.decode_root(root_bytes)
+    return root.anchor, root.globals_

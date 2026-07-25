@@ -4,6 +4,7 @@ from .._commands import closer, offer_source
 from . import signature
 
 TAG = "req"
+VERBS = frozenset({"sync"})
 
 
 # SHAPE
@@ -39,8 +40,16 @@ def global_rows(f):
 
 def evaluate(f, globals_, ctx):
     removed = {value for name, value in globals_ if name == "removal"}
-    return f.body["pk"] not in removed and not any(
-        ctx.has_offer_value("author", public) for public in removed)
+    now = [value for name, value in globals_ if name == "now"]
+    return f.t == TAG and f.body["verb"] in VERBS \
+        and len(now) == 1 and f.body["exp"] >= now[0] \
+        and f.body["pk"] not in removed and not any(
+            ctx.has_offer_value("author", public) for public in removed)
+
+
+def grant(f):
+    """The sealed capability subject after successful evaluation."""
+    return f.body["pk"], f.body["verb"]
 
 
 def blob_refs(f):

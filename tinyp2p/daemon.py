@@ -15,11 +15,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import cmds
-from .close import decode_pile
+from . import cmds, mint as gate
 from .crypto import h, seal_to
-from .facts.auth import request
-from .kernel import evaluate
 from .node import Node, now_ms
 from .sync import sync
 
@@ -52,13 +49,15 @@ class Syncer(threading.Thread):
                         # peer down or refused: the next cadence retries
 
 
-def make_token(secret, member, ws):
-    pj = json.dumps({"m": member, "ws": ws, "exp": now_ms() + GRANT_TTL}, sort_keys=True)
+def make_token(secret, member, ws, verb="sync"):
+    pj = json.dumps({
+        "exp": now_ms() + GRANT_TTL, "m": member, "v": verb, "ws": ws,
+    }, sort_keys=True)
     mac = hmaclib.new(secret, pj.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(pj.encode()).decode() + "." + mac
 
 
-def check_token(secret, auth, ws):
+def check_token(secret, auth, ws, verb="sync"):
     try:
         body, mac = auth.split(" ", 1)[1].split(".")
         pj = base64.urlsafe_b64decode(body)
@@ -66,7 +65,8 @@ def check_token(secret, auth, ws):
                 hmaclib.new(secret, pj, hashlib.sha256).hexdigest(), mac):
             return None
         g = json.loads(pj)
-        return g["m"] if g["ws"] == ws and g["exp"] > now_ms() else None
+        return g["m"] if g["ws"] == ws and g["v"] == verb \
+            and g["exp"] > now_ms() else None
     except Exception:
         return None
 
@@ -156,30 +156,44 @@ class Handler(BaseHTTPRequestHandler):
             self.node.turn(ws)
             return self._send(204)
         if parts[0] == "mint":
-            return self.mint(json.loads(self._body()))
+            try:
+                return self.mint(json.loads(self._body()))
+            except (TypeError, ValueError):
+                return self._send(400)
         self._send(404)
 
     def mint(self, o):
         """Evaluate mode: the payload proves itself; no drain, no writes."""
-        ws = o["ws"]
+        try:
+            if not isinstance(o, dict):
+                raise TypeError
+            ws, encoded = o["ws"], o["pile"]
+            if not isinstance(ws, str) or not isinstance(encoded, str):
+                raise TypeError
+            pile = base64.b64decode(encoded, validate=True)
+        except (KeyError, TypeError, ValueError):
+            return self._send(400)
         if not self._known(ws):
             return self._send(404)
-        try:
-            facts, _ = decode_pile(base64.b64decode(o["pile"]))
-        except Exception:
-            return self._send(400)
-        with self.node.lock:
-            globals_ = self.node.globals(ws)
-        ok = evaluate(facts, ws, globals_)
-        rq = [fact for fact in facts if fact.t == request.TAG]
-        if not ok or len(rq) != 1 or rq[0].body["exp"] < now_ms():
-            return self._send(403)
-        token = make_token(self.secret, rq[0].body["pk"][:16], ws)
         root = self.node.store(ws).get("root")
+        if not root:
+            return self._send(403)
+        try:
+            anchor, globals_ = gate.root_globals(root)
+        except Exception:
+            return self._send(403)
+        if anchor != ws:
+            return self._send(403)
+        grant = gate.mint(pile, anchor, globals_, now_ms())
+        if grant is None:
+            return self._send(403)
+        public, verb = grant
+        token = make_token(self.secret, public[:16], ws, verb)
         return self._json(200, {
-            "grant": base64.b64encode(seal_to(rq[0].body["pk"], token.encode())).decode(),
-            "root": base64.b64encode(root).decode() if root else None,
-            "etag": h(root) if root else None})
+            "grant": base64.b64encode(
+                seal_to(public, token.encode())).decode(),
+            "root": base64.b64encode(root).decode(),
+            "etag": h(root)})
 
     # ---- node-local control plane (not part of the protocol) ----
     def ctl_get(self, parts, q):

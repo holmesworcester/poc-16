@@ -35,7 +35,12 @@ def anchor_chain():
 
 
 def judge(facts, anchor, g=None):
-    return validate(facts, anchor) if g is None else evaluate(facts, anchor, g)
+    if g is None:
+        return validate(facts, anchor)
+    globals_ = set(g)
+    if not any(name == "now" for name, _ in globals_):
+        globals_.add(Global("now", now_ms()))
+    return evaluate(facts, anchor, globals_)
 
 
 def test_genesis_and_msg(anchor_chain):
@@ -282,7 +287,7 @@ def test_removal_gates_requests_only(anchor_chain):
     s = signature(sk, pk, m, ts)
     rq = request(pk, "sync", ts + 9999, ts)
     sr = signature(sk, pk, rq, ts)
-    globals_ = {Global("removal", pk)}
+    globals_ = {Global("removal", pk), Global("now", ts)}
     assert validate([g, s, m], g.fid)                  # persistent: globals-blind
     assert not judge([g, sr, rq], g.fid, g=globals_)   # ephemeral: refused
     assert judge([g, sr, rq], g.fid, g=set())
@@ -329,10 +334,12 @@ def test_removed_member_cannot_launder_a_mint_through_a_fresh_user(
 
     assert validate(stream, root.fid)
     assert not evaluate(
-        stream, root.fid, {Global("removal", bob)})
+        stream, root.fid,
+        {Global("removal", bob), Global("now", ts + 6)})
     _, unrelated = keypair()
     assert evaluate(
-        stream, root.fid, {Global("removal", unrelated)})
+        stream, root.fid,
+        {Global("removal", unrelated), Global("now", ts + 6)})
 
 
 def test_removed_device_issuer_invalidates_its_descendant_mint(
@@ -368,7 +375,8 @@ def test_removed_device_issuer_invalidates_its_descendant_mint(
 
     assert validate(stream, root.fid)
     assert not evaluate(
-        stream, root.fid, {Global("removal", laptop)})
+        stream, root.fid,
+        {Global("removal", laptop), Global("now", ts + 5)})
 
 
 def test_drain_emits_removal_global_only(anchor_chain):
