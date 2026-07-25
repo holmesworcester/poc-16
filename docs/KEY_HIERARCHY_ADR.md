@@ -184,7 +184,9 @@ wrap inventory, and local absence are not triggers or proofs.
    retirement position where supported.
 10. Promote the already existing S/T pair. No allocation is permitted after P
     destruction.
-11. Publish durable completion evidence and finalized S. Only then can S
+11. Revalidate that the live S and staged T handles still match both
+    suite-qualified public commitments in the accepted claim. Publish durable
+    completion evidence and finalized S only after that check. Only then can S
     satisfy key-wrap, request, proactive-share, or healing needs.
 12. Garbage-collect superseded P metadata and ciphertext opportunistically.
     Archived P ciphertext is assumed to survive.
@@ -292,18 +294,32 @@ three-handle transition on each supported device class.
 ### TPM 2.0
 
 A direct TPM provider can bind sealed generation state to an exact monotonic NV
-position. The TPM specification defines
+retirement position. The TPM specification defines
 [`TPM2_PolicyNV`](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-1-Version-184_pub.pdf)
 as a policy assertion over NV contents, and an NV index with
 [`TPMA_NV_COUNTER`](https://trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-2-Structures-00.99.pdf)
 can only be modified with `TPM2_NV_Increment`.
 
-For the strong tier, P objects and P claim authorization are usable only at
-position `n`; completion increments to `n+1`; archived position-`n` blobs then
-fail policy. Authorization must prevent an attacker from deleting/redefining
-the counter or swapping the hierarchy. TPM clear may destroy the root and data
-availability, but must not restore an old position. NV endurance, ownership,
-multi-process coordination, and provisioning are release gates.
+A retirement counter alone is insufficient for the strong tier. If it remains
+at `n` while P is needed for migration, two callers can authorize different
+claims before either completion increments it. The provider must therefore
+also perform a protected claim-digest CAS: while P is at position `n`, atomically
+change a hardware-protected per-position claim slot from empty to
+`H(suite-qualified P/S/T/batch)`, or return the already matching digest, before
+`claim` reports acceptance. A different digest conflicts. The generic
+`TPM2_NV_Write`, `TPM2_NV_Increment`, and
+[`TPM2_NV_Extend`](https://trustedcomputinggroup.org/wp-content/uploads/TPM-2.0-1.83-Part-3-Commands.pdf)
+primitives are building blocks, not by themselves a reviewed CAS construction.
+
+Only a platform adapter that proves that protected claim-digest CAS, prevents
+claim-slot and counter deletion/redefinition, and binds P operations to both
+the matching digest and position `n` may claim `rollback-resistant`. Completion
+then advances the retirement position to `n+1`, making archived position-`n`
+objects fail policy. The generic TPM mapping remains `hardware-isolated`;
+rollback resistance is a conditional, separately reviewed provider extension.
+TPM clear may destroy the root and data availability, but must not restore an
+old position. NV endurance, ownership, multi-process coordination, and
+provisioning are release gates.
 
 ### Software-only
 
@@ -370,7 +386,7 @@ arguments from a current-key or timestamp lookup.
 | P-derived forward ratchet | Rejected: P compromise derives successors; a retained seed/root can recreate retired material. |
 | Precomputed reverse chain | Rejected for v1: either precompute/storage is unbounded or a retained root remains a recovery path. |
 | Permanent root gated only by rollbackable generation metadata | Rejected: restoring metadata re-enables old operations. |
-| TPM/external root gated by non-rollback exact position | Deferred provider extension; it must prove the complete contract and any lower handle peak. |
+| TPM/external root gated by non-rollback exact position | Deferred provider extension; a counter alone is insufficient, so it must additionally prove protected claim-digest CAS, the complete contract, and any lower handle peak. |
 | Independent per-node keys with no generation binding | Rejected for v1 first-F-only mode; it changes healing/wrap policy and needs separate proof that no old recipient/root path exists. |
 | Remote serialization witness | Possible future rollback/clone tier, but it changes offline guarantees and is not part of the local v1 provider. |
 
@@ -386,6 +402,8 @@ The versioned fixture is
   rejection when a staged handle is regenerated under the same label;
 - exact purge-manifest binding plus rejection of mismatched migration,
   destruction, promotion, and finalization state;
+- authenticated binding of every cover-envelope context field and rejection of
+  field mutation, record transplant, and ciphertext tamper;
 - independent real X25519 keys, including failure of known P material to open S
   or T ciphertext and different keys for equal public labels across providers;
 - two steady handles, the three-handle peak, and capacity failure before
@@ -394,6 +412,8 @@ The versioned fixture is
   and finalization;
 - stale-snapshot writer rejection and forward reconstruction of destruction
   evidence from protected retirement state;
+- pre-finalization revalidation of both committed S/T handles after loss or
+  replacement;
 - strong snapshot restore failing to revive P or fork its claim;
 - software snapshot restore honestly demonstrating resurrection and a sibling
   claim;

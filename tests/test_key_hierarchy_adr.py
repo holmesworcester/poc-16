@@ -8,7 +8,7 @@ against its real provider API.
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,7 @@ FIXTURE = json.loads(FIXTURE_PATH.read_text())
 GENERATIONS = FIXTURE["decision"]["recipient_generations"]
 PURGE_OPERATION_TARGETS = FIXTURE["decision"]["purge_operation_targets"]
 RECIPIENT_SUITE = FIXTURE["decision"]["software_recipient_suite"]
+COVER_CONTEXT = FIXTURE["cover_context"]
 
 
 def generation_index(generation):
@@ -48,9 +49,31 @@ def purge_targets_for_operations(operations):
 
 
 @dataclass(frozen=True)
-class Envelope:
+class CoverContext:
+    version: int
+    provider_suite: str
+    recipient_lineage_id: str
     generation: str
+    content_scope_id: str
+    frontier_id: str
+    secret_kind: str
+    range_start: int
+    range_width: int
+    bit_depth: int
+    event_id_prefix: str
+    source_secret_ref: str
+    tombstone_context: str
+    recovery_policy_ref: str
+
+
+@dataclass(frozen=True)
+class Envelope:
+    context: CoverContext
     ciphertext: bytes
+
+    @property
+    def generation(self):
+        return self.context.generation
 
 
 @dataclass(frozen=True)
@@ -268,26 +291,71 @@ class ProviderModel:
         self.disk["leases"][writer] = generation
         return "accepted"
 
-    def _cover_aad(self, cover_id, generation):
-        return (
-            b"poc16-cover-v1\0"
-            + generation.encode()
-            + b"\0"
-            + cover_id.encode()
+    def _cover_context(self, cover_id, generation):
+        record = next(
+            (
+                item
+                for item in FIXTURE["cover_records"]
+                if item["id"] == cover_id
+            ),
+            None,
+        )
+        if record is None:
+            record = {
+                "secret_kind": "HistoryNode",
+                "range_start": 0,
+                "range_width": 1,
+                "bit_depth": 256,
+                "event_id_prefix": "00" * 32,
+                "source_secret_ref": "00" * 32,
+                "tombstone_context": "00" * 32,
+            }
+        return CoverContext(
+            version=COVER_CONTEXT["version"],
+            provider_suite=COVER_CONTEXT["provider_suite"],
+            recipient_lineage_id=COVER_CONTEXT["recipient_lineage_id"],
+            generation=generation,
+            content_scope_id=COVER_CONTEXT["content_scope_id"],
+            frontier_id=COVER_CONTEXT["frontier_id"],
+            secret_kind=record["secret_kind"],
+            range_start=record["range_start"],
+            range_width=record["range_width"],
+            bit_depth=record["bit_depth"],
+            event_id_prefix=record["event_id_prefix"],
+            source_secret_ref=record["source_secret_ref"],
+            tombstone_context=record["tombstone_context"],
+            recovery_policy_ref=COVER_CONTEXT["recovery_policy_ref"],
         )
 
-    def _seal(self, generation, cover_id, plaintext):
+    def _cover_aad(self, cover_id, context):
+        return b"poc16-cover-envelope\0" + json.dumps(
+            {
+                "cover_id": cover_id,
+                **asdict(context),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+    def _seal(self, generation, cover_id, plaintext, context=None):
+        if context is None:
+            context = self._cover_context(cover_id, generation)
+        if (
+            context.generation != generation
+            or context.provider_suite != RECIPIENT_SUITE
+        ):
+            raise CryptoError("cover context does not match provider generation")
         key = public.PrivateKey(self._usable_private(generation)).public_key
-        bound_plaintext = self._cover_aad(cover_id, generation) + b"\0" + plaintext
+        bound_plaintext = self._cover_aad(cover_id, context) + b"\0" + plaintext
         return Envelope(
-            generation,
+            context,
             bytes(public.SealedBox(key).encrypt(bound_plaintext)),
         )
 
     def _open(self, cover_id, envelope):
         key = public.PrivateKey(self._usable_private(envelope.generation))
         bound_plaintext = public.SealedBox(key).decrypt(envelope.ciphertext)
-        prefix = self._cover_aad(cover_id, envelope.generation) + b"\0"
+        prefix = self._cover_aad(cover_id, envelope.context) + b"\0"
         if not bound_plaintext.startswith(prefix):
             raise CryptoError("cover context mismatch")
         return bound_plaintext[len(prefix) :]
@@ -364,7 +432,12 @@ class ProviderModel:
             if envelope.generation != predecessor:
                 return "unexpected-cover-generation"
             plaintext = self._open(cover_id, envelope)
-            migrated[cover_id] = self._seal(successor, cover_id, plaintext)
+            migrated[cover_id] = self._seal(
+                successor,
+                cover_id,
+                plaintext,
+                replace(envelope.context, generation=successor),
+            )
         self.disk["covers"] = migrated
         self.disk["migrated"][predecessor] = (successor, manifest)
         return "migrated"
@@ -458,8 +531,9 @@ class ProviderModel:
             return "already-finalized"
         if (
             self.active != successor
+            or self.staged != claim.next_generation
             or self._is_retired(successor)
-            or successor not in self._handles
+            or not self._claim_handles_match(claim)
         ):
             return "completion-evidence-required"
         self.disk["finalized"].add(successor)
@@ -677,6 +751,48 @@ def test_fence_migrates_survivors_purges_target_and_blocks_late_writer():
     )
 
 
+def test_cover_envelope_authenticates_every_context_field():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    cover_id = "retained-node-a"
+    plaintext = cover_fixture()[cover_id]
+    provider.seed_cover(cover_id, plaintext)
+    envelope = provider.cover_envelope(cover_id)
+
+    mutations = {
+        "version": envelope.context.version + 1,
+        "provider_suite": "P-256",
+        "recipient_lineage_id": "other-lineage",
+        "generation": "S",
+        "content_scope_id": "other-workspace",
+        "frontier_id": "other-frontier",
+        "secret_kind": "FrontierRoot",
+        "range_start": envelope.context.range_start + 1,
+        "range_width": envelope.context.range_width + 1,
+        "bit_depth": envelope.context.bit_depth + 1,
+        "event_id_prefix": "ff" * 32,
+        "source_secret_ref": "ee" * 32,
+        "tombstone_context": "dd" * 32,
+        "recovery_policy_ref": "other-policy",
+    }
+    for field, value in mutations.items():
+        relabeled = replace(
+            envelope,
+            context=replace(envelope.context, **{field: value}),
+        )
+        with pytest.raises(CryptoError, match="context|decrypt"):
+            provider._open(cover_id, relabeled)
+
+    with pytest.raises(CryptoError, match="context"):
+        provider._open("transplanted-record", envelope)
+    tampered = replace(
+        envelope,
+        ciphertext=envelope.ciphertext[:-1]
+        + bytes([envelope.ciphertext[-1] ^ 1]),
+    )
+    with pytest.raises(CryptoError):
+        provider._open(cover_id, tampered)
+
+
 def test_transition_steps_reject_unclaimed_successors_and_changed_manifest():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     covers = cover_fixture()
@@ -732,6 +848,31 @@ def test_claim_binds_actual_public_keys_and_rejects_replaced_staged_handle():
     assert provider.migrate("P", "S", manifest) == "prepared-key-mismatch"
     assert provider.disk["destroyed"] == {}
     assert provider.open_cover("frontier-root") == b"survivor"
+
+
+@pytest.mark.parametrize(
+    ("generation", "replace_handle"),
+    (("T", False), ("S", True), ("T", True)),
+)
+def test_finalization_revalidates_both_committed_handles(
+    generation, replace_handle
+):
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+    manifest = purge_targets_for_operations(prepared.operations)
+    assert provider.migrate("P", "S", manifest) == "migrated"
+    assert provider.destroy("P", "S") == "destroyed"
+    assert provider.promote(prepared) == "promoted-without-allocation"
+
+    del provider._handles[generation]
+    if replace_handle:
+        assert provider._generate(generation) == "generated"
+    assert provider.finalize("P", "S") == "completion-evidence-required"
+    assert provider.wrap_eligible == set()
 
 
 def test_destroy_retry_rehydrates_evidence_from_protected_retirement_state():
@@ -832,7 +973,16 @@ def test_rejected_roots_and_platform_limits_are_explicit():
     ]["maximum_default_tier"] == "hardware-isolated"
     assert platforms[
         "tpm-2-policy-nv-provider"
-    ]["maximum_default_tier"] == "rollback-resistant-when-provisioned"
+    ]["maximum_default_tier"] == "hardware-isolated"
+    assert platforms[
+        "tpm-2-policy-nv-provider"
+    ]["retirement_counter_available"] is True
+    assert platforms[
+        "tpm-2-policy-nv-provider"
+    ]["protected_claim_digest_cas_required"] is True
+    assert platforms[
+        "tpm-2-policy-nv-provider"
+    ]["conditional_tier"] == "rollback-resistant-after-reviewed-claim-cas"
     assert platforms["software-only"]["maximum_default_tier"] == "normal-disk"
     for platform in platforms.values():
         assert all(source.startswith("https://") for source in platform["sources"])
@@ -849,6 +999,7 @@ def test_adr_records_protocol_crash_backup_and_algorithm_requirements():
         "same-device restore",
         "StrongBox alone",
         "TPM2_PolicyNV",
+        "protected claim-digest CAS",
         "normal-disk",
         "hardware-isolated",
         "rollback-resistant",
