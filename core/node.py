@@ -27,6 +27,7 @@ from .keychain import Keychain
 from .kernel import (
     Judgment,
     drain,
+    drain_committed,
     extend_proofs,
     proof_sources,
     resolve_deps,
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v9-attachments"
+INDEX_VERSION = "family-contract-v10-hoisted-tree"
 APP_VERSION = 3
 
 
@@ -319,6 +320,17 @@ class Node:
 
     def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
+        valids = tuple(valids)
+        by_fid = {valid.fact.fid: valid for valid in valids}
+        valids = tuple(
+            by_fid[fact.fid]
+            for fact in close(
+                [valid.fact for valid in valids],
+                lambda fid: [
+                    dep for dep in by_fid[fid].deps if dep in by_fid],
+                lambda fid: by_fid[fid].fact,
+            )
+        )
         idx.execute("BEGIN")
         try:
             for v in valids:
@@ -620,12 +632,19 @@ class Node:
                 if root.anchor != ws:
                     raise ValueError("root anchor")
                 fetch = lambda oid: st.get("obj/" + oid)
-                for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
-                    if leaf.n:
-                        stream += tree.leaf_facts(
-                            leaf, lo, hi, FACT, fetch)
-                result = drain(stream, ws)
-                assert result.ok, "own store failed its own kernel"
+                try:
+                    stream = list(tree.validate_view(
+                        root.view, FACT, tree.FAT, fetch))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid tree facts: {exc}") from exc
+                committed = {fact.fid for fact in stream}
+                if ws not in committed:
+                    raise ValueError("tree fact set")
+                result = drain_committed(
+                    stream, ws, root.globals_)
+                if not result.ok:
+                    raise ValueError("invalid tree facts")
             idx.execute("BEGIN")
             try:
                 for table in ("facts", "offers", "proofs", "globals"):

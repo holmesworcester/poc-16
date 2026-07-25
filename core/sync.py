@@ -1,6 +1,6 @@
 """Thin reconciliation driver over :mod:`core.tree`."""
 from . import tree
-from .close import decode_pile
+from .close import encode_pile
 from .crypto import h
 from .shape import FACT
 from .store import RemoteStore
@@ -41,7 +41,7 @@ def sync(node, ws, url):
         return remote_objects[oid]
 
     fetch_local = lambda oid: node.store(ws).get("obj/" + oid)
-    pulled_oids, pushed_fids = set(), set()
+    pull_ranges, missing_fids, pushed_fids = [], set(), set()
     for lo, hi, my_keys, their_leaf in tree.diff(
             mine, theirs, FACT, fetch_local, fetch_remote):
         their_keys = set(tree.range_keys(
@@ -49,20 +49,8 @@ def sync(node, ws, url):
         mine_keys = set(my_keys)
         missing = {FACT.fid_of(key) for key in their_keys - mine_keys}
         if missing:
-            candidates = (
-                [(their_leaf.oid, fetch_remote(their_leaf.oid))]
-                if their_leaf.oid else remote_objects.items()
-            )
-            for oid, raw in candidates:
-                if oid in pulled_oids or raw is None:
-                    continue
-                try:
-                    stream, _ = decode_pile(raw)
-                except Exception:
-                    continue
-                if missing.intersection(fact.fid for fact in stream):
-                    pull(node, ws, oid, raw)
-                    pulled_oids.add(oid)
+            pull_ranges.append((lo, hi))
+            missing_fids.update(missing)
         outgoing = [
             FACT.fid_of(key) for key in mine_keys - their_keys
             if FACT.fid_of(key) not in pushed_fids
@@ -72,18 +60,27 @@ def sync(node, ws, url):
             pushed_fids.update(outgoing)
             retag = None
 
-    if pulled_oids:
+    pulled = 0
+    if pull_ranges:
+        stream = tree.range_facts(
+            theirs, pull_ranges, fetch_remote, FACT)
+        if not missing_fids.issubset(
+                fact.fid for fact in stream):
+            raise ValueError("remote range is missing committed facts")
+        raw = encode_pile(stream)
+        pull(node, ws, h(raw), raw)
+        pulled = 1
         node.turn(ws)
     _fetch_blobs(node, ws, peer)
     cache.update({
         "etag": retag, "root": remote_root,
         "local": node.store(ws).etag("root"),
     })
-    return len(pulled_oids), len(pushed_fids)
+    return pulled, len(pushed_fids)
 
 
 def pull(node, ws, oid, raw):
-    """Put a remote leaf pile verbatim into local ingress."""
+    """Put one verified path union into local ingress."""
     if raw is None or h(raw) != oid:
         raise ValueError("remote object integrity")
     node.store(ws).put(f"pile/{node.member_for(ws)}/{oid}", raw)

@@ -23,7 +23,7 @@ import facts as families
 from . import tree
 from .close import decode_pile
 from .crypto import h
-from .kernel import SCHEMA, evaluate, unresolved_facts, validate
+from .kernel import SCHEMA, drain_committed, evaluate, unresolved_facts
 from .shape import FACT
 
 
@@ -38,18 +38,16 @@ class Authority:
     @classmethod
     def from_root(cls, root_bytes, fetch):
         root = tree.decode_root(root_bytes)
-        active, closure = {}, set()
-        for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
-            unit = tree.leaf_facts(leaf, lo, hi, FACT, fetch)
-            if not validate(unit, root.anchor):
-                raise ValueError("invalid authority leaf")
-            closure.update(fact.fid for fact in unit)
-            active.update(
-                (fact.fid, fact)
-                for fact in unit
-                if lo < FACT.key(fact) <= hi
-            )
-        if len(active) != root.view.n or not closure.issubset(active):
+        try:
+            unit = tree.validate_view(
+                root.view, FACT, tree.FAT, fetch)
+        except ValueError as exc:
+            raise ValueError(f"invalid authority tree: {exc}") from exc
+        result = drain_committed(unit, root.anchor, root.globals_)
+        if not result.ok:
+            raise ValueError("invalid authority tree")
+        active = {fact.fid: fact for fact in unit}
+        if root.anchor not in active:
             raise ValueError("authority projection does not match root")
 
         db = sqlite3.connect(":memory:", check_same_thread=False)

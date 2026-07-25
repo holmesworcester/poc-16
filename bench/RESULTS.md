@@ -1,17 +1,53 @@
 # Sync throughput — measured
 
-`python3 bench/bench_sync.py` against the tinyp2p engine on `main`. 100 members,
-messages spread uniformly over 3 simulated years, 8 kernel workers, on this
-desktop. Every run asserts the catching-up / reconciled nodes reach a
-**byte-identical root** (`ok = y`), so these are throughput numbers on
-provably-correct convergence, not best-effort. `rec/s` and the redundancy factor
-are steady across repeats; absolute seconds carry a few percent of machine noise.
+Current production rows and the historical baseline below were measured on the
+same desktop with 100 members, messages spread uniformly over 3 simulated years,
+and 8 kernel workers. Every run asserts that the catching-up / reconciled nodes
+reach a **byte-identical root** (`ok = y`), so these are throughput numbers on
+provably-correct convergence, not best-effort. Absolute seconds carry a few
+percent of machine noise.
 
-**Shipped default: tiered layout, `COLD_CUT = 4096`** (~1.5 MB cold pages under a
+## Production settle-node check (2026-07-25)
+
+The current fat-tree format stores each fact once at its settle node; the
+leaf-only/tiered results below are retained as the baseline it replaced.
+Post-landing real-engine runs measured:
+
+| full catchup | facts | streamed | redundancy | transfer | ingest | facts/s | converged |
+|---|--:|--:|--:|--:|--:|--:|:--:|
+| 5k | 4,999 | 4,999 | **1.00×** | 3.4 MB | 1.21 s | 4,122 | ✓ |
+| 50k | 49,999 | 49,999 | **1.00×** | 32.9 MB | 12.84 s | 3,894 | ✓ |
+
+For bidirectional range sync, “useful” is the missing set on that leg and
+“streamed” includes the shared authority path needed to judge it:
+
+| scale | union facts | useful pull / push | streamed pull / push | redundancy per leg | transfer pull / push | reconciliation | useful moved/s | converged |
+|---|--:|--:|--:|--:|--:|--:|--:|:--:|
+| 5k | 4,997 | 2,300 / 2,300 | 2,697 / 2,697 | **1.17×** | 1.8 / 0.9 MB | 1.78 s | 2,583 | ✓ |
+| 50k | 49,997 | 24,800 / 24,800 | 25,197 / 25,197 | **1.02×** | 16.6 / 8.6 MB | 19.77 s | 2,509 | ✓ |
+
+The companion prototype rerun measured flat leaf-only `ρ=2.96–2.98×`
+(14.8k fact copies for 4,999 facts), while settle storage and full verification
+were exactly 4,999 facts, a 66.5% reduction. The production catchup therefore
+hits the predicted `ρ→1` floor. A partial range still pays one flat shared-core
+tax per leg, visible as 1.17× at 5k and amortized to 1.02× at 50k.
+`bench_order.py 5000 star chain` also retained the ordering result: timestamp
+range tax is member-wide, delegation order makes it path-shaped, and deep-chain
+leaf-only full sync remains about 24× while settle full sync stays 1×.
+
+Reproduce the current path with `python3 bench/bench_sync.py 5000`; cross-check
+the model with `python3 bench/bench_hoist.py 5000`,
+`python3 bench/bench_hoist_sync.py 5000`, and
+`python3 bench/bench_order.py 5000 star chain`.
+
+## Historical leaf-only baseline
+
+**Retired default: tiered layout, `COLD_CUT = 4096`** (~1.5 MB cold pages under a
 fine `CUT = 8` guard window) — the calibrated one-size-fits-most leaf (see
-docs/MODEL.md "Leaf Sizing"). §1–2 measure that default; §3 pins flat
+docs/MODEL.md "Leaf Sizing"). Sections 1–2 measure that default; §3 pins flat
 (`COLD_CUT = None`) to show the redundancy-vs-page-size law that motivates it;
-§4 is the head-to-head.
+§4 is the head-to-head. These tables are archival measurements of the former
+leaf-closure layout; the current engine does not expose its CUT/tier sweeps.
 
 ## 1. Catchup — a fresh node ingests a whole workspace from empty
 
@@ -123,10 +159,11 @@ here.
   quadratic blowup this refresh would otherwise have hit.
 
 ---
-*Reproduce:* `python3 bench/bench_sync.py` (default catchup + bidi),
-`python3 bench/bench_sync.py 500000` (add 500k), `python3 bench/bench_sync.py cut`
-(flat CUT sweep), `python3 bench/bench_sync.py tier` (tiered vs flat).
-Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
+*Reproduce the current engine:* `python3 bench/bench_sync.py` (default catchup +
+bidi) or `python3 bench/bench_sync.py 500000` (add 500k). The historical
+`cut` and `tier` modes intentionally exit instead of presenting the retired
+leaf-layout measurements as current. Working dir defaults to a scratchpad path;
+override with `BENCH_DIR`.
 
 ---
 

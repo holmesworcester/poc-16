@@ -1,7 +1,7 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
 Layout: root (the CAS'd fat-root metadata, only mutable key besides
-piles/invites), obj/<hash> (tree nodes, leaf piles, blobs — immutable),
+piles/invites), obj/<hash> (tree nodes, settle piles, blobs — immutable),
 pile/<member>/<hash> (ingress), invite/<id> (public reads), and
 quarantine/<fid> (node-local retention for a previously valid pruned fact).
 """

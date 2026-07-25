@@ -4,7 +4,7 @@ Design of record. The Engine, Auth, Node State, and Concurrency sections mark
 landed behavior versus remaining beads; where earlier System/Store/Walk prose
 still describes the pre-S1 flat manifest, those sections are historical
 motivation and the later foldback takes precedence. [SIMPLIFY.md](docs/SIMPLIFY.md)
-maps the landed core and remaining production step. Unreplaced numbers remain
+maps the landed core. Unreplaced numbers remain
 estimates until `bench/`
 supersedes them; [MODEL.md](docs/MODEL.md) carries the performance model and loop
 math.
@@ -382,6 +382,24 @@ to a full build of the union. The root is `Root(view, anchor, globals_)`, so
 anchor and canonical global rows ride the tree rather than a separate flat
 manifest. This absorbs the old `treap.py` / `layout.py` algorithms and the
 fat-node and two-root-fold work (`jbg.1` / `jbg.4`) into one implementation.
+Two-root merge keeps the pruned path-copy fast path for facts whose dependency
+edges cannot change. A delta that offers an address or declares a need can
+change the canonical provider graph of either side; without a provider summary
+the safe implementation loads the union, recomputes proof ranks, and stages a
+full byte-identical rebuild. `jbg.3` owns amortizing that fallback for
+append-only root sets without weakening convergence.
+
+Production fat trees also absorb the multi-level pile. Every fact is serialized
+once in a content-addressed payload at `settle(f)`, the deepest node covering
+its own key and every dependent key. A root-to-node payload union is closed;
+a full preorder contains each fact exactly once. Structural node `oid` commits
+its payload hash and child summaries, while `fp` covers only in-range keys, so
+closure placement never enters the diff algebra. Full sync and rebuild consume
+one closed preorder (`ρ → 1`); range sync fetches a deduplicated union of the
+selected paths and pays the measured shared-core tax once. Stable span bounds
+let `fold` rehome only the new batch's rising dependencies plus nodes whose
+physical interval split, preserving path-copy incrementality and exact
+full-build identity.
 
 The public kernel verbs — `validate`, `drain`, and `evaluate` — share one
 internal judge loop. `validate` returns a boolean; `drain` additionally returns
@@ -419,9 +437,9 @@ tmp on-disk file when the caller knows better (replay, iOS) — never a
 flag, because policy belongs to the caller and the kernel stays
 context-free; disposal, placement (an NSE uses the app-group
 container), and parallelism (one connection per invocation, across
-cores) are the caller's too. Replay then costs nothing new to design: full and
-windowed replay alike are the store's own leaf piles streamed through the same
-judge. Persistent proof ranks are retained for every offer source and
+cores) are the caller's too. Replay then costs nothing new to design: a full
+replay is the tree's closed preorder and a windowed replay is one closed path
+union, both streamed through the same judge. Persistent proof ranks are retained for every offer source and
 explicit-ref target, keeping canonical dependency choice stable across
 incremental admission and index rebuild.
 
@@ -618,13 +636,15 @@ conflict and revive a quarantined chain. The request family owns tag, verb,
 expiry, removal, and removed-issuer policy; the daemon parses no fact body.
 Failure returns no grant. Success returns the family grant for
 `Handler.mint` to seal to the requester's public key and pair with the current
-root bytes and ETag. The path drains nothing, writes nothing, and never reads
-`app.db`; its canonical authority view is a read-only input. Replay only
-produces ciphertext for the same requester. The landed peer holds its
-workspace lock while snapshotting root plus canonical idx, then releases it
-after evaluation. A stateless deployment reconstructs that view from validated
-tree leaves with `mint.Authority.from_root`; `mint.stateless` reuses it only
-while its root ETag matches and otherwise rebuilds it before evaluating.
+root bytes and ETag. Evaluation drains nothing, writes nothing, and never reads
+`app.db`; its canonical authority view is a read-only input. A peer may first
+rebuild that derived view if its root stamp is stale. Replay only produces
+ciphertext for the same requester. The landed peer holds its workspace lock,
+synchronizes the index stamp to the current root, then snapshots root plus
+canonical idx for evaluation. A stateless deployment
+reconstructs that view with `mint.Authority.from_root`, which accepts only
+known durable facts and requires root globals to exactly equal the rows derived
+by draining them; `mint.stateless` reuses it only while its root ETag matches.
 
 The cloud target returns presigned URLs; the landed peer daemon returns a
 bearer token. To the client either is an opaque request decorator, the only
@@ -734,8 +754,8 @@ different jobs, and either can be deleted and rebuilt.
 - **`idx.db` is the root-stamped engine projection.** It contains accepted
   fact bytes, offers, persistent proof ranks, monotone globals, metadata, and
   the append-only projection log. A semantic index-version change or a root
-  ETag mismatch rebuilds it by streaming the root's own closed leaves through
-  `drain`. The index is intentionally marked dirty before publication, so an
+  ETag mismatch rebuilds it by streaming the root's one-copy closed preorder
+  through `drain`. The index is intentionally marked dirty before publication, so an
   interrupted pre-CAS turn cannot masquerade as current state.
 - Engine and kernel working state is ephemeral SQLite by
   **caller-injected connection**: `:memory:` normally, on-disk temp
@@ -759,12 +779,15 @@ different jobs, and either can be deleted and rebuilt.
   provenance. The kernel is small and frozen; projector mistakes replay away.
 
 Root bytes carry tree view, anchor, and canonical globals, but not the expanded
-offer/proof view. A peer mint reads that view from its root-stamped `idx.db`;
-`app.db` is never involved. A Worker or Lambda builds the equivalent
-root-stamped, read-only `:memory:` projection from the root/tree, and may cache
-it by ETag. A cold or stale cache rebuilds before minting, so warmth cannot
-change a verdict. The derived view's SQLite byte format is not part of the
-protocol; cloud publication remains §Concurrency & FaaS work.
+offer/proof view. On rebuild and stateless mint, all committed facts must be
+known durable families and a fresh drain must reproduce those globals exactly;
+metadata is authenticated by derivation, not trusted merely because it rides
+beside a valid Merkle view. A peer mint reads the offer/proof view from its
+root-stamped `idx.db`; `app.db` is never involved. A Worker or Lambda builds the
+equivalent root-stamped, read-only `:memory:` projection from the root/tree,
+and may cache it by ETag. A cold or stale cache rebuilds before minting, so
+warmth cannot change a verdict. The derived view's SQLite byte format is not
+part of the protocol; cloud publication remains §Concurrency & FaaS work.
 
 ## Deployments
 
@@ -788,8 +811,14 @@ and amortized merge remain `jbg.3`.
 concurrent PUTs are idempotent and commutative, and the arrangement is a
 deterministic fold of the pile set. No operation is non-commutative (facts
 additive, tombstones remove-wins, fold deterministic), so roots form a
-join-semilattice, `merge(A,B) = root(A∪B)` is the O(diff) tree-join, and
-convergence is **Strong Eventual Consistency** — same observed set ⇒
+join-semilattice and `merge(A,B) = root(A∪B)`. For roots already validated at
+publication, the join is O(diff) when the delta cannot rewire a declared need.
+Before any shortcut, untrusted roots must reproduce the byte-identical
+canonical settle placement derived from their facts; validating only the full
+fact set is insufficient because a malformed partial path may not be closed.
+Provider-bearing or provider-consuming deltas currently take the
+correctness-first canonical rebuild described in the Engine section.
+Convergence is **Strong Eventual Consistency** — same observed set ⇒
 bit-identical root (one hash compare), no conflict resolution, self-healing.
 The only mutable cell is a 32-byte root hash per workspace, itself optional
 (state ≡ ⊔ of all published roots). This is the Merkle Search Tree
@@ -811,7 +840,12 @@ is dropped. Full catch-up walks the fat root in ~2–3 parallel round-trip waves
 then bandwidth-bound page transfer; only fat fanout makes this cheap (binary ⇒
 ~log₂n waves ⇒ keep a manifest). Precomputed fingerprints in the immutable nodes
 are what let a **dumb store** answer a reader-driven pruned walk with only GETs
-(git "dumb HTTP" over a Merkle DAG); `Range` the fingerprint region to trim bytes.
+(git "dumb HTTP" over a Merkle DAG). Each node also names its optional settle
+payload pile. This is the landed `T_fact` representation. A suppression tree
+cannot reuse it unchanged: its authority closure contains facts with no
+suppression key, and differently partitioned whole-node piles do not guarantee
+cross-tree body deduplication. `poc-16-yez.15` owns stable closure-only placement
+and shared fact-body references before the synced `T_supp` root lands.
 
 **Reads pick a guarantee.** *Fast* — walk any recent root (may lag by fold
 latency). *Authoritative* — reconcile: root-vs-`LIST` diff, or peer fingerprint

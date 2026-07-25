@@ -216,6 +216,8 @@ def test_chained_bidirectional_reconciliation_converges(tmp_path):
     assert result["shape"] == "chain"
     assert result["depth"]["max"] == 23
     assert result["facts"] > result["a_before"]
+    assert result["pull_streamed"] > result["pull_useful"]
+    assert result["push_streamed"] > result["push_useful"]
 
 
 def test_chain_seed_is_stack_safe_beyond_python_recursion_depth(tmp_path):

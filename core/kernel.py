@@ -427,6 +427,23 @@ def drain(stream, anchor, *, db=None):
     return kernel(stream, anchor, mode=DRAIN, db=db)
 
 
+def drain_committed(stream, anchor, globals_):
+    """Validate a published durable stream and its derived root metadata."""
+    unit = tuple(stream)
+    handlers = tuple(facts.handler_for(fact.t) for fact in unit)
+    try:
+        expected = _globals(globals_)
+    except (TypeError, ValueError):
+        return Judgment(False, (), frozenset())
+    if any(
+            handler is None or not handler.DURABLE
+            for handler in handlers):
+        return Judgment(False, (), frozenset())
+    result = drain(unit, anchor)
+    return result if result.ok and result.globals == expected \
+        else Judgment(False, (), frozenset())
+
+
 def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
     """Validate an ephemeral payload against committed globals; return bool."""
     return kernel(

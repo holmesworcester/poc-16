@@ -3,10 +3,9 @@
 Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
-            "download + ingestion" number: decode every published unit
-            (one leaf pile), judge each through the kernel (parallel, own
-            scratchpads — exactly what turn() does), merge by id, then one
-            layout commit. facts/s here is directly comparable to the
+            "download + ingestion" number: stream the tree's one-copy closed
+            preorder, judge it through the kernel, merge by id, then one
+            tree commit. facts/s here is directly comparable to the
             2000-5000 facts/s poc-7..13 have gotten.
 
   bidi      Two peers with shared membership and disjoint message sets do
@@ -133,12 +132,10 @@ def manifest_objs(store):
 
 
 def seed_units(store, root):
-    """Every published leaf pile a walk would deliver: a topo-sorted closed
-    set (in-range leaves plus their closure)."""
+    """The production full-sync unit: one closed stream, each fact once."""
     fetch = lambda oid: store.get("obj/" + oid)
-    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
-        if leaf.n:
-            yield decode_pile(fetch(leaf.oid))[0]
+    if root.view.n:
+        yield tree.facts(root.view, fetch, FACT)
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -214,7 +211,8 @@ def reconcile(A, B, ws):
         return remote_objects[oid]
 
     t0 = perf()
-    pulled, pulled_oids, push_fids, pull_bytes = [], set(), [], 0
+    pulled, pull_ranges = [], []
+    pull_fids, push_fids = set(), set()
     for lo, hi, my_keys, remote_leaf in tree.diff(
             mine, theirs, FACT,
             lambda oid: astore.get("obj/" + oid), fetch_remote):
@@ -222,32 +220,25 @@ def reconcile(A, B, ws):
             remote_leaf, lo, hi, FACT, fetch_remote))
         local_keys = set(my_keys)
         missing = {fid_of(key) for key in remote_keys - local_keys}
-        candidates = (
-            [(remote_leaf.oid, fetch_remote(remote_leaf.oid))]
-            if remote_leaf.oid else remote_objects.items()
-        )
-        for oid, raw in candidates:
-            if not missing or oid in pulled_oids or raw is None:
-                continue
-            try:
-                stream = decode_pile(raw)[0]
-            except Exception:
-                continue
-            if missing.intersection(fact.fid for fact in stream):
-                pull_bytes += len(raw)
-                pulled.append(stream)
-                pulled_oids.add(oid)
-        push_fids += [
+        if missing:
+            pull_ranges.append((lo, hi))
+            pull_fids.update(missing)
+        push_fids.update(
             fid_of(key) for key in local_keys - remote_keys
-            if fid_of(key) not in push_fids
-        ]
+        )
 
-    push_bytes = 0
+    if pull_ranges:
+        pulled.append(tree.range_facts(
+            theirs, pull_ranges, fetch_remote, FACT))
+    pull_bytes = sum(
+        len(raw) for raw in remote_objects.values() if raw is not None)
+    push_bytes = push_streamed = 0
     if push_fids:
         idx = A.idx(ws)
-        news = [A.fact_of(ws, fid) for fid in push_fids]
+        news = [A.fact_of(ws, fid) for fid in sorted(push_fids)]
         facts = close(news, lambda fid: resolve_deps(A.fact_of(ws, fid), idx) or [],
                       lambda fid: A.fact_of(ws, fid))
+        push_streamed = len(facts)
         pile = encode_pile(facts)
         push_bytes = len(pile)
         ingest(B, ws, [decode_pile(pile)[0]])  # B absorbs A's half
@@ -264,7 +255,9 @@ def reconcile(A, B, ws):
     match = A.store(ws).get("root") == B.store(ws).get("root")
     total = A.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return {"recon_s": t1 - t0, "pulled_units": len(pulled),
-            "pull_facts": sum(len(u) for u in pulled), "push_facts": len(push_fids),
+            "pull_useful": len(pull_fids),
+            "pull_streamed": sum(len(u) for u in pulled),
+            "push_useful": len(push_fids), "push_streamed": push_streamed,
             "pull_mb": pull_bytes / 1e6, "push_mb": push_bytes / 1e6,
             "facts": total, "match": match}
 
@@ -343,69 +336,46 @@ def run_catchup(scales):
 def run_bidi(scales):
     print("\n=== BIDI: two peers, shared membership, disjoint messages, "
           "one one-sided walk ===\n")
-    hdr = ("converged", "A_before", "B_before", "pull_facts", "push_facts",
-           "pull_MB", "push_MB", "recon_s", "facts/s", "ok")
-    print("  {:>9} {:>9} {:>9} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8} {:>3}"
-          .format(*hdr))
+    hdr = (
+        "converged", "A_before", "B_before",
+        "pull_use", "pull_sent", "pull_rho",
+        "push_use", "push_sent", "push_rho",
+        "pull_MB", "push_MB", "recon_s", "useful/s", "ok",
+    )
+    print(
+        "  {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8} "
+        "{:>8} {:>8} {:>8} {:>9} {:>3}".format(*hdr))
     for scale in scales:
         d = os.path.join(WORK, f"bidi_{scale}")
         shutil.rmtree(d, ignore_errors=True)
         r = bidi(scale, d)
-        print("  {:>9} {:>9} {:>9} {:>10} {:>10} {:>8.1f} {:>8.1f} {:>8.2f} "
-              "{:>8.0f} {:>3}".format(
-                  r["facts"], r["a_before"], r["b_before"], r["pull_facts"],
-                  r["push_facts"], r["pull_mb"], r["push_mb"], r["recon_s"],
-                  r["facts"] / r["recon_s"], "y" if r["match"] else "N"))
+        useful = r["pull_useful"] + r["push_useful"]
+        print(
+            "  {:>9} {:>9} {:>9} {:>9} {:>9} {:>7.2f}x {:>9} {:>9} "
+            "{:>7.2f}x {:>8.1f} {:>8.1f} {:>8.2f} {:>9.0f} {:>3}".format(
+                r["facts"], r["a_before"], r["b_before"],
+                r["pull_useful"], r["pull_streamed"],
+                r["pull_streamed"] / r["pull_useful"],
+                r["push_useful"], r["push_streamed"],
+                r["push_streamed"] / r["push_useful"],
+                r["pull_mb"], r["push_mb"], r["recon_s"],
+                useful / r["recon_s"], "y" if r["match"] else "N"))
         sys.stdout.flush()
         gc.collect()
         shutil.rmtree(d, ignore_errors=True)
 
 
-def run_cut_sweep(scale, cuts=(8, 16, 32, 64, 128)):
-    """Same fact set, different page size. CUT=8 (E[8] facts/page) re-ships
-    each range's shared closure over and over on a full catchup;
-    bigger pages amortize it, so redundancy falls and useful facts/s climbs
-    toward the raw judge rate (rec/s)."""
-    import core.shape as shape
-    print(f"\n=== CUT SWEEP: catchup at {scale} facts, varying page size ===")
-    print("    flat (COLD_CUT=None) each row; only E[facts/page] changes\n")
-    hdr = ("CUT", "facts", "pages", "dl_MB", "streamed", "redund",
-           "ingest_s", "facts/s", "rec/s", "ok")
-    print("  {:>4} {:>8} {:>7} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}".format(*hdr))
-    orig, orig_cold = shape.CUT, shape.COLD_CUT
-    shape.COLD_CUT = None  # pin flat so the sweep isolates fine-cut redundancy
-    try:
-        for cut in cuts:
-            shape.CUT = cut
-            d = os.path.join(WORK, f"cut_{cut}")
-            shutil.rmtree(d, ignore_errors=True)
-            seed, ws, _ = build_seed(os.path.join(d, "seed"), scale)
-            r = catchup(seed, ws, os.path.join(d, "fresh"))
-            print("  {:>4} {:>8} {:>7} {:>7.1f} {:>9} {:>5.1f}x {:>9.2f} "
-                  "{:>8.0f} {:>8.0f} {:>3}".format(
-                      cut, r["facts"], r["pages"], mb(r["dl_bytes"]),
-                      r["streamed"], r["streamed"] / r["facts"], r["ingest_s"],
-                      r["facts"] / r["ingest_s"], r["streamed"] / r["ingest_s"],
-                      "y" if r["match"] else "N"))
-            sys.stdout.flush()
-            del seed
-            gc.collect()
-            shutil.rmtree(d, ignore_errors=True)
-    finally:
-        shape.CUT, shape.COLD_CUT = orig, orig_cold
-
-
 def check_leaves(seed, ws):
-    """Every published leaf pile still judges alone from empty —
-    the leaves-are-piles invariant, under whatever cut the layout used."""
+    """Every published root-to-leaf path still judges alone from empty."""
     st = seed.store(ws)
     root = tree.decode_root(st.get("root"))
     fetch = lambda oid: st.get("obj/" + oid)
     n = 0
-    for _, _, leaf in tree.leaf_ranges(root.view, fetch):
+    for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
         if leaf.n:
-            ok, _, _ = kernel(decode_pile(fetch(leaf.oid))[0], ws)
-            assert ok, "a leaf failed the kernel"
+            ok, _, _ = kernel(
+                tree.range_facts(root.view, (lo, hi), fetch, FACT), ws)
+            assert ok, "a root-to-leaf path failed the kernel"
             n += 1
     return n
 
@@ -489,8 +459,8 @@ def main():
         raise SystemExit(
             "tier mode measured the retired moving-boundary flat layout")
     if "cut" in sys.argv:
-        run_cut_sweep(args[0] if args else 50000)
-        return
+        raise SystemExit(
+            "cut mode measured the retired leaf-closure flat layout")
     scales = args or [5000, 10000, 50000, 100000]
     run_catchup(scales)
     run_bidi([s for s in scales if s <= 200000] or scales)

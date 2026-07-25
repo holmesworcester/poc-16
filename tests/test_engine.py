@@ -7,15 +7,23 @@ from dataclasses import replace
 
 import pytest
 
-from core import hoist, layout, shape, treap, tree
+from core import hoist, layout, shape, sync as sync_module, treap, tree
 from core import cmds
-from core.crypto import h
+from core.crypto import h, keypair
 from core.fact import Fact, canon
+from facts.auth.signature import signature
+from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
 from core.kernel import Scratchpad, resolve_deps
 from core.node import Node
 
-from .util import author_msg, closed_subset, deliver
+from .util import (
+    all_fids,
+    author_msg,
+    closed_subset,
+    deliver,
+    mismatched_tree_key,
+)
 
 
 class Driver:
@@ -50,6 +58,31 @@ def build(keys, by_fid, packing, driver):
         keys, shape.FACT, packing, by_fid.__getitem__,
         lambda fid: (), driver.emit,
     )
+
+
+def legacy_fat(keys, by_fid, packing, driver):
+    """Build the v1 production fat format for mixed-upgrade tests."""
+    leaves, _ = tree._leaf_views(
+        keys, shape.FACT, packing, by_fid.__getitem__,
+        lambda fid: (), driver.emit,
+    )
+    nodes, level = leaves, 1
+    while True:
+        fresh = []
+        for group in tree._fat_groups(
+                nodes, level, packing, shape.FACT):
+            view = tree.View(
+                tree._fp("fat", level, group), "", group[-1].sep,
+                sum(child.n for child in group), tuple(group),
+                level=level, kind="fat", mark=packing.fanout,
+                config=f"1:fat:{packing.fanout}:{shape.FACT.cut()}",
+            )
+            fresh.append(replace(
+                view, oid=driver.emit(tree._legacy_branch_bytes(view))))
+        nodes = fresh
+        if len(nodes) == 1:
+            return nodes[0]
+        level += 1
 
 
 def cold(view, anchor="workspace", globals_=frozenset()):
@@ -135,6 +168,140 @@ def test_fat_root_is_self_describing_and_shallow(engine_world):
     wire["tree"]["c"][0]["f"] = "forged"
     with pytest.raises(ValueError, match="tree"):
         tree.decode_root(canon(wire))
+
+
+@pytest.mark.parametrize("case", ("empty-child", "duplicate-separator"))
+def test_fat_branch_rejects_empty_or_nonincreasing_children(case):
+    fact = Fact("sample", 1, [], {})
+    driver, packing = Driver(), tree.fat(2)
+    root = tree.build(
+        [fact.key], shape.FACT, packing,
+        lambda fid: fact, lambda fid: (), driver.emit,
+    )
+    leaf = root.children[0]
+    if case == "empty-child":
+        empty = tree.View(
+            shape.FACT.fingerprint([]), "", "", 0, (), (),
+            level=0, kind="leaf", mark=packing.fanout,
+            config=tree.config(packing, shape.FACT), spans=(),
+        )
+        empty = replace(
+            empty, oid=driver.emit(tree._node_bytes(empty)))
+        children = (empty, leaf)
+    else:
+        children = (leaf, leaf)
+    malformed = replace(
+        root, fp=tree._fp("fat", root.level, children), oid="",
+        n=sum(child.n for child in children), sep=children[-1].sep,
+        children=children,
+    )
+    malformed = replace(
+        malformed, oid=driver.emit(tree._node_bytes(malformed)))
+    encoded = tree.encode_root(tree.Root(
+        malformed, fact.fid, frozenset()))
+
+    with pytest.raises(ValueError, match="tree node shape"):
+        tree.decode_root(encoded)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("non-string", "empty-fid", "missing-low", "missing-high", "reversed"),
+)
+def test_fat_reader_rejects_malformed_span_bounds(case):
+    fact = Fact("sample", 1, [], {})
+    driver, packing = Driver(), tree.fat(2)
+    root = tree.build(
+        [fact.key], shape.FACT, packing,
+        lambda fid: fact, lambda fid: (), driver.emit,
+    )
+    leaf = root.children[0]
+    rows = {
+        "non-string": [fact.fid, 1, fact.key],
+        "empty-fid": [""],
+        "missing-low": [fact.fid, "", fact.key],
+        "missing-high": [fact.fid, fact.key, ""],
+        "reversed": [fact.fid, fact.key + "z", fact.key],
+    }
+    body = json.loads(driver.fetch(leaf.oid))
+    body["a"] = [rows[case]]
+    malformed_leaf = replace(
+        leaf, oid=driver.emit(canon(body)))
+    malformed_root = replace(
+        root, oid="", children=(malformed_leaf,))
+    malformed_root = replace(
+        malformed_root,
+        oid=driver.emit(tree._node_bytes(malformed_root)),
+    )
+    encoded = tree.encode_root(tree.Root(
+        malformed_root, fact.fid, frozenset()))
+    decoded = tree.decode_root(encoded)
+
+    with pytest.raises(ValueError, match="tree span"):
+        tree.facts(decoded.view, driver.fetch, shape.FACT)
+
+
+def test_fat_node_wire_version_must_match_its_config():
+    fact = Fact("sample", 1, [], {})
+    driver, packing = Driver(), tree.fat(2)
+    root = tree.build(
+        [fact.key], shape.FACT, packing,
+        lambda fid: fact, lambda fid: (), driver.emit,
+    )
+    body = json.loads(driver.fetch(root.oid))
+    body["v"] = 1
+    hybrid_oid = driver.emit(canon(body))
+    wire = json.loads(tree.encode_root(tree.Root(
+        root, fact.fid, frozenset())))
+    wire["tree"]["o"] = hybrid_oid
+    decoded = tree.decode_root(canon(wire))
+
+    with pytest.raises(ValueError, match="tree config"):
+        tree.facts(decoded.view, driver.fetch, shape.FACT)
+
+
+@pytest.mark.parametrize("case", ("retained-oid", "nonempty-level-zero"))
+def test_fat_root_accepts_only_the_canonical_empty_sentinel(case):
+    fact = Fact("sample", 1, [], {})
+    driver, packing = Driver(), tree.fat(2)
+    source = tree.build(
+        [fact.key] if case == "retained-oid" else [],
+        shape.FACT, packing, lambda fid: fact,
+        lambda fid: (), driver.emit,
+    )
+    wire = json.loads(tree.encode_root(tree.Root(
+        source, fact.fid, frozenset())))
+    wire["tree"].update({
+        "c": [],
+        "f": shape.FACT.fingerprint([]),
+        "k": "fat",
+        "l": 0,
+        "n": 0,
+        "p": "",
+        "q": 0,
+        "s": "",
+    })
+    if case == "nonempty-level-zero":
+        wire["tree"]["n"] = 1
+
+    with pytest.raises(ValueError, match="tree node shape"):
+        tree.decode_root(canon(wire))
+
+
+def test_legacy_fat_root_rejects_an_unrecognized_config():
+    fact = Fact("sample", 1, [], {})
+    driver, packing = Driver(), tree.fat(2)
+    root = legacy_fat(
+        [fact.key], {fact.fid: fact}, packing, driver)
+    malformed = replace(root, config="unversioned", oid="")
+    malformed = replace(
+        malformed,
+        oid=driver.emit(tree._legacy_branch_bytes(malformed)),
+    )
+
+    with pytest.raises(ValueError, match="tree config"):
+        tree.decode_root(tree.encode_root(tree.Root(
+            malformed, fact.fid, frozenset())))
 
 
 def test_tree_config_roll_forces_a_new_root_format(tmp_path, monkeypatch):
@@ -317,8 +484,38 @@ def test_diff_aligns_across_a_promoted_leaf_boundary(engine_world):
         symmetric.update(set(my_keys) ^ set(their_keys))
 
     assert symmetric == {promoted}
-    assert len(set(driver.reads)) <= mine.level + theirs.level + 2
+    # Two extra reads authenticate the cold v2 root summaries before pruning.
+    assert len(set(driver.reads)) <= mine.level + theirs.level + 4
     assert len(set(driver.reads)) < leaf_count
+
+
+@pytest.mark.parametrize("operation", ("diff", "merge"))
+def test_cold_v2_root_summary_is_authenticated_before_pruning(
+        engine_world, operation):
+    keys, by_fid = engine_world
+    driver, packing = Driver(), tree.fat(8)
+    left = build(keys[:40], by_fid, packing, driver)
+    right = build(keys[40:80], by_fid, packing, driver)
+    left_wire = json.loads(tree.encode_root(tree.Root(
+        left, "workspace", frozenset())))
+    forged_wire = json.loads(tree.encode_root(tree.Root(
+        right, "workspace", frozenset())))
+    forged_wire["tree"] = left_wire["tree"]
+    forged_wire["tree"]["o"] = right.oid
+    honest = cold(left)
+    forged = tree.decode_root(canon(forged_wire)).view
+
+    with pytest.raises(ValueError, match="tree child summary"):
+        if operation == "diff":
+            list(tree.diff(
+                honest, forged, shape.FACT,
+                driver.fetch, driver.fetch,
+            ))
+        else:
+            tree.merge(
+                honest, forged, shape.FACT, packing,
+                driver.fetch, driver.emit,
+            )
 
 
 def test_merge_one_delta_reads_and_writes_only_spines(engine_world):
@@ -337,12 +534,14 @@ def test_merge_one_delta_reads_and_writes_only_spines(engine_world):
 
     merged = tree.merge(
         mine, theirs, shape.FACT, packing,
-        driver.fetch, driver.emit,
+        driver.fetch, driver.emit, prevalidated=True,
     )
 
     assert (merged.fp, merged.oid, merged.n) == \
         (theirs.fp, theirs.oid, theirs.n)
-    assert len(set(driver.reads)) <= mine.level + theirs.level + 2
+    # Merge reads structural spines plus their separate settle payloads.
+    assert len(set(driver.reads)) <= 2 * (
+        mine.level + theirs.level) + 2
     assert len(set(driver.reads)) < leaf_count
     assert len(set(driver.writes)) <= 2 * (mine.level + 1)
 
@@ -367,13 +566,13 @@ def test_merge_height_change_still_reads_only_spines(monkeypatch):
 
     merged = tree.merge(
         mine, theirs, shape.FACT, packing,
-        driver.fetch, driver.emit,
+        driver.fetch, driver.emit, prevalidated=True,
     )
 
     spines = mine.level + theirs.level
     assert mine.level != theirs.level
     assert (merged.fp, merged.oid) == (theirs.fp, theirs.oid)
-    assert len(set(driver.reads)) <= 2 * spines
+    assert len(set(driver.reads)) <= 2 * spines + 2
     assert len(set(driver.writes)) <= 2 * spines
 
 
@@ -390,11 +589,132 @@ def test_merge_is_root_of_union(engine_world, packing):
     driver.reads.clear()
 
     merged = tree.merge(
-        a, b, shape.FACT, packing, driver.fetch, driver.emit)
+        a, b, shape.FACT, packing, driver.fetch, driver.emit,
+        prevalidated=True)
 
     assert (merged.fp, merged.oid, merged.n) == \
         (expected.fp, expected.oid, expected.n)
     assert len(set(driver.reads)) < len(keys)
+
+
+@pytest.mark.parametrize("legacy_kind", ("flat", "fat-v1"))
+@pytest.mark.parametrize("reverse", (False, True))
+@pytest.mark.parametrize("case", ("overlap", "same-set", "empty-current"))
+def test_merge_normalizes_mixed_legacy_and_v2_roots(
+        engine_world, legacy_kind, reverse, case):
+    keys, by_fid = engine_world
+    keys = keys[:40]
+    if case == "overlap":
+        legacy_keys, current_keys = keys[:20], keys[10:]
+    elif case == "same-set":
+        legacy_keys = current_keys = keys
+    else:
+        legacy_keys, current_keys = keys, []
+    driver, packing = Driver(), tree.fat(8)
+    legacy = (
+        build(legacy_keys, by_fid, tree.FLAT, driver)
+        if legacy_kind == "flat"
+        else legacy_fat(legacy_keys, by_fid, packing, driver)
+    )
+    current = build(current_keys, by_fid, packing, driver)
+    left, right = (
+        (legacy, current) if reverse else (current, legacy))
+
+    actual = tree.merge(
+        cold(left), cold(right), shape.FACT, packing,
+        driver.fetch, driver.emit,
+    )
+    union = set(legacy_keys) | set(current_keys)
+    expected = build(union, by_fid, packing, driver)
+
+    assert actual.config == tree.config(packing, shape.FACT)
+    assert tree.encode_root(tree.Root(
+        actual, "workspace", frozenset())) == tree.encode_root(tree.Root(
+            expected, "workspace", frozenset()))
+    assert {
+        fact.fid for fact in tree.facts(actual, driver.fetch, shape.FACT)
+    } == {shape.FACT.fid_of(key) for key in union}
+
+
+@pytest.mark.parametrize(
+    "case", ("provider-delta", "consumer-delta", "same-set"))
+@pytest.mark.parametrize("reverse", (False, True))
+def test_merge_enforces_union_wide_canonical_provider_graph(
+        case, reverse):
+    secret, public = keypair()
+    consumer = message(public, "slot", "consumer", 100)
+    for ordinal in range(10_000):
+        anchor = workspace_fact(
+            secret, public, f"workspace-{ordinal}", 1)
+        if anchor.fid < consumer.fid:
+            break
+    else:
+        pytest.fail("could not order workspace fixture")
+
+    lower = upper = None
+    for ordinal in range(10_000):
+        candidate = signature(
+            secret, public, consumer, 200 + ordinal)
+        if candidate.fid < consumer.fid \
+                and (lower is None or candidate.fid < lower.fid):
+            lower = candidate
+        if candidate.fid > consumer.fid \
+                and (upper is None or candidate.fid > upper.fid):
+            upper = candidate
+        if lower is not None and upper is not None:
+            break
+    if lower is None or upper is None:
+        pytest.fail("could not bracket consumer fixture")
+
+    items = {
+        fact.fid: fact
+        for fact in (anchor, lower, consumer, upper)
+    }
+    packing, driver = tree.fat(2), Driver()
+
+    def root(included, provider):
+        deps = {fid: () for fid in included}
+        if consumer.fid in included:
+            deps[consumer.fid] = (provider.fid, anchor.fid)
+        return tree.build(
+            [items[fid].key for fid in included],
+            shape.FACT, packing, items.__getitem__,
+            deps.__getitem__, driver.emit,
+        )
+
+    canonical = root(set(items), lower)
+    if case == "same-set":
+        first = root(set(items), upper)
+        second = canonical
+    elif case == "consumer-delta":
+        first = root(
+            {anchor.fid, lower.fid, upper.fid}, lower)
+        second = root(
+            {anchor.fid, upper.fid, consumer.fid}, upper)
+    else:
+        first = root(
+            {anchor.fid, upper.fid, consumer.fid}, upper)
+        second = root(
+            {anchor.fid, lower.fid, consumer.fid}, lower)
+    left, right = (
+        (second, first) if reverse else (first, second))
+
+    if case == "same-set":
+        with pytest.raises(ValueError, match="tree placement"):
+            tree.merge(
+                cold(left), cold(right), shape.FACT, packing,
+                driver.fetch, driver.emit,
+            )
+        return
+
+    merged = tree.merge(
+        cold(left), cold(right), shape.FACT, packing,
+        driver.fetch, driver.emit,
+    )
+
+    assert tree.encode_root(tree.Root(
+        merged, anchor.fid, frozenset())) == tree.encode_root(tree.Root(
+            canonical, anchor.fid, frozenset()))
 
 
 @pytest.mark.parametrize("missing", [
@@ -498,6 +818,233 @@ def test_read_floor_a_b_p_plus_spine(engine_world):
     assert hit <= leaf_reads
     assert len(set(driver.reads)) <= len(hit) * (view.level + 1)
     assert leaf_reads < all_leaves
+
+
+# ---- production settle payloads (poc-16-808.9) ------------------------------
+
+def settle_world(monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 1)
+    facts = [
+        Fact("sample", ts, [], {"ordinal": ts})
+        for ts in range(16)
+    ]
+    by_fid = {fact.fid: fact for fact in facts}
+    deps = {fact.fid: () for fact in facts}
+    deps[facts[-1].fid] = (facts[0].fid,)
+    return facts, by_fid, deps
+
+
+def payloads(view, fetch):
+    view = tree._resolved(view, fetch)
+    yield tree._payload(view, fetch)
+    for child in view.children:
+        yield from payloads(child, fetch)
+
+
+def test_fat_tree_stores_each_fact_once_and_every_leaf_path_is_closed(
+        monkeypatch):
+    facts, by_fid, deps = settle_world(monkeypatch)
+    driver = Driver()
+    root = tree.build(
+        [fact.key for fact in facts], shape.FACT, tree.fat(2),
+        by_fid.__getitem__, deps.__getitem__, driver.emit,
+    )
+    stored = [
+        fact for payload in payloads(root, driver.fetch)
+        for fact in payload
+    ]
+
+    assert len(stored) == len(facts) == len({fact.fid for fact in stored})
+    assert facts[0].fid in {
+        fact.fid for fact in tree._payload(root, driver.fetch)
+    }
+    for lo, hi, leaf in tree.leaf_ranges(root, driver.fetch):
+        unit = tree.range_facts(
+            root, (lo, hi), driver.fetch, shape.FACT)
+        present = {fact.fid for fact in unit}
+        assert {
+            shape.FACT.fid_of(key)
+            for key in tree.range_keys(
+                leaf, lo, hi, shape.FACT, driver.fetch)
+        } <= present
+        assert all(set(deps[fact.fid]) <= present for fact in unit)
+
+
+def test_closure_placement_changes_oid_but_not_diff_fingerprint(monkeypatch):
+    facts, by_fid, deps = settle_world(monkeypatch)
+    keys = [fact.key for fact in facts]
+    driver = Driver()
+    plain = tree.build(
+        keys, shape.FACT, tree.fat(2), by_fid.__getitem__,
+        lambda fid: (), driver.emit,
+    )
+    hoisted = tree.build(
+        keys, shape.FACT, tree.fat(2), by_fid.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+
+    assert plain.fp == hoisted.fp
+    assert plain.oid != hoisted.oid
+    assert list(tree.diff(
+        plain, hoisted, shape.FACT, driver.fetch, driver.fetch)) == []
+
+
+def test_fold_rehomes_an_existing_dependency_and_equals_full_build(
+        monkeypatch):
+    facts, by_fid, deps = settle_world(monkeypatch)
+    driver, packing = Driver(), tree.fat(2)
+    before = cold(tree.build(
+        [fact.key for fact in facts[:-1]], shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__, driver.emit,
+    ))
+
+    actual = tree.fold(
+        before, [facts[-1].key], shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__, driver.fetch, driver.emit,
+    )
+    expected = tree.build(
+        [fact.key for fact in facts], shape.FACT, packing,
+        by_fid.__getitem__, deps.__getitem__, driver.emit,
+    )
+    stored = [
+        fact for payload in payloads(actual, driver.fetch)
+        for fact in payload
+    ]
+
+    assert tree.encode_root(tree.Root(
+        actual, "workspace", frozenset())) == tree.encode_root(tree.Root(
+            expected, "workspace", frozenset()))
+    assert [fact.fid for fact in stored].count(facts[0].fid) == 1
+
+
+@pytest.mark.parametrize(
+    "reader", ("facts", "range_facts", "key_facts"))
+def test_fat_fact_readers_reject_payload_leaf_key_mismatch(reader):
+    fact = Fact("sample", 1, [], {})
+    driver = Driver()
+    root = tree.build(
+        [fact.key], shape.FACT, tree.fat(2),
+        lambda fid: fact, lambda fid: (), driver.emit,
+    )
+    root_bytes = tree.encode_root(tree.Root(
+        root, fact.fid, frozenset()))
+    corrupt = tree.decode_root(mismatched_tree_key(
+        root_bytes, driver.fetch, driver.emit)).view
+
+    with pytest.raises(ValueError, match="tree fact set"):
+        if reader == "facts":
+            tree.facts(corrupt, driver.fetch, shape.FACT)
+        elif reader == "range_facts":
+            tree.range_facts(
+                corrupt, ("", corrupt.sep), driver.fetch, shape.FACT)
+        else:
+            tree.key_facts(
+                corrupt, (corrupt.sep,), driver.fetch, shape.FACT)
+
+
+def test_live_oids_of_a_decoded_empty_fat_root_fetches_nothing():
+    driver = Driver()
+    empty = tree.build(
+        [], shape.FACT, tree.FAT,
+        lambda fid: None, lambda fid: (), driver.emit,
+    )
+    decoded = cold(empty)
+
+    assert tree.live_oids(
+        decoded, lambda oid: pytest.fail(f"fetched empty root {oid}")) == set()
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_fat_fold_matches_full_build_for_dependent_stragglers(
+        monkeypatch, seed):
+    monkeypatch.setattr(shape, "CUT", 2)
+    rng = random.Random(seed)
+    facts = [
+        Fact("sample", ordinal, [], {"ordinal": ordinal})
+        for ordinal in range(64)
+    ]
+    by_fid = {fact.fid: fact for fact in facts}
+    deps = {}
+    for ordinal, fact in enumerate(facts):
+        candidates = facts[:ordinal]
+        deps[fact.fid] = tuple(
+            item.fid for item in rng.sample(
+                candidates, min(len(candidates), rng.randrange(4))))
+
+    order = facts[:]
+    rng.shuffle(order)
+    driver, packing = Driver(), tree.fat(2)
+    view = tree.build(
+        [], shape.FACT, packing, by_fid.__getitem__,
+        deps.__getitem__, driver.emit,
+    )
+    seen = set()
+    while order:
+        take = rng.randrange(1, 8)
+        chosen, order = order[:take], order[take:]
+        closure, stack = set(), [fact.fid for fact in chosen]
+        while stack:
+            fid = stack.pop()
+            if fid not in closure:
+                closure.add(fid)
+                stack.extend(deps[fid])
+        additions = closure - seen
+        seen.update(additions)
+        view = tree.fold(
+            cold(view), [by_fid[fid].key for fid in additions],
+            shape.FACT, packing, by_fid.__getitem__, deps.__getitem__,
+            driver.fetch, driver.emit,
+        )
+        expected = tree.build(
+            [by_fid[fid].key for fid in seen],
+            shape.FACT, packing, by_fid.__getitem__, deps.__getitem__,
+            driver.emit,
+        )
+        assert tree.encode_root(tree.Root(
+            view, "workspace", frozenset())) == tree.encode_root(tree.Root(
+                expected, "workspace", frozenset()))
+
+
+def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice")
+    destination = Node(str(tmp_path / "destination"))
+    deliver(
+        destination, workspace,
+        closed_subset(source, workspace, [workspace]),
+    )
+    destination.turn(workspace)
+    for ordinal in range(24):
+        cmds.post(
+            source, workspace, "general", f"message {ordinal}",
+            ts=source.fact_of(workspace, workspace).ts + ordinal + 1,
+        )
+
+    class LocalPeer:
+        def __init__(self, node, ws, url):
+            self.node, self.ws = node, ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            raw = source.store(self.ws).get("root")
+            return raw, source.store(self.ws).etag("root")
+
+        def obj(self, oid):
+            return source.store(self.ws).get("obj/" + oid)
+
+        def put_pile(self, raw):
+            deliver(source, self.ws, raw)
+            source.turn(self.ws)
+
+    monkeypatch.setattr(sync_module, "Peer", LocalPeer)
+    pulled, pushed = sync_module.sync(
+        destination, workspace, "local://source")
+
+    assert (pulled, pushed) == (1, 0)
+    assert all_fids(destination, workspace) == all_fids(source, workspace)
+    assert destination.store(workspace).get("root") \
+        == source.store(workspace).get("root")
 
 
 # ---- kernel unification (poc-16-808.3, stage S2) -----------------------------
