@@ -160,6 +160,43 @@ def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
     assert not judge(first + [forged_sig, forged], root.fid)
 
 
+def test_authority_facts_cannot_satisfy_their_own_prerequisite(anchor_chain):
+    founder_sk, founder_pk, root = anchor_chain
+    ts = now_ms()
+    primary = device(founder_pk, "phone", ts + 1)
+    primary_sig = signature(founder_sk, founder_pk, primary, ts + 1)
+
+    self_device = Fact(
+        "device_invite",
+        ts + 2,
+        [
+            ["offer", "member", founder_pk],
+            ["offer", "device", founder_pk, founder_pk],
+        ],
+        {
+            "pk": founder_pk,
+            "user": founder_pk,
+            "device": founder_pk,
+            "label": "self",
+        },
+    )
+    self_device_sig = signature(
+        founder_sk, founder_pk, self_device, ts + 2)
+    assert not judge(
+        [root, primary_sig, primary, self_device_sig, self_device],
+        root.fid)
+
+    self_admin = Fact(
+        "admin",
+        ts + 2,
+        [["offer", "admin", founder_pk]],
+        {"pk": founder_pk, "target": founder_pk},
+    )
+    self_admin_sig = signature(
+        founder_sk, founder_pk, self_admin, ts + 2)
+    assert not judge([root, self_admin_sig, self_admin], root.fid)
+
+
 def test_removal_gates_requests_only(anchor_chain):
     """Validity is globals-blind; only the ephemeral family reads removal."""
     sk, pk, g = anchor_chain

@@ -6,7 +6,7 @@ import urllib.request
 from ...close import encode_pile
 from ...crypto import box_decrypt, h, kdf, load_sk, sign, verify
 from ...fact import Fact, from_json
-from . import signature, user_invite
+from . import legacy_invite, signature, user_invite
 
 TAG = "user"
 
@@ -58,8 +58,12 @@ def blob_refs(f):
 # MATERIALIZE
 def materialize(db, workspace, valid):
     body = valid.fact.body
-    db.execute("INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
-               (workspace, body["pk"], body["name"], "member"))
+    db.execute(
+        "INSERT INTO members VALUES(?,?,?,?,0) "
+        "ON CONFLICT(ws, pk) DO UPDATE SET "
+        "name=excluded.name, role=excluded.role "
+        "WHERE members.role='device'",
+        (workspace, body["pk"], body["name"], "member"))
 
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
@@ -75,7 +79,10 @@ def accept(node, link, name):
         f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15).read()
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
     bootstrap = [from_json(item) for item in blob["pile"]]
-    invitation = [fact for fact in bootstrap if fact.t == user_invite.TAG][-1]
+    invitation = [
+        fact for fact in bootstrap
+        if fact.t in {user_invite.TAG, legacy_invite.TAG}
+    ][-1]
     ts = now_ms()
     secret, public = node.identity()
     member = user(invitation, load_sk(blob["isk"]), public, name, ts)

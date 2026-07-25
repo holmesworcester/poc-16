@@ -7,8 +7,11 @@ from tinyp2p import cmds
 from tinyp2p import facts
 from tinyp2p.crypto import keypair
 from tinyp2p.facts.auth.device import bind, device, devices
+from tinyp2p.facts.auth.device_invite import device_invite as device_invite_fact
 from tinyp2p.facts.auth.device_invite import grant
 from tinyp2p.facts.auth.signature import signature
+from tinyp2p.facts.auth.user import user
+from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.auth.workspace import workspace as workspace_fact
 from tinyp2p.kernel import drain
 from tinyp2p.node import Node
@@ -96,3 +99,40 @@ def test_duplicate_device_projection_uses_the_smallest_fact_id():
     winner = min((first, second), key=lambda fact: fact.fid)
     assert observed[0] == observed[1] == [
         (public, public, winner.body["label"], winner.fid)]
+
+
+def test_bearer_user_precedes_device_role_in_every_arrival_order():
+    founder_secret, founder = keypair()
+    root = workspace_fact(founder_secret, founder, "alice", 1)
+    primary = device(founder, "phone", 2)
+    primary_sig = signature(founder_secret, founder, primary, 2)
+
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(founder, invite_public, 3)
+    invitation_sig = signature(founder_secret, founder, invitation, 3)
+    bob_secret, bob = keypair()
+    joined = user(invitation, invite_secret, bob, "Bob", 4)
+    joined_sig = signature(bob_secret, bob, joined, 4)
+    direct = device_invite_fact(
+        founder, founder, bob, "laptop", 5)
+    direct_sig = signature(founder_secret, founder, direct, 5)
+
+    prefix = [root, primary_sig, primary]
+    bearer = [invitation_sig, invitation, joined_sig, joined]
+    device_grant = [direct_sig, direct]
+    observed = []
+    for stream in (
+            prefix + bearer + device_grant,
+            prefix + device_grant + bearer):
+        result = drain(stream, root.fid)
+        assert result.ok
+        db = sqlite3.connect(":memory:")
+        db.executescript(facts.APP_SCHEMA)
+        for valid in result.valids:
+            facts.materialize(db, root.fid, valid)
+        observed.append(db.execute(
+            "SELECT name, role FROM members WHERE ws=? AND pk=?",
+            (root.fid, bob)).fetchone())
+        db.close()
+
+    assert observed == [("Bob", "member"), ("Bob", "member")]

@@ -65,7 +65,10 @@ def blob_refs(f):
 def materialize(db, workspace, valid):
     body = valid.fact.body
     db.execute(
-        "INSERT OR IGNORE INTO members VALUES(?,?,?,?,0)",
+        "INSERT INTO members VALUES(?,?,?,?,0) "
+        "ON CONFLICT(ws, pk) DO UPDATE SET "
+        "name=excluded.name, role=excluded.role "
+        "WHERE members.role='device'",
         (workspace, body["pk"], body["name"], "member"))
 
 

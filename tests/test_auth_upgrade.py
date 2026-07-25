@@ -1,6 +1,9 @@
 """Upgrade coverage for workspaces persisted with the pre-rename auth tags."""
+import base64
+
 from tinyp2p import cmds
-from tinyp2p.crypto import keypair
+from tinyp2p.crypto import box_encrypt, kdf, keypair
+from tinyp2p.fact import canon
 from tinyp2p.facts.auth.legacy_genesis import genesis
 from tinyp2p.facts.auth.legacy_invite import invite
 from tinyp2p.facts.auth.legacy_join import join
@@ -67,3 +70,47 @@ def test_legacy_auth_store_upgrades_rebuilds_and_accepts_new_facts(tmp_path):
     assert {row[0] for row in upgraded.idx(workspace).execute(
         "SELECT DISTINCT t FROM facts")} \
         >= {"genesis", "sig", "invite", "join", "signature", "msg"}
+
+
+def test_invite_link_minted_before_upgrade_redeems_after_upgrade(
+        tmp_path, monkeypatch):
+    founder_secret, founder = keypair()
+    root = genesis(founder_secret, founder, "alice", 1)
+    invite_secret, invite_public = keypair()
+    invitation = invite(founder, invite_public, 2)
+    invitation_sig = legacy_signature(
+        founder_secret, founder, invitation, 2)
+    seed = b"legacy-invite-seed".ljust(32, b"\0")
+    blob = canon({
+        "pile": [
+            root.to_json(),
+            invitation_sig.to_json(),
+            invitation.to_json(),
+        ],
+        "isk": invite_secret.encode().hex(),
+        "ws": root.fid,
+    })
+    encrypted = box_encrypt(kdf(seed, "key"), blob)
+
+    class Response:
+        def read(self):
+            return encrypted
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("tinyp2p.walk.walk", lambda *args, **kwargs: None)
+    link = base64.urlsafe_b64encode(canon({
+        "u": "http://legacy-peer",
+        "ws": root.fid,
+        "s": seed.hex(),
+    })).decode()
+    joining = Node(str(tmp_path / "joining"))
+
+    workspace = cmds.join(joining, link, "bob")
+
+    assert workspace == root.fid
+    assert {row[0] for row in joining.idx(workspace).execute(
+        "SELECT DISTINCT t FROM facts")} \
+        >= {"genesis", "sig", "invite", "signature", "user"}
+    assert {member["name"] for member in cmds.members(joining, workspace)} \
+        == {"alice", "bob"}

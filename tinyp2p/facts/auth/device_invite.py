@@ -13,6 +13,8 @@ TAG = "device_invite"
 
 # SHAPE
 def device_invite(pk, user, device_pk, label, ts):
+    if pk == device_pk:
+        raise ValueError("a device grant must target another key")
     return Fact(
         TAG, ts,
         [["offer", "member", device_pk],

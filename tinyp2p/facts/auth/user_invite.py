@@ -67,6 +67,8 @@ def make(node, workspace):
     item = user_invite(public, invite_pk, ts)
     sig = signature.signature(secret, public, item, ts)
     member = offer_source(node, workspace, "member", public)
+    if member is None:
+        raise ValueError("local identity is not a workspace member")
     with node.lock:
         facts = closer(node, workspace, {sig.fid: sig, item.fid: item},
                        {item.fid: [sig.fid, member], sig.fid: []})

@@ -23,6 +23,8 @@ def test_only_an_admin_can_grant_and_grants_delegate(tmp_path):
         cmds.grant_admin(node, workspace, "carol")
 
     node.bind_identity(workspace, founder)
+    with pytest.raises(ValueError, match="another member"):
+        cmds.grant_admin(node, workspace, founder)
     cmds.grant_admin(node, workspace, "bob")
     node.bind_identity(workspace, bob)
     cmds.grant_admin(node, workspace, carol)

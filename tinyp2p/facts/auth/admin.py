@@ -13,6 +13,8 @@ TAG = "admin"
 
 # SHAPE
 def admin(pk, target_pk, ts):
+    if pk == target_pk:
+        raise ValueError("an admin grant must target another member")
     return Fact(
         TAG, ts, [["offer", "admin", target_pk]],
         {"pk": pk, "target": target_pk})

@@ -57,8 +57,10 @@ def payload(node, workspace, verb, exp, ts):
     item = request(public, verb, exp, ts)
     sig = signature.signature(secret, public, item, ts)
     member = offer_source(node, workspace, "member", public)
+    if member is None:
+        raise ValueError("local identity is not a workspace member")
     newmap = {item.fid: item, sig.fid: sig}
-    deps = {item.fid: [sig.fid] + ([member] if member else []), sig.fid: []}
+    deps = {item.fid: [sig.fid, member], sig.fid: []}
     with node.lock:
         return closer(node, workspace, newmap, deps)
 

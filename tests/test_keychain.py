@@ -24,6 +24,12 @@ def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
     assert node.identity_id(workspace) == default_id
     node.bind_identity(workspace, other_id)
     assert node.identity_id(workspace) == other_id
+    fact_count = node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0]
+    with pytest.raises(ValueError, match="not a workspace member"):
+        cmds.post(node, workspace, "general", "must not report success")
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
 
     reopened = Node(node.dir)
     assert reopened.identity_id(workspace) == other_id

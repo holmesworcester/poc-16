@@ -32,7 +32,10 @@ def publish(node, workspace, fact, signature, role="member", blobs=None):
     """Close one signed fact with its local authority edge and ingest it."""
     _, public_key = node.identity(workspace)
     src = offer_source(node, workspace, role, public_key)
+    if src is None:
+        raise ValueError(
+            f"local identity is not a workspace {role}")
     deps = {fact.fid: [r for _, r in fact.refs()] + [signature.fid]
-            + ([src] if src else []), signature.fid: []}
+            + [src], signature.fid: []}
     node.ingest_new(workspace, [signature, fact], deps, blobs)
     return fact.fid
