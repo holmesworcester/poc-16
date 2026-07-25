@@ -96,9 +96,10 @@ def grant(node, workspace, user, device_pk, label):
         if member is None or device_source is None:
             raise ValueError("local identity is not a device-set member")
         # Timestamps order facts but do not establish causality. Reuse the
-        # canonical device-authority fact's timestamp so this logical grant
-        # has stable bytes; refs/needs and close() carry the actual relation.
-        ts = node.fact_of(workspace, device_source).ts
+        # immutable workspace anchor's timestamp so this logical grant has
+        # stable bytes even if an authority proof winner later changes;
+        # refs/needs and close() carry the actual relation.
+        ts = node.fact_of(workspace, workspace).ts
         item = device_invite(public, user, device_pk, label, ts)
         if node.fact_of(workspace, item.fid) is not None:
             return item.fid

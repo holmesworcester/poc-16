@@ -169,8 +169,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400)
         with self.node.lock:
-            globals_ = self.node.globals(ws)
-        ok = evaluate(facts, ws, globals_)
+            ok = evaluate(
+                facts, ws, self.node.globals(ws),
+                canonical_db=self.node.idx(ws))
         rq = [fact for fact in facts if fact.t == request.TAG]
         if not ok or len(rq) != 1 or rq[0].body["exp"] < now_ms():
             return self._send(403)

@@ -293,7 +293,29 @@ def _globals(rows):
     return frozenset(Global(*row) for row in (rows or ()))
 
 
-def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
+def _matches_committed_providers(fact, presented, committed):
+    """Reject a stale proof that hides a committed canonical offer winner.
+
+    A genuinely new address has no committed provider and may bootstrap
+    through the self-contained payload. Once an address exists in the
+    committed workspace, however, evaluate mode must use that same raw winner.
+    Co-offer requirements are intentionally checked only after winner
+    selection, so comparing raw winners also catches a committed winner whose
+    associated value makes the presented need unsatisfiable.
+    """
+    handler = facts.handler_for(fact.t)
+    for need in handler.needs(fact):
+        name, a0, a1, _ = _need_parts(need)
+        committed_source = offer_src(committed, name, a0, a1)
+        if committed_source is not None \
+                and offer_src(presented, name, a0, a1) != committed_source:
+            return False
+    return True
+
+
+def kernel(
+        stream, anchor, *, mode=VALIDATE, globals_=(), db=None,
+        canonical_db=None):
     """Run the shared judge and return its complete internal result.
 
     Most callers should use :func:`validate`, :func:`drain`, or
@@ -318,6 +340,9 @@ def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
                 for _, fid in f.refs())
             deps = resolve_deps(f, con) if handler is not None and refs_seen else None
             good = deps is not None and handler.validate(f, ctx) is True
+            if good and mode == EVALUATE and canonical_db is not None:
+                good = _matches_committed_providers(
+                    f, con, canonical_db)
             if good and mode == EVALUATE and hasattr(handler, "evaluate"):
                 good = handler.evaluate(f, supplied, ctx) is True
         except Exception:
@@ -357,6 +382,8 @@ def drain(stream, anchor, *, db=None):
     return kernel(stream, anchor, mode=DRAIN, db=db)
 
 
-def evaluate(stream, anchor, globals_, *, db=None):
+def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
     """Validate an ephemeral payload against committed globals; return bool."""
-    return kernel(stream, anchor, mode=EVALUATE, globals_=globals_, db=db).ok
+    return kernel(
+        stream, anchor, mode=EVALUATE, globals_=globals_, db=db,
+        canonical_db=canonical_db).ok

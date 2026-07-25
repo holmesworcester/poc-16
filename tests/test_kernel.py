@@ -328,6 +328,13 @@ def test_removed_member_cannot_launder_a_mint_through_a_fresh_user(
     ]
 
     assert validate(stream, root.fid)
+    committed = sqlite3.connect(":memory:")
+    try:
+        assert drain(stream[:5], root.fid, db=committed).ok
+        assert evaluate(
+            stream, root.fid, set(), canonical_db=committed)
+    finally:
+        committed.close()
     assert not evaluate(
         stream, root.fid, {Global("removal", bob)})
     _, unrelated = keypair()

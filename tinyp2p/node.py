@@ -105,9 +105,13 @@ class Node:
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
-            for key in [
-                    key for key in self.sync_cache if key[0] == workspace]:
-                self.sync_cache.pop(key).clear()
+            self._invalidate_sync_cache(workspace)
+
+    def _invalidate_sync_cache(self, workspace):
+        """Make every peer recompare this workspace on its next walk."""
+        for key in [
+                key for key in self.sync_cache if key[0] == workspace]:
+            self.sync_cache.pop(key).clear()
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -222,6 +226,8 @@ class Node:
                     self._rebuild_globals(ws)
             idx.commit()
             if pruned or restored:
+                if restored:
+                    self._invalidate_sync_cache(ws)
                 self._reproject.add(ws)
                 out = [valid for valid in out
                        if valid.fact.fid not in pruned]
@@ -397,6 +403,8 @@ class Node:
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
             idx.commit()
+            if restored:
+                self._invalidate_sync_cache(ws)
         except Exception:
             idx.rollback()
             raise
