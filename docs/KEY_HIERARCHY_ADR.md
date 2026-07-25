@@ -93,10 +93,14 @@ nonce / sender public material
 ciphertext
 ```
 
-Every field above is authenticated. Implementations may use randomized
-encryption and store the ciphertext in ordinary database/object storage. They
-must not place plaintext F, HistoryNode secrets, leaf keys, or recipient
-private material in facts, sync piles, logs, crash reports, or backup exports.
+Every field above is authenticated. On open, the caller supplies the exact
+authoritative context from the named cover record and the provider compares it
+with the authenticated envelope context. An envelope cannot authorize itself
+by asking the provider to trust its own scope, frontier, coordinate, source, or
+policy labels. Implementations may use randomized encryption and store the
+ciphertext in ordinary database/object storage. They must not place plaintext
+F, HistoryNode secrets, leaf keys, or recipient private material in facts, sync
+piles, logs, crash reports, or backup exports.
 
 ## Provider boundary
 
@@ -105,7 +109,7 @@ The production boundary must expose operations equivalent to:
 | Operation | Required behavior |
 |---|---|
 | `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle. Track or destroy orphan allocation after failure. |
-| `open(handle, envelope, aad)` | Open only with the exact generation and authenticated context. Private material never leaves a non-exportable provider. |
+| `open(handle, envelope, expected_context)` | Open only with the exact generation and caller-supplied authoritative context; reject a valid ciphertext whose authenticated self-description differs. Private material never leaves a non-exportable provider. |
 | `seal(public, plaintext, aad)` | Seal F or one retained-cover node to a named generation and exact context. |
 | `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, and freeze the purge-target manifest derived from that causally closed batch; identical saved-input retries coalesce and every mismatch conflicts. |
 | `acquire_writer_lease(P)` | Admit a generation-bound write only while P is finalized and unfenced. |
@@ -155,10 +159,14 @@ For a predecessor P:
 - finalized S must causally close over the claim, exact batch, fence/drain,
   migration, P destruction, provider completion evidence, and reader proof.
 
-At the next transition, the already committed S/T pair advances to S/T/U. A
-rollback-resistant provider retains enough one-time claim state outside
-rollbackable application storage to reject a second P claim after restoration
-of an older snapshot.
+At the next transition, the already committed S/T pair advances to S/T/U. The
+provider resolves the exact causal parent claim by predecessor id—not a latest
+key or time lookup—and verifies that the live S and T public keys still equal
+that claim before allocating U and again before accepting S/T/U. Replacing the
+handle currently stored under the label `T` cannot silently create a new
+schedule. A rollback-resistant provider retains enough one-time claim state
+outside rollbackable application storage to reject a second P claim after
+restoration of an older snapshot.
 
 ## Rotation and migration protocol
 
@@ -175,8 +183,12 @@ wrap inventory, and local absence are not triggers or proofs.
 5. Close the P writer fence. Abort or drain every P lease.
 6. Load the purge-target manifest frozen by the claim. A different or omitted
    manifest fails; exact purge targets are not copied to S.
-7. Open each live P envelope through the provider, immediately reseal to S, and
-   durably mark the exact record complete. Clear plaintext buffers.
+7. Open each live P envelope through the provider using the authoritative cover
+   record context, immediately reseal to S, and durably mark the exact record
+   complete. On restart, cryptographically reopen and context-check even a
+   record already labeled S before counting it complete; a relabeled,
+   transplanted, or corrupt record blocks P destruction. Clear plaintext
+   buffers.
 8. Verify that every survivor has an S envelope, that the live S/T handles
    still match the exact public-key bytes in the claim, and that no committed
    record can still be written under P.

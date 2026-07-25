@@ -192,6 +192,8 @@ class ProviderModel:
         expected_index = generation_index(self.staged) + 1
         if generation_index(generation) != expected_index:
             return "invalid-recursive-schedule"
+        if not self._active_pair_matches_parent_claim():
+            return "recursive-commitment-mismatch"
         result = self._generate(generation)
         if result == "capacity-failure-before-predecessor-destruction":
             return result
@@ -239,12 +241,48 @@ class ProviderModel:
                 return False
         return True
 
+    def _accepted_claim(self, predecessor):
+        """Return only the immutable claim for this exact predecessor."""
+        protected = self._hardware_claims.get(predecessor)
+        if protected is not None:
+            return protected
+        return self.disk["claims"].get(predecessor)
+
+    def _active_pair_matches_parent_claim(self):
+        """Validate the causal P/S/T chain without selecting a latest key."""
+        active_index = generation_index(self.active)
+        if active_index == 0:
+            return True
+        parent_predecessor = GENERATIONS[active_index - 1]
+        parent = self._accepted_claim(parent_predecessor)
+        if parent is None:
+            return False
+        if (
+            parent.successor != self.active
+            or parent.next_generation != self.staged
+            or parent.successor_suite != RECIPIENT_SUITE
+            or parent.next_suite != RECIPIENT_SUITE
+        ):
+            return False
+        expected = (
+            (self.active, parent.successor_public),
+            (self.staged, parent.next_public),
+        )
+        for generation, expected_public in expected:
+            private_bytes = self._handles.get(generation)
+            if private_bytes is None:
+                return False
+            actual_public = bytes(
+                public.PrivateKey(private_bytes).public_key
+            )
+            if actual_public != expected_public:
+                return False
+        return True
+
     def claim(self, prepared):
         predecessor = prepared.predecessor
         claim = prepared.claim
-        prior = self._hardware_claims.get(predecessor)
-        if prior is None:
-            prior = self.disk["claims"].get(predecessor)
+        prior = self._accepted_claim(predecessor)
         if prior is not None:
             if prior != claim:
                 return "conflict"
@@ -266,6 +304,8 @@ class ProviderModel:
             return "invalid-successor"
         if prepared.next_generation != self.disk["prepared_next"]:
             return "invalid-next-commitment"
+        if not self._active_pair_matches_parent_claim():
+            return "recursive-commitment-mismatch"
         if not self._claim_handles_match(claim):
             return "prepared-key-mismatch"
         try:
@@ -337,14 +377,8 @@ class ProviderModel:
             separators=(",", ":"),
         ).encode()
 
-    def _seal(self, generation, cover_id, plaintext, context=None):
-        if context is None:
-            context = self._cover_context(cover_id, generation)
-        if (
-            context.generation != generation
-            or context.provider_suite != RECIPIENT_SUITE
-        ):
-            raise CryptoError("cover context does not match provider generation")
+    def _seal(self, generation, cover_id, plaintext):
+        context = self._cover_context(cover_id, generation)
         key = public.PrivateKey(self._usable_private(generation)).public_key
         bound_plaintext = self._cover_aad(cover_id, context) + b"\0" + plaintext
         return Envelope(
@@ -353,9 +387,12 @@ class ProviderModel:
         )
 
     def _open(self, cover_id, envelope):
+        expected_context = self._cover_context(cover_id, envelope.generation)
+        if envelope.context != expected_context:
+            raise CryptoError("cover context does not match authoritative record")
         key = public.PrivateKey(self._usable_private(envelope.generation))
         bound_plaintext = public.SealedBox(key).decrypt(envelope.ciphertext)
-        prefix = self._cover_aad(cover_id, envelope.context) + b"\0"
+        prefix = self._cover_aad(cover_id, expected_context) + b"\0"
         if not bound_plaintext.startswith(prefix):
             raise CryptoError("cover context mismatch")
         return bound_plaintext[len(prefix) :]
@@ -426,18 +463,17 @@ class ProviderModel:
         for cover_id, envelope in self.disk["covers"].items():
             if cover_id in manifest:
                 continue
-            if envelope.generation == successor:
-                migrated[cover_id] = envelope
-                continue
-            if envelope.generation != predecessor:
+            if envelope.generation not in (predecessor, successor):
                 return "unexpected-cover-generation"
             plaintext = self._open(cover_id, envelope)
-            migrated[cover_id] = self._seal(
-                successor,
-                cover_id,
-                plaintext,
-                replace(envelope.context, generation=successor),
-            )
+            if envelope.generation == successor:
+                migrated[cover_id] = envelope
+            else:
+                migrated[cover_id] = self._seal(
+                    successor,
+                    cover_id,
+                    plaintext,
+                )
         self.disk["covers"] = migrated
         self.disk["migrated"][predecessor] = (successor, manifest)
         return "migrated"
@@ -793,6 +829,53 @@ def test_cover_envelope_authenticates_every_context_field():
         provider._open(cover_id, tampered)
 
 
+def test_cover_open_rejects_valid_ciphertext_for_self_described_foreign_context():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    cover_id = "retained-node-a"
+    expected = provider._cover_context(cover_id, "P")
+    foreign = replace(
+        expected,
+        content_scope_id="other-workspace",
+        frontier_id="other-frontier",
+    )
+    key = public.PrivateKey(provider._usable_private("P")).public_key
+    bound = (
+        provider._cover_aad(cover_id, foreign)
+        + b"\0"
+        + b"foreign secret"
+    )
+    envelope = Envelope(
+        foreign,
+        bytes(public.SealedBox(key).encrypt(bound)),
+    )
+
+    with pytest.raises(CryptoError, match="authoritative record"):
+        provider._open(cover_id, envelope)
+
+
+def test_migration_reopens_successor_labeled_records_before_destroying_p():
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    provider.seed_cover("frontier-root", b"survivor")
+    transition = FIXTURE["decision"]["transition_batches"][0]
+    assert provider.prepare_next("T") == "prepared"
+    prepared = prepared_transition(provider, transition)
+    assert provider.claim(prepared) == "accepted"
+    assert provider.fence_and_drain("P")[0] == "fenced"
+
+    envelope = provider.cover_envelope("frontier-root")
+    provider.disk["covers"]["frontier-root"] = replace(
+        envelope,
+        context=replace(envelope.context, generation="S"),
+    )
+    manifest = purge_targets_for_operations(prepared.operations)
+    with pytest.raises(CryptoError):
+        provider.migrate("P", "S", manifest)
+
+    assert provider.disk["migrated"] == {}
+    assert "P" in provider._handles
+    assert provider.destroy("P", "S") == "migration-required"
+
+
 def test_transition_steps_reject_unclaimed_successors_and_changed_manifest():
     provider = ProviderModel(capacity=3, rollback_resistant=True)
     covers = cover_fixture()
@@ -848,6 +931,32 @@ def test_claim_binds_actual_public_keys_and_rejects_replaced_staged_handle():
     assert provider.migrate("P", "S", manifest) == "prepared-key-mismatch"
     assert provider.disk["destroyed"] == {}
     assert provider.open_cover("frontier-root") == b"survivor"
+
+
+@pytest.mark.parametrize("replace_before_prepare", (True, False))
+def test_next_transition_rejects_replacement_of_committed_staged_key(
+    replace_before_prepare,
+):
+    provider = ProviderModel(capacity=3, rollback_resistant=True)
+    first = FIXTURE["decision"]["transition_batches"][0]
+    complete_transition(provider, first)
+    committed_t_public = provider._hardware_claims["P"].next_public
+    second = FIXTURE["decision"]["transition_batches"][1]
+
+    if not replace_before_prepare:
+        assert provider.prepare_next("U") == "prepared"
+    del provider._handles["T"]
+    assert provider._generate("T") == "generated"
+    assert provider.public_key("T") != committed_t_public
+
+    if replace_before_prepare:
+        assert provider.prepare_next("U") == "recursive-commitment-mismatch"
+        assert "U" not in provider._handles
+    else:
+        replacement = prepared_transition(provider, second)
+        assert replacement.successor_public != committed_t_public
+        assert provider.claim(replacement) == "recursive-commitment-mismatch"
+        assert provider.disk["claims"].get("S") is None
 
 
 @pytest.mark.parametrize(
