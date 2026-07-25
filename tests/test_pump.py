@@ -12,7 +12,15 @@ from tinyp2p.node import Node, now_ms
 from tinyp2p.pump import pump, retract
 from tinyp2p.suppression import atom
 
-from .util import add_member, all_fids, closed_subset, deliver
+from .util import (
+    add_member,
+    all_fids,
+    closed_subset,
+    deliver,
+    projection_state,
+    replay_random,
+    suppression_world,
+)
 
 
 @pytest.fixture
@@ -219,9 +227,9 @@ def test_missing_cursor_rebuilds(world, monkeypatch, historical_minus):
 
 
 @pytest.mark.parametrize("boundary", ("live", "retry", "restart", "rebuild"))
-def test_pump_preserves_order_for_dependent_updates(
+def test_dependent_facts_follow_source_at_every_projection_boundary(
         tmp_path, monkeypatch, boundary):
-    """Same-batch UPDATEs follow their member across every replay boundary."""
+    """Dependent facts materialize after their source across every boundary."""
     from tinyp2p import node as runtime
 
     source = Node(str(tmp_path / "source"))
@@ -439,16 +447,40 @@ def test_removal_join_confluence(tmp_path):
 
 # ---- THE theorem (poc-16-808.7) ------------------------------------------------
 
-@pytest.mark.skip(reason="poc-16-808.7")
-def test_fold_pm_over_d_equals_fold_over_e():
+def test_fold_pm_over_d_equals_fold_over_e(tmp_path, monkeypatch):
     """Live: fold± over random delivery orders of D. Rebuild: fold over E in
     canonical order. Identical app.db (dump compare), for every world in the
     suppression corpus."""
-    raise NotImplementedError
+    source, workspace, _, _ = suppression_world(
+        tmp_path / "source", monkeypatch)
+    expected = projection_state(source)
+    for seed in range(4):
+        live = replay_random(
+            source, workspace, Node(str(tmp_path / f"live-{seed}")), seed)
+        assert projection_state(live) == expected
+        live.rebuild(workspace)
+        assert projection_state(live) == expected
 
 
-@pytest.mark.skip(reason="poc-16-808.7")
-def test_rebuild_fires_zero_retractions():
+def test_rebuild_fires_zero_retractions(tmp_path, monkeypatch):
     """Replay computes S first (T_supp / the root), folds over E: the '−'
     path never runs; the retraction counter stays 0."""
-    raise NotImplementedError
+    import tinyp2p.pump as pump_module
+
+    node, workspace, targets, _ = suppression_world(
+        tmp_path / "node", monkeypatch)
+    expected = projection_state(node)
+    calls = []
+    monkeypatch.setattr(
+        pump_module, "retract",
+        lambda *args: calls.append(args))
+
+    node.rebuild(workspace)
+
+    assert calls == []
+    assert projection_state(node) == expected
+    assert not {
+        targets[index] for index in (1, 4, 6)
+    }.intersection(
+        src for (src,) in node.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (workspace,)))

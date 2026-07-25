@@ -40,10 +40,13 @@ def deathkey(fact):
     return suppkey(fact) if is_deletion(fact) else None
 
 
-def victims(fact):
-    """The explicit target of today's single-target deletion."""
+def victims(fact, fact_of):
+    """The explicit non-deletion target of today's single-target deletion."""
     if not is_deletion(fact):
         return ()
     targets = tuple(
         fid for name, fid in fact.refs() if name == TARGET)
-    return targets if len(targets) == 1 else ()
+    if len(targets) != 1:
+        return ()
+    target = fact_of(targets[0])
+    return targets if target is not None and not is_deletion(target) else ()

@@ -26,6 +26,7 @@ from .kernel import (
     Judgment,
     drain,
     extend_proofs,
+    proof_sources,
     proof_rank,
     rebuild_proofs,
     resolve_deps,
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v7-pump"
+INDEX_VERSION = "family-contract-v8-ref-proofs"
 APP_VERSION = 1
 
 
@@ -255,7 +256,9 @@ class Node:
         admitted = tuple(admitted)
         retracted = set(retracted)
         for fid in admitted:
-            retracted.update(victims(self.fact_of(ws, fid)))
+            retracted.update(victims(
+                self.fact_of(ws, fid),
+                lambda target: self.fact_of(ws, target)))
         append_admitted(idx, admitted)
         append_retracted(idx, sorted(retracted))
         if reproject:
@@ -448,13 +451,12 @@ class Node:
             if shadows or not newfids else set()
         if shadows or restored or not newfids:
             return self._prune_unresolved(ws), restored
-        # A healthy index has proofs for every old offer source.  On the
-        # conflict-free append path only new offer sources can be missing, so
-        # do not anti-join the complete offers/proofs tables on every post.
+        # A healthy index ranks every offer source and explicit-ref target.
+        # Only new facts can introduce either, so ordinary appends stay O(new).
         missing = {
-            fid for fid in newfids
-            if (fact := self.fact_of(ws, fid)) is not None and fact.offers()
-            and idx.execute(
+            fid for fid in proof_sources(
+                newfids, lambda source: self.fact_of(ws, source))
+            if idx.execute(
                 "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone() is None
         }
         if not missing:

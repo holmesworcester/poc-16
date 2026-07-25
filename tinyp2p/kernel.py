@@ -268,8 +268,21 @@ def extend_proofs(db, fids, fact_of):
     return frozenset(unresolved)
 
 
+def proof_sources(fids, fact_of):
+    """Facts whose ranks must persist: offer providers and ref targets."""
+    sources = set()
+    for fid in fids:
+        fact = fact_of(fid)
+        if fact is None:
+            continue
+        if fact.offers():
+            sources.add(fid)
+        sources.update(ref for _, ref in fact.refs())
+    return sources
+
+
 def rebuild_proofs(db, fact_of):
-    """Recompute shortest authority proofs for every offer source.
+    """Recompute shortest authority proofs for every persistent source.
 
     Facts are admitted in rank waves.  A fact in wave ``r`` can depend only on
     providers from earlier waves, which gives every accepted set one
@@ -282,8 +295,9 @@ def rebuild_proofs(db, fact_of):
     """
     db.execute("DELETE FROM proofs")
     return extend_proofs(
-        db,
-        [fid for (fid,) in db.execute("SELECT DISTINCT src FROM offers")],
+        db, proof_sources(
+            (fid for (fid,) in db.execute("SELECT fid FROM facts")),
+            fact_of),
         fact_of,
     )
 

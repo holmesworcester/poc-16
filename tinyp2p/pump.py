@@ -12,6 +12,7 @@ the root), folds over E in canonical order, and zero retractions fire.
 from . import facts
 from .close import close
 from .kernel import Valid, resolve_deps
+from .suppression import victims
 
 # idx.db — appended by node.merge in the same transaction as facts/offers
 LOG_SCHEMA = """
@@ -95,16 +96,24 @@ def pump(node, ws, projector="app"):
         try:
             if rebuilding:
                 facts.clear(app, ws)
-                active = [
+                valid_facts = [
                     node.fact_of(ws, fid)
                     for (fid,) in idx.execute("SELECT fid FROM facts")
                 ]
+                by_fid = {fact.fid: fact for fact in valid_facts}
+                suppressed = {
+                    target
+                    for fact in valid_facts
+                    for target in victims(fact, by_fid.get)
+                }
                 ordered = close(
-                    active,
+                    valid_facts,
                     lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or (),
                     lambda fid: node.fact_of(ws, fid),
                 )
-                for item in (valid(fact.fid) for fact in ordered):
+                for item in (
+                        valid(fact.fid) for fact in ordered
+                        if fact.fid not in suppressed):
                     materialize(item)
                 end = idx.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
