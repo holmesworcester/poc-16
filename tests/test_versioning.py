@@ -125,8 +125,14 @@ def test_unreadable_pile_is_retained_and_drains_after_upgrade():
 
 
 @pytest.mark.skip(reason="skeleton — poc-16-9fc.5")
-def test_unreadable_range_stalls_instead_of_being_re_pulled_every_walk():
-    """The live bug: today those facts never land, so the leaf re-pulls forever."""
+def test_unreadable_range_stalls_instead_of_being_refetched():
+    """The live bug: the range never converges, so every root change refetches it."""
+    raise NotImplementedError
+
+
+@pytest.mark.skip(reason="skeleton — poc-16-9fc.5")
+def test_unreadable_retention_is_bounded_per_prefix():
+    """Suspending blame must not reopen the litter DoS: a byte cap and a TTL."""
     raise NotImplementedError
 
 
