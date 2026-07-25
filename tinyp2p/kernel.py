@@ -293,6 +293,53 @@ def _globals(rows):
     return frozenset(Global(*row) for row in (rows or ()))
 
 
+def _admit(con, fact, rank):
+    con.execute(
+        "INSERT OR IGNORE INTO facts VALUES(?,?,?)",
+        (fact.fid, fact.ts, fact.t),
+    )
+    con.executemany(
+        "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
+        ((*offer, fact.fid) for offer in fact.offers()),
+    )
+    con.execute(
+        "INSERT OR IGNORE INTO proofs VALUES(?,?)",
+        (fact.fid, rank),
+    )
+
+
+def _judge(stream, ctx, mode=VALIDATE, supplied=frozenset()):
+    """The one streaming judge, with transaction policy left to its caller."""
+    con = ctx.db
+    valids, emitted = [], set()
+    for fact in stream:
+        if con.execute(
+                "SELECT 1 FROM facts WHERE fid=?",
+                (fact.fid,)).fetchone():
+            continue
+        try:
+            handler = facts.handler_for(fact.t)
+            refs_seen = all(con.execute(
+                "SELECT 1 FROM facts WHERE fid=?", (fid,)).fetchone()
+                for _, fid in fact.refs())
+            deps = resolve_deps(
+                fact, con) if handler is not None and refs_seen else None
+            good = deps is not None and handler.validate(fact, ctx) is True
+            if good and mode == EVALUATE and hasattr(handler, "evaluate"):
+                good = handler.evaluate(fact, supplied, ctx) is True
+        except Exception:
+            good = False  # hostile family bytes are litter, never poison
+        rank = proof_rank(con, deps) if good else None
+        if rank is None:
+            return Judgment(False, tuple(valids), frozenset())
+        _admit(con, fact, rank)
+        if mode == DRAIN:
+            emitted.update(
+                Global(*row) for row in handler.global_rows(fact))
+        valids.append(Valid(fact, tuple(deps)))
+    return Judgment(True, tuple(valids), frozenset(emitted))
+
+
 def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
     """Run the shared judge and return its complete internal result.
 
@@ -306,45 +353,16 @@ def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
     con = db or sqlite3.connect(":memory:")
     con.executescript(SCHEMA)
     con.execute("BEGIN")
-    valids, emitted = [], set()
-    ctx = Context(con, anchor)
-    for f in stream:
-        if con.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone():
-            continue
-        try:
-            handler = facts.handler_for(f.t)
-            refs_seen = all(con.execute(
-                "SELECT 1 FROM facts WHERE fid=?", (fid,)).fetchone()
-                for _, fid in f.refs())
-            deps = resolve_deps(f, con) if handler is not None and refs_seen else None
-            good = deps is not None and handler.validate(f, ctx) is True
-            if good and mode == EVALUATE and hasattr(handler, "evaluate"):
-                good = handler.evaluate(f, supplied, ctx) is True
-        except Exception:
-            good = False  # hostile family bytes are litter, never poison
-        if not good:
-            con.rollback()
-            if db is None:
-                con.close()
-            return Judgment(False, (), frozenset())
-        rank = proof_rank(con, deps)
-        if rank is None:
-            con.rollback()
-            if db is None:
-                con.close()
-            return Judgment(False, (), frozenset())
-        con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
-        for name, a0, a1 in f.offers():
-            con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-                        (name, a0, a1, f.fid))
-        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
-        if mode == DRAIN:
-            emitted.update(Global(*row) for row in handler.global_rows(f))
-        valids.append(Valid(f, tuple(deps)))
+    result = _judge(stream, Context(con, anchor), mode, supplied)
+    if not result.ok:
+        con.rollback()
+        if db is None:
+            con.close()
+        return Judgment(False, (), frozenset())
     con.commit()
     if db is None:
         con.close()
-    return Judgment(True, tuple(valids), frozenset(emitted))
+    return result
 
 
 def validate(stream, anchor, *, db=None):
@@ -362,11 +380,7 @@ def evaluate(stream, anchor, globals_, *, db=None):
     return kernel(stream, anchor, mode=EVALUATE, globals_=globals_, db=db).ok
 
 
-# ---- PLAN SKELETON (poc-16-808.3, stage S2) — the path scratchpad -----------
-# SIMPLIFY.md §1. The verified-ancestor context for tree descents becomes a
-# kernel capability, and hoist._judge/_insert/_pop are DELETED — they are this
-# loop, copy-pasted. tree.verify drives it; sync.sync carries ONE scratchpad
-# across consecutive differing ranges, which closes the catchup re-verify tax.
+# ---- verified path context --------------------------------------------------
 
 
 class Scratchpad:
@@ -374,19 +388,74 @@ class Scratchpad:
     the one judge loop. Memory stays O(depth · payload)."""
 
     def __init__(self, anchor, db=None):
-        raise NotImplementedError("poc-16-808.3")
+        self.db = db or sqlite3.connect(":memory:")
+        self._owned = db is None
+        self.db.executescript(SCHEMA)
+        if not self.db.in_transaction:
+            self.db.execute("BEGIN")
+        self.ctx = Context(self.db, anchor)
 
     def judge(self, stream):
         """Judge a payload against the accumulated context and absorb it on
         success — kernel(mode=VALIDATE) without the txn wrapper. Returns
         (ok, accepted fids)."""
-        raise NotImplementedError("poc-16-808.3")
+        self.db.execute("SAVEPOINT judge")
+        try:
+            result = _judge(stream, self.ctx)
+        except Exception:
+            self.db.execute("ROLLBACK TO judge")
+            self.db.execute("RELEASE judge")
+            raise
+        if not result.ok:
+            self.db.execute("ROLLBACK TO judge")
+        self.db.execute("RELEASE judge")
+        if not result.ok:
+            return False, ()
+        return result.ok, tuple(valid.fact.fid for valid in result.valids)
 
     def context(self, stream):
         """Materialize an already-verified payload as context without
         re-judging (spine reuse: ph in base_phs)."""
-        raise NotImplementedError("poc-16-808.3")
+        self.db.execute("SAVEPOINT context")
+        accepted = []
+        try:
+            for fact in stream:
+                if self.db.execute(
+                        "SELECT 1 FROM facts WHERE fid=?",
+                        (fact.fid,)).fetchone():
+                    continue
+                deps = resolve_deps(fact, self.db)
+                rank = proof_rank(
+                    self.db, deps) if deps is not None else None
+                if rank is None:
+                    raise ValueError(
+                        "cached payload is not dependency-closed")
+                _admit(self.db, fact, rank)
+                accepted.append(fact.fid)
+        except Exception:
+            self.db.execute("ROLLBACK TO context")
+            self.db.execute("RELEASE context")
+            raise
+        self.db.execute("RELEASE context")
+        return tuple(accepted)
 
     def pop(self, fids):
         """Undo one node's payload on backtrack."""
-        raise NotImplementedError("poc-16-808.3")
+        rows = [(fid,) for fid in fids]
+        self.db.executemany(
+            "DELETE FROM offers WHERE src=?", rows)
+        self.db.executemany(
+            "DELETE FROM proofs WHERE fid=?", rows)
+        self.db.executemany(
+            "DELETE FROM facts WHERE fid=?", rows)
+
+    def close(self):
+        if self._owned:
+            self.db.rollback()
+            self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

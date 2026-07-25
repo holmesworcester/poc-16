@@ -46,8 +46,9 @@ Two accumulators, one down, one up:
 
 - **down**: the separator interval plus the *path scratchpad* — the verified
   ancestor context (`sqlite :memory:`, push on descend, pop on backtrack). This
-  is `verify_once`'s scratchpad, and it is the same thing the sync walk should
-  carry so consecutive ranges share a verified set (the known catchup tax).
+  is `verify_once`'s scratchpad, and it is the same capability the hoisted sync
+  walk carries so consecutive ranges share a verified path (the known catchup
+  tax; production wiring lands with hoisting in `808.9`).
 - **up**: rebuilt node hashes / pull-push sets / verdicts, committed at the top
   by ONE commit discipline (CAS root, or append into `roots/` + amortized merge
   — jbg.3; the engine takes it as a callback).
@@ -228,7 +229,8 @@ fold±(delivery order over D) = fold(canonical order over E)      (the theorem)
 S1  shape.py + tree.py extraction under golden gates, absorbing jbg.1
     (binary + flat packings reproduce today's bytes; fat packing added third).
 S2  kernel unification: path scratchpad into kernel.py, delete hoist._judge;
-    walk carries the scratchpad across ranges (closes the catchup re-verify tax).
+    tree verification carries it across ranges. Production sync wiring waits
+    for settle-node payloads (`808.9`); current ingress piles stay independent.
 S3  mint reduction (§4); daemon.mint thins to decode→evaluate→seal.
 S4  log + cursor + pump (§5), single-target retraction.
 S5  projector contract + removal/join confluence fix; AST tests.

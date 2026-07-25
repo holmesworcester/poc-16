@@ -23,13 +23,12 @@ door, so any insertion order yields the identical tree, exactly as treap.py.
     node.hash = h("HN" | sep | ph | L.hash | R.hash)   (leaf: h("HL" | ph))
     ph        = h(encode_pile(payload)),  payload = facts settling at the node
 """
-import sqlite3
 import sys
 
-from . import facts as _fam
+from . import tree
 from .close import encode_pile
 from .crypto import h
-from .kernel import SCHEMA, Context, proof_rank, resolve_deps
+from .kernel import Scratchpad
 from .shape import boundary, fid_of, priority
 
 sys.setrecursionlimit(200000)
@@ -182,60 +181,6 @@ def path_union(root, target):
 
 # ---- Part B: verify-once ----------------------------------------------------
 
-def _judge(con, stream, anchor):
-    """The kernel VALIDATE loop against a con already holding the ancestor
-    context — mirrors kernel.kernel(mode=VALIDATE) without the txn wrapper so
-    the caller can push/pop the path. Returns (ok, [accepted fids])."""
-    ctx = Context(con, anchor)
-    acc = []
-    for f in stream:
-        if con.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone():
-            continue
-        try:
-            handler = _fam.handler_for(f.t)
-            refs_seen = all(con.execute("SELECT 1 FROM facts WHERE fid=?", (fid,)).fetchone()
-                            for _, fid in f.refs())
-            deps = resolve_deps(f, con) if handler is not None and refs_seen else None
-            good = deps is not None and handler.validate(f, ctx) is True
-        except Exception:
-            good = False
-        if not good:
-            return False, acc
-        rank = proof_rank(con, deps)
-        if rank is None:
-            return False, acc
-        con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
-        for name, a0, a1 in f.offers():
-            con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, f.fid))
-        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
-        acc.append(f.fid)
-    return True, acc
-
-
-def _insert(con, stream):
-    """Materialize an already-verified payload as context, without re-judging."""
-    n = 0
-    for f in stream:
-        if con.execute("SELECT 1 FROM facts WHERE fid=?", (f.fid,)).fetchone():
-            continue
-        deps = resolve_deps(f, con)
-        rank = proof_rank(con, deps) if deps is not None else None
-        if rank is None:
-            raise ValueError("cached payload is not dependency-closed")
-        con.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?)", (f.fid, f.ts, f.t))
-        for name, a0, a1 in f.offers():
-            con.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, f.fid))
-        con.execute("INSERT OR IGNORE INTO proofs VALUES(?,?)", (f.fid, rank))
-        n += 1
-    return n
-
-
-def _pop(con, fids):
-    """Undo a node's payload on backtrack — memory stays O(depth·payload)."""
-    con.executemany("DELETE FROM facts WHERE fid=?", [(f,) for f in fids])
-    con.executemany("DELETE FROM offers WHERE src=?", [(f,) for f in fids])
-    con.executemany("DELETE FROM proofs WHERE fid=?", [(f,) for f in fids])
-
 
 def verify_once(root, anchor, fact_of, base_hashes=None, base_phs=None):
     """Descend top-down carrying a scratchpad = the verified ancestor pathUnion
@@ -247,33 +192,6 @@ def verify_once(root, anchor, fact_of, base_hashes=None, base_phs=None):
     `base_phs` is re-materialized as context but NOT re-judged, so judge-ops
     counts only genuinely changed facts. Full catchup (no baseline) judges each
     fact once: judge-ops = |V|."""
-    con = sqlite3.connect(":memory:")
-    con.executescript(SCHEMA)
-    con.execute("BEGIN")
-    st = {"judged": set(), "judge_ops": 0, "ctx_ops": 0, "skipped": 0, "ok": True}
-
-    def rec(nd):
-        if base_hashes is not None and nd["hash"] in base_hashes:
-            st["skipped"] += 1
-            return True                       # unchanged subtree: already judged
-        stream = [fact_of(fid) for fid in nd["pay"]]
-        if base_phs is not None and nd["ph"] in base_phs:
-            st["ctx_ops"] += _insert(con, stream)   # unchanged payload on the spine
-            acc = nd["pay"]
-        else:
-            ok, acc = _judge(con, stream, anchor)
-            st["judge_ops"] += len(acc)
-            st["judged"].update(acc)
-            if not ok:
-                st["ok"] = False
-                _pop(con, acc)
-                return False
-        good = True
-        if not nd["leaf"]:
-            good = rec(nd["L"]) and rec(nd["R"])
-        _pop(con, acc)
-        return good
-
-    st["ok"] = rec(root) and st["ok"]
-    con.close()
-    return st
+    with Scratchpad(anchor) as pad:
+        return tree.verify(
+            root, pad, fact_of, None, base_hashes, base_phs)

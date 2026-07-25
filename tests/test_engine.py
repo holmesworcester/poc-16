@@ -1,15 +1,18 @@
 """Acceptance laws for the one sans-I/O tree engine."""
+import ast
 import json
+import pathlib
 import random
 from dataclasses import replace
 
 import pytest
 
-from tinyp2p import layout, shape, treap, tree
+from tinyp2p import hoist, layout, shape, treap, tree
 from tinyp2p import cmds
 from tinyp2p.crypto import h
 from tinyp2p.fact import Fact, canon
 from tinyp2p.facts.content.message import message
+from tinyp2p.kernel import Scratchpad, resolve_deps
 from tinyp2p.node import Node
 
 from .util import author_msg, closed_subset, deliver
@@ -499,16 +502,106 @@ def test_read_floor_a_b_p_plus_spine(engine_world):
 
 # ---- kernel unification (poc-16-808.3, stage S2) -----------------------------
 
-@pytest.mark.skip(reason="poc-16-808.3")
-def test_verify_judge_ops_equal_valid_set_on_cold_catchup():
-    raise NotImplementedError
+@pytest.fixture(scope="module")
+def hoist_world(tmp_path_factory):
+    node = Node(str(tmp_path_factory.mktemp("hoist")))
+    workspace = cmds.create(node, "alice", ts=1_000_000)
+    for ordinal in range(24):
+        cmds.post(
+            node, workspace, "general", f"message {ordinal}",
+            ts=1_000_001 + ordinal,
+        )
+    idx = node.idx(workspace)
+    fact_of = lambda fid: node.fact_of(workspace, fid)
+    deps_of = lambda fid: resolve_deps(fact_of(fid), idx) or ()
+    root, objects = hoist.build(node.keys(workspace), fact_of, deps_of)
+    return workspace, root, objects, fact_of
 
 
-@pytest.mark.skip(reason="poc-16-808.3")
-def test_scratchpad_carried_across_ranges():
-    raise NotImplementedError
+def test_verify_judge_ops_equal_valid_set_on_cold_catchup(hoist_world):
+    workspace, root, objects, fact_of = hoist_world
+    expected = {fid for node in hoist.walk(root) for fid in node["pay"]}
+
+    with Scratchpad(workspace) as pad:
+        actual = tree.verify(root, pad, fact_of, objects.get)
+
+    assert actual["ok"]
+    assert actual["judged"] == expected
+    assert actual["judge_ops"] == len(expected)
+    assert actual == hoist.verify_once(root, workspace, fact_of)
 
 
-@pytest.mark.skip(reason="poc-16-808.3")
+def test_scratchpad_carried_across_ranges(hoist_world):
+    workspace, root, objects, fact_of = hoist_world
+    assert not root["leaf"] and root["pay"]
+    expected = {fid for node in hoist.walk(root) for fid in node["pay"]}
+
+    with Scratchpad(workspace) as pad:
+        ok, shared = pad.judge(
+            [fact_of(fid) for fid in root["pay"]])
+        left = tree.verify(root["L"], pad, fact_of, objects.get)
+        right = tree.verify(root["R"], pad, fact_of, objects.get)
+        pad.pop(shared)
+
+    judged = set(shared) | left["judged"] | right["judged"]
+    assert ok and left["ok"] and right["ok"]
+    assert judged == expected
+    assert len(shared) + left["judge_ops"] + right["judge_ops"] \
+        == len(expected)
+
+
+def test_failed_scratchpad_judge_is_atomic(hoist_world):
+    workspace, root, _, fact_of = hoist_world
+    signature = next(
+        fact_of(fid) for node in hoist.walk(root) for fid in node["pay"]
+        if fact_of(fid).t == "signature"
+    )
+    bad = Fact("unknown", signature.ts, (), {})
+
+    with Scratchpad(workspace) as pad:
+        ok, retained = pad.judge([fact_of(workspace)])
+        before = pad.db.execute(
+            "SELECT fid FROM facts ORDER BY fid").fetchall()
+        rejected = pad.judge([signature, bad])
+        after = pad.db.execute(
+            "SELECT fid FROM facts ORDER BY fid").fetchall()
+        pad.pop(retained)
+
+    assert ok
+    assert rejected == (False, ())
+    assert after == before
+
+
 def test_single_judge_loop():
-    raise NotImplementedError
+    root = pathlib.Path(__file__).resolve().parent.parent / "tinyp2p"
+    modules = {
+        name: ast.parse((root / f"{name}.py").read_text())
+        for name in ("hoist", "kernel")
+    }
+    hoist_defs = {
+        node.name for node in modules["hoist"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    kernel_defs = {
+        node.name: node for node in modules["kernel"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    scratchpad = next(
+        node for node in modules["kernel"].body
+        if isinstance(node, ast.ClassDef) and node.name == "Scratchpad"
+    )
+    methods = {
+        node.name: node for node in scratchpad.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    assert {"_judge", "_insert", "_pop"}.isdisjoint(hoist_defs)
+    assert sum(isinstance(node, ast.For)
+               for node in ast.walk(kernel_defs["_judge"])) == 1
+    for caller in (kernel_defs["kernel"], methods["judge"]):
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_judge"
+            for node in ast.walk(caller)
+        )

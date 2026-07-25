@@ -740,8 +740,52 @@ def merge(a, b, shape, packing, fetch, emit):
 
 
 def verify(root, pad, fact_of, fetch, base_hashes=None, base_phs=None):
-    """Stage S2: kernel Scratchpad descent (poc-16-808.3)."""
-    raise NotImplementedError("poc-16-808.3")
+    """Verify a hoisted tree once, carrying ``pad`` down each changed path.
+
+    Callers may retain a common ancestor in the same pad while invoking this
+    on consecutive child ranges; shared context is then judged only once.
+    """
+    st = {
+        "judged": set(), "judge_ops": 0, "ctx_ops": 0,
+        "skipped": 0, "ok": True,
+    }
+
+    def payload(node):
+        if fetch is None or not node["pay"]:
+            return [fact_of(fid) for fid in node["pay"]]
+        raw = fetch(node["ph"])
+        if raw is None or h(raw) != node["ph"]:
+            raise ValueError("payload integrity")
+        stream, _ = decode_pile(raw)
+        if len(stream) != node["n"] \
+                or tuple(fact.fid for fact in stream) != tuple(node["pay"]):
+            raise ValueError("payload summary")
+        return stream
+
+    def rec(node):
+        if base_hashes is not None and node["hash"] in base_hashes:
+            st["skipped"] += 1
+            return True
+        stream = payload(node)
+        accepted = ()
+        try:
+            if base_phs is not None and node["ph"] in base_phs:
+                accepted = pad.context(stream)
+                st["ctx_ops"] += len(accepted)
+            else:
+                ok, accepted = pad.judge(stream)
+                st["judge_ops"] += len(accepted)
+                st["judged"].update(accepted)
+                if not ok:
+                    st["ok"] = False
+                    return False
+            return node["leaf"] or (
+                rec(node["L"]) and rec(node["R"]))
+        finally:
+            pad.pop(accepted)
+
+    st["ok"] = rec(root) and st["ok"]
+    return st
 
 
 def live_oids(view, fetch=None):
