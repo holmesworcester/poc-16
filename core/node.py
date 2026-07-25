@@ -36,6 +36,7 @@ from .pump import (
     CURSOR_SCHEMA,
     LOG_SCHEMA,
     append_admitted,
+    append_received,
     append_retracted,
     pump,
 )
@@ -53,8 +54,8 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v8-ref-proofs"
-APP_VERSION = 1
+INDEX_VERSION = "family-contract-v9-attachments"
+APP_VERSION = 3
 
 
 def now_ms():
@@ -87,6 +88,9 @@ class Node:
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
+            self.log_arrivals(ws, (
+                fid for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
+            ))
             pump(self, ws)  # resume rows committed after the last root publish
 
     # ---- node-local state ----------------------------------------------------
@@ -239,9 +243,26 @@ class Node:
                         new_globals.update(global_rows)
                         blobs.update(u[1])
                 fresh, newfids = self.merge(ws, valids, new_globals)
+                arrived = set()
                 for bh, b in blobs.items():
-                    st.put_if_absent("obj/" + bh, b)
+                    if not st.has("obj/" + bh):
+                        st.put("obj/" + bh, b)
+                        arrived.add(bh)
                 self.commit(ws, newfids)
+                spilled = {}
+                for valid in fresh:
+                    refs = facts.blob_refs(valid.fact)
+                    if refs:
+                        spilled[valid.fact.fid] = refs
+                received = {
+                    fid for fid, refs in spilled.items()
+                    if set(refs) & arrived
+                }
+                if received:
+                    self.log_arrivals(ws, received, repeat=True)
+                resident = set(spilled) - received
+                if resident:
+                    self.log_arrivals(ws, resident)
                 pump(self, ws)
                 for k in piles:
                     st.delete(k)  # retire ingress after the CAS
@@ -251,6 +272,33 @@ class Node:
                 # expose an ahead index or app projection after a failed turn.
                 self._restore_authoritative_projections(ws)
                 raise
+
+    def log_arrivals(self, ws, fids, *, repeat=False):
+        """Append resident-object events, but only for published facts.
+
+        ``repeat`` records an actual re-delivery, allowing a missing local
+        object to be repaired after an earlier event. Ordinary probes stay
+        idempotent, including startup repair of a CAS-to-log crash.
+        """
+        with self.lock:
+            self._sync_index(ws)
+            idx, st = self.idx(ws), self.store(ws)
+            notified = set() if repeat else {
+                fid for (fid,) in idx.execute(
+                    "SELECT DISTINCT fid FROM log WHERE op='*'")
+            }
+            landed = []
+            for fid in dict.fromkeys(fids):
+                fact = self.fact_of(ws, fid)
+                if fact is None or fid in notified:
+                    continue
+                refs = facts.blob_refs(fact)
+                if refs and all(st.has("obj/" + oid) for oid in refs):
+                    landed.append(fid)
+            if landed:
+                append_received(idx, landed)
+                idx.commit()
+            return landed
 
     def _log_projection(self, ws, admitted, retracted, reproject):
         idx = self.idx(ws)
@@ -580,8 +628,10 @@ class Node:
                 assert result.ok, "own store failed its own kernel"
             idx.execute("BEGIN")
             try:
-                for table in ("facts", "offers", "proofs", "globals", "log"):
+                for table in ("facts", "offers", "proofs", "globals"):
                     idx.execute(f"DELETE FROM {table}")
+                idx.execute("DROP TABLE IF EXISTS log")
+                idx.execute(LOG_SCHEMA)
                 idx.execute(
                     "DELETE FROM meta WHERE k IN ('root','reproject')")
                 idx.commit()
@@ -590,16 +640,17 @@ class Node:
                 raise
             self._reproject.add(ws)
             if not man:
-                pump(self, ws)
                 self._stamp(ws)
+                pump(self, ws)
                 return
             self.merge(ws, result.valids, result.globals)
-            pump(self, ws)
             if republish:
                 # A semantic index upgrade can select different canonical
                 # providers for the same fact ids. Fingerprints cover ids, not
                 # closure edges, so old fences are deliberately not memoized.
                 self.commit(ws, reuse=False)
-                pump(self, ws)
             else:
                 self._stamp(ws)
+            self.log_arrivals(
+                ws, (valid.fact.fid for valid in result.valids))
+            pump(self, ws)

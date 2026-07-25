@@ -711,10 +711,11 @@ code. Peers may offer long-poll on `/root` as a liveness hint; cadence
 remains the correctness mechanism (POC-13's rule).
 
 Two dialers behind one client, picked by URL scheme: `https://` (WebPKI —
-S3, Lambda, mirrors) and `iroh://<node-id>` (h3 over iroh; the node id is
-the key, so dialing authenticates; hole-punching and relays included). iroh
-is dumb pipes only — no iroh-docs/blobs/gossip, bao stays retired — and
-pre-1.0, so the connector module is its containment boundary.
+  S3, Lambda, mirrors) and `iroh://<node-id>` (h3 over iroh; the node id is
+  the key, so dialing authenticates; hole-punching and relays included). iroh
+  is dumb pipes only — no iroh-docs/blobs/gossip; Bao is confined to attachment
+  verification — and pre-1.0, so the connector module is its containment
+  boundary.
 
 Every node = a **responder half** (seven verbs over its store, zero sync
 logic) + optional **initiator half** (per-workspace walk on cadence,
@@ -876,6 +877,30 @@ Proofs first; no transport work until both numbers exist.
   amortized write-amplification — safe because the cut stays a pure function of
   the set; scaling bounds the fence-run length, not the redundancy (which the
   membership-closure size already caps).
-- Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
-  findings, hash-list slices not bao). (Bulk-join body bundles: resolved
-  2026-07-22 by packed pages — bodies live in the page objects, docs/MODEL.md.)
+- Multi-group on one bucket. (Bulk-join body bundles: resolved 2026-07-22 by
+  packed pages — bodies live in the page objects, docs/MODEL.md.)
+- **Attachments: Bao, resolved 2026-07-25.** A signed descriptor commits the
+  file with one 32-byte BLAKE3 root. Each 256 KiB chunk fact names a separate
+  immutable proof object that authenticates its payload against that root.
+  This gives two useful properties:
+
+  - progress counts only locally resident chunks whose proof verifies, without
+    trusting arrival order, a peer, or projection state; and
+  - the descriptor remains O(1), measured at about 660 bytes from 1 MB through
+    256 MB, instead of growing with a per-slice hash list.
+
+  The measured price is 6.3–6.5% proof overhead, the pinned `bao 0.13.1` Rust
+  dependency, and sequential per-chunk GETs that reached about 93 MB/s for a
+  1 GB download. Peak RSS stayed below 100 MB on both daemons, versus 10 GB on
+  the replaced whole-blob send path (`bench/RESULTS.md`).
+
+  POC-14's per-slice hashes remain the live alternative: they need only
+  `hash(bytes) == id` and avoid native code, but make the descriptor O(chunks).
+  The policy boundary is deliberately narrow (`core/bao.py` and
+  `facts/content/{file,chunk}.py`) if that trade changes.
+
+  New descriptors use the versioned `file_bao` wire tag; the old `file` handler
+  remains read-only so persisted whole-blob workspaces survive upgrades.
+  Proofs ride `obj/`; only their signed chunk facts enter the tree. Object
+  arrival is therefore a second delivery channel, represented by `*fid` in the
+  projection log and folded through the same resumable path as admission.

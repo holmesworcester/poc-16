@@ -11,6 +11,7 @@ import hashlib
 import hmac as hmaclib
 import json
 import os
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -234,10 +235,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.syncer.kick()
                 return self._json(200, r)
             if parts[1] == "send":
-                r = {"fid": cmds.send_file(n, ws, o.get("chan", "general"), o["name"],
-                                           base64.b64decode(o["data"]))}
+                r = {"fid": self.send_file(n, ws, o)}
                 self.syncer.kick()
                 return self._json(200, r)
+            if parts[1] == "save":
+                return self._json(
+                    200, cmds.save_file(n, ws, o["fid"], o["out"]))
             if parts[1] == "evict":
                 r = {"fid": cmds.evict(n, ws, o["member"])}
                 self.syncer.kick()
@@ -253,6 +256,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404)
+
+    def send_file(self, node, ws, request):
+        """Use daemon-local paths for large files; spool inline control data."""
+        if request.get("path"):
+            return cmds.send_file(
+                node, ws, request.get("chan", "general"),
+                request["path"], request.get("name"))
+        handle, path = tempfile.mkstemp(prefix="poc-16-ctl-")
+        try:
+            with os.fdopen(handle, "wb") as spool:
+                spool.write(base64.b64decode(request["data"]))
+            return cmds.send_file(
+                node, ws, request.get("chan", "general"), path,
+                request.get("name") or "attachment")
+        finally:
+            os.unlink(path)
 
     def _resolve(self, ws):
         """Accept a unique workspace-id prefix on the control plane."""

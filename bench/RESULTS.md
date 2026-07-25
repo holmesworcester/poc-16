@@ -127,3 +127,75 @@ here.
 `python3 bench/bench_sync.py 500000` (add 500k), `python3 bench/bench_sync.py cut`
 (flat CUT sweep), `python3 bench/bench_sync.py tier` (tiered vs flat).
 Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
+
+---
+
+# Attachments — measured
+
+`python3 bench/bench_files.py` on the same desktop. Files are Bao-rooted: one
+32-byte BLAKE3 root commits the whole file, each 256 KiB chunk carries its
+authentication path, and only verified chunks count toward progress. Every run
+reassembles on the receiver and checks that the saved bytes match the source.
+
+## 1. Self-proving overhead
+
+| MB | chunks | proof % | B/chunk | descriptor B | outboard MB | tree keys |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 6.28 | 15,704 | 656 | 0.06 | 10 |
+| 8 | 31 | 6.35 | 16,392 | 658 | 0.50 | 64 |
+| 64 | 245 | 6.42 | 16,780 | 661 | 4.00 | 492 |
+| 256 | 977 | 6.47 | 16,959 | 662 | 16.00 | 1,956 |
+
+The proof tax stays near 6.3–6.5% while the descriptor remains about 660 bytes.
+A per-slice hash list moves that cost into the descriptor and crosses the 8 KB
+body-spill threshold at roughly 20 MB of file.
+
+## 2. Author side, cold local store
+
+| MB | chunks | send s | send MB/s | save s | save MB/s | store MB | peak RSS GB | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 64 | 245 | 0.62 | 103.0 | 0.10 | 628.6 | 68.5 | 0.03 | ✓ |
+| 256 | 977 | 1.89 | 135.2 | 0.40 | 641.5 | 274.2 | 0.04 | ✓ |
+| 1024 | 3,907 | 7.48 | 136.8 | 1.55 | 661.0 | 1,097.4 | 0.08 | ✓ |
+
+Send builds the Bao tree, extracts and verifies each slice, and spills each
+proof before publishing the descriptor and chunk facts. Save re-verifies every
+slice while atomically assembling the output.
+
+## 3. Download over two real daemons
+
+| MB | chunks | send MB/s | first chunk s | download s | download MB/s | wall MB/s | RSS tx | RSS rx | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 8 | 31 | 72.4 | 0.21 | 0.26 | 30.6 | 21.5 | 0.03 | 0.04 | ✓ |
+| 64 | 245 | 99.1 | 0.31 | 0.73 | 87.9 | 46.6 | 0.03 | 0.04 | ✓ |
+| 256 | 977 | 130.7 | 1.04 | 2.71 | 94.5 | 54.9 | 0.05 | 0.05 | ✓ |
+| 1024 | 3,907 | 128.9 | 3.83 | 11.04 | 92.8 | 54.0 | 0.08 | 0.09 | ✓ |
+
+Progress becomes visible at the first verified chunk and advances while objects
+land. The sequential fetch loop is the remaining throughput ceiling.
+
+## 4. Against the replaced whole-blob path
+
+Same machine and 1 GB payload:
+
+| | whole blob | Bao chunks | |
+|---|---:|---:|---|
+| send | 78.3 MB/s | 128.9 MB/s | 1.6× faster |
+| download | 129.6 MB/s | 92.8 MB/s | 0.72× |
+| peak RSS, sender | 10.03 GB | 0.08 GB | 125× less |
+| peak RSS, receiver | 5.03 GB | 0.09 GB | 56× less |
+| progress | none | per verified chunk | |
+| resumable | no | yes | |
+
+The chunked path keeps one roughly 280 KB proof in memory at a time, making
+peak memory a function of chunk width rather than file size.
+
+The integration-line rerun after landing measured 31.4 MB/s at 8 MB and
+83.9 MB/s at 1,024 MB, byte-identical, with 0.08 GB peak receiver RSS. That is
+within the expected sequential-HTTP variance and preserves the memory result.
+
+---
+*Reproduce:* `python3 bench/bench_files.py --mode overhead 1 8 64 256`,
+`python3 bench/bench_files.py --mode send 64 256 1024`, and
+`python3 bench/bench_files.py 8 64 256 1024`. Override the scratch directory
+with `BENCH_DIR`.

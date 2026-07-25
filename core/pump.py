@@ -18,7 +18,7 @@ from .suppression import victims
 LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS log(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    op  TEXT NOT NULL CHECK(op IN ('+','-')),
+    op  TEXT NOT NULL CHECK(op IN ('+','-','*')),
     fid TEXT NOT NULL);
 """
 
@@ -45,6 +45,14 @@ def append_retracted(idx, targets):
     idx.executemany(
         "INSERT INTO log(op, fid) VALUES('-', ?)",
         ((fid,) for fid in targets),
+    )
+
+
+def append_received(idx, fids):
+    """*fid when every immutable object named by a fact is resident."""
+    idx.executemany(
+        "INSERT INTO log(op, fid) VALUES('*', ?)",
+        ((fid,) for fid in fids),
     )
 
 
@@ -92,6 +100,7 @@ def pump(node, ws, projector="app"):
             )
             facts.materialize(app, ws, item)
 
+        blob_of = lambda oid: node.store(ws).get("obj/" + oid)
         app.execute("BEGIN")
         try:
             if rebuilding:
@@ -111,10 +120,17 @@ def pump(node, ws, projector="app"):
                     lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or (),
                     lambda fid: node.fact_of(ws, fid),
                 )
-                for item in (
-                        valid(fact.fid) for fact in ordered
-                        if fact.fid not in suppressed):
+                active = {
+                    fact.fid for fact in ordered
+                    if fact.fid not in suppressed
+                }
+                for item in (valid(fact.fid) for fact in ordered
+                             if fact.fid in active):
                     materialize(item)
+                for (fid,) in idx.execute(
+                        "SELECT fid FROM log WHERE op='*' ORDER BY seq"):
+                    if fid in active:
+                        facts.received(app, ws, valid(fid), blob_of)
                 end = idx.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
             else:
@@ -122,6 +138,12 @@ def pump(node, ws, projector="app"):
                     if op == "+":
                         item = valid(fid)
                         materialize(item)
+                    elif op == "*":
+                        if app.execute(
+                                "SELECT 1 FROM projected "
+                                "WHERE ws=? AND src=?",
+                                (ws, fid)).fetchone() is not None:
+                            facts.received(app, ws, valid(fid), blob_of)
                     else:
                         retract(app, ws, fid)
                 end = rows[-1][0]

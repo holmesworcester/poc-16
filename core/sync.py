@@ -20,6 +20,7 @@ def sync(node, ws, url):
     got = peer.root(cache.get("etag"))
     if got is None:
         if node.store(ws).etag("root") == cache.get("local"):
+            _fetch_blobs(node, ws, peer)
             return 0, 0
         remote_root, retag = cache.get("root"), cache.get("etag")
     else:
@@ -73,7 +74,7 @@ def sync(node, ws, url):
 
     if pulled_oids:
         node.turn(ws)
-        _fetch_blobs(node, ws, peer)
+    _fetch_blobs(node, ws, peer)
     cache.update({
         "etag": retag, "root": remote_root,
         "local": node.store(ws).etag("root"),

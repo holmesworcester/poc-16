@@ -1,5 +1,7 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
+import os
 import random
+import tempfile
 
 import facts
 
@@ -205,3 +207,15 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 def all_fids(n, ws):
     return [fid for (fid,) in n.idx(ws).execute("SELECT fid FROM facts ORDER BY ts, fid")]
+
+
+def send_bytes(node, workspace, name, data, channel="general", ts=None):
+    """Test adapter for the path-only attachment authoring seam."""
+    handle, path = tempfile.mkstemp(prefix="poc-16-test-")
+    try:
+        with os.fdopen(handle, "wb") as spool:
+            spool.write(data)
+        return cmds.send_file(
+            node, workspace, channel, path, name=name, ts=ts)
+    finally:
+        os.unlink(path)
