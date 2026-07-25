@@ -30,6 +30,10 @@ For one device recipient lineage:
   created for it. Recreating a handle under the same label does not change that
   commitment and makes every open, wrap, writer, and transition operation fail
   closed.
+- The recipient lineage is bound to one protected provider epoch. Restore
+  compares that epoch and every restored suite-qualified generation commitment
+  with the live provider; state from a fresh or reprovisioned provider fails
+  closed and must enter as a new lineage.
 - FrontierRoot and HistoryNode cover secrets are encrypted data, not hardware
   handles. Their count may grow with the canonical puncture cover while
   hardware handle count remains constant per recipient lineage.
@@ -127,12 +131,14 @@ The production boundary must expose operations equivalent to:
 | `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle, and retain the id's immutable suite-qualified public commitment. Track or destroy orphan allocation after failure; a replacement handle under the same id is ineligible for every provider operation. |
 | `open(handle, envelope, expected_context, expected_secret_commitment)` | Before decrypting, require the handle to match the exact immutable generation suite and public key. Then authenticate the caller-supplied context and canonical local-secret commitment and recompute the commitment from plaintext. Private material never leaves a non-exportable provider. |
 | `seal(public, plaintext, aad, secret_commitment)` | Seal F or one retained-cover node to a named generation, exact context, and generation-independent canonical local-secret commitment. |
-| `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, together with the purge-target manifest derived from the canonical set of causally referenced operation ids. On the rollback-resistant tier, commit that whole protected claim/manifest record before writing rollbackable mirrors. Duplicate refs do not create another batch, identical saved-input retries coalesce, and every semantic mismatch conflicts. |
+| `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, together with the purge-target manifest derived from the canonical set of causally referenced operation ids. On the rollback-resistant tier, P must be the exact protected live position and a non-genesis P must have exact protected parent completion; then commit the whole protected claim/manifest record before writing rollbackable mirrors. Duplicate refs do not create another batch, identical saved-input retries coalesce, and every semantic mismatch conflicts. |
 | `acquire_writer_lease(P)` | Admit a caller-requested generation-bound write only while that exact P is active, finalized, unfenced, and the live active/staged handles still match their immutable public commitments. Every commit rechecks the same conditions. Never replace a saved P request with the current generation. |
 | `close_and_drain(P)` | Require P's accepted claim and immutable suite/public commitment, persist a provider-protected closing phase before returning, reject new P leases and commits against both protected and application state, and drain or abort all existing leases before survivor enumeration. |
-| `migrate(P, S, manifest)` | Require P and S to match their immutable suite/public commitments and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. Freeze the exact `(cover id, local-secret commitment)` map on the first attempt; retries must match rather than replace it. The rollback-resistant tier commits this proof in protected state before replacing rollbackable cover storage. |
-| `destroy(P)` | Immediately before retirement, require P's immutable suite/public commitment, the exact frozen survivor map, and cryptographically reopen every authoritative survivor as S. On the rollback-resistant tier, atomically commit the protected successor retirement position, which makes P unusable, before physical cleanup. Other tiers durably persist an exact claim/manifest/migration/key destruction intent before invoking non-transactional key deletion. Cleanup and evidence completion are idempotent. |
-| `promote(P, S, T, claim)` | Change active/staged state to S/T without allocation or dependence on a clock or lookup-selected key. |
+| `migrate(P, S, manifest)` | Require the authoritative fence (the protected fence on the strong tier), P and S's immutable suite/public commitments, and the manifest from P's accepted claim; then reseal every live cover record except exact purge targets with restartable per-record progress. Freeze the exact `(cover id, local-secret commitment)` map on the first attempt; retries must match rather than replace it. The rollback-resistant tier commits this proof in protected state before replacing rollbackable cover storage. |
+| `destroy(P)` | In one serialized retirement operation, snapshot the exact frozen survivor records, cryptographically reopen them as S, then prove the records are unchanged and recheck exact P/S/T handles immediately before retirement. On the rollback-resistant tier, atomically bind the exact claim and migration proof into the protected successor retirement position, which makes P unusable, before physical cleanup. Other tiers durably persist the same exact destruction intent before invoking non-transactional key deletion. Cleanup and evidence completion are idempotent. |
+| `promote(P, S, T, claim)` | Require exact provider retirement evidence and P-handle absence, then change active/staged state to S/T without allocation or dependence on a clock or lookup-selected key. |
+| `finalize(P, S, T, claim)` | Recheck exact retirement evidence, P absence, S/T commitments, and the causal parent ref. The strong tier commits exact protected completion first; finalized and wrap-eligible fields are replayable mirrors, so a crash between them cannot strand or falsely authorize S. |
+| `restore(metadata)` | Compare the restored provider epoch and suite-qualified generation commitments with live protected state. A foreign/reprovisioned provider or stale protected position fails closed; it is never rebound to an existing lineage by matching labels. |
 | `capabilities()` | Report suite, non-exportability, deletion, rollback, attestation, capacity, backup, and clone guarantees without exaggeration. |
 
 The stable identity provider may sign a provider attestation or shared
@@ -191,12 +197,15 @@ Finalized S and the provider's promoted state persist an explicit ref to the
 exact P claim id/digest. At the next transition, the already committed S/T pair
 advances to S/T/U. The provider follows that ref—not generation-list order, a
 latest key, or a time lookup—and verifies that the live S and T public keys
-still equal the referenced claim before allocating U and again before
-accepting S/T/U. S must itself be finalized and wrap-eligible before its claim
-can begin. Replacing the handle currently stored under the label `T` cannot
-silently create a new schedule. A rollback-resistant provider retains enough
-one-time claim state outside rollbackable application storage to reject a
-second P claim after restoration of an older snapshot.
+still equal the referenced claim before allocating U and again before accepting
+S/T/U. On the strong tier it also requires the protected live position to be S
+and the exact protected P-to-S retirement/completion record to match that ref.
+Forged or restored `active`, `finalized`, and `wrap_eligible` mirrors cannot
+advance the protected schedule. S must itself be finalized and wrap-eligible
+before its claim can begin. Replacing the handle currently stored under the
+label `T` cannot silently create a new schedule. A rollback-resistant provider
+retains enough one-time claim state outside rollbackable application storage to
+reject a second P claim after restoration of an older snapshot.
 
 ## Rotation and migration protocol
 
@@ -235,27 +244,33 @@ wrap inventory, and local absence are not triggers or proofs.
    migration retry must reproduce that map and may never bless a reduced or
    changed set. On the rollback-resistant tier the freeze is a protected CAS
    committed before rollbackable cover replacement.
-9. Immediately before P retirement, require the current survivor map to equal
-   the frozen proof, cryptographically reopen every authoritative survivor as S
-   and recompute its commitment, verify that the live S/T handles still match
-   the exact claim, and verify that no record can still be written under P. A
-   missing record, attacker-generated valid S ciphertext, metadata labels, or
-   an earlier completion bit alone are insufficient.
+9. In one lock/transaction/serialized provider retirement operation, snapshot
+   the exact survivor records, require their map to equal the frozen proof,
+   cryptographically reopen every snapshot record as S and recompute its
+   commitment, then require the live records to be byte-for-byte unchanged and
+   revalidate exact P/S/T handles immediately before the irreversible call.
+   Also verify that no record can still be written under P. Loss or replacement
+   of S, T, or P during validation, a missing or changed record,
+   attacker-generated valid S ciphertext, metadata labels, or an earlier
+   completion bit leaves P unretired.
 10. Revalidate P's immutable suite-qualified public commitment. On the
-    rollback-resistant tier, atomically advance protected retirement to the
-    successor, making P unusable, before physical P-handle/keyblob cleanup. On
-    lower tiers, durably write an exact destruction intent binding P's suite and
-    public key, accepted claim/manifest, and migration proof before calling the
-    non-transactional deletion API. A retry with that exact intent distinguishes
-    “not yet deleted” from “deleted before evidence commit”; any mismatch fails
-    closed.
+    rollback-resistant tier, atomically record the exact accepted
+    claim/manifest and migration proof while advancing protected retirement to
+    the successor, making P unusable, before physical P-handle/keyblob cleanup.
+    A floor or rollbackable `destroyed` bit without that exact record is not
+    completion evidence. On lower tiers, durably write the equivalent exact
+    destruction intent before calling the non-transactional deletion API. A
+    retry with that exact intent distinguishes “not yet deleted” from “deleted
+    before evidence commit”; any mismatch fails closed.
 11. Promote the already existing S/T pair. No allocation is permitted after P
     destruction.
-12. Revalidate that the live S and staged T handles, their immutable public
+12. Revalidate that protected retirement names the exact transition, P is
+    physically absent, and the live S and staged T handles, immutable public
     commitments, and S's persisted parent claim ref still match the accepted
-    claim. Publish durable completion
-    evidence and finalized S only after that check. Only then can S satisfy
-    key-wrap, request, proactive-share, or healing needs.
+    claim. On the strong tier, commit protected completion before projecting
+    rollbackable finalized and wrap-eligible mirrors; an exact retry repairs
+    either missing mirror. Only then can S satisfy key-wrap, request,
+    proactive-share, or healing needs.
 13. Garbage-collect superseded P metadata and ciphertext opportunistically.
     Archived P ciphertext is assumed to survive.
 
@@ -280,6 +295,7 @@ transition.
 | Lower tier after P deletion, before destruction evidence | Provider absence plus the exact precommitted intent permits forward reconstruction and promotion. Missing or mismatched intent fails closed. |
 | After P cleanup, before promotion | Retry destruction idempotently. The strong tier reconstructs from the exact protected claim/proof and advanced floor; a lower tier requires its exact durable pre-delete intent plus provider absence. If the required evidence is missing, fail closed. Never allocate a replacement S or T or restore P. |
 | After promotion, before finalization | S/T are durable but S remains ineligible for shared wraps until completion evidence closes. |
+| After protected completion, between finalized/eligibility mirrors | Retry exact finalization. Protected completion is authoritative and reprojects both mirrors; a disk-only mirror cannot authorize the next claim. |
 | After finalization | Duplicate completion/finalization coalesces. Late P mismatch remains a conflict. |
 
 An error before P destruction must leave P usable or report a precisely
@@ -422,16 +438,22 @@ On same-device restore:
 - `hardware-isolated` depends on provider behavior and makes no rollback claim;
   and
 - `rollback-resistant` compares restored metadata with monotonic hardware
-  state, rejects stale P state, and reconciles forward from S/T and shared
-  evidence. A maliciously old snapshot may lose availability, but cannot regain
-  P.
+  state, the protected provider epoch, and the canonical suite/public
+  commitments. It rejects stale P state, a snapshot from a fresh or
+  reprovisioned provider, and forged schedule mirrors, then reconciles forward
+  from exact protected retirement/completion and shared evidence. A maliciously
+  old snapshot may lose availability, but cannot regain P.
 
-Every lease, commit, open, wrap-eligibility query, promotion, and finalization
-checks the protected retirement position and exact live suite-qualified
-active/staged public commitments. Rolled-back metadata that still calls P active
-or finalized, a context relabeled to another provider suite, or a new handle
-generated under an old label is fail-closed before private-key use; it cannot
-admit a writer or open replacement-key ciphertext.
+Every private operation checks its addressed generation's protected provider
+epoch and exact suite-qualified public commitment. Schedule operations—lease,
+commit, wrap eligibility, claim, promotion, and finalization—also check the
+protected live position and exact active/staged pair. Rolled-back metadata that
+still calls P active or finalized, a context relabeled to another provider
+suite, a foreign provider snapshot, or a new handle generated under an old
+label is fail-closed before private-key use; it cannot admit a writer or open
+replacement-key ciphertext. Opening a valid S cover does not by itself require
+unrelated T to remain present, but S cannot become or remain wrap-eligible
+without the exact live S/T schedule.
 
 No restore path asks which key or timestamp is “latest.” It uses explicit
 generation refs and the provider's exact monotonic position.
@@ -476,10 +498,13 @@ The versioned fixture is
 - protected-first claim ordering, including repair of a disk-only partial write
   before rejecting a sibling retry, and immunity to tampered claim/manifest
   mirrors;
+- exact protected-head enforcement, including rejection of forged
+  active/finalized mirrors before a parent transition has protected completion;
 - binding of those claims to actual suite-qualified public-key bytes, including
   rejection when an initial, active, or staged handle is regenerated under the
   same label, rejection of a recreated predecessor even with an empty survivor
-  set, and revalidation on every writer commit and provider open;
+  set, rejection of a foreign/reprovisioned provider epoch on restore, and
+  revalidation on every writer commit and provider open;
 - exact purge-manifest binding plus rejection of mismatched migration,
   destruction, promotion, and finalization state;
 - authenticated binding of every cover-envelope context field and rejection of
@@ -493,14 +518,18 @@ The versioned fixture is
   or T ciphertext and different keys for equal public labels across providers;
 - two steady handles, the three-handle peak, and capacity failure before
   destruction;
-- writer fencing, survivor migration, target purge, allocation-free promotion,
-  rejection of forged destruction evidence, and finalization;
+- protected writer-fence authority, survivor migration, target purge,
+  allocation-free promotion, rejection of forged destruction evidence, and
+  finalization;
 - stale-snapshot writer rejection, protected retirement before physical handle
-  cleanup, exact lower-tier destruction intent before non-transactional
-  deletion, and forward reconstruction of destruction evidence after every
-  crash boundary;
+  cleanup, exact protected retirement records, exact lower-tier destruction
+  intent before non-transactional deletion, and forward reconstruction of
+  destruction evidence after every crash boundary;
+- serialized post-open revalidation under loss/replacement of P, S, or T and
+  concurrent survivor-record replacement or deletion;
 - pre-finalization revalidation of both committed S/T handles after loss or
-  replacement;
+  replacement, plus replay of finalized/eligibility mirrors after a crash
+  following protected completion;
 - strong snapshot restore failing to revive P or fork its claim;
 - software snapshot restore honestly demonstrating resurrection and a sibling
   claim;
