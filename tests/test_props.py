@@ -9,18 +9,21 @@ identical root back.
 P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
 """
 import random
+import sqlite3
 
 import pytest
 
 from tinyp2p import cmds, tree
-from tinyp2p.close import decode_pile, encode_pile
+from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.crypto import h, keypair
 from tinyp2p.fact import Fact
+from tinyp2p.facts.auth.request import payload as request_payload
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
-from tinyp2p.kernel import drain, resolve_deps
+from tinyp2p.facts.content.message import message
+from tinyp2p.kernel import drain, evaluate, resolve_deps
 from tinyp2p.node import Node, now_ms
 from tinyp2p.shape import FACT
 
@@ -121,6 +124,261 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
 
     assert st.get("root") == root_bytes
     assert all_fids(n, ws) == before
+
+
+def test_pre_manifest_crash_replays_from_the_authoritative_root(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    old_root = node.store(workspace).etag("root")
+
+    secret, public = node.identity(workspace)
+    item = message(public, "general", "survives retry", 2)
+    signed = signature(secret, public, item, 2)
+    new = {fact.fid: fact for fact in (signed, item)}
+    deps = {
+        signed.fid: [],
+        item.fid: [signed.fid, member_src(node, workspace, public)],
+    }
+
+    def fact_of(fid):
+        return new.get(fid) or node.fact_of(workspace, fid)
+
+    pile = encode_pile(close(
+        [signed, item],
+        lambda fid: deps[fid] if fid in deps else
+        (resolve_deps(fact_of(fid), node.idx(workspace)) or ()),
+        fact_of,
+    ))
+    deliver(node, workspace, pile)
+    stream, _ = decode_pile(pile)
+    judgment = drain(stream, workspace)
+    assert judgment.ok
+    node.merge(workspace, judgment.valids, judgment.globals)
+
+    # Model process death at the exact merge/manifest boundary: no exception
+    # handler gets to restore the derived index before its connections close.
+    assert node.store(workspace).etag("root") == old_root
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() is None
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone()[0] == 0
+    assert node.store(workspace).list("pile/")
+
+    for index in node._idx.values():
+        index.close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    assert reopened.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone()[0] == 0
+    assert reopened.store(workspace).list("pile/")
+
+    reopened.turn(workspace)
+
+    assert [message["text"] for message in cmds.msgs(
+        reopened, workspace)] == ["survives retry"]
+    assert reopened.store(workspace).list("pile/") == []
+    root = reopened.store(workspace).etag("root")
+    assert reopened.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert reopened.app.execute(
+        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
+        (workspace,)).fetchone()[0] == reopened.idx(workspace).execute(
+        "SELECT MAX(seq) FROM log").fetchone()[0]
+
+
+def test_failed_turn_restores_authoritative_state_before_return(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    ts = now_ms()
+    proof = request_payload(
+        node, workspace, "sync", ts + 60_000, ts)
+    node.bind_identity(workspace, founder)
+    door = node.globals(workspace) | {("now", ts)}
+    assert evaluate(
+        proof,
+        workspace,
+        door,
+        canonical_db=node.idx(workspace),
+    )
+
+    old_root = node.store(workspace).etag("root")
+    store = node.store(workspace)
+    original_cas = store.cas
+
+    def fail_manifest_cas(*args, **kwargs):
+        raise RuntimeError("simulated pre-manifest CAS failure")
+
+    monkeypatch.setattr(store, "cas", fail_manifest_cas)
+    with pytest.raises(RuntimeError, match="pre-manifest CAS failure"):
+        cmds.evict(node, workspace, bob)
+
+    # The daemon catches command failures and keeps serving. Before turn()
+    # releases its lock, the old root must again govern mint, globals, and app.
+    assert node.store(workspace).etag("root") == old_root
+    assert evaluate(
+        proof,
+        workspace,
+        door,
+        canonical_db=node.idx(workspace),
+    )
+    assert ("removal", bob) not in node.globals(workspace)
+    assert next(
+        member for member in cmds.members(node, workspace)
+        if member["pk"] == bob
+    )["evicted"] is False
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (0,)
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (old_root,)
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM cursors WHERE ws=?",
+        (workspace,)).fetchone() == (1,)
+    assert not node.idx(workspace).in_transaction
+    assert not node.app.in_transaction
+    assert node.store(workspace).list("pile/")
+
+    monkeypatch.setattr(store, "cas", original_cas)
+    node.turn(workspace)
+
+    assert not evaluate(
+        proof,
+        workspace,
+        node.globals(workspace) | {("now", ts)},
+        canonical_db=node.idx(workspace),
+    )
+    assert ("removal", bob) in node.globals(workspace)
+    assert next(
+        member for member in cmds.members(node, workspace)
+        if member["pk"] == bob
+    )["evicted"] is True
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (1,)
+    assert node.store(workspace).list("pile/") == []
+    root = node.store(workspace).etag("root")
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert node.app.execute(
+        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
+        (workspace,)).fetchone()[0] == node.idx(workspace).execute(
+        "SELECT MAX(seq) FROM log").fetchone()[0]
+
+
+def test_index_stamp_rolls_back_a_partial_write(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    index = node.idx(workspace)
+    expected = index.execute(
+        "SELECT k, v FROM meta ORDER BY k").fetchall()
+    index.executescript(
+        "CREATE TRIGGER fail_index_version "
+        "BEFORE INSERT ON meta WHEN NEW.k='index-version' "
+        "BEGIN SELECT RAISE(FAIL, 'simulated stamp failure'); END;"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="stamp failure"):
+        node._stamp(workspace)
+
+    assert not index.in_transaction
+    assert index.execute(
+        "SELECT k, v FROM meta ORDER BY k").fetchall() == expected
+    index.execute("DROP TRIGGER fail_index_version")
+    index.commit()
+    node._stamp(workspace)
+
+
+def test_partial_stamp_failure_retries_in_the_same_process(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    original_stamp = node._stamp
+    failed = False
+
+    def fail_once_after_root(stamped_workspace):
+        nonlocal failed
+        if not failed:
+            failed = True
+            node.idx(stamped_workspace).execute(
+                "INSERT OR REPLACE INTO meta VALUES('root', ?)",
+                (node.store(stamped_workspace).etag("root"),),
+            )
+            raise RuntimeError("simulated partial stamp")
+        original_stamp(stamped_workspace)
+
+    monkeypatch.setattr(node, "_stamp", fail_once_after_root)
+    with pytest.raises(RuntimeError, match="simulated partial stamp"):
+        cmds.post(node, workspace, "general", "stamp retry", ts=2)
+
+    assert not node.idx(workspace).in_transaction
+    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
+        == ["stamp retry"]
+    assert node.store(workspace).list("pile/")
+
+    node.turn(workspace)
+
+    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
+        == ["stamp retry"]
+    assert node.store(workspace).list("pile/") == []
+    root = node.store(workspace).etag("root")
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert node.app.execute(
+        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
+        (workspace,)).fetchone()[0] == node.idx(workspace).execute(
+        "SELECT MAX(seq) FROM log").fetchone()[0]
+
+
+def test_bulk_index_crash_cannot_preserve_unpublished_facts(
+        tmp_path, monkeypatch):
+    from bench.bench_sync import bulk_author
+
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    old_root = node.store(workspace).etag("root")
+    bulk_author(
+        node,
+        workspace,
+        [node.identity(workspace)],
+        1,
+        2,
+        1,
+        random.Random(16),
+    )
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == (3,)
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() is None
+
+    def fail_before_manifest(*args, **kwargs):
+        raise RuntimeError("simulated bulk pre-manifest failure")
+
+    monkeypatch.setattr(node.store(workspace), "cas", fail_before_manifest)
+    with pytest.raises(RuntimeError, match="bulk pre-manifest failure"):
+        node.commit(workspace)
+
+    for index in node._idx.values():
+        index.close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert reopened.store(workspace).etag("root") == old_root
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == (1,)
+    assert reopened.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone() == (0,)
 
 
 def test_old_index_rebuilds_generic_globals_on_open(world):

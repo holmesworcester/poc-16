@@ -86,6 +86,7 @@ def test_restart_discards_index_ahead_of_root(tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     root = node.store(workspace).get("root")
+    root_etag = node.store(workspace).etag("root")
 
     def crash(*args, **kwargs):
         raise RuntimeError("before root")
@@ -94,7 +95,11 @@ def test_restart_discards_index_ahead_of_root(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="before root"):
         cmds.post(node, workspace, "general", "not published")
     assert node.idx(workspace).execute(
-        "SELECT 1 FROM meta WHERE k='root'").fetchone() is None
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root_etag,)
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts WHERE t='message'").fetchone() == (0,)
+    assert cmds.msgs(node, workspace) == []
+    assert node.store(workspace).list("pile/")
 
     node.idx(workspace).close()
     node.app.close()
@@ -211,13 +216,24 @@ def test_missing_cursor_with_retraction_rebuilds(world, monkeypatch):
     assert [item["text"] for item in cmds.msgs(node, workspace)] == ["hello"]
 
 
-def test_pump_preserves_order_for_dependent_updates(tmp_path):
-    """Every same-batch UPDATE follows the member row it consumes."""
+@pytest.mark.parametrize("boundary", ("live", "retry", "restart", "rebuild"))
+def test_pump_preserves_order_for_dependent_updates(
+        tmp_path, monkeypatch, boundary):
+    """Same-batch UPDATEs follow their member across every replay boundary."""
+    from tinyp2p import node as runtime
+
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice")
+    clock = [source.fact_of(workspace, workspace).ts]
+
+    def tick():
+        clock[0] += 10
+        return clock[0]
+
+    monkeypatch.setattr(runtime, "now_ms", tick)
     for ordinal in range(64):
         _, target, joined = add_member(
-            source, workspace, f"member-{ordinal}")
+            source, workspace, f"member-{ordinal}", ts=tick())
         granted = cmds.grant_admin(source, workspace, target)
         removed = cmds.evict(source, workspace, target)
         if granted < joined.fid and removed < joined.fid:
@@ -228,14 +244,42 @@ def test_pump_preserves_order_for_dependent_updates(tmp_path):
     pile = closed_subset(source, workspace, all_fids(source, workspace))
     expected = [fact.fid for fact in decode_pile(pile)[0]]
     peer = Node(str(tmp_path / "peer"))
+    peer.add_workspace(workspace, "alice", peers=[])
+    peer.rebuild(workspace)
     deliver(peer, workspace, pile)
-    peer.turn(workspace)
 
-    assert [
+    def crash(*args, **kwargs):
+        raise RuntimeError(boundary)
+
+    if boundary == "retry":
+        commit = peer.commit
+        monkeypatch.setattr(peer, "commit", crash)
+        with pytest.raises(RuntimeError, match=boundary):
+            peer.turn(workspace)
+        monkeypatch.setattr(peer, "commit", commit)
+        peer.turn(workspace)
+    elif boundary == "restart":
+        monkeypatch.setattr(runtime, "pump", crash)
+        with pytest.raises(RuntimeError, match=boundary):
+            peer.turn(workspace)
+        monkeypatch.setattr(runtime, "pump", pump)
+        peer.idx(workspace).close()
+        peer.app.close()
+        peer = Node(peer.dir)
+    else:
+        peer.turn(workspace)
+        if boundary == "rebuild":
+            peer.rebuild(workspace)
+
+    admitted = [
         fid for op, fid in peer.idx(workspace).execute(
             "SELECT op, fid FROM log ORDER BY seq")
         if op == "+"
-    ] == expected
+    ]
+    if boundary != "rebuild":
+        assert admitted == expected
+    assert admitted.index(joined.fid) < admitted.index(granted)
+    assert admitted.index(joined.fid) < admitted.index(removed)
     projected = next(
         row for row in cmds.members(peer, workspace)
         if row["pk"] == target)

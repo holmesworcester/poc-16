@@ -293,6 +293,24 @@ def _globals(rows):
     return frozenset(Global(*row) for row in (rows or ()))
 
 
+def _matches_committed_authority(fact, committed):
+    """Require the committed winner to satisfy every already-known need.
+
+    A genuinely new address may bootstrap through its self-contained payload.
+    Once an address exists, its committed raw winner must satisfy the need's
+    co-offers. Equivalent presented winners remain valid so honest peers can
+    authenticate the walk that converges them.
+    """
+    handler = facts.handler_for(fact.t)
+    for need in handler.needs(fact):
+        name, a0, a1, requires = _need_parts(need)
+        raw_source = offer_src(committed, name, a0, a1)
+        if raw_source is not None and offer_src(
+                committed, name, a0, a1, requires) is None:
+            return False
+    return True
+
+
 def _admit(con, fact, rank):
     con.execute(
         "INSERT OR IGNORE INTO facts VALUES(?,?,?)",
@@ -308,7 +326,9 @@ def _admit(con, fact, rank):
     )
 
 
-def _judge(stream, ctx, mode=VALIDATE, supplied=frozenset()):
+def _judge(
+        stream, ctx, mode=VALIDATE, supplied=frozenset(),
+        canonical_db=None):
     """The one streaming judge, with transaction policy left to its caller."""
     con = ctx.db
     valids, emitted = [], set()
@@ -325,6 +345,9 @@ def _judge(stream, ctx, mode=VALIDATE, supplied=frozenset()):
             deps = resolve_deps(
                 fact, con) if handler is not None and refs_seen else None
             good = deps is not None and handler.validate(fact, ctx) is True
+            if good and mode == EVALUATE and canonical_db is not None:
+                good = _matches_committed_authority(
+                    fact, canonical_db)
             if good and mode == EVALUATE and hasattr(handler, "evaluate"):
                 good = handler.evaluate(fact, supplied, ctx) is True
         except Exception:
@@ -340,7 +363,9 @@ def _judge(stream, ctx, mode=VALIDATE, supplied=frozenset()):
     return Judgment(True, tuple(valids), frozenset(emitted))
 
 
-def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
+def kernel(
+        stream, anchor, *, mode=VALIDATE, globals_=(), db=None,
+        canonical_db=None):
     """Run the shared judge and return its complete internal result.
 
     Most callers should use :func:`validate`, :func:`drain`, or
@@ -353,7 +378,8 @@ def kernel(stream, anchor, *, mode=VALIDATE, globals_=(), db=None):
     con = db or sqlite3.connect(":memory:")
     con.executescript(SCHEMA)
     con.execute("BEGIN")
-    result = _judge(stream, Context(con, anchor), mode, supplied)
+    result = _judge(
+        stream, Context(con, anchor), mode, supplied, canonical_db)
     if not result.ok:
         con.rollback()
         if db is None:
@@ -375,9 +401,11 @@ def drain(stream, anchor, *, db=None):
     return kernel(stream, anchor, mode=DRAIN, db=db)
 
 
-def evaluate(stream, anchor, globals_, *, db=None):
+def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
     """Validate an ephemeral payload against committed globals; return bool."""
-    return kernel(stream, anchor, mode=EVALUATE, globals_=globals_, db=db).ok
+    return kernel(
+        stream, anchor, mode=EVALUATE, globals_=globals_, db=db,
+        canonical_db=canonical_db).ok
 
 
 # ---- verified path context --------------------------------------------------

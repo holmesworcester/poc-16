@@ -97,7 +97,7 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
             idx, signatures, lambda fid: node.fact_of(ws, fid))
         if unresolved:
             raise ValueError("bulk-authored signatures could not be ranked")
-        idx.commit()
+        node.commit_index(ws)
     except Exception:
         idx.rollback()
         raise
@@ -196,7 +196,7 @@ def copy_facts(dst, ws, src, fids):
         di.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)", row)
         for name, a0, a1 in from_json(json.loads(row[3])).offers():
             di.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, fid))
-    di.commit()
+    dst.commit_index(ws)
 
 
 def reconcile(A, B, ws):

@@ -26,7 +26,7 @@ from .close import decode_pile
 from .kernel import evaluate
 
 
-def mint(pile_bytes, anchor, globals_, now):
+def mint(pile_bytes, anchor, globals_, now, canonical_db=None):
     """decode → kernel.evaluate(facts, anchor, globals ∪ {("now", now)}) →
     grant_of. Returns (pk, verb) to seal, or None to refuse. The challenge is
     ephemeral (never persisted); replay is harmless because the grant is
@@ -35,7 +35,8 @@ def mint(pile_bytes, anchor, globals_, now):
         facts, _ = decode_pile(pile_bytes)
         grant = grant_of(facts)
         allowed = evaluate(
-            facts, anchor, frozenset(globals_) | {("now", now)})
+            facts, anchor, frozenset(globals_) | {("now", now)},
+            canonical_db=canonical_db)
     except Exception:
         return None
     return grant if grant is not None and allowed else None

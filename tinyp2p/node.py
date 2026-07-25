@@ -113,9 +113,13 @@ class Node:
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
-            for key in [
-                    key for key in self.sync_cache if key[0] == workspace]:
-                self.sync_cache.pop(key).clear()
+            self._invalidate_sync_cache(workspace)
+
+    def _invalidate_sync_cache(self, workspace):
+        """Make every peer recompare this workspace on its next walk."""
+        for key in [
+                key for key in self.sync_cache if key[0] == workspace]:
+            self.sync_cache.pop(key).clear()
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -135,20 +139,47 @@ class Node:
         """Every SQLite is a derived projection stamped with the root it
         reflects; a mismatched stamp means rebuild from the store."""
         etag = self.store(ws).etag("root")
-        row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
-        version = self.idx(ws).execute(
+        idx = self.idx(ws)
+        row = idx.execute("SELECT v FROM meta WHERE k='root'").fetchone()
+        version = idx.execute(
             "SELECT v FROM meta WHERE k='index-version'").fetchone()
         semantic_upgrade = version is None or version[0] != INDEX_VERSION
         if row is None or row[0] != etag or semantic_upgrade:
             self.rebuild(ws, republish=semantic_upgrade)
 
+    def _restore_authoritative_projections(self, ws):
+        """Discard a failed turn's local state before releasing its lock."""
+        self.idx(ws).rollback()
+        self.app.rollback()
+        self._sync_index(ws)
+        pump(self, ws)
+
     def _stamp(self, ws):
         idx = self.idx(ws)
-        idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
-                    (self.store(ws).etag("root"),))
-        idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-                    (INDEX_VERSION,))
-        idx.commit()
+        try:
+            idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
+                        (self.store(ws).etag("root"),))
+            idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
+                        (INDEX_VERSION,))
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
+
+    def commit_index(self, ws):
+        """Commit direct derived-index writes as ahead of the manifest.
+
+        The live merge path and bulk benchmark builders share this boundary so
+        a process death before ``commit()`` cannot leave unpublished rows under
+        an apparently current root stamp.
+        """
+        idx = self.idx(ws)
+        try:
+            idx.execute("DELETE FROM meta WHERE k='root'")
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
 
     def fact_of(self, ws, fid) -> Fact:
         row = self.idx(ws).execute("SELECT j FROM facts WHERE fid=?", (fid,)).fetchone()
@@ -170,34 +201,45 @@ class Node:
             piles = st.list("pile/")
             if not piles:
                 return []  # nothing delivered; drain-on-read stays free
-            units = []
-            for k in piles:
-                try:
-                    units.append(decode_pile(st.get(k)))
-                except Exception:
-                    units.append(None)  # malformed: rejected on the spot
-            if len(units) > 1:  # independent piles judge in parallel
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    results = list(ex.map(
-                        lambda u: drain(u[0], ws) if u else Judgment(False, (), frozenset()),
-                        units))
-            else:
-                results = [drain(u[0], ws) if u else Judgment(False, (), frozenset())
-                           for u in units]
-            valids, new_globals, blobs = [], set(), {}
-            for u, (ok, vs, global_rows) in zip(units, results):
-                if ok:
-                    valids += vs
-                    new_globals.update(global_rows)
-                    blobs.update(u[1])
-            fresh, newfids = self.merge(ws, valids, new_globals)
-            for bh, b in blobs.items():
-                st.put_if_absent("obj/" + bh, b)
-            self.commit(ws, newfids)
-            pump(self, ws)
-            for k in piles:
-                st.delete(k)  # retire ingress after the CAS, rejects included
-            return fresh
+            try:
+                self._sync_index(ws)
+                units = []
+                for k in piles:
+                    try:
+                        units.append(decode_pile(st.get(k)))
+                    except Exception:
+                        units.append(None)  # malformed: rejected on the spot
+                if len(units) > 1:  # independent piles judge in parallel
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        results = list(ex.map(
+                            lambda u: drain(u[0], ws) if u else
+                            Judgment(False, (), frozenset()),
+                            units))
+                else:
+                    results = [
+                        drain(u[0], ws) if u else
+                        Judgment(False, (), frozenset())
+                        for u in units
+                    ]
+                valids, new_globals, blobs = [], set(), {}
+                for u, (ok, vs, global_rows) in zip(units, results):
+                    if ok:
+                        valids += vs
+                        new_globals.update(global_rows)
+                        blobs.update(u[1])
+                fresh, newfids = self.merge(ws, valids, new_globals)
+                for bh, b in blobs.items():
+                    st.put_if_absent("obj/" + bh, b)
+                self.commit(ws, newfids)
+                pump(self, ws)
+                for k in piles:
+                    st.delete(k)  # retire ingress after the CAS
+                return fresh
+            except Exception:
+                # The manifest CAS is the commit point. A live daemon must not
+                # expose an ahead index or app projection after a failed turn.
+                self._restore_authoritative_projections(ws)
+                raise
 
     def _log_projection(self, ws, admitted, retracted, reproject):
         idx = self.idx(ws)
@@ -244,6 +286,8 @@ class Node:
                 if pruned or restored:
                     self._rebuild_globals(ws)
             if pruned or restored:
+                if restored:
+                    self._invalidate_sync_cache(ws)
                 self._reproject.add(ws)
                 out = [valid for valid in out
                        if valid.fact.fid not in pruned]
@@ -427,7 +471,10 @@ class Node:
                     set(pruned) - restored, True)
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
-            idx.commit()
+            # Also covers supported direct/bulk writers which bypass merge().
+            self.commit_index(ws)
+            if restored:
+                self._invalidate_sync_cache(ws)
         except Exception:
             idx.rollback()
             raise
@@ -552,5 +599,6 @@ class Node:
                 # providers for the same fact ids. Fingerprints cover ids, not
                 # closure edges, so old fences are deliberately not memoized.
                 self.commit(ws, reuse=False)
+                pump(self, ws)
             else:
                 self._stamp(ws)

@@ -175,16 +175,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400)
         if not self._known(ws):
             return self._send(404)
-        root = self.node.store(ws).get("root")
-        if not root:
-            return self._send(403)
-        try:
-            anchor, globals_ = gate.root_globals(root)
-        except Exception:
-            return self._send(403)
-        if anchor != ws:
-            return self._send(403)
-        grant = gate.mint(pile, anchor, globals_, now_ms())
+        with self.node.lock:
+            root = self.node.store(ws).get("root")
+            if not root:
+                return self._send(403)
+            try:
+                anchor, globals_ = gate.root_globals(root)
+            except Exception:
+                return self._send(403)
+            if anchor != ws:
+                return self._send(403)
+            grant = gate.mint(
+                pile, anchor, globals_, now_ms(),
+                canonical_db=self.node.idx(ws))
         if grant is None:
             return self._send(403)
         public, verb = grant

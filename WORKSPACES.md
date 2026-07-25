@@ -147,10 +147,11 @@ Three properties hold, the trio you named:
 
 - **Idempotent** — every device-targeted grant is content-addressed (a
   deterministic function of device key + workspace + admitting member +
-  label). It inherits the admitting device-authority fact's timestamp;
-  causality remains entirely in refs/needs and closure, not time. Re-issuing
-  after replay, restart, or a lost response reconstructs the same fact and is
-  a no-op, so the reconcile tail can run every turn.
+  label). It inherits the immutable workspace anchor's timestamp; causality
+  remains entirely in refs/needs and closure, not time. Re-issuing after
+  replay, restart, a lost response, or an authority proof-winner change
+  reconstructs the same fact and is a no-op, so the reconcile tail can run
+  every turn.
 - **Monotone** — the device and workspace rosters are grow-only with terminal tombstones
   (remove-wins). Nothing is mutated in place, so no device observes an add→remove→add flap; a
   removal is one tombstone every device honors, forever.

@@ -25,8 +25,16 @@ move multi-MB files, survive stragglers, eviction, and restarts —
 Everything enters through a pile: local commands, pulled units, and pushed
 piles all land in `pile/<member>/<hash>` and go through the same `turn()`.
 Independent piles validate in parallel (each kernel call gets its own
-`:memory:` scratchpad); handlers and projectors only ever
-`INSERT OR IGNORE` by id, so replays and races are harmless by construction.
+`:memory:` scratchpad). The same index transaction that admits facts appends
+their dependency-ordered ids to a delivery log and invalidates the root stamp.
+After the root CAS, the app pump applies pending rows and advances its cursor
+in one transaction, so closure replays and pile retries are projection no-ops.
+A crash with an index ahead of the root rebuilds from that root before
+retrying its retained pile; a crash after publication resumes the cursor. A
+caught turn failure performs that same resynchronization before releasing the
+workspace lock, so a live daemon cannot authorize from unpublished index or
+global rows. Stamp writes roll back as one SQLite transaction, and bulk
+builders use the same dirty-index boundary as live merge.
 This holds *because validity is globals-blind* — a pure function of each
 pile's closure. An operation whose verdict depends on a global that can change
 concurrently (e.g. set-valued deletion — deleting a whole channel, not one
@@ -76,9 +84,15 @@ The three kernel entry points share one internal forward pass. Inputs are
 already canonical-topological closed piles, so none sorts: `validate` returns
 only a boolean for trustless consumers, `drain` additionally exposes `Valid`
 values and new monotone global rows, and `evaluate` applies ephemeral gates but
-returns only a boolean. The index stores globals generically as `(name, value)`
-rows and the manifest publishes their canonical sorted records; neither the
-node nor layout knows what `removal` means.
+returns only a boolean. At mint, the generic evaluator also requires the
+committed canonical provider at every already-known address to satisfy that
+need's exact co-offers; genuinely new addresses remain self-bootstrapping.
+Equivalent providers may differ while honest peers converge, but a caller
+cannot omit an incompatible winning conflict and revive a quarantined
+authority closure. The committed index never enters family validators.
+The index stores globals generically as `(name, value)` rows and the manifest
+publishes their canonical sorted records; neither the node nor layout knows
+what `removal` means.
 
 ## Treap leaves are piles — the confirmation
 

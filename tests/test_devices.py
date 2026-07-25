@@ -5,16 +5,19 @@ import pytest
 
 from tinyp2p import cmds
 from tinyp2p import facts
+import tinyp2p.sync as sync_module
+import tinyp2p.walk as walk_module
 from tinyp2p.close import close, encode_pile
 from tinyp2p.crypto import keypair
 from tinyp2p.facts.auth.device import bind, device, devices
 from tinyp2p.facts.auth.device_invite import device_invite as device_invite_fact
 from tinyp2p.facts.auth.device_invite import grant
+from tinyp2p.facts.auth.request import payload as request_payload
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
 from tinyp2p.facts.auth.workspace import workspace as workspace_fact
-from tinyp2p.kernel import drain, offer_src, resolve_deps
+from tinyp2p.kernel import drain, evaluate, offer_src, resolve_deps
 from tinyp2p.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
@@ -59,8 +62,7 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     ]
     assert {fact.t for fact in dependencies} \
         == {"signature", "workspace", "device"}
-    assert granted.ts == next(
-        fact.ts for fact in dependencies if fact.t == "device")
+    assert granted.ts == node.fact_of(workspace, workspace).ts
     facts_after_first = node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0]
     assert grant(node, workspace, user, laptop, "laptop") == first
@@ -97,6 +99,79 @@ def test_direct_grant_retry_after_restart_reconstructs_the_same_fact(tmp_path):
     assert grant(reopened, workspace, user, laptop, "laptop") == first
     assert reopened.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
+
+
+def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder_secret, founder = node.identity(workspace)
+    bind(node, workspace, "phone")
+    original_device = offer_src(
+        node.idx(workspace), "device_key", founder)
+
+    laptop_secret, laptop = keypair()
+    node.keychain.add_identity(laptop_secret)
+    first = grant(node, workspace, founder, laptop, "laptop")
+
+    # A same-rank duplicate can change the canonical authority source by fid.
+    # Its timestamp is deliberately different: retry identity must not depend
+    # on whichever proof currently wins.
+    alternate = None
+    for ordinal in range(256):
+        candidate = device(founder, f"alternate-{ordinal}", 10_000 + ordinal)
+        if candidate.fid < original_device:
+            alternate = candidate
+            break
+    assert alternate is not None
+    alternate_sig = signature(
+        founder_secret, founder, alternate, alternate.ts)
+    node.ingest_new(
+        workspace,
+        [alternate_sig, alternate],
+        {
+            alternate_sig.fid: [],
+            alternate.fid: [
+                alternate_sig.fid,
+                member_src(node, workspace, founder),
+            ],
+        },
+    )
+    assert offer_src(
+        node.idx(workspace), "device_key", founder) == alternate.fid
+
+    fact_count = node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert grant(node, workspace, founder, laptop, "laptop") == first
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
+
+
+def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    bind(node, workspace, "phone")
+    founder = node.identity_id(workspace)
+
+    laptop_secret, laptop = keypair()
+    node.keychain.add_identity(laptop_secret)
+    grant(node, workspace, founder, laptop, "laptop")
+    node.bind_identity(workspace, laptop)
+
+    statements = []
+    node.app.set_trace_callback(statements.append)
+    try:
+        cmds.post(node, workspace, "general", "ordinary device write", ts=10)
+    finally:
+        node.app.set_trace_callback(None)
+
+    normalized = [" ".join(statement.lower().split())
+                  for statement in statements]
+    assert not [
+        statement for statement in normalized
+        if statement.startswith("delete from devices")
+    ]
+    assert {row["pk"] for row in devices(node, workspace, founder)} \
+        == {founder, laptop}
 
 
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
@@ -273,10 +348,18 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     target_claim = _inject_device_claim(
         node, workspace, bob_secret, bob, bob, target, "target", 100)
     node.bind_identity(workspace, target)
-    _, child = keypair()
+    child_secret, child = keypair()
+    node.keychain.add_identity(child_secret)
     child_claim = _inject_device_claim(
         node, workspace, target_secret, target, bob, child, "child", 101)
     assert target_claim.fid in resolve_deps(child_claim, node.idx(workspace))
+    node.bind_identity(workspace, child)
+    ts = now_ms()
+    stale_request = request_payload(
+        node, workspace, "sync", ts + 120_000, ts)
+    door = node.globals(workspace) | {("now", ts)}
+    assert evaluate(stale_request, workspace, door)
+    node.bind_identity(workspace, target)
     target_chain = closed_subset(
         node, workspace, [target_claim.fid, child_claim.fid])
 
@@ -325,6 +408,12 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     accepted = node.ingest_new(
         workspace, [conflict_sig, conflict], conflict_deps)
     assert any(valid.fact.fid == conflict.fid for valid in accepted)
+    assert not evaluate(
+        stale_request,
+        workspace,
+        door,
+        canonical_db=node.idx(workspace),
+    )
 
     for current in (node, peer):
         assert current.fact_of(workspace, conflict.fid) == conflict
@@ -349,6 +438,105 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     assert node.store(workspace).list("pile/") == []
     posted = cmds.post(node, workspace, "general", "still authorized")
     assert node.fact_of(workspace, posted) is not None
+
+
+def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "root", ts=1)
+    root_secret, root = source.identity(workspace)
+    bob_secret, bob = keypair()
+    candidates = []
+    for ordinal in range(2):
+        invite_secret, invite_public = keypair()
+        invitation = user_invite(
+            root, invite_public, 10 + 2 * ordinal)
+        invitation_sig = signature(
+            root_secret, root, invitation, invitation.ts)
+        joined = user(
+            invitation, invite_secret, bob, f"bob-{ordinal}",
+            11 + 2 * ordinal)
+        joined_sig = signature(
+            bob_secret, bob, joined, joined.ts)
+        candidates.append(
+            (joined.fid, invitation_sig, invitation, joined_sig, joined))
+    original_chain, rejoin_chain = (
+        max(candidates, key=lambda item: item[0]),
+        min(candidates, key=lambda item: item[0]),
+    )
+    (
+        _,
+        original_invitation_sig,
+        original_invitation,
+        original_joined_sig,
+        original,
+    ) = original_chain
+    source.ingest_new(
+        workspace,
+        [
+            original_invitation_sig,
+            original_invitation,
+            original_joined_sig,
+            original,
+        ],
+        {
+            original_invitation_sig.fid: [],
+            original_invitation.fid: [
+                original_invitation_sig.fid,
+                member_src(source, workspace, root),
+            ],
+            original_joined_sig.fid: [],
+            original.fid: [
+                original_invitation.fid,
+                original_joined_sig.fid,
+            ],
+        },
+    )
+    common = closed_subset(source, workspace, all_fids(source, workspace))
+
+    remote = Node(str(tmp_path / "remote"))
+    remote.add_workspace(workspace, "root", peers=[])
+    deliver(remote, workspace, common)
+    remote.turn(workspace)
+
+    source.keychain.add_identity(bob_secret)
+    source.bind_identity(workspace, bob)
+    _, invitation_sig, invitation, rejoined_sig, rejoined = rejoin_chain
+    source.ingest_new(
+        workspace,
+        [invitation_sig, invitation, rejoined_sig, rejoined],
+        {
+            invitation_sig.fid: [],
+            invitation.fid: [
+                invitation_sig.fid,
+                member_src(source, workspace, root),
+            ],
+            rejoined_sig.fid: [],
+            rejoined.fid: [invitation.fid, rejoined_sig.fid],
+        },
+    )
+    assert member_src(source, workspace, bob) == rejoined.fid
+    assert member_src(remote, workspace, bob) == original.fid
+
+    remote.keychain.add_identity(bob_secret)
+    remote.bind_identity(workspace, bob)
+    ts = now_ms()
+    source_request = request_payload(
+        source, workspace, "sync", ts + 120_000, ts)
+    remote_request = request_payload(
+        remote, workspace, "sync", ts + 120_000, ts)
+
+    assert evaluate(
+        source_request,
+        workspace,
+        remote.globals(workspace) | {("now", ts)},
+        canonical_db=remote.idx(workspace),
+    )
+    assert evaluate(
+        remote_request,
+        workspace,
+        source.globals(workspace) | {("now", ts)},
+        canonical_db=source.idx(workspace),
+    )
 
 
 def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
@@ -403,7 +591,11 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
     assert node.fact_of(workspace, child_claim.fid) is None
 
 
-def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
+def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
+        tmp_path, monkeypatch):
+    from tinyp2p import node as runtime
+
+    original_pump = runtime.pump
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "root")
     root_secret, root = node.identity(workspace)
@@ -425,10 +617,24 @@ def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
         cmds.bind_device(node, workspace, label)
 
     _, target = keypair()
+    deep_item = short_item = None
+    for ordinal in range(1024):
+        candidate_deep = device_invite_fact(
+            deep, deep, target, f"from-deep-{ordinal}", 200)
+        candidate_short = device_invite_fact(
+            short, short, target, f"from-short-{ordinal}", 201)
+        if candidate_short.fid < candidate_deep.fid:
+            deep_item, short_item = candidate_deep, candidate_short
+            break
+    assert deep_item is not None and short_item is not None
     deep_claim = _inject_device_claim(
-        node, workspace, deep_secret, deep, deep, target, "from-deep", 200)
+        node, workspace, deep_secret, deep, deep, target,
+        deep_item.body["label"], deep_item.ts)
     short_claim = _inject_device_claim(
-        node, workspace, short_secret, short, short, target, "from-short", 201)
+        node, workspace, short_secret, short, short, target,
+        short_item.body["label"], short_item.ts)
+    assert deep_claim == deep_item
+    assert short_claim == short_item
     assert node.app.execute(
         "SELECT user, source FROM devices WHERE ws=? AND pk=?",
         (workspace, target)).fetchone() == (short, short_claim.fid)
@@ -443,25 +649,66 @@ def test_rank_only_shadow_reconciles_the_device_projection(tmp_path):
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", ts + 1)
     rejoined_sig = signature(deep_secret, deep, rejoined, ts + 1)
-    fresh = node.ingest_new(
-        workspace,
-        [invitation_sig, invitation, rejoined_sig, rejoined],
-        {
-            invitation_sig.fid: [],
-            invitation.fid: [
-                invitation_sig.fid,
-                member_src(node, workspace, root),
-            ],
-            rejoined_sig.fid: [],
-            rejoined.fid: [invitation.fid, rejoined_sig.fid],
-        },
+    deps = {
+        invitation_sig.fid: [],
+        invitation.fid: [
+            invitation_sig.fid,
+            member_src(node, workspace, root),
+        ],
+        rejoined_sig.fid: [],
+        rejoined.fid: [invitation.fid, rejoined_sig.fid],
+    }
+    new = {
+        fact.fid: fact
+        for fact in (invitation_sig, invitation, rejoined_sig, rejoined)
+    }
+    stream = close(
+        list(new.values()),
+        lambda fid: deps[fid] if fid in deps else resolve_deps(
+            node.fact_of(workspace, fid), node.idx(workspace)),
+        lambda fid: new.get(fid) or node.fact_of(workspace, fid),
     )
+    pile = encode_pile(stream)
+    deliver(node, workspace, pile, member="crash00000000000")
+
+    # Model a process death after the manifest/index commit but before the app
+    # transaction. The retained ingress pile must repair the lagging projection
+    # on retry even though every fact is now already present in the index.
+    def crash_after_commit(*args, **kwargs):
+        raise RuntimeError("simulated projection crash")
+
+    monkeypatch.setattr(runtime, "pump", crash_after_commit)
+    with pytest.raises(RuntimeError, match="simulated projection crash"):
+        node.turn(workspace)
+    monkeypatch.setattr(runtime, "pump", original_pump)
+
+    assert offer_src(
+        node.idx(workspace), "device_key", target) == deep_claim.fid
+    assert node.app.execute(
+        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
+        (workspace, target)).fetchone() == (short, short_claim.fid)
+    assert node.store(workspace).list("pile/")
+
+    fresh = node.turn(workspace)
 
     assert fresh
     assert not any(
         name == "device_key"
         for valid in fresh
         for name, _, _ in valid.fact.offers())
+    assert node.app.execute(
+        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
+        (workspace, target)).fetchone() == (deep, deep_claim.fid)
+
+    # A late duplicate delivery of the lower-fid but rank-losing claim is a
+    # projection no-op once this manifest generation has been materialized.
+    deliver(
+        node,
+        workspace,
+        closed_subset(node, workspace, [short_claim.fid]),
+        member="stale00000000000",
+    )
+    node.turn(workspace)
     assert node.app.execute(
         "SELECT user, source FROM devices WHERE ws=? AND pk=?",
         (workspace, target)).fetchone() == (deep, deep_claim.fid)
@@ -613,3 +860,127 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert source.store(workspace).get("root") \
         == first.store(workspace).get("root") \
         == second.store(workspace).get("root")
+
+
+def test_restoration_forces_a_followup_walk_for_the_restored_fact(
+        tmp_path, monkeypatch):
+    """A pull that restores quarantine must not leave a valid 304 cache."""
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "root", ts=1)
+    root_secret, root = source.identity(workspace)
+
+    q_secret, q, _ = add_member(source, workspace, "q", ts=10)
+    short_secret, short, _ = add_member(
+        source, workspace, "short", inviter=(q_secret, q), ts=20)
+    deep_secret, deep, _ = add_member(source, workspace, "d1", ts=30)
+    for ordinal, name in enumerate(("d2", "d3", "deep")):
+        deep_secret, deep, _ = add_member(
+            source,
+            workspace,
+            name,
+            inviter=(deep_secret, deep),
+            ts=40 + 10 * ordinal,
+        )
+
+    for secret, public, label in (
+            (short_secret, short, "short-primary"),
+            (deep_secret, deep, "deep-primary")):
+        source.keychain.add_identity(secret)
+        source.bind_identity(workspace, public)
+        cmds.bind_device(source, workspace, label)
+
+    target_secret, target = keypair()
+    source.keychain.add_identity(target_secret)
+    deep_claim = _inject_device_claim(
+        source, workspace, deep_secret, deep, deep, target,
+        "from-deep", 200)
+    source.bind_identity(workspace, target)
+    _, child = keypair()
+    child_claim = _inject_device_claim(
+        source, workspace, target_secret, target, deep, child,
+        "child", 201)
+    child_signature = next(
+        fid for fid in resolve_deps(child_claim, source.idx(workspace))
+        if source.fact_of(workspace, fid).t == "signature")
+    deep_pile = closed_subset(
+        source, workspace, [deep_claim.fid, child_claim.fid])
+    target_pile = closed_subset(source, workspace, [deep_claim.fid])
+    child_signature_pile = closed_subset(
+        source, workspace, [child_signature])
+
+    short_claim = _inject_device_claim(
+        source, workspace, short_secret, short, short, target,
+        "from-short", 400)
+    short_pile = closed_subset(source, workspace, [short_claim.fid])
+    assert source.fact_of(workspace, child_claim.fid) is None
+
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(root, invite_public, 500)
+    invitation_sig = signature(root_secret, root, invitation, 500)
+    rejoined = user(
+        invitation, invite_secret, deep, "deep-direct", 501)
+    rejoined_sig = signature(deep_secret, deep, rejoined, 501)
+    source.ingest_new(
+        workspace,
+        [invitation_sig, invitation, rejoined_sig, rejoined],
+        {
+            invitation_sig.fid: [],
+            invitation.fid: [
+                invitation_sig.fid,
+                member_src(source, workspace, root),
+            ],
+            rejoined_sig.fid: [],
+            rejoined.fid: [invitation.fid, rejoined_sig.fid],
+        },
+    )
+    rejoin_pile = closed_subset(source, workspace, [rejoined.fid])
+    assert source.fact_of(workspace, child_claim.fid) == child_claim
+
+    local = Node(str(tmp_path / "local"))
+    for pile in (deep_pile, short_pile):
+        deliver(local, workspace, pile)
+        local.turn(workspace)
+    assert local.fact_of(workspace, child_claim.fid) is None
+
+    remote = Node(str(tmp_path / "remote"))
+    for pile in (target_pile, child_signature_pile, short_pile):
+        deliver(remote, workspace, pile)
+        remote.turn(workspace)
+    assert all_fids(local, workspace) == all_fids(remote, workspace)
+
+    class LocalPeer:
+        def __init__(self, node, ws, url):
+            self.node, self.ws, self.url = node, ws, url
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            current = remote.store(self.ws).get("root")
+            current_etag = remote.store(self.ws).etag("root")
+            return None if etag == current_etag else (
+                current, current_etag)
+
+        def obj(self, object_hash):
+            return remote.store(self.ws).get("obj/" + object_hash)
+
+        def put_pile(self, body):
+            deliver(remote, self.ws, body)
+            remote.turn(self.ws)
+
+    monkeypatch.setattr(sync_module, "Peer", LocalPeer)
+    url = "local://remote"
+    assert walk_module.walk(local, workspace, url) == (0, 0)
+    assert (workspace, url) in local.sync_cache
+
+    deliver(remote, workspace, rejoin_pile)
+    remote.turn(workspace)
+    assert remote.fact_of(workspace, child_claim.fid) is None
+
+    pulled, _ = walk_module.walk(local, workspace, url)
+    assert pulled
+    assert local.fact_of(workspace, child_claim.fid) == child_claim
+    assert (workspace, url) not in local.sync_cache
+
+    _, pushed = walk_module.walk(local, workspace, url)
+    assert pushed
+    assert remote.fact_of(workspace, child_claim.fid) == child_claim
+    assert all_fids(local, workspace) == all_fids(remote, workspace)
