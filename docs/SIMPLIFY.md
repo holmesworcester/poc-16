@@ -171,8 +171,9 @@ mint(pile) = decode → evaluate(pile, anchor, globals ∪ {("now", now_ms())})
   because the grant is sealed to the requester's pk.
 - A peer passes its root-stamped canonical offer/proof view into `evaluate`, so
   omitted incompatible authority winners cannot revive quarantined chains.
-  A Worker/λ must derive the equivalent view from the root/tree before
-  presigning. **Neither path reads app.db**; §5 remains a leaf-client concern.
+  A Worker/λ uses `mint.Authority.from_root` to derive the equivalent read-only
+  view from validated tree leaves; `mint.stateless` reuses it only for the same
+  root ETag. **Neither path reads app.db**; §5 remains a leaf-client concern.
 - gxz (evicted-signer relay by an active member): the candidate seam is the
   gate mask — screen the *whole submitted closure* against S at mint/ingress,
   not just the requester — plus suppression of post-removal authority via the

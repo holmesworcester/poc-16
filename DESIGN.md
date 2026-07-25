@@ -622,8 +622,9 @@ root bytes and ETag. The path drains nothing, writes nothing, and never reads
 `app.db`; its canonical authority view is a read-only input. Replay only
 produces ciphertext for the same requester. The landed peer holds its
 workspace lock while snapshotting root plus canonical idx, then releases it
-after evaluation. A stateless deployment can evaluate snapshots in parallel;
-constructing those snapshots is the `poc-16-jbg.10` FaaS boundary.
+after evaluation. A stateless deployment reconstructs that view from validated
+tree leaves with `mint.Authority.from_root`; `mint.stateless` reuses it only
+while its root ETag matches and otherwise rebuilds it before evaluating.
 
 The cloud target returns presigned URLs; the landed peer daemon returns a
 bearer token. To the client either is an opaque request decorator, the only
@@ -758,12 +759,11 @@ different jobs, and either can be deleted and rebuilt.
 
 Root bytes carry tree view, anchor, and canonical globals, but not the expanded
 offer/proof view. A peer mint reads that view from its root-stamped `idx.db`;
-`app.db` is never involved. A Worker or Lambda must derive an equivalent
-canonical authority view from the root/tree before it can enforce the same
-conflict checks. Root metadata plus a request pile is sufficient only in the
-conflict-free case, not full production parity. The derived view's SQLite byte
-format is not part of the protocol; cloud publication remains §Concurrency &
-FaaS work.
+`app.db` is never involved. A Worker or Lambda builds the equivalent
+root-stamped, read-only `:memory:` projection from the root/tree, and may cache
+it by ETag. A cold or stale cache rebuilds before minting, so warmth cannot
+change a verdict. The derived view's SQLite byte format is not part of the
+protocol; cloud publication remains §Concurrency & FaaS work.
 
 ## Deployments
 

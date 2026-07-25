@@ -302,6 +302,18 @@ def rebuild_proofs(db, fact_of):
     )
 
 
+def unresolved_facts(db, fact_of):
+    """Rebuild proof ranks and return every fact outside the finite DAG."""
+    unresolved = set(rebuild_proofs(db, fact_of))
+    for (fid,) in db.execute("SELECT fid FROM facts ORDER BY fid"):
+        if fid in unresolved:
+            continue
+        deps = resolve_deps(fact_of(fid), db)
+        if deps is None or proof_rank(db, deps) is None:
+            unresolved.add(fid)
+    return frozenset(unresolved)
+
+
 def _globals(rows):
     """Normalize the family-neutral public ``(name, value)`` row shape."""
     return frozenset(Global(*row) for row in (rows or ()))

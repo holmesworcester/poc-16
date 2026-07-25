@@ -7,11 +7,12 @@ from core import cmds
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact
+from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
-from core.kernel import resolve_deps
+from core.kernel import offer_src, resolve_deps
 from core.node import Node, now_ms
 from core.suppression import TARGET, atom, is_deletion
 
@@ -162,9 +163,30 @@ def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):
 
 
 def member_src(n, ws, pk):
-    from core.kernel import offer_src
     with n.lock:
         return offer_src(n.idx(ws), "member", pk)
+
+
+def inject_device_claim(
+        node, workspace, secret, public, user, target, label, ts):
+    """Author a valid direct-device claim past command duplicate checks."""
+    item = device_invite(public, user, target, label, ts)
+    signed = signature(secret, public, item, ts)
+    node.ingest_new(
+        workspace,
+        [signed, item],
+        {
+            signed.fid: [],
+            item.fid: [
+                signed.fid,
+                member_src(node, workspace, public),
+                offer_src(
+                    node.idx(workspace), "device_key", public,
+                    requires=(("device", user, public),)),
+            ],
+        },
+    )
+    return item
 
 
 def closed_subset(n, ws, fids):

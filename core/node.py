@@ -29,9 +29,8 @@ from .kernel import (
     drain,
     extend_proofs,
     proof_sources,
-    proof_rank,
-    rebuild_proofs,
     resolve_deps,
+    unresolved_facts,
 )
 from .pump import (
     CURSOR_SCHEMA,
@@ -358,20 +357,6 @@ class Node:
                     return True
         return False
 
-    def _rebuild_proofs(self, ws):
-        """Return every fact outside the set's finite canonical proof DAG."""
-        idx = self.idx(ws)
-        unresolved = set(rebuild_proofs(
-            idx, lambda fid: self.fact_of(ws, fid)))
-        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
-            if fid in unresolved:
-                continue
-            fact = self.fact_of(ws, fid)
-            deps = resolve_deps(fact, idx)
-            if deps is None or proof_rank(idx, deps) is None:
-                unresolved.add(fid)
-        return unresolved
-
     def _restore_quarantine(self, ws):
         """Reinsert previously valid facts before recomputing authority.
 
@@ -420,7 +405,8 @@ class Node:
         """Derive the same finite-proof subset from any arrival order."""
         idx, pruned = self.idx(ws), set()
         while True:
-            unresolved = self._rebuild_proofs(ws)
+            unresolved = set(unresolved_facts(
+                idx, lambda fid: self.fact_of(ws, fid)))
             if not unresolved:
                 return pruned
             pruned.update(unresolved)
