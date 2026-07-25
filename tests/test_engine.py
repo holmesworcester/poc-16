@@ -17,7 +17,6 @@ from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
 from core.kernel import Scratchpad, resolve_deps
 from core.node import Node
-from core.suppression import is_deletion, suppkey
 
 from .util import (
     all_fids,
@@ -125,21 +124,6 @@ def internal_boundary(keys):
     )
 
 
-def suppression_shape():
-    """Test-only T_supp projection; production instantiation is yez.10."""
-    def key(fact):
-        group = suppkey(fact)
-        if group is None:
-            return None
-        tag = "0" if is_deletion(fact) else "1"
-        return f"{group}|{tag}|{fact.ts:015d}:{fact.fid}"
-
-    return shape.Shape(
-        key, shape.fid_of, shape.boundary, shape.priority,
-        shape.fingerprint, shape.stable_cut_positions, shape.leaf_cut,
-    )
-
-
 def suppression_tree_world(path, monkeypatch, initial_secret=None):
     node, workspace, _, _ = suppression_world(
         path, monkeypatch, initial_secret)
@@ -151,7 +135,7 @@ def suppression_tree_world(path, monkeypatch, initial_secret=None):
         fid: tuple(resolve_deps(fact, node.idx(workspace)) or ())
         for fid, fact in items.items()
     }
-    secondary = suppression_shape()
+    secondary = shape.supp_shape()
     keys = sorted(
         key for fact in items.values()
         if (key := secondary.key(fact)) is not None

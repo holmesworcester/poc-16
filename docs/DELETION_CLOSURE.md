@@ -43,7 +43,7 @@ content-addressed Merkle treap over the *same fact set*, differing only in its
 | treap    | key                    | walk yields                              |
 |----------|------------------------|------------------------------------------|
 | `T_fact` | `ts:fid`               | range `Q` + dep-ref closure (existing P3) |
-| `T_supp` | `suppkey \|\| ts:fid`  | **all facts sharing a death key, contiguous** |
+| `T_supp` | `suppkey \|\| tag \|\| ts:fid` | **all facts sharing a death key, contiguous** |
 
 `suppkey` is the fact's suppression attribute (the death-key domain, e.g.
 `chan=X`). Facts with no suppression attribute are absent from `T_supp`. A
@@ -55,11 +55,12 @@ out-of-range victims is a range walk, the *same* one-sided RBSR machinery
 no serial full-state pass.
 
 `T_supp` is a pure function of the set, exactly like `T_fact` (content-defined
-chunking + treap priority ⇒ history-independent; a new victim under `K` perturbs
-only `K`'s root-to-leaf path). So it is **built and maintained by the existing
-`treap.build` / `treap.update`, and diffed/walked by the existing RBSR** — this
-is the *"update the tree whenever we have new suppression keys"* requirement:
-maintenance is just the blind incremental `update`, no new code path.
+chunking + priority ⇒ history-independent; a new victim under `K` perturbs only
+`K`'s root-to-leaf path). The landed `shape.supp_shape()` supplies only the key
+projection; the same `tree.build` / `tree.fold` engine maintains both indexes
+and the same RBSR diff/walk reconciles them. This is the *"update the tree
+whenever we have new suppression keys"* requirement: maintenance is the
+ordinary blind incremental fold, not a second code path.
 
 ## 2. When the pass runs — a closure post-pass
 
@@ -231,8 +232,8 @@ traversal, zero SQL**, mirroring `bench/bench_sync.py` and the `hoist` prototype
    subset of `chan=X` facts at timestamps deliberately **outside** a chosen range
    `Q`, scattered across key space. Author one deletion fact `D`, death key
    `chan=X`, placed *inside* `Q` (or dragged in by `Q`'s dep-closure).
-2. **Build both treaps** with `treap.build`: `T_fact` (key `ts:fid`) and `T_supp`
-   (key `chan||ts:fid`), sharing the same `fact_of` / `deps_of`.
+2. **Build both trees** with the shared engine: `T_fact` (key `ts:fid`) and
+   `T_supp` (key `chan||tag||ts:fid`), sharing the same `fact_of` / `deps_of`.
 3. **Primary closure.** Run `closure_sync(Q)` against `T_fact`. **Assert it yields
    `D` but MISSES the out-of-range `chan=X` victims** — the bug the pass fixes.
    Surfacing this miss is half the proof.

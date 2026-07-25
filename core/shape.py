@@ -9,17 +9,18 @@ Absorbs (delete the originals in the same change):
     treap.priority / treap._fid        hoist.priority / hoist._fid
     node.keys' inline "{ts:015d}:{fid}" format      walk's key splitting
 
-The engine (tree.py) is parametric over a Shape. Two planned instantiations:
+The engine (tree.py) is parametric over a Shape. Two instantiations:
     FACT          — the canonical set order, key "<ts:015d>:<fid>"
     supp_shape()  — T_supp, key "<suppkey>‖<tag>‖<ts>:<fid>", deletions at
                     tag=0 so a group's deletion sorts at its head
-                    (docs/DELETION_CLOSURE.md §3; production bead poc-16-yez.10)
+                    (docs/DELETION_CLOSURE.md §1)
 
 """
 from dataclasses import dataclass
 from typing import Callable
 
 from .crypto import h
+from .suppression import is_deletion, suppkey
 
 CUT = 8          # engine leaf density
 COLD_CUT = 4096  # legacy flat facade: coarse cold-page density
@@ -123,10 +124,21 @@ FACT = Shape(
     leaf_cut)
 
 
+def _supp_key(fact):
+    group = suppkey(fact)
+    if group is None:
+        return None
+    tag = "0" if is_deletion(fact) else "1"
+    return f"{group}|{tag}|{key(fact)}"
+
+
+SUPP = Shape(
+    _supp_key, fid_of, boundary, priority, fingerprint,
+    stable_cut_positions, leaf_cut)
+
+
 def supp_shape():
-    """The T_supp instantiation (poc-16-yez.10): key
+    """The T_supp instantiation: key
     "<suppkey>‖<tag>‖<ts>:<fid>", tag=0 for deletions so a suppression
-    group's deletion sorts at its head; a range is one suppression key.
-    Built HERE so yez.10 instantiates the engine, not the binary prototype
-    that jbg.1 replaces (docs/SIMPLIFY.md §3)."""
-    raise NotImplementedError("poc-16-yez.10 — instantiate on the engine")
+    group's deletion sorts at its head; a range is one suppression key."""
+    return SUPP
