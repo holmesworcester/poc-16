@@ -145,6 +145,34 @@ def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
         "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
 
 
+def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    bind(node, workspace, "phone")
+    founder = node.identity_id(workspace)
+
+    laptop_secret, laptop = keypair()
+    node.keychain.add_identity(laptop_secret)
+    grant(node, workspace, founder, laptop, "laptop")
+    node.bind_identity(workspace, laptop)
+
+    statements = []
+    node.app.set_trace_callback(statements.append)
+    try:
+        cmds.post(node, workspace, "general", "ordinary device write", ts=10)
+    finally:
+        node.app.set_trace_callback(None)
+
+    normalized = [" ".join(statement.lower().split())
+                  for statement in statements]
+    assert not [
+        statement for statement in normalized
+        if statement.startswith("delete from devices")
+    ]
+    assert {row["pk"] for row in devices(node, workspace, founder)} \
+        == {founder, laptop}
+
+
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -400,6 +428,105 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     assert node.store(workspace).list("pile/") == []
     posted = cmds.post(node, workspace, "general", "still authorized")
     assert node.fact_of(workspace, posted) is not None
+
+
+def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "root", ts=1)
+    root_secret, root = source.identity(workspace)
+    bob_secret, bob = keypair()
+    candidates = []
+    for ordinal in range(2):
+        invite_secret, invite_public = keypair()
+        invitation = user_invite(
+            root, invite_public, 10 + 2 * ordinal)
+        invitation_sig = signature(
+            root_secret, root, invitation, invitation.ts)
+        joined = user(
+            invitation, invite_secret, bob, f"bob-{ordinal}",
+            11 + 2 * ordinal)
+        joined_sig = signature(
+            bob_secret, bob, joined, joined.ts)
+        candidates.append(
+            (joined.fid, invitation_sig, invitation, joined_sig, joined))
+    original_chain, rejoin_chain = (
+        max(candidates, key=lambda item: item[0]),
+        min(candidates, key=lambda item: item[0]),
+    )
+    (
+        _,
+        original_invitation_sig,
+        original_invitation,
+        original_joined_sig,
+        original,
+    ) = original_chain
+    source.ingest_new(
+        workspace,
+        [
+            original_invitation_sig,
+            original_invitation,
+            original_joined_sig,
+            original,
+        ],
+        {
+            original_invitation_sig.fid: [],
+            original_invitation.fid: [
+                original_invitation_sig.fid,
+                member_src(source, workspace, root),
+            ],
+            original_joined_sig.fid: [],
+            original.fid: [
+                original_invitation.fid,
+                original_joined_sig.fid,
+            ],
+        },
+    )
+    common = closed_subset(source, workspace, all_fids(source, workspace))
+
+    remote = Node(str(tmp_path / "remote"))
+    remote.add_workspace(workspace, "root", peers=[])
+    deliver(remote, workspace, common)
+    remote.turn(workspace)
+
+    source.keychain.add_identity(bob_secret)
+    source.bind_identity(workspace, bob)
+    _, invitation_sig, invitation, rejoined_sig, rejoined = rejoin_chain
+    source.ingest_new(
+        workspace,
+        [invitation_sig, invitation, rejoined_sig, rejoined],
+        {
+            invitation_sig.fid: [],
+            invitation.fid: [
+                invitation_sig.fid,
+                member_src(source, workspace, root),
+            ],
+            rejoined_sig.fid: [],
+            rejoined.fid: [invitation.fid, rejoined_sig.fid],
+        },
+    )
+    assert member_src(source, workspace, bob) == rejoined.fid
+    assert member_src(remote, workspace, bob) == original.fid
+
+    remote.keychain.add_identity(bob_secret)
+    remote.bind_identity(workspace, bob)
+    ts = now_ms()
+    source_request = request_payload(
+        source, workspace, "sync", ts + 120_000, ts)
+    remote_request = request_payload(
+        remote, workspace, "sync", ts + 120_000, ts)
+
+    assert evaluate(
+        source_request,
+        workspace,
+        remote.globals(workspace),
+        canonical_db=remote.idx(workspace),
+    )
+    assert evaluate(
+        remote_request,
+        workspace,
+        source.globals(workspace),
+        canonical_db=source.idx(workspace),
+    )
 
 
 def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):

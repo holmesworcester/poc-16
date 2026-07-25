@@ -191,7 +191,7 @@ class Node:
             for bh, b in blobs.items():
                 st.put_if_absent("obj/" + bh, b)
             self.commit(ws, newfids)
-            self.materialize(ws, fresh)
+            self.materialize(ws, fresh, changed=newfids)
             for k in piles:
                 st.delete(k)  # retire ingress after the CAS, rejects included
             return fresh
@@ -428,7 +428,7 @@ class Node:
         self._stamp(ws)
         return man
 
-    def materialize(self, ws, valids):
+    def materialize(self, ws, valids, changed=None):
         valids = tuple(valids)
         db = self.app
         rebuilding = ws in self._reproject
@@ -450,11 +450,13 @@ class Node:
                     Valid(fact, tuple(resolve_deps(fact, idx) or ()))
                     for fact in ordered
                 )
+                changed = None
             for valid in valids:
                 facts.materialize(db, ws, valid)
             facts.reconcile(
                 db, ws, self.idx(ws),
-                lambda fid: self.fact_of(ws, fid), valids)
+                lambda fid: self.fact_of(ws, fid), valids,
+                changed=changed)
             db.commit()
         except Exception:
             db.rollback()

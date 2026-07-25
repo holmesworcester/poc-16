@@ -23,11 +23,12 @@ def materialize(db, workspace, valid):
     ROUTES[valid.fact.t].materialize(db, workspace, valid)
 
 
-def reconcile(db, workspace, index, fact_of, valids):
+def reconcile(db, workspace, index, fact_of, valids, changed=None):
     """Let families reconcile projections that use canonical offer winners."""
     for module in MODULES:
         if hasattr(module, "reconcile"):
-            module.reconcile(db, workspace, index, fact_of, valids)
+            module.reconcile(
+                db, workspace, index, fact_of, valids, changed=changed)
 
 
 def clear(db, workspace):

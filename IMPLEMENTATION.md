@@ -76,11 +76,12 @@ The three kernel entry points share one internal forward pass. Inputs are
 already canonical-topological closed piles, so none sorts: `validate` returns
 only a boolean for trustless consumers, `drain` additionally exposes `Valid`
 values and new monotone global rows, and `evaluate` applies ephemeral gates but
-returns only a boolean. At mint, the generic evaluator also requires every
-presented need at an already-known address to use the committed workspace's
-canonical provider; genuinely new addresses remain self-bootstrapping. This
-prevents a caller from omitting a winning conflict and reviving a quarantined
-authority closure without exposing the committed index to family validators.
+returns only a boolean. At mint, the generic evaluator also requires the
+committed canonical provider at every already-known address to satisfy that
+need's exact co-offers; genuinely new addresses remain self-bootstrapping.
+Equivalent providers may differ while honest peers converge, but a caller
+cannot omit an incompatible winning conflict and revive a quarantined
+authority closure. The committed index never enters family validators.
 The index stores globals generically as `(name, value)` rows and the manifest
 publishes their canonical sorted records; neither the node nor layout knows
 what `removal` means.

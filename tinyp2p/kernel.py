@@ -293,22 +293,22 @@ def _globals(rows):
     return frozenset(Global(*row) for row in (rows or ()))
 
 
-def _matches_committed_providers(fact, presented, committed):
-    """Reject a stale proof that hides a committed canonical offer winner.
+def _matches_committed_authority(fact, committed):
+    """Require the committed winner to satisfy every already-known need.
 
     A genuinely new address has no committed provider and may bootstrap
-    through the self-contained payload. Once an address exists in the
-    committed workspace, however, evaluate mode must use that same raw winner.
-    Co-offer requirements are intentionally checked only after winner
-    selection, so comparing raw winners also catches a committed winner whose
-    associated value makes the presented need unsatisfiable.
+    through the self-contained payload. Once an address exists, its committed
+    raw winner must satisfy the need's co-offers. The presented closure may use
+    a different source with equivalent authority: honest peers can temporarily
+    disagree about a winner and still authenticate the walk that converges
+    them.
     """
     handler = facts.handler_for(fact.t)
     for need in handler.needs(fact):
-        name, a0, a1, _ = _need_parts(need)
-        committed_source = offer_src(committed, name, a0, a1)
-        if committed_source is not None \
-                and offer_src(presented, name, a0, a1) != committed_source:
+        name, a0, a1, requires = _need_parts(need)
+        raw_source = offer_src(committed, name, a0, a1)
+        if raw_source is not None and offer_src(
+                committed, name, a0, a1, requires) is None:
             return False
     return True
 
@@ -341,8 +341,8 @@ def kernel(
             deps = resolve_deps(f, con) if handler is not None and refs_seen else None
             good = deps is not None and handler.validate(f, ctx) is True
             if good and mode == EVALUATE and canonical_db is not None:
-                good = _matches_committed_providers(
-                    f, con, canonical_db)
+                good = _matches_committed_authority(
+                    f, canonical_db)
             if good and mode == EVALUATE and hasattr(handler, "evaluate"):
                 good = handler.evaluate(f, supplied, ctx) is True
         except Exception:
