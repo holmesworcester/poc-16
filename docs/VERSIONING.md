@@ -4,10 +4,13 @@
 `bd dep tree poc-16-9fc`. Companion to `DESIGN.md` §Versioning (the model of
 record), `docs/SIMPLIFY.md` §5 (the log/cursor/pump seam a bump replays
 through), and `docs/CHAINED_AUTH_PLAN.md` §2 (the family fidelity rubric every
-version handler must still satisfy). Handoff for another agent; do not implement
-from memory — read this, `DESIGN.md` §Versioning and §The Engine (Needs and
-offers, Fact-family boundary), and `core/kernel.py` first. Plan only — each bead
-names its section here.
+version handler must still satisfy). **The worked-out form of the normalization
+mechanism is `~/poc-17/DESIGN.md`** — Dotted variables, Provide, and Two SQLite
+state layers; read those three before implementing §3, §4, §6 or §8, because
+POC-17 has already settled details this plan only sketches. Handoff for another
+agent; do not implement from memory — read this, `DESIGN.md` §Versioning and
+§The Engine (Needs and offers, Fact-family boundary), and `core/kernel.py`
+first. Plan only — each bead names its section here.
 
 **Skeletons:** branch `versioning-skeleton` (commit `7307280`) holds the stub
 surfaces this plan pins — `facts.offers(f)` plus `VERSIONS` /
@@ -51,7 +54,8 @@ pays off immediately.
 
 What already works:
 
-- **The shape of a per-version handler, as residue.** `facts/auth/legacy_genesis.py`,
+- - **The shape of a per-version handler, as residue.**
+  `facts/auth/legacy_genesis.py`,
   `legacy_signature.py`, `legacy_invite.py`, `legacy_join.py` keep the `genesis`
   / `sig` / `invite` / `join` tags judgeable beside `workspace` / `signature` /
   `user_invite` / `user`, author nothing, and are exercised by
@@ -65,7 +69,8 @@ What already works:
   `rebuild(ws, republish=True)` (`core/node.py:150-160`, `:579-619`): stream the
   store's own leaves back through `drain`, wipe and re-emit every derived table,
   republish without memoizing old fences. `APP_VERSION` (`core/node.py:58`)
-  mismatch ⇒ delete `app.db` and refold. Seven `INDEX_VERSION` bumps on main (eight distinct values since it was
+  mismatch ⇒ delete `app.db` and refold. Seven `INDEX_VERSION` bumps on main
+  (eight distinct values since it was
   introduced).
 
 What does not:
@@ -116,7 +121,8 @@ Validation is reconstruction equality in essentially every family — `f ==
 shaped`, where `shaped` comes from the family's own SHAPE constructor
 (`facts/auth/workspace.py:32-35`, `facts/auth/user.py:39-42`,
 `facts/content/message.py:31`, and twelve more — every family module in the
-tree, six via a `shaped` local and nine calling the SHAPE constructor inline). Any scheme that adds bytes to a
+tree, six via a `shaped` local and nine calling the SHAPE constructor inline).
+Any scheme that adds bytes to a
 fact must thread them through every constructor or every validator returns
 False. So the version stays where the codebase already put it: **in the wire
 tag**, with module metadata beside it.
@@ -138,10 +144,38 @@ path, so a third anchor-family version silently breaks two-root merge.
 
 ## 3. Offers become handler output — the one seam
 
-Add `offers(f)` to the family contract, beside `needs(f)`. The kernel admits
-`handler.offers(f)`, not `fact.offers()`. Every family's first implementation is
-`return f.offers()` — the identity — so the change lands byte-identical, green,
-and gives every future version handler the seam it needs.
+Add `offers(f)` to the family contract, beside `needs(f)` — a per-version
+**normalizer**, in POC-17's terms: a pure function from one supported source
+shape to one current semantic form. The kernel admits `handler.offers(f)`, not
+`fact.offers()`. Every family's first implementation is `return f.offers()` —
+the identity — so the change lands byte-identical, green, and gives every future
+version handler the seam it needs.
+
+Three properties come from `~/poc-17/DESIGN.md` and should be adopted verbatim,
+because each closes a hole this plan would otherwise leave open:
+
+- **The vocabulary is a canonical dotted path**, `content.message.body`, built
+  through one path object shared by constructors, normalizers, validators and
+  queries. A source version that called the concept `content.post.text` emits
+  `content.message.body` from its normalizer, and no current code retains the
+  old name. This is the concrete form of §5's relabeling law: one namespace,
+  one current spelling, historical names readable only inside their own adapter.
+- **Emission is all-or-nothing.** A valid fact's normalized offers are copied
+  whole; the family never returns a subset. That makes the normalizer a security
+  boundary, not just a decoder — it must recognize an exact supported source
+  shape and *reject extra source offers* rather than let a sender smuggle one
+  into a valid owner. POC-16 has no such check today, because the atoms simply
+  are the offers.
+- **A source offer atom is not itself a matching offer**; it is input to that
+  version's normalizer, and only the emitted row matches. That single sentence
+  is the seam, and it is what licenses renaming a variable, re-encoding a key or
+  payload, splitting or combining fields, and mapping an old tag into current
+  semantics without touching one immutable byte.
+
+One deliberate divergence: POC-17 parks a fact whose `Require` has no match,
+while POC-16 deleted parking from the grammar — a closed unit means the closer
+either shipped the providers or authored a broken pile, so an unmet need rejects
+the unit. Take POC-17's normalization, not its parking.
 
 `Fact.offers()` survives as the envelope accessor: families still shape and
 validate their own atoms with it, and the clear-envelope vocabulary stays
@@ -223,9 +257,9 @@ An unknown `(family, version)` is not an invalid fact; the node is not current.
 The two outcomes must be opposite:
 
 ```text
-invalid     -> delete the pile, charge the pusher's prefix, never retry
-unreadable  -> keep the pile (bounded), charge nobody, do not advance
-               that range, retry after upgrade
+invalid     -> drop the pile, charge the pusher's prefix, never retry
+unreadable  -> drop the pile, charge nobody, mark the range stalled,
+               re-sync after upgrade
 ```
 
 POC-10 said this as *"core does not store future-version incoming facts as
@@ -238,6 +272,16 @@ change); `core/node.py:237-241` is where the outcome must be distinguished from
 CAS`, today unconditional — is the line that must become conditional;
 `core/sync.py` marks the range stalled instead of re-pulling it.
 
+**Nothing is retained.** POC-17 states the disposal rule the same way POC-10
+did and sharper: bytes become durable only once the current release can decode,
+normalize, and project them, so an unreadable version stays *outside* the store
+rather than parked inside it. That removes the retention hazard this plan
+briefly carried — an unknown tag is free to fabricate, needing no key, no chain,
+no closure, so keeping such piles unblamed and unexpired would have converted a
+solved DoS into an open one. There is no byte cap and no TTL to design, because
+there is nothing held. The change is bookkeeping: stop charging the pusher, and
+mark the range stalled so the walk stops rediscovering it.
+
 **Both halves are new work: there is no blame mechanism today.** `do_PUT` stores
 the pile and returns 204 unconditionally (`core/daemon.py:143-145` — "delivery
 receipt; acceptance is the treap"), and `turn()` deletes every pile after the
@@ -245,13 +289,7 @@ CAS whatever its verdict. The pusher prefix exists in the key but is never
 consulted afterwards. So §6 adds *two* behaviors — charging the invalid side and
 exempting the unreadable one — rather than exempting one that exists.
 
-**Retention must be bounded.** An unknown tag is free to fabricate: no key, no
-chain, no closure. Keeping such piles unblamed and un-expired converts a solved
-DoS (`DESIGN.md` §The Store: "a hostile writer can litter but never poison")
-into an open one — unbounded pinned storage in a grant-holder's prefix that
-every drain re-reads. Unreadability suspends blame, not accounting: a per-prefix
-byte cap and a TTL, after which the pile is dropped and the range simply
-re-syncs.
+
 
 Piles are all-or-nothing, so one unreadable fact stalls its whole unit — which
 is the right semantics: a behind-version client stops cleanly at the version
@@ -317,6 +355,14 @@ same bead:
   (`core/node.py:600`) and relies on the process-local `self._reproject` set;
   safety comes only from `meta['root']` also being deleted. Any new
   version-driven wipe path must preserve that invariant.
+
+Two properties come with it, from POC-17's Two SQLite state layers: the rebuild
+runs in **bounded, resumable transactions** rather than one pass with the whole
+set resident — the host may be an NSE whose database exceeds its memory budget —
+and until it reaches quiescence, completeness-sensitive queries **fail closed**
+rather than answering from a half-rebuilt view. Both bear directly on the
+measured shape of today's reproject, which is one transaction, O(|V| · deps)
+unbatched round trips, whole set in memory.
 
 Cost is the catchup path, so it is priced by it — ~1.1k facts/s while nothing
 has sealed, 5,826–7,909 at 50–100k once the tiered cold pages fire, at the

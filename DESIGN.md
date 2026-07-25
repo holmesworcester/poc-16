@@ -644,15 +644,34 @@ The offer table records what *this* release makes of that assertion, normalized
 to the current vocabulary. Today the two are the same thing — the kernel admits
 the envelope atoms verbatim and no family has an offer hook — so the interlingua
 is asserted rather than built. Versioning is the change that separates them:
-offers become handler output, of which today's behavior is the identity case.
-**Needs are normalized the same way, or nothing matches** — both sides of a
-match must speak one vocabulary, and a version that relabelled its offers but
-not its needs would look up an address nothing answers to. Needs already come
-from code, a handler function the running release evaluates; offers come from
-stored bytes. Closing that gap, so both sides of a match are handler output, is
-the whole of the change. The payoff is that no consumer ever decodes a
-producer's old schema — it needs an address, and the producer's own old handler
-is what puts a current-vocabulary offer there. Globals ride the same seam, being
+offers become the output of a per-version **normalizer**, a pure function from
+one supported source shape to one current semantic form, of which today's
+behavior is the identity case. **Needs are normalized the same way, or nothing
+matches** — both sides of a match must speak one vocabulary, and a version that
+relabelled its offers but not its needs would look up an address nothing answers
+to. Needs already come from code, a handler function the running release
+evaluates; offers come from stored bytes. Closing that gap, so both sides of a
+match are normalizer output, is the whole of the change. The payoff is that no
+consumer ever decodes a producer's old schema — it needs an address, and the
+producer's own old normalizer is what puts a current-vocabulary offer there.
+
+POC-17 works this out in detail and POC-16 should take its shape (its DESIGN.md,
+Dotted variables and Provide). Three parts carry the weight. The vocabulary is a
+**canonical dotted path** — `content.message.body` — built through one path
+object that constructors, normalizers, validators, and queries all share, so a
+source version that called the same concept `content.post.text` emits
+`content.message.body` from its normalizer and no current code retains the old
+name. Emission is **all-or-nothing**: a valid fact's normalized offers are
+copied whole, the family never returning a subset, which is what makes the
+normalizer the security boundary — it must recognize an exact supported source
+shape and reject extra source offers rather than let a sender smuggle one into a
+valid owner. And a source offer atom **is not itself a matching offer**; it is
+input to that version's normalizer, so only the emitted row matches. That last
+line is the seam stated exactly, and it is what licenses renaming a variable,
+re-encoding a key or payload, splitting or combining fields, and mapping an old
+tag into current semantics without touching one immutable byte.
+
+Globals ride the same seam, being
 handler output published in the root; their value space must stay stable
 identities, keys and fids, which is what they already carry, because a
 schema-shaped global would rewrite root bytes on every release.
@@ -717,11 +736,17 @@ redemption one-shot.
 
 **Meeting a version you do not implement is a verdict about the node, not the
 fact.** The two outcomes have to be opposite: an invalid pile is dropped and
-charged to its pusher, while an unreadable one is kept, charged to nobody, and
-retried after upgrade. POC-10 said it as "core does not store future-version
-incoming facts as protocol truth — incoming is volatile intake"; here it is a
-third kernel outcome beside valid and invalid, entering the set never,
-destroying nothing, attributing nothing. Both halves are work, because today an
+charged to its pusher, while an unreadable one is dropped and charged to nobody.
+POC-10 said it as "core does not store future-version incoming facts as protocol
+truth — incoming is volatile intake", and POC-17 keeps the rule while sharpening
+the disposal: bytes become durable only once the current release can decode,
+normalize, and project them, so an unreadable version stays *outside* the store
+rather than parked inside it. Nothing is retained, which is what keeps an
+unknown tag — free to fabricate, needing no key, no chain, no closure — from
+becoming pinned storage in a grant-holder's prefix. So this is a third kernel
+outcome beside valid and invalid, entering the set never, destroying nothing,
+attributing nothing, and costing nothing to hold. Both halves are work,
+because today an
 unknown tag resolves to no handler and the unit rejects whole — taking down
 every fact in it the reader does understand — while ingress is retired
 unconditionally after the CAS with nothing counted against anyone either way.
@@ -731,10 +756,9 @@ tight loop, which is why it has gone unnoticed. With the third outcome the same
 situation is a clean fail-stop — piles are all-or-nothing, so a behind-version
 client stops at the version boundary rather than serving a partial truth, and
 nothing is lost, since the peer still holds the range and the fingerprints still
-differ. Retention has to be bounded or it hands back the DoS the pile design
-closed, an unknown tag being free to fabricate: unreadability suspends blame,
-not accounting, so a per-prefix byte cap and a TTL, after which the pile is
-dropped and the range simply re-syncs. Deployments whose engine is the vendor's
+differ. The whole change is therefore bookkeeping rather than storage: stop
+charging the pusher, and mark the range stalled so the walk stops rediscovering
+it. Deployments whose engine is the vendor's
 own — cloud node, home server — upgrade first and never meet any of it.
 
 **An upgrade is one replay.** A stored stamp that does not match the running
@@ -747,7 +771,12 @@ semantic index stamp re-running the kernel and republishing while an app schema
 stamp replaces the read models, but they are two hand-maintained constants that
 have never moved together and are tied neither to each other nor to a release,
 and there is no release version in the tree at all. Making one constant drive
-both is the versioning work. Cost is the catchup path, so it is priced by it —
+both is the versioning work. Two properties come with it, from POC-17: the
+rebuild runs in **bounded, resumable transactions** rather than one pass with
+the set resident, since the host may be an NSE with a database larger than its
+memory budget; and until it reaches quiescence, completeness-sensitive queries
+**fail closed** rather than answering from a half-rebuilt view. Cost is the
+catchup path, so it is priced by it —
 ~1.1k facts/s under the shipped monotone cut, against a raw judge ceiling near
 9k (bench/RESULTS.md) — and it is the same code as a fresh join. What replay
 cannot fix is retiring a version. The suppression-marker cutover is the case in
