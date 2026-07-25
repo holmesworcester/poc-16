@@ -1,4 +1,5 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
+import base64
 import os
 import random
 import tempfile
@@ -6,7 +7,7 @@ from dataclasses import replace
 
 import facts
 
-from core import cmds, tree
+from core import cmds, daemon, tree
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact
@@ -19,6 +20,18 @@ from core.kernel import offer_src, resolve_deps
 from core.node import Node, now_ms
 from core.shape import FACT
 from core.suppression import TARGET, atom, is_deletion
+
+
+def invoke_mint(node, workspace, pile):
+    handler = object.__new__(daemon.Handler)
+    handler.node, handler.secret = node, b"mint-test-secret"
+    handler._known = lambda candidate: candidate == workspace
+    handler._send = lambda code, *args, **kwargs: (code, None)
+    handler._json = lambda code, body: (code, body)
+    return handler, handler.mint({
+        "ws": workspace,
+        "pile": base64.b64encode(pile).decode(),
+    })
 
 
 def channel_delete(target, channel, ts):
