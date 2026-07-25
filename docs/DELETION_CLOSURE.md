@@ -77,6 +77,16 @@ close_deletions(closure):                       # after the dep-ref closure of Q
   return closure                                 # now deletion-closed as well as dep-closed
 ```
 
+The landed `core.suppression.supp_walk` maps `K` to one open-left prefix range
+and delegates to `tree.range_facts`. Its result separates exact `facts` (the
+semantic K-group members) from `unit` (the closed, topological transport and
+judgment context, including page/ancestor padding). `close_deletions` walks
+only the sorted death keys in its input, unions exact members into `facts`, and
+deduplicates the closed units in stream order. Padding therefore neither
+becomes a semantic match nor recursively triggers an adjacent group scan. Both
+functions take only a tree view and `fetch` callback—there is no database or
+second traversal implementation.
+
 **Why after dep-closure, before project** (this is the "interesting question:
 when should the pass be", answered):
 

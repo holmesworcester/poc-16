@@ -9,7 +9,7 @@ import pytest
 
 from core import hoist, layout, shape, sync as sync_module, treap, tree
 from core import cmds
-from core.close import encode_pile
+from core.close import close, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact, canon
 from facts.auth.signature import signature
@@ -17,6 +17,9 @@ from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message
 from core.kernel import Scratchpad, resolve_deps
 from core.node import Node
+from core.suppression import (
+    atom, close_deletions, deathkey, is_deletion, supp_walk, suppkey,
+)
 
 from .util import (
     all_fids,
@@ -1182,6 +1185,90 @@ def test_secondary_paths_include_and_validate_closure_only_facts(
         tree._canonical_graph((unit,), require_anchor=False)
 
 
+def test_suppression_walk_closes_every_match_for_a_deletion_key(
+        tmp_path, monkeypatch):
+    items, deps, secondary, keys = suppression_tree_world(
+        tmp_path / "node", monkeypatch)
+    driver = Driver()
+    root = tree.build(
+        keys, secondary, tree.fat(2),
+        items.__getitem__, deps.__getitem__, driver.emit,
+    )
+    deletion = next(fact for fact in items.values() if is_deletion(fact))
+    group = deathkey(deletion)
+    initial = close(
+        [deletion], deps.__getitem__, items.__getitem__)
+    expected = {
+        fact.fid for fact in items.values()
+        if suppkey(fact) == group
+    }
+
+    walked = supp_walk(cold(root), group, driver.fetch)
+    actual = close_deletions(
+        initial, cold(root), driver.fetch)
+    present = {fact.fid for fact in actual.unit}
+    position = {
+        fact.fid: index for index, fact in enumerate(actual.unit)
+    }
+
+    assert {fact.fid for fact in walked.facts} == expected
+    assert {
+        fact.fid for fact in actual.facts
+        if suppkey(fact) is not None
+    } == expected
+    assert expected - {fact.fid for fact in initial}
+    assert all(
+        set(deps[fact.fid]) <= present
+        and all(position[dep] < position[fact.fid] for dep in deps[fact.fid])
+        for fact in actual.unit
+    )
+    assert supp_walk(
+        cold(root), '["chan","absent"]', driver.fetch).facts == ()
+
+
+def test_suppression_walk_separates_boundary_padding_from_matches(
+        monkeypatch):
+    monkeypatch.setattr(shape, "CUT", 4)
+    facts = []
+    for group in range(80):
+        channel = f"g{group:03d}"
+        facts.append(Fact(
+            "del", group * 100,
+            [atom(channel, deletion=True)], {"g": group},
+        ))
+        facts.extend(
+            Fact(
+                "target", group * 100 + ordinal + 1,
+                [atom(channel)], {"g": group, "i": ordinal},
+            )
+            for ordinal in range(20)
+        )
+    items = {fact.fid: fact for fact in facts}
+    secondary, driver = shape.supp_shape(), Driver()
+    root = tree.build(
+        [secondary.key(fact) for fact in facts],
+        secondary, tree.fat(8), items.__getitem__,
+        lambda fid: (), driver.emit,
+    )
+    group, padding_group = suppkey(facts[0]), suppkey(facts[21])
+    driver.reads.clear()
+    driver.calls.clear()
+
+    walked = supp_walk(cold(root), group, driver.fetch)
+    closed = close_deletions(
+        (facts[0],), cold(root), driver.fetch)
+    expected = {fact.fid for fact in facts[:21]}
+
+    assert {fact.fid for fact in walked.facts} == expected
+    assert {
+        fact.fid for fact in walked.unit
+        if suppkey(fact) == padding_group
+    } == {facts[21].fid}
+    assert {fact.fid for fact in closed.facts} == expected
+    assert facts[21] in closed.unit
+    assert len(set(driver.reads)) < len(driver.objects) // 20
+
+
 @pytest.mark.parametrize("seed", range(3))
 def test_secondary_fold_matches_full_build_under_shuffled_promotions(
         tmp_path, monkeypatch, seed):
@@ -1508,7 +1595,12 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
 
 @pytest.fixture(scope="module")
 def hoist_world(tmp_path_factory):
-    node = Node(str(tmp_path_factory.mktemp("hoist")))
+    # Fixed identity pins the boundary hashes this fixture needs: an internal
+    # root with shared payload context, rather than a probabilistic one-leaf tree.
+    node = Node(
+        str(tmp_path_factory.mktemp("hoist")),
+        initial_secret=load_sk(f"{1:064x}"),
+    )
     workspace = cmds.create(node, "alice", ts=1_000_000)
     for ordinal in range(24):
         cmds.post(
