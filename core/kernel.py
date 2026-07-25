@@ -51,6 +51,21 @@ class Judgment(NamedTuple):
     globals: frozenset
 
 
+UNREADABLE = "unreadable"
+"""The third outcome — poc-16-9fc.5, docs/VERSIONING.md §6.
+
+A tag with no handler in this release is a verdict about the NODE, not the
+fact: it enters the set never, destroys nothing, and blames nobody.  Invalid
+still means delete the pile and blame the pusher's prefix; unreadable means
+keep the pile, do not advance that range, retry after upgrade.
+
+`Judgment` must carry the unreadable tags, but widening it is part of the bead,
+not of this skeleton: it is tuple-unpacked at its call sites (core/node.py,
+core/tree.py, core/mint.py), so a fourth field — even with a default — breaks
+them.  Widen the NamedTuple and fix the unpacks in one change.
+"""
+
+
 @dataclass(frozen=True)
 class Context:
     """Immutable in-pile context visible to every family validator.
