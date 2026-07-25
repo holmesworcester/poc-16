@@ -155,6 +155,13 @@ class Node:
             self._reproject.add(ws)
             self.materialize(ws, ())
 
+    def _restore_authoritative_projections(self, ws):
+        """Discard a failed turn's local state before releasing its lock."""
+        self.idx(ws).rollback()
+        self.app.rollback()
+        self._sync_index(ws)
+        self._sync_projection(ws)
+
     def _stamp_projection(self, ws):
         """Record the manifest generation reflected by the current app txn."""
         self.app.execute(
@@ -164,11 +171,30 @@ class Node:
 
     def _stamp(self, ws):
         idx = self.idx(ws)
-        idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
-                    (self.store(ws).etag("root"),))
-        idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-                    (INDEX_VERSION,))
-        idx.commit()
+        try:
+            idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
+                        (self.store(ws).etag("root"),))
+            idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
+                        (INDEX_VERSION,))
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
+
+    def commit_index(self, ws):
+        """Commit direct derived-index writes as ahead of the manifest.
+
+        The live merge path and bulk benchmark builders share this boundary so
+        a process death before ``commit()`` cannot leave unpublished rows under
+        an apparently current root stamp.
+        """
+        idx = self.idx(ws)
+        try:
+            idx.execute("DELETE FROM meta WHERE k='root'")
+            idx.commit()
+        except Exception:
+            idx.rollback()
+            raise
 
     def fact_of(self, ws, fid) -> Fact:
         row = self.idx(ws).execute("SELECT j FROM facts WHERE fid=?", (fid,)).fetchone()
@@ -190,36 +216,46 @@ class Node:
             piles = st.list("pile/")
             if not piles:
                 return []  # nothing delivered; drain-on-read stays free
-            self._sync_index(ws)
-            self._sync_projection(ws)
-            units = []
-            for k in piles:
-                try:
-                    units.append(decode_pile(st.get(k)))
-                except Exception:
-                    units.append(None)  # malformed: rejected on the spot
-            if len(units) > 1:  # independent piles judge in parallel
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    results = list(ex.map(
-                        lambda u: drain(u[0], ws) if u else Judgment(False, (), frozenset()),
-                        units))
-            else:
-                results = [drain(u[0], ws) if u else Judgment(False, (), frozenset())
-                           for u in units]
-            valids, new_globals, blobs = [], set(), {}
-            for u, (ok, vs, global_rows) in zip(units, results):
-                if ok:
-                    valids += vs
-                    new_globals.update(global_rows)
-                    blobs.update(u[1])
-            fresh, newfids = self.merge(ws, valids, new_globals)
-            for bh, b in blobs.items():
-                st.put_if_absent("obj/" + bh, b)
-            self.commit(ws, newfids)
-            self.materialize(ws, fresh, changed=newfids)
-            for k in piles:
-                st.delete(k)  # retire ingress after the CAS, rejects included
-            return fresh
+            try:
+                self._sync_index(ws)
+                self._sync_projection(ws)
+                units = []
+                for k in piles:
+                    try:
+                        units.append(decode_pile(st.get(k)))
+                    except Exception:
+                        units.append(None)  # malformed: rejected on the spot
+                if len(units) > 1:  # independent piles judge in parallel
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        results = list(ex.map(
+                            lambda u: drain(u[0], ws) if u else
+                            Judgment(False, (), frozenset()),
+                            units))
+                else:
+                    results = [
+                        drain(u[0], ws) if u else
+                        Judgment(False, (), frozenset())
+                        for u in units
+                    ]
+                valids, new_globals, blobs = [], set(), {}
+                for u, (ok, vs, global_rows) in zip(units, results):
+                    if ok:
+                        valids += vs
+                        new_globals.update(global_rows)
+                        blobs.update(u[1])
+                fresh, newfids = self.merge(ws, valids, new_globals)
+                for bh, b in blobs.items():
+                    st.put_if_absent("obj/" + bh, b)
+                self.commit(ws, newfids)
+                self.materialize(ws, fresh, changed=newfids)
+                for k in piles:
+                    st.delete(k)  # retire ingress after the CAS
+                return fresh
+            except Exception:
+                # The manifest CAS is the commit point. A live daemon must not
+                # expose an ahead index or app projection after a failed turn.
+                self._restore_authoritative_projections(ws)
+                raise
 
     def merge(self, ws, valids, global_rows=()):
         idx, out, newfids = self.idx(ws), [], []
@@ -251,8 +287,7 @@ class Node:
                     self._rebuild_globals(ws)
             # The index is ahead of the authoritative manifest until commit()
             # publishes a root and _stamp() records that generation.
-            idx.execute("DELETE FROM meta WHERE k='root'")
-            idx.commit()
+            self.commit_index(ws)
             if pruned or restored:
                 if restored:
                     self._invalidate_sync_cache(ws)
@@ -430,8 +465,8 @@ class Node:
                 self._reproject.add(ws)
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
-                idx.execute("DELETE FROM meta WHERE k='root'")
-            idx.commit()
+            # Also covers supported direct/bulk writers which bypass merge().
+            self.commit_index(ws)
             if restored:
                 self._invalidate_sync_cache(ws)
         except Exception:
@@ -537,7 +572,7 @@ class Node:
             idx.executescript(
                 "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
                 "DELETE FROM globals; DELETE FROM meta WHERE k='root';")
-            idx.commit()
+            self.commit_index(ws)
             self._reproject.add(ws)
             man = st.get("root")
             if not man:

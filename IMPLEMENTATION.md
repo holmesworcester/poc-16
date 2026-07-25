@@ -32,7 +32,11 @@ are therefore projection no-ops, including after the app commit but before
 the ingress pile is retired. The derived index stamp is deleted in the same
 transaction that advances the index and restored only after the manifest CAS;
 a crash with an index ahead of the root therefore rebuilds from the root
-before retrying its retained pile.
+before retrying its retained pile. A caught turn failure performs that same
+rollback and resynchronization before releasing the workspace lock, so a live
+daemon cannot authorize from unpublished index or global rows. Stamp writes
+roll back as one SQLite transaction, and the bulk benchmark builders use the
+same dirty-index commit boundary as live merge.
 This holds *because validity is globals-blind* — a pure function of each
 pile's closure. An operation whose verdict depends on a global that can change
 concurrently (e.g. set-valued deletion — deleting a whole channel, not one

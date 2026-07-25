@@ -113,7 +113,7 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
             parents[member_pk] = inviter_pk
             depths[member_pk] = depths[inviter_pk] + 1
             users[member_pk] = joined.fid
-        idx.commit()
+        node.commit_index(workspace)
         node.keychain.save()
     except Exception:
         idx.rollback()
@@ -161,7 +161,7 @@ def grow_devices(
                 device_to_user[sibling_public] = user_public
                 ts += 1
             all_devices.extend(device_set)
-        idx.commit()
+        node.commit_index(workspace)
         node.keychain.save()
     except Exception:
         idx.rollback()

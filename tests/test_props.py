@@ -10,17 +10,19 @@ P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
 """
 import json
 import random
+import sqlite3
 
 import pytest
 
 from tinyp2p import cmds
-from tinyp2p.close import decode_pile
+from tinyp2p.close import close, decode_pile, encode_pile
 from tinyp2p.crypto import keypair
 from tinyp2p.fact import Fact
 from tinyp2p.facts.auth.request import request
 from tinyp2p.facts.auth.signature import signature
 from tinyp2p.facts.auth.user import user
 from tinyp2p.facts.auth.user_invite import user_invite
+from tinyp2p.facts.content.message import message
 from tinyp2p.kernel import drain, resolve_deps
 from tinyp2p.node import Node, now_ms
 
@@ -103,19 +105,37 @@ def test_rebuild(world):
 
 
 def test_pre_manifest_crash_replays_from_the_authoritative_root(
-        tmp_path, monkeypatch):
+        tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     old_root = node.store(workspace).etag("root")
 
-    def crash_before_manifest(*args, **kwargs):
-        raise RuntimeError("simulated pre-manifest crash")
+    secret, public = node.identity(workspace)
+    item = message(public, "general", "survives retry", 2)
+    signed = signature(secret, public, item, 2)
+    new = {fact.fid: fact for fact in (signed, item)}
+    deps = {
+        signed.fid: [],
+        item.fid: [signed.fid, member_src(node, workspace, public)],
+    }
 
-    monkeypatch.setattr(node, "commit", crash_before_manifest)
-    with pytest.raises(RuntimeError, match="simulated pre-manifest crash"):
-        cmds.post(
-            node, workspace, "general", "survives retry", ts=2)
+    def fact_of(fid):
+        return new.get(fid) or node.fact_of(workspace, fid)
 
+    pile = encode_pile(close(
+        [signed, item],
+        lambda fid: deps[fid] if fid in deps else
+        (resolve_deps(fact_of(fid), node.idx(workspace)) or ()),
+        fact_of,
+    ))
+    deliver(node, workspace, pile)
+    stream, _ = decode_pile(pile)
+    judgment = drain(stream, workspace)
+    assert judgment.ok
+    node.merge(workspace, judgment.valids, judgment.globals)
+
+    # Model process death at the exact merge/manifest boundary: no exception
+    # handler gets to restore the derived index before its connections close.
     assert node.store(workspace).etag("root") == old_root
     assert node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
@@ -149,6 +169,150 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
     assert reopened.app.execute(
         "SELECT root FROM projection_meta WHERE ws=?",
         (workspace,)).fetchone() == (root,)
+
+
+def test_failed_turn_restores_authoritative_state_before_return(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    old_root = node.store(workspace).etag("root")
+    original_commit = node.commit
+
+    def fail_before_manifest(*args, **kwargs):
+        raise RuntimeError("simulated pre-manifest failure")
+
+    monkeypatch.setattr(node, "commit", fail_before_manifest)
+    with pytest.raises(RuntimeError, match="simulated pre-manifest failure"):
+        cmds.post(node, workspace, "general", "live retry", ts=2)
+
+    # The daemon may catch the error and continue serving. Before turn() gives
+    # up its lock, both local projections must already reflect the old root.
+    assert node.store(workspace).etag("root") == old_root
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == (1,)
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (old_root,)
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone() == (0,)
+    assert node.store(workspace).list("pile/")
+
+    monkeypatch.setattr(node, "commit", original_commit)
+    node.turn(workspace)
+
+    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
+        == ["live retry"]
+    assert node.store(workspace).list("pile/") == []
+    root = node.store(workspace).etag("root")
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert node.app.execute(
+        "SELECT root FROM projection_meta WHERE ws=?",
+        (workspace,)).fetchone() == (root,)
+
+
+def test_index_stamp_rolls_back_a_partial_write(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    index = node.idx(workspace)
+    expected = index.execute(
+        "SELECT k, v FROM meta ORDER BY k").fetchall()
+    index.executescript(
+        "CREATE TRIGGER fail_index_version "
+        "BEFORE INSERT ON meta WHEN NEW.k='index-version' "
+        "BEGIN SELECT RAISE(FAIL, 'simulated stamp failure'); END;"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="stamp failure"):
+        node._stamp(workspace)
+
+    assert not index.in_transaction
+    assert index.execute(
+        "SELECT k, v FROM meta ORDER BY k").fetchall() == expected
+    index.execute("DROP TRIGGER fail_index_version")
+    index.commit()
+    node._stamp(workspace)
+
+
+def test_partial_stamp_failure_retries_in_the_same_process(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    original_stamp = node._stamp
+    failed = False
+
+    def fail_once_after_root(stamped_workspace):
+        nonlocal failed
+        if not failed:
+            failed = True
+            node.idx(stamped_workspace).execute(
+                "INSERT OR REPLACE INTO meta VALUES('root', ?)",
+                (node.store(stamped_workspace).etag("root"),),
+            )
+            raise RuntimeError("simulated partial stamp")
+        original_stamp(stamped_workspace)
+
+    monkeypatch.setattr(node, "_stamp", fail_once_after_root)
+    with pytest.raises(RuntimeError, match="simulated partial stamp"):
+        cmds.post(node, workspace, "general", "stamp retry", ts=2)
+
+    assert not node.idx(workspace).in_transaction
+    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
+        == ["stamp retry"]
+    assert node.store(workspace).list("pile/")
+
+    node.turn(workspace)
+
+    assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
+        == ["stamp retry"]
+    assert node.store(workspace).list("pile/") == []
+    root = node.store(workspace).etag("root")
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert node.app.execute(
+        "SELECT root FROM projection_meta WHERE ws=?",
+        (workspace,)).fetchone() == (root,)
+
+
+def test_bulk_index_crash_cannot_preserve_unpublished_facts(
+        tmp_path, monkeypatch):
+    from bench.bench_sync import bulk_author
+
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    old_root = node.store(workspace).etag("root")
+    bulk_author(
+        node,
+        workspace,
+        [node.identity(workspace)],
+        1,
+        2,
+        1,
+        random.Random(16),
+    )
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == (3,)
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() is None
+
+    def fail_before_manifest(*args, **kwargs):
+        raise RuntimeError("simulated bulk pre-manifest failure")
+
+    monkeypatch.setattr(node.store(workspace), "cas", fail_before_manifest)
+    with pytest.raises(RuntimeError, match="bulk pre-manifest failure"):
+        node.commit(workspace)
+
+    for index in node._idx.values():
+        index.close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert reopened.store(workspace).etag("root") == old_root
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == (1,)
+    assert reopened.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone() == (0,)
 
 
 def test_old_index_rebuilds_generic_globals_on_open(world):
