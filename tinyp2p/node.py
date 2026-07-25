@@ -132,12 +132,16 @@ class Node:
         """Every SQLite is a derived projection stamped with the manifest it
         reflects; a mismatched stamp means rebuild from the store."""
         etag = self.store(ws).etag("root")
-        row = self.idx(ws).execute("SELECT v FROM meta WHERE k='root'").fetchone()
-        version = self.idx(ws).execute(
+        idx = self.idx(ws)
+        row = idx.execute("SELECT v FROM meta WHERE k='root'").fetchone()
+        version = idx.execute(
             "SELECT v FROM meta WHERE k='index-version'").fetchone()
         semantic_upgrade = version is None or version[0] != INDEX_VERSION
-        if etag and (row is None or row[0] != etag
-                     or semantic_upgrade):
+        dirty_without_root = etag is None and idx.execute(
+            "SELECT 1 FROM facts LIMIT 1").fetchone() is not None
+        if dirty_without_root or (
+                etag is not None
+                and (row is None or row[0] != etag or semantic_upgrade)):
             self.rebuild(ws, republish=semantic_upgrade)
 
     def _sync_projection(self, ws):
@@ -186,6 +190,7 @@ class Node:
             piles = st.list("pile/")
             if not piles:
                 return []  # nothing delivered; drain-on-read stays free
+            self._sync_index(ws)
             self._sync_projection(ws)
             units = []
             for k in piles:
@@ -244,6 +249,9 @@ class Node:
                     ws, newfids, shadows)
                 if pruned or restored:
                     self._rebuild_globals(ws)
+            # The index is ahead of the authoritative manifest until commit()
+            # publishes a root and _stamp() records that generation.
+            idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
             if pruned or restored:
                 if restored:
@@ -422,6 +430,7 @@ class Node:
                 self._reproject.add(ws)
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
+                idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
             if restored:
                 self._invalidate_sync_cache(ws)
@@ -527,7 +536,7 @@ class Node:
             st, idx = self.store(ws), self.idx(ws)
             idx.executescript(
                 "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
-                "DELETE FROM globals;")
+                "DELETE FROM globals; DELETE FROM meta WHERE k='root';")
             idx.commit()
             self._reproject.add(ws)
             man = st.get("root")

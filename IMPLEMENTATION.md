@@ -29,7 +29,10 @@ Independent piles validate in parallel (each kernel call gets its own
 reflects: a lagging generation is reprojected before ingress replay, while an
 aligned generation materializes only the newly indexed ids. Closure replays
 are therefore projection no-ops, including after the app commit but before
-the ingress pile is retired.
+the ingress pile is retired. The derived index stamp is deleted in the same
+transaction that advances the index and restored only after the manifest CAS;
+a crash with an index ahead of the root therefore rebuilds from the root
+before retrying its retained pile.
 This holds *because validity is globals-blind* — a pure function of each
 pile's closure. An operation whose verdict depends on a global that can change
 concurrently (e.g. set-valued deletion — deleting a whole channel, not one

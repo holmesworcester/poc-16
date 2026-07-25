@@ -102,6 +102,55 @@ def test_rebuild(world):
     assert n.store(ws).etag("root") == before
 
 
+def test_pre_manifest_crash_replays_from_the_authoritative_root(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    old_root = node.store(workspace).etag("root")
+
+    def crash_before_manifest(*args, **kwargs):
+        raise RuntimeError("simulated pre-manifest crash")
+
+    monkeypatch.setattr(node, "commit", crash_before_manifest)
+    with pytest.raises(RuntimeError, match="simulated pre-manifest crash"):
+        cmds.post(
+            node, workspace, "general", "survives retry", ts=2)
+
+    assert node.store(workspace).etag("root") == old_root
+    assert node.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() is None
+    assert node.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone()[0] == 0
+    assert node.store(workspace).list("pile/")
+
+    for index in node._idx.values():
+        index.close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    assert reopened.app.execute(
+        "SELECT COUNT(*) FROM messages WHERE ws=?",
+        (workspace,)).fetchone()[0] == 0
+    assert reopened.store(workspace).list("pile/")
+
+    reopened.turn(workspace)
+
+    assert [message["text"] for message in cmds.msgs(
+        reopened, workspace)] == ["survives retry"]
+    assert reopened.store(workspace).list("pile/") == []
+    root = reopened.store(workspace).etag("root")
+    assert reopened.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
+    assert reopened.app.execute(
+        "SELECT root FROM projection_meta WHERE ws=?",
+        (workspace,)).fetchone() == (root,)
+
+
 def test_old_index_rebuilds_generic_globals_on_open(world):
     """An index stamped before the family/global split cannot silently lose
     its removal rows when the code is upgraded."""
