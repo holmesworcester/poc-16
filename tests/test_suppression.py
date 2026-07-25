@@ -23,7 +23,7 @@ class EnvelopeOnly:
 
 def test_channel_targets_share_an_envelope_visible_suppkey():
     msg = message("pk", "general", "hello", 1)
-    attachment = file("pk", "general", "a.txt", 3, "blob", 2)
+    attachment = file("pk", "general", "a.txt", 3, "ab" * 32, 1, 2)
 
     assert suppkey(msg) == suppkey(attachment) == '["chan","general"]'
     assert deathkey(msg) is None

@@ -34,6 +34,7 @@ from .pump import (
     CURSOR_SCHEMA,
     LOG_SCHEMA,
     append_admitted,
+    append_received,
     append_retracted,
     pump,
 )
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v7-pump"
+INDEX_VERSION = "family-contract-v8-attachments"
 
 
 def now_ms():
@@ -193,11 +194,33 @@ class Node:
             fresh, newfids = self.merge(ws, valids, new_globals)
             for bh, b in blobs.items():
                 st.put_if_absent("obj/" + bh, b)
+            self.log_arrivals(ws, [v.fact for v in fresh])
             self.commit(ws, newfids)
             pump(self, ws)
             for k in piles:
                 st.delete(k)  # retire ingress after the CAS, rejects included
             return fresh
+
+    def log_arrivals(self, ws, candidates):
+        """A fact and its spilled bytes travel on separate channels; this is
+        the second one. Once every object a fact names is present, the log
+        says so, and read models fold that arrival exactly once — the same
+        machinery as admission, so nothing polls residency.
+
+        Known gap: the object is written before its log row, so a crash in
+        between leaves bytes with no arrival. A rebuild repairs it.
+        """
+        st = self.store(ws)
+        landed = [
+            f.fid for f in candidates
+            if facts.blob_refs(f)
+            and all(st.has("obj/" + bh) for bh in facts.blob_refs(f))
+        ]
+        if landed:
+            idx = self.idx(ws)
+            append_received(idx, landed)
+            idx.commit()
+        return landed
 
     def _log_projection(self, ws, admitted, retracted, reproject):
         idx = self.idx(ws)
@@ -532,8 +555,12 @@ class Node:
                 assert result.ok, "own store failed its own kernel"
             idx.execute("BEGIN")
             try:
-                for table in ("facts", "offers", "proofs", "globals", "log"):
+                for table in ("facts", "offers", "proofs", "globals"):
                     idx.execute(f"DELETE FROM {table}")
+                # Dropped, not emptied: the log's shape is part of the index
+                # version, so an upgrade has to be able to widen it.
+                idx.execute("DROP TABLE IF EXISTS log")
+                idx.executescript(LOG_SCHEMA)
                 idx.execute(
                     "DELETE FROM meta WHERE k IN ('root','reproject')")
                 idx.commit()
@@ -546,6 +573,11 @@ class Node:
                 self._stamp(ws)
                 return
             self.merge(ws, result.valids, result.globals)
+            # Residency is local, not replicated, so it is the one thing a
+            # rebuild cannot re-derive from the fact set. Probe for it once
+            # here — bounded by the facts that spill — rather than let a
+            # rebuild silently re-download bytes already on disk.
+            self.log_arrivals(ws, [v.fact for v in result.valids])
             pump(self, ws)
             if republish:
                 # A semantic index upgrade can select different canonical

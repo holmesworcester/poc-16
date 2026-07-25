@@ -31,6 +31,7 @@ from .util import (
     closed_subset,
     deliver,
     member_src,
+    send_bytes,
 )
 
 
@@ -47,7 +48,7 @@ def world(tmp_path):
     for i in range(40):
         sk, pk = rng.choice(actors)
         author_msg(n, ws, sk, pk, f"m{i}", t0 + 10 + i)
-    cmds.send_file(n, ws, "general", "blob.bin", rng.randbytes(30_000))
+    send_bytes(n, ws, "blob.bin", rng.randbytes(30_000))
     cmds.evict(n, ws, "carol")
     return n, ws
 
@@ -207,7 +208,7 @@ def test_incremental_equals_full(tmp_path):
         who = (n.sk, n.pk) if i % 2 else (bsk, bpk)
         author_msg(n, ws, *who, f"m{i}", t0 + 10 + i)
         assert n.store(ws).get("root") == full_manifest(n, ws)
-    cmds.send_file(n, ws, "general", "f.bin", b"x" * 20_000)
+    send_bytes(n, ws, "f.bin", b"x" * 20_000)
     assert n.store(ws).get("root") == full_manifest(n, ws)
     author_msg(n, ws, n.sk, n.pk, "straggler", t0 + 5)  # lands deep in history
     assert n.store(ws).get("root") == full_manifest(n, ws)

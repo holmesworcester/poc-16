@@ -11,7 +11,7 @@ from .facts.auth.device import bind as bind_device, devices
 from .facts.auth.device_invite import grant as grant_device
 from .facts.auth.removal import evict
 from .facts.content.file import bytes_for as file_bytes
-from .facts.content.file import files, send as send_file
+from .facts.content.file import files, save as save_file, send as send_file
 from .facts.content.message import messages as msgs
 from .facts.content.message import post
 

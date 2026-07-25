@@ -1,5 +1,7 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
+import os
 import random
+import tempfile
 
 from tinyp2p.close import close, encode_pile
 from tinyp2p.crypto import h, keypair
@@ -75,3 +77,17 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 def all_fids(n, ws):
     return [fid for (fid,) in n.idx(ws).execute("SELECT fid FROM facts ORDER BY ts, fid")]
+
+
+def send_bytes(n, ws, name, data, chan="general"):
+    """Author an attachment from bytes: send() takes a path, because a large
+    file must never be held in memory to be published."""
+    from tinyp2p import cmds
+
+    handle, path = tempfile.mkstemp(prefix="tinyp2p-test-")
+    try:
+        with os.fdopen(handle, "wb") as spool:
+            spool.write(data)
+        return cmds.send_file(n, ws, chan, path, name)
+    finally:
+        os.unlink(path)

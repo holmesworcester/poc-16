@@ -127,3 +127,97 @@ here.
 `python3 bench/bench_sync.py 500000` (add 500k), `python3 bench/bench_sync.py cut`
 (flat CUT sweep), `python3 bench/bench_sync.py tier` (tiered vs flat).
 Working dir defaults to a scratchpad path; override with `BENCH_DIR`.
+
+---
+
+# Attachments — measured
+
+`python3 bench/bench_files.py` on the same desktop. Files are bao-rooted: one
+32-byte BLAKE3 root commits the whole file, each 256 KiB chunk carries the
+authentication path that proves it against that root, and only chunks that
+verify count toward progress. Every run below re-assembles on the receiver and
+asserts the saved bytes are identical to the source (`ok = ✓`).
+
+## 1. What self-proving costs
+
+| MB | chunks | proof % | B/chunk | descriptor B | outboard MB | tree keys |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 4 | 6.28 | 15,704 | 652 | 0.06 | 10 |
+| 8 | 31 | 6.35 | 16,392 | 654 | 0.50 | 64 |
+| 64 | 245 | 6.42 | 16,780 | 657 | 4.00 | 492 |
+| 256 | 977 | 6.47 | 16,959 | 658 | 16.00 | 1,956 |
+
+The proof tax is ~6.3–6.5 % of payload, flat. What it buys is the fourth
+column: the **descriptor stays ~655 bytes at every size** — the commitment is
+O(1), so a 1 GB attachment costs the fact tree no more metadata than a 1 MB one.
+A per-slice hash list would put that cost in the descriptor instead, growing it
+past the 8 KB body-spill threshold at ~20 MB of file. Both are defensible; this
+is the trade, priced.
+
+## 2. Author side (in-process, cold store)
+
+| MB | chunks | send s | send MB/s | save s | save MB/s | store MB | peak RSS GB | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 64 | 245 | 0.62 | 103.0 | 0.10 | 628.6 | 68.5 | 0.03 | ✓ |
+| 256 | 977 | 1.89 | 135.2 | 0.40 | 641.5 | 274.2 | 0.04 | ✓ |
+| 1024 | 3,907 | 7.48 | 136.8 | 1.55 | 661.0 | 1,097.4 | 0.08 | ✓ |
+
+`send` builds the bao tree, extracts every slice, verifies each one against the
+root *before* signing anything, and spills it to `obj/`. `save` re-verifies
+every chunk on the way out — export never trusts the projection.
+
+## 3. Download, two real daemons on real sockets
+
+| MB | chunks | send MB/s | first chunk s | download s | download MB/s | wall MB/s | RSS tx | RSS rx | ok |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 8 | 31 | 72.4 | 0.21 | 0.26 | 30.6 | 21.5 | 0.03 | 0.04 | ✓ |
+| 64 | 245 | 99.1 | 0.31 | 0.73 | 87.9 | 46.6 | 0.03 | 0.04 | ✓ |
+| 256 | 977 | 130.7 | 1.04 | 2.71 | 94.5 | 54.9 | 0.05 | 0.05 | ✓ |
+| 1024 | 3,907 | 128.9 | 3.83 | 11.04 | 92.8 | 54.0 | 0.08 | 0.09 | ✓ |
+
+`first chunk` is time to the receiver's first *verified* chunk — progress is
+visible from there on, climbing as objects land, not a step function at the end.
+
+## 4. Against the whole-blob path this replaces
+
+Same box, same 1 GB payload, two daemons. The old path put the entire file in one
+object and shipped it base64'd through one JSON document.
+
+| | whole blob | bao chunks | |
+|---|---:|---:|---|
+| send | 78.3 MB/s | 128.9 MB/s | 1.6× faster |
+| download | 129.6 MB/s | 92.8 MB/s | 0.72× — the honest cost |
+| peak RSS, sender | 10.03 GB | 0.08 GB | **125× less** |
+| peak RSS, receiver | 5.03 GB | 0.09 GB | **56× less** |
+| progress | none | per 256 KiB chunk | |
+| resumable | no | yes | |
+
+Download throughput is the one number that got worse: 3,907 sequential object
+GETs cost more than one 1 GB GET. That is the price of chunking, and it is where
+the remaining headroom is — the fetch is strictly sequential today.
+
+The memory column is why the trade is worth taking anyway. The old path needed
+**10 GB of RAM to send a 1 GB file** (raw bytes, base64 string, JSON document,
+and canonical encoding all resident at once); peak memory scaled with file size,
+so 1 GB was near the practical ceiling on a 16 GB machine and 10 GiB was
+unreachable. The chunked path holds one 280 KB proof at a time: peak memory is
+now a function of chunk width, not file size.
+
+## Takeaways
+
+- **1 GB works and is efficient**: 11 s to download, 93 MB/s, byte-identical,
+  under 100 MB of RAM on both ends.
+- **Peak memory is decoupled from file size.** This, not throughput, is what
+  chunking bought.
+- **Verified progress is real progress.** A chunk counts only after its bao proof
+  checks against the signed root, so the percentage cannot run ahead of what the
+  receiver can actually prove it has.
+- **bao is not the bottleneck.** The primitive runs at 516 MB/s encoding and
+  761 MB/s verifying at 1 GiB; the engine's JSON/base64 unit codec (~190 MB/s)
+  and the sequential fetch loop are what bound the numbers above.
+
+---
+*Reproduce:* `python3 bench/bench_files.py --mode overhead 1 8 64 256`,
+`python3 bench/bench_files.py --mode send 64 256 1024`,
+`python3 bench/bench_files.py 8 64 256 1024`.
+Working dir defaults to a scratchpad path; override with `BENCH_DIR`.

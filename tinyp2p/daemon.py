@@ -11,6 +11,7 @@ import hashlib
 import hmac as hmaclib
 import json
 import os
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -231,10 +232,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.syncer.kick()
                 return self._json(200, r)
             if parts[1] == "send":
-                r = {"fid": cmds.send_file(n, ws, o.get("chan", "general"), o["name"],
-                                           base64.b64decode(o["data"]))}
+                r = {"fid": self.send_file(n, ws, o)}
                 self.syncer.kick()
                 return self._json(200, r)
+            if parts[1] == "save":
+                return self._json(200, cmds.save_file(n, ws, o["fid"], o["out"]))
             if parts[1] == "evict":
                 r = {"fid": cmds.evict(n, ws, o["member"])}
                 self.syncer.kick()
@@ -250,6 +252,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404)
+
+    def send_file(self, node, ws, o):
+        """Accept a path (the large-file route) or inline bytes (the small
+        one); a path is never read into the control plane."""
+        if o.get("path"):
+            return cmds.send_file(node, ws, o.get("chan", "general"),
+                                  o["path"], o.get("name"))
+        handle, temporary = tempfile.mkstemp(prefix="tinyp2p-ctl-")
+        try:
+            with os.fdopen(handle, "wb") as spool:
+                spool.write(base64.b64decode(o["data"]))
+            return cmds.send_file(node, ws, o.get("chan", "general"),
+                                  temporary, o.get("name") or "attachment")
+        finally:
+            os.unlink(temporary)
 
     def _resolve(self, ws):
         """Accept a unique workspace-id prefix on the control plane."""

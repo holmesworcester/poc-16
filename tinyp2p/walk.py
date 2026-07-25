@@ -10,6 +10,9 @@ from .crypto import h, unseal
 from .facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
+from .pump import append_received, pump
+
+ARRIVAL_BATCH = 16  # objects between progress folds
 
 
 class Peer:
@@ -95,14 +98,45 @@ def _push(node, ws, peer, push_fids):
 
 
 def _fetch_blobs(node, ws, peer):
-    """Spilled bodies ride blob/ (served by the same page route): fetch what
-    accepted file facts reference and we lack."""
+    """Spilled bodies ride obj/ (served by the same page route): fetch what
+    accepted facts reference and we lack, then tell the delivery log which
+    facts are now whole, so arrival projects exactly once."""
     st = node.store(ws)
     with node.lock:
-        refs = {blob for (fid,) in node.idx(ws).execute("SELECT fid FROM facts")
-                for blob in families.blob_refs(node.fact_of(ws, fid))}
-    for bh in refs:
-        if not st.has("obj/" + bh):
+        pending = [
+            (fid, refs) for (fid,) in node.idx(ws).execute(
+                "SELECT fid FROM facts")
+            if (refs := families.blob_refs(node.fact_of(ws, fid)))
+            and not all(st.has("obj/" + bh) for bh in refs)
+        ]
+    landed, batch = [], []
+    for fid, refs in pending:
+        whole = True
+        for bh in refs:
+            if st.has("obj/" + bh):
+                continue
             b = peer.obj(bh)
             if b and h(b) == bh:
                 st.put("obj/" + bh, b)
+            else:
+                whole = False
+        if whole:
+            batch.append(fid)
+        if len(batch) >= ARRIVAL_BATCH:
+            landed += _land(node, ws, batch)
+            batch = []
+    landed += _land(node, ws, batch)
+    return landed
+
+
+def _land(node, ws, fids):
+    """Publish one batch of arrivals and fold it in, so a long download
+    reports progress while it is still running rather than at the end."""
+    if not fids:
+        return []
+    with node.lock:
+        idx = node.idx(ws)
+        append_received(idx, fids)
+        idx.commit()
+    pump(node, ws)
+    return fids

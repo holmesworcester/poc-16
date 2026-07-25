@@ -883,6 +883,42 @@ Proofs first; no transport work until both numbers exist.
   amortized write-amplification — safe because the cut stays a pure function of
   the set; scaling bounds the fence-run length, not the redundancy (which the
   membership-closure size already caps).
-- Multi-group on one bucket; blob attachments (`blob/<hash>`, POC-13 branch
-  findings, hash-list slices not bao). (Bulk-join body bundles: resolved
-  2026-07-22 by packed pages — bodies live in the page objects, MODEL.md.)
+- Multi-group on one bucket. (Bulk-join body bundles: resolved 2026-07-22 by
+  packed pages — bodies live in the page objects, MODEL.md.)
+- **Attachments: bao, resolved 2026-07-25** (was "hash-list slices not bao").
+  A file is committed by one 32-byte BLAKE3 root; each 256 KiB chunk carries
+  the authentication path proving it against that root. Two things follow, and
+  they are the reason:
+  - **Self-verifying facts make download progress mean something.** A chunk
+    proves itself against the signed root with no siblings, no ordering, and
+    no database, so it can be accepted from any peer and counted the moment it
+    lands. Progress is a fold over *proven* chunks — a percentage that cannot
+    run ahead of what the receiver can demonstrate it holds.
+  - **The commitment is O(1).** Measured: the descriptor stays ~655 bytes from
+    1 MB to 256 MB (`bench/RESULTS.md`). It never approaches the 8 KB
+    body-spill threshold, so no attachment needs an extra round to learn its
+    own shape.
+
+  The price, also measured: **~6.3–6.5 % of every attachment byte**, an
+  unaudited beta Rust crate (`bao 0.13.1`) behind a pinned binding, and a Cargo
+  toolchain at build time. POC-14 weighed the same trade and went the other way
+  at the slice layer — per-slice hashes in the descriptor, scaled slice width to
+  keep it bounded — which buys one verification primitive (`hash == id`) and no
+  native dependency. **That is a reasonable design and remains the live
+  alternative**; POC-14's own DESIGN.md keeps bao for exactly this case ("bao
+  earns its keep only where a single object is too large to ingest before
+  trusting structure… bulk-class slice facts, whose bao proofs against the
+  descriptor root double as verified download progress").
+
+  We take bao here for the capability above and for apples-to-apples
+  comparability with POC-13, which used the same crate, the same 256 KiB width,
+  and the same self-proving slice. The swap back is confined to `tinyp2p/bao.py`
+  plus the descriptor body; `bench/RESULTS.md` publishes the overhead line that
+  would justify taking it.
+
+  One forced difference from POC-13: the proof rides `obj/` and the chunk fact
+  is its signed in-tree name. POC-13 put the proof in the fact body, which here
+  would put megabytes into leaf piles that are fetched whole on any diff.
+  Consequence: byte arrival is a second delivery channel, carried as `*` in the
+  projection log, so arrival folds into read models by the same exactly-once
+  path as admission.

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tinyp2p-bao"
+version = "0.1.0"
+description = "Narrow Python binding to the official Bao verified-streaming crate"
+requires-python = ">=3.8"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

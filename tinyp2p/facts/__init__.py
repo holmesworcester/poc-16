@@ -39,3 +39,16 @@ def clear(db, workspace):
 def blob_refs(fact):
     """Return immutable object hashes named by a fact, if that family has any."""
     return tuple(ROUTES[fact.t].blob_refs(fact))
+
+
+def received(db, workspace, valid, blob_of):
+    """Project the arrival of a fact's spilled bytes.
+
+    A fact and the bytes it names travel on separate channels, so a family
+    that spills gets told twice: once when the fact is admitted, once when
+    its objects land. ``blob_of`` reads one by hash. Families that never
+    spill do not implement this.
+    """
+    module = ROUTES[valid.fact.t]
+    if hasattr(module, "received"):
+        module.received(db, workspace, valid, blob_of)

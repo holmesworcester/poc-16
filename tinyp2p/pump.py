@@ -17,7 +17,7 @@ from .kernel import Valid, resolve_deps
 LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS log(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    op  TEXT NOT NULL CHECK(op IN ('+','-')),
+    op  TEXT NOT NULL CHECK(op IN ('+','-','*')),
     fid TEXT NOT NULL);
 """
 
@@ -47,6 +47,17 @@ def append_retracted(idx, targets):
     )
 
 
+def append_received(idx, fids):
+    """``*fid`` for each fact whose bulk object is now resident and proved.
+    Object arrival is a second delivery channel over the same log, so a
+    chunk's bytes land in the read model by exactly the same fold as its
+    fact — and a duplicate delivery is a no-op, not a double count."""
+    idx.executemany(
+        "INSERT INTO log(op, fid) VALUES('*', ?)",
+        ((fid,) for fid in fids),
+    )
+
+
 def pump(node, ws, projector="app"):
     """Apply log rows past the cursor and advance it, in ONE app.db
     transaction. Exactly-once replaces idempotence as the handler obligation
@@ -73,6 +84,7 @@ def pump(node, ws, projector="app"):
             return 0
 
         valids = []
+        blob_of = lambda bh: node.store(ws).get("obj/" + bh)
 
         def valid(fid):
             fact = node.fact_of(ws, fid)
@@ -97,6 +109,10 @@ def pump(node, ws, projector="app"):
                 valids = [valid(fact.fid) for fact in ordered]
                 for item in valids:
                     facts.materialize(app, ws, item)
+                for (fid,) in idx.execute(
+                        "SELECT fid FROM log WHERE op='*' ORDER BY seq"):
+                    if node.fact_of(ws, fid) is not None:
+                        facts.received(app, ws, valid(fid), blob_of)
                 end = idx.execute(
                     "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
             else:
@@ -105,6 +121,8 @@ def pump(node, ws, projector="app"):
                         item = valid(fid)
                         facts.materialize(app, ws, item)
                         valids.append(item)
+                    elif op == "*":
+                        facts.received(app, ws, valid(fid), blob_of)
                     else:
                         retract(app, ws, fid)
                 end = rows[-1][0]
