@@ -4,6 +4,7 @@ from .close import encode_pile
 from .crypto import h
 from .shape import FACT, SUPP, SUPP_INDEX
 from .store import RemoteStore
+from .suppression import close_deletions
 from .walk import Peer, _fetch_blobs, _push
 
 
@@ -20,6 +21,12 @@ def _union(units):
             seen.add(fact.fid)
             out.append(fact)
     return tuple(out)
+
+
+def closure_sync(view, ranges, supp, fetch):
+    """Close primary ranges under deps first, then suppression matches."""
+    primary = tree.range_facts(view, ranges, fetch, FACT)
+    return close_deletions(primary, supp, fetch).unit
 
 
 def sync(node, ws, url):
@@ -47,12 +54,10 @@ def sync(node, ws, url):
         raise ValueError("root indexes")
     local_supp = local.index(SUPP_INDEX) if local else None
     remote_supp = other.index(SUPP_INDEX) if other else None
+    local_supp = local_supp or _empty(SUPP)
+    remote_supp = remote_supp or _empty(SUPP)
     indexes = (
-        (
-            SUPP,
-            local_supp or _empty(SUPP),
-            remote_supp or _empty(SUPP),
-        ),
+        (SUPP, local_supp, remote_supp),
         (
             FACT,
             local.view if local else _empty(FACT),
@@ -99,8 +104,12 @@ def sync(node, ws, url):
             }
             pushed_fids.update(local_only)
         if pull_ranges:
-            stream = tree.range_facts(
-                theirs, pull_ranges, fetch_remote, projection)
+            if projection is FACT:
+                stream = closure_sync(
+                    theirs, pull_ranges, remote_supp, fetch_remote)
+            else:
+                stream = tree.range_facts(
+                    theirs, pull_ranges, fetch_remote, projection)
             if not missing_fids.issubset(
                     fact.fid for fact in stream):
                 raise ValueError("remote range is missing committed facts")
