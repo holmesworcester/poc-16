@@ -26,9 +26,10 @@ For one device recipient lineage:
   P, S, and T.
 - After P destruction, promotion performs no key creation and returns to
   steady state S/T.
-- A generation id is permanently bound to the public key created for it.
-  Recreating a handle under the same label does not change that commitment and
-  makes the live schedule fail closed.
+- A generation id is permanently bound to the provider suite and public key
+  created for it. Recreating a handle under the same label does not change that
+  commitment and makes every open, wrap, writer, and transition operation fail
+  closed.
 - FrontierRoot and HistoryNode cover secrets are encrypted data, not hardware
   handles. Their count may grow with the canonical puncture cover while
   hardware handle count remains constant per recipient lineage.
@@ -108,13 +109,14 @@ preserves it.
 Every field above is authenticated. On open, the caller supplies the exact
 authoritative context and expected local-secret commitment from the named
 canonical cover record. The provider compares them with the authenticated
-envelope fields, then recomputes the commitment from the opened plaintext. An
-envelope cannot authorize itself by asking the provider to trust its own scope,
-frontier, coordinate, source, policy, or secret identity. Implementations may
-use randomized encryption and store the ciphertext in ordinary
-database/object storage. They must not place plaintext F, HistoryNode secrets,
-leaf keys, or recipient private material in facts, sync piles, logs, crash
-reports, or backup exports.
+envelope fields, verifies that the handle still matches the generation's
+immutable suite-qualified public commitment, then decrypts and recomputes the
+commitment from plaintext. An envelope cannot authorize itself by asking the
+provider to trust its own suite, scope, frontier, coordinate, source, policy,
+generation label, or secret identity. Implementations may use randomized
+encryption and store the ciphertext in ordinary database/object storage. They
+must not place plaintext F, HistoryNode secrets, leaf keys, or recipient private
+material in facts, sync piles, logs, crash reports, or backup exports.
 
 ## Provider boundary
 
@@ -122,14 +124,14 @@ The production boundary must expose operations equivalent to:
 
 | Operation | Required behavior |
 |---|---|
-| `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle, and retain the id's immutable public commitment. Track or destroy orphan allocation after failure; a replacement handle under the same id is ineligible. |
-| `open(handle, envelope, expected_context, expected_secret_commitment)` | Open only with the exact generation and caller-supplied authoritative context and canonical local-secret commitment; authenticate both and recompute the commitment from plaintext. Private material never leaves a non-exportable provider. |
+| `generate_generation(id, suite)` | Create an independent key; return public material and an opaque handle, and retain the id's immutable suite-qualified public commitment. Track or destroy orphan allocation after failure; a replacement handle under the same id is ineligible for every provider operation. |
+| `open(handle, envelope, expected_context, expected_secret_commitment)` | Before decrypting, require the handle to match the exact immutable generation suite and public key. Then authenticate the caller-supplied context and canonical local-secret commitment and recompute the commitment from plaintext. Private material never leaves a non-exportable provider. |
 | `seal(public, plaintext, aad, secret_commitment)` | Seal F or one retained-cover node to a named generation, exact context, and generation-independent canonical local-secret commitment. |
 | `claim(P, S, T, batch)` | Atomically accept one exact transition tuple, including both successor suites and public-key bytes, together with the purge-target manifest derived from the canonical set of causally referenced operation ids. On the rollback-resistant tier, commit that whole protected claim/manifest record before writing rollbackable mirrors. Duplicate refs do not create another batch, identical saved-input retries coalesce, and every semantic mismatch conflicts. |
 | `acquire_writer_lease(P)` | Admit a caller-requested generation-bound write only while that exact P is active, finalized, unfenced, and the live active/staged handles still match their immutable public commitments. Every commit rechecks the same conditions. Never replace a saved P request with the current generation. |
-| `close_and_drain(P)` | Require P's accepted claim, persist a provider-protected closing phase before returning, reject new P leases and commits against both protected and application state, and drain or abort all existing leases before survivor enumeration. |
-| `migrate(P, S, manifest)` | Require S and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. Freeze the exact `(cover id, local-secret commitment)` map on the first attempt; retries must match rather than replace it. The rollback-resistant tier commits this proof in protected state before replacing rollbackable cover storage. |
-| `destroy(P)` | Immediately before retirement, require the exact frozen survivor map and cryptographically reopen every authoritative survivor as S. Atomically commit the protected successor retirement position, which makes P unusable, before deleting the P handle/keyblob and rollbackable metadata; physical cleanup is idempotent. |
+| `close_and_drain(P)` | Require P's accepted claim and immutable suite/public commitment, persist a provider-protected closing phase before returning, reject new P leases and commits against both protected and application state, and drain or abort all existing leases before survivor enumeration. |
+| `migrate(P, S, manifest)` | Require P and S to match their immutable suite/public commitments and the manifest to match P's accepted claim, then reseal every live cover record except the exact purge targets with restartable per-record progress. Freeze the exact `(cover id, local-secret commitment)` map on the first attempt; retries must match rather than replace it. The rollback-resistant tier commits this proof in protected state before replacing rollbackable cover storage. |
+| `destroy(P)` | Immediately before retirement, require P's immutable suite/public commitment, the exact frozen survivor map, and cryptographically reopen every authoritative survivor as S. On the rollback-resistant tier, atomically commit the protected successor retirement position, which makes P unusable, before physical cleanup. Other tiers durably persist an exact claim/manifest/migration/key destruction intent before invoking non-transactional key deletion. Cleanup and evidence completion are idempotent. |
 | `promote(P, S, T, claim)` | Change active/staged state to S/T without allocation or dependence on a clock or lookup-selected key. |
 | `capabilities()` | Report suite, non-exportability, deletion, rollback, attestation, capacity, backup, and clone guarantees without exaggeration. |
 
@@ -204,28 +206,31 @@ wrap inventory, and local absence are not triggers or proofs.
 1. Identify the exact causally committed purge batch and recovery-eligible
    secret set.
 2. Verify that P is the exact caller-requested active, finalized predecessor
+   whose live handle matches its immutable suite-qualified public commitment,
    and that active/staged P/S match P's explicit causal parent claim when P has
-   one. Generate and durably validate T. Capacity failure here leaves P live
-   and returns a retryable failure.
+   one. Generate and durably validate T. Capacity failure here leaves P live and
+   returns a retryable failure.
 3. Atomically claim `(P, S, T, batch)` and its derived exact purge manifest. On
    the rollback-resistant tier, commit the protected claim/manifest CAS before
    its rollbackable mirrors.
 4. Author the non-wrap reservation and its complete dependency-first closed
    pile.
 5. Close the P writer fence in provider-protected state before reporting it
-   closed. Abort or drain every P lease. On the rollback-resistant tier, an old
-   application snapshot cannot remove that closing phase or re-enable a saved
-   P lease.
+   closed, after revalidating P's suite and public key. Abort or drain every P
+   lease. On the rollback-resistant tier, an old application snapshot cannot
+   remove that closing phase or re-enable a saved P lease.
 6. Load the purge-target manifest frozen by the claim. A different or omitted
    manifest fails; exact purge targets are not copied to S.
 7. Open each live P envelope through the provider using the authoritative cover
    record context and generation-independent local-secret commitment stored
-   separately from the envelope, including the expected generation. Recompute
-   the commitment from plaintext. Immediately reseal to S without changing that
-   commitment and atomically persist the new authoritative context with the
-   envelope. On restart, cryptographically reopen and recheck even a record
-   already labeled S before counting it complete; an envelope cannot choose the
-   handle or secret identity by self-description. Clear plaintext buffers.
+   separately from the envelope, including the expected generation and provider
+   suite. Before decrypting, verify the handle against that generation's
+   immutable suite-qualified public commitment. Recompute the local-secret
+   commitment from plaintext. Immediately reseal to S without changing it and
+   atomically persist the new authoritative context with the envelope. On
+   restart, cryptographically reopen and recheck even a record already labeled
+   S before counting it complete; an envelope cannot choose the handle, suite,
+   or secret identity by self-description. Clear plaintext buffers.
 8. Freeze the first exact `(survivor id, local-secret commitment)` map. A
    migration retry must reproduce that map and may never bless a reduced or
    changed set. On the rollback-resistant tier the freeze is a protected CAS
@@ -236,9 +241,14 @@ wrap inventory, and local absence are not triggers or proofs.
    the exact claim, and verify that no record can still be written under P. A
    missing record, attacker-generated valid S ciphertext, metadata labels, or
    an earlier completion bit alone are insufficient.
-10. Atomically advance protected retirement to the successor, making P
-    unusable, before physical P-handle/keyblob cleanup. Cleanup and rollbackable
-    destruction evidence are restartable.
+10. Revalidate P's immutable suite-qualified public commitment. On the
+    rollback-resistant tier, atomically advance protected retirement to the
+    successor, making P unusable, before physical P-handle/keyblob cleanup. On
+    lower tiers, durably write an exact destruction intent binding P's suite and
+    public key, accepted claim/manifest, and migration proof before calling the
+    non-transactional deletion API. A retry with that exact intent distinguishes
+    “not yet deleted” from “deleted before evidence commit”; any mismatch fails
+    closed.
 11. Promote the already existing S/T pair. No allocation is permitted after P
     destruction.
 12. Revalidate that the live S and staged T handles, their immutable public
@@ -266,7 +276,9 @@ transition.
 | After protected survivor-map CAS, during cover replacement | Resume resealing from P or revalidate already-S records. The exact id-and-secret-commitment map cannot shrink or change. |
 | After migration, before P retirement | Compare the live record/commitment map with the frozen proof and cryptographically reopen every authoritative S survivor again. Deletion, insertion, corruption, relabeling, or valid public-key encryption of different plaintext fails with P intact. |
 | After protected retirement, before physical P cleanup | P already fails policy even if its handle bytes remain. Retry cleanup and reconstruct rollbackable destruction evidence from the exact protected claim, survivor proof, and retirement position. |
-| After P cleanup, before promotion | Retry destruction idempotently. If rollbackable destruction metadata was lost, reconstruct it only when protected retirement state contains the exact suite-qualified P/S/T/batch claim and its floor has advanced through S; then reconcile forward. Never allocate a replacement S or T and never restore P. |
+| Lower tier after destruction intent, before P deletion | P remains fenced. Retry the exact intent, revalidate P's suite/public commitment, and invoke deletion. |
+| Lower tier after P deletion, before destruction evidence | Provider absence plus the exact precommitted intent permits forward reconstruction and promotion. Missing or mismatched intent fails closed. |
+| After P cleanup, before promotion | Retry destruction idempotently. The strong tier reconstructs from the exact protected claim/proof and advanced floor; a lower tier requires its exact durable pre-delete intent plus provider absence. If the required evidence is missing, fail closed. Never allocate a replacement S or T or restore P. |
 | After promotion, before finalization | S/T are durable but S remains ineligible for shared wraps until completion evidence closes. |
 | After finalization | Duplicate completion/finalization coalesces. Late P mismatch remains a conflict. |
 
@@ -415,10 +427,11 @@ On same-device restore:
   P.
 
 Every lease, commit, open, wrap-eligibility query, promotion, and finalization
-checks the protected retirement position and the exact live active/staged public
-commitments. Rolled-back metadata that still calls P active or finalized, or a
-new handle generated under an old label, is fail-closed; it cannot admit a
-writer and discover the mismatch only during encryption.
+checks the protected retirement position and exact live suite-qualified
+active/staged public commitments. Rolled-back metadata that still calls P active
+or finalized, a context relabeled to another provider suite, or a new handle
+generated under an old label is fail-closed before private-key use; it cannot
+admit a writer or open replacement-key ciphertext.
 
 No restore path asks which key or timestamp is “latest.” It uses explicit
 generation refs and the provider's exact monotonic position.
@@ -465,12 +478,14 @@ The versioned fixture is
   mirrors;
 - binding of those claims to actual suite-qualified public-key bytes, including
   rejection when an initial, active, or staged handle is regenerated under the
-  same label and revalidation on every writer commit;
+  same label, rejection of a recreated predecessor even with an empty survivor
+  set, and revalidation on every writer commit and provider open;
 - exact purge-manifest binding plus rejection of mismatched migration,
   destruction, promotion, and finalization state;
 - authenticated binding of every cover-envelope context field and rejection of
-  field mutation, record transplant, ciphertext tamper, and public-key
-  encryption of attacker-chosen survivor plaintext;
+  field mutation, suite relabeling, record transplant, ciphertext tamper,
+  replacement-handle ciphertext, and public-key encryption of attacker-chosen
+  survivor plaintext;
 - generation-independent canonical local-secret commitments, immutable
   survivor id/commitment proofs across migration retries, and protected proof
   recovery after rollback;
@@ -481,7 +496,8 @@ The versioned fixture is
 - writer fencing, survivor migration, target purge, allocation-free promotion,
   rejection of forged destruction evidence, and finalization;
 - stale-snapshot writer rejection, protected retirement before physical handle
-  cleanup, and forward reconstruction of destruction evidence after either
+  cleanup, exact lower-tier destruction intent before non-transactional
+  deletion, and forward reconstruction of destruction evidence after every
   crash boundary;
 - pre-finalization revalidation of both committed S/T handles after loss or
   replacement;

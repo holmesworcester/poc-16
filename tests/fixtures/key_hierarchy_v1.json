@@ -11,6 +11,8 @@
         "parent_claim_link": "explicit-claim-id",
         "next_claim_requires_finalized_predecessor": true,
         "writer_lease_generation": "caller-supplied-exact",
+        "generation_identity": "immutable-suite-and-public-key",
+        "provider_open_revalidates_generation": true,
         "cover_expected_context": "separate-authoritative-record",
         "duplicate_operation_refs": "canonical-set",
         "protected_claim_before_rollbackable_mirror": true,
@@ -20,6 +22,7 @@
         "migration_proof": "exact-survivor-id-and-secret-commitment-set",
         "migration_proof_cas": "protected-first-immutable",
         "retirement_order": "protected-disable-before-handle-delete",
+        "lower_tier_destruction_intent": "exact-before-delete",
         "wrap_eligibility": "live-active-staged-public-commitments",
         "finalization_revalidates_parent_claim": true,
         "recipient_generations": [
