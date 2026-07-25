@@ -355,7 +355,8 @@ read-after-write on objects and native conditional writes (`If-Match` / `onlyIf:
 so the pile set is strongly consistent and single-key CAS on `root` works as above. The
 difference: **Durable Objects** — a per-workspace, single-threaded, strongly-consistent actor —
 can *serialize* root updates (and hold the in-memory fold + transactional storage), replacing
-CAS-retry with a clean linearizable point that S3 lacks. Workers are the stateless compute
+CAS-retry with a clean linearizable point that S3 lacks (optional — the chosen default is
+non-serialized; see below). Workers are the stateless compute
 (≈ lambdas), triggered by **R2 event notifications → Queues** (~seconds). Watch-outs: **Workers KV
 is eventually consistent (~60 s) — never put `root` in KV**; R2 is largely single-location per
 bucket (location hints, no built-in cross-region replication lag); Worker CPU limits (~30 s) mean
@@ -368,6 +369,39 @@ anyone may use, and never delete an incoming pile before its facts are folded in
 tree. Drive GC from *committed/converged* state, never a lambda's partial view — the
 residency ⊇ coverage / evict-before-flush discipline (poc-13 memory-limiting lineage). Removals
 converge too, because tombstones are monotone (remove-wins), independent of order.
+
+**The non-serialized design (chosen).** No single-owner funnel — any Worker folds and
+publishes; nothing routes through a per-workspace actor. Because *no operation is
+non-commutative* (facts additive, tombstones remove-wins, fold deterministic), coordination is
+never required for correctness — only, optionally, for freshness or to damp wasted work.
+
+- **The root is an append-only *set* of checkpoints, not one mutable cell.** Each folder
+  publishes its root as a content-addressed object and appends the hash to a grow-only `roots/`
+  set; the true state is `merge(live roots)`, always well-defined and **never clobbered** (no
+  overwrite ⇒ no lost update, not even transient). A background **sweep** merges them into one
+  canonical root and tombstones the subsumed ones. *(Simpler variants, still non-serialized, no
+  DO: a single `root` key updated by CAS — `If-Match`/`onlyIf`, optimistic and retry-on-conflict;
+  or blind last-writer-wins healed by the sweep.)*
+- **Folding is idempotent and multiply-triggered:** an R2 event per new pile, plus any reader's
+  reconciliation (which discovers unfolded piles), plus a periodic backstop sweep. Overlapping
+  folds are safe — path-copy gives structural sharing, and two roots **merge to a unique third in
+  O(diff)** via the same RBSR descent (no re-fold from scratch). Piles are closed, so folds carry
+  no cross-pile ordering dependency.
+- **Readers pick their guarantee.** Fast path: read any recent root and serve it (may lag new
+  piles by ~fold latency). Authoritative path: merge the `roots/` set / reconcile against peers.
+  **Read-your-writes needs no server coordination** — the writer folds its own pile locally (or
+  checks its hash is reachable) right after the PUT.
+- **GC is the one remaining discipline, made generational.** Reclaim a pile only once it is
+  reachable from a durable root, and treat **every root within a grace window as live** (Merkle
+  mark-and-sweep from all recent roots — `git gc` with a reflog window); never collect newer than
+  the window. That is residency ⊇ coverage without needing a commit point.
+
+**Give up:** an instant shared "latest" pointer (mitigated client-side), a single clean commit
+moment for GC (replaced by the grace window), and some redundant folding (cheap + idempotent).
+**Gain:** horizontal scaling with **no per-workspace bottleneck**, pure Workers + R2 (no DO
+dependency), and no single point of contention or failure. A Durable Object stays available as a
+*per-workspace opt-in* — for instant-fresh reads or folding-suppression on a hot workspace — but
+is **never the default**.
 
 What you deliberately forgo — and never need: a global total order of piles, synchronized
 delivery, or a lock. Transient divergence (lambdas mid-catch-up) is **stale, never wrong**, and
