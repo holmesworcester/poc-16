@@ -1,0 +1,854 @@
+{
+    "schema": "poc-16.puncturable-encryption-source.v1",
+    "source_commits": {
+        "poc-10": {
+            "ad380cb4": "ad380cb4c19da14d19a09058787a0f925dd11c52",
+            "7f60936f": "7f60936fba1670a899575171b8b1066ac12815b9",
+            "536b13c3": "536b13c3ce2788a645c39fd9f5295a5802e897b9",
+            "9b40f352": "9b40f35279c55bb3c1782ff27e332875c35af2da",
+            "bdaa60f6": "bdaa60f6e77756da9d535adb9d1a056243fb5055",
+            "178f198b": "178f198b43377252c1b57c8a535e17f450be07fa",
+            "341b8c37": "341b8c3736c24225629916fb0571a668213b1343",
+            "ed04d84f": "ed04d84faa59b828475b381d2062f44db055c6cd",
+            "122cc471": "122cc471f5f90995ba03ca660de02a2d39c2b479",
+            "72756900": "72756900f0ace16f5026fbbbb5419f9302dfd255",
+            "fc111ad5": "fc111ad5f49e78d0dc33e145d926e2b013fb4943"
+        },
+        "poc-13": {
+            "e61fd61": "e61fd61b1297cf232c36a58f23044eae2f82c258"
+        }
+    },
+    "kdf": {
+        "root_secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "root_time_start": 0,
+        "root_time_width": 9223372036854775808,
+        "time_domain_ascii": "topo time split v1",
+        "trie_domain_ascii": "topo trie split v1",
+        "time_splits": [
+            {
+                "parent_secret": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+                "parent_start": 1699840,
+                "parent_width": 128,
+                "child_side": 1,
+                "child_start": 1699904,
+                "child_width": 64,
+                "info": "000000000019f000000000000000008001000000000019f0400000000000000040",
+                "child_secret": "62324763c89229ae8683fabd3adb323bbd24cc442acaa5a69008131957a4fb36"
+            }
+        ],
+        "trie_splits": [
+            {
+                "parent_secret": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+                "parent_depth": 12,
+                "parent_prefix": "00123456789abcdef0112233445566778899aabbccddeeff0011223344556677",
+                "masked_parent_prefix": "0010000000000000000000000000000000000000000000000000000000000000",
+                "child_side": 0,
+                "child_depth": 13,
+                "child_prefix": "00112233445566778899aabbccddeeffffeeddccbbaa99887766554433221100",
+                "info": "000c001000000000000000000000000000000000000000000000000000000000000000000d0010000000000000000000000000000000000000000000000000000000000000",
+                "child_secret": "9069f94f481c8caad20df05b0ca161ba4e6d45c0fa44a8f2c745d990343135c5"
+            }
+        ],
+        "root_to_leaf": [
+            {
+                "authored_at_ms": 0,
+                "expected_time_bucket": 0,
+                "content_coordinate": "8000000000000000000000000000000000000000000000000000000000000000",
+                "first_time_child_secret": "714350f6146b21914208b1ab22b87141ce726f7b0d273ad4298fcfb3c1cec1f1",
+                "bucket_secret": "d5f8dd7af4a8739be2be2c4ed131f69fd2118fa99a4c654d99d216fcc367c164",
+                "leaf_secret": "06049f68c1e02131e2d4a27c15b518e22c031169b41bf0b8ae49a02adda77864"
+            },
+            {
+                "authored_at_ms": 102000056789,
+                "expected_time_bucket": 1700000,
+                "content_coordinate": "00112233445566778899aabbccddeeffffeeddccbbaa99887766554433221100",
+                "first_time_child_secret": "714350f6146b21914208b1ab22b87141ce726f7b0d273ad4298fcfb3c1cec1f1",
+                "bucket_secret": "dfd233b0214f44c4896462f65d555483848ffbbc1f6311c84dbe8e1941aad151",
+                "leaf_secret": "ad0ebcbc5ddeb27aad74bbde9629ce8cbddbecf9748b86b07ecaa7012df1c6d6"
+            }
+        ]
+    },
+    "content_preparation": {
+        "initial": {
+            "authored_at_ms": 1720000000789,
+            "content_coordinate": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a55a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "retry": {
+            "authored_at_ms": 1720000000789,
+            "content_coordinate": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a55a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "lookup_inputs": [],
+        "derived_local_artifact_authored_at_ms": null
+    },
+    "wrap_contract": {
+        "type_tag": 22,
+        "local_root_type_tag": 144,
+        "local_history_node_type_tag": 145,
+        "purpose_ascii": "topo key wrap v1",
+        "hkdf_info_ascii": "topo x25519 xchacha20poly1305 key",
+        "sender_domain_ascii": "topo key wrap sender x25519 v1",
+        "nonce_domain_ascii": "topo key wrap nonce v1",
+        "workspace_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "frontier_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recipient_key_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "recipient_private_key": "9999999999999999999999999999999999999999999999999999999999999999",
+        "recipient_public_key": "ba193836cff1f4e866c139715d306408d26a76f76d638a39afc1001084d25411",
+        "vectors": [
+            {
+                "name": "frontier-root",
+                "kind": 0,
+                "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "authored_at_ms": 1720000000123,
+                "wrapped_secret_id": "c0690b533ab290bbe5af569b0d167a54568e6c9d8584668406a42ae9ac2ee0de",
+                "wrapped_source_secret_id": "0000000000000000000000000000000000000000000000000000000000000000",
+                "wrapped_tombstone_node_id": "0000000000000000000000000000000000000000000000000000000000000000",
+                "range_start": 0,
+                "range_width": 0,
+                "bit_depth": 0,
+                "event_id_prefix": "0000000000000000000000000000000000000000000000000000000000000000",
+                "sender_private_key": "a5f5bb09bd4cc617dff7ee67e067080c9d25a08f780f96425f0cdb746846f664",
+                "sender_public_key": "aa4be191dfbbd84ce1c0fd0e491c2c0c80c109c8504294c3d662cfc82cbb8d59",
+                "nonce": "f9eaac2c4111a60bab4498e7b4ca02f5fec735b4720c7cb0",
+                "aead_key": "be5245a98e2faf78d3acfd97ccbb185a9e7758130c53d051fc6ba0f80b8da5b6",
+                "ciphertext": "1cbd81526d00d120272a606393d7fde510cc75f64c7cadc3379d2291a73e8f8b515125ffc6d8b91bb629a37abf790f91"
+            },
+            {
+                "name": "history-node",
+                "kind": 1,
+                "secret": "2769a00cdc106204d24644223bd6a6500b0f0b9200b2853882b7d7d5feafdae0",
+                "authored_at_ms": 1720000000456,
+                "wrapped_secret_id": "c34d9ea2f118905d660cd2a75632fd232ae7da4b2d39843a4b7bb44345077f9a",
+                "wrapped_source_secret_id": "eb0ab3fbd0435fd58602aafa91d687b7cb7f00ee9f073a4a7d596e25ff7b1690",
+                "wrapped_tombstone_node_id": "0000000000000000000000000000000000000000000000000000000000000000",
+                "range_start": 1700000,
+                "range_width": 1,
+                "bit_depth": 12,
+                "event_id_prefix": "0010000000000000000000000000000000000000000000000000000000000000",
+                "sender_private_key": "a21704139a9a27cc4a73e9e25b0a0e09a087fe9e8902f210aae9b2b3d750cd7c",
+                "sender_public_key": "078c1fe2557346ce096aa19167cc70f3cf9e4f0732dd7801e8a9e16e2040ac59",
+                "nonce": "eef50e89cebd0894f5c39df49cc266fc8106c03c783f8d81",
+                "aead_key": "44f9e1c86342b09792da9d42b7b0de9603e89d15ff6d2224b757e59a2a7546ff",
+                "ciphertext": "92718393acb13f39e63afb63d1c85675b9a052ae0f2dda16c6cbb89db0499d3772e455589793788f67ec1bad796c612f"
+            }
+        ]
+    },
+    "purge_batches": [
+        {
+            "name": "first-frontier-root-purge",
+            "secrets": [
+                {
+                    "kind": "FrontierRoot",
+                    "shared_wrap_allowed": true,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": true,
+            "expected_recipient_rotations": 1
+        },
+        {
+            "name": "later-history-node-with-delayed-remote-wrap",
+            "secrets": [
+                {
+                    "kind": "HistoryNode",
+                    "shared_wrap_allowed": true,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": true,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": true,
+            "expected_recipient_rotations": 1
+        },
+        {
+            "name": "later-generation-sealed-history-node",
+            "secrets": [
+                {
+                    "kind": "HistoryNode",
+                    "shared_wrap_allowed": false,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": true,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": true,
+            "expected_recipient_rotations": 1
+        },
+        {
+            "name": "later-root-derived-history-node",
+            "secrets": [
+                {
+                    "kind": "HistoryNode",
+                    "shared_wrap_allowed": false,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": true
+                }
+            ],
+            "expected_recovery_eligible": true,
+            "expected_recipient_rotations": 1
+        },
+        {
+            "name": "batched-root-and-history-purge",
+            "secrets": [
+                {
+                    "kind": "FrontierRoot",
+                    "shared_wrap_allowed": true,
+                    "observed_local_wrap": true,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": false
+                },
+                {
+                    "kind": "HistoryNode",
+                    "shared_wrap_allowed": false,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": true,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": true,
+            "expected_recipient_rotations": 1
+        },
+        {
+            "name": "explicit-weaker-tier-independent-history-node",
+            "secrets": [
+                {
+                    "kind": "HistoryNode",
+                    "shared_wrap_allowed": false,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": false,
+            "expected_recipient_rotations": 0
+        },
+        {
+            "name": "transient-no-recovery-leaf",
+            "secrets": [
+                {
+                    "kind": "Leaf",
+                    "shared_wrap_allowed": false,
+                    "observed_local_wrap": false,
+                    "remote_wrap_delivered_after_purge": false,
+                    "sealed_to_generation": false,
+                    "retained_root_derivable": false
+                }
+            ],
+            "expected_recovery_eligible": false,
+            "expected_recipient_rotations": 0
+        }
+    ],
+    "recipient_transition": {
+        "claim_attempts": [
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000009000,
+                "expected": "accepted"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000009000,
+                "expected": "coalesced"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T2",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000010000,
+                "expected": "conflict"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S2",
+                "next": "T",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000010100,
+                "expected": "conflict"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "batch": [
+                    "operation-B"
+                ],
+                "authored_at_ms": 1720000011000,
+                "expected": "conflict"
+            },
+            {
+                "action": "claim",
+                "predecessor": "S",
+                "successor": "T",
+                "next": "U",
+                "batch": [
+                    "operation-X"
+                ],
+                "authored_at_ms": 1720000012000,
+                "expected": "blocked-until-P-finalized"
+            },
+            {
+                "action": "finalize",
+                "predecessor": "P",
+                "completion_fact": "reservation-P-S-T-A",
+                "expected": "blocked-until-completion-evidence"
+            },
+            {
+                "action": "finalize",
+                "predecessor": "P",
+                "completion_fact": "transition-P-S-completion",
+                "expected": "finalized"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000009000,
+                "expected": "coalesced"
+            },
+            {
+                "action": "claim",
+                "predecessor": "P",
+                "successor": "S",
+                "next": "T2",
+                "batch": [
+                    "operation-A"
+                ],
+                "authored_at_ms": 1720000013000,
+                "expected": "conflict"
+            },
+            {
+                "action": "claim",
+                "predecessor": "S",
+                "successor": "V",
+                "next": "U",
+                "batch": [
+                    "operation-X"
+                ],
+                "authored_at_ms": 1720000014000,
+                "expected": "conflict"
+            },
+            {
+                "action": "claim",
+                "predecessor": "S",
+                "successor": "T",
+                "next": "U",
+                "batch": [
+                    "operation-X"
+                ],
+                "authored_at_ms": 1720000012000,
+                "expected": "accepted"
+            }
+        ],
+        "fact_graph": {
+            "workspace-anchor": {
+                "refs": [],
+                "needs": []
+            },
+            "reader-authority": {
+                "refs": [
+                    "workspace-anchor"
+                ],
+                "needs": []
+            },
+            "recipient-P": {
+                "refs": [
+                    "reader-authority"
+                ],
+                "needs": []
+            },
+            "successor-S-reservation": {
+                "refs": [
+                    "recipient-P"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "next-T-commitment": {
+                "refs": [
+                    "successor-S-reservation"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "operation-A": {
+                "kind": "purge-operation",
+                "refs": [
+                    "recipient-P"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "operation-X": {
+                "kind": "purge-operation",
+                "refs": [
+                    "recipient-P"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "claim-P-S-T-A": {
+                "kind": "transition-claim",
+                "predecessor": "P",
+                "refs": [
+                    "recipient-P",
+                    "successor-S-reservation",
+                    "next-T-commitment",
+                    "operation-A"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "reservation-P-S-T-A": {
+                "refs": [
+                    "claim-P-S-T-A",
+                    "operation-A",
+                    "recipient-P"
+                ],
+                "needs": [
+                    "reader-authority",
+                    "workspace-anchor"
+                ]
+            },
+            "writer-fence-P-drained": {
+                "kind": "writer-fence-completion",
+                "generation": "P",
+                "refs": [
+                    "reservation-P-S-T-A"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "survivor-cover-migration-P-S": {
+                "kind": "survivor-migration-completion",
+                "predecessor": "P",
+                "generation": "S",
+                "refs": [
+                    "writer-fence-P-drained",
+                    "successor-S-reservation"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "predecessor-P-handle-destroyed": {
+                "kind": "predecessor-destruction-evidence",
+                "generation": "P",
+                "refs": [
+                    "survivor-cover-migration-P-S",
+                    "next-T-commitment"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "transition-P-S-completion": {
+                "kind": "durable-transition-completion",
+                "predecessor": "P",
+                "generation": "S",
+                "refs": [
+                    "reservation-P-S-T-A",
+                    "writer-fence-P-drained",
+                    "survivor-cover-migration-P-S",
+                    "predecessor-P-handle-destroyed"
+                ],
+                "needs": [
+                    "workspace-anchor",
+                    "reader-authority"
+                ]
+            },
+            "finalized-S": {
+                "kind": "finalized-recipient",
+                "generation": "S",
+                "refs": [
+                    "reservation-P-S-T-A",
+                    "operation-A",
+                    "transition-P-S-completion"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            },
+            "operation-X-rebase-to-S": {
+                "kind": "operation-rebase",
+                "generation": "S",
+                "refs": [
+                    "operation-X",
+                    "finalized-S"
+                ],
+                "needs": [
+                    "reader-authority"
+                ]
+            }
+        },
+        "delivery_cases": [
+            {
+                "name": "complete-reservation",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "accepted",
+                "expected_parked": []
+            },
+            {
+                "name": "multi-root-reservation-and-excluded-operation",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "operation-X",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "accepted-operation-X-remains-excluded",
+                "expected_parked": []
+            },
+            {
+                "name": "complete-reservation-then-standalone-operation-duplicate",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ],
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "operation-A"
+                    ]
+                ],
+                "expected": "accepted-idempotent-duplicate",
+                "expected_parked": []
+            },
+            {
+                "name": "truncated-missing-predecessor",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "rejected-no-side-effects",
+                "expected_parked": []
+            },
+            {
+                "name": "truncated-missing-authority",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "rejected-no-side-effects",
+                "expected_parked": []
+            },
+            {
+                "name": "truncated-missing-claim",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "rejected-no-side-effects",
+                "expected_parked": []
+            },
+            {
+                "name": "truncated-missing-operation",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ]
+                ],
+                "expected": "rejected-no-side-effects",
+                "expected_parked": []
+            },
+            {
+                "name": "premature-finalization-without-completion-evidence",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A",
+                        "finalized-S"
+                    ]
+                ],
+                "expected": "rejected-no-side-effects",
+                "expected_parked": []
+            },
+            {
+                "name": "complete-finalization",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A",
+                        "writer-fence-P-drained",
+                        "survivor-cover-migration-P-S",
+                        "predecessor-P-handle-destroyed",
+                        "transition-P-S-completion",
+                        "finalized-S"
+                    ]
+                ],
+                "expected": "accepted-finalized",
+                "expected_parked": []
+            },
+            {
+                "name": "excluded-operation-observed-before-reservation",
+                "piles": [
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "operation-X"
+                    ],
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A"
+                    ],
+                    [
+                        "workspace-anchor",
+                        "reader-authority",
+                        "recipient-P",
+                        "operation-X",
+                        "successor-S-reservation",
+                        "next-T-commitment",
+                        "operation-A",
+                        "claim-P-S-T-A",
+                        "reservation-P-S-T-A",
+                        "writer-fence-P-drained",
+                        "survivor-cover-migration-P-S",
+                        "predecessor-P-handle-destroyed",
+                        "transition-P-S-completion",
+                        "finalized-S",
+                        "operation-X-rebase-to-S"
+                    ]
+                ],
+                "expected": "accepted-operation-X-rebases-to-S",
+                "expected_parked": []
+            }
+        ],
+        "timestamp_assignment": {
+            "batch_claim": "claim-P-S-T-A",
+            "rebase_facts": [
+                "operation-X-rebase-to-S"
+            ],
+            "rewrites": [
+                {
+                    "workspace-anchor": 1720000000000,
+                    "reader-authority": 1720000000100,
+                    "recipient-P": 1720000000200,
+                    "successor-S-reservation": 1720000000800,
+                    "next-T-commitment": 1720000000700,
+                    "operation-A": 1720000000900,
+                    "operation-X": 1720000000001,
+                    "claim-P-S-T-A": 1720000000500,
+                    "reservation-P-S-T-A": 1720000000700,
+                    "writer-fence-P-drained": 1720000001000,
+                    "survivor-cover-migration-P-S": 1720000001050,
+                    "predecessor-P-handle-destroyed": 1720000001100,
+                    "transition-P-S-completion": 1720000001150,
+                    "finalized-S": 1720000001200,
+                    "operation-X-rebase-to-S": 1720000001300
+                },
+                {
+                    "workspace-anchor": 1721000000900,
+                    "reader-authority": 1721000000800,
+                    "recipient-P": 1721000000700,
+                    "successor-S-reservation": 1721000000600,
+                    "next-T-commitment": 1721000000500,
+                    "operation-A": 1721000000100,
+                    "operation-X": 1721000009900,
+                    "claim-P-S-T-A": 1721000000050,
+                    "reservation-P-S-T-A": 1721000000075,
+                    "writer-fence-P-drained": 1721000000065,
+                    "survivor-cover-migration-P-S": 1721000000055,
+                    "predecessor-P-handle-destroyed": 1721000000045,
+                    "transition-P-S-completion": 1721000000035,
+                    "finalized-S": 1721000000025,
+                    "operation-X-rebase-to-S": 1721000000010
+                }
+            ],
+            "expected_assignment": {
+                "operation-A": "P",
+                "operation-X": "S"
+            }
+        },
+        "writer_race": {
+            "steps": [
+                {
+                    "op": "lease",
+                    "writer": "writer-1",
+                    "generation": "P",
+                    "expected": "accepted"
+                },
+                {
+                    "op": "prepare",
+                    "writer": "writer-1",
+                    "record": "survivor-racing",
+                    "expected": "accepted"
+                },
+                {
+                    "op": "fence",
+                    "generation": "P",
+                    "expected": "accepted-aborted-writer-1"
+                },
+                {
+                    "op": "lease",
+                    "writer": "writer-2",
+                    "generation": "P",
+                    "expected": "rejected"
+                },
+                {
+                    "op": "commit",
+                    "writer": "writer-1",
+                    "record": "survivor-racing",
+                    "expected": "rejected"
+                },
+                {
+                    "op": "scan-survivors",
+                    "generation": "P",
+                    "expected": []
+                },
+                {
+                    "op": "migrate",
+                    "generation": "S",
+                    "expected": "accepted"
+                },
+                {
+                    "op": "destroy",
+                    "generation": "P",
+                    "expected": "accepted"
+                },
+                {
+                    "op": "promote",
+                    "generation": "S",
+                    "expected": "accepted"
+                }
+            ],
+            "expected_final_generation": "S",
+            "expected_post_fence_P_commits": []
+        },
+        "handle_budgets": [
+            {
+                "capacity": 2,
+                "expected": "capacity-failure-before-P-destruction",
+                "expected_live_handles": [
+                    "P",
+                    "S"
+                ],
+                "expected_finalized": false
+            },
+            {
+                "capacity": 3,
+                "expected": "success",
+                "expected_live_handles": [
+                    "S",
+                    "T"
+                ],
+                "expected_peak_handles": [
+                    "P",
+                    "S",
+                    "T"
+                ],
+                "expected_finalized": true
+            }
+        ]
+    }
+}
