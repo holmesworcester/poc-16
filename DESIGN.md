@@ -60,8 +60,8 @@ removal set — removal is connection-level, mutual removals both land).
 
 **The engine.** Semantics-free: hash-verify, kernel, merge by key into
 the tail, promote by the cut rule into write-once leaf piles,
-union globals, one CAS, delete piles. Runs only on request, under a
-lease. Access is a handshake: the requester sends a small closed
+union globals, one CAS, delete piles. Runs only on request; the lease is the *optional*
+linearizable path — non-serialized by default (§Concurrency & FaaS). Access is a handshake: the requester sends a small closed
 pile — a request fact plus its auth closure — and the mint, a pure
 function, runs the same kernel over it and returns a grant encrypted
 to the author's key. Invites are the one ungated read — **public**
@@ -764,10 +764,65 @@ rebuild from its store.
 | | store | serving | engine | initiates |
 |---|---|---|---|---|
 | cloud node | s3 | presigned (store is server) | Lambda on poke | never |
+| cloud node (CF) | R2 | Workers (store is server) | Worker on event/poke | never |
 | peer | sqlite | daemon | on request | cadence + news |
 | home server | sqlite or s3 | daemon | on request | never |
 | static mirror | any HTTPS host | files | no | never |
 | iOS NSE | fs pile in app group | no | validate-only; hands off to app | never |
+
+## Concurrency & FaaS
+
+Many stateless workers — Lambda, **Cloudflare Workers** — run the engine
+concurrently over one store, **coordination-free**. Non-serialized is the
+default; the single-writer lease and the one CAS'd manifest of §The System in
+One Page / §The Engine are the *optional* linearizable path, not a requirement.
+
+**It is a CRDT.** Piles and tree nodes are immutable and content-addressed:
+concurrent PUTs are idempotent and commutative, and the arrangement is a
+deterministic fold of the pile set. No operation is non-commutative (facts
+additive, tombstones remove-wins, fold deterministic), so roots form a
+join-semilattice, `merge(A,B) = root(A∪B)` is the O(diff) tree-join, and
+convergence is **Strong Eventual Consistency** — same observed set ⇒
+bit-identical root (one hash compare), no conflict resolution, self-healing.
+The only mutable cell is a 32-byte root hash per workspace, itself optional
+(state ≡ ⊔ of all published roots). This is the Merkle Search Tree
+(Auvolat–Taïani 2019) / prolly-tree (Noms → Dolt) line reconciled by RBSR
+(Meyer 2023); full treatment in WORKSPACES.md §9.
+
+**Root without a lease.** Publish roots into an append-only `roots/` set; truth
+is `merge(live roots)`, never clobbered. Every fold and every authoritative
+read merges what it sees and republishes — anti-entropy amortized into traffic;
+concurrent merges are deterministic, so they produce the same hash and dedup (no
+storm), so no dedicated sweeper is needed beyond a cold-workspace cron. CAS on a
+single `root` (S3 `If-Match`, R2 `onlyIf`) or blind-LWW+sweep are lease-free
+variants. A per-workspace lease/DO returns only as an opt-in for
+instant-authoritative reads or to damp folding on a hot workspace.
+
+**Fat nodes, no manifest.** Nodes carry each child's `(hash, fingerprint)` at
+B-tree fanout — self-describing and shallow (~2–3 levels), so the flat manifest
+is dropped. Full catch-up walks the fat root in ~2–3 parallel round-trip waves,
+then bandwidth-bound page transfer; only fat fanout makes this cheap (binary ⇒
+~log₂n waves ⇒ keep a manifest). Precomputed fingerprints in the immutable nodes
+are what let a **dumb store** answer a reader-driven pruned walk with only GETs
+(git "dumb HTTP" over a Merkle DAG); `Range` the fingerprint region to trim bytes.
+
+**Reads pick a guarantee.** *Fast* — walk any recent root (may lag by fold
+latency). *Authoritative* — reconcile: root-vs-`LIST` diff, or peer fingerprint
+diff. One primitive; empty-prior = full catch-up. RYW is client-side (fold your
+pile after PUT); monotonic reads = merge-not-replace against a watermark; causal
+is free from dep-closure.
+
+**GC is generational.** Reclaim only what no root in a grace window reaches
+(git-gc + a reflog window); the folder that path-copies stamps superseded nodes
+with a grace expiry; reclamation is lazy and never on the correctness path.
+
+**Cloudflare Workers, exclusively.** The tree lives in R2, so every hot op is
+O(log n) memory / O(ms) incremental CPU — 128 MB / 30 s (→5 min) never bite in
+steady state, and a pile parses in a few MB. R2 gives strong read-after-write +
+conditional writes; fold on **R2 event → Queues**; **never put `root` in KV**
+(eventually consistent); R2 egress is free. The one O(n) job — a from-scratch
+rebuild — is skipped by copying the content-addressed tree or chunked across
+invocations via a Durable Object `alarm()`; no heavy tier is required.
 
 ## Staged Plan
 
