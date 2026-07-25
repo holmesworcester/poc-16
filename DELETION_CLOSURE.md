@@ -151,6 +151,54 @@ So the four candidate mechanisms rank as:
 - **Default lock/queue — rejected.** It reintroduces the per-workspace
   serialization bottleneck the FaaS epic just removed (the DO path in disguise).
 
+## 3b. Where the walk fires, what rides with it, what it writes
+
+Aligns with the `E = V∖S` frame in `SIMPLIFY.md` §3–§5 (the 808 engine epic);
+suppression **masks after judgment** at three places only — gate, closure edge
+(`resolve_supp`), pump — never the kernel, never the tree.
+
+- **The walk fires per suppression-participant, at merge/serve — not per pile,
+  not at projection.** Projection is a pure fold over a delivery log
+  `log(seq, ±fid)` and does **zero** tree walking. The `T_supp` walk happens at
+  **merge** (per newly-admitted fact with a `suppkey`: one head-of-group check;
+  per newly-admitted deletion: surface held targets → emit `−fid`) and at
+  **serve** (`closure_sync` surfaces *out-of-range* victims for a peer). A plain
+  fact with no suppression attribute costs nothing.
+- **Cost adds up as O(S·log N), paid once, monotone.** Each participant's status
+  is decided once at ingest — same class as `resolve_deps` — and a not-yet-
+  suppressed target flips at most once (a single `−fid` append, never a re-scan).
+  Memoize against the K-subtree hash: steady state is a hash-compare. The only
+  1:N cost (a hot death key's full blast radius) is paid solely by a node that
+  holds/serves the whole target set, once; scoped projectors never pay it.
+- **A discovery writes to the closure — as a `±fid` log row, paid once.** The
+  append lands in the **local delivery log** (`log(seq, ±fid)` in `idx.db`), **not
+  in any leaf pile** — piles are immutable/content-addressed and the target's bytes
+  never change (suppression hides it, it stays a member). The pump consumes the row
+  as `DELETE … WHERE src = ?` exactly-once. When a deletion `D` lands it does two
+  *tree* inserts (into `T_fact` under its own key, into `T_supp` under `K`), each an
+  O(log N) path-copy; the per-target flip is one *log* append each — the log and
+  `app.db` are both derived/rebuildable, so the flip mutates no canonical state.
+  **S itself never lives in `app.db`** — it lives in `T_supp`/the root; rebuild
+  recomputes S first, folds E, fires zero retractions. Optionally also persist surfaced out-of-range victims locally to
+  avoid re-surfacing (the read-time-walk vs embed-annex tradeoff, §6). Monotone ⇒
+  either write is safe.
+- **A deletion carries its own validity closure.** `valid(D) = pred(D,
+  closure(D))` — its authority chain (admin cert / membership / signatures). A
+  `T_supp` leaf carrying D is a **closed pile** (same `close()`): D **plus**
+  `closure(D)`, self-validating on arrival, exactly like a `T_fact` leaf. Only a
+  D that arrived with its own closure enters S (`S(D) = targets of *valid*
+  suppression facts`). Validity-closure (may D delete) stays separate from the
+  suppression relation (what D deletes).
+- **`T_supp` hoists — for free, as the engine's second instance.** D's authority
+  closure is *shared* closure (one admin deletes many channels), so the ρ≈3×
+  leaf-duplication tax hits `T_supp` too. Because `T_supp` is the same engine
+  (`tree.py`/`shape.py`) keyed differently, it inherits hoisting; and closure
+  facts are content-addressed, so `T_fact` and `T_supp` reference **one shared
+  hoisted closure pool** (only index nodes are extra, ~×2). Production `T_supp`
+  must ride the hoisting engine (808.2 / jbg.1), **not** the flat per-leaf-closure
+  prototype (`layout` + per-leaf `close()`, ρ≈3× measured — `MULTILEVEL_PILE.md`);
+  the yez.6 proof may run on the prototype (SIMPLIFY §3), production must not.
+
 ## 4. Why there is no serial pass (the advance on the Open Question)
 
 `DESIGN.md` worried multi-target needs "full state awareness … a singleton serial
