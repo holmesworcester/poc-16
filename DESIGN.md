@@ -1,7 +1,8 @@
 # Passive-Store Reconciliation — POC-16 Design
 
-Design of record. The Engine, Auth, Node State, and Concurrency sections mark
-landed behavior versus remaining beads; where earlier System/Store/Walk prose
+Design of record. The Engine, Versioning, Auth, Node State, and Concurrency
+sections mark landed behavior versus remaining beads; where earlier
+System/Store/Walk prose
 still describes the pre-S1 flat manifest, those sections are historical
 motivation and the later foldback takes precedence. [SIMPLIFY.md](docs/SIMPLIFY.md)
 maps the landed core. Unreplaced numbers remain
@@ -36,8 +37,9 @@ clear envelope, values encrypted in the body. Causality lives in refs
 alone; ts is an uninterpreted locality key with zero correctness
 weight. The valid, dep-closed set serializes as a canonical
 `(ts, fid)`-sorted run of packed pages (records + body heap) under
-fence runs, topped by one CAS'd manifest — same set, same bytes,
-everywhere. Diffing is fence-fingerprint comparison plus ranged GETs:
+fence runs, topped by one CAS'd manifest — same set, same bytes, everywhere
+within a release and a layout configuration (§Versioning). Diffing is
+fence-fingerprint comparison plus ranged GETs:
 O(d·log n), ~4 rounds, against a counterpart that executes almost no
 code.
 
@@ -60,8 +62,8 @@ behind the cursor, or the unit rejects — then per-fact integrity and
 the family handler, workspace scope via the anchor (genesis fid;
 workspace id = `H(genesis)`). Zero store reads; caller-injected SQLite
 working state; parallel invocations. Validity is forever and
-globals-blind; only ephemeral request facts read globals (the monotone
-removal set — removal is connection-level, mutual removals both land).
+globals-blind; among validators only ephemeral request facts read globals (the
+monotone removal set — removal is connection-level, mutual removals both land).
 
 **The engine.** Semantics-free: hash-verify, kernel, merge by key into
 the tail, promote by the cut rule into write-once leaf piles,
@@ -119,7 +121,9 @@ canonical form. Atoms carry the fact's needs, offers, and dep refs in
 the **clear envelope**; encrypted values ride the body — **matching
 reads addresses, never values** — so dep topology and the offer
 vocabulary are store-visible while content never is, and the engine
-derives each leaf's closure from envelopes alone. Signatures are not envelope
+derives each leaf's closure from envelopes plus the owning family's
+handler (§Versioning — a need's canonical provider is handler output,
+so the closure is not store-visible the way a ref is). Signatures are not envelope
 fields but their own offering facts (Atoms, below).
 Reconciliation key is `(ts, fid)`. **Dependency references must carry the
 full `(ts, fid)`** — a bare fid is unresolvable without a secondary index we
@@ -136,7 +140,8 @@ by window.
 
 **Treap.** The canonical structure is a treap keyed `(ts, fid)`, priority
 from the fid hash — history-independent, so the same set gives the same
-shape, fingerprints, and pages on every node. That is what makes one-sided
+shape and fingerprints on every node, and the same pages within one release and
+layout configuration (§Versioning). That is what makes one-sided
 comparison possible: aligned ranges, plain Merkle fingerprints, no
 boundary negotiation. It is math, not layout — on disk it is realized as
 the sorted run + fence hierarchy below. No homomorphic sums — they exist
@@ -195,12 +200,15 @@ stateless. No size cap: splitting duplicates closures, and the merge
 streams. **All-or-nothing**: the kernel judges a pile as a unit;
 rejects (malformed, bad hash, unresolved ref, invalid) are deleted on
 the spot, blame lands on the pusher's own prefix, and anything valid
-that sank with a bad batch comes back on the sender's next walk.
+that sank with a bad batch comes back on the sender's next walk. One
+exception, and it is versioning's: a pile carrying a version this node
+does not implement is *unreadable*, not invalid — retained, unblamed,
+retried after upgrade under a bounded cap (§Versioning).
 Byte-level layout never composes across concurrent piles — the engine
 re-cuts, because **recomputation is the verification** — but
 record-level merge does, associatively: history-independence makes any
-arrival grouping converge to identical bytes. Nothing parks; every
-drain empties the pile.
+arrival grouping converge to identical bytes. Nothing parks except across a
+version boundary; every other drain empties the pile.
 
 **WAL.** Not a separate tier but **the treap's rightmost range**:
 validated-but-unpromoted facts live in a content-addressed *tail page*
@@ -224,7 +232,8 @@ the page it lands in — same commit, ~2–3 extra PUTs, rare because the
 boundary's guard window is the tail's time depth (B_t/λ: hours busy, days
 quiet). The boundary itself is content-determined (the highest cut point
 with fewer than B_t entries above it), so the whole layout — tail included
-— is a pure function of the set (docs/MODEL.md, Stragglers).
+— is a pure function of the set given the layout configuration
+(docs/MODEL.md, Stragglers).
 
 **ObjectStore trait.** Every node stores through one S3-shaped trait:
 
@@ -282,8 +291,8 @@ pusher's own already-built leaves verbatim, so over-pushing is just copying
 bytes it holds. The responder **drains on receipt** — a pushed pile lands in its
 ingress and the same PUT handler turns it into the treap — so a peer push needs
 no poke. (The presigned-cloud path, whose write goes straight to S3 with no
-handler to hook, keeps the explicit poke; and the mint that authorizes any read
-already drains before it responds.)
+handler to hook, keeps the explicit poke; the mint never drains, so it is not an
+alternative to it.)
 
 The walk computes the *symmetric* difference, so **one dial converges both
 sides; the responder runs zero sync logic.** Eager delivery still exists — put
@@ -317,10 +326,12 @@ set, judgeable by the same kernel predicate as any pile. **Nothing is copied to
 fix ordering**: topo-sort places every dependency before its dependent, so the
 old "annex" of in-range skew-inversion copies is gone by construction; the only
 facts a leaf carries beyond its in-range leaves are the genuinely out-of-range
-**shared closure** (auth/membership). That closure is a pure set function
-(identical sets ⇒ identical bytes), built **by aggregation, never by search**:
+**shared closure** (auth/membership). That closure is a pure set function within
+a release (identical sets ⇒ identical bytes; provider selection is release-scoped
+— §Versioning), built **by aggregation, never by search**:
 piles arrive fully closed, so every copy a leaf needs came in with some pile; at
-promotion each ref is classified in one pass (in-range, else shared closure).
+promotion each ref *and each handler-resolved need provider* is classified in
+one pass (in-range, else shared closure).
 Fat leaves swallow the common context; hot hubs (genesis, certs) cost one copy
 per leaf, amortized away as leaves grow. Storage pays the duplication; nobody
 chases a graph.
@@ -376,8 +387,9 @@ verification, parameterized by physical `Packing`. Binary treap and flat
 manifest packings remain golden compatibility fixtures; production uses
 shallow content-defined fat nodes. The engine takes `fetch(oid)` and
 `emit(bytes) -> oid` callbacks and knows nothing about files, HTTP, S3, or R2.
-Within a packing, a set and tree-format configuration determine byte-identical
-nodes; `fold(view, delta)` path-copies changed branches and is byte-identical
+Within a packing, a release, a set, and a tree-format configuration determine
+byte-identical nodes (§Versioning: the fingerprint is version-free, the oid is
+not); `fold(view, delta)` path-copies changed branches and is byte-identical
 to a full build of the union. The root is `Root(view, anchor, globals_)`, so
 anchor and canonical global rows ride the tree rather than a separate flat
 manifest. This absorbs the old `treap.py` / `layout.py` algorithms and the
@@ -477,9 +489,10 @@ order-free, because per-pile extraction composes as union. Eviction
 validity is removal-blind (valid iff the author's chain shows admin),
 so **mutual removals remove each other** — monotone, no ordering
 question to answer; "non-removal" is enforced at the connection, never
-in fact validity. Globals are read **only by ephemeral-family
+in fact validity. Among validators, globals are read **only by ephemeral-family
 handlers**: a persistent-family handler that consulted them would make
-verdicts time-dependent and collapse order-independence. Fact validity
+verdicts time-dependent and collapse order-independence. (Outside validity
+entirely, the authoring floor reads them too — §Versioning.) Fact validity
 is forever; removal only closes doors.
 
 Single-target deletion is a separate post-validity layer:
@@ -522,7 +535,8 @@ about to verify. What a pile can never do is bind *validity* to its
 own delivery: **validity binds to the workspace through the chain;
 delivery binds to the pusher through the grant; the two never mix** —
 a fact must judge identically however and whenever it arrives. Consumers stay trustless — they re-verify what they
-pull, closures always in hand — but nothing parks anywhere: piles are
+pull, closures always in hand — but nothing parks anywhere except across a
+version boundary (§Versioning): piles are
 closed by format, syncs arrive closed by P3. Anything needing negative
 or global knowledge (uniqueness, latest-wins) stays a projection-time
 verdict, deterministic from the set — never a validation input.
@@ -540,10 +554,9 @@ compose: refs say *where* (exact `(ts, fid)` providers, keeping
 each leaf's closure deterministic), needs say *what* (the assertion
 the provider must offer). Offers are the **version interlingua** —
 the reason the model earns its weight: facts of different versions in
-one pile never read each other's schemas; each version's handler
-decodes only its own bytes and emits normalized offers, consumers
-need the offers, and a new version is a new handler, not a migration
-(POC-10's adapt layer, dissolved into offer emission).
+one pile never read each other's schemas. §Versioning owns the seam
+that makes offers handler output rather than envelope atoms, and today
+they are still the atoms.
 
 **Signature is a fact type that offers.** The kernel's built-in
 judgment shrinks to integrity — `fid` = hash of canonical bytes,
@@ -606,6 +619,198 @@ in flight ⇒ 3–5k GET/s; Ed25519 ~50–100 µs, parallel across cores;
 executing (+1 GB ≈ $0.05/day at a 1-min/2-s cadence ≈ 120k GETs), the hot
 set is tens of MB, and immutable pages mean the cache needs no invalidation
 — a warm worker can reuse any content-addressed page it already fetched.
+
+## Versioning
+
+**Three things carry a version, and they live in different places.** The *fact*
+version rides the type tag and is frozen into `fid` — the base store is
+unversioned in the sense that matters, because atoms are forever: no fact is
+rewritten, migrated, or re-signed. There is nowhere to add a version *field*
+either, since every family validates by reconstructing the fact from its own
+constructor and comparing, so one new byte would have to thread through all
+fifteen of them; the tag is the version, and it is already inside `fid`. The
+*layout* version is a config string published in the root
+(`1:kind:fanout:CUT`) and enforced there — a fold refuses a mismatched config,
+a two-root merge refuses a cross-config join. The *derived-state* version
+stamps what a node materializes — offers, proof ranks, globals, the projection
+log, read models — node-local and rebuildable, except for the globals it
+publishes in the root. Underneath all three sits one version-blind discipline:
+keys and fingerprints read only `ts` and the fid's own hash, priorities and cuts
+only the fid's. **The fingerprint is version-free; the oid is not** — that
+single split governs everything below.
+
+**A family tolerates every version of its own type, and no version of anyone
+else's.** The tag names family and version; each version keeps its own handler;
+a new version is a new handler, never a migration. This is the one place the POC
+keeps compatibility on purpose, and the boundary is worth drawing precisely:
+everywhere else it keeps none — no read-compat shims, no dual decoders, no state
+migrations, because there is no installed base and breaking the format costs
+less than the legibility a shim spends. Fact-family versioning is not an
+exception grudgingly made; it is the mechanism under test, so the POC should
+show it working. `legacy_genesis`, `legacy_signature`, `legacy_invite`, and
+`legacy_join` already do — old tags judgeable beside `workspace`, `signature`,
+`user_invite`, and `user`, authoring nothing, `legacy_invite` still enforcing its
+own admin-only rule while `user_invite` admits any member. That is two versions
+of one family disagreeing about semantics and both staying valid, which is
+exactly what this section claims is possible. Attachments then did it again
+under load: new descriptors author the versioned `file_bao` tag while the old
+`file` handler stays read-only, so whole-blob workspaces survive the cutover to
+Bao chunking. Three instances now, none of them planned by this section — which
+is the argument for naming the pattern. The rule is affordable because the
+obligation is local: N versions of my own type, borne by the family that owns them. N versions
+× M families is the product no release can ship, and buying it out is what the
+interlingua is for. So a release carries one version constant and no matrix of
+releases; compatibility with old retained facts lives in the owning family, and
+everything that family writes is current-version (POC-10's rule, kept verbatim).
+
+**Offers are that interlingua, so a fact's emitted offers are not the offer
+atoms in its body.** The atoms record what the author asserted, in the
+vocabulary of the release that authored it — immutable, store-visible in the
+clear envelope, and still exactly what the family's own validator reconstructs.
+The offer table records what *this* release makes of that assertion, normalized
+to the current vocabulary. Today the two are the same thing — the kernel admits
+the envelope atoms verbatim and no family has an offer hook — so the interlingua
+is asserted rather than built. Versioning is the change that separates them:
+offers become the output of a per-version **normalizer**, a pure function from
+one supported source shape to one current semantic form, of which today's
+behavior is the identity case. **Needs are normalized the same way, or nothing
+matches** — both sides of a match must speak one vocabulary, and a version that
+relabelled its offers but not its needs would look up an address nothing answers
+to. Needs already come from code, a handler function the running release
+evaluates; offers come from stored bytes. Closing that gap, so both sides of a
+match are normalizer output, is the whole of the change. The payoff is that no
+consumer ever decodes a producer's old schema — it needs an address, and the
+producer's own old normalizer is what puts a current-vocabulary offer there.
+
+POC-17 works this out in detail and POC-16 should take its shape (its DESIGN.md,
+Dotted variables and Provide). Three parts carry the weight. The vocabulary is a
+**canonical dotted path** — `content.message.body` — built through one path
+object that constructors, normalizers, validators, and queries all share, so a
+source version that called the same concept `content.post.text` emits
+`content.message.body` from its normalizer and no current code retains the old
+name. Emission is **all-or-nothing**: a valid fact's normalized offers are
+copied whole, the family never returning a subset, which is what makes the
+normalizer the security boundary — it must recognize an exact supported source
+shape and reject extra source offers rather than let a sender smuggle one into a
+valid owner. And a source offer atom **is not itself a matching offer**; it is
+input to that version's normalizer, so only the emitted row matches. That last
+line is the seam stated exactly, and it is what licenses renaming a variable,
+re-encoding a key or payload, splitting or combining fields, and mapping an old
+tag into current semantics without touching one immutable byte.
+
+Globals ride the same seam, being
+handler output published in the root; their value space must stay stable
+identities, keys and fids, which is what they already carry, because a
+schema-shaped global would rewrite root bytes on every release.
+
+**Validity is forever, so a release may not move it.** If a verdict were a
+function of the reader's release as well as of the fact and its closure, two
+replicas would disagree about membership permanently, fingerprints would differ
+over facts both hold, and syncing could never close the gap — the one failure
+this design cannot repair. So normalization is a *relabeling*: **meanings are
+append-only** — a name, once spent, is never reused for a different assertion —
+and an address is just this release's name for a meaning, applied to offers and
+needs together, in one release, which is exactly why matching is invariant under
+it. A release that genuinely changes a meaning mints a new one and leaves the
+old alone. The cost is worth stating plainly: a retained version's validity rule
+is frozen forever, but its *vocabulary tail* moves with each release, so a
+retained fact's emitted offers are a function of the reader's build. Tier 1 is
+therefore a discipline rather than a structural guarantee, and it is enforced by
+a test rather than by a type — replay a golden corpus under release N and
+release N+1, and the valid set must be identical. It is also not true yet: until
+an unimplemented version resolves to *unreadable* below it resolves to
+*invalid*, so today a behind-version node already judges facts invalid that an
+ahead-version node judges valid, and the reader's release already moves the set.
+
+**The arrangement may move, and the skew is nearly invisible.** Which provider
+is canonical for a need decides a leaf's closure, hence its pile bytes, hence
+its oid — so a release that changes provider selection republishes rather than
+memoizing old fences. Re-selection cannot reach validity: a provider is chosen
+only from offers already emitted behind the cursor, so a different canonical
+pick is still a behind-cursor pick, the streaming invariant holds under any
+release's selection, and readers still never sort. Only the recorded closure
+edge moves, and with it the bytes. Fingerprints cover in-range keys only, so the
+walk prunes on the same identities and both sides converge on the same set —
+which is also the hazard: two peers on different releases holding identical
+facts produce identical fingerprints and different roots, the walk reports
+convergence, and no *release* version rides the seven verbs, the grant, or the
+root to notice by (the root's format marker is written and never read; its
+config string pins layout, not release). One place the skew is not inert: the
+mint compares a need against the *committed* canonical winner (§Auth), so a
+release that re-ranks providers can change a grant decision over an unchanged
+set. Grants are ephemeral, so the set is safe — but a deployment must upgrade
+before its clients, and a mint and the drain that wrote its root must be the
+same release. Byte-identity is a claim *within* a release and a layout
+configuration, never across them.
+
+**Activation is an authoring policy; validity never reads it.** POC-10's release
+rule survives — do not author a new durable type until every non-deprecated
+release can decode, authenticate, validate, and project it — but not its
+mechanism: a ceiling computed from a signed release manifest and trusted time is
+ambient mutable state, and a validator reading it would make verdicts
+time-dependent, the same argument that keeps globals out of persistent handlers.
+So a fact authored at version v is valid at version v forever, however and
+whenever it arrives. Devices advertise the versions they implement as ordinary
+facts, and the authoring floor is the minimum over non-removed members — a
+commands-path read, never a validator's. A client that jumps the gun harms
+nobody's correctness; it only strands its own facts at peers that cannot yet
+read them. The two auth edges need a different floor, having no membership to
+take a minimum over: the mint must distinguish *cannot read* from *not entitled*
+and say which, since its path retains nothing to retry from; and the invite blob
+is authored at the oldest release the deployment still supports, its reader
+being a joiner who is not yet a member, its read public and unauthenticated, its
+redemption one-shot.
+
+**Meeting a version you do not implement is a verdict about the node, not the
+fact.** The two outcomes have to be opposite: an invalid pile is dropped and
+charged to its pusher, while an unreadable one is dropped and charged to nobody.
+POC-10 said it as "core does not store future-version incoming facts as protocol
+truth — incoming is volatile intake", and POC-17 keeps the rule while sharpening
+the disposal: bytes become durable only once the current release can decode,
+normalize, and project them, so an unreadable version stays *outside* the store
+rather than parked inside it. Nothing is retained, which is what keeps an
+unknown tag — free to fabricate, needing no key, no chain, no closure — from
+becoming pinned storage in a grant-holder's prefix. So this is a third kernel
+outcome beside valid and invalid, entering the set never, destroying nothing,
+attributing nothing, and costing nothing to hold. Both halves are work,
+because today an
+unknown tag resolves to no handler and the unit rejects whole — taking down
+every fact in it the reader does understand — while ingress is retired
+unconditionally after the CAS with nothing counted against anyone either way.
+The range then never converges, and the leaf comes back once per root change on
+either side and once per process restart: an unbounded refetch rather than a
+tight loop, which is why it has gone unnoticed. With the third outcome the same
+situation is a clean fail-stop — piles are all-or-nothing, so a behind-version
+client stops at the version boundary rather than serving a partial truth, and
+nothing is lost, since the peer still holds the range and the fingerprints still
+differ. The whole change is therefore bookkeeping rather than storage: stop
+charging the pusher, and mark the range stalled so the walk stops rediscovering
+it. Deployments whose engine is the vendor's
+own — cloud node, home server — upgrade first and never meet any of it.
+
+**An upgrade is one replay.** A stored stamp that does not match the running
+release means every derived artifact is suspect; rebuild streams the store's own
+leaf piles back through the same kernel, re-emitting offers, proofs, globals,
+the projection log, and the read models under the new handlers. No fact is
+rewritten — the piles around them are re-emitted at new oids when the
+arrangement moves, which is that bump's whole cost. The mechanism is landed, a
+semantic index stamp re-running the kernel and republishing while an app schema
+stamp replaces the read models, but they are two hand-maintained constants that
+have never moved together and are tied neither to each other nor to a release,
+and there is no release version in the tree at all. Making one constant drive
+both is the versioning work. Two properties come with it, from POC-17: the
+rebuild runs in **bounded, resumable transactions** rather than one pass with
+the set resident, since the host may be an NSE with a database larger than its
+memory budget; and until it reaches quiescence, completeness-sensitive queries
+**fail closed** rather than answering from a half-rebuilt view. Cost is the
+catchup path, so it is priced by it —
+~1.1k facts/s under the shipped monotone cut, against a raw judge ceiling near
+9k (bench/RESULTS.md) — and it is the same code as a fresh join. What replay
+cannot fix is retiring a version. The suppression-marker cutover is the case in
+hand: the marker is a shape requirement of the new content version, so old
+markerless facts stay valid at their own version, and the break comes only when
+that version stops being judgeable at all. That is a flag day, not a version,
+and the only honest support for it is to spend it early.
 
 ## Auth
 
@@ -818,7 +1023,8 @@ canonical settle placement derived from their facts; validating only the full
 fact set is insufficient because a malformed partial path may not be closed.
 Provider-bearing or provider-consuming deltas currently take the
 correctness-first canonical rebuild described in the Engine section.
-Convergence is **Strong Eventual Consistency** — same observed set ⇒
+Convergence is **Strong Eventual Consistency** — same observed set *at one
+release and one layout configuration* (§Versioning) ⇒
 bit-identical root (one hash compare), no conflict resolution, self-healing.
 The only mutable cell is a 32-byte root hash per workspace, itself optional
 (state ≡ ⊔ of all published roots). This is the Merkle Search Tree
@@ -829,7 +1035,12 @@ The only mutable cell is a 32-byte root hash per workspace, itself optional
 is `merge(live roots)`, never clobbered. Every fold and every authoritative
 read merges what it sees and republishes — anti-entropy amortized into traffic;
 concurrent merges are deterministic, so they produce the same hash and dedup (no
-storm), so no dedicated sweeper is needed beyond a cold-workspace cron. CAS on a
+storm), so no dedicated sweeper is needed beyond a cold-workspace cron. That
+determinism is release-scoped too: merge short-circuits on equal fingerprint and
+count by returning its own side, so under release skew `merge(A,B)` and
+`merge(B,A)` disagree and rival roots republish forever. A cross-release merge
+must refuse the way a cross-config merge already does, rather than silently pick.
+CAS on a
 single `root` (S3 `If-Match`, R2 `onlyIf`) or blind-LWW+sweep are lease-free
 variants. A per-workspace lease/DO returns only as an opt-in for
 instant-authoritative reads or to damp folding on a hot workspace.
@@ -871,7 +1082,8 @@ Proofs first; no transport work until both numbers exist.
 
 1. **Core** — leaf run + fence runs, deterministic cut, codec; trait with
    mem + sqlite drivers; manifest CAS. Property test: same set ⇒
-   same layout — pages, fences, and tail.
+   same layout — pages, fences, and tail — at one release and configuration;
+   the cross-release form is §Versioning's golden-corpus replay.
 2. **P1 bench** — divergence sweep, measure rounds/bytes vs O(d · log n).
 3. **P2 bench** — messaging-shaped synthetic pile; engine vs sqlite store,
    then vs real S3 from a warm Lambda; pin facts/s and $/M; pick page size.
@@ -911,6 +1123,20 @@ Proofs first; no transport work until both numbers exist.
   amortized write-amplification — safe because the cut stays a pure function of
   the set; scaling bounds the fence-run length, not the redundancy (which the
   membership-closure size already caps).
+- **Versioning is designed, mostly unbuilt, and one live bug.** §Versioning is
+  the model: per-version handlers, offers as the interlingua, replay as the
+  upgrade. Landed today are the per-version read handlers — `legacy_*` for the
+  auth families, and now `file` beside `file_bao` — plus the two derived-state
+  stamps. Unbuilt are the offer hook itself (the kernel still admits envelope
+  atoms verbatim, so nothing normalizes), the append-only vocabulary registry,
+  and any release constant at all. The bug: an unknown tag rejects a whole unit,
+  so a behind-version peer never converges that range and refetches it once per
+  root change and once per restart, while no release version rides the verbs,
+  the grant, or the root to notice by. Open inside it: whether a release marker
+  rides the root — making the skew observable in one conditional GET, at the
+  price of two releases differing by construction on an unchanged set — or sits
+  beside it, in `roots/` metadata or the mint response. Tracked by
+  `poc-16-9fc` (`docs/VERSIONING.md`).
 - Multi-group on one bucket. (Bulk-join body bundles: resolved 2026-07-22 by
   packed pages — bodies live in the page objects, docs/MODEL.md.)
 - **Attachments: Bao, resolved 2026-07-25.** A signed descriptor commits the
