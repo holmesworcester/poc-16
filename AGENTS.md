@@ -7,8 +7,14 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
 - **Design of record:** `WORKSPACES.md` (multi-workspace / identity / infra model) and
   `MODEL.md` + `DESIGN.md` (the passive-store RBSR + hoisting core). `MULTILEVEL_PILE.md`
   has the hoisting math + measurements.
-- **Current work:** the epic **`poc-16-zgj`** — "Port poc-13 auth into poc-16 + test hoisting
-  on chained seeds". Its full plan is `CHAINED_AUTH_PLAN.md`.
+- **Current epics** (`bd ready` for the claimable frontier):
+  - **`poc-16-zgj`** — port poc-13 auth + test hoisting on chained seeds. Plan:
+    `CHAINED_AUTH_PLAN.md`. (Phases 0–3 landed; only the hand-back bead remains.)
+  - **`poc-16-jbg`** — FaaS concurrency + Cloudflare Workers, coordination-free. Notes
+    in `DESIGN.md` §Concurrency & FaaS and `WORKSPACES.md` §9. Entry: `.1` / `.7`.
+  - **`poc-16-yez`** — global 1:N deletion closure (suppression-key treap). Plan:
+    `DELETION_CLOSURE.md`. Entry: `.1`. Proof bead is `.6` (surface out-of-range
+    victims by treap traversal, no DB).
 
 ## bd workflow
 - `bd prime` — load full workflow context (run first).
