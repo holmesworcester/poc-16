@@ -199,7 +199,6 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(tmp_path):
         for statement in normalized)
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
     node, workspace, _ = build_seed(
         str(tmp_path / "seed"), 511, n_members=24, shape="random")
@@ -210,7 +209,6 @@ def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
     assert result["facts"] == 511
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_chained_bidirectional_reconciliation_converges(tmp_path):
     result = bidi(
         511, str(tmp_path / "bidi"), n_members=24, shape="chain", seed=16)
@@ -223,7 +221,6 @@ def test_chained_bidirectional_reconciliation_converges(tmp_path):
     assert result["push_streamed"] > result["push_useful"]
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_chain_seed_is_stack_safe_beyond_python_recursion_depth(tmp_path):
     members = 520
     membership_facts = 1 + 4 * (members - 1)

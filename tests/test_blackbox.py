@@ -70,7 +70,6 @@ def converged(ws, *whos):
     return len(roots) == 1 and None not in roots
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_alice_bob_carol(tmp_path):
     procs = {}
     try:

@@ -13,14 +13,25 @@ import pytest
 
 import core.manifest as manifest
 import core.shape as shape
+import core.sync as sync_module
 from core import cmds
 from core.close import close, decode_pile, encode_pile
-from core.crypto import h
+from core.crypto import h, keypair
 from core.fact import canon
-from core.kernel import resolve_deps
+from core.kernel import Valid, drain, resolve_deps
 from core.node import Node
+from facts.auth.signature import signature
+from facts.content.message import message
 
-from .util import add_member, all_fids, author_msg, replay_random
+from .util import (
+    add_member,
+    all_fids,
+    author_msg,
+    closed_subset,
+    deliver,
+    member_src,
+    replay_random,
+)
 
 SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
 
@@ -276,43 +287,269 @@ def test_layout_stamp_forces_rebuild(tmp_path):
 # ---- oyd.3: sync rewrite ----------------------------------------------------
 
 
-@SKELETON
-def test_oid_diff_prunes_equal_subtrees():
+def pair(tmp_path):
+    """A settled multi-leaf source and a converged destination replica."""
+    source = Node(str(tmp_path / "source"))
+    ws = cmds.create(source, "alice", ts=1)
+    ts, cuts = 100, 0
+    while cuts < 2:  # several home leaves, so subtree pruning is real
+        cuts += shape.boundary(cmds.post(
+            source, ws, "general", f"m{ts}", ts=ts))
+        ts += 1
+    destination = Node(str(tmp_path / "destination"))
+    deliver(
+        destination, ws,
+        closed_subset(source, ws, all_fids(source, ws)))
+    destination.turn(ws)
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
+    return source, ws, destination, ts
+
+
+def peer_for(source, singles, batches, pushed=None):
+    """A local Peer over ``source``'s store, recording every GET."""
+    class LocalPeer:
+        def __init__(self, node, ws, url):
+            self.node, self.ws = node, ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            return (source.store(self.ws).get("root"),
+                    source.store(self.ws).etag("root"))
+
+        def obj(self, oid):
+            singles.append(oid)
+            return source.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            oids = tuple(oids)
+            batches.append(oids)
+            return tuple(
+                source.store(self.ws).get("obj/" + oid) for oid in oids)
+
+        def put_pile(self, raw):
+            if pushed is None:
+                pytest.fail("dial unexpectedly pushed")
+            pushed.append(raw)
+            deliver(source, self.ws, raw)
+            source.turn(self.ws)
+
+    return LocalPeer
+
+
+def test_oid_diff_prunes_equal_subtrees(tmp_path):
     """diff() never descends into a shard or leaf whose oid we hold (§1)."""
+    source, ws, destination, ts = pair(tmp_path)
+    mine, _ = read(destination, ws)
+    src = source.store(ws)
+    reads = []
+    fetch = lambda oid: (reads.append(oid) or src.get("obj/" + oid))
+
+    man = manifest.decode_root(src.get("root"))[2]
+    assert manifest.diff(mine, man, fetch) == []
+    assert reads == []  # equal root oid: pruned before a single GET
+
+    cmds.post(source, ws, "general", "delta", ts=ts + 1)
+    held = {entry.leaf for entry in mine}
+    manifest.encode(mine, lambda raw: held.add(h(raw)))  # my shard oids too
+    man = manifest.decode_root(src.get("root"))[2]
+    differing = manifest.diff(mine, man, fetch)
+    theirs = read(source, ws)[0]
+    shards = set()
+    manifest.encode(theirs, lambda raw: shards.add(h(raw)))
+    assert differing  # the delta's home leaf really differs
+    assert {e.leaf for e in differing} \
+        == {e.leaf for e in theirs} - {e.leaf for e in mine}  # exactly it
+    assert set(reads) == shards - held  # unheld shards read, held pruned
+    assert len(reads) == len(set(reads))  # and each descended into once
+    assert set(reads).isdisjoint({e.leaf for e in theirs})  # never a pile
 
 
-@SKELETON
-def test_oid_diff_fetches_exactly_the_difference():
+def test_oid_diff_fetches_exactly_the_difference(tmp_path, monkeypatch):
     """After pull, fetched leaf set == entries whose oids differed — no
     misses, no refetch of held content (§2.1)."""
+    source, ws, destination, ts = pair(tmp_path)
+    held = {entry.leaf for entry in read(destination, ws)[0]}
+    for tick in range(3):
+        cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 1 + tick)
+    difference = {
+        entry.leaf for entry in read(source, ws)[0]} - held
+
+    singles, batches = [], []
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(source, singles, batches))
+    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
+
+    leaves = {entry.leaf for entry in read(source, ws)[0]}
+    fetched = [oid for batch in batches for oid in batch] \
+        + [oid for oid in singles if oid in leaves]
+    assert set(fetched) == difference  # no misses, no refetch of held piles
+    assert len(fetched) == len(difference)  # and each exactly once
+    assert all_fids(destination, ws) == all_fids(source, ws)
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
 
 
-@SKELETON
-def test_local_only_keys_still_push():
+def test_local_only_keys_still_push(tmp_path, monkeypatch):
     """A leaf whose oid differs because WE hold extra keys produces a push,
     not a fetch loop: the one dial still converges both sides (§2.1)."""
+    source, ws, destination, ts = pair(tmp_path)
+    secret, public = source.identity(ws)
+    local_only = author_msg(
+        destination, ws, secret, public, "mine alone", ts=ts + 1)
+
+    extra = set(all_fids(destination, ws)) - set(all_fids(source, ws))
+    assert local_only.fid in extra
+    singles, batches, pushed = [], [], []
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(source, singles, batches, pushed))
+    pulled, count = sync_module.sync(destination, ws, "local://source")
+
+    assert (pulled, count) == (0, len(extra))
+    assert len(pushed) == 1  # ONE closed pile, the ordinary wire codec
+    assert local_only.fid in {f.fid for f in decode_pile(pushed[0])[0]}
+    assert source.fact_of(ws, local_only.fid) == local_only
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
+    assert sync_module.sync(  # converged: the next dial is a no-op
+        destination, ws, "local://source") == (0, 0)
 
 
-@SKELETON
-def test_warm_sync_fetches_no_closure_siblings():
+def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
     """A warm delta pull touches leaf piles and manifest shards only; the
     sibling objects are for cold-partial readers, and the modes that never
     use them must not pay for them (COSTS §5)."""
+    source, ws, destination, ts = pair(tmp_path)
+    for tick in range(3):
+        cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 1 + tick)
+
+    singles, batches = [], []
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(source, singles, batches))
+    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
+
+    entries, _ = read(source, ws)
+    siblings = {entry.closure for entry in entries if entry.closure}
+    leaves = {entry.leaf for entry in entries}
+    shards = set()
+    manifest.encode(entries, lambda raw: shards.add(h(raw)))
+    assert siblings  # the store really has out-of-range closure to skip
+    fetched = set(singles) | {oid for batch in batches for oid in batch}
+    assert fetched.isdisjoint(siblings)
+    assert fetched <= leaves | shards  # leaf piles and manifest shards ONLY
+    assert all(oid not in leaves for oid in singles)  # leaves ride batches
+    assert all_fids(destination, ws) == all_fids(source, ws)
 
 
-@SKELETON
-def test_cold_partial_fetch_depth_two():
+def test_cold_partial_fetch_depth_two(tmp_path, world):
     """A cold reader of one range completes closure in two dependent waves:
     leaf+sibling, then the whole frontier via fetch_plan (§2.2). Sibling
-    keys are transitive — assert no third wave, don't loop."""
+    keys are transitive — assert no third wave, don't loop. The corpus is
+    ``world``'s invite chain, so the closure is genuinely deep: a wave-per-hop
+    (or direct-deps-only sibling) regression fails here, not just on the
+    flat one-author shape."""
+    source, ws = world
+    entries, fetch_src = read(source, ws)
+    entry = next(  # a content range far from its auth closure
+        e for e in reversed(entries) if e.closure)
+    members, _ = decode_pile(fetch_src(entry.leaf))
+
+    idx, depths = source.idx(ws), {}
+
+    def depth(fid):  # dep-chain height; proofs are acyclic
+        if fid not in depths:
+            deps = resolve_deps(source.fact_of(ws, fid), idx) or []
+            depths[fid] = 1 + max(map(depth, deps), default=0)
+        return depths[fid]
+
+    assert max(depth(f.fid) for f in members) >= 5  # chain-shaped, not flat
+
+    cold = Node(str(tmp_path / "cold"))
+    waves = []
+
+    def fetch(oid):
+        return fetch_src(oid)
+
+    def many(oids):
+        oids = tuple(oids)
+        waves.append(oids)
+        return tuple(fetch_src(oid) for oid in oids)
+
+    fetch.many = many
+    stream = sync_module.assemble(
+        cold, ws, [(entry, members)], entries, fetch)
+
+    assert len(waves) == 2  # sibling keys are transitive: no third wave
+    assert set(waves[0]) == {entry.closure}  # wave 1 tail: sibling keys
+    assert set(waves[1]) == set(manifest.fetch_plan(  # wave 2: the whole
+        entries, json.loads(fetch_src(entry.closure))["keys"]))  # frontier
+    assert drain(tuple(stream), ws).ok  # the range judges from empty
 
 
-@SKELETON
-def test_pull_feeds_ordinary_admission():
+def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     """The assembled closed set is judged by the same ingress path as a
-    pushed pile; the kernel cannot tell pull from push (§2.3).
+    pushed pile; the kernel cannot tell pull from push (§2.3): a twin
+    replica fed the captured union BYTES through deliver() lands in the
+    identical state, and an invalid fact riding a pulled range is rejected
+    by the same judge with the same (pile-whole) effect on both paths.
     (Removal-leg-before-fact-leg ordering is
     tests/test_removals.py::test_sync_fetches_removals_before_fact_ranges.)"""
+    source, ws, destination, ts = pair(tmp_path)
+    twin = Node(str(tmp_path / "twin"))  # converged like destination
+    deliver(twin, ws, closed_subset(source, ws, all_fids(source, ws)))
+    twin.turn(ws)
+    for tick in range(2):
+        cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 1 + tick)
+    delivered = {}
+    actual_pull = sync_module.pull
+
+    def capture_pull(node, w, oid, raw):
+        actual_pull(node, w, oid, raw)
+        delivered[oid] = raw
+        # the union sits in the SAME ingress prefix a pushed pile lands in
+        assert node.store(w).get(
+            f"pile/{node.member_for(w)}/{oid}") == raw
+
+    singles, batches = [], []
+    monkeypatch.setattr(sync_module, "pull", capture_pull)
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(source, singles, batches))
+    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
+
+    ((oid, raw),) = delivered.items()
+    stream, blobs = decode_pile(raw)  # the ordinary wire codec, verbatim
+    assert not blobs
+    assert drain(stream, ws).ok  # one judge; no source annotation anywhere
+    assert destination.store(ws).list("pile/") == []  # retired by turn()
+    assert all_fids(destination, ws) == all_fids(source, ws)
+
+    deliver(twin, ws, raw)  # the SAME bytes through the push ingress
+    twin.turn(ws)
+    assert all_fids(twin, ws) == all_fids(destination, ws)
+    assert twin.store(ws).get("root") == destination.store(ws).get("root")
+
+    # A compromised source publishes a forged message — merge+commit skip
+    # its own judge, so the invalid fact sits in a real leaf pile and rides
+    # the next pull's assembled range. Both ingress paths reject the union
+    # pile whole, retire it, and land nothing: one judge, one effect.
+    secret, public = source.identity(ws)
+    forged = message(public, "general", "forged", ts + 10)
+    unsigned = signature(keypair()[0], public, forged, ts + 10)  # wrong sk
+    with source.lock:
+        _, fresh = source.merge(ws, [
+            Valid(unsigned, ()),
+            Valid(forged, (unsigned.fid, member_src(source, ws, public)))])
+        source.commit(ws, fresh)
+    before = all_fids(destination, ws)
+    delivered.clear()
+    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
+    ((_, poisoned),) = delivered.items()
+    poisoned_stream = decode_pile(poisoned)[0]
+    assert forged.fid in {f.fid for f in poisoned_stream}  # it rode the pull
+    assert not drain(poisoned_stream, ws).ok  # the one judge says no
+    assert all_fids(destination, ws) == before  # same effect: nothing landed
+    assert destination.store(ws).list("pile/") == []  # rejected AND retired
+    deliver(twin, ws, poisoned)  # identical bytes through the push ingress
+    twin.turn(ws)
+    assert all_fids(twin, ws) == before
+    assert twin.store(ws).list("pile/") == []
 
 
 # ---- oyd.4: read contract + retraction --------------------------------------

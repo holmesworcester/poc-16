@@ -856,7 +856,6 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
         == second.store(workspace).get("root")
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_restoration_forces_a_followup_walk_for_the_restored_fact(
         tmp_path, monkeypatch):
     """A pull that restores quarantine must not leave a valid 304 cache."""

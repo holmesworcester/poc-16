@@ -33,14 +33,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import cmds, tree
+from core import cmds, manifest
+from core import node as node_module
+from core import sync as sync_module
 from core.close import close, decode_pile, encode_pile
 from core.fact import from_json
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import extend_proofs, kernel, resolve_deps
 from core.node import Node, now_ms
-from core.shape import FACT, fid_of
+from core.shape import fid_of
 
 from tests.util import add_member, all_fids
 
@@ -126,16 +128,24 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 # ---- unit streaming ----------------------------------------------------------
 
 def manifest_objs(store):
-    root = tree.decode_root(store.get("root"))
-    fetch = lambda oid: store.get("obj/" + oid)
-    return root, tree.live_oids(root.view, fetch)
+    """``(manifest oid, live oids)`` — every object a cold reader fetches:
+    manifest shards, leaf piles, closure siblings, and the removal index."""
+    oids = []
+    fetch = lambda oid: (oids.append(oid) or store.get("obj/" + oid))
+    _, _, man, removals = manifest.decode_root(store.get("root"))
+    entries = manifest.decode(fetch(man), fetch)
+    oids += [e.leaf for e in entries]
+    oids += [e.closure for e in entries if e.closure]
+    if removals["oid"]:
+        oids.append(removals["oid"])
+    return man, oids
 
 
-def seed_units(store, root):
+def seed_units(store, man):
     """The production full-sync unit: one closed stream, each fact once."""
-    fetch = lambda oid: store.get("obj/" + oid)
-    if root.view.n:
-        yield tree.facts(root.view, fetch, FACT)
+    stream = node_module.resident(man, lambda oid: store.get("obj/" + oid))
+    if stream:
+        yield stream
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -168,11 +178,11 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 def catchup(seed, ws, fresh_dir):
     fresh = Node(fresh_dir)
     src = seed.store(ws)
-    root, ohs = manifest_objs(src)
+    man, ohs = manifest_objs(src)
     dl_bytes = len(src.get("root")) + sum(len(src.get("obj/" + oh)) for oh in ohs)
 
     t0 = perf()
-    streamed = ingest(fresh, ws, seed_units(src, root))
+    streamed = ingest(fresh, ws, seed_units(src, man))
     fresh.commit(ws)
     t1 = perf()
 
@@ -180,7 +190,7 @@ def catchup(seed, ws, fresh_dir):
     match = fresh.store(ws).get("root") == src.get("root")
     return {"ingest_s": t1 - t0, "facts": total, "streamed": streamed,
             "dl_bytes": dl_bytes, "objs": len(ohs), "match": match,
-            "pages": sum(1 for _ in seed_units(src, root))}
+            "pages": sum(1 for _ in seed_units(src, man))}
 
 
 # ---- the bidi benchmark ------------------------------------------------------
@@ -197,12 +207,10 @@ def copy_facts(dst, ws, src, fids):
 
 
 def reconcile(A, B, ws):
-    """One one-sided dial, exactly as walk(): A prunes by fingerprint, pulls
-    B's differing ranges as closed units, pushes the symmetric difference as
-    one closed pile that B ingests. Both sides converge."""
+    """One one-sided dial, exactly as sync(): A diffs B's manifest by oid,
+    assembles the differing leaves into one closed union, and pushes the
+    local-only keys as one closed pile that B ingests. Both converge."""
     astore, bstore = A.store(ws), B.store(ws)
-    mine = tree.decode_root(astore.get("root")).view
-    theirs = tree.decode_root(bstore.get("root")).view
     remote_objects = {}
 
     def fetch_remote(oid):
@@ -210,29 +218,32 @@ def reconcile(A, B, ws):
             remote_objects[oid] = bstore.get("obj/" + oid)
         return remote_objects[oid]
 
-    t0 = perf()
-    pulled, pull_ranges = [], []
-    pull_fids, push_fids = set(), set()
-    for lo, hi, my_keys, remote_leaf in tree.diff(
-            mine, theirs, FACT,
-            lambda oid: astore.get("obj/" + oid), fetch_remote):
-        remote_keys = set(tree.range_keys(
-            remote_leaf, lo, hi, FACT, fetch_remote))
-        local_keys = set(my_keys)
-        missing = {fid_of(key) for key in remote_keys - local_keys}
-        if missing:
-            pull_ranges.append((lo, hi))
-            pull_fids.update(missing)
-        push_fids.update(
-            fid_of(key) for key in local_keys - remote_keys
-        )
+    fetch_remote.many = lambda oids: tuple(fetch_remote(oid) for oid in oids)
 
-    if pull_ranges:
-        pulled.append(tree.range_facts(
-            theirs, pull_ranges, fetch_remote, FACT))
+    t0 = perf()
+    fetch_local = lambda oid: astore.get("obj/" + oid)
+    _, _, my_man, _ = manifest.decode_root(astore.get("root"))
+    _, _, their_man, _ = manifest.decode_root(bstore.get("root"))
+    mine = manifest.decode(fetch_local(my_man), fetch_local)
+    theirs = manifest.decode(fetch_remote(their_man), fetch_remote)
+    differing = set(manifest.diff(mine, their_man, fetch_remote))
+    my_keys = A.keys(ws)
+    members_of = lambda e: decode_pile(fetch_remote(e.leaf))[0]
+    pulled_piles, push_keys = sync_module.frontier(
+        my_keys, theirs, differing, members_of)
+    held = set(my_keys)
+    pull_fids = {
+        fact.fid for _, members in pulled_piles for fact in members
+        if fact.key not in held}
+
+    pulled = []
+    if pulled_piles:
+        pulled.append(tuple(sync_module.assemble(
+            A, ws, pulled_piles, theirs, fetch_remote)))
     pull_bytes = sum(
         len(raw) for raw in remote_objects.values() if raw is not None)
     push_bytes = push_streamed = 0
+    push_fids = {fid_of(key) for key in push_keys}
     if push_fids:
         idx = A.idx(ws)
         news = [A.fact_of(ws, fid) for fid in sorted(push_fids)]
@@ -244,7 +255,7 @@ def reconcile(A, B, ws):
         ingest(B, ws, [decode_pile(pile)[0]])  # B absorbs A's half
         B.commit(ws)
 
-    # walk() pushes each local difference before draining its pulled ingress.
+    # sync() pushes each local difference before draining its pulled ingress.
     # Preserve that order so canonical pruning cannot remove a fact before its
     # precomputed symmetric-difference pile reaches the peer.
     ingest(A, ws, pulled)  # A absorbs B's half
@@ -366,17 +377,25 @@ def run_bidi(scales):
 
 
 def check_leaves(seed, ws):
-    """Every published root-to-leaf path still judges alone from empty."""
+    """Every published leaf plus its closure sibling still judges alone."""
     st = seed.store(ws)
-    root = tree.decode_root(st.get("root"))
     fetch = lambda oid: st.get("obj/" + oid)
+    _, _, man, _ = manifest.decode_root(st.get("root"))
+    entries = manifest.decode(fetch(man), fetch)
+    piles = {e.leaf: decode_pile(fetch(e.leaf))[0] for e in entries}
     n = 0
-    for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
-        if leaf.n:
-            ok, _, _ = kernel(
-                tree.range_facts(root.view, (lo, hi), fetch, FACT), ws)
-            assert ok, "a root-to-leaf path failed the kernel"
-            n += 1
+    for entry in entries:
+        items = {f.fid: f for f in piles[entry.leaf]}
+        if entry.closure:
+            for key in json.loads(fetch(entry.closure))["keys"]:
+                home = manifest.locate(entries, key)
+                items.update({
+                    f.fid: f for f in piles[home.leaf] if f.key == key})
+        deps = node_module._edges(items)
+        stream = close(items.values(), deps.__getitem__, items.__getitem__)
+        ok, _, _ = kernel(stream, ws)
+        assert ok, "a leaf plus its closure sibling failed the kernel"
+        n += 1
     return n
 
 

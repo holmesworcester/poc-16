@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from core import hoist, layout, shape, sync as sync_module, treap, tree
+from core import hoist, layout, manifest, shape, sync as sync_module, treap, tree
 from core import cmds
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
@@ -1626,10 +1626,8 @@ def test_fact_body_refs_reject_missing_or_corrupt_objects(body):
         tree.facts(cold(root), fetch, shape.FACT)
 
 
-@pytest.mark.parametrize("primary_walk", (True, False))
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
 def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
-        tmp_path, monkeypatch, primary_walk):
+        tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice")
     destination = Node(str(tmp_path / "destination"))
@@ -1643,17 +1641,7 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
             source, workspace, "general", f"message {ordinal}",
             ts=source.fact_of(workspace, workspace).ts + ordinal + 1,
         )
-    individual, batches = [], []
-    actual_diff, walked = tree.diff, []
-
-    def selected_diff(*args, **kwargs):
-        projection = args[2]
-        walked.append(projection)
-        if not primary_walk and projection is shape.FACT:
-            return iter(())
-        return actual_diff(*args, **kwargs)
-
-    monkeypatch.setattr(tree, "diff", selected_diff)
+    individual, batches, delivered = [], [], []
 
     class LocalPeer:
         def __init__(self, node, ws, url):
@@ -1680,26 +1668,36 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
             deliver(source, self.ws, raw)
             source.turn(self.ws)
 
+    actual_pull = sync_module.pull
+
+    def capture_pull(node, ws, oid, raw):
+        delivered.append(decode_pile(raw)[0])
+        return actual_pull(node, ws, oid, raw)
+
+    monkeypatch.setattr(sync_module, "pull", capture_pull)
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     pulled, pushed = sync_module.sync(
         destination, workspace, "local://source")
 
     assert (pulled, pushed) == (1, 0)
-    assert walked == [shape.SUPP, shape.FACT]
-    body_oids = {
-        h(canon(source.fact_of(workspace, fid).to_json()))
-        for fid in all_fids(source, workspace)
-    }
-    assert batches
-    assert body_oids.isdisjoint(individual)
+    (stream,) = delivered  # ONE closed union pile, not per-leaf bare leaves
+    assert drain(stream, workspace).ok  # deps-first: judges from empty
+    st = source.store(workspace)
+    entries = manifest.decode_root(st.get("root"))[2]
+    leaf_oids = {
+        entry.leaf for entry in manifest.decode(
+            st.get("obj/" + entries), lambda oid: st.get("obj/" + oid))}
+    assert batches  # leaf piles arrive in batched waves (Peer.objs)
+    assert leaf_oids.isdisjoint(individual)  # never one GET per leaf
     assert all_fids(destination, workspace) == all_fids(source, workspace)
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
-def test_sync_deduplicates_closure_facts_across_index_pushes(
-        tmp_path, monkeypatch):
+def test_sync_pushes_one_closed_deduplicated_pile(tmp_path, monkeypatch):
+    # Replaces test_sync_deduplicates_closure_facts_across_index_pushes:
+    # there is no second index leg to deduplicate against anymore; the push
+    # contract is ONE closed pile, each closure fact once, judged whole.
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice", ts=1)
     destination = Node(str(tmp_path / "destination"))
@@ -1754,9 +1752,13 @@ def test_sync_deduplicates_closure_facts_across_index_pushes(
         == source.store(workspace).get("root")
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.3")
-def test_sync_closes_a_primary_deletion_leaf_under_suppression(
+def test_sync_pulls_a_missing_deletion_through_the_removal_leg(
         tmp_path, monkeypatch):
+    # Replaces test_sync_closes_a_primary_deletion_leaf_under_suppression:
+    # a missing removal no longer needs SUPP-closure range augmentation —
+    # the removal-index leg runs first, judges the removal's closure through
+    # the ordinary ingress, and both roots (fact manifest AND removals
+    # {oid, fp} slot) converge (REMOVALS.md §5, CUTOVER §2).
     source, workspace, _, _ = suppression_world(
         tmp_path / "source", monkeypatch,
         initial_secret=load_sk(f"{1:064x}"))
@@ -1777,23 +1779,9 @@ def test_sync_closes_a_primary_deletion_leaf_under_suppression(
         closed_subset(source, workspace, existing),
     )
     destination.turn(workspace)
-    transferred, primary = [], []
-    actual_pull = sync_module.pull
-    actual_diff = tree.diff
-    actual_closure_sync = sync_module.closure_sync
-
-    def capture_pull(node, ws, oid, raw):
-        transferred.extend(decode_pile(raw)[0])
-        return actual_pull(node, ws, oid, raw)
-
-    def primary_only(*args, **kwargs):
-        return iter(()) if args[2] is shape.SUPP \
-            else actual_diff(*args, **kwargs)
-
-    def capture_primary(view, ranges, supp, fetch):
-        primary.extend(tree.range_facts(
-            view, ranges, fetch, shape.FACT))
-        return actual_closure_sync(view, ranges, supp, fetch)
+    slot_before = manifest.decode_root(
+        destination.store(workspace).get("root"))[3]
+    assert slot_before["fp"]  # the world's own deletions already settled
 
     class LocalPeer:
         def __init__(self, node, ws, url):
@@ -1813,16 +1801,20 @@ def test_sync_closes_a_primary_deletion_leaf_under_suppression(
         def put_pile(self, raw):
             pytest.fail("destination unexpectedly pushed")
 
-    monkeypatch.setattr(sync_module, "pull", capture_pull)
-    monkeypatch.setattr(sync_module, "closure_sync", capture_primary)
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
-    monkeypatch.setattr(tree, "diff", primary_only)
-    assert sync_module.sync(
-        destination, workspace, "local://source") == (1, 0)
+    pulled, pushed = sync_module.sync(destination, workspace, "local://source")
 
-    expected = {deletion.fid, *targets}
-    assert expected - {fact.fid for fact in primary}
-    assert expected <= {fact.fid for fact in transferred}
+    # The removal leg alone landed the deletion: by the time the fact leg
+    # diffed, both manifests already agreed. Stub pull_removals out and
+    # this reads (1, 0) from the fact-leg fallback.
+    assert (pulled, pushed) == (0, 0)
+    assert destination.fact_of(workspace, deletion.fid) == deletion
+    slot = manifest.decode_root(
+        destination.store(workspace).get("root"))[3]
+    assert slot != slot_before
+    assert slot == manifest.decode_root(
+        source.store(workspace).get("root"))[3]
+    assert all_fids(destination, workspace) == all_fids(source, workspace)
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")
 

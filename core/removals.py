@@ -122,13 +122,17 @@ def encode(entries, facts, emit):
 
 
 def decode(raw):
-    """Read back ``(entries, refs)`` with integrity checks."""
+    """Read back ``(entries, refs)`` with integrity checks. Refs must be
+    ``shape.key``-shaped — everything downstream (``fid_of``, ``locate``)
+    assumes it, so hostile bytes stop here as a ValueError."""
     obj = json.loads(raw)
     if not isinstance(obj, dict) or set(obj) != {"entries", "refs"}:
         raise ValueError("removal index shape")
     rows, refs = obj["entries"], obj["refs"]
     if not isinstance(rows, list) or not isinstance(refs, list) \
-            or not all(isinstance(ref, str) and ref for ref in refs) \
+            or not all(
+                isinstance(ref, str) and ref[15:16] == ":"
+                and ref[:15].isdigit() and ref[16:] for ref in refs) \
             or sorted(set(refs)) != refs \
             or not all(
                 isinstance(row, list) and len(row) == 3

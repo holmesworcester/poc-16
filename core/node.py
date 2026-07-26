@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import facts
 
-from . import manifest
+from . import manifest, removals
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
@@ -42,7 +42,7 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import FACT, key_parts
+from .shape import FACT, key, key_parts
 from .store import FsStore
 from .suppression import is_deletion, suppkeys, victims
 
@@ -641,7 +641,7 @@ class Node:
             return oid
 
         fetch = lambda oid: st.get("obj/" + oid)
-        entries, removals = self._previous(ws, prev, fetch)
+        entries = self._previous(ws, prev, fetch)
         # A settle is a pure function of the key set; ``entries`` only memoizes
         # unchanged leaves. Shadows/prunes/republish can re-pick canonical
         # providers for an unchanged member set, so they drop the memo.
@@ -650,30 +650,52 @@ class Node:
         _, man = manifest.build(
             self.keys(ws), lambda fid: self.fact_of(ws, fid), deps_of, emit,
             entries)
-        root = manifest.encode_root(ws, self.globals(ws), man, removals)
+        root = manifest.encode_root(
+            ws, self.globals(ws), man, self._removal_slot(ws, deps_of, emit))
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
         self._stamp(ws)
         return root
 
+    def _removal_slot(self, ws, deps_of, emit):
+        """Settle the removal index beside the manifest: one ordinary store
+        object of sorted entries plus the closures' fact keys (REMOVALS.md
+        §2, I3), and the ``{oid, fp}`` pair the root publishes (I4). Like
+        the manifest it is a pure function of the committed set — entries
+        derive from the resident deletion facts at the author chokepoint
+        (I6), so a synced entry and a local one settle identically.
+        Grow-only across prune/restore (I1's local caveat) is oyd.4's hook."""
+        dels = [
+            fact for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
+            for fact in (self.fact_of(ws, fid),) if is_deletion(fact)]
+        if not dels:
+            return {"oid": "", "fp": ""}
+        entries = [
+            removals.entry(fact, lambda fid: key(self.fact_of(ws, fid)))
+            for fact in dels]
+        oid = removals.encode(
+            entries,
+            close(dels, deps_of, lambda fid: self.fact_of(ws, fid)),
+            emit)
+        return {"oid": oid, "fp": removals.fingerprint(entries)}
+
     def _previous(self, ws, raw, fetch):
-        """The previous root's ``(entries, removals)``: a memo for the next
-        settle and the carrier of the removal-index slot. Bytes we cannot read
-        — a foreign layout stamp, a missing shard — settle from scratch; there
-        is no read-compat path (docs/CUTOVER.md §1)."""
-        empty = ((), {"oid": "", "fp": ""})
+        """The previous root's manifest entries: a memo for the next settle.
+        Bytes we cannot read — a foreign layout stamp, a missing shard —
+        settle from scratch; there is no read-compat path (docs/CUTOVER.md
+        §1)."""
         if not raw:
-            return empty
+            return ()
         try:
-            anchor, _, man, removals = manifest.decode_root(raw)
+            anchor, _, man, _ = manifest.decode_root(raw)
         except ValueError:
-            return empty
+            return ()
         if anchor != ws:
             raise ValueError("root anchor")
         try:
-            return manifest.decode(_object(man, fetch), fetch), removals
+            return manifest.decode(_object(man, fetch), fetch)
         except ValueError:
-            return (), removals
+            return ()
 
     def materialize(self, ws, _valids=()):
         """Transitional benchmark API; the delivery log is authoritative."""
