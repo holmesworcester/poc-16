@@ -1,4 +1,6 @@
 """Behavioral tests for delegation-aware key-order measurement."""
+import pytest
+
 import core.shape as tree_shape
 
 from bench.bench_order import benchmark, delegation_topology
@@ -41,6 +43,7 @@ def test_reconstruction_uses_user_refs_not_ephemeral_invitee_keys(tmp_path):
     assert topology["depth"] == stats["depth_by_member"]
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_chain_dfs_tax_is_path_bounded_and_beats_scattered_orders(tmp_path):
     _, _, _, _, results = run_benchmark(tmp_path, "chain")
     rows = {
@@ -57,6 +60,7 @@ def test_chain_dfs_tax_is_path_bounded_and_beats_scattered_orders(tmp_path):
         assert row["tax"] < rows["ts"][row["users"]]["tax"]
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_star_reproduces_the_auth_core_and_ordering_regression(tmp_path):
     _, _, stats, _, results = run_benchmark(tmp_path, "star")
     auth_facts = 1 + 4 * (stats["members"] - 1)

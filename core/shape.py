@@ -22,7 +22,8 @@ from typing import Callable
 from .crypto import h
 from .suppression import is_deletion, suppkey
 
-CUT = 8          # engine leaf density
+CUT = 64         # home-leaf density: the knee where a whole fetch goes
+                 # bandwidth-bound (docs/COSTS.md §6)
 COLD_CUT = 4096  # legacy flat facade: coarse cold-page density
 GUARD = 256      # legacy flat facade: fine warm-zone width
 

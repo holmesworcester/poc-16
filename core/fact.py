@@ -76,6 +76,6 @@ def from_json(o) -> Fact:
             and _atoms_ok(e.get("a"))):
         raise ValueError("fact shape")
     f = Fact(e["t"], e["ts"], e["a"], o["b"])
-    if f.fid != h(canon(e)) or f.bh != e["bh"]:
+    if f.fid != h(canon(e)) or f.bh != e.get("bh"):
         raise ValueError("fact integrity")
     return f

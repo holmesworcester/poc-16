@@ -13,18 +13,18 @@ Stable validity never reads suppression:
 
 Suppression masks only after judgment. A peer passes its root-stamped idx so
 evaluate can reject omitted incompatible authority winners. A stateless
-runtime builds the same read-only projection from validated tree leaves and
+runtime builds the same read-only projection from validated leaf piles and
 may reuse it while its root ETag matches.
 """
 import sqlite3
 from dataclasses import dataclass
 
 import facts as families
-from . import tree
+from . import manifest
 from .close import decode_pile
 from .crypto import h
 from .kernel import SCHEMA, drain_committed, evaluate, unresolved_facts
-from .shape import FACT
+from .node import resident
 
 
 @dataclass
@@ -32,22 +32,22 @@ class Authority:
     """A reusable canonical offer/proof projection for exactly one root."""
 
     etag: str
-    root: tree.Root
+    anchor: str
+    globals_: frozenset
     db: sqlite3.Connection
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        root = tree.decode_root(root_bytes)
+        anchor, globals_, man, _ = manifest.decode_root(root_bytes)
         try:
-            unit = tree.validate_view(
-                root.view, FACT, tree.FAT, fetch)
+            unit = resident(man, fetch)
         except ValueError as exc:
-            raise ValueError(f"invalid authority tree: {exc}") from exc
-        result = drain_committed(unit, root.anchor, root.globals_)
+            raise ValueError(f"invalid authority store: {exc}") from exc
+        result = drain_committed(unit, anchor, globals_)
         if not result.ok:
-            raise ValueError("invalid authority tree")
+            raise ValueError("invalid authority store")
         active = {fact.fid: fact for fact in unit}
-        if root.anchor not in active:
+        if anchor not in active:
             raise ValueError("authority projection does not match root")
 
         db = sqlite3.connect(":memory:", check_same_thread=False)
@@ -67,7 +67,7 @@ class Authority:
                 raise ValueError("authority root has no finite proof set")
             db.commit()
             db.execute("PRAGMA query_only=ON")
-            return cls(h(root_bytes), root, db)
+            return cls(h(root_bytes), anchor, globals_, db)
         except Exception:
             db.close()
             raise
@@ -108,9 +108,8 @@ def stateless(pile_bytes, root_bytes, fetch, now, projection=None):
         if authority is None or authority.etag != h(root_bytes):
             authority = Authority.from_root(root_bytes, fetch)
             owned = True
-        root = authority.root
         return mint(
-            pile_bytes, root.anchor, root.globals_, now,
+            pile_bytes, authority.anchor, authority.globals_, now,
             canonical_db=authority.db)
     except Exception:
         return None
@@ -148,5 +147,5 @@ def screen(facts, supp):
 
 def root_globals(root_bytes):
     """Read root-riding metadata; stateless production uses ``stateless``."""
-    root = tree.decode_root(root_bytes)
-    return root.anchor, root.globals_
+    anchor, globals_, _, _ = manifest.decode_root(root_bytes)
+    return anchor, globals_

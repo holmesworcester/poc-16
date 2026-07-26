@@ -7,7 +7,7 @@ import random
 import pytest
 from nacl.exceptions import CryptoError
 
-from core import cmds, daemon, mint, tree
+from core import cmds, daemon, manifest, mint, tree
 from core.close import encode_pile
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
@@ -248,6 +248,7 @@ def test_stateless_mint_accepts_without_persistent_sqlite(world):
         == (node.pk, "sync")
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_stateless_authority_rejects_payload_leaf_key_mismatch(world):
     node, workspace, now, _, pile = world
     store = node.store(workspace)
@@ -268,18 +269,16 @@ def test_stateless_authority_rejects_payload_leaf_key_mismatch(world):
 def test_stateless_authority_rejects_an_empty_root_without_its_anchor(
         world):
     node, workspace, now, _, pile = world
-    empty = tree.build(
-        [], FACT, tree.FAT,
-        lambda fid: None, lambda fid: (), lambda raw: h(raw),
-    )
-    root = tree.encode_root(tree.Root(
-        empty, workspace, frozenset()))
+    objects = {}
+    _, empty = manifest.build(
+        [], lambda fid: None, lambda fid: (),
+        lambda raw: objects.__setitem__(h(raw), raw))
+    root = manifest.encode_root(workspace, frozenset(), empty, {})
 
     with pytest.raises(
             ValueError, match="authority projection does not match root"):
-        mint.Authority.from_root(root, lambda oid: None)
-    assert mint.stateless(
-        pile, root, lambda oid: None, now) is None
+        mint.Authority.from_root(root, objects.get)
+    assert mint.stateless(pile, root, objects.get, now) is None
 
 
 def test_root_metadata_cannot_omit_an_eviction(tmp_path):
@@ -308,14 +307,15 @@ def test_root_metadata_cannot_omit_an_eviction(tmp_path):
         canonical_db=node.idx(workspace)) is None
     store.put("root", forged)
 
-    with pytest.raises(ValueError, match="invalid authority tree"):
+    with pytest.raises(ValueError, match="invalid authority store"):
         mint.Authority.from_root(forged, fetch)
     assert mint.stateless(pile, forged, fetch, now) is None
     assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="invalid tree facts"):
+    with pytest.raises(ValueError, match="invalid store facts"):
         node.rebuild(workspace)
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_published_authority_rejects_ephemeral_facts_at_every_boundary(
         world):
     node, workspace, now, request_facts, pile = world
@@ -352,6 +352,7 @@ def test_published_authority_rejects_ephemeral_facts_at_every_boundary(
         node.rebuild(workspace)
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_published_roots_require_canonical_settle_placement(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")

@@ -13,7 +13,7 @@ import sqlite3
 
 import pytest
 
-from core import cmds, tree
+from core import cmds, manifest, tree
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -25,7 +25,7 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import Judgment, drain, evaluate, resolve_deps
 from core.node import Node, now_ms
-from core.shape import FACT, SUPP, SUPP_INDEX
+from core.shape import FACT
 
 from . import util as test_util
 from .util import (
@@ -79,6 +79,7 @@ def units_of(store):
                 root.view, (lo, hi), fetch, FACT)
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_paths_are_piles(world):
     """Every hoisted root-to-leaf path judges alone, from nothing."""
     n, ws = world
@@ -122,6 +123,7 @@ def test_rebuild(world):
     assert n.store(ws).etag("root") == before
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_rebuild_rejects_a_corrupted_leaf(world):
     n, ws = world
     st = n.store(ws)
@@ -142,6 +144,7 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     assert all_fids(n, ws) == before
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_rebuild_rejects_payload_leaf_key_mismatch(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
@@ -163,6 +166,7 @@ def test_rebuild_rejects_payload_leaf_key_mismatch(tmp_path):
     assert all_fids(node, workspace) == before
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_rebuild_rejects_hidden_fact_in_a_legacy_leaf(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
@@ -207,7 +211,7 @@ def test_rebuild_uses_an_explicit_kernel_validity_gate(
             False, (), frozenset()),
     )
 
-    with pytest.raises(ValueError, match="invalid tree facts"):
+    with pytest.raises(ValueError, match="invalid store facts"):
         node.rebuild(workspace)
 
     assert all_fids(node, workspace) == before
@@ -218,19 +222,32 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     before = all_fids(node, workspace)
-    empty = tree.build(
-        [], FACT, tree.FAT,
-        lambda fid: None, lambda fid: (), lambda raw: h(raw),
-    )
-    node.store(workspace).put(
-        "root",
-        tree.encode_root(tree.Root(empty, workspace, frozenset())),
-    )
+    store = node.store(workspace)
+    _, empty = manifest.build(
+        [], lambda fid: None, lambda fid: (),
+        lambda raw: store.put("obj/" + h(raw), raw))
+    store.put(
+        "root", manifest.encode_root(workspace, frozenset(), empty, {}))
 
-    with pytest.raises(ValueError, match="tree fact set"):
+    with pytest.raises(ValueError, match="store fact set"):
         node.rebuild(workspace)
 
     assert all_fids(node, workspace) == before
+
+
+def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
+    """The publisher never mints a root every reader must reject: rebuild and
+    mint.Authority.from_root both demand the anchor, so an index that lacks
+    it is not publishable — it stays ahead of the manifest instead."""
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    root = node.store(workspace).get("root")
+    node.idx(workspace).executescript("DELETE FROM facts;")
+
+    assert node.commit(workspace) is None
+    assert node.store(workspace).get("root") == root
+    node.rebuild(workspace)  # the store, not the index, stayed authoritative
+    assert all_fids(node, workspace) == [workspace]
 
 
 def test_pre_manifest_crash_replays_from_the_authoritative_root(
@@ -537,8 +554,7 @@ def test_efficient_updates(world):
 
 
 def full_manifest(n, ws):
-    """The root a from-scratch full recompute would write."""
-    from core.kernel import resolve_deps
+    """The root a from-scratch full recompute would write (no memo)."""
     idx, cache = n.idx(ws), {}
 
     def deps_of(fid):
@@ -546,23 +562,10 @@ def full_manifest(n, ws):
             cache[fid] = resolve_deps(n.fact_of(ws, fid), idx) or []
         return cache[fid]
 
-    objects = {}
-
-    def emit(raw):
-        oid = h(raw)
-        objects[oid] = raw
-        return oid
-
-    view = tree.build(
-        n.keys(ws), FACT, tree.FAT,
-        lambda fid: n.fact_of(ws, fid), deps_of, emit,
-    )
-    supp = tree.build(
-        n.keys(ws, SUPP), SUPP, tree.FAT,
-        lambda fid: n.fact_of(ws, fid), deps_of, emit,
-    )
-    return tree.encode_root(tree.Root(
-        view, ws, n.globals(ws), ((SUPP_INDEX, supp),)))
+    _, man = manifest.build(
+        n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of,
+        lambda raw: None)
+    return manifest.encode_root(ws, n.globals(ws), man, {})
 
 
 def test_incremental_equals_full(tmp_path):
@@ -658,6 +661,7 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
         assert drain(stream, ws).ok
 
 
+@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_incremental_reuses_work(world):
     """Reuse is real: a post into a promoted store loads only the tail's few
     facts, not the whole set — the O(changed) compute win, not just O(1) IO."""

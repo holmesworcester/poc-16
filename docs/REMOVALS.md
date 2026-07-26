@@ -3,6 +3,10 @@
 Status: plan of record (2026-07-26). Supersedes `docs/DELETION_CLOSURE.md`
 (T_supp, epic poc-16-yez), which is deleted on this branch. Pinned against
 `main@7635cf8`; line references are to that commit. Epic: poc-16-3fo.
+Execution: merged into the one-store cutover — `docs/CUTOVER.md`, epic
+poc-16-oyd (3fo's sync/node/demolition/proof/measure beads execute inside
+oyd.3-.7). This document remains the removal *semantics*; CUTOVER supplies
+the encoding it rides on.
 
 The one-sentence design: the fact tree stays immutable and fingerprinted over
 member keys only; deletions live in a single grow-only removal index — a head
@@ -70,9 +74,49 @@ removal's victims occupy. `fid` is the removal fact. Entries sort by
 
 The span is routing, not semantics. It may over-approximate (a too-wide span
 costs a wasted read, never a wrong suppression); it must never
-under-approximate. The predicate applied per fact decides actual matches:
+under-approximate. The predicate applied per fact decides actual matches.
 
-    applies(r, f) = ¬is_deletion(f) ∧ (target(r) = fid(f) ∨ suppkey(f) = suppkey(r))
+**A fact belongs to as many suppression groups as it declares.** That is the
+mechanism, not an edge case: one message can be reachable by "kill channel
+general", "purge author X", and "delete thread T" at once — each one removal
+naming one group. A fact's membership is the set of groups its `TARGET`-tag
+markers name; a removal's `DELETE`-tag marker names exactly one group (I3's
+admission rule). Kind is read off the removal's clear envelope by its
+`TARGET` *ref*: present ⇒ point, absent ⇒ kill — and each kind reaches
+through a single clause:
+
+    suppkeys(f) = { group(m) : m a TARGET-tag marker of f }        — a SET
+    deathkey(r) = the one group r's DELETE-tag marker names
+
+    applies(r, f) = ¬is_deletion(f) ∧ ( target(r) = fid(f)         r a point
+                                      ; deathkey(r) ∈ suppkeys(f)  r a kill )
+
+A point's death marker still names a group — that group is **inert for
+reach** (it may scope authorization or display); the victim set is exactly
+the `TARGET` ref. The spans above are then derived, not asserted: point ⇒
+`(K, K)` from the ref; kill ⇒ `("", "~")`. Group markers on a removal are
+inert everywhere (I2: removals are never victims), and removals contribute
+no victims-index rows.
+
+Two traps, both proven by three independent reviews of the first
+implementation (2026-07-26); the predicate above is shaped to avoid them:
+the group clause is **membership**, never scalar equality —
+`suppression._marker` collapsing 0-or-2+ markers to `None`
+(core/suppression.py:22-29) is the one-group-per-fact assumption fossilized
+in code, a defect to fix, not a rule to keep; and a point's death marker
+must never feed the group clause — channel-mates share the channel group,
+so deleting one message would delete the channel while routing to a single
+key, exactly the I6 under-approximation the span rule forbids.
+
+Consequences:
+
+- The local victims index is **many-to-many**: `supp(fid, k, PRIMARY
+  KEY(fid, k))` with an index on `k` — one row per non-deletion fact per
+  group; today's `supp(fid PRIMARY KEY, k …)` hard-codes one group per
+  fact. Kill-victim enumeration (§3.3) is `SELECT fid FROM supp WHERE k=?`.
+- `tests/util.py::channel_delete` (channel death marker + `TARGET` ref) is
+  a valid **point** fixture as it stands; what the suite lacks is a *kill*
+  fixture (death marker, no `TARGET` ref) and a multi-group fact.
 
 **Routing invariant (I6):** an entry's span covers every present and future
 victim's key. Guards: point spans embed the victim fid in the key, so
@@ -118,11 +162,18 @@ index self-annihilates without the guard. `is_deletion` reads only the fact's
 own clear envelope — no recursion, no ordering. Corollary: membership is
 removal-blind, computed over V, never over E (core/pump.py:110-117).
 
-**I3 — entries are self-validating and individually admitted.** Each entry
-carries its removal's closure by *refs* (the settle encoding,
-core/tree.py:583-590), not an inlined pile: `encode_pile` rejection is
-pile-atomic (core/kernel.py:381-383, 409-413) and one poisoned entry must not
-block the whole removal history. Admission is per entry. "Exactly one death
+**I3 — entries are self-validating and individually admitted.** An entry
+names its removal **by key**; the removal's closure resolves the way every
+other cross-leaf need does — through the manifest, from home leaf piles
+(docs/CUTOVER.md §2). The index carries no fact bytes: per-body objects are
+what the cutover deleted (docs/COSTS.md §5), and re-adding them here would
+store every removal a second time, beside the copy already inlined at its
+home leaf. What this invariant is really about is the *granularity of
+rejection*: `encode_pile` rejection is pile-atomic (core/kernel.py:381-383,
+409-413) and one poisoned entry must not block the whole removal history.
+Admission is per entry. (Before 2026-07-26 this paragraph said "closure by
+refs, the settle encoding, core/tree.py:583-590" — that encoding no longer
+exists; refs-by-key is its one-store replacement.) "Exactly one death
 marker" becomes an admission rule (today `_marker` silently collapses 0 or
 2+, core/suppression.py:22-29).
 

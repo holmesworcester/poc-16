@@ -146,3 +146,36 @@ def pull(node, ws, oid, raw):
 def push(node, ws, peer, fids):
     """Close this dial's local-only union and deliver it once."""
     return _push(node, ws, peer, fids)
+
+
+# ---- cutover skeletons (oyd.3, docs/CUTOVER.md §2) --------------------------
+# Bodies land with the sync rewrite; everything above this line except
+# _union, pull, and push is deleted by that rewrite.
+
+
+def pull_removals(node, ws, remote_root, fetch):
+    """The removal-index leg, run BEFORE the fact leg (REMOVALS.md §5).
+
+    Compare the remote root's removals fp (manifest.decode_root) with ours;
+    when they differ, fetch the index pile, decode entries, and admit each
+    entry individually (removals.admit + judging its removal's closure via
+    the ordinary assembly below — one judge, I3). Replaces the SUPP index
+    leg and close_deletions. Returns the admitted entries so the fact leg
+    carries the removal set while reading."""
+    raise NotImplementedError
+
+
+def assemble(node, ws, pulled_piles, entries, fetch):
+    """Two-wave closed-set assembly (docs/CUTOVER.md §2.2).
+
+    Wave 1 already happened: ``pulled_piles`` are the differing home-leaf
+    piles from manifest.diff. For their member facts, resolve every dep from
+    our own store first (kernel.resolve_deps against the index); the
+    remainder is the union of the leaves' closure-sibling keys, filtered to
+    keys we don't hold. Wave 2: manifest.fetch_plan groups those keys by
+    home leaf; one batched GET wave (fetch.many / store.PAGE_BATCH); extract
+    exactly the needed facts from each fetched pile by key. Sibling keys are
+    transitive, so there is no wave 3 — assert, don't loop. Returns one
+    deps-first stream (close.close) ready for encode_pile -> pull() ->
+    node.turn(): the ordinary ingress admission, same as push and mint."""
+    raise NotImplementedError

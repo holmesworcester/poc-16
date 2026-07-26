@@ -3,7 +3,7 @@
 One serial loop — turn() — is the only mutator of a workspace:
 
     drain piles -> kernel each (parallel, own scratchpads) -> merge valid/globals
-    -> spill blobs -> commit (pure index folds -> put objects -> CAS manifest)
+    -> spill blobs -> commit (settle the manifest -> put objects -> CAS root)
     -> pump projection log -> retire piles
 
 Everything enters through a pile: local commands, pulled units, pushed
@@ -19,12 +19,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import facts
 
-from . import tree
+from . import manifest
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
 from .keychain import Keychain
 from .kernel import (
+    SCHEMA as KERNEL_SCHEMA,
     Judgment,
     drain,
     drain_committed,
@@ -41,7 +42,7 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import FACT, SUPP, SUPP_INDEX, key_parts
+from .shape import FACT, SUPP, key_parts
 from .store import FsStore
 from .suppression import victims
 
@@ -56,12 +57,66 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v12-suppression-root"
+INDEX_VERSION = "family-contract-v13-one-store"
 APP_VERSION = 3
 
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+def _object(oid, fetch):
+    """One immutable object, hash-verified at the door; "" names nothing."""
+    raw = fetch(oid) if oid else None
+    if raw is None or h(raw) != oid:
+        raise ValueError("object integrity")
+    return raw
+
+
+def _edges(items):
+    """Closure edges resolved against the whole resident set: the canonical
+    providers any reader of the store derives, with no index of its own
+    (was tree._canonical_graph)."""
+    deps, db = {}, sqlite3.connect(":memory:")
+    try:
+        db.executescript(KERNEL_SCHEMA)
+        db.executemany(
+            "INSERT INTO facts VALUES(?,?,?)",
+            ((f.fid, f.ts, f.t) for f in items.values()))
+        db.executemany(
+            "INSERT INTO offers VALUES(?,?,?,?)",
+            ((*offer, f.fid)
+             for f in items.values() for offer in f.offers()))
+        if unresolved_facts(db, items.get):
+            raise ValueError("store closure")
+        for fid, f in items.items():
+            resolved = resolve_deps(f, db)
+            if resolved is None or any(d not in items for d in resolved):
+                raise ValueError("store closure")
+            deps[fid] = resolved
+    finally:
+        db.close()
+    return deps
+
+
+def resident(man, fetch):
+    """Every committed fact, deps-first, from the manifest alone.
+
+    Leaf piles decode with the ONE pile codec (close.decode_pile); the member
+    set is then proved by rebuilding the manifest from the keys we read and
+    comparing its root oid — placement, chunking, pile and sibling bytes in a
+    single equality (replaces tree.validate_view).
+    """
+    items = {}
+    for entry in manifest.decode(_object(man, fetch), fetch):
+        members, _ = decode_pile(_object(entry.leaf, fetch))
+        items.update({f.fid: f for f in members})
+    deps = _edges(items)
+    if manifest.build(
+            sorted(f.key for f in items.values()), items.__getitem__,
+            deps.__getitem__, lambda raw: None)[1] != man:
+        raise ValueError("store placement")
+    return close(items.values(), deps.__getitem__, items.__getitem__)
 
 
 class Node:
@@ -183,20 +238,7 @@ class Node:
             idx.rollback()
             raise
 
-    def _backfill_supp(self, ws):
-        """Index direct/bulk fact-table writes that bypass :meth:`merge`."""
-        idx = self.idx(ws)
-        missing = idx.execute(
-            "SELECT f.fid, f.j FROM facts f "
-            "LEFT JOIN supp s ON s.fid=f.fid WHERE s.fid IS NULL"
-        ).fetchall()
-        idx.executemany(
-            "INSERT INTO supp VALUES(?,?)",
-            ((fid, SUPP.key(from_json(json.loads(raw))))
-             for fid, raw in missing),
-        )
-
-    def commit_index(self, ws, *, backfill=True):
+    def commit_index(self, ws):
         """Commit direct derived-index writes as ahead of the manifest.
 
         The live merge path and bulk benchmark builders share this boundary so
@@ -205,8 +247,6 @@ class Node:
         """
         idx = self.idx(ws)
         try:
-            if backfill:
-                self._backfill_supp(ws)
             idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
         except Exception:
@@ -223,11 +263,6 @@ class Node:
                 key_parts(ts, fid) for ts, fid in
                 self.idx(ws).execute(
                     "SELECT ts, fid FROM facts ORDER BY ts, fid")
-            ]
-        if projection is SUPP:
-            return [
-                key for (key,) in self.idx(ws).execute(
-                    "SELECT k FROM supp WHERE k IS NOT NULL ORDER BY k")
             ]
         return sorted(filter(None, (
             projection.key(self.fact_of(ws, fid))
@@ -555,6 +590,14 @@ class Node:
 
     def commit(self, ws, newfids=(), *, reuse=True):
         st, idx = self.store(ws), self.idx(ws)
+        # A root names its anchor — rebuild() and mint.Authority.from_root
+        # both reject one that doesn't, so never publish one. An index
+        # without it is not a store yet (an arrival order can land bare
+        # signatures first): it stays ahead of the manifest, unpublished,
+        # until a turn brings the anchor in. A rootless store is legal.
+        if idx.execute(
+                "SELECT 1 FROM facts WHERE fid=?", (ws,)).fetchone() is None:
+            return None
         shadows = self._shadows(ws, newfids)
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
@@ -571,7 +614,7 @@ class Node:
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
             # merge() and the direct/bulk boundary have already indexed keys.
-            self.commit_index(ws, backfill=False)
+            self.commit_index(ws)
             if restored:
                 self._invalidate_sync_cache(ws)
         except Exception:
@@ -593,49 +636,40 @@ class Node:
                 st.put("obj/" + oid, raw)
             return oid
 
-        previous = tree.decode_root(prev) if prev else None
-        if previous is not None and previous.anchor != ws:
-            raise ValueError("root anchor")
-        stable = reuse and not shadows and not pruned and not restored
         fetch = lambda oid: st.get("obj/" + oid)
-        fact_of = lambda fid: self.fact_of(ws, fid)
-
-        def layout(old, count, keys, delta, projection):
-            if stable and old is not None \
-                    and old.kind == tree.FAT.kind \
-                    and old.config == tree.config(tree.FAT, projection) \
-                    and old.n + len(delta) == count:
-                return tree.fold(
-                    old, delta, projection, tree.FAT,
-                    fact_of, deps_of, fetch, emit,
-                )
-            return tree.build(
-                keys(), projection, tree.FAT,
-                fact_of, deps_of, emit,
-            )
-
-        newfacts = [fact_of(fid) for fid in newfids]
-        fact_count = idx.execute(
-            "SELECT COUNT(*) FROM facts").fetchone()[0]
-        supp_count = idx.execute(
-            "SELECT COUNT(k) FROM supp").fetchone()[0]
-        view = layout(
-            previous.view if previous else None,
-            fact_count, lambda: self.keys(ws),
-            [FACT.key(fact) for fact in newfacts], FACT,
-        )
-        supp = layout(
-            previous.index(SUPP_INDEX) if previous else None,
-            supp_count, lambda: self.keys(ws, SUPP),
-            [key for fact in newfacts if (key := SUPP.key(fact))],
-            SUPP,
-        )
-        root = tree.encode_root(tree.Root(
-            view, ws, self.globals(ws), ((SUPP_INDEX, supp),)))
+        entries, removals = self._previous(ws, prev, fetch)
+        # A settle is a pure function of the key set; ``entries`` only memoizes
+        # unchanged leaves. Shadows/prunes/republish can re-pick canonical
+        # providers for an unchanged member set, so they drop the memo.
+        if not (reuse and not shadows and not pruned and not restored):
+            entries = ()
+        _, man = manifest.build(
+            self.keys(ws), lambda fid: self.fact_of(ws, fid), deps_of, emit,
+            entries)
+        root = manifest.encode_root(ws, self.globals(ws), man, removals)
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
         self._stamp(ws)
         return root
+
+    def _previous(self, ws, raw, fetch):
+        """The previous root's ``(entries, removals)``: a memo for the next
+        settle and the carrier of the removal-index slot. Bytes we cannot read
+        — a foreign layout stamp, a missing shard — settle from scratch; there
+        is no read-compat path (docs/CUTOVER.md §1)."""
+        empty = ((), {"oid": "", "fp": ""})
+        if not raw:
+            return empty
+        try:
+            anchor, _, man, removals = manifest.decode_root(raw)
+        except ValueError:
+            return empty
+        if anchor != ws:
+            raise ValueError("root anchor")
+        try:
+            return manifest.decode(_object(man, fetch), fetch), removals
+        except ValueError:
+            return (), removals
 
     def materialize(self, ws, _valids=()):
         """Transitional benchmark API; the delivery log is authoritative."""
@@ -675,44 +709,33 @@ class Node:
     def rebuild(self, ws, *, republish=False):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
-            man = st.get("root")
-            stream = []
-            if man:
-                root = tree.decode_root(man)
-                if root.anchor != ws:
+            raw, root = st.get("root"), None
+            if raw:
+                try:
+                    root = manifest.decode_root(raw)
+                except ValueError:
+                    # A layout we have no reader for (foreign stamp, damaged
+                    # bytes). The derived index is the store's only remaining
+                    # reader, so republish FROM it under the current stamp and
+                    # rebuild from what we just wrote — never over bytes we
+                    # could not read (§1: rebuild wholesale, no compat path).
+                    self.commit(ws, reuse=False)
+                    raw = st.get("root")
+                    root = manifest.decode_root(raw)
+            if root is not None:
+                anchor, globals_, man, _ = root
+                if anchor != ws:
                     raise ValueError("root anchor")
-                if any(name != SUPP_INDEX for name, _ in root.indexes):
-                    raise ValueError("root indexes")
                 fetch = lambda oid: st.get("obj/" + oid)
                 try:
-                    stream = list(tree.validate_view(
-                        root.view, FACT, tree.FAT, fetch))
+                    stream = list(resident(man, fetch))
                 except ValueError as exc:
-                    raise ValueError(
-                        f"invalid tree facts: {exc}") from exc
-                committed = {fact.fid for fact in stream}
-                if ws not in committed:
-                    raise ValueError("tree fact set")
-                supp = root.index(SUPP_INDEX)
-                if supp is not None:
-                    try:
-                        supp_stream = tree.validate_view(
-                            supp, SUPP, tree.FAT, fetch)
-                        supp_keys = tree.leaf_keys(supp, fetch, SUPP)
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"invalid suppression tree: {exc}") from exc
-                    expected = sorted(filter(None, (
-                        SUPP.key(fact) for fact in stream
-                    )))
-                    if supp_keys != expected or any(
-                            fact.fid not in committed
-                            for fact in supp_stream):
-                        raise ValueError("suppression tree fact set")
-                result = drain_committed(
-                    stream, ws, root.globals_)
+                    raise ValueError(f"invalid store facts: {exc}") from exc
+                if ws not in {fact.fid for fact in stream}:
+                    raise ValueError("store fact set")
+                result = drain_committed(stream, ws, globals_)
                 if not result.ok:
-                    raise ValueError("invalid tree facts")
+                    raise ValueError("invalid store facts")
             idx.execute("BEGIN")
             try:
                 for table in (
@@ -727,7 +750,7 @@ class Node:
                 idx.rollback()
                 raise
             self._reproject.add(ws)
-            if not man:
+            if root is None:  # no root at all: an empty store is legal
                 self._stamp(ws)
                 pump(self, ws)
                 return
@@ -742,3 +765,21 @@ class Node:
             self.log_arrivals(
                 ws, (valid.fact.fid for valid in result.valids))
             pump(self, ws)
+
+    # ---- cutover skeleton (oyd.4, docs/CUTOVER.md §4.4) ----------------------
+
+    def apply_removals(self, ws, entries):
+        """Apply newly known removal entries to the projection log.
+
+        Retroactive retraction: for each entry, enumerate already-resident
+        victims — the supp table for kills, the direct target for points —
+        and append '-' rows (pump.append_retracted) for those whose rows are
+        materialized. Runs when a removal fact is admitted AND when sync's
+        removal leg lands entries whose removal facts we don't hold yet.
+        The forward mask is not here: it is the removals.overlapping +
+        applies consult at victim admission (node.merge/_log_projection) and
+        in pump's rebuild branch — one consult path, no second mechanism.
+        Note the store-closure corollary: locally a removal FACT always
+        follows its victim (its target is a hard ref; kernel refs_seen is
+        unchanged); only index ENTRIES can precede victims, via sync."""
+        raise NotImplementedError

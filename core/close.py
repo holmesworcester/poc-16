@@ -1,9 +1,9 @@
 """close(): the canonical-topo serializer, and the ingress unit codec.
 
 Ingress, request, and invite piles use the same ordered fact-list codec
-(+ attached blobs). Tree settle manifests instead reference the same
-canonical fact bodies individually, so differently partitioned indexes share
-their bytes.
+(+ attached blobs) — and so does a settled home leaf: one pile codec serves
+the wire and residence alike (docs/CUTOVER.md §3), so a fact's bytes live
+once and a resident leaf decodes with the reader the ingress already has.
 close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
@@ -44,8 +44,15 @@ def encode_pile(facts, blobs=None) -> bytes:
 
 
 def decode_pile(b: bytes):
-    """Hash-verify everything at the door — cheapest checks first."""
+    """Hash-verify everything at the door — cheapest checks first.
+
+    Total over arbitrary JSON: foreign bytes leave here as a ValueError or
+    not at all, so a caller can say ``except ValueError`` and mean it.
+    """
     o = json.loads(b)
+    if not isinstance(o, dict) or not isinstance(o.get("facts"), list) \
+            or not isinstance(o.get("blobs", {}), dict):
+        raise ValueError("pile shape")
     facts = [from_json(fo) for fo in o["facts"]]  # raises on integrity mismatch
     blobs = {}
     for k, v in o.get("blobs", {}).items():
