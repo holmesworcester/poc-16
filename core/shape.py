@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .crypto import h
-from .suppression import is_deletion, suppkey
+from .suppression import deathkey, suppkeys
 
 CUT = 64         # home-leaf density: the knee where a whole fetch goes
                  # bandwidth-bound (docs/COSTS.md §6)
@@ -126,11 +126,16 @@ FACT = Shape(
 
 
 def _supp_key(fact):
-    group = suppkey(fact)
-    if group is None:
-        return None
-    tag = "0" if is_deletion(fact) else "1"
-    return f"{group}|{tag}|{key(fact)}"
+    # Legacy T_supp key: one group per fact. Deletions key by deathkey,
+    # single-group targets by their one suppkey; multi-group facts have no
+    # T_supp position (the tree dies in oyd.5; the supp table carries them).
+    death, groups = deathkey(fact), suppkeys(fact)
+    if death is not None and not groups:
+        return f"{death}|0|{key(fact)}"
+    if death is None and len(groups) == 1:
+        (group,) = groups
+        return f"{group}|1|{key(fact)}"
+    return None
 
 
 SUPP = Shape(

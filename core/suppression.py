@@ -19,32 +19,43 @@ def atom(channel, *, deletion=False):
     return [ATOM, DOMAIN, channel, DELETE if deletion else TARGET]
 
 
-def _marker(fact):
-    markers = [
+def _markers(fact):
+    """Every well-formed suppression marker — no 0-or-2+ collapse (the
+    one-group-per-fact assumption fossilized in code; REMOVALS.md §2)."""
+    return [
         entry for entry in fact.atoms
         if isinstance(entry, list) and len(entry) == 4 and entry[0] == ATOM
         and entry[1] == DOMAIN and isinstance(entry[2], str)
         and entry[3] in (TARGET, DELETE)
     ]
-    return markers[0] if len(markers) == 1 else None
 
 
-def is_deletion(fact):
-    """Whether the clear envelope carries one canonical deletion marker."""
-    marker = _marker(fact)
-    return marker is not None and marker[3] == DELETE
+def _group(marker):
+    return json.dumps(marker[1:3], separators=(",", ":"))
 
 
-def suppkey(fact):
-    """Canonical T_supp key component, or None for a non-participant."""
-    marker = _marker(fact)
-    return None if marker is None else json.dumps(
-        marker[1:3], separators=(",", ":"))
+def suppkeys(fact):
+    """The SET of groups the fact's TARGET-tag markers declare (§2).
+
+    Membership, never a scalar: one fact can sit in many groups at once
+    (channel, author, thread), each reachable by its own kill."""
+    return frozenset(
+        _group(marker) for marker in _markers(fact)
+        if marker[3] == TARGET)
 
 
 def deathkey(fact):
-    """A deletion's suppression key, or None for targets/non-participants."""
-    return suppkey(fact) if is_deletion(fact) else None
+    """The one group the DELETE-tag marker names, or None.
+
+    Exactly one death marker is I3's admission rule; 0 or 2+ yield None,
+    so such a fact is no deletion and admits no removal entry."""
+    deaths = [m for m in _markers(fact) if m[3] == DELETE]
+    return _group(deaths[0]) if len(deaths) == 1 else None
+
+
+def is_deletion(fact):
+    """Whether the clear envelope carries exactly one death marker."""
+    return deathkey(fact) is not None
 
 
 def key_bounds(group, *, deletions=False):
@@ -60,7 +71,9 @@ def supp_walk(view, group, fetch):
 
     unit = tree.range_facts(
         view, key_bounds(group), fetch, SUPP)
-    facts = tuple(fact for fact in unit if suppkey(fact) == group)
+    facts = tuple(
+        fact for fact in unit
+        if group in suppkeys(fact) or deathkey(fact) == group)
     return SuppressionClosure(facts, unit if facts else ())
 
 

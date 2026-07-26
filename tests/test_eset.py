@@ -4,6 +4,8 @@ import threading
 
 import pytest
 
+import facts
+
 from core import cmds, daemon, tree
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
@@ -13,10 +15,12 @@ from core.suppression import victims
 from facts.auth.request import payload as request_payload
 
 from .util import (
+    MultiGroupFamily,
     all_fids,
     channel_delete,
     closed_subset,
     invoke_mint,
+    multi_group_post,
     projection_state,
     replay_random,
     suppression_world,
@@ -99,6 +103,44 @@ def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
             "SELECT fid FROM proofs")
     }.issuperset(referenced)
     assert projection_state(upgraded) == expected
+
+
+def test_pre_v14_index_rebuild_recreates_supp_multiplicity(
+        tmp_path, monkeypatch):
+    """A pre-v14 restart DROPs the old supp table, not just its rows: the
+    v13 DDL (fid PK, k UNIQUE) survives CREATE IF NOT EXISTS, and its stale
+    UNIQUE would silently swallow all but one victim per group on re-merge
+    — the I6 under-suppression — before stamping the file v14 for good."""
+    monkeypatch.setitem(
+        facts.ROUTES, MultiGroupFamily.TAG, MultiGroupFamily)
+    node, workspace, targets, _ = suppression_world(
+        tmp_path / "node", monkeypatch)
+    both = multi_group_post("channel-0", "alice", "hi", 50)
+    node.ingest_new(workspace, [both], {both.fid: []})
+    index = node.idx(workspace)
+    fresh = sorted(index.execute("SELECT fid, k FROM supp"))
+    chan0 = '["chan","channel-0"]'
+    assert [k for _, k in fresh].count(chan0) == 5  # 4 posts + both
+    assert sorted(k for fid, k in fresh if fid == both.fid) == [
+        '["chan","author/alice"]', chan0]
+
+    index.executescript(
+        "DROP INDEX supp_by_k; DROP TABLE supp;"
+        "CREATE TABLE supp(fid TEXT PRIMARY KEY, k TEXT UNIQUE);")
+    index.executemany("INSERT OR IGNORE INTO supp VALUES(?,?)", fresh)
+    index.execute(
+        "INSERT OR REPLACE INTO meta VALUES('index-version', "
+        "'family-contract-v13-one-store')")
+    index.commit()
+    assert index.execute(
+        "SELECT COUNT(*) FROM supp").fetchone()[0] < len(fresh)
+    index.close()
+    node.app.close()
+
+    upgraded = Node(node.dir)
+
+    assert sorted(upgraded.idx(workspace).execute(
+        "SELECT fid, k FROM supp")) == fresh
 
 
 def test_verdicts_never_read_s(tmp_path, monkeypatch):

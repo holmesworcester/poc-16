@@ -22,7 +22,8 @@ def delete(pk, channel, target, ts):
     target ref — ``[supp(channel, deletion=True), ["ref", TARGET, target]]``
     — body ``{"pk": pk}``. The target ref makes the victim a hard dep, so a
     closed store always holds the victim before the deletion (see
-    core/node.py:apply_removals)."""
+    core/node.py:apply_removals). The channel in the death marker is inert
+    for reach (kind = TARGET ref); reach is exactly the target."""
     raise NotImplementedError
 
 
@@ -32,8 +33,8 @@ def needs(f):
 
 
 # VALIDATE — shape-exact (f == delete(...)), target must not itself be a
-# deletion (I2), and exactly one death marker (I3's admission rule; today
-# suppression._marker silently collapses 0 or 2+ — reject here instead).
+# deletion (I2), and exactly one death marker (I3's admission rule;
+# suppression.is_deletion enforces exactly-one — reject, never collapse).
 def validate(f, ctx):
     raise NotImplementedError
 

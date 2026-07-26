@@ -35,10 +35,25 @@ def invoke_mint(node, workspace, pile):
 
 
 def channel_delete(target, channel, ts):
-    """Synthetic valid single-target deletion used by suppression laws."""
+    """Synthetic valid POINT removal: death marker + TARGET ref. The
+    channel is inert for reach; the victim is exactly ``target``."""
     return Fact(
         "channel_delete", ts,
         [atom(channel, deletion=True), ["ref", TARGET, target]], {})
+
+
+def channel_kill(channel, ts):
+    """Synthetic valid KILL: death marker, NO TARGET ref — reach is
+    deathkey ∈ suppkeys(f) over the whole group (REMOVALS.md §2)."""
+    return Fact("channel_kill", ts, [atom(channel, deletion=True)], {})
+
+
+def multi_group_post(channel, author, text, ts):
+    """A fact declaring TWO suppression groups — channel and author — via
+    two TARGET-tag markers; a kill of either group reaches it (§2)."""
+    return Fact(
+        "multi_group_post", ts,
+        [atom(channel), atom(f"author/{author}")], {"text": text})
 
 
 class DeletionFamily:
@@ -74,6 +89,22 @@ class DeletionFamily:
     @staticmethod
     def materialize(db, workspace, valid):
         return None
+
+
+class MultiGroupFamily(DeletionFamily):
+    """Durable content sitting in two suppression groups at once
+    (monkeypatch alongside DeletionFamily, ROUTES[TAG] = this)."""
+    TAG = "multi_group_post"
+
+    @staticmethod
+    def validate(fact, context):
+        try:
+            channel, author = (marker[2] for marker in fact.atoms)
+        except (IndexError, TypeError, ValueError):
+            return False
+        return not fact.refs() and fact == multi_group_post(
+            channel, author.removeprefix("author/"),
+            fact.body.get("text"), fact.ts)
 
 
 def suppression_world(path, monkeypatch, initial_secret=None):

@@ -42,22 +42,24 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import FACT, SUPP, key_parts
+from .shape import FACT, key_parts
 from .store import FsStore
-from .suppression import victims
+from .suppression import is_deletion, suppkeys, victims
 
+SUPP_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS supp(fid TEXT, k TEXT, PRIMARY KEY(fid, k));",
+    "CREATE INDEX IF NOT EXISTS supp_by_k ON supp(k);")
 IDX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
-CREATE TABLE IF NOT EXISTS supp(fid TEXT PRIMARY KEY, k TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-""" + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v13-one-store"
+""" + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
+INDEX_VERSION = "family-contract-v14-multi-supp"
 APP_VERSION = 3
 
 
@@ -408,9 +410,10 @@ class Node:
                     newfids.append(f.fid)
                 idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
                             (f.fid, f.ts, f.t, json.dumps(f.to_json())))
-                idx.execute(
-                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
-                    (f.fid, SUPP.key(f)))
+                if not is_deletion(f):  # I2: removals are never victims
+                    idx.executemany(
+                        "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                        ((f.fid, k) for k in sorted(suppkeys(f))))
                 for name, a0, a1 in f.offers():
                     idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                                 (name, a0, a1, f.fid))
@@ -510,9 +513,10 @@ class Node:
             idx.execute(
                 "INSERT INTO facts VALUES(?,?,?,?)",
                 (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
-            idx.execute(
-                "INSERT OR IGNORE INTO supp VALUES(?,?)",
-                (fact.fid, SUPP.key(fact)))
+            if not is_deletion(fact):  # I2: removals are never victims
+                idx.executemany(
+                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                    ((fact.fid, k) for k in sorted(suppkeys(fact))))
             for name, a0, a1 in fact.offers():
                 idx.execute(
                     "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
@@ -738,11 +742,15 @@ class Node:
                     raise ValueError("invalid store facts")
             idx.execute("BEGIN")
             try:
-                for table in (
-                        "facts", "offers", "proofs", "supp", "globals"):
+                for table in ("facts", "offers", "proofs", "globals"):
                     idx.execute(f"DELETE FROM {table}")
-                idx.execute("DROP TABLE IF EXISTS log")
-                idx.execute(LOG_SCHEMA)
+                # DROP, not DELETE: CREATE IF NOT EXISTS keeps a pre-v14
+                # file's single-group supp DDL, whose UNIQUE(k) would
+                # silently swallow all but one victim per group on re-merge.
+                for table in ("supp", "log"):
+                    idx.execute(f"DROP TABLE IF EXISTS {table}")
+                for statement in SUPP_SCHEMA + (LOG_SCHEMA,):
+                    idx.execute(statement)
                 idx.execute(
                     "DELETE FROM meta WHERE k IN ('root','reproject')")
                 idx.commit()

@@ -9,7 +9,7 @@ from facts.content.file import file
 from facts.content.message import message
 from core.kernel import offer_src
 from core.node import Node
-from core.suppression import atom, deathkey, is_deletion, suppkey
+from core.suppression import atom, deathkey, is_deletion, suppkeys
 
 
 class EnvelopeOnly:
@@ -25,7 +25,7 @@ def test_channel_targets_share_an_envelope_visible_suppkey():
     msg = message("pk", "general", "hello", 1)
     attachment = file("pk", "general", "a.txt", 3, "ab" * 32, 1, 2)
 
-    assert suppkey(msg) == suppkey(attachment) == '["chan","general"]'
+    assert suppkeys(msg) == suppkeys(attachment) == {'["chan","general"]'}
     assert deathkey(msg) is None
     assert not is_deletion(msg)
     assert msg.atoms == [atom("general")]
@@ -35,9 +35,10 @@ def test_deathkey_and_tag_are_body_free():
     target = EnvelopeOnly([atom("general")])
     deletion = EnvelopeOnly([atom("general", deletion=True)])
 
-    assert suppkey(target) == deathkey(deletion) == '["chan","general"]'
+    assert suppkeys(target) == {deathkey(deletion)} == {'["chan","general"]'}
     assert not is_deletion(target)
     assert is_deletion(deletion)
+    assert suppkeys(deletion) == frozenset()  # a death marker is no membership
 
 
 def test_suppression_tree_key_groups_deletions_before_targets():
@@ -91,7 +92,7 @@ def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
         )
 
     assert node.fact_of(workspace, markerless.fid) is None
-    assert suppkey(markerless) is None
+    assert suppkeys(markerless) == frozenset()
 
 
 @pytest.mark.parametrize("atoms", [
@@ -110,10 +111,20 @@ def test_malformed_suppression_atoms_are_rejected_at_the_door(atoms):
     [["supp", "chan", 1, "target"]],
     [["supp", "other", "general", "target"]],
     [["supp", "chan", "general", "other"]],
-    [atom("general"), atom("general")],
+    [atom("general", deletion=True), atom("other", deletion=True)],
 ])
 def test_noncanonical_or_ambiguous_markers_do_not_index(atoms):
     fact = EnvelopeOnly(atoms)
-    assert suppkey(fact) is None
+    assert suppkeys(fact) == frozenset()
+    assert deathkey(fact) is None
+    assert not is_deletion(fact)
+
+
+def test_target_markers_are_a_membership_set():
+    """Many TARGET markers declare many groups (REMOVALS.md §2) — the old
+    0-or-2+ collapse to None was the one-group assumption, not a rule."""
+    fact = EnvelopeOnly(
+        [atom("general"), atom("author/alice"), atom("general")])
+    assert suppkeys(fact) == {'["chan","general"]', '["chan","author/alice"]'}
     assert deathkey(fact) is None
     assert not is_deletion(fact)

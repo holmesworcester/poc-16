@@ -15,7 +15,7 @@ from typing import NamedTuple
 from . import shape
 from .crypto import h
 from .fact import canon
-from .suppression import TARGET, is_deletion, suppkey
+from .suppression import TARGET, deathkey, is_deletion, suppkeys
 
 HEAD = ("", "~")
 
@@ -32,26 +32,26 @@ class Entry(NamedTuple):
     fid: str
 
 
-def _target(removal):
-    """The single explicit victim ref, or None for a kill (or an ambiguous
-    multi-target removal, whose honest span is then the head)."""
-    targets = [fid for name, fid in removal.refs() if name == TARGET]
-    return targets[0] if len(targets) == 1 else None
+def _targets(removal):
+    """All TARGET-named refs. Kind is their PRESENCE (§2: present ⇒ point,
+    absent ⇒ kill), so a malformed multi-target removal stays a point over
+    its named fids — it must never fall into the group clause."""
+    return tuple(fid for name, fid in removal.refs() if name == TARGET)
 
 
 def entry(fact, key_of):
     """Derive the canonical entry for one removal fact (author-side only).
 
     Point removals span exactly ``key_of(target)``; kills span ``HEAD``.
-    Raises for non-deletions, which by ``_marker`` includes a fact carrying
-    0 or 2+ death markers — the I3 admission rule, not a silent collapse.
+    Raises for non-deletions, which by ``is_deletion`` includes a fact
+    carrying 0 or 2+ death markers — the I3 admission rule.
     """
     if not is_deletion(fact):
         raise ValueError("not a removal")
-    target = _target(fact)
-    if target is None:
+    targets = _targets(fact)
+    if len(targets) != 1:  # kill, or multi-target: honest span is the head
         return Entry(*HEAD, fact.fid)
-    key = key_of(target)
+    key = key_of(targets[0])
     return Entry(key, key, fact.fid)
 
 
@@ -76,21 +76,20 @@ def overlapping(entries, lo, hi):
 def applies(removal, fact):
     """Whether ``removal`` suppresses ``fact``; never True for removals (I2).
 
-    A point removal matches its target fid and nothing else; only a kill
-    matches a whole suppression group. The gate is what keeps the victim set
-    inside the span ``entry`` derives: a point span is one key, so a
-    group-matching point removal would under-approximate — the one forbidden
-    failure (I6), and suppression would then depend on where the leaf cut
-    fell. REMOVALS.md §2's one-line formula omits the gate; §2's own point
-    spans, I6, §3.3 and node.apply_removals all require it.
+    The REMOVALS.md §2 predicate, exactly: kind is the ``TARGET`` ref —
+    present ⇒ point, reaching that fid and nothing else; absent ⇒ kill,
+    reaching by group MEMBERSHIP, ``deathkey(removal) in suppkeys(fact)``
+    (never scalar equality — a fact declares many groups). A point's death
+    marker never feeds the group clause: channel-mates share the channel
+    group, so one deleted message would delete its channel while routing to
+    a single key — the I6 under-approximation.
     """
     if is_deletion(fact):
         return False
-    target = _target(removal)
-    if target is not None:
-        return target == fact.fid
-    group = suppkey(fact)
-    return group is not None and group == suppkey(removal)
+    targets = _targets(removal)
+    if targets:
+        return fact.fid in targets
+    return deathkey(removal) in suppkeys(fact)
 
 
 def admit(e, removal):
@@ -99,9 +98,9 @@ def admit(e, removal):
         return False
     if (e.lo, e.hi) == HEAD:
         return True
-    target = _target(removal)
-    return (e.lo == e.hi and ":" in e.lo and target is not None
-            and shape.fid_of(e.lo) == target)
+    targets = _targets(removal)
+    return (e.lo == e.hi and ":" in e.lo and len(targets) == 1
+            and shape.fid_of(e.lo) == targets[0])
 
 
 def encode(entries, facts, emit):

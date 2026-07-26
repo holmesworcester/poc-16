@@ -18,7 +18,7 @@ from facts.content.message import message
 from core.kernel import Scratchpad, drain, resolve_deps
 from core.node import Node
 from core.suppression import (
-    atom, close_deletions, deathkey, is_deletion, supp_walk, suppkey,
+    atom, close_deletions, deathkey, is_deletion, supp_walk, suppkeys,
 )
 
 from .util import (
@@ -1293,7 +1293,7 @@ def test_suppression_walk_closes_every_match_for_a_deletion_key(
         [deletion], deps.__getitem__, items.__getitem__)
     expected = {
         fact.fid for fact in items.values()
-        if suppkey(fact) == group
+        if group in suppkeys(fact) or deathkey(fact) == group
     }
 
     walked = supp_walk(cold(root), group, driver.fetch)
@@ -1307,7 +1307,7 @@ def test_suppression_walk_closes_every_match_for_a_deletion_key(
     assert {fact.fid for fact in walked.facts} == expected
     assert {
         fact.fid for fact in actual.facts
-        if suppkey(fact) is not None
+        if suppkeys(fact) or is_deletion(fact)
     } == expected
     assert expected - {fact.fid for fact in initial}
     assert all(
@@ -1343,7 +1343,7 @@ def test_suppression_walk_separates_boundary_padding_from_matches(
         secondary, tree.fat(8), items.__getitem__,
         lambda fid: (), driver.emit,
     )
-    group, padding_group = suppkey(facts[0]), suppkey(facts[21])
+    group, padding_group = deathkey(facts[0]), deathkey(facts[21])
     driver.reads.clear()
     driver.calls.clear()
 
@@ -1355,7 +1355,7 @@ def test_suppression_walk_separates_boundary_padding_from_matches(
     assert {fact.fid for fact in walked.facts} == expected
     assert {
         fact.fid for fact in walked.unit
-        if suppkey(fact) == padding_group
+        if padding_group in suppkeys(fact) or deathkey(fact) == padding_group
     } == {facts[21].fid}
     assert {fact.fid for fact in closed.facts} == expected
     assert facts[21] in closed.unit

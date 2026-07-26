@@ -9,7 +9,7 @@ from core.crypto import h
 from core.fact import Fact
 from core.kernel import drain
 from core.suppression import (
-    atom, close_deletions, deathkey, is_deletion, supp_walk, suppkey,
+    atom, close_deletions, deathkey, is_deletion, supp_walk, suppkeys,
 )
 
 GROUP = "proof-channel"
@@ -34,7 +34,7 @@ class ProofFamily:
         return fact.t == ProofFamily.TAG \
             and set(fact.body) == {"ordinal"} \
             and fact.body["ordinal"] == fact.ts \
-            and (not fact.atoms or suppkey(fact) is not None)
+            and bool(not fact.atoms or suppkeys(fact) or is_deletion(fact))
 
     @staticmethod
     def global_rows(fact):
@@ -101,7 +101,7 @@ def effective(stream):
     deaths = {deathkey(fact) for fact in stream if is_deletion(fact)}
     return {
         fact.fid for fact in stream
-        if is_deletion(fact) or suppkey(fact) not in deaths
+        if is_deletion(fact) or deaths.isdisjoint(suppkeys(fact))
     }
 
 
@@ -153,7 +153,8 @@ def test_suppression_walk_surfaces_out_of_range_targets_without_sql(
     primary = tree.range_facts(
         cold(fact_root), (lo, hi), store.fetch, shape.FACT)
     assert {
-        fact.fid for fact in primary if suppkey(fact) == group
+        fact.fid for fact in primary
+        if group in suppkeys(fact) or deathkey(fact) == group
     } == {deletion.fid, in_range.fid}
     assert out_of_range_fids.isdisjoint(fact.fid for fact in primary)
 
@@ -218,9 +219,9 @@ def test_concurrent_deletion_and_targets_converge_without_a_match_write(
         store.fetch, store.emit, prevalidated=True,
     )
     before = supp_walk(
-        cold(right), suppkey(deletion), store.fetch).facts
+        cold(right), deathkey(deletion), store.fetch).facts
     after = supp_walk(
-        cold(merged), suppkey(deletion), store.fetch).facts
+        cold(merged), deathkey(deletion), store.fetch).facts
     target_fids = {fact.fid for fact in targets}
 
     assert merged.oid == reverse.oid == expected.oid

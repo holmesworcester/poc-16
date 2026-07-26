@@ -6,6 +6,9 @@ core/removals.py. Section and invariant numbers cite docs/REMOVALS.md.
 import pytest
 
 import core.removals as removals
+from facts.content.message import message
+
+from .util import channel_delete, channel_kill, multi_group_post
 
 SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
 
@@ -32,10 +35,40 @@ def test_span_never_under_approximates():
     rejects; the author chokepoint derives spans from the victim (I6)."""
 
 
+def test_point_deletion_never_suppresses_channel_mates():
+    """REGRESSION (§2): a point removal of m1 reaches exactly m1 — never
+    channel-mate m2. This fails against scalar suppkey equality AND against
+    any form where a point's death marker feeds the group clause: both
+    messages share the channel group, so either defect deletes m2 (the I6
+    under-approximation, span (K,K) routing to one key)."""
+    m1 = message("pk", "general", "hello", 1)
+    m2 = message("pk", "general", "world", 2)
+    point = channel_delete(m1.fid, "general", 3)
+
+    assert removals.applies(point, m1)
+    assert not removals.applies(point, m2)
+
+
+def test_multi_group_fact_reachable_by_every_declared_group():
+    """MULTI-GROUP (§2): membership is a SET. A fact in {chan, author} is
+    reached by a kill of either group, not by a kill of a third, and a
+    point removal of it reaches it alone."""
+    fact = multi_group_post("general", "alice", "hi", 1)
+    twin = multi_group_post("general", "alice", "again", 2)
+
+    assert removals.applies(channel_kill("general", 3), fact)
+    assert removals.applies(channel_kill("author/alice", 3), fact)
+    assert not removals.applies(channel_kill("elsewhere", 3), fact)
+    point = channel_delete(fact.fid, "general", 3)
+    assert removals.applies(point, fact)
+    assert not removals.applies(point, twin)
+
+
 @SKELETON
 def test_predicate_never_suppresses_removals():
-    """not is_deletion(f) is a correctness requirement: a kill's deathkey is
-    its own suppkey, so without the guard the index self-annihilates (I2)."""
+    """not is_deletion(f) is a correctness requirement (I2): removals are
+    never victims and write no supp rows, so no removal — point or kill —
+    can retract another, and the index cannot self-annihilate."""
 
 
 @SKELETON
