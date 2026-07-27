@@ -5,14 +5,13 @@
                                                        (tests/test_pump.py)
 
 The λ path never touches this module: read models are a leaf-client concern.
-Rebuild is the clean side of the theorem: replay computes today's
-single-target S from valid deletion facts first, folds over E in canonical
-order, and fires zero retractions. The synced T_supp replaces that scan later.
+Rebuild is the clean side of the theorem: replay computes S by the ONE
+removal consult (node.removal_entries + node.suppressed, CUTOVER §2.4),
+folds over E = V∖S in canonical order, and fires zero retractions.
 """
 import facts
 from .close import close
 from .kernel import Valid, resolve_deps
-from .suppression import victims
 
 # idx.db — appended by node.merge in the same transaction as facts/offers
 LOG_SCHEMA = """
@@ -39,9 +38,10 @@ def append_admitted(idx, fids):
 
 
 def append_retracted(idx, targets):
-    """−target for each target of a newly admitted deletion; 1:N victims
-    stream in as yez.3's surfacing walk hands them over. A deletion refs its
-    target, so −t follows +t in every legal stream."""
+    """−target for each suppressed victim: the forward mask and
+    node.apply_removals both land here. −t follows +t in every legal
+    stream — locally a removal follows its victim (its target is a hard
+    ref); a synced entry masks at admission, in the same transaction."""
     idx.executemany(
         "INSERT INTO log(op, fid) VALUES('-', ?)",
         ((fid,) for fid in targets),
@@ -109,11 +109,10 @@ def pump(node, ws, projector="app"):
                     node.fact_of(ws, fid)
                     for (fid,) in idx.execute("SELECT fid FROM facts")
                 ]
-                by_fid = {fact.fid: fact for fact in valid_facts}
-                suppressed = {
-                    target
-                    for fact in valid_facts
-                    for target in victims(fact, by_fid.get)
+                entries = node.removal_entries(ws)
+                suppressed = {  # E = V∖S by the one consult (CUTOVER §2.4)
+                    fact.fid for fact in valid_facts
+                    if node.suppressed(ws, fact, entries)
                 }
                 ordered = close(
                     valid_facts,

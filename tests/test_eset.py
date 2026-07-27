@@ -6,12 +6,12 @@ import pytest
 
 import facts
 
+import core.removals as removals
 from core import cmds, daemon, tree
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
 from core.shape import SUPP, SUPP_INDEX
-from core.suppression import victims
 from facts.auth.request import payload as request_payload
 
 from .util import (
@@ -73,8 +73,7 @@ def test_suppression_facts_not_suppressible(tmp_path, monkeypatch):
             workspace, [recursive], {recursive.fid: [first.fid]})
 
     assert node.fact_of(workspace, recursive.fid) is None
-    assert victims(recursive, lambda fid: first if fid == first.fid else None) \
-        == ()
+    assert not removals.applies(recursive, first)  # I2: never a victim
 
 
 def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):

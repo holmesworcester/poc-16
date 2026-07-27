@@ -103,7 +103,7 @@ def admit(e, removal):
             and shape.fid_of(e.lo) == targets[0])
 
 
-def encode(entries, facts, emit):
+def encode(entries, facts, emit, refs=()):
     """Settle the index: sorted entry table plus the removal closures' fact
     keys, sorted and deduplicated — refs, never an inlined pile (I3).
 
@@ -111,14 +111,26 @@ def encode(entries, facts, emit):
     its home leaf's pile, and every cross-leaf need is a ref by key (CUTOVER
     §1, §3's address-form row), so the reader resolves a ref through
     ``manifest.locate``/``fetch_plan`` — the same two-wave path closure
-    siblings use. The index object is the only object this emits.
+    siblings use. ``refs`` carries pre-derived keys forward — the previous
+    slot's, so a quarantined removal's closure survives the settle (I1) —
+    and a stale ref only costs a reader a wasted fetch (per-entry admission
+    skips it). The index object is the only object this emits.
     """
     raw = canon({
         "entries": [list(e) for e in sorted(entries, key=entry_key)],
-        "refs": sorted({shape.key(fact) for fact in facts}),
+        "refs": sorted({shape.key(fact) for fact in facts} | set(refs)),
     })
     emit(raw)
     return h(raw)
+
+
+def _keyish(ref):
+    """``shape.key``-shaped: ``<ts:015d>:<fid>`` — the width is a MINIMUM
+    (a far-future ts prints wider), so parse at the first colon."""
+    if not isinstance(ref, str):
+        return False
+    ts, _, fid = ref.partition(":")
+    return len(ts) >= 15 and ts.isdigit() and bool(fid)
 
 
 def decode(raw):
@@ -130,9 +142,7 @@ def decode(raw):
         raise ValueError("removal index shape")
     rows, refs = obj["entries"], obj["refs"]
     if not isinstance(rows, list) or not isinstance(refs, list) \
-            or not all(
-                isinstance(ref, str) and ref[15:16] == ":"
-                and ref[:15].isdigit() and ref[16:] for ref in refs) \
+            or not all(map(_keyish, refs)) \
             or sorted(set(refs)) != refs \
             or not all(
                 isinstance(row, list) and len(row) == 3

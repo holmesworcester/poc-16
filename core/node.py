@@ -44,7 +44,7 @@ from .pump import (
 )
 from .shape import FACT, key, key_parts
 from .store import FsStore
-from .suppression import is_deletion, suppkeys, victims
+from .suppression import TARGET, deathkey, is_deletion, suppkeys
 
 SUPP_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS supp(fid TEXT, k TEXT, PRIMARY KEY(fid, k));",
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v14-multi-supp"
+INDEX_VERSION = "family-contract-v15-removal-consult"
 APP_VERSION = 3
 
 
@@ -370,13 +370,15 @@ class Node:
     def _log_projection(self, ws, admitted, retracted, reproject):
         idx = self.idx(ws)
         admitted = tuple(admitted)
+        entries = self.removal_entries(ws)
         retracted = set(retracted)
-        for fid in admitted:
-            retracted.update(victims(
-                self.fact_of(ws, fid),
-                lambda target: self.fact_of(ws, target)))
+        retracted.update(  # forward mask: entry known before the victim
+            fid for fid in admitted
+            if self.suppressed(ws, self.fact_of(ws, fid), entries))
         append_admitted(idx, admitted)
         append_retracted(idx, sorted(retracted))
+        self.apply_removals(  # removal arrival: retroactive '-' rows
+            ws, [e for e in entries if e.fid in set(admitted)])
         if reproject:
             seq = idx.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
@@ -660,23 +662,22 @@ class Node:
     def _removal_slot(self, ws, deps_of, emit):
         """Settle the removal index beside the manifest: one ordinary store
         object of sorted entries plus the closures' fact keys (REMOVALS.md
-        §2, I3), and the ``{oid, fp}`` pair the root publishes (I4). Like
-        the manifest it is a pure function of the committed set — entries
-        derive from the resident deletion facts at the author chokepoint
-        (I6), so a synced entry and a local one settle identically.
-        Grow-only across prune/restore (I1's local caveat) is oyd.4's hook."""
+        §2, I3), and the ``{oid, fp}`` pair the root publishes (I4). The
+        entry table is removal_entries — the same one every consult reads —
+        so a synced entry and a local one settle identically, and the index
+        stays grow-only across prune/restore (I1's local caveat): a
+        quarantined removal's entry and refs ride forward from the previous
+        slot instead of being re-derived from the resident set."""
+        entries = self.removal_entries(ws)
+        if not entries:
+            return {"oid": "", "fp": ""}
         dels = [
             fact for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
             for fact in (self.fact_of(ws, fid),) if is_deletion(fact)]
-        if not dels:
-            return {"oid": "", "fp": ""}
-        entries = [
-            removals.entry(fact, lambda fid: key(self.fact_of(ws, fid)))
-            for fact in dels]
         oid = removals.encode(
             entries,
             close(dels, deps_of, lambda fid: self.fact_of(ws, fid)),
-            emit)
+            emit, self._published(ws)[1])
         return {"oid": oid, "fp": removals.fingerprint(entries)}
 
     def _previous(self, ws, raw, fetch):
@@ -762,6 +763,13 @@ class Node:
                 result = drain_committed(stream, ws, globals_)
                 if not result.ok:
                     raise ValueError("invalid store facts")
+            # Drop the cursor BEFORE the log DROP resets AUTOINCREMENT: a
+            # crash anywhere after this point leaves no cursor row, so a
+            # restarted pump takes the rebuild branch instead of skipping
+            # new low seqs against the stale-high cursor (the process-local
+            # _reproject flag does not survive a restart).
+            self.app.execute("DELETE FROM cursors WHERE ws=?", (ws,))
+            self.app.commit()
             idx.execute("BEGIN")
             try:
                 for table in ("facts", "offers", "proofs", "globals"):
@@ -796,20 +804,87 @@ class Node:
                 ws, (valid.fact.fid for valid in result.valids))
             pump(self, ws)
 
-    # ---- cutover skeleton (oyd.4, docs/CUTOVER.md §4.4) ----------------------
+    # ---- removal consult + retraction (docs/CUTOVER.md §2.4) -----------------
+
+    def _published(self, ws):
+        """``(entries, refs)`` behind the last published root's removals
+        slot — the grow-only floor removal_entries and the settle carry
+        forward. An unreadable root (none yet, foreign stamp) holds none."""
+        raw = self.store(ws).get("root")
+        try:
+            slot = manifest.decode_root(raw)[3] if raw else None
+        except ValueError:
+            slot = None
+        obj = self.store(ws).get("obj/" + slot["oid"]) \
+            if slot and slot["oid"] else None
+        return removals.decode(obj) if obj else ((), ())
+
+    def removal_entries(self, ws):
+        """THE current local entry table — the one accessor every consult
+        site and the settle read (CUTOVER §2.4, DRY): the last published
+        slot's entries (grow-only across prune/restore, I1) overlaid with
+        entries derived from resident deletion facts at the author
+        chokepoint (I6) — where node.commit's slot gets them too."""
+        table = {e.fid: e for e in self._published(ws)[0]}
+        for (fid,) in self.idx(ws).execute("SELECT fid FROM facts"):
+            fact = self.fact_of(ws, fid)
+            if is_deletion(fact):
+                table[fid] = removals.entry(
+                    fact, lambda dep: key(self.fact_of(ws, dep)))
+        return tuple(table.values())
+
+    def _removal_of(self, ws, fid):
+        """A removal fact by fid, resident or quarantined: an index entry
+        outlives its pruned removal (I1), so the consult may need the
+        quarantine copy of the clear envelope to run ``applies``."""
+        fact = self.fact_of(ws, fid)
+        if fact is None:
+            raw = self.store(ws).get("quarantine/" + fid)
+            fact = from_json(json.loads(raw)) if raw else None
+        return fact
+
+    def suppressed(self, ws, fact, entries):
+        """THE consult (CUTOVER §2.4): stab ``entries`` at key(fact) —
+        removals.overlapping head + point stab — then ``applies``. Gates E,
+        never V; membership and validity stay removal-blind (I2)."""
+        k = key(fact)
+        return any(
+            (r := self._removal_of(ws, e.fid)) is not None
+            and removals.applies(r, fact)
+            for e in removals.overlapping(entries, k, k))
 
     def apply_removals(self, ws, entries):
         """Apply newly known removal entries to the projection log.
 
         Retroactive retraction: for each entry, enumerate already-resident
-        victims — the supp table for kills, the direct target for points —
-        and append '-' rows (pump.append_retracted) for those whose rows are
-        materialized. Runs when a removal fact is admitted AND when sync's
-        removal leg lands entries whose removal facts we don't hold yet.
-        The forward mask is not here: it is the removals.overlapping +
-        applies consult at victim admission (node.merge/_log_projection) and
-        in pump's rebuild branch — one consult path, no second mechanism.
-        Note the store-closure corollary: locally a removal FACT always
-        follows its victim (its target is a hard ref; kernel refs_seen is
-        unchanged); only index ENTRIES can precede victims, via sync."""
-        raise NotImplementedError
+        victims — the supp table (k = suppression group) for kills, the
+        DIRECT target fid for points — filter through removals.applies (I2
+        lives there), and append '-' rows (pump.append_retracted) for
+        victims still net-'+' in the log, so the forward mask (same
+        transaction) and repeated sync legs never double-retract. Appends
+        only: the caller owns the idx transaction and the pump (merge's
+        turn, or sync.pull_removals). Runs when a removal fact is admitted
+        AND when sync's removal leg lands entries. The forward mask is not
+        here: it is the suppressed() consult at victim admission
+        (_log_projection) and in pump's rebuild branch — one consult path,
+        no second mechanism. Note the store-closure corollary: locally a
+        removal FACT always follows its victim (its target is a hard ref;
+        kernel refs_seen is unchanged); only index ENTRIES can precede
+        victims, via sync."""
+        idx, dead = self.idx(ws), set()
+        for e in entries:
+            r = self._removal_of(ws, e.fid)
+            if r is None:
+                continue
+            targets = [fid for name, fid in r.refs() if name == TARGET]
+            fids = targets or [fid for (fid,) in idx.execute(
+                "SELECT fid FROM supp WHERE k=?", (deathkey(r),))]
+            dead.update(
+                fid for fid in fids
+                if (f := self.fact_of(ws, fid)) is not None
+                and removals.applies(r, f))
+        last = dict(idx.execute(  # net log state: the last row per fid wins
+            "SELECT fid, op FROM log WHERE op IN ('+','-') ORDER BY seq"))
+        append_retracted(idx, sorted(
+            fid for fid in dead if last.get(fid) == "+"))
+        return dead

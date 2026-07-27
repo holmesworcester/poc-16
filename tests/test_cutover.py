@@ -11,7 +11,10 @@ import random
 
 import pytest
 
+import facts
+
 import core.manifest as manifest
+import core.removals as removals
 import core.shape as shape
 import core.sync as sync_module
 from core import cmds
@@ -24,9 +27,11 @@ from facts.auth.signature import signature
 from facts.content.message import message
 
 from .util import (
+    DeletionFamily,
     add_member,
     all_fids,
     author_msg,
+    channel_delete,
     closed_subset,
     deliver,
     member_src,
@@ -555,18 +560,127 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
 # ---- oyd.4: read contract + retraction --------------------------------------
 
 
-@SKELETON
-def test_dep_evidence_not_suppressed():
+def test_dep_evidence_not_suppressed(tmp_path, monkeypatch):
     """A removed fact fetched as an out-of-range dep still validates its
-    dependents: removals gate E, never V (§2.4)."""
+    dependents: removals gate E, never V (§2.4). On the full node the dead
+    dep leaves E while every dependent stays. A cold-partial reader runs
+    the real order — index leg first (REMOVALS.md §5), then one content
+    range — so the dead dep is already a known victim when its dependents'
+    range assembles; assembly still carries it as evidence with ZERO
+    removal consults, the range judges valid, and after ingestion the
+    dependents sit in V and E while the dep sits in V only — deletion
+    hides content, not evidence."""
+    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
+    node = Node(str(tmp_path / "node"))
+    ws = cmds.create(node, "alice", ts=1)
+    sk, pk, joined = add_member(node, ws, "bob", ts=10)
+    msgs, ts, cuts = [], 100, 0
+    while cuts < 2:  # bob's member proof is a dep of every content range
+        msg = author_msg(node, ws, sk, pk, f"m{ts}", ts=ts)
+        msgs.append(msg.fid)
+        cuts += shape.boundary(msg.fid)
+        ts += 1
+    deletion = channel_delete(joined.fid, "general", ts)
+    node.ingest_new(ws, [deletion], {deletion.fid: [joined.fid]})
+
+    surfaced = {src for (src,) in node.app.execute(
+        "SELECT src FROM projected WHERE ws=?", (ws,))}
+    assert joined.fid not in surfaced  # the dead dep left E...
+    assert set(msgs) <= surfaced  # ...its dependents did not
+
+    entries, fetch_src = read(node, ws)
+    entry = next(  # a content range whose sibling names the dead dep
+        e for e in reversed(entries)
+        if e.closure and shape.key(joined) in json.loads(
+            fetch_src(e.closure))["keys"]
+        and {f.fid for f in members_of(e, fetch_src)} & set(msgs))
+    members = members_of(entry, fetch_src)
+    dependents = [f.fid for f in members if f.fid in set(msgs)]
+    cold = Node(str(tmp_path / "cold"))
+    fetch = lambda oid: fetch_src(oid)
+    fetch.many = lambda oids: tuple(fetch_src(oid) for oid in oids)
+    sync_module.pull_removals(  # the real order: the index leg first
+        cold, ws, node.store(ws).get("root"), fetch)
+
+    consults = []
+    stab = removals.overlapping
+    monkeypatch.setattr(
+        removals, "overlapping",
+        lambda *args: consults.append(args) or stab(*args))
+    stream = tuple(sync_module.assemble(
+        cold, ws, [(entry, members)], entries, fetch))
+
+    assert joined.fid in {f.fid for f in stream}  # fetched as evidence
+    assert drain(stream, ws).ok  # the dead dep still validates dependents
+    assert not consults  # the read entered V with no removal look
+
+    monkeypatch.setattr(removals, "overlapping", stab)  # admission may look
+    raw = encode_pile(stream)
+    sync_module.pull(cold, ws, h(raw), raw)
+    cold.turn(ws)
+    on_screen = {src for (src,) in cold.app.execute(
+        "SELECT src FROM projected WHERE ws=?", (ws,))}
+    assert cold.fact_of(ws, joined.fid) is not None  # the dep entered V...
+    assert joined.fid not in on_screen  # ...and V only
+    for fid in dependents:  # ...while its dependents entered V AND E
+        assert cold.fact_of(ws, fid) is not None and fid in on_screen
 
 
-@SKELETON
-def test_removal_consult_in_range_only():
+def test_removal_consult_in_range_only(tmp_path, monkeypatch):
     """Range evaluation touches the removal head plus the [a,b] slice and
-    stabs no out-of-range dep keys (§2.4; REMOVALS.md §3).
+    stabs no out-of-range dep keys (§2.4; REMOVALS.md §3): the stab set of
+    a pull is EXACTLY the arriving members' keys — one single-fact stab
+    each, none skipped, none extra — and applies() only ever judges an
+    arriving member or the retro victim named by DIRECT target fid. The
+    dead target — an out-of-range closure sibling — is never stabbed and
+    never judged. A sibling key CAN equal an arriving member's (a boundary
+    cut between a dependent and its same-batch dep); it is then stabbed as
+    that member, in its own range — so disjointness from the sibling union
+    is not the law and must not be asserted.
     (Entry-before-victim masking is
     tests/test_removals.py::test_removal_before_victim_retracts_on_arrival.)"""
+    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
+    source, ws, destination, ts = pair(tmp_path)
+    victim = next(
+        source.fact_of(ws, fid) for fid in all_fids(source, ws)
+        if source.fact_of(ws, fid).t == "msg")
+    deletion = channel_delete(victim.fid, "general", ts + 50)
+    source.ingest_new(ws, [deletion], {deletion.fid: [victim.fid]})
+    for tick in range(3):
+        cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 60 + tick)
+    before = set(all_fids(destination, ws))
+
+    stabs, judged = [], []
+    stab, match = removals.overlapping, removals.applies
+    monkeypatch.setattr(
+        removals, "overlapping",
+        lambda entries, lo, hi:
+        stabs.append((lo, hi)) or stab(entries, lo, hi))
+    monkeypatch.setattr(
+        removals, "applies",
+        lambda r, f: judged.append(f.fid) or match(r, f))
+    monkeypatch.setattr(sync_module, "Peer", peer_for(source, [], []))
+    sync_module.sync(destination, ws, "local://source")
+
+    new = set(all_fids(destination, ws)) - before
+    arrived = {shape.key(destination.fact_of(ws, fid)) for fid in new}
+    assert stabs  # the consult really ran on this pull
+    assert all(lo == hi for lo, hi in stabs)  # single-fact stabs only
+    assert {lo for lo, _ in stabs} == arrived  # EXACTLY the arriving keys
+    siblings = set()
+    for e in read(source, ws)[0]:
+        if e.closure:
+            siblings |= set(json.loads(
+                source.store(ws).get("obj/" + e.closure))["keys"])
+    assert shape.key(victim) in siblings  # out-of-range deps really exist
+    assert shape.key(victim) not in arrived  # ...with keys off the range
+    assert shape.key(victim) not in {lo for lo, _ in stabs}  # never stabbed
+    assert victim.fid in judged  # the retro path ran, by direct target fid
+    assert set(judged) <= new | {victim.fid}  # never an out-of-range dep
+    assert destination.app.execute(  # yet its own range retracted it here
+        "SELECT 1 FROM projected WHERE ws=? AND src=?",
+        (ws, victim.fid)).fetchone() is None
+    assert all_fids(destination, ws) == all_fids(source, ws)
 
 
 # ---- oyd.7: measure + first production deletion family ----------------------

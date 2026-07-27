@@ -97,15 +97,3 @@ def close_deletions(closure, view, fetch):
         extend(facts, fact_fids, walked.facts)
         extend(unit, unit_fids, walked.unit)
     return SuppressionClosure(tuple(facts), tuple(unit))
-
-
-def victims(fact, fact_of):
-    """The explicit non-deletion target of today's single-target deletion."""
-    if not is_deletion(fact):
-        return ()
-    targets = tuple(
-        fid for name, fid in fact.refs() if name == TARGET)
-    if len(targets) != 1:
-        return ()
-    target = fact_of(targets[0])
-    return targets if target is not None and not is_deletion(target) else ()

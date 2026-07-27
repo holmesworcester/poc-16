@@ -15,6 +15,7 @@ from . import manifest, removals, shape
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import extend_proofs, resolve_deps
+from .pump import pump
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
 
@@ -208,9 +209,12 @@ def pull_removals(node, ws, remote_root, fetch):
     Compare the remote root's removals fp (manifest.decode_root) with ours;
     when they differ, fetch the index pile, decode entries, and admit each
     entry individually (removals.admit + judging its removal's closure via
-    the ordinary assembly below — one judge, I3). Replaces the SUPP index
-    leg and close_deletions. Returns the admitted entries so the fact leg
-    carries the removal set while reading."""
+    the ordinary assembly below — one judge, I3). node.apply_removals then
+    appends retroactive '-' rows for already-materialized victims and the
+    pump applies them. Replaces the SUPP index leg and close_deletions.
+    Returns the admitted entries — the per-entry admission observable
+    (I3); the fact leg reads the same table through node.removal_entries,
+    THE one accessor."""
     ours = {"oid": "", "fp": ""}
     local_root = node.store(ws).get("root")
     if local_root:
@@ -219,7 +223,8 @@ def pull_removals(node, ws, remote_root, fetch):
         return ()
     _, _, man, theirs = manifest.decode_root(remote_root)
     if not theirs["oid"] or theirs["fp"] == ours["fp"]:
-        return _entries(node, ws, ours)
+        with node.lock:
+            return node.removal_entries(ws)
     entries, refs = removals.decode(_object(theirs["oid"], fetch))
     if removals.fingerprint(entries) != theirs["fp"]:
         raise ValueError("removal index fingerprint")
@@ -253,19 +258,11 @@ def pull_removals(node, ws, remote_root, fetch):
         entry for entry in entries
         if (fact := node.fact_of(ws, entry.fid)) is not None
         and removals.admit(entry, fact))
-    try:
+    with node.lock:
         node.apply_removals(ws, admitted)
-    except NotImplementedError:
-        pass  # retroactive retraction lands in oyd.4
+        node.idx(ws).commit()
+        pump(node, ws)
     return admitted
-
-
-def _entries(node, ws, slot):
-    """The locally published entry set behind a root's removals slot."""
-    if not slot["oid"]:
-        return ()
-    raw = node.store(ws).get("obj/" + slot["oid"])
-    return removals.decode(raw)[0] if raw else ()
 
 
 def _sibling_keys(raw):
