@@ -274,6 +274,9 @@ carrying what the ~2,050-line tree engine and the SUPP machinery used to.
 
 ## 7. Explicitly out of scope
 
+(Code citations below are pinned lineage against `main@7635cf8`; that engine
+is deleted. The posture is unchanged — see §8 for its first measured price.)
+
 - **Compaction / publishing removals back into leaf ranges** — cut. Bytes
   and keys are one object (core/tree.py:766-772), `fold` is additive-only
   (core/tree.py:1291-1311), an uncompacted peer's `local_only` pushes
@@ -288,12 +291,38 @@ carrying what the ~2,050-line tree engine and the SUPP machinery used to.
 - **Authoritative read mode** (yez.12) — orthogonal; the index changes
   where removals live, not when reads are allowed to trust them.
 
-## 8. Measure before trusting any growth number
+## 8. Measured (2026-07-26, oyd.7)
 
-There are zero production deletions: every `deletion=True` site is a test
-and the only deletion family is monkeypatched into existence
-(tests/util.py:37-81). All sizing in this document — |index| at either
-granularity, head width, slice locality, re-encode cost per admitted
-removal — is projection. The first production deletion family settles them;
-its bead includes measuring, and exercising the prune cascade that no test
-currently reaches.
+This section used to say every number here was projection, because no
+production deletion family existed. `facts/content/delete.py` now does, and
+`bench/measure_piles.py` runs it over four seeded corpora (flat-m8-n600,
+flat-m8-n2400, flat-m32-n2400, chain-m32-n2400) at CUT=64. Full tables and
+method: docs/COSTS.md §3.1. What the projections got right and wrong:
+
+- **Index growth: 601-737 B per removal** — several times the ~100 B an
+  entry costs, because each entry carries its removal's closure keys (~5-6
+  refs × ~80 B). 49 removals produce a 29-36 KB whole index. The read-whole
+  posture of §5 holds comfortably; the segmented layout stays unbuilt.
+- **Head width is 1 per kill, and slice locality is real**: a warm 40-message
+  range stabs 1-2 entries. §3.1's "sorting is the skipping mechanism" is
+  doing what it claimed.
+- **Re-encode cost per admitted removal: 4-5 objects, 31-116 KB median** —
+  and it is *not* the index. It is re-emitting the removal's own home leaf
+  pile. I5 says victims' leaves never move; the removal's own leaf does, and
+  at CUT=64 that leaf is the dominant per-deletion write.
+- **The prune cascade is now exercised** (flat-m8-n600): the entry floor
+  held through quarantine, suppression held in the window and after restore.
+  I1's local caveat is tested rather than argued.
+- **Retraction at scale checks out**: 387 retracted / 2,013 surviving in a
+  2,400-message corpus, with zero over- or under-retraction asserted.
+
+Two findings that did not come from the projections at all. **Settle garbage
+is 1.6-1.9× reachable bytes** at 64-message commit batching and accretes per
+commit — the first measured price of the no-GC posture in §7, and the number
+to revisit if that posture is ever reconsidered. And a removal quarantined by
+its own deleter's shadowed proof **wedges a peer that synced during the
+window** (bead poc-16-3tg): not a removal defect — it reproduces with an
+ordinary message and no removal anywhere — but the removal-quarantine path is
+where it surfaced, and the trailing assertions in
+`test_quarantined_removal_holds_locally_but_diverges_peers` pin it as current
+behavior, not as law. Fixing it must flip them.
