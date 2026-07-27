@@ -35,10 +35,10 @@ tax per leg, visible as 1.17× at 5k and amortized to 1.02× at 50k.
 range tax is member-wide, delegation order makes it path-shaped, and deep-chain
 leaf-only full sync remains about 24× while settle full sync stays 1×.
 
-Reproduce the current path with `python3 bench/bench_sync.py 5000`; cross-check
-the model with `python3 bench/bench_hoist.py 5000`,
-`python3 bench/bench_hoist_sync.py 5000`, and
-`python3 bench/bench_order.py 5000 star chain`.
+Reproduce the current path with `python3 bench/bench_sync.py 5000`. The model
+cross-check harnesses (`bench_hoist.py`, `bench_hoist_sync.py`,
+`bench_order.py`) were deleted with the tree engine (bead poc-16-oyd.5); their
+numbers above stand as the record.
 
 ## Historical leaf-only baseline
 

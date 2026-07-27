@@ -7,7 +7,6 @@ import facts
 
 from core import cmds, mint
 import core.sync as sync_module
-import core.walk as walk_module
 from core.close import close, encode_pile
 from core.crypto import keypair
 from facts.auth.device import bind, device, devices
@@ -962,19 +961,19 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
 
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     url = "local://remote"
-    assert walk_module.walk(local, workspace, url) == (0, 0)
+    assert sync_module.sync(local, workspace, url) == (0, 0)
     assert (workspace, url) in local.sync_cache
 
     deliver(remote, workspace, rejoin_pile)
     remote.turn(workspace)
     assert remote.fact_of(workspace, child_claim.fid) is None
 
-    pulled, _ = walk_module.walk(local, workspace, url)
+    pulled, _ = sync_module.sync(local, workspace, url)
     assert pulled
     assert local.fact_of(workspace, child_claim.fid) == child_claim
     assert (workspace, url) not in local.sync_cache
 
-    _, pushed = walk_module.walk(local, workspace, url)
+    _, pushed = sync_module.sync(local, workspace, url)
     assert pushed
     assert remote.fact_of(workspace, child_claim.fid) == child_claim
     assert all_fids(local, workspace) == all_fids(remote, workspace)

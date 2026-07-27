@@ -493,6 +493,35 @@ def test_prune_restore_keeps_removals(tmp_path, monkeypatch):
         (workspace, child)).fetchone() is None
 
 
+def test_e_is_the_v_minus_s_fold(tmp_path, monkeypatch):
+    """The E = V∖S fold guard (was test_suppression_proof.effective, kept
+    beside I2's contracts): the projected set equals the pure fold
+    {f ∈ V : is_deletion(f) or no valid removal applies to f} — removals
+    themselves stay in E, and S is exactly the applies() fold, kills and
+    points alike."""
+    monkeypatch.setitem(facts.ROUTES, KillFamily.TAG, KillFamily)
+    node, ws, targets, _ = suppression_world(tmp_path / "node", monkeypatch)
+    kill = channel_kill("channel-0", 300)
+    node.ingest_new(ws, [kill], {kill.fid: []})
+
+    valid = [node.fact_of(ws, fid) for fid in all_fids(node, ws)]
+    deletions = [f for f in valid if is_deletion(f)]
+    s = {
+        f.fid for f in valid
+        if not is_deletion(f)  # I2 is the frame: removals never leave E
+        and any(removals.applies(r, f) for r in deletions)
+    }
+    e = {f.fid for f in valid} - s
+
+    assert {d.fid for d in deletions} <= e  # deletions sit in E themselves
+    assert set(targets) & s  # the fold really suppressed content...
+    assert set(targets) & e  # ...and really spared the rest
+    assert {
+        src for (src,) in node.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (ws,))
+    } == e
+
+
 def test_fact_tree_fingerprints_unchanged_by_removal(tmp_path, monkeypatch):
     """Admitting a removal changes its OWN home leaf and the index slot —
     never a victim's leaf (I5 in one-store terms): no other range's leaf

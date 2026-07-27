@@ -1,7 +1,7 @@
 """Death/suppression keys are extractable from clear envelopes alone."""
 import pytest
 
-from core import cmds, shape
+from core import cmds
 from core.close import decode_pile, encode_pile
 from core.fact import Fact, from_json
 from facts.auth.signature import signature
@@ -39,25 +39,6 @@ def test_deathkey_and_tag_are_body_free():
     assert not is_deletion(target)
     assert is_deletion(deletion)
     assert suppkeys(deletion) == frozenset()  # a death marker is no membership
-
-
-def test_suppression_tree_key_groups_deletions_before_targets():
-    deletion = Fact(
-        "channel_delete", 99, [atom("general", deletion=True)], {})
-    targets = [
-        Fact("msg", ts, [atom("general")], {})
-        for ts in (1, 100)
-    ]
-    unrelated = Fact("sample", 2, [], {})
-    projection = shape.supp_shape()
-    deletion_key = projection.key(deletion)
-    target_keys = [projection.key(fact) for fact in targets]
-
-    assert deletion_key.startswith('["chan","general"]|0|')
-    assert all(key.startswith('["chan","general"]|1|') for key in target_keys)
-    assert deletion_key < min(target_keys)
-    assert projection.fid_of(deletion_key) == deletion.fid
-    assert projection.key(unrelated) is None
 
 
 def test_suppression_marker_survives_the_wire_codec():

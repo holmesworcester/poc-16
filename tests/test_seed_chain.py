@@ -55,7 +55,6 @@ def test_seed_rejects_unknown_shapes(tmp_path):
         build_seed(str(tmp_path / "bad"), 10, shape="broom")
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_multi_device_seed_groups_equal_author_keys_by_user(tmp_path):
     node, workspace, stats = build_seed(
         str(tmp_path / "devices"), 255, n_members=12, shape="random",

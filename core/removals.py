@@ -1,6 +1,6 @@
 """Grow-only removal index: range-kill head + target-keyed points.
 
-One entry per removal fact, spanning the fact-tree keys its victims occupy:
+One entry per removal fact, spanning the fact keys its victims occupy:
 a single-target deletion spans its victim's exact key and sorts to the
 victim's position; a channel kill spans ``("", "~")`` and sorts to the head.
 Spans are routing only — over-approximation is safe, under-approximation is
@@ -26,7 +26,7 @@ JOIN = "\0"
 
 
 class Entry(NamedTuple):
-    """One removal's routing span over fact-tree target keys, closed."""
+    """One removal's routing span over fact target keys, closed."""
     lo: str
     hi: str
     fid: str

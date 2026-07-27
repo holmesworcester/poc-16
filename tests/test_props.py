@@ -8,12 +8,13 @@ P-rebuild: wipe the derived index, replay the store's own units, get the
 identical root back.
 P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
 """
+import json
 import random
 import sqlite3
 
 import pytest
 
-from core import cmds, manifest, tree
+from core import cmds, manifest
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -24,8 +25,8 @@ from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import Judgment, drain, evaluate, resolve_deps
+from core import node as node_module
 from core.node import Node, now_ms
-from core.shape import FACT
 
 from . import util as test_util
 from .util import (
@@ -35,7 +36,6 @@ from .util import (
     closed_subset,
     deliver,
     member_src,
-    mismatched_tree_key,
     send_bytes,
 )
 
@@ -71,24 +71,39 @@ def world(tmp_path, monkeypatch):
 
 
 def units_of(store):
-    root = tree.decode_root(store.get("root"))
+    """Per-leaf published unit, from the store alone: the home-leaf pile's
+    members plus its closure sibling's facts (each resolved at its own home
+    leaf), serialized deps-first by the ordinary close()."""
     fetch = lambda oid: store.get("obj/" + oid)
-    for lo, hi, leaf in tree.leaf_ranges(root.view, fetch):
-        if leaf.n:
-            yield leaf, tree.range_facts(
-                root.view, (lo, hi), fetch, FACT)
+    _, _, man, _ = manifest.decode_root(store.get("root"))
+    entries = manifest.decode(fetch(man), fetch)
+    piles = {
+        entry.sep: decode_pile(fetch(entry.leaf))[0] for entry in entries}
+
+    def at(key):
+        home = manifest.locate(entries, key)
+        return next(f for f in piles[home.sep] if f.key == key)
+
+    for entry in entries:
+        members = piles[entry.sep]
+        outside = json.loads(fetch(entry.closure))["keys"] \
+            if entry.closure else []
+        items = {f.fid: f for f in members}
+        items.update((f.fid, f) for f in map(at, outside))
+        deps = node_module._edges(items)  # unit-local canonical providers
+        yield entry, close(members, deps.__getitem__, items.__getitem__)
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_paths_are_piles(world):
-    """Every hoisted root-to-leaf path judges alone, from nothing."""
+    """Every published leaf unit — pile plus closure sibling — judges
+    alone, from nothing."""
     n, ws = world
     count = 0
-    for fen, stream in units_of(n.store(ws)):
+    for entry, stream in units_of(n.store(ws)):
         result = drain(stream, ws)
-        assert result.ok, f"unit failed the kernel: {fen}"
+        assert result.ok, f"unit failed the kernel: {entry}"
         count += 1
-    assert count >= 5  # the set actually promoted into multiple leaves
+    assert count == 4  # pinned world: exactly four leaves; layout drift shows here
 
 
 def test_history_independence(tmp_path, world):
@@ -123,81 +138,65 @@ def test_rebuild(world):
     assert n.store(ws).etag("root") == before
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_rebuild_rejects_a_corrupted_leaf(world):
     n, ws = world
     st = n.store(ws)
     before = all_fids(n, ws)
     root_bytes = st.get("root")
-    root = tree.decode_root(root_bytes)
     fetch = lambda oid: st.get("obj/" + oid)
-    payload = next(
-        oid for oid in tree.live_oids(root.view, fetch)
-        if b'"refs"' in st.get("obj/" + oid)
-    )
-    st.put("obj/" + payload, encode_pile([]))
+    _, _, man, _ = manifest.decode_root(root_bytes)
+    entries = manifest.decode(fetch(man), fetch)
+    st.put("obj/" + entries[0].leaf, encode_pile([]))
 
-    with pytest.raises(ValueError, match="payload integrity"):
+    with pytest.raises(ValueError, match="object integrity"):
         n.rebuild(ws)
 
     assert st.get("root") == root_bytes
     assert all_fids(n, ws) == before
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
-def test_rebuild_rejects_payload_leaf_key_mismatch(tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    store = node.store(workspace)
-    before = all_fids(node, workspace)
+def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
+    """A root naming a leaf pile whose fact set deviates from the canonical
+    settle — a smuggled extra fact, or members shuffled across leaves — is
+    caught by resident()'s single rebuild equality ("store placement")."""
+    n, ws = world
+    st = n.store(ws)
+    before = all_fids(n, ws)
+    honest = st.get("root")
+    fetch = lambda oid: st.get("obj/" + oid)
+    body = json.loads(honest)
+    entries = manifest.decode(fetch(body["manifest"]), fetch)
 
     def emit(raw):
         oid = h(raw)
-        store.put("obj/" + oid, raw)
+        st.put("obj/" + oid, raw)
         return oid
 
-    root = store.get("root")
-    fetch = lambda oid: store.get("obj/" + oid)
-    store.put("root", mismatched_tree_key(root, fetch, emit))
-
-    with pytest.raises(ValueError, match="tree fact set"):
-        node.rebuild(workspace)
-
-    assert all_fids(node, workspace) == before
-
-
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
-def test_rebuild_rejects_hidden_fact_in_a_legacy_leaf(tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    store = node.store(workspace)
-    anchor = node.fact_of(workspace, workspace)
+    # A smuggled fact with no proof chain breaks store closure.
     hidden = Fact("sample", 0, [], {"hidden": True})
-    indexed = Fact("sample", 2, [], {"indexed": True})
+    members = decode_pile(fetch(entries[0].leaf))[0]
+    smuggled = entries[0]._replace(
+        leaf=emit(encode_pile([hidden] + members)))
+    man = manifest.encode([smuggled] + list(entries[1:]), emit)
+    st.put("root", manifest.encode_root(
+        ws, n.globals(ws), man, body["removals"]))
+    with pytest.raises(ValueError, match="invalid store facts"):
+        n.rebuild(ws)
 
-    def leaf(facts, key):
-        raw = encode_pile(facts)
-        oid = h(raw)
-        store.put("obj/" + oid, raw)
-        return tree.View(
-            FACT.fingerprint([key]), oid, key, 1, (), (key,))
+    # The same members shuffled across leaves break the rebuild equality.
+    first = decode_pile(fetch(entries[0].leaf))[0]
+    second = decode_pile(fetch(entries[1].leaf))[0]
+    moved = [
+        entries[0]._replace(leaf=emit(encode_pile(first[:-1]))),
+        entries[1]._replace(leaf=emit(encode_pile([first[-1]] + second))),
+    ] + list(entries[2:])
+    st.put("root", manifest.encode_root(
+        ws, n.globals(ws), manifest.encode(moved, emit), body["removals"]))
+    with pytest.raises(ValueError, match="store placement"):
+        n.rebuild(ws)
 
-    view = tree._flat_view(
-        (leaf([anchor], anchor.key),
-         leaf([hidden, indexed], indexed.key)),
-        1,
-        FACT,
-    )
-    root_bytes = tree.encode_root(tree.Root(
-        view, workspace, frozenset()))
-    root = tree.decode_root(root_bytes)
-    fetch = lambda oid: store.get("obj/" + oid)
-
-    assert len({fact.fid for fact in tree.facts(
-        root.view, fetch, FACT)}) == root.view.n + 1
-    store.put("root", root_bytes)
-    with pytest.raises(ValueError, match="tree fact set"):
-        node.rebuild(workspace)
+    st.put("root", honest)
+    assert all_fids(n, ws) == before
 
 
 def test_rebuild_uses_an_explicit_kernel_validity_gate(
@@ -661,28 +660,36 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
         assert drain(stream, ws).ok
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
-def test_incremental_reuses_work(world):
-    """Reuse is real: a post into a promoted store loads only the tail's few
-    facts, not the whole set — the O(changed) compute win, not just O(1) IO."""
+def test_incremental_reuses_work(world, monkeypatch):
+    """Reuse is real: a post into a settled store walks the closure of the
+    touched leaf only, not every range. (Pile bytes are always re-encoded —
+    manifest.build's member-set proof — so the incremental win is the
+    closure walk and the O(1) object writes, not fact loads.)"""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    loads, scans = [], []
-    orig, keys, backfill = n.fact_of, n.keys, n._backfill_supp
-    n.fact_of = lambda w, fid: (loads.append(fid), orig(w, fid))[1]
+    resolved, scans, puts = [], [], []
+    keys = n.keys
+    store = n.store(ws)
+    real_put = store.put
+    real = node_module.resolve_deps
+    monkeypatch.setattr(
+        node_module, "resolve_deps",
+        lambda fact, db: (resolved.append(fact.fid), real(fact, db))[1])
+    monkeypatch.setattr(
+        store, "put", lambda k, b: (puts.append(k), real_put(k, b))[1])
     n.keys = lambda *args: (scans.append("keys"), keys(*args))[1]
-    n._backfill_supp = lambda *args: (
-        scans.append("backfill"), backfill(*args))[1]
     try:
         cmds.post(n, ws, "general", "incremental", ts=3_000_000)
     finally:
-        n.fact_of = orig
         n.keys = keys
-        n._backfill_supp = backfill
     assert total > 30
-    assert scans == []
-    assert len(set(loads)) < total // 2, \
-        f"loaded {len(set(loads))} of {total} facts — reuse isn't skipping ranges"
+    assert scans == ["keys"]  # one index-only key scan per settle
+    objects = [k for k in puts if k.startswith("obj/")]
+    assert len(objects) == 2, \
+        f"O(1) object writes: touched leaf pile + manifest, got {objects}"
+    assert len(set(resolved)) < total // 2, \
+        f"resolved {len(set(resolved))} of {total} closures — the memo " \
+        "isn't skipping settled ranges"
 
 
 def test_shadow_guard_keeps_identity(world):
@@ -702,9 +709,9 @@ def test_shadow_guard_keeps_identity(world):
 
 def test_removal_set_rides_the_root(world):
     n, ws = world
-    root = tree.decode_root(n.store(ws).get("root"))
+    globals_ = manifest.decode_root(n.store(ws).get("root"))[1]
     carol = [m["pk"] for m in cmds.members(n, ws) if m["name"] == "carol"]
-    assert root.globals_ == frozenset({("removal", carol[0])})
+    assert globals_ == frozenset({("removal", carol[0])})
 
 
 def test_poison_pile_is_litter_not_poison(world):

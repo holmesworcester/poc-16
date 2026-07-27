@@ -159,7 +159,8 @@ the bead notes instead of improvising a third design.
    line and writing bodies that test the docstring's claim.
 3. Run `python -m pytest -q` from the worktree root (~30 s). Green includes
    skips; red or error is never left behind. For sync-touching work also run
-   the slow end-to-end file: `python -m pytest -q tests/test_engine.py`.
+   the slow end-to-end file: `python -m pytest -q tests/test_cutover.py`
+   (`tests/test_engine.py` died with the tree engine in oyd.5).
 4. Every DELETE in the brief means delete now, in this bead — not comment
    out, not deprecate. After deleting symbol X, `grep -rn "X" core/ facts/
    tests/ bench/` must show nothing (or only the brief-listed survivors).

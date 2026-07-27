@@ -275,6 +275,15 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
             lambda fid: resolve_deps(by_fid[fid], db) or [],
             by_fid.get,
         )
+        # The delivery-order theorem (was test_suppression_proof
+        # .assert_closed): every explicit dependency precedes the fact that
+        # needs it in a serialized unit, with no duplicates.
+        positions = {fact.fid: index for index, fact in enumerate(closed)}
+        assert len(positions) == len(closed)
+        assert all(
+            ref in positions and positions[ref] < positions[fact.fid]
+            for fact in closed for _, ref in fact.refs()
+        )
         assert drain(closed, root.fid).ok
         db.close()
 
@@ -405,3 +414,27 @@ def test_order_matters_seen_set(anchor_chain):
     m = message(pk, "c", "hi", ts)
     s = signature(sk, pk, m, ts)
     assert not judge([g, m, s], g.fid)  # sig after its dependent: unmet need
+
+
+def test_single_judge_loop():
+    """kernel._judge is THE one judging loop (was test_engine's law over
+    hoist+kernel; the hoist half died with the tree): a single for-loop,
+    reached from kernel()."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "core"
+    module = ast.parse((root / "kernel.py").read_text())
+    defs = {
+        node.name: node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    assert sum(isinstance(node, ast.For)
+               for node in ast.walk(defs["_judge"])) == 1
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_judge"
+        for node in ast.walk(defs["kernel"])
+    )

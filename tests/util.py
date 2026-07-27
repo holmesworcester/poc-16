@@ -3,11 +3,10 @@ import base64
 import os
 import random
 import tempfile
-from dataclasses import replace
 
 import facts
 
-from core import cmds, daemon, tree
+from core import cmds, daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact
@@ -18,7 +17,6 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import offer_src, resolve_deps
 from core.node import Node, now_ms
-from core.shape import FACT
 from core.suppression import TARGET, atom, is_deletion
 
 
@@ -253,28 +251,6 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 def all_fids(n, ws):
     return [fid for (fid,) in n.idx(ws).execute("SELECT fid FROM facts ORDER BY ts, fid")]
-
-
-def mismatched_tree_key(root_bytes, fetch, emit):
-    """Return a self-hashed one-leaf root whose payload and leaf key disagree."""
-    root = tree.decode_root(root_bytes)
-    branch = tree._resolved(root.view, fetch)
-    if branch.level != 1 or len(branch.children) != 1:
-        raise ValueError("fixture requires one leaf")
-    leaf = tree._resolved(branch.children[0], fetch)
-    if leaf.n != 1:
-        raise ValueError("fixture requires one fact")
-
-    timestamp, fid = leaf.keys[0].split(":", 1)
-    key = f"{int(timestamp) + 1:015d}:{fid}"
-    leaf = replace(
-        leaf, fp=FACT.fingerprint([key]), oid="", sep=key, keys=(key,))
-    leaf = replace(leaf, oid=emit(tree._node_bytes(leaf)))
-    branch = replace(
-        branch, fp=tree._fp("fat", branch.level, (leaf,)), oid="",
-        sep=key, children=(leaf,))
-    branch = replace(branch, oid=emit(tree._node_bytes(branch)))
-    return tree.encode_root(replace(root, view=branch))
 
 
 def send_bytes(node, workspace, name, data, channel="general", ts=None):

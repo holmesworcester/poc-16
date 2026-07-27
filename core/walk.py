@@ -1,4 +1,4 @@
-"""HTTP peer and pile-transfer helpers for the engine sync driver."""
+"""HTTP peer and pile-transfer helpers for the sync dial."""
 import base64
 import json
 import urllib.error
@@ -86,12 +86,6 @@ class Peer:
 
     def poke(self):
         self._http("POST", "/poke", data=b"", auth=False)
-
-
-def walk(node, ws, url):
-    """Compatibility name for the shared engine diff driver."""
-    from .sync import sync
-    return sync(node, ws, url)
 
 
 def _push(node, ws, peer, push_fids):

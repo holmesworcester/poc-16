@@ -208,42 +208,61 @@ production deletions measured, start at one object and add nothing.
 
 ## 6. Demolition inventory (clean house)
 
-Everything below is at `main@7635cf8`. Delete:
+Executed across oyd.2-.5 (pinned against `main@7635cf8`; final state below is
+the branch after the oyd.5 sweep). Deleted:
 
-- **core/shape.py** — `SUPP` shape, `_supp_key`, `SUPP_INDEX` (:127-145) and
-  the `is_deletion`/`suppkey` import (:23).
-- **core/suppression.py** — `key_bounds`, `supp_walk`, `close_deletions`
-  (:50-86). Keep `atom`, `_marker`, `is_deletion`, `suppkey`, `deathkey`,
-  `victims` — clear-envelope primitives the index reuses.
-- **core/sync.py** — the SUPP index tuple and `_empty(SUPP)` plumbing
-  (:55-66), the `close_deletions` import and call (:7, :27-29;
-  `closure_sync` returns to dep-closure only), the root-index validation
-  (:50-54) in its SUPP form.
-- **core/node.py** — supp-key maintenance on admit/restore (:195, :227,
-  :378, :480), the second `layout()` and root index publication (:620-634),
-  the suppression-tree validation walk (:684-711), `_backfill_supp` (:186),
-  and an `INDEX_VERSION` bump (:59) to force rebuild — a dev-loop stamp, not
-  compat. The `supp` **table** (:54) stays: it is the local victims index
-  that retroactive retraction needs.
-- **core/tree.py** — the closure-only secondary-index machinery whose sole
-  user was SUPP (added in 2444894 +176 and c9caaf1 +39; `sync.py:50-54`
-  proves no other index name was ever legal). Identified symbol-by-symbol in
-  the demolition bead.
-- **tests** — `test_suppression_proof.py` and the T_supp halves of
-  `test_suppression.py`/`test_eset.py`/`test_engine.py`/`test_props.py`/
-  `test_pump.py` retarget to the contracts in `tests/test_removals.py`. The
-  E = V∖S fold guard (`test_suppression_proof.py:101,104`) survives as I2's
-  test.
+- **core/tree.py, core/hoist.py, core/layout.py, core/treap.py** — the whole
+  fact-tree engine and its packings (~2,050 lines), including the
+  closure-only secondary-index machinery whose sole user was SUPP. The
+  manifest spine (core/manifest.py) plus `node.resident`'s single rebuild
+  equality replace every reader path.
+- **core/shape.py** — `SUPP` shape, `_supp_key`, `SUPP_INDEX`, `supp_shape`,
+  and with the tree the legacy flat facade (`COLD_CUT`, `GUARD`,
+  `cut_positions`), `priority`, `leaf_cut`, and the `Shape`/`FACT` bundle.
+  What survives: `CUT`, `key`, `key_parts`, `fid_of`, `boundary`,
+  `stable_cut_positions`, `fingerprint` — the pure key discipline the
+  manifest, sync, and removal index share.
+- **core/suppression.py** — `key_bounds`, `supp_walk`, `close_deletions`,
+  `SuppressionClosure` (and earlier, scalar `suppkey`/`victims`). Kept:
+  `atom`, `_markers`, `is_deletion`, `suppkeys`, `deathkey` — clear-envelope
+  primitives the index, node, and families consume.
+- **core/sync.py** — the SUPP leg, `_empty`, `closure_sync`, the root-index
+  validation, and the tree.diff loop, all replaced by the oyd.3 rewrite
+  (removal leg + oid-diff + two-wave assembly).
+- **core/node.py** — supp-key scalar maintenance, `_backfill_supp`, the
+  second `layout()`/root-index publication, the suppression-tree validation
+  walk, and `keys()`'s projection parameter. The `supp` **table** stays: it
+  is the local victims index the retroactive consult reads.
+- **core/kernel.py** — `Scratchpad` (push/pop verified path context): its
+  only production caller was `hoist.verify_once`, which died with the tree.
+  `_judge` remains the one judge loop, reached from `kernel()`.
+- **core/walk.py** — the `walk()` compat shim (its one caller,
+  `facts/auth/user.py`, now calls `sync.sync`). `Peer`/`_push`/
+  `_fetch_blobs` stay (CUTOVER §6).
+- **bench** — `bench_hoist.py`, `bench_hoist_sync.py`, `bench_treap.py`,
+  `bench_order.py` (all drove the dead tree); `measure_piles.py` is a stub
+  until oyd.7 rewrites it over the manifest spine. `bench_sync.py` and
+  `seed_chain.py` were retargeted and live.
+- **tests** — `test_suppression_proof.py`, `test_engine.py`,
+  `test_bench_order.py` deleted with their machinery. Retargeted with the
+  law intact: the E = V∖S fold guard is
+  `test_removals.py::test_e_is_the_v_minus_s_fold` (I2's frame); the
+  delivery-order theorem and single-judge-loop law live in
+  `tests/test_kernel.py`; the sync end-to-end laws moved to
+  `tests/test_cutover.py`; the publish-atomicity law is
+  `test_eset.py::test_suppression_stays_behind_the_manifest_commit` over the
+  removals slot; placement/authority laws retarget to `resident()`'s
+  rebuild equality in `test_props.py`/`test_mint.py`;
+  `tests/util.py::mismatched_tree_key` died with its subject.
 - **docs/DELETION_CLOSURE.md** — superseded by this document.
 - **beads** — epic poc-16-yez is superseded (note added on the epic; its
   open review beads .9/.14 retarget to this index; in-progress .11 is its
   owner's call).
 
-New code is `core/removals.py` (see the skeleton beside this doc) plus the
-node/pump hooks of §3.3 and the sync cutover of §5. The earlier estimate for
-the analogous flat-bucket surgery was net −70 core lines before the
-secondary-index machinery; with it, the branch should come out several
-hundred lines lighter than main.
+New code is `core/removals.py` plus the node/pump hooks of §3.3 and the sync
+cutover of §5. Net effect of the epic on `core/`: about 1,550 lines lighter
+than main (5,182 → 3,623), with `manifest.py` + `removals.py` (~420 lines)
+carrying what the ~2,050-line tree engine and the SUPP machinery used to.
 
 ## 7. Explicitly out of scope
 

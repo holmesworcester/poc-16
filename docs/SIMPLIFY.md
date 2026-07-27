@@ -1,5 +1,11 @@
 # Simplification plan — one engine, one kernel, mint = evaluate, cursored pump
 
+**Status (2026-07-26): historical.** The one tree engine this plan built was
+itself deleted in the one-store cutover (docs/CUTOVER.md; bead poc-16-oyd.5
+removed `core/tree.py`, `hoist.py`, `layout.py`, `treap.py`,
+`kernel.Scratchpad`, and `tests/test_engine.py`). This document is the record
+of that engine and of the simplification method.
+
 **Status (2026-07-25):** stages S1–S7 and production settle-node placement
 landed on the integration line: one parameterized tree engine, one kernel
 judge, pure mint, cursored pump, source-keyed projectors, the confluence suite,

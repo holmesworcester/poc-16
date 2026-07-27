@@ -68,7 +68,7 @@ def materialize(db, workspace, valid):
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
     from core.node import now_ms
-    from core.walk import walk
+    from core.sync import sync
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
     url, workspace = link_data["u"], link_data["ws"]
@@ -90,7 +90,7 @@ def accept(node, link, name):
     pile = encode_pile(bootstrap + [sig, member])  # bootstrap is already closed/topo
     node.store(workspace).put(f"pile/{node.member_for(workspace)}/{h(pile)}", pile)
     node.turn(workspace)
-    walk(node, workspace, url)
+    sync(node, workspace, url)
     return workspace
 
 

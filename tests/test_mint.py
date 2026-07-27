@@ -7,22 +7,21 @@ import random
 import pytest
 from nacl.exceptions import CryptoError
 
-from core import cmds, daemon, manifest, mint, tree
-from core.close import encode_pile
+from core import cmds, daemon, manifest, mint, shape
+from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
 from core.kernel import drain
 from facts.auth.device import bind
 from facts.auth import request
 from facts.auth.signature import signature
+from core import node as node_module
 from core.node import Node, now_ms
-from core.shape import FACT
 
 from .util import (
     add_member,
     inject_device_claim,
     invoke_mint,
-    mismatched_tree_key,
 )
 
 
@@ -45,28 +44,28 @@ def combine(*streams):
     return out
 
 
-def root_with(node, workspace, extra):
-    """Build a self-hashed root over the current facts plus ``extra``."""
+def root_with(node, workspace, extra, deps_of=None):
+    """Build a self-hashed root over the current facts plus ``extra``,
+    optionally under non-canonical closure choices (``deps_of``)."""
     store = node.store(workspace)
-    current = tree.decode_root(store.get("root"))
     fetch = lambda oid: store.get("obj/" + oid)
-    unit = combine(tree.facts(current.view, fetch, FACT), extra)
+    _, _, man, slot = manifest.decode_root(store.get("root"))
+    resident = list(node_module.resident(man, fetch))
+    unit = combine(resident, extra)
     result = drain(unit, workspace)
     assert result.ok
     by_fid = {fact.fid: fact for fact in unit}
-    deps = {valid.fact.fid: valid.deps for valid in result.valids}
+    deps = {valid.fact.fid: list(valid.deps) for valid in result.valids}
 
     def emit(raw):
         oid = h(raw)
         store.put("obj/" + oid, raw)
         return oid
 
-    view = tree.build(
-        [fact.key for fact in unit], FACT, tree.FAT,
-        by_fid.__getitem__, deps.__getitem__, emit,
-    )
-    return tree.encode_root(tree.Root(
-        view, workspace, result.globals))
+    _, forged = manifest.build(
+        [fact.key for fact in unit], by_fid.__getitem__,
+        deps_of or deps.__getitem__, emit)
+    return manifest.encode_root(workspace, result.globals, forged, slot)
 
 
 def conflict_world(path, seed):
@@ -233,7 +232,7 @@ def test_low_level_mint_requires_committed_authority(world):
 
 
 def test_stateless_mint_accepts_without_persistent_sqlite(world):
-    """A cold tree projection accepts a new request and never reads app.db."""
+    """A cold store projection accepts a new request and never reads app.db."""
     node, workspace, now, _, pile = world
     store = node.store(workspace)
     root = store.get("root")
@@ -248,20 +247,31 @@ def test_stateless_mint_accepts_without_persistent_sqlite(world):
         == (node.pk, "sync")
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
-def test_stateless_authority_rejects_payload_leaf_key_mismatch(world):
+def test_stateless_authority_rejects_a_noncanonical_leaf_pile(world):
+    """A published leaf pile must be the canonical key-ordered encoding of
+    its members; any other bytes fail resident()'s rebuild equality."""
     node, workspace, now, _, pile = world
+    for tick in range(3):
+        cmds.post(node, workspace, "general", f"m{tick}", ts=now - 9 + tick)
     store = node.store(workspace)
+    fetch = lambda oid: store.get("obj/" + oid)
 
     def emit(raw):
         oid = h(raw)
         store.put("obj/" + oid, raw)
         return oid
 
-    fetch = lambda oid: store.get("obj/" + oid)
-    corrupt = mismatched_tree_key(store.get("root"), fetch, emit)
+    anchor, globals_, man, slot = manifest.decode_root(store.get("root"))
+    entries = manifest.decode(fetch(man), fetch)
+    members = decode_pile(fetch(entries[0].leaf))[0]
+    assert len(members) > 1
+    shuffled = entries[0]._replace(
+        leaf=emit(encode_pile(list(reversed(members)))))
+    corrupt = manifest.encode_root(
+        anchor, globals_,
+        manifest.encode([shuffled] + list(entries[1:]), emit), slot)
 
-    with pytest.raises(ValueError, match="tree fact set"):
+    with pytest.raises(ValueError, match="invalid authority store"):
         mint.Authority.from_root(corrupt, fetch)
     assert mint.stateless(pile, corrupt, fetch, now) is None
 
@@ -315,95 +325,52 @@ def test_root_metadata_cannot_omit_an_eviction(tmp_path):
         node.rebuild(workspace)
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_published_authority_rejects_ephemeral_facts_at_every_boundary(
         world):
     node, workspace, now, request_facts, pile = world
     store = node.store(workspace)
-    honest = tree.decode_root(store.get("root"))
     rogue_bytes = root_with(node, workspace, request_facts)
-    rogue = tree.decode_root(rogue_bytes)
     fetch = lambda oid: store.get("obj/" + oid)
-    empty = tree.build(
-        [], FACT, tree.FAT,
-        lambda fid: None, lambda fid: (), lambda raw: h(raw),
-    )
 
-    with pytest.raises(ValueError, match="invalid authority tree"):
+    with pytest.raises(ValueError, match="invalid authority store"):
         mint.Authority.from_root(rogue_bytes, fetch)
-    for left, right in (
-            (honest.view, rogue.view),
-            (empty, rogue.view),
-            (rogue.view, empty),
-            (rogue.view, rogue.view),
-            (rogue.view, honest.view)):
-        writes = []
-        with pytest.raises(ValueError, match="merge closure"):
-            tree.merge(
-                left, right, FACT, tree.FAT, fetch,
-                lambda raw: writes.append(raw) or h(raw),
-            )
-        assert writes == []
 
     store.put("root", rogue_bytes)
     assert mint.stateless(pile, rogue_bytes, fetch, now) is None
     assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="invalid tree facts"):
+    with pytest.raises(ValueError, match="invalid store facts"):
         node.rebuild(workspace)
 
 
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_published_roots_require_canonical_settle_placement(tmp_path):
+    """The same fact set under non-canonical closure choices (empty
+    siblings) is a different, rejected root: placement is not a publisher
+    freedom (was the tree-placement law; now resident()'s rebuild equality)."""
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
-    add_member(node, workspace, "bob")
+    workspace = cmds.create(node, "alice", ts=1)
+    add_member(node, workspace, "bob", ts=10)
+    ts, cuts = 100, 0
+    while cuts < 2:  # several leaves, so closure siblings really exist
+        cuts += shape.boundary(
+            cmds.post(node, workspace, "general", f"m{ts}", ts=ts))
+        ts += 1
     now = now_ms()
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
     store = node.store(workspace)
-    honest = tree.decode_root(store.get("root"))
+    honest = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    unit = tree.facts(honest.view, fetch, FACT)
-    by_fid = {fact.fid: fact for fact in unit}
+    wrong_bytes = root_with(
+        node, workspace, [], deps_of=lambda fid: [])
 
-    def emit(raw):
-        oid = h(raw)
-        store.put("obj/" + oid, raw)
-        return oid
-
-    wrong = tree.build(
-        [fact.key for fact in unit], FACT, tree.FAT,
-        by_fid.__getitem__, lambda fid: (), emit,
-    )
-    wrong_bytes = tree.encode_root(tree.Root(
-        wrong, workspace, honest.globals_))
-    empty = tree.build(
-        [], FACT, tree.FAT,
-        lambda fid: None, lambda fid: (), lambda raw: h(raw),
-    )
-
-    assert wrong.fp == honest.view.fp
-    assert wrong.oid != honest.view.oid
-    with pytest.raises(ValueError, match="tree placement"):
+    assert wrong_bytes != honest  # same facts, different closure bytes
+    with pytest.raises(ValueError, match="store placement"):
         mint.Authority.from_root(wrong_bytes, fetch)
-    for left, right in (
-            (empty, wrong),
-            (wrong, empty),
-            (wrong, wrong),
-            (wrong, honest.view),
-            (honest.view, wrong)):
-        writes = []
-        with pytest.raises(ValueError, match="tree placement"):
-            tree.merge(
-                left, right, FACT, tree.FAT, fetch,
-                lambda raw: writes.append(raw) or h(raw),
-            )
-        assert writes == []
 
     store.put("root", wrong_bytes)
     assert mint.stateless(pile, wrong_bytes, fetch, now) is None
     assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="tree placement"):
+    with pytest.raises(ValueError, match="store placement"):
         node.rebuild(workspace)
 
 
@@ -416,7 +383,7 @@ def test_stateless_authority_is_root_stamped_and_reusable(world):
     with mint.Authority.from_root(old_root, fetch) as projection:
         assert mint.stateless(
             pile, old_root,
-            lambda _: pytest.fail("warm projection fetched the tree"),
+            lambda _: pytest.fail("warm projection fetched the store"),
             now, projection) == (node.pk, "sync")
 
         cmds.post(node, workspace, "general", "changes the root")
@@ -445,7 +412,7 @@ def test_every_mint_path_matches_randomized_canonical_conflicts(
     with mint.Authority.from_root(old_root, fetch) as old_projection:
         assert mint.stateless(
             stale, old_root,
-            lambda _: pytest.fail("matching old projection fetched the tree"),
+            lambda _: pytest.fail("matching old projection fetched the store"),
             now, old_projection)
         assert mint.stateless(
             stale, root, fetch, now, old_projection) is None
@@ -458,7 +425,7 @@ def test_every_mint_path_matches_randomized_canonical_conflicts(
             assert mint.stateless(pile, root, fetch, now) == expected
             assert mint.stateless(
                 pile, root,
-                lambda _: pytest.fail("cached mint fetched the tree"),
+                lambda _: pytest.fail("cached mint fetched the store"),
                 now, projection) == expected
             assert invoke_mint(node, workspace, pile)[1][0] \
                 == (200 if expected else 403)

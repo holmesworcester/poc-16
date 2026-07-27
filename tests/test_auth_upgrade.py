@@ -1,5 +1,6 @@
 """Upgrade coverage for workspaces persisted with the pre-rename auth tags."""
 import base64
+import json
 
 import facts
 
@@ -13,7 +14,8 @@ from facts.auth.legacy_signature import legacy_signature
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
-from core.layout import layout
+from core import manifest
+from core.crypto import h
 from core.node import INDEX_VERSION, Node
 from core.shape import boundary
 
@@ -143,7 +145,7 @@ def test_invite_link_minted_before_upgrade_redeems_after_upgrade(
 
     monkeypatch.setattr(
         "urllib.request.urlopen", lambda *args, **kwargs: Response())
-    monkeypatch.setattr("core.walk.walk", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.sync.sync", lambda *args, **kwargs: None)
     link = base64.urlsafe_b64encode(canon({
         "u": "http://legacy-peer",
         "ws": root.fid,
@@ -223,15 +225,25 @@ def test_semantic_index_upgrade_republishes_ranked_authority_closures(
         node, workspace, final)
 
     canonical_root = node.store(workspace).get("root")
-    legacy_root, objects = layout(
+    # A root over the SAME fact set whose piles embed the old minimum-fid
+    # closures instead of the current shortest-proof winners.
+    objects = {}
+
+    def emit(raw):
+        oid = h(raw)
+        objects["obj/" + oid] = raw
+        return oid
+
+    _, man = manifest.build(
         node.keys(workspace),
         lambda fid: node.fact_of(workspace, fid),
         lambda fid: _minimum_fid_deps(
             node, workspace, node.fact_of(workspace, fid)),
-        workspace,
-        node.globals(workspace),
-        None,
+        emit,
     )
+    legacy_root = manifest.encode_root(
+        workspace, node.globals(workspace), man,
+        json.loads(canonical_root)["removals"])
     assert legacy_root != canonical_root
     store = node.store(workspace)
     for key, value in objects.items():

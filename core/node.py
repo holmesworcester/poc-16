@@ -42,7 +42,7 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import FACT, key, key_parts
+from .shape import key, key_parts
 from .store import FsStore
 from .suppression import TARGET, deathkey, is_deletion, suppkeys
 
@@ -259,17 +259,12 @@ class Node:
         row = self.idx(ws).execute("SELECT j FROM facts WHERE fid=?", (fid,)).fetchone()
         return from_json(json.loads(row[0])) if row else None
 
-    def keys(self, ws, projection=FACT):
-        if projection is FACT:
-            return [
-                key_parts(ts, fid) for ts, fid in
-                self.idx(ws).execute(
-                    "SELECT ts, fid FROM facts ORDER BY ts, fid")
-            ]
-        return sorted(filter(None, (
-            projection.key(self.fact_of(ws, fid))
-            for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
-        )))
+    def keys(self, ws):
+        return [
+            key_parts(ts, fid) for ts, fid in
+            self.idx(ws).execute(
+                "SELECT ts, fid FROM facts ORDER BY ts, fid")
+        ]
 
     def globals(self, ws):
         return frozenset(self.idx(ws).execute(
@@ -757,7 +752,19 @@ class Node:
                 try:
                     stream = list(resident(man, fetch))
                 except ValueError as exc:
-                    raise ValueError(f"invalid store facts: {exc}") from exc
+                    if not republish:
+                        raise ValueError(
+                            f"invalid store facts: {exc}") from exc
+                    # A semantic index upgrade can re-pick canonical
+                    # providers for the same fact set; the old placement is
+                    # then a layout this code has no reader for. Republish
+                    # from the index under the current rule (same answer as
+                    # the foreign-stamp branch above) and read back what we
+                    # just wrote.
+                    self.commit(ws, reuse=False)
+                    raw = st.get("root")
+                    anchor, globals_, man, _ = manifest.decode_root(raw)
+                    stream = list(resident(man, fetch))
                 if ws not in {fact.fid for fact in stream}:
                     raise ValueError("store fact set")
                 result = drain_committed(stream, ws, globals_)

@@ -126,8 +126,8 @@ def resolve_deps(f: Fact, db):
     """Resolve refs and family needs to deterministic provider ids.
 
     ``None`` means an unmet need or unknown family.  The same resolver is used
-    during judgment and by the closure/layout paths, so closure edges are a pure
-    function of the accepted set.
+    during judgment and by the closure paths (manifest build, sync), so closure
+    edges are a pure function of the accepted set.
     """
     handler = facts.handler_for(f.t)
     if handler is None:
@@ -450,83 +450,3 @@ def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
         stream, anchor, mode=EVALUATE, globals_=globals_, db=db,
         canonical_db=canonical_db).ok
 
-
-# ---- verified path context --------------------------------------------------
-
-
-class Scratchpad:
-    """Push/pop verified ancestor context (sqlite :memory:, SCHEMA) around
-    the one judge loop. Memory stays O(depth · payload)."""
-
-    def __init__(self, anchor, db=None):
-        self.db = db or sqlite3.connect(":memory:")
-        self._owned = db is None
-        self.db.executescript(SCHEMA)
-        if not self.db.in_transaction:
-            self.db.execute("BEGIN")
-        self.ctx = Context(self.db, anchor)
-
-    def judge(self, stream):
-        """Judge a payload against the accumulated context and absorb it on
-        success — kernel(mode=VALIDATE) without the txn wrapper. Returns
-        (ok, accepted fids)."""
-        self.db.execute("SAVEPOINT judge")
-        try:
-            result = _judge(stream, self.ctx)
-        except Exception:
-            self.db.execute("ROLLBACK TO judge")
-            self.db.execute("RELEASE judge")
-            raise
-        if not result.ok:
-            self.db.execute("ROLLBACK TO judge")
-        self.db.execute("RELEASE judge")
-        if not result.ok:
-            return False, ()
-        return result.ok, tuple(valid.fact.fid for valid in result.valids)
-
-    def context(self, stream):
-        """Materialize an already-verified payload as context without
-        re-judging (spine reuse: ph in base_phs)."""
-        self.db.execute("SAVEPOINT context")
-        accepted = []
-        try:
-            for fact in stream:
-                if self.db.execute(
-                        "SELECT 1 FROM facts WHERE fid=?",
-                        (fact.fid,)).fetchone():
-                    continue
-                deps = resolve_deps(fact, self.db)
-                rank = proof_rank(
-                    self.db, deps) if deps is not None else None
-                if rank is None:
-                    raise ValueError(
-                        "cached payload is not dependency-closed")
-                _admit(self.db, fact, rank)
-                accepted.append(fact.fid)
-        except Exception:
-            self.db.execute("ROLLBACK TO context")
-            self.db.execute("RELEASE context")
-            raise
-        self.db.execute("RELEASE context")
-        return tuple(accepted)
-
-    def pop(self, fids):
-        """Undo one node's payload on backtrack."""
-        rows = [(fid,) for fid in fids]
-        self.db.executemany(
-            "DELETE FROM offers WHERE src=?", rows)
-        self.db.executemany(
-            "DELETE FROM proofs WHERE fid=?", rows)
-        self.db.executemany(
-            "DELETE FROM facts WHERE fid=?", rows)
-
-    def close(self):
-        if self._owned:
-            self.db.rollback()
-            self.db.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()

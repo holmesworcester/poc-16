@@ -3,18 +3,18 @@
 Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
-            "download + ingestion" number: stream the tree's one-copy closed
-            preorder, judge it through the kernel, merge by id, then one
-            tree commit. facts/s here is directly comparable to the
-            2000-5000 facts/s poc-7..13 have gotten.
+            "download + ingestion" number: fetch the manifest's leaf piles
+            and closure siblings, judge each unit through the kernel, merge
+            by id, then one commit. facts/s here is directly comparable to
+            the 2000-5000 facts/s poc-7..13 have gotten.
 
   bidi      Two peers with shared membership and disjoint message sets do
             one one-sided walk (pull differing ranges as closed units, push
             the symmetric difference as one closed pile). Both converge; we
             measure the diff.
 
-The seed is bulk-built (facts inserted straight into the index, one layout
-at the end) so setup is O(n log n), not O(n^2) — building 500k facts by
+The seed is bulk-built (facts inserted straight into the index, one manifest
+build at the end) so setup is O(n log n), not O(n^2) — building 500k facts by
 replaying 250k turns would be hopeless. The measured paths are the honest
 ones.
 
@@ -117,7 +117,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     t_auth = perf()
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
     t_layout = perf()
-    n.commit(ws)  # one full layout over the whole set
+    n.commit(ws)  # one full manifest build over the whole set
     t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
@@ -320,7 +320,7 @@ def run_catchup(scales):
     import core.shape as shape
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          f"workers, fat tree with monotone CUT={shape.CUT}\n")
+          f"workers, one-store manifest with monotone CUT={shape.CUT}\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -474,12 +474,6 @@ def main():
                 f"catchup={'y' if result['catchup']['match'] else 'N'} "
                 f"bidi={'y' if result['bidi']['match'] else 'N'}")
         return
-    if "tier" in sys.argv:
-        raise SystemExit(
-            "tier mode measured the retired moving-boundary flat layout")
-    if "cut" in sys.argv:
-        raise SystemExit(
-            "cut mode measured the retired leaf-closure flat layout")
     scales = args or [5000, 10000, 50000, 100000]
     run_catchup(scales)
     run_bidi([s for s in scales if s <= 200000] or scales)

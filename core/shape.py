@@ -1,35 +1,19 @@
-"""The pure key discipline shared by every tree packing.
+"""The pure key discipline of the one store.
 
-Everything the tree engine needs to know about WHERE a key lives — key format,
-chunk boundaries, treap priority, cut tiers, range fingerprint — and nothing
-about what a fact means. docs/SIMPLIFY.md §1.
-
-Absorbs (delete the originals in the same change):
-    layout.CUT / COLD_CUT / GUARD / boundary / _cut_positions / fingerprint
-    treap.priority / treap._fid        hoist.priority / hoist._fid
-    node.keys' inline "{ts:015d}:{fid}" format      walk's key splitting
-
-The engine (tree.py) is parametric over a Shape. Two instantiations:
-    FACT          — the canonical set order, key "<ts:015d>:<fid>"
-    supp_shape()  — T_supp, key "<suppkey>‖<tag>‖<ts>:<fid>", deletions at
-                    tag=0 so a group's deletion sorts at its head
-                    (docs/DELETION_CLOSURE.md §1)
-
+Everything a reader or writer needs to know about WHERE a fact lives —
+canonical key format, content-derived chunk boundaries, range fingerprint —
+and nothing about what a fact means. Leaf piles (manifest.build) and manifest
+shards (manifest.encode) both cut on ``boundary``; there is no second
+chunking rule. docs/CUTOVER.md §3.
 """
-from dataclasses import dataclass
-from typing import Callable
-
 from .crypto import h
-from .suppression import deathkey, suppkeys
 
-CUT = 64         # home-leaf density: the knee where a whole fetch goes
-                 # bandwidth-bound (docs/COSTS.md §6)
-COLD_CUT = 4096  # legacy flat facade: coarse cold-page density
-GUARD = 256      # legacy flat facade: fine warm-zone width
+CUT = 64  # home-leaf density: the knee where a whole fetch goes
+          # bandwidth-bound (docs/COSTS.md §6)
 
 
 def key(fact):
-    """Canonical sort key "<ts:015d>:<fid>" (today inline in node.keys)."""
+    """Canonical sort key "<ts:015d>:<fid>"."""
     return key_parts(fact.ts, fact.fid)
 
 
@@ -39,54 +23,19 @@ def key_parts(ts, fid):
 
 
 def fid_of(k):
-    """Inverse projection: the fid inside a key (treap._fid / hoist._fid)."""
+    """Inverse projection: the fid inside a key."""
     return k.rsplit(":", 1)[1]
 
 
-def boundary(fid, cut=None):
-    """A key ends a chunk iff its own hash mod cut == 0 (layout.boundary).
+def boundary(fid):
+    """A key ends a chunk iff its own hash mod CUT == 0.
     Reads only the key's own hash => history independence."""
-    return int(fid[:8], 16) % (cut or CUT) == 0
-
-
-def priority(fid):
-    """Treap priority of a boundary key: its full content hash as an int —
-    uniform, ~unique => expected-balanced shape (treap.priority)."""
-    return int(fid, 16)
-
-
-def cut_positions(fids):
-    """Legacy flat-layout positions, tiered:
-    COLD_CUT pages below the last coarse boundary <= len-GUARD, the fine CUT
-    window above it (layout._cut_positions, semantics verbatim)."""
-    if not COLD_CUT:
-        return [
-            index + 1
-            for index, fid in enumerate(fids)
-            if boundary(fid)
-        ]
-    cold = [
-        index + 1
-        for index, fid in enumerate(fids)
-        if boundary(fid, COLD_CUT)
-    ]
-    split = max(
-        (position for position in cold if position <= len(fids) - GUARD),
-        default=0,
-    )
-    return [position for position in cold if position <= split] + [
-        index + 1
-        for index, fid in enumerate(fids)
-        if index + 1 > split and boundary(fid)
-    ]
+    return int(fid[:8], 16) % CUT == 0
 
 
 def stable_cut_positions(fids):
-    """Monotone content cuts used by incremental trees.
-
-    Unlike the legacy warm/cold flat layout, adding keys never removes one of
-    these boundaries, so a fold can rebuild only the touched leaf and spine.
-    """
+    """Monotone content cuts: adding keys never removes a boundary, so a
+    settle rebuilds only the touched leaf and shard."""
     return [
         index + 1
         for index, fid in enumerate(fids)
@@ -94,58 +43,7 @@ def stable_cut_positions(fids):
     ]
 
 
-def leaf_cut():
-    """Current expected leaf width (kept callable for benchmark overrides)."""
-    return CUT
-
-
 def fingerprint(keys):
-    """fp over the IN-RANGE keys in key order only — the diff identity.
-    The closure lives in the pile but outside the fingerprinted set: fp is
-    what the walk prunes on, oid (h(pile bytes)) is what you fetch by.
-    Never conflate the two (docs/SIMPLIFY.md §0)."""
+    """fp over sorted keys only — the set identity the removal index
+    publishes beside its pile oid (docs/REMOVALS.md I4)."""
     return h("|".join(keys).encode())
-
-
-@dataclass(frozen=True)
-class Shape:
-    """The bundle tree.py is parametric over. Every member is a pure function of
-    key/fid bytes — no store, no db, no globals."""
-    key: Callable
-    fid_of: Callable
-    boundary: Callable
-    priority: Callable
-    fingerprint: Callable
-    cuts: Callable = cut_positions
-    cut: Callable = leaf_cut
-
-
-FACT = Shape(
-    key, fid_of, boundary, priority, fingerprint, stable_cut_positions,
-    leaf_cut)
-
-
-def _supp_key(fact):
-    # Legacy T_supp key: one group per fact. Deletions key by deathkey,
-    # single-group targets by their one suppkey; multi-group facts have no
-    # T_supp position (the tree dies in oyd.5; the supp table carries them).
-    death, groups = deathkey(fact), suppkeys(fact)
-    if death is not None and not groups:
-        return f"{death}|0|{key(fact)}"
-    if death is None and len(groups) == 1:
-        (group,) = groups
-        return f"{group}|1|{key(fact)}"
-    return None
-
-
-SUPP = Shape(
-    _supp_key, fid_of, boundary, priority, fingerprint,
-    stable_cut_positions, leaf_cut)
-SUPP_INDEX = "supp"
-
-
-def supp_shape():
-    """The T_supp instantiation: key
-    "<suppkey>‖<tag>‖<ts>:<fid>", tag=0 for deletions so a suppression
-    group's deletion sorts at its head; a range is one suppression key."""
-    return SUPP

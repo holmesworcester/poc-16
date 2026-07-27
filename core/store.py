@@ -1,9 +1,10 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
 Layout: root (the CAS'd workspace/index manifest, only mutable key besides
-piles/invites), obj/<hash> (tree nodes, settle piles, blobs — immutable),
-pile/<member>/<hash> (ingress), invite/<id> (public reads), and
-quarantine/<fid> (node-local retention for a previously valid pruned fact).
+piles/invites), obj/<hash> (manifest shards, leaf piles, closure siblings,
+blobs — immutable), pile/<member>/<hash> (ingress), invite/<id> (public
+reads), and quarantine/<fid> (node-local retention for a previously valid
+pruned fact).
 """
 import os
 import re
@@ -14,40 +15,6 @@ from .crypto import h
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 PAGE_BATCH = 256
-
-
-class MemStore:
-    def __init__(self):
-        self.d, self.lock = {}, threading.Lock()
-
-    def get(self, key):
-        return self.d.get(key)
-
-    def has(self, key):
-        return key in self.d
-
-    def etag(self, key):
-        b = self.d.get(key)
-        return None if b is None else h(b)
-
-    def put(self, key, b):
-        self.d[key] = b
-
-    def put_if_absent(self, key, b):
-        self.d.setdefault(key, b)
-
-    def cas(self, key, etag, b):
-        with self.lock:
-            if self.etag(key) != etag:
-                return None
-            self.d[key] = b
-            return h(b)
-
-    def list(self, prefix):
-        return sorted(k for k in self.d if k.startswith(prefix))
-
-    def delete(self, key):
-        self.d.pop(key, None)
 
 
 class FsStore:
@@ -117,12 +84,12 @@ class FsStore:
             pass
 
 
-# ---- remote trees through the same trait ------------------------------------
+# ---- remote stores through the same trait -----------------------------------
 
 
 class RemoteStore:
-    """Read-only ObjectStore over a walk.Peer, so a remote tree is fetched
-    through the same interface the engine's fetch(oid) driver wraps —
+    """Read-only ObjectStore over a walk.Peer, so a remote store is fetched
+    through the same interface the local fetch(oid) driver wraps —
     sync.py stops special-casing 'their side' (docs/SIMPLIFY.md §1)."""
 
     def __init__(self, peer):
@@ -157,4 +124,4 @@ class RemoteStore:
         return h(value) if value is not None else None
 
     def list(self, prefix):
-        raise TypeError("remote tree stores do not expose LIST")
+        raise TypeError("remote stores do not expose LIST")

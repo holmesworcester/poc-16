@@ -5,16 +5,11 @@ large files as blobs, stragglers, eviction, and restart-with-wiped-index.
 """
 import base64
 import hashlib
-import json
 import os
 import random
-import shutil
 import subprocess
 import sys
 import time
-import urllib.request
-
-import pytest
 
 from core.cli import ctl
 

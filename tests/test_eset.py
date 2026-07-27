@@ -6,12 +6,12 @@ import pytest
 
 import facts
 
+import core.manifest as manifest
 import core.removals as removals
-from core import cmds, daemon, tree
+from core import cmds, daemon
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
-from core.shape import SUPP, SUPP_INDEX
 from facts.auth.request import payload as request_payload
 
 from .util import (
@@ -163,10 +163,11 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("restart", (False, True))
-@pytest.mark.skip(reason="CUTOVER_SKIP: lands in oyd.5")
 def test_suppression_stays_behind_the_manifest_commit(
         tmp_path, monkeypatch, restart):
-    """An ahead T_supp row is invisible until the shared root CAS succeeds."""
+    """An ahead removal — admitted deletion, consult-side entry — is
+    invisible until the shared root CAS succeeds (was the ahead-T_supp-row
+    law; the published state is now the root's removals slot)."""
     node, workspace, _, _ = suppression_world(
         tmp_path / "node", monkeypatch)
     target_fid = cmds.post(
@@ -182,15 +183,13 @@ def test_suppression_stays_behind_the_manifest_commit(
             (workspace, target.fid)).fetchone() is not None
 
     def published_fids(raw):
-        root = tree.decode_root(raw)
-        supp = root.index(SUPP_INDEX)
-        return {
-            SUPP.fid_of(key)
-            for key in tree.leaf_keys(
-                supp, lambda oid: store.get("obj/" + oid), SUPP)
-        }
+        slot = manifest.decode_root(raw)[3]
+        if not slot["oid"]:
+            return set()
+        entries, _ = removals.decode(store.get("obj/" + slot["oid"]))
+        return {e.fid for e in entries}
 
-    assert target.fid in published_fids(old_root)
+    assert published_fids(old_root)  # the world's deletions already settled
     assert deletion.fid not in published_fids(old_root)
     assert projected()
     now = daemon.now_ms()
@@ -201,7 +200,7 @@ def test_suppression_stays_behind_the_manifest_commit(
 
     def observe_canonical(*args, **kwargs):
         canonical_observed.append(kwargs["canonical_db"].execute(
-            "SELECT COUNT(*) FROM supp WHERE fid=?",
+            "SELECT COUNT(*) FROM facts WHERE fid=?",
             (deletion.fid,)).fetchone()[0])
         return original_mint(*args, **kwargs)
 
@@ -229,9 +228,9 @@ def test_suppression_stays_behind_the_manifest_commit(
         candidate.append(raw)
         assert key == "root"
         assert store.get("root") == old_root
-        assert node.idx(workspace).execute(
-            "SELECT k FROM supp WHERE fid=?",
-            (deletion.fid,)).fetchone() == (SUPP.key(deletion),)
+        # the consult-side entry table is ahead of the published slot
+        assert deletion.fid in {
+            e.fid for e in node.removal_entries(workspace)}
         release_reader.set()
         assert reader_waiting.wait(timeout=5)
         raise RuntimeError("suppression manifest CAS failed")
@@ -247,9 +246,8 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert deletion.fid in published_fids(candidate[0])
     assert store.get("root") == old_root
     assert node.fact_of(workspace, deletion.fid) is None
-    assert node.idx(workspace).execute(
-        "SELECT 1 FROM supp WHERE fid=?",
-        (deletion.fid,)).fetchone() is None
+    assert deletion.fid not in {
+        e.fid for e in node.removal_entries(workspace)}
     assert observed == [(200, old_root)]
     assert canonical_observed == [0]
     assert projected()
@@ -287,11 +285,7 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert store.get("root") == candidate[0]
     assert node.fact_of(workspace, deletion.fid) == deletion
     assert deletion.fid in published_fids(store.get("root"))
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM supp WHERE fid=?",
-        (deletion.fid,)).fetchone() == (1,)
     assert not projected()
-    assert store.list("pile/") == []
     _, (code, body) = invoke_mint(node, workspace, request)
     assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
     assert canonical_observed == [0, 1]

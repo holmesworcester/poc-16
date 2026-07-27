@@ -1,5 +1,10 @@
 # Blind incremental tree update — cost analysis + prototype
 
+**Status (2026-07-26): historical.** The engine that absorbed this prototype
+(`core/tree.py`, `core/treap.py`, `bench/bench_treap.py`) was deleted in the
+one-store cutover (docs/CUTOVER.md; bead poc-16-oyd.5). The cost model and
+lower-bound argument below are the design record of the retired fat tree.
+
 **Status (2026-07-25): absorbed by the engine.** The cost floor and
 measurements remain the design record; `core/tree.py` now implements the
 sans-I/O fold once for binary, flat-compatibility, and production fat

@@ -98,7 +98,7 @@ def test_core_fact_module_has_no_family_authors():
 
 
 def test_core_judge_and_engine_do_not_name_family_policy():
-    for name in ("fact.py", "kernel.py", "node.py", "layout.py"):
+    for name in ("fact.py", "kernel.py", "node.py", "manifest.py"):
         source = (ROOT / "core" / name).read_text()
         assert '"removal"' not in source, name
         assert '"workspace"' not in source, name

@@ -19,7 +19,7 @@ import core.shape as shape
 import core.sync as sync_module
 from core import cmds
 from core.close import close, decode_pile, encode_pile
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.fact import canon
 from core.kernel import Valid, drain, resolve_deps
 from core.node import Node
@@ -36,6 +36,7 @@ from .util import (
     deliver,
     member_src,
     replay_random,
+    suppression_world,
 )
 
 SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
@@ -555,6 +556,114 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     twin.turn(ws)
     assert all_fids(twin, ws) == before
     assert twin.store(ws).list("pile/") == []
+
+
+def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    ws = cmds.create(source, "alice")
+    destination = Node(str(tmp_path / "destination"))
+    deliver(destination, ws, closed_subset(source, ws, [ws]))
+    destination.turn(ws)
+    for ordinal in range(24):
+        cmds.post(
+            source, ws, "general", f"message {ordinal}",
+            ts=source.fact_of(ws, ws).ts + ordinal + 1,
+        )
+    singles, batches, delivered = [], [], []
+    actual_pull = sync_module.pull
+
+    def capture_pull(node, w, oid, raw):
+        delivered.append(decode_pile(raw)[0])
+        return actual_pull(node, w, oid, raw)
+
+    monkeypatch.setattr(sync_module, "pull", capture_pull)
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(source, singles, batches))
+    pulled, pushed = sync_module.sync(destination, ws, "local://source")
+
+    assert (pulled, pushed) == (1, 0)
+    (stream,) = delivered  # ONE closed union pile, not per-leaf bare leaves
+    assert drain(stream, ws).ok  # deps-first: judges from empty
+    st = source.store(ws)
+    entries = manifest.decode_root(st.get("root"))[2]
+    leaf_oids = {
+        entry.leaf for entry in manifest.decode(
+            st.get("obj/" + entries), lambda oid: st.get("obj/" + oid))}
+    assert batches  # leaf piles arrive in batched waves (Peer.objs)
+    assert leaf_oids.isdisjoint(singles)  # never one GET per leaf
+    assert all_fids(destination, ws) == all_fids(source, ws)
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
+
+
+def test_sync_pushes_one_closed_deduplicated_pile(tmp_path, monkeypatch):
+    # The push contract is ONE closed pile, each closure fact once, judged
+    # whole (there is no second index leg to deduplicate against).
+    source = Node(str(tmp_path / "source"))
+    ws = cmds.create(source, "alice", ts=1)
+    destination = Node(str(tmp_path / "destination"))
+    deliver(destination, ws, closed_subset(source, ws, [ws]))
+    destination.turn(ws)
+    for ordinal in range(3):
+        cmds.post(
+            source, ws, "general", f"message {ordinal}", ts=10 + ordinal)
+    before = set(all_fids(destination, ws))
+    pushed_piles = []
+    monkeypatch.setattr(
+        sync_module, "Peer", peer_for(destination, [], [], pushed_piles))
+    pulled, pushed = sync_module.sync(source, ws, "local://destination")
+
+    seen = set()
+    for raw in pushed_piles:
+        unit = decode_pile(raw)[0]
+        fids = {fact.fid for fact in unit}
+        assert drain(unit, ws).ok
+        assert seen.isdisjoint(fids)
+        seen.update(fids)
+
+    assert pulled == 0
+    assert pushed == len(set(all_fids(source, ws)) - before)
+    assert len(pushed_piles) == 1
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
+
+
+def test_sync_pulls_a_missing_deletion_through_the_removal_leg(
+        tmp_path, monkeypatch):
+    # A missing removal needs no closure range augmentation: the
+    # removal-index leg runs first, judges the removal's closure through
+    # the ordinary ingress, and both roots (fact manifest AND removals
+    # {oid, fp} slot) converge (REMOVALS.md §5, §2).
+    source, ws, _, _ = suppression_world(
+        tmp_path / "source", monkeypatch,
+        initial_secret=load_sk(f"{1:064x}"))
+    targets = [
+        cmds.post(
+            source, ws, "wide", f"message {ordinal}", ts=200 + ordinal)
+        for ordinal in range(32)
+    ]
+    deletion = channel_delete(targets[0], "wide", 300)
+    source.ingest_new(ws, [deletion], {deletion.fid: [targets[0]]})
+    destination = Node(str(tmp_path / "destination"))
+    existing = set(all_fids(source, ws)) - {deletion.fid}
+    deliver(destination, ws, closed_subset(source, ws, existing))
+    destination.turn(ws)
+    slot_before = manifest.decode_root(
+        destination.store(ws).get("root"))[3]
+    assert slot_before["fp"]  # the world's own deletions already settled
+
+    monkeypatch.setattr(sync_module, "Peer", peer_for(source, [], []))
+    pulled, pushed = sync_module.sync(destination, ws, "local://source")
+
+    # The removal leg alone landed the deletion: by the time the fact leg
+    # diffed, both manifests already agreed. Stub pull_removals out and
+    # this reads (1, 0) from the fact-leg fallback.
+    assert (pulled, pushed) == (0, 0)
+    assert destination.fact_of(ws, deletion.fid) == deletion
+    slot = manifest.decode_root(destination.store(ws).get("root"))[3]
+    assert slot != slot_before
+    assert slot == manifest.decode_root(source.store(ws).get("root"))[3]
+    assert all_fids(destination, ws) == all_fids(source, ws)
+    assert destination.store(ws).get("root") == source.store(ws).get("root")
 
 
 # ---- oyd.4: read contract + retraction --------------------------------------
