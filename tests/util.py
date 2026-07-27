@@ -4,8 +4,6 @@ import os
 import random
 import tempfile
 
-import facts
-
 from core import cmds, daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
@@ -55,6 +53,12 @@ def multi_group_post(channel, author, text, ts):
 
 
 class DeletionFamily:
+    """Deliberately kept raw-fact deletion family (production deletions
+    author through facts/content/delete.py): the needs()-free monkeypatch
+    base for KillFamily/MultiGroupFamily and for adversarial fixtures whose
+    victims are auth facts outside the content family's channel-marker
+    domain (test_prune_restore_keeps_removals, test_dep_evidence_not_
+    suppressed)."""
     TAG = "channel_delete"
     TABLES = ()
     DURABLE = True
@@ -105,9 +109,9 @@ class MultiGroupFamily(DeletionFamily):
             fact.body.get("text"), fact.ts)
 
 
-def suppression_world(path, monkeypatch, initial_secret=None):
-    """A valid set with targets and deletions, authored in one fixed order."""
-    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
+def suppression_world(path, initial_secret=None):
+    """A valid set with targets and PRODUCTION deletions
+    (facts/content/delete.py via cmds.remove), authored in one fixed order."""
     node = Node(str(path), initial_secret=initial_secret)
     workspace = cmds.create(node, "alice", ts=1)
     targets = [
@@ -116,14 +120,10 @@ def suppression_world(path, monkeypatch, initial_secret=None):
             f"message-{ordinal}", ts=10 + ordinal)
         for ordinal in range(8)
     ]
-    deletions = []
-    for ordinal in (1, 4, 6):
-        target = node.fact_of(workspace, targets[ordinal])
-        deletion = channel_delete(
-            target.fid, target.body["chan"], 100 + ordinal)
-        node.ingest_new(
-            workspace, [deletion], {deletion.fid: [target.fid]})
-        deletions.append(deletion.fid)
+    deletions = [
+        cmds.remove(node, workspace, targets[ordinal], ts=100 + ordinal)
+        for ordinal in (1, 4, 6)
+    ]
     return node, workspace, targets, deletions
 
 

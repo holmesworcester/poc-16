@@ -831,14 +831,29 @@ class Node:
         site and the settle read (CUTOVER §2.4, DRY): the last published
         slot's entries (grow-only across prune/restore, I1) overlaid with
         entries derived from resident deletion facts at the author
-        chokepoint (I6) — where node.commit's slot gets them too."""
+        chokepoint (I6) — where node.commit's slot gets them too.
+
+        A removal whose target is not resident yields NO entry: it can
+        suppress nothing, and this accessor runs inside merge's
+        transaction, so a derivation that raises here retries forever on
+        every turn() — one such fact would wedge a workspace permanently
+        (families reject such targets too; this is the belt)."""
         table = {e.fid: e for e in self._published(ws)[0]}
         for (fid,) in self.idx(ws).execute("SELECT fid FROM facts"):
             fact = self.fact_of(ws, fid)
             if is_deletion(fact):
-                table[fid] = removals.entry(
-                    fact, lambda dep: key(self.fact_of(ws, dep)))
+                try:
+                    table[fid] = removals.entry(fact, lambda dep: key(
+                        self._resident(ws, dep)))
+                except ValueError:
+                    continue
         return tuple(table.values())
+
+    def _resident(self, ws, fid):
+        fact = self.fact_of(ws, fid)
+        if fact is None:
+            raise ValueError("target is not resident")
+        return fact
 
     def _removal_of(self, ws, fid):
         """A removal fact by fid, resident or quarantined: an index entry

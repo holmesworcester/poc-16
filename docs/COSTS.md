@@ -5,6 +5,9 @@ pinned to Cloudflare Workers + R2. Corpus constants measured by
 `bench/measure_piles.py` against this branch's engine (production `tree.build`,
 fanout 64, leaf density CUT=8); cloud constants are Cloudflare's published
 limits and prices as of this writing — re-verify before contract-level bets.
+§3.1 (dated 2026-07-26, oyd.7) adds the CUT=64 re-measurement on the adopted
+one-store layout, including the first production-deletion numbers; the CUT=8
+tables stand as the historical baseline they were decided against.
 
 The question this document answers: **"piles are full closure, with large
 blob spillover" is the simplest possible encoding — does anything actually
@@ -131,6 +134,92 @@ Findings:
    per leaf (flat), head-clustered (old auth facts sort low). Resolving
    closure by *fetching home leaves* costs a handful of GETs, once, cached.
 
+### 3.1 CUT=64 one-store re-measurement (2026-07-26, branch removal-index)
+
+The adopted layout (config E: home-leaf piles + key refs + closure
+siblings + manifest spine + removal index), measured by the rewritten
+`bench/measure_piles.py` — same four corpus shapes, now SEEDED (identities
+from a deterministic stream, so these numbers are byte-stable per seed).
+A second seed (8, measured 2026-07-26) reproduces every trend and ordering
+and is mostly slightly worse: ρ moves ≤ 0.04, cold GETs +4 to +11, but
+per-point commit *bytes* swing up to 2.2× (116 → 54 KB) and tail leaves
+1-2 → 2-3. **Read the trends and the orders of magnitude, not the points.**
+ρ_E = reachable store bytes (root + shards + leaf piles + siblings +
+index) / canonical fact bytes:
+
+| corpus | facts | leaves | ρ_E | leaf med / p95 | sibling med (n) | shards (depth) | cold GETs | tail: leaves/40 msgs |
+|---|---|---|---|---|---|---|---|---|
+| 600 msgs, 8 flat | 1,233 | 18 | **1.07** | 17.3 / 93.5 KB | 1.8 KB (15) | 4.0 KB (1, d1) | 20 | 1 of 18 |
+| 2,400 msgs, 8 flat | 4,833 | 65 | **1.06** | 17.0 / 81.6 KB | 2.1 KB (51) | 14.2 KB (1, d1) | 67 | 2 of 66 |
+| 2,400 msgs, 32 flat | 4,929 | 79 | **1.18** | 16.6 / 68.4 KB | 3.9 KB (76) | 17.5 KB (3, d2) | 83 | 1 of 79 |
+| 2,400 msgs, 32 chain | 4,929 | 79 | **1.23** | 16.1 / 60.5 KB | 9.1 KB (47) | 17.2 KB (1, d1) | 81 | 1 of 80 |
+
+(Shard depth is a content-cut draw, not a size threshold: the two 79-leaf
+corpora landed on different depths because sharding cuts where a
+separator's fid hash says so.)
+
+Three things this table does *not* say. It is measured **before** the
+deletion mix, so ρ_E's index term is zero here — the measured index size
+is in the next table, and folding it in adds ~1.5-2% to ρ. The cold-GET
+column is `1 + shards + leaves` and so **excludes the one removal-index
+GET** a real cold clone pays (+1, and it is counted in §4's depth). And
+`p95` over 18 leaves *is* the max (the 600-msg row's 93.5 KB); the largest
+leaf measured anywhere is 232 KB (2,400 msgs, 8 flat, p95 81.6 KB).
+
+The deletion mix — 2% single-target removals through the production
+family (`facts/content/delete.py`, one commit each) plus one channel kill
+per corpus (the synthetic kill fixture: production has no kill family
+yet):
+
+| corpus | removals | index bytes / entries / refs | head width | index B per removal | per-point commit (objects, bytes med) | warm-range slice |
+|---|---|---|---|---|---|---|
+| 600 msgs, 8 flat | 12 + 1 | 8.4 KB / 13 / 66 | 1 | 646 B | 4, 31.6 KB | 2 of 13 |
+| 2,400 msgs, 8 flat | 48 + 1 | 29.5 KB / 49 / 218 | 1 | 601 B | 4, 116 KB | 1 of 49 |
+| 2,400 msgs, 32 flat | 48 + 1 | 33.1 KB / 49 / 262 | 1 | 676 B | 5, 75 KB | 1 of 49 |
+| 2,400 msgs, 32 chain | 48 + 1 | 36.1 KB / 49 / 298 | 1 | 737 B | 4-5, 61 KB | 1 of 49 |
+
+Retraction correctness held at scale in all four corpora (asserted in the
+harness): every point victim and every killed-channel row gone from
+`message_rows`, every survivor present — 387 retracted / 2,013 surviving
+in each 2,400-message corpus. The prune cascade was exercised on
+flat-m8-n600 (shadowed-deleter quarantine, REMOVALS.md §8): removal
+quarantined while its victim stayed resident, entry floor held, suppression
+held through the window and after restore.
+
+CUT=64 findings, measured against the projections above and in §4-§6:
+
+1. **The ρ collapse is real and better than the flat projection, but ρ is
+   not fully shape-free.** 2.2-8.5 (CUT=8 resident closure) → 1.06-1.23.
+   §4's ~1.1 holds exactly for the 8-member flat shape; 32 members and the
+   chain still show through the closure *siblings* (median 1.8 KB → 9.1 KB,
+   ρ 1.18-1.23) — bounded and off the warm path now, unbounded and on every
+   leaf before.
+2. **Cold GETs ≈ facts/60 + shards + 2** (81-83 in the table, +1 for the
+   index leg it omits, at ~4.9k facts) → ~1.7k at 100k facts, ~7× under
+   §4's "~12.7k" (that row was priced at CUT=8).
+3. **p95 leaf 61-93 KB, max 232 KB** — the small corpus exceeds §6's
+   "p95 ≈ 70 KB" sketch (93.5 KB, which at 18 leaves is its max), and the
+   worst single leaf anywhere is 232 KB; still ~90× under the Worker
+   decode bar.
+4. **Warm deltas touch 1-3 leaves per 40 messages** at CUT=64 (was 9-15 at
+   CUT=8; 1-2 at seed 7, 2-3 at seed 8); a touched leaf is 17-93 KB
+   typical, so a warm delta lands at 20-150 KB — and even 2 worst-case
+   232 KB leaves stay inside the ≤500 KB warm bar.
+5. **Index growth ≈ 600-740 B per removal, refs-dominated** (~5-6 closure
+   keys per removal at ~80 B each; the entry itself is ~100 B). At 2%
+   deletions of a 100k corpus (~1k removals) the whole index is ~0.7 MB —
+   read-whole stays right (§5 of REMOVALS.md), the size dial untouched.
+   Head width stays 1 per kill; a warm 40-message range stabs 1-2 entries.
+6. **A point removal commits 4-5 objects (31-116 KB median)** — dominated
+   by re-emitting its own tail leaf pile; the index object is the small
+   part. ~5 Class A puts per deletion at R2 prices is noise.
+7. **NEW COST — settle garbage.** `obj/` is content-addressed and never
+   collected, so disk is already 1.6-1.9× reachable bytes (3.5-4.0 MB vs
+   1.9-2.2 MB) even with 64-message commit batching; superseded leaves and
+   index piles accrete per *commit*, not per corpus. Storage dollars don't
+   bind, but the GC posture (REMOVALS.md §7 "zero bytes reclaimed") now
+   has its first measured growth number.
+
 ## 4. The configurations against the bars (100k facts ≈ 50k messages, 37 MB corpus)
 
 | | (A) full-closure piles | (B) main: per-body + hoist | (E) home-leaf piles + key refs |
@@ -147,6 +236,15 @@ Findings:
 (B) fails cold wall-clock on request count and pays ~1× corpus in pure hash
 overhead. (A) fails the cold-ρ bar as soon as the invite graph is deep, which
 it will be. (E) passes every bar.
+
+**(E) adopted — measured 2026-07-26** (CUT=64 one-store build, §3.1;
+scaled from the 4.9k-fact corpora): cold GETs **~1.7k** (projected ~12.7k —
+a CUT=8 price), cold bytes **~40-45 MB** (projected ~42-46), cold ρ
+**1.06-1.07 flat-8 / 1.18-1.23 at 32 members or a chain** (projected ~1.1),
+serial depth root → shards → leaf wave = **3, +1 for the removal leg**
+(projected ~5-6). Every bar passes with margin; the one number that moved
+against us is ρ's residual shape-dependence via the siblings (finding 1,
+§3.1).
 
 ## 5. Verdict: the simplest model that survives
 
@@ -290,6 +388,13 @@ Why each rejected simpler/other option loses, in one line each:
 
 ## 7. Re-running
 
-`python3 bench/measure_piles.py all` builds the four corpora through the
-real ingress and prints the table's raw numbers (deterministic, ~3 min).
-Configurations and output schema are at the top of the script.
+`python3 bench/measure_piles.py all` (optionally `--out DIR`, `--seed N`
+— §3.1's tables are seed 7 and its cross-seed caveat is `--seed 8` — or a
+single tag such as `flat-m8-n2400`) builds the four corpora through the real
+ingress against the one-store layout, runs the deletion mix (production
+point removals + one synthetic kill) and the flat-m8-n600 prune cascade,
+prints §3.1's raw numbers, and writes one JSON per corpus (deterministic,
+seeded, ~1.5 min total). Corpus shapes and the output schema are at the top
+of the script. The historical CUT=8 numbers in §3 came from this script's
+pre-cutover version at commit f1e5016; the fact-tree engine it drove is
+deleted, so they are frozen, not re-runnable.

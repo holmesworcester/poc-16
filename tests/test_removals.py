@@ -1,7 +1,6 @@
 """Contract for the grow-only removal index (docs/REMOVALS.md).
 
-Section and invariant numbers cite docs/REMOVALS.md; the remaining
-skeletons land with oyd.4 (retraction) and oyd.7 (production family).
+Section and invariant numbers cite docs/REMOVALS.md.
 """
 import pytest
 
@@ -13,6 +12,7 @@ import core.shape as shape
 import core.sync as sync_module
 from core import cmds
 from core.crypto import h, keypair, load_sk
+from core.close import decode_pile
 from core.fact import Fact, canon
 from core.node import Node
 from core.suppression import TARGET, atom, deathkey, is_deletion, suppkeys
@@ -25,6 +25,7 @@ from .util import (
     DeletionFamily,
     add_member,
     all_fids,
+    author_msg,
     channel_delete,
     channel_kill,
     closed_subset,
@@ -34,8 +35,6 @@ from .util import (
     multi_group_post,
     suppression_world,
 )
-
-SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
 
 
 def victim_key(*victims):
@@ -325,7 +324,7 @@ def test_poisoned_entry_does_not_block_the_index(tmp_path, monkeypatch):
     removal is excluded from the admitted tuple even though its closure
     lands, and the destination re-derives the honest span itself."""
     source, workspace, _, deletions = suppression_world(
-        tmp_path / "source", monkeypatch,
+        tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
     destination = Node(str(tmp_path / "destination"))
     survivors = set(all_fids(source, workspace)) - set(deletions)
@@ -381,7 +380,7 @@ def test_removal_before_victim_retracts_on_arrival(tmp_path, monkeypatch):
     consult, keeps it out of E (the point legs cannot pin this hook: a
     point removal's victim always rides its removal's own closure)."""
     source, workspace, targets, deletions = suppression_world(
-        tmp_path / "source", monkeypatch,
+        tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
     dead = {targets[ordinal] for ordinal in (1, 4, 6)}
     monkeypatch.setattr(sync_module, "Peer", local_peer(source))
@@ -465,6 +464,10 @@ def test_prune_restore_keeps_removals(tmp_path, monkeypatch):
     window (and an index rebuild inside it), and suppression HOLDS at every
     step — E excludes the victim before the cascade, inside the window,
     after the rebuild, and after restore."""
+    # DeletionFamily kept deliberately: the victim is an AUTH fact (a device
+    # claim, no channel marker — outside the production content family) and
+    # a needs()-free removal isolates the cascade to the victim edge alone;
+    # the removal-side cascade is the production-family test below.
     monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "root", ts=1)
@@ -560,7 +563,7 @@ def test_e_is_the_v_minus_s_fold(tmp_path, monkeypatch):
     themselves stay in E, and S is exactly the applies() fold, kills and
     points alike."""
     monkeypatch.setitem(facts.ROUTES, KillFamily.TAG, KillFamily)
-    node, ws, targets, _ = suppression_world(tmp_path / "node", monkeypatch)
+    node, ws, targets, _ = suppression_world(tmp_path / "node")
     kill = channel_kill("channel-0", 300)
     node.ingest_new(ws, [kill], {kill.fid: []})
 
@@ -582,12 +585,11 @@ def test_e_is_the_v_minus_s_fold(tmp_path, monkeypatch):
     } == e
 
 
-def test_fact_tree_fingerprints_unchanged_by_removal(tmp_path, monkeypatch):
+def test_fact_tree_fingerprints_unchanged_by_removal(tmp_path):
     """Admitting a removal changes its OWN home leaf and the index slot —
     never a victim's leaf (I5 in one-store terms): no other range's leaf
     byte, key, or sibling moves, so cold ranges stay cold and the
     root-etag short-circuit keeps meaning "nothing to do"."""
-    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     first = cmds.post(node, workspace, "general", "m100", ts=100)
@@ -605,8 +607,8 @@ def test_fact_tree_fingerprints_unchanged_by_removal(tmp_path, monkeypatch):
     assert home != before[-1]  # the victim's range is genuinely elsewhere
     assert slot == {"oid": "", "fp": ""}
 
-    deletion = channel_delete(victim.fid, "general", ts + 1000)
-    node.ingest_new(workspace, [deletion], {deletion.fid: [victim.fid]})
+    deletion = node.fact_of(
+        workspace, cmds.remove(node, workspace, victim.fid, ts=ts + 1000))
 
     man, slot = manifest.decode_root(st.get("root"))[2:]
     after = manifest.decode(fetch(man), fetch)
@@ -620,11 +622,10 @@ def test_sync_fetches_removals_before_fact_ranges(tmp_path, monkeypatch):
     """One index fetch ahead of the fact walk replaces the SUPP leg and
     close_deletions range augmentation (§5)."""
     source, workspace, targets, _ = suppression_world(
-        tmp_path / "source", monkeypatch,
+        tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
-    target = source.fact_of(workspace, targets[0])
-    deletion = channel_delete(target.fid, target.body["chan"], 500)
-    source.ingest_new(workspace, [deletion], {deletion.fid: [target.fid]})
+    deletion = source.fact_of(
+        workspace, cmds.remove(source, workspace, targets[0], ts=500))
     unsynced = [
         cmds.post(source, workspace, "general", f"late {i}", ts=600 + i)
         for i in range(4)
@@ -676,9 +677,230 @@ def test_sync_fetches_removals_before_fact_ranges(tmp_path, monkeypatch):
     assert all_fids(destination, workspace) == all_fids(source, workspace)
 
 
-@SKELETON
-def test_production_deletion_family():
-    """facts/content/delete.py is registered in content.MODULES; its author
-    command derives channel and span from the actual victim (I6); admitting
-    one retracts the victim's projected row and lands one index entry —
-    the first non-monkeypatched deletion end to end (REMOVALS.md §8)."""
+def test_production_deletion_family(tmp_path):
+    """facts/content/delete.py against the index contracts the monkeypatched
+    fixtures pinned (the end-to-end half is
+    tests/test_cutover.py::test_production_deletion_family): the author
+    command derives channel and span from the LOADED victim (I6), rejects
+    deleting a deletion at both command and validate (I2), and validation
+    is shape-exact — a mixed envelope (extra group marker) rejects
+    structurally, the admission-policy answer oyd.8 deferred here.
+
+    Two admission rules beyond shape, both adversarial (oyd.7 review):
+    the victim must be a DURABLE fact of a known family — an EPHEMERAL
+    target is never resident, so its entry has no key to span, and
+    admitting one would make removal_entries raise inside every merge
+    transaction forever (a member-craftable permanent workspace wedge) —
+    and the same victim is not deleted twice, since the index is grow-only.
+    The stated authorization policy is also pinned here: any MEMBER may
+    delete any member's content, a non-member may not."""
+    from facts.auth.request import request
+    from facts.content.delete import TAG, delete
+
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    secret, public = node.identity(workspace)
+    victim_fid = cmds.post(node, workspace, "general", "doomed", ts=10)
+    mate_fid = cmds.post(node, workspace, "general", "mate", ts=11)
+    victim = node.fact_of(workspace, victim_fid)
+    mate = node.fact_of(workspace, mate_fid)
+    with pytest.raises(ValueError, match="no such fact"):
+        cmds.remove(node, workspace, "f" * 64, ts=19)
+
+    fid = cmds.remove(node, workspace, victim_fid, ts=20)
+    removal = node.fact_of(workspace, fid)
+    assert removal == delete(public, "general", victim_fid, 20)  # I6 channel
+    entry = removals.entry(removal, victim_key(victim))
+    assert (entry.lo, entry.hi) == (shape.key(victim),) * 2  # I6 span
+    assert removals.admit(entry, removal)
+    assert entry in node.removal_entries(workspace)
+    assert removals.applies(removal, victim)
+    assert not removals.applies(removal, mate)  # point reach: victim only
+    assert not surfaced(node, workspace, victim_fid)
+
+    with pytest.raises(ValueError, match="never victims"):
+        cmds.remove(node, workspace, fid, ts=30)  # I2 at the command
+    recursive = delete(public, "general", fid, 30)  # I2 at validate
+    sig = signature(secret, public, recursive, 30)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        node.ingest_new(workspace, [sig, recursive], {
+            recursive.fid: [
+                fid, sig.fid, member_src(node, workspace, public)],
+            sig.fid: []})
+    assert node.fact_of(workspace, recursive.fid) is None
+
+    mixed = Fact(  # shape-exact: an extra group marker rejects whole
+        TAG, 31,
+        [atom("general", deletion=True), atom("general"),
+         ["ref", TARGET, mate_fid]], {"pk": public})
+    mixed_sig = signature(secret, public, mixed, 31)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        node.ingest_new(workspace, [mixed_sig, mixed], {
+            mixed.fid: [
+                mate_fid, mixed_sig.fid,
+                member_src(node, workspace, public)],
+            mixed_sig.fid: []})
+    assert node.fact_of(workspace, mixed.fid) is None
+    assert surfaced(node, workspace, mate_fid)  # the lie suppressed nothing
+
+    with pytest.raises(ValueError, match="already removed"):
+        cmds.remove(node, workspace, victim_fid, ts=32)  # grow-only (I1)
+    assert node.removal_entries(workspace) == (entry,)
+
+    req = request(public, "sync", 10 ** 15, 33)  # EPHEMERAL victim
+    req_sig = signature(secret, public, req, 33)
+    doom = delete(public, "general", req.fid, 34)
+    doom_sig = signature(secret, public, doom, 34)
+    member = member_src(node, workspace, public)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        node.ingest_new(workspace, [req_sig, req, doom_sig, doom], {
+            req_sig.fid: [], req.fid: [req_sig.fid, member],
+            doom_sig.fid: [], doom.fid: [req.fid, doom_sig.fid, member]})
+    assert node.fact_of(workspace, doom.fid) is None
+    node.turn(workspace)  # and the workspace still turns (the belt held)
+    assert node.removal_entries(workspace) == (entry,)
+
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=40)
+    bobs = author_msg(node, workspace, bob_secret, bob, "bob's", ts=41)
+    assert surfaced(node, workspace, bobs.fid)
+    cmds.remove(node, workspace, bobs.fid, ts=42)  # any member, any content
+    assert not surfaced(node, workspace, bobs.fid)
+    outsider_secret, outsider = keypair()  # ...but only a MEMBER
+    stranger = delete(outsider, "general", mate_fid, 43)
+    stranger_sig = signature(outsider_secret, outsider, stranger, 43)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        node.ingest_new(workspace, [stranger_sig, stranger], {
+            stranger.fid: [mate_fid, stranger_sig.fid], stranger_sig.fid: []})
+    assert surfaced(node, workspace, mate_fid)
+
+
+def test_quarantined_removal_holds_locally_but_diverges_peers(
+        tmp_path, monkeypatch):
+    """The oyd.4 adversarial scenario, pinned: a removal quarantined by its
+    OWN needs() — a shadowed deleter membership proof — while its victim
+    stays RESIDENT. Locally suppression holds through the window: the entry
+    rides the published slot (I1's floor) and _removal_of reads the
+    quarantine copy. But a fresh peer inside the window can never admit the
+    entry — the removal fact is in no manifest leaf and quarantine/ is
+    local-only — so the peer SURFACES the victim and its removals-slot fp
+    cannot converge until restore. That divergence is the design's own
+    documented gap; this test keeps it from changing silently. It also
+    pins what restore actually buys back: a FRESH reader converges (fp
+    equal; index OID legally differs — I4 is why the slot publishes an fp
+    at all), while the window peer's next pull raises out of sync.assemble.
+
+    That last assertion pins a DEFECT as current behavior, not as law: the
+    wedge is a pre-existing shadow/restore sync bug with nothing to do with
+    removals — assemble's scratch resolver reuses stale proof ranks, so the
+    flipped device_key winner never re-ranks — and it reproduces with an
+    ordinary msg and no removal anywhere (verified, oyd.7 review). It is
+    asserted here only so that fixing it fails this test loudly rather than
+    changing this scenario silently. Bead: poc-16-3tg."""
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "root", ts=1)
+    root_secret, root_pk = node.identity(workspace)
+    q_secret, q, _ = add_member(node, workspace, "q", ts=10)
+    short_secret, short, _ = add_member(
+        node, workspace, "short", inviter=(q_secret, q), ts=20)
+    deep_secret, deep, _ = add_member(node, workspace, "d1", ts=30)
+    for ordinal, name in enumerate(("d2", "d3", "deep")):
+        deep_secret, deep, _ = add_member(
+            node, workspace, name, inviter=(deep_secret, deep),
+            ts=40 + 10 * ordinal)
+    for secret, public, label in (
+            (short_secret, short, "short-primary"),
+            (deep_secret, deep, "deep-primary")):
+        node.keychain.add_identity(secret)
+        node.bind_identity(workspace, public)
+        cmds.bind_device(node, workspace, label)
+    target_secret, target = keypair()
+    node.keychain.add_identity(target_secret)
+    inject_device_claim(
+        node, workspace, deep_secret, deep, deep, target, "from-deep", 200)
+    node.bind_identity(workspace, target)
+    deleter_secret, deleter = keypair()
+    node.keychain.add_identity(deleter_secret)
+    claim = inject_device_claim(  # the deleter's ONLY membership provider
+        node, workspace, target_secret, target, deep, deleter,
+        "deleter", 201)
+    victim = author_msg(  # the victim is someone else's — it stays resident
+        node, workspace, root_secret, root_pk, "doomed", ts=250)
+
+    node.bind_identity(workspace, deleter)
+    removal = node.fact_of(
+        workspace, cmds.remove(node, workspace, victim.fid, ts=300))
+    entry = removals.entry(removal, victim_key(victim))
+    assert not surfaced(node, workspace, victim.fid)
+    assert entry in node.removal_entries(workspace)
+
+    # The shadow: a shorter conflicting claim orphans the deleter's
+    # membership; the removal follows it into quarantine — its victim not.
+    inject_device_claim(
+        node, workspace, short_secret, short, short, target,
+        "from-short", 400)
+    st = node.store(workspace)
+    for fid in (claim.fid, removal.fid):
+        assert node.fact_of(workspace, fid) is None
+        assert st.has("quarantine/" + fid)
+    assert node.fact_of(workspace, victim.fid) == victim  # RESIDENT
+    assert entry in node.removal_entries(workspace)  # published-slot floor
+    assert not surfaced(node, workspace, victim.fid)  # suppression holds
+    fetch = lambda oid: st.get("obj/" + oid)
+    man = manifest.decode_root(st.get("root"))[2]
+    published = {
+        f.fid for e in manifest.decode(fetch(man), fetch)
+        for f in decode_pile(fetch(e.leaf))[0]}
+    assert victim.fid in published  # the divergence premise, literally:
+    assert removal.fid not in published  # no leaf serves the removal
+
+    monkeypatch.setattr(sync_module, "Peer", local_peer(node))
+    peer = Node(str(tmp_path / "peer"))  # a fresh peer inside the window
+    sync_module.sync(peer, workspace, "local://node")
+    assert peer.fact_of(workspace, victim.fid) == victim
+    assert peer.fact_of(workspace, removal.fid) is None  # inadmissible
+    assert entry not in peer.removal_entries(workspace)
+    assert surfaced(peer, workspace, victim.fid)  # the peer SURFACES it
+    ours = manifest.decode_root(st.get("root"))[3]
+    theirs = manifest.decode_root(peer.store(workspace).get("root"))[3]
+    assert theirs["fp"] != ours["fp"]  # the slot cannot converge
+
+    # Restore: a direct rejoin shortens the deep proof; the deleter's
+    # membership resolves again and the removal comes back.
+    invite_secret, invite_public = keypair()
+    invitation = user_invite(root_pk, invite_public, 500)
+    invitation_sig = signature(root_secret, root_pk, invitation, 500)
+    rejoined = user(invitation, invite_secret, deep, "deep-direct", 501)
+    rejoined_sig = signature(deep_secret, deep, rejoined, 501)
+    node.ingest_new(
+        workspace,
+        [invitation_sig, invitation, rejoined_sig, rejoined], {
+            invitation_sig.fid: [],
+            invitation.fid: [
+                invitation_sig.fid, member_src(node, workspace, root_pk)],
+            rejoined_sig.fid: [],
+            rejoined.fid: [invitation.fid, rejoined_sig.fid],
+        })
+    assert node.fact_of(workspace, removal.fid) == removal
+    assert entry in node.removal_entries(workspace)
+    assert not surfaced(node, workspace, victim.fid)
+
+    fresh = Node(str(tmp_path / "fresh"))  # a fresh reader converges
+    sync_module.sync(fresh, workspace, "local://node")
+    assert fresh.fact_of(workspace, removal.fid) == removal
+    assert entry in fresh.removal_entries(workspace)
+    assert not surfaced(fresh, workspace, victim.fid)  # retro-retracted
+    ours = manifest.decode_root(st.get("root"))
+    theirs = manifest.decode_root(fresh.store(workspace).get("root"))
+    assert theirs[:3] == ours[:3]  # anchor, globals, fact manifest converge
+    assert theirs[3]["fp"] == ours[3]["fp"]  # set identity converges (I4)
+    assert theirs[3]["oid"] != ours[3]["oid"]  # ours: ride-forward refs
+
+    # ...but the WINDOW peer is wedged — a pre-existing sync defect, NOT a
+    # removal law (poc-16-3tg): assemble reuses its stale ranks, the
+    # flipped device_key winner never re-ranks, and the pull raises; even
+    # an index rebuild (same fact set, same ranks) does not free it.
+    with pytest.raises(ValueError, match="closure assembly"):
+        sync_module.sync(peer, workspace, "local://node")
+    peer.rebuild(workspace)
+    with pytest.raises(ValueError, match="closure assembly"):
+        sync_module.sync(peer, workspace, "local://node")

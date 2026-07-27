@@ -13,13 +13,15 @@ from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
 from facts.auth.request import payload as request_payload
+from facts.auth.signature import signature
+from facts.content.delete import delete
 
 from .util import (
     MultiGroupFamily,
     all_fids,
-    channel_delete,
     closed_subset,
     invoke_mint,
+    member_src,
     multi_group_post,
     projection_state,
     replay_random,
@@ -30,8 +32,7 @@ from .util import (
 def test_e_identical_across_partitions_orders_batchings(
         tmp_path, monkeypatch):
     """Random pile partitions, orders, and turn batches converge to one E."""
-    source, workspace, targets, _ = suppression_world(
-        tmp_path / "source", monkeypatch)
+    source, workspace, targets, _ = suppression_world(tmp_path / "source")
     suppressed = {targets[index] for index in (1, 4, 6)}
     effective = set(all_fids(source, workspace)) - suppressed
     referenced = {
@@ -61,16 +62,23 @@ def test_e_identical_across_partitions_orders_batchings(
         assert projection_state(peer) == expected_app
 
 
-def test_suppression_facts_not_suppressible(tmp_path, monkeypatch):
-    """A deletion targeting a deletion cannot make S shrink."""
-    node, workspace, _, deletions = suppression_world(
-        tmp_path / "node", monkeypatch)
+def test_suppression_facts_not_suppressible(tmp_path):
+    """A deletion targeting a deletion cannot make S shrink: I2 rejects at
+    the author command AND at the family validate (the production family,
+    end to end)."""
+    node, workspace, _, deletions = suppression_world(tmp_path / "node")
     first = node.fact_of(workspace, deletions[0])
-    recursive = channel_delete(first.fid, "channel-1", 200)
+    with pytest.raises(ValueError, match="never victims"):
+        cmds.remove(node, workspace, deletions[0], ts=200)
+    secret, public = node.identity(workspace)
+    recursive = delete(public, "channel-1", first.fid, 200)
+    sig = signature(secret, public, recursive, 200)
 
     with pytest.raises(ValueError, match="outside the canonical set"):
-        node.ingest_new(
-            workspace, [recursive], {recursive.fid: [first.fid]})
+        node.ingest_new(workspace, [sig, recursive], {
+            recursive.fid: [
+                first.fid, sig.fid, member_src(node, workspace, public)],
+            sig.fid: []})
 
     assert node.fact_of(workspace, recursive.fid) is None
     assert not removals.applies(recursive, first)  # I2: never a victim
@@ -78,8 +86,7 @@ def test_suppression_facts_not_suppressible(tmp_path, monkeypatch):
 
 def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
     """A v7 restart repairs unranked ref targets before serving E."""
-    node, workspace, targets, deletions = suppression_world(
-        tmp_path / "node", monkeypatch)
+    node, workspace, targets, deletions = suppression_world(tmp_path / "node")
     referenced = {targets[index] for index in (1, 4, 6)}
     expected = projection_state(node)
     index = node.idx(workspace)
@@ -112,8 +119,7 @@ def test_pre_v14_index_rebuild_recreates_supp_multiplicity(
     — the I6 under-suppression — before stamping the file v14 for good."""
     monkeypatch.setitem(
         facts.ROUTES, MultiGroupFamily.TAG, MultiGroupFamily)
-    node, workspace, targets, _ = suppression_world(
-        tmp_path / "node", monkeypatch)
+    node, workspace, targets, _ = suppression_world(tmp_path / "node")
     both = multi_group_post("channel-0", "alice", "hi", 50)
     node.ingest_new(workspace, [both], {both.fid: []})
     index = node.idx(workspace)
@@ -145,7 +151,7 @@ def test_pre_v14_index_rebuild_recreates_supp_multiplicity(
 def test_verdicts_never_read_s(tmp_path, monkeypatch):
     """Adding a valid deletion masks its target without changing validity."""
     source, workspace, targets, deletions = suppression_world(
-        tmp_path / "source", monkeypatch)
+        tmp_path / "source")
     target = targets[1]
     alone, _ = decode_pile(closed_subset(source, workspace, [target]))
     with_deletion, _ = decode_pile(closed_subset(
@@ -168,12 +174,12 @@ def test_suppression_stays_behind_the_manifest_commit(
     """An ahead removal — admitted deletion, consult-side entry — is
     invisible until the shared root CAS succeeds (was the ahead-T_supp-row
     law; the published state is now the root's removals slot)."""
-    node, workspace, _, _ = suppression_world(
-        tmp_path / "node", monkeypatch)
+    node, workspace, _, _ = suppression_world(tmp_path / "node")
     target_fid = cmds.post(
         node, workspace, "unpublished", "target", ts=300)
     target = node.fact_of(workspace, target_fid)
-    deletion = channel_delete(target.fid, "unpublished", 301)
+    deletion = delete(  # the fid cmds.remove(ts=301) authors below
+        node.identity_id(workspace), "unpublished", target.fid, 301)
     store = node.store(workspace)
     old_root = store.get("root")
 
@@ -237,8 +243,7 @@ def test_suppression_stays_behind_the_manifest_commit(
 
     monkeypatch.setattr(store, "cas", fail_before_publish)
     with pytest.raises(RuntimeError, match="manifest CAS failed"):
-        node.ingest_new(
-            workspace, [deletion], {deletion.fid: [target.fid]})
+        cmds.remove(node, workspace, target.fid, ts=301)
     reader.join(timeout=5)
 
     assert not reader.is_alive()

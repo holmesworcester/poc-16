@@ -17,9 +17,7 @@ from facts.content import chunk, file as file_family
 from facts.content.legacy_file import legacy_file
 
 from .util import (
-    DeletionFamily,
     all_fids,
-    channel_delete,
     closed_subset,
     deliver,
     member_src,
@@ -234,17 +232,13 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     assert progress(destination, workspace)["have"] == 0
 
 
-def test_late_arrival_cannot_resurrect_a_retracted_chunk(
-        tmp_path, monkeypatch):
-    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
+def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     send_bytes(node, workspace, "gone.bin", b"gone")
     chunk_fid = node.idx(workspace).execute(
         "SELECT fid FROM facts WHERE t='chunk'").fetchone()[0]
-    deletion = channel_delete(chunk_fid, "general", 10**15)
-    node.ingest_new(
-        workspace, [deletion], {deletion.fid: [chunk_fid]})
+    cmds.remove(node, workspace, chunk_fid, ts=10**15)
     assert progress(node, workspace)["have"] == 0
 
     node.log_arrivals(workspace, [chunk_fid], repeat=True)

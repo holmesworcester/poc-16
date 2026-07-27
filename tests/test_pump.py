@@ -452,8 +452,7 @@ def test_removal_join_confluence(tmp_path):
 def test_fold_pm_over_d_equals_fold_over_e(tmp_path, monkeypatch):
     """Live: fold± over random delivery orders of D. Rebuild: fold over E in
     canonical order. Identical logical app state for every suppression world."""
-    source, workspace, _, _ = suppression_world(
-        tmp_path / "source", monkeypatch)
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
     expected = projection_state(source)
     for seed in range(4):
         live = replay_random(
@@ -467,8 +466,7 @@ def test_rebuild_fires_zero_retractions(tmp_path, monkeypatch):
     """Replay scans valid deletions for S first, then folds E without '−'."""
     import core.pump as pump_module
 
-    node, workspace, targets, _ = suppression_world(
-        tmp_path / "node", monkeypatch)
+    node, workspace, targets, _ = suppression_world(tmp_path / "node")
     expected = projection_state(node)
     calls = []
     monkeypatch.setattr(

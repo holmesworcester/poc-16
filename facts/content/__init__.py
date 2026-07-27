@@ -1,7 +1,7 @@
 """Content fact-family table of contents."""
-from . import chunk, file, legacy_file, message
+from . import chunk, delete, file, legacy_file, message
 
-MODULES = (message, legacy_file, file, chunk)
+MODULES = (message, legacy_file, file, chunk, delete)
 
 APP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS message_rows(

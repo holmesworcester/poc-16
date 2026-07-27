@@ -40,8 +40,6 @@ from .util import (
     suppression_world,
 )
 
-SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
-
 
 # ---- oyd.2: manifest + residency --------------------------------------------
 
@@ -151,7 +149,7 @@ def test_history_independence_holds_with_removals(tmp_path, monkeypatch):
     ride-forward of a pruned removal's entry+refs is the one sanctioned
     history dependence, and it is local, never replayed."""
     source, ws, _, _ = suppression_world(
-        tmp_path / "source", monkeypatch,
+        tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
     root = source.store(ws).get("root")
     slot = manifest.decode_root(root)[3]
@@ -673,15 +671,14 @@ def test_sync_pulls_a_missing_deletion_through_the_removal_leg(
     # the ordinary ingress, and both roots (fact manifest AND removals
     # {oid, fp} slot) converge (REMOVALS.md §5, §2).
     source, ws, _, _ = suppression_world(
-        tmp_path / "source", monkeypatch,
+        tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
     targets = [
         cmds.post(
             source, ws, "wide", f"message {ordinal}", ts=200 + ordinal)
         for ordinal in range(32)
     ]
-    deletion = channel_delete(targets[0], "wide", 300)
-    source.ingest_new(ws, [deletion], {deletion.fid: [targets[0]]})
+    deletion = source.fact_of(ws, cmds.remove(source, ws, targets[0], ts=300))
     destination = Node(str(tmp_path / "destination"))
     existing = set(all_fids(source, ws)) - {deletion.fid}
     deliver(destination, ws, closed_subset(source, ws, existing))
@@ -718,6 +715,9 @@ def test_dep_evidence_not_suppressed(tmp_path, monkeypatch):
     removal consults, the range judges valid, and after ingestion the
     dependents sit in V and E while the dep sits in V only — deletion
     hides content, not evidence."""
+    # DeletionFamily kept deliberately: the victim is an AUTH fact (a user
+    # join) with no channel marker — outside the production content
+    # family's domain, and exactly the evidence-shaped dep this law needs.
     monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
     node = Node(str(tmp_path / "node"))
     ws = cmds.create(node, "alice", ts=1)
@@ -787,13 +787,11 @@ def test_removal_consult_in_range_only(tmp_path, monkeypatch):
     is not the law and must not be asserted.
     (Entry-before-victim masking is
     tests/test_removals.py::test_removal_before_victim_retracts_on_arrival.)"""
-    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
     source, ws, destination, ts = pair(tmp_path)
     victim = next(
         source.fact_of(ws, fid) for fid in all_fids(source, ws)
         if source.fact_of(ws, fid).t == "msg")
-    deletion = channel_delete(victim.fid, "general", ts + 50)
-    source.ingest_new(ws, [deletion], {deletion.fid: [victim.fid]})
+    cmds.remove(source, ws, victim.fid, ts=ts + 50)
     for tick in range(3):
         cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 60 + tick)
     before = set(all_fids(destination, ws))
@@ -834,9 +832,53 @@ def test_removal_consult_in_range_only(tmp_path, monkeypatch):
 # ---- oyd.7: measure + first production deletion family ----------------------
 
 
-@SKELETON
-def test_production_deletion_family():
+def test_production_deletion_family(tmp_path):
     """facts/content/delete.py is registered in content.MODULES; its author
     command derives channel and span from the actual victim (I6); admitting
     one retracts the victim's projected row and lands one index entry —
-    the first non-monkeypatched deletion end to end (REMOVALS.md §8)."""
+    the first non-monkeypatched deletion end to end (REMOVALS.md §8) — and
+    both retraction and entry survive a node restart AND a rebuild."""
+    from facts.content import delete as delete_family
+
+    assert delete_family in facts.MODULES
+    assert facts.handler_for(delete_family.TAG) is delete_family
+    node = Node(str(tmp_path / "node"))
+    ws = cmds.create(node, "alice", ts=1)
+    victim_fid = cmds.post(node, ws, "general", "doomed", ts=10)
+    spared = cmds.post(node, ws, "general", "spared", ts=11)
+    victim = node.fact_of(ws, victim_fid)
+
+    def screen(n):
+        return {src for (src,) in n.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (ws,))}
+
+    assert victim_fid in screen(node)  # projected before the deletion
+    fid = cmds.remove(node, ws, victim_fid, ts=20)
+    removal = node.fact_of(ws, fid)
+    assert removal == delete_family.delete(  # channel FROM the victim (I6)
+        node.identity_id(ws), "general", victim_fid, 20)
+    (entry,) = node.removal_entries(ws)  # ONE entry, span FROM the victim
+    assert entry == removals.Entry(shape.key(victim), shape.key(victim), fid)
+
+    assert victim_fid not in screen(node)  # the projected row retracted...
+    assert node.app.execute(
+        "SELECT 1 FROM message_rows WHERE ws=? AND src=?",
+        (ws, victim_fid)).fetchone() is None
+    assert spared in screen(node) and fid in screen(node)  # ...alone
+    slot = manifest.decode_root(node.store(ws).get("root"))[3]
+    published, _ = removals.decode(node.store(ws).get("obj/" + slot["oid"]))
+    assert published == (entry,)
+    assert slot["fp"] == removals.fingerprint(published)
+
+    node.idx(ws).close()
+    node.app.close()
+    survivor = Node(node.dir)  # restart: derived projections resume
+    assert survivor.fact_of(ws, victim_fid) == victim  # V keeps the victim
+    assert victim_fid not in screen(survivor)
+    assert tuple(survivor.removal_entries(ws)) == (entry,)
+
+    survivor.rebuild(ws)  # rebuild: the store's own units, same kernel
+    assert survivor.fact_of(ws, victim_fid) == victim
+    assert victim_fid not in screen(survivor)
+    assert spared in screen(survivor)
+    assert tuple(survivor.removal_entries(ws)) == (entry,)
