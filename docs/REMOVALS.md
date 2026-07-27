@@ -1,17 +1,21 @@
 # Removals — a grow-only, target-keyed index beside the fact tree
 
 Status: plan of record (2026-07-26). Supersedes `docs/DELETION_CLOSURE.md`
-(T_supp, epic poc-16-yez), which is deleted on this branch. Pinned against
-`main@7635cf8`; line references are to that commit. Epic: poc-16-3fo.
+(T_supp, epic poc-16-yez), which is deleted on this branch. Epic: poc-16-3fo.
 Execution: merged into the one-store cutover — `docs/CUTOVER.md`, epic
 poc-16-oyd (3fo's sync/node/demolition/proof/measure beads execute inside
 oyd.3-.7). This document remains the removal *semantics*; CUTOVER supplies
-the encoding it rides on.
+the encoding it rides on. Reading rule: §1 is design *rationale* whose code
+citations are pinned against `main@7635cf8` (that code is deleted; the
+citations are lineage, not references); §2-§5 are LIVING one-store
+semantics, kept current by the design owner; §6 is the executed demolition
+inventory. Agents editing this repo change §6 only.
 
-The one-sentence design: the fact tree stays immutable and fingerprinted over
-member keys only; deletions live in a single grow-only removal index — a head
-of range-kills followed by point entries sorted by target key — read as
-head-plus-slice by anyone evaluating a range, synced whole while small.
+The one-sentence design: the fact store stays immutable and content-
+addressed over member keys only; deletions live in a single grow-only
+removal index — a head of range-kills followed by point entries sorted by
+target key — read as head-plus-slice by anyone evaluating a range, synced
+whole while small.
 
 ## 1. Why removals get their own structure
 
@@ -182,13 +186,17 @@ closure-edge choices (`offer_src` winners; core/node.py:736), so one oid does
 not identify the set. The root slot publishes `fingerprint(sorted entry
 keys)` beside the pile oid; peers compare fingerprints.
 
-**I5 — the fact tree never notices a removal.** No fact-leaf byte, key, or
-fingerprint changes when a removal is admitted. Cold ranges stay cold
-forever; the root-etag short-circuit keeps meaning "nothing to do". This is
-the property every rejected alternative in §1 gives up. Closure needs no
-fingerprint coverage either: deps are fixed at creation and closure-
-completeness is an admission requirement, so fp over member keys already
-pins everything a valid pile contains.
+**I5 — victims' leaves never notice a removal.** A removal is an ordinary
+fact: admitting it changes its own home leaf pile and the root's removals
+slot, nothing else. No victim's leaf pile, key set, or oid changes — cold
+ranges stay cold forever, and the root-etag short-circuit keeps meaning
+"nothing to do" for them. This is the property every rejected alternative
+in §1 gives up. Closure needs no index coverage either: deps are fixed at
+creation and closure-completeness is an admission requirement, so the pile
+oid already pins everything a valid leaf contains. (Pre-cutover this
+invariant read "no fact-leaf byte changes" over a fingerprinted tree; the
+one-store manifest states the same law in oids, with the removal's own
+home leaf as the one ordinary-admission exception.)
 
 ## 5. Sync
 
