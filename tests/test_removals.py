@@ -15,7 +15,7 @@ from core import cmds
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact, canon
 from core.node import Node
-from core.suppression import TARGET, atom, is_deletion
+from core.suppression import TARGET, atom, deathkey, is_deletion, suppkeys
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
@@ -195,6 +195,31 @@ def test_multi_group_fact_reachable_by_every_declared_group():
     assert not removals.applies(point, twin)
 
 
+def test_multi_target_removal_stays_a_point_over_named_fids():
+    """A malformed 2+-TARGET removal keeps POINT reach — exactly its named
+    fids, never the group clause (_targets' contract: kind is the refs'
+    PRESENCE, §2) — while routing to the HEAD (over-approximation is safe;
+    a one-victim point span would hide the other victim, the I6
+    under-approximation), and admission rejects any point-shaped span."""
+    m1 = message("pk", "general", "hello", 1)
+    m2 = message("pk", "general", "world", 2)
+    mate = message("pk", "general", "spared", 3)
+    multi = Fact(
+        "channel_delete", 9,
+        [atom("general", deletion=True),
+         ["ref", TARGET, m1.fid], ["ref", TARGET, m2.fid]], {})
+    assert is_deletion(multi)
+
+    e = removals.entry(multi, victim_key())  # no victim lookup: head span
+    assert (e.lo, e.hi) == removals.HEAD
+    assert removals.admit(e, multi)
+    assert removals.applies(multi, m1)
+    assert removals.applies(multi, m2)
+    assert not removals.applies(multi, mate)  # shared channel group: inert
+    for k in (shape.key(m1), shape.key(m2)):  # I6: no one-victim span
+        assert not removals.admit(removals.Entry(k, k, multi.fid), multi)
+
+
 def test_predicate_never_suppresses_removals():
     """not is_deletion(f) is a correctness requirement (I2): removals are
     never victims and write no supp rows, so no removal — point or kill —
@@ -208,6 +233,19 @@ def test_predicate_never_suppresses_removals():
     assert not removals.applies(kill, kill)  # ...but never against removals
     assert not removals.applies(other_kill, kill)
     assert not removals.applies(point_at_kill, kill)
+
+    # The GUARD, not marker absence, must be load-bearing: group markers on
+    # a removal are inert (§2), so a removal may declare membership in the
+    # very group its death marker names — kill-matches-itself. Without
+    # ¬is_deletion the group clause matches and the index self-annihilates.
+    marked = Fact(
+        "channel_kill", 8,
+        [atom("general", deletion=True), atom("general")], {})
+    assert is_deletion(marked)
+    assert deathkey(marked) in suppkeys(marked)  # the self-match premise
+    assert not removals.applies(marked, marked)  # I2 holds regardless
+    assert not removals.applies(kill, marked)  # kills never reach removals
+    assert removals.applies(marked, victim)  # while staying live for content
 
 
 def test_exactly_one_death_marker_admission_rule():
@@ -252,6 +290,16 @@ def test_encode_decode_roundtrip_and_fingerprint():
     assert removals.fingerprint(entries) \
         == removals.fingerprint(reversed(entries))
     assert removals.fingerprint(entries) != removals.fingerprint(entries[:1])
+    # The fp covers SPANS, not just the removal fid set: the same removal
+    # under a different (admissible-by-design, I6-inert) lying span must
+    # not fingerprint equal — pull_removals short-circuits the index leg
+    # on fp equality, so a fid-only fp would freeze a liar's routing
+    # forever against the honest entry.
+    liar = removals.Entry(
+        shape.key_parts(999_999, victim.fid),
+        shape.key_parts(999_999, victim.fid), point.fid)
+    assert removals.admit(liar, point)  # same removal, admissible span
+    assert removals.fingerprint([entries[0]]) != removals.fingerprint([liar])
 
 
 def _crafted_root(source, workspace, entries, refs):
@@ -271,7 +319,11 @@ def _crafted_root(source, workspace, entries, refs):
 
 def test_poisoned_entry_does_not_block_the_index(tmp_path, monkeypatch):
     """Admission is per entry: one bad entry rejects alone, never
-    pile-atomically with the rest of the removal history (I3)."""
+    pile-atomically with the rest of the removal history (I3) — and the
+    sync door's removals.admit is load-bearing (I6 at pull_removals, not
+    just at the unit level): a lying-span entry for a REAL, resolvable
+    removal is excluded from the admitted tuple even though its closure
+    lands, and the destination re-derives the honest span itself."""
     source, workspace, _, deletions = suppression_world(
         tmp_path / "source", monkeypatch,
         initial_secret=load_sk(f"{1:064x}"))
@@ -287,8 +339,11 @@ def test_poisoned_entry_does_not_block_the_index(tmp_path, monkeypatch):
     honest, refs = removals.decode(src.get("obj/" + slot["oid"]))
     ghost = "d" * 64  # a removal whose closure resolves to nothing
     poisoned = removals.Entry("", "~", ghost)
+    truth = next(e for e in honest if e.fid == deletions[0])
+    widened = removals.Entry(truth.lo, "~", truth.fid)  # real removal, lie
     root, crafted = _crafted_root(
-        source, workspace, [*honest, poisoned],
+        source, workspace,
+        [e for e in honest if e.fid != truth.fid] + [widened, poisoned],
         [*refs, shape.key_parts(300, ghost)])
 
     def fetch(oid):
@@ -298,10 +353,15 @@ def test_poisoned_entry_does_not_block_the_index(tmp_path, monkeypatch):
     admitted = sync_module.pull_removals(
         destination, workspace, root, fetch)
 
-    assert {entry.fid for entry in admitted} == set(deletions)
-    assert poisoned not in admitted
-    for fid in deletions:  # the honest history landed despite the poison
+    assert {entry.fid for entry in admitted} \
+        == set(deletions) - {truth.fid}  # the lying span rejects at the door
+    assert poisoned not in admitted and widened not in admitted
+    for fid in deletions:  # the honest history landed despite the poison —
         assert destination.fact_of(workspace, fid) is not None
+    rederived = next(  # — and the author chokepoint re-derives the truth
+        e for e in destination.removal_entries(workspace)
+        if e.fid == truth.fid)
+    assert (rederived.lo, rederived.hi) == (truth.lo, truth.hi)
 
 
 def test_removal_before_victim_retracts_on_arrival(tmp_path, monkeypatch):

@@ -1,11 +1,12 @@
 """Upgrade coverage for workspaces persisted with the pre-rename auth tags."""
 import base64
 import json
+import random
 
 import facts
 
 from core import cmds
-from core.crypto import box_encrypt, kdf, keypair
+from core.crypto import box_encrypt, kdf, keypair, load_sk
 from core.fact import canon
 from facts.auth.legacy_genesis import genesis
 from facts.auth.legacy_invite import invite
@@ -19,6 +20,7 @@ from core.crypto import h
 from core.node import INDEX_VERSION, Node
 from core.shape import boundary
 
+from . import util
 from .util import (
     add_member,
     all_fids,
@@ -27,6 +29,19 @@ from .util import (
     deliver,
     member_src,
 )
+
+
+def seeded_keypair(seed):
+    """A deterministic ``crypto.keypair`` replacement: the try-N fixture
+    loops below must never depend on os.urandom draws (a rare unlucky
+    stream exhausts the loop — the known full-run flake)."""
+    rng = random.Random(seed)
+
+    def det_keypair():
+        sk = load_sk(f"{rng.getrandbits(256):064x}")
+        return sk, sk.verify_key.encode().hex()
+
+    return det_keypair
 
 
 def _minimum_fid_deps(node, workspace, fact):
@@ -164,13 +179,16 @@ def test_invite_link_minted_before_upgrade_redeems_after_upgrade(
 
 
 def test_semantic_index_upgrade_republishes_ranked_authority_closures(
-        tmp_path):
+        tmp_path, monkeypatch):
     """An old root can fingerprint the same ids but embed different closures.
 
     Opening it under a proof-ranked index contract must publish a fresh layout,
     not stamp or memoize the old minimum-fid leaf piles.
     """
-    node = Node(str(tmp_path / "old-layout"))
+    det_keypair = seeded_keypair(0x516)
+    monkeypatch.setattr(util, "keypair", det_keypair)  # add_member's draws
+    node = Node(
+        str(tmp_path / "old-layout"), initial_secret=load_sk(f"{5:064x}"))
     workspace = cmds.create(node, "root", ts=1)
     bob_secret, bob, original = add_member(node, workspace, "bob", ts=10)
     q_secret, q, _ = add_member(node, workspace, "q", ts=20)
@@ -178,7 +196,7 @@ def test_semantic_index_upgrade_republishes_ranked_authority_closures(
         node, workspace, "deep", ts=30, inviter=(q_secret, q))
 
     for ordinal in range(1000):
-        invite_secret, invite_public = keypair()
+        invite_secret, invite_public = det_keypair()
         invitation = user_invite(
             deep, invite_public, 100 + ordinal * 2)
         rejoined = user(

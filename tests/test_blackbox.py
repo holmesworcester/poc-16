@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 import random
+import socket
 import subprocess
 import sys
 import time
@@ -14,7 +15,27 @@ import time
 from core.cli import ctl
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORTS = {"alice": 17311, "bob": 17312, "carol": 17313}
+
+
+def _free_ports(names):
+    """OS-assigned ports instead of fixed numbers: concurrent suites on one
+    machine collided on 17311-13 (the known flake). The daemon CLI cannot
+    report a port-0 binding back, so bind-and-release is the closest the
+    harness can get; all sockets are held open together so the answers are
+    distinct."""
+    socks = [socket.socket() for _ in names]
+    try:
+        for sock in socks:
+            sock.bind(("127.0.0.1", 0))
+        return {
+            name: sock.getsockname()[1]
+            for name, sock in zip(names, socks)}
+    finally:
+        for sock in socks:
+            sock.close()
+
+
+PORTS = _free_ports(("alice", "bob", "carol"))
 
 
 def url(who):

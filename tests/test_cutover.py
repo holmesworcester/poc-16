@@ -26,6 +26,7 @@ from core.node import Node
 from facts.auth.signature import signature
 from facts.content.message import message
 
+from . import util
 from .util import (
     DeletionFamily,
     add_member,
@@ -48,20 +49,38 @@ SKELETON = pytest.mark.skip(reason="skeleton: contract only, body unwritten")
 @pytest.fixture(scope="module")
 def world(tmp_path_factory):
     """A settled store wide enough to hold several home leaves, authored by
-    an invite chain so its closures genuinely cross leaf boundaries."""
-    node = Node(str(tmp_path_factory.mktemp("cutover") / "node"))
-    ws = cmds.create(node, "alice", ts=1)
-    actors = [node.identity(ws)]
-    for step, name in enumerate(("bob", "carol", "dave")):
-        sk, pk, _ = add_member(
-            node, ws, name, ts=10 * step + 10, inviter=actors[-1])
-        actors.append((sk, pk))
-    ts, cuts = 100, 0
-    while cuts < 2:  # post until the content cut has actually fired twice
-        sk, pk = actors[ts % len(actors)]
-        msg = author_msg(node, ws, sk, pk, f"m{ts}", ts=ts)
-        cuts += shape.boundary(msg.fid)
-        ts += 1
+    an invite chain so its closures genuinely cross leaf boundaries.
+
+    Deterministic: every key comes from a seeded stream, so the corpus —
+    cut positions, sibling contents, closure depths — is byte-identical
+    every run. The shape preconditions below (deep chains, siblings on a
+    content range) are then facts of THIS corpus, not of a lucky draw
+    (unseeded keypairs were the cold-partial full-run blip)."""
+    rng = random.Random(0xC01D)
+
+    def det_keypair():
+        sk = load_sk(f"{rng.getrandbits(256):064x}")
+        return sk, sk.verify_key.encode().hex()
+
+    real, util.keypair = util.keypair, det_keypair
+    try:
+        node = Node(
+            str(tmp_path_factory.mktemp("cutover") / "node"),
+            initial_secret=load_sk(f"{3:064x}"))
+        ws = cmds.create(node, "alice", ts=1)
+        actors = [node.identity(ws)]
+        for step, name in enumerate(("bob", "carol", "dave")):
+            sk, pk, _ = add_member(
+                node, ws, name, ts=10 * step + 10, inviter=actors[-1])
+            actors.append((sk, pk))
+        ts, cuts = 100, 0
+        while cuts < 2:  # post until the content cut has actually fired twice
+            sk, pk = actors[ts % len(actors)]
+            msg = author_msg(node, ws, sk, pk, f"m{ts}", ts=ts)
+            cuts += shape.boundary(msg.fid)
+            ts += 1
+    finally:
+        util.keypair = real
     return node, ws
 
 
@@ -122,6 +141,26 @@ def test_manifest_history_independence(tmp_path, world):
         assert all_fids(other, ws) == all_fids(node, ws)
         assert other.store(ws).get("root") == root  # byte-equal root
         assert objects(other, ws) == want  # and every object it names
+
+
+def test_history_independence_holds_with_removals(tmp_path, monkeypatch):
+    """§1 on a corpus WITH admitted removals: the removals slot — entries
+    plus the accumulated closure refs — is a pure function of the resident
+    set too, so the WHOLE root (fp, index oid and all) is byte-equal under
+    any partition/order/batching. Quarantine-free by construction: I1's
+    ride-forward of a pruned removal's entry+refs is the one sanctioned
+    history dependence, and it is local, never replayed."""
+    source, ws, _, _ = suppression_world(
+        tmp_path / "source", monkeypatch,
+        initial_secret=load_sk(f"{1:064x}"))
+    root = source.store(ws).get("root")
+    slot = manifest.decode_root(root)[3]
+    assert slot["oid"] and slot["fp"]  # a non-empty index is really in play
+    for seed in range(3):
+        other = replay_random(
+            source, ws, Node(str(tmp_path / f"replay{seed}")), seed)
+        assert all_fids(other, ws) == all_fids(source, ws)
+        assert other.store(ws).get("root") == root  # byte-equal, slot too
 
 
 def test_boundary_rule_shared_by_leaves_and_manifest(world):

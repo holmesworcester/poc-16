@@ -8,7 +8,7 @@ import facts
 from core import cmds, mint
 import core.sync as sync_module
 from core.close import close, encode_pile
-from core.crypto import keypair
+from core.crypto import keypair, load_sk
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import device_invite as device_invite_fact
 from facts.auth.device_invite import grant
@@ -88,14 +88,18 @@ def test_direct_grant_retry_after_restart_reconstructs_the_same_fact(tmp_path):
 
 
 def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    # Deterministic identities: the alternate-device search below must beat
+    # ``original_device`` by fid within 256 tries, which an unlucky random
+    # founder key can defeat (the known full-run flake).
+    node = Node(str(tmp_path / "node"), initial_secret=load_sk(f"{7:064x}"))
     workspace = cmds.create(node, "alice", ts=1)
     founder_secret, founder = node.identity(workspace)
     bind(node, workspace, "phone")
     original_device = offer_src(
         node.idx(workspace), "device_key", founder)
 
-    laptop_secret, laptop = keypair()
+    laptop_secret = load_sk(f"{8:064x}")
+    laptop = laptop_secret.verify_key.encode().hex()
     node.keychain.add_identity(laptop_secret)
     first = grant(node, workspace, founder, laptop, "laptop")
 
