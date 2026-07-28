@@ -14,7 +14,7 @@ import sqlite3
 from . import manifest, removals, shape
 from .close import close, decode_pile, encode_pile
 from .crypto import h
-from .kernel import extend_proofs, resolve_deps
+from .kernel import proof_rank, rebuild_proofs, resolve_deps
 from .pump import pump
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
@@ -49,7 +49,19 @@ def _resolver(node, ws, extra):
         mem.executemany(
             "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
             ((*offer, f.fid) for f in facts for offer in f.offers()))
-        return extend_proofs(mem, [f.fid for f in facts], fact_of)
+        # A newly arrived lower-rank provider can change the canonical winner
+        # for facts already present in the scratch copy.  Incrementally ranking
+        # only ``facts`` leaves those old rows stale and wedges the next closure
+        # assembly after a shadow/restore window.  The scratch database is
+        # bounded to this sync proof, so rebuild its ranks from the exact
+        # current fact set before resolving any edge.
+        rebuild_proofs(mem, fact_of)
+        unresolved = set()
+        for fact in facts:
+            deps = resolve_deps(fact, mem)
+            if deps is None or proof_rank(mem, deps) is None:
+                unresolved.add(fact.fid)
+        return frozenset(unresolved)
 
     return mem, fact_of, load
 
@@ -271,8 +283,8 @@ def _sibling_keys(raw):
     TypeError; ``":" in k`` guards ``shape.fid_of`` downstream."""
     obj = json.loads(raw)
     keys = obj.get("keys") if isinstance(obj, dict) else None
-    if not isinstance(keys, list) or not all(
-            isinstance(k, str) and ":" in k for k in keys):
+    if not isinstance(keys, list) or not all(shape.is_key(k) for k in keys) \
+            or keys != sorted(set(keys)):
         raise ValueError("closure sibling shape")
     return set(keys)
 

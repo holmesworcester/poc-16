@@ -93,10 +93,20 @@ poc-16-yez.7
 poc-16-yez.8
 poc-16-yez.9
 """.split())
-RECOVERY_ISSUES = {
+RECOVERY_STAGE_ISSUES = {
     RECOVERY_EPIC,
     *(f"{RECOVERY_EPIC}.{number}" for number in range(1, 12)),
 }
+RECOVERY_SIMPLIFICATION_ISSUES = {
+    f"{RECOVERY_EPIC}.4.1",
+    f"{RECOVERY_EPIC}.5.1",
+    f"{RECOVERY_EPIC}.5.2",
+    f"{RECOVERY_EPIC}.5.3",
+    f"{RECOVERY_EPIC}.6.1",
+    f"{RECOVERY_EPIC}.10.1",
+    f"{RECOVERY_EPIC}.11.1",
+}
+RECOVERY_ISSUES = RECOVERY_STAGE_ISSUES | RECOVERY_SIMPLIFICATION_ISSUES
 RECOVERY_BLOCKERS = {
     f"{RECOVERY_EPIC}.2": {f"{RECOVERY_EPIC}.4"},
     f"{RECOVERY_EPIC}.5": {f"{RECOVERY_EPIC}.2"},
@@ -111,6 +121,18 @@ RECOVERY_BLOCKERS = {
         f"{RECOVERY_EPIC}.9",
     },
     f"{RECOVERY_EPIC}.11": {f"{RECOVERY_EPIC}.10"},
+    f"{RECOVERY_EPIC}.5.1": {f"{RECOVERY_EPIC}.2"},
+    f"{RECOVERY_EPIC}.5.2": {f"{RECOVERY_EPIC}.5.1"},
+    f"{RECOVERY_EPIC}.5.3": {f"{RECOVERY_EPIC}.5.1"},
+    f"{RECOVERY_EPIC}.6.1": {f"{RECOVERY_EPIC}.5"},
+    f"{RECOVERY_EPIC}.10.1": {
+        f"{RECOVERY_EPIC}.3",
+        f"{RECOVERY_EPIC}.6",
+        f"{RECOVERY_EPIC}.7",
+        f"{RECOVERY_EPIC}.8",
+        f"{RECOVERY_EPIC}.9",
+    },
+    f"{RECOVERY_EPIC}.11.1": {f"{RECOVERY_EPIC}.10"},
 }
 LINK = re.compile(r"\[[^]]*]\(([^)]+)\)")
 OLD_REFERENCE = re.compile(
@@ -201,6 +223,7 @@ def test_active_exported_beads_belong_to_the_bankruptcy_recovery_epic():
     assert active_ids <= RECOVERY_ISSUES
     assert all(
         issue["id"] == RECOVERY_EPIC
+        or issue["id"] in RECOVERY_SIMPLIFICATION_ISSUES
         or any(
             dependency["type"] == "parent-child"
             and dependency["depends_on_id"] == RECOVERY_EPIC

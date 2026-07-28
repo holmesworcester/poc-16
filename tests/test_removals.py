@@ -784,18 +784,10 @@ def test_quarantined_removal_holds_locally_but_diverges_peers(
     entry — the removal fact is in no manifest leaf and quarantine/ is
     local-only — so the peer SURFACES the victim and its removals-slot fp
     cannot converge until restore. That divergence is the design's own
-    documented gap; this test keeps it from changing silently. It also
-    pins what restore actually buys back: a FRESH reader converges (fp
-    equal; index OID legally differs — I4 is why the slot publishes an fp
-    at all), while the window peer's next pull raises out of sync.assemble.
-
-    That last assertion pins a DEFECT as current behavior, not as law: the
-    wedge is a pre-existing shadow/restore sync bug with nothing to do with
-    removals — assemble's scratch resolver reuses stale proof ranks, so the
-    flipped device_key winner never re-ranks — and it reproduces with an
-    ordinary msg and no removal anywhere (verified, oyd.7 review). It is
-    asserted here only so that fixing it fails this test loudly rather than
-    changing this scenario silently. Bead: poc-16-3tg."""
+    documented gap; this test keeps it from changing silently. After restore,
+    both a fresh reader and the peer that observed the shadow window must
+    converge. The latter is the regression: assembly must rebuild scratch
+    proof ranks when a shorter provider changes the canonical winner."""
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "root", ts=1)
     root_secret, root_pk = node.identity(workspace)
@@ -895,12 +887,19 @@ def test_quarantined_removal_holds_locally_but_diverges_peers(
     assert theirs[3]["fp"] == ours[3]["fp"]  # set identity converges (I4)
     assert theirs[3]["oid"] != ours[3]["oid"]  # ours: ride-forward refs
 
-    # ...but the WINDOW peer is wedged — a pre-existing sync defect, NOT a
-    # removal law (poc-16-3tg): assemble reuses its stale ranks, the
-    # flipped device_key winner never re-ranks, and the pull raises; even
-    # an index rebuild (same fact set, same ranks) does not free it.
-    with pytest.raises(ValueError, match="closure assembly"):
-        sync_module.sync(peer, workspace, "local://node")
+    # The WINDOW peer now re-ranks the exact scratch fact set and converges.
+    sync_module.sync(peer, workspace, "local://node")
+    assert peer.fact_of(workspace, removal.fid) == removal
+    assert entry in peer.removal_entries(workspace)
+    assert not surfaced(peer, workspace, victim.fid)
+    peer_root = manifest.decode_root(peer.store(workspace).get("root"))
+    assert peer_root[:3] == ours[:3]
+    assert peer_root[3]["fp"] == ours[3]["fp"]
+
+    # Restart and another dial stay converged; no stale process cache is
+    # required for the repaired rank derivation.
+    peer = Node(str(tmp_path / "peer"))
     peer.rebuild(workspace)
-    with pytest.raises(ValueError, match="closure assembly"):
-        sync_module.sync(peer, workspace, "local://node")
+    sync_module.sync(peer, workspace, "local://node")
+    assert peer.fact_of(workspace, removal.fid) == removal
+    assert not surfaced(peer, workspace, victim.fid)

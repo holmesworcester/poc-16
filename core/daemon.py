@@ -44,11 +44,14 @@ class Syncer(threading.Thread):
                 for url in self.node.keyring["workspaces"][ws]["peers"]:
                     try:
                         sync(self.node, ws, url)
-                    except Exception:
+                    except Exception as error:
+                        self.node.record_sync_failure(ws, url, error)
                         if os.environ.get("TINYP2P_DEBUG"):
                             import traceback
                             traceback.print_exc()
                         # peer down or refused: the next cadence retries
+                    else:
+                        self.node.record_sync_success(ws, url)
 
 
 def make_token(secret, member, ws, verb="sync"):
@@ -268,7 +271,13 @@ class Handler(BaseHTTPRequestHandler):
             if parts[1] == "sync":
                 for w in ([ws] if ws else n.workspaces()):
                     for url in n.keyring["workspaces"][w]["peers"]:
-                        sync(n, w, url)
+                        try:
+                            sync(n, w, url)
+                        except Exception as error:
+                            n.record_sync_failure(w, url, error)
+                            raise
+                        else:
+                            n.record_sync_success(w, url)
                 return self._json(200, {"ok": True})
             if parts[1] == "rebuild":
                 n.rebuild(ws)

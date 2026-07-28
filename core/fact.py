@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 
 from .crypto import h
-from .shape import key
+from .shape import key, valid_timestamp
 
 
 def canon(o) -> bytes:
@@ -26,6 +26,8 @@ class Fact:
     fid: str = field(init=False)
 
     def __post_init__(self):
+        if not valid_timestamp(self.ts):
+            raise ValueError("fact timestamp")
         object.__setattr__(self, "bh", h(canon(self.body)))
         object.__setattr__(self, "fid", h(canon(self.env)))
 
@@ -72,7 +74,7 @@ def _atoms_ok(atoms) -> bool:
 def from_json(o) -> Fact:
     e = o.get("e") if isinstance(o, dict) else None
     if not (isinstance(e, dict) and isinstance(e.get("t"), str)
-            and isinstance(e.get("ts"), int) and isinstance(o.get("b"), dict)
+            and valid_timestamp(e.get("ts")) and isinstance(o.get("b"), dict)
             and _atoms_ok(e.get("a"))):
         raise ValueError("fact shape")
     f = Fact(e["t"], e["ts"], e["a"], o["b"])

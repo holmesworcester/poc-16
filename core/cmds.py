@@ -26,5 +26,9 @@ def status(node):
                 "facts": node.idx(workspace).execute(
                     "SELECT COUNT(*) FROM facts").fetchone()[0],
                 "peers": entry["peers"], "name": entry["name"],
-                "identity": entry["identity"]}
+                "identity": entry["identity"],
+                "ingress_failures": node.ingress_failures(workspace),
+                "state_failures": node.state_failures(workspace),
+                "sync_failures": node.sync_failures(workspace),
+            }
     return out

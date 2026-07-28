@@ -15,7 +15,6 @@ import os
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import facts
 
@@ -26,7 +25,6 @@ from .fact import Fact, canon, from_json
 from .keychain import Keychain
 from .kernel import (
     SCHEMA as KERNEL_SCHEMA,
-    Judgment,
     drain,
     drain_committed,
     extend_proofs,
@@ -145,6 +143,8 @@ class Node:
         self._reproject = set()
         self._quarantine_offer_cache = {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
+        self._sync_errors = {}
+        self._state_errors = {}
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
             self.log_arrivals(ws, (
@@ -194,6 +194,76 @@ class Node:
         for key in [
                 key for key in self.sync_cache if key[0] == workspace]:
             self.sync_cache.pop(key).clear()
+
+    def _quarantine_ingress(self, ws, source, raw, error):
+        """Retire one permanently failing ingress unit without losing bytes.
+
+        Piles are independent closed units.  Keeping a bad one under ``pile/``
+        retries it forever and prevents unrelated work from draining; moving it
+        to the node-local failure area makes the failure explicit and
+        recoverable while removing it from the live ingress queue.
+        """
+        st = self.store(ws)
+        payload = raw if isinstance(raw, bytes) else b""
+        failure_id = h(payload or source.encode())
+        if payload:
+            st.put_if_absent("failed/pile/" + failure_id, payload)
+        st.put(
+            "failed/meta/" + failure_id,
+            canon({
+                "error": f"{type(error).__name__}: {error}",
+                "id": failure_id,
+                "source": source,
+                "ts": now_ms(),
+            }),
+        )
+        st.delete(source)
+
+    def ingress_failures(self, ws):
+        """Durable summaries for quarantined piles; payloads stay local."""
+        out = []
+        for name in self.store(ws).list("failed/meta"):
+            try:
+                value = json.loads(self.store(ws).get(name))
+                if isinstance(value, dict):
+                    out.append(value)
+            except (TypeError, ValueError):
+                out.append({
+                    "error": "ValueError: unreadable failure record",
+                    "id": name.rsplit("/", 1)[-1],
+                    "source": name,
+                    "ts": 0,
+                })
+        return sorted(out, key=lambda row: (row.get("ts", 0), row.get("id", "")))
+
+    def record_sync_failure(self, ws, url, error):
+        with self.lock:
+            self._sync_errors[(ws, url)] = {
+                "error": f"{type(error).__name__}: {error}",
+                "peer": url,
+                "ts": now_ms(),
+            }
+
+    def record_sync_success(self, ws, url):
+        with self.lock:
+            self._sync_errors.pop((ws, url), None)
+
+    def sync_failures(self, ws):
+        with self.lock:
+            return [
+                dict(value)
+                for (workspace, _), value in sorted(self._sync_errors.items())
+                if workspace == ws
+            ]
+
+    def state_failures(self, ws):
+        with self.lock:
+            return [
+                {"component": component, **value}
+                for (workspace, component), value
+                in sorted(self._state_errors.items())
+                if workspace == ws
+            ]
 
     def store(self, ws) -> FsStore:
         if ws not in self._stores:
@@ -278,62 +348,52 @@ class Node:
             piles = st.list("pile/")
             if not piles:
                 return []  # nothing delivered; drain-on-read stays free
-            try:
-                self._sync_index(ws)
-                units = []
-                for k in piles:
-                    try:
-                        units.append(decode_pile(st.get(k)))
-                    except Exception:
-                        units.append(None)  # malformed: rejected on the spot
-                if len(units) > 1:  # independent piles judge in parallel
-                    with ThreadPoolExecutor(max_workers=8) as ex:
-                        results = list(ex.map(
-                            lambda u: drain(u[0], ws) if u else
-                            Judgment(False, (), frozenset()),
-                            units))
-                else:
-                    results = [
-                        drain(u[0], ws) if u else
-                        Judgment(False, (), frozenset())
-                        for u in units
-                    ]
-                valids, new_globals, blobs = [], set(), {}
-                for u, (ok, vs, global_rows) in zip(units, results):
-                    if ok:
-                        valids += vs
-                        new_globals.update(global_rows)
-                        blobs.update(u[1])
-                fresh, newfids = self.merge(ws, valids, new_globals)
-                arrived = set()
-                for bh, b in blobs.items():
-                    if not st.has("obj/" + bh):
-                        st.put("obj/" + bh, b)
-                        arrived.add(bh)
-                self.commit(ws, newfids)
-                spilled = {}
-                for valid in fresh:
-                    refs = facts.blob_refs(valid.fact)
-                    if refs:
-                        spilled[valid.fact.fid] = refs
-                received = {
-                    fid for fid, refs in spilled.items()
-                    if set(refs) & arrived
-                }
-                if received:
-                    self.log_arrivals(ws, received, repeat=True)
-                resident = set(spilled) - received
-                if resident:
-                    self.log_arrivals(ws, resident)
-                pump(self, ws)
-                for k in piles:
-                    st.delete(k)  # retire ingress after the CAS
-                return fresh
-            except Exception:
-                # The manifest CAS is the commit point. A live daemon must not
-                # expose an ahead index or app projection after a failed turn.
-                self._restore_authoritative_projections(ws)
-                raise
+            fresh_all = []
+            for source in piles:
+                raw = st.get(source)
+                try:
+                    unit = decode_pile(raw)
+                except Exception as error:
+                    self._quarantine_ingress(ws, source, raw, error)
+                    continue
+
+                result = drain(unit[0], ws)
+                if not result.ok:
+                    self._quarantine_ingress(
+                        ws, source, raw, ValueError("ingress rejected"))
+                    continue
+
+                try:
+                    self._sync_index(ws)
+                    fresh, newfids = self.merge(
+                        ws, result.valids, result.globals)
+                    arrived = set()
+                    for bh, blob in unit[1].items():
+                        if not st.has("obj/" + bh):
+                            st.put("obj/" + bh, blob)
+                            arrived.add(bh)
+                    self.commit(ws, newfids)
+                    spilled = {}
+                    for valid in fresh:
+                        refs = facts.blob_refs(valid.fact)
+                        if refs:
+                            spilled[valid.fact.fid] = refs
+                    received = {
+                        fid for fid, refs in spilled.items()
+                        if set(refs) & arrived
+                    }
+                    if received:
+                        self.log_arrivals(ws, received, repeat=True)
+                    resident = set(spilled) - received
+                    if resident:
+                        self.log_arrivals(ws, resident)
+                    pump(self, ws)
+                except Exception:
+                    self._restore_authoritative_projections(ws)
+                    raise
+                st.delete(source)
+                fresh_all.extend(fresh)
+            return fresh_all
 
     def log_arrivals(self, ws, fids, *, repeat=False):
         """Append resident-object events, but only for published facts.
@@ -817,14 +877,20 @@ class Node:
         """``(entries, refs)`` behind the last published root's removals
         slot — the grow-only floor removal_entries and the settle carry
         forward. An unreadable root (none yet, foreign stamp) holds none."""
-        raw = self.store(ws).get("root")
         try:
+            raw = self.store(ws).get("root")
             slot = manifest.decode_root(raw)[3] if raw else None
-        except ValueError:
-            slot = None
-        obj = self.store(ws).get("obj/" + slot["oid"]) \
-            if slot and slot["oid"] else None
-        return removals.decode(obj) if obj else ((), ())
+            obj = self.store(ws).get("obj/" + slot["oid"]) \
+                if slot and slot["oid"] else None
+            result = removals.decode(obj) if obj else ((), ())
+        except (TypeError, ValueError) as error:
+            self._state_errors[(ws, "published-removals")] = {
+                "error": f"{type(error).__name__}: {error}",
+                "ts": now_ms(),
+            }
+            return (), ()
+        self._state_errors.pop((ws, "published-removals"), None)
+        return result
 
     def removal_entries(self, ws):
         """THE current local entry table — the one accessor every consult

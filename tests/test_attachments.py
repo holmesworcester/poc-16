@@ -6,7 +6,7 @@ import pytest
 
 import facts
 import core.sync as sync_module
-from core import bao, cmds
+from core import bao, cmds, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.node import Node
@@ -67,7 +67,8 @@ def test_legacy_whole_blob_workspace_upgrades_and_remains_readable(tmp_path):
     secret, public = node.identity(workspace)
     data = b"persisted before Bao"
     item = legacy_file(
-        public, "general", "legacy.bin", len(data), h(data), 10**15)
+        public, "general", "legacy.bin", len(data), h(data),
+        shape.FACT_TS_MAX)
     signed = signature(secret, public, item, item.ts)
     publish(node, workspace, item, signed, blobs={h(data): data})
     old_root = node.store(workspace).get("root")
@@ -238,7 +239,7 @@ def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
     send_bytes(node, workspace, "gone.bin", b"gone")
     chunk_fid = node.idx(workspace).execute(
         "SELECT fid FROM facts WHERE t='chunk'").fetchone()[0]
-    cmds.remove(node, workspace, chunk_fid, ts=10**15)
+    cmds.remove(node, workspace, chunk_fid, ts=shape.FACT_TS_MAX)
     assert progress(node, workspace)["have"] == 0
 
     node.log_arrivals(workspace, [chunk_fid], repeat=True)

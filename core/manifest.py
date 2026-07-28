@@ -23,7 +23,7 @@ from typing import NamedTuple
 from .close import encode_pile
 from .crypto import h
 from .fact import canon
-from .shape import fid_of, key, stable_cut_positions
+from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
 
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
@@ -170,6 +170,8 @@ def _shard(oid, fetch, seen):
     once: a canonical manifest never repeats a shard (separators are unique,
     so equal content cannot occur twice), and a repeat is how a handful of
     hostile objects would otherwise expand into an unbounded walk."""
+    if not valid_fid(oid):
+        raise ValueError("manifest integrity")
     raw = fetch(oid)
     if raw is None or h(raw) != oid or oid in seen:
         raise ValueError("manifest integrity")
@@ -193,9 +195,17 @@ def _rows(shard, fetch, seen):
     if not isinstance(shard, dict):
         raise ValueError("manifest shape")
     if "shards" not in shard:
-        return [Entry(*row) for row in _list(shard, "entries", 3)]
+        rows = [Entry(*row) for row in _list(shard, "entries", 3)]
+        if any(
+                not is_key(row.sep) or not valid_fid(row.leaf)
+                or row.closure and not valid_fid(row.closure)
+                for row in rows):
+            raise ValueError("manifest entry")
+        return rows
     out = []
     for sep, oid in _list(shard, "shards", 2):
+        if not is_key(sep) or not valid_fid(oid):
+            raise ValueError("manifest shard")
         rows = _rows(_shard(oid, fetch, seen), fetch, seen)
         if not rows or rows[0].sep != sep:
             raise ValueError("manifest separator")
@@ -241,11 +251,14 @@ def decode_root(raw):
     if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
         raise ValueError("root stamp")
     removals, rows = o.get("removals"), o.get("globals")
-    if not (isinstance(o.get("anchor"), str)
+    if not (valid_fid(o.get("anchor"))
             and isinstance(o.get("manifest"), str)
+            and (not o["manifest"] or valid_fid(o["manifest"]))
             and isinstance(removals, dict)
             and isinstance(removals.get("oid"), str)
+            and (not removals["oid"] or valid_fid(removals["oid"]))
             and isinstance(removals.get("fp"), str)
+            and (not removals["fp"] or valid_fid(removals["fp"]))
             and isinstance(rows, list)
             and all(isinstance(row, list) and len(row) == 2
                     and all(isinstance(part, str) for part in row)

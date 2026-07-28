@@ -94,12 +94,13 @@ def applies(removal, fact):
 
 def admit(e, removal):
     """Per-entry admission: span integrity (I6), one death marker (I3)."""
-    if not is_deletion(removal) or e.fid != removal.fid:
+    if not shape.valid_fid(e.fid) or not is_deletion(removal) \
+            or e.fid != removal.fid:
         return False
     if (e.lo, e.hi) == HEAD:
         return True
     targets = _targets(removal)
-    return (e.lo == e.hi and ":" in e.lo and len(targets) == 1
+    return (e.lo == e.hi and shape.is_key(e.lo) and len(targets) == 1
             and shape.fid_of(e.lo) == targets[0])
 
 
@@ -125,12 +126,8 @@ def encode(entries, facts, emit, refs=()):
 
 
 def _keyish(ref):
-    """``shape.key``-shaped: ``<ts:015d>:<fid>`` — the width is a MINIMUM
-    (a far-future ts prints wider), so parse at the first colon."""
-    if not isinstance(ref, str):
-        return False
-    ts, _, fid = ref.partition(":")
-    return len(ts) >= 15 and ts.isdigit() and bool(fid)
+    """The exact canonical fact-address grammar shared by every index."""
+    return shape.is_key(ref)
 
 
 def decode(raw):
@@ -147,6 +144,7 @@ def decode(raw):
             or not all(
                 isinstance(row, list) and len(row) == 3
                 and all(isinstance(part, str) for part in row)
+                and shape.valid_fid(row[2])
                 and row[0] <= row[1] for row in rows):
         raise ValueError("removal index shape")
     entries = tuple(Entry(*row) for row in rows)
