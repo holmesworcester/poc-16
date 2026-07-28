@@ -30,12 +30,12 @@ def validate(f, ctx):
         return False
 
 
-# MODE — only drain publishes this monotone row; evaluate merely consumes it.
+# MODE
 DURABLE = True
 
 
 def global_rows(f):
-    return (("removal", f.offers()[0][1]),)
+    return ()
 
 
 def blob_refs(f):

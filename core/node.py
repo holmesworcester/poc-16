@@ -18,7 +18,7 @@ import time
 
 import facts
 
-from . import indexes, manifest, removals
+from . import actions, indexes, manifest
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
@@ -42,9 +42,8 @@ from .pump import (
     append_retracted,
     pump,
 )
-from .shape import key, key_parts
+from .shape import key_parts
 from .store import FsStore
-from .suppression import TARGET, deathkey, is_deletion, suppkeys
 
 SUPP_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS supp(fid TEXT, k TEXT, PRIMARY KEY(fid, k));",
@@ -61,8 +60,8 @@ CREATE TABLE IF NOT EXISTS edges(
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-""" + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v16-explicit-selectors"
+""" + actions.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
+INDEX_VERSION = "family-contract-v17-action-slots"
 APP_VERSION = 3
 
 
@@ -345,6 +344,97 @@ class Node:
         return frozenset(self.idx(ws).execute(
             "SELECT name, value FROM globals ORDER BY name, value").fetchall())
 
+    def _provider_scopes(self, ws, provider, incoming=None):
+        """Scopes whose activation withdraws this authority candidate."""
+        incoming = incoming or {}
+        scopes = set(actions.provider_scopes(provider))
+        policy = facts.policy_for(provider.t)
+        if policy is None:
+            return frozenset(scopes)
+        edges = dict(self.idx(ws).execute(
+            "SELECT role, dst FROM edges WHERE src=?", (provider.fid,)))
+        for role in policy.authority_liveness_guards:
+            fid = edges.get(role)
+            guarded = incoming.get(fid) or self.fact_of(ws, fid)
+            if guarded is None:
+                raise ValueError("authority liveness edge")
+            scopes.update(actions.provider_scopes(guarded))
+        return frozenset(scopes)
+
+    def _screen_guards(self, ws, fact, edges, incoming=None):
+        """Reject a new effect whose declared authority is already masked."""
+        policy = facts.policy_for(fact.t)
+        if policy is None or not policy.authorization_guards:
+            return
+        by_role = {edge.role: edge.fid for edge in edges}
+        incoming = incoming or {}
+        idx = self.idx(ws)
+        for role in policy.authorization_guards:
+            fid = by_role.get(role)
+            provider = incoming.get(fid) or self.fact_of(ws, fid)
+            if provider is None:
+                raise ValueError("authorization guard edge")
+            if any(
+                    actions.blocks(idx, sid, fact.key)
+                    for sid in self._provider_scopes(
+                        ws, provider, incoming)):
+                raise actions.ScreenRejected("suppressed authority")
+
+    def _action_evidence(self, ws, fact, incoming, incoming_deps):
+        """Persist the action's already-validated immutable proof closure."""
+        idx = self.idx(ws)
+        fact_of = lambda fid: incoming.get(fid) or self.fact_of(ws, fid)
+
+        def deps_of(fid):
+            if fid in incoming_deps:
+                return incoming_deps[fid]
+            item = fact_of(fid)
+            return resolve_deps(item, idx) if item is not None else None
+
+        raw = encode_pile(close([fact], deps_of, fact_of))
+        oid = h(raw)
+        self.store(ws).put_if_absent("obj/" + oid, raw)
+        return oid
+
+    def _backfill_current_actions(self, ws):
+        """One-format-cut helper: turn resident action facts into evidence."""
+        idx = self.idx(ws)
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+            fact = self.fact_of(ws, fid)
+            if not actions.action_sids(fact):
+                continue
+            evidence = self._action_evidence(ws, fact, {}, {})
+            actions.archive(idx, fact, evidence)
+
+    def _restore_root_actions(self, ws, root_bytes, fetch):
+        """Rebuild the local action projection from authenticated tree slots."""
+        from .worker import WorkerView
+
+        view = WorkerView.from_root(root_bytes, fetch)
+        fact_tree = view._reader(indexes.FACT)
+        for sid, slot in view._reader(indexes.SUPP).items():
+            if not isinstance(slot, dict) or slot.get("state") != "active":
+                continue
+            fid = slot.get("action")
+            if fact_tree.get(indexes.action_key(sid)) != slot:
+                raise ValueError("action slot mismatch")
+            record = view.fact_record(fid)
+            evidence_oid = record["evidence"]
+            if not evidence_oid:
+                raise ValueError("action evidence missing")
+            raw = _object(evidence_oid, fetch)
+            stream, blobs = decode_pile(raw)
+            result = drain(stream, ws)
+            candidates = [
+                valid.fact for valid in result.valids
+                if valid.fact.fid == fid and sid in actions.action_sids(
+                    valid.fact)
+            ]
+            if blobs or not result.ok or len(candidates) != 1:
+                raise ValueError("action evidence")
+            actions.archive(
+                self.idx(ws), candidates[0], evidence_oid)
+
     # ---- the turn ------------------------------------------------------------
 
     def turn(self, ws):
@@ -393,6 +483,11 @@ class Node:
                     if resident:
                         self.log_arrivals(ws, resident)
                     pump(self, ws)
+                except actions.ScreenRejected as error:
+                    self._restore_authoritative_projections(ws)
+                    self._quarantine_ingress(
+                        ws, source, raw, error)
+                    raise
                 except Exception:
                     self._restore_authoritative_projections(ws)
                     raise
@@ -427,18 +522,22 @@ class Node:
                 idx.commit()
             return landed
 
-    def _log_projection(self, ws, admitted, retracted, reproject):
+    def _log_projection(
+            self, ws, admitted, retracted, reproject, action_sids=()):
         idx = self.idx(ws)
         admitted = tuple(admitted)
-        entries = self.removal_entries(ws)
         retracted = set(retracted)
-        retracted.update(  # forward mask: entry known before the victim
+        retracted.update(  # forward mask: action known before the victim
             fid for fid in admitted
-            if self.suppressed(ws, self.fact_of(ws, fid), entries))
+            if self.suppressed(ws, self.fact_of(ws, fid)))
         append_admitted(idx, admitted)
         append_retracted(idx, sorted(retracted))
-        self.apply_removals(  # removal arrival: retroactive '-' rows
-            ws, [e for e in entries if e.fid in set(admitted)])
+        self.apply_actions(
+            ws, set(action_sids) | {
+                sid for sid, fid in idx.execute(
+                    "SELECT sid, fid FROM actions")
+                if fid in set(admitted)
+            })
         if reproject:
             seq = idx.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
@@ -447,9 +546,13 @@ class Node:
                 (seq,))
 
     def merge(self, ws, valids, global_rows=()):
-        idx, out, newfids = self.idx(ws), [], []
+        idx, out, newfids, new_action_sids = self.idx(ws), [], [], set()
         valids = tuple(valids)
         by_fid = {valid.fact.fid: valid for valid in valids}
+        incoming = {valid.fact.fid: valid.fact for valid in valids}
+        incoming_deps = {
+            valid.fact.fid: valid.deps for valid in valids
+        }
         valids = tuple(
             by_fid[fact.fid]
             for fact in close(
@@ -472,10 +575,10 @@ class Node:
                     newfids.append(f.fid)
                 idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
                             (f.fid, f.ts, f.t, json.dumps(f.to_json())))
-                if not is_deletion(f):  # I2: removals are never victims
-                    idx.executemany(
-                        "INSERT OR IGNORE INTO supp VALUES(?,?)",
-                        ((f.fid, k) for k in sorted(suppkeys(f))))
+                idx.executemany(
+                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                    ((f.fid, sid)
+                     for sid in sorted(actions.fact_scopes(f))))
                 for name, a0, a1 in f.offers():
                     idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                                 (name, a0, a1, f.fid))
@@ -514,6 +617,19 @@ class Node:
                     ((f.fid, edge.role, edge.fid, edge.kind)
                      for edge in edges),
                 )
+                self._screen_guards(ws, f, edges, incoming)
+                for sid in actions.action_sids(f):
+                    before = idx.execute(
+                        "SELECT fid FROM actions WHERE sid=?",
+                        (sid,)).fetchone()
+                    evidence = self._action_evidence(
+                        ws, f, incoming, incoming_deps)
+                    actions.archive(idx, f, evidence)
+                    after = idx.execute(
+                        "SELECT fid FROM actions WHERE sid=?",
+                        (sid,)).fetchone()
+                    if after == (f.fid,) and before != after:
+                        new_action_sids.add(sid)
                 out.append(v)
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
@@ -537,7 +653,7 @@ class Node:
                 self._reproject.add(ws)
             self._log_projection(
                 ws, newfids, set(pruned) - admitted - restored,
-                reproject)
+                reproject, new_action_sids)
             idx.execute("DELETE FROM meta WHERE k='root'")
             idx.commit()
             return out, newfids
@@ -610,10 +726,10 @@ class Node:
             idx.execute(
                 "INSERT INTO facts VALUES(?,?,?,?)",
                 (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
-            if not is_deletion(fact):  # I2: removals are never victims
-                idx.executemany(
-                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
-                    ((fact.fid, k) for k in sorted(suppkeys(fact))))
+            idx.executemany(
+                "INSERT OR IGNORE INTO supp VALUES(?,?)",
+                ((fact.fid, sid)
+                 for sid in sorted(actions.fact_scopes(fact))))
             for name, a0, a1 in fact.offers():
                 idx.execute(
                     "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
@@ -720,6 +836,7 @@ class Node:
         if idx.execute(
                 "SELECT 1 FROM facts WHERE fid=?", (ws,)).fetchone() is None:
             return None
+        self._backfill_current_actions(ws)
         shadows = self._shadows(ws, newfids)
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
@@ -778,33 +895,13 @@ class Node:
             ws, idx, lambda fid: self.fact_of(ws, fid), emit,
             previous=previous_trees, fetch=fetch)
         root = manifest.encode_root(
-            ws, self.globals(ws), man, self._removal_slot(ws, deps_of, emit),
+            ws, self.globals(ws), man,
+            action_summary=actions.summary(idx),
             layout_seed=seed, trees=trees)
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
         self._stamp(ws)
         return root
-
-    def _removal_slot(self, ws, deps_of, emit):
-        """Settle the removal index beside the manifest: one ordinary store
-        object of sorted entries plus the closures' fact keys (REMOVALS.md
-        §2, I3), and the ``{oid, fp}`` pair the root publishes (I4). The
-        entry table is removal_entries — the same one every consult reads —
-        so a synced entry and a local one settle identically, and the index
-        stays grow-only across prune/restore (I1's local caveat): a
-        quarantined removal's entry and refs ride forward from the previous
-        slot instead of being re-derived from the resident set."""
-        entries = self.removal_entries(ws)
-        if not entries:
-            return {"oid": "", "fp": ""}
-        dels = [
-            fact for (fid,) in self.idx(ws).execute("SELECT fid FROM facts")
-            for fact in (self.fact_of(ws, fid),) if is_deletion(fact)]
-        oid = removals.encode(
-            entries,
-            close(dels, deps_of, lambda fid: self.fact_of(ws, fid)),
-            emit, self._published(ws)[1])
-        return {"oid": oid, "fp": removals.fingerprint(entries)}
 
     def _previous(self, ws, raw, fetch):
         """The previous root's manifest entries: a memo for the next settle.
@@ -814,7 +911,7 @@ class Node:
         if not raw:
             return ()
         try:
-            anchor, _, man, _ = manifest.decode_root(raw)
+            anchor, _, man = manifest.decode_root(raw)
         except ValueError:
             return ()
         if anchor != ws:
@@ -876,7 +973,7 @@ class Node:
                     raw = st.get("root")
                     root = manifest.decode_root(raw)
             if root is not None:
-                anchor, globals_, man, _ = root
+                anchor, globals_, man = root
                 if anchor != ws:
                     raise ValueError("root anchor")
                 fetch = lambda oid: st.get("obj/" + oid)
@@ -894,7 +991,7 @@ class Node:
                     # just wrote.
                     self.commit(ws, reuse=False)
                     raw = st.get("root")
-                    anchor, globals_, man, _ = manifest.decode_root(raw)
+                    anchor, globals_, man = manifest.decode_root(raw)
                     stream = list(resident(man, fetch))
                 if ws not in {fact.fid for fact in stream}:
                     raise ValueError("store fact set")
@@ -910,7 +1007,8 @@ class Node:
             self.app.commit()
             idx.execute("BEGIN")
             try:
-                for table in ("facts", "offers", "proofs", "globals"):
+                for table in (
+                        "facts", "offers", "proofs", "globals", "actions"):
                     idx.execute(f"DELETE FROM {table}")
                 # DROP, not DELETE: CREATE IF NOT EXISTS keeps a pre-v14
                 # file's single-group supp DDL, whose UNIQUE(k) would
@@ -931,6 +1029,15 @@ class Node:
                 pump(self, ws)
                 return
             self.merge(ws, result.valids, result.globals)
+            try:
+                self._restore_root_actions(
+                    ws, raw, lambda oid: st.get("obj/" + oid))
+            except ValueError:
+                if not republish:
+                    raise
+            self.apply_actions(
+                ws, [sid for (sid,) in self.idx(ws).execute(
+                    "SELECT sid FROM actions")])
             if republish:
                 # A semantic index upgrade can select different canonical
                 # providers for the same fact ids. Fingerprints cover ids, not
@@ -942,120 +1049,23 @@ class Node:
                 ws, (valid.fact.fid for valid in result.valids))
             pump(self, ws)
 
-    # ---- removal consult + retraction (docs/CUTOVER.md §2.4) -----------------
+    # ---- exact suppression consult + local reverse projection ----------------
 
-    def _published(self, ws):
-        """``(entries, refs)`` behind the last published root's removals
-        slot — the grow-only floor removal_entries and the settle carry
-        forward. An unreadable root (none yet, foreign stamp) holds none."""
-        try:
-            raw = self.store(ws).get("root")
-            slot = manifest.decode_root(raw)[3] if raw else None
-            obj = self.store(ws).get("obj/" + slot["oid"]) \
-                if slot and slot["oid"] else None
-            result = removals.decode(obj) if obj else ((), ())
-        except (TypeError, ValueError) as error:
-            self._state_errors[(ws, "published-removals")] = {
-                "error": f"{type(error).__name__}: {error}",
-                "ts": now_ms(),
-            }
-            return (), ()
-        self._state_errors.pop((ws, "published-removals"), None)
-        return result
+    def suppressed(self, ws, fact):
+        """The one local mask: explicit fact scopes intersect active actions."""
+        return actions.suppresses(self.idx(ws), fact)
 
-    def removal_entries(self, ws):
-        """THE current local entry table — the one accessor every consult
-        site and the settle read (CUTOVER §2.4, DRY): the last published
-        slot's entries (grow-only across prune/restore, I1) overlaid with
-        entries derived from resident deletion facts at the author
-        chokepoint (I6) — where node.commit's slot gets them too.
-
-        A removal whose target is not resident yields NO entry: it can
-        suppress nothing, and this accessor runs inside merge's
-        transaction, so a derivation that raises here retries forever on
-        every turn() — one such fact would wedge a workspace permanently
-        (families reject such targets too; this is the belt)."""
-        table = {e.fid: e for e in self._published(ws)[0]}
-        for (fid,) in self.idx(ws).execute("SELECT fid FROM facts"):
-            fact = self.fact_of(ws, fid)
-            if is_deletion(fact):
-                try:
-                    table[fid] = removals.entry(fact, lambda dep: key(
-                        self._resident(ws, dep)))
-                except ValueError:
-                    continue
-        return tuple(table.values())
-
-    def _resident(self, ws, fid):
-        fact = self.fact_of(ws, fid)
-        if fact is None:
-            raise ValueError("target is not resident")
-        return fact
-
-    def _removal_of(self, ws, fid):
-        """A removal fact by fid, resident or quarantined: an index entry
-        outlives its pruned removal (I1), so the consult may need the
-        quarantine copy of the clear envelope to run ``applies``."""
-        fact = self.fact_of(ws, fid)
-        if fact is None:
-            raw = self.store(ws).get("quarantine/" + fid)
-            fact = from_json(json.loads(raw)) if raw else None
-        return fact
-
-    def suppressed(self, ws, fact, entries):
-        """One selector intersection for both direct and inherited masking.
-
-        During the legacy-index overlap window all entries are locally
-        available, so explicit parent/ancestor selectors are checked against
-        every active action.  The S5 SuppTree replaces this compatibility
-        scan with exact sid reads.
-        """
-        return any(
-            (r := self._removal_of(ws, e.fid)) is not None
-            and removals.applies(r, fact)
-            for e in entries)
-
-    def apply_removals(self, ws, entries):
-        """Apply newly known removal entries to the projection log.
-
-        Retroactive retraction: for each entry, enumerate already-resident
-        victims — the supp table (k = suppression group) for kills, the
-        DIRECT target fid for points — filter through removals.applies (I2
-        lives there), and append '-' rows (pump.append_retracted) for
-        victims still net-'+' in the log, so the forward mask (same
-        transaction) and repeated sync legs never double-retract. Appends
-        only: the caller owns the idx transaction and the pump (merge's
-        turn, or sync.pull_removals). Runs when a removal fact is admitted
-        AND when sync's removal leg lands entries. The forward mask is not
-        here: it is the suppressed() consult at victim admission
-        (_log_projection) and in pump's rebuild branch — one consult path,
-        no second mechanism. Note the store-closure corollary: locally a
-        removal FACT always follows its victim (its target is a hard ref;
-        kernel refs_seen is unchanged); only index ENTRIES can precede
-        victims, via sync."""
-        idx, dead = self.idx(ws), set()
-        for e in entries:
-            r = self._removal_of(ws, e.fid)
-            if r is None:
-                continue
-            from .suppression import action_target_fid
-            if action_target_fid(r) is None:
-                # Temporary read compatibility for old/test point removals.
-                legacy = [
-                    fid for name, fid in r.refs() if name == TARGET
-                ]
-            else:
-                legacy = []
-            # New exact actions and old group kills share the reverse selector
-            # index.  SELF and descendant PARENT/ANCESTOR offers resolve to
-            # the same sid.
-            fids = legacy or [fid for (fid,) in idx.execute(
-                "SELECT fid FROM supp WHERE k=?", (deathkey(r),))]
-            dead.update(
-                fid for fid in fids
-                if (f := self.fact_of(ws, fid)) is not None
-                and removals.applies(r, f))
-        last = dict(idx.execute(  # net log state: the last row per fid wins
+    def apply_actions(self, ws, sids):
+        """Retract resident victims through the rebuildable sid reverse map."""
+        idx = self.idx(ws)
+        dead = {
+            fid
+            for sid in set(sids)
+            for (fid,) in idx.execute(
+                "SELECT fid FROM supp WHERE k=?", (sid,))
+            if self.fact_of(ws, fid) is not None
+        }
+        last = dict(idx.execute(
             "SELECT fid, op FROM log WHERE op IN ('+','-') ORDER BY seq"))
         append_retracted(idx, sorted(
             fid for fid in dead if last.get(fid) == "+"))

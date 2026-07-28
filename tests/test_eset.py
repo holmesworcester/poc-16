@@ -4,11 +4,7 @@ import threading
 
 import pytest
 
-import facts
-
-import core.manifest as manifest
-import core.removals as removals
-from core import cmds, daemon
+from core import cmds, daemon, sync
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
@@ -18,12 +14,10 @@ from facts.content.delete import delete
 from facts._policy import OWNER
 
 from .util import (
-    MultiGroupFamily,
     all_fids,
     closed_subset,
     invoke_mint,
     member_src,
-    multi_group_post,
     projection_state,
     replay_random,
     suppression_world,
@@ -81,9 +75,6 @@ def test_suppression_facts_not_suppressible(tmp_path):
             sig.fid: []})
 
     assert node.fact_of(workspace, recursive.fid) is None
-    assert not removals.applies(recursive, first)  # I2: never a victim
-
-
 def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
     """A v7 restart repairs unranked ref targets before serving E."""
     node, workspace, targets, deletions = suppression_world(tmp_path / "node")
@@ -111,50 +102,6 @@ def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
     assert projection_state(upgraded) == expected
 
 
-def test_pre_v14_index_rebuild_recreates_supp_multiplicity(
-        tmp_path, monkeypatch):
-    """A pre-v14 restart DROPs the old supp table, not just its rows: the
-    v13 DDL (fid PK, k UNIQUE) survives CREATE IF NOT EXISTS, and its stale
-    UNIQUE would silently swallow all but one victim per group on re-merge
-    — the I6 under-suppression — before stamping the file v14 for good."""
-    monkeypatch.setitem(
-        facts.ROUTES, MultiGroupFamily.TAG, MultiGroupFamily)
-    node, workspace, targets, _ = suppression_world(tmp_path / "node")
-    legacy = [
-        multi_group_post(
-            "channel-0", f"author-{ordinal}", f"m{ordinal}", 40 + ordinal)
-        for ordinal in range(4)
-    ]
-    node.ingest_new(
-        workspace, legacy, {fact.fid: [] for fact in legacy})
-    both = multi_group_post("channel-0", "alice", "hi", 50)
-    node.ingest_new(workspace, [both], {both.fid: []})
-    index = node.idx(workspace)
-    fresh = sorted(index.execute("SELECT fid, k FROM supp"))
-    chan0 = '["chan","channel-0"]'
-    assert [k for _, k in fresh].count(chan0) == 5  # 4 posts + both
-    assert sorted(k for fid, k in fresh if fid == both.fid) == [
-        '["chan","author/alice"]', chan0]
-
-    index.executescript(
-        "DROP INDEX supp_by_k; DROP TABLE supp;"
-        "CREATE TABLE supp(fid TEXT PRIMARY KEY, k TEXT UNIQUE);")
-    index.executemany("INSERT OR IGNORE INTO supp VALUES(?,?)", fresh)
-    index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('index-version', "
-        "'family-contract-v13-one-store')")
-    index.commit()
-    assert index.execute(
-        "SELECT COUNT(*) FROM supp").fetchone()[0] < len(fresh)
-    index.close()
-    node.app.close()
-
-    upgraded = Node(node.dir)
-
-    assert sorted(upgraded.idx(workspace).execute(
-        "SELECT fid, k FROM supp")) == fresh
-
-
 def test_verdicts_never_read_s(tmp_path, monkeypatch):
     """Adding a valid deletion masks its target without changing validity."""
     source, workspace, targets, deletions = suppression_world(
@@ -178,9 +125,7 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
 @pytest.mark.parametrize("restart", (False, True))
 def test_suppression_stays_behind_the_manifest_commit(
         tmp_path, monkeypatch, restart):
-    """An ahead removal — admitted deletion, consult-side entry — is
-    invisible until the shared root CAS succeeds (was the ahead-T_supp-row
-    law; the published state is now the root's removals slot)."""
+    """An ahead action projection is invisible until the composite root CAS."""
     node, workspace, _, _ = suppression_world(tmp_path / "node")
     target_fid = cmds.post(
         node, workspace, "unpublished", "target", ts=300)
@@ -196,11 +141,10 @@ def test_suppression_stays_behind_the_manifest_commit(
             (workspace, target.fid)).fetchone() is not None
 
     def published_fids(raw):
-        slot = manifest.decode_root(raw)[3]
-        if not slot["oid"]:
-            return set()
-        entries, _ = removals.decode(store.get("obj/" + slot["oid"]))
-        return {e.fid for e in entries}
+        return {
+            fid for fid, _ in sync.action_rows(
+                raw, lambda oid: store.get("obj/" + oid)).values()
+        }
 
     assert published_fids(old_root)  # the world's deletions already settled
     assert deletion.fid not in published_fids(old_root)
@@ -240,9 +184,11 @@ def test_suppression_stays_behind_the_manifest_commit(
         candidate.append(raw)
         assert key == "root"
         assert store.get("root") == old_root
-        # the consult-side entry table is ahead of the published slot
+        # The local reverse projection is ahead, but readers still receive
+        # exactly the old composite root until the CAS.
         assert deletion.fid in {
-            e.fid for e in node.removal_entries(workspace)}
+            fid for (fid,) in node.idx(workspace).execute(
+                "SELECT fid FROM actions")}
         release_reader.set()
         assert reader_waiting.wait(timeout=5)
         raise RuntimeError("suppression manifest CAS failed")
@@ -258,7 +204,8 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert store.get("root") == old_root
     assert node.fact_of(workspace, deletion.fid) is None
     assert deletion.fid not in {
-        e.fid for e in node.removal_entries(workspace)}
+        fid for (fid,) in node.idx(workspace).execute(
+            "SELECT fid FROM actions")}
     assert observed == [(200, old_root)]
     assert canonical_observed == [True]
     assert projected()

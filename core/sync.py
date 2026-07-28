@@ -1,7 +1,7 @@
 """Reconciliation over the one-store layout (docs/CUTOVER.md §2).
 
-One dial: the removal-index leg first (docs/REMOVALS.md §5), then a
-manifest oid-diff splitting the key space, a push of the local-only keys,
+One dial: the authenticated action leg first, then a manifest oid-diff
+splitting the key space, a push of the local-only keys,
 then two-wave closure assembly of the pulled ranges — the push lands
 before the pulled pile is drained, so canonical pruning during the turn
 cannot retract a fact ahead of its delivery. Every arriving fact is judged
@@ -11,13 +11,13 @@ where a pile came from.
 import json
 import sqlite3
 
-from . import manifest, removals, shape
+from . import actions, indexes, manifest, shape
 from .close import close, decode_pile, encode_pile
 from .crypto import h
-from .kernel import proof_rank, rebuild_proofs, resolve_deps
-from .pump import pump
+from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
+from .worker import WorkerView
 
 
 def _object(oid, fetch):
@@ -118,17 +118,33 @@ def sync(node, ws, url):
     fetch_remote.many = fetch_many
 
     st = node.store(ws)
+    local_before = st.get("root")
     their_man = ""
     if remote_root:
-        anchor, _, their_man, _ = manifest.decode_root(remote_root)
+        anchor, _, their_man = manifest.decode_root(remote_root)
         if anchor != ws:
             raise ValueError("root anchor")
 
-    pull_removals(node, ws, remote_root, fetch_remote)
+    same_actions = remote_root and local_before \
+        and json.loads(remote_root)["actions"] \
+        == json.loads(local_before)["actions"]
+    if same_actions:
+        with node.lock:
+            remote_actions = {
+                sid: (fid, evidence)
+                for sid, fid, evidence in node.idx(ws).execute(
+                    "SELECT sid, fid, evidence FROM actions")
+            }
+    else:
+        remote_actions = action_rows(remote_root, fetch_remote) \
+            if remote_root else {}
+    pull_actions(node, ws, remote_root, fetch_remote, remote_actions)
+    pushed_actions = push_actions(
+        node, ws, peer, remote_actions)
 
     local_root, mine = st.get("root"), ()
     if local_root:
-        anchor, _, man, _ = manifest.decode_root(local_root)
+        anchor, _, man = manifest.decode_root(local_root)
         if anchor != ws:
             raise ValueError("root anchor")
         if man:
@@ -173,7 +189,7 @@ def sync(node, ws, url):
         "etag": retag, "root": remote_root,
         "local": node.store(ws).etag("root"),
     })
-    return pulled, len(push_fids)
+    return pulled, len(push_fids) + pushed_actions
 
 
 def frontier(my_keys, theirs, differing, members_of):
@@ -215,66 +231,102 @@ def push(node, ws, peer, fids):
     return _push(node, ws, peer, fids)
 
 
-def pull_removals(node, ws, remote_root, fetch):
-    """The removal-index leg, run BEFORE the fact leg (REMOVALS.md §5).
-
-    Compare the remote root's removals fp (manifest.decode_root) with ours;
-    when they differ, fetch the index pile, decode entries, and admit each
-    entry individually (removals.admit + judging its removal's closure via
-    the ordinary assembly below — one judge, I3). node.apply_removals then
-    appends retroactive '-' rows for already-materialized victims and the
-    pump applies them. Replaces the SUPP index leg and close_deletions.
-    Returns the admitted entries — the per-entry admission observable
-    (I3); the fact leg reads the same table through node.removal_entries,
-    THE one accessor."""
-    ours = {"oid": "", "fp": ""}
-    local_root = node.store(ws).get("root")
-    if local_root:
-        ours = manifest.decode_root(local_root)[3]
-    if not remote_root:
-        return ()
-    _, _, man, theirs = manifest.decode_root(remote_root)
-    if not theirs["oid"] or theirs["fp"] == ours["fp"]:
-        with node.lock:
-            return node.removal_entries(ws)
-    entries, refs = removals.decode(_object(theirs["oid"], fetch))
-    if removals.fingerprint(entries) != theirs["fp"]:
-        raise ValueError("removal index fingerprint")
-
-    extra = {}
-    mem, fact_of, load = _resolver(node, ws, extra)
-    try:
-        need = [k for k in refs if not _holds(node, ws, extra, k)]
-        if need:
-            spine = manifest.decode(_object(man, fetch), fetch)
-            load(_extract(node, ws, extra, spine, need, fetch))
-        by_fid = {shape.fid_of(k): k for k in refs}
-        judged = False
-        for entry in entries:
-            fact = extra.get(entry.fid)
-            if node.fact_of(ws, entry.fid) is not None \
-                    or entry.fid not in by_fid or fact is None:
+def action_rows(root_bytes, fetch):
+    """Certified active sid -> (witness fid, evidence oid) off-request map."""
+    if not root_bytes:
+        return {}
+    view = WorkerView.from_root(root_bytes, fetch)
+    fact_tree = view._reader(indexes.FACT)
+    out = {}
+    for sid, slot in view._reader(indexes.SUPP).items():
+        if not isinstance(slot, dict) or slot.get("state") != "active":
+            continue
+        try:
+            fid = slot.get("action")
+            if fact_tree.get(indexes.action_key(sid)) != slot:
                 continue
-            try:  # one poisoned closure rejects alone (I3), never the index
-                unit = close([fact], _deps(mem, fact_of), fact_of)
-            except ValueError:
+            record = view.fact_record(fid)
+            if not record["evidence"]:
                 continue
-            raw = encode_pile(unit)
-            pull(node, ws, h(raw), raw)
-            judged = True
-        if judged:
-            node.turn(ws)
-    finally:
-        mem.close()
-    admitted = tuple(
-        entry for entry in entries
-        if (fact := node.fact_of(ws, entry.fid)) is not None
-        and removals.admit(entry, fact))
+            out[sid] = (fid, record["evidence"])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _validated_action(ws, sid, fid, evidence_oid, fetch):
+    raw = _object(evidence_oid, fetch)
+    stream, blobs = decode_pile(raw)
+    result = drain(stream, ws)
+    matches = [
+        valid.fact for valid in result.valids
+        if valid.fact.fid == fid and sid in actions.action_sids(valid.fact)
+    ]
+    if blobs or not result.ok or len(matches) != 1:
+        raise ValueError("action evidence")
+    return matches[0], raw
+
+
+def pull_actions(node, ws, remote_root, fetch, rows=None):
+    """Land independently validated action witnesses before ordinary ranges."""
+    rows = action_rows(remote_root, fetch) if rows is None else rows
+    accepted = []
     with node.lock:
-        node.apply_removals(ws, admitted)
-        node.idx(ws).commit()
-        pump(node, ws)
-    return admitted
+        local = {
+            sid: (fid, evidence)
+            for sid, fid, evidence in node.idx(ws).execute(
+                "SELECT sid, fid, evidence FROM actions")
+        }
+    for sid, (fid, evidence_oid) in sorted(rows.items()):
+        if local.get(sid, ("~", "~")) <= (fid, evidence_oid):
+            continue
+        try:
+            fact, raw = _validated_action(
+                ws, sid, fid, evidence_oid, fetch)
+        except (TypeError, ValueError):
+            continue
+        accepted.append((sid, fact, evidence_oid, raw))
+    if not accepted:
+        return ()
+
+    # A rootless join needs the evidence closure to establish its anchor.
+    if node.store(ws).get("root") is None:
+        for _, _, _, raw in accepted:
+            pull(node, ws, h(raw), raw)
+        node.turn(ws)
+        return tuple(fact.fid for _, fact, _, _ in accepted)
+
+    with node.lock:
+        try:
+            node._sync_index(ws)
+            for _, fact, evidence_oid, raw in accepted:
+                node.store(ws).put_if_absent("obj/" + evidence_oid, raw)
+                actions.archive(node.idx(ws), fact, evidence_oid)
+            node.apply_actions(ws, [sid for sid, _, _, _ in accepted])
+            node.commit(ws)
+            from .pump import pump
+            pump(node, ws)
+        except Exception:
+            node._restore_authoritative_projections(ws)
+            raise
+    return tuple(fact.fid for _, fact, _, _ in accepted)
+
+
+def push_actions(node, ws, peer, remote_rows):
+    """Push local witnesses missing from the peer; reverse state stays derived."""
+    with node.lock:
+        rows = node.idx(ws).execute(
+            "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
+        payloads = [
+            node.store(ws).get("obj/" + evidence)
+            for sid, fid, evidence in rows
+            if remote_rows.get(sid, ("~", "~")) > (fid, evidence)
+        ]
+    for raw in payloads:
+        if raw is None:
+            raise ValueError("local action evidence")
+        peer.put_pile(raw)
+    return len(payloads)
 
 
 def _sibling_keys(raw):

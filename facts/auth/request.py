@@ -40,12 +40,10 @@ def global_rows(f):
 
 
 def evaluate(f, globals_, ctx):
-    removed = {value for name, value in globals_ if name == "removal"}
     now = [value for name, value in globals_ if name == "now"]
     return f.t == TAG and f.body["verb"] in VERBS \
         and len(now) == 1 and f.body["exp"] >= now[0] \
-        and f.body["pk"] not in removed and not any(
-            ctx.has_offer_value("author", public) for public in removed)
+        and isinstance(f.body["pk"], str)
 
 
 def grant(f):

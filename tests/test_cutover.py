@@ -1,11 +1,4 @@
-"""Contracts for the one-store cutover (docs/CUTOVER.md).
-
-Skeleton: names and docstrings are the contract; bodies land with the steps
-of epic poc-16-oyd — each section header names the bead that fills (and
-un-skips) it. Section references cite docs/CUTOVER.md unless noted.
-Removal-index invariants I1-I6 live in tests/test_removals.py; nothing here
-duplicates them.
-"""
+"""Contracts for canonical fact transport and the composite root."""
 import json
 import random
 
@@ -14,7 +7,6 @@ import pytest
 import facts
 
 import core.manifest as manifest
-import core.removals as removals
 import core.shape as shape
 import core.sync as sync_module
 from core import cmds
@@ -29,11 +21,9 @@ from facts.content.message import message
 
 from . import util
 from .util import (
-    DeletionFamily,
     add_member,
     all_fids,
     author_msg,
-    channel_delete,
     closed_subset,
     deliver,
     member_src,
@@ -87,7 +77,7 @@ def read(node, ws):
     """``(entries, fetch)`` — the store as any reader sees it."""
     st = node.store(ws)
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man, _ = manifest.decode_root(st.get("root"))
+    _, _, man = manifest.decode_root(st.get("root"))
     return manifest.decode(fetch(man), fetch), fetch
 
 
@@ -99,7 +89,7 @@ def objects(node, ws):
         seen[oid] = st.get("obj/" + oid)
         return seen[oid]
 
-    _, _, man, _ = manifest.decode_root(st.get("root"))
+    _, _, man = manifest.decode_root(st.get("root"))
     for entry in manifest.decode(fetch(man), fetch):
         fetch(entry.leaf)
         if entry.closure:
@@ -142,19 +132,14 @@ def test_manifest_history_independence(tmp_path, world):
         assert objects(other, ws) == want  # and every object it names
 
 
-def test_history_independence_holds_with_removals(tmp_path, monkeypatch):
-    """§1 on a corpus WITH admitted removals: the removals slot — entries
-    plus the accumulated closure refs — is a pure function of the resident
-    set too, so the WHOLE root (fp, index oid and all) is byte-equal under
-    any partition/order/batching. Quarantine-free by construction: I1's
-    ride-forward of a pruned removal's entry+refs is the one sanctioned
-    history dependence, and it is local, never replayed."""
+def test_history_independence_holds_with_actions(tmp_path):
+    """The action archive and all three trees are arrival-order independent."""
     source, ws, _, _ = suppression_world(
         tmp_path / "source",
         initial_secret=load_sk(f"{1:064x}"))
     root = source.store(ws).get("root")
-    slot = manifest.decode_root(root)[3]
-    assert slot["oid"] and slot["fp"]  # a non-empty index is really in play
+    assert source.idx(ws).execute(
+        "SELECT COUNT(*) FROM actions").fetchone()[0] > 0
     for seed in range(3):
         other = replay_random(
             source, ws, Node(str(tmp_path / f"replay{seed}")), seed)
@@ -216,19 +201,19 @@ def test_root_atomically_names_manifest_and_three_logical_trees(world):
     raw = node.store(ws).get("root")
     body = json.loads(raw)
     assert set(body) == {
-        "anchor", "globals", "layout_seed", "manifest", "removals",
-        "stamp", "trees"}
+        "actions", "anchor", "globals", "layout_seed", "manifest", "stamp",
+        "trees"}
     assert body["anchor"] == ws and body["stamp"] == manifest.LAYOUT
     assert shape.valid_fid(body["layout_seed"])
     assert set(body["trees"]) == {"fact", "supp", "authority"}
+    assert set(body["actions"]) == {"count", "digest"}
     assert all(
         set(descriptor) == {"root", "count", "depth"}
         and descriptor["root"] and descriptor["count"] > 0
         and 0 < descriptor["depth"] <= 17
         for descriptor in body["trees"].values())
-    assert set(body["removals"]) == {"oid", "fp"}
     assert manifest.decode_root(raw) == (
-        ws, node.globals(ws), body["manifest"], body["removals"])
+        ws, node.globals(ws), body["manifest"])
     entries, fetch = read(node, ws)
     assert all(len(entry) == 3 for entry in entries)  # no fp, no n-count
     assert b"fp" not in fetch(body["manifest"])
@@ -538,9 +523,7 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     pushed pile; the kernel cannot tell pull from push (§2.3): a twin
     replica fed the captured union BYTES through deliver() lands in the
     identical state, and an invalid fact riding a pulled range is rejected
-    by the same judge with the same (pile-whole) effect on both paths.
-    (Removal-leg-before-fact-leg ordering is
-    tests/test_removals.py::test_sync_fetches_removals_before_fact_ranges.)"""
+    by the same judge with the same (pile-whole) effect on both paths."""
     source, ws, destination, ts = pair(tmp_path)
     twin = Node(str(tmp_path / "twin"))  # converged like destination
     deliver(twin, ws, closed_subset(source, ws, all_fids(source, ws)))
@@ -671,160 +654,13 @@ def test_sync_pushes_one_closed_deduplicated_pile(tmp_path, monkeypatch):
     assert destination.store(ws).get("root") == source.store(ws).get("root")
 
 
-def test_sync_pulls_a_missing_deletion_through_the_removal_leg(
-        tmp_path, monkeypatch):
-    # A missing removal needs no closure range augmentation: the
-    # removal-index leg runs first, judges the removal's closure through
-    # the ordinary ingress, and both roots (fact manifest AND removals
-    # {oid, fp} slot) converge (REMOVALS.md §5, §2).
-    source, ws, _, _ = suppression_world(
-        tmp_path / "source",
-        initial_secret=load_sk(f"{1:064x}"))
-    targets = [
-        cmds.post(
-            source, ws, "wide", f"message {ordinal}", ts=200 + ordinal)
-        for ordinal in range(32)
-    ]
-    deletion = source.fact_of(ws, cmds.remove(source, ws, targets[0], ts=300))
-    destination = Node(str(tmp_path / "destination"))
-    existing = set(all_fids(source, ws)) - {deletion.fid}
-    deliver(destination, ws, closed_subset(source, ws, existing))
-    destination.turn(ws)
-    slot_before = manifest.decode_root(
-        destination.store(ws).get("root"))[3]
-    assert slot_before["fp"]  # the world's own deletions already settled
-
-    monkeypatch.setattr(sync_module, "Peer", peer_for(source, [], []))
-    pulled, pushed = sync_module.sync(destination, ws, "local://source")
-
-    # The removal leg alone landed the deletion: by the time the fact leg
-    # diffed, both manifests already agreed. Stub pull_removals out and
-    # this reads (1, 0) from the fact-leg fallback.
-    assert (pulled, pushed) == (0, 0)
-    assert destination.fact_of(ws, deletion.fid) == deletion
-    slot = manifest.decode_root(destination.store(ws).get("root"))[3]
-    assert slot != slot_before
-    assert slot == manifest.decode_root(source.store(ws).get("root"))[3]
-    assert all_fids(destination, ws) == all_fids(source, ws)
-    assert destination.store(ws).get("root") == source.store(ws).get("root")
-
-
-# ---- oyd.4: read contract + retraction --------------------------------------
-
-
-def test_dep_evidence_not_suppressed(tmp_path, monkeypatch):
-    """A removed fact fetched as an out-of-range dep still validates its
-    dependents: removals gate E, never V (§2.4). On the full node the dead
-    dep leaves E while every dependent stays. A cold-partial reader runs
-    the real order — index leg first (REMOVALS.md §5), then one content
-    range — so the dead dep is already a known victim when its dependents'
-    range assembles; assembly still carries it as evidence with ZERO
-    removal consults, the range judges valid, and after ingestion the
-    dependents sit in V and E while the dep sits in V only — deletion
-    hides content, not evidence."""
-    # DeletionFamily kept deliberately: the victim is an AUTH fact (a user
-    # join) with no channel marker — outside the production content
-    # family's domain, and exactly the evidence-shaped dep this law needs.
-    monkeypatch.setitem(facts.ROUTES, DeletionFamily.TAG, DeletionFamily)
-    node = Node(str(tmp_path / "node"))
-    ws = cmds.create(node, "alice", ts=1)
-    sk, pk, joined = add_member(node, ws, "bob", ts=10)
-    msgs, ts, cuts = [], 100, 0
-    while cuts < 2:  # bob's member proof is a dep of every content range
-        msg = author_msg(node, ws, sk, pk, f"m{ts}", ts=ts)
-        msgs.append(msg.fid)
-        cuts += shape.boundary(msg.fid)
-        ts += 1
-    deletion = channel_delete(joined.fid, "general", ts)
-    node.ingest_new(ws, [deletion], {deletion.fid: [joined.fid]})
-
-    surfaced = {src for (src,) in node.app.execute(
-        "SELECT src FROM projected WHERE ws=?", (ws,))}
-    assert joined.fid not in surfaced  # the dead dep left E...
-    assert set(msgs) <= surfaced  # ...its dependents did not
-
-    entries, fetch_src = read(node, ws)
-    entry = next(  # a content range whose sibling names the dead dep
-        e for e in reversed(entries)
-        if e.closure and shape.key(joined) in json.loads(
-            fetch_src(e.closure))["keys"]
-        and {f.fid for f in members_of(e, fetch_src)} & set(msgs))
-    members = members_of(entry, fetch_src)
-    dependents = [f.fid for f in members if f.fid in set(msgs)]
-    cold = Node(str(tmp_path / "cold"))
-    fetch = lambda oid: fetch_src(oid)
-    fetch.many = lambda oids: tuple(fetch_src(oid) for oid in oids)
-    sync_module.pull_removals(  # the real order: the index leg first
-        cold, ws, node.store(ws).get("root"), fetch)
-
-    consults = []
-    stab = removals.overlapping
-    monkeypatch.setattr(
-        removals, "overlapping",
-        lambda *args: consults.append(args) or stab(*args))
-    stream = tuple(sync_module.assemble(
-        cold, ws, [(entry, members)], entries, fetch))
-
-    assert joined.fid in {f.fid for f in stream}  # fetched as evidence
-    assert drain(stream, ws).ok  # the dead dep still validates dependents
-    assert not consults  # the read entered V with no removal look
-
-    monkeypatch.setattr(removals, "overlapping", stab)  # admission may look
-    raw = encode_pile(stream)
-    sync_module.pull(cold, ws, h(raw), raw)
-    cold.turn(ws)
-    on_screen = {src for (src,) in cold.app.execute(
-        "SELECT src FROM projected WHERE ws=?", (ws,))}
-    assert cold.fact_of(ws, joined.fid) is not None  # the dep entered V...
-    assert joined.fid not in on_screen  # ...and V only
-    for fid in dependents:  # ...while its dependents entered V AND E
-        assert cold.fact_of(ws, fid) is not None and fid in on_screen
-
-
-def test_explicit_selector_consult_retires_legacy_range_slices(
-        tmp_path, monkeypatch):
-    """Parent selectors can point outside a fact-key range, so the transition
-    consult must not pretend a target-key slice is complete.  S5 replaces
-    this compatibility scan with exact SuppTree sid reads."""
-    source, ws, destination, ts = pair(tmp_path)
-    victim = next(
-        source.fact_of(ws, fid) for fid in all_fids(source, ws)
-        if source.fact_of(ws, fid).t == "msg")
-    cmds.remove(source, ws, victim.fid, ts=ts + 50)
-    for tick in range(3):
-        cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 60 + tick)
-    before = set(all_fids(destination, ws))
-
-    stabs, judged = [], []
-    stab, match = removals.overlapping, removals.applies
-    monkeypatch.setattr(
-        removals, "overlapping",
-        lambda entries, lo, hi:
-        stabs.append((lo, hi)) or stab(entries, lo, hi))
-    monkeypatch.setattr(
-        removals, "applies",
-        lambda r, f: judged.append(f.fid) or match(r, f))
-    monkeypatch.setattr(sync_module, "Peer", peer_for(source, [], []))
-    sync_module.sync(destination, ws, "local://source")
-
-    assert set(all_fids(destination, ws)) - before
-    assert stabs == []  # no false completeness claim from the retired slice
-    assert victim.fid in judged
-    assert destination.app.execute(  # yet its own range retracted it here
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (ws, victim.fid)).fetchone() is None
-    assert all_fids(destination, ws) == all_fids(source, ws)
-
-
 # ---- oyd.7: measure + first production deletion family ----------------------
 
 
 def test_production_deletion_family(tmp_path):
     """facts/content/delete.py is registered in content.MODULES; its author
-    command derives channel and span from the actual victim (I6); admitting
-    one retracts the victim's projected row and lands one index entry —
-    the first non-monkeypatched deletion end to end (REMOVALS.md §8) — and
-    both retraction and entry survive a node restart AND a rebuild."""
+    command binds the exact target offer; its action and retraction survive
+    both a node restart and a derived-index rebuild."""
     from facts.content import delete as delete_family
 
     assert delete_family in facts.MODULES
@@ -844,28 +680,31 @@ def test_production_deletion_family(tmp_path):
     removal = node.fact_of(ws, fid)
     assert removal == delete_family.delete(
         node.identity_id(ws), victim.key, OWNER, 20)
-    (entry,) = node.removal_entries(ws)  # ONE entry, span FROM the victim
-    assert entry == removals.Entry(shape.key(victim), shape.key(victim), fid)
+    action = node.idx(ws).execute(
+        "SELECT fid, evidence FROM actions WHERE sid=?",
+        (f"fact:{victim_fid}",)).fetchone()
+    assert action and action[0] == fid
+    assert node.store(ws).has("obj/" + action[1])
 
     assert victim_fid not in screen(node)  # the projected row retracted...
     assert node.app.execute(
         "SELECT 1 FROM message_rows WHERE ws=? AND src=?",
         (ws, victim_fid)).fetchone() is None
     assert spared in screen(node) and fid in screen(node)  # ...alone
-    slot = manifest.decode_root(node.store(ws).get("root"))[3]
-    published, _ = removals.decode(node.store(ws).get("obj/" + slot["oid"]))
-    assert published == (entry,)
-    assert slot["fp"] == removals.fingerprint(published)
 
     node.idx(ws).close()
     node.app.close()
     survivor = Node(node.dir)  # restart: derived projections resume
     assert survivor.fact_of(ws, victim_fid) == victim  # V keeps the victim
     assert victim_fid not in screen(survivor)
-    assert tuple(survivor.removal_entries(ws)) == (entry,)
+    assert survivor.idx(ws).execute(
+        "SELECT fid FROM actions WHERE sid=?",
+        (f"fact:{victim_fid}",)).fetchone() == (fid,)
 
     survivor.rebuild(ws)  # rebuild: the store's own units, same kernel
     assert survivor.fact_of(ws, victim_fid) == victim
     assert victim_fid not in screen(survivor)
     assert spared in screen(survivor)
-    assert tuple(survivor.removal_entries(ws)) == (entry,)
+    assert survivor.idx(ws).execute(
+        "SELECT fid FROM actions WHERE sid=?",
+        (f"fact:{victim_fid}",)).fetchone() == (fid,)

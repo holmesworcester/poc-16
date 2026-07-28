@@ -118,8 +118,7 @@ def remove(node, workspace, target, ts=None):
 
     with node.lock:
         victim = node.fact_of(workspace, target)
-        if victim is not None and node.suppressed(
-                workspace, victim, node.removal_entries(workspace)):
+        if victim is not None and node.suppressed(workspace, victim):
             raise ValueError("already removed")
     if victim is None:
         raise ValueError("no such fact")

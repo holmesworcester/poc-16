@@ -16,7 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import cmds, mint as gate
+from . import actions, cmds, mint as gate
 from .crypto import h, seal_to
 from .node import Node, now_ms
 from .store import PAGE_BATCH
@@ -281,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
             if parts[1] == "rebuild":
                 n.rebuild(ws)
                 return self._json(200, {"ok": True})
+        except actions.ScreenRejected as e:
+            return self._json(403, {"error": f"{type(e).__name__}: {e}"})
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404)

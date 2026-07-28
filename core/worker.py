@@ -7,6 +7,7 @@ from . import btreap, indexes, manifest
 from .close import decode_pile
 from .crypto import h
 from .kernel import drain
+from .shape import valid_fid
 
 MAX_PROOF_FACTS = 64
 
@@ -22,7 +23,7 @@ class WorkerView:
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        anchor, globals_, _, _ = manifest.decode_root(root_bytes)
+        anchor, globals_, _ = manifest.decode_root(root_bytes)
         seed, trees = manifest.decode_composite(root_bytes)
         if not all(trees[name]["root"] for name in indexes.TREE_NAMES):
             raise ValueError("composite root is not Worker-readable")
@@ -37,7 +38,7 @@ class WorkerView:
     def fact_record(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
         if not isinstance(row, dict) or set(row) != {
-                "edges", "key", "liveness", "offers", "raw",
+                "edges", "evidence", "key", "liveness", "offers", "raw",
                 "selectors", "tag"}:
             raise ValueError("missing FactRecord")
         if not isinstance(row["selectors"], list) \
@@ -47,7 +48,9 @@ class WorkerView:
                 or len(row["liveness"]) > indexes.MAX_SELECTORS \
                 or not all(isinstance(sid, str) for sid in row["liveness"]) \
                 or not isinstance(row["edges"], dict) \
-                or not isinstance(row["offers"], list):
+                or not isinstance(row["offers"], list) \
+                or not isinstance(row["evidence"], str) \
+                or row["evidence"] and not valid_fid(row["evidence"]):
             raise ValueError("FactRecord shape")
         return row
 

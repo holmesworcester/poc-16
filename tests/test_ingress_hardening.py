@@ -1,7 +1,9 @@
 """Real ingress failures are isolated, durable and visible."""
 import json
 
+import pytest
 from core import cmds
+from core import manifest
 from core.crypto import h
 from core.fact import canon
 from core.node import Node
@@ -66,17 +68,12 @@ def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
         "sync_failures"] == []
 
 
-def test_published_removal_decode_failure_is_guarded_and_reported(tmp_path):
+def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "node", ts=1)
     store = node.store(workspace)
     root = json.loads(store.get("root"))
-    malformed = canon({"entries": [], "refs": ["-1:" + "0" * 64]})
-    store.put("obj/" + h(malformed), malformed)
-    root["removals"] = {"oid": h(malformed), "fp": h(b"bad")}
-    store.put("root", canon(root))
+    root["removals"] = {"oid": "", "fp": ""}
 
-    assert node._published(workspace) == ((), ())
-    failures = cmds.status(node)["workspaces"][workspace]["state_failures"]
-    assert failures[0]["component"] == "published-removals"
-    assert failures[0]["error"] == "ValueError: removal index shape"
+    with pytest.raises(ValueError, match="root shape"):
+        manifest.decode_root(canon(root))

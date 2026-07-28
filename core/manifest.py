@@ -28,7 +28,7 @@ from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists, per docs/CUTOVER.md §1). Replaces tree.config/FAT_VERSION.
-LAYOUT = "composite-btreap-v1"
+LAYOUT = "composite-btreap-v2"
 TREE_NAMES = ("fact", "supp", "authority")
 
 
@@ -224,65 +224,70 @@ def decode(raw, fetch):
 
 
 def encode_root(
-        anchor, globals_, manifest_oid, removals, *,
-        layout_seed=None, trees=None):
+        anchor, globals_, manifest_oid, *,
+        action_summary=None, layout_seed=None, trees=None):
     """The mutable root — the only non-content-addressed fact-layer key:
 
         canon({"anchor": ..., "globals": [[name, value], ...],
-               "manifest": <root shard oid or "">,
-               "removals": {"oid": <index pile oid or "">, "fp": <I4 fp>},
+               "manifest": <transport manifest oid or "">,
+               "trees": {fact, supp, authority},
                "stamp": LAYOUT})
 
-    Replaces tree.encode_root. The removal index keeps a fingerprint beside
-    its oid because pile bytes embed local closure-edge choices (REMOVALS.md
-    I4); everything else is identified by oid alone."""
+    Suppression and action evidence live in the authenticated logical trees;
+    there is deliberately no separately published removal object."""
     layout_seed = layout_seed or h(canon(
         ["composite-layout-seed-v1", anchor]))
     trees = trees or {
         name: {"root": "", "count": 0, "depth": 0}
         for name in TREE_NAMES
     }
+    action_summary = action_summary or {
+        "count": 0,
+        "digest": h(canon(["action-set-v1", []])),
+    }
     return canon({
+        "actions": action_summary,
         "anchor": anchor,
         "globals": sorted([list(row) for row in globals_]),
         "layout_seed": layout_seed,
         "manifest": manifest_oid or "",
-        "removals": {"oid": removals.get("oid", ""),
-                     "fp": removals.get("fp", "")},
         "stamp": LAYOUT,
         "trees": trees,
     })
 
 
 def decode_root(raw):
-    """``(anchor, globals_, manifest_oid, removals)`` back out of root bytes;
+    """``(anchor, globals_, manifest_oid)`` back out of root bytes;
     raises ValueError on any malformation or on ``stamp != LAYOUT`` (the
     rebuild trigger — there is deliberately no other answer)."""
     o = json.loads(raw)
     if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
         raise ValueError("root stamp")
-    removals, rows = o.get("removals"), o.get("globals")
+    rows = o.get("globals")
     trees = o.get("trees")
-    if not (valid_fid(o.get("anchor"))
+    action_summary = o.get("actions")
+    if not (set(o) == {
+                "actions", "anchor", "globals", "layout_seed", "manifest",
+                "stamp", "trees"}
+            and valid_fid(o.get("anchor"))
             and valid_fid(o.get("layout_seed"))
             and isinstance(o.get("manifest"), str)
             and (not o["manifest"] or valid_fid(o["manifest"]))
-            and isinstance(removals, dict)
-            and isinstance(removals.get("oid"), str)
-            and (not removals["oid"] or valid_fid(removals["oid"]))
-            and isinstance(removals.get("fp"), str)
-            and (not removals["fp"] or valid_fid(removals["fp"]))
             and isinstance(rows, list)
             and all(isinstance(row, list) and len(row) == 2
                     and all(isinstance(part, str) for part in row)
                     for row in rows)
+            and isinstance(action_summary, dict)
+            and set(action_summary) == {"count", "digest"}
+            and type(action_summary["count"]) is int
+            and action_summary["count"] >= 0
+            and valid_fid(action_summary["digest"])
             and _trees_ok(trees)):
         raise ValueError("root shape")
     return (
         o["anchor"],
         frozenset(tuple(row) for row in rows),
         o["manifest"],
-        {"oid": removals["oid"], "fp": removals["fp"]},
     )
 
 

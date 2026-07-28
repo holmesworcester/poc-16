@@ -129,15 +129,13 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 
 def manifest_objs(store):
     """``(manifest oid, live oids)`` — every object a cold reader fetches:
-    manifest shards, leaf piles, closure siblings, and the removal index."""
+    manifest shards, leaf piles, and closure siblings."""
     oids = []
     fetch = lambda oid: (oids.append(oid) or store.get("obj/" + oid))
-    _, _, man, removals = manifest.decode_root(store.get("root"))
+    _, _, man = manifest.decode_root(store.get("root"))
     entries = manifest.decode(fetch(man), fetch)
     oids += [e.leaf for e in entries]
     oids += [e.closure for e in entries if e.closure]
-    if removals["oid"]:
-        oids.append(removals["oid"])
     return man, oids
 
 
@@ -222,8 +220,8 @@ def reconcile(A, B, ws):
 
     t0 = perf()
     fetch_local = lambda oid: astore.get("obj/" + oid)
-    _, _, my_man, _ = manifest.decode_root(astore.get("root"))
-    _, _, their_man, _ = manifest.decode_root(bstore.get("root"))
+    _, _, my_man = manifest.decode_root(astore.get("root"))
+    _, _, their_man = manifest.decode_root(bstore.get("root"))
     mine = manifest.decode(fetch_local(my_man), fetch_local)
     theirs = manifest.decode(fetch_remote(their_man), fetch_remote)
     differing = set(manifest.diff(mine, their_man, fetch_remote))
@@ -380,7 +378,7 @@ def check_leaves(seed, ws):
     """Every published leaf plus its closure sibling still judges alone."""
     st = seed.store(ws)
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man, _ = manifest.decode_root(st.get("root"))
+    _, _, man = manifest.decode_root(st.get("root"))
     entries = manifest.decode(fetch(man), fetch)
     piles = {e.leaf: decode_pile(fetch(e.leaf))[0] for e in entries}
     n = 0

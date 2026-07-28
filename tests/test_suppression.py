@@ -12,7 +12,6 @@ from core.node import Node
 from core.suppression import (
     SELF,
     action,
-    atom,
     deathkey,
     is_deletion,
     self_selector,
@@ -46,14 +45,14 @@ def test_type_owned_selectors_are_envelope_visible_and_exact():
     assert msg.atoms == [self_selector()]
 
 
-def test_deathkey_and_tag_are_body_free():
-    target = EnvelopeOnly([atom("general")])
-    deletion = EnvelopeOnly([atom("general", deletion=True)])
+def test_deathkey_is_body_free():
+    target = message("pk", "general", "hello", 1)
+    deletion = EnvelopeOnly([
+        action(CONTENT_DELETE, SELF, target.key)])
 
-    assert suppkeys(target) == {deathkey(deletion)} == {'["chan","general"]'}
-    assert not is_deletion(target)
+    assert deathkey(deletion) == "fact:" + target.fid
     assert is_deletion(deletion)
-    assert suppkeys(deletion) == frozenset()  # a death marker is no membership
+    assert suppkeys(deletion) == frozenset()
 
 
 def test_suppression_marker_survives_the_wire_codec():
@@ -110,20 +109,10 @@ def test_malformed_suppression_atoms_are_rejected_at_the_door(atoms):
     [["supp", "chan", 1, "target"]],
     [["supp", "other", "general", "target"]],
     [["supp", "chan", "general", "other"]],
-    [atom("general", deletion=True), atom("other", deletion=True)],
+    [["action", CONTENT_DELETE, SELF, "not-a-key"]],
 ])
 def test_noncanonical_or_ambiguous_markers_do_not_index(atoms):
     fact = EnvelopeOnly(atoms)
     assert suppkeys(fact) == frozenset()
-    assert deathkey(fact) is None
-    assert not is_deletion(fact)
-
-
-def test_target_markers_are_a_membership_set():
-    """Many TARGET markers declare many groups (REMOVALS.md §2) — the old
-    0-or-2+ collapse to None was the one-group assumption, not a rule."""
-    fact = EnvelopeOnly(
-        [atom("general"), atom("author/alice"), atom("general")])
-    assert suppkeys(fact) == {'["chan","general"]', '["chan","author/alice"]'}
     assert deathkey(fact) is None
     assert not is_deletion(fact)

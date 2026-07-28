@@ -49,7 +49,7 @@ def root_with(node, workspace, extra, deps_of=None):
     optionally under non-canonical closure choices (``deps_of``)."""
     store = node.store(workspace)
     fetch = lambda oid: store.get("obj/" + oid)
-    _, _, man, slot = manifest.decode_root(store.get("root"))
+    _, _, man = manifest.decode_root(store.get("root"))
     resident = list(node_module.resident(man, fetch))
     unit = combine(resident, extra)
     result = drain(unit, workspace)
@@ -65,7 +65,7 @@ def root_with(node, workspace, extra, deps_of=None):
     _, forged = manifest.build(
         [fact.key for fact in unit], by_fid.__getitem__,
         deps_of or deps.__getitem__, emit)
-    return manifest.encode_root(workspace, result.globals, forged, slot)
+    return manifest.encode_root(workspace, result.globals, forged)
 
 
 def conflict_world(path, seed):
@@ -261,7 +261,7 @@ def test_stateless_authority_rejects_a_noncanonical_leaf_pile(world):
         store.put("obj/" + oid, raw)
         return oid
 
-    anchor, globals_, man, slot = manifest.decode_root(store.get("root"))
+    anchor, globals_, man = manifest.decode_root(store.get("root"))
     entries = manifest.decode(fetch(man), fetch)
     members = decode_pile(fetch(entries[0].leaf))[0]
     assert len(members) > 1
@@ -269,7 +269,7 @@ def test_stateless_authority_rejects_a_noncanonical_leaf_pile(world):
         leaf=emit(encode_pile(list(reversed(members)))))
     corrupt = manifest.encode_root(
         anchor, globals_,
-        manifest.encode([shuffled] + list(entries[1:]), emit), slot)
+        manifest.encode([shuffled] + list(entries[1:]), emit))
 
     with pytest.raises(ValueError, match="invalid authority store"):
         mint.Authority.from_root(corrupt, fetch)
@@ -283,7 +283,7 @@ def test_stateless_authority_rejects_an_empty_root_without_its_anchor(
     _, empty = manifest.build(
         [], lambda fid: None, lambda fid: (),
         lambda raw: objects.__setitem__(h(raw), raw))
-    root = manifest.encode_root(workspace, frozenset(), empty, {})
+    root = manifest.encode_root(workspace, frozenset(), empty)
 
     with pytest.raises(
             ValueError, match="authority projection does not match root"):
@@ -291,7 +291,7 @@ def test_stateless_authority_rejects_an_empty_root_without_its_anchor(
     assert mint.stateless(pile, root, objects.get, now) is None
 
 
-def test_root_metadata_cannot_omit_an_eviction(tmp_path):
+def test_root_globals_cannot_override_an_eviction_action(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     founder = node.identity_id(workspace)
@@ -306,8 +306,8 @@ def test_root_metadata_cannot_omit_an_eviction(tmp_path):
     store = node.store(workspace)
     honest = store.get("root")
     root = json.loads(honest)
-    assert ["removal", bob] in root["globals"]
-    root["globals"] = []
+    assert root["globals"] == []
+    root["globals"] = [["removal", bob]]
     forged = canon(root)
     fetch = lambda oid: store.get("obj/" + oid)
 

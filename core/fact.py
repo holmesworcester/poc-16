@@ -64,11 +64,8 @@ def _atoms_ok(atoms) -> bool:
             if len(a) not in (3, 4):
                 return False
         elif a[0] == "supp":
-            from .suppression import (
-                valid_legacy_marker,
-                valid_selector_marker,
-            )
-            if not valid_selector_marker(a) and not valid_legacy_marker(a):
+            from .suppression import valid_selector_marker
+            if not valid_selector_marker(a):
                 return False
         elif a[0] == "action":
             from .suppression import valid_action_marker

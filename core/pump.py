@@ -5,9 +5,9 @@
                                                        (tests/test_pump.py)
 
 The λ path never touches this module: read models are a leaf-client concern.
-Rebuild is the clean side of the theorem: replay computes S by the ONE
-removal consult (node.removal_entries + node.suppressed, CUTOVER §2.4),
-folds over E = V∖S in canonical order, and fires zero retractions.
+Rebuild is the clean side of the theorem: replay computes S through the same
+exact suppression-id consult as live admission, folds over E = V∖S in
+canonical order, and fires zero retractions.
 """
 import facts
 from .close import close
@@ -39,9 +39,8 @@ def append_admitted(idx, fids):
 
 def append_retracted(idx, targets):
     """−target for each suppressed victim: the forward mask and
-    node.apply_removals both land here. −t follows +t in every legal
-    stream — locally a removal follows its victim (its target is a hard
-    ref); a synced entry masks at admission, in the same transaction."""
+    node.apply_actions both land here. −t follows +t in every legal stream;
+    an action's immutable evidence is admitted before its sid becomes active."""
     idx.executemany(
         "INSERT INTO log(op, fid) VALUES('-', ?)",
         ((fid,) for fid in targets),
@@ -109,10 +108,9 @@ def pump(node, ws, projector="app"):
                     node.fact_of(ws, fid)
                     for (fid,) in idx.execute("SELECT fid FROM facts")
                 ]
-                entries = node.removal_entries(ws)
                 suppressed = {  # E = V∖S by the one consult (CUTOVER §2.4)
                     fact.fid for fact in valid_facts
-                    if node.suppressed(ws, fact, entries)
+                    if node.suppressed(ws, fact)
                 }
                 ordered = close(
                     valid_facts,

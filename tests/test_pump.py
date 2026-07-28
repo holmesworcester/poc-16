@@ -1,5 +1,4 @@
 """Acceptance laws for the cursored projection pump."""
-from types import SimpleNamespace
 
 import pytest
 
@@ -8,11 +7,8 @@ import facts
 from core import cmds
 from core.close import decode_pile
 from core.crypto import keypair
-from core.fact import Fact
-from core.kernel import Valid
-from core.node import Node, now_ms
+from core.node import Node
 from core.pump import pump, retract
-from core.suppression import atom
 
 from .util import (
     add_member,
@@ -297,37 +293,6 @@ def test_dependent_facts_follow_source_at_every_projection_boundary(
         if row["pk"] == target)
     assert projected["role"] == "admin"
     assert projected["evicted"] is True
-
-
-def test_minus_follows_plus(world, monkeypatch):
-    """A deletion refs its target, so −t appears after +t in every legal
-    stream node.merge appends."""
-    node, workspace, target = world
-    deletion = Fact(
-        "channel_delete", now_ms(),
-        [atom("general", deletion=True), ["ref", "target", target]],
-        {},
-    )
-    monkeypatch.setitem(
-        facts.ROUTES, deletion.t,
-        SimpleNamespace(DURABLE=True),
-    )
-
-    node.merge(workspace, [Valid(deletion, (target,))])
-
-    rows = node.idx(workspace).execute(
-        "SELECT seq, op, fid FROM log "
-        "WHERE fid IN (?, ?) ORDER BY seq",
-        (target, deletion.fid),
-    ).fetchall()
-    target_plus = next(seq for seq, op, fid in rows
-                       if op == "+" and fid == target)
-    deletion_plus = next(seq for seq, op, fid in rows
-                         if op == "+" and fid == deletion.fid)
-    target_minus = next(seq for seq, op, fid in rows
-                        if op == "-" and fid == target)
-
-    assert target_plus < deletion_plus < target_minus
 
 
 # ---- the contract (poc-16-808.6) ----------------------------------------------

@@ -11,7 +11,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 
+import pytest
 from core.cli import ctl
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,7 +148,9 @@ def test_alice_bob_carol(tmp_path):
                    30, "eviction reaches bob")
         time.sleep(2.5)  # let carol's cached grant expire: the designed
         # leakage window is exactly the grant TTL, nothing more
-        ctl(url("carol"), "POST", "post", {"ws": ws, "text": "ghost"})
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            ctl(url("carol"), "POST", "post", {"ws": ws, "text": "ghost"})
+        assert rejected.value.code == 403
         time.sleep(4)  # several cadences: her mint is now refused
         assert "ghost" not in texts("alice", ws)
         assert "ghost" not in texts("bob", ws)

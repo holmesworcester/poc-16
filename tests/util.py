@@ -7,7 +7,6 @@ import tempfile
 from core import cmds, daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
-from core.fact import Fact
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
@@ -15,7 +14,6 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import offer_src, resolve_deps
 from core.node import Node, now_ms
-from core.suppression import TARGET, atom, is_deletion
 
 
 def invoke_mint(node, workspace, pile):
@@ -28,85 +26,6 @@ def invoke_mint(node, workspace, pile):
         "ws": workspace,
         "pile": base64.b64encode(pile).decode(),
     })
-
-
-def channel_delete(target, channel, ts):
-    """Synthetic valid POINT removal: death marker + TARGET ref. The
-    channel is inert for reach; the victim is exactly ``target``."""
-    return Fact(
-        "channel_delete", ts,
-        [atom(channel, deletion=True), ["ref", TARGET, target]], {})
-
-
-def channel_kill(channel, ts):
-    """Synthetic valid KILL: death marker, NO TARGET ref — reach is
-    deathkey ∈ suppkeys(f) over the whole group (REMOVALS.md §2)."""
-    return Fact("channel_kill", ts, [atom(channel, deletion=True)], {})
-
-
-def multi_group_post(channel, author, text, ts):
-    """A fact declaring TWO suppression groups — channel and author — via
-    two TARGET-tag markers; a kill of either group reaches it (§2)."""
-    return Fact(
-        "multi_group_post", ts,
-        [atom(channel), atom(f"author/{author}")], {"text": text})
-
-
-class DeletionFamily:
-    """Deliberately kept raw-fact deletion family (production deletions
-    author through facts/content/delete.py): the needs()-free monkeypatch
-    base for KillFamily/MultiGroupFamily and for adversarial fixtures whose
-    victims are auth facts outside the content family's channel-marker
-    domain (test_prune_restore_keeps_removals, test_dep_evidence_not_
-    suppressed)."""
-    TAG = "channel_delete"
-    TABLES = ()
-    DURABLE = True
-
-    @staticmethod
-    def needs(fact):
-        return ()
-
-    @staticmethod
-    def validate(fact, context):
-        try:
-            ((name, target),) = fact.refs()
-            channel = fact.atoms[0][2]
-        except (IndexError, TypeError, ValueError):
-            return False
-        row = context.db.execute(
-            "SELECT t FROM facts WHERE fid=?", (target,)).fetchone()
-        return name == TARGET and is_deletion(fact) \
-            and row is not None and row[0] != DeletionFamily.TAG \
-            and fact == channel_delete(target, channel, fact.ts)
-
-    @staticmethod
-    def global_rows(fact):
-        return ()
-
-    @staticmethod
-    def blob_refs(fact):
-        return ()
-
-    @staticmethod
-    def materialize(db, workspace, valid):
-        return None
-
-
-class MultiGroupFamily(DeletionFamily):
-    """Durable content sitting in two suppression groups at once
-    (monkeypatch alongside DeletionFamily, ROUTES[TAG] = this)."""
-    TAG = "multi_group_post"
-
-    @staticmethod
-    def validate(fact, context):
-        try:
-            channel, author = (marker[2] for marker in fact.atoms)
-        except (IndexError, TypeError, ValueError):
-            return False
-        return not fact.refs() and fact == multi_group_post(
-            channel, author.removeprefix("author/"),
-            fact.body.get("text"), fact.ts)
 
 
 def suppression_world(path, initial_secret=None):

@@ -20,7 +20,7 @@ import sqlite3
 from dataclasses import dataclass
 
 import facts as families
-from . import manifest
+from . import actions, manifest
 from .close import decode_pile
 from .crypto import h
 from .kernel import SCHEMA, drain_committed, evaluate, unresolved_facts
@@ -39,7 +39,7 @@ class Authority:
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        anchor, globals_, man, _ = manifest.decode_root(root_bytes)
+        anchor, globals_, man = manifest.decode_root(root_bytes)
         try:
             unit = resident(man, fetch)
         except ValueError as exc:
@@ -99,7 +99,18 @@ def mint(pile_bytes, anchor, globals_, now, *, canonical_db):
             canonical_db=canonical_db)
     except Exception:
         return None
-    return grant if grant is not None and allowed else None
+    if grant is None or not allowed:
+        return None
+    try:
+        if actions.active(
+                canonical_db,
+                actions.principal_sid("member", grant[0])):
+            return None
+    except sqlite3.OperationalError:
+        # The pre-tree compatibility projection has no action table. New
+        # production callers use WorkerView and exact authenticated slots.
+        pass
+    return grant
 
 
 def stateless(pile_bytes, root_bytes, fetch, now, projection=None):
@@ -148,5 +159,5 @@ def screen(facts, supp):
 
 def root_globals(root_bytes):
     """Read root-riding metadata; stateless production uses ``stateless``."""
-    anchor, globals_, _, _ = manifest.decode_root(root_bytes)
+    anchor, globals_, _ = manifest.decode_root(root_bytes)
     return anchor, globals_

@@ -1,13 +1,12 @@
 """Three logical authenticated indexes over the one B-treap codec."""
 from collections import defaultdict
+import json
 
 import facts
 
-from . import btreap
+from . import actions, btreap
 from .crypto import h
-from .fact import canon
-from .suppression import deathkey, is_deletion, suppkeys
-from .fact import from_json
+from .fact import canon, from_json
 
 FACT = "fact"
 SUPP = "supp"
@@ -29,20 +28,7 @@ def action_key(sid):
     return "action:" + sid
 
 
-def principal_sid(kind, public_key):
-    return f"{kind}:{public_key}"
-
-
-def action_sids(fact):
-    out = set()
-    if is_deletion(fact):
-        out.add(deathkey(fact))
-    out.update(
-        principal_sid("member", target)
-        for name, target, _ in fact.offers()
-        if name == "removed"
-    )
-    return frozenset(out)
+principal_sid = actions.principal_sid
 
 
 def need_key(name, a0, a1=None, requires=()):
@@ -81,23 +67,22 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
         for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid")
     ]
 
-    archived_actions = {}
-    try:
-        for fid, raw in idx.execute(
-                "SELECT fid, j FROM actions ORDER BY fid"):
-            fact = from_json(__import__("json").loads(raw))
-            if fact.fid != fid:
-                raise ValueError("action archive integrity")
-            archived_actions[fid] = fact
-    except Exception as exc:
-        if "no such table" not in str(exc):
-            raise
+    archived_actions, action_rows = {}, []
+    for sid, fid, raw, evidence in idx.execute(
+            "SELECT sid, fid, j, evidence FROM actions ORDER BY sid"):
+        fact = from_json(json.loads(raw))
+        if fact.fid != fid or sid not in actions.action_sids(fact):
+            raise ValueError("action archive integrity")
+        archived_actions[fid] = fact
+        action_rows.append((sid, fid))
+    action_evidence = dict(idx.execute(
+        "SELECT fid, evidence FROM actions ORDER BY fid"))
 
     def add_fact_record(fact):
         raw = canon(fact.to_json())
         if len(raw) > MAX_RAW_FACT_BYTES:
             raise ValueError("raw fact exceeds authenticated record budget")
-        selectors = sorted(suppkeys(fact))
+        selectors = sorted(actions.fact_scopes(fact))
         if len(selectors) > MAX_SELECTORS:
             raise ValueError("fact selector budget")
         raw_oid = h(raw)
@@ -108,21 +93,17 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
             "SELECT role, dst FROM edges WHERE src=? ORDER BY role",
             (fact.fid,)).fetchall())
         policy = facts.policy_for(fact.t)
-        liveness = set()
+        liveness = set(actions.provider_scopes(fact)) - set(selectors)
         if policy is not None:
             for role in policy.authority_liveness_guards:
                 provider_fid = edges.get(role)
                 provider = fact_of(provider_fid) if provider_fid else None
                 if provider is None:
                     raise ValueError("authority liveness edge")
-                liveness.update(suppkeys(provider))
-                for name, public_key, _ in provider.offers():
-                    if name == "member":
-                        liveness.add(principal_sid("member", public_key))
-                    elif name == "device_key":
-                        liveness.add(principal_sid("device", public_key))
+                liveness.update(actions.provider_scopes(provider))
         fact_rows[fact_key(fact.fid)] = {
             "edges": edges,
+            "evidence": action_evidence.get(fact.fid, ""),
             "key": fact.key,
             "liveness": sorted(liveness),
             "offers": [list(row) for row in fact.offers()],
@@ -134,6 +115,14 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
             supp_rows.setdefault(sid, {"state": "clear"})
         if policy is not None and policy.direct_targets:
             sid = fact_key(fact.fid)
+            fact_rows.setdefault(action_key(sid), {"state": "clear"})
+        for name, public_key, _ in fact.offers():
+            if name == "member":
+                sid = principal_sid("member", public_key)
+            elif name == "device_key":
+                sid = principal_sid("device", public_key)
+            else:
+                continue
             fact_rows.setdefault(action_key(sid), {"state": "clear"})
 
     for fact in current:
@@ -154,11 +143,9 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
         supp_rows.setdefault(principal_sid(kind, public_key),
                              {"state": "clear"})
 
-    actions = archived_actions.values() if archived_actions else current
-    for fact in actions:
-        for sid in action_sids(fact):
-            _activate(supp_rows, sid, fact.fid)
-            _activate(fact_rows, action_key(sid), fact.fid)
+    for sid, fid in action_rows:
+        _activate(supp_rows, sid, fid)
+        _activate(fact_rows, action_key(sid), fid)
 
     # Authority is current-state, not a grow-only archive.  Previously known
     # NeedKeys remain explicit NO_PROVIDER rows so absence is authenticated.

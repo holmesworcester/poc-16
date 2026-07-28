@@ -260,8 +260,7 @@ def test_semantic_index_upgrade_republishes_ranked_authority_closures(
         emit,
     )
     legacy_root = manifest.encode_root(
-        workspace, node.globals(workspace), man,
-        json.loads(canonical_root)["removals"])
+        workspace, node.globals(workspace), man)
     assert legacy_root != canonical_root
     store = node.store(workspace)
     for key, value in objects.items():

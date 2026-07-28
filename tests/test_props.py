@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from core import cmds, indexes, manifest
+from core import actions, cmds, indexes, manifest, mint
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -75,7 +75,7 @@ def units_of(store):
     members plus its closure sibling's facts (each resolved at its own home
     leaf), serialized deps-first by the ordinary close()."""
     fetch = lambda oid: store.get("obj/" + oid)
-    _, _, man, _ = manifest.decode_root(store.get("root"))
+    _, _, man = manifest.decode_root(store.get("root"))
     entries = manifest.decode(fetch(man), fetch)
     piles = {
         entry.sep: decode_pile(fetch(entry.leaf))[0] for entry in entries}
@@ -144,7 +144,7 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     before = all_fids(n, ws)
     root_bytes = st.get("root")
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man, _ = manifest.decode_root(root_bytes)
+    _, _, man = manifest.decode_root(root_bytes)
     entries = manifest.decode(fetch(man), fetch)
     st.put("obj/" + entries[0].leaf, encode_pile([]))
 
@@ -179,7 +179,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         leaf=emit(encode_pile([hidden] + members)))
     man = manifest.encode([smuggled] + list(entries[1:]), emit)
     st.put("root", manifest.encode_root(
-        ws, n.globals(ws), man, body["removals"]))
+        ws, n.globals(ws), man))
     with pytest.raises(ValueError, match="invalid store facts"):
         n.rebuild(ws)
 
@@ -191,7 +191,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         entries[1]._replace(leaf=emit(encode_pile([first[-1]] + second))),
     ] + list(entries[2:])
     st.put("root", manifest.encode_root(
-        ws, n.globals(ws), manifest.encode(moved, emit), body["removals"]))
+        ws, n.globals(ws), manifest.encode(moved, emit)))
     with pytest.raises(ValueError, match="store placement"):
         n.rebuild(ws)
 
@@ -226,7 +226,7 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
         [], lambda fid: None, lambda fid: (),
         lambda raw: store.put("obj/" + h(raw), raw))
     store.put(
-        "root", manifest.encode_root(workspace, frozenset(), empty, {}))
+        "root", manifest.encode_root(workspace, frozenset(), empty))
 
     with pytest.raises(ValueError, match="store fact set"):
         node.rebuild(workspace)
@@ -337,8 +337,8 @@ def test_failed_turn_restores_authoritative_state_before_return(
         canonical_db=node.idx(workspace),
     )
 
-    old_root = node.store(workspace).etag("root")
     store = node.store(workspace)
+    old_root = store.etag("root")
     original_cas = store.cas
 
     def fail_manifest_cas(*args, **kwargs):
@@ -376,13 +376,10 @@ def test_failed_turn_restores_authoritative_state_before_return(
     monkeypatch.setattr(store, "cas", original_cas)
     node.turn(workspace)
 
-    assert not evaluate(
-        proof,
-        workspace,
-        node.globals(workspace) | {("now", ts)},
-        canonical_db=node.idx(workspace),
-    )
-    assert ("removal", bob) in node.globals(workspace)
+    assert mint.stateless(
+        encode_pile(proof), store.get("root"),
+        lambda oid: store.get("obj/" + oid), ts) is None
+    assert ("removal", bob) not in node.globals(workspace)
     assert next(
         member for member in cmds.members(node, workspace)
         if member["pk"] == bob
@@ -568,7 +565,9 @@ def full_manifest(n, ws):
     seed, trees = indexes.build(
         ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
     return manifest.encode_root(
-        ws, n.globals(ws), man, {}, layout_seed=seed, trees=trees)
+        ws, n.globals(ws), man,
+        action_summary=actions.summary(idx),
+        layout_seed=seed, trees=trees)
 
 
 def test_incremental_equals_full(tmp_path):
@@ -711,11 +710,12 @@ def test_shadow_guard_keeps_identity(world):
     assert n.store(ws).get("root") == full_manifest(n, ws)  # still byte-identical
 
 
-def test_removal_set_rides_the_root(world):
+def test_action_set_rides_the_root_without_removal_globals(world):
     n, ws = world
-    globals_ = manifest.decode_root(n.store(ws).get("root"))[1]
-    carol = [m["pk"] for m in cmds.members(n, ws) if m["name"] == "carol"]
-    assert globals_ == frozenset({("removal", carol[0])})
+    root = json.loads(n.store(ws).get("root"))
+    assert manifest.decode_root(n.store(ws).get("root"))[1] == frozenset()
+    assert root["globals"] == []
+    assert root["actions"] == actions.summary(n.idx(ws))
 
 
 def test_poison_pile_is_litter_not_poison(world):

@@ -1,18 +1,9 @@
-"""Clear-envelope suppression selectors and exact action targets.
-
-The codec in this module is policy-neutral.  Fact families declare which
-selectors are required and which actions may invoke them in facts._policy.
-Legacy channel markers remain decodable until the storage cutover; newly
-authored registered families use only SELF/PARENT/ANCESTOR selectors.
-"""
-import json
+"""Clear-envelope explicit selectors and exact action targets."""
 
 from . import shape
 
 ATOM = "supp"
-DOMAIN = "chan"
 TARGET = "target"
-DELETE = "delete"
 SELF = "self"
 PARENT = "parent"
 ANCESTOR = "ancestor"
@@ -45,22 +36,6 @@ def action(name, selector, target_key):
     return [ACTION, name, selector, target_key]
 
 
-def atom(channel, *, deletion=False):
-    """Legacy channel marker retained only for old/test removal families."""
-    return [ATOM, DOMAIN, channel, DELETE if deletion else TARGET]
-
-
-def _markers(fact):
-    """Every well-formed suppression marker — no 0-or-2+ collapse (the
-    one-group-per-fact assumption fossilized in code; REMOVALS.md §2)."""
-    return [
-        entry for entry in fact.atoms
-        if isinstance(entry, list) and len(entry) == 4 and entry[0] == ATOM
-        and entry[1] == DOMAIN and isinstance(entry[2], str)
-        and entry[3] in (TARGET, DELETE)
-    ]
-
-
 def valid_selector_marker(entry):
     return entry == [ATOM, SELF] or (
         isinstance(entry, list) and len(entry) == 4
@@ -73,13 +48,6 @@ def valid_selector_marker(entry):
         and isinstance(entry[2], str) and "/" in entry[2]
         and shape.valid_fid(entry[3])
     )
-
-
-def valid_legacy_marker(entry):
-    return isinstance(entry, list) and len(entry) == 4 \
-        and entry[0] == ATOM and entry[1] == DOMAIN \
-        and isinstance(entry[2], str) \
-        and entry[3] in (TARGET, DELETE)
 
 
 def selector_markers(fact):
@@ -104,37 +72,23 @@ def action_markers(fact):
     )
 
 
-def _group(marker):
-    return json.dumps(marker[1:3], separators=(",", ":"))
-
-
 def suppkeys(fact):
     """Resolved suppression ids offered by the clear envelope.
 
     SELF expands only after ``fact.fid`` has passed envelope integrity.
-    Parent and ancestor selectors already carry exact ancestor fids.  Legacy
-    channel memberships occupy a disjoint JSON namespace during migration.
+    Parent and ancestor selectors already carry exact ancestor fids.
     """
-    explicit = {
+    return frozenset({
         "fact:" + (fact.fid if marker[1] == SELF else marker[3])
         for marker in selector_markers(fact)
-    }
-    legacy = {
-        _group(marker) for marker in _markers(fact)
-        if marker[3] == TARGET
-    }
-    return frozenset(explicit | legacy)
+    })
 
 
 def deathkey(fact):
-    """The one sid an exact action or legacy delete marker activates."""
+    """The one sid activated by an exact action."""
     actions = action_markers(fact)
-    legacy = [m for m in _markers(fact) if m[3] == DELETE]
-    if len(actions) + len(legacy) != 1:
-        return None
-    if actions:
-        return "fact:" + shape.fid_of(actions[0][3])
-    return _group(legacy[0])
+    return "fact:" + shape.fid_of(actions[0][3]) \
+        if len(actions) == 1 else None
 
 
 def action_target_key(fact):
