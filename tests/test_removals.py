@@ -19,10 +19,12 @@ from core.suppression import TARGET, atom, deathkey, is_deletion, suppkeys
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
+from facts._policy import OWNER
 from facts.content.message import message
 
 from .util import (
     DeletionFamily,
+    MultiGroupFamily,
     add_member,
     all_fids,
     author_msg,
@@ -223,7 +225,7 @@ def test_predicate_never_suppresses_removals():
     """not is_deletion(f) is a correctness requirement (I2): removals are
     never victims and write no supp rows, so no removal — point or kill —
     can retract another, and the index cannot self-annihilate."""
-    victim = message("pk", "general", "hello", 1)
+    victim = multi_group_post("general", "alice", "hello", 1)
     kill = channel_kill("general", 5)
     other_kill = channel_kill("general", 6)
     point_at_kill = channel_delete(kill.fid, "general", 7)
@@ -439,11 +441,15 @@ def test_removal_before_victim_retracts_on_arrival(tmp_path, monkeypatch):
     # no removal, so only the admission-consult mask stands between the
     # victim and E.
     monkeypatch.setitem(facts.ROUTES, KillFamily.TAG, KillFamily)
+    monkeypatch.setitem(facts.ROUTES, MultiGroupFamily.TAG, MultiGroupFamily)
     kill = channel_kill("channel-0", 150)
     source.ingest_new(workspace, [kill], {kill.fid: []})
     sync_module.sync(forward, workspace, "local://source")  # index first
     assert forward.fact_of(workspace, kill.fid) is not None
-    late = cmds.post(source, workspace, "channel-0", "posthumous", ts=700)
+    late_fact = multi_group_post(
+        "channel-0", "late", "posthumous", 700)
+    source.ingest_new(workspace, [late_fact], {late_fact.fid: []})
+    late = late_fact.fid
     assert not surfaced(source, workspace, late)  # masked at the author too
     watch.append(late)
     trace.clear()
@@ -709,7 +715,7 @@ def test_production_deletion_family(tmp_path):
 
     fid = cmds.remove(node, workspace, victim_fid, ts=20)
     removal = node.fact_of(workspace, fid)
-    assert removal == delete(public, "general", victim_fid, 20)  # I6 channel
+    assert removal == delete(public, victim.key, OWNER, 20)
     entry = removals.entry(removal, victim_key(victim))
     assert (entry.lo, entry.hi) == (shape.key(victim),) * 2  # I6 span
     assert removals.admit(entry, removal)
@@ -720,7 +726,7 @@ def test_production_deletion_family(tmp_path):
 
     with pytest.raises(ValueError, match="never victims"):
         cmds.remove(node, workspace, fid, ts=30)  # I2 at the command
-    recursive = delete(public, "general", fid, 30)  # I2 at validate
+    recursive = delete(public, removal.key, OWNER, 30)  # I2 at validate
     sig = signature(secret, public, recursive, 30)
     with pytest.raises(ValueError, match="outside the canonical set"):
         node.ingest_new(workspace, [sig, recursive], {
@@ -749,7 +755,7 @@ def test_production_deletion_family(tmp_path):
 
     req = request(public, "sync", 10 ** 15, 33)  # EPHEMERAL victim
     req_sig = signature(secret, public, req, 33)
-    doom = delete(public, "general", req.fid, 34)
+    doom = delete(public, req.key, OWNER, 34)
     doom_sig = signature(secret, public, doom, 34)
     member = member_src(node, workspace, public)
     with pytest.raises(ValueError, match="outside the canonical set"):
@@ -766,7 +772,7 @@ def test_production_deletion_family(tmp_path):
     cmds.remove(node, workspace, bobs.fid, ts=42)  # any member, any content
     assert not surfaced(node, workspace, bobs.fid)
     outsider_secret, outsider = keypair()  # ...but only a MEMBER
-    stranger = delete(outsider, "general", mate_fid, 43)
+    stranger = delete(outsider, mate.key, OWNER, 43)
     stranger_sig = signature(outsider_secret, outsider, stranger, 43)
     with pytest.raises(ValueError, match="outside the canonical set"):
         node.ingest_new(workspace, [stranger_sig, stranger], {
@@ -815,8 +821,8 @@ def test_quarantined_removal_holds_locally_but_diverges_peers(
     claim = inject_device_claim(  # the deleter's ONLY membership provider
         node, workspace, target_secret, target, deep, deleter,
         "deleter", 201)
-    victim = author_msg(  # the victim is someone else's — it stays resident
-        node, workspace, root_secret, root_pk, "doomed", ts=250)
+    victim = author_msg(  # same owner, different device; stays resident
+        node, workspace, deep_secret, deep, "doomed", ts=250)
 
     node.bind_identity(workspace, deleter)
     removal = node.fact_of(

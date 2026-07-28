@@ -120,10 +120,14 @@ def suppression_world(path, initial_secret=None):
             f"message-{ordinal}", ts=10 + ordinal)
         for ordinal in range(8)
     ]
+    attachment = send_bytes(
+        node, workspace, "suppression.bin",
+        b"attachment-cascade-" * 4096, channel="channel-0", ts=30)
     deletions = [
         cmds.remove(node, workspace, targets[ordinal], ts=100 + ordinal)
         for ordinal in (1, 4, 6)
     ]
+    deletions.append(cmds.remove(node, workspace, attachment, ts=110))
     return node, workspace, targets, deletions
 
 

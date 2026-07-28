@@ -1,7 +1,7 @@
 """facts/content/legacy_file.py — read compatibility for whole-blob files."""
 from core.crypto import h
 from core.fact import Fact
-from core.suppression import atom as supp
+from .._policy import author_selectors
 
 TAG = "file"
 TABLES = ("legacy_file_rows", "legacy_file_arrival_rows")
@@ -10,7 +10,7 @@ TABLES = ("legacy_file_rows", "legacy_file_arrival_rows")
 # SHAPE
 def legacy_file(pk, channel, name, size, blob, ts):
     return Fact(
-        TAG, ts, [supp(channel)],
+        TAG, ts, author_selectors(TAG, {}),
         {"pk": pk, "chan": channel, "name": name,
          "size": size, "blob": blob},
     )

@@ -4,10 +4,23 @@ Core code dispatches through this table and contains no auth/content tags or
 projection SQL.  Scope packages are deliberately just tables of contents.
 """
 from . import auth, content
+from ._policy import (
+    ADMIN,
+    CONTENT_DELETE,
+    NEVER,
+    OWNER,
+    POLICIES,
+    allows_direct_target,
+    author_selectors,
+    member_principal,
+    policy_for,
+    validate_fact_policy,
+)
 
 MODULES = auth.MODULES + content.MODULES
 ROUTES = {module.TAG: module for module in MODULES}
 assert len(ROUTES) == len(MODULES), "duplicate fact tag"
+assert set(POLICIES) == set(ROUTES), "family policy registry must be exhaustive"
 assert all(not hasattr(module, "evaluate") or not module.DURABLE for module in MODULES), \
     "only ephemeral families may inspect evaluate-mode globals"
 

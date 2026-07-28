@@ -5,6 +5,7 @@ device and workspace member. There is no bearer secret or follow-up join; the
 poc-13 two-family flow collapses to the direct-key form settled for poc-16.
 """
 from core.fact import Fact
+from .._policy import author_selectors
 from .._commands import offer_source
 from . import signature
 
@@ -18,7 +19,8 @@ def device_invite(pk, user, device_pk, label, ts):
         raise ValueError("a device grant must target another key")
     return Fact(
         TAG, ts,
-        [["offer", "member", device_pk],
+        author_selectors(TAG, {}) + [
+         ["offer", "member", device_pk],
          ["offer", "device_key", device_pk],
          ["offer", "device", user, device_pk]],
         {"pk": pk, "user": user, "device": device_pk, "label": label})

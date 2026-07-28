@@ -1462,8 +1462,9 @@ def test_admin_liveness_and_content_deletion_policy_are_settled():
     assert "This exact action masks only that invite; it does not create a " \
         "terminal `DevicePrincipal` tombstone" in normalized
     assert "legacy `facts/content/delete.py` handler" in normalized
-    assert "TRANSITION POLICY" in delete_handler
-    assert "until the coordinated S5" in delete_handler
+    assert "TRANSITION POLICY" not in delete_handler
+    assert "OWNER- or ADMIN-authorized exact action" in delete_handler
+    assert "_policy.allows_direct_target" in delete_handler
     assert "docs leave it open" not in delete_handler
     assert "MAX_LEGACY_ACTOR_ADMISSION_RECORD_BYTES = 8 * 1024" in ledger
     assert "MAX_LEGACY_ACTOR_ADMISSION_COMMIT_ROW_BYTES = 8 * 1024" in ledger

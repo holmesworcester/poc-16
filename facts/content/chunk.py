@@ -2,7 +2,8 @@
 from core import bao
 from core.crypto import h
 from core.fact import Fact
-from core.suppression import atom as supp
+from core.suppression import ANCESTOR, PARENT, selector_markers
+from .._policy import author_selectors
 from ..auth import signature
 
 TAG = "chunk"
@@ -10,9 +11,13 @@ TABLES = ("file_slice_rows", "file_chunk_rows")
 
 
 # SHAPE
-def chunk(pk, channel, root, index, count, cid, ts):
+def chunk(pk, channel, root, index, count, cid, ts, file_fid, member_fid):
     return Fact(
-        TAG, ts, [supp(channel)],
+        TAG, ts,
+        author_selectors(
+            TAG,
+            {"file": file_fid, "file/member": member_fid},
+        ) + [["ref", "file", file_fid]],
         {"pk": pk, "chan": channel, "root": root,
          "i": index, "n": count, "cid": cid},
     )
@@ -20,14 +25,12 @@ def chunk(pk, channel, root, index, count, cid, ts):
 
 # NEEDS
 def needs(f):
-    """Author, membership, and this author's descriptor at this geometry."""
+    """Author and membership; the descriptor is the explicit ``file`` ref."""
     body = f.body
-    pk, root = body.get("pk", ""), body.get("root", "")
+    pk = body.get("pk", "")
     return (
         ("author", f.fid, pk),
         ("member", pk, None),
-        ("file", root, pk,
-         (("slices", root, str(body.get("n", ""))),)),
     )
 
 
@@ -50,9 +53,27 @@ def validate(f, ctx):
                 char in "0123456789abcdef"
                 for char in body["root"] + body["cid"]):
             return False
-        return f == chunk(
+        ((ref_role, file_fid),) = f.refs()
+        if ref_role != "file":
+            return False
+        if ctx.offers_from(file_fid, "file") != [
+                (body["root"], body["pk"])]:
+            return False
+        if ctx.offers_from(file_fid, "slices") != [
+                (body["root"], str(body["n"]))]:
+            return False
+        parents = [
+            marker[3] for marker in selector_markers(f)
+            if marker[1] == PARENT and marker[2] == "file"
+        ]
+        ancestors = [
+            marker[3] for marker in selector_markers(f)
+            if marker[1] == ANCESTOR and marker[2] == "file/member"
+        ]
+        return len(parents) == len(ancestors) == 1 and f == chunk(
             body["pk"], body["chan"], body["root"],
-            body["i"], body["n"], body["cid"], f.ts)
+            body["i"], body["n"], body["cid"], f.ts,
+            parents[0], ancestors[0])
     except Exception:
         return False
 
@@ -99,8 +120,12 @@ def received(db, workspace, valid, blob_of):
 
 
 # COMMANDS
-def author(secret, public, channel, root, index, count, cid, ts):
-    item = chunk(public, channel, root, index, count, cid, ts)
+def author(
+        secret, public, channel, root, index, count, cid, ts,
+        file_fid, member_fid):
+    item = chunk(
+        public, channel, root, index, count, cid, ts,
+        file_fid, member_fid)
     return item, signature.signature(secret, public, item, ts)
 
 

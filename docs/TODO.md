@@ -55,6 +55,25 @@ Ground rules that outlive this file:
 
 ## 1. Suppression is an explicit, type-owned offer set `CRITICAL`
 
+**LANDED ON MAIN (2026-07-28).** `facts/_policy.py` is the single exhaustive
+runtime registry. `core.kernel.ResolvedEdge` retains declared ref/need roles;
+admission independently recomputes every serialized selector; and registered
+families reject missing, extra, wrong-path, and `NEVER` selectors even if a
+family validator is made permissive. Content deletion now binds the target's
+exact key and `SELF` token and selects one ordinary conjunctive `OWNER` or
+`ADMIN` need. `OWNER` is derived from the target and actor's admitted member
+providers, so one user's sibling devices can delete that user's content while
+an unrelated member cannot; `ADMIN` can delete every family whose matrix says
+it is directly deletable. No caller supplies an owner or naked sid.
+
+The running transition consult already uses the same sid for a file's `SELF`
+and each chunk's `PARENT(file)`/`ANCESTOR(file/member)`. Descriptor deletion
+retracts all chunk facts in live and rebuild folds, and suppressed chunks are
+excluded from blob demand. Until the composite-root cutover below, the old
+published removal object remains the transport source and the node performs a
+compatibility scan over its locally complete entries; it no longer claims that
+a target-key range slice can prove inherited-selector completeness.
+
 **THE RULE (locked).** A fact family declares whether facts of that family can
 be suppressed and, if so, exactly which suppression selectors they offer.
 There is no generic inference from every dependency and no guess based on a

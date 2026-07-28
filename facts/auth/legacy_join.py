@@ -5,6 +5,7 @@ New commands author only the ``user`` family.
 """
 from core.crypto import sign, verify
 from core.fact import Fact
+from .._policy import author_selectors
 
 TAG = "join"
 TABLES = ("member_rows",)
@@ -12,7 +13,7 @@ TABLES = ("member_rows",)
 
 # SHAPE
 def join(invite_fact, invite_sk, pk, name, ts):
-    atoms = [
+    atoms = author_selectors(TAG, {}) + [
         ["ref", invite_fact.ts, invite_fact.fid],
         ["offer", "member", pk],
     ]
@@ -41,7 +42,8 @@ def validate(f, ctx):
         invite_pk = invited[0][0]
         shaped = Fact(
             TAG, f.ts,
-            [["ref", ref_ts, ref_fid],
+            author_selectors(TAG, {}) + [
+             ["ref", ref_ts, ref_fid],
              ["offer", "member", f.body["pk"]]],
             dict(f.body))
         return f == shaped \

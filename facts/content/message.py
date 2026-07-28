@@ -1,6 +1,6 @@
 """facts/content/message.py — a member-signed channel message."""
 from core.fact import Fact
-from core.suppression import atom as supp
+from .._policy import author_selectors
 from .._commands import publish
 from ..auth import signature
 
@@ -11,7 +11,7 @@ TABLES = ("message_rows",)
 # SHAPE
 def message(pk, channel, text, ts):
     return Fact(
-        TAG, ts, [supp(channel)],
+        TAG, ts, author_selectors(TAG, {}),
         {"pk": pk, "chan": channel, "text": text},
     )
 

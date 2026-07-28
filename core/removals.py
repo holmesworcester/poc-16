@@ -15,7 +15,14 @@ from typing import NamedTuple
 from . import shape
 from .crypto import h
 from .fact import canon
-from .suppression import TARGET, deathkey, is_deletion, suppkeys
+from .suppression import (
+    TARGET,
+    action_target_fid,
+    action_target_key,
+    deathkey,
+    is_deletion,
+    suppkeys,
+)
 
 HEAD = ("", "~")
 
@@ -48,6 +55,9 @@ def entry(fact, key_of):
     """
     if not is_deletion(fact):
         raise ValueError("not a removal")
+    exact_key = action_target_key(fact)
+    if exact_key is not None:
+        return Entry(exact_key, exact_key, fact.fid)
     targets = _targets(fact)
     if len(targets) != 1:  # kill, or multi-target: honest span is the head
         return Entry(*HEAD, fact.fid)
@@ -86,6 +96,8 @@ def applies(removal, fact):
     """
     if is_deletion(fact):
         return False
+    if action_target_fid(removal) is not None:
+        return deathkey(removal) in suppkeys(fact)
     targets = _targets(removal)
     if targets:
         return fact.fid in targets
@@ -99,6 +111,9 @@ def admit(e, removal):
         return False
     if (e.lo, e.hi) == HEAD:
         return True
+    exact_key = action_target_key(removal)
+    if exact_key is not None:
+        return e.lo == e.hi == exact_key
     targets = _targets(removal)
     return (e.lo == e.hi and shape.is_key(e.lo) and len(targets) == 1
             and shape.fid_of(e.lo) == targets[0])

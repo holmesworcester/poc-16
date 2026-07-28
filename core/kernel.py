@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT);
 CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
+CREATE TABLE IF NOT EXISTS edges(
+    src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
+    PRIMARY KEY(src, role));
 -- src-leading covering index: offers_from() matches on (src, name), which the
 -- PK index (src last) can't serve, so without this it full-scans the offers
 -- table per lookup -> O(joins * offers) rebuild/validate. We have a db; seek.
@@ -38,6 +41,13 @@ MODES = {DRAIN, VALIDATE, EVALUATE}
 class Valid(NamedTuple):
     fact: Fact
     deps: tuple  # refs + canonical providers for family-declared needs
+    edges: tuple = ()  # same dependencies with stable family-declared roles
+
+
+class ResolvedEdge(NamedTuple):
+    role: str
+    fid: str
+    kind: str
 
 
 class Global(NamedTuple):
@@ -73,6 +83,15 @@ class Context:
         return self.db.execute(
             "SELECT 1 FROM offers WHERE name=? AND a1=? LIMIT 1",
             (name, value)).fetchone() is not None
+
+    def edge_source(self, source, role):
+        rows = self.db.execute(
+            "SELECT dst FROM edges WHERE src=? AND role=? ORDER BY dst",
+            (source, role)).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
+
+    def provider(self, name, a0, a1=None, requires=()):
+        return offer_src(self.db, name, a0, a1, requires)
 
 
 def offer_src(db, name, a0, a1=None, requires=()):
@@ -122,6 +141,40 @@ def _need_parts(need):
     raise ValueError("a need must have three fields plus optional co-offers")
 
 
+def resolve_edges(f: Fact, db):
+    """Resolve refs and needs to deterministic, family-declared named edges."""
+    handler = facts.handler_for(f.t)
+    if handler is None:
+        return None
+    policy = facts.policy_for(f.t)
+    refs = list(f.refs())
+    needs = list(handler.needs(f))
+    if policy is None:
+        ref_roles = tuple(
+            f"ref:{name}:{ordinal}" for ordinal, (name, _) in enumerate(refs))
+        need_roles = tuple(
+            f"need:{need[0]}:{ordinal}"
+            for ordinal, need in enumerate(needs))
+    else:
+        ref_roles, need_roles = policy.ref_roles, policy.need_roles
+        if len(refs) != len(ref_roles) or len(needs) != len(need_roles):
+            return None
+    edges = [
+        ResolvedEdge(role, fid, "ref")
+        for role, (_, fid) in zip(ref_roles, refs)
+    ]
+    try:
+        for role, need in zip(need_roles, needs):
+            name, a0, a1, requires = _need_parts(need)
+            source = offer_src(db, name, a0, a1, requires)
+            if source is None:
+                return None
+            edges.append(ResolvedEdge(role, source, "need"))
+    except Exception:
+        return None
+    return tuple(edges)
+
+
 def resolve_deps(f: Fact, db):
     """Resolve refs and family needs to deterministic provider ids.
 
@@ -129,20 +182,8 @@ def resolve_deps(f: Fact, db):
     during judgment and by the closure paths (manifest build, sync), so closure
     edges are a pure function of the accepted set.
     """
-    handler = facts.handler_for(f.t)
-    if handler is None:
-        return None
-    deps = [fid for _, fid in f.refs()]
-    try:
-        for need in handler.needs(f):
-            name, a0, a1, requires = _need_parts(need)
-            source = offer_src(db, name, a0, a1, requires)
-            if source is None:
-                return None
-            deps.append(source)
-    except Exception:
-        return None
-    return deps
+    edges = resolve_edges(f, db)
+    return None if edges is None else [edge.fid for edge in edges]
 
 
 def proof_rank(db, deps):
@@ -337,7 +378,7 @@ def _matches_committed_authority(fact, committed):
     return True
 
 
-def _admit(con, fact, rank):
+def _admit(con, fact, rank, edges):
     con.execute(
         "INSERT OR IGNORE INTO facts VALUES(?,?,?)",
         (fact.fid, fact.ts, fact.t),
@@ -349,6 +390,10 @@ def _admit(con, fact, rank):
     con.execute(
         "INSERT OR IGNORE INTO proofs VALUES(?,?)",
         (fact.fid, rank),
+    )
+    con.executemany(
+        "INSERT OR REPLACE INTO edges VALUES(?,?,?,?)",
+        ((fact.fid, edge.role, edge.fid, edge.kind) for edge in edges),
     )
 
 
@@ -368,9 +413,11 @@ def _judge(
             refs_seen = all(con.execute(
                 "SELECT 1 FROM facts WHERE fid=?", (fid,)).fetchone()
                 for _, fid in fact.refs())
-            deps = resolve_deps(
+            edges = resolve_edges(
                 fact, con) if handler is not None and refs_seen else None
-            good = deps is not None and handler.validate(fact, ctx) is True
+            deps = None if edges is None else [edge.fid for edge in edges]
+            good = edges is not None and handler.validate(fact, ctx) is True \
+                and facts.validate_fact_policy(fact, edges, ctx)
             if good and mode == EVALUATE and canonical_db is not None:
                 good = _matches_committed_authority(
                     fact, canonical_db)
@@ -381,11 +428,11 @@ def _judge(
         rank = proof_rank(con, deps) if good else None
         if rank is None:
             return Judgment(False, tuple(valids), frozenset())
-        _admit(con, fact, rank)
+        _admit(con, fact, rank, edges)
         if mode == DRAIN:
             emitted.update(
                 Global(*row) for row in handler.global_rows(fact))
-        valids.append(Valid(fact, tuple(deps)))
+        valids.append(Valid(fact, tuple(deps), tuple(edges)))
     return Judgment(True, tuple(valids), frozenset(emitted))
 
 
@@ -449,4 +496,3 @@ def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
     return kernel(
         stream, anchor, mode=EVALUATE, globals_=globals_, db=db,
         canonical_db=canonical_db).ok
-

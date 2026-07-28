@@ -6,6 +6,7 @@ import urllib.request
 from core.close import encode_pile
 from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
 from core.fact import Fact, from_json
+from .._policy import author_selectors
 from . import legacy_invite, signature, user_invite
 
 TAG = "user"
@@ -14,7 +15,8 @@ TABLES = ("member_rows",)
 
 # SHAPE
 def user(invite_fact, invite_sk, pk, name, ts):
-    atoms = [["ref", invite_fact.ts, invite_fact.fid], ["offer", "member", pk]]
+    atoms = author_selectors(TAG, {}) + [
+        ["ref", invite_fact.ts, invite_fact.fid], ["offer", "member", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)})
 
@@ -37,7 +39,9 @@ def validate(f, ctx):
             return False
         invite_pk = invited[0][0]
         shaped = Fact(TAG, f.ts,
-                      [["ref", ref_ts, ref_fid], ["offer", "member", f.body["pk"]]],
+                      author_selectors(TAG, {}) + [
+                       ["ref", ref_ts, ref_fid],
+                       ["offer", "member", f.body["pk"]]],
                       dict(f.body))
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
     except Exception:

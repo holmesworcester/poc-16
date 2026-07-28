@@ -5,6 +5,7 @@ is the poc-13 device authority edge with poc-10 transport atoms omitted; all
 devices are equal peers and the fact carries no endpoint policy.
 """
 from core.fact import Fact
+from .._policy import author_selectors
 from .._commands import offer_source, publish
 from . import signature
 
@@ -16,7 +17,8 @@ TABLES = ("device_rows",)
 def device(pk, label, ts):
     return Fact(
         TAG, ts,
-        [["offer", "device_key", pk],
+        author_selectors(TAG, {}) + [
+         ["offer", "device_key", pk],
          ["offer", "device", pk, pk]],
         {"pk": pk, "label": label})
 

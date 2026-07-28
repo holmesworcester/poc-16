@@ -110,13 +110,17 @@ def _fetch_blobs(node, ws, peer):
     """Fetch missing spilled objects and fold verified arrivals in batches."""
     st = node.store(ws)
     with node.lock:
+        active_removals = node.removal_entries(ws)
         notified = {
             fid for (fid,) in node.idx(ws).execute(
                 "SELECT DISTINCT fid FROM log WHERE op='*'")
         }
         pending = []
         for (fid,) in node.idx(ws).execute("SELECT fid FROM facts"):
-            refs = families.blob_refs(node.fact_of(ws, fid))
+            fact = node.fact_of(ws, fid)
+            if node.suppressed(ws, fact, active_removals):
+                continue
+            refs = families.blob_refs(fact)
             if refs:
                 pending.append((fid, refs))
     landed, batch = [], []

@@ -64,7 +64,15 @@ def _atoms_ok(atoms) -> bool:
             if len(a) not in (3, 4):
                 return False
         elif a[0] == "supp":
-            if len(a) != 4 or not all(isinstance(value, str) for value in a[1:]):
+            from .suppression import (
+                valid_legacy_marker,
+                valid_selector_marker,
+            )
+            if not valid_selector_marker(a) and not valid_legacy_marker(a):
+                return False
+        elif a[0] == "action":
+            from .suppression import valid_action_marker
+            if not valid_action_marker(a):
                 return False
         else:
             return False

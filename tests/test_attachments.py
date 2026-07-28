@@ -11,6 +11,7 @@ from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.node import Node
 from core.pump import pump
+from core.walk import _fetch_blobs
 from facts._commands import publish
 from facts.auth.signature import signature
 from facts.content import chunk, file as file_family
@@ -211,7 +212,8 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     invalid = b"not a Bao proof"
     item, signed = chunk.author(
         secret, public, "general", descriptor.body["root"], 0, 1,
-        h(invalid), descriptor.ts + 1)
+        h(invalid), descriptor.ts + 1, descriptor.fid,
+        member_src(source, workspace, public))
     source.ingest_new(
         workspace, [signed, item],
         {
@@ -251,3 +253,41 @@ def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
 
     node.rebuild(workspace)
     assert progress(node, workspace)["have"] == 0
+
+
+def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
+    """SELF(file) and PARENT(file) resolve to one sid on every path."""
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    data = b"private-cascade-marker" * 40_000
+    descriptor_fid = send_bytes(
+        source, workspace, "cascade.bin", data, ts=10)
+    chunk_fids = {
+        fid for (fid,) in source.idx(workspace).execute(
+            "SELECT fid FROM facts WHERE t='chunk'")
+    }
+    assert len(chunk_fids) > 1
+
+    cmds.remove(source, workspace, descriptor_fid, ts=20)
+    active = {
+        src for (src,) in source.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (workspace,))
+    }
+    assert descriptor_fid not in active
+    assert chunk_fids.isdisjoint(active)
+    before = tuple(sorted(active))
+
+    source.rebuild(workspace)
+    rebuilt = tuple(sorted(
+        src for (src,) in source.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (workspace,))))
+    assert rebuilt == before
+
+    class NoBlobPeer:
+        def obj(self, oid):
+            raise AssertionError(f"suppressed blob was demanded: {oid}")
+
+    for fid in chunk_fids:
+        for oid in facts.blob_refs(source.fact_of(workspace, fid)):
+            source.store(workspace).delete("obj/" + oid)
+    assert _fetch_blobs(source, workspace, NoBlobPeer()) == []

@@ -25,10 +25,12 @@ from .fact import Fact, canon, from_json
 from .keychain import Keychain
 from .kernel import (
     SCHEMA as KERNEL_SCHEMA,
+    ResolvedEdge,
     drain,
     drain_committed,
     extend_proofs,
     proof_sources,
+    resolve_edges,
     resolve_deps,
     unresolved_facts,
 )
@@ -53,11 +55,14 @@ CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
                                   PRIMARY KEY(name, a0, a1, src));
 CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
+CREATE TABLE IF NOT EXISTS edges(
+    src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
+    PRIMARY KEY(src, role));
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v15-removal-consult"
+INDEX_VERSION = "family-contract-v16-explicit-selectors"
 APP_VERSION = 3
 
 
@@ -474,6 +479,41 @@ class Node:
                 for name, a0, a1 in f.offers():
                     idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                                 (name, a0, a1, f.fid))
+                edges = v.edges
+                if not edges:
+                    policy = facts.policy_for(f.t)
+                    if policy is None:
+                        ref_count = len(f.refs())
+                        roles = tuple(
+                            f"ref:{name}:{ordinal}"
+                            for ordinal, (name, _) in enumerate(f.refs())
+                        ) + tuple(
+                            f"dep:{ordinal}"
+                            for ordinal in range(
+                                ref_count, len(v.deps))
+                        )
+                    else:
+                        ref_count = len(policy.ref_roles)
+                        roles = policy.ref_roles + policy.need_roles
+                    if len(roles) == len(v.deps):
+                        edges = tuple(
+                            ResolvedEdge(
+                                role, dep,
+                                "ref" if ordinal < ref_count
+                                else "need",
+                            )
+                            for ordinal, (role, dep)
+                            in enumerate(zip(roles, v.deps))
+                        )
+                    else:
+                        edges = resolve_edges(f, idx)
+                if edges is None:
+                    raise ValueError("fact has no named dependency edges")
+                idx.executemany(
+                    "INSERT OR REPLACE INTO edges VALUES(?,?,?,?)",
+                    ((f.fid, edge.role, edge.fid, edge.kind)
+                     for edge in edges),
+                )
                 out.append(v)
             idx.executemany(
                 "INSERT OR IGNORE INTO globals VALUES(?,?)", global_rows)
@@ -609,6 +649,9 @@ class Node:
                 "DELETE FROM proofs WHERE fid=?",
                 ((fid,) for fid in unresolved))
             idx.executemany(
+                "DELETE FROM edges WHERE src=?",
+                ((fid,) for fid in unresolved))
+            idx.executemany(
                 "DELETE FROM supp WHERE fid=?",
                 ((fid,) for fid in unresolved))
             idx.executemany(
@@ -629,10 +672,26 @@ class Node:
     def _update_proofs(self, ws, newfids, shadows):
         """Rank an append or prune to the union's canonical finite subset."""
         idx = self.idx(ws)
+
+        def refresh_edges():
+            idx.execute("DELETE FROM edges")
+            for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
+                fact = self.fact_of(ws, fid)
+                edges = resolve_edges(fact, idx)
+                if edges is None:
+                    raise ValueError("ranked fact has no named edges")
+                idx.executemany(
+                    "INSERT INTO edges VALUES(?,?,?,?)",
+                    ((fid, edge.role, edge.fid, edge.kind)
+                     for edge in edges),
+                )
+
         restored = self._restore_quarantine(ws) \
             if shadows or not newfids else set()
         if shadows or restored or not newfids:
-            return self._prune_unresolved(ws), restored
+            pruned = self._prune_unresolved(ws)
+            refresh_edges()
+            return pruned, restored
         # A healthy index ranks every offer source and explicit-ref target.
         # Only new facts can introduce either, so ordinary appends stay O(new).
         missing = {
@@ -646,7 +705,9 @@ class Node:
         unresolved = extend_proofs(
             idx, missing, lambda fid: self.fact_of(ws, fid))
         if unresolved:
-            return self._prune_unresolved(ws), restored
+            pruned = self._prune_unresolved(ws)
+            refresh_edges()
+            return pruned, restored
         return set(), restored
 
     def commit(self, ws, newfids=(), *, reuse=True):
@@ -932,14 +993,17 @@ class Node:
         return fact
 
     def suppressed(self, ws, fact, entries):
-        """THE consult (CUTOVER §2.4): stab ``entries`` at key(fact) —
-        removals.overlapping head + point stab — then ``applies``. Gates E,
-        never V; membership and validity stay removal-blind (I2)."""
-        k = key(fact)
+        """One selector intersection for both direct and inherited masking.
+
+        During the legacy-index overlap window all entries are locally
+        available, so explicit parent/ancestor selectors are checked against
+        every active action.  The S5 SuppTree replaces this compatibility
+        scan with exact sid reads.
+        """
         return any(
             (r := self._removal_of(ws, e.fid)) is not None
             and removals.applies(r, fact)
-            for e in removals.overlapping(entries, k, k))
+            for e in entries)
 
     def apply_removals(self, ws, entries):
         """Apply newly known removal entries to the projection log.
@@ -964,8 +1028,18 @@ class Node:
             r = self._removal_of(ws, e.fid)
             if r is None:
                 continue
-            targets = [fid for name, fid in r.refs() if name == TARGET]
-            fids = targets or [fid for (fid,) in idx.execute(
+            from .suppression import action_target_fid
+            if action_target_fid(r) is None:
+                # Temporary read compatibility for old/test point removals.
+                legacy = [
+                    fid for name, fid in r.refs() if name == TARGET
+                ]
+            else:
+                legacy = []
+            # New exact actions and old group kills share the reverse selector
+            # index.  SELF and descendant PARENT/ANCESTOR offers resolve to
+            # the same sid.
+            fids = legacy or [fid for (fid,) in idx.execute(
                 "SELECT fid FROM supp WHERE k=?", (deathkey(r),))]
             dead.update(
                 fid for fid in fids

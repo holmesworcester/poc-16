@@ -23,6 +23,7 @@ from core.crypto import h, keypair, load_sk
 from core.fact import canon
 from core.kernel import Valid, drain, resolve_deps
 from core.node import Node
+from facts._policy import OWNER
 from facts.auth.signature import signature
 from facts.content.message import message
 
@@ -774,19 +775,11 @@ def test_dep_evidence_not_suppressed(tmp_path, monkeypatch):
         assert cold.fact_of(ws, fid) is not None and fid in on_screen
 
 
-def test_removal_consult_in_range_only(tmp_path, monkeypatch):
-    """Range evaluation touches the removal head plus the [a,b] slice and
-    stabs no out-of-range dep keys (§2.4; REMOVALS.md §3): the stab set of
-    a pull is EXACTLY the arriving members' keys — one single-fact stab
-    each, none skipped, none extra — and applies() only ever judges an
-    arriving member or the retro victim named by DIRECT target fid. The
-    dead target — an out-of-range closure sibling — is never stabbed and
-    never judged. A sibling key CAN equal an arriving member's (a boundary
-    cut between a dependent and its same-batch dep); it is then stabbed as
-    that member, in its own range — so disjointness from the sibling union
-    is not the law and must not be asserted.
-    (Entry-before-victim masking is
-    tests/test_removals.py::test_removal_before_victim_retracts_on_arrival.)"""
+def test_explicit_selector_consult_retires_legacy_range_slices(
+        tmp_path, monkeypatch):
+    """Parent selectors can point outside a fact-key range, so the transition
+    consult must not pretend a target-key slice is complete.  S5 replaces
+    this compatibility scan with exact SuppTree sid reads."""
     source, ws, destination, ts = pair(tmp_path)
     victim = next(
         source.fact_of(ws, fid) for fid in all_fids(source, ws)
@@ -808,21 +801,9 @@ def test_removal_consult_in_range_only(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_module, "Peer", peer_for(source, [], []))
     sync_module.sync(destination, ws, "local://source")
 
-    new = set(all_fids(destination, ws)) - before
-    arrived = {shape.key(destination.fact_of(ws, fid)) for fid in new}
-    assert stabs  # the consult really ran on this pull
-    assert all(lo == hi for lo, hi in stabs)  # single-fact stabs only
-    assert {lo for lo, _ in stabs} == arrived  # EXACTLY the arriving keys
-    siblings = set()
-    for e in read(source, ws)[0]:
-        if e.closure:
-            siblings |= set(json.loads(
-                source.store(ws).get("obj/" + e.closure))["keys"])
-    assert shape.key(victim) in siblings  # out-of-range deps really exist
-    assert shape.key(victim) not in arrived  # ...with keys off the range
-    assert shape.key(victim) not in {lo for lo, _ in stabs}  # never stabbed
-    assert victim.fid in judged  # the retro path ran, by direct target fid
-    assert set(judged) <= new | {victim.fid}  # never an out-of-range dep
+    assert set(all_fids(destination, ws)) - before
+    assert stabs == []  # no false completeness claim from the retired slice
+    assert victim.fid in judged
     assert destination.app.execute(  # yet its own range retracted it here
         "SELECT 1 FROM projected WHERE ws=? AND src=?",
         (ws, victim.fid)).fetchone() is None
@@ -855,8 +836,8 @@ def test_production_deletion_family(tmp_path):
     assert victim_fid in screen(node)  # projected before the deletion
     fid = cmds.remove(node, ws, victim_fid, ts=20)
     removal = node.fact_of(ws, fid)
-    assert removal == delete_family.delete(  # channel FROM the victim (I6)
-        node.identity_id(ws), "general", victim_fid, 20)
+    assert removal == delete_family.delete(
+        node.identity_id(ws), victim.key, OWNER, 20)
     (entry,) = node.removal_entries(ws)  # ONE entry, span FROM the victim
     assert entry == removals.Entry(shape.key(victim), shape.key(victim), fid)
 

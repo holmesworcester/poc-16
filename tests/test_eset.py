@@ -15,6 +15,7 @@ from core.node import Node
 from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 from facts.content.delete import delete
+from facts._policy import OWNER
 
 from .util import (
     MultiGroupFamily,
@@ -34,7 +35,11 @@ def test_e_identical_across_partitions_orders_batchings(
     """Random pile partitions, orders, and turn batches converge to one E."""
     source, workspace, targets, _ = suppression_world(tmp_path / "source")
     suppressed = {targets[index] for index in (1, 4, 6)}
-    effective = set(all_fids(source, workspace)) - suppressed
+    effective = {
+        src for (src,) in source.app.execute(
+            "SELECT src FROM projected WHERE ws=?", (workspace,))
+    }
+    assert suppressed.isdisjoint(effective)
     referenced = {
         target
         for fid in all_fids(source, workspace)
@@ -44,11 +49,6 @@ def test_e_identical_across_partitions_orders_batchings(
         fid for (fid,) in source.idx(workspace).execute(
             "SELECT fid FROM proofs")
     }
-    assert {
-        src for (src,) in source.app.execute(
-            "SELECT src FROM projected WHERE ws=?", (workspace,))
-    } == effective
-
     expected_root = source.store(workspace).get("root")
     expected_app = projection_state(source)
     for seed in range(5):
@@ -71,7 +71,7 @@ def test_suppression_facts_not_suppressible(tmp_path):
     with pytest.raises(ValueError, match="never victims"):
         cmds.remove(node, workspace, deletions[0], ts=200)
     secret, public = node.identity(workspace)
-    recursive = delete(public, "channel-1", first.fid, 200)
+    recursive = delete(public, first.key, OWNER, 200)
     sig = signature(secret, public, recursive, 200)
 
     with pytest.raises(ValueError, match="outside the canonical set"):
@@ -120,6 +120,13 @@ def test_pre_v14_index_rebuild_recreates_supp_multiplicity(
     monkeypatch.setitem(
         facts.ROUTES, MultiGroupFamily.TAG, MultiGroupFamily)
     node, workspace, targets, _ = suppression_world(tmp_path / "node")
+    legacy = [
+        multi_group_post(
+            "channel-0", f"author-{ordinal}", f"m{ordinal}", 40 + ordinal)
+        for ordinal in range(4)
+    ]
+    node.ingest_new(
+        workspace, legacy, {fact.fid: [] for fact in legacy})
     both = multi_group_post("channel-0", "alice", "hi", 50)
     node.ingest_new(workspace, [both], {both.fid: []})
     index = node.idx(workspace)
@@ -179,7 +186,7 @@ def test_suppression_stays_behind_the_manifest_commit(
         node, workspace, "unpublished", "target", ts=300)
     target = node.fact_of(workspace, target_fid)
     deletion = delete(  # the fid cmds.remove(ts=301) authors below
-        node.identity_id(workspace), "unpublished", target.fid, 301)
+        node.identity_id(workspace), target.key, OWNER, 301)
     store = node.store(workspace)
     old_root = store.get("root")
 

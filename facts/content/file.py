@@ -5,7 +5,8 @@ import tempfile
 from core import bao
 from core.crypto import h
 from core.fact import Fact
-from core.suppression import atom as supp
+from core.suppression import PARENT, selector_markers
+from .._policy import author_selectors
 from .._commands import offer_source
 from ..auth import signature
 from . import chunk as chunkfam
@@ -19,11 +20,10 @@ ENCODING = "clear-v1"
 
 
 # SHAPE
-def file(pk, channel, name, size, root, count, ts):
+def file(pk, channel, name, size, root, count, ts, member_fid):
     return Fact(
         TAG, ts,
-        [
-            supp(channel),
+        author_selectors(TAG, {"member": member_fid}) + [
             ["offer", "file", root, pk],
             ["offer", "slices", root, str(count)],
         ],
@@ -62,9 +62,13 @@ def validate(f, ctx):
             return False
         if body["n"] != bao.geometry(body["size"], body["width"]):
             return False
-        return f == file(
+        parents = [
+            marker[3] for marker in selector_markers(f)
+            if marker[1] == PARENT and marker[2] == "member"
+        ]
+        return len(parents) == 1 and f == file(
             body["pk"], body["chan"], body["name"], body["size"],
-            body["root"], body["n"], f.ts)
+            body["root"], body["n"], f.ts, parents[0])
     except Exception:
         return False
 
@@ -127,14 +131,15 @@ def send(node, workspace, channel, path, name=None, ts=None):
             raise ValueError("file changed while it was being proved")
 
     descriptor = file(
-        public, channel, label, size, root, count, timestamp)
+        public, channel, label, size, root, count, timestamp, member)
     signed = signature.signature(
         secret, public, descriptor, timestamp)
     news = [signed, descriptor]
     deps = {signed.fid: [], descriptor.fid: [signed.fid, member]}
     for index, cid in enumerate(cids):
         item, item_signature = chunkfam.author(
-            secret, public, channel, root, index, count, cid, timestamp)
+            secret, public, channel, root, index, count, cid, timestamp,
+            descriptor.fid, member)
         news += [item_signature, item]
         deps[item_signature.fid] = []
         deps[item.fid] = [item_signature.fid, member, descriptor.fid]

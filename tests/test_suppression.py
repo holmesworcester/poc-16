@@ -9,7 +9,16 @@ from facts.content.file import file
 from facts.content.message import message
 from core.kernel import offer_src
 from core.node import Node
-from core.suppression import atom, deathkey, is_deletion, suppkeys
+from core.suppression import (
+    SELF,
+    action,
+    atom,
+    deathkey,
+    is_deletion,
+    self_selector,
+    suppkeys,
+)
+from facts._policy import CONTENT_DELETE
 
 
 class EnvelopeOnly:
@@ -21,14 +30,20 @@ class EnvelopeOnly:
         raise AssertionError("suppression extraction read the body")
 
 
-def test_channel_targets_share_an_envelope_visible_suppkey():
+def test_type_owned_selectors_are_envelope_visible_and_exact():
+    member = "cd" * 32
     msg = message("pk", "general", "hello", 1)
-    attachment = file("pk", "general", "a.txt", 3, "ab" * 32, 1, 2)
+    attachment = file(
+        "pk", "general", "a.txt", 3, "ab" * 32, 1, 2, member)
 
-    assert suppkeys(msg) == suppkeys(attachment) == {'["chan","general"]'}
+    assert suppkeys(msg) == {"fact:" + msg.fid}
+    assert suppkeys(attachment) == {
+        "fact:" + attachment.fid,
+        "fact:" + member,
+    }
     assert deathkey(msg) is None
     assert not is_deletion(msg)
-    assert msg.atoms == [atom("general")]
+    assert msg.atoms == [self_selector()]
 
 
 def test_deathkey_and_tag_are_body_free():
@@ -42,12 +57,15 @@ def test_deathkey_and_tag_are_body_free():
 
 
 def test_suppression_marker_survives_the_wire_codec():
-    deletion = Fact("channel_delete", 3, [atom("general", deletion=True)], {})
+    target = message("pk", "general", "hello", 2)
+    deletion = Fact(
+        "sample_delete", 3,
+        [action(CONTENT_DELETE, SELF, target.key)], {})
     decoded, _ = decode_pile(encode_pile([deletion]))
 
     assert decoded == [deletion]
     assert is_deletion(decoded[0])
-    assert deathkey(decoded[0]) == '["chan","general"]'
+    assert deathkey(decoded[0]) == "fact:" + target.fid
 
 
 @pytest.mark.parametrize("fact", [
