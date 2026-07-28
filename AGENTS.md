@@ -4,53 +4,40 @@ This project tracks work with **bd (beads)**, a dependency-aware issue graph.
 **Do not** use markdown TODO lists for task tracking — use bd.
 
 ## Start here
-- **Design of record:** `docs/WORKSPACES.md` (multi-workspace / identity / infra model) and
-  `docs/MODEL.md` + `DESIGN.md` (the passive-store RBSR + hoisting core). `docs/MULTILEVEL_PILE.md`
-  has the hoisting math + measurements.
-- **Current epics** (`bd ready` for the claimable frontier):
-  - **`poc-16-808`** — simplification. The one tree engine, one kernel judge,
-    pure mint, cursored pump, source-keyed projectors, and confluence laws are
-    landed (`.1`–`.8`). Production settle-node placement is `.9`. Plan:
-    `docs/SIMPLIFY.md`. The original signature skeletons remain on branch
-    `simplify-skeleton`.
-  - **`poc-16-jbg`** — FaaS concurrency + Cloudflare Workers, coordination-free. Notes
-    in `DESIGN.md` §Concurrency & FaaS and `docs/WORKSPACES.md` §9. Fat nodes and
-    two-root fold are landed; current entries are `.2`, `.3`, `.7`, and the
-    stateless canonical-mint fix `.10`.
-  - **`poc-16-yez`** — global 1:N deletion closure (suppression-key treap). Plan:
-    `docs/DELETION_CLOSURE.md`. Death-key extraction is landed; P1 entries are `.2`,
-    `.9`, and the publication-isolation regression `.13`; optional P2 `.5` is
-    also claimable.
-  - **`poc-16-x1o`** — puncturable content encryption and KDF history tree,
-    sourced from poc-10. The frozen lineage, threat model, lifecycle contract,
-    and v1 vectors are in `docs/PUNCTURABLE_ENCRYPTION_SOURCE.md`; the selected
-    bounded recipient hierarchy and purge tiers are in
-    `docs/KEY_HIERARCHY_ADR.md`.
-  - **`poc-16-9fc`** — versioning: offers as the release interlingua, replay as
-    the upgrade. Nothing landed yet; entries are `.1` (FAMILY/VERSION constants),
-    `.5` (the `unreadable` outcome — a live bug: an unknown tag rejects a whole
-    unit, so the range never converges), and `.9`, a steer that blocks `.6`.
-    Plan: `docs/VERSIONING.md`. Model: `DESIGN.md` §Versioning. Skeletons on
-    branch `versioning-skeleton`.
-  - **`poc-16-zgj`** — poc-13 auth port + chained-seed hoisting measurement.
-    Closed; plan and hand-back: `docs/CHAINED_AUTH_PLAN.md` / `docs/MULTILEVEL_PILE.md`.
+- **Temporary design and execution authority:** `docs/TODO.md`. The existing
+  README/DESIGN/docs corpus contains useful history but is known stale; S10 owns
+  consolidation after the recovery implementation lands.
+- **Current epic** (claimed through S10; use `bd ready --exclude-type=epic`
+  for the claimable implementation frontier):
+  - **`poc-16-kb6`** — post-cutover recovery: explicit type-owned suppression
+    selectors plus separate authorization guards, immutable removal admissions,
+    hard-capped fact/suppression/authority trees, service-exclusive
+    capacity-checked composite-root publication, and bounded Cloudflare Worker
+    reads with precomputed freshness witnesses rather than per-request rebuilds.
+    Temporary plan and bankruptcy ledger: `docs/TODO.md`.
+
+Bead bankruptcy was declared on 2026-07-27. Every bead that was active before
+`poc-16-kb6` is closed as superseded; closed history is evidence, not an
+implementation mandate. Do not reopen or copy dependencies from the old
+`808`/`jbg`/`yez`/`x1o`/`9fc`/`t9f` graphs. A requirement exists only when
+`docs/TODO.md` states it and a `poc-16-kb6.*` child owns it.
 
 ## bd workflow
 - `bd prime` — load full workflow context (run first).
-- `bd ready` — claimable work (no active blockers).
-- `bd show <id>` — read a bead, e.g. `bd show poc-16-808.9`.
+- `bd ready --exclude-type=epic` — claimable implementation work (no active
+  blockers). The recovery epic stays claimed until S10 closes it.
+- `bd show <id>` — read a bead, e.g. `bd show poc-16-kb6.4`.
 - `bd update <id> --claim` — take a bead before starting it.
 - `bd close <id>` — mark done; releases its blocked dependents.
-- `bd dep tree poc-16-808` — the dependency graph.
+- `bd dep tree poc-16-kb6` — the dependency graph.
 
-Each implementation bead names its plan section and dependencies. The closed
-`poc-16-zgj` graph remains the section-by-section record for
-`docs/CHAINED_AUTH_PLAN.md`; do not reopen or replay its phase ordering when
-starting current work.
+Each implementation bead names its `docs/TODO.md` section and dependencies.
+Do not revive bankrupt work because an older design document still describes
+it; S10 owns the final documentation consolidation.
 
 ## Style
 Keep poc-13 code idioms: one file per family under `facts/auth/`, the
 `SHAPE → NEEDS → VALIDATE → MODE → MATERIALIZE → COMMANDS → QUERIES` skeleton, "COMMANDS: build
 a fact, admit it, stop." See the fidelity rubric in `docs/CHAINED_AUTH_PLAN.md` §2. The port uses
-**poc-13 naming** (`workspace`/`user`/`user_invite`/`device`/…), applied as a mechanical first
-step (bead `poc-16-zgj.1`).
+**poc-13 naming** (`workspace`/`user`/`user_invite`/`device`/…), applied as a
+mechanical first step (contract bead `poc-16-kb6.4`).
