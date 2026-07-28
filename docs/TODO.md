@@ -1,16 +1,15 @@
 # TODO — post-cutover work list
 
 Status: bankruptcy ledger and implementation plan of record (2026-07-27).
-Replacement epic: `poc-16-kb6`. Branch `removal-index`, worktree
-`~/poc-16-removals`. Written from a 13-agent read-only audit of this branch;
-every finding below was reproduced at least twice, and the three marked CRITICAL
-were re-verified by hand against `b500288`.
+Replacement epic: `poc-16-kb6`. Landed on `main` from the `removal-index`
+recovery branch. Written from a 13-agent read-only audit; every finding below
+was reproduced at least twice, and the three marked CRITICAL were re-verified
+by hand against `b500288`.
 
 This is the temporary design and execution authority after bead bankruptcy.
-Items 1 and 7 are now decided. Item 5 retains only the application-policy
-choices that cannot be inferred from mechanics. Items 8 and 9 will delete this
-file: once DESIGN.md is true and the replacement graph is complete, the
-surviving decisions move there.
+Items 1, 5, 7 and 8 are now decided. Items 8 and 9 will delete this file: once
+DESIGN.md is true and the replacement graph is complete, the surviving
+decisions move there.
 
 ## How to use this
 
@@ -103,7 +102,17 @@ its file.” A device fact's `SELF` remains an explicit suppression key inherite
 by its requests, but device revocation uses the separately guarded,
 family-declared `DevicePrincipal(public_key)` action. That action covers every
 device-provider fact for the key, including a duplicate label/timestamp record
-and any provider published later. Terminal user eviction likewise uses
+and any provider published later. The target capability must itself prove
+control of that key: v1 accepts only the key-signed self-bound `device` fact or
+the key-signed `DeviceOwnerConsent` for an exact `device_invite`. A bare
+`device_invite` remains a provider that a legitimate key-wide action will mask,
+but is never a principal-action target; an inviter therefore cannot pre-tombstone
+an arbitrary public key. It is nevertheless revocable without cooperation from
+the invited key: the invite offers its own exact `SELF` to the separately
+declared `device.grant.delete` action. Its retained owner (the inviting user's
+principal) may retract that one grant, and an admin may retract any such grant.
+This exact action masks only that invite; it does not create a terminal
+`DevicePrincipal` tombstone for the key. Terminal user eviction likewise uses
 `MemberPrincipal(public_key)`, never an inherited `ExactSids` shortcut. A
 principal action is accepted only from an authenticated target FactRecord whose
 family derives that exact principal value; a caller-supplied public key alone is
@@ -185,8 +194,10 @@ Use a declarative family constant, logically:
 ```
 SUPPRESSION = NEVER
 SUPPRESSION = Policy(self=True)
-DIRECT_TARGETS = (Target("content.delete", SELF),)
+DELETE_OWNER = ActorOwner(("author-principal",))
+DIRECT_TARGETS = (Target("content.delete", SELF, modes=(OWNER, ADMIN)),)
 SUPPRESSION = Policy(self=True, inherit=(Parent("file"),))
+DELETE_OWNER = NEVER
 DIRECT_TARGETS = ()
 SUPPRESSION = Policy(
     self=True,
@@ -194,7 +205,10 @@ SUPPRESSION = Policy(
 )
 DIRECT_TARGETS = ()
 PRINCIPAL_TARGETS = (
-    Target("device.revoke", DevicePrincipal(field="pk")),
+    Target(
+        "device.revoke", DevicePrincipal(field="device_key"),
+        target_kinds=(SELF_BOUND_DEVICE, DEVICE_OWNER_CONSENT),
+    ),
 )
 AUTHORIZATION_GUARDS = ()
 AUTHORIZATION_GUARDS = (
@@ -218,6 +232,15 @@ may directly target, which target FactRecord fields derive a terminal
 `MemberPrincipal` or `DevicePrincipal` scope, and which named edges authorize an
 irreversible effect or keep an authority offer live. A guard is not serialized
 as an offered suppression key and does not make a `NEVER` fact targetable.
+`DELETE_OWNER = NEVER` emits no delete offer. A directly deletable row instead
+names one exact actor edge; admission turns that edge into the proof-carrying
+`OwnerBinding` and normalized `DeleteOffer` specified under item 5. Thus
+suppression, direct targetability and ownership are all explicit type
+declarations, rather than guesses from a field name or from every dependency.
+The matrix also contains the durable, device-key-authored
+`DeviceOwnerConsent` row from item 5. Only that row exposes a `DEVICE` actor
+edge; `device_invite` supplies its exact grant evidence but never by itself
+offers ownership of the invited key.
 
 The authoring helper expands the declared paths over the actual closed
 dependency set, unions and deduplicates their offered keys, and serializes the
@@ -279,6 +302,9 @@ representation before it ships.
   presented as a content target, a device's exact `SELF` presented in place of
   `DevicePrincipal`, a naked principal key, the wrong target ref, and every
   removal-family/selector or principal-scope pair not explicitly declared.
+  A bare `device_invite` cannot be the target of `DevicePrincipal`; only the
+  target-key-signed self-bound `device` or `DeviceOwnerConsent` row can create
+  that terminal action.
   Removing an ancestor by its own `SELF` still suppresses all descendants that
   offered its id. Two valid device records with the same key but different
   labels/timestamps, plus a later third provider, are all masked by one
@@ -483,13 +509,25 @@ The mechanism decisions are now locked:
   a new key.
 - Device-only revocation declares the family-owned
   `DEVICE_PRINCIPAL(public_key)` target scope derived from the authenticated
-  device target FactRecord. It expands to every device-provider fact for that
-  key, not just the selected fid. This closes the current stable-validation gap
-  in which different labels or timestamps produce several valid device facts
-  for one key. The same registry rule masks a matching provider in the root
-  that first publishes it after revocation. Provider count and future-slot
-  escrow are capped exactly as for membership, and re-enrollment uses a new
-  device key.
+  target FactRecord. The target must be either that key's signed self-bound
+  `device` fact or its signed `DeviceOwnerConsent` naming an exact invite;
+  `device_invite` alone is deliberately ineligible. Once admitted, the action
+  expands to every device-provider fact for that key, including bare competing
+  invites, not just the selected fid. This both closes the current
+  stable-validation gap in which different labels or timestamps produce
+  several valid device facts for one key and prevents a hostile inviter from
+  planting a future tombstone for a caller-chosen key. The same registry rule
+  masks a matching provider in the root that first publishes it after
+  revocation. Provider count and future-slot escrow are capped exactly as for
+  membership, and re-enrollment uses a new device key.
+- A bare `device_invite` is still independently retractable by exact `SELF`
+  through the family-owned `device.grant.delete` direct-target row. The action
+  uses the invite's retained `OwnerBinding`: the inviting user may revoke the
+  grant from any consenting device, and an admin may revoke it under the same
+  `ADMIN` handler used for other deletable facts. This closes a lost-device
+  grant without asking the invited key to mint consent. It never expands to
+  other providers for that public key and therefore cannot pre-tombstone an
+  unrelated key.
 - Facts merely relayed by an active member retain the original author's
   selectors; a relay cannot launder them through its own grant.
 - For ordinary facts, before/after authoring is irrelevant. The suppression tree
@@ -518,13 +556,322 @@ The submitted closed authority proof already names the membership and device
 fids; the final Worker path collects their selectors and performs item 7's
 authenticated multi-lookup without rebuilding a fact database.
 
-**OPEN application policy, to freeze in the exhaustive family matrix before
-bodies are written:** whether delegated-admin facts inherit the grantor,
-grantee, or both; and who may delete another member's content (author only,
-admin, or any member). The delegated-admin choice is expressed only through
-that family's `AUTHORITY_LIVENESS_GUARDS`; generic proof closure may not add the
-omitted principal back. These choices determine selectors, continuing liveness
-and one-time authorization but do not change the lookup mechanism.
+**SETTLED application policy, to freeze in the exhaustive family matrix before
+bodies are written:**
+
+- A delegated-admin provider has **grantee-only continuing liveness**. Its
+  immutable admission proof must contain the grantor's authorship, live
+  membership and live admin provider and the grantee's live membership. The
+  admitted provider then carries `SELF` plus the grantee-membership parent
+  selector. Those mandatory provider selectors mask it if the grant itself or
+  the grantee is removed. The grantor proof is a one-time
+  `AUTHORIZATION_GUARD`, not an `AUTHORITY_LIVENESS_GUARD`, and the production
+  row has no `FollowAuthority(grantor-admin)`. Removing the grantor or changing
+  that grantor's later canonical admin winner therefore does not retroactively
+  revoke an already-admitted grant. This follows the same rule as a committed
+  removal receipt: losing authority closes the future, not a valid act already
+  committed in the past.
+  Migration applies that rule only with authenticated timing. From S4 shadow
+  activation onward, first publication of every authority-producing fact
+  stores its exact committed actor-authority evidence in the serialized
+  publication path. A closure within the native bound uses
+  `BOUNDED(AuthorityAdmissionRef)` with its `CommittedAuthorityProof` and
+  `AuthorityProofCommitProof`; an over-budget but checkpointable closure uses
+  `PAGED_S4(S4PagedAuthorityAdmissionRef)` with a content-addressed paged
+  `LegacyAuthorityProofRecord`, its strong commit row and post-commit proof.
+  Either form proves whether all one-time authorization guards were live then.
+  The same rule applies to an exact proof closure over a provider that already
+  existed when the recorder started, and to a newly selected alternate closure
+  for an already-recorded provider. Before a deletable target may cite either
+  closure, the service admits and post-commit-proves that exact closure at a
+  prior frontier. The later target CAS may cite only that durable proof, never a
+  prospective row or merely the provider's first recorded closure. This
+  two-frontier path is an admission at the current serialized point, not a
+  backfill from a later winner. If its one-time guards or the finite shadow
+  proof reserve fail, legacy S4 may still publish the target unchanged, but it
+  creates no actor record and therefore cannot cut to S5.
+  If an authority provider predates that recorder and no post-activation actor
+  use committed its exact closure, cutover may admit it only when every
+  one-time guard is still live. If any such guard is no longer live in the
+  frozen cutover state, S5 cannot distinguish “admitted before removal” from a
+  globals-blind first relay after removal, so migration stops on writable S4 or
+  explicitly re-anchors. In particular, an old delegated-admin grant with a
+  removed grantor is never guessed into or out of existence.
+  The grantee address is also preserved literally. An existing
+  `admin(target_pk)` whose target is a device member migrates as key-scoped
+  `admin(device_key)`, not as an admin grant to that device's owner. The
+  migration certifier replays the exact grantee offer and rejects a
+  key-to-owner rewrite. Owner-level use is a separate composed proof over
+  `admin(owner_principal)` plus the acting device's retained
+  `DeviceOwnerConsent`, so it cannot arise from a device-targeted grant.
+- A directly deletable target exposes a normalized
+  `DeleteOffer("content.delete", SELF, OwnerBinding(...))`.
+  `OwnerBinding` contains the signing key, immutable `OwnerPrincipal`, binding
+  kind (`DIRECT_MEMBER` or `DEVICE`), exact provider fact key/fid/FactRecord
+  oid, the committed authority-proof record/commit-proof identity, and the
+  deterministic admission-service-signed `ActorBindingProof` over the target
+  fact key/fid and that exact evidence. No mutable root oid, frontier serial,
+  retry generation or current winner enters the signed statement. The service
+  issues it only after recomputing the complete actor rule at the serialized
+  attempt that first claims the immutable target `FactSlot`; inclusion in that
+  service-published root is the commit and a signed pre-CAS orphan is inert.
+  The target's `FactRecord` roots that complete binding and proof closure.
+  Certification verifies the retained signed verdict after provider shadowing,
+  historical-root collection and restart; it neither retains/reopens an old
+  composite root nor re-resolves current authority to rediscover or change an
+  owner, and it never trusts an unproved cached principal. Equal statements
+  produce byte-identical proofs under the workspace's fixed deterministic
+  Ed25519 admission key, so retries do not make equal logical rows diverge.
+  No owner field is accepted from the proposal caller. A target type with no
+  suppression selector or no matching
+  `DIRECT_TARGETS`/`DeleteOffer` row is not deletable. In particular, `NEVER`
+  emits no deletion offer. Admin status does not create one. The
+  `device_invite` family is a distinct non-content example: it offers
+  `DeleteOffer("device.grant.delete", SELF, OwnerBinding(...))`, so its owner
+  or an admin can retract that exact provider without manufacturing a
+  key-wide `DevicePrincipal` capability.
+- `content.delete` has two explicit proposal modes, `OWNER` and `ADMIN`, so
+  each handler returns an ordinary conjunctive needs tuple rather than asking
+  the kernel for a generic `AnyOf`. Both modes require proposal authorship, a
+  live member actor, the exact target ref, the target's matching
+  `content.delete`/`SELF` offer, and live authorization guards. `OWNER`
+  additionally requires the authenticated
+  `ActorPrincipal(signing_key)` to equal the target's `OwnerPrincipal`.
+  `ADMIN` instead carries one explicit `admin_scope`, `KEY` or `OWNER`, and
+  derives rather than accepts its subject. `KEY` requires the live
+  `admin(signing_key)` offer. `OWNER` is available only to a `DEVICE` actor and
+  requires the live `admin(owner_principal)` offer from that actor's retained
+  `DeviceOwnerConsent`. A grant to a device key `D` therefore remains exactly
+  `admin(D)` and authorizes only `D`; it is never normalized into `admin(U)` and
+  never promotes `D`'s siblings. Separately, a grant to user key `U` authorizes
+  `U` under `KEY` and each consenting device owned by `U` under `OWNER`. The
+  selected scope and exact admin provider/proof are retained in the receipt, so
+  no current winner or caller-supplied principal chooses between them.
+  Thus an admin may delete every fact whose type declares it deletable, while
+  an ordinary user may delete only that user's own deletable facts.
+  The bare proposal is therefore constructible and stageable. The immutable
+  receipt is the later post-proposal commit gate, not a proposal need or an
+  input to its own `proof_digest`: proposal/support proof refs plus the
+  service-derived `ActionAuthorization` → `proof_digest` → receipt → receipt
+  `EvidenceRef` → `ActionRecord` remains the only construction order.
+  These modes are the complete policy for new `LIVE_GUARDS` actions. Fenced
+  migration has a third, non-callable receipt variant,
+  `GRANDFATHER(LegacyEffectAuthorizationRef)`, solely to preserve an effect
+  already present in the authoritative S4 removal slot or removal globals.
+  The ref binds the exact pre-seed `LegacyEffectCensus` row, old source
+  FactRecord and `LEGACY_SLOT`/`LEGACY_GLOBAL` kind; the migration seal and
+  translation attestation prove that row came from the frozen authoritative S4
+  state. It deliberately does not claim that the old actor satisfied the new
+  owner/admin policy. Thus an old cross-user deletion that S4 validly made
+  effective remains grow-only, while no live proposal, caller, later relay or
+  bare legacy fact can select `GRANDFATHER`.
+- `ActorPrincipal` is also type-owned proof, not a string comparison. A
+  `DIRECT_MEMBER` offer normalized only from the matrix's direct-membership
+  families (`workspace`/`user`, plus their sealed legacy equivalents) has
+  absolute precedence and makes the signing key act as itself, even if a
+  `device_invite` also names that key. Classification asks first whether the
+  serialized state contains **any admitted, shape-valid direct-member
+  claimant**, including a masked one. If it does, the actor class is
+  `DIRECT_MEMBER`; a selected direct provider must then pass the live-member
+  guard. If all such providers are suppressed the action fails, and it never
+  falls through to a device claim. `DEVICE` therefore means no direct-member
+  claimant exists at that serializing check, not merely that no direct provider
+  is currently live.
+
+  A bare `device_invite` is also never ownership consent. Before a device-only
+  signing key may act as a user, that key must author a durable
+  `DeviceOwnerConsent(workspace, device_key, owner_principal,
+  device_invite_ref)`: it hard-refers to the exact admitted invite/provider,
+  needs the device key's own signature and live membership, verifies the
+  provider's exact `device(owner_principal, device_key)` co-offer, and exposes
+  the matrix's `DEVICE` actor edge. Its own suppression selectors inherit the
+  exact provider and member liveness declared by that family. The one-step
+  direct-key invite may still admit a known sibling as a member; this consent is
+  the separate proof that lets the sibling's key speak for the shared user when
+  authoring owned content or actions.
+
+  The same consent boundary applies when the key is the victim rather than the
+  actor. A `DevicePrincipal(device_key)` action must target either the
+  key-signed self-bound `device` row or this exact key-signed consent row.
+  Admission derives the key from that retained target and verifies its
+  signature/provider edge. A bare invite is still included among the provider
+  fids masked by a legitimate key-wide action, but it offers no
+  `device.revoke` target capability of its own.
+
+  Actor resolution selects only a canonical, live
+  `DeviceOwnerConsent` proof for the signing key. A competing invite without the
+  target-key signature can at worst make an authority edge unavailable; it
+  cannot assign the target key's content to the inviter, and the inviter's other
+  devices can never gain `OWNER` deletion from it. Multiple consents require the
+  existing canonical provider rule, but every candidate was signed by the
+  device key whose role it declares. Both actor branches bind and retain the
+  exact selected provider/proof and target-bound service verdict as above.
+  A direct member's ordinary self-owned `device` provider seeds that user's
+  device set and is not a `DEVICE` ownership candidate: the actor remains the
+  direct member. A `DEVICE` owner binding comes only from the consent row that
+  maps a distinct device key to a user through its exact invite proof. This
+  matches the existing direct-member-over-device role rule and prevents an
+  unsolicited or conflicting device claim from taking ownership of either a
+  member key or a device-only key. Consequently every consenting equal peer in
+  one user's device set can delete content owned by that user, and no inviter
+  can claim another key as an owner.
+
+  Actor class is serialization-relative, not globally monotonic. A later direct
+  rejoin may legitimately rerank a formerly device-only signing key and controls
+  new facts/actions from that later serialized state; it does not rewrite an
+  older target's signed `OwnerBinding`. Conversely, a later device claim cannot
+  steal a key for which any direct-member claimant exists at the check being
+  serialized. Two attempts to install different bindings for the same raw target
+  race at one `FactSlot`: the first valid service CAS fixes the bytes, and every
+  retry or competing attempt must match that binding or reject. Relaying a fact
+  never changes either principal.
+
+For a newly admitted target, authoring and admission derive and retain its
+`OwnerBinding` from the exact named actor edge. Legacy migration does **not**
+rerun direct-member precedence over the frozen S4 set: that would rewrite a
+target authored by device `D` for user `U` if `D` joined later as a direct
+member. The S4 shadow writer instead begins recording a capped immutable
+`LegacyActorAdmissionRecord` for each directly deletable target at the same CAS
+that first publishes that target. The record binds its target key/fid, exact
+actor class, signing key, owner principal, selected authority proof and exact
+legacy binding basis. Normal direct-member and consented-device targets record
+the same basis S5 will use. For compatibility while S4 remains authoritative,
+a device-only key that has not yet published `DeviceOwnerConsent` may record
+the narrow `S4_DEVICE_INVITE_ACCEPTANCE` basis only when the device submits a
+separate contextual signature over `(workspace, target key/fid, device key,
+owner principal, exact invite key/fid/FactRecord oid)`. The target itself must
+also be authored by that device key, and the bound live invite proof must offer
+both `member(device_key)` and `device(owner_principal, device_key)`. The ordinary
+detached target signature alone is insufficient because it names none of the
+workspace, owner or invite fields. The contextual signature is acceptance for
+this one target only. It neither creates a standalone `DeviceOwnerConsent`,
+authorizes another target or action, nor makes the invite eligible for
+`DevicePrincipal`.
+
+The recorder may write that target record only after the exact selected actor
+closure has a durable `RecordedActorAuthorityRef`. A within-budget closure uses
+`BOUNDED(AuthorityAdmissionRef)` and requires its
+`CommittedAuthorityProof`/`AuthorityProofCommitProof`. A closure above
+`MAX_AUTHORITY_PROOF_FACTS` uses
+`PAGED_S4(S4PagedAuthorityAdmissionRef)`: before the target CAS, the service
+canonicalizes the complete closure into the same paged
+`LegacyAuthorityProofRecord` shape used by cutover, commits its immutable
+manifest/pages and exact provider under `CommittedS4PagedAuthorityProof`, and
+waits for `S4PagedAuthorityProofCommitProof`. If the provider predates recorder
+activation, or the same provider is now selected through a different proof
+closure, the service performs the applicable separate idempotent bounded or
+paged admission against the current S4 frontier, validates every one-time
+guard, waits for its post-commit proof, and only then attempts the target CAS.
+Committing that closure remains useful even if the later target loses its CAS;
+it is not an orphan or a target-capacity leak. A closure that cannot pass its
+guards or fit the separately provisioned finite shadow authority-proof reserve
+is never referenced by `LegacyActorAdmissionRecord`; the legacy target can
+still publish without the record and deterministically blocks S5.
+
+The recorder is shadow evidence, not a new S4 validity gate. If an otherwise
+valid legacy target lacks the contextual acceptance or another complete actor
+basis, S4 still publishes it under the unchanged authoritative rules but
+creates no actor-admission record; that explicit absence blocks S5 until
+re-anchoring. It never guesses an owner or silently rejects a fact that old S4
+peers accept.
+
+For an eligible target, the capped immutable record is first written only after
+the service claims one already-provisioned
+`S4ActorAdmissionScratchSlot`. That generation-fenced slot charges the maximum
+scratch record object/bytes and one write lease before upload. The one
+serialized target CAS verifies the sealed scratch hash and live lease, then
+atomically publishes the target, debits the disjoint canonical
+record/row/slot/proof/lease dimensions from
+`S4ActorAdmissionCapacityCell`, writes the
+`CommittedLegacyActorAdmission` row, creates the deterministic
+`LegacyActorAdmissionProofSlot` in `RESERVED` state, and transitions the
+scratch slot to `COMMITTED_COPYING`. Scratch and canonical record allowances
+therefore coexist after a winning CAS until the content-addressed canonical copy
+has been verified. Insufficient canonical capacity leaves the target valid on
+S4 but without a record and therefore blocks S5. A losing or failed CAS changes
+no canonical capacity, record or slot; it moves the scratch slot to
+`ABORTING`, fences it, definitively drains its write lease, and only then makes
+the precharged slot reusable. A successful CAS has already reserved the maximum
+proof bytes and lease. The post-CAS signer issues
+`LegacyActorAdmissionCommitProof` only after rereading the committed target,
+canonical record, row and slot; recovery can deterministically finish the same
+copy and proof after a crash. It contains no caller assertion and cannot be
+synthesized from a later root.
+
+During the one fenced S4-to-S5 cut, an older deletable target gets an
+`OwnerBinding` only from a valid prior immutable owner binding or that exact
+admission-time record and proof. The migrated `FactRecord` roots the record,
+commit proof and exact legacy authority proof/checkpoint. Its legacy evidence
+keeps the record's original `RecordedActorAuthorityRef` as immutable provenance
+and separately carries either a byte-equal bounded `DIRECT` S5 transport ref or
+an authenticated `CHECKPOINT` transport ref for a `PAGED_S4` source. The
+checkpoint form binds the exact new checkpoint provider/commit identity to the
+original provider, proof closure, paged legacy proof oid and source candidate
+id; certification rederives that translation. It never pretends the future
+checkpoint identity
+was present in the S4 record. The resulting S5 `ActorBindingProof` signs both
+the recorded source and the selected transport while carrying the same actor
+fields without retaining or reopening the historical S4 root. A target that
+predates the shadow recorder
+and has no such evidence is not guessed from current providers—even if the
+current state appears unambiguous—and keeps the workspace on writable S4 or
+requires explicit re-anchoring. For a target published after the recorder was
+enabled, a missing device-key-signed `DeviceOwnerConsent` is not itself a
+failure when the committed record proves the exact per-target
+`S4_DEVICE_INVITE_ACCEPTANCE` fallback above, including its contextual device
+signature. An absent/ambiguous record, a
+missing commit row or proof, or evidence beyond both the native proof cap and
+signed paged checkpoint/source ceilings has the safe writable-S4 outcome; a
+merely deep recorded proof takes the existing `LegacyAuthorityCheckpoint`
+path. After S5 activates, the fallback can migrate old target ownership but
+cannot authorize the device to publish anything new: the device must first
+publish ordinary `DeviceOwnerConsent`.
+
+Admission reloads and authenticates the target and authority `FactRecord`s and
+recomputes the proposal mode's complete needs/offer match. A bare target fid,
+sid, owner key, inherited selector, unsigned or redirected device consent,
+mismatched device co-offer, invalid `admin_scope`, or `OWNER` proposal for
+another principal rejects. An ordinary member cannot select `ADMIN` without
+the exact live admin provider derived for its declared scope.
+The proposal fact remains
+`SUPPRESSION = NEVER` and inert until its receipt commits. A receipt committed
+before a later admin removal remains effective; after removal that admin cannot
+obtain a new receipt. These are family checks over normalized needs and offers,
+not a second policy engine and not a reason to rebuild SQLite at request time.
+
+Concretely, the two policy modes instantiate ordinary conjunctive handlers.
+`AdminSubject` is a checked family derivation, not a caller-supplied key:
+
+```
+OWNER = (Author(proposal, signing_key),
+         LiveMember(ActorBinding(signing_key)),
+         ExactTargetRef(target),
+         Need("content.delete", target.SELF,
+              ActorBinding(signing_key).owner_principal))
+ADMIN = (Author(proposal, signing_key),
+         LiveMember(ActorBinding(signing_key)),
+         AdminSubject(
+             KEY => signing_key,
+             OWNER => ActorBinding(signing_key).owner_principal
+                      iff ActorBinding.kind == DEVICE),
+         LiveAdmin(AdminSubject),
+         ExactTargetRef(target),
+         Need("content.delete", target.SELF, ANY))
+```
+
+`OWNER`'s exact third field matches the immutable target owner; `ADMIN`'s
+canonical `ANY` still has to resolve the exact target's offered row and does not
+invent targetability. The `KEY` and `OWNER` `AdminSubject` branches are two
+declared resolved-edge variants, each a simple conjunction; there is no generic
+kernel disjunction. The named skeleton supplies the proof-carrying
+`ActorBinding` and exact admin provider; handlers do not accept a caller-supplied
+principal. The receipt is deliberately absent from both tuples.
+
+This freezes the S2/S5 contract; it is not a claim that the legacy
+`facts/content/delete.py` handler already enforces it. That handler remains the
+documented any-member behavior until the coordinated S5 semantic cut, because
+partially changing stable validation before receipts and the new roots are
+authoritative would fork peers.
 
 ### Done when
 
@@ -535,6 +882,64 @@ and one-time authorization but do not change the lookup mechanism.
 - A removed admin cannot obtain or relay a new removal admission. A receipt
   committed before a later eviction survives provider shadow/restore and remains
   effective, while a bare, forged or signature-only receipt never creates a row.
+- Production delegated-admin fixtures prove removing the grantee masks the
+  admitted admin provider, while removing or re-ranking the grantor does not.
+  The generic paired grantee-only/grantor-only fixtures remain to prove the
+  engine obeys declarations rather than hard-coding the production choice.
+  Migration fixtures distinguish a post-recorder grant committed before its
+  grantor's removal (survives), one first relayed after removal (has no admitted
+  authority proof), and a pre-recorder grant with a now-removed one-time guard
+  (blocks S5/requires re-anchor rather than guessing either history).
+  A pre-recorder member closure used by a post-recorder target, and an alternate
+  closure for an already-recorded provider, each commit and post-commit-prove
+  that exact closure at a prior frontier before the target record can cite it.
+  Mutants that reuse only the provider's first closure, cite a prospective
+  proof, or consume shadow proof capacity on a losing proof CAS fail.
+- Deletion fixtures prove a direct member key and two sibling devices can each
+  delete that user's content; an ordinary member cannot delete another user's
+  content; a live admin can delete another user's deletable content but cannot
+  delete a `NEVER` fact; and hostile owner/mode/device/target-offer
+  substitutions reject.
+  A direct `admin(D)` grant lets only device key `D` use `ADMIN/KEY` and does
+  not promote its owner or siblings. An `admin(U)` grant lets `U` use
+  `ADMIN/KEY` and a device with an exact retained `D -> U` consent use
+  `ADMIN/OWNER`; wrong-scope and sibling-without-consent attempts reject.
+  A direct member key remains self-owned when a conflicting device claim names
+  it. A hostile member can publish or grind a competing invite for a device-only
+  key, but without that target key's `DeviceOwnerConsent` the claim can neither
+  own new content, create a `DevicePrincipal` tombstone, nor let the hostile
+  member's siblings delete it. A valid
+  device consent, its wrong-owner/provider/target signature mutants, and the
+  direct-claim-present-but-masked no-fallback rule all have named fixtures.
+  Target ownership remains byte-identical after provider shadowing, root
+  collection, restart and restore because the exact owner proof is retained
+  without retaining the historical root.
+  A direct member can still publish its self-owned primary `device` fact and
+  grant the first sibling. A later direct rejoin changes actor resolution for
+  new work without changing an older device-authored target's retained owner.
+  A closure containing a new actor provider plus a deletable child commits and
+  proves the provider first; a forged, missing, wrong-target, root-dependent or
+  current-winner-substituted `ActorBindingProof` rejects.
+  Grandfather fixtures preserve an authoritative S4 cross-user deletion and a
+  later-evicted admin's removal global with
+  `GRANDFATHER(LegacyEffectAuthorizationRef)`. Forcing either through
+  `OWNER`/`ADMIN`, or allowing a `LIVE_GUARDS` proposal to select
+  `GRANDFATHER`, fails.
+- A later direct rejoin cannot rewrite a legacy device-authored target:
+  migration uses its admission-time `LegacyActorAdmissionRecord`, atomic commit
+  row, filled proof slot and commit proof, never current direct-member
+  precedence. A fact predating that recorder has no inferred owner and leaves
+  S4 writable. A device-authorized S4 target without prior consent records the
+  exact device-signed contextual `S4_DEVICE_INVITE_ACCEPTANCE` basis; a mutation
+  that substitutes the workspace, target, owner or invite, treats it as reusable
+  consent, or accepts only the ordinary target signature fails. A deep
+  but checkpointable recorded legacy owner proof migrates through
+  `LegacyAuthorityCheckpoint` while retaining its original recorded authority
+  ref and a distinct authenticated checkpoint transport. A mutant that
+  overwrites the recorded ref with the future checkpoint identity, omits either
+  ref, or fails to replay their exact source translation cannot certify. Only
+  missing/ambiguous/uncommitted evidence or evidence beyond the signed
+  checkpoint/source/cutover ceilings blocks the cut.
 - Arrival-order tests prove a suppressed incidental support fact does not veto
   a child whose family deliberately omitted inheritance from that edge.
 - Matrix fixtures instantiate grantee-only and grantor-only delegated-admin
@@ -755,7 +1160,11 @@ derived from fenced pre-record state below, never from the final
 `cutover_digest`. Either typed-principal set may temporarily be empty. A live
 `PrincipalBinding` must resolve its target fact, match the declared
 membership/device family, derive the redundantly bound kind and public key from
-that FactRecord, and satisfy that family's exact `PRINCIPAL_TARGETS` entry. The
+that FactRecord, and satisfy that family's exact `PRINCIPAL_TARGETS` entry.
+For `DevicePrincipal`, the only live target kinds are a key-signed self-bound
+`device` row and a key-signed `DeviceOwnerConsent`; a `device_invite` binding
+is rejected even though the resulting legitimate tombstone later includes that
+invite among its provider effects. The
 receipt therefore retains every binding and exact target FactRecord oid. The
 ActionRecord makes each named target FactRecord and its raw-root closure
 independently reachable for the action's lifetime even if that target later
@@ -858,7 +1267,7 @@ CommittedAuthorityProof(
 authority_proof_commit_id =
     H("authority-proof-commit", workspace, authority_proof_record_oid,
       provider_fid)
-AuthorityProofCommitProof =
+AuthorityProofCommitProof[authority_proof_commit_id] =
     sign(admission_sk, canon(["authority-proof-commit-v1",
                              authority_proof_commit_id,
                              CommittedAuthorityProof(...)]))
@@ -930,8 +1339,20 @@ strong root/frontier transaction stores one `CommittedAuthorityProof` row for
 that oid under a deterministic `authority_proof_commit_id`; the post-commit
 signer then emits the bounded `AuthorityProofCommitProof`. Base/full refs name
 that id, and composite-state GC retains its row and proof sidecar. A pre-CAS
-proof record or signature is inert. Cutover uses the non-cyclic
-`CutoverGeneration` binding, exactly as grandfather action admissions do.
+proof record or signature is inert. The row's `CommitBinding` is immutable:
+an exact proof closure committed before the fence keeps its historical
+`DirectRoot` row and post-commit proof through cutover. The cutover may use the
+non-cyclic `CutoverGeneration` binding only when it first commits a closure
+that has no row under that deterministic id. It never rewrites or recommits an
+existing `DirectRoot` row as `CutoverGeneration`; a byte-different row at the
+same id is a certification failure. Registry refs and GC retain whichever one
+strong row/proof pair won that closure's first serialized commit. If a crash
+left that winning row without its deterministic proof sidecar, the signer
+rereads the row and regenerates
+`AuthorityProofCommitProof[authority_proof_commit_id]`; row presence is never
+misclassified as “uncommitted” merely because the proof write is pending.
+Cutover blocks on that recovery instead of attempting a second generation-bound
+row.
 The full and base candidate-registry values root each proof record, which roots
 every support FactRecord/raw closure through shadow, restart and historical-root
 GC.
@@ -1255,6 +1676,131 @@ be few.
 For every effective proposal `r` and admission `a`, the snapshot invariant is:
 
 ```
+AuthorityAdmissionRef =
+    canon(provider_fact_key, provider_fid, provider_fact_record_oid,
+          authority_proof_record_oid, authority_proof_commit_id)
+S4PagedAuthorityAdmissionRef =
+    canon(provider_fact_key, provider_fid, provider_fact_record_oid,
+          legacy_authority_proof_record_oid,
+          s4_paged_authority_proof_commit_id,
+          s4_paged_authority_proof_commit_proof_oid)
+s4_paged_authority_proof_commit_id =
+    H("s4-paged-authority-proof-commit", workspace, provider_fid,
+      legacy_authority_proof_record_oid)
+CommittedS4PagedAuthorityProof[s4_paged_authority_proof_commit_id] =
+    canon(workspace, provider_fact_key, provider_fid,
+          provider_fact_record_oid, legacy_authority_proof_record_oid,
+          s4_generation, s4_frontier_serial, committed_s4_root_digest)
+S4PagedAuthorityProofSlot[s4_paged_authority_proof_commit_id] =
+    RESERVED(MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_PROOF_BYTES)
+  | FILLED(s4_paged_authority_proof_commit_proof_oid)
+S4PagedAuthorityProofCommitProof[
+        s4_paged_authority_proof_commit_proof_oid] =
+    sign(admission_sk,
+         canon(["s4-paged-authority-proof-commit-v1",
+                s4_paged_authority_proof_commit_id,
+                CommittedS4PagedAuthorityProof[
+                    s4_paged_authority_proof_commit_id]]))
+H(S4PagedAuthorityProofCommitProof[
+    s4_paged_authority_proof_commit_proof_oid]) =
+        s4_paged_authority_proof_commit_proof_oid
+RecordedActorAuthorityRef =
+    BOUNDED(AuthorityAdmissionRef)
+  | PAGED_S4(S4PagedAuthorityAdmissionRef)
+S4DeviceInviteAcceptance =
+    canon(workspace, target_fact_key, target_fid,
+          device_key, owner_principal,
+          invite_fact_key, invite_fid, invite_fact_record_oid,
+          device_signature)
+verify(device_key, H(canon(
+    ["s4-device-invite-acceptance-v1", workspace,
+     target_fact_key, target_fid, device_key, owner_principal,
+     invite_fact_key, invite_fid, invite_fact_record_oid])),
+    device_signature) = true
+LegacyActorAdmissionBasis =
+    NORMAL
+  | S4_DEVICE_INVITE_ACCEPTANCE(S4DeviceInviteAcceptance)
+LegacyActorAdmissionRecord =
+    canon(workspace, target_fact_key, target_fid,
+          binding_kind, signing_key, owner_principal,
+          RecordedActorAuthorityRef,
+          LegacyActorAdmissionBasis)
+legacy_actor_admission_record_oid =
+    H("legacy-actor-admission-record", LegacyActorAdmissionRecord)
+legacy_actor_admission_commit_id =
+    H("legacy-actor-admission-commit", workspace, target_fact_key, target_fid,
+      legacy_actor_admission_record_oid)
+CommittedLegacyActorAdmission[legacy_actor_admission_commit_id] =
+    canon(workspace, target_fact_key, target_fid,
+          legacy_actor_admission_record_oid,
+          s4_generation, s4_frontier_serial, committed_s4_root_digest)
+LegacyActorAdmissionProofSlot[legacy_actor_admission_commit_id] =
+    RESERVED(MAX_LEGACY_ACTOR_ADMISSION_COMMIT_PROOF_BYTES)
+  | FILLED(legacy_actor_admission_commit_proof_oid)
+LegacyActorAdmissionCommitProof[legacy_actor_admission_commit_proof_oid] =
+    sign(admission_sk,
+         canon(["legacy-actor-admission-commit-v1",
+                legacy_actor_admission_commit_id,
+                CommittedLegacyActorAdmission[
+                    legacy_actor_admission_commit_id]]))
+H(LegacyActorAdmissionCommitProof[legacy_actor_admission_commit_proof_oid])
+    = legacy_actor_admission_commit_proof_oid
+ActorAdmissionEvidence =
+    NATIVE(AuthorityAdmissionRef)
+  | LEGACY(RecordedActorAuthorityRef,
+           LegacyActorAuthorityTransport,
+           legacy_actor_admission_record_oid,
+           legacy_actor_admission_commit_id,
+           legacy_actor_admission_commit_proof_oid)
+LegacyActorAuthorityTransport =
+    DIRECT(AuthorityAdmissionRef)
+  | CHECKPOINT(
+        checkpoint_fact_key, checkpoint_fid, checkpoint_fact_record_oid,
+        checkpoint_authority_ref,
+        source_legacy_authority_proof_oid, source_candidate_id)
+recorded_actor_authority_ref(NATIVE(ref)) = BOUNDED(ref)
+recorded_actor_authority_ref(LEGACY(recorded_ref, ...)) = recorded_ref
+transport_actor_authority_ref(NATIVE(ref)) = ref
+transport_actor_authority_ref(LEGACY(_, DIRECT(ref), ...)) = ref
+transport_actor_authority_ref(
+    LEGACY(_, CHECKPOINT(_, _, _, checkpoint_ref, _, _), ...)) =
+        checkpoint_ref
+ActorBindingStatement =
+    canon(workspace, target_fact_key, target_fid,
+          binding_kind, signing_key, owner_principal, ActorAdmissionEvidence)
+    where binding_kind in {DIRECT_MEMBER, DEVICE}
+ActorBindingProof =
+    sign(admission_sk,
+         canon(["actor-binding-v1", ActorBindingStatement]))
+len(ActorBindingProof) <= MAX_ACTOR_BINDING_PROOF_BYTES
+OwnerBinding =
+    canon(ActorBindingStatement, ActorBindingProof)
+AdminSubject(KEY, ActorBinding) = ActorBinding.signing_key
+AdminSubject(OWNER, ActorBinding) = ActorBinding.owner_principal
+    iff ActorBinding.binding_kind = DEVICE
+AdminAuthorityRef =
+    canon(admin_scope, AdminSubject, admin_provider_fact_key,
+          admin_provider_fid, admin_provider_fact_record_oid,
+          admin_authority_proof_record_oid, admin_authority_proof_commit_id)
+LegacyEffectAuthorizationRef =
+    canon(LEGACY_SLOT | LEGACY_GLOBAL,
+          legacy_effect_census_oid, legacy_effect_row_key,
+          legacy_effect_row_digest,
+          source_fact_key, source_fid, source_fact_record_oid)
+ActionActorBinding =
+    canon(ActorBindingStatement, ActorBindingProof)
+    where ActorBindingStatement.(target_fact_key, target_fid) = (K(r), fid(r))
+ActionAuthorization =
+    OWNER(ActionActorBinding)
+  | ADMIN(ActionActorBinding, AdminAuthorityRef)
+  | GRANDFATHER(LegacyEffectAuthorizationRef)
+len(canon(ActionAuthorization)) <= MAX_ACTION_AUTHORIZATION_BYTES
+DeleteOffer(kind, f) =
+    canon(kind, SELF, OwnerBinding)
+    where kind in {"content.delete", "device.grant.delete"}
+delete_offer_address(kind, f) =
+    (kind, resolve(f, SELF),
+     OwnerBinding.ActorBindingStatement.owner_principal)
 EvidenceRef(role, f) =
     canon(role, K(f), fid(f), fact_record_oid(f))
 proof_refs(r) =
@@ -1262,10 +1808,12 @@ proof_refs(r) =
            EvidenceRef("support", f) for every detached signature/support f)
 len(proof_refs(r)) <= MAX_ADMISSION_PROOF_REFS
 proof_digest(r) =
-    hash(canon(the named proof edges and proof_refs(r)))
+    hash(canon(the named proof edges, proof_refs(r), ActionAuthorization))
 admission(a) = (workspace, fid(r), target_spec,
                 basis_frontier,
-                evidence_kind, evidence_fids, proof_digest(r))
+                evidence_kind, evidence_fids, ActionAuthorization,
+                proof_digest(r))
+len(canon(admission(a))) <= MAX_ADMIT_CELL_BYTES
 evidence_fids = the fids in proof_refs(r)
 # Only after canonical a, fid(a), FactRecord(a), and raw_root_oid(a) exist:
 evidence_refs(a) =
@@ -1280,6 +1828,153 @@ len(ActionRecord[action_record_oid]) <= MAX_ACTION_RECORD_BYTES
 FactRecord[b.target_fact_record_oid] has key b.target_fact_key
 FactRecord[b.target_fact_record_oid].raw_root_oid roots the complete target fact
     for every live TargetBinding or PrincipalBinding b in target_spec(a)
+FactRecord(a).raw_root_oid authenticates admission(a), including the exact
+    ActionAuthorization derived by the admission service
+ActionRecord's receipt EvidenceRef roots FactRecord(a); certification and GC
+    follow ActionAuthorization's bounded actor/admin provider FactRecords,
+    AuthorityProofRecords, CommittedAuthorityProof rows and
+    AuthorityProofCommitProofs, or its grandfather census/source closure, as
+    an additional retained arm
+if b selects delete_kind in {"content.delete", "device.grant.delete"}:
+    FactRecord[b.target_fact_record_oid].delete_offer =
+        DeleteOffer(delete_kind, target)
+    transport_actor_authority_ref(
+        OwnerBinding.ActorBindingStatement.ActorAdmissionEvidence)
+        resolves to the exact provider FactRecord, AuthorityProofRecord,
+        CommittedAuthorityProof row and AuthorityProofCommitProof retained for
+        the target's author admission
+    if ActorAdmissionEvidence is LEGACY:
+        H("legacy-actor-admission-record", LegacyActorAdmissionRecord)
+            = legacy_actor_admission_record_oid
+        LegacyActorAdmissionRecord.(workspace, target_fact_key, target_fid,
+            binding_kind, signing_key, owner_principal)
+          = ActorBindingStatement's corresponding scalar fields
+        LegacyActorAdmissionRecord.RecordedActorAuthorityRef =
+            recorded_actor_authority_ref(ActorAdmissionEvidence)
+        CommittedLegacyActorAdmission[legacy_actor_admission_commit_id]
+            names the same target and legacy_actor_admission_record_oid
+        LegacyActorAdmissionProofSlot[legacy_actor_admission_commit_id]
+            = FILLED(legacy_actor_admission_commit_proof_oid)
+        verify(LegacyActorAdmissionCommitProof[
+            legacy_actor_admission_commit_proof_oid]) =
+            ("legacy-actor-admission-commit-v1",
+             legacy_actor_admission_commit_id,
+             CommittedLegacyActorAdmission[
+                 legacy_actor_admission_commit_id])
+        the proof signer issued it only after rereading the target, record,
+            atomic commit row and pre-reserved proof slot
+        if RecordedActorAuthorityRef is BOUNDED(recorded_ref):
+            recorded_ref resolves to the exact provider FactRecord,
+                AuthorityProofRecord, CommittedAuthorityProof row and
+                AuthorityProofCommitProof admitted before the target CAS
+        if RecordedActorAuthorityRef is PAGED_S4(paged_ref):
+            hash and complete replay of paged_ref's
+                LegacyAuthorityProofRecord manifest/pages reproduce the exact
+                provider, closure digest, NeedKey, actor offer, logical depth,
+                cost and liveness scopes selected before the target CAS
+            CommittedS4PagedAuthorityProof[
+                paged_ref.s4_paged_authority_proof_commit_id] names that exact
+                provider, FactRecord and legacy_authority_proof_record_oid
+            S4PagedAuthorityProofSlot[
+                paged_ref.s4_paged_authority_proof_commit_id] =
+                FILLED(
+                    paged_ref.s4_paged_authority_proof_commit_proof_oid)
+            verify(S4PagedAuthorityProofCommitProof[
+                paged_ref.s4_paged_authority_proof_commit_proof_oid]) equals
+                that strong commit row
+            H(S4PagedAuthorityProofCommitProof[
+                paged_ref.s4_paged_authority_proof_commit_proof_oid]) =
+                paged_ref.s4_paged_authority_proof_commit_proof_oid
+        if LegacyActorAuthorityTransport is DIRECT(ref):
+            LegacyActorAdmissionRecord.RecordedActorAuthorityRef =
+                BOUNDED(ref)
+        if LegacyActorAuthorityTransport is CHECKPOINT(
+                checkpoint_fact_key, checkpoint_fid,
+                checkpoint_fact_record_oid, checkpoint_authority_ref,
+                source_legacy_authority_proof_oid, source_candidate_id):
+            LegacyActorAdmissionRecord.RecordedActorAuthorityRef =
+                PAGED_S4(paged_ref)
+            paged_ref.legacy_authority_proof_record_oid =
+                source_legacy_authority_proof_oid
+            checkpoint_authority_ref resolves to that exact checkpoint
+                FactRecord, AuthorityProofRecord, CommittedAuthorityProof and
+                AuthorityProofCommitProof
+            the checkpoint's paged source proof replays the exact provider,
+                proof closure and commit named by
+                paged_ref and its CommittedS4PagedAuthorityProof
+            checkpoint.(source_legacy_authority_proof_oid,
+                source_candidate_id) equals the transport fields
+            the checkpoint source fid, proof digest, NeedKey and actor offer
+                equal the recorded source after replay
+            ActorBindingProof authenticates this source-to-transport
+                translation; the checkpoint ref is not required or permitted
+                to equal the earlier recorded ref
+        if LegacyActorAdmissionBasis is S4_DEVICE_INVITE_ACCEPTANCE:
+            binding_kind = DEVICE
+            target is authored by signing_key
+            verify(S4DeviceInviteAcceptance.device_signature) = true
+            S4DeviceInviteAcceptance.(workspace, target_fact_key, target_fid,
+                device_key, owner_principal, invite_fact_key, invite_fid,
+                invite_fact_record_oid) = the record's exact corresponding
+                workspace, target, signing-key, owner and invite fields
+            the exact retained invite FactRecord/proof offers both
+                member(signing_key) and
+                device(owner_principal, signing_key)
+    verify(OwnerBinding.ActorBindingProof) =
+        OwnerBinding.ActorBindingStatement
+    OwnerBinding.ActorBindingStatement.(target_fact_key, target_fid) =
+        (b.target_fact_key, fid(target))
+    ActorBindingProof attests that the exact provider proof passed the complete
+        direct-claim-present-before-device classification and liveness rule at
+        the service CAS that first installed FactSlot(target_fact_key)
+        without placing that root/frontier identity in ActorBindingStatement
+    if binding_kind = DEVICE and ActorAdmissionEvidence is not the legacy
+        S4_DEVICE_INVITE_ACCEPTANCE basis,
+        recorded_actor_authority_ref(ActorAdmissionEvidence) names a
+        target-key-authored DeviceOwnerConsent whose exact invite/provider ref
+        offers device(owner_principal, signing_key)
+# The following authorization checks are action-scoped, not nested under any
+# TargetBinding or direct-delete branch.
+if evidence_kind = LIVE_GUARDS:
+    ActionAuthorization.ActionActorBinding is the exact action-time actor
+        statement/proof, not any target's OwnerBinding
+    ActionActorBinding is service-derived while admitting r; its deterministic
+        proof is committed by receipt a rather than by an ordinary FactSlot,
+        and a signed pre-CAS orphan is inert
+    ActionActorBinding may not use S4_DEVICE_INVITE_ACCEPTANCE to authorize a
+        new action after S5
+    ActionAuthorization is not GRANDFATHER
+    if proposal mode = OWNER:
+        ActionAuthorization = OWNER(ActionActorBinding)
+        target_spec is ExactSids with at least one matching direct-delete
+            TargetBinding
+        for every direct-delete TargetBinding b:
+            ActionActorBinding.owner_principal =
+                FactRecord[b.target_fact_record_oid].
+                    OwnerBinding.ActorBindingStatement.owner_principal
+    if proposal mode = ADMIN:
+        ActionAuthorization =
+            ADMIN(ActionActorBinding, AdminAuthorityRef)
+        AdminAuthorityRef.admin_scope is KEY or OWNER
+        AdminAuthorityRef.AdminSubject = AdminSubject(
+            admin_scope, ActionActorBinding.ActorBindingStatement)
+        the exact retained admin provider proof offers admin(AdminSubject)
+        OWNER requires ActionActorBinding.binding_kind = DEVICE
+        no admin(device_key) provider can satisfy admin(owner_principal)
+if evidence_kind in {LEGACY_SLOT, LEGACY_GLOBAL}:
+    ActionAuthorization =
+        GRANDFATHER(LegacyEffectAuthorizationRef)
+    LegacyEffectAuthorizationRef.kind = evidence_kind
+    LegacyEffectAuthorizationRef names the exact content-hash-matching
+        pre-seed LegacyEffectCensus row and old source FactRecord
+    LegacyMigrationSeal and LegacyTranslationAttestation authenticate the
+        complete census containing that row
+    LEGACY_SLOT additionally matches the exact LegacyEntryMap row and
+        authoritative old slot entry
+    LEGACY_GLOBAL additionally matches the authenticated old removal
+        global and its canonical source fact
+    no live request path accepts GRANDFATHER and no current owner, member
+        or admin guard is rerun during backfill
 FactRecord[p.provider_fact_record_oid] has key p.provider_fact_key
 FactRecord[p.provider_fact_record_oid].fid = p.provider_fid
 FactRecord[p.provider_fact_record_oid].raw_root_oid roots the complete provider
@@ -1359,15 +2054,25 @@ AdmissionCommitProof =
                              CutoverCommitAnchor(...) or EMPTY]))
 ```
 
-The construction order is proof refs → proof digest → signed receipt and its
-FactRecord/raw root → receipt EvidenceRef → ActionRecord. The receipt never
+The construction order is proof refs plus the service-derived
+`ActionAuthorization` → proof digest → signed receipt and its FactRecord/raw
+root → receipt EvidenceRef → ActionRecord. The receipt never
 hashes or names its own EvidenceRef, fid, FactRecord oid or ActionRecord oid, so
 there is no content-hash cycle.
 
-The ActionSlot-to-ActionRecord reachability graph has two bounded arms:
+The ActionSlot-to-ActionRecord reachability graph has three bounded arms:
 every target binding points to its exact target FactRecord/raw root, and every
-EvidenceRef points to its proposal/support/receipt FactRecord/raw root. It is
-the action-specific canonical reachability path after sync, restart and GC.
+EvidenceRef points to its proposal/support/receipt FactRecord/raw root. The
+receipt's authenticated `ActionAuthorization` additionally follows the exact
+action-time `ActionActorBinding` and, for `ADMIN`, the selected
+`AdminAuthorityRef`, through their provider FactRecords, proof records,
+committed-proof rows and post-commit proofs. It never substitutes the target
+author's `OwnerBinding` for the acting principal or reselects a current admin
+winner. A migration-only `GRANDFATHER` authorization instead follows its exact
+pre-seed `LegacyEffectCensus` row and old source FactRecord through
+`LegacyMigrationSeal` and `LegacyTranslationAttestation`; it has no invented
+action-time actor arm.
+They form the action-specific canonical reachability path after sync, restart and GC.
 The forward candidate registry has a third, independent bounded arm:
 each `AuthorityCandidateRef` points to one `AuthorityProofRecord`, whose exact
 fact bindings point to every FactRecord/raw root in that candidate's proof.
@@ -1378,7 +2083,9 @@ admission log, a mutable reverse cache, a historical root or incidental object
 retention. The
 certifier recomputes `proof_refs(r)` from the proposal/support
 closure, requires those roles/fids to match the receipt's `evidence_fids`, and
-replays the named proof edges committed by `proof_digest(r)`. Separately, it
+rederives the exact live actor/admin choice or fenced grandfather census
+binding, requires byte-equal `ActionAuthorization`, and replays the named proof
+edges and authorization preimages committed by `proof_digest(r)`. Separately, it
 requires the ActionRecord evidence set to equal those exact proof refs plus the
 one self-matching receipt EvidenceRef, and rejects an unreferenced or missing
 object. Pre-receipt proof evidence is bounded by `MAX_ADMISSION_PROOF_REFS`;
@@ -1445,7 +2152,10 @@ author-signature and support records must total at most
 `MAX_ADMISSION_PROOF_BYTES`; their canonical bundle framing is independently
 capped at `MAX_PENDING_BUNDLE_FRAMING_BYTES`, and the two maxima sum exactly to
 `MAX_PENDING_BUNDLE_BYTES`. The service-generated receipt is not transported in
-that input bundle and has its own raw-record/admit-cell caps. Pending slots and
+that input bundle. Its service-derived `ActionAuthorization` is separately
+capped by `MAX_ACTION_AUTHORIZATION_BYTES`, and the complete canonical receipt
+including that field must fit `MAX_ADMIT_CELL_BYTES`; it is not charged to or
+accepted from caller-controlled pending framing. Pending slots and
 bytes have a physically enforced quota disjoint from both content and canonical
 control metadata. Exhausting that optional queue rejects more staging but
 cannot consume revocation escrow or prevent the direct admission path; direct
@@ -1472,7 +2182,12 @@ exist before the snapshot:
    s5_policy_template_digest, service_writer_identity,
    capacity_ceiling_oid, pending_capacity_digest,
    content_capacity_digest, legacy_source_ceiling_oid,
-   cutover_capacity_digest, fallback_generation_id)`. It commits the service
+   cutover_capacity_digest,
+   s4_authority_proof_capacity_cell_id,
+   s4_authority_proof_capacity_envelope_oid,
+   s4_actor_admission_capacity_cell_id,
+   s4_actor_admission_capacity_envelope_oid,
+   fallback_generation_id)`. It commits the service
    identity, immutable capacity ceilings, physical quota boundaries, derivation
    policy and fallback generation that must already be provisioned. It
    content-hash-roots the complete canonical `CapacityCeiling` and
@@ -1815,6 +2530,96 @@ authority, so an existing file deletion cannot disappear merely because normal
 receipt issuance is not live yet; the Worker grant route remains on its current
 full-view path.
 
+The shadow writer also timestamps authority admission rather than merely
+reconstructing it at cutover. For every authority-producing fact first
+published after recorder activation, the serialized transaction creates its
+exact `RecordedActorAuthorityRef` only if all named one-time
+`AUTHORIZATION_GUARDS` pass at that S4 frontier. A native-sized closure creates
+its `AuthorityProofRecord` and `CommittedAuthorityProof` with the exact
+historical `DirectRoot` binding, followed by `AuthorityProofCommitProof`. A
+larger checkpointable closure instead creates a canonical paged
+`LegacyAuthorityProofRecord` and
+`CommittedS4PagedAuthorityProof`, followed by
+`S4PagedAuthorityProofCommitProof`; that source record is complete S4 evidence,
+not a future checkpoint placeholder. Its `S4PagedAuthorityAdmissionRef`
+retains both the strong commit id and the content-addressed commit-proof oid,
+while `S4PagedAuthorityProofSlot[commit_id]` authenticates that mapping, so
+certification and GC reach that proof directly without an object scan. The
+proof identity is per exact closure, not per provider fid. Before any later
+`LegacyActorAdmissionRecord` can cite a preexisting provider or an alternate
+closure, the service uses the same serialized path to commit the applicable
+bounded or paged evidence at a separate earlier frontier and waits for its
+post-commit proof. An existing commit is reused idempotently, including its
+original `DirectRoot` binding; cutover never tries to replace that immutable
+row with a `CutoverGeneration` variant. A successful closure commit remains
+valid if the subsequent target CAS loses; an uncommitted or prospective closure
+is never placed in an actor record. Both first-publication and on-demand closure
+commits consume the physically provisioned finite S4 shadow authority-proof
+reserve.
+
+The paged strong-commit transaction creates its proof slot as `RESERVED`.
+Only after rereading the exact row and reserved slot does the deterministic
+post-commit signer write the content-addressed proof and atomically change the
+slot to `FILLED(proof_oid)`. A target may retain a `PAGED_S4` ref only after that
+fill. A crash at any earlier point leaves an already-budgeted row/slot: restart
+recomputes the same proof and oid, or the closure remains ineligible. It never
+scans objects, drops the occupied commit id, or takes the cutover
+“no commitment” branch.
+
+A fact that legacy S4 accepts through a globals-blind late relay may remain in
+S4 storage, but without that committed proof it cannot become an S5 authority
+candidate or actor source. Failure of a one-time guard or the shadow proof
+reserve leaves legacy S4 validity unchanged and merely prevents the actor
+record/S5 cut. For a pre-recorder authority fact never used and committed after
+activation, cutover may create a proof only when every one-time guard is still
+live; if any such guard has since been removed, the admission time is
+unknowable and the workspace remains on S4 or explicitly re-anchors. This rule
+covers delegated admin, membership and every other family with a one-time
+authority guard; it is not an admin-only exception.
+
+From the moment the S4 shadow writer is enabled, every newly published directly
+deletable target with complete actor evidence uses the serialized publication
+path to write an immutable `LegacyActorAdmissionRecord`. It builds the record
+in a generation-fenced, physically precharged
+`S4ActorAdmissionScratchSlot`: the slot's record object/bytes and write lease
+are claimed before upload. The target CAS verifies the sealed scratch record,
+atomically publishes the target, debits the disjoint canonical dimensions in
+`S4ActorAdmissionCapacityCell` for one capped record, one
+`CommittedLegacyActorAdmission` row, one proof slot, the maximum commit-proof
+object/bytes and its write lease, writes the commit row, creates the proof slot
+as `RESERVED`, and leaves the scratch slot charged as `COMMITTED_COPYING`.
+Thus the scratch and canonical copies may coexist without borrowing capacity.
+If the CAS loses, no canonical debit/row/slot exists; the scratch slot becomes
+reusable only after fencing and definitive lease drain. If the CAS wins, the
+service verifies the canonical copy before draining scratch, then the post-CAS
+signer rereads the target, record, row and slot, emits the deterministic
+`LegacyActorAdmissionCommitProof`, and fills the slot. A crash leaves a
+repairable, already-budgeted copy or reserved slot, never an unbudgeted or
+falsely proved target.
+
+An otherwise valid S4 target that lacks a complete actor basis—including a
+device-authorized target missing the contextual
+`S4DeviceInviteAcceptance`—or cannot fit the shadow envelope is still published
+under the unchanged legacy authority path without a record. That does not
+weaken S4, but the missing record is a deterministic S5 eligibility failure
+until explicit re-anchoring. Shadow recording never substitutes a bare target
+signature, current winner or newly ground invite.
+
+This registry is bounded service-side migration evidence, not a fourth Worker
+tree. Each record, row, slot and proof obeys its individual byte cap below; the
+S4 envelope has finite object/row/byte/lease dimensions, and the canonical
+`CapacityEnvelope`, componentwise `CapacityCeiling` and whole-corpus
+`CutoverCapacityEnvelope` separately reserve its retained and staged S5 copy.
+It is append-only and never backfilled from a later proof winner. The
+`S4_DEVICE_INVITE_ACCEPTANCE` basis preserves current S4 behavior for a
+device-authorized target without standalone consent, but is valid only when
+that exact device key signed the contextual workspace/target/owner/invite tuple
+and separately authored the target under the retained invite proof.
+Consequently facts already present when this recorder is deployed may lack
+migration evidence; that is an explicit S5 eligibility failure, not a reason to
+reconstruct an admission-time actor class from timestamps, the current proof
+table or the current root.
+
 S5 starts with a **grandfather/backfill barrier while S4 is still
 authoritative**. This is a coordinated per-workspace format cut, not a lazy
 reader migration:
@@ -1881,6 +2686,10 @@ reader migration:
        H("s5-legacy-mask-namespace", anchor, reconciled_s4_root_oid,
          old_slot_globals_digest,
          pre_cutover_iam_fence_attestation_digest)
+   legacy_authority_checkpoint_namespace =
+       H("s5-legacy-authority-checkpoint-namespace", anchor,
+         reconciled_s4_root_oid, old_slot_globals_digest,
+         pre_cutover_iam_fence_attestation_digest)
    ```
 
    Still before constructing any migrated `FactRecord`, the authority enumerates
@@ -1906,7 +2715,8 @@ reader migration:
    over its sorted logical rows. The migration preflight charges the complete
    census closure and its bytes.
 
-   `legacy_mask_namespace` contains no migrated FactRecord oid,
+   Neither `legacy_mask_namespace` nor
+   `legacy_authority_checkpoint_namespace` contains a migrated FactRecord oid,
    `legacy_universe_rows_digest`, layout seed, B-treap root or
    `cutover_digest`. Because the census classified the frozen legacy sources
    from their authenticated old bytes, every required migration-only selector
@@ -1942,6 +2752,15 @@ reader migration:
    bytes and deterministic S5 FactRecord/raw-root representation before this
    choice; conflicting fact bytes, fid/body integrity, or derived object values
    for one fid abort the migration rather than selecting an origin.
+   For each directly deletable ordinary row it also requires either a prior
+   immutable owner binding or the exact capped
+   `LegacyActorAdmissionRecord`, `CommittedLegacyActorAdmission`, filled proof
+   slot and commit proof captured when that target first published under S4
+   shadow recording. It checks the target key/fid, actor fields and legacy
+   basis against the record and roots that evidence from the new FactRecord.
+   It never chooses an owner by replaying current direct-member precedence.
+   Missing admission-time evidence aborts the cut while the prepared S4
+   fallback remains authoritative.
    The already-frozen `LegacyEffectCensus` and complete old entry/global
    inventory deterministically classify every row before hashing:
    non-removal facts are `ORDINARY`; the canonical lowest-fid proposal selected
@@ -1974,9 +2793,18 @@ reader migration:
    unreceipted removal found in FactTree. The origin flag does not become a
    Worker authority bit: during the fence, certification enumerates every
    bounded sealed ordinary proof closure that was valid or could become
-   selectable after an authenticated legacy shadow/restore, and gives each one a
-   `CommittedAuthorityProof` under the cutover generation. An omitted closure is
-   a migration-certification failure; later winner changes do not manufacture a
+   selectable after an authenticated legacy shadow/restore. If its deterministic
+   `authority_proof_commit_id` already names a valid pre-fence `DirectRoot`
+   commitment and post-commit proof, the migrator reuses and retains that exact
+   immutable pair. Only a closure with no existing commitment may receive a new
+   `CommittedAuthorityProof` under the cutover generation, after its applicable
+   one-time guards pass at the fenced frontier. A second byte-different row at
+   an existing id, including a `CutoverGeneration` replacement for a
+   `DirectRoot` row, aborts migration. An existing row whose proof sidecar is
+   temporarily absent takes the idempotent proof-recovery path above and blocks
+   the cut until it verifies; it is not eligible for the “no commitment” branch.
+   An omitted closure is a
+   migration-certification failure; later winner changes do not manufacture a
    new proof or revoke one. This makes the S5 FactTree
    the authenticated archive for ordinary facts from the first root onward
    while the frozen map continues to prove all legacy bytes, origin,
@@ -1987,7 +2815,8 @@ reader migration:
    ```
    cutover_basis_digest =
        H("s5-cutover-basis", anchor, reconciled_s4_root_oid,
-         legacy_mask_namespace, legacy_effect_census_digest,
+         legacy_mask_namespace, legacy_authority_checkpoint_namespace,
+         legacy_effect_census_digest,
          legacy_universe_rows_digest,
          old_slot_globals_digest,
          pre_cutover_iam_fence_attestation_digest)
@@ -2010,8 +2839,8 @@ reader migration:
          candidate_seed(trial), legacy_universe_map_root)
    ```
 
-   Thus fenced source bytes and `legacy_mask_namespace` exist before migrated
-   FactRecords and logical rows, logical rows exist before the seed, the seed
+   Thus fenced source bytes and both root-free migration namespaces exist before
+   migrated FactRecords and logical rows, logical rows exist before the seed, the seed
    exists before the map root, and the map root exists before
    `cutover_digest`; none hashes a value that already depends on itself.
 
@@ -2049,6 +2878,13 @@ reader migration:
 
    For a canonical slot entry, `evidence_kind = LEGACY_SLOT` binds the entry and
    its proposal from the published-or-quarantined legacy universe. The receipt
+   carries
+   `GRANDFATHER(LegacyEffectAuthorizationRef(LEGACY_SLOT, ...))`, whose census
+   row and source FactRecord match that exact authoritative entry. It does not
+   force the old proposal through `OWNER` or `ADMIN`: in particular, a
+   cross-user content deletion accepted by the legacy any-member handler stays
+   effective without being misrepresented as new-policy authorization.
+   The receipt
    uses a normal `TargetBinding` only when the allowlisted legacy proposal maps
    to a current removal family, the victim family's `DIRECT_TARGETS` matrix
    permits that exact removal-family/selector-role pair, and recomputation
@@ -2088,6 +2924,10 @@ reader migration:
    public_key))`. This migration-only binding derives the key from the
    authenticated old global and is the explicit zero-provider exception to a
    live `PrincipalBinding`. The first S5 root must
+   give its receipt the matching
+   `GRANDFATHER(LegacyEffectAuthorizationRef(LEGACY_GLOBAL, ...))`; that form
+   proves the sealed old global rather than rerunning the source admin's current
+   guard. It then must
    structurally create the reserved `ActionSlot(MemberPrincipal(public_key))`
    from that authenticated global even when no membership provider exists, then
    fill it with the grandfather action pointer. It must
@@ -2108,9 +2948,27 @@ reader migration:
 3. Before S5 eligibility, the authority processes every Worker-authorizable
    legacy proof closure that is currently valid or can become selected after a
    certified shadow/restore. It gives every within-budget closure its cutover
-   `CommittedAuthorityProof`, and flattens every over-budget closure. The
+   `CommittedAuthorityProof`, and flattens every over-budget closure. An
+   over-budget closure already named by a post-recorder actor's
+   `PAGED_S4(S4PagedAuthorityAdmissionRef)` is not first invented at this fence:
+   the migrator verifies its earlier strong commit and post-commit proof, reuses
+   the byte-identical content-addressed `LegacyAuthorityProofRecord`
+   manifest/pages as the checkpoint source, and includes those already durable
+   objects in the frozen source/cutover manifests. Other over-budget candidate
+   closures may be paged for the first time only under the fenced rules below.
+   The
+   one-time authorization decision must itself be unambiguous: a provider first
+   published after S4 recorder activation must carry its exact historical
+   commit-proven authority proof, while a pre-recorder provider may be admitted
+   at the fence only if every one-time guard is still live there. A pre-recorder
+   provider whose one-time guard is now removed blocks migration/requires
+   re-anchor; current state cannot prove whether it was admitted before that
+   removal or first relayed afterward. No cutover-generated proof launders that
+   ambiguity into `ADMITTED_PROOF`.
+   The
    source closure is not forced into the new 64-fact Worker record. Instead the
-   fenced migrator builds a canonical paged:
+   fenced migrator builds, or verifies and reuses an already committed S4 actor
+   source with, the canonical paged:
 
    ```
    LegacyAuthorityProofRecord(
@@ -2131,8 +2989,9 @@ reader migration:
    on the checkpoint's new bounded Worker proof.
 
    The migrator then emits a migration-only, service-signed
-   `LegacyAuthorityCheckpoint(cutover_digest, source_candidate_id, source_fid,
-   source_legacy_authority_proof_oid, source_proof_closure_digest,
+   `LegacyAuthorityCheckpoint(legacy_authority_checkpoint_namespace,
+   source_candidate_id, source_fid, source_legacy_authority_proof_oid,
+   source_proof_closure_digest,
    source_proof_depth, source_canonical_proof_cost, source_need_key, subject,
    selectors, sorted_source_provider_sids, sorted_source_action_scopes,
    budget_class)` for every distinct over-budget candidate closure that could
@@ -2142,6 +3001,10 @@ reader migration:
    source_fid, source_legacy_authority_proof_oid,
    source_proof_closure_digest)` is derived only after the paged proof manifest
    is hashed; neither it nor the checkpoint fid appears inside that manifest.
+   The root-free checkpoint namespace was fixed from fenced S4 source bytes
+   before any migrated FactRecord. It replaces `cutover_digest` in checkpoint
+   identity, so an owner FactRecord may bind the checkpoint oid before
+   `LegacyUniverseRows`, its seeded map root and the final digest exist.
    The checkpoint offers exactly the source closure's normalized authority,
    carries its recomputed S5 suppression selectors, has no recursive authority
    need, and is eligible only under the fixed migration budget. Its FactRecord
@@ -2183,7 +3046,10 @@ reader migration:
 4. The authority writes the same globally serialized admission cell used for a
    normal action. Backfill deliberately does **not** re-run current guards: an
    effect that took effect before its author was later evicted remains
-   grow-only.
+   grow-only. Its receipt is constructible because `LEGACY_SLOT` and
+   `LEGACY_GLOBAL` use only the matching, non-callable
+   `GRANDFATHER(LegacyEffectAuthorizationRef)` arm. `LIVE_GUARDS` may never use
+   that arm.
 5. Certification requires complete correspondence: every legacy slot entry has
    exactly one `LegacyEntryMap` row whose canonical target has a valid receipt,
    every canonical legacy action and every legacy removal global has one valid
@@ -2209,6 +3075,7 @@ reader migration:
    The immutable
    `LegacyMigrationSeal` binds the `cutover_digest`,
    `reconciled_s4_root_oid`, `legacy_mask_namespace`,
+   `legacy_authority_checkpoint_namespace`,
    `legacy_effect_census_oid`, `legacy_effect_census_digest`,
    `LegacyUniverseMap` root,
    `LegacyEntryMap` root, old slot/globals digest and registered publisher
@@ -2259,7 +3126,10 @@ reader migration:
    `CommitBinding = CutoverGeneration(service_generation_id)`, never
    `DirectRoot`; the certificate reservation is likewise keyed by the
    pre-root `service_generation_id` and publishing deployment, not by an
-   unknown root oid.
+   unknown root oid. Newly materialized cutover authority proofs use the same
+   generation binding and service manifest, but a proof already committed in
+   S4 remains behind its retained `DirectRoot` row/proof pair and is referenced
+   from the first-root registries without a duplicate service row.
 
    A canonical, paged
    `CutoverPayloadManifest(object_manifest_root_oid,
@@ -2371,12 +3241,15 @@ reader migration:
 Any failure after the legacy-writer fence but before the first S5 root CAS uses
 one explicit abort protocol. The authority generation-fences and drains every
 S5 scratch/IAM writer, discards all uncommitted receipts and candidate objects,
-and atomically activates the pre-attested fresh S4 credential generation for
-the service-exclusive writer. It never re-enables an old publisher credential
-or the fenced generation. The unchanged last S4 root, legacy `removals` slot and
-removal globals remain authoritative throughout; once activation is durable,
-ordinary S4 publication resumes through the service and registered publishers
-must reseed. A later S5 retry is a **new migration attempt**: while that S4
+and performs the S4 scratch handoff above before atomically activating the
+pre-attested fresh S4 credential generation for the service-exclusive writer.
+The handoff changes no workspace-global canonical capacity balance, so all
+actor/proof commitments written by every predecessor generation remain charged
+and reusable. It never re-enables an old publisher credential or the fenced
+generation. The unchanged last S4 root, legacy `removals` slot and removal
+globals remain authoritative throughout; once activation is durable,
+ordinary S4 publication resumes through the service and registered publishers must
+reseed. A later S5 retry is a **new migration attempt**: while that S4
 generation is still active and writable, the provider first provisions and
 attests another inactive fresh service-only S4 fallback generation, reruns the
 whole-cutover sizing/quota guard, emits new retained `CapacityCeiling` and
@@ -2468,6 +3341,42 @@ derives the recorded digest, transport depth/cost, logical depth and post-hash
 candidate rank without a search. It verifies the exact
 `AuthorityProofCommitProof` and never re-resolves that historical admission
 against later AuthorityTree winners.
+For every directly deletable `FactRecord` it also follows the complete
+`OwnerBinding`, verifies its provider FactRecord, proof record, committed-proof
+row and post-commit proof, verifies `ActorBindingProof` under `admission_pk`,
+requires the signed target key/fid to match this FactRecord, and verifies the
+selected evidence and service-attested complete actor verdict. It deliberately
+does not fetch or retain the historical composite root: the root-excluded
+statement plus its exact provider proof is the bounded certification preimage.
+A legacy binding must additionally root a matching
+`LegacyActorAdmissionRecord`, `CommittedLegacyActorAdmission`, filled
+`LegacyActorAdmissionProofSlot` and valid
+`LegacyActorAdmissionCommitProof` from the S4 first-publication transaction.
+Certification compares every actor field, recorded provider ref and legacy
+basis with the S5 statement; it never recomputes actor class from the cutover
+winner set. A `DIRECT` transport must equal that recorded ref. A `CHECKPOINT`
+transport may name a different new provider identity only after certification
+replays the checkpoint's paged source proof and proves its source
+fid/digest/NeedKey/candidate id correspond exactly to the recorded ref. The
+signed `ActorBindingProof` authenticates both refs and the transport choice.
+Absence of either side of that translation is a cutover failure, not permission
+to overwrite the old record with a future checkpoint identity or infer a
+convenient current owner.
+A `DIRECT_MEMBER` binding must come from a direct-membership family and derive
+`owner_principal == signing_key`; the same key's self-owned `device` provider
+is auxiliary device-set evidence, not a competing owner kind. A native
+`DEVICE` binding must come from a canonical target-key-authored
+`DeviceOwnerConsent`, follow its exact invite/provider proof, carry the
+matching `device(owner_principal, signing_key)` co-offer, and carry the signed
+verdict that no admitted shape-valid direct-member claimant—masked or
+live—existed at the serializing check. A legacy `DEVICE` binding may instead
+use only its per-target `S4_DEVICE_INVITE_ACCEPTANCE` record, which verifies the
+same exact invite/co-offer plus both the contextual acceptance and ordinary
+target authorship signatures and grants no reusable post-S5 actor authority.
+A later direct rejoin or provider rerank may change actor
+resolution for new work but cannot invalidate or rewrite the retained proof.
+Certification authenticates that owner; it never substitutes a later provider
+winner, an unsigned invite or a caller-supplied principal.
 For every `CONTENT_COMMIT` FactRecord it also verifies the generation-free
 `RawFactContentCommit` id, exact `ContentCommitPin[ROOTED]` row and post-commit
 proof, then walks the positional manifest to the declared bytes/fid. This is
@@ -2702,6 +3611,53 @@ physical layout changes neither the fact nor its fid. Existing unbounded message
 text is therefore representable and does not block S4 publication. Blob bodies
 remain separate.
 
+For a directly deletable fact, that bounded record additionally contains its
+one canonical `DeleteOffer` and complete immutable `OwnerBinding`. Composite
+reachability follows the binding to the exact provider FactRecord/raw root,
+`AuthorityProofRecord`, `CommittedAuthorityProof` row and
+`AuthorityProofCommitProof`, plus the deterministic target-bound
+`ActorBindingProof`. It does not point to or retain the prior composite root;
+GC may collect that root and may not replace the retained proof arm with a
+current authority lookup.
+Those bytes and objects count against
+`MAX_FACT_RECORD_BYTES`, content/control occupancy and the fact's
+`AtomicCommitBudget`. For a newly authored target the referenced actor proof is
+already committed and does not contain the target; the service signs the
+statement over the already-known raw target fid before hashing the target
+FactRecord, so this adds no self-hash cycle. The statement omits mutable
+root/frontier/generation values; identical statements therefore produce
+identical FactRecords across retries. If one submitted closure introduces both
+an actor provider and a directly deletable child, the authority advances and
+commit-proves the provider first, then evaluates the child against that next
+certified frontier; it never writes a child binding to a merely prospective
+provider proof.
+
+At the S5 fence a legacy actor proof above the native bound is represented by
+its sealed `LegacyAuthorityCheckpoint`; the migrated target and checkpoint are
+built in the cutover generation's already-acyclic order. The target retains the
+original `PAGED_S4(S4PagedAuthorityAdmissionRef)` from
+`LegacyActorAdmissionRecord` as recorded provenance and separately binds the
+checkpoint's deterministic committed-provider identity as its `CHECKPOINT`
+transport. The checkpoint FactRecord roots the exact paged legacy source proof
+that was already strongly committed before the target CAS; certification
+replays both that S4 commit and the source-to-checkpoint translation, and the
+post-activation checkpoint proof sidecar is required before certification.
+The recorded paged ref and checkpoint transport ref are deliberately not
+byte-equal and neither is substituted for the other. A within-native-bound
+legacy actor instead retains `BOUNDED(AuthorityAdmissionRef)` and uses only the
+byte-equal `DIRECT` transport. A legacy `DEVICE` binding
+additionally requires either the device key's signed `DeviceOwnerConsent`, an
+already immutable equivalent owner binding, or its non-reusable per-target
+`S4_DEVICE_INVITE_ACCEPTANCE` record proving that the same key signed the
+complete contextual tuple and separately authored the target. An invite or
+ordinary target signature alone, without that contextual acceptance, is
+insufficient. Every legacy binding also requires its admission-time
+`LegacyActorAdmissionRecord`, committed row, filled proof slot and commit
+proof; the cutover never reapplies direct-member precedence to the current set.
+Missing, ambiguous or uncommitted ownership/consent evidence, or evidence
+exceeding the signed legacy checkpoint/source and cutover ceilings, keeps the
+workspace writable on S4.
+
 Raw ordinary fact bytes do not have to fit the fixed metadata
 `PublicationAttempt`. Before ordinary metadata publication, the same authority
 uses the quota-isolated content gateway to execute:
@@ -2882,6 +3838,18 @@ FACT_TS_MIN           = 0
 FACT_TS_MAX           = 999999999999999  # exactly 15 decimal digits at max
 MAX_FACT_KEY_BYTES    = 80  # 15-digit ts + ":" + 64 lowercase hex fid
 MAX_FACT_RECORD_BYTES = 32 * 1024
+MAX_ACTOR_BINDING_PROOF_BYTES = 4 * 1024
+MAX_ACTION_AUTHORIZATION_BYTES = 6 * 1024
+MAX_LEGACY_ACTOR_ADMISSION_RECORD_BYTES = 8 * 1024
+MAX_LEGACY_ACTOR_ADMISSION_COMMIT_ROW_BYTES = 8 * 1024
+MAX_LEGACY_ACTOR_ADMISSION_PROOF_SLOT_BYTES = 512
+MAX_LEGACY_ACTOR_ADMISSION_COMMIT_PROOF_BYTES = 4 * 1024
+MAX_S4_AUTHORITY_PROOF_CAPACITY_ENVELOPE_BYTES = 4 * 1024
+MAX_S4_ACTOR_ADMISSION_CAPACITY_ENVELOPE_BYTES = 4 * 1024
+MAX_S4_AUTHORITY_PROOF_CAPACITY_CELL_BYTES = 4 * 1024
+MAX_S4_ACTOR_ADMISSION_CAPACITY_CELL_BYTES = 4 * 1024
+MAX_S4_AUTHORITY_PROOF_SCRATCH_SLOT_BYTES = 4 * 1024
+MAX_S4_ACTOR_ADMISSION_SCRATCH_SLOT_BYTES = 4 * 1024
 MAX_FACT_CHUNK_BYTES  = 32 * 1024
 MAX_RAW_FACT_MANIFEST_PAGE_ENTRIES = 64
 MAX_RAW_FACT_MANIFEST_PAGE_BYTES = 64 * 1024
@@ -2900,6 +3868,9 @@ MAX_AUTHORITY_PROOF_COMMIT_PROOF_BYTES = 4 * 1024
 MAX_LEGACY_AUTHORITY_PROOF_PAGE_FACTS = 64
 MAX_LEGACY_AUTHORITY_PROOF_PAGE_EDGES = 128
 MAX_LEGACY_AUTHORITY_PROOF_PAGE_BYTES = 64 * 1024
+MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_ROW_BYTES = 4 * 1024
+MAX_S4_PAGED_AUTHORITY_PROOF_SLOT_BYTES = 512
+MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_PROOF_BYTES = 4 * 1024
 MAX_ACTION_RECORD_BYTES = 16 * 1024
 MAX_ADMISSION_PROOF_BYTES = 56 * 1024
 MAX_PENDING_BUNDLE_FRAMING_BYTES = 8 * 1024
@@ -3070,10 +4041,90 @@ pins a componentwise ceiling; only the post-snapshot `S5CutoverBinding` pins the
 exact envelope, which may not exceed that ceiling:
 
 ```
+S4AuthorityProofCapacityEnvelope(
+    s4_authority_proof_scratch_slots,
+    s4_authority_proof_scratch_slot_bytes,
+    s4_authority_proof_scratch_objects,
+    s4_authority_proof_scratch_bytes,
+    s4_authority_proof_scratch_write_leases,
+    authority_proof_record_objects, authority_proof_record_bytes,
+    authority_proof_commit_rows, authority_proof_commit_bytes,
+    authority_proof_commit_proof_objects,
+    authority_proof_commit_proof_bytes,
+    authority_proof_commit_proof_write_leases,
+    s4_paged_authority_proof_manifest_objects,
+    s4_paged_authority_proof_manifest_bytes,
+    s4_paged_authority_proof_page_objects,
+    s4_paged_authority_proof_page_bytes,
+    s4_paged_authority_proof_commit_rows,
+    s4_paged_authority_proof_commit_bytes,
+    s4_paged_authority_proof_slot_rows,
+    s4_paged_authority_proof_slot_bytes,
+    s4_paged_authority_proof_commit_proof_objects,
+    s4_paged_authority_proof_commit_proof_bytes,
+    s4_paged_authority_proof_commit_proof_write_leases,
+)
+s4_authority_proof_capacity_envelope_oid =
+    H("s4-authority-proof-capacity-envelope",
+      canon(S4AuthorityProofCapacityEnvelope(...)))
+s4_authority_proof_capacity_cell_id =
+    H("s4-authority-proof-capacity-cell", workspace)
+S4AuthorityProofCapacityCell[s4_authority_proof_capacity_cell_id] =
+    canon(workspace, s4_authority_proof_capacity_envelope_oid,
+          remaining_canonical_authority_proof_capacity)
+S4AuthorityProofScratchSlot(
+    workspace, s4_generation, scratch_slot,
+    FREE
+      | OPEN(attempt_id, reserved_objects, reserved_bytes, write_lease)
+      | SEALED(attempt_id, manifest_oid, object_count, canonical_bytes,
+               write_lease)
+      | COMMITTED_COPYING(attempt_id, authority_commit_id, write_lease)
+      | ABORTING(attempt_id, write_lease))
+S4ActorAdmissionCapacityEnvelope(
+    legacy_actor_admission_scratch_slots,
+    legacy_actor_admission_scratch_slot_bytes,
+    legacy_actor_admission_scratch_record_objects,
+    legacy_actor_admission_scratch_record_bytes,
+    legacy_actor_admission_scratch_write_leases,
+    legacy_actor_admission_record_objects,
+    legacy_actor_admission_record_bytes,
+    legacy_actor_admission_commit_rows,
+    legacy_actor_admission_commit_bytes,
+    legacy_actor_admission_proof_slot_rows,
+    legacy_actor_admission_proof_slot_bytes,
+    legacy_actor_admission_commit_proof_objects,
+    legacy_actor_admission_commit_proof_bytes,
+    legacy_actor_admission_commit_proof_write_leases,
+)
+s4_actor_admission_capacity_envelope_oid =
+    H("s4-actor-admission-capacity-envelope",
+      canon(S4ActorAdmissionCapacityEnvelope(...)))
+s4_actor_admission_capacity_cell_id =
+    H("s4-actor-admission-capacity-cell", workspace)
+S4ActorAdmissionCapacityCell[s4_actor_admission_capacity_cell_id] =
+    canon(workspace, s4_actor_admission_capacity_envelope_oid,
+          remaining_canonical_actor_admission_capacity)
+S4ActorAdmissionScratchSlot(
+    workspace, s4_generation, scratch_slot,
+    FREE
+      | OPEN(attempt_id, reserved_record_bytes, write_lease)
+      | SEALED(attempt_id, legacy_actor_admission_record_oid,
+               canonical_bytes, write_lease)
+      | COMMITTED_COPYING(attempt_id, legacy_actor_admission_commit_id,
+                          write_lease)
+      | ABORTING(attempt_id, write_lease))
 CapacityEnvelope(
     fact_tree_rows, fact_tree_bytes,
     supp_tree_rows, supp_tree_bytes,
     authority_tree_rows, authority_tree_bytes,
+    s4_authority_proof_capacity_envelope_objects,
+    s4_authority_proof_capacity_envelope_bytes,
+    s4_authority_proof_capacity_cell_rows,
+    s4_authority_proof_capacity_cell_bytes,
+    s4_actor_admission_capacity_envelope_objects,
+    s4_actor_admission_capacity_envelope_bytes,
+    s4_actor_admission_capacity_cell_rows,
+    s4_actor_admission_capacity_cell_bytes,
     fact_record_objects, fact_record_bytes,
     raw_fact_chunk_objects, raw_fact_chunk_bytes,
     authority_proof_record_objects, authority_proof_record_bytes,
@@ -3081,6 +4132,20 @@ CapacityEnvelope(
     authority_proof_commit_proof_objects,
     authority_proof_commit_proof_bytes,
     legacy_authority_proof_objects, legacy_authority_proof_bytes,
+    s4_paged_authority_proof_commit_rows,
+    s4_paged_authority_proof_commit_bytes,
+    s4_paged_authority_proof_slot_rows,
+    s4_paged_authority_proof_slot_bytes,
+    s4_paged_authority_proof_commit_proof_objects,
+    s4_paged_authority_proof_commit_proof_bytes,
+    legacy_actor_admission_record_objects,
+    legacy_actor_admission_record_bytes,
+    legacy_actor_admission_commit_rows,
+    legacy_actor_admission_commit_bytes,
+    legacy_actor_admission_proof_slot_rows,
+    legacy_actor_admission_proof_slot_bytes,
+    legacy_actor_admission_commit_proof_objects,
+    legacy_actor_admission_commit_proof_bytes,
     action_record_objects, action_record_bytes,
     legacy_universe_map_objects, legacy_universe_map_bytes,
     legacy_entry_map_objects, legacy_entry_map_bytes,
@@ -3150,6 +4215,10 @@ CutoverCapacityEnvelope(
     cutover_manifest_rows, cutover_manifest_bytes,
     cutover_staging_objects, cutover_staging_bytes,
     cutover_staging_write_leases,
+    cutover_legacy_actor_admission_objects,
+    cutover_legacy_actor_admission_bytes,
+    cutover_legacy_actor_admission_service_rows,
+    cutover_legacy_actor_admission_service_bytes,
     cutover_content_manifest_objects, cutover_content_manifest_bytes,
     cutover_content_staging_objects, cutover_content_staging_bytes,
     cutover_content_staging_write_leases,
@@ -3162,6 +4231,108 @@ CutoverCapacityEnvelope(
 ```
 
 These are workspace-specific finite bounds, not request-size constants.
+The two `S4*CapacityCell` rows are workspace-global, durable and monotonic;
+`s4_generation` is deliberately absent from their keys. Each is initialized
+exactly once from the content-addressed envelope named in the cell before its
+shadow recorder is enabled. Its remaining vector contains only canonical
+dimensions. Canonical records, commit rows, proof slots and proof objects from
+every S4 generation debit that one vector and are never refunded merely because
+a migration attempt aborts or a new fallback generation becomes writable.
+Existing canonical objects from predecessor generations therefore remain both
+reachable and charged. The exact envelope preimages are retained beside the
+cells, hash-checked by their oids, and capped respectively by
+`MAX_S4_AUTHORITY_PROOF_CAPACITY_ENVELOPE_BYTES` and
+`MAX_S4_ACTOR_ADMISSION_CAPACITY_ENVELOPE_BYTES`. The first S5 root and cutover
+object manifest carry them forward, and the matching eight `CapacityEnvelope`
+dimensions charge those two retained objects/bytes plus the two strong
+capacity-cell rows/bytes. The cells reject above
+`MAX_S4_AUTHORITY_PROOF_CAPACITY_CELL_BYTES` and
+`MAX_S4_ACTOR_ADMISSION_CAPACITY_CELL_BYTES`; a bare oid, collected preimage or
+unbudgeted cell cannot certify a balance.
+
+Scratch slots remain generation-fenced but reuse one separately precharged
+physical pool. A post-fence abort first rejects new predecessor writes, settles
+every ambiguous CAS, finishes or aborts each `COMMITTED_COPYING` operation, and
+definitively drains every scratch write lease. One strong fallback-activation
+transaction then makes the predecessor scratch rows inert, rebinds the same
+physical slots as `FREE` rows for the already attested successor generation,
+and proves the workspace-global canonical capacity-cell ids and balances are
+byte-identical before and after activation. The per-attempt
+`MigrationBootstrapCommitment` binds those stable cell identities and immutable
+envelope oids; it cannot provision a fresh canonical vector. A retry may reset
+only the drained scratch state. Failure to drain, rebind, or preserve either
+canonical balance leaves the workspace fail-closed/read-only or requires
+explicit re-anchor; it never activates a refill.
+
+`S4AuthorityProofCapacityEnvelope` is physically provisioned before either
+first-publication or on-demand authority recording is enabled. Before accepting
+any proof bytes, the service atomically claims one fixed
+`S4AuthorityProofScratchSlot` whose precharged object/byte maximum can hold the
+complete permitted bounded record or one permitted paged manifest and all its
+pages; each strong slot row also fits
+`MAX_S4_AUTHORITY_PROOF_SCRATCH_SLOT_BYTES`, and every scratch upload holds the
+slot's write lease. After seal, the strong
+proof commit validates the exact manifest/hash/counts and atomically debits the
+applicable disjoint canonical bounded or paged dimensions in
+`S4AuthorityProofCapacityCell`, creates its commit row and, for paged evidence,
+its `RESERVED` proof slot, and moves the scratch slot to `COMMITTED_COPYING`.
+Scratch and canonical allowances coexist
+until every content-addressed copy verifies and the lease definitively drains.
+An idempotent canonical match consumes nothing new. A losing proof CAS debits no
+canonical dimension but moves its scratch slot through `ABORTING`; the slot is
+not reusable until fencing and definitive lease drain. The post-commit signer
+consumes the already reserved proof object/byte/lease allowance. A bounded
+`AuthorityProofRecord` receives the ordinary commit/proof pair. An over-budget
+but checkpointable actor closure receives a `LegacyAuthorityProofRecord`,
+`CommittedS4PagedAuthorityProof` and
+`S4PagedAuthorityProofCommitProof` before any target may cite it. A proof
+committed solely to support a later actor record remains canonical if that
+target loses its CAS, because it is itself a valid admission of that exact
+provider closure rather than target scratch. Canonical
+`authority_proof_*` or `legacy_authority_proof_*` plus
+`s4_paged_authority_proof_commit_*` dimensions retain it after S5, while the
+whole-cutover object/service staging totals fund its disjoint copy. Every
+`CommittedS4PagedAuthorityProof` row fits
+`MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_ROW_BYTES`; its strong proof slot fits
+`MAX_S4_PAGED_AUTHORITY_PROOF_SLOT_BYTES`. The retained proof is addressed by
+the proof oid carried in `S4PagedAuthorityAdmissionRef`, matched by that slot,
+and fits
+`MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_PROOF_BYTES`.
+
+`S4ActorAdmissionCapacityEnvelope` is physically provisioned before the shadow
+recorder is enabled. Its fixed scratch-slot object/byte/lease dimensions are
+physically precharged separately from the canonical remaining vector held in
+the strong `S4ActorAdmissionCapacityCell`. Before record upload the service
+claims one `S4ActorAdmissionScratchSlot`, whose write gateway accepts only the
+matching live generation/attempt and at most
+`MAX_LEGACY_ACTOR_ADMISSION_RECORD_BYTES`; the slot row itself fits
+`MAX_S4_ACTOR_ADMISSION_SCRATCH_SLOT_BYTES`. Each successful eligible-target CAS
+verifies that sealed scratch record and atomically charges one canonical record
+no larger than
+`MAX_LEGACY_ACTOR_ADMISSION_RECORD_BYTES`, one commit row no larger than
+`MAX_LEGACY_ACTOR_ADMISSION_COMMIT_ROW_BYTES`, one fixed proof slot no larger
+than `MAX_LEGACY_ACTOR_ADMISSION_PROOF_SLOT_BYTES`, and one proof object plus
+write lease for at most
+`MAX_LEGACY_ACTOR_ADMISSION_COMMIT_PROOF_BYTES`. The proof allocation and lease
+are reserved in the same transaction before the new target becomes visible,
+even though its deterministic signature is written afterward. The winning CAS
+also changes the scratch slot to `COMMITTED_COPYING`; because its capacity was
+already charged separately, scratch and the canonical record can coexist until
+the canonical hash/size is verified. A failed CAS leaves the canonical capacity
+cell unchanged and moves only its scratch slot to `ABORTING`; a
+generation-fenced scratch record is reclaimed only after every write lease
+drains. Exhausting a scratch or canonical dimension omits the shadow record and
+makes S5 ineligible without rejecting the still-valid legacy target or changing
+the old authority path.
+
+The canonical legacy-actor dimensions retain the complete record/commit/slot/
+proof closure after S5. The explicitly named cutover dimensions fund a
+simultaneous inactive-generation copy; they are also included in the aggregate
+staging totals rather than borrowed from content or ordinary publication
+capacity. Thus the migration sizer charges the worst case once per potentially
+deletable target admitted after recorder activation and never assumes that
+proof objects will deduplicate.
+
 `CapacityCeiling` has exactly the canonical field order, names and nonnegative
 integer domains of `CapacityEnvelope`; its retained encoding rejects above
 `MAX_CAPACITY_CEILING_BYTES`. A componentwise proof therefore decodes two
@@ -3232,6 +4403,11 @@ certification even when the proof-record bytes themselves are valid.
 manifest and all of its capped binding/edge pages. Its workspace-specific total
 comes from the signed legacy source ceiling and cutover manifest, never from a
 Worker request budget or favorable cross-closure deduplication. Every generated
+post-recorder paged actor source additionally retains its exact
+`CommittedS4PagedAuthorityProof` row and
+`S4PagedAuthorityProofCommitProof`; the
+`s4_paged_authority_proof_commit_*` dimensions charge those rows and objects
+independently of the manifest/pages and cutover checkpoint proof. Every generated
 revocation base fact must fit one
 `MAX_REVOCATION_RECORD_RAW_BYTES` raw chunk, and there are at most
 `MAX_ACTION_EVIDENCE_REFS` such facts. The submitted pre-receipt subset also
@@ -4356,8 +5532,10 @@ explains *why* stays, marked as history.
 `tests/test_repository_layout.py` already owns a stale-reference regex but points
 it at the bead export. Point it at the documentation, where the breakage is.
 
-**OPEN:** whether AGENTS.md survives as the agent entry point (recommended: keep
-it, ~20 lines, pointing at DESIGN.md and nothing else).
+**SETTLED:** `AGENTS.md` survives as the short agent entry point beside
+`README.md` and `DESIGN.md`, and points at `DESIGN.md` rather than preserving a
+fourth plan. `tests/test_repository_layout.py::test_only_entrypoint_docs_live_at_root`
+already ratchets that exact three-file root set.
 
 ---
 

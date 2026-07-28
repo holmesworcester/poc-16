@@ -128,6 +128,9 @@ def test_only_entrypoint_docs_live_at_root():
     assert not (ROOT / "tinyp2p").exists()
     assert (ROOT / "core" / "__init__.py").is_file()
     assert (ROOT / "facts" / "__init__.py").is_file()
+    ledger = (ROOT / "docs" / "TODO.md").read_text()
+    assert "**SETTLED:** `AGENTS.md` survives" in ledger
+    assert "**OPEN:** whether AGENTS.md survives" not in ledger
 
 
 def test_python_imports_do_not_restore_the_old_namespace():
@@ -320,7 +323,8 @@ def test_recovery_beads_own_the_safe_storage_transition():
     assert "admit-cell byte reserve" in s4
     assert "migration-seal object/byte reserve" in s4
     assert "Every admit cell reserves exact bytes" in s5
-    assert "At most 7 proposal/support proof refs determine proof_digest" in s5
+    assert "At most 7 proposal/support proof refs plus the service-derived " \
+        "ActionAuthorization determine proof_digest" in s5
     assert "full-size admit-cell bytes" in \
         "\n".join(strings(issues[f"{RECOVERY_EPIC}.10"]))
     assert "Receipt-cycle mutation" in \
@@ -654,10 +658,11 @@ def test_device_revocation_is_key_wide_and_future_safe():
     assert ("device_key", public_key, "") in dual_scope.offers()
 
     ledger = (ROOT / "docs" / "TODO.md").read_text()
+    normalized = " ".join(ledger.split())
     assert "DevicePrincipal(public_key)" in ledger
     assert "DevicePrincipal(PrincipalBinding(...))" in ledger
     assert "different labels or timestamps produce several valid device facts" \
-        in ledger
+        in normalized
     assert "A later provider may implement several typed scopes at once" \
         in ledger
     assert "initial effective set is **every** committed `MemberPrincipal` " \
@@ -1283,6 +1288,354 @@ def test_authority_candidate_masks_follow_declared_liveness_guards():
     assert "AuthorityProofCommitProof" in ledger
 
 
+def test_admin_liveness_and_content_deletion_policy_are_settled():
+    """S2 must not leave either application policy to an implementation guess."""
+    ledger = (ROOT / "docs" / "TODO.md").read_text()
+    delete_handler = (ROOT / "facts" / "content" / "delete.py").read_text()
+    normalized = " ".join(ledger.split())
+    issues = {issue["id"]: issue for issue in exported_beads()}
+    contracts = {
+        stage: " ".join(strings(issues[f"{RECOVERY_EPIC}.{stage}"]))
+        for stage in (2, 4, 5, 6, 7, 10)
+    }
+    epic_contract = " ".join(strings(issues[RECOVERY_EPIC]))
+
+    assert "**OPEN application policy" not in ledger
+    assert "delegated-admin provider has **grantee-only continuing liveness**" \
+        in ledger
+    assert "one-time\n  `AUTHORIZATION_GUARD`, not an " \
+        "`AUTHORITY_LIVENESS_GUARD`" in ledger
+    assert "no `FollowAuthority(grantor-admin)`" in ledger
+    assert "`DeleteOffer(\"content.delete\", SELF, " \
+        "OwnerBinding(...))`" in ledger
+    assert "exact provider fact key/fid/FactRecord oid" in normalized
+    assert "AuthorityProofRecord, CommittedAuthorityProof row and " \
+        "AuthorityProofCommitProof" in normalized
+    assert "two explicit proposal modes, `OWNER` and `ADMIN`" in ledger
+    assert "ordinary conjunctive needs tuple" in ledger
+    assert "receipt is the later post-proposal commit gate, not a proposal " \
+        "need" in normalized
+    assert "The receipt is deliberately absent from both tuples" in ledger
+    assert "has absolute precedence and makes the signing key act as itself" \
+        in normalized
+    assert "any admitted, shape-valid direct-member claimant" in normalized
+    assert "including a masked one" in normalized
+    assert "If all such providers are suppressed the action fails, and it " \
+        "never falls through to a device claim" in normalized
+    assert "`DEVICE` therefore means no direct-member claimant exists" \
+        in normalized
+    assert "A bare `device_invite` is also never ownership consent" in ledger
+    assert "DeviceOwnerConsent(workspace, device_key, owner_principal," \
+        in ledger
+    assert "A bare `device_invite` cannot be the target of " \
+        "`DevicePrincipal`" in ledger
+    assert "key-signed self-bound `device` or `DeviceOwnerConsent` row" \
+        in normalized
+    assert "without the target-key signature" in normalized
+    assert "self-owned `device` provider seeds that user's device set and is " \
+        "not a `DEVICE` ownership candidate" in normalized
+    assert "Actor class is serialization-relative, not globally monotonic" \
+        in ledger
+    assert "later direct rejoin may legitimately rerank a formerly " \
+        "device-only signing key" in normalized
+    assert "ActorBindingProof =" in ledger
+    assert "ActorBasis =" not in ledger
+    assert "canon(workspace, target_fact_key, target_fid," in ledger
+    assert "No mutable root oid, frontier serial, retry generation or current " \
+        "winner enters the signed statement" in normalized
+    assert "without retaining the historical root" in normalized
+    assert "MAX_ACTOR_BINDING_PROOF_BYTES = 4 * 1024" in ledger
+    assert "advances and commit-proves the provider first" in normalized
+    assert "LegacyActorAdmissionRecord =" in ledger
+    assert "CommittedLegacyActorAdmission[" in ledger
+    assert "LegacyActorAdmissionProofSlot[" in ledger
+    assert "LegacyActorAdmissionCommitProof[" in ledger
+    assert "legacy_actor_admission_record_oid =" in ledger
+    assert "legacy_actor_admission_commit_id =" in ledger
+    assert "does **not** rerun direct-member precedence over the frozen S4 " \
+        "set" in normalized
+    assert "cannot be synthesized from a later root" in normalized
+    assert "facts already present when this recorder is deployed may lack " \
+        "migration evidence" in normalized
+    assert "never chooses an owner by replaying current direct-member " \
+        "precedence" in normalized
+    assert "evidence beyond both the native proof cap and signed paged " \
+        "checkpoint/source ceilings" in normalized
+    assert "S4_DEVICE_INVITE_ACCEPTANCE" in ledger
+    assert "The contextual signature is acceptance for this one target only" \
+        in normalized
+    assert "ordinary detached target signature alone is insufficient" \
+        in normalized
+    assert "s4-device-invite-acceptance-v1" in ledger
+    assert "workspace, target_fact_key, target_fid, device_key, " \
+        "owner_principal" in normalized
+    assert "grants no reusable post-S5 actor authority" in normalized
+    assert "An invite or ordinary target signature alone, without that " \
+        "contextual acceptance, is insufficient" \
+        in normalized
+    assert "ActionAuthorization =" in ledger
+    assert "OWNER(ActionActorBinding)" in ledger
+    assert "ADMIN(ActionActorBinding, AdminAuthorityRef)" in ledger
+    assert "GRANDFATHER(LegacyEffectAuthorizationRef)" in ledger
+    assert "LegacyEffectAuthorizationRef =" in ledger
+    assert "cross-user content deletion accepted by the legacy any-member " \
+        "handler stays\n   effective" in ledger
+    assert "if evidence_kind = LIVE_GUARDS:\n" \
+        "    ActionAuthorization.ActionActorBinding" in ledger
+    assert "    ActionAuthorization is not GRANDFATHER" in ledger
+    assert "no live request path accepts GRANDFATHER" in ledger
+    assert "MAX_ACTION_AUTHORIZATION_BYTES = 6 * 1024" in ledger
+    assert "MAX_PENDING_BUNDLE_FRAMING_BYTES = 8 * 1024" in ledger
+    assert "it is not charged to or accepted from caller-controlled pending " \
+        "framing" in normalized
+    assert "proof_refs(r), ActionAuthorization" in ledger
+    assert "evidence_kind, evidence_fids, ActionAuthorization," in ledger
+    assert "ActionAuthorization derived by the admission service" in ledger
+    assert "a signed pre-CAS orphan is inert" in normalized
+    assert "may not use S4_DEVICE_INVITE_ACCEPTANCE to authorize a new action" \
+        in normalized
+    assert "ActionAuthorization's bounded actor/admin provider FactRecords" \
+        in normalized
+    delete_guard = ledger.index(
+        'if b selects delete_kind in {"content.delete", "device.grant.delete"}:')
+    target_owner_check = ledger.index(
+        "OwnerBinding.ActorBindingStatement.ActorAdmissionEvidence",
+        delete_guard,
+    )
+    action_scope = ledger.index(
+        "# The following authorization checks are action-scoped",
+        target_owner_check,
+    )
+    next_unconditional_section = ledger.index(
+        "FactRecord[p.provider_fact_record_oid]",
+        action_scope,
+    )
+    assert delete_guard < target_owner_check < action_scope < \
+        next_unconditional_section
+    assert ledger.index(
+        "if evidence_kind in {LEGACY_SLOT, LEGACY_GLOBAL}:",
+        action_scope,
+    ) < next_unconditional_section
+    assert "not nested under any\n# TargetBinding or direct-delete branch" \
+        in ledger
+    assert "an admin may delete every fact whose type declares it deletable" \
+        in ledger
+    assert "ordinary user may delete only that user's own deletable facts" \
+        in ledger
+    assert "`ADMIN` instead carries one explicit `admin_scope`, `KEY` or " \
+        "`OWNER`" in normalized
+    assert "A grant to a device key `D` therefore remains exactly `admin(D)` " \
+        "and authorizes only `D`" in normalized
+    assert "never promotes `D`'s siblings" in normalized
+    assert "a grant to user key `U` authorizes `U` under `KEY` and each " \
+        "consenting device owned by `U` under `OWNER`" in normalized
+    assert "AdminSubject(KEY, ActorBinding)" in ledger
+    assert "no admin(device_key) provider can satisfy admin(owner_principal)" \
+        in ledger
+    assert "A target type with no suppression selector or no matching " \
+        "`DIRECT_TARGETS`/`DeleteOffer` row is not deletable" in normalized
+    assert 'DeleteOffer("device.grant.delete", SELF, OwnerBinding(...))' \
+        in ledger
+    assert "This exact action masks only that invite; it does not create a " \
+        "terminal `DevicePrincipal` tombstone" in normalized
+    assert "legacy `facts/content/delete.py` handler" in normalized
+    assert "TRANSITION POLICY" in delete_handler
+    assert "until the coordinated S5" in delete_handler
+    assert "docs leave it open" not in delete_handler
+    assert "MAX_LEGACY_ACTOR_ADMISSION_RECORD_BYTES = 8 * 1024" in ledger
+    assert "MAX_LEGACY_ACTOR_ADMISSION_COMMIT_ROW_BYTES = 8 * 1024" in ledger
+    assert "MAX_LEGACY_ACTOR_ADMISSION_PROOF_SLOT_BYTES = 512" in ledger
+    assert "MAX_LEGACY_ACTOR_ADMISSION_COMMIT_PROOF_BYTES = 4 * 1024" in ledger
+    assert "S4ActorAdmissionCapacityEnvelope(" in ledger
+    assert "S4ActorAdmissionCapacityCell[" in ledger
+    assert "S4ActorAdmissionScratchSlot(" in ledger
+    assert "legacy_actor_admission_scratch_record_objects" in ledger
+    assert "legacy_actor_admission_scratch_record_bytes" in ledger
+    assert "legacy_actor_admission_scratch_write_leases" in ledger
+    assert "COMMITTED_COPYING(attempt_id, " \
+        "legacy_actor_admission_commit_id" in ledger
+    assert "legacy_actor_admission_commit_proof_write_leases" in ledger
+    assert "cutover_legacy_actor_admission_service_rows" in ledger
+    assert "target CAS verifies the sealed scratch record, atomically " \
+        "publishes the target, debits the disjoint canonical dimensions in " \
+        "`S4ActorAdmissionCapacityCell`" in normalized
+    assert "A failed CAS leaves the canonical capacity cell unchanged" \
+        in normalized
+    assert "generation-fenced scratch record is reclaimed only after every " \
+        "write lease drains" in normalized
+    assert "scratch and the canonical record can coexist until the canonical " \
+        "hash/size is verified" in normalized
+    assert "old delegated-admin grant with a removed grantor is never guessed " \
+        "into or out of existence" in normalized
+    assert "preexisting provider or an alternate closure" in normalized
+    assert "commit the applicable bounded or paged evidence at a separate " \
+        "earlier frontier" in normalized
+    assert "uncommitted or prospective closure is never placed in an actor " \
+        "record" in normalized
+    assert "S4AuthorityProofCapacityEnvelope(" in ledger
+    assert "S4AuthorityProofCapacityCell[" in ledger
+    assert "S4AuthorityProofScratchSlot(" in ledger
+    assert "s4_authority_proof_scratch_objects" in ledger
+    assert "s4_authority_proof_scratch_bytes" in ledger
+    assert "s4_authority_proof_scratch_write_leases" in ledger
+    assert "A losing proof CAS debits no\ncanonical dimension" in ledger
+    assert "PAGED_S4(S4PagedAuthorityAdmissionRef)" in ledger
+    assert "CommittedS4PagedAuthorityProof[" in ledger
+    assert "S4PagedAuthorityProofCommitProof[" in ledger
+    assert "before any target may cite it" in normalized
+    assert "not a future checkpoint placeholder" in normalized
+    assert "pre-recorder provider whose one-time guard is now removed blocks " \
+        "migration/requires re-anchor" in normalized
+    assert "legacy_authority_checkpoint_namespace =" in ledger
+    assert "LegacyAuthorityCheckpoint(legacy_authority_checkpoint_namespace," \
+        in ledger
+    assert "replaces `cutover_digest` in checkpoint identity" in normalized
+    assert "LegacyAuthorityCheckpoint(cutover_digest" not in ledger
+    assert "LegacyActorAuthorityTransport =" in ledger
+    assert "recorded_actor_authority_ref(" in ledger
+    assert "transport_actor_authority_ref(" in ledger
+    assert "recorded paged ref and checkpoint transport ref are deliberately " \
+        "not\nbyte-equal" in ledger
+    assert "checkpoint ref is not required or permitted\n" \
+        "                to equal the earlier recorded ref" in ledger
+    assert "source-to-transport\n" \
+        "                translation" in ledger
+    assert "13 times 17 pages" in epic_contract
+    assert "8 times 17 pages" not in epic_contract
+    assert "13 keys times 17 pages" in contracts[4]
+    assert "8 keys times 17 pages" not in contracts[4]
+    assert "grantee-only continuing liveness" in contracts[4]
+    assert "review-corrected" in contracts[4]
+    assert "admission-time LegacyActorAdmissionRecord" in contracts[4]
+    assert "bare device_invite cannot create DevicePrincipal" in contracts[4]
+    assert "admin(D) remains key-scoped" in contracts[4]
+    assert "ActionAuthorization" in contracts[4]
+    assert "S4_DEVICE_INVITE_ACCEPTANCE" in contracts[4]
+    assert "legacy_authority_checkpoint_namespace" in contracts[4]
+    assert "pre-recorder delegated-admin" in contracts[4]
+    assert "GRANDFATHER" in contracts[4]
+    assert "on-demand authority closure" in contracts[4]
+    assert "CHECKPOINT transport" in contracts[4]
+    assert "ActionAuthorization verification is action-scoped" in contracts[4]
+    assert "Proposal/support proof refs plus the service-derived " \
+        "ActionAuthorization determine proof_digest" in contracts[4]
+    assert "DELETE_OWNER or NEVER" in contracts[2]
+    assert "bare device_invite is never a DevicePrincipal target" \
+        in contracts[2]
+    assert "device.grant.delete" in contracts[2]
+    assert "roots its exact DeleteOffer/OwnerBinding" in contracts[5]
+    assert "LegacyActorAdmissionRecord" in contracts[5]
+    assert "S4ActorAdmissionCapacityEnvelope" in contracts[5]
+    assert "losing CAS" in contracts[5]
+    assert "S4ActorAdmissionScratchSlot" in contracts[5]
+    assert "disjoint scratch plus canonical coexistence" in contracts[5]
+    assert "proposal/support proof refs plus the service-derived " \
+        "ActionAuthorization determine proof_digest and the signed receipt" \
+        in contracts[6]
+    assert "permits primary device bootstrap and later direct rejoin" \
+        in contracts[6]
+    assert "explicit KEY or OWNER admin scope" in contracts[6]
+    assert "ordinary cross-user denial" in contracts[7]
+    assert "pre-tombstone" in contracts[7]
+    assert "migrate checkpointable deep owner proofs" in contracts[10]
+    assert "target-key-signed DeviceOwnerConsent" in contracts[10]
+    assert "admission-time actor record" in contracts[10]
+    assert "current-winner-substituted evidence" in contracts[10]
+    assert "PAGED_S4(S4PagedAuthorityAdmissionRef)" in contracts[10]
+    assert "before the target CAS" in contracts[10]
+    assert "136-page ordinary insertion" not in contracts[10]
+    assert "221-page ordinary insertion" in contracts[10]
+
+
+def test_s4_recorded_authority_survives_cutover_and_fallback_retries():
+    """Recorded proof identity and canonical quota cannot reset at cutover."""
+    ledger = (ROOT / "docs" / "TODO.md").read_text()
+    normalized = " ".join(ledger.split())
+    issues = {issue["id"]: issue for issue in exported_beads()}
+    contracts = " ".join(
+        " ".join(strings(issues[f"{RECOVERY_EPIC}.{stage}"]))
+        for stage in (4, 5, 6, 10)
+    )
+
+    paged_ref = re.search(
+        r"S4PagedAuthorityAdmissionRef =\s+canon\("
+        r"provider_fact_key, provider_fid, provider_fact_record_oid,\s+"
+        r"legacy_authority_proof_record_oid,\s+"
+        r"s4_paged_authority_proof_commit_id,\s+"
+        r"s4_paged_authority_proof_commit_proof_oid\)",
+        ledger,
+    )
+    assert paged_ref
+    assert "paged_ref.s4_paged_authority_proof_commit_proof_oid]) equals" \
+        in ledger
+    assert "paged_ref.s4_paged_authority_proof_commit_id]) equals" not in ledger
+    assert "retains both the strong commit id and the content-addressed " \
+        "commit-proof oid" in normalized
+    assert "MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_ROW_BYTES = 4 * 1024" \
+        in ledger
+    assert "MAX_S4_PAGED_AUTHORITY_PROOF_SLOT_BYTES = 512" in ledger
+    assert "MAX_S4_PAGED_AUTHORITY_PROOF_COMMIT_PROOF_BYTES = 4 * 1024" \
+        in ledger
+    assert "S4PagedAuthorityProofSlot[" in ledger
+    assert "FILLED(\n                    " \
+        "paged_ref.s4_paged_authority_proof_commit_proof_oid)" in ledger
+    assert "restart\nrecomputes the same proof and oid" in ledger
+    assert "MAX_S4_AUTHORITY_PROOF_CAPACITY_ENVELOPE_BYTES = 4 * 1024" \
+        in ledger
+    assert "MAX_S4_ACTOR_ADMISSION_CAPACITY_ENVELOPE_BYTES = 4 * 1024" \
+        in ledger
+    assert "MAX_S4_AUTHORITY_PROOF_CAPACITY_CELL_BYTES = 4 * 1024" in ledger
+    assert "MAX_S4_ACTOR_ADMISSION_CAPACITY_CELL_BYTES = 4 * 1024" in ledger
+    assert "MAX_S4_AUTHORITY_PROOF_SCRATCH_SLOT_BYTES = 4 * 1024" in ledger
+    assert "MAX_S4_ACTOR_ADMISSION_SCRATCH_SLOT_BYTES = 4 * 1024" in ledger
+
+    assert "The row's `CommitBinding` is immutable" in ledger
+    assert "AuthorityProofCommitProof[authority_proof_commit_id] =" in ledger
+    assert "keeps its historical\n`DirectRoot` row and post-commit proof " \
+        "through cutover" in ledger
+    assert "never rewrites or recommits an\nexisting `DirectRoot` row as " \
+        "`CutoverGeneration`" in ledger
+    assert "row presence is never\nmisclassified as “uncommitted”" in ledger
+    assert "Cutover blocks on that recovery instead of attempting a second " \
+        "generation-bound\nrow" in ledger
+    assert "a `CutoverGeneration` replacement for a\n   `DirectRoot` row, " \
+        "aborts migration" in ledger
+    assert "an exact proof closure committed before the fence keeps its " \
+        "historical `DirectRoot` row" in normalized
+
+    assert "s4_authority_proof_capacity_cell_id =\n" \
+        '    H("s4-authority-proof-capacity-cell", workspace)' in ledger
+    assert "S4AuthorityProofCapacityCell[" \
+        "s4_authority_proof_capacity_cell_id] =" in ledger
+    assert "s4_actor_admission_capacity_cell_id =\n" \
+        '    H("s4-actor-admission-capacity-cell", workspace)' in ledger
+    assert "S4ActorAdmissionCapacityCell[" \
+        "s4_actor_admission_capacity_cell_id] =" in ledger
+    assert "S4AuthorityProofCapacityCell(\n    workspace, s4_generation" \
+        not in ledger
+    assert "S4ActorAdmissionCapacityCell(\n    workspace, s4_generation" \
+        not in ledger
+    assert "`s4_generation` is deliberately absent from their keys" in ledger
+    assert "initialized\nexactly once" in ledger
+    assert "s4_authority_proof_capacity_envelope_objects" in ledger
+    assert "s4_actor_admission_capacity_envelope_objects" in ledger
+    assert "s4_authority_proof_capacity_cell_rows" in ledger
+    assert "s4_actor_admission_capacity_cell_rows" in ledger
+    assert "s4_paged_authority_proof_slot_rows" in ledger
+    assert "a bare oid, collected preimage or\nunbudgeted cell cannot certify " \
+        "a balance" \
+        in ledger
+    assert "A retry may reset\nonly the drained scratch state" in ledger
+    assert "canonical capacity balance" in normalized
+    assert "workspace-global canonical capacity balance" in normalized
+    assert "canonical balances are workspace-global" in contracts
+    assert "paged proof oid" in contracts
+    assert "DirectRoot" in contracts
+    assert "S4PagedAuthorityProofSlot" in contracts
+    assert "capacity cells have deterministic ids" in contracts
+    assert "explicit cell/slot row-and-byte charges" in contracts
+
+
 def test_recovery_ledger_pins_history_independent_tree_shapes():
     """Equal logical states cannot diverge by insertion history or seed drift."""
     ledger = (ROOT / "docs" / "TODO.md").read_text()
@@ -1369,6 +1722,7 @@ def test_migration_retains_the_frozen_root_and_effect_census():
     assert (
         "`LegacyMigrationSeal` binds the `cutover_digest`, "
         "`reconciled_s4_root_oid`, `legacy_mask_namespace`, "
+        "`legacy_authority_checkpoint_namespace`, "
         "`legacy_effect_census_oid`, `legacy_effect_census_digest`"
     ) in normalized
     assert (
@@ -1918,7 +2272,7 @@ def test_authority_candidates_root_bounded_proof_preimages():
     assert "transport_proof_depth, logical_proof_depth" in ledger
     assert "MAX_LOGICAL_PROOF_DEPTH = 2**63 - 1" in ledger
     assert "authority_proof_commit_id =" in ledger
-    assert "AuthorityProofCommitProof =" in ledger
+    assert "AuthorityProofCommitProof[authority_proof_commit_id] =" in ledger
 
 
 def test_need_keys_bind_complete_required_cooffers():
@@ -2319,7 +2673,14 @@ def test_s5_facttree_is_the_authenticated_quarantine_archive():
 def test_receipt_proof_digest_has_no_content_hash_cycle():
     """Receipt identity is fixed before its ref enters the ActionRecord."""
     ledger = (ROOT / "docs" / "TODO.md").read_text()
-    proof_refs = ledger.index("proof_refs(r) =")
+    issues = exported_beads()
+    issue_contracts = "\n".join(
+        "\n".join(strings(issue))
+        for issue in issues
+        if issue["id"].startswith(RECOVERY_EPIC)
+    )
+    authorization = ledger.index("ActionAuthorization =")
+    proof_refs = ledger.index("proof_refs(r) =", authorization)
     proof_digest = ledger.index("proof_digest(r) =", proof_refs)
     admission = ledger.index("admission(a) =", proof_digest)
     receipt_ref = ledger.index(
@@ -2330,7 +2691,17 @@ def test_receipt_proof_digest_has_no_content_hash_cycle():
         "ActionRecord[action_record_oid] =",
         receipt_ref,
     )
-    assert proof_refs < proof_digest < admission < receipt_ref < action_record
+    assert authorization < proof_refs < proof_digest < admission < \
+        receipt_ref < action_record
+    assert "hash(canon(the named proof edges, proof_refs(r), " \
+        "ActionAuthorization))" in ledger
+    assert "proposal/support proof refs plus the\n  service-derived " \
+        "`ActionAuthorization` → `proof_digest` → receipt" in ledger
+    assert "proposal/support proof refs determine the receipt digest" not in \
+        issue_contracts
+    assert "proof refs determine proof_digest and signed receipt" not in \
+        issue_contracts
+    assert "alone determines proof_digest" not in issue_contracts
     assert "The receipt never\nhashes or names its own EvidenceRef" in ledger
     assert "ActionRecord evidence set to equal those exact proof refs plus " \
         "the\none self-matching receipt EvidenceRef" in ledger

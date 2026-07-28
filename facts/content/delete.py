@@ -7,11 +7,12 @@ fact at the author chokepoint (REMOVALS.md I6: the span comes from the
 actual victim, never from a parameter). Deletion is visible only as the
 victim's absence: no projection rows — victims' rows leave via pump.retract.
 
-POLICY (stated because the docs leave it open — an open question in the
-oyd.7 bead notes, not a settled law): needs() is authorship + membership,
-so ANY member may delete ANY member's content, and by I1 never un-delete
-it. facts/auth/removal.py shows the alternative shape if the answer ever
-becomes admin-only.
+TRANSITION POLICY: docs/TODO.md now settles the replacement as two ordinary
+OWNER/ADMIN handlers over a target's type-owned DeleteOffer and retained
+OwnerBinding. This legacy body intentionally remains authorship + membership,
+so any member can still delete any member's content until the coordinated S5
+semantic cut installs receipts and switches the handler atomically. Changing
+this function alone would fork old and new validation during shadow mode.
 """
 import json
 
