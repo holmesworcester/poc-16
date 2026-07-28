@@ -94,16 +94,29 @@ def test_alice_bob_carol(tmp_path):
         for who in PORTS:
             procs[who] = spawn(tmp_path, who)
 
+        # -- malformed control requests fail closed without phantom state -----
+        with pytest.raises(urllib.error.HTTPError) as unknown:
+            ctl(url("alice"), "POST", "rebuild", {"ws": "missing"})
+        assert unknown.value.code == 404
+        assert ctl(url("alice"), "GET", "status")["workspaces"] == {}
+
         # -- create + invite + join ------------------------------------------
         ws = ctl(url("alice"), "POST", "create", {"name": "alice"})["ws"]
+        with pytest.raises(urllib.error.HTTPError) as malformed:
+            ctl(url("alice"), "GET", "file", ws=ws)
+        assert malformed.value.code == 400
         link_b = ctl(url("alice"), "POST", "invite", {"ws": ws})["link"]
         link_c = ctl(url("alice"), "POST", "invite", {"ws": ws})["link"]
         assert ctl(url("bob"), "POST", "join", {"link": link_b, "name": "bob"})["ws"] == ws
         assert ctl(url("carol"), "POST", "join", {"link": link_c, "name": "carol"})["ws"] == ws
 
         # -- everyone talks; sync is ongoing (no manual sync anywhere) -------
-        ctl(url("alice"), "POST", "post", {"ws": ws, "text": "welcome"})
-        ctl(url("bob"), "POST", "post", {"ws": ws, "text": "hi from bob"})
+        welcome = ctl(
+            url("alice"), "POST", "post",
+            {"ws": ws, "text": "welcome"})["fid"]
+        bob_message = ctl(
+            url("bob"), "POST", "post",
+            {"ws": ws, "text": "hi from bob"})["fid"]
         ctl(url("carol"), "POST", "post", {"ws": ws, "text": "hi from carol"})
         wait_until(lambda: converged(ws, "alice", "bob", "carol"), 30, "3-way convergence")
         for who in PORTS:
@@ -135,6 +148,39 @@ def test_alice_bob_carol(tmp_path):
         wait_until(lambda: got_file("alice", fid2, small) and got_file("carol", fid2, small),
                    45, "bob's file reaches alice and carol")
 
+        # -- real deletion route + CLI: owner and admin, message and file ----
+        removed = subprocess.run(
+            [sys.executable, "-m", "core", "--node", url("alice"),
+             "remove", "--ws", ws[:12], welcome],
+            cwd=REPO, capture_output=True, text=True, timeout=30)
+        assert removed.returncode == 0, removed.stderr
+        refused = subprocess.run(
+            [sys.executable, "-m", "core", "--node", url("alice"),
+             "remove", "--ws", ws[:12], "0" * 64],
+            cwd=REPO, capture_output=True, text=True, timeout=30)
+        assert refused.returncode == 1
+        assert "core: 400:" in refused.stderr
+        assert "Traceback" not in refused.stderr
+        ctl(url("alice"), "POST", "remove", {"ws": ws, "fid": bob_message})
+        ctl(url("bob"), "POST", "remove", {"ws": ws, "fid": fid2})
+        ctl(url("alice"), "POST", "remove", {"ws": ws, "fid": fid})
+
+        def deletions_visible(who):
+            messages = texts(who, ws)
+            files = {row["fid"] for row in ctl(
+                url(who), "GET", "files", ws=ws)}
+            return "welcome" not in messages \
+                and "hi from bob" not in messages \
+                and fid not in files and fid2 not in files
+
+        wait_until(
+            lambda: all(deletions_visible(who) for who in PORTS)
+            and converged(ws, *PORTS),
+            45, "message and attachment deletions converge")
+        with pytest.raises(urllib.error.HTTPError) as gone:
+            ctl(url("carol"), "GET", "file", ws=ws, fid=fid)
+        assert gone.value.code == 404
+
         # -- straggler: an old-ts fact mini-folds into promoted history ------
         old = int(time.time() * 1000) - 48 * 3600 * 1000
         ctl(url("carol"), "POST", "post", {"ws": ws, "text": "late", "ts": old})
@@ -143,15 +189,27 @@ def test_alice_bob_carol(tmp_path):
 
         # -- eviction: removal kills the mint; the door shuts ----------------
         ctl(url("alice"), "POST", "evict", {"ws": ws, "member": "carol"})
-        wait_until(lambda: any(m["name"] == "carol" and m["evicted"]
-                               for m in ctl(url("bob"), "GET", "members", ws=ws)),
-                   30, "eviction reaches bob")
+        wait_until(
+            lambda: any(m["name"] == "carol" and m["evicted"]
+                        for m in ctl(
+                            url("bob"), "GET", "members", ws=ws)),
+            30, "eviction reaches an authorized replica")
         time.sleep(2.5)  # let carol's cached grant expire: the designed
         # leakage window is exactly the grant TTL, nothing more
-        with pytest.raises(urllib.error.HTTPError) as rejected:
+        wait_until(
+            lambda: any(
+                "HTTP Error 403" in failure["error"]
+                for failure in ctl(url("carol"), "GET", "status")[
+                    "workspaces"][ws]["sync_failures"]),
+            10, "carol's remote mint is refused")
+        # ctl is a trusted node-local surface, not the remote auth boundary:
+        # a replica that received its own eviction rejects here too; one that
+        # missed it may keep writing an isolated store, but cannot deliver it.
+        try:
             ctl(url("carol"), "POST", "post", {"ws": ws, "text": "ghost"})
-        assert rejected.value.code == 403
-        time.sleep(4)  # several cadences: her mint is now refused
+        except urllib.error.HTTPError as local_rejection:
+            assert local_rejection.code == 403
+        time.sleep(4)  # several cadences prove it cannot cross the door
         assert "ghost" not in texts("alice", ws)
         assert "ghost" not in texts("bob", ws)
         ctl(url("alice"), "POST", "post", {"ws": ws, "text": "after evict"})
@@ -166,6 +224,7 @@ def test_alice_bob_carol(tmp_path):
         os.unlink(tmp_path / "bob" / "app.db")
         procs["bob"] = spawn(tmp_path, "bob")
         assert "after evict" in texts("bob", ws)  # rebuilt read model, pre-walk
+        assert deletions_visible("bob")
         ctl(url("alice"), "POST", "post", {"ws": ws, "text": "post restart"})
         wait_until(lambda: "post restart" in texts("bob", ws) and
                    converged(ws, "alice", "bob"), 30, "bob back after restart")

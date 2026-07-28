@@ -223,35 +223,54 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- node-local control plane (not part of the protocol) ----
     def ctl_get(self, parts, q):
-        n, ws = self.node, self._resolve(q.get("ws", ""))
-        if parts[1] == "status":
-            return self._json(200, cmds.status(n))
-        if parts[1] == "msgs":
-            return self._json(200, cmds.msgs(n, ws, q.get("chan")))
-        if parts[1] == "members":
-            return self._json(200, cmds.members(n, ws))
-        if parts[1] == "files":
-            return self._json(200, cmds.files(n, ws))
-        if parts[1] == "file":
-            got = cmds.file_bytes(n, ws, q["fid"])
-            if not got or got[1] is None:
+        n = self.node
+        try:
+            if len(parts) != 2:
                 return self._send(404)
-            return self._json(200, {"name": got[0],
-                                    "data": base64.b64encode(got[1]).decode()})
-        self._send(404)
+            if parts[1] == "status":
+                return self._json(200, cmds.status(n))
+            ws = self._resolve(q.get("ws", ""))
+            if not self._known(ws):
+                return self._send(404)
+            if parts[1] == "msgs":
+                return self._json(200, cmds.msgs(n, ws, q.get("chan")))
+            if parts[1] == "members":
+                return self._json(200, cmds.members(n, ws))
+            if parts[1] == "files":
+                return self._json(200, cmds.files(n, ws))
+            if parts[1] == "file":
+                got = cmds.file_bytes(n, ws, q["fid"])
+                if not got or got[1] is None:
+                    return self._send(404)
+                return self._json(
+                    200, {"name": got[0],
+                          "data": base64.b64encode(got[1]).decode()})
+            return self._send(404)
+        except (KeyError, TypeError, ValueError):
+            return self._send(400)
 
     def ctl_post(self, parts, body):
-        n, o = self.node, json.loads(body or b"{}")
-        ws = self._resolve(o.get("ws", ""))
+        try:
+            if len(parts) != 2:
+                return self._send(404)
+            o = json.loads(body or b"{}")
+            if not isinstance(o, dict):
+                raise TypeError
+        except (json.JSONDecodeError, TypeError):
+            return self._send(400)
+        n = self.node
         try:
             if parts[1] == "create":
                 return self._json(200, {"ws": cmds.create(n, o["name"])})
-            if parts[1] == "invite":
-                return self._json(200, {"link": cmds.make_invite(n, ws)})
             if parts[1] == "join":
                 r = {"ws": cmds.join(n, o["link"], o["name"])}
                 self.syncer.kick()
                 return self._json(200, r)
+            ws = self._resolve(o.get("ws", ""))
+            if not self._known(ws):
+                return self._send(404)
+            if parts[1] == "invite":
+                return self._json(200, {"link": cmds.make_invite(n, ws)})
             if parts[1] == "post":
                 r = {"fid": cmds.post(n, ws, o.get("chan", "general"), o["text"], o.get("ts"))}
                 self.syncer.kick()
@@ -267,8 +286,12 @@ class Handler(BaseHTTPRequestHandler):
                 r = {"fid": cmds.evict(n, ws, o["member"])}
                 self.syncer.kick()
                 return self._json(200, r)
+            if parts[1] == "remove":
+                r = {"fid": cmds.remove(n, ws, o["fid"])}
+                self.syncer.kick()
+                return self._json(200, r)
             if parts[1] == "sync":
-                for w in ([ws] if ws else n.workspaces()):
+                for w in [ws]:
                     for url in n.keyring["workspaces"][w]["peers"]:
                         try:
                             sync(n, w, url)
@@ -283,6 +306,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
         except actions.ScreenRejected as e:
             return self._json(403, {"error": f"{type(e).__name__}: {e}"})
+        except (KeyError, TypeError, ValueError) as e:
+            return self._json(400, {"error": f"{type(e).__name__}: {e}"})
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404)

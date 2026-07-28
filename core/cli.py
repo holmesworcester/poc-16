@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -15,6 +16,55 @@ def ctl(node_url, method, path, body=None, **q):
         data=json.dumps(body).encode() if body is not None else None, method=method)
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read())
+
+
+def run_command(a):
+    if a.cmd == "create":
+        return ctl(a.node, "POST", "create", {"name": a.name})
+    if a.cmd == "invite":
+        return ctl(a.node, "POST", "invite", {"ws": a.ws})
+    if a.cmd == "join":
+        return ctl(
+            a.node, "POST", "join", {"link": a.link, "name": a.name})
+    if a.cmd == "post":
+        return ctl(
+            a.node, "POST", "post",
+            {"ws": a.ws, "chan": a.chan or "general", "text": a.text})
+    if a.cmd == "send":
+        with open(a.path, "rb") as source:
+            data = source.read()
+        return ctl(
+            a.node, "POST", "send",
+            {"ws": a.ws, "chan": a.chan or "general",
+             "name": a.path.rsplit("/", 1)[-1],
+             "data": base64.b64encode(data).decode()})
+    if a.cmd == "get":
+        out = ctl(a.node, "GET", "file", ws=a.ws, fid=a.fid)
+        raw = base64.b64decode(out.pop("data"))
+        path = a.out or out["name"]
+        with open(path, "wb") as target:
+            target.write(raw)
+        out["wrote"] = path
+        return out
+    if a.cmd == "evict":
+        return ctl(
+            a.node, "POST", "evict", {"ws": a.ws, "member": a.member})
+    if a.cmd == "remove":
+        return ctl(
+            a.node, "POST", "remove", {"ws": a.ws, "fid": a.fid})
+    if a.cmd == "msgs":
+        return ctl(a.node, "GET", "msgs", ws=a.ws, chan=a.chan)
+    if a.cmd == "members":
+        return ctl(a.node, "GET", "members", ws=a.ws)
+    if a.cmd == "files":
+        return ctl(a.node, "GET", "files", ws=a.ws)
+    if a.cmd == "status":
+        return ctl(a.node, "GET", "status")
+    if a.cmd == "sync":
+        return ctl(a.node, "POST", "sync", {"ws": a.ws})
+    if a.cmd == "rebuild":
+        return ctl(a.node, "POST", "rebuild", {"ws": a.ws})
+    raise ValueError(f"unknown command: {a.cmd}")
 
 
 def main(argv=None):
@@ -36,6 +86,7 @@ def main(argv=None):
         "send": [("--ws",), ("--chan",), ("path",)],
         "get": [("--ws",), ("fid",), ("--out",)],
         "evict": [("--ws",), ("member",)],
+        "remove": [("--ws",), ("fid",)],
         "msgs": [("--ws",), ("--chan",)], "members": [("--ws",)],
         "files": [("--ws",)], "status": [], "sync": [("--ws",)],
         "rebuild": [("--ws",)],
@@ -49,42 +100,19 @@ def main(argv=None):
         from .daemon import serve
         return serve(a.dir, a.port, a.host, a.cadence, a.url)
 
-    if a.cmd == "create":
-        out = ctl(a.node, "POST", "create", {"name": a.name})
-    elif a.cmd == "invite":
-        out = ctl(a.node, "POST", "invite", {"ws": a.ws})
-    elif a.cmd == "join":
-        out = ctl(a.node, "POST", "join", {"link": a.link, "name": a.name})
-    elif a.cmd == "post":
-        out = ctl(a.node, "POST", "post", {"ws": a.ws, "chan": a.chan or "general", "text": a.text})
-    elif a.cmd == "send":
-        data = open(a.path, "rb").read()
-        out = ctl(a.node, "POST", "send", {"ws": a.ws, "chan": a.chan or "general",
-                                           "name": a.path.rsplit("/", 1)[-1],
-                                           "data": base64.b64encode(data).decode()})
-    elif a.cmd == "get":
-        out = ctl(a.node, "GET", "file", ws=a.ws, fid=a.fid)
-        raw = base64.b64decode(out.pop("data"))
-        path = a.out or out["name"]
-        open(path, "wb").write(raw)
-        out["wrote"] = path
-    elif a.cmd == "evict":
-        out = ctl(a.node, "POST", "evict", {"ws": a.ws, "member": a.member})
-    elif a.cmd == "msgs":
-        out = ctl(a.node, "GET", "msgs", ws=a.ws, chan=a.chan)
-    elif a.cmd == "members":
-        out = ctl(a.node, "GET", "members", ws=a.ws)
-    elif a.cmd == "files":
-        out = ctl(a.node, "GET", "files", ws=a.ws)
-    elif a.cmd == "status":
-        out = ctl(a.node, "GET", "status")
-    elif a.cmd == "sync":
-        out = ctl(a.node, "POST", "sync", {"ws": a.ws})
-    elif a.cmd == "rebuild":
-        out = ctl(a.node, "POST", "rebuild", {"ws": a.ws})
+    try:
+        out = run_command(a)
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read()).get("error", error.reason)
+        except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
+            detail = error.reason
+        print(f"core: {error.code}: {detail}", file=sys.stderr)
+        return 1
     json.dump(out, sys.stdout, indent=2)
     print()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
