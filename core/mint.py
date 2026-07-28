@@ -25,6 +25,7 @@ from .close import decode_pile
 from .crypto import h
 from .kernel import SCHEMA, drain_committed, evaluate, unresolved_facts
 from .node import resident
+from .worker import WorkerView
 
 
 @dataclass
@@ -102,20 +103,20 @@ def mint(pile_bytes, anchor, globals_, now, *, canonical_db):
 
 
 def stateless(pile_bytes, root_bytes, fetch, now, projection=None):
-    """Mint from store state alone, optionally reusing a matching projection."""
-    authority, owned = projection, False
-    try:
-        if authority is None or authority.etag != h(root_bytes):
-            authority = Authority.from_root(root_bytes, fetch)
-            owned = True
+    """Mint through bounded tree reads; retain the old projection as a shim."""
+    if isinstance(projection, WorkerView) \
+            and projection.etag == h(root_bytes):
+        return projection.mint(pile_bytes, now)
+    # Compatibility for callers explicitly holding the pre-cutover in-memory
+    # projection. New cold and mismatched-root reads never build it.
+    if isinstance(projection, Authority) and projection.etag == h(root_bytes):
         return mint(
-            pile_bytes, authority.anchor, authority.globals_, now,
-            canonical_db=authority.db)
+            pile_bytes, projection.anchor, projection.globals_, now,
+            canonical_db=projection.db)
+    try:
+        return WorkerView.from_root(root_bytes, fetch).mint(pile_bytes, now)
     except Exception:
         return None
-    finally:
-        if owned and authority is not None:
-            authority.close()
 
 
 def grant_of(facts):

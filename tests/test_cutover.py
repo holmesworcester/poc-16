@@ -210,16 +210,22 @@ def test_locate_maps_key_to_home_leaf(world):
     assert manifest.locate(entries, "~") == entries[-1]
 
 
-def test_root_names_manifest_and_removals(world):
-    """Root bytes carry exactly anchor, globals, manifest oid, removals
-    {oid, fp}, and the layout stamp (manifest.encode_root docstring); the
-    removal index is the only structure with an fp (§3, REMOVALS.md I4)."""
+def test_root_atomically_names_manifest_and_three_logical_trees(world):
+    """One root CAS binds sync content and every request-time index."""
     node, ws = world
     raw = node.store(ws).get("root")
     body = json.loads(raw)
     assert set(body) == {
-        "anchor", "globals", "manifest", "removals", "stamp"}
+        "anchor", "globals", "layout_seed", "manifest", "removals",
+        "stamp", "trees"}
     assert body["anchor"] == ws and body["stamp"] == manifest.LAYOUT
+    assert shape.valid_fid(body["layout_seed"])
+    assert set(body["trees"]) == {"fact", "supp", "authority"}
+    assert all(
+        set(descriptor) == {"root", "count", "depth"}
+        and descriptor["root"] and descriptor["count"] > 0
+        and 0 < descriptor["depth"] <= 17
+        for descriptor in body["trees"].values())
     assert set(body["removals"]) == {"oid", "fp"}
     assert manifest.decode_root(raw) == (
         ws, node.globals(ws), body["manifest"], body["removals"])

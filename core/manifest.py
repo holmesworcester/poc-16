@@ -28,7 +28,8 @@ from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists, per docs/CUTOVER.md §1). Replaces tree.config/FAT_VERSION.
-LAYOUT = "one-store-v1"
+LAYOUT = "composite-btreap-v1"
+TREE_NAMES = ("fact", "supp", "authority")
 
 
 class Entry(NamedTuple):
@@ -222,7 +223,9 @@ def decode(raw, fetch):
     return out
 
 
-def encode_root(anchor, globals_, manifest_oid, removals):
+def encode_root(
+        anchor, globals_, manifest_oid, removals, *,
+        layout_seed=None, trees=None):
     """The mutable root — the only non-content-addressed fact-layer key:
 
         canon({"anchor": ..., "globals": [[name, value], ...],
@@ -233,13 +236,21 @@ def encode_root(anchor, globals_, manifest_oid, removals):
     Replaces tree.encode_root. The removal index keeps a fingerprint beside
     its oid because pile bytes embed local closure-edge choices (REMOVALS.md
     I4); everything else is identified by oid alone."""
+    layout_seed = layout_seed or h(canon(
+        ["composite-layout-seed-v1", anchor]))
+    trees = trees or {
+        name: {"root": "", "count": 0, "depth": 0}
+        for name in TREE_NAMES
+    }
     return canon({
         "anchor": anchor,
         "globals": sorted([list(row) for row in globals_]),
+        "layout_seed": layout_seed,
         "manifest": manifest_oid or "",
         "removals": {"oid": removals.get("oid", ""),
                      "fp": removals.get("fp", "")},
         "stamp": LAYOUT,
+        "trees": trees,
     })
 
 
@@ -251,7 +262,9 @@ def decode_root(raw):
     if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
         raise ValueError("root stamp")
     removals, rows = o.get("removals"), o.get("globals")
+    trees = o.get("trees")
     if not (valid_fid(o.get("anchor"))
+            and valid_fid(o.get("layout_seed"))
             and isinstance(o.get("manifest"), str)
             and (not o["manifest"] or valid_fid(o["manifest"]))
             and isinstance(removals, dict)
@@ -262,7 +275,8 @@ def decode_root(raw):
             and isinstance(rows, list)
             and all(isinstance(row, list) and len(row) == 2
                     and all(isinstance(part, str) for part in row)
-                    for row in rows)):
+                    for row in rows)
+            and _trees_ok(trees)):
         raise ValueError("root shape")
     return (
         o["anchor"],
@@ -270,3 +284,27 @@ def decode_root(raw):
         o["manifest"],
         {"oid": removals["oid"], "fp": removals["fp"]},
     )
+
+
+def _trees_ok(trees):
+    return isinstance(trees, dict) and set(trees) == set(TREE_NAMES) \
+        and all(
+            isinstance(value, dict)
+            and set(value) == {"root", "count", "depth"}
+            and isinstance(value["root"], str)
+            and (not value["root"] or valid_fid(value["root"]))
+            and type(value["count"]) is int and value["count"] >= 0
+            and type(value["depth"]) is int
+            and 0 <= value["depth"] <= 17
+            and bool(value["root"]) == bool(value["count"])
+            for value in trees.values()
+        )
+
+
+def decode_composite(raw):
+    """Return ``(layout_seed, tree descriptors)`` after the root door."""
+    decode_root(raw)
+    value = json.loads(raw)
+    return value["layout_seed"], {
+        name: dict(value["trees"][name]) for name in TREE_NAMES
+    }

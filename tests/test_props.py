@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from core import cmds, manifest
+from core import cmds, indexes, manifest
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -547,8 +547,9 @@ def test_efficient_updates(world):
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
-    # Two indexes rewrite two bounded paths; fact bodies remain shared.
-    assert len(objs) <= 12, f"a single post rewrote {len(objs)} objects"
+    # One raw record plus at most one bounded path in each logical tree.
+    assert len(objs) <= 1 + 3 * 17, \
+        f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
 
@@ -564,7 +565,10 @@ def full_manifest(n, ws):
     _, man = manifest.build(
         n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of,
         lambda raw: None)
-    return manifest.encode_root(ws, n.globals(ws), man, {})
+    seed, trees = indexes.build(
+        ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
+    return manifest.encode_root(
+        ws, n.globals(ws), man, {}, layout_seed=seed, trees=trees)
 
 
 def test_incremental_equals_full(tmp_path):
@@ -685,8 +689,8 @@ def test_incremental_reuses_work(world, monkeypatch):
     assert total > 30
     assert scans == ["keys"]  # one index-only key scan per settle
     objects = [k for k in puts if k.startswith("obj/")]
-    assert len(objects) == 2, \
-        f"O(1) object writes: touched leaf pile + manifest, got {objects}"
+    assert len(objects) <= 2 + 3 * 17, \
+        f"bounded manifest + three tree paths, got {objects}"
     assert len(set(resolved)) < total, \
         f"resolved {len(set(resolved))} of {total} closures — the memo " \
         "isn't skipping settled ranges"

@@ -209,15 +209,14 @@ def test_suppression_stays_behind_the_manifest_commit(
     request = encode_pile(request_payload(
         node, workspace, "sync", now + 60_000, now))
     canonical_observed = []
-    original_mint = daemon.gate.mint
+    original_mint = daemon.gate.stateless
 
-    def observe_canonical(*args, **kwargs):
-        canonical_observed.append(kwargs["canonical_db"].execute(
-            "SELECT COUNT(*) FROM facts WHERE fid=?",
-            (deletion.fid,)).fetchone()[0])
-        return original_mint(*args, **kwargs)
+    def observe_canonical(pile, root, fetch, trusted_now, projection=None):
+        canonical_observed.append(root == old_root)
+        return original_mint(
+            pile, root, fetch, trusted_now, projection)
 
-    monkeypatch.setattr(daemon.gate, "mint", observe_canonical)
+    monkeypatch.setattr(daemon.gate, "stateless", observe_canonical)
 
     release_reader = threading.Event()
     reader_waiting = threading.Event()
@@ -261,7 +260,7 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert deletion.fid not in {
         e.fid for e in node.removal_entries(workspace)}
     assert observed == [(200, old_root)]
-    assert canonical_observed == [0]
+    assert canonical_observed == [True]
     assert projected()
     assert store.list("pile/")
 
@@ -300,4 +299,4 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert not projected()
     _, (code, body) = invoke_mint(node, workspace, request)
     assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
-    assert canonical_observed == [0, 1]
+    assert canonical_observed == [True, False]

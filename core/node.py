@@ -18,7 +18,7 @@ import time
 
 import facts
 
-from . import manifest, removals
+from . import indexes, manifest, removals
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
@@ -768,8 +768,18 @@ class Node:
         _, man = manifest.build(
             self.keys(ws), lambda fid: self.fact_of(ws, fid), deps_of, emit,
             entries)
+        previous_trees = {}
+        if prev:
+            try:
+                _, previous_trees = manifest.decode_composite(prev)
+            except ValueError:
+                pass
+        seed, trees = indexes.build(
+            ws, idx, lambda fid: self.fact_of(ws, fid), emit,
+            previous=previous_trees, fetch=fetch)
         root = manifest.encode_root(
-            ws, self.globals(ws), man, self._removal_slot(ws, deps_of, emit))
+            ws, self.globals(ws), man, self._removal_slot(ws, deps_of, emit),
+            layout_seed=seed, trees=trees)
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
         self._stamp(ws)
