@@ -108,7 +108,12 @@ class Peer:
     def root(self, etag=None):
         status, b, hdr = self._http(
             "GET", "/root", etag=etag, response_limit=MAX_ROOT_BYTES)
-        return None if status == 304 else (b, hdr.get("ETag"))
+        response_etag = next(
+            (value for name, value in hdr.items()
+             if name.lower() == "etag"),
+            None,
+        )
+        return None if status == 304 else (b, response_etag)
 
     def obj(self, oh):
         _, b, _ = self._http(

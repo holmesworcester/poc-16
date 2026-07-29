@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 target/
+deploy/aws_lambda/.aws-sam/
+deploy/aws_lambda/stage/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

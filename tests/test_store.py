@@ -304,6 +304,14 @@ def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
             "GET", "/public", auth=False, response_limit=8)
 
 
+def test_peer_reads_snapshot_etag_case_insensitively():
+    peer = object.__new__(WalkPeer)
+    peer._http = lambda *_args, **_kwargs: (
+        200, b"root", {"etag": "opaque"})
+
+    assert peer.root() == (b"root", "opaque")
+
+
 def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
     first, third = b"first", b"third"
     first_oid, missing_oid, third_oid = h(first), "b" * 64, h(third)

@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: POC-16 database-free authorization and immutable-object gateway
+
+Parameters:
+  WorkspaceId:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{64}$"
+  BucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  StorePrefix:
+    Type: String
+    MinLength: 1
+    AllowedPattern: "^[a-z0-9:_-][a-z0-9:._-]*(/[a-z0-9:_-][a-z0-9:._-]*)*$"
+  ExpectedBucketOwner:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}$"
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  DailyInvocationBudget:
+    Type: Number
+    Default: 100000
+    MinValue: 1
+
+Conditions:
+  HasExpectedOwner: !Not [!Equals [!Ref ExpectedBucketOwner, ""]]
+
+Resources:
+  GrantSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Stable HMAC secret shared by every POC-16 Lambda sandbox
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 64
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadOneWorkspace
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRoot
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/root"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+              - Sid: ReadImmutableObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+              - Sid: ReadGrantSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GrantSecret
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub
+                  "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-gateway:*"
+
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-gateway"
+      CodeUri: stage/
+      Handler: deploy.aws_lambda.app.handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Role: !GetAtt GatewayRole.Arn
+      MemorySize: 512
+      Timeout: 15
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Environment:
+        Variables:
+          TINYP2P_WORKSPACE_ID: !Ref WorkspaceId
+          TINYP2P_S3_BUCKET: !Ref BucketName
+          TINYP2P_S3_PREFIX: !Ref StorePrefix
+          TINYP2P_EXPECTED_BUCKET_OWNER: !If
+            - HasExpectedOwner
+            - !Ref ExpectedBucketOwner
+            - !Ref AWS::NoValue
+          TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret
+          TINYP2P_MAX_REQUEST_BYTES: "524288"
+          TINYP2P_MAX_ROOT_BYTES: "1048576"
+          TINYP2P_MAX_OBJECT_BYTES: "4194304"
+          TINYP2P_MAX_BATCH_COUNT: "256"
+          TINYP2P_MAX_BATCH_BYTES: "4194304"
+          TINYP2P_MINT_MAX_FETCHES: "128"
+          TINYP2P_MINT_MAX_FETCH_BYTES: "4194304"
+          TINYP2P_GRANT_TTL: "60000"
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-gateway"
+      RetentionInDays: !Ref LogRetentionDays
+
+  GatewayErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: POC-16 Lambda gateway returned an invocation error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GatewayFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DailyInvocationBudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: POC-16 Lambda daily invocation budget was exceeded
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GatewayFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref DailyInvocationBudget
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  GatewayUrl:
+    Description: Public transport endpoint; POC-16 grants authorize data reads
+    Value: !GetAtt GatewayFunctionUrl.FunctionUrl
+  GrantSecretArn:
+    Value: !Ref GrantSecret
