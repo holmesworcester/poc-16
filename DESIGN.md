@@ -167,9 +167,9 @@ the pile. Clients can neither list/delete the namespace nor write root.
 The split follows the authority actually required by each step:
 
 ```text
-client     exact create-only obj and pile PUT capabilities
+client     exact create-only object and closed-pile upload capabilities
 broker     validates upload authority and attenuates it to exact requests
-publisher  reads workspace ingress, derives pages, CASes root, proves retirement
+publisher  verifies/promotes ingress, derives pages, CASes root, proves retirement
 reader     reads only the pinned root and its authenticated closure
 ```
 
