@@ -72,15 +72,16 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
 
     writes = []
     store = node.store(workspace)
-    original_put = store.put
+    original_put_if_absent = store.put_if_absent
 
-    def counted_put(key, raw):
-        if key.startswith("obj/"):
+    def counted_put_if_absent(key, raw):
+        created = original_put_if_absent(key, raw)
+        if created and key.startswith("obj/"):
             writes.append((key, len(raw)))
-        return original_put(key, raw)
+        return created
 
     node.keys = timed_keys
-    store.put = counted_put
+    store.put_if_absent = counted_put_if_absent
     post_times = []
     try:
         for step in range(posts):
@@ -91,7 +92,7 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
             post_times.append(time.perf_counter() - started)
     finally:
         node.keys = original_keys
-        store.put = original_put
+        store.put_if_absent = original_put_if_absent
 
     old_peer = sync_module.Peer
     old_fetch_blobs = sync_module._fetch_blobs

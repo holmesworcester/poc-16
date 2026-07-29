@@ -202,7 +202,7 @@ def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
 
     assert authorize(node, workspace, pile, now) is None
     assert authorize(node, workspace, pile, now, root=forged) is None
-    store.put("root", forged)
+    store._replace("root", forged)
     assert invoke_mint(node, workspace, pile)[1][0] == 403
     node.rebuild(workspace)
     assert "globals" not in json.loads(store.get("root"))

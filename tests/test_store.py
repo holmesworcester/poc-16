@@ -1,9 +1,10 @@
 """Object-store concurrency contracts."""
 import base64
+import fcntl
 import json
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pytest
 
@@ -37,6 +38,87 @@ def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
     assert len(set(sources)) == 2
     assert store.get("pile/member/same") in values
     assert not tuple(tmp_path.rglob("*.tmp"))
+
+
+def test_fs_put_if_absent_is_one_atomic_immutable_create(tmp_path):
+    stores = [FsStore(str(tmp_path)) for _ in range(8)]
+    raw = b"one immutable value"
+    key = "obj/" + h(raw)
+    start = threading.Barrier(len(stores))
+
+    def create(store):
+        start.wait(timeout=5)
+        return store.put_if_absent(key, raw)
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        results = list(pool.map(create, stores))
+
+    assert results.count(True) == 1
+    assert results.count(False) == len(stores) - 1
+    assert stores[0].get(key) == raw
+    assert not tuple(tmp_path.rglob("*.tmp"))
+
+    stores[0]._replace(key, b"corrupt")
+    with pytest.raises(ValueError, match="conflict"):
+        stores[1].put_if_absent(key, raw)
+    with pytest.raises(ValueError, match="address"):
+        stores[1].put_if_absent("obj/" + "0" * 64, raw)
+
+
+def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
+    first, second = FsStore(str(tmp_path)), FsStore(str(tmp_path))
+    assert first.cas("root", None, b"base") == h(b"base")
+
+    # Holding the bucket's stable lock prevents another handle from even
+    # comparing the root. This distinguishes a shared CAS from two per-object
+    # Python locks without relying on a lucky thread race.
+    with open(first._root_lock, "a+b") as held, \
+            ThreadPoolExecutor(max_workers=1) as pool:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="reserved"):
+            first.delete(".root.lock")
+        attempt = pool.submit(
+            second.cas, "root", h(b"base"), b"after-lock")
+        with pytest.raises(TimeoutError):
+            attempt.result(timeout=0.1)
+        fcntl.flock(held, fcntl.LOCK_UN)
+        assert attempt.result(timeout=5) == h(b"after-lock")
+
+    expected = h(b"after-lock")
+    start = threading.Barrier(2)
+
+    def advance(store, value):
+        start.wait(timeout=5)
+        return store.cas("root", expected, value)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            future.result()
+            for future in (
+                pool.submit(advance, first, b"alice"),
+                pool.submit(advance, second, b"bob"),
+            )
+        ]
+    assert sum(result is not None for result in results) == 1
+    assert first.get("root") in {b"alice", b"bob"}
+    assert ".root.lock" not in first.list("")
+    for key in (
+            ".root.lock", ".root.lock/child", "./.root.lock",
+            "root/child", "/outside", "../outside"):
+        with pytest.raises(ValueError, match="key"):
+            first.put(key, b"clobber")
+    with pytest.raises(ValueError, match="only root"):
+        first.cas("obj/" + h(b"x"), None, b"x")
+    with pytest.raises(ValueError, match="conditional"):
+        first.put("root", b"clobber")
+    with pytest.raises(ValueError, match="compare-and-swap"):
+        first.put_if_absent("root", b"clobber")
+    with pytest.raises(ValueError, match="conditional"):
+        first.put("obj/" + h(b"x"), b"x")
+    with pytest.raises(ValueError, match="not deletable"):
+        first.delete("root")
+    with pytest.raises(ValueError, match="not deletable"):
+        first.delete("obj/" + h(b"x"))
 
 
 def test_remote_store_adapts_peer_gets_without_exposing_list():

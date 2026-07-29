@@ -56,8 +56,7 @@ class WorkspaceRuntime:
                         if node.fact_of(ws, valid.fact.fid) is not None)
                     arrived = set()
                     for oid, blob in blobs.items():
-                        if not store.has("obj/" + oid):
-                            store.put("obj/" + oid, blob)
+                        if store.put_if_absent("obj/" + oid, blob):
                             arrived.add(oid)
                     node.commit(ws, settlement)
                     spilled = {

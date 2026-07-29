@@ -136,8 +136,7 @@ def _fetch_blobs(node, ws, peer):
                 continue
             blob = peer.obj(oid)
             if blob and h(blob) == oid:
-                st.put("obj/" + oid, blob)
-                fetched = True
+                fetched = st.put_if_absent("obj/" + oid, blob) or fetched
             else:
                 whole = False
                 complete = False

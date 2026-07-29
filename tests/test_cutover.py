@@ -310,7 +310,7 @@ def test_layout_stamp_forces_rebuild(tmp_path):
         with pytest.raises(ValueError, match="root stamp"):  # no second reader
             manifest.decode_root(canon({**body, "stamp": stamp}))
     foreign = canon({**body, "stamp": "one-store-v0"})
-    node.store(ws).put("root", foreign)
+    node.store(ws)._replace("root", foreign)
     node._sync_index(ws)
     republished = node.store(ws).get("root")
     assert republished != foreign

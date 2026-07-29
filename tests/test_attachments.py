@@ -240,5 +240,5 @@ def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
 
     for fid in chunk_fids:
         for oid in facts.blob_refs(source.fact_of(workspace, fid)):
-            source.store(workspace).delete("obj/" + oid)
+            source.store(workspace)._delete("obj/" + oid)
     assert _fetch_blobs(source, workspace, NoBlobPeer()) == ([], True)

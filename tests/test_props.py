@@ -28,6 +28,7 @@ from facts.content.message import message
 from core.kernel import drain, resolve_deps
 from core import node as node_module
 from core.node import Node, now_ms
+from core.publication import Publisher
 
 from . import util as test_util
 from .util import (
@@ -147,7 +148,7 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     fetch = lambda oid: st.get("obj/" + oid)
     man = manifest.decode_root(root_bytes).manifest
     entries = manifest.decode(fetch(man), fetch)
-    st.put("obj/" + entries[0].leaf, encode_pile([]))
+    st._replace("obj/" + entries[0].leaf, encode_pile([]))
 
     with pytest.raises(ValueError, match="object integrity"):
         n.rebuild(ws)
@@ -170,7 +171,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
 
     def emit(raw):
         oid = h(raw)
-        st.put("obj/" + oid, raw)
+        st._replace("obj/" + oid, raw)
         return oid
 
     # A smuggled fact with no proof chain breaks store closure.
@@ -179,7 +180,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
     smuggled = entries[0]._replace(
         leaf=emit(encode_pile([hidden] + members)))
     man = manifest.encode([smuggled] + list(entries[1:]), emit)
-    st.put("root", manifest.encode_root(ws, man))
+    st._replace("root", manifest.encode_root(ws, man))
     with pytest.raises(ValueError, match="invalid store facts"):
         n.rebuild(ws)
 
@@ -190,12 +191,12 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         entries[0]._replace(leaf=emit(encode_pile(first[:-1]))),
         entries[1]._replace(leaf=emit(encode_pile([first[-1]] + second))),
     ] + list(entries[2:])
-    st.put("root", manifest.encode_root(
+    st._replace("root", manifest.encode_root(
         ws, manifest.encode(moved, emit)))
     with pytest.raises(ValueError, match="store placement"):
         n.rebuild(ws)
 
-    st.put("root", honest)
+    st._replace("root", honest)
     assert all_fids(n, ws) == before
 
 
@@ -220,8 +221,8 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
     store = node.store(workspace)
     _, empty = manifest.build(
         [], lambda fid: None, lambda fid: (),
-        lambda raw: store.put("obj/" + h(raw), raw))
-    store.put(
+        lambda raw: store._replace("obj/" + h(raw), raw))
+    store._replace(
         "root", manifest.encode_root(workspace, empty))
 
     with pytest.raises(ValueError, match="store fact set"):
@@ -241,6 +242,8 @@ def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
 
     assert node.commit(workspace) is None
     assert node.store(workspace).get("root") == root
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM meta WHERE k='root'").fetchone() is None
     node.rebuild(workspace)  # the store, not the index, stayed authoritative
     assert all_fids(node, workspace) == [workspace]
 
@@ -346,7 +349,8 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     def die_after_cas(*args, **kwargs):
         raise RuntimeError("simulated post-CAS death")
 
-    monkeypatch.setattr(node, "_stamp", die_after_cas)
+    original_stamp = Publisher.stamp
+    monkeypatch.setattr(Publisher, "stamp", die_after_cas)
     with pytest.raises(RuntimeError, match="post-CAS death"):
         node.commit(workspace, settlement)
     assert node.store(workspace).get("root") != old_root
@@ -356,6 +360,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     for index in node._idx.values():
         index.close()
     node.app.close()
+    monkeypatch.setattr(Publisher, "stamp", original_stamp)
 
     reopened = Node(node.dir)
     assert reopened.fact_of(workspace, item.fid) == item
@@ -452,35 +457,39 @@ def test_index_stamp_rolls_back_a_partial_write(tmp_path):
     )
 
     with pytest.raises(sqlite3.IntegrityError, match="stamp failure"):
-        node._stamp(workspace)
+        Publisher(node, workspace).stamp(
+            node.store(workspace).get("root"))
 
     assert not index.in_transaction
     assert index.execute(
         "SELECT k, v FROM meta ORDER BY k").fetchall() == expected
     index.execute("DROP TRIGGER fail_index_version")
     index.commit()
-    node._stamp(workspace)
+    Publisher(node, workspace).stamp(
+        node.store(workspace).get("root"))
 
 
 def test_partial_stamp_failure_retries_in_the_same_process(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    original_stamp = node._stamp
+    original_stamp = Publisher.stamp
     failed = False
 
-    def fail_once_after_root(stamped_workspace, admitted=()):
+    def fail_once_after_root(publisher, root_bytes, admitted=()):
         nonlocal failed
+        root_etag = h(root_bytes) if root_bytes is not None else None
+        stamped_workspace = publisher.workspace
         if not failed:
             failed = True
             node.idx(stamped_workspace).execute(
                 "INSERT OR REPLACE INTO meta VALUES('root', ?)",
-                (node.store(stamped_workspace).etag("root"),),
+                (root_etag,),
             )
             raise RuntimeError("simulated partial stamp")
-        original_stamp(stamped_workspace, admitted)
+        original_stamp(publisher, root_bytes, admitted)
 
-    monkeypatch.setattr(node, "_stamp", fail_once_after_root)
+    monkeypatch.setattr(Publisher, "stamp", fail_once_after_root)
     with pytest.raises(RuntimeError, match="simulated partial stamp"):
         cmds.post(node, workspace, "general", "stamp retry", ts=2)
 

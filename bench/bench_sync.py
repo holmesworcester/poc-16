@@ -42,6 +42,7 @@ from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import extend_proofs, kernel, resolve_deps
 from core.node import Node, now_ms
+from core.publication import Publisher
 from core.pump import pump
 from core.shape import fid_of
 
@@ -71,6 +72,9 @@ def _insert(idx, fact):
 def _commit_index(node, workspace):
     """Benchmark-only direct-write boundary; runtime code never uses it."""
     idx = node.idx(workspace)
+    idx.execute(
+        "INSERT OR REPLACE INTO meta VALUES('publish-base', ?)",
+        (node.store(workspace).etag("root"),))
     idx.execute("DELETE FROM meta WHERE k='root'")
     idx.execute(
         "INSERT OR REPLACE INTO meta VALUES('tree-rebuild','1')")
@@ -163,6 +167,8 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
     """decode is the caller's (serial, like turn); kernel is parallel; merge
     + materialize serial. Returns streamed-record count. No commit — caller
     lays out once at the end."""
+    node._sync_index(ws)
+    base = Publisher(node, ws).base()
     streamed = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
         buf = []
@@ -170,7 +176,8 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
         def flush(bb):
             for judgment in ex.map(lambda u: kernel(u, ws), bb):
                 assert judgment.ok, "a published unit failed the kernel"
-                node.merge(ws, (valid.fact for valid in judgment.valids))
+                node.merge(
+                    ws, (valid.fact for valid in judgment.valids), base=base)
                 pump(node, ws)
 
         for u in units:

@@ -108,6 +108,13 @@ invite/<unguessable-id>      encrypted invite blob
 failed/...                   node-local quarantine diagnostics
 ```
 
+The Store API enforces the authoritative-key rules: `root` rejects ordinary
+put and delete, `obj/*` rejects replacement and delete, object creation is
+atomic put-if-absent with hash equality, and only root CAS may replace the
+composite snapshot. The adapter's stable CAS-lock path is reserved from every
+public key operation. Piles, invites, and quarantine records remain ordinary
+non-authoritative keys.
+
 The workspace SQLite database contains a stable local admission catalog plus
 derived eligibility and reverse indexes. A kernel-valid durable receipt is
 stored once; losing canonical standing removes its proof row, not its bytes or
@@ -131,6 +138,22 @@ trees. There is no second mutable removal root and therefore no two-root
 transaction. `action_etag` only avoids enumerating SuppTree when ordinary facts
 change but actions do not; Workers never trust it, and action evidence remains
 authoritative only through the authenticated trees.
+
+Catalog settlement returns a publication plan pinned to the exact root bytes
+and ETag that settlement read. Object and tree compilation never rereads
+`root` to adopt a newer base. A successful publisher stamps its local derived
+index with the exact bytes won by its own CAS; if another writer advances root
+before that stamp, the stamp is honestly stale and the next index
+synchronization rebuilds. It can never falsely label old local state as the
+later writer's root.
+
+Rebuild force-settles the complete retained catalog, including currently
+inactive local receipts, then compiles that exact answer. If its bytes equal
+the pinned root, publication performs an ETag-checked no-op and stamps it. If
+local standing has changed, publication CASes the derived union from the
+pinned root instead. Thus a newly reactivated local receipt is either present
+in the stamped root or remains durable intent after a lost CAS; rebuild never
+stamps somebody else’s smaller snapshot as its own.
 
 The range manifest partitions sorted fact keys with the shared stable boundary
 rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
@@ -184,7 +207,7 @@ root CAS.
 
 ## Shared-bucket concurrency contract
 
-Concurrent database-free services are modeled as three pieces:
+Concurrent store users are modeled as three pieces:
 
 ```text
 O : oid → bytes       grow-only, content-addressed immutable objects
@@ -206,6 +229,11 @@ slot, and action witness used by the decision must remain explainable by the
 one pinned root. Re-reading `root` for individual components is incoherent,
 even when each component is independently valid.
 
+The writer-side client catalog is an optimization and durable-intent cache;
+the CF authorization reader has no database at all. It needs only pinned root
+bytes, immutable object fetches, the submitted bounded closure, and trusted
+service time.
+
 The safety laws are:
 
 1. every object key equals the hash of its bytes;
@@ -221,7 +249,11 @@ Its breadth-first explorer covers two writers and one reader and returns the
 shortest schedule for a violated law. Mutation tests prove the laws reject
 root-before-objects publication, split composite roots, and a reader that
 repins halfway through a decision. Concrete Store, Publisher, Worker, and
-authenticated-tree schedules refine this model.
+authenticated-tree schedules refine this model in
+`tests/test_shared_bucket_node.py`: every successful root is fully walked,
+competing suppression winners are observed under whole roots, a stale mint is
+run with SQLite disabled, and the terminal concurrent result must equal a
+serial canonical rebuild.
 
 ## Explicit suppression
 
@@ -375,10 +407,12 @@ one closed pile, remote ranges are assembled, and missing live blobs are
 fetched. Push happens before draining the pull so canonical pruning cannot
 remove a precomputed difference before delivery.
 
-Malformed ingress failures and sync failures are quarantined and visible through
-`status`. Malformed roots, pages, facts, selectors, action evidence, or
-authority rows fail closed. A root format mismatch forces a wholesale rebuild
-from the current derived index; there is no ongoing dual decoder.
+Malformed ingress failures and sync failures are quarantined and visible
+through `status`. Malformed roots, pages, facts, selectors, action evidence,
+or authority rows fail closed. A root format mismatch may be republished from
+the current derived index only when its known snapshot fields equal the exact
+root bytes that index recorded; a different or unreadable snapshot is never
+clobbered. There is no ongoing dual decoder.
 
 Application tables are insert-only source rows plus a projection cursor.
 Suppression appends retractions to the delivery log. Rebuild replays the

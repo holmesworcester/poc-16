@@ -36,7 +36,7 @@ from .pump import (
     append_retracted,
     open_projection,
 )
-from .publication import Publisher
+from .publication import INDEX_VERSION, Publisher, RootChanged
 from .runtime import WorkspaceRuntime
 from .shape import key_parts
 from .store import FsStore, verified_object
@@ -47,7 +47,6 @@ SUPP_SCHEMA = (
 IDX_SCHEMA = catalog.SCHEMA + """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
-INDEX_VERSION = "admission-catalog-v21"
 
 
 def now_ms():
@@ -261,14 +260,20 @@ class Node:
 
     def _sync_index(self, ws):
         """Rebuild derived standing when the catalog's root stamp is stale."""
-        etag = self.store(ws).etag("root")
-        idx = self.idx(ws)
-        row = idx.execute("SELECT v FROM meta WHERE k='root'").fetchone()
-        version = idx.execute(
-            "SELECT v FROM meta WHERE k='index-version'").fetchone()
-        semantic_upgrade = version is None or version[0] != INDEX_VERSION
-        if row is None or row[0] != etag or semantic_upgrade:
-            self.rebuild(ws, republish=semantic_upgrade)
+        for _ in range(8):
+            etag = self.store(ws).etag("root")
+            idx = self.idx(ws)
+            row = idx.execute("SELECT v FROM meta WHERE k='root'").fetchone()
+            version = idx.execute(
+                "SELECT v FROM meta WHERE k='index-version'").fetchone()
+            semantic_upgrade = version is None or version[0] != INDEX_VERSION
+            if row == (etag,) and not semantic_upgrade:
+                return
+            try:
+                self.rebuild(ws, republish=semantic_upgrade)
+            except RootChanged:
+                continue
+        raise RootChanged("root kept changing during index synchronization")
 
     def _restore_authoritative_projections(self, ws):
         """Discard a failed turn's local state before releasing its lock."""
@@ -276,20 +281,6 @@ class Node:
         self.app.rollback()
         self._sync_index(ws)
         self.workspace(ws).project()
-
-    def _stamp(self, ws, admitted=()):
-        idx = self.idx(ws)
-        try:
-            self.catalog(ws).commit_stage(admitted)
-            idx.execute("DELETE FROM meta WHERE k='tree-rebuild'")
-            idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
-                        (self.store(ws).etag("root"),))
-            idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-                        (INDEX_VERSION,))
-            idx.commit()
-        except Exception:
-            idx.rollback()
-            raise
 
     def fact_of(self, ws, fid) -> Fact:
         return self.catalog(ws).eligible(fid)
@@ -335,7 +326,7 @@ class Node:
         return changed
 
     def _validate_root_actions(self, ws, root_bytes, fetch):
-        """Cross-check derived action evidence against authenticated slots."""
+        """Validate action evidence entirely through authenticated slots."""
         from .worker import WorkerView
 
         view = WorkerView.from_root(root_bytes, fetch)
@@ -354,13 +345,6 @@ class Node:
                 ws, sid, fid, evidence_oid, fetch)
             if action.fid != fid:
                 raise ValueError("action evidence fact")
-            row = self.idx(ws).execute(
-                "SELECT evidence FROM actions WHERE sid=? AND fid=?",
-                (sid, fid),
-            ).fetchone()
-            if row != (evidence_oid,):
-                raise ValueError("action evidence mismatch")
-
     # ---- the turn ------------------------------------------------------------
 
     def turn(self, ws):
@@ -416,7 +400,9 @@ class Node:
                 "INSERT OR REPLACE INTO meta VALUES('reproject', ?)",
                 (seq,))
 
-    def merge(self, ws, candidates):
+    def merge(self, ws, candidates, *, base=None, force=False):
+        publisher = Publisher(self, ws)
+        base = publisher.base() if base is None else base
         idx, newfids = self.idx(ws), []
         admitted = self.catalog(ws)
         idx.execute("BEGIN")
@@ -435,9 +421,10 @@ class Node:
                 if facts.action_sids(f):
                     actions_dirty = True
                     suppression_state.archive(idx, f)
-            force = not newfids and not admitted.has_eligible() \
+            force = force or (
+                not newfids and not admitted.has_eligible()
                 and idx.execute(
-                    "SELECT 1 FROM facts LIMIT 1").fetchone() is not None
+                    "SELECT 1 FROM facts LIMIT 1").fetchone() is not None)
             change = admitted.settle(
                 newfids, force=force, actions_dirty=actions_dirty) \
                 if newfids or force or actions_dirty \
@@ -455,24 +442,23 @@ class Node:
             self._log_projection(
                 ws, change.activated, deactivated,
                 reproject, action_changes)
-            idx.execute("DELETE FROM meta WHERE k='root'")
+            publisher.dirty(base)
             idx.commit()
-            return catalog.Eligibility(
-                change.received,
-                change.activated,
-                change.deactivated,
-                reproject,
-            )
+            return publisher.plan(catalog.Eligibility(
+                change.received, change.activated, change.deactivated,
+                reproject), base)
         except Exception:
             idx.rollback()
             raise
 
-    def commit(self, ws, settlement=None, *, reuse=True):
+    def commit(self, ws, settlement=None, *, reuse=True, _base=None):
         idx = self.idx(ws)
+        publisher = Publisher(self, ws)
         if settlement is None:
+            base = publisher.base(pending=True) if _base is None else _base
             try:
                 staged = self.catalog(ws).staged_ids()
-                idx.execute("DELETE FROM meta WHERE k='root'")
+                publisher.dirty(base)
                 admitted = self.catalog(ws)
                 change = admitted.settle(
                     staged, force=True, actions_dirty=True)
@@ -481,7 +467,7 @@ class Node:
                         "SELECT 1 FROM actions WHERE evidence='' LIMIT 1"
                 ).fetchone() is not None:
                     action_changes.update(self._refresh_action_evidence(ws))
-                settlement = catalog.Eligibility(
+                change = catalog.Eligibility(
                     staged,
                     change.activated,
                     change.deactivated,
@@ -489,13 +475,14 @@ class Node:
                 )
                 if change.activated or change.deactivated or action_changes:
                     self._log_projection(
-                        ws, settlement.activated,
-                        settlement.deactivated, True, action_changes)
+                        ws, change.activated,
+                        change.deactivated, True, action_changes)
                 idx.commit()
+                settlement = publisher.plan(change, base)
             except Exception:
                 idx.rollback()
                 raise
-        return Publisher(self, ws).publish(settlement, reuse=reuse)
+        return publisher.publish(settlement, reuse=reuse)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -507,20 +494,24 @@ class Node:
     def rebuild(self, ws, *, republish=False):
         with self.lock:
             st, idx = self.store(ws), self.idx(ws)
-            raw, root = st.get("root"), None
+            publisher = Publisher(self, ws)
+            base = publisher.root_base()
+            raw, root, stream = base[0], None, []
             if raw:
                 try:
                     root = manifest.decode_root(raw)
                 except ValueError:
-                    # A layout we have no reader for (foreign stamp, damaged
-                    # bytes). The derived index is the store's only remaining
-                    # reader, so republish FROM it under the current stamp and
-                    # rebuild from what we just wrote — never over bytes we
-                    # could not read (§1: rebuild wholesale, no compat path).
+                    # A foreign envelope may be republished from this index
+                    # only when all known snapshot bindings equal the exact
+                    # root it stamped. Damaged or different bytes fail closed.
+                    if not publisher.same_snapshot_envelope(raw):
+                        raise ValueError(
+                            "unreadable root does not match indexed snapshot")
                     staged = self.catalog(ws).discard_stage()
                     suppression_state.discard(idx, staged)
-                    self.commit(ws, reuse=False)
+                    self.commit(ws, reuse=False, _base=base)
                     raw = st.get("root")
+                    base = (raw, h(raw))
                     root = manifest.decode_root(raw)
             if root is not None:
                 if root.anchor != ws:
@@ -540,6 +531,7 @@ class Node:
                     # just wrote.
                     self.commit(ws, reuse=False)
                     raw = st.get("root")
+                    base = (raw, h(raw))
                     root = manifest.decode_root(raw)
                     stream = list(resident(root.manifest, fetch, ws))
                 if ws not in {fact.fid for fact in stream}:
@@ -574,36 +566,42 @@ class Node:
                          for sid in sorted(facts.fact_scopes(fact))),
                     )
                 idx.execute(
-                    "DELETE FROM meta WHERE k IN ('root','reproject')")
+                    "DELETE FROM meta "
+                    "WHERE k IN ('root','publish-base','reproject')")
                 idx.commit()
             except Exception:
                 idx.rollback()
                 raise
-            if root is None:  # no root at all: an empty store is legal
-                self.catalog(ws).settle(
-                    (), force=True, actions_dirty=True)
-                self._stamp(ws)
-                self.workspace(ws).project()
-                return
-            settlement = self.merge(ws, stream)
-            try:
-                self._validate_root_actions(
-                    ws, raw, lambda oid: st.get("obj/" + oid))
-            except ValueError:
-                if not republish:
-                    raise
+            settlement = self.merge(
+                ws, stream, base=base, force=True)
+            if root is not None:
+                try:
+                    self._validate_root_actions(
+                        ws, raw, lambda oid: st.get("obj/" + oid))
+                except ValueError:
+                    if not republish:
+                        raise
             self.apply_actions(
                 ws, [sid for (sid,) in self.idx(ws).execute(
                     "SELECT sid FROM actions")])
-            if republish:
-                # A semantic index upgrade can select different canonical
-                # providers for the same fact ids. Fingerprints cover ids, not
-                # closure edges, so old fences are deliberately not memoized.
-                self.commit(ws, settlement, reuse=False)
-            else:
-                self._stamp(ws, settlement.received)
-            self.log_arrivals(
-                ws, (fact.fid for fact in stream))
+            # A semantic index upgrade can select different canonical
+            # providers for the same fact ids. A retained local receipt can
+            # also regain standing under an external (or absent) root. Compile
+            # the exact derived answer: Publisher skips CAS only when those
+            # bytes equal the base, otherwise it publishes the local union.
+            try:
+                publisher.publish(settlement, reuse=False)
+            except Exception:
+                idx.rollback()
+                raise
+            # Rebuild resets the delivery log. The published answer can be
+            # larger than ``stream`` when retained local receipts regain
+            # standing, so restore blob arrivals from the exact eligible set
+            # we just compiled rather than only from the old root.
+            published = tuple(
+                fid for (fid,) in idx.execute(
+                    "SELECT fid FROM proofs ORDER BY fid"))
+            self.log_arrivals(ws, published)
             self.workspace(ws).project()
 
     # ---- exact suppression consult + local reverse projection ----------------
