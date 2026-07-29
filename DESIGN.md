@@ -141,6 +141,38 @@ authoritative adapters. LIST is strong but paginated, and several pages are
 not one transaction. Piles, invites, and quarantine records remain
 non-authoritative operations with explicitly idempotent handling.
 
+The Cloudflare authorization deployment is a Python Worker at compatibility
+date `2026-07-29`, selecting Python 3.13 and the Pyodide 0.28.3 dependency
+index through `workers-py` 1.16.0. This choice was made only after a clean
+pywrangler artifact and local workerd loaded the real `core`, `facts`, R2
+adapter, and shared gateway, then completed Ed25519 sign/verify and a
+sealed-box round trip. A generated build stage copies the selected canonical
+source files on every build; there is no checked-in security-core fork.
+Its import-graph ratchet excludes `fcntl`, `sqlite3`, `threading`, and
+`multiprocessing`, plus the host-only S3 compatibility adapters.
+
+Pyodide's PyNaCl 1.5.0 wheel contains libsodium browser-randomness `EM_ASM`
+exports. Workerd deliberately rejects their eager dynamic registration.
+The deployment build checks the pinned wheel layout, disables only those
+exports and PyNaCl's eager RNG initialization, and obtains ephemeral
+sealed-box seeds from request-context `os.urandom`. Ed25519 and the
+deterministic Curve25519/XSalsa20-Poly1305 box operations remain PyNaCl
+primitives, and interoperability tests compare both directions with native
+PyNaCl's sealed-box wire format. The first request runs the cryptographic
+self-test because Workers intentionally deny entropy during top-level
+snapshot construction.
+
+The Worker receives one direct `BUCKET` R2 binding, one exact `WORKSPACE`,
+one exact `STORE_PREFIX`, and one required encrypted `GRANT_SECRET`. Production
+config generation requires an explicit route and leaves workers.dev disabled.
+The application caps request bodies at 512 KiB while streaming, root at
+64 KiB, individual objects at 4 MiB, object batches at 48 items/4 MiB, and
+mint authorization at 48 unique fetches/384 KiB. It exposes only health,
+mint, invite, root, and authenticated object reads; the R2 capability passed
+to the gateway has only `get` and `has`. The opt-in live smoke command uses a
+unique workers.dev deployment, never mutates R2, and removes the Worker even
+when authorization fails.
+
 Each workspace SQLite database contains one stable local fact catalog plus
 family-neutral derived indexes:
 

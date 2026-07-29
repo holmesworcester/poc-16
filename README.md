@@ -82,6 +82,54 @@ protocol routes.
 Consequently `content.file.send` and `content.file.save` paths are resolved by
 the daemon process, just like the POC-17 local command model.
 
+## Cloudflare read-only gateway
+
+The Cloudflare Python Worker is isolated under `deploy/cloudflare_worker`. It
+uses a direct R2 binding for one workspace prefix, imports the canonical
+Python authorization code, and advertises `{"cap":"sync-v1/read"}`. It never
+writes R2, opens SQLite, or exposes pile/poke/control mutations.
+
+Install `uv`, then run its complete host, clean-bundle, and local-workerd
+checks:
+
+```sh
+python3 deploy/cloudflare_worker/manage.py test
+```
+
+Local development uses the placeholder workspace and local R2 bucket in the
+checked-in config. Supply a stable 32-byte base64 grant secret:
+
+```sh
+export GRANT_SECRET=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+python3 deploy/cloudflare_worker/manage.py dev
+```
+
+Production commands generate an ignored Wrangler config and require every
+deployment identity explicitly:
+
+```sh
+export CF_WORKSPACE=64_LOWERCASE_HEX_CHARACTERS
+export CF_STORE_PREFIX=workspaces/$CF_WORKSPACE
+export CF_R2_BUCKET=poc16-production
+export CF_R2_PREVIEW_BUCKET=poc16-preview
+export CF_WORKER_NAME=poc-16-readonly-gateway
+export CF_ROUTE='gateway.example.com/*'
+export CF_ZONE_NAME=example.com
+export GRANT_SECRET=BASE64_OF_ONE_STABLE_32_BYTE_SECRET
+
+python3 deploy/cloudflare_worker/manage.py build
+python3 deploy/cloudflare_worker/manage.py deploy
+python3 deploy/cloudflare_worker/manage.py remove
+```
+
+`deploy` passes the secret through Wrangler's encrypted secret upload and
+never writes it to the generated config. The checked-in config has no public
+route and cannot accidentally target a real bucket. `smoke` is an explicit
+live test: set `CF_LIVE_SMOKE=1` and `CF_SMOKE_MINT_FILE` to a Python-generated
+mint request whose snapshot already exists at the configured prefix. It
+deploys a unique workers.dev Worker, verifies authorization, and removes that
+Worker in a `finally` path without changing or deleting R2 data.
+
 ## Test and measure
 
 Run the full suite:

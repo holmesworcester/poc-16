@@ -61,11 +61,14 @@ class Gateway:
             max_batch_bytes=MAX_PAGE_BATCH_BYTES,
             max_mint_fetches=MAX_MINT_FETCHES,
             max_mint_fetch_bytes=MAX_MINT_FETCH_BYTES,
-            grant_ttl_ms=60_000):
+            grant_ttl_ms=60_000,
+            seal=seal_to):
         if not isinstance(workspace, str) or not workspace:
             raise ValueError("workspace")
         if not isinstance(secret, bytes) or len(secret) < 32:
             raise ValueError("grant secret")
+        if not callable(seal):
+            raise ValueError("grant sealer")
         self.store, self.workspace = store, workspace
         self.secret, self.now = secret, now
         if not peer_capability.known(sync_profile):
@@ -95,6 +98,7 @@ class Gateway:
         self.max_mint_fetches = max_mint_fetches
         self.max_mint_fetch_bytes = max_mint_fetch_bytes
         self.grant_ttl_ms = grant_ttl_ms
+        self.seal = seal
 
     @staticmethod
     def _header(headers, name):
@@ -176,7 +180,7 @@ class Gateway:
             "cap": self.sync_profile,
             "etag": h(root),
             "grant": base64.b64encode(
-                seal_to(public, token.encode())).decode(),
+                self.seal(public, token.encode())).decode(),
             "root": base64.b64encode(root).decode(),
         })
 

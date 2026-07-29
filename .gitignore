@@ -10,3 +10,13 @@ deploy/aws_lambda/stage/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Cloudflare Python Worker generated environments and deployment inputs
+deploy/cloudflare_worker/.dev.vars*
+deploy/cloudflare_worker/.env*
+deploy/cloudflare_worker/.venv/
+deploy/cloudflare_worker/.venv-workers/
+deploy/cloudflare_worker/.wrangler/
+deploy/cloudflare_worker/build/
+deploy/cloudflare_worker/python_modules/
+deploy/cloudflare_worker/wrangler.generated.json

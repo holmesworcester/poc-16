@@ -1,0 +1,61 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "poc-16-readonly-gateway",
+  "main": "build/worker/entry.py",
+  "base_dir": "build/worker",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": [
+    "python_workers"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "replace-with-production-bucket",
+      "preview_bucket_name": "replace-with-preview-bucket",
+      "remote": false
+    }
+  ],
+  "vars": {
+    "WORKSPACE": "0000000000000000000000000000000000000000000000000000000000000000",
+    "STORE_PREFIX": "workspaces/0000000000000000000000000000000000000000000000000000000000000000",
+    "MAX_REQUEST_BYTES": 524288,
+    "MAX_ROOT_BYTES": 65536,
+    "MAX_OBJECT_BYTES": 4194304,
+    "MAX_BATCH_COUNT": 48,
+    "MAX_BATCH_BYTES": 4194304,
+    "MAX_MINT_FETCHES": 48,
+    "MAX_MINT_FETCH_BYTES": 393216,
+    "GRANT_TTL_MS": 60000
+  },
+  "secrets": {
+    "required": [
+      "GRANT_SECRET"
+    ]
+  },
+  "python_modules": {
+    "excludes": [
+      "**/*.pyc",
+      "**/__pycache__"
+    ]
+  },
+  "build": {
+    "command": "python manage.py stage",
+    "cwd": ".",
+    "watch_dir": [
+      "../../core",
+      "../../facts",
+      "../../adapters/r2",
+      "../gateway.py",
+      "crypto_compat.py",
+      "entry.py",
+      "runtime.py"
+    ]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.01
+  }
+}
