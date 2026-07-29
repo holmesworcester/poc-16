@@ -6,6 +6,8 @@ import sys
 import tempfile
 from unittest.mock import patch
 
+from adapters.s3.sdk_smoke import require_s3_capabilities
+
 
 def _endpoint_isolation(boto3, Config):
     """Prove ambient endpoint configuration cannot redirect AWS clients."""
@@ -68,14 +70,7 @@ def main():
             raise RuntimeError(f"{name} was not imported from the artifact")
     _endpoint_isolation(boto3, Config)
 
-    operation = get_session().get_service_model(
-        "s3").operation_model("PutObject")
-    fields = operation.input_shape.members
-    required = {"IfMatch", "IfNoneMatch", "ChecksumSHA256"}
-    missing = required - set(fields)
-    if missing:
-        raise RuntimeError(
-            f"botocore PutObject model lacks {sorted(missing)}")
+    require_s3_capabilities(Config, get_session())
     secret = PrivateKey.generate()
     message = b"lambda-package-smoke"
     sealed = SealedBox(secret.public_key).encrypt(message)

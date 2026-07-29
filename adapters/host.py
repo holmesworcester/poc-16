@@ -22,6 +22,7 @@ _COMMON = frozenset({
     "bucket",
     "connect_timeout",
     "list_page_size",
+    "max_body_read_calls",
     "max_list_pages",
     "max_pool_connections",
     "read_timeout",

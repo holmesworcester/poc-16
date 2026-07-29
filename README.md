@@ -32,6 +32,15 @@ python3 -m pip install ./native/bao_py
 The extension is loaded only by attachment operations. Auth, messages, sync,
 and most tests run without it.
 
+The local filesystem and Cloudflare Worker do not import AWS SDK packages.
+Only a host daemon configured for S3 or R2's S3-compatible API needs the
+optional, known-capable provider pair:
+
+```sh
+python3 -m pip install "boto3==1.43.51" "botocore==1.43.51"
+python3 -m adapters.s3.sdk_smoke
+```
+
 ## Run
 
 Start a node:
@@ -81,6 +90,40 @@ Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`
 protocol routes.
 Consequently `content.file.send` and `content.file.save` paths are resolved by
 the daemon process, just like the POC-17 local command model.
+
+### Host S3/R2 object stores
+
+Pass a strict JSON file to `--store-config`; credentials stay outside the file
+and come from boto's environment, shared-config, container, or instance
+credential chain. An Amazon S3 configuration is:
+
+```json
+{
+  "schema": "poc16-host-store-v1",
+  "backend": "s3",
+  "bucket": "my-bucket",
+  "base_prefix": "poc16/tenant",
+  "region_name": "us-west-2"
+}
+```
+
+R2 uses the direct account endpoint derived from `account_id`:
+
+```json
+{
+  "schema": "poc16-host-store-v1",
+  "backend": "r2",
+  "account_id": "0123456789abcdef0123456789abcdef",
+  "bucket": "my-bucket",
+  "base_prefix": "poc16/tenant"
+}
+```
+
+After saving one of those documents as `store.json`, start the host with:
+
+```sh
+python3 -m core daemon ./state/alice --store-config store.json
+```
 
 ## Cloudflare read-only gateway
 

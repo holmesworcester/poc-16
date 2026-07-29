@@ -22,6 +22,7 @@ class R2S3Config:
     read_total_max_attempts: int = 3
     list_page_size: int = 1000
     max_list_pages: int = 10_000
+    max_body_read_calls: int = 4096
 
     def __post_init__(self):
         if not isinstance(self.account_id, str) \
@@ -48,6 +49,7 @@ class R2S3Config:
             addressing_style="path",
             list_page_size=self.list_page_size,
             max_list_pages=self.max_list_pages,
+            max_body_read_calls=self.max_body_read_calls,
         )
 
 

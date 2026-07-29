@@ -119,6 +119,8 @@ def config(**changes):
          "bucket_key_enabled": True},
         {"list_page_size": 1001},
         {"read_total_max_attempts": 0},
+        {"max_body_read_calls": 0},
+        {"max_body_read_calls": 65_537},
         {"connect_timeout": float("nan")},
         {"connect_timeout": float("inf")},
         {"read_timeout": float("-inf")},
@@ -441,7 +443,7 @@ def test_bounded_get_accepts_legal_short_reads_and_detects_true_edges():
     assert over.closed
 
 
-def test_bounded_get_accumulates_realistic_one_byte_fragments():
+def test_bounded_get_caps_realistic_one_byte_fragment_calls():
     class Fragmented:
         def __init__(self, size):
             self.value = b"x" * size
@@ -462,14 +464,18 @@ def test_bounded_get_accumulates_realistic_one_byte_fragments():
             self.closed = True
 
     size = 64 * 1024
+    read_budget = 4096
     body = Fragmented(size)
-    store = S3Store(config(), client=ScriptedClient(get_object=[{
+    store = S3Store(config(
+        max_body_read_calls=read_budget), client=ScriptedClient(get_object=[{
         "Body": body,
         "ContentLength": size,
     }]))
 
-    assert store.get_bounded("obj/" + "0" * 64, size) == b"x" * size
-    assert body.reads == size + 1
+    with pytest.raises(StoreError, match="fragment budget"):
+        store.get_bounded("obj/" + "0" * 64, size)
+    assert body.reads == read_budget
+    assert body.offset == read_budget
     assert body.closed
 
 

@@ -39,6 +39,7 @@ _IP_STYLE_BUCKET_RE = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
 _RESERVED_BUCKET_PREFIXES = ("xn--", "sthree-")
 _RESERVED_BUCKET_SUFFIXES = (
     "-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3")
+_MAX_BODY_READ_CALLS = 65_536
 _KEY_MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _CONFIG_ERROR_NAMES = frozenset({
     "InvalidRegionError",
@@ -199,6 +200,7 @@ class S3Config:
     addressing_style: str | None = None
     list_page_size: int = 1000
     max_list_pages: int = 10_000
+    max_body_read_calls: int = 4096
     probe_access_denied_missing: bool = False
 
     def __post_init__(self):
@@ -247,6 +249,9 @@ class S3Config:
             raise ValueError("addressing_style")
         _positive_int(self.list_page_size, "list_page_size", maximum=1000)
         _positive_int(self.max_list_pages, "max_list_pages")
+        _positive_int(
+            self.max_body_read_calls, "max_body_read_calls",
+            maximum=_MAX_BODY_READ_CALLS)
         if not isinstance(self.probe_access_denied_missing, bool):
             raise ValueError("probe_access_denied_missing")
 
@@ -371,9 +376,13 @@ class S3Store:
         return etag
 
     @staticmethod
-    def _response_body(response, operation, max_bytes):
+    def _response_body(
+            response, operation, max_bytes, max_body_read_calls):
         if type(max_bytes) is not int or not 0 < max_bytes <= MAX_OBJECT_BYTES:
             raise ValueError("S3 read byte limit")
+        _positive_int(
+            max_body_read_calls, "max_body_read_calls",
+            maximum=_MAX_BODY_READ_CALLS)
         body = response.get("Body") if isinstance(response, dict) else None
         if body is None or not callable(getattr(body, "read", None)):
             raise StoreError(f"S3 {operation} response has no readable body")
@@ -388,9 +397,17 @@ class S3Store:
                     f"S3 {operation} response exceeds byte limit")
             ceiling = declared if declared is not None else max_bytes
             value = bytearray()
+            read_calls = 0
             while True:
+                # Botocore's StreamingBody normally fills ``amount``. Treat
+                # extreme legal short-read fragmentation as a provider fault
+                # before Python call overhead can dominate the byte budget.
+                if read_calls >= max_body_read_calls:
+                    raise StoreError(
+                        f"S3 {operation} response exceeded fragment budget")
                 amount = ceiling - len(value) + 1
                 chunk = body.read(amount)
+                read_calls += 1
                 if not isinstance(chunk, bytes):
                     raise StoreError(
                         f"S3 {operation} response body is not bytes")
@@ -476,7 +493,8 @@ class S3Store:
         """Read no more than ``max_bytes + 1`` bytes from one S3 response."""
         response = self._get_response(key, "GetObject")
         return None if response is None else self._response_body(
-            response, "GetObject", max_bytes)
+            response, "GetObject", max_bytes,
+            self.config.max_body_read_calls)
 
     def read_versioned(self, key):
         response = self._get_response(key, "GetObject")
@@ -484,7 +502,9 @@ class S3Store:
             return ABSENT
         etag = self._response_etag(response, "GetObject", mutation=False)
         limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
-        value = self._response_body(response, "GetObject", limit)
+        value = self._response_body(
+            response, "GetObject", limit,
+            self.config.max_body_read_calls)
         return Versioned(value, VersionToken(etag))
 
     def has(self, key):
