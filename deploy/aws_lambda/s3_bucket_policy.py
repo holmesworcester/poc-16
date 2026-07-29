@@ -20,8 +20,10 @@ def policy(
     mutation for the whole bucket. AWS account administrators who can replace
     the bucket policy, and lifecycle rules that predate the guard, remain
     outside what an S3 bucket policy can prove. Pre-existing object ACLs,
-    tags, annotations, and annotation replication also need an operator audit
-    before the guard is attached.
+    tags, annotations, and replication also need an operator audit before the
+    guard is attached. Replication principals allowed ``ReplicateObject``,
+    ``ReplicateDelete``, ``ReplicateTags``, ``ReplicateObjectAnnotation``, or
+    ``ObjectOwnerOverrideToBucketOwner`` remain trusted.
 
     ``single-publisher`` is intentionally narrower. It is useful only when the
     named principal is the complete writer set and all other bucket writers
@@ -70,9 +72,11 @@ def policy(
                     "s3:DeleteObjectTagging",
                     "s3:DeleteObjectVersionTagging",
                     "s3:PutObjectAcl",
+                    "s3:PutObjectVersionAcl",
                     "s3:PutObjectAnnotation",
                     "s3:PutObjectTagging",
                     "s3:PutObjectVersionTagging",
+                    "s3:UpdateObjectEncryption",
                 ],
                 "Resource": [root, objects],
             },
@@ -126,12 +130,15 @@ def main(argv=None):
     if args.profile == "bucket-wide":
         note = (
             "bucket-wide profile: audit existing lifecycle rules, object "
-            "ACLs, tags, annotations, and annotation replication before "
-            "attaching; prefer BucketOwnerEnforced; policy and replication "
+            "ACLs, tags, annotations, and replication before attaching; "
+            "prefer BucketOwnerEnforced; ReplicateObject, ReplicateDelete, "
+            "ReplicateTags, ReplicateObjectAnnotation, "
+            "ObjectOwnerOverrideToBucketOwner, bucket-policy, and KMS-key "
             "administrators remain trusted")
     else:
         note = (
-            "single-publisher profile: all other writers and bucket-policy "
+            "single-publisher profile: all other writers, replication "
+            "principals, bucket-policy administrators, and KMS-key "
             "administrators remain trusted")
     print(note, file=sys.stderr)
     print(json.dumps(

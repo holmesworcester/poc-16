@@ -487,9 +487,11 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
         "s3:DeleteObjectTagging",
         "s3:DeleteObjectVersionTagging",
         "s3:PutObjectAcl",
+        "s3:PutObjectVersionAcl",
         "s3:PutObjectAnnotation",
         "s3:PutObjectTagging",
         "s3:PutObjectVersionTagging",
+        "s3:UpdateObjectEncryption",
     }
     assert metadata["Resource"] == authoritative_resources
     assert all(
@@ -504,9 +506,22 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
         }}
     assert statements["DenyLifecycleMutation"]["Action"] \
         == "s3:PutLifecycleConfiguration"
-    assert all(
-        "s3:ReplicateObjectAnnotation" not in statement["Action"]
-        for statement in document["Statement"])
+    guarded_actions = {
+        action
+        for statement in document["Statement"]
+        for action in (
+            [statement["Action"]]
+            if isinstance(statement["Action"], str)
+            else statement["Action"])
+    }
+    trusted_replication_actions = {
+        "s3:ReplicateObject",
+        "s3:ReplicateDelete",
+        "s3:ReplicateTags",
+        "s3:ReplicateObjectAnnotation",
+        "s3:ObjectOwnerOverrideToBucketOwner",
+    }
+    assert guarded_actions.isdisjoint(trusted_replication_actions)
 
 
 def test_single_publisher_policy_names_its_residual_trust_boundary():
