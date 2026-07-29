@@ -32,6 +32,7 @@ from core.object_store import (
     authoritative_key,
     validate_key,
 )
+from .sdk_smoke import require_s3_capabilities
 
 
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -290,10 +291,13 @@ class S3Store:
         try:
             boto3 = importlib.import_module("boto3")
             botocore_config = importlib.import_module("botocore.config")
+            botocore_session = importlib.import_module("botocore.session")
         except ImportError as error:
             raise RuntimeError(
                 "boto3 and botocore are required unless S3 clients are "
                 "injected") from error
+        require_s3_capabilities(
+            botocore_config.Config, botocore_session.get_session())
 
         base = {
             "connect_timeout": config.connect_timeout,

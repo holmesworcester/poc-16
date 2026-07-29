@@ -754,11 +754,32 @@ def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
             clients.append((service, kwargs, client))
             return client
 
+    class FakeSession:
+        @staticmethod
+        def get_service_model(service):
+            assert service == "s3"
+            operation = type("Operation", (), {
+                "input_shape": type("Shape", (), {
+                    "members": {
+                        "ChecksumSHA256": object(),
+                        "IfMatch": object(),
+                        "IfNoneMatch": object(),
+                    },
+                })(),
+            })()
+            return type("Service", (), {
+                "operation_model": staticmethod(
+                    lambda name: operation if name == "PutObject" else None),
+            })()
+
     def module(name):
         if name == "boto3":
             return FakeBoto3
         if name == "botocore.config":
             return type("Module", (), {"Config": FakeConfig})
+        if name == "botocore.session":
+            return type("Module", (), {
+                "get_session": staticmethod(FakeSession)})
         raise AssertionError(name)
 
     monkeypatch.setattr(
@@ -777,27 +798,86 @@ def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
         addressing_style="virtual",
         read_total_max_attempts=7))
 
-    assert [item.kwargs["retries"] for item in configs] == [
+    assert configs[0].kwargs == {
+        "ignore_configured_endpoint_urls": True}
+    runtime_configs = configs[1:]
+    assert [item.kwargs["retries"] for item in runtime_configs] == [
         {"mode": "standard", "total_max_attempts": 7},
         {"mode": "standard", "total_max_attempts": 1},
     ]
     assert all(item.kwargs["s3"] == {"addressing_style": "virtual"}
-               for item in configs)
+               for item in runtime_configs)
     assert all(
         item.kwargs["ignore_configured_endpoint_urls"] is True
-        for item in configs)
+        for item in runtime_configs)
     assert clients[0][:2] == ("s3", {
-        "config": configs[0],
+        "config": runtime_configs[0],
         "region_name": "us-west-2",
         "endpoint_url": "https://s3.us-west-2.amazonaws.com",
     })
     assert clients[1][:2] == ("s3", {
-        "config": configs[1],
+        "config": runtime_configs[1],
         "region_name": "us-west-2",
         "endpoint_url": "https://s3.us-west-2.amazonaws.com",
     })
     assert store._read_client is clients[0][2]
     assert store._mutation_client is clients[1][2]
+
+
+def test_sdk_store_startup_rejects_an_old_model_before_client_creation(
+        monkeypatch):
+    client_calls = []
+
+    class Config:
+        def __init__(self, **_options):
+            pass
+
+    class Session:
+        @staticmethod
+        def get_service_model(_service):
+            operation = type("Operation", (), {
+                "input_shape": type("Shape", (), {
+                    "members": {
+                        "ChecksumSHA256": object(),
+                        "IfNoneMatch": object(),
+                    },
+                })(),
+            })()
+            return type("Service", (), {
+                "operation_model": staticmethod(lambda _name: operation),
+            })()
+
+    class Boto3:
+        @staticmethod
+        def client(*args, **kwargs):
+            client_calls.append((args, kwargs))
+            return object()
+
+    modules = {
+        "boto3": Boto3,
+        "botocore.config": type("Module", (), {"Config": Config}),
+        "botocore.session": type("Module", (), {
+            "get_session": staticmethod(Session),
+        }),
+    }
+    monkeypatch.setattr(
+        "adapters.s3.store.importlib.import_module",
+        lambda name: modules[name])
+
+    with pytest.raises(RuntimeError, match="lacks IfMatch"):
+        S3Store(config())
+    assert client_calls == []
+
+
+def test_injected_sdk_clients_do_not_run_the_installed_capability_probe(
+        monkeypatch):
+    monkeypatch.setattr(
+        "adapters.s3.store.require_s3_capabilities",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("injected clients probed the installed SDK")))
+
+    client = ScriptedClient()
+    assert S3Store(config(), client=client)._read_client is client
 
 
 def test_injected_botocore_client_must_disable_hidden_mutation_retries():
