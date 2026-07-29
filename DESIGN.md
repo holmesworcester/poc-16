@@ -189,21 +189,25 @@ rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
 whose home is outside that exact leaf. **RangeTree** is a logical map from each
 opaque ordered range separator to its leaf and closure oids. It uses the same
 persistent Merkle-treap primitive as every other authenticated tree; it is not
-a second tree implementation. On an additions-only commit SQLite's
-`fact_boundaries` partial index finds the old stable-boundary window and
-`fact_keys` reads only its current members. The publisher rebuilds those
-leaves and path-copies their wire-map rows; it never traverses RangeTree to
-discover local ranges, enumerates RangeTree entries, calls `Node.keys`, or runs
-the unconditional corpus-wide ordered fact-key query. Equal subtrees have
-equal object ids, so sync descends only remote paths whose oids are not present
-in the local RangeTree. Repair, format cutover, deactivation, and
-canonical-authority changes deliberately retain the full reference build.
+a second tree implementation. On an additions-only commit the publisher
+performs one bounded authenticated predecessor/successor search per new key,
+verifies the selected old leaf pile, unions its members with the new keys, and
+path-copies the replacement wire-map rows. It neither enumerates RangeTree nor
+consults a SQLite range directory, calls `Node.keys`, or runs an unconditional
+corpus-wide ordered fact-key query. Equal subtrees have equal object ids, so
+sync descends only remote paths whose oids are not present in the local
+RangeTree. Repair, format cutover, deactivation, and canonical-authority
+changes deliberately retain the full SQLite-backed reference build: those
+operations reconstruct client-local standing and have no CF authorization
+counterpart.
 
 RangeTree is an authenticated wire map for synchronization and store recovery,
-not a fourth local or Worker index. A database-free Worker does not open it
-and never scans timestamp/fid keys: `WorkerView` exact-reads only FactTree,
-SuppTree, and AuthorityTree. An edge responder may serve RangeTree objects by
-oid, but it does not interpret them; the CF Worker never traverses RangeTree.
+not a fourth authorization index. A read-only database-free Worker does not
+need it and never scans timestamp/fid keys: `WorkerView` exact-reads only
+FactTree, SuppTree, and AuthorityTree. A store-backed publisher, whether
+locally hosted or moved to an edge later, can use the same bounded RangeTree
+neighbor operation without constructing SQLite. An edge responder may also
+serve RangeTree objects by oid without interpreting them.
 FactTree cannot substitute for this map without also gaining ordered raw-fact
 residency and pile/closure routing; object-store LIST cannot substitute
 because object names are content hashes and include unreachable history.
@@ -476,12 +480,12 @@ bytes on demand.
 
 | Seed facts | Post p50 | Post p95 | object touches/post | immutable KiB/post |
 |---:|---:|---:|---:|---:|
-| 1,000 | 35.07 ms | 40.17 ms | 93.0 | 97.0 |
-| 5,000 | 19.88 ms | 22.62 ms | 101.3 | 48.0 |
-| 10,000 | 22.73 ms | 24.66 ms | 119.3 | 63.7 |
+| 1,000 | 12.20 ms | 19.55 ms | 90.6 | 43.0 |
+| 5,000 | 23.75 ms | 25.90 ms | 109.6 | 72.8 |
+| 10,000 | 22.01 ms | 27.70 ms | 122.9 | 71.9 |
 
 Every measured post performed zero `Node.keys` calls. Authenticated-tree and
-RangeTree touches grow with their paths (93–119 here), not with the
+RangeTree touches grow with their paths (91–123 here), not with the
 1,000–10,000-fact corpus. A primed same-root idle dial measured 0.007–0.008 ms
 p50/p95 locally and performed no fact, tree, object, or blob-demand scan.
 These numbers are diagnostic, not cross-machine service guarantees.

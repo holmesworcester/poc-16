@@ -128,13 +128,16 @@ class Publisher:
             store.put_if_absent("obj/" + oid, raw)
             return oid
 
-        fetch = lambda oid: store.get("obj/" + oid)
+        objects = {}
+
+        def fetch(oid):
+            if oid not in objects:
+                objects[oid] = store.get("obj/" + oid)
+            return objects[oid]
+
         incremental = reuse and not forced_rebuild \
             and not authority_changed and not deactivated \
             and previous_root is not None
-        changed_ranges = node.catalog(ws).changed_ranges(
-            node.fact_of(ws, fid).key for fid in changed) \
-            if incremental else None
 
         previous = None
         if previous_root:
@@ -145,9 +148,16 @@ class Publisher:
             if previous is not None and previous.anchor != ws:
                 raise ValueError("root anchor")
         if incremental and previous and previous.manifest:
-            manifest_oid = manifest.update(
-                previous.manifest, changed_ranges,
-                lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)
+            if changed:
+                changed_ranges = manifest.changed_ranges(
+                    previous.manifest,
+                    (node.fact_of(ws, fid).key for fid in changed),
+                    fetch)
+                manifest_oid = manifest.update(
+                    previous.manifest, changed_ranges,
+                    lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)
+            else:
+                manifest_oid = previous.manifest
         else:
             incremental = False
             _, manifest_oid = manifest.build(

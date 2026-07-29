@@ -1,9 +1,10 @@
-"""Canonical bulk/path-copy equivalence for RangeTree."""
+"""Canonical authenticated discovery and path-copy equivalence for RangeTree."""
 import json
 import random
-import sqlite3
 
-from core import catalog, manifest, shape
+import pytest
+
+from core import btreap, manifest, shape
 from core.crypto import h
 from core.fact import Fact
 
@@ -42,20 +43,11 @@ def test_randomized_batches_match_clean_full_build_and_touch_bounded_paths():
         rng = random.Random(seed)
         rng.shuffle(order)
         active, objects, root, largest_touch = {}, {}, "", 0
-        db = sqlite3.connect(":memory:")
-        db.executescript(catalog.SCHEMA)
-        ranges = catalog.Catalog(db, "")
         at = 0
         while at < len(order):
             batch = order[at:at + rng.randint(1, 7)]
             at += len(batch)
             active.update((fact.fid, fact) for fact in batch)
-            for fact in batch:
-                ranges.stage(fact)
-            ranges.commit_stage(fact.fid for fact in batch)
-            db.executemany(
-                "INSERT INTO proofs VALUES(?,0)",
-                ((fact.fid,) for fact in batch))
             fresh = set()
             if not root:
                 _, root = manifest.build(
@@ -64,8 +56,8 @@ def test_randomized_batches_match_clean_full_build_and_touch_bounded_paths():
             else:
                 before_depth = json.loads(objects[root])["depth"]
                 root = manifest.update(
-                    root, ranges.changed_ranges(
-                        fact.key for fact in batch),
+                    root, manifest.changed_ranges(
+                        root, (fact.key for fact in batch), objects.get),
                     active.get, lambda fid: (), objects.get,
                     _emitter(objects, fresh))
                 assert len(fresh) <= len(batch) * (
@@ -86,4 +78,33 @@ def test_randomized_batches_match_clean_full_build_and_touch_bounded_paths():
         assert largest_touch < len(corpus)
         canonical = canonical or root
         assert root == canonical
-        db.close()
+
+
+def test_new_key_discovery_reads_one_authenticated_path_not_the_map(
+        monkeypatch):
+    corpus = _corpus()
+    active = {fact.fid: fact for fact in corpus}
+    objects = {}
+    entries, root = manifest.build(
+        (fact.key for fact in corpus), active.get, lambda fid: (),
+        _emitter(objects))
+    candidate = Fact("sample", 500, [], {"new": True})
+    assert candidate.fid not in active
+    touched = []
+
+    def fetch(oid):
+        touched.append(oid)
+        return objects.get(oid)
+
+    monkeypatch.setattr(
+        btreap.Reader, "items",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("range discovery enumerated the tree")))
+    ranges = manifest.changed_ranges(root, (candidate.key,), fetch)
+
+    assert any(candidate.key in keys for _, keys in ranges)
+    assert sum(len(keys) for _, keys in ranges) < len(corpus)
+    assert len(set(touched)) <= json.loads(objects[root])["depth"] + 2
+    assert len(entries) > 2
+    with pytest.raises(ValueError, match="changed range key"):
+        manifest.changed_ranges(root, (None,), objects.get)

@@ -24,8 +24,6 @@ from .kernel import (
     extend_proofs,
     rebuild_proofs,
 )
-from .shape import boundary, parse_key
-
 TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX))
@@ -42,11 +40,8 @@ CREATE TABLE IF NOT EXISTS fact_index(
     PRIMARY KEY(kind, k0, k1, src));
 CREATE INDEX IF NOT EXISTS fact_index_by_src
     ON fact_index(src, kind, k0, k1);
-CREATE INDEX IF NOT EXISTS fact_keys
-    ON fact_index(k0, src) WHERE kind='fact.key';
-CREATE INDEX IF NOT EXISTS fact_boundaries
-    ON fact_index(k0, src)
-    WHERE kind='fact.key' AND k1='1';
+DROP INDEX IF EXISTS fact_keys;
+DROP INDEX IF EXISTS fact_boundaries;
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS edges(
     src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
@@ -60,7 +55,7 @@ def _index_rows(fact):
         raise ValueError("reserved fact index kind")
     return (
         (TYPE_INDEX, fact.t, "", fact.fid),
-        (KEY_INDEX, fact.key, "1" if boundary(fact.fid) else "", fact.fid),
+        (KEY_INDEX, fact.key, "", fact.fid),
         *((*offer, fact.fid) for offer in fact.offers()),
     )
 
@@ -88,15 +83,22 @@ def upgrade_schema(db):
     if not columns:
         return
     if "blob" in columns:
-        # v23 already used canonical blobs but predates reconciliation-key
-        # rows. Backfill before _sync_index can republish an old root.
-        needs_key_rows = db.execute(
+        # v23 predates reconciliation-key rows; early v24 key rows also
+        # carried a now-removed boundary marker. Normalize either local shape
+        # before _sync_index can republish an old root.
+        needs_key_reindex = db.execute(
             "SELECT 1 FROM facts LIMIT 1").fetchone() is not None \
-            and db.execute(
-                "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
-                (KEY_INDEX,)).fetchone() is None
+            and (
+                db.execute(
+                    "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
+                    (KEY_INDEX,)).fetchone() is None
+                or db.execute(
+                    "SELECT 1 FROM fact_index "
+                    "WHERE kind=? AND k1!='' LIMIT 1",
+                    (KEY_INDEX,)).fetchone() is not None
+            )
         try:
-            if needs_key_rows:
+            if needs_key_reindex:
                 db.execute("BEGIN")
                 _reindex(db)
             db.execute("DROP TABLE IF EXISTS offers")
@@ -213,60 +215,6 @@ class Catalog:
     def by_type(self, tag):
         """Current facts of one type, selected through the generic index."""
         return self.indexed(TYPE_INDEX, tag)
-
-    def changed_ranges(self, keys):
-        """Affected ``(old separator, current keys)`` wire ranges.
-
-        SQLite's generic key rows own local discovery. The RangeTree remains
-        only the authenticated wire map served to other database-backed peers.
-        """
-        changed = frozenset(keys)
-        if not changed:
-            return ()
-        for fact_key in changed:
-            _, fid = parse_key(fact_key)
-            if self.db.execute(
-                    "SELECT 1 FROM fact_index i "
-                    "JOIN proofs p ON p.fid=i.src "
-                    "WHERE i.kind='fact.key' AND i.k0=? AND i.src=?",
-                    (fact_key, fid)).fetchone() is None:
-                raise ValueError("changed range fact")
-
-        def edge(fact_key, before):
-            op, order = ("<", "DESC") if before else (">", "ASC")
-            candidates = self.db.execute(
-                "SELECT i.k0 FROM fact_index i "
-                "INDEXED BY fact_boundaries "
-                "JOIN proofs p ON p.fid=i.src "
-                "WHERE i.kind='fact.key' AND i.k1='1' "
-                f"AND i.k0 {op} ? ORDER BY i.k0 {order} LIMIT ?",
-                (fact_key, len(changed) + 1),
-            )
-            return next((
-                item for (item,) in candidates if item not in changed
-            ), None)
-
-        windows = {
-            (edge(fact_key, True), edge(fact_key, False))
-            for fact_key in changed
-        }
-        out = []
-        for left, right in sorted(windows, key=lambda pair: pair[0] or ""):
-            rows = tuple(
-                fact_key for (fact_key,) in self.db.execute(
-                    "SELECT i.k0 FROM fact_index i INDEXED BY fact_keys "
-                    "JOIN proofs p ON p.fid=i.src "
-                    "WHERE i.kind='fact.key' AND i.k0>? AND i.k0<=? "
-                    "ORDER BY i.k0",
-                    (left or "", right or "\uffff"),
-                )
-            )
-            old = next(
-                (fact_key for fact_key in rows if fact_key not in changed),
-                None,
-            )
-            out.append((old, rows))
-        return tuple(out)
 
     def staged_ids(self):
         return tuple(

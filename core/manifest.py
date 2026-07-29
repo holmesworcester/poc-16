@@ -3,9 +3,9 @@
 One entry maps a leaf's first opaque canonical key to its pile oid and closure
 sibling oid. The RangeTree uses the same persistent authenticated treap as the
 Worker indexes: full build defines one history-independent root, while an
-additions-only commit encodes SQLite-selected ranges and path-copies only its
-tree paths. Equal RangeTree subtrees and equal leaf piles have equal oids, so
-one-sided sync still prunes by oid alone.
+additions-only commit locates affected leaves through bounded authenticated
+neighbor reads and path-copies only their tree paths. Equal RangeTree subtrees
+and equal leaf piles have equal oids, so one-sided sync still prunes by oid.
 """
 import json
 from bisect import bisect_right
@@ -16,7 +16,7 @@ from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
 from .close import decode_pile, encode_pile
 from .crypto import h
 from .fact import canon
-from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
+from .shape import boundary, fid_of, is_key, key, stable_cut_positions, valid_fid
 from .store import verified_object
 
 # The one format identity. Written into the root; checked by decode_root.
@@ -112,12 +112,67 @@ def build(keys, fact_of, deps_of, emit):
     return entries, encode(entries, emit)
 
 
-def update(root, changed_ranges, fact_of, deps_of, fetch, emit):
-    """Encode SQLite-selected range replacements into the wire RangeTree."""
+def changed_ranges(root, keys, fetch):
+    """Verified old leaves plus new keys for an additions-only update.
+
+    A new key has no exact row yet, so locate its predecessor and successor in
+    the published RangeTree. The old home pile supplies the bounded existing
+    members. Content-derived cuts never disappear, so insertion can only split
+    that old leaf; no database key directory or full tree walk is involved.
+    """
+    if not root:
+        raise ValueError("missing RangeTree")
+    supplied = tuple(keys)
+    if any(not is_key(item) for item in supplied):
+        raise ValueError("changed range key")
+    changed = tuple(sorted(set(supplied)))
+    if not changed:
+        return ()
+    reader = btreap.Reader(root, RANGE_SEED, fetch)
+    members = {}
+    groups = {}
+
+    def member_keys(found):
+        if found.sep not in members:
+            members[found.sep] = tuple(
+                key(fact) for fact in range_members(found, fetch))
+        return members[found.sep]
+
+    for item in changed:
+        before_row, after_row = reader.neighbors(item)
+        before = _entry(*before_row) if before_row else None
+        after = _entry(*after_row) if after_row else None
+        before_keys = member_keys(before) if before is not None else ()
+        if before is not None and item in before_keys:
+            raise ValueError("changed range already present")
+        if before is None:
+            home = after
+        elif item <= before_keys[-1]:
+            home = before
+        elif after is not None:
+            if not boundary(fid_of(before_keys[-1])):
+                raise ValueError("manifest range boundary")
+            home = after
+        else:
+            home = before \
+                if not boundary(fid_of(before_keys[-1])) else None
+        if home is not None:
+            member_keys(home)
+        groups.setdefault(home.sep if home else None, set()).add(item)
+
+    out = []
+    for old_sep, additions in groups.items():
+        old = members.get(old_sep, ())
+        out.append((old_sep, tuple(sorted((*old, *additions)))))
+    return tuple(sorted(out, key=lambda row: row[0] or "\uffff"))
+
+
+def update(root, ranges, fact_of, deps_of, fetch, emit):
+    """Encode authenticated range replacements into the wire RangeTree."""
     if not root:
         raise ValueError("missing RangeTree")
     changes = {}
-    for old_sep, keys in changed_ranges:
+    for old_sep, keys in ranges:
         if old_sep is not None:
             if not is_key(old_sep):
                 raise ValueError("manifest separator")

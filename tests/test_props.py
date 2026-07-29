@@ -837,17 +837,25 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
 
 def test_hot_commit_uses_range_tree_without_corpus_scan(
         world, monkeypatch):
-    """SQLite selects one range; publication path-copies wire-tree pages."""
+    """The authenticated RangeTree selects one old leaf and path-copies it."""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    resolved, puts, statements = [], [], []
+    resolved, puts, statements, discovered = [], [], [], []
     keys = n.keys
     store = n.store(ws)
     real_put = store.put_if_absent
     real = node_module.resolve_deps
+    real_ranges = manifest.changed_ranges
+
+    def observed_ranges(root, changed, fetch):
+        ranges = real_ranges(root, changed, fetch)
+        discovered.append(sum(len(current) for _, current in ranges))
+        return ranges
+
     monkeypatch.setattr(
         node_module, "resolve_deps",
         lambda fact, db: (resolved.append(fact.fid), real(fact, db))[1])
+    monkeypatch.setattr(manifest, "changed_ranges", observed_ranges)
     monkeypatch.setattr(
         store, "put_if_absent",
         lambda k, b: (puts.append(k), real_put(k, b))[1])
@@ -866,10 +874,12 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
         and "join proofs" in statement.lower()
         and "order by" in statement.lower()
     ]
-    assert ordered
-    assert all("indexed by fact_" in statement for statement in ordered)
-    assert any("fact_boundaries" in statement for statement in ordered)
-    assert any("fact_keys" in statement for statement in ordered)
+    assert not ordered
+    assert discovered and 0 < max(discovered) < total
+    assert n.idx(ws).execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name IN ('fact_keys','fact_boundaries')"
+    ).fetchone() is None
     objects = [k for k in puts if k.startswith("obj/")]
     tree_depth = max(
         row["depth"] for row in

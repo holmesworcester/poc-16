@@ -295,10 +295,10 @@ class Node:
         return self.select(ws, catalog.TYPE_INDEX, tag, **options)
 
     def keys(self, ws):
-        """Canonical eligible keys for repair/full sync, read from SQLite."""
+        """Canonical eligible keys for client-only repair/full publication."""
         return [
             fact_key for (fact_key,) in self.idx(ws).execute(
-                "SELECT i.k0 FROM fact_index i INDEXED BY fact_keys "
+                "SELECT i.k0 FROM fact_index i "
                 "JOIN proofs p ON p.fid=i.src "
                 "WHERE i.kind='fact.key' ORDER BY i.k0")
         ]

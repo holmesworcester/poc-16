@@ -5,7 +5,7 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from core import catalog, cmds
+from core import catalog, cmds, manifest
 from core import kernel as kernel_module
 from core.close import close, decode_pile
 from core.kernel import drain, resolve_deps
@@ -174,14 +174,14 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     index = node.idx(workspace)
     total = index.execute("SELECT COUNT(*) FROM proofs").fetchone()[0]
     discovered = []
-    changed_ranges = catalog.Catalog.changed_ranges
+    changed_ranges = manifest.changed_ranges
 
-    def bounded_ranges(self, keys):
-        ranges = changed_ranges(self, keys)
+    def bounded_ranges(root, keys, fetch):
+        ranges = changed_ranges(root, keys, fetch)
         discovered.append(sum(len(current) for _, current in ranges))
         return ranges
 
-    monkeypatch.setattr(catalog.Catalog, "changed_ranges", bounded_ranges)
+    monkeypatch.setattr(manifest, "changed_ranges", bounded_ranges)
     monkeypatch.setattr(
         catalog.Catalog, "eligible_ids",
         lambda *_: pytest.fail("ordinary append enumerated all proofs"))

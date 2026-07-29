@@ -35,6 +35,11 @@ root + immutable objects → WorkerView → family authorize hook
 
 It must remain database-free. `Node` composes local resources and exposes the
 workspace-bound runtime; do not add another admission route in daemon or sync.
+Preserve read isomorphism: if both client and CF paths ask the same published
+state question, both must use the authenticated-tree answer. SQLite is for
+client-only durable intent, query assembly, and full repair—not a parallel
+answer or range directory. New fact placement uses bounded RangeTree neighbor
+reads over immutable objects.
 
 Every behavior change needs a realistic test. Prefer real daemon/socket
 coverage at product boundaries and direct hostile-input tests at codec and

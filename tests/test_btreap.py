@@ -59,6 +59,24 @@ def test_exact_reads_are_bounded_and_missing_is_authenticated():
     assert reader.pages_read <= built.page_depth
 
 
+def test_neighbor_reads_are_bounded_and_match_ordered_map():
+    objects = {}
+    built = btreap.build(rows(), SEED, emitter(objects))
+    reader = btreap.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+
+    assert reader.neighbors("a") == (None, rows()[0])
+    assert reader.pages_read <= built.page_depth
+    exact = rows()[128]
+    assert reader.neighbors(exact[0]) == (exact, exact)
+    assert reader.pages_read <= built.page_depth
+    assert reader.neighbors("key:00128:after") == (rows()[128], rows()[129])
+    assert reader.pages_read <= built.page_depth
+    assert reader.neighbors("z") == (rows()[-1], None)
+    assert reader.pages_read <= built.page_depth
+
+
 def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     objects = {}
     initial = btreap.build(rows(), SEED, emitter(objects))

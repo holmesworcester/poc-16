@@ -191,22 +191,35 @@ class Reader:
         return rank
 
     def get(self, key):
+        before, _ = self.neighbors(key)
+        return before[1] if before is not None and before[0] == key else None
+
+    def neighbors(self, key):
+        """Authenticated rows immediately at/before and at/after ``key``.
+
+        This is the ordered counterpart to ``get``: it follows one bounded
+        search path and never enumerates the logical map.
+        """
         if not isinstance(key, str) or not key:
             raise ValueError("btreap lookup key")
         self.pages_read = 0
         self._page_budget = self.max_page_depth
         oid, lo, hi, parent = self.root, None, None, None
+        before = after = None
         while oid:
             page = self._page(oid)
             rank = self._ordered(page, lo, hi, parent)
+            row = (page["key"], page["value"])
             if key == page["key"]:
-                return page["value"]
+                return row, row
             if key < page["key"]:
+                after = row
                 oid, hi = page["left"], page["key"]
             else:
+                before = row
                 oid, lo = page["right"], page["key"]
             parent = rank
-        return None
+        return before, after
 
     def items(self, known=None, *, max_pages=None):
         """The complete map, sourcing shared pages from ``known`` locally."""

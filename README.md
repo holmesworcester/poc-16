@@ -72,7 +72,9 @@ Nodes synchronize on their daemon cadence. `python3 -m core core.sync
 WORKSPACE` requests an immediate dial, and `core.rebuild WORKSPACE`
 reconstructs eligibility and authenticated/generic indexes around the stable
 local fact catalog and published root. Family queries assemble views directly
-from that catalog.
+from that catalog. Published-state decisions shared with the CF path use the
+same authenticated trees; SQLite is reserved for client-local intent, query
+assembly, and full repair.
 
 The single `ctl/command` endpoint is a trusted node-local control plane.
 Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`

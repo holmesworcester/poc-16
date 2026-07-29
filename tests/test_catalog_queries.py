@@ -6,7 +6,6 @@ from core import catalog, cmds, suppression_state
 from core.crypto import h
 from core.fact import Fact, canon, decode, encode
 from core.node import Node
-from core.shape import boundary
 
 
 def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
@@ -29,8 +28,7 @@ def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
             "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)))
         assert rows == {
             (catalog.TYPE_INDEX, fact.t, ""),
-            (catalog.KEY_INDEX, fact.key,
-             "1" if boundary(fact.fid) else ""),
+            (catalog.KEY_INDEX, fact.key, ""),
             *fact.offers(),
         }
 
@@ -119,10 +117,8 @@ def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
     )) == {
         (catalog.TYPE_INDEX, "legacy", "", committed.fid),
         (catalog.TYPE_INDEX, "legacy", "", pending.fid),
-        (catalog.KEY_INDEX, committed.key,
-         "1" if boundary(committed.fid) else "", committed.fid),
-        (catalog.KEY_INDEX, pending.key,
-         "1" if boundary(pending.fid) else "", pending.fid),
+        (catalog.KEY_INDEX, committed.key, "", committed.fid),
+        (catalog.KEY_INDEX, pending.key, "", pending.fid),
         ("legacy-key", "one", "", committed.fid),
     }
     assert db.execute(
@@ -185,8 +181,7 @@ def test_rebuild_replaces_stale_and_missing_generic_index_rows(tmp_path):
             "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)
         )) == {
             (catalog.TYPE_INDEX, fact.t, ""),
-            (catalog.KEY_INDEX, fact.key,
-             "1" if boundary(fact.fid) else ""),
+            (catalog.KEY_INDEX, fact.key, ""),
             *fact.offers(),
         }
     assert [row["fid"] for row in cmds.msgs(node, workspace)] == [message]
@@ -230,6 +225,46 @@ def test_v23_blob_catalog_backfills_keys_before_foreign_root_republish(
     ).fetchone() == reopened.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts"
     ).fetchone()
+
+
+def test_old_boundary_directory_is_normalized_without_republishing(tmp_path):
+    directory = tmp_path / "node"
+    node = Node(str(directory))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "kept", ts=2)
+    root = node.store(workspace).get("root")
+    index = node.idx(workspace)
+    fid = index.execute(
+        "SELECT src FROM fact_index WHERE kind=? LIMIT 1",
+        (catalog.KEY_INDEX,),
+    ).fetchone()[0]
+    index.execute(
+        "UPDATE fact_index SET k1='1' WHERE kind=? AND src=?",
+        (catalog.KEY_INDEX, fid),
+    )
+    index.execute(
+        "CREATE INDEX fact_boundaries ON fact_index(k0,src) "
+        "WHERE kind='fact.key' AND k1='1'"
+    )
+    index.execute(
+        "CREATE INDEX fact_keys ON fact_index(k0,src) "
+        "WHERE kind='fact.key'"
+    )
+    index.commit()
+    index.close()
+
+    reopened = Node(str(directory))
+    upgraded = reopened.idx(workspace)
+
+    assert upgraded.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? AND k1!=''",
+        (catalog.KEY_INDEX,),
+    ).fetchone() is None
+    assert upgraded.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name IN ('fact_keys','fact_boundaries')"
+    ).fetchone() is None
+    assert reopened.store(workspace).get("root") == root
 
 
 def test_index_lookup_decodes_only_selected_fact_bodies(tmp_path, monkeypatch):
