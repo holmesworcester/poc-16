@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from core import actions, cmds
+from core import cmds, suppression_state
 from core.close import close, encode_pile
 from core.crypto import h
 from core.kernel import resolve_deps
@@ -91,7 +91,9 @@ def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
         {signed.fid: (), item.fid: (signed.fid, provider)})
     deliver(node, workspace, pile)
 
-    with pytest.raises(actions.ScreenRejected, match="suppressed authority"):
+    with pytest.raises(
+            suppression_state.ScreenRejected,
+            match="suppressed authority"):
         node.turn(workspace)
     assert node.fact_of(workspace, item.fid) is None
     assert node.store(workspace).list("pile/") == []
@@ -116,7 +118,9 @@ def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
         {signed.fid: (), item.fid: (signed.fid, admin_fid)})
     deliver(node, workspace, pile)
 
-    with pytest.raises(actions.ScreenRejected, match="suppressed authority"):
+    with pytest.raises(
+            suppression_state.ScreenRejected,
+            match="suppressed authority"):
         node.turn(workspace)
     assert node.fact_of(workspace, item.fid) is None
 
@@ -136,8 +140,9 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
         "SELECT src FROM offers WHERE name='member' AND a0=? ORDER BY src",
         (bob,)).fetchall()
     assert len(providers) == 2
-    assert actions.active(
-        node.idx(workspace), actions.principal_sid("member", bob))
+    assert suppression_state.active(
+        node.idx(workspace),
+        suppression_state.principal_sid("member", bob))
 
 
 def test_action_leg_converges_before_the_ordinary_fact_diff(
@@ -220,8 +225,10 @@ def test_one_poisoned_action_witness_does_not_block_an_honest_action(
 
     assert rows[honest_sid][0] in accepted
     assert rows[poisoned_sid][0] not in accepted
-    assert actions.active(destination.idx(workspace), honest_sid)
-    assert not actions.active(destination.idx(workspace), poisoned_sid)
+    assert suppression_state.active(
+        destination.idx(workspace), honest_sid)
+    assert not suppression_state.active(
+        destination.idx(workspace), poisoned_sid)
     assert destination.app.execute(
         "SELECT 1 FROM projected WHERE ws=? AND src=?",
         (workspace, honest_target)).fetchone() is None

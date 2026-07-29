@@ -1,7 +1,7 @@
 """Delegated admin authority reaches the running eviction command."""
 import pytest
 
-from core import actions, cmds
+from core import cmds, suppression_state
 from core.crypto import keypair
 from facts.auth.admin import admins
 from core.node import Node, now_ms
@@ -37,8 +37,9 @@ def test_only_an_admin_can_grant_and_grants_delegate(tmp_path):
     removal_fid = cmds.evict(node, workspace, "bob")
     removal = node.fact_of(workspace, removal_fid)
     assert removal.body["pk"] == carol
-    assert actions.active(
-        node.idx(workspace), actions.principal_sid("member", bob))
+    assert suppression_state.active(
+        node.idx(workspace),
+        suppression_state.principal_sid("member", bob))
     assert ("removal", bob) not in node.globals(workspace)
 
 

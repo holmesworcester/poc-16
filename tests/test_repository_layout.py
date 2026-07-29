@@ -67,3 +67,10 @@ def test_deleted_dual_paths_do_not_return():
             "facts/content/legacy_file.py",
             "tests/test_auth_upgrade.py"):
         assert not (ROOT / path).exists()
+
+
+def test_suppression_state_uses_the_explicit_module_name():
+    assert (ROOT / "core" / "suppression_state.py").is_file()
+    assert (ROOT / "tests" / "test_suppression_state.py").is_file()
+    assert not (ROOT / "core" / "actions.py").exists()
+    assert not (ROOT / "tests" / "test_actions.py").exists()

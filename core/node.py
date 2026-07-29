@@ -18,7 +18,7 @@ import time
 
 import facts
 
-from . import actions, indexes, manifest
+from . import indexes, manifest, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon, from_json
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS edges(
 CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-""" + actions.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
+""" + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
 INDEX_VERSION = "family-contract-v18-current-families"
 APP_VERSION = 4
 
@@ -351,7 +351,7 @@ class Node:
     def _provider_scopes(self, ws, provider, incoming=None):
         """Scopes whose activation withdraws this authority candidate."""
         incoming = incoming or {}
-        scopes = set(actions.provider_scopes(provider))
+        scopes = set(suppression_state.provider_scopes(provider))
         policy = facts.policy_for(provider.t)
         if policy is None:
             return frozenset(scopes)
@@ -362,7 +362,7 @@ class Node:
             guarded = incoming.get(fid) or self.fact_of(ws, fid)
             if guarded is None:
                 raise ValueError("authority liveness edge")
-            scopes.update(actions.provider_scopes(guarded))
+            scopes.update(suppression_state.provider_scopes(guarded))
         return frozenset(scopes)
 
     def _screen_guards(self, ws, fact, edges, incoming=None):
@@ -379,10 +379,11 @@ class Node:
             if provider is None:
                 raise ValueError("authorization guard edge")
             if any(
-                    actions.blocks(idx, sid, fact.key)
+                    suppression_state.blocks(idx, sid, fact.key)
                     for sid in self._provider_scopes(
                         ws, provider, incoming)):
-                raise actions.ScreenRejected("suppressed authority")
+                raise suppression_state.ScreenRejected(
+                    "suppressed authority")
 
     def _action_evidence(self, ws, fact, incoming, incoming_deps):
         """Persist the action's already-validated immutable proof closure."""
@@ -421,12 +422,12 @@ class Node:
             result = drain(stream, ws)
             candidates = [
                 valid.fact for valid in result.valids
-                if valid.fact.fid == fid and sid in actions.action_sids(
-                    valid.fact)
+                if valid.fact.fid == fid \
+                and sid in suppression_state.action_sids(valid.fact)
             ]
             if blobs or not result.ok or len(candidates) != 1:
                 raise ValueError("action evidence")
-            actions.archive(
+            suppression_state.archive(
                 self.idx(ws), candidates[0], evidence_oid)
 
     # ---- the turn ------------------------------------------------------------
@@ -477,7 +478,7 @@ class Node:
                     if resident:
                         self.log_arrivals(ws, resident)
                     pump(self, ws)
-                except actions.ScreenRejected as error:
+                except suppression_state.ScreenRejected as error:
                     self._restore_authoritative_projections(ws)
                     self._quarantine_ingress(
                         ws, source, raw, error)
@@ -572,7 +573,8 @@ class Node:
                 idx.executemany(
                     "INSERT OR IGNORE INTO supp VALUES(?,?)",
                     ((f.fid, sid)
-                     for sid in sorted(actions.fact_scopes(f))))
+                     for sid in sorted(
+                         suppression_state.fact_scopes(f))))
                 for name, a0, a1 in f.offers():
                     idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                                 (name, a0, a1, f.fid))
@@ -612,13 +614,13 @@ class Node:
                      for edge in edges),
                 )
                 self._screen_guards(ws, f, edges, incoming)
-                for sid in actions.action_sids(f):
+                for sid in suppression_state.action_sids(f):
                     before = idx.execute(
                         "SELECT fid FROM actions WHERE sid=?",
                         (sid,)).fetchone()
                     evidence = self._action_evidence(
                         ws, f, incoming, incoming_deps)
-                    actions.archive(idx, f, evidence)
+                    suppression_state.archive(idx, f, evidence)
                     after = idx.execute(
                         "SELECT fid FROM actions WHERE sid=?",
                         (sid,)).fetchone()
@@ -723,7 +725,8 @@ class Node:
             idx.executemany(
                 "INSERT OR IGNORE INTO supp VALUES(?,?)",
                 ((fact.fid, sid)
-                 for sid in sorted(actions.fact_scopes(fact))))
+                 for sid in sorted(
+                     suppression_state.fact_scopes(fact))))
             for name, a0, a1 in fact.offers():
                 idx.execute(
                     "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
@@ -898,7 +901,7 @@ class Node:
             changed_fids=newfids if incremental else None)
         root = manifest.encode_root(
             ws, self.globals(ws), man,
-            action_summary=actions.summary(idx),
+            action_summary=suppression_state.summary(idx),
             layout_seed=seed, trees=trees)
         if st.cas("root", etag, root) is None:  # the single commit point
             raise RuntimeError("root changed")
@@ -1054,7 +1057,7 @@ class Node:
 
     def suppressed(self, ws, fact):
         """The one local mask: explicit fact scopes intersect active actions."""
-        return actions.suppresses(self.idx(ws), fact)
+        return suppression_state.suppresses(self.idx(ws), fact)
 
     def apply_actions(self, ws, sids):
         """Retract resident victims through the rebuildable sid reverse map."""

@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from core import actions, btreap, cmds, indexes, manifest, mint
+from core import btreap, cmds, indexes, manifest, mint, suppression_state
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -571,7 +571,7 @@ def full_manifest(n, ws):
         ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
     return manifest.encode_root(
         ws, n.globals(ws), man,
-        action_summary=actions.summary(idx),
+        action_summary=suppression_state.summary(idx),
         layout_seed=seed, trees=trees)
 
 
@@ -723,7 +723,7 @@ def test_action_set_rides_the_root_without_removal_globals(world):
     root = json.loads(n.store(ws).get("root"))
     assert manifest.decode_root(n.store(ws).get("root"))[1] == frozenset()
     assert root["globals"] == []
-    assert root["actions"] == actions.summary(n.idx(ws))
+    assert root["actions"] == suppression_state.summary(n.idx(ws))
 
 
 def test_poison_pile_is_litter_not_poison(world):

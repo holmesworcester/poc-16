@@ -11,7 +11,7 @@ where a pile came from.
 import json
 import sqlite3
 
-from . import actions, indexes, manifest, shape
+from . import indexes, manifest, shape, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
@@ -274,7 +274,8 @@ def _validated_action(ws, sid, fid, evidence_oid, fetch):
     result = drain(stream, ws)
     matches = [
         valid.fact for valid in result.valids
-        if valid.fact.fid == fid and sid in actions.action_sids(valid.fact)
+        if valid.fact.fid == fid \
+            and sid in suppression_state.action_sids(valid.fact)
     ]
     if blobs or not result.ok or len(matches) != 1:
         raise ValueError("action evidence")
@@ -315,7 +316,8 @@ def pull_actions(node, ws, remote_root, fetch, rows=None):
             node._sync_index(ws)
             for _, fact, evidence_oid, raw in accepted:
                 node.store(ws).put_if_absent("obj/" + evidence_oid, raw)
-                actions.archive(node.idx(ws), fact, evidence_oid)
+                suppression_state.archive(
+                    node.idx(ws), fact, evidence_oid)
             node.apply_actions(ws, [sid for sid, _, _, _ in accepted])
             node.commit(ws)
             from .pump import pump

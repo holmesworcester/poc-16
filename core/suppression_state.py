@@ -1,10 +1,15 @@
-"""Durable suppression actions and their local reverse projection.
+"""Admitted suppression state and its local reverse projection.
 
 The authenticated state is keyed by suppression id: SuppTree answers whether
 one id is CLEAR or ACTIVE and FactTree's matching action slot names the
 immutable evidence record.  This SQLite table is only the node-local,
 rebuildable reverse projection used to enumerate already-resident victims.
 It is never consulted by a Worker and is not a second authority index.
+
+``core.suppression`` defines the pure clear-envelope selector and exact-target
+vocabulary. This module is the stateful half: it derives the ids activated by
+validated action facts, records their evidence, and answers admission and
+projection queries against the derived index.
 """
 import json
 
