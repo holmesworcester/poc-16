@@ -137,16 +137,19 @@ themselves.
 
 The intended cloud path is direct-to-object-store and is not implemented yet.
 After proving workspace upload authority, a client will receive short-lived
-capabilities for exact `obj/<sha256>` keys, upload immutable file objects
-first, and finally upload one exact `pile/<member>/<sha256>` publication
-intent. A conforming direct PUT must bind a collision-resistant body digest,
-an exact length or hard byte ceiling, expiry, and `If-None-Match: *`; clients
-will receive no LIST, DELETE, or `root` permission. An S3/R2 object-created
-event, authenticated poke, or scheduled scan will wake a database-free
-publisher. That publisher will validate the pile and objects, update the
-authenticated trees, CAS `root`, and retire the pile only after the committed
-root proves publication. A lost event or poke will affect latency, not
-durability.
+capabilities for exact broker-chosen upload keys, upload file objects first,
+and finally upload one exact closed-pile publication intent. A provider that
+can prove the complete request may target canonical `obj/<sha256>` and
+`pile/<member>/<sha256>` keys directly. An isolated-ingress deployment uses
+session-scoped staging keys and lets the publisher promote only verified
+SHA-256 objects. In either case a conforming request binds a
+collision-resistant body digest, an exact length or hard byte ceiling, expiry,
+and create-only semantics; clients receive no LIST, DELETE, or `root`
+permission. An S3/R2 object-created event, authenticated poke, or scheduled
+scan wakes a database-free publisher. That publisher validates the pile and
+objects, updates the authenticated trees, CASes `root`, and retires ingress
+only after the committed root proves publication. A lost event or poke affects
+latency, not durability.
 
 There is no correctness reason to proxy immutable bytes through the publisher.
 The object store can enforce the exact key, create-only condition, checksum,

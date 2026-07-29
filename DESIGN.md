@@ -154,13 +154,15 @@ The running cloud deployment is read-only: a host daemon still receives remote
 object/pile PUTs and performs publication. The target write path removes that
 proxy without giving clients root authority. After authorization, a broker
 signs short-lived, exact-key conditional PUT capabilities. A client uploads
-content-addressed `obj/` values first and a `pile/<member>/` intent last.
-Provider object-created events, an authenticated poke, and a scheduled fallback
-may all wake interchangeable database-free publishers. Wakeups are advisory;
-the durable pile is the work item. Publishers verify workspace, uploader,
+objects first and a closed-pile intent last. A provider-verified deployment
+may write canonical content addresses; an isolated-ingress deployment writes
+session-scoped staging keys and promotes only verified values. Provider
+object-created events, an authenticated poke, and a scheduled fallback may all
+wake interchangeable database-free publishers. Wakeups are advisory; the
+durable pile is the work item. Publishers verify workspace, uploader,
 checksums, closure, and referenced objects, then update the authenticated
 trees and CAS root. Missing objects, throttling, crashes, and CAS loss retain
-the pile. Clients can neither list/delete the prefix nor write root.
+the pile. Clients can neither list/delete the namespace nor write root.
 
 The split follows the authority actually required by each step:
 
@@ -171,10 +173,13 @@ publisher  reads workspace ingress, derives pages, CASes root, proves retirement
 reader     reads only the pinned root and its authenticated closure
 ```
 
-Proxying immutable bytes through the publisher adds bandwidth and failure
-surface but no serialization point: immutable creation is already safe at the
-object store. Publication is different. It combines a validated pile with the
-current authenticated snapshot and therefore remains behind the one root CAS
+Proxying the client upload through the publisher adds bandwidth and failure
+surface but no serialization point: the client writes its exact granted
+object-store key directly. A staging deployment may require the publisher to
+read, verify, and promote that stored value before it becomes canonical; that
+is a bounded validation step, not a client-to-function upload path.
+Publication itself is different. It combines a validated pile with the current
+authenticated snapshot and therefore remains behind the one root CAS
 authority. A presigned request is a bearer capability, not workspace
 membership; the broker derives its exact key and signed constraints from a
 fresh workspace-bound authorization decision, and a publisher repeats all
