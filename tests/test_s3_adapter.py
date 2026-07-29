@@ -1,0 +1,643 @@
+"""Amazon S3 adapter requests, races, and failure classification."""
+import base64
+import hashlib
+import io
+from pathlib import Path
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from adapters.s3 import S3Config, S3Store
+from core.crypto import h
+from core.object_store import (
+    ABSENT,
+    CREATED,
+    EXISTS,
+    Applied,
+    OutcomeUnknown,
+    RetryableStoreError,
+    STALE,
+    StoreError,
+    Versioned,
+    VersionToken,
+    ensure_object,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ServiceError(Exception):
+    def __init__(self, status, code=None):
+        super().__init__(code or str(status))
+        self.response = {
+            "ResponseMetadata": {"HTTPStatusCode": status},
+            "Error": {"Code": code or str(status)},
+        }
+
+
+class Body(io.BytesIO):
+    def __init__(self, value):
+        super().__init__(value)
+        self.reads = 0
+        self.closes = 0
+
+    def read(self, *args):
+        self.reads += 1
+        return super().read(*args)
+
+    def close(self):
+        self.closes += 1
+        super().close()
+
+
+class ScriptedClient:
+    def __init__(self, **outcomes):
+        self.outcomes = {
+            operation: list(values)
+            for operation, values in outcomes.items()
+        }
+        self.calls = []
+
+    def _call(self, operation, args):
+        self.calls.append((operation, args))
+        values = self.outcomes.get(operation)
+        if not values:
+            raise AssertionError(f"unexpected {operation}")
+        outcome = values.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(args)
+        return outcome
+
+    def get_object(self, **args):
+        return self._call("get_object", args)
+
+    def head_object(self, **args):
+        return self._call("head_object", args)
+
+    def put_object(self, **args):
+        return self._call("put_object", args)
+
+    def list_objects_v2(self, **args):
+        return self._call("list_objects_v2", args)
+
+    def delete_object(self, **args):
+        return self._call("delete_object", args)
+
+
+def checksum(value):
+    return base64.b64encode(hashlib.sha256(value).digest()).decode("ascii")
+
+
+def config(**changes):
+    values = {
+        "bucket": "test-bucket",
+        "prefix": "tenant/workspace",
+        "expected_bucket_owner": "123456789012",
+    }
+    values.update(changes)
+    return S3Config(**values)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"bucket": "an_arn_is_not_a_general_bucket"},
+        {"bucket": "directory--x-s3"},
+        {"bucket": "192.168.1.1"},
+        {"prefix": "../workspace"},
+        {"prefix": "workspace/"},
+        {"server_side_encryption": "AES256",
+         "sse_kms_key_id": "kms-key"},
+        {"server_side_encryption": "AES256",
+         "bucket_key_enabled": True},
+        {"list_page_size": 1001},
+        {"read_total_max_attempts": 0},
+    ])
+def test_config_rejects_ambiguous_or_unsupported_provider_settings(changes):
+    with pytest.raises((TypeError, ValueError)):
+        config(**changes)
+
+
+def test_read_versioned_and_cas_preserve_the_same_response_opaque_etags():
+    old, new = b"old root", b"new root"
+    body = Body(old)
+    client = ScriptedClient(
+        get_object=[{"Body": body, "ETag": '"opaque:old-7"'}],
+        put_object=[{"ETag": '"opaque:new-11"'}])
+    store = S3Store(config(
+        server_side_encryption="aws:kms",
+        sse_kms_key_id="arn:aws:kms:us-west-2:123456789012:key/test",
+        bucket_key_enabled=True), client=client)
+
+    versioned = store.read_versioned("root")
+    assert versioned == Versioned(
+        old, VersionToken('"opaque:old-7"'))
+    assert body.reads == 1
+    assert body.closes == 1
+    assert client.calls[0] == ("get_object", {
+        "Bucket": "test-bucket",
+        "Key": "tenant/workspace/root",
+        "ExpectedBucketOwner": "123456789012",
+    })
+
+    assert store.cas("root", versioned.token, new) == Applied(
+        VersionToken('"opaque:new-11"'))
+    assert client.calls[1] == ("put_object", {
+        "Bucket": "test-bucket",
+        "Key": "tenant/workspace/root",
+        "ExpectedBucketOwner": "123456789012",
+        "Body": new,
+        "ChecksumAlgorithm": "SHA256",
+        "ChecksumSHA256": checksum(new),
+        "ServerSideEncryption": "aws:kms",
+        "SSEKMSKeyId":
+            "arn:aws:kms:us-west-2:123456789012:key/test",
+        "BucketKeyEnabled": True,
+        "IfMatch": '"opaque:old-7"',
+    })
+
+
+def test_absent_read_and_first_root_cas_use_if_none_match():
+    raw = b"first root"
+    client = ScriptedClient(
+        get_object=[ServiceError(404, "NoSuchKey")],
+        put_object=[{"ETag": '"first"'}])
+    store = S3Store(config(), client=client)
+
+    assert store.read_versioned("root") is ABSENT
+    assert store.cas("root", ABSENT, raw) == Applied(
+        VersionToken('"first"'))
+    assert client.calls[-1] == ("put_object", {
+        "Bucket": "test-bucket",
+        "Key": "tenant/workspace/root",
+        "ExpectedBucketOwner": "123456789012",
+        "Body": raw,
+        "ChecksumAlgorithm": "SHA256",
+        "ChecksumSHA256": checksum(raw),
+        "IfNoneMatch": "*",
+    })
+
+
+def test_conditional_object_create_sends_address_checksum_and_header():
+    raw = b"immutable bytes"
+    key = "obj/" + h(raw)
+    client = ScriptedClient(put_object=[{}])
+    store = S3Store(config(), client=client)
+
+    assert store.put_if_absent(key, raw) is CREATED
+    assert client.calls == [("put_object", {
+        "Bucket": "test-bucket",
+        "Key": "tenant/workspace/" + key,
+        "ExpectedBucketOwner": "123456789012",
+        "Body": raw,
+        "ChecksumAlgorithm": "SHA256",
+        "ChecksumSHA256": checksum(raw),
+        "IfNoneMatch": "*",
+    })]
+
+
+def test_ensure_object_verifies_both_collision_and_unknown_outcome():
+    raw = b"immutable bytes"
+    oid = h(raw)
+
+    same_body = Body(raw)
+    collision_client = ScriptedClient(
+        put_object=[ServiceError(412, "PreconditionFailed")],
+        get_object=[{"Body": same_body, "ETag": '"incumbent"'}])
+    assert ensure_object(
+        S3Store(config(), client=collision_client), oid, raw) is EXISTS
+    assert [call[0] for call in collision_client.calls] == [
+        "put_object", "get_object"]
+
+    unknown_body = Body(raw)
+    unknown_client = ScriptedClient(
+        put_object=[ServiceError(500, "InternalError")],
+        get_object=[{"Body": unknown_body, "ETag": '"applied"'}])
+    assert ensure_object(
+        S3Store(config(), client=unknown_client), oid, raw) is EXISTS
+    assert [call[0] for call in unknown_client.calls] == [
+        "put_object", "get_object"]
+
+    wrong_client = ScriptedClient(
+        put_object=[ServiceError(412, "PreconditionFailed")],
+        get_object=[{"Body": Body(b"wrong"), "ETag": '"wrong"'}])
+    with pytest.raises(ValueError, match="immutable object conflict"):
+        ensure_object(S3Store(config(), client=wrong_client), oid, raw)
+
+
+def test_ensure_object_retries_once_after_unknown_and_strong_absent_read():
+    raw = b"immutable bytes"
+    oid = h(raw)
+    client = ScriptedClient(
+        put_object=[
+            ConnectionError("response lost"),
+            {},
+        ],
+        get_object=[ServiceError(404, "NoSuchKey")])
+
+    assert ensure_object(
+        S3Store(config(), client=client), oid, raw) is CREATED
+    assert [call[0] for call in client.calls] == [
+        "put_object", "get_object", "put_object"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ServiceError(403, "AccessDenied"), StoreError),
+        (ServiceError(404, "NoSuchBucket"), StoreError),
+        (ServiceError(409, "Conflict"), RetryableStoreError),
+        (ServiceError(429, "TooManyRequests"), RetryableStoreError),
+        (ServiceError(500, "InternalError"), RetryableStoreError),
+        (ConnectionError("network down"), RetryableStoreError),
+    ])
+def test_get_failure_classification_never_turns_403_into_absence(
+        error, expected):
+    store = S3Store(
+        config(), client=ScriptedClient(get_object=[error]))
+
+    with pytest.raises(expected) as caught:
+        store.get("root")
+    assert type(caught.value) is expected
+
+
+def test_get_and_head_only_treat_key_level_404_as_absent():
+    client = ScriptedClient(
+        get_object=[ServiceError(404, "NoSuchKey")],
+        head_object=[
+            ServiceError(404, "NotFound"),
+            ServiceError(403, "AccessDenied"),
+        ])
+    store = S3Store(config(), client=client)
+
+    assert store.get("invite/missing") is None
+    assert not store.has("invite/missing")
+    with pytest.raises(StoreError) as caught:
+        store.has("invite/forbidden")
+    assert type(caught.value) is StoreError
+
+
+def test_streaming_body_transport_failure_is_retryable_and_still_closes():
+    class BrokenBody:
+        def __init__(self):
+            self.closed = False
+
+        @staticmethod
+        def read():
+            raise ConnectionError("body truncated")
+
+        def close(self):
+            self.closed = True
+            raise ConnectionError("cleanup also failed")
+
+    body = BrokenBody()
+    store = S3Store(config(), client=ScriptedClient(get_object=[{
+        "Body": body,
+        "ETag": '"response-token"',
+    }]))
+
+    with pytest.raises(RetryableStoreError, match="ConnectionError"):
+        store.read_versioned("root")
+    assert body.closed
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ServiceError(403, "AccessDenied"), StoreError),
+        (ServiceError(404, "NoSuchBucket"), StoreError),
+        (ServiceError(409, "ConditionalRequestConflict"),
+         RetryableStoreError),
+        (ServiceError(429, "TooManyRequests"), RetryableStoreError),
+        (ServiceError(500, "InternalError"), OutcomeUnknown),
+        (ConnectionError("response lost"), OutcomeUnknown),
+    ])
+def test_conditional_create_failure_classification(error, expected):
+    raw = b"immutable"
+    store = S3Store(
+        config(), client=ScriptedClient(put_object=[error]))
+
+    with pytest.raises(expected) as caught:
+        store.put_if_absent("obj/" + h(raw), raw)
+    assert type(caught.value) is expected
+
+
+def test_precondition_results_are_definitive_only_in_their_context():
+    token = VersionToken('"old"')
+    create = S3Store(config(), client=ScriptedClient(
+        put_object=[ServiceError(412, "PreconditionFailed")]))
+    assert create.put_if_absent("obj/" + h(b"x"), b"x") is EXISTS
+
+    stale = S3Store(config(), client=ScriptedClient(put_object=[
+        ServiceError(412, "PreconditionFailed"),
+        ServiceError(404, "NoSuchKey"),
+    ]))
+    assert stale.cas("root", token, b"new") is STALE
+    assert stale.cas("root", token, b"newer") is STALE
+
+    absent = S3Store(config(), client=ScriptedClient(
+        put_object=[ServiceError(404, "NoSuchKey")]))
+    with pytest.raises(StoreError) as caught:
+        absent.cas("root", ABSENT, b"first")
+    assert type(caught.value) is StoreError
+
+    missing_bucket = S3Store(config(), client=ScriptedClient(
+        put_object=[ServiceError(404, "NoSuchBucket")]))
+    with pytest.raises(StoreError) as caught:
+        missing_bucket.cas("root", token, b"new")
+    assert type(caught.value) is StoreError
+
+
+def test_successful_cas_without_etag_is_an_unknown_applied_mutation():
+    store = S3Store(
+        config(), client=ScriptedClient(put_object=[{}]))
+
+    with pytest.raises(OutcomeUnknown, match="without a usable ETag"):
+        store.cas("root", ABSENT, b"root")
+
+
+def test_non_authoritative_put_and_delete_use_direct_scoped_requests():
+    raw = b"pile"
+    client = ScriptedClient(
+        put_object=[{}],
+        delete_object=[{}])
+    store = S3Store(config(), client=client)
+
+    assert store.put("pile/member/key", raw) is None
+    assert store.delete("pile/member/key") is None
+    assert client.calls == [
+        ("put_object", {
+            "Bucket": "test-bucket",
+            "Key": "tenant/workspace/pile/member/key",
+            "ExpectedBucketOwner": "123456789012",
+            "Body": raw,
+            "ChecksumAlgorithm": "SHA256",
+            "ChecksumSHA256": checksum(raw),
+        }),
+        ("delete_object", {
+            "Bucket": "test-bucket",
+            "Key": "tenant/workspace/pile/member/key",
+            "ExpectedBucketOwner": "123456789012",
+        }),
+    ]
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_ambiguous_unconditional_mutations_raise_outcome_unknown(operation):
+    client = ScriptedClient(**{
+        "put_object" if operation == "put" else "delete_object":
+            [ServiceError(503, "SlowDown")]})
+    store = S3Store(config(), client=client)
+
+    with pytest.raises(OutcomeUnknown):
+        if operation == "put":
+            store.put("pile/member/key", b"value")
+        else:
+            store.delete("pile/member/key")
+
+
+def test_authoritative_guards_fail_before_any_sdk_request():
+    client = ScriptedClient()
+    store = S3Store(config(), client=client)
+    raw = b"value"
+
+    for key in ("root", "root/child", "obj", "obj/" + h(raw)):
+        with pytest.raises(ValueError):
+            store.put(key, raw)
+        with pytest.raises(ValueError):
+            store.delete(key)
+    with pytest.raises(ValueError, match="compare-and-swap"):
+        store.put_if_absent("root", raw)
+    with pytest.raises(ValueError, match="address"):
+        store.put_if_absent("obj/" + "0" * 64, raw)
+    with pytest.raises(ValueError, match="only root"):
+        store.cas("obj/" + h(raw), ABSENT, raw)
+    with pytest.raises(TypeError, match="version token"):
+        store.cas("root", "not-a-token", raw)
+    for key in ("/outside", "../outside", "pile//key", "Root"):
+        with pytest.raises(ValueError):
+            store.put(key, raw)
+    assert client.calls == []
+
+
+def test_list_objects_v2_reads_every_page_with_bounded_exact_requests():
+    client = ScriptedClient(list_objects_v2=[
+        {
+            "Contents": [
+                {"Key": "tenant/workspace/pile/member/b"},
+                {"Key": "tenant/workspace/pile/member/a"},
+            ],
+            "IsTruncated": True,
+            "NextContinuationToken": "opaque-page-token",
+        },
+        {
+            "Contents": [
+                {"Key": "tenant/workspace/pile/member/c"},
+                {"Key": "tenant/workspace/pile/member/b"},
+            ],
+            "IsTruncated": False,
+        },
+    ])
+    store = S3Store(
+        config(list_page_size=37, max_list_pages=2), client=client)
+
+    assert store.list("pile/member/") == [
+        "pile/member/a", "pile/member/b", "pile/member/c"]
+    assert client.calls == [
+        ("list_objects_v2", {
+            "Bucket": "test-bucket",
+            "Prefix": "tenant/workspace/pile/member/",
+            "MaxKeys": 37,
+            "ExpectedBucketOwner": "123456789012",
+        }),
+        ("list_objects_v2", {
+            "Bucket": "test-bucket",
+            "Prefix": "tenant/workspace/pile/member/",
+            "MaxKeys": 37,
+            "ExpectedBucketOwner": "123456789012",
+            "ContinuationToken": "opaque-page-token",
+        }),
+    ]
+
+
+@pytest.mark.parametrize("second_page", [False, True])
+def test_list_rejects_nonadvancing_or_over_bound_pagination(second_page):
+    pages = [{
+        "Contents": [],
+        "IsTruncated": True,
+        "NextContinuationToken": "same",
+    }]
+    if second_page:
+        pages.append({
+            "Contents": [],
+            "IsTruncated": True,
+            "NextContinuationToken": "same",
+        })
+    store = S3Store(
+        config(max_list_pages=2 if second_page else 1),
+        client=ScriptedClient(list_objects_v2=pages))
+
+    message = "token did not advance" if second_page else "page bound"
+    with pytest.raises(StoreError, match=message):
+        store.list("")
+
+
+def test_list_rejects_provider_keys_outside_the_workspace_namespace():
+    store = S3Store(config(), client=ScriptedClient(list_objects_v2=[{
+        "Contents": [{"Key": "other/workspace/pile/member/key"}],
+        "IsTruncated": False,
+    }]))
+
+    with pytest.raises(StoreError, match="out-of-prefix"):
+        store.list("pile/")
+
+
+class ConditionalBucket:
+    def __init__(self, parties):
+        self.values = {}
+        self.lock = threading.Lock()
+        self.start = threading.Barrier(parties)
+        self.generation = 0
+
+    def put(self, **args):
+        self.start.wait(timeout=5)
+        with self.lock:
+            key = args["Key"]
+            if args.get("IfNoneMatch") == "*" and key in self.values:
+                raise ServiceError(412, "PreconditionFailed")
+            if "IfMatch" in args and (
+                    key not in self.values
+                    or self.values[key][1] != args["IfMatch"]):
+                raise ServiceError(412, "PreconditionFailed")
+            self.generation += 1
+            etag = f'"opaque-generation-{self.generation}"'
+            self.values[key] = (args["Body"], etag)
+            return {"ETag": etag}
+
+
+class RaceClient:
+    def __init__(self, bucket):
+        self.bucket = bucket
+
+    def put_object(self, **args):
+        return self.bucket.put(**args)
+
+
+def test_independent_adapter_handles_admit_one_absent_root_winner():
+    bucket = ConditionalBucket(2)
+    stores = [
+        S3Store(config(), client=RaceClient(bucket)),
+        S3Store(config(), client=RaceClient(bucket)),
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            result.result(timeout=5)
+            for result in (
+                pool.submit(stores[0].cas, "root", ABSENT, b"alice"),
+                pool.submit(stores[1].cas, "root", ABSENT, b"bob"),
+            )
+        ]
+
+    assert sum(isinstance(result, Applied) for result in results) == 1
+    assert results.count(STALE) == 1
+    assert bucket.values["tenant/workspace/root"][0] in {
+        b"alice", b"bob"}
+
+
+def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
+        monkeypatch):
+    configs = []
+    clients = []
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            configs.append(self)
+
+    class FakeBoto3:
+        @staticmethod
+        def client(service, **kwargs):
+            client = object()
+            clients.append((service, kwargs, client))
+            return client
+
+    def module(name):
+        if name == "boto3":
+            return FakeBoto3
+        if name == "botocore.config":
+            return type("Module", (), {"Config": FakeConfig})
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "adapters.s3.store.importlib.import_module", module)
+    store = S3Store(config(
+        region_name="us-west-2",
+        endpoint_url="https://s3.us-west-2.amazonaws.com",
+        addressing_style="virtual",
+        read_total_max_attempts=7))
+
+    assert [item.kwargs["retries"] for item in configs] == [
+        {"mode": "standard", "total_max_attempts": 7},
+        {"mode": "standard", "total_max_attempts": 1},
+    ]
+    assert all(item.kwargs["s3"] == {"addressing_style": "virtual"}
+               for item in configs)
+    assert clients[0][:2] == ("s3", {
+        "config": configs[0],
+        "region_name": "us-west-2",
+        "endpoint_url": "https://s3.us-west-2.amazonaws.com",
+    })
+    assert clients[1][:2] == ("s3", {
+        "config": configs[1],
+        "region_name": "us-west-2",
+        "endpoint_url": "https://s3.us-west-2.amazonaws.com",
+    })
+    assert store._read_client is clients[0][2]
+    assert store._mutation_client is clients[1][2]
+
+
+def test_injected_botocore_client_must_disable_hidden_mutation_retries():
+    class Client:
+        def __init__(self, retries):
+            sdk_config = type("Config", (), {"retries": retries})()
+            self.meta = type("Meta", (), {"config": sdk_config})()
+
+    with pytest.raises(ValueError, match="exactly one total attempt"):
+        S3Store(config(), client=Client({
+            "mode": "standard", "total_max_attempts": 3}))
+
+    one_attempt = Client({
+        "mode": "standard", "total_max_attempts": 1})
+    assert S3Store(config(), client=one_attempt)._mutation_client \
+        is one_attempt
+
+    no_retries_after_initial = Client({
+        "mode": "standard", "max_attempts": 0})
+    assert S3Store(
+        config(), client=no_retries_after_initial)._mutation_client \
+        is no_retries_after_initial
+
+
+def test_import_and_injected_construction_do_not_require_provider_sdks():
+    script = r"""
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.split(".", 1)[0] in {"boto3", "botocore"}:
+        raise AssertionError("provider SDK imported")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+from adapters.s3 import S3Config, S3Store
+S3Store(S3Config(bucket="test-bucket"), client=object())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=ROOT,
+        capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
