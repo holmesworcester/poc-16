@@ -160,6 +160,10 @@ credential. In particular, create-only permission does not by itself prove
 that bytes uploaded under a SHA-256 name have that SHA-256 digest. The AWS and
 R2 paths therefore each need live conformance evidence for their exact signed
 request; `Content-MD5` alone is not the content-address proof.
+Cloudflare also requires provider-level separation: unless R2 offers a
+live-proven write-only parent credential, the upload broker targets a separate
+ingress bucket and only the publisher can promote verified objects into the
+canonical workspace bucket. This remains a direct client-to-R2 upload.
 
 ## Cloudflare read-only gateway
 
