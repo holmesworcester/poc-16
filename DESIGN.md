@@ -141,6 +141,19 @@ authoritative adapters. LIST is strong but paginated, and several pages are
 not one transaction. Piles, invites, and quarantine records remain
 non-authoritative operations with explicitly idempotent handling.
 
+The production profile also treats each provider's documented RFC 9110 strong
+ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must
+change when the root bytes change. Adapters reject missing, empty, and `W/`
+weak validators, and the conformance harness records every observed
+token-to-bytes pairing so a fake that aliases one token across distinct bytes
+fails deterministically. This is the same kind of provider assumption as
+acknowledged durability; a live test can exercise it but cannot prove it for
+all values. Deliberately constructing a collision in a provider's underlying
+ETag algorithm is outside this profile. That stronger threat model would need
+an independent conditional generation register, such as DynamoDB on AWS or a
+Durable Object on Cloudflare, because a content hash or R2's non-conditional
+`version` field is not itself a CAS capability.
+
 The Cloudflare authorization deployment is a Python Worker at compatibility
 date `2026-07-29`, selecting Python 3.13 and the Pyodide 0.28.3 dependency
 index through `workers-py` 1.16.0. This choice was made only after a clean
@@ -344,7 +357,9 @@ different bytes. The converse is unnecessary. An `X → Y → X` value-ABA may
 reuse X's token and is safe here because root bytes completely define the
 published state and every referenced object is immutable. This must be
 revisited if later generations gain deletion, GC, or history-dependent side
-effects.
+effects. The direct S3/R2 implementation refines this law under the strong-ETag
+provider axiom above; the abstract model itself does not assume any ETag
+algorithm.
 
 A lost mutation response is not a stale precondition. Publication rereads:
 candidate bytes mean the CAS succeeded; the exact unchanged base permits one
@@ -546,8 +561,14 @@ missing or poisoned witness is skipped without blocking honest actions. The
 RangeTree is then compared by oid: shared pages are read from the authenticated
 local tree, while only novel remote paths and their changed piles are fetched.
 Local-only facts are pushed as one closed pile, remote ranges are assembled,
-and missing live blobs are fetched. Push happens before draining the pull so
-canonical pruning cannot remove a precomputed difference before delivery.
+and missing live blobs are fetched. A full-profile sender first delivers each
+locally available referenced blob as an idempotent, hash-verified immutable
+object, then delivers the fact-only pile. That order matters in a directed
+peer graph: an object-transfer failure cannot leave the receiver with a fact
+difference that only the one-way sender could satisfy. A replica that does
+not yet have a blob may still relay the fact so another source can complete
+it. Push happens before draining the pull so canonical pruning cannot remove
+a precomputed difference before delivery.
 
 Malformed ingress failures and sync failures are quarantined and visible
 through `status`. Malformed roots, pages, facts, selectors, action evidence,
@@ -587,6 +608,8 @@ These numbers are diagnostic, not cross-machine service guarantees.
 - Logical deletion stops query visibility, authorization, and future blob
   demand; it does not erase immutable objects already stored. Physical GC is
   unbuilt.
-- The current prototype assumes one workspace per store directory. Shared
-  multi-workspace buckets, lifecycle policy, and production cloud deployment
-  are out of scope.
+- A local filesystem workspace still has its own store directory. Provider
+  adapters isolate workspaces under validated bucket prefixes, while each
+  read-only Lambda or Worker deployment is intentionally bound to one exact
+  workspace and prefix. Bucket lifecycle/garbage collection and a writable
+  serverless publisher remain future work.
