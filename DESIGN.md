@@ -219,15 +219,30 @@ When a provider cannot enforce this for a raw presigned PUT, the deployment
 uses a narrowly isolated upload verifier that has conditional-create access
 but still has no root, list, delete, or policy authority.
 
+The current Cloudflare primitives make the distinction concrete. R2's
+[S3-compatible `PutObject` surface][r2-s3-api] advertises `Content-MD5`, not a
+flexible SHA-256 checksum, while the [native Worker binding][r2-worker-api]
+accepts a `sha256` put option and a conditional. Thus a raw presigned canonical
+R2 PUT is not assumed safe: Cloudflare either streams it through an
+upload-only verifier or accepts it directly into isolated staging for later
+verified promotion.
+
 Provider credentials must preserve the same separation. AWS can give a
 presigner a PutObject-only resource policy. R2 can attenuate a child
 credential to exact object paths and actions, but its parent Object Read and
-Write token is bucket-scoped and also reads/lists objects. A Cloudflare broker
-therefore must not hold such a parent token for the canonical workspace
-bucket. Unless a narrower parent primitive is live-proven, Cloudflare uses a
-separate ingress bucket: clients upload there directly, while only the
-publisher can validate/promote objects into the canonical bucket and CAS its
-root. The extra bucket is an authority boundary, not a second database.
+Write token is bucket-scoped and also reads, lists, and deletes objects. A
+Cloudflare broker therefore must not hold such a parent token for the
+canonical workspace bucket. Unless a narrower parent primitive is
+live-proven, Cloudflare uses a separate ingress bucket: clients upload there
+directly, while only the publisher can validate/promote objects into the
+canonical bucket and CAS its root. The extra bucket is an authority boundary,
+not a second database. It protects canonical integrity, but does not by itself
+protect acknowledged staging from a compromised parent; that residual
+availability boundary must be either accepted explicitly with client retry
+until root publication or removed with a put-only verifier/parent.
+
+[r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
+[r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 
 The production profile also treats each provider's documented RFC 9110 strong
 ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must

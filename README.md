@@ -159,22 +159,35 @@ objects, updates the authenticated trees, CASes `root`, and retires ingress
 only after the committed root proves publication. A lost event or poke affects
 latency, not durability.
 
-There is no correctness reason to proxy immutable bytes through the publisher.
-The object store can enforce the exact key, create-only condition, checksum,
-and expiry while carrying the data directly from the client. The narrower
-boundary is intentional: uploaders may create only the objects named by their
-grants, while publishers alone may list ingress, read workspace state, create
-derived index pages, retire proven piles, and CAS `root`. If a deployment
-cannot enforce those exact conditional requests, it must keep using the host
-daemon or a narrow upload-only verifier rather than grant a broader bucket
-credential. In particular, create-only permission does not by itself prove
-that bytes uploaded under a SHA-256 name have that SHA-256 digest. The AWS and
-R2 paths therefore each need live conformance evidence for their exact signed
-request; `Content-MD5` alone is not the content-address proof.
-Cloudflare also requires provider-level separation: unless R2 offers a
-live-proven write-only parent credential, the upload broker targets a separate
-ingress bucket and only the publisher can promote verified objects into the
-canonical workspace bucket. This remains a direct client-to-R2 upload.
+There is no correctness reason to proxy immutable bytes through the publisher
+when the provider can enforce the complete request. The narrower boundary is
+intentional: uploaders may create only the objects named by their grants,
+while publishers alone may list ingress, read workspace state, create derived
+index pages, retire proven piles, and CAS `root`. If a deployment cannot
+enforce the exact key, create-only condition, body digest, byte bound, and
+expiry, it must use isolated staging, keep the host daemon, or put a narrow
+streaming upload verifier in front of the object store rather than grant a
+broader bucket credential.
+
+That fallback is concrete on Cloudflare. As checked on 2026-07-29, R2's
+[S3-compatible `PutObject` table][r2-s3-api] advertises conditional writes and
+`Content-MD5`, but not the flexible SHA-256 checksum needed to protect a
+canonical `obj/<sha256>` name. The [native R2 Worker `put` API][r2-worker-api]
+does accept a SHA-256 checksum and a conditional, so a write-only streaming
+Worker can verify a canonical upload without owning `root`; alternatively the
+client uploads directly into an isolated ingress bucket and the publisher
+verifies and promotes it. Raw presigned canonical R2 PUTs remain unproven.
+
+Cloudflare also requires provider-level separation. A child R2 credential can
+be limited to `PutObject`, but the broker's current parent read/write token can
+read, list, and delete within its bucket. It must never target the canonical
+workspace bucket. A separate ingress bucket preserves canonical integrity,
+but parent compromise could still erase unpublished staging; whether that
+availability loss is accepted as a retryable pre-publication boundary or
+requires a put-only verifier/parent remains an explicit deployment decision.
+
+[r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
+[r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 
 ## Cloudflare read-only gateway
 
