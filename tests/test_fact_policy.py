@@ -106,11 +106,7 @@ def test_runtime_policy_rejects_a_forged_nonancestor(
     workspace = cmds.create(node, "alice", ts=1)
     descriptor_fid = send_bytes(
         node, workspace, "one.bin", b"ancestor", ts=10)
-    original = next(
-        node.fact_of(workspace, fid)
-        for (fid,) in node.idx(workspace).execute(
-            "SELECT fid FROM facts WHERE t='chunk'")
-    )
+    original = node.by_type(workspace, "chunk")[0]
     atoms = [
         marker[:] if not (
             marker[0] == "supp" and marker[1] == ANCESTOR

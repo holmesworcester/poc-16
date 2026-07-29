@@ -11,7 +11,7 @@ where a pile came from.
 import json
 import sqlite3
 
-from . import indexes, manifest, shape, suppression_state
+from . import catalog, indexes, manifest, shape, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
@@ -36,6 +36,7 @@ def _resolver(node, ws, extra):
     mem = sqlite3.connect(":memory:")
     with node.lock:
         node.idx(ws).backup(mem)
+    scratch = catalog.Catalog(mem, ws)
 
     def fact_of(fid):
         return extra.get(fid) or node.fact_of(ws, fid)
@@ -43,12 +44,8 @@ def _resolver(node, ws, extra):
     def load(facts):
         facts = tuple(facts)
         extra.update({f.fid: f for f in facts})
-        mem.executemany(
-            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?,1)",
-            ((f.fid, f.ts, f.t, json.dumps(f.to_json())) for f in facts))
-        mem.executemany(
-            "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-            ((*offer, f.fid) for f in facts for offer in f.offers()))
+        for fact in facts:
+            scratch.stage(fact)
         # A newly arrived lower-rank provider can change the canonical winner
         # for facts already present in the scratch copy.  Incrementally ranking
         # only ``facts`` leaves those old rows stale and wedges the next closure

@@ -23,6 +23,7 @@ from .util import (
     deliver,
     inject_device_claim,
     member_src,
+    visible_fids,
 )
 
 
@@ -67,7 +68,7 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
         f"fact:{target}", action_fid)
 
 
-def test_action_reverse_projection_rebuilds_from_the_trees(tmp_path):
+def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
     workspace = cmds.create(node, "alice", ts=1)
@@ -77,16 +78,12 @@ def test_action_reverse_projection_rebuilds_from_the_trees(tmp_path):
     expected_actions = _action_rows(node, workspace)
 
     node.idx(workspace).close()
-    node.app.close()
     os.unlink(directory / "ws" / f"{workspace}.idx.db")
-    os.unlink(directory / "app.db")
 
     rebuilt = Node(str(directory))
     assert _action_rows(rebuilt, workspace) == expected_actions
     assert rebuilt.store(workspace).get("root") == expected_root
-    assert rebuilt.app.execute(
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (workspace, target)).fetchone() is None
+    assert target not in visible_fids(rebuilt, workspace)
 
 
 def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
@@ -146,7 +143,8 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
         member_identity=(bob_secret, bob))
     assert rejoined == bob
     providers = node.idx(workspace).execute(
-        "SELECT src FROM offers WHERE name='member' AND a0=? ORDER BY src",
+        "SELECT src FROM fact_index "
+        "WHERE kind='member' AND k0=? ORDER BY src",
         (bob,)).fetchall()
     assert len(providers) == 2
     assert suppression_state.active(
@@ -334,9 +332,7 @@ def test_action_evidence_recanonicalizes_across_equivalent_providers(
     for peer, _, posted, _ in peers:
         peer.rebuild(workspace)
         assert _action_rows(peer, workspace)[0][2] == evidence[0]
-        assert peer.app.execute(
-            "SELECT 1 FROM projected WHERE ws=? AND src=?",
-            (workspace, posted)).fetchone() is None
+        assert posted not in visible_fids(peer, workspace)
 
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):
@@ -404,9 +400,7 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
 
     assert _action_rows(destination, workspace)[0][:2] == (
         f"fact:{target}", action_fid)
-    assert destination.app.execute(
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (workspace, target)).fetchone() is None
+    assert target not in visible_fids(destination, workspace)
 
 
 def test_one_poisoned_action_witness_does_not_block_an_honest_action(
@@ -448,9 +442,5 @@ def test_one_poisoned_action_witness_does_not_block_an_honest_action(
         destination.idx(workspace), honest_sid)
     assert not suppression_state.active(
         destination.idx(workspace), poisoned_sid)
-    assert destination.app.execute(
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (workspace, honest_target)).fetchone() is None
-    assert destination.app.execute(
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (workspace, poisoned_target)).fetchone() is not None
+    assert honest_target not in visible_fids(destination, workspace)
+    assert poisoned_target in visible_fids(destination, workspace)

@@ -5,7 +5,6 @@ from .._policy import FamilyPolicy, SidOffer
 from . import signature
 
 TAG = "evict"
-TABLES = ("removal_rows",)
 POLICY = FamilyPolicy(
     authorization_guards=("admin",),
     action_offers=(SidOffer("removed", "member"),),
@@ -40,14 +39,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    fact = valid.fact
-    db.execute(
-        "INSERT INTO removal_rows VALUES(?,?,?)",
-        (workspace, fact.fid, fact.offers()[0][1]))
 
 
 # COMMANDS

@@ -3,7 +3,7 @@
 Authority flows in one direction:
 
     ingress bytes -> kernel judgment -> catalog settlement -> root CAS
-                  -> client projection -> ingress retirement
+                  -> ingress retirement
 
 The daemon and local commands both enter here. Transport never gains a second
 admission path, and the database-free Worker remains entirely separate.
@@ -13,7 +13,6 @@ import facts
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, resolve_deps
-from .pump import pump
 
 
 class AuthorityRejected(ValueError):
@@ -54,36 +53,15 @@ class WorkspaceRuntime:
                     valids = tuple(
                         valid for valid in judgment.valids
                         if node.fact_of(ws, valid.fact.fid) is not None)
-                    arrived = set()
                     for oid, blob in blobs.items():
-                        if store.put_if_absent("obj/" + oid, blob):
-                            arrived.add(oid)
+                        store.put_if_absent("obj/" + oid, blob)
                     node.commit(ws, settlement)
-                    spilled = {
-                        valid.fact.fid: refs
-                        for valid in valids
-                        if (refs := facts.blob_refs(valid.fact))
-                    }
-                    redelivered = {
-                        fid for fid, refs in spilled.items()
-                        if set(refs) & arrived
-                    }
-                    if redelivered:
-                        node.log_arrivals(ws, redelivered, repeat=True)
-                    resident = set(spilled) - redelivered
-                    if resident:
-                        node.log_arrivals(ws, resident)
-                    self.project()
                 except Exception:
-                    node._restore_authoritative_projections(ws)
+                    node._restore_authoritative_state(ws)
                     raise
                 store.delete(source)
                 fresh_all.extend(valids)
             return fresh_all
-
-    def project(self):
-        """Advance the disposable client view to the workspace log."""
-        return pump(self.node, self.workspace)
 
     def ingest(self, news, deps_new, blobs=None):
         """Close locally authored facts, enqueue them, and run one turn."""

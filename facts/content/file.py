@@ -18,7 +18,6 @@ from ..auth import signature
 from . import chunk as chunkfam
 
 TAG = "file_bao"
-TABLES = ("file_rows",)
 POLICY = FamilyPolicy(
     suppression=(Self(), Parent("member")),
     direct_targets=DELETE_SELF,
@@ -92,15 +91,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    f, body = valid.fact, valid.fact.body
-    db.execute(
-        "INSERT INTO file_rows VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (workspace, f.fid, body["chan"], body["name"], body["size"],
-         body["root"], body["width"], body["n"], body["pk"], f.ts))
-
-
 # COMMANDS
 def send(node, workspace, channel, path, name=None, ts=None):
     """Prove every slice locally, spill it, then publish one closed pile."""
@@ -156,14 +146,13 @@ def send(node, workspace, channel, path, name=None, ts=None):
 
 def save(node, workspace, selector, out_path):
     """Re-verify every slice, then atomically replace the requested path."""
-    record = resolve(node, workspace, selector)
+    record, cids = _resolve_state(node, workspace, selector)
     if record is None:
         raise ValueError("no such file")
     if record["have"] < record["total"]:
         raise ValueError(
             f"file incomplete: have {record['have']}/{record['total']} slices")
     store = node.store(workspace)
-    cids = _cids(node, workspace, record["root"])
     parts = (
         bao.verify(
             store.get("obj/" + cids[index]),
@@ -195,60 +184,93 @@ def save(node, workspace, selector, out_path):
 
 
 # QUERIES
-def files(node, workspace):
+def _file_state(node, workspace):
+    """Decode descriptors and verify resident Bao slices on demand."""
     with node.lock:
-        rows = node.app.execute(
-            "SELECT fid, chan, name, size, root, total, have, ts, "
-            "blob, encoding "
-            "FROM file_progress WHERE ws=? ORDER BY ts, fid",
-            (workspace,)).fetchall()
-    return [
-        {"fid": fid, "chan": channel, "name": name, "size": size,
-         "root": root, "blob": blob, "encoding": encoding,
-         "total": total, "have": have,
-         "complete": have >= total,
-         "pct": 100 if total == 0 else have * 100 // total,
-         "ts": timestamp}
-        for (
-            fid, channel, name, size, root, total, have, timestamp,
-            blob, encoding,
-        ) in rows
-    ]
+        descriptors = {
+            fact.fid: fact for fact in node.by_type(workspace, TAG)
+        }
+        cids = {fid: {} for fid in descriptors}
+        store = node.store(workspace)
+        for fact in node.by_type(workspace, chunkfam.TAG):
+            descriptor = descriptors.get(dict(fact.refs()).get("file"))
+            if descriptor is None:
+                continue
+            body, parent = fact.body, descriptor.body
+            if body["root"] != parent["root"] \
+                    or body["n"] != parent["n"] \
+                    or body["pk"] != parent["pk"] \
+                    or body["chan"] != parent["chan"]:
+                continue
+            raw = store.get("obj/" + body["cid"])
+            try:
+                if raw is None or len(raw) > bao.MAX_PROOF_BYTES \
+                        or h(raw) != body["cid"]:
+                    continue
+                bao.verify(raw, parent["root"], body["i"], parent["size"])
+            except Exception:
+                continue
+            cids[descriptor.fid].setdefault(body["i"], body["cid"])
+
+        records = []
+        for fact in descriptors.values():
+            body = fact.body
+            have = len(cids[fact.fid])
+            total = body["n"]
+            records.append({
+                "fid": fact.fid,
+                "chan": body["chan"],
+                "name": body["name"],
+                "size": body["size"],
+                "root": body["root"],
+                "blob": None,
+                "encoding": "bao-v1",
+                "total": total,
+                "have": have,
+                "complete": have >= total,
+                "pct": 100 if total == 0 else have * 100 // total,
+                "ts": fact.ts,
+            })
+    return (
+        sorted(records, key=lambda row: (row["ts"], row["fid"])),
+        cids,
+    )
 
 
-def resolve(node, workspace, selector):
-    listing = files(node, workspace)
+def files(node, workspace):
+    return _file_state(node, workspace)[0]
+
+
+def _resolve_state(node, workspace, selector):
+    listing, cids = _file_state(node, workspace)
     for record in listing:
         if selector in (record["fid"], record["root"], record["blob"]):
-            return record
+            return record, cids[record["fid"]]
     matches = [
         record for record in listing
         if record["fid"].startswith(selector)
     ]
-    return matches[0] if len(matches) == 1 else None
+    record = matches[0] if len(matches) == 1 else None
+    return (record, cids[record["fid"]]) if record else (None, {})
+
+
+def resolve(node, workspace, selector):
+    return _resolve_state(node, workspace, selector)[0]
 
 
 def bytes_for(node, workspace, fid):
-    record = resolve(node, workspace, fid)
+    record, cids = _resolve_state(node, workspace, fid)
     if record is None:
         return None
     if record["have"] < record["total"]:
         return record["name"], None
     store = node.store(workspace)
-    cids = _cids(node, workspace, record["root"])
     output = bytearray()
     for index in range(record["total"]):
         output += bao.verify(
             store.get("obj/" + cids[index]),
             record["root"], index, record["size"])
     return record["name"], bytes(output)
-
-
-def _cids(node, workspace, root):
-    with node.lock:
-        return dict(node.app.execute(
-            "SELECT idx, cid FROM file_chunk_rows "
-            "WHERE ws=? AND root=?", (workspace, root)).fetchall())
 
 
 CLI = {"content.file.send": send, "content.file.save": save,

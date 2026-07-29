@@ -2,14 +2,13 @@
 
 ``WorkspaceRuntime`` owns the serial write turn:
 
-    ingress -> kernel -> catalog -> publisher root CAS -> pump -> retirement
+    ingress -> kernel -> catalog -> publisher root CAS -> retirement
 
 This class supplies its local resources: keychain/workspace configuration,
-stores, the stable admitted catalog, the disposable client projection, and
-diagnostics. Every replicated effect still enters through a pile. The
-published set and client view can be rebuilt from the root; node-local
-ineligible catalog receipts are intentionally not published and survive only
-while this node's catalog does.
+stores, the stable fact catalog, generic derived indexes, and diagnostics.
+Every replicated effect still enters through a pile. Family queries select
+ids through the generic index and decode the canonical fact blobs directly;
+there is no second application database to synchronize.
 """
 import json
 import os
@@ -29,16 +28,8 @@ from .kernel import (
     resolve_deps,
     rebuild_proofs,
 )
-from .pump import (
-    LOG_SCHEMA,
-    append_admitted,
-    append_received,
-    append_retracted,
-    open_projection,
-)
 from .publication import INDEX_VERSION, Publisher, RootChanged
 from .runtime import WorkspaceRuntime
-from .shape import key_parts
 from .store import FsStore, verified_object
 
 SUPP_SCHEMA = (
@@ -46,7 +37,7 @@ SUPP_SCHEMA = (
     "CREATE INDEX IF NOT EXISTS supp_by_k ON supp(k);")
 IDX_SCHEMA = catalog.SCHEMA + """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-""" + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
+""" + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA)
 
 
 def now_ms():
@@ -60,14 +51,10 @@ def _edges(items, anchor=None):
     deps, db = {}, sqlite3.connect(":memory:")
     try:
         db.executescript(catalog.SCHEMA)
-        db.executemany(
-            "INSERT INTO facts VALUES(?,?,?,?,1)",
-            ((f.fid, f.ts, f.t, json.dumps(f.to_json()))
-             for f in items.values()))
-        db.executemany(
-            "INSERT INTO offers VALUES(?,?,?,?)",
-            ((*offer, f.fid)
-             for f in items.values() for offer in f.offers()))
+        admitted = catalog.Catalog(db, anchor)
+        for fact in items.values():
+            admitted.stage(fact)
+        admitted.commit_stage(items)
         if rebuild_proofs(db, items.get, anchor):
             raise ValueError("store closure")
         for fid, f in items.items():
@@ -115,18 +102,17 @@ class Node:
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
-        self.app = open_projection(os.path.join(dir, "app.db"))
+        # app.db was a disposable projection cache. The canonical blob catalog
+        # plus generic index now answers family queries directly.
+        try:
+            os.remove(os.path.join(dir, "app.db"))
+        except FileNotFoundError:
+            pass
         self._stores, self._idx = {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._sync_errors = {}
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
-            self.log_arrivals(ws, (
-                fid for (fid,) in self.idx(ws).execute("SELECT fid FROM proofs")
-            ))
-            # Resume rows committed after the last root publication through
-            # the same workspace boundary used by live turns.
-            self.workspace(ws).project()
 
     # ---- node-local state ----------------------------------------------------
 
@@ -247,14 +233,8 @@ class Node:
             con = sqlite3.connect(os.path.join(self.dir, "ws", ws + ".idx.db"),
                                   check_same_thread=False)
             con.executescript(IDX_SCHEMA)
-            columns = {
-                row[1] for row in con.execute("PRAGMA table_info(facts)")
-            }
-            if "admitted" not in columns:
-                con.execute(
-                    "ALTER TABLE facts ADD COLUMN admitted INT "
-                    "NOT NULL DEFAULT 1 CHECK(admitted IN (0,1))")
-                con.commit()
+            catalog.upgrade_schema(con)
+            suppression_state.upgrade_schema(con)
             self._idx[ws] = con
         return self._idx[ws]
 
@@ -275,12 +255,10 @@ class Node:
                 continue
         raise RootChanged("root kept changing during index synchronization")
 
-    def _restore_authoritative_projections(self, ws):
+    def _restore_authoritative_state(self, ws):
         """Discard a failed turn's local state before releasing its lock."""
         self.idx(ws).rollback()
-        self.app.rollback()
         self._sync_index(ws)
-        self.workspace(ws).project()
 
     def fact_of(self, ws, fid) -> Fact:
         return self.catalog(ws).eligible(fid)
@@ -292,13 +270,33 @@ class Node:
     def catalog(self, ws):
         return catalog.Catalog(self.idx(ws), ws)
 
+    def select_ranked(
+            self, ws, kind, k0=None, k1=None, *,
+            include_suppressed=False):
+        """Select current facts through the one generic type/offer index."""
+        with self.lock:
+            self._sync_index(ws)
+            rows = self.catalog(ws).indexed(kind, k0, k1)
+            if include_suppressed:
+                return rows
+            return tuple(
+                (rank, fact) for rank, fact in rows
+                if not self.suppressed(ws, fact)
+            )
+
+    def select(self, ws, kind, k0=None, k1=None, **options):
+        return tuple(
+            fact for _, fact in self.select_ranked(
+                ws, kind, k0, k1, **options)
+        )
+
+    def by_type(self, ws, tag, **options):
+        return self.select(ws, catalog.TYPE_INDEX, tag, **options)
+
     def keys(self, ws):
-        return [
-            key_parts(ts, fid) for ts, fid in
-            self.idx(ws).execute(
-                "SELECT f.ts, f.fid FROM facts f "
-                "JOIN proofs p ON p.fid=f.fid ORDER BY f.ts, f.fid")
-        ]
+        return sorted(
+            self.fact_of(ws, fid).key
+            for (fid,) in self.idx(ws).execute("SELECT fid FROM proofs"))
 
     def _action_evidence(self, ws, fact):
         """Persist the action's current canonical proof closure."""
@@ -313,11 +311,19 @@ class Node:
         self.store(ws).put_if_absent("obj/" + oid, raw)
         return oid
 
-    def _refresh_action_evidence(self, ws):
+    def _refresh_action_evidence(self, ws, sids=None):
         """Canonicalize proof bytes after eligibility and edges settle."""
         idx, changed = self.idx(ws), set()
-        for (fid,) in idx.execute(
-                "SELECT DISTINCT fid FROM actions ORDER BY fid"):
+        fids = {
+            fid for (fid,) in idx.execute(
+                "SELECT DISTINCT fid FROM actions ORDER BY fid")
+        } if sids is None else {
+            row[0]
+            for sid in sorted(set(sids))
+            if (row := idx.execute(
+                "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone())
+        }
+        for fid in sorted(fids):
             fact = self.fact_of(ws, fid)
             if fact is None:
                 raise ValueError("active action lacks standing")
@@ -350,56 +356,6 @@ class Node:
     def turn(self, ws):
         return self.workspace(ws).turn()
 
-    def log_arrivals(self, ws, fids, *, repeat=False):
-        """Append resident-object events, but only for published facts.
-
-        ``repeat`` records an actual re-delivery, allowing a missing local
-        object to be repaired after an earlier event. Ordinary probes stay
-        idempotent, including startup repair of a CAS-to-log crash.
-        """
-        with self.lock:
-            self._sync_index(ws)
-            idx, st = self.idx(ws), self.store(ws)
-            notified = set() if repeat else {
-                fid for (fid,) in idx.execute(
-                    "SELECT DISTINCT fid FROM log WHERE op='*'")
-            }
-            landed = []
-            for fid in dict.fromkeys(fids):
-                fact = self.fact_of(ws, fid)
-                if fact is None or fid in notified:
-                    continue
-                refs = facts.blob_refs(fact)
-                if refs and all(st.has("obj/" + oid) for oid in refs):
-                    landed.append(fid)
-            if landed:
-                append_received(idx, landed)
-                idx.commit()
-            return landed
-
-    def _log_projection(
-            self, ws, admitted, retracted, reproject, action_sids=()):
-        idx = self.idx(ws)
-        admitted = tuple(admitted)
-        retracted = set(retracted)
-        retracted.update(  # forward mask: action known before the victim
-            fid for fid in admitted
-            if self.suppressed(ws, self.fact_of(ws, fid)))
-        append_admitted(idx, admitted)
-        append_retracted(idx, sorted(retracted))
-        self.apply_actions(
-            ws, set(action_sids) | {
-                sid for sid, fid in idx.execute(
-                    "SELECT sid, fid FROM actions")
-                if fid in set(admitted)
-            })
-        if reproject:
-            seq = idx.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM log").fetchone()[0]
-            idx.execute(
-                "INSERT OR REPLACE INTO meta VALUES('reproject', ?)",
-                (seq,))
-
     def merge(self, ws, candidates, *, base=None, force=False):
         publisher = Publisher(self, ws)
         base = publisher.base() if base is None else base
@@ -428,25 +384,21 @@ class Node:
             change = admitted.settle(
                 newfids, force=force, actions_dirty=actions_dirty) \
                 if newfids or force or actions_dirty \
-                else catalog.Eligibility((), (), (), False)
-            action_changes = set(admitted.action_changes)
-            if action_changes or change.authority_changed or idx.execute(
-                    "SELECT 1 FROM actions WHERE evidence='' LIMIT 1"
-            ).fetchone() is not None:
-                action_changes.update(self._refresh_action_evidence(ws))
-            deactivated = set(change.deactivated)
+                else catalog.Eligibility((), (), (), False, ())
+            changed_sids = set(change.changed_sids)
+            if change.authority_changed:
+                changed_sids.update(self._refresh_action_evidence(ws))
+            elif changed_sids:
+                changed_sids.update(
+                    self._refresh_action_evidence(ws, changed_sids))
+            change = change._replace(
+                changed_sids=tuple(sorted(changed_sids)))
             restored = set(change.activated) - set(newfids)
             if restored:
                 self._invalidate_sync_cache(ws)
-            reproject = change.authority_changed or bool(action_changes)
-            self._log_projection(
-                ws, change.activated, deactivated,
-                reproject, action_changes)
             publisher.dirty(base)
             idx.commit()
-            return publisher.plan(catalog.Eligibility(
-                change.received, change.activated, change.deactivated,
-                reproject), base)
+            return publisher.plan(change, base)
         except Exception:
             idx.rollback()
             raise
@@ -462,21 +414,13 @@ class Node:
                 admitted = self.catalog(ws)
                 change = admitted.settle(
                     staged, force=True, actions_dirty=True)
-                action_changes = set(admitted.action_changes)
-                if action_changes or change.authority_changed or idx.execute(
-                        "SELECT 1 FROM actions WHERE evidence='' LIMIT 1"
-                ).fetchone() is not None:
-                    action_changes.update(self._refresh_action_evidence(ws))
-                change = catalog.Eligibility(
-                    staged,
-                    change.activated,
-                    change.deactivated,
-                    True,
+                changed_sids = set(change.changed_sids)
+                changed_sids.update(self._refresh_action_evidence(ws))
+                change = change._replace(
+                    received=tuple(staged),
+                    authority_changed=True,
+                    changed_sids=tuple(sorted(changed_sids)),
                 )
-                if change.activated or change.deactivated or action_changes:
-                    self._log_projection(
-                        ws, change.activated,
-                        change.deactivated, True, action_changes)
                 idx.commit()
                 settlement = publisher.plan(change, base)
             except Exception:
@@ -536,27 +480,22 @@ class Node:
                     stream = list(resident(root.manifest, fetch, ws))
                 if ws not in {fact.fid for fact in stream}:
                     raise ValueError("store fact set")
-            # Drop the cursor BEFORE the log DROP resets AUTOINCREMENT: a
-            # crash anywhere after this point leaves no cursor row, so a
-            # restarted pump takes the rebuild branch instead of skipping
-            # new low seqs against a stale-high cursor.
-            self.app.execute("DELETE FROM cursors WHERE ws=?", (ws,))
-            self.app.commit()
             idx.execute("BEGIN")
             try:
                 staged = self.catalog(ws).discard_stage()
                 suppression_state.discard(idx, staged)
-                # facts/offers are the stable admitted catalog. Rebuild only
-                # the root-derived eligibility, edges, actions, and reverse
-                # projections around it.
+                # Facts and their generic index rows are the stable admitted
+                # catalog. Re-derive the generic rows exactly from canonical
+                # blobs, then rebuild root-derived eligibility, edges,
+                # actions, and the selector reverse map around them.
+                self.catalog(ws).reindex()
                 for table in ("proofs", "edges", "actions"):
                     idx.execute(f"DELETE FROM {table}")
                 # DROP, not DELETE: CREATE IF NOT EXISTS keeps a pre-v14
                 # file's single-group supp DDL, whose UNIQUE(k) would
                 # silently swallow all but one victim per group on re-merge.
-                for table in ("supp", "log"):
-                    idx.execute(f"DROP TABLE IF EXISTS {table}")
-                for statement in SUPP_SCHEMA + (LOG_SCHEMA,):
+                idx.execute("DROP TABLE IF EXISTS supp")
+                for statement in SUPP_SCHEMA:
                     idx.execute(statement)
                 for (fid,) in idx.execute("SELECT fid FROM facts"):
                     fact = self.candidate_of(ws, fid)
@@ -567,7 +506,7 @@ class Node:
                     )
                 idx.execute(
                     "DELETE FROM meta "
-                    "WHERE k IN ('root','publish-base','reproject')")
+                    "WHERE k IN ('root','publish-base')")
                 idx.commit()
             except Exception:
                 idx.rollback()
@@ -581,9 +520,6 @@ class Node:
                 except ValueError:
                     if not republish:
                         raise
-            self.apply_actions(
-                ws, [sid for (sid,) in self.idx(ws).execute(
-                    "SELECT sid FROM actions")])
             # A semantic index upgrade can select different canonical
             # providers for the same fact ids. A retained local receipt can
             # also regain standing under an external (or absent) root. Compile
@@ -594,35 +530,9 @@ class Node:
             except Exception:
                 idx.rollback()
                 raise
-            # Rebuild resets the delivery log. The published answer can be
-            # larger than ``stream`` when retained local receipts regain
-            # standing, so restore blob arrivals from the exact eligible set
-            # we just compiled rather than only from the old root.
-            published = tuple(
-                fid for (fid,) in idx.execute(
-                    "SELECT fid FROM proofs ORDER BY fid"))
-            self.log_arrivals(ws, published)
-            self.workspace(ws).project()
 
-    # ---- exact suppression consult + local reverse projection ----------------
+    # ---- exact suppression consult -------------------------------------------
 
     def suppressed(self, ws, fact):
         """The one local mask: explicit fact scopes intersect active actions."""
         return suppression_state.suppresses(self.idx(ws), fact)
-
-    def apply_actions(self, ws, sids):
-        """Retract resident victims through the rebuildable sid reverse map."""
-        idx = self.idx(ws)
-        dead = {
-            fid
-            for sid in set(sids)
-            if suppression_state.active(idx, sid)
-            for (fid,) in idx.execute(
-                "SELECT fid FROM supp WHERE k=?", (sid,))
-            if self.fact_of(ws, fid) is not None
-        }
-        last = dict(idx.execute(
-            "SELECT fid, op FROM log WHERE op IN ('+','-') ORDER BY seq"))
-        append_retracted(idx, sorted(
-            fid for fid in dead if last.get(fid) == "+"))
-        return dead

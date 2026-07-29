@@ -10,7 +10,6 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "admin"
-TABLES = ("admin_rows",)
 POLICY = FamilyPolicy(
     authorization_guards=("grantor_admin",),
     # Grantor authority is checked when the grant is admitted. The resulting
@@ -55,13 +54,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    db.execute(
-        "INSERT INTO admin_rows VALUES(?,?,?)",
-        (workspace, valid.fact.fid, valid.fact.body["target"]))
-
-
 # COMMANDS — build a fact, admit it, stop.
 def grant(node, workspace, target):
     from core.node import now_ms
@@ -88,12 +80,13 @@ def grant(node, workspace, target):
 
 # QUERIES
 def admins(node, workspace):
-    with node.lock:
-        rows = node.app.execute(
-            "SELECT pk, name, evicted FROM members "
-            "WHERE ws=? AND role='admin' ORDER BY name, pk",
-            (workspace,)).fetchall()
+    from .user import members
+
+    rows = [
+        row for row in members(node, workspace)
+        if row["role"] == "admin"
+    ]
     return [
-        {"pk": public, "name": name, "evicted": bool(evicted)}
-        for public, name, evicted in rows
+        {"pk": row["pk"], "name": row["name"], "evicted": row["evicted"]}
+        for row in rows
     ]

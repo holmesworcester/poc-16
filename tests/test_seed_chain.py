@@ -25,10 +25,8 @@ def test_seed_shapes_have_the_claimed_depth(tmp_path, shape, expected_max):
     assert stats["facts"] == 127
     assert stats["depth"]["max"] == expected_max
     assert sum(stats["depth"]["histogram"].values()) == 24
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='user'").fetchone()[0] == 23
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='user_invite'").fetchone()[0] == 23
+    assert len(node.by_type(workspace, "user")) == 23
+    assert len(node.by_type(workspace, "user_invite")) == 23
 
 
 def test_random_seed_is_deep_and_its_leaf_closes_over_the_real_path(tmp_path):
@@ -64,10 +62,8 @@ def test_multi_device_seed_groups_equal_author_keys_by_user(tmp_path):
     assert all(len(group) == 3 for group in stats["devices_by_user"].values())
     assert len(stats["device_to_user"]) == 36
     assert set(stats["device_to_user"]) <= set(node.keyring["keys"])
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='device'").fetchone()[0] == 12
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='device_invite'").fetchone()[0] == 24
+    assert len(node.by_type(workspace, "device")) == 12
+    assert len(node.by_type(workspace, "device_invite")) == 24
     assert check_leaves(node, workspace) > 1
 
 
@@ -103,9 +99,7 @@ def test_topology_and_content_use_independent_rng_streams(tmp_path):
     def messages(node, workspace):
         return sorted(
             (fact.body["text"], fact.body["pk"], fact.ts)
-            for (fid,) in node.idx(workspace).execute(
-                "SELECT fid FROM facts WHERE t='msg'")
-            for fact in (node.fact_of(workspace, fid),)
+            for fact in node.by_type(workspace, "msg")
         )
 
     assert star_stats["parents"] != random_stats["parents"]
@@ -117,8 +111,10 @@ def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
         str(tmp_path / "bulk-ranks"), 127, n_members=12,
         shape="star", seed=16)
     before = set(all_fids(node, workspace))
-    first_ts = node.idx(workspace).execute(
-        "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
+    first_ts = max(
+        node.candidate_of(workspace, fid).ts
+        for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
+    ) + 1
 
     bulk_author(
         node, workspace, [(node.sk, node.pk)], 1,

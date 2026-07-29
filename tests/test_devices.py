@@ -1,9 +1,6 @@
 """Direct-key device grants and equal-peer runtime behavior."""
-import sqlite3
 
 import pytest
-
-import facts
 
 from core import cmds, mint
 import core.sync as sync_module
@@ -16,22 +13,11 @@ from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
-from facts.auth.workspace import workspace as workspace_fact
 from core.kernel import drain, offer_src, resolve_deps
 from core.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
 from .util import inject_device_claim as _inject_device_claim
-
-
-def _materialize(db, workspace, valid):
-    """Unit-test seam for the pump-owned source/rank ledger."""
-    db.execute(
-        "INSERT INTO projected VALUES(?,?,?,0)",
-        (workspace, valid.fact.fid, valid.fact.t))
-    facts.materialize(db, workspace, valid)
-
-
 def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -79,7 +65,6 @@ def test_direct_grant_retry_after_restart_reconstructs_the_same_fact(tmp_path):
     fact_count = node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0]
     node.idx(workspace).close()
-    node.app.close()
 
     reopened = Node(node.dir)
     assert grant(reopened, workspace, user, laptop, "laptop") == first
@@ -136,7 +121,7 @@ def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
         "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
 
 
-def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
+def test_device_authored_write_leaves_the_roster_unchanged(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
@@ -147,18 +132,10 @@ def test_device_authored_write_does_not_rebuild_the_roster(tmp_path):
     grant(node, workspace, founder, laptop, "laptop")
     node.bind_identity(workspace, laptop)
 
-    statements = []
-    node.app.set_trace_callback(statements.append)
-    try:
-        cmds.post(node, workspace, "general", "ordinary device write", ts=10)
-    finally:
-        node.app.set_trace_callback(None)
-
-    normalized = [" ".join(statement.lower().split())
-                  for statement in statements]
-    assert not any(statement.startswith(
-        ("delete from device_rows", "delete from member_rows"))
-        for statement in normalized)
+    before = devices(node, workspace, founder)
+    cmds.post(node, workspace, "general", "ordinary device write", ts=10)
+    assert devices(node, workspace, founder) == before
+    assert not (tmp_path / "node" / "app.db").exists()
     assert {row["pk"] for row in devices(node, workspace, founder)} \
         == {founder, laptop}
 
@@ -196,70 +173,6 @@ def test_device_commands_reject_existing_members_and_bindings(tmp_path):
         grant(node, workspace, node.pk, bob, "captured bob")
 
 
-def test_duplicate_device_projection_uses_the_smallest_fact_id():
-    secret, public = keypair()
-    root = workspace_fact(secret, public, "alice", 1)
-    first = device(public, "phone", 2)
-    first_sig = signature(secret, public, first, 2)
-    second = device(public, "tablet", 3)
-    second_sig = signature(secret, public, second, 3)
-
-    observed = []
-    for stream in (
-            [root, first_sig, first, second_sig, second],
-            [root, second_sig, second, first_sig, first]):
-        result = drain(stream, root.fid)
-        assert result.ok
-        db = sqlite3.connect(":memory:")
-        db.executescript(facts.APP_SCHEMA)
-        for valid in result.valids:
-            _materialize(db, root.fid, valid)
-        observed.append(db.execute(
-            "SELECT user, pk, label, source FROM devices").fetchall())
-        db.close()
-
-    winner = min((first, second), key=lambda fact: fact.fid)
-    assert observed[0] == observed[1] == [
-        (public, public, winner.body["label"], winner.fid)]
-
-
-def test_bearer_user_precedes_device_role_in_every_arrival_order():
-    founder_secret, founder = keypair()
-    root = workspace_fact(founder_secret, founder, "alice", 1)
-    primary = device(founder, "phone", 2)
-    primary_sig = signature(founder_secret, founder, primary, 2)
-
-    invite_secret, invite_public = keypair()
-    invitation = user_invite(founder, invite_public, 3)
-    invitation_sig = signature(founder_secret, founder, invitation, 3)
-    bob_secret, bob = keypair()
-    joined = user(invitation, invite_secret, bob, "Bob", 4)
-    joined_sig = signature(bob_secret, bob, joined, 4)
-    direct = device_invite_fact(
-        founder, founder, bob, "laptop", 5)
-    direct_sig = signature(founder_secret, founder, direct, 5)
-
-    prefix = [root, primary_sig, primary]
-    bearer = [invitation_sig, invitation, joined_sig, joined]
-    device_grant = [direct_sig, direct]
-    observed = []
-    for stream in (
-            prefix + bearer + device_grant,
-            prefix + device_grant + bearer):
-        result = drain(stream, root.fid)
-        assert result.ok
-        db = sqlite3.connect(":memory:")
-        db.executescript(facts.APP_SCHEMA)
-        for valid in result.valids:
-            _materialize(db, root.fid, valid)
-        observed.append(db.execute(
-            "SELECT name, role FROM members WHERE ws=? AND pk=?",
-            (root.fid, bob)).fetchone())
-        db.close()
-
-    assert observed == [("Bob", "member"), ("Bob", "member")]
-
-
 def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
         tmp_path):
     node = Node(str(tmp_path / "node"))
@@ -283,8 +196,8 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
             public, user, sibling, f"{user[:8]}-sibling", 100 + ordinal)
         signed = signature(secret, public, item, 100 + ordinal)
         device_source = node.idx(workspace).execute(
-            "SELECT o.src FROM offers o JOIN proofs p ON p.fid=o.src "
-            "WHERE o.name='device_key' AND o.a0=? "
+            "SELECT o.src FROM fact_index o JOIN proofs p ON p.fid=o.src "
+            "WHERE o.kind='device_key' AND o.k0=? "
             "ORDER BY p.rank, o.src LIMIT 1",
             (public,),
         ).fetchone()[0]
@@ -311,8 +224,8 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
         grant(node, workspace, bob, another, "must-not-use-losing-claim")
 
     winner = node.idx(workspace).execute(
-        "SELECT o.src FROM offers o JOIN proofs p ON p.fid=o.src "
-        "WHERE o.name='device_key' AND o.a0=? "
+        "SELECT o.src FROM fact_index o JOIN proofs p ON p.fid=o.src "
+        "WHERE o.kind='device_key' AND o.k0=? "
         "ORDER BY p.rank, o.src LIMIT 1",
         (sibling,),
     ).fetchone()[0]
@@ -407,17 +320,11 @@ def test_conflicting_authority_converges_to_one_finite_subset(
         assert current.fact_of(workspace, conflict.fid) == conflict
         assert current.fact_of(workspace, target_claim.fid) == target_claim
         assert current.fact_of(workspace, child_claim.fid) is None
-        assert current.app.execute(
-            "SELECT 1 FROM devices WHERE ws=? AND pk=?",
-            (workspace, child)).fetchone() is None
+        assert child not in {
+            row["pk"] for row in devices(current, workspace)}
         assert current.store(workspace).list("pile/") == []
-        seen = set()
-        for op, fid in current.idx(workspace).execute(
-                "SELECT op, fid FROM log ORDER BY seq"):
-            if op == "+":
-                seen.add(fid)
-            else:
-                assert fid in seen
+        assert current.idx(workspace).execute(
+            "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
     assert all_fids(node, workspace) == all_fids(peer, workspace)
     assert node.store(workspace).get("root") \
         == peer.store(workspace).get("root")
@@ -650,11 +557,7 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
     assert node.fact_of(workspace, child_claim.fid) is None
 
 
-def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
-        tmp_path, monkeypatch):
-    from core import runtime
-
-    original_pump = runtime.pump
+def test_rank_only_shadow_query_tracks_winner_and_stale_replay(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "root")
     root_secret, root = node.identity(workspace)
@@ -694,9 +597,10 @@ def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
         short_item.body["label"], short_item.ts)
     assert deep_claim == deep_item
     assert short_claim == short_item
-    assert node.app.execute(
-        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
-        (workspace, target)).fetchone() == (short, short_claim.fid)
+    assert next(
+        row for row in devices(node, workspace)
+        if row["pk"] == target
+    )["user"] == short
 
     # Rejoining the deep member directly from root adds only signature,
     # invitee, and member offers. It shortens the old deep device claim's
@@ -730,24 +634,6 @@ def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
     pile = encode_pile(stream)
     deliver(node, workspace, pile, member="crash00000000000")
 
-    # Model a process death after the manifest/index commit but before the app
-    # transaction. The retained ingress pile must repair the lagging projection
-    # on retry even though every fact is now already present in the index.
-    def crash_after_commit(*args, **kwargs):
-        raise RuntimeError("simulated projection crash")
-
-    monkeypatch.setattr(runtime, "pump", crash_after_commit)
-    with pytest.raises(RuntimeError, match="simulated projection crash"):
-        node.turn(workspace)
-    monkeypatch.setattr(runtime, "pump", original_pump)
-
-    assert offer_src(
-        node.idx(workspace), "device_key", target) == deep_claim.fid
-    assert node.app.execute(
-        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
-        (workspace, target)).fetchone() == (short, short_claim.fid)
-    assert node.store(workspace).list("pile/")
-
     fresh = node.turn(workspace)
 
     assert fresh
@@ -755,12 +641,15 @@ def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
         name == "device_key"
         for valid in fresh
         for name, _, _ in valid.fact.offers())
-    assert node.app.execute(
-        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
-        (workspace, target)).fetchone() == (deep, deep_claim.fid)
+    assert offer_src(
+        node.idx(workspace), "device_key", target) == deep_claim.fid
+    assert next(
+        row for row in devices(node, workspace)
+        if row["pk"] == target
+    )["user"] == deep
 
     # A late duplicate delivery of the lower-fid but rank-losing claim is a
-    # projection no-op once this manifest generation has been materialized.
+    # query no-op once this manifest generation has settled.
     deliver(
         node,
         workspace,
@@ -768,9 +657,10 @@ def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
         member="stale00000000000",
     )
     node.turn(workspace)
-    assert node.app.execute(
-        "SELECT user, source FROM devices WHERE ws=? AND pk=?",
-        (workspace, target)).fetchone() == (deep, deep_claim.fid)
+    assert next(
+        row for row in devices(node, workspace)
+        if row["pk"] == target
+    )["user"] == deep
 
 
 def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
@@ -823,8 +713,8 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert source.fact_of(workspace, child_claim.fid) is None
     assert source.candidate_of(workspace, child_claim.fid) == child_claim
     assert source.idx(workspace).execute(
-        "SELECT admitted FROM facts WHERE fid=?",
-        (child_claim.fid,)).fetchone() == (1,)
+        "SELECT 1 FROM staged WHERE fid=?",
+        (child_claim.fid,)).fetchone() is None
     assert source.store(workspace).list("quarantine/") == []
 
     invite_secret, invite_public = keypair()
@@ -888,9 +778,10 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
 
     for current in (source, first, second):
         assert current.fact_of(workspace, child_claim.fid) == child_claim
-        assert current.app.execute(
-            "SELECT user FROM devices WHERE ws=? AND pk=?",
-            (workspace, child)).fetchone() == (deep,)
+        assert next(
+            row for row in devices(current, workspace)
+            if row["pk"] == child
+        )["user"] == deep
     assert all_fids(source, workspace) \
         == all_fids(first, workspace) \
         == all_fids(second, workspace)

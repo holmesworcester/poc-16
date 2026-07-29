@@ -244,7 +244,7 @@ def test_alice_bob_carol(tmp_path):
         procs["bob"].wait(10)
         for f in (tmp_path / "bob" / "ws").glob("*.idx.db"):
             f.unlink()
-        os.unlink(tmp_path / "bob" / "app.db")
+        assert not (tmp_path / "bob" / "app.db").exists()
         procs["bob"] = spawn(tmp_path, "bob")
         assert "after evict" in texts("bob", ws)  # rebuilt read model, pre-walk
         assert deletions_visible("bob")

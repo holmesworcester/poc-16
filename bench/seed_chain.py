@@ -199,8 +199,10 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     }
     content_identities = identities
     if devices_per_user > 1:
-        first_device_ts = node.idx(workspace).execute(
-            "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
+        first_device_ts = max(
+            node.candidate_of(workspace, fid).ts
+            for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
+        ) + 1
         content_identities, devices_by_user, device_to_user = grow_devices(
             node, workspace, identities, first_device_ts, devices_per_user,
             keys=keys)
@@ -210,14 +212,15 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         "SELECT COUNT(*) FROM facts").fetchone()[0]
     n_messages = max(0, (total_facts - membership_facts) // 2)
     window = years * 365 * 24 * 3600 * 1000
-    content_ts = node.idx(workspace).execute(
-        "SELECT MAX(ts) FROM facts").fetchone()[0] + 1
+    content_ts = max(
+        node.candidate_of(workspace, fid).ts
+        for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
+    ) + 1
     bulk_author(
         node, workspace, content_identities, n_messages,
         content_ts, window, content_rng)
     authored = time.perf_counter()
     node.commit(workspace)
-    node.workspace(workspace).project()
     finished = time.perf_counter()
 
     total = node.idx(workspace).execute(

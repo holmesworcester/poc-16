@@ -14,7 +14,6 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "user_invite"
-TABLES = ()
 POLICY = FamilyPolicy(authorization_guards=("member",))
 
 

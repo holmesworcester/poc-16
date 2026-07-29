@@ -1,6 +1,5 @@
 """facts/content/chunk.py — the signed name of one self-proving Bao slice."""
 from core import bao
-from core.crypto import h
 from core.fact import Fact, Need
 from core.suppression import ANCESTOR, PARENT, selector_markers
 from .._policy import (
@@ -14,7 +13,6 @@ from .._policy import (
 from ..auth import signature
 
 TAG = "chunk"
-TABLES = ("file_slice_rows", "file_chunk_rows")
 POLICY = FamilyPolicy(
     suppression=(
         Self(),
@@ -101,35 +99,6 @@ DURABLE = True
 
 def blob_refs(f):
     return (f.body["cid"],)
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    f, body = valid.fact, valid.fact.body
-    db.execute(
-        "INSERT INTO file_slice_rows VALUES(?,?,?,?,?,?)",
-        (workspace, f.fid, body["root"], body["i"], body["cid"], f.ts))
-
-
-def received(db, workspace, valid, blob_of):
-    """Count a resident slice only after its proof matches the descriptor."""
-    f, body = valid.fact, valid.fact.body
-    row = db.execute(
-        "SELECT size FROM files WHERE ws=? AND root=? AND pk=? AND chan=?",
-        (workspace, body["root"], body["pk"], body["chan"])).fetchone()
-    if row is None:
-        return
-    try:
-        blob = blob_of(body["cid"])
-        if blob is None or len(blob) > bao.MAX_PROOF_BYTES \
-                or h(blob) != body["cid"]:
-            return
-        bao.verify(blob, body["root"], body["i"], row[0])
-    except Exception:
-        return
-    db.execute(
-        "INSERT OR IGNORE INTO file_chunk_rows VALUES(?,?,?,?,?,?)",
-        (workspace, f.fid, body["root"], body["i"], body["cid"], f.ts))
 
 
 # COMMANDS

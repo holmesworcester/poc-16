@@ -7,7 +7,7 @@ from limits and future work; it is not a backlog.
 
 POC-16 asks whether peers can reconcile an authenticated workspace against a
 counterpart that mostly serves immutable bytes. The active peer performs the
-walk, verifies hashes, validates fact closures, and updates local projections.
+walk, verifies hashes, validates fact closures, and settles its local catalog.
 The responder supplies a small authentication gate plus an object-store-shaped
 HTTP surface.
 
@@ -35,10 +35,10 @@ kernel → registered fact family                judgment and policy
 Catalog.settle                                 admitted receipt → eligibility
         ↓
 Publisher.publish                              snapshot → one root CAS
-        ↓
-pump                                            disposable client read model
 
 root + immutable-object fetches → WorkerView   database-free CF authorization
+
+generic type/offer index → family query        client read assembly
 ```
 
 `Node` composes local identity, workspace handles, diagnostics, and these
@@ -115,12 +115,41 @@ composite snapshot. The adapter's stable CAS-lock path is reserved from every
 public key operation. Piles, invites, and quarantine records remain ordinary
 non-authoritative keys.
 
-The workspace SQLite database contains a stable local admission catalog plus
-derived eligibility and reverse indexes. A kernel-valid durable receipt is
-stored once; losing canonical standing removes its proof row, not its bytes or
-offers. The separate application database is disposable and rebuilt by the
-projection pump. Deleting the workspace catalog can lose node-local,
-currently ineligible receipts that were deliberately never published.
+Each workspace SQLite database contains one stable local fact catalog plus
+family-neutral derived indexes:
+
+```text
+facts(fid, blob)                 one canonical encoded body
+fact_index(kind, k0, k1, src)   type + every declared offer
+proofs / edges                   current eligibility and resolved authority
+actions / supp                   suppression frontier and selector reverse map
+```
+
+There is no application projection database and no family-owned durable
+table. A kernel-valid durable receipt is stored once; losing canonical
+standing removes its proof row, not its bytes or index rows. Every fact gets a
+`fact.type` index row, and each declared offer becomes another row
+mechanically. Family queries select candidate fids through that combined
+index, load the canonical blobs, apply suppression, and assemble their view.
+Deleting the workspace catalog can still lose node-local, currently
+ineligible receipts that were deliberately never published.
+
+### Fact versions and derived replay
+
+POC-16 does not yet accept multiple fact versions. When it does, the canonical
+blob catalog remains an immutable record of the originally admitted bytes, but
+derived tables must never replay that historical shape directly. Replay first
+decodes and hydrates each blob through the current version adapter, in the
+same context and into the same current form exposed when that fact is supplied
+as context to another fact. Type and dependency-key index rows, eligibility,
+and query views are then derived from that hydrated form.
+
+Thus a version/schema change is an explicit derived-index version change:
+discard the old derived rows and replay the retained canonical blobs through
+the new hydrator. The original bytes and fid do not change, while every
+consumer sees one current contextual form. A future adapter must be
+deterministic and must not consult replica-local arrival order or wall-clock
+state.
 
 The root uses layout stamp `composite-btreap-v4` and atomically binds:
 
@@ -196,10 +225,10 @@ slots and FactRecord.
 
 Local SQLite retains `action_proposals` and their targets alongside the stable
 catalog. It derives `actions(sid, fid, evidence)` as the current effective
-frontier and `supp(fid, sid)` as the reverse map used to retract resident
-victims. Only the proposals are retained input; the latter two tables are
-rebuildable projections. None is a second published authority index, and the
-database-free Worker never reads them.
+frontier and `supp(fid, sid)` as the selector reverse map. Only the proposals
+are retained input; the latter two tables are rebuildable indexes. None is a
+second published authority index, and the database-free Worker never reads
+them.
 
 An action, its `action:<sid>` slot, its `sid` suppression slot, the fact and
 authority updates, and the range manifest all become visible under the same
@@ -414,11 +443,12 @@ the current derived index only when its known snapshot fields equal the exact
 root bytes that index recorded; a different or unreadable snapshot is never
 clobbered. There is no ongoing dual decoder.
 
-Application tables are insert-only source rows plus a projection cursor.
-Suppression appends retractions to the delivery log. Rebuild replays the
-authenticated resident facts together with the stable local catalog,
-reconstructs eligibility, action and selector reverse maps, and then
-reproduces the application view.
+Rebuild replays authenticated resident facts together with the stable local
+catalog and reconstructs eligibility, action state, and selector reverse maps.
+Queries need no replay phase or cursor: once the workspace index is stamped
+for the pinned root, they select and decode the same canonical catalog rows
+used by settlement. Blob-bearing queries verify currently resident object
+bytes on demand.
 
 ## Performance
 
@@ -442,7 +472,7 @@ diagnostic, not cross-machine service guarantees.
 
 - Ordinary bodies are plaintext. End-to-end body encryption needs a separate
   design and implementation.
-- Logical deletion stops projection, authorization, and future blob demand; it
+- Logical deletion stops query visibility, authorization, and future blob demand; it
   does not erase immutable objects already stored. Physical GC is unbuilt.
 - The canonical range manifest still performs an O(n) index-only key scan per
   commit.

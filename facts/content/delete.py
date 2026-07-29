@@ -21,7 +21,6 @@ from .._commands import offer_source, publish
 from ..auth import signature
 
 TAG = "delete"
-TABLES = ()  # no projection rows: this family only retracts others' rows
 POLICY = _policy.FamilyPolicy(
     authorization_guards=("actor_authority",),
 )
@@ -101,9 +100,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE — action effects retract the target's projection rows.
-
-
 # COMMANDS
 def remove(node, workspace, target, ts=None):
     """Choose OWNER when principals match, otherwise require ADMIN."""
@@ -137,8 +133,9 @@ def remove(node, workspace, target, ts=None):
         target_actor = None
         if target_member is not None:
             row = node.idx(workspace).execute(
-                "SELECT a0 FROM offers WHERE src=? AND name='member' "
-                "ORDER BY a0 LIMIT 1", (target_provider[0],)).fetchone()
+                "SELECT k0 FROM fact_index "
+                "WHERE src=? AND kind='member' "
+                "ORDER BY k0 LIMIT 1", (target_provider[0],)).fetchone()
             target_actor = row[0] if row else None
         target_principal = _policy.member_principal(
             node.idx(workspace), target_provider[0], target_actor

@@ -148,8 +148,8 @@ def member_principal(db_or_ctx, provider_fid, actor_key):
     """
     offers_from = db_or_ctx.offers_from if hasattr(db_or_ctx, "offers_from") \
         else lambda source, name: db_or_ctx.execute(
-            "SELECT a0, a1 FROM offers WHERE src=? AND name=? "
-            "ORDER BY a0, a1", (source, name)).fetchall()
+            "SELECT k0, k1 FROM fact_index WHERE src=? AND kind=? "
+            "ORDER BY k0, k1", (source, name)).fetchall()
     members = offers_from(provider_fid, "member")
     if (actor_key, "") not in members:
         return None

@@ -29,6 +29,7 @@ from .util import (
     member_src,
     replay_random,
     suppression_world,
+    visible_fids,
 )
 
 
@@ -714,10 +715,9 @@ def test_production_deletion_family(tmp_path):
     victim = node.fact_of(ws, victim_fid)
 
     def screen(n):
-        return {src for (src,) in n.app.execute(
-            "SELECT src FROM projected WHERE ws=?", (ws,))}
+        return visible_fids(n, ws)
 
-    assert victim_fid in screen(node)  # projected before the deletion
+    assert victim_fid in screen(node)  # visible before the deletion
     fid = cmds.remove(node, ws, victim_fid, ts=20)
     removal = node.fact_of(ws, fid)
     assert removal == delete_family.delete(
@@ -728,15 +728,13 @@ def test_production_deletion_family(tmp_path):
     assert action and action[0] == fid
     assert node.store(ws).has("obj/" + action[1])
 
-    assert victim_fid not in screen(node)  # the projected row retracted...
-    assert node.app.execute(
-        "SELECT 1 FROM message_rows WHERE ws=? AND src=?",
-        (ws, victim_fid)).fetchone() is None
+    assert victim_fid not in screen(node)
+    assert victim_fid not in {
+        row["fid"] for row in cmds.msgs(node, ws)}
     assert spared in screen(node) and fid in screen(node)  # ...alone
 
     node.idx(ws).close()
-    node.app.close()
-    survivor = Node(node.dir)  # restart: derived projections resume
+    survivor = Node(node.dir)
     assert survivor.fact_of(ws, victim_fid) == victim  # V keeps the victim
     assert victim_fid not in screen(survivor)
     assert survivor.idx(ws).execute(

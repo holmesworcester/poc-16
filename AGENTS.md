@@ -13,18 +13,20 @@ git status --short
 ```
 
 Use one module per fact family under `facts/auth/` or `facts/content/`.
-Families own construction, needs, validation, materialization, commands, and
-queries, plus the family’s `POLICY`. `facts/__init__.py` is the one checked
-dispatch inventory; `facts/_policy.py` defines policy vocabulary but contains
-no parallel tag registry. Keep `core/` family-neutral.
+Families own construction, needs, validation, commands, query assembly, and
+the family’s `POLICY`. `facts/__init__.py` is the one checked dispatch
+inventory; `facts/_policy.py` defines policy vocabulary but contains no
+parallel tag registry. Keep `core/` family-neutral. Durable facts live once as
+canonical blobs; the generic index mechanically covers type and every offer.
 
 Read and change the write path in authority order:
 
 ```text
-runtime turn → kernel/family → catalog settlement → publisher root CAS → pump
+runtime turn → kernel/family → catalog settlement → publisher root CAS
 ```
 
-The read-only CF path is separate:
+Client queries select through the generic catalog index and let the family
+assemble its view. The read-only CF path is separate:
 
 ```text
 root + immutable objects → WorkerView → family authorize hook

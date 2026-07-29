@@ -10,7 +10,6 @@ from .._commands import publish
 from ..auth import signature
 
 TAG = "msg"
-TABLES = ("message_rows",)
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     direct_targets=DELETE_SELF,
@@ -51,14 +50,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    f, body = valid.fact, valid.fact.body
-    db.execute(
-        "INSERT INTO message_rows VALUES(?,?,?,?,?,?)",
-        (workspace, f.fid, body["chan"], body["pk"], body["text"], f.ts))
-
-
 # COMMANDS
 def post(node, workspace, channel, text, ts=None):
     from core.node import now_ms
@@ -72,15 +63,24 @@ def post(node, workspace, channel, text, ts=None):
 
 # QUERIES
 def messages(node, workspace, channel=None):
-    query = "SELECT chan, pk, text, ts, fid FROM messages WHERE ws=?" + \
-        (" AND chan=?" if channel else "") + " ORDER BY ts, fid"
+    from ..auth.user import members
+
     with node.lock:
-        rows = node.app.execute(
-            query, (workspace, channel) if channel else (workspace,)).fetchall()
-        names = dict(node.app.execute(
-            "SELECT pk, name FROM members WHERE ws=?", (workspace,)))
-    return [{"chan": chan, "from": names.get(pk, pk[:8]), "text": text,
-             "ts": ts, "fid": fid} for chan, pk, text, ts, fid in rows]
+        names = {row["pk"]: row["name"] for row in members(node, workspace)}
+        selected = [
+            fact for fact in node.by_type(workspace, TAG)
+            if channel is None or fact.body["chan"] == channel
+        ]
+    return [
+        {
+            "chan": fact.body["chan"],
+            "from": names.get(fact.body["pk"], fact.body["pk"][:8]),
+            "text": fact.body["text"],
+            "ts": fact.ts,
+            "fid": fact.fid,
+        }
+        for fact in sorted(selected, key=lambda fact: (fact.ts, fact.fid))
+    ]
 
 
 CLI = {"content.message.post": post, "content.message.list": messages}

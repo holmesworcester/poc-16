@@ -4,7 +4,6 @@ from core.fact import Fact, canon
 from .._policy import FamilyPolicy, SidOffer
 
 TAG = "workspace"
-TABLES = ("member_rows",)
 POLICY = FamilyPolicy(
     principal_offers=(SidOffer("member", "member"),),
 )
@@ -26,7 +25,7 @@ def needs(f):
     return ()
 
 
-# VALIDATE — immutable, context-only judgment; exactly bool, never projection.
+# VALIDATE — immutable, context-only judgment; exactly bool, no host effects.
 def validate(f, ctx):
     try:
         body = f.body
@@ -43,14 +42,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-# MATERIALIZE — receives only kernel-minted Valid values.
-def materialize(db, workspace, valid):
-    f, body = valid.fact, valid.fact.body
-    db.execute(
-        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
-        (workspace, f.fid, body["pk"], body["name"], "admin"))
 
 
 # COMMANDS — workspace bootstrap necessarily records its anchor in the keyring.

@@ -7,7 +7,7 @@ from .crypto import h
 from .kernel import resolve_deps
 from .store import verified_object
 
-INDEX_VERSION = "admission-catalog-v22"
+INDEX_VERSION = "admission-catalog-v23"
 
 
 class RootChanged(RuntimeError):
@@ -21,6 +21,7 @@ class PublicationPlan(NamedTuple):
     activated: tuple
     deactivated: tuple
     authority_changed: bool
+    changed_sids: tuple
     base_root: bytes | None
     base_etag: str | None
 
@@ -128,6 +129,7 @@ class Publisher:
         changed = settlement.activated
         deactivated = set(settlement.deactivated)
         authority_changed = settlement.authority_changed
+        changed_sids = settlement.changed_sids
         cache = {}
 
         def deps_of(fid):
@@ -157,19 +159,24 @@ class Publisher:
             node.keys(ws), lambda fid: node.fact_of(ws, fid), deps_of, emit,
             entries, changed=changed_keys)
 
-        previous_trees = {}
+        previous_snapshot = None
         if previous_root:
             try:
-                previous_trees = manifest.decode_root(previous_root).trees
+                previous_snapshot = manifest.decode_root(previous_root)
             except ValueError:
                 pass
         seed, trees = indexes.build(
             ws, idx, lambda fid: node.fact_of(ws, fid), emit,
-            previous=previous_trees, fetch=fetch,
-            changed_fids=changed if incremental else None)
+            previous=previous_snapshot.trees if previous_snapshot else {},
+            fetch=fetch,
+            changed_fids=changed if incremental else None,
+            changed_sids=changed_sids if incremental else ())
+        action_etag = previous_snapshot.action_etag \
+            if incremental and not changed_sids and previous_snapshot \
+            else suppression_state.etag(idx)
         root = manifest.encode_root(
             ws, manifest_oid,
-            action_etag=suppression_state.etag(idx),
+            action_etag=action_etag,
             layout_seed=seed, trees=trees)
         if root == settlement.base_root:
             if store.etag("root") != settlement.base_etag:

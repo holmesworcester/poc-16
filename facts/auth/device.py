@@ -10,7 +10,6 @@ from .._commands import offer_source, publish
 from . import signature
 
 TAG = "device"
-TABLES = ("device_rows",)
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     authorization_guards=("member",),
@@ -53,15 +52,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    fact = valid.fact
-    body = fact.body
-    db.execute(
-        "INSERT INTO device_rows VALUES(?,?,?,?,?)",
-        (workspace, fact.fid, body["pk"], body["pk"], body["label"]))
-
-
 # COMMANDS — build a fact, admit it, stop.
 def bind(node, workspace, label):
     from core.node import now_ms
@@ -79,12 +69,29 @@ def bind(node, workspace, label):
 
 # QUERIES
 def devices(node, workspace, user=None):
-    query = "SELECT user, pk, label FROM devices WHERE ws=?" \
-        + (" AND user=?" if user else "") + " ORDER BY user, pk"
-    args = (workspace, user) if user else (workspace,)
     with node.lock:
-        rows = node.app.execute(query, args).fetchall()
+        chosen = {}
+        for rank, fact in node.select_ranked(workspace, "device"):
+            body = fact.body
+            if fact.t == TAG:
+                row = body.get("pk"), body.get("pk"), body.get("label")
+            elif fact.t == "device_invite":
+                row = (
+                    body.get("user"), body.get("device"), body.get("label"))
+            else:
+                continue
+            user_pk, device_pk, label = row
+            choice = (rank, fact.fid)
+            if device_pk and label and (
+                    device_pk not in chosen
+                    or choice < chosen[device_pk][0]):
+                chosen[device_pk] = (choice, user_pk, label)
+        rows = [
+            (user_pk, device_pk, label)
+            for device_pk, (_, user_pk, label) in chosen.items()
+            if user is None or user_pk == user
+        ]
     return [
         {"user": user_pk, "pk": device_pk, "label": label}
-        for user_pk, device_pk, label in rows
+        for user_pk, device_pk, label in sorted(rows)
     ]

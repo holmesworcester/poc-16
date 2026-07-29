@@ -33,17 +33,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import cmds, manifest
+from core import catalog, cmds, manifest
 from core import node as node_module
 from core import sync as sync_module
 from core.close import close, decode_pile, encode_pile
-from core.fact import from_json
+from core.fact import decode
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import extend_proofs, kernel, resolve_deps
 from core.node import Node, now_ms
 from core.publication import Publisher
-from core.pump import pump
 from core.shape import fid_of
 
 from tests.util import add_member, all_fids
@@ -62,11 +61,7 @@ perf = time.perf_counter
 # ---- bulk seed building ------------------------------------------------------
 
 def _insert(idx, fact):
-    idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?,0)",
-                (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
-    for name, a0, a1 in fact.offers():
-        idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-                    (name, a0, a1, fact.fid))
+    catalog.Catalog(idx, "").stage(fact)
 
 
 def _commit_index(node, workspace):
@@ -133,7 +128,6 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
     t_layout = perf()
     n.commit(ws)  # one full manifest build over the whole set
-    n.workspace(ws).project()
     t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
@@ -165,7 +159,7 @@ def seed_units(store, man, workspace):
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
     """decode is the caller's (serial, like turn); kernel is parallel; merge
-    + materialize serial. Returns streamed-record count. No commit — caller
+    + catalog settlement serial. Returns streamed-record count. No commit — caller
     lays out once at the end."""
     node._sync_index(ws)
     base = Publisher(node, ws).base()
@@ -178,7 +172,6 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
                 assert judgment.ok, "a published unit failed the kernel"
                 node.merge(
                     ws, (valid.fact for valid in judgment.valids), base=base)
-                pump(node, ws)
 
         for u in units:
             streamed += len(u)
@@ -217,13 +210,9 @@ def copy_facts(dst, ws, src, fids):
     di, si = dst.idx(ws), src.idx(ws)
     di.execute("BEGIN")
     for fid in fids:
-        row = si.execute(
-            "SELECT fid,ts,t,j,admitted FROM facts WHERE fid=?",
-            (fid,)).fetchone()
-        di.execute(
-            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?,0)", row[:4])
-        for name, a0, a1 in from_json(json.loads(row[3])).offers():
-            di.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, fid))
+        raw = si.execute(
+            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()[0]
+        _insert(di, decode(raw))
     _commit_index(dst, ws)
 
 
@@ -325,7 +314,10 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
     copy_facts(B, ws, A, membership)
 
     per_side = max(1, (total_facts - len(membership)) // 4)  # msgs per side
-    first = A.idx(ws).execute("SELECT MAX(ts) FROM facts").fetchone()[0] + 1
+    first = max(
+        A.candidate_of(ws, fid).ts
+        for (fid,) in A.idx(ws).execute("SELECT fid FROM facts")
+    ) + 1
     bulk_author(A, ws, members, per_side, first, window, random.Random(1), "A")
     bulk_author(B, ws, members, per_side, first, window, random.Random(2), "B")
     A.commit(ws)
@@ -464,7 +456,11 @@ def measure_write_cost(node_dir, scale, posts=200):
     import statistics as S
     shutil.rmtree(node_dir, ignore_errors=True)
     seed, ws, _ = build_seed(node_dir, scale)
-    lo, hi = seed.idx(ws).execute("SELECT MIN(ts), MAX(ts) FROM facts").fetchone()
+    timestamps = [
+        seed.candidate_of(ws, fid).ts
+        for (fid,) in seed.idx(ws).execute("SELECT fid FROM facts")
+    ]
+    lo, hi = min(timestamps), max(timestamps)
     st = seed.store(ws)
     acc = {"b": 0}
     orig = st.put

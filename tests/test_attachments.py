@@ -1,4 +1,4 @@
-"""Bao attachment policy and arrival-log crash boundaries."""
+"""Bao attachment policy and query-time object verification."""
 import os
 import random
 
@@ -10,7 +10,6 @@ from core import bao, cmds, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.node import Node
-from core.pump import pump
 from core.walk import _fetch_blobs
 from facts.content import chunk, file as file_family
 
@@ -24,7 +23,6 @@ from .util import (
 
 
 def close_node(node):
-    node.app.close()
     for index in node._idx.values():
         index.close()
 
@@ -35,7 +33,7 @@ def progress(node, workspace):
     return records[0]
 
 
-def test_round_trip_survives_rebuild_and_projection_wipe(tmp_path):
+def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     path = tmp_path / "node"
     node = Node(str(path))
     workspace = cmds.create(node, "alice")
@@ -50,7 +48,7 @@ def test_round_trip_survives_rebuild_and_projection_wipe(tmp_path):
     assert progress(node, workspace)["complete"]
 
     close_node(node)
-    os.unlink(path / "app.db")
+    assert not (path / "app.db").exists()
     os.unlink(path / "ws" / f"{workspace}.idx.db")
     rebuilt = Node(str(path))
     output = tmp_path / "saved.bin"
@@ -58,7 +56,7 @@ def test_round_trip_survives_rebuild_and_projection_wipe(tmp_path):
     assert output.read_bytes() == data
 
 
-def test_failed_manifest_publish_logs_no_arrival_and_retry_repairs_it(
+def test_failed_manifest_publish_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -80,7 +78,7 @@ def test_failed_manifest_publish_logs_no_arrival_and_retry_repairs_it(
     assert node.store(workspace).get("root") == old_root
     assert node.fact_of(workspace, descriptor.fid) is None
     assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM log WHERE op='*'").fetchone()[0] == 0
+        "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
     assert all(node.store(workspace).has("obj/" + item.body["cid"])
                for item in chunks)
 
@@ -89,21 +87,13 @@ def test_failed_manifest_publish_logs_no_arrival_and_retry_repairs_it(
     assert progress(node, workspace)["have"] == len(chunks)
 
 
-def test_restart_repairs_crash_between_manifest_and_arrival_log(
-        tmp_path, monkeypatch):
+def test_committed_blob_is_visible_without_an_arrival_cache(tmp_path):
     path = tmp_path / "node"
     node = Node(str(path))
     workspace = cmds.create(node, "alice")
-
-    def fail_arrival_log(*args, **kwargs):
-        raise RuntimeError("injected arrival-log crash")
-
-    monkeypatch.setattr(node, "log_arrivals", fail_arrival_log)
-
-    with pytest.raises(RuntimeError, match="arrival-log crash"):
-        send_bytes(node, workspace, "restart.bin", b"restart")
-
-    assert progress(node, workspace)["have"] == 0
+    send_bytes(node, workspace, "restart.bin", b"restart")
+    assert progress(node, workspace)["complete"]
+    assert not (path / "app.db").exists()
     close_node(node)
     restarted = Node(str(path))
     assert progress(restarted, workspace)["complete"]
@@ -190,17 +180,15 @@ def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     send_bytes(node, workspace, "gone.bin", b"gone")
-    chunk_fid = node.idx(workspace).execute(
-        "SELECT fid FROM facts WHERE t='chunk'").fetchone()[0]
+    chunk_fid = node.by_type(workspace, chunk.TAG)[0].fid
     cmds.remove(node, workspace, chunk_fid, ts=shape.FACT_TS_MAX)
     assert progress(node, workspace)["have"] == 0
 
-    node.log_arrivals(workspace, [chunk_fid], repeat=True)
-    pump(node, workspace)
+    # The proof object remains present, but the query excludes its suppressed
+    # fact before considering bytes.
     assert progress(node, workspace)["have"] == 0
-    assert node.app.execute(
-        "SELECT 1 FROM file_chunk_rows WHERE ws=? AND src=?",
-        (workspace, chunk_fid)).fetchone() is None
+    assert chunk_fid not in {
+        fact.fid for fact in node.by_type(workspace, chunk.TAG)}
 
     node.rebuild(workspace)
     assert progress(node, workspace)["have"] == 0
@@ -214,25 +202,17 @@ def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     descriptor_fid = send_bytes(
         source, workspace, "cascade.bin", data, ts=10)
     chunk_fids = {
-        fid for (fid,) in source.idx(workspace).execute(
-            "SELECT fid FROM facts WHERE t='chunk'")
+        fact.fid for fact in source.by_type(workspace, chunk.TAG)
     }
     assert len(chunk_fids) > 1
 
     cmds.remove(source, workspace, descriptor_fid, ts=20)
-    active = {
-        src for (src,) in source.app.execute(
-            "SELECT src FROM projected WHERE ws=?", (workspace,))
-    }
-    assert descriptor_fid not in active
-    assert chunk_fids.isdisjoint(active)
-    before = tuple(sorted(active))
+    assert cmds.files(source, workspace) == []
+    assert chunk_fids.isdisjoint(
+        fact.fid for fact in source.by_type(workspace, chunk.TAG))
 
     source.rebuild(workspace)
-    rebuilt = tuple(sorted(
-        src for (src,) in source.app.execute(
-            "SELECT src FROM projected WHERE ws=?", (workspace,))))
-    assert rebuilt == before
+    assert cmds.files(source, workspace) == []
 
     class NoBlobPeer:
         def obj(self, oid):

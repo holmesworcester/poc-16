@@ -1,20 +1,20 @@
-"""Stable client admission catalog and derived canonical eligibility.
+"""Stable fact-blob catalog plus generic indexes and derived eligibility.
 
-``facts`` and ``offers`` are immutable local receipts. ``proofs`` is the
-current finite canonical DAG: a fact is publishable exactly when it has a
-proof row. Winner changes replace proofs/edges; they never serialize, delete,
-or reinsert a receipt.
+``facts(fid, blob)`` is the only stored fact representation. ``fact_index``
+indexes every fact by type and every dependency-key offer; it never copies a
+fact body. ``proofs`` is the current finite canonical DAG: a fact is
+publishable exactly when it has a proof row. Winner changes replace
+proofs/edges; they never serialize, delete, or reinsert a receipt.
 
-Receipts enter as staged (``admitted=0``). Publication marks them admitted
-only after the composite-root CAS. Recovery discards an uncommitted stage and
+Receipts enter with a row in ``staged``. Publication removes that marker only
+after the composite-root CAS. Recovery discards an uncommitted stage and
 replays the still-live pile, while a post-CAS crash recovers from the new root.
 """
-import json
 from typing import NamedTuple
 
 import facts
 
-from .fact import from_json
+from .fact import decode, encode, from_json
 from . import suppression_state
 from .close import close
 from .kernel import (
@@ -25,14 +25,20 @@ from .kernel import (
     rebuild_proofs,
 )
 
-SCHEMA = """
+TYPE_INDEX = "fact.type"
+FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
-    fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT,
-    admitted INT NOT NULL CHECK(admitted IN (0,1)));
-CREATE TABLE IF NOT EXISTS offers(
-    name TEXT, a0 TEXT, a1 TEXT, src TEXT,
-    PRIMARY KEY(name, a0, a1, src));
-CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
+    fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
+"""
+
+SCHEMA = FACTS_SCHEMA + """
+CREATE TABLE IF NOT EXISTS staged(
+    fid TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS fact_index(
+    kind TEXT, k0 TEXT, k1 TEXT, src TEXT,
+    PRIMARY KEY(kind, k0, k1, src));
+CREATE INDEX IF NOT EXISTS fact_index_by_src
+    ON fact_index(src, kind, k0, k1);
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS edges(
     src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
@@ -40,31 +46,87 @@ CREATE TABLE IF NOT EXISTS edges(
 """
 
 
+def _index_rows(fact):
+    """The complete derived index contribution of one canonical fact."""
+    if any(name == TYPE_INDEX for name, _, _ in fact.offers()):
+        raise ValueError("reserved fact index kind")
+    return (
+        (TYPE_INDEX, fact.t, "", fact.fid),
+        *((*offer, fact.fid) for offer in fact.offers()),
+    )
+
+
+def upgrade_schema(db):
+    """Preserve old local receipts while cutting over to canonical blobs."""
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(facts)")
+    }
+    if not columns or "blob" in columns:
+        db.execute("DROP TABLE IF EXISTS offers")
+        db.execute("DROP TABLE IF EXISTS log")
+        db.commit()
+        return
+    if not {"fid", "j", "admitted"} <= columns:
+        raise ValueError("unknown fact catalog schema")
+
+    import json
+
+    rows = db.execute(
+        "SELECT fid, j, admitted FROM facts ORDER BY fid").fetchall()
+    db.execute("BEGIN")
+    try:
+        db.execute("ALTER TABLE facts RENAME TO facts_legacy")
+        db.execute(FACTS_SCHEMA)
+        db.execute("DELETE FROM staged")
+        db.execute("DELETE FROM fact_index")
+        for fid, raw_json, admitted in rows:
+            fact = from_json(json.loads(raw_json))
+            if fact.fid != fid:
+                raise ValueError("legacy fact catalog integrity")
+            db.execute("INSERT INTO facts VALUES(?,?)", (fid, encode(fact)))
+            if not admitted:
+                db.execute("INSERT INTO staged VALUES(?)", (fid,))
+            db.executemany(
+                "INSERT INTO fact_index VALUES(?,?,?,?)",
+                _index_rows(fact),
+            )
+        db.execute("DROP TABLE facts_legacy")
+        if db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='offers'").fetchone():
+            db.execute("DROP TABLE offers")
+        db.execute("DROP TABLE IF EXISTS log")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 class Eligibility(NamedTuple):
-    """One settlement, consumed unchanged by publication and projection."""
+    """One settlement, consumed unchanged by publication."""
 
     received: tuple
     activated: tuple
     deactivated: tuple
     authority_changed: bool
+    changed_sids: tuple
 
 
 class Catalog:
     def __init__(self, db, anchor):
         self.db = db
         self.anchor = anchor
-        self.action_changes = frozenset()
 
     def candidate(self, fid):
         row = self.db.execute(
-            "SELECT j FROM facts WHERE fid=?", (fid,)).fetchone()
-        return from_json(json.loads(row[0])) if row else None
+            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
+        return decode(row[0]) if row else None
 
     def eligible(self, fid):
         row = self.db.execute(
-            "SELECT f.j FROM facts f JOIN proofs p ON p.fid=f.fid "
+            "SELECT f.blob FROM facts f JOIN proofs p ON p.fid=f.fid "
             "WHERE f.fid=?", (fid,)).fetchone()
-        return from_json(json.loads(row[0])) if row else None
+        return decode(row[0]) if row else None
 
     def eligible_ids(self):
         return {
@@ -75,10 +137,47 @@ class Catalog:
         return self.db.execute(
             "SELECT 1 FROM proofs LIMIT 1").fetchone() is not None
 
+    def indexed(self, kind, k0=None, k1=None):
+        """Current facts at one generic index address, in canonical rank order.
+
+        Type rows use ``kind=fact.type`` and ``k0=<tag>``. Every other row is
+        copied mechanically from a fact's declared offers. Bodies are loaded
+        once from ``facts`` and decoded only after the index has selected ids.
+        """
+        clauses, args = ["i.kind=?"], [kind]
+        if k0 is not None:
+            clauses.append("i.k0=?")
+            args.append(k0)
+        if k1 is not None:
+            clauses.append("i.k1=?")
+            args.append(k1)
+        rows = self.db.execute(
+            "SELECT i.src, f.blob, p.rank "
+            "FROM fact_index i "
+            "JOIN proofs p ON p.fid=i.src "
+            "JOIN facts f ON f.fid=i.src "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY p.rank, i.src",
+            tuple(args),
+        )
+        seen, out = set(), []
+        for fid, raw, rank in rows:
+            if fid not in seen:
+                fact = decode(raw)
+                if fact.fid != fid:
+                    raise ValueError("fact catalog integrity")
+                seen.add(fid)
+                out.append((rank, fact))
+        return tuple(out)
+
+    def by_type(self, tag):
+        """Current facts of one type, selected through the generic index."""
+        return self.indexed(TYPE_INDEX, tag)
+
     def staged_ids(self):
         return tuple(
             fid for (fid,) in self.db.execute(
-                "SELECT fid FROM facts WHERE admitted=0 ORDER BY fid")
+                "SELECT fid FROM staged ORDER BY fid")
         )
 
     def edges(self, fid):
@@ -92,32 +191,52 @@ class Catalog:
 
     def stage(self, fact):
         """Store one kernel-minted durable receipt once; return whether new."""
-        fresh = self.db.execute(
-            "SELECT 1 FROM facts WHERE fid=?", (fact.fid,)).fetchone() is None
-        self.db.execute(
-            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?,0)",
-            (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
+        raw = encode(fact)
+        row = self.db.execute(
+            "SELECT blob FROM facts WHERE fid=?", (fact.fid,)).fetchone()
+        fresh = row is None
+        if row is not None and row[0] != raw:
+            raise ValueError("fact catalog conflict")
+        self.db.execute("INSERT OR IGNORE INTO facts VALUES(?,?)",
+                        (fact.fid, raw))
+        if fresh:
+            self.db.execute("INSERT INTO staged VALUES(?)", (fact.fid,))
         self.db.executemany(
-            "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-            ((*offer, fact.fid) for offer in fact.offers()),
+            "INSERT OR IGNORE INTO fact_index VALUES(?,?,?,?)",
+            _index_rows(fact),
         )
         return fresh
 
+    def reindex(self):
+        """Rebuild the exact generic index from every retained fact blob."""
+        rows = self.db.execute(
+            "SELECT fid, blob FROM facts ORDER BY fid").fetchall()
+        self.db.execute("DELETE FROM fact_index")
+        for fid, raw in rows:
+            fact = decode(raw)
+            if fact.fid != fid:
+                raise ValueError("fact catalog integrity")
+            self.db.executemany(
+                "INSERT INTO fact_index VALUES(?,?,?,?)",
+                _index_rows(fact),
+            )
+
     def commit_stage(self, fids):
         self.db.executemany(
-            "UPDATE facts SET admitted=1 WHERE fid=?",
+            "DELETE FROM staged WHERE fid=?",
             ((fid,) for fid in fids),
         )
 
     def discard_stage(self):
         staged = [
             fid for (fid,) in self.db.execute(
-                "SELECT fid FROM facts WHERE admitted=0")
+                "SELECT fid FROM staged")
         ]
         self.db.executemany(
-            "DELETE FROM offers WHERE src=?", ((fid,) for fid in staged))
+            "DELETE FROM fact_index WHERE src=?", ((fid,) for fid in staged))
         self.db.executemany(
             "DELETE FROM facts WHERE fid=?", ((fid,) for fid in staged))
+        self.db.execute("DELETE FROM staged")
         return tuple(staged)
 
     def shadows(self, fids):
@@ -128,8 +247,8 @@ class Catalog:
                 continue
             for name, a0, a1 in fact.offers():
                 if self.db.execute(
-                        "SELECT COUNT(*) FROM offers "
-                        "WHERE name=? AND a0=?",
+                        "SELECT COUNT(*) FROM fact_index "
+                        "WHERE kind=? AND k0=?",
                         (name, a0)).fetchone()[0] > 1:
                     return True
         return False
@@ -151,7 +270,8 @@ class Catalog:
             return False
         try:
             return not any(
-                suppression_state.blocks(self.db, sid, fact.key)
+                suppression_state.blocks(
+                    self.db, sid, fact.key, self.candidate)
                 for sid in self._authorization_scopes(fact, edges)
             )
         except (KeyError, TypeError, ValueError):
@@ -172,11 +292,12 @@ class Catalog:
 
     def settle(self, received, *, force=False, actions_dirty=False):
         """Settle once and return the exact eligibility delta."""
-        self.action_changes = frozenset()
         received = tuple(dict.fromkeys(received))
         received_set = set(received)
         shadows = self.shadows(received) if received else False
         rebuild = force or shadows or not received
+        action_before = suppression_state.snapshot(self.db) \
+            if rebuild or actions_dirty else None
         before = self.eligible_ids() - received_set \
             if rebuild or actions_dirty else None
         if rebuild:
@@ -187,6 +308,7 @@ class Catalog:
                 self.db, received, self.candidate,
                 self.anchor, self._accept)
             if unresolved:
+                action_before = suppression_state.snapshot(self.db)
                 before = self.eligible_ids() - received_set
                 rebuild_proofs(
                     self.db, self.candidate, self.anchor, self._accept)
@@ -197,9 +319,9 @@ class Catalog:
                     self._proof_order(received),
                     (),
                     False,
+                    (),
                 )
 
-        changed_actions = set()
         if rebuild or actions_dirty:
             seen = set()
             while True:
@@ -212,18 +334,19 @@ class Catalog:
                     self.db, self.eligible, self._authorization_scopes)
                 if not changed:
                     break
-                changed_actions.update(changed)
                 rebuild_proofs(
                     self.db, self.candidate, self.anchor, self._accept)
 
         after = self.eligible_ids()
         deactivated = before - after
         activated = after - before
-        self.action_changes = frozenset(changed_actions)
+        changed_sids = suppression_state.changed(
+            action_before, suppression_state.snapshot(self.db))
         return Eligibility(
             tuple(sorted(received)),
             self._proof_order(activated),
             tuple(sorted(deactivated)),
-            shadows or bool(changed_actions) or bool(
+            shadows or bool(
                 deactivated or (activated - received_set)),
+            tuple(sorted(changed_sids)),
         )

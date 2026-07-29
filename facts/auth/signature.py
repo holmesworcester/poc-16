@@ -4,7 +4,6 @@ from core.fact import Fact
 from .._policy import FamilyPolicy
 
 TAG = "signature"
-TABLES = ()
 POLICY = FamilyPolicy()
 
 

@@ -10,9 +10,6 @@ from .crypto import h, unseal
 from facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
-from .pump import pump
-
-ARRIVAL_BATCH = 16
 
 
 class Peer:
@@ -115,10 +112,6 @@ def _fetch_blobs(node, ws, peer):
     """
     st = node.store(ws)
     with node.lock:
-        notified = {
-            fid for (fid,) in node.idx(ws).execute(
-                "SELECT DISTINCT fid FROM log WHERE op='*'")
-        }
         pending = []
         for (fid,) in node.idx(ws).execute("SELECT fid FROM proofs"):
             fact = node.fact_of(ws, fid)
@@ -127,7 +120,7 @@ def _fetch_blobs(node, ws, peer):
             refs = families.blob_refs(fact)
             if refs:
                 pending.append((fid, refs))
-    landed, batch, complete = [], [], True
+    landed, complete = [], True
     for fid, refs in pending:
         fetched = False
         whole = True
@@ -140,17 +133,6 @@ def _fetch_blobs(node, ws, peer):
             else:
                 whole = False
                 complete = False
-        if whole and (fetched or fid not in notified):
-            batch.append(fid)
-        if len(batch) >= ARRIVAL_BATCH:
-            landed += _land(node, ws, batch)
-            batch = []
-    landed += _land(node, ws, batch)
+        if whole and fetched:
+            landed.append(fid)
     return landed, complete
-
-
-def _land(node, ws, fids):
-    fids = node.log_arrivals(ws, fids, repeat=True)
-    if fids:
-        pump(node, ws)
-    return fids

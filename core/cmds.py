@@ -1,7 +1,7 @@
 """Stable command façade over auth and content fact families.
 
-Family modules own authoring, materialization, and read-model queries.  This
-root module remains the small control-plane API used by the daemon and tests.
+Family modules own authoring and query assembly. This root module remains the
+small control-plane API used by the daemon and tests.
 """
 from facts.auth.user import accept as join, members
 from facts.auth.user_invite import make as make_invite

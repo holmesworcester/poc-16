@@ -63,7 +63,6 @@ def _shared_clones(seed, workspace, path, *actors):
     initial = _snapshot(seed.store(workspace))
     for index in seed._idx.values():
         index.close()
-    seed.app.close()
 
     bucket = ScriptedBucket(initial)
     nodes = []
@@ -123,7 +122,7 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
         bob.commit(workspace, bob_plan)
     assert bob.store(workspace).get("root") == alice_root
 
-    bob._restore_authoritative_projections(workspace)
+    bob._restore_authoritative_state(workspace)
     retry = bob.merge(workspace, candidates(raw_b))
     final_root = bob.commit(workspace, retry)
     assert {fact.fid for fact in _commit_facts(
@@ -252,8 +251,7 @@ def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
         before[0]["have"], before[0]["total"], before[0]["complete"]
     ) == (2, 2, True)
     chunk_fids = {
-        fid for (fid,) in alice.idx(workspace).execute(
-            "SELECT fid FROM facts WHERE t='chunk'")
+        fact.fid for fact in alice.by_type(workspace, "chunk")
     }
     assert len(chunk_fids) == 2
 
@@ -307,11 +305,11 @@ def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
         restored[0]["total"],
         restored[0]["complete"],
     ) == (2, 2, True)
-    arrivals = {
-        fid for (fid,) in alice.idx(workspace).execute(
-            "SELECT DISTINCT fid FROM log WHERE op='*'")
-    }
-    assert chunk_fids <= arrivals
+    assert all(
+        alice.store(workspace).has(
+            "obj/" + alice.fact_of(workspace, fid).body["cid"])
+        for fid in chunk_fids
+    )
     assert alice.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (h(union_root),)
 

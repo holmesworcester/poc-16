@@ -134,7 +134,8 @@ def test_rebuild(world):
     n, ws = world
     before = n.store(ws).etag("root")
     n.idx(ws).executescript(
-        "DELETE FROM facts; DELETE FROM offers; DELETE FROM meta;")
+        "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
+        "DELETE FROM meta;")
     n.rebuild(ws)
     n.commit(ws)
     assert n.store(ws).etag("root") == before
@@ -285,21 +286,16 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() is None
-    assert node.app.execute(
-        "SELECT COUNT(*) FROM messages WHERE ws=?",
-        (workspace,)).fetchone()[0] == 0
+    assert cmds.msgs(node, workspace) == []
     assert node.store(workspace).list("pile/")
 
     for index in node._idx.values():
         index.close()
-    node.app.close()
 
     reopened = Node(node.dir)
     assert reopened.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == 1
-    assert reopened.app.execute(
-        "SELECT COUNT(*) FROM messages WHERE ws=?",
-        (workspace,)).fetchone()[0] == 0
+    assert cmds.msgs(reopened, workspace) == []
     assert reopened.store(workspace).list("pile/")
 
     reopened.turn(workspace)
@@ -310,10 +306,8 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
     root = reopened.store(workspace).etag("root")
     assert reopened.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
-    assert reopened.app.execute(
-        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
-        (workspace,)).fetchone()[0] == reopened.idx(workspace).execute(
-        "SELECT MAX(seq) FROM log").fetchone()[0]
+    assert reopened.idx(workspace).execute(
+        "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
 
 
 def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
@@ -355,18 +349,17 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
         node.commit(workspace, settlement)
     assert node.store(workspace).get("root") != old_root
     assert node.idx(workspace).execute(
-        "SELECT admitted FROM facts WHERE fid=?",
-        (item.fid,)).fetchone() == (0,)
+        "SELECT 1 FROM staged WHERE fid=?",
+        (item.fid,)).fetchone() == (1,)
     for index in node._idx.values():
         index.close()
-    node.app.close()
     monkeypatch.setattr(Publisher, "stamp", original_stamp)
 
     reopened = Node(node.dir)
     assert reopened.fact_of(workspace, item.fid) == item
     assert reopened.idx(workspace).execute(
-        "SELECT admitted FROM facts WHERE fid=?",
-        (item.fid,)).fetchone() == (1,)
+        "SELECT 1 FROM staged WHERE fid=?",
+        (item.fid,)).fetchone() is None
     assert reopened.store(workspace).list("pile/")
     reopened.turn(workspace)
     assert reopened.store(workspace).list("pile/") == []
@@ -403,7 +396,7 @@ def test_failed_turn_restores_authoritative_state_before_return(
         cmds.evict(node, workspace, bob)
 
     # The daemon catches command failures and keeps serving. Before turn()
-    # releases its lock, the old root must again govern mint and the app view.
+    # releases its lock, the old root must again govern mint and queries.
     assert node.store(workspace).etag("root") == old_root
     assert mint.stateless(
         proof_bytes, node.store(workspace).get("root"), fetch, ts)
@@ -411,15 +404,11 @@ def test_failed_turn_restores_authoritative_state_before_return(
         member for member in cmds.members(node, workspace)
         if member["pk"] == bob
     )["evicted"] is False
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (0,)
+    assert node.by_type(workspace, "evict") == ()
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (old_root,)
-    assert node.app.execute(
-        "SELECT COUNT(*) FROM cursors WHERE ws=?",
-        (workspace,)).fetchone() == (1,)
     assert not node.idx(workspace).in_transaction
-    assert not node.app.in_transaction
+    assert not (tmp_path / "node" / "app.db").exists()
     assert node.store(workspace).list("pile/")
 
     monkeypatch.setattr(store, "cas", original_cas)
@@ -432,16 +421,13 @@ def test_failed_turn_restores_authoritative_state_before_return(
         member for member in cmds.members(node, workspace)
         if member["pk"] == bob
     )["evicted"] is True
-    assert node.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts WHERE t='evict'").fetchone() == (1,)
+    assert len(node.by_type(workspace, "evict")) == 1
     assert node.store(workspace).list("pile/") == []
     root = node.store(workspace).etag("root")
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
-    assert node.app.execute(
-        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
-        (workspace,)).fetchone()[0] == node.idx(workspace).execute(
-        "SELECT MAX(seq) FROM log").fetchone()[0]
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
 
 
 def test_index_stamp_rolls_back_a_partial_write(tmp_path):
@@ -506,10 +492,8 @@ def test_partial_stamp_failure_retries_in_the_same_process(
     root = node.store(workspace).etag("root")
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
-    assert node.app.execute(
-        "SELECT seq FROM cursors WHERE ws=? AND projector='app'",
-        (workspace,)).fetchone()[0] == node.idx(workspace).execute(
-        "SELECT MAX(seq) FROM log").fetchone()[0]
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
 
 
 def test_bulk_index_crash_cannot_preserve_unpublished_facts(
@@ -542,15 +526,12 @@ def test_bulk_index_crash_cannot_preserve_unpublished_facts(
 
     for index in node._idx.values():
         index.close()
-    node.app.close()
 
     reopened = Node(node.dir)
     assert reopened.store(workspace).etag("root") == old_root
     assert reopened.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone() == (1,)
-    assert reopened.app.execute(
-        "SELECT COUNT(*) FROM messages WHERE ws=?",
-        (workspace,)).fetchone() == (0,)
+    assert cmds.msgs(reopened, workspace) == []
 
 
 def test_semantic_index_upgrade_preserves_the_published_snapshot(world):
@@ -560,7 +541,6 @@ def test_semantic_index_upgrade_preserves_the_published_snapshot(world):
     idx.execute("DELETE FROM meta WHERE k='index-version'")
     idx.commit()
     idx.close()
-    n.app.close()
 
     reopened = Node(n.dir)
     assert reopened.store(ws).get("root") == expected
@@ -575,7 +555,10 @@ def test_straggler_minifold(tmp_path, world):
     b.turn(ws)
     assert b.store(ws).get("root") == n.store(ws).get("root")
 
-    old = min(ts for (ts,) in n.idx(ws).execute("SELECT ts FROM facts")) + 5
+    old = min(
+        n.candidate_of(ws, fid).ts
+        for (fid,) in n.idx(ws).execute("SELECT fid FROM facts")
+    ) + 5
     f = author_msg(n, ws, n.sk, n.pk, "late straggler", ts=old)
     assert f.fid in all_fids(n, ws)
     deliver(b, ws, closed_subset(n, ws, [f.fid]))
@@ -622,6 +605,128 @@ def full_manifest(n, ws):
         ws, man,
         action_etag=suppression_state.etag(idx),
         layout_seed=seed, trees=trees)
+
+
+def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
+    """Existing actions are not rescanned or republished for an unrelated fact."""
+    node, workspace, _, _ = test_util.suppression_world(tmp_path / "node")
+    before = manifest.decode_root(node.store(workspace).get("root"))
+    statements, updates = [], []
+    index = node.idx(workspace)
+    index.set_trace_callback(statements.append)
+    update = btreap.update
+
+    def observed(root, seed, rows, fetch, emit):
+        rows = tuple(rows)
+        updates.append(rows)
+        return update(root, seed, rows, fetch, emit)
+
+    monkeypatch.setattr(btreap, "update", observed)
+    try:
+        added = cmds.post(
+            node, workspace, "general", "bounded action consult", ts=1_000)
+    finally:
+        index.set_trace_callback(None)
+
+    action_reads = [
+        " ".join(statement.lower().split())
+        for statement in statements
+        if statement.lstrip().lower().startswith("select")
+        and " from actions" in statement.lower()
+    ]
+    assert action_reads
+    assert all(
+        " where sid=" in statement or " where fid=" in statement
+        for statement in action_reads
+    ), action_reads
+    by_tree = dict(zip(indexes.TREE_NAMES, updates))
+    sid = indexes.fact_key(added)
+    assert {
+        key for key, _ in by_tree[indexes.FACT]
+        if key.startswith("action:")
+    } == {indexes.action_key(sid)}
+    assert dict(by_tree[indexes.SUPP]) == {
+        sid: {"state": "clear"},
+    }
+    after = manifest.decode_root(node.store(workspace).get("root"))
+    assert after.action_etag == before.action_etag
+    assert node.store(workspace).get("root") == full_manifest(
+        node, workspace)
+
+
+def test_action_publication_path_copies_only_its_changed_sid(
+        tmp_path, monkeypatch):
+    node, workspace, _, _ = test_util.suppression_world(tmp_path / "node")
+    target = cmds.post(
+        node, workspace, "general", "one more target", ts=40)
+    updates = []
+    update = btreap.update
+
+    def observed(root, seed, rows, fetch, emit):
+        rows = tuple(rows)
+        updates.append(rows)
+        return update(root, seed, rows, fetch, emit)
+
+    monkeypatch.setattr(btreap, "update", observed)
+    action = cmds.remove(node, workspace, target, ts=200)
+
+    by_tree = dict(zip(indexes.TREE_NAMES, updates))
+    sid = indexes.fact_key(target)
+    active = {"state": "active", "action": action}
+    assert {
+        key: value for key, value in by_tree[indexes.FACT]
+        if key.startswith("action:")
+    } == {indexes.action_key(sid): active}
+    assert dict(by_tree[indexes.SUPP]) == {sid: active}
+    assert node.store(workspace).get("root") == full_manifest(
+        node, workspace)
+
+
+def test_resident_action_winner_delta_matches_full_fact_tree(tmp_path):
+    """A changed sid republishes the newly selected resident action evidence."""
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    target = cmds.post(node, workspace, "general", "target", ts=10)
+    first = cmds.remove(node, workspace, target, ts=20)
+    from facts import _policy
+    from facts.content.delete import delete
+
+    victim = node.fact_of(workspace, target)
+    secret, public = node.identity(workspace)
+    proposal = delete(public, victim.key, _policy.OWNER, 30)
+    signed = signature(secret, public, proposal, 30)
+    node.ingest_new(
+        workspace, [signed, proposal], {
+            signed.fid: (),
+            proposal.fid: (
+                target, signed.fid, member_src(node, workspace, public)),
+        })
+    second = proposal.fid
+    sid = indexes.fact_key(target)
+    index = node.idx(workspace)
+    assert index.execute(
+        "SELECT fid FROM actions WHERE sid=?", (sid,)
+    ).fetchone() == (first,)
+
+    second_fact = node.fact_of(workspace, second)
+    evidence = node._action_evidence(workspace, second_fact)
+    index.execute(
+        "UPDATE actions SET fid=?, evidence=? WHERE sid=?",
+        (second, evidence, sid),
+    )
+    snapshot = manifest.decode_root(node.store(workspace).get("root"))
+    fetch = lambda oid: node.store(workspace).get("obj/" + oid)
+
+    incremental = indexes.build(
+        workspace, index, lambda fid: node.fact_of(workspace, fid),
+        lambda raw: h(raw),
+        previous=snapshot.trees, fetch=fetch,
+        changed_fids=(), changed_sids=(sid,))
+    rebuilt = indexes.build(
+        workspace, index, lambda fid: node.fact_of(workspace, fid),
+        lambda raw: h(raw))
+
+    assert incremental == rebuilt
 
 
 def test_incremental_equals_full(tmp_path):

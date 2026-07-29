@@ -44,11 +44,11 @@ def combine(*streams):
     return out
 
 
-def authorize(node, workspace, pile, now, root=None, projection=None):
+def authorize(node, workspace, pile, now, root=None, view=None):
     store = node.store(workspace)
     root = root or store.get("root")
     return mint.stateless(
-        pile, root, lambda oid: store.get("obj/" + oid), now, projection)
+        pile, root, lambda oid: store.get("obj/" + oid), now, view)
 
 
 def conflict_world(path, seed):
@@ -161,10 +161,8 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
     before = (
         store.list(""),
         tuple(node.idx(workspace).iterdump()),
-        tuple(node.app.iterdump()),
     )
     node.idx(workspace).close()
-    node.app.close()
     code, _ = invoke_mint(node, workspace, pile)[1]
     assert code == 200
 
@@ -172,7 +170,6 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
     after = (
         reopened.store(workspace).list(""),
         tuple(reopened.idx(workspace).iterdump()),
-        tuple(reopened.app.iterdump()),
     )
     assert after == before
 

@@ -8,7 +8,7 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
-from .fact import Fact
+from .fact import Fact, decode
 
 class Valid(NamedTuple):
     fact: Fact
@@ -38,12 +38,17 @@ class Context(NamedTuple):
     anchor: str
 
     def fact_meta(self, fid):
-        return self.db.execute(
-            "SELECT ts, t FROM facts WHERE fid=?", (fid,)).fetchone()
+        row = self.db.execute(
+            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
+        if row is None:
+            return None
+        fact = decode(row[0])
+        return fact.ts, fact.t
 
     def offers_from(self, source, name):
         return self.db.execute(
-            "SELECT a0, a1 FROM offers WHERE src=? AND name=? ORDER BY a0, a1",
+            "SELECT k0, k1 FROM fact_index "
+            "WHERE src=? AND kind=? ORDER BY k0, k1",
             (source, name)).fetchall()
 
     def edge_source(self, source, role):
@@ -133,13 +138,13 @@ def offer_src(db, name, a0, a1=None, requires=()):
     if hasattr(db, "resolve_offer"):
         return db.resolve_offer(name, a0, a1, requires)
     query = (
-        "SELECT o.src FROM offers o "
+        "SELECT o.src FROM fact_index o "
         "JOIN proofs p ON p.fid=o.src "
-        "WHERE o.name=? AND o.a0=?"
+        "WHERE o.kind=? AND o.k0=?"
     )
     args = [name, a0]
     if a1 is not None:
-        query, args = query + " AND o.a1=?", args + [a1]
+        query, args = query + " AND o.k1=?", args + [a1]
     row = db.execute(
         query + " ORDER BY p.rank, o.src LIMIT 1", args).fetchone()
     if row is None:
@@ -147,8 +152,8 @@ def offer_src(db, name, a0, a1=None, requires=()):
     source = row[0]
     for required_name, required_a0, required_a1 in requires:
         if db.execute(
-                "SELECT 1 FROM offers "
-                "WHERE src=? AND name=? AND a0=? AND a1=?",
+                "SELECT 1 FROM fact_index "
+                "WHERE src=? AND kind=? AND k0=? AND k1=?",
                 (source, required_name, required_a0,
                  required_a1 or "")).fetchone() is None:
             return None

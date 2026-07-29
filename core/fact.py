@@ -97,3 +97,24 @@ def from_json(o) -> Fact:
     if f.fid != h(canon(e)) or f.bh != e.get("bh"):
         raise ValueError("fact integrity")
     return f
+
+
+def encode(fact: Fact) -> bytes:
+    """The one canonical byte representation stored and carried for a fact."""
+    if not isinstance(fact, Fact):
+        raise ValueError("not a fact")
+    return canon(fact.to_json())
+
+
+def decode(raw: bytes) -> Fact:
+    """Strictly decode one canonical fact blob and re-check its content id."""
+    if not isinstance(raw, bytes):
+        raise ValueError("fact bytes")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("fact encoding") from error
+    fact = from_json(value)
+    if encode(fact) != raw:
+        raise ValueError("non-canonical fact encoding")
+    return fact

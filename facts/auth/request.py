@@ -5,7 +5,6 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "req"
-TABLES = ()
 POLICY = FamilyPolicy(authorization_guards=("member",))
 VERBS = frozenset({"sync"})
 
@@ -65,9 +64,6 @@ def authorize(view, valid, stream, trusted_now):
             or view.suppression(sid)["state"] != "clear":
         return None
     return body["pk"], body["verb"]
-
-
-# MATERIALIZE — ephemeral families never enter client projections.
 
 
 # COMMANDS — build the already-topological request + auth closure for a mint.

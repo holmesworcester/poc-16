@@ -6,11 +6,12 @@ import urllib.request
 from core.close import encode_pile
 from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, from_json
+from core import suppression_state
+from core.suppression import scoped_id
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from . import signature, user_invite
 
 TAG = "user"
-TABLES = ("member_rows",)
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     principal_offers=(SidOffer("member", "member"),),
@@ -58,14 +59,6 @@ def validate(f, ctx):
 DURABLE = True
 
 
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    fact, body = valid.fact, valid.fact.body
-    db.execute(
-        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
-        (workspace, fact.fid, body["pk"], body["name"], "member"))
-
-
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
@@ -96,12 +89,44 @@ def accept(node, link, name):
 
 # QUERIES
 def members(node, workspace):
+    """Assemble the roster from current ``member`` and ``admin`` offers."""
     with node.lock:
-        rows = node.app.execute(
-            "SELECT pk, name, role, evicted FROM members WHERE ws=? ORDER BY name",
-            (workspace,)).fetchall()
-    return [{"pk": pk, "name": name, "role": role, "evicted": bool(evicted)}
-            for pk, name, role, evicted in rows]
+        candidates = {}
+        role_order = {"admin": 0, "member": 1, "device": 2}
+        for rank, fact in node.select_ranked(workspace, "member"):
+            body = fact.body
+            if fact.t == "workspace":
+                row = body.get("pk"), body.get("name"), "admin"
+            elif fact.t == TAG:
+                row = body.get("pk"), body.get("name"), "member"
+            elif fact.t == "device_invite":
+                row = body.get("device"), body.get("label"), "device"
+            else:
+                continue
+            public, name, role = row
+            choice = (role_order[role], rank, fact.fid)
+            if public and name and (
+                    public not in candidates
+                    or choice < candidates[public][0]):
+                candidates[public] = (choice, name, role)
+
+        admins = {
+            public
+            for fact in node.select(workspace, "admin")
+            for name, public, _ in fact.offers()
+            if name == "admin"
+        }
+        rows = [
+            {
+                "pk": public,
+                "name": name,
+                "role": "admin" if public in admins else role,
+                "evicted": suppression_state.active(
+                    node.idx(workspace), scoped_id("member", public)),
+            }
+            for public, (_, name, role) in candidates.items()
+        ]
+    return sorted(rows, key=lambda row: (row["name"], row["pk"]))
 
 
 CLI = {"auth.user.join": accept, "auth.user.list": members}

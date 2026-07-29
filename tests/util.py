@@ -1,5 +1,6 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
 import base64
+import json
 import os
 import random
 import tempfile
@@ -71,22 +72,39 @@ def replay_random(source, workspace, destination, seed):
     return destination
 
 
-def projection_state(node):
-    """Canonical logical app state, excluding the history cursor."""
-    names = [
-        name for (name,) in node.app.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' "
-            "AND name != 'cursors' ORDER BY name")
-    ]
-    state = []
-    for name in names:
-        columns = node.app.execute(f"PRAGMA table_info({name})").fetchall()
-        order = ",".join(str(index) for index in range(1, len(columns) + 1))
-        state.append(
-            (name, tuple(node.app.execute(
-                f"SELECT * FROM {name} ORDER BY {order}"))))
-    return tuple(state)
+def query_state(node, workspace=None):
+    """Canonical public query state over the single fact catalog."""
+    if workspace is None:
+        known = node.workspaces() or list(node._idx)
+        if len(known) != 1:
+            raise ValueError("query_state needs one workspace")
+        workspace = known[0]
+    queries = (
+        ("admins", cmds.admins),
+        ("devices", cmds.devices),
+        ("files", cmds.files),
+        ("members", cmds.members),
+        ("messages", cmds.msgs),
+    )
+    return tuple(
+        (
+            name,
+            tuple(json.dumps(row, sort_keys=True) for row in query(
+                node, workspace)),
+        )
+        for name, query in queries
+    )
+
+
+def visible_fids(node, workspace):
+    """Eligible facts not masked by their explicit suppression ids."""
+    with node.lock:
+        return {
+            fid
+            for (fid,) in node.idx(workspace).execute(
+                "SELECT fid FROM proofs")
+            if not node.suppressed(workspace, node.fact_of(workspace, fid))
+        }
 
 
 def add_member(
@@ -173,11 +191,12 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 
 def all_fids(n, ws):
-    return [
-        fid for (fid,) in n.idx(ws).execute(
-            "SELECT f.fid FROM facts f JOIN proofs p ON p.fid=f.fid "
-            "ORDER BY f.ts, f.fid")
-    ]
+    with n.lock:
+        facts = [
+            n.fact_of(ws, fid)
+            for (fid,) in n.idx(ws).execute("SELECT fid FROM proofs")
+        ]
+    return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
 
 
 def send_bytes(node, workspace, name, data, channel="general", ts=None):

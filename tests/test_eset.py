@@ -18,9 +18,10 @@ from .util import (
     closed_subset,
     invoke_mint,
     member_src,
-    projection_state,
+    query_state,
     replay_random,
     suppression_world,
+    visible_fids,
 )
 
 
@@ -29,10 +30,7 @@ def test_e_identical_across_partitions_orders_batchings(
     """Random pile partitions, orders, and turn batches converge to one E."""
     source, workspace, targets, _ = suppression_world(tmp_path / "source")
     suppressed = {targets[index] for index in (1, 4, 6)}
-    effective = {
-        src for (src,) in source.app.execute(
-            "SELECT src FROM projected WHERE ws=?", (workspace,))
-    }
+    effective = visible_fids(source, workspace)
     assert suppressed.isdisjoint(effective)
     referenced = {
         target
@@ -44,16 +42,13 @@ def test_e_identical_across_partitions_orders_batchings(
             "SELECT fid FROM proofs")
     }
     expected_root = source.store(workspace).get("root")
-    expected_app = projection_state(source)
+    expected_app = query_state(source)
     for seed in range(5):
         peer = replay_random(
             source, workspace, Node(str(tmp_path / f"peer-{seed}")), seed)
         assert peer.store(workspace).get("root") == expected_root
-        assert {
-            src for (src,) in peer.app.execute(
-                "SELECT src FROM projected WHERE ws=?", (workspace,))
-        } == effective
-        assert projection_state(peer) == expected_app
+        assert visible_fids(peer, workspace) == effective
+        assert query_state(peer) == expected_app
 
 
 def test_suppression_facts_not_suppressible(tmp_path):
@@ -79,17 +74,16 @@ def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
     """A v7 restart repairs unranked ref targets before serving E."""
     node, workspace, targets, deletions = suppression_world(tmp_path / "node")
     referenced = {targets[index] for index in (1, 4, 6)}
-    expected = projection_state(node)
+    expected = query_state(node)
     index = node.idx(workspace)
     index.executemany(
         "DELETE FROM proofs WHERE fid=?",
         ((target,) for target in referenced))
     index.execute(
         "INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-        ("family-contract-v7-pump",))
+        ("obsolete-index-version",))
     index.commit()
     index.close()
-    node.app.close()
 
     upgraded = Node(node.dir)
 
@@ -99,7 +93,7 @@ def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
         fid for (fid,) in upgraded.idx(workspace).execute(
             "SELECT fid FROM proofs")
     }.issuperset(referenced)
-    assert projection_state(upgraded) == expected
+    assert query_state(upgraded) == expected
 
 
 def test_verdicts_never_read_s(tmp_path, monkeypatch):
@@ -116,16 +110,13 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
     assert alone_result.ok and deletion_result.ok
     assert target in {valid.fact.fid for valid in alone_result.valids}
     assert target in {valid.fact.fid for valid in deletion_result.valids}
-    assert source.app.execute(
-        "SELECT 1 FROM projected WHERE ws=? AND src=?",
-        (workspace, target),
-    ).fetchone() is None
+    assert target not in visible_fids(source, workspace)
 
 
 @pytest.mark.parametrize("restart", (False, True))
 def test_suppression_stays_behind_the_manifest_commit(
         tmp_path, monkeypatch, restart):
-    """An ahead action projection is invisible until the composite root CAS."""
+    """Ahead local action state is invisible until the composite root CAS."""
     node, workspace, _, _ = suppression_world(tmp_path / "node")
     target_fid = cmds.post(
         node, workspace, "unpublished", "target", ts=300)
@@ -135,10 +126,8 @@ def test_suppression_stays_behind_the_manifest_commit(
     store = node.store(workspace)
     old_root = store.get("root")
 
-    def projected():
-        return node.app.execute(
-            "SELECT 1 FROM projected WHERE ws=? AND src=?",
-            (workspace, target.fid)).fetchone() is not None
+    def visible():
+        return target.fid in visible_fids(node, workspace)
 
     def published_fids(raw):
         return {
@@ -148,17 +137,17 @@ def test_suppression_stays_behind_the_manifest_commit(
 
     assert published_fids(old_root)  # the world's deletions already settled
     assert deletion.fid not in published_fids(old_root)
-    assert projected()
+    assert visible()
     now = daemon.now_ms()
     request = encode_pile(request_payload(
         node, workspace, "sync", now + 60_000, now))
     canonical_observed = []
     original_mint = daemon.gate.stateless
 
-    def observe_canonical(pile, root, fetch, trusted_now, projection=None):
+    def observe_canonical(pile, root, fetch, trusted_now, view=None):
         canonical_observed.append(root == old_root)
         return original_mint(
-            pile, root, fetch, trusted_now, projection)
+            pile, root, fetch, trusted_now, view)
 
     monkeypatch.setattr(daemon.gate, "stateless", observe_canonical)
 
@@ -184,7 +173,7 @@ def test_suppression_stays_behind_the_manifest_commit(
         candidate.append(raw)
         assert key == "root"
         assert store.get("root") == old_root
-        # The local reverse projection is ahead, but readers still receive
+        # The local suppression state is ahead, but readers still receive
         # exactly the old composite root until the CAS.
         assert deletion.fid in {
             fid for (fid,) in node.idx(workspace).execute(
@@ -208,19 +197,16 @@ def test_suppression_stays_behind_the_manifest_commit(
             "SELECT fid FROM actions")}
     assert observed == [(200, old_root)]
     assert canonical_observed == [True]
-    assert projected()
+    assert visible()
     assert store.list("pile/")
 
     if restart:
         index = node.idx(workspace)
         index.executescript(
-            "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
-            "DELETE FROM supp; DELETE FROM meta;")
+            "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
+            "DELETE FROM proofs; DELETE FROM supp; DELETE FROM meta;")
         index.commit()
         index.close()
-        node.app.execute("PRAGMA user_version=0")
-        node.app.commit()
-        node.app.close()
         node = Node(node.dir)
         store = node.store(workspace)
     else:
@@ -228,7 +214,7 @@ def test_suppression_stays_behind_the_manifest_commit(
 
     assert node.fact_of(workspace, deletion.fid) is None
     assert store.get("root") == old_root
-    assert projected()
+    assert visible()
     retry_cas = store.cas
     retried = []
 
@@ -243,7 +229,7 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert store.get("root") == candidate[0]
     assert node.fact_of(workspace, deletion.fid) == deletion
     assert deletion.fid in published_fids(store.get("root"))
-    assert not projected()
+    assert not visible()
     _, (code, body) = invoke_mint(node, workspace, request)
     assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
     assert canonical_observed == [True, False]

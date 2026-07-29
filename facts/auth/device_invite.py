@@ -10,7 +10,6 @@ from .._commands import offer_source
 from . import signature
 
 TAG = "device_invite"
-TABLES = ("device_rows", "member_rows")
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     authorization_guards=("member", "device"),
@@ -65,18 +64,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    fact = valid.fact
-    body = fact.body
-    db.execute(
-        "INSERT INTO device_rows VALUES(?,?,?,?,?)",
-        (workspace, fact.fid, body["user"], body["device"], body["label"]))
-    db.execute(
-        "INSERT INTO member_rows VALUES(?,?,?,?,?)",
-        (workspace, fact.fid, body["device"], body["label"], "device"))
 
 
 # COMMANDS — build a fact, admit it, stop.

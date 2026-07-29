@@ -32,19 +32,19 @@ same admitted snapshot into three maps over the history-independent B-treap:
 
 All three descriptors are returned together for the composite root's single
 CAS. They use an anchor-derived seed, so a logical map has one root independent
-of insertion order. The incremental path may only path-copy an additions-only
-commit; prune, restore, winner changes, format changes, and direct bulk writes
-take the full canonical path. Both paths must produce the same roots for the
-same logical maps.
+of insertion order. The incremental path receives new fact ids and exact
+changed suppression ids; prune, restore, authority-winner changes, format
+changes, and direct bulk writes take the full canonical path. Both paths must
+produce the same roots for the same logical maps.
 """
 from collections import defaultdict
-import json
 
 import facts
 
-from . import btreap, suppression_state
+from . import btreap
+from .catalog import TYPE_INDEX
 from .crypto import h
-from .fact import canon, from_json
+from .fact import canon
 
 FACT = "fact"
 SUPP = "supp"
@@ -79,24 +79,16 @@ def need_key(name, a0, a1=None, requires=()):
     ]).decode()
 
 
-def _activate(rows, key, action_fid):
-    """Monotonically activate a slot with a replica-independent witness."""
-    current = rows.get(key)
-    winner = action_fid
-    if isinstance(current, dict) and current.get("state") == "active":
-        winner = min(winner, current["action"])
-    rows[key] = {"state": "active", "action": winner}
-
-
 def build(
         anchor, idx, fact_of, emit, *, previous=None, fetch=None,
-        changed_fids=None):
+        changed_fids=None, changed_sids=()):
     """Build or path-update Fact/Supp/Authority for one logical commit.
 
-    ``changed_fids`` is an additions-only ordinary commit. Prune, restore,
-    proof-winner changes, and format upgrades pass ``None`` and take the
-    canonical bulk path. ``previous`` is only a path-copy optimization: it
-    cannot affect the logical rows or resulting roots.
+    ``changed_fids`` is an additions-only commit and ``changed_sids`` is the
+    exact effective-action/evidence delta. Prune, restore, proof-winner
+    changes, and format upgrades pass ``None`` and take the canonical bulk
+    path. ``previous`` is only a path-copy optimization: it cannot affect the
+    logical rows or resulting roots.
 
     The caller supplies one derived-index snapshot and publishes the returned
     descriptors together with the range manifest. This function emits
@@ -108,17 +100,41 @@ def build(
     incremental = changed_fids is not None and all(
         previous.get(name, {}).get("root") for name in TREE_NAMES)
 
-    archived_actions, action_rows, action_evidence = {}, [], {}
-    for sid, fid, raw, evidence in idx.execute(
-            "SELECT sid, fid, j, evidence FROM actions ORDER BY sid"):
-        fact = from_json(json.loads(raw))
-        if fact.fid != fid \
-                or sid not in facts.action_sids(fact):
+    action_by_sid, action_evidence = {}, {}
+
+    def checked_action(sid, fid):
+        fact = fact_of(fid)
+        if fact is None or sid not in facts.action_sids(fact):
             raise ValueError("action archive integrity")
-        archived_actions[fid] = fact
-        action_rows.append((sid, fid))
-        action_evidence[fid] = min(
-            evidence, action_evidence.get(fid, evidence))
+        return fact
+
+    if not incremental:
+        for sid, fid, evidence in idx.execute(
+                "SELECT sid, fid, evidence FROM actions ORDER BY sid"):
+            checked_action(sid, fid)
+            action_by_sid[sid] = (fid, evidence)
+            action_evidence[fid] = min(
+                evidence, action_evidence.get(fid, evidence))
+
+    active_cache = {}
+
+    def active_binding(sid):
+        if sid not in active_cache:
+            row = idx.execute(
+                "SELECT fid, evidence FROM actions WHERE sid=?",
+                (sid,)).fetchone()
+            if row is not None:
+                checked_action(sid, row[0])
+            active_cache[sid] = row
+        return active_cache[sid]
+
+    def evidence_for(fid):
+        if not incremental:
+            return action_evidence.get(fid, "")
+        row = idx.execute(
+            "SELECT evidence FROM actions WHERE fid=? "
+            "ORDER BY evidence LIMIT 1", (fid,)).fetchone()
+        return row[0] if row else ""
 
     def fact_record(fact):
         selectors = sorted(facts.fact_scopes(fact))
@@ -135,7 +151,7 @@ def build(
         liveness = set(facts.authority_scopes(
             fact, edges_of, fact_of)) - set(selectors)
         return {
-            "evidence": action_evidence.get(fact.fid, ""),
+            "evidence": evidence_for(fact.fid),
             "liveness": sorted(liveness),
             "offers": [list(row) for row in fact.offers()],
             "selectors": selectors,
@@ -144,8 +160,8 @@ def build(
     def active_slot(sid):
         # CLEAR is authenticated state for a reserved id, never shorthand for
         # an absent tree row. ACTIVE carries the deterministic archive winner.
-        row = idx.execute(
-            "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone()
+        row = active_binding(sid) if incremental \
+            else action_by_sid.get(sid)
         return {"state": "active", "action": row[0]} \
             if row is not None else {"state": "clear"}
 
@@ -174,17 +190,17 @@ def build(
         name, a0, a1 = address
         if a1 is None:
             row = idx.execute(
-                "SELECT p.rank, o.src FROM offers o "
+                "SELECT p.rank, o.src FROM fact_index o "
                 "JOIN proofs p ON p.fid=o.src "
-                "WHERE o.name=? AND o.a0=? "
+                "WHERE o.kind=? AND o.k0=? "
                 "ORDER BY p.rank, o.src LIMIT 1",
                 (name, a0),
             ).fetchone()
         else:
             row = idx.execute(
-                "SELECT p.rank, o.src FROM offers o "
+                "SELECT p.rank, o.src FROM fact_index o "
                 "JOIN proofs p ON p.fid=o.src "
-                "WHERE o.name=? AND o.a0=? AND o.a1=? "
+                "WHERE o.kind=? AND o.k0=? AND o.k1=? "
                 "ORDER BY p.rank, o.src LIMIT 1",
                 (name, a0, a1),
             ).fetchone()
@@ -211,14 +227,27 @@ def build(
                 addresses.add((name, a0, a1))
                 addresses.add((name, a0, None))
 
-        # Action state is a small monotone set. Include it on every update so
-        # action-first sync can publish a witness not yet in the ordinary set.
-        for sid, fid in action_rows:
-            fact = archived_actions[fid]
-            fact_changes[fact_key(fid)] = fact_record(fact)
-            active = {"state": "active", "action": fid}
-            fact_changes[action_key(sid)] = active
-            supp_changes[sid] = active
+        fact_reader = btreap.Reader(previous[FACT]["root"], seed, fetch)
+        for sid in sorted(set(changed_sids)):
+            if not isinstance(sid, str) or not sid:
+                raise ValueError("changed suppression id")
+            slot = active_slot(sid)
+            address = action_key(sid)
+            previous_slot = fact_reader.get(address)
+            fact_changes[address] = slot
+            supp_changes[sid] = slot
+            current_fid = slot.get("action") \
+                if slot["state"] == "active" else None
+            if current_fid is not None:
+                current = checked_action(sid, current_fid)
+                fact_changes[fact_key(current_fid)] = fact_record(current)
+            old_fid = previous_slot.get("action") \
+                if isinstance(previous_slot, dict) \
+                and previous_slot.get("state") == "active" else None
+            if old_fid is not None and old_fid != current_fid:
+                old = fact_of(old_fid)
+                fact_changes[fact_key(old_fid)] = \
+                    fact_record(old) if old is not None else None
 
         authority_changes = {
             need_key(*address): authority_value(address)
@@ -258,24 +287,22 @@ def build(
             fact_rows.setdefault(key, value)
         for key, value in supp_slots.items():
             supp_rows.setdefault(key, value)
-    for fid, fact in archived_actions.items():
-        if fact_key(fid) not in fact_rows:
-            fact_rows[fact_key(fid)] = fact_record(fact)
-
     for _, sid in idx.execute(
             "SELECT s.fid, s.k FROM supp s "
             "JOIN proofs p ON p.fid=s.fid ORDER BY s.fid, s.k"):
         supp_rows.setdefault(sid, active_slot(sid))
 
-    for sid, fid in action_rows:
-        _activate(supp_rows, sid, fid)
-        _activate(fact_rows, action_key(sid), fid)
+    for sid, (fid, _) in action_by_sid.items():
+        active = {"state": "active", "action": fid}
+        supp_rows[sid] = active
+        fact_rows[action_key(sid)] = active
 
     authority_rows, candidates = {}, defaultdict(list)
     for name, a0, a1, src, rank in idx.execute(
-            "SELECT o.name, o.a0, o.a1, o.src, p.rank "
-            "FROM offers o JOIN proofs p ON p.fid=o.src "
-            "ORDER BY p.rank, o.src"):
+            "SELECT o.kind, o.k0, o.k1, o.src, p.rank "
+            "FROM fact_index o JOIN proofs p ON p.fid=o.src "
+            "WHERE o.kind != ? ORDER BY p.rank, o.src",
+            (TYPE_INDEX,)):
         candidates[(name, a0, a1)].append((rank, src))
         candidates[(name, a0, None)].append((rank, src))
     for address, choices in candidates.items():
