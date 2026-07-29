@@ -485,13 +485,13 @@ bytes on demand.
 
 | Seed facts | Post p50 | Post p95 | object touches/post | immutable KiB/post |
 |---:|---:|---:|---:|---:|
-| 1,000 | 12.20 ms | 19.55 ms | 90.6 | 43.0 |
-| 5,000 | 23.75 ms | 25.90 ms | 109.6 | 72.8 |
-| 10,000 | 22.01 ms | 27.70 ms | 122.9 | 71.9 |
+| 1,000 | 15.41 ms | 16.34 ms | 84.9 | 48.0 |
+| 5,000 | 27.98 ms | 31.10 ms | 114.1 | 67.0 |
+| 10,000 | 19.40 ms | 27.24 ms | 127.1 | 55.4 |
 
 Every measured post performed zero `Node.keys` calls. Authenticated-tree and
-RangeTree touches grow with their paths (91–123 here), not with the
-1,000–10,000-fact corpus. A primed same-root idle dial measured 0.007–0.008 ms
+RangeTree touches grow with their paths (85–127 here), not with the
+1,000–10,000-fact corpus. A primed same-root idle dial measured 0.008–0.013 ms
 p50/p95 locally and performed no fact, tree, object, or blob-demand scan.
 These numbers are diagnostic, not cross-machine service guarantees.
 
