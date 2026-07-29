@@ -3,6 +3,7 @@ import base64
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from adapters.s3 import S3Config
 from core import cmds
 from core.close import encode_pile
 from core.crypto import h, unseal
@@ -17,31 +19,82 @@ from core.grants import check_token
 from core.limits import MAX_MINT_REQUEST_BYTES
 from core.node import Node
 from deploy.aws_lambda import app
+from deploy.aws_lambda.config import (
+    BUCKET_PATTERN,
+    DEPLOYMENT_ID_TAG,
+    DEPLOYMENT_MARKER,
+    DEPLOYMENT_TAG,
+    FUNCTION_TIMEOUT_SECONDS,
+    MAX_LOG_METHOD_CHARS,
+    MAX_LOG_PATH_CHARS,
+    MAX_LOG_RECORD_BYTES,
+    MAX_QUERY_BYTES,
+    MAX_QUERY_FIELDS,
+    MAX_STORE_PREFIX_LENGTH,
+    PREFIX_PATTERN,
+    SDK_CLEANUP_MARGIN_SECONDS,
+    SDK_CONNECT_TIMEOUT_SECONDS,
+    SDK_READ_TIMEOUT_SECONDS,
+    SDK_TOTAL_ATTEMPTS,
+    validate_sdk_budget,
+)
 from deploy.aws_lambda.s3_bucket_policy import policy
-from deploy.gateway import AsyncFromSyncReader, Gateway
+from deploy.gateway import AsyncFromSyncReader, Gateway, Response
 from facts.auth import request
 
 ROOT = Path(__file__).resolve().parents[1]
 LAMBDA = ROOT / "deploy" / "aws_lambda"
 
 
-def event(method, path, workspace=None, body=None, headers=None):
-    encoded = base64.b64encode(body).decode() if body is not None else None
+def event(
+        method, path, workspace=None, body=None, headers=None, *,
+        raw_query=None, base64_body=True):
+    encoded = None
+    if body is not None:
+        encoded = base64.b64encode(body).decode() \
+            if base64_body else body.decode()
     return {
         "version": "2.0",
         "rawPath": path,
-        "rawQueryString": urlencode({"ws": workspace})
-        if workspace is not None else "",
+        "rawQueryString": raw_query if raw_query is not None else (
+            urlencode({"ws": workspace}) if workspace is not None else ""),
         "headers": headers or {},
         "requestContext": {"http": {"method": method}},
         "body": encoded,
-        "isBase64Encoded": body is not None,
+        "isBase64Encoded": body is not None and base64_body,
     }
 
 
 def response(result):
     return result["statusCode"], result["headers"], base64.b64decode(
         result["body"])
+
+
+def load_manage(name="lambda_manage"):
+    spec = importlib.util.spec_from_file_location(
+        name, LAMBDA / "manage.py")
+    manage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manage)
+    return manage
+
+
+def deployment_args(**changes):
+    values = {
+        "alarm_action_arn": None,
+        "bucket": "test-bucket",
+        "create": True,
+        "deployment_id": "edge-west-2",
+        "expected_owner": None,
+        "kms_key_arn": None,
+        "prefix": "tenant",
+        "profile": None,
+        "region": "us-west-2",
+        "stack": "poc16-edge",
+        "update": False,
+        "workspace": "a" * 64,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def world(tmp_path):
@@ -119,6 +172,110 @@ def test_lambda_denies_bad_proofs_and_malformed_function_events(tmp_path):
     assert response(app.handler(oversized, None))[0] == 413
 
 
+def test_lambda_bounds_query_bytes_and_fields_before_parsing(tmp_path):
+    _, workspace, _, _ = world(tmp_path)
+
+    byte_over = event(
+        "GET", "/root", raw_query="x" * (MAX_QUERY_BYTES + 1))
+    assert response(app.handler(byte_over, None))[0] == 413
+
+    fields_over = event(
+        "GET", "/root",
+        raw_query="&".join(
+            [f"ws={workspace}"]
+            + [f"k{index}=v" for index in range(MAX_QUERY_FIELDS)]))
+    assert response(app.handler(fields_over, None))[0] == 413
+
+    plain = event(
+        "POST", "/mint", workspace, b"not-json",
+        base64_body=False)
+    assert response(app.handler(plain, None))[0] == 400
+
+
+def test_lambda_rejects_malformed_query_encoding_before_gateway_io(
+        tmp_path):
+    _, workspace, _, _ = world(tmp_path)
+    calls = []
+
+    class Probe:
+        async def handle(self, *request):
+            calls.append(request)
+            return Response(200)
+
+    app._gateway_cache = Probe()
+    for malformed in ("%", "%2", "%GG", "%FF"):
+        request_event = event(
+            "GET", "/root",
+            raw_query=f"ws={workspace}&bad={malformed}")
+        assert response(app.handler(request_event, None))[0] == 400
+    assert calls == []
+
+    valid = event(
+        "GET", "/root",
+        raw_query=f"ws={workspace}&ok=%E2%9C%93")
+    assert response(app.handler(valid, None))[0] == 200
+    assert calls[0][2]["ok"] == ["✓"]
+
+
+def test_lambda_logs_handled_5xx_without_request_secrets(
+        tmp_path, caplog):
+    _, workspace, _, _ = world(tmp_path)
+
+    class Failure:
+        async def handle(self, *_request):
+            return Response(503)
+
+    app._gateway_cache = Failure()
+    request_event = event(
+        "GET", "/page/" + "0" * 64, workspace,
+        headers={"authorization": "Bearer top-secret-token"})
+    context = SimpleNamespace(aws_request_id="request-123")
+
+    with caplog.at_level("ERROR", logger=app.__name__):
+        result = app.handler(request_event, context)
+
+    assert response(result)[0] == 503
+    record = json.loads(caplog.records[-1].message)
+    assert record == {
+        "error_type": None,
+        "event": "poc16_gateway_failure",
+        "kind": "gateway_response",
+        "method": "GET",
+        "path": "/page/" + "0" * 64,
+        "request_id": "request-123",
+        "status": 503,
+    }
+    assert "top-secret-token" not in caplog.text
+    assert workspace not in caplog.text
+
+
+def test_lambda_failure_telemetry_has_exact_attacker_field_bounds(caplog):
+    exact_method = "M" * MAX_LOG_METHOD_CHARS
+    exact_path = "/" + "p" * (MAX_LOG_PATH_CHARS - 1)
+    over_method = exact_method + "OVER"
+    over_path = exact_path + "OVER"
+
+    with caplog.at_level("ERROR", logger=app.__name__):
+        app._log_failure(
+            "gateway_response",
+            request=(exact_method, exact_path),
+            status=503)
+        app._log_failure(
+            "gateway_response",
+            request=(over_method, over_path),
+            status=503)
+
+    exact, over = (
+        json.loads(record.message) for record in caplog.records[-2:])
+    assert exact["method"] == exact_method
+    assert exact["path"] == exact_path
+    assert over["method"] == exact_method
+    assert over["path"] == exact_path
+    assert all(
+        len(record.message.encode()) <= MAX_LOG_RECORD_BYTES
+        for record in caplog.records[-2:])
+
+
 def test_lambda_cold_sandboxes_load_one_stable_external_secret(
         tmp_path, monkeypatch):
     node, workspace, _, _ = world(tmp_path)
@@ -131,11 +288,14 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
 
     class Boto:
         @staticmethod
-        def client(name):
+        def client(name, **options):
             assert name == "secretsmanager"
+            assert options == {"config": "bounded-botocore"}
             return Secrets()
 
     monkeypatch.setitem(sys.modules, "boto3", Boto)
+    monkeypatch.setattr(
+        app, "_botocore_config", lambda: "bounded-botocore")
     monkeypatch.setattr(
         app, "_store",
         lambda: AsyncFromSyncReader(node.store(workspace)))
@@ -151,17 +311,48 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
     assert calls == [{"SecretId": "stable-secret"}]
 
 
+def test_lambda_sdk_deadline_budget_precedes_hard_timeout(monkeypatch):
+    connect, read, attempts = validate_sdk_budget()
+    assert attempts == 1
+    assert connect + read <= (
+        FUNCTION_TIMEOUT_SECONDS - SDK_CLEANUP_MARGIN_SECONDS)
+
+    monkeypatch.setenv("TINYP2P_AWS_TOTAL_ATTEMPTS", "2")
+    with pytest.raises(RuntimeError, match="deadline budget"):
+        app._sdk_budget()
+
+
+def test_lambda_store_uses_the_validated_one_attempt_deadline(
+        monkeypatch):
+    captured = []
+
+    class Store:
+        def __init__(self, config):
+            captured.append(config)
+
+    monkeypatch.setattr(app, "S3Store", Store)
+    monkeypatch.setenv("TINYP2P_S3_BUCKET", "test-bucket")
+    monkeypatch.setenv("TINYP2P_S3_PREFIX", "tenant")
+    monkeypatch.delenv("TINYP2P_AWS_TOTAL_ATTEMPTS", raising=False)
+    wrapped = app._store()
+
+    assert isinstance(wrapped.reader, Store)
+    assert len(captured) == 1
+    assert captured[0].connect_timeout == SDK_CONNECT_TIMEOUT_SECONDS
+    assert captured[0].read_timeout == SDK_READ_TIMEOUT_SECONDS
+    assert captured[0].read_total_max_attempts == SDK_TOTAL_ATTEMPTS
+    assert captured[0].probe_access_denied_missing is True
+
+
 def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
-    spec = importlib.util.spec_from_file_location(
-        "lambda_manage", LAMBDA / "manage.py")
-    manage = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(manage)
+    manage = load_manage()
     staged = manage.stage(tmp_path / "stage")
 
     assert (staged / "core" / "mint.py").is_file()
     assert (staged / "facts" / "auth" / "request.py").is_file()
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
+    assert (staged / "deploy" / "aws_lambda" / "config.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "sdk_smoke.py").is_file()
     assert (
         staged / "deploy" / "aws_lambda" / "s3_bucket_policy.py").is_file()
@@ -178,8 +369,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
 
 def test_lambda_template_is_read_only_bounded_and_reproducible():
     template = (LAMBDA / "template.yaml").read_text()
-    requirements = (
-        LAMBDA / "requirements.txt").read_text().splitlines()
+    requirements = (LAMBDA / "requirements.txt").read_text()
 
     assert "Runtime: python3.13" in template
     assert "Architectures: [x86_64]" in template
@@ -190,18 +380,94 @@ def test_lambda_template_is_read_only_bounded_and_reproducible():
     assert "s3:GetObject" in template
     assert "s3:PutObject" not in template
     assert "s3:DeleteObject" not in template
-    assert "s3:ListBucket" not in template
-    assert "AWS::CloudWatch::Alarm" in template
-    assert requirements == [
-        "boto3==1.43.51",
-        "botocore==1.43.51",
-        "PyNaCl==1.6.2",
-    ]
+    assert "Action: s3:ListBucket" in template
+    assert "s3:prefix:" in template
+    assert '${StorePrefix}/root' in template
+    assert '${StorePrefix}/obj/*' in template
+    assert '${StorePrefix}/invite/*' in template
+    assert "MetricName: Url5xxCount" in template
+    assert "MetricName: Errors" not in template
+    assert "AlarmActions: !If" in template
+    assert "Action: kms:Decrypt" in template
+    assert "Resource: !Ref KmsKeyArn" in template
+    assert "Action: kms:*" not in template
+    assert f"Value: {DEPLOYMENT_MARKER}" in template
+    assert "Value: !Ref DeploymentId" in template
+    assert f"Timeout: {FUNCTION_TIMEOUT_SECONDS}" in template
+    assert (
+        f'TINYP2P_AWS_CONNECT_TIMEOUT_SECONDS: '
+        f'"{SDK_CONNECT_TIMEOUT_SECONDS}"') in template
+    assert (
+        f'TINYP2P_AWS_READ_TIMEOUT_SECONDS: '
+        f'"{SDK_READ_TIMEOUT_SECONDS}"') in template
+    assert (
+        f'TINYP2P_AWS_TOTAL_ATTEMPTS: '
+        f'"{SDK_TOTAL_ATTEMPTS}"') in template
+    assert f"AllowedPattern: '{BUCKET_PATTERN}'" in template
+    assert f"AllowedPattern: '{PREFIX_PATTERN}'" in template
+    assert f"MaxLength: {MAX_STORE_PREFIX_LENGTH}" in template
+
+    assert "--require-hashes" in requirements
+    assert "--only-binary=:all:" in requirements
+    for package in (
+            "boto3==1.43.51", "botocore==1.43.51", "cffi==2.1.0",
+            "jmespath==1.1.0", "pycparser==3.0", "PyNaCl==1.6.2",
+            "python-dateutil==2.9.0.post0", "s3transfer==0.19.2",
+            "six==1.17.0", "urllib3==2.7.0"):
+        assert package in requirements
+    assert requirements.count("--hash=sha256:") == 10
+
+
+def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
+    bucket_re, prefix_re = re.compile(BUCKET_PATTERN), re.compile(
+        PREFIX_PATTERN)
+    for bucket in (
+            "abc", "workspace-bucket", "a.b-c",
+            "0" * 62 + "a"):
+        assert bucket_re.fullmatch(bucket)
+        S3Config(bucket=bucket, prefix="tenant")
+    for bucket in (
+            "xn--bucket", "sthree-bucket", "192.168.1.1",
+            "bad..bucket", "directory--x-s3", "alias-s3alias"):
+        assert not bucket_re.fullmatch(bucket)
+        with pytest.raises(ValueError):
+            S3Config(bucket=bucket, prefix="tenant")
+
+    for prefix in ("tenant", "tenant/workspace", "a" * 760):
+        assert len(prefix) <= MAX_STORE_PREFIX_LENGTH
+        assert prefix_re.fullmatch(prefix)
+        S3Config(bucket="test-bucket", prefix=prefix)
+    for prefix in (
+            "/tenant", "tenant/", "tenant//workspace",
+            "tenant/../workspace"):
+        assert not prefix_re.fullmatch(prefix)
+        with pytest.raises(ValueError):
+            S3Config(bucket="test-bucket", prefix=prefix)
+
+    # The longest public key is invite/<256 bytes>; this is exactly S3's
+    # 1,024-byte physical-key ceiling at the accepted prefix maximum.
+    assert MAX_STORE_PREFIX_LENGTH + 1 + len("invite/") + 256 == 1024
+
+
+def test_list_permission_is_limited_to_gateway_read_namespaces():
+    template = (LAMBDA / "template.yaml").read_text()
+    block = template.split(
+        "- Sid: DistinguishMissingWorkspaceKeys", 1)[1].split(
+            "- Sid: ReadRoot", 1)[0]
+
+    assert "Action: s3:ListBucket" in block
+    assert '"arn:${AWS::Partition}:s3:::${BucketName}"' in block
+    assert block.count("!Sub") == 4
+    assert '${StorePrefix}/root' in block
+    assert '${StorePrefix}/obj/*' in block
+    assert '${StorePrefix}/invite/*' in block
+    assert '${StorePrefix}/*' not in block
+    assert "s3:max-keys: 1" in block
 
 
 def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
-    principal = "arn:aws:iam::123456789012:role/poc16-publisher"
-    document = policy("workspace-bucket", "tenant", principal)
+    document = policy(
+        "workspace-bucket", "tenant", profile="bucket-wide")
     statements = {
         statement["Sid"]: statement
         for statement in document["Statement"]
@@ -210,10 +476,23 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
     deletion = statements["DenyAuthoritativeDeletion"]
     assert set(deletion["Action"]) == {
         "s3:DeleteObject", "s3:DeleteObjectVersion"}
-    assert deletion["Resource"] == [
+    authoritative_resources = [
         "arn:aws:s3:::workspace-bucket/tenant/root",
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
     ]
+    assert deletion["Resource"] == authoritative_resources
+    metadata = statements["DenyAuthoritativeMetadataMutation"]
+    assert set(metadata["Action"]) == {
+        "s3:DeleteObjectTagging",
+        "s3:DeleteObjectVersionTagging",
+        "s3:PutObjectAcl",
+        "s3:PutObjectTagging",
+        "s3:PutObjectVersionTagging",
+    }
+    assert metadata["Resource"] == authoritative_resources
+    assert all(
+        statement["Principal"] == "*"
+        for statement in document["Statement"])
     assert statements["RequireImmutableObjectCreate"]["Condition"] == {
         "Null": {"s3:if-none-match": "true"}}
     assert statements["RequireRootCompareAndSwap"]["Condition"] == {
@@ -221,21 +500,383 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
             "s3:if-match": "true",
             "s3:if-none-match": "true",
         }}
-    assert statements["DenyPublisherLifecycleMutation"]["Action"] \
+    assert statements["DenyLifecycleMutation"]["Action"] \
         == "s3:PutLifecycleConfiguration"
+
+
+def test_single_publisher_policy_names_its_residual_trust_boundary():
+    principal = "arn:aws:iam::123456789012:role/poc16-publisher"
+    document = policy(
+        "workspace-bucket", "tenant", principal,
+        profile="single-publisher")
+
+    assert all(
+        statement["Principal"] == {"AWS": principal}
+        for statement in document["Statement"])
+    with pytest.raises(ValueError, match="does not accept one publisher"):
+        policy(
+            "workspace-bucket", "tenant", principal,
+            profile="bucket-wide")
+    with pytest.raises(ValueError, match="principal"):
+        policy(
+            "workspace-bucket", "tenant",
+            profile="single-publisher")
+
+
+def test_deploy_validates_inputs_and_requires_readiness(monkeypatch):
+    manage = load_manage("lambda_manage_deploy")
+    calls = []
+    monkeypatch.setattr(
+        manage, "build", lambda _args: calls.append("build"))
+    monkeypatch.setattr(
+        manage, "_deploy_stack",
+        lambda _args: calls.append("deploy"))
+    monkeypatch.setattr(
+        manage, "_stack_url",
+        lambda _args: "https://gateway.lambda-url.example")
+    monkeypatch.setattr(
+        manage, "_readiness",
+        lambda url: calls.append(("ready", url)))
+
+    manage.deploy(deployment_args())
+    assert calls == [
+        "build", "deploy",
+        ("ready", "https://gateway.lambda-url.example"),
+    ]
+
+    calls.clear()
+    with pytest.raises(ValueError, match="bucket"):
+        manage.deploy(deployment_args(bucket="directory--x-s3"))
+    assert calls == []
+    with pytest.raises(ValueError, match="prefix"):
+        manage.deploy(deployment_args(
+            prefix="a" * (MAX_STORE_PREFIX_LENGTH + 1)))
+    assert calls == []
+
+
+def test_deploy_passes_exact_kms_alarm_and_ownership_inputs(monkeypatch):
+    manage = load_manage("lambda_manage_parameters")
+    calls = []
+    monkeypatch.setattr(
+        manage, "_run", lambda command: calls.append(command))
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy", lambda _args: _args.stack)
+    kms = "arn:aws:kms:us-west-2:123456789012:key/key-id"
+    alarm = "arn:aws:sns:us-west-2:123456789012:poc16-alerts"
+
+    manage._deploy_stack(deployment_args(
+        expected_owner="123456789012",
+        kms_key_arn=kms,
+        alarm_action_arn=alarm))
+
+    command = calls[0]
+    assert f"ExpectedBucketOwner=123456789012" in command
+    assert f"KmsKeyArn={kms}" in command
+    assert f"AlarmActionArn={alarm}" in command
+    assert "--tags" in command
+    assert f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}" in command
+    assert f"{DEPLOYMENT_ID_TAG}=edge-west-2" in command
+    assert "DeploymentId=edge-west-2" in command
+
+
+def test_remove_requires_same_account_region_tag_and_output(
+        monkeypatch):
+    manage = load_manage("lambda_manage_remove")
+    args = deployment_args()
+
+    def stack(**changes):
+        value = {
+            "StackName": args.stack,
+            "StackId": (
+                "arn:aws:cloudformation:us-west-2:123456789012:"
+                f"stack/{args.stack}/opaque"),
+            "StackStatus": "UPDATE_COMPLETE",
+            "Tags": [{
+                "Key": DEPLOYMENT_TAG,
+                "Value": DEPLOYMENT_MARKER,
+            }, {
+                "Key": DEPLOYMENT_ID_TAG,
+                "Value": args.deployment_id,
+            }],
+            "Outputs": [
+                {
+                    "OutputKey": "DeploymentMarker",
+                    "OutputValue": DEPLOYMENT_MARKER,
+                },
+                {
+                    "OutputKey": "DeploymentId",
+                    "OutputValue": args.deployment_id,
+                },
+            ],
+        }
+        value.update(changes)
+        return value
+
+    selected = [stack()]
+    commands = []
+    monkeypatch.setattr(
+        manage, "_describe_stack", lambda _args: selected[0])
+    monkeypatch.setattr(
+        manage, "_caller_account", lambda _args: "123456789012")
+    monkeypatch.setattr(
+        manage, "_run", lambda command: commands.append(command))
+
+    manage.remove(args)
+    assert commands == [[
+        "sam", "delete", "--stack-name", selected[0]["StackId"],
+        "--no-prompts",
+        "--region", "us-west-2",
+    ]]
+
+    commands.clear()
+    wrong_id_tag = stack()
+    wrong_id_tag["Tags"][1]["Value"] = "another-deployment"
+    wrong_id_output = stack()
+    wrong_id_output["Outputs"][1]["OutputValue"] = "another-deployment"
+    bad_stacks = [
+        stack(Tags=[]),
+        stack(Outputs=[]),
+        wrong_id_tag,
+        wrong_id_output,
+        stack(StackName="unrelated"),
+        stack(StackStatus="DELETE_IN_PROGRESS"),
+        stack(StackId=(
+            "arn:aws:cloudformation:eu-west-1:123456789012:"
+            f"stack/{args.stack}/opaque")),
+        stack(StackId=(
+            "arn:aws:cloudformation:us-west-2:999999999999:"
+            f"stack/{args.stack}/opaque")),
+    ]
+    for candidate in bad_stacks:
+        selected[0] = candidate
+        with pytest.raises(RuntimeError):
+            manage.remove(args)
+    assert commands == []
+
+
+def test_deploy_mode_refuses_collisions_and_targets_owned_stack_id(
+        monkeypatch):
+    manage = load_manage("lambda_manage_deploy_identity")
+    args = deployment_args()
+    stack_id = (
+        "arn:aws:cloudformation:us-west-2:123456789012:"
+        f"stack/{args.stack}/opaque")
+    owned = {
+        "StackName": args.stack,
+        "StackId": stack_id,
+        "StackStatus": "UPDATE_COMPLETE",
+        "Tags": [{
+            "Key": DEPLOYMENT_TAG,
+            "Value": DEPLOYMENT_MARKER,
+        }, {
+            "Key": DEPLOYMENT_ID_TAG,
+            "Value": args.deployment_id,
+        }],
+        "Outputs": [
+            {
+                "OutputKey": "DeploymentMarker",
+                "OutputValue": DEPLOYMENT_MARKER,
+            },
+            {
+                "OutputKey": "DeploymentId",
+                "OutputValue": args.deployment_id,
+            },
+        ],
+    }
+    selected = [None]
+    monkeypatch.setattr(
+        manage, "_stack_or_none", lambda _args: selected[0])
+    monkeypatch.setattr(
+        manage, "_caller_account", lambda _args: "123456789012")
+
+    assert manage._stack_for_deploy(args) == args.stack
+    selected[0] = owned
+    with pytest.raises(RuntimeError, match="absent"):
+        manage._stack_for_deploy(args)
+
+    args.create, args.update = False, True
+    assert manage._stack_for_deploy(args) == stack_id
+    args.deployment_id = "another-deployment"
+    with pytest.raises(RuntimeError, match="deployment ID"):
+        manage._stack_for_deploy(args)
+    args.deployment_id = "edge-west-2"
+    selected[0] = None
+    with pytest.raises(RuntimeError, match="existing"):
+        manage._stack_for_deploy(args)
+
+    args.create = args.update = False
+    with pytest.raises(ValueError, match="exactly one"):
+        manage._stack_for_deploy(args)
+
+
+def test_generated_remove_treats_true_absence_as_safe(monkeypatch):
+    manage = load_manage("lambda_manage_absent_cleanup")
+    args = deployment_args(generated_smoke=True)
+    commands = []
+    monkeypatch.setattr(
+        manage, "_stack_or_none", lambda _args: None)
+    monkeypatch.setattr(
+        manage, "_run", lambda command: commands.append(command))
+
+    assert manage.remove(args) is False
+    assert commands == []
+
+
+def test_stack_absence_classification_never_hides_access_errors(
+        monkeypatch):
+    manage = load_manage("lambda_manage_absence")
+    args = deployment_args()
+    errors = [
+        subprocess.CalledProcessError(
+            255, ["aws"], stderr=(
+                "An error occurred (ValidationError): Stack with id "
+                "poc16-edge does not exist")),
+        subprocess.CalledProcessError(
+            255, ["aws"], stderr=(
+                "An error occurred (AccessDenied): denied")),
+    ]
+
+    def fail(_command):
+        raise errors.pop(0)
+
+    monkeypatch.setattr(manage, "_json_command", fail)
+    with pytest.raises(manage.StackAbsent):
+        manage._describe_stack(args)
+    with pytest.raises(subprocess.CalledProcessError):
+        manage._describe_stack(args)
+
+
+def test_live_smoke_never_cleans_a_collision_and_preserves_dual_failures(
+        tmp_path, monkeypatch):
+    manage = load_manage("lambda_manage_live_outcomes")
+    args = deployment_args(state=str(tmp_path))
+    calls = []
+    monkeypatch.setattr(manage, "build", lambda _args: calls.append("build"))
+
+    def collision(_args):
+        raise RuntimeError("stack collision")
+
+    monkeypatch.setattr(manage, "_stack_for_deploy", collision)
+    monkeypatch.setattr(
+        manage, "remove",
+        lambda _args: calls.append("unexpected cleanup"))
+    with pytest.raises(RuntimeError, match="stack collision"):
+        manage.live_smoke(args)
+    assert calls == ["build"]
+
+    calls.clear()
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy", lambda deploy_args: deploy_args.stack)
+
+    def possibly_applied(_args, _target):
+        calls.append("deploy attempted")
+        raise RuntimeError("deploy response lost")
+
+    def cleanup_failed(_args):
+        calls.append("cleanup attempted")
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(manage, "_deploy_stack", possibly_applied)
+    monkeypatch.setattr(manage, "remove", cleanup_failed)
+    with pytest.raises(ExceptionGroup) as caught:
+        manage.live_smoke(args)
+
+    assert calls == [
+        "build", "deploy attempted", "cleanup attempted"]
+    assert [str(error) for error in caught.value.exceptions] == [
+        "deploy response lost", "cleanup failed"]
+
+
+def test_management_subprocesses_have_distinct_finite_deadlines(
+        monkeypatch):
+    manage = load_manage("lambda_manage_timeouts")
+    calls = []
+
+    def run(command, **options):
+        calls.append((command, options))
+        return SimpleNamespace(stdout="{}")
+
+    monkeypatch.setattr(manage.subprocess, "run", run)
+    manage._run(["sam", "build"])
+    assert manage._json_command(["aws", "sts", "get-caller-identity"]) == {}
+
+    assert calls[0][1]["timeout"] == manage.MUTATION_TIMEOUT_SECONDS
+    assert calls[1][1]["timeout"] == manage.METADATA_TIMEOUT_SECONDS
+    assert 0 < calls[1][1]["timeout"] < calls[0][1]["timeout"]
+
+    def timeout(command, **_options):
+        raise subprocess.TimeoutExpired(command, 1)
+
+    monkeypatch.setattr(manage.subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        manage._run(["sam", "deploy"])
+
+
+def test_package_smoke_executes_sam_artifact_in_lambda_runtime(
+        tmp_path, monkeypatch):
+    manage = load_manage("lambda_manage_package")
+    artifact = tmp_path / "GatewayFunction"
+    artifact.mkdir()
+    calls = []
+    monkeypatch.setattr(manage, "ARTIFACT", artifact)
+    monkeypatch.setattr(
+        manage, "build", lambda _args: calls.append("build"))
+    monkeypatch.setattr(
+        manage, "_run", lambda command: calls.append(command))
+
+    manage.package_smoke(SimpleNamespace())
+
+    assert calls[0] == "build"
+    command = calls[1]
+    assert command[:5] == [
+        "docker", "run", "--rm", "--platform", "linux/amd64"]
+    assert "/var/lang/bin/python3.13" in command
+    assert f"{artifact}:/var/task:ro" in command
+    assert manage.LAMBDA_RUNTIME_IMAGE in command
+    assert command[-2:] == [
+        "-m", "deploy.aws_lambda.sdk_smoke"]
+
+
+def test_readiness_is_bounded_and_requires_explicit_ok(monkeypatch):
+    manage = load_manage("lambda_manage_readiness")
+    observed = []
+
+    class Reply:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read(amount):
+            assert amount == 4097
+            return b'{"ok":true}'
+
+    def open_request(request, timeout):
+        observed.append((request.full_url, timeout))
+        return Reply()
+
+    monkeypatch.setattr(manage.urllib.request, "urlopen", open_request)
+
+    assert manage._readiness(
+        "https://gateway.lambda-url.example") == {"ok": True}
+    assert observed == [
+        ("https://gateway.lambda-url.example/readyz", 10)]
 
 
 def test_live_smoke_always_removes_its_generated_stack(
         tmp_path, monkeypatch):
-    spec = importlib.util.spec_from_file_location(
-        "lambda_manage_smoke", LAMBDA / "manage.py")
-    manage = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(manage)
+    manage = load_manage("lambda_manage_smoke")
     calls = []
     monkeypatch.setattr(manage, "build", lambda args: calls.append("build"))
     monkeypatch.setattr(
+        manage, "_stack_for_deploy", lambda args: args.stack)
+    monkeypatch.setattr(
         manage, "_deploy_stack",
-        lambda args: calls.append(("deploy", args.stack)))
+        lambda args, target: calls.append(("deploy", target)))
     monkeypatch.setattr(
         manage, "_stack_url",
         lambda args: "https://generated.lambda-url.example")
@@ -259,4 +900,5 @@ def test_live_smoke_always_removes_its_generated_stack(
     assert calls[0] == "build"
     assert calls[1][0] == "deploy"
     assert calls[1][1].startswith("poc16-smoke-")
+    assert len(calls[1][1].removeprefix("poc16-smoke-")) == 32
     assert calls[-1] == ("remove", calls[1][1])

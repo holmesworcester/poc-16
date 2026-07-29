@@ -26,6 +26,7 @@ from facts.auth import request as request_fact
 class R2Object:
     def __init__(self, value):
         self.value = value
+        self.size = len(value)
 
     async def arrayBuffer(self):
         return self.value
@@ -222,6 +223,85 @@ def test_runtime_bounds_and_authenticates_r2_object_reads(
     assert corrupt.status == 503
     assert read_only.status == 405
     assert not hasattr(runtime.ReadOnlyStore(bucket, prefix), "put")
+
+
+def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
+        tmp_path, monkeypatch):
+    node, workspace, pile, healthy, environment = worker_world(
+        tmp_path, monkeypatch)
+    mint_body = json.dumps({
+        "pile": base64.b64encode(pile).decode(),
+        "ws": workspace,
+    }).encode()
+    minted = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        mint_body,
+    ), environment))
+    token = native_unseal(
+        node.identity(workspace)[0],
+        base64.b64decode(json.loads(minted.body)["grant"]),
+    ).decode()
+    headers = {"Authorization": "Bearer " + token}
+
+    class OversizedObject:
+        def __init__(self, size):
+            self.size = size
+            self.array_calls = 0
+
+        async def arrayBuffer(self):
+            self.array_calls += 1
+            raise AssertionError("oversized R2 body was allocated")
+
+    class OversizedBucket:
+        def __init__(self, healthy_root=None):
+            self.healthy_root = healthy_root
+            self.objects = []
+
+        async def get(self, key):
+            if self.healthy_root is not None and key.endswith("/root"):
+                return R2Object(self.healthy_root)
+            limit = runtime.MAX_ROOT_BYTES \
+                if key.endswith("/root") else runtime.MAX_OBJECT_BYTES
+            obj = OversizedObject(limit + 1)
+            self.objects.append(obj)
+            return obj
+
+    oversized = OversizedBucket()
+    environment.BUCKET = oversized
+    oid = "0" * 64
+    results = [
+        run(runtime.handle(Request(
+            "GET", f"https://worker.example/root?ws={workspace}",
+            headers=headers,
+        ), environment)),
+        run(runtime.handle(Request(
+            "GET", f"https://worker.example/invite/code?ws={workspace}",
+        ), environment)),
+        run(runtime.handle(Request(
+            "GET", f"https://worker.example/page/{oid}?ws={workspace}",
+            headers=headers,
+        ), environment)),
+        run(runtime.handle(Request(
+            "POST", f"https://worker.example/page?ws={workspace}",
+            json.dumps([oid]).encode(), headers,
+        ), environment)),
+    ]
+
+    assert [result.status for result in results] == [503, 413, 413, 413]
+    assert len(oversized.objects) == len(results)
+    assert all(obj.array_calls == 0 for obj in oversized.objects)
+
+    prefix = environment.STORE_PREFIX
+    selective = OversizedBucket(healthy.data[f"{prefix}/root"])
+    environment.BUCKET = selective
+    mint_oversize = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        mint_body,
+    ), environment))
+
+    assert mint_oversize.status == 503
+    assert selective.objects
+    assert all(obj.array_calls == 0 for obj in selective.objects)
 
 
 def test_runtime_applies_mint_fetch_byte_budget_at_the_binding(

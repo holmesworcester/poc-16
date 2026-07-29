@@ -3,6 +3,11 @@ Transform: AWS::Serverless-2016-10-31
 Description: POC-16 database-free authorization and immutable-object gateway
 
 Parameters:
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{2,63}$"
   WorkspaceId:
     Type: String
     AllowedPattern: "^[0-9a-f]{64}$"
@@ -10,11 +15,12 @@ Parameters:
     Type: String
     MinLength: 3
     MaxLength: 63
-    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    AllowedPattern: '^(?!xn--)(?!sthree-)(?![0-9]{1,3}(?:\.[0-9]{1,3}){3}$)(?!.*\.\.)(?!.*(?:-s3alias|--ol-s3|\.mrap|--x-s3|--table-s3)$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
   StorePrefix:
     Type: String
     MinLength: 1
-    AllowedPattern: "^[a-z0-9:_-][a-z0-9:._-]*(/[a-z0-9:_-][a-z0-9:._-]*)*$"
+    MaxLength: 760
+    AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
   ExpectedBucketOwner:
     Type: String
     Default: ""
@@ -31,9 +37,19 @@ Parameters:
     Type: Number
     Default: 100000
     MinValue: 1
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$'
+  AlarmActionArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:[a-z0-9-]+:[^:]*:[^:]*:.+$'
 
 Conditions:
   HasExpectedOwner: !Not [!Equals [!Ref ExpectedBucketOwner, ""]]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasAlarmAction: !Not [!Equals [!Ref AlarmActionArn, ""]]
 
 Resources:
   GrantSecret:
@@ -59,6 +75,19 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              - Sid: DistinguishMissingWorkspaceKeys
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub
+                  "arn:${AWS::Partition}:s3:::${BucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub "${StorePrefix}/root"
+                      - !Sub "${StorePrefix}/obj/*"
+                      - !Sub "${StorePrefix}/invite/*"
+                  NumericLessThanEquals:
+                    s3:max-keys: 1
               - Sid: ReadRoot
                 Effect: Allow
                 Action: s3:GetObject
@@ -82,6 +111,13 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref GrantSecret
+              - !If
+                - HasKmsKey
+                - Sid: DecryptWorkspaceObjects
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
               - Sid: WriteFunctionLogs
                 Effect: Allow
                 Action:
@@ -111,7 +147,19 @@ Resources:
             - HasExpectedOwner
             - !Ref ExpectedBucketOwner
             - !Ref AWS::NoValue
+          TINYP2P_S3_SERVER_SIDE_ENCRYPTION: !If
+            - HasKmsKey
+            - "aws:kms"
+            - !Ref AWS::NoValue
+          TINYP2P_S3_KMS_KEY_ID: !If
+            - HasKmsKey
+            - !Ref KmsKeyArn
+            - !Ref AWS::NoValue
           TINYP2P_GRANT_SECRET_ARN: !Ref GrantSecret
+          TINYP2P_FUNCTION_TIMEOUT_SECONDS: "15"
+          TINYP2P_AWS_CONNECT_TIMEOUT_SECONDS: "2"
+          TINYP2P_AWS_READ_TIMEOUT_SECONDS: "5"
+          TINYP2P_AWS_TOTAL_ATTEMPTS: "1"
           TINYP2P_MAX_REQUEST_BYTES: "524288"
           TINYP2P_MAX_ROOT_BYTES: "1048576"
           TINYP2P_MAX_OBJECT_BYTES: "4194304"
@@ -131,12 +179,12 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-gateway"
       RetentionInDays: !Ref LogRetentionDays
 
-  GatewayErrors:
+  GatewayUrl5xx:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: POC-16 Lambda gateway returned an invocation error
+      AlarmDescription: POC-16 Function URL returned a server error
       Namespace: AWS/Lambda
-      MetricName: Errors
+      MetricName: Url5xxCount
       Dimensions:
         - Name: FunctionName
           Value: !Ref GatewayFunction
@@ -146,6 +194,10 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmAction
+        - [!Ref AlarmActionArn]
+        - !Ref AWS::NoValue
 
   DailyInvocationBudgetAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -162,8 +214,18 @@ Resources:
       Threshold: !Ref DailyInvocationBudget
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmAction
+        - [!Ref AlarmActionArn]
+        - !Ref AWS::NoValue
 
 Outputs:
+  DeploymentMarker:
+    Description: Marker required by the ownership-checked removal command
+    Value: poc16-aws-lambda-gateway-v1
+  DeploymentId:
+    Description: Stable non-secret identity required for update and removal
+    Value: !Ref DeploymentId
   GatewayUrl:
     Description: Public transport endpoint; POC-16 grants authorize data reads
     Value: !GetAtt GatewayFunctionUrl.FunctionUrl

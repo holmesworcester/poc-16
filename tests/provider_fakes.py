@@ -31,7 +31,7 @@ class BrokenBody:
         self.closed = False
 
     @staticmethod
-    def read():
+    def read(_amount):
         raise ConnectionError("scripted truncated response")
 
     def close(self):
@@ -86,7 +86,11 @@ class FakeS3Client:
             body = factory(value) if factory is not None else AtomicBody(value)
             self.bucket._record(
                 self.actor, "get", key, (value, token))
-            return {"Body": body, "ETag": token}
+            return {
+                "Body": body,
+                "ContentLength": len(value),
+                "ETag": token,
+            }
 
     def head_object(self, **request):
         key = request["Key"]
@@ -160,6 +164,7 @@ class R2Page:
 class R2Object:
     def __init__(self, key, value, etag):
         self.key, self.value, self.etag = key, value, etag
+        self.size = len(value)
 
     async def arrayBuffer(self):
         return self.value

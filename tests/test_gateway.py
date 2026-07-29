@@ -9,7 +9,7 @@ from core import cmds, peer_capability
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
-from core.limits import MAX_OBJECT_BYTES
+from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
 from core.node import Node
 from deploy.gateway import AsyncFromSyncReader, Gateway
 from facts.auth import request
@@ -135,6 +135,9 @@ def test_gateway_is_read_only_and_workspace_scoped(tmp_path):
         "GET", "/healthz").status == 200
     assert call(
         gateway,
+        "GET", "/readyz").status == 200
+    assert call(
+        gateway,
         "GET", "/root", {"ws": "other"}, headers).status == 404
     assert call(
         gateway,
@@ -168,6 +171,49 @@ def test_gateway_mint_fails_closed_on_fetch_and_request_budgets(tmp_path):
         tiny_request,
         "POST", "/mint", {"ws": workspace}, {}, request_body
     ).status == 413
+
+
+def test_gateway_reports_provider_failures_as_observable_503(
+        tmp_path, monkeypatch):
+    node, workspace, _, pile, _ = world(tmp_path)
+    request_body = json.dumps({
+        "pile": base64.b64encode(pile).decode(),
+        "ws": workspace,
+    }).encode()
+
+    class FailingReader:
+        async def get_bounded(self, key, _limit):
+            if key == "root":
+                return node.store(workspace).get("root")
+            raise OSError("injected provider failure")
+
+    gateway = Gateway(
+        FailingReader(), workspace, b"s" * 32, lambda: 100)
+
+    assert call(
+        gateway, "POST", "/mint", {"ws": workspace}, {},
+        request_body).status == 503
+
+    async def raising_after_fetch(
+            _pile, _root, fetch, _now, **_limits):
+        await fetch("0" * 64)
+        raise ValueError("verifier stopped after provider failure")
+
+    monkeypatch.setattr(
+        "deploy.gateway.mint.async_stateless", raising_after_fetch)
+    assert call(
+        gateway, "POST", "/mint", {"ws": workspace}, {},
+        request_body).status == 503
+
+    async def invalid_without_fetch(
+            _pile, _root, _fetch, _now, **_limits):
+        raise ValueError("invalid proof")
+
+    monkeypatch.setattr(
+        "deploy.gateway.mint.async_stateless", invalid_without_fetch)
+    assert call(
+        gateway, "POST", "/mint", {"ws": workspace}, {},
+        request_body).status == 403
 
 
 def test_gateway_rejects_corrupt_content_addressed_reads(tmp_path):
@@ -219,3 +265,55 @@ def test_gateway_rejects_deployment_limits_above_protocol_ceiling(tmp_path):
             AsyncFromSyncReader(node.store(workspace)),
             workspace, b"s" * 32, lambda: 100,
             max_object_bytes=MAX_OBJECT_BYTES + 1)
+
+
+def test_gateway_translates_preallocation_read_limit_to_413(tmp_path):
+    node, workspace, _, pile, healthy = world(tmp_path)
+    _, _, token = mint(node, workspace, pile, healthy)
+
+    class Oversized:
+        async def get_bounded(self, _key, _limit):
+            raise PayloadTooLarge("provider body")
+
+    gateway = Gateway(
+        Oversized(), workspace, b"s" * 32, lambda: 100)
+    headers = {"Authorization": "Bearer " + token}
+
+    assert call(
+        gateway, "GET", "/page/" + "0" * 64,
+        {"ws": workspace}, headers).status == 413
+    assert call(
+        gateway, "POST", "/page", {"ws": workspace}, headers,
+        json.dumps(["0" * 64]).encode()).status == 413
+    assert call(
+        gateway, "GET", "/invite/example",
+        {"ws": workspace}).status == 413
+    assert call(
+        gateway, "GET", "/root",
+        {"ws": workspace}, headers).status == 503
+    assert call(gateway, "GET", "/readyz").status == 503
+
+
+def test_gateway_fetches_duplicate_batch_oids_once_and_preserves_order(
+        tmp_path):
+    node, workspace, _, pile, healthy = world(tmp_path)
+    _, _, token = mint(node, workspace, pile, healthy)
+    raw, calls = b"deduplicated", []
+    oid = h(raw)
+
+    class Counting:
+        async def get_bounded(self, key, limit):
+            calls.append((key, limit))
+            return raw
+
+    gateway = Gateway(
+        Counting(), workspace, b"s" * 32, lambda: 100)
+    response = call(
+        gateway, "POST", "/page", {"ws": workspace},
+        {"Authorization": "Bearer " + token},
+        json.dumps([oid] * 256).encode())
+
+    assert response.status == 200
+    assert json.loads(response.body) == [
+        base64.b64encode(raw).decode()] * 256
+    assert calls == [("obj/" + oid, gateway.max_object_bytes)]

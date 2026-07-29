@@ -16,6 +16,7 @@ from core.limits import (
     MAX_PAGE_REQUEST_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
+    PayloadTooLarge,
     decode_json,
 )
 
@@ -38,6 +39,15 @@ class AsyncFromSyncReader:
 
     async def get(self, key):
         return self.reader.get(key)
+
+    async def get_bounded(self, key, max_bytes):
+        bounded = getattr(self.reader, "get_bounded", None)
+        if callable(bounded):
+            return bounded(key, max_bytes)
+        value = self.reader.get(key)
+        if value is not None and len(value) > max_bytes:
+            raise PayloadTooLarge("object read exceeds byte limit")
+        return value
 
     async def has(self, key):
         return self.reader.has(key)
@@ -132,11 +142,17 @@ class Gateway:
             trusted_now=trusted_now,
         )
 
+    async def _get(self, key, max_bytes):
+        bounded = getattr(self.store, "get_bounded", None)
+        if callable(bounded):
+            return await bounded(key, max_bytes)
+        value = await self.store.get(key)
+        if value is not None and len(value) > max_bytes:
+            raise PayloadTooLarge("object read exceeds byte limit")
+        return value
+
     async def _root(self):
-        root = await self.store.get("root")
-        if root is not None and len(root) > self.max_root_bytes:
-            raise ValueError("root size")
-        return root
+        return await self._get("root", self.max_root_bytes)
 
     @staticmethod
     def _decode_mint(body, workspace):
@@ -159,16 +175,32 @@ class Gateway:
         try:
             root = await self._root()
             if not root or manifest.decode_root(root).anchor != self.workspace:
-                return Response(403)
+                return Response(503)
+        except Exception:
+            return Response(503)
+        fetch_error = None
+
+        async def fetch(oid):
+            nonlocal fetch_error
+            try:
+                return await self._get(
+                    "obj/" + oid, self.max_object_bytes)
+            except Exception as error:
+                fetch_error = error
+                return None
+
+        try:
             grant = await mint.async_stateless(
                 pile, root,
-                lambda oid: self.store.get("obj/" + oid),
+                fetch,
                 trusted_now,
                 max_unique_fetches=self.max_mint_fetches,
                 max_fetch_bytes=self.max_mint_fetch_bytes,
             )
         except Exception:
-            return Response(403)
+            return Response(503 if fetch_error is not None else 403)
+        if fetch_error is not None:
+            return Response(503)
         if grant is None:
             return Response(403)
         public, verb = grant
@@ -204,12 +236,14 @@ class Gateway:
                 return Response(413)
         except (TypeError, ValueError, json.JSONDecodeError):
             return Response(400)
-        values, encoded_bytes = [], 2
+        values, encoded_bytes, fetched = [], 2, {}
         try:
             for index, oid in enumerate(oids):
-                raw = await self.store.get("obj/" + oid)
-                if raw is not None and (
-                        len(raw) > self.max_object_bytes or h(raw) != oid):
+                if oid not in fetched:
+                    fetched[oid] = await self._get(
+                        "obj/" + oid, self.max_object_bytes)
+                raw = fetched[oid]
+                if raw is not None and h(raw) != oid:
                     return Response(503)
                 item_bytes = 4 if raw is None \
                     else 2 + 4 * ((len(raw) + 2) // 3)
@@ -219,6 +253,8 @@ class Gateway:
                 values.append(
                     base64.b64encode(raw).decode()
                     if raw is not None else None)
+        except PayloadTooLarge:
+            return Response(413)
         except Exception:
             return Response(503)
         return self._json(200, values)
@@ -236,6 +272,15 @@ class Gateway:
         path = "/" + path.strip("/")
         if path == "/healthz" and method == "GET":
             return self._json(200, {"ok": True})
+        if path == "/readyz" and method == "GET":
+            try:
+                root = await self._root()
+                if not root \
+                        or manifest.decode_root(root).anchor != self.workspace:
+                    raise ValueError("root readiness")
+            except Exception:
+                return self._json(503, {"ok": False})
+            return self._json(200, {"ok": True})
         if not self._workspace(query):
             return Response(404)
         trusted_now = self.now()
@@ -246,13 +291,14 @@ class Gateway:
             if not INVITE_RE.fullmatch(invite):
                 return Response(404)
             try:
-                raw = await self.store.get("invite/" + invite)
+                raw = await self._get(
+                    "invite/" + invite, self.max_object_bytes)
+            except PayloadTooLarge:
+                return Response(413)
             except Exception:
                 return Response(503)
             if raw is None:
                 return Response(404)
-            if len(raw) > self.max_object_bytes:
-                return Response(413)
             return Response(
                 200, raw, {
                     "Cache-Control": "no-store",
@@ -287,13 +333,14 @@ class Gateway:
             if not OID_RE.fullmatch(oid):
                 return Response(404)
             try:
-                raw = await self.store.get("obj/" + oid)
+                raw = await self._get(
+                    "obj/" + oid, self.max_object_bytes)
+            except PayloadTooLarge:
+                return Response(413)
             except Exception:
                 return Response(503)
             if raw is None:
                 return Response(404)
-            if len(raw) > self.max_object_bytes:
-                return Response(413)
             if h(raw) != oid:
                 return Response(503)
             return Response(

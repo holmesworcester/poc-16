@@ -1,5 +1,6 @@
 """Cloudflare Worker R2-binding implementation of AsyncObjectStore."""
 from core.crypto import h
+from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PayloadTooLarge
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -84,11 +85,36 @@ class R2BindingStore:
             value = value.to_py()
         return bytes(value)
 
+    @classmethod
+    async def _bounded_bytes(cls, obj, max_bytes):
+        size = getattr(obj, "size", None)
+        if size is None:
+            raise StoreError("R2 response has no size")
+        if type(size) is not int or size < 0:
+            raise StoreError("R2 response has invalid size")
+        if size > max_bytes:
+            raise PayloadTooLarge("R2 response exceeds byte limit")
+        value = await cls._bytes(obj)
+        if len(value) > max_bytes:
+            raise PayloadTooLarge("R2 response exceeds byte limit")
+        if len(value) != size:
+            raise StoreError("R2 response size mismatch")
+        return value
+
     async def get(self, key):
+        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        return await self.get_bounded(key, limit)
+
+    async def get_bounded(self, key, max_bytes):
+        """Reject a known oversized R2 body before allocating its ArrayBuffer."""
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+            raise ValueError("R2 read byte limit")
         try:
             obj = await self.bucket.get(self._key(key))
-            return None if obj is None else await self._bytes(obj)
-        except StoreError:
+            if obj is None:
+                return None
+            return await self._bounded_bytes(obj, max_bytes)
+        except (PayloadTooLarge, StoreError):
             raise
         except Exception as error:
             raise StoreError(f"R2 read failed for {key}") from error
@@ -98,9 +124,10 @@ class R2BindingStore:
             obj = await self.bucket.get(self._key(key))
             if obj is None:
                 return ABSENT
+            limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
             return Versioned(
-                await self._bytes(obj), self._token(obj))
-        except StoreError:
+                await self._bounded_bytes(obj, limit), self._token(obj))
+        except (PayloadTooLarge, StoreError):
             raise
         except Exception as error:
             raise StoreError(
@@ -115,10 +142,11 @@ class R2BindingStore:
     @staticmethod
     def _token(obj):
         value = getattr(obj, "etag", None)
-        if value is None:
-            raise StoreError("R2 response has no usable strong ETag")
-        value = str(value)
-        if not value or value.startswith("W/"):
+        # Pyodide converts JavaScript primitive strings at the binding
+        # boundary. Do not stringify arbitrary proxies or malformed provider
+        # values: that would fabricate a CAS token which R2 never returned.
+        if not isinstance(value, str) \
+                or not value or value.startswith("W/"):
             raise StoreError("R2 response has no usable strong ETag")
         return VersionToken(value)
 

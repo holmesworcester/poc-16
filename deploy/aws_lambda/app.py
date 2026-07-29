@@ -1,15 +1,31 @@
 """AWS Lambda Function URL adapter for the shared database-free gateway."""
 import asyncio
 import base64
+import json
+import logging
 import os
 import time
 from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
 from core.limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
+from deploy.aws_lambda.config import (
+    FUNCTION_TIMEOUT_SECONDS,
+    MAX_LOG_METHOD_CHARS,
+    MAX_LOG_PATH_CHARS,
+    MAX_LOG_RECORD_BYTES,
+    MAX_QUERY_BYTES,
+    MAX_QUERY_FIELDS,
+    SDK_CONNECT_TIMEOUT_SECONDS,
+    SDK_READ_TIMEOUT_SECONDS,
+    SDK_TOTAL_ATTEMPTS,
+    validate_sdk_budget,
+)
 from deploy.gateway import AsyncFromSyncReader, Gateway, Response
 
 _gateway_cache = None
+_logger = logging.getLogger(__name__)
+_HEX = frozenset("0123456789abcdefABCDEF")
 
 
 def _required(name):
@@ -29,10 +45,47 @@ def _positive(name, default):
     return value
 
 
+def _sdk_budget():
+    values = (
+        _positive(
+            "TINYP2P_FUNCTION_TIMEOUT_SECONDS",
+            FUNCTION_TIMEOUT_SECONDS),
+        _positive(
+            "TINYP2P_AWS_CONNECT_TIMEOUT_SECONDS",
+            SDK_CONNECT_TIMEOUT_SECONDS),
+        _positive(
+            "TINYP2P_AWS_READ_TIMEOUT_SECONDS",
+            SDK_READ_TIMEOUT_SECONDS),
+        _positive(
+            "TINYP2P_AWS_TOTAL_ATTEMPTS",
+            SDK_TOTAL_ATTEMPTS),
+    )
+    try:
+        return validate_sdk_budget(*values)
+    except ValueError as error:
+        raise RuntimeError("invalid AWS SDK deadline budget") from error
+
+
+def _botocore_config():
+    from botocore.config import Config
+
+    connect, read, attempts = _sdk_budget()
+    return Config(
+        connect_timeout=connect,
+        ignore_configured_endpoint_urls=True,
+        read_timeout=read,
+        retries={
+            "mode": "standard",
+            "total_max_attempts": attempts,
+        },
+    )
+
+
 def _secret():
     import boto3
 
-    response = boto3.client("secretsmanager").get_secret_value(
+    response = boto3.client(
+        "secretsmanager", config=_botocore_config()).get_secret_value(
         SecretId=_required("TINYP2P_GRANT_SECRET_ARN"))
     if isinstance(response.get("SecretString"), str):
         value = response["SecretString"].encode()
@@ -46,6 +99,7 @@ def _secret():
 
 
 def _store():
+    connect, read, attempts = _sdk_budget()
     config = S3Config(
         bucket=_required("TINYP2P_S3_BUCKET"),
         prefix=_required("TINYP2P_S3_PREFIX"),
@@ -55,6 +109,10 @@ def _store():
         server_side_encryption=os.environ.get(
             "TINYP2P_S3_SERVER_SIDE_ENCRYPTION") or None,
         sse_kms_key_id=os.environ.get("TINYP2P_S3_KMS_KEY_ID") or None,
+        connect_timeout=connect,
+        read_timeout=read,
+        read_total_max_attempts=attempts,
+        probe_access_denied_missing=True,
     )
     # Gateway receives only the narrowed reader wrapper. The execution role
     # has no S3 mutation action even though S3Store also implements publishing.
@@ -113,8 +171,31 @@ def _event(event):
         body = encoded.encode()
     if len(body) > MAX_MINT_REQUEST_BYTES:
         raise PayloadTooLarge("Function URL body")
-    query = parse_qs(
-        event.get("rawQueryString") or "", keep_blank_values=True)
+    raw_query = event.get("rawQueryString") or ""
+    if not isinstance(raw_query, str):
+        raise ValueError("Function URL query")
+    try:
+        query_bytes = raw_query.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("Function URL query encoding") from error
+    if len(query_bytes) > MAX_QUERY_BYTES:
+        raise PayloadTooLarge("Function URL query")
+    for index, character in enumerate(raw_query):
+        if character == "%" and (
+                index + 2 >= len(raw_query)
+                or raw_query[index + 1] not in _HEX
+                or raw_query[index + 2] not in _HEX):
+            raise ValueError("Function URL query percent escape")
+    field_count = 0 if not raw_query else raw_query.count("&") + 1
+    if field_count > MAX_QUERY_FIELDS:
+        raise PayloadTooLarge("Function URL query fields")
+    try:
+        query = parse_qs(
+            raw_query, keep_blank_values=True,
+            encoding="utf-8", errors="strict",
+            max_num_fields=MAX_QUERY_FIELDS)
+    except ValueError as error:
+        raise ValueError("Function URL query encoding") from error
     return method, path, query, headers, body
 
 
@@ -129,7 +210,42 @@ def _response(response):
     }
 
 
-def handler(event, _context):
+def _log_text(value, maximum):
+    if not isinstance(value, str):
+        return None
+    return "".join(
+        character if " " <= character <= "~" else "?"
+        for character in value[:maximum])
+
+
+def _log_failure(kind, *, request=None, context=None, error=None, status=503):
+    """Emit a fixed-shape record without request bodies, tokens, or secrets."""
+    method = _log_text(
+        request[0] if request is not None else None,
+        MAX_LOG_METHOD_CHARS)
+    path = _log_text(
+        request[1] if request is not None else None,
+        MAX_LOG_PATH_CHARS)
+    request_id = _log_text(
+        getattr(context, "aws_request_id", None), 128)
+    record = {
+        "error_type": _log_text(
+            type(error).__name__ if error is not None else None, 64),
+        "event": "poc16_gateway_failure",
+        "kind": kind,
+        "method": method,
+        "path": path,
+        "request_id": request_id,
+        "status": status,
+    }
+    encoded = json.dumps(
+        record, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode()) > MAX_LOG_RECORD_BYTES:
+        raise RuntimeError("failure telemetry exceeded fixed byte bound")
+    _logger.error(encoded)
+
+
+def handler(event, context):
     """Normalize one Function URL v2 event and fail closed."""
     try:
         request = _event(event)
@@ -138,6 +254,14 @@ def handler(event, _context):
     except Exception:
         return _response(Response(400))
     try:
-        return _response(asyncio.run(_gateway().handle(*request)))
-    except Exception:
+        response = asyncio.run(_gateway().handle(*request))
+        if response.status >= 500:
+            _log_failure(
+                "gateway_response", request=request,
+                context=context, status=response.status)
+        return _response(response)
+    except Exception as error:
+        _log_failure(
+            "handler_exception", request=request,
+            context=context, error=error)
         return _response(Response(503))

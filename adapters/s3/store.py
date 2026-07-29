@@ -12,6 +12,11 @@ import math
 import re
 
 from core.crypto import h
+from core.limits import (
+    MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PayloadTooLarge,
+)
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -124,6 +129,11 @@ def _is_missing_key(error):
         code is None or code in _KEY_MISSING_CODES)
 
 
+def _is_access_denied(error):
+    status, _ = _error_details(error)
+    return status == 403
+
+
 def _raise_read_error(operation, error):
     status, _ = _error_details(error)
     message = _error_label(operation, error)
@@ -189,6 +199,7 @@ class S3Config:
     addressing_style: str | None = None
     list_page_size: int = 1000
     max_list_pages: int = 10_000
+    probe_access_denied_missing: bool = False
 
     def __post_init__(self):
         if not isinstance(self.bucket, str) \
@@ -236,6 +247,8 @@ class S3Config:
             raise ValueError("addressing_style")
         _positive_int(self.list_page_size, "list_page_size", maximum=1000)
         _positive_int(self.max_list_pages, "max_list_pages")
+        if not isinstance(self.probe_access_denied_missing, bool):
+            raise ValueError("probe_access_denied_missing")
 
 
 class S3Store:
@@ -279,6 +292,7 @@ class S3Store:
 
         base = {
             "connect_timeout": config.connect_timeout,
+            "ignore_configured_endpoint_urls": True,
             "read_timeout": config.read_timeout,
             "max_pool_connections": config.max_pool_connections,
         }
@@ -357,12 +371,49 @@ class S3Store:
         return etag
 
     @staticmethod
-    def _response_body(response, operation):
+    def _response_body(response, operation, max_bytes):
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+            raise ValueError("S3 read byte limit")
         body = response.get("Body") if isinstance(response, dict) else None
         if body is None or not callable(getattr(body, "read", None)):
             raise StoreError(f"S3 {operation} response has no readable body")
+        declared = response.get("ContentLength")
         try:
-            value = body.read()
+            if declared is not None and (
+                    type(declared) is not int or declared < 0):
+                raise StoreError(
+                    f"S3 {operation} response has invalid ContentLength")
+            if declared is not None and declared > max_bytes:
+                raise PayloadTooLarge(
+                    f"S3 {operation} response exceeds byte limit")
+            ceiling = declared if declared is not None else max_bytes
+            chunks = []
+            total = 0
+            while True:
+                amount = ceiling - total + 1
+                chunk = body.read(amount)
+                if not isinstance(chunk, bytes):
+                    raise StoreError(
+                        f"S3 {operation} response body is not bytes")
+                if len(chunk) > amount:
+                    raise StoreError(
+                        f"S3 {operation} response exceeded read request")
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if declared is not None and total > declared:
+                    raise StoreError(
+                        f"S3 {operation} response ContentLength mismatch")
+                if total > max_bytes:
+                    raise PayloadTooLarge(
+                        f"S3 {operation} response exceeds byte limit")
+            if declared is not None and total != declared:
+                raise StoreError(
+                    f"S3 {operation} response ContentLength mismatch")
+            value = b"".join(chunks)
+        except (PayloadTooLarge, StoreError):
+            raise
         except Exception as error:
             _raise_read_error(operation, error)
         finally:
@@ -375,8 +426,6 @@ class S3Store:
                     # bytes that were returned. Do not let cleanup obscure a
                     # classified read failure.
                     pass
-        if not isinstance(value, bytes):
-            raise StoreError(f"S3 {operation} response body is not bytes")
         return value
 
     def _get_response(self, key, operation):
@@ -385,19 +434,59 @@ class S3Store:
         except Exception as error:
             if _is_missing_key(error):
                 return None
+            if self.config.probe_access_denied_missing \
+                    and _is_access_denied(error) \
+                    and self._exact_key_absent(key):
+                return None
             _raise_read_error(operation, error)
 
+    def _exact_key_absent(self, key):
+        """Disambiguate one 403 with a prefix-scoped one-key LIST probe."""
+        physical = self._physical(key)
+        try:
+            response = self._read_client.list_objects_v2(
+                Bucket=self.config.bucket,
+                Prefix=physical,
+                MaxKeys=1,
+                **self._owner_args())
+        except Exception as error:
+            _raise_read_error("missing-key ListObjectsV2 probe", error)
+        if not isinstance(response, dict):
+            raise StoreError(
+                "S3 missing-key probe response is not a mapping")
+        contents = response.get("Contents", ())
+        if contents is None:
+            contents = ()
+        if not isinstance(contents, (list, tuple)) or len(contents) > 1:
+            raise StoreError(
+                "S3 missing-key probe Contents is invalid")
+        for item in contents:
+            candidate = item.get("Key") if isinstance(item, dict) else None
+            if not isinstance(candidate, str) \
+                    or not candidate.startswith(physical):
+                raise StoreError(
+                    "S3 missing-key probe returned an out-of-prefix key")
+            if candidate == physical:
+                return False
+        return True
+
     def get(self, key):
+        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        return self.get_bounded(key, limit)
+
+    def get_bounded(self, key, max_bytes):
+        """Read no more than ``max_bytes + 1`` bytes from one S3 response."""
         response = self._get_response(key, "GetObject")
         return None if response is None else self._response_body(
-            response, "GetObject")
+            response, "GetObject", max_bytes)
 
     def read_versioned(self, key):
         response = self._get_response(key, "GetObject")
         if response is None:
             return ABSENT
         etag = self._response_etag(response, "GetObject", mutation=False)
-        value = self._response_body(response, "GetObject")
+        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        value = self._response_body(response, "GetObject", limit)
         return Versioned(value, VersionToken(etag))
 
     def has(self, key):

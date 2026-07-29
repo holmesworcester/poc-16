@@ -12,6 +12,7 @@ import pytest
 
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
+from core.limits import PayloadTooLarge
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -141,7 +142,7 @@ def test_read_versioned_and_cas_preserve_the_same_response_opaque_etags():
     versioned = store.read_versioned("root")
     assert versioned == Versioned(
         old, VersionToken('"opaque:old-7"'))
-    assert body.reads == 1
+    assert body.reads == 2
     assert body.closes == 1
     assert client.calls[0] == ("get_object", {
         "Bucket": "test-bucket",
@@ -286,13 +287,49 @@ def test_get_and_head_only_treat_key_level_404_as_absent():
     assert type(caught.value) is StoreError
 
 
+def test_opt_in_exact_list_probe_disambiguates_missing_from_denied_403():
+    physical = "tenant/workspace/invite/missing"
+    client = ScriptedClient(
+        get_object=[
+            ServiceError(403, "AccessDenied"),
+            ServiceError(403, "AccessDenied"),
+            ServiceError(403, "AccessDenied"),
+        ],
+        list_objects_v2=[
+            {"Contents": [], "IsTruncated": False},
+            {
+                "Contents": [{"Key": physical}],
+                "IsTruncated": False,
+            },
+            ServiceError(403, "AccessDenied"),
+        ])
+    store = S3Store(
+        config(probe_access_denied_missing=True), client=client)
+
+    assert store.get("invite/missing") is None
+    with pytest.raises(StoreError, match="AccessDenied"):
+        store.get("invite/missing")
+    with pytest.raises(StoreError, match="AccessDenied"):
+        store.get("invite/missing")
+    list_calls = [
+        request for operation, request in client.calls
+        if operation == "list_objects_v2"
+    ]
+    assert list_calls == [{
+        "Bucket": "test-bucket",
+        "Prefix": physical,
+        "MaxKeys": 1,
+        "ExpectedBucketOwner": "123456789012",
+    }] * 3
+
+
 def test_streaming_body_transport_failure_is_retryable_and_still_closes():
     class BrokenBody:
         def __init__(self):
             self.closed = False
 
         @staticmethod
-        def read():
+        def read(_amount):
             raise ConnectionError("body truncated")
 
         def close(self):
@@ -308,6 +345,100 @@ def test_streaming_body_transport_failure_is_retryable_and_still_closes():
     with pytest.raises(RetryableStoreError, match="ConnectionError"):
         store.read_versioned("root")
     assert body.closed
+
+
+def test_bounded_get_checks_length_and_never_uses_an_unbounded_read():
+    class GuardedBody(Body):
+        def __init__(self, value):
+            super().__init__(value)
+            self.amounts = []
+
+        def read(self, amount=None):
+            if amount is None:
+                raise AssertionError("unbounded provider read")
+            self.amounts.append(amount)
+            return super().read(amount)
+
+    exact = GuardedBody(b"abcd")
+    oversized = GuardedBody(b"abcde")
+    declared_oversized = GuardedBody(b"must not be read")
+    store = S3Store(config(), client=ScriptedClient(get_object=[
+        {"Body": exact, "ContentLength": 4},
+        {"Body": oversized},
+        {"Body": declared_oversized, "ContentLength": 5},
+    ]))
+
+    assert store.get_bounded("obj/" + "0" * 64, 4) == b"abcd"
+    assert exact.amounts == [5, 1]
+    assert exact.closes == 1
+    with pytest.raises(PayloadTooLarge, match="byte limit"):
+        store.get_bounded("obj/" + "1" * 64, 4)
+    assert oversized.amounts == [5]
+    assert oversized.closes == 1
+    with pytest.raises(PayloadTooLarge, match="byte limit"):
+        store.get_bounded("obj/" + "2" * 64, 4)
+    assert declared_oversized.amounts == []
+    assert declared_oversized.closes == 1
+
+
+@pytest.mark.parametrize(
+    ("declared", "value", "message"),
+    [
+        ("4", b"abcd", "invalid ContentLength"),
+        (-1, b"", "invalid ContentLength"),
+        (4, b"abc", "ContentLength mismatch"),
+        (3, b"abcd", "ContentLength mismatch"),
+    ])
+def test_bounded_get_rejects_malformed_or_inconsistent_content_length(
+        declared, value, message):
+    body = Body(value)
+    store = S3Store(config(), client=ScriptedClient(get_object=[{
+        "Body": body,
+        "ContentLength": declared,
+    }]))
+
+    with pytest.raises(StoreError, match=message):
+        store.get_bounded("obj/" + "0" * 64, 4)
+    assert body.closes == 1
+
+
+def test_bounded_get_accepts_legal_short_reads_and_detects_true_edges():
+    class Chunked:
+        def __init__(self, value):
+            self.value = value
+            self.offset = 0
+            self.amounts = []
+            self.closed = False
+
+        def read(self, amount):
+            self.amounts.append(amount)
+            if self.offset == len(self.value):
+                return b""
+            chunk = self.value[self.offset:self.offset + 1]
+            self.offset += 1
+            return chunk
+
+        def close(self):
+            self.closed = True
+
+    exact = Chunked(b"abcd")
+    truncated = Chunked(b"abc")
+    over = Chunked(b"abcde")
+    store = S3Store(config(), client=ScriptedClient(get_object=[
+        {"Body": exact, "ContentLength": 4},
+        {"Body": truncated, "ContentLength": 4},
+        {"Body": over},
+    ]))
+
+    assert store.get_bounded("obj/" + "0" * 64, 4) == b"abcd"
+    assert exact.amounts == [5, 4, 3, 2, 1]
+    assert exact.closed
+    with pytest.raises(StoreError, match="ContentLength mismatch"):
+        store.get_bounded("obj/" + "1" * 64, 4)
+    assert truncated.closed
+    with pytest.raises(PayloadTooLarge, match="byte limit"):
+        store.get_bounded("obj/" + "2" * 64, 4)
+    assert over.closed
 
 
 @pytest.mark.parametrize(
@@ -569,7 +700,7 @@ def test_independent_adapter_handles_admit_one_absent_root_winner():
 
 
 def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
-        monkeypatch):
+        monkeypatch, tmp_path):
     configs = []
     clients = []
 
@@ -594,6 +725,14 @@ def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
 
     monkeypatch.setattr(
         "adapters.s3.store.importlib.import_module", module)
+    hostile_config = tmp_path / "aws-config"
+    hostile_config.write_text(
+        "[default]\nservices=hostile\n"
+        "[services hostile]\ns3 =\n"
+        "  endpoint_url = https://shared-profile.invalid\n")
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL_S3", "https://environment.invalid")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(hostile_config))
     store = S3Store(config(
         region_name="us-west-2",
         endpoint_url="https://s3.us-west-2.amazonaws.com",
@@ -606,6 +745,9 @@ def test_sdk_construction_separates_read_retries_from_one_attempt_mutations(
     ]
     assert all(item.kwargs["s3"] == {"addressing_style": "virtual"}
                for item in configs)
+    assert all(
+        item.kwargs["ignore_configured_endpoint_urls"] is True
+        for item in configs)
     assert clients[0][:2] == ("s3", {
         "config": configs[0],
         "region_name": "us-west-2",

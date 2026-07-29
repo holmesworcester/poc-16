@@ -150,6 +150,64 @@ that exact name even if Wrangler applied the deployment before reporting a
 failure. Primary and cleanup failures are both reported; neither path changes
 or deletes R2 data.
 
+## AWS Lambda read-only gateway
+
+The AWS package is isolated under `deploy/aws_lambda/`. It requires the AWS
+and SAM CLIs plus Docker. Build and execute the exact SAM artifact under the
+Lambda Python 3.13 x86_64 runtime with:
+
+```sh
+python3 deploy/aws_lambda/manage.py package-smoke
+```
+
+Before publishing, merge a storage-law guard into the existing bucket policy.
+The default profile applies authoritative-key denies to every principal and
+freezes lifecycle-policy mutation for the whole bucket:
+
+```sh
+python3 deploy/aws_lambda/manage.py bucket-policy \
+  --bucket BUCKET --prefix PREFIX
+```
+
+Audit existing lifecycle rules, object tags, and ACLs first; existing tags can
+already influence lifecycle behavior. Prefer S3 Object Ownership's
+`BucketOwnerEnforced` setting so ACLs are disabled. An AWS administrator able
+to replace the bucket policy remains trusted. The narrower `--profile
+single-publisher --publisher-principal ARN` form is safe only when that ARN is
+the complete writer set and every other bucket writer and administrator is
+explicitly trusted.
+
+Deploy validates the bucket and prefix locally, builds in SAM's target
+container, installs the hash-locked dependency closure, and requires the
+Function URL to pass a root-backed readiness check:
+
+```sh
+python3 deploy/aws_lambda/manage.py deploy \
+  --create --stack poc16-edge --deployment-id edge-west-2 \
+  --workspace WORKSPACE_ID \
+  --bucket BUCKET --prefix PREFIX --region us-west-2
+```
+
+For a customer-managed SSE-KMS bucket, add the exact `--kms-key-arn`; to
+notify on handled Function URL 5xx responses and invocation-budget alarms,
+add `--alarm-action-arn`. Later deployments use `--update` and refuse to
+target a stack without the original ownership markers. Removal retains the
+external bucket and its objects,
+and refuses to act unless the named stack has the expected account, region,
+deployment tag, and template marker:
+
+```sh
+python3 deploy/aws_lambda/manage.py remove \
+  --stack poc16-edge --deployment-id edge-west-2 --region us-west-2
+```
+
+The deployment ID is a stable, non-secret operator identity stored in both
+stack tags and outputs; another valid POC-16 stack does not match it. Create
+mode proves the name absent immediately before SAM, but that check and SAM's
+create are not one CloudFormation transaction. Operators must serialize
+creation of a chosen friendly name; automated callers should use high-entropy
+names.
+
 ## Test and measure
 
 Run the full suite:

@@ -147,6 +147,9 @@ class ReadOnlyStore:
     async def get(self, key):
         return await self._store.get(key)
 
+    async def get_bounded(self, key, max_bytes):
+        return await self._store.get_bounded(key, max_bytes)
+
     async def has(self, key):
         return await self._store.has(key)
 
