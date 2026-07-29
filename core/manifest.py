@@ -7,7 +7,6 @@ additions-only commit locates affected leaves through bounded authenticated
 neighbor reads and path-copies only their tree paths. Equal RangeTree subtrees
 and equal leaf piles have equal oids, so one-sided sync still prunes by oid.
 """
-import json
 from bisect import bisect_right
 from typing import NamedTuple
 
@@ -16,6 +15,7 @@ from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
 from .close import decode_pile, encode_pile
 from .crypto import h
 from .fact import canon
+from .limits import MAX_ROOT_BYTES, decode_json
 from .shape import boundary, fid_of, is_key, key, stable_cut_positions, valid_fid
 from .object_store import verified_object
 
@@ -283,7 +283,7 @@ def decode_root(raw):
     Any malformed shape or foreign stamp is the wholesale-rebuild trigger;
     there is deliberately no compatibility path.
     """
-    o = json.loads(raw)
+    o = decode_json(raw, MAX_ROOT_BYTES, "root")
     if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
         raise ValueError("root stamp")
     trees = o.get("trees")

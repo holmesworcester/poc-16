@@ -107,7 +107,7 @@ def test_mint_rejects_malformed_requests(world):
             {"ws": workspace, "pile": []}):
         assert handler.mint(body) == (400, None)
     handler._q = lambda: (["mint"], {"ws": workspace})
-    handler._body = lambda: b"{"
+    handler._body = lambda *_: b"{"
     assert handler.do_POST() == (400, None)
 
 

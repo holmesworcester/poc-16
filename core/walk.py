@@ -11,6 +11,15 @@ from . import peer_capability
 from .close import close, encode_pile
 from .crypto import h, unseal
 from .kernel import resolve_deps
+from .limits import (
+    MAX_CONTROL_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_PAGE_BATCH_BYTES,
+    MAX_PILE_BYTES,
+    MAX_ROOT_BYTES,
+    decode_json,
+)
 from .node import now_ms
 from .object_store import ensure_object
 
@@ -37,7 +46,7 @@ class Peer:
 
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
-            require_push=False):
+            require_push=False, response_limit=MAX_CONTROL_BYTES):
         req = urllib.request.Request(f"{self.url}{path}?ws={self.ws}", data=data, method=method)
         if auth:
             if "token" not in self.cache:
@@ -49,7 +58,18 @@ class Peer:
             req.add_header("If-None-Match", etag)
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
-                return r.status, r.read(), dict(r.headers)
+                claimed = r.headers.get("Content-Length")
+                if claimed is not None:
+                    try:
+                        length = int(claimed)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("peer content length") from error
+                    if length < 0 or length > response_limit:
+                        raise ValueError("peer response too large")
+                body = r.read(response_limit + 1)
+                if len(body) > response_limit:
+                    raise ValueError("peer response too large")
+                return r.status, body, dict(r.headers)
         except urllib.error.HTTPError as e:
             if e.code == 304:
                 return 304, b"", {}
@@ -58,7 +78,8 @@ class Peer:
                 self.cache.pop("sync_profile", None)
                 return self._http(
                     method, path, data, etag, auth, retry=False,
-                    require_push=require_push)
+                    require_push=require_push,
+                    response_limit=response_limit)
             raise
 
     def mint(self):
@@ -71,8 +92,12 @@ class Peer:
             facts = auth_request.payload(n, self.ws, "sync", ts + 120_000, ts)
         body = json.dumps({"ws": self.ws,
                            "pile": base64.b64encode(encode_pile(facts)).decode()}).encode()
-        _, resp, _ = self._http("POST", "/mint", body, auth=False)
-        o = json.loads(resp)
+        if len(body) > MAX_MINT_REQUEST_BYTES:
+            raise ValueError("mint request too large")
+        _, resp, _ = self._http(
+            "POST", "/mint", body, auth=False,
+            response_limit=MAX_CONTROL_BYTES)
+        o = decode_json(resp, MAX_CONTROL_BYTES, "mint response")
         secret, _ = self.node.identity(self.ws)
         token = unseal(secret, base64.b64decode(o["grant"])).decode()
         self.cache.update({
@@ -81,31 +106,50 @@ class Peer:
         })
 
     def root(self, etag=None):
-        status, b, hdr = self._http("GET", "/root", etag=etag)
+        status, b, hdr = self._http(
+            "GET", "/root", etag=etag, response_limit=MAX_ROOT_BYTES)
         return None if status == 304 else (b, hdr.get("ETag"))
 
     def obj(self, oh):
-        _, b, _ = self._http("GET", f"/page/{oh}")
+        _, b, _ = self._http(
+            "GET", f"/page/{oh}", response_limit=MAX_OBJECT_BYTES)
         return b
 
     def objs(self, oids):
-        """Fetch an ordered object batch in one authenticated request."""
+        """Fetch an ordered object batch, splitting a provider-sized 413."""
         oids = tuple(oids)
-        _, raw, _ = self._http(
-            "POST", "/page", json.dumps(oids).encode())
-        values = json.loads(raw)
+        if not oids:
+            return ()
+        try:
+            _, raw, _ = self._http(
+                "POST", "/page", json.dumps(oids).encode(),
+                response_limit=MAX_PAGE_BATCH_BYTES)
+        except urllib.error.HTTPError as error:
+            if error.code != 413:
+                raise
+            if len(oids) == 1:
+                raise ValueError("single object exceeds page batch") from error
+            middle = len(oids) // 2
+            return self.objs(oids[:middle]) + self.objs(oids[middle:])
+        values = decode_json(
+            raw, MAX_PAGE_BATCH_BYTES, "page batch response")
         if not isinstance(values, list) or len(values) != len(oids):
             raise ValueError("page batch")
-        return tuple(
-            base64.b64decode(value, validate=True)
-            if value is not None else None
-            for value in values
-        )
+        try:
+            return tuple(
+                base64.b64decode(value, validate=True)
+                if value is not None else None
+                for value in values
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("page batch encoding") from error
 
     def put_pile(self, b):
+        if not isinstance(b, bytes) or len(b) > MAX_PILE_BYTES:
+            raise ValueError("pile too large")
         self._http(
             "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b,
-            require_push=True)
+            require_push=True, response_limit=MAX_CONTROL_BYTES)
 
     def poke(self):
         self._http("POST", "/poke", data=b"", auth=False)
@@ -113,18 +157,16 @@ class Peer:
 
 def _push(node, ws, peer, push_fids):
     """Close one dial's push set into a pile and PUT it — the mirror of a
-    pull. The responder drains on receipt, so there is no poke."""
+    pull. Blob proofs stay in immutable objects and travel through
+    ``_fetch_blobs``; embedding every attachment here would make pile size
+    proportional to file size. The responder drains on receipt, so there is
+    no poke."""
     with node.lock:
         idx = node.idx(ws)
         facts = close([node.fact_of(ws, fid) for fid in push_fids],
                       lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or [],
                       lambda fid: node.fact_of(ws, fid))
-        st, blobs = node.store(ws), {}
-        for f in facts:
-            for bh in families.blob_refs(f):
-                if st.has("obj/" + bh):
-                    blobs[bh] = st.get("obj/" + bh)
-        b = encode_pile(facts, blobs)
+        b = encode_pile(facts)
     peer.put_pile(b)
     return tuple(fact.fid for fact in facts)
 

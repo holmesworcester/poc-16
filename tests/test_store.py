@@ -1,14 +1,17 @@
 """Object-store concurrency contracts."""
 import base64
 import fcntl
+import io
 import json
 import os
 import threading
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pytest
 
 from core import daemon
+from core import walk
 from core.crypto import h
 from core.object_store import (
     ABSENT,
@@ -218,7 +221,7 @@ def test_peer_decodes_one_ordered_page_batch():
     expected = (b"first", None, b"third")
     calls = []
 
-    def http(method, path, data):
+    def http(method, path, data, **kwargs):
         calls.append((method, path, json.loads(data)))
         raw = json.dumps([
             base64.b64encode(value).decode()
@@ -234,9 +237,77 @@ def test_peer_decodes_one_ordered_page_batch():
     assert calls == [("POST", "/page", list(oids))]
 
 
+def test_peer_adaptively_splits_413_batches_without_losing_order_or_misses():
+    peer = object.__new__(WalkPeer)
+    oids = tuple(f"{ordinal:064x}" for ordinal in range(5))
+    held = {
+        oids[0]: b"zero",
+        oids[2]: b"two",
+        oids[4]: b"four",
+    }
+    calls = []
+
+    def http(method, path, data, **kwargs):
+        requested = tuple(json.loads(data))
+        calls.append(requested)
+        if len(requested) > 2:
+            raise urllib.error.HTTPError(
+                "https://peer/page", 413, "too large", {}, io.BytesIO())
+        return 200, json.dumps([
+            base64.b64encode(held[oid]).decode() if oid in held else None
+            for oid in requested
+        ]).encode(), {}
+
+    peer._http = http
+
+    assert peer.objs(oids) == (
+        b"zero", None, b"two", None, b"four")
+    assert list(map(len, calls)) == [5, 2, 3, 1, 2]
+
+
+def test_peer_reports_a_single_object_that_cannot_fit_a_batch():
+    peer = object.__new__(WalkPeer)
+
+    def http(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://peer/page", 413, "too large", {}, io.BytesIO())
+
+    peer._http = http
+
+    with pytest.raises(ValueError, match="single object"):
+        peer.objs(("a" * 64,))
+
+
+def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, count):
+            assert count == 9
+            return b"x" * count
+
+    monkeypatch.setattr(
+        walk.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: Response())
+    peer = object.__new__(WalkPeer)
+    peer.url, peer.ws, peer.cache = "https://peer", "workspace", {}
+
+    with pytest.raises(ValueError, match="response too large"):
+        peer._http(
+            "GET", "/public", auth=False, response_limit=8)
+
+
 def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
     first, third = b"first", b"third"
-    objects = {"a" * 64: first, "c" * 64: third}
+    first_oid, missing_oid, third_oid = h(first), "b" * 64, h(third)
+    objects = {first_oid: first, third_oid: third}
 
     class Store:
         def get(self, key):
@@ -251,20 +322,55 @@ def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
     handler._q = lambda: (["page"], {"ws": "workspace"})
     handler._known = lambda ws: True
     handler._member = lambda ws: "member"
-    handler._body = lambda: json.dumps(
-        ["a" * 64, "b" * 64, "c" * 64]).encode()
-    handler._json = lambda code, body: (code, body)
+    handler._body = lambda *_: json.dumps(
+        [first_oid, missing_oid, third_oid]).encode()
+    handler._json = lambda code, body, **kwargs: (code, body)
     handler._send = lambda code: code
 
     handler._member = lambda ws: None
     assert handler.do_POST() == 401
     handler._member = lambda ws: "member"
-    handler._body = lambda: json.dumps(["a" * 64] * 257).encode()
-    assert handler.do_POST() == 400
-    handler._body = lambda: json.dumps(
-        ["a" * 64, "b" * 64, "c" * 64]).encode()
+    handler._body = lambda *_: json.dumps([first_oid] * 257).encode()
+    assert handler.do_POST() == 413
+    handler._body = lambda *_: json.dumps(
+        [first_oid, missing_oid, third_oid]).encode()
 
     assert handler.do_POST() == (200, [
         base64.b64encode(first).decode(), None,
         base64.b64encode(third).decode(),
     ])
+
+
+def test_page_batch_route_stops_before_256_valid_objects_exceed_bytes(
+        monkeypatch):
+    objects = {
+        h(f"object-{ordinal}".encode()): f"object-{ordinal}".encode()
+        for ordinal in range(256)
+    }
+
+    class Store:
+        def __init__(self):
+            self.reads = 0
+
+        def get(self, key):
+            self.reads += 1
+            return objects.get(key[4:])
+
+    store = Store()
+
+    class Node:
+        def store(self, ws):
+            return store
+
+    handler = object.__new__(daemon.Handler)
+    handler.node = Node()
+    handler._q = lambda: (["page"], {"ws": "workspace"})
+    handler._known = lambda ws: True
+    handler._member = lambda ws: "member"
+    handler._body = lambda *_: json.dumps(list(objects)).encode()
+    handler._json = lambda code, body, **kwargs: (code, body)
+    handler._send = lambda code, *args, **kwargs: code
+    monkeypatch.setattr(daemon, "MAX_PAGE_BATCH_BYTES", 64)
+
+    assert handler.do_POST() == 413
+    assert store.reads < len(objects)

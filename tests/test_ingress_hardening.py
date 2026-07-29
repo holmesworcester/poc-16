@@ -2,10 +2,12 @@
 import json
 
 import pytest
-from core import cmds
-from core import manifest
+from core import (
+    btreap, close, cmds, daemon, fact, manifest, object_store, sync,
+)
 from core.crypto import h
 from core.fact import canon
+from core.limits import PayloadTooLarge
 from core.node import Node
 from tests.util import closed_subset, deliver
 
@@ -77,3 +79,65 @@ def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
 
     with pytest.raises(ValueError, match="root shape"):
         manifest.decode_root(canon(root))
+
+
+@pytest.mark.parametrize("decoder", [
+    close.decode_pile,
+    manifest.decode_root,
+    sync._sibling_keys,
+    fact.decode,
+])
+def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
+    nested = b"[" * 5_000 + b"0" + b"]" * 5_000
+
+    with pytest.raises(ValueError):
+        decoder(nested)
+
+
+def test_btreap_parser_recursion_is_also_a_value_error():
+    nested = b"[" * 2_000 + b"0" + b"]" * 2_000
+
+    with pytest.raises(ValueError, match="btreap page shape"):
+        btreap._decode(nested, h(nested), h(b"seed"))
+
+
+def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
+    cases = (
+        (close, "MAX_PILE_BYTES", close.decode_pile, b'{"facts":[]}'),
+        (manifest, "MAX_ROOT_BYTES", manifest.decode_root, b'{"stamp":"x"}'),
+        (sync, "MAX_OBJECT_BYTES", sync._sibling_keys, b'{"keys":[]}'),
+    )
+    for module, limit, decoder, raw in cases:
+        monkeypatch.setattr(module, limit, len(raw) - 1)
+        with pytest.raises(PayloadTooLarge):
+            decoder(raw)
+
+
+def test_pile_encoder_and_object_publisher_enforce_the_reader_bounds(
+        monkeypatch):
+    empty = close.encode_pile(())
+    monkeypatch.setattr(close, "MAX_PILE_BYTES", len(empty) - 1)
+    with pytest.raises(PayloadTooLarge):
+        close.encode_pile(())
+
+    class NeverWritten:
+        def put_if_absent(self, *_args):
+            raise AssertionError("oversized object was written")
+
+    raw = b"too large"
+    monkeypatch.setattr(object_store, "MAX_OBJECT_BYTES", len(raw) - 1)
+    with pytest.raises(ValueError, match="address"):
+        object_store.ensure_object(NeverWritten(), h(raw), raw)
+
+
+def test_daemon_body_rejects_claimed_oversize_without_reading():
+    class NeverRead:
+        def read(self, _count):
+            raise AssertionError("oversized body was read")
+
+    handler = object.__new__(daemon.Handler)
+    handler.headers = {"Content-Length": "9"}
+    handler.rfile = NeverRead()
+
+    with pytest.raises(PayloadTooLarge):
+        handler._body(8)

@@ -7,6 +7,17 @@ import re
 from core import manifest, mint, peer_capability
 from core.crypto import h, seal_to
 from core.grants import check_token, make_token
+from core.limits import (
+    MAX_MINT_FETCHES,
+    MAX_MINT_FETCH_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_PAGE_BATCH_BYTES,
+    MAX_PAGE_REQUEST_BYTES,
+    MAX_ROOT_BYTES,
+    PAGE_BATCH,
+    decode_json,
+)
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
 INVITE_RE = re.compile(r"^[a-zA-Z0-9._~-]{1,256}$")
@@ -43,13 +54,13 @@ class Gateway:
     def __init__(
             self, store, workspace, secret, now,
             *, sync_profile=peer_capability.READ_ONLY,
-            max_request_bytes=512 * 1024,
-            max_root_bytes=1024 * 1024,
-            max_object_bytes=8 * 1024 * 1024,
-            max_batch_count=256,
-            max_batch_bytes=4 * 1024 * 1024,
-            max_mint_fetches=128,
-            max_mint_fetch_bytes=4 * 1024 * 1024,
+            max_request_bytes=MAX_MINT_REQUEST_BYTES,
+            max_root_bytes=MAX_ROOT_BYTES,
+            max_object_bytes=MAX_PAGE_BATCH_BYTES,
+            max_batch_count=PAGE_BATCH,
+            max_batch_bytes=MAX_PAGE_BATCH_BYTES,
+            max_mint_fetches=MAX_MINT_FETCHES,
+            max_mint_fetch_bytes=MAX_MINT_FETCH_BYTES,
             grant_ttl_ms=60_000):
         if not isinstance(workspace, str) or not workspace:
             raise ValueError("workspace")
@@ -59,6 +70,22 @@ class Gateway:
         self.secret, self.now = secret, now
         if not peer_capability.known(sync_profile):
             raise ValueError("sync profile")
+        bounded = (
+            ("request bytes", max_request_bytes, MAX_MINT_REQUEST_BYTES),
+            ("root bytes", max_root_bytes, MAX_ROOT_BYTES),
+            ("object bytes", max_object_bytes, MAX_OBJECT_BYTES),
+            ("batch count", max_batch_count, PAGE_BATCH),
+            ("batch bytes", max_batch_bytes, MAX_PAGE_BATCH_BYTES),
+        )
+        if any(
+                type(value) is not int or not 0 < value <= ceiling
+                for _, value, ceiling in bounded) or any(
+                type(value) is not int or not 0 <= value <= ceiling
+                for value, ceiling in (
+                    (max_mint_fetches, MAX_MINT_FETCHES),
+                    (max_mint_fetch_bytes, MAX_MINT_FETCH_BYTES),
+                )):
+            raise ValueError("gateway limits")
         self.sync_profile = sync_profile
         self.max_request_bytes = max_request_bytes
         self.max_root_bytes = max_root_bytes
@@ -109,7 +136,8 @@ class Gateway:
 
     @staticmethod
     def _decode_mint(body, workspace):
-        request = json.loads(body)
+        request = decode_json(
+            body, MAX_MINT_REQUEST_BYTES, "mint request")
         if not isinstance(request, dict) \
                 or set(request) != {"ws", "pile"} \
                 or request["ws"] != workspace \
@@ -154,7 +182,8 @@ class Gateway:
 
     @staticmethod
     def _decode_batch(body):
-        oids = json.loads(body)
+        oids = decode_json(
+            body, MAX_MINT_REQUEST_BYTES, "page request")
         if not isinstance(oids, list) or not all(
                 isinstance(oid, str) and OID_RE.fullmatch(oid)
                 for oid in oids):
@@ -162,7 +191,8 @@ class Gateway:
         return oids
 
     async def _batch(self, body):
-        if not isinstance(body, bytes) or len(body) > self.max_request_bytes:
+        if not isinstance(body, bytes) or len(body) > min(
+                self.max_request_bytes, MAX_PAGE_REQUEST_BYTES):
             return Response(413)
         try:
             oids = self._decode_batch(body)
@@ -172,17 +202,19 @@ class Gateway:
             return Response(400)
         values, encoded_bytes = [], 2
         try:
-            for oid in oids:
+            for index, oid in enumerate(oids):
                 raw = await self.store.get("obj/" + oid)
                 if raw is not None and (
                         len(raw) > self.max_object_bytes or h(raw) != oid):
                     return Response(503)
-                value = base64.b64encode(raw).decode() \
-                    if raw is not None else None
-                encoded_bytes += 4 if value is None else len(value) + 2
+                item_bytes = 4 if raw is None \
+                    else 2 + 4 * ((len(raw) + 2) // 3)
+                encoded_bytes += item_bytes + (1 if index else 0)
                 if encoded_bytes > self.max_batch_bytes:
                     return Response(413)
-                values.append(value)
+                values.append(
+                    base64.b64encode(raw).decode()
+                    if raw is not None else None)
         except Exception:
             return Response(503)
         return self._json(200, values)

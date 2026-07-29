@@ -15,7 +15,7 @@ from core.crypto import h
 from core.object_store import Applied
 from core.fact import canon
 from core.node import Node
-from core.walk import _fetch_blobs
+from core.walk import _fetch_blobs, _push
 from core.worker import WorkerView
 from facts.content import chunk, file as file_family
 
@@ -290,6 +290,40 @@ def test_committed_blob_is_visible_without_an_arrival_cache(tmp_path):
     close_node(node)
     restarted = Node(str(path))
     assert progress(restarted, workspace)["complete"]
+
+
+def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice")
+    send_bytes(
+        source, workspace, "separate-proof-path.bin",
+        random.Random(31).randbytes(bao.WIDTH + 1))
+
+    class Capture:
+        def put_pile(self, raw):
+            self.raw = raw
+
+    capture = Capture()
+    _push(source, workspace, capture, all_fids(source, workspace))
+    stream, embedded = decode_pile(capture.raw)
+    assert embedded == {}
+
+    destination = Node(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "copy", [])
+    deliver(destination, workspace, capture.raw)
+    destination.turn(workspace)
+    assert progress(destination, workspace)["have"] == 0
+
+    class SourceObjects:
+        def obj(self, oid):
+            return source.store(workspace).get("obj/" + oid)
+
+    landed, complete = _fetch_blobs(
+        destination, workspace, SourceObjects())
+    assert complete
+    assert len(landed) == len([
+        item for item in stream if item.t == "chunk"])
+    assert progress(destination, workspace)["complete"]
 
 
 def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):

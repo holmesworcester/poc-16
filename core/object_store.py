@@ -21,6 +21,7 @@ import re
 from typing import Protocol
 
 from .crypto import h
+from .limits import MAX_OBJECT_BYTES
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 
@@ -172,7 +173,8 @@ class AsyncObjectStore(AsyncObjectReader, Protocol):
 def verified_object(oid, fetch):
     """Fetch one content-addressed object and verify its name."""
     raw = fetch(oid) if oid else None
-    if raw is None or h(raw) != oid:
+    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+            or h(raw) != oid:
         raise ValueError("object integrity")
     return raw
 
@@ -185,7 +187,8 @@ def ensure_object(store, oid, raw):
     read and retried once when the key is still absent; it is never collapsed
     into ``EXISTS``.
     """
-    if not isinstance(oid, str) or h(raw) != oid:
+    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+            or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid
     unknown = None
@@ -213,7 +216,8 @@ def ensure_object(store, oid, raw):
 
 async def ensure_object_async(store, oid, raw):
     """Awaited equivalent of :func:`ensure_object` for edge bindings."""
-    if not isinstance(oid, str) or h(raw) != oid:
+    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+            or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid
     unknown = None

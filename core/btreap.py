@@ -131,29 +131,29 @@ def build(rows, seed, emit, *, max_page_depth=MAX_PAGE_DEPTH):
 
 
 def _decode(raw, oid, seed):
-    if raw is None or h(raw) != oid:
+    if not isinstance(raw, bytes) or len(raw) > MAX_PAGE_BYTES \
+            or h(raw) != oid:
         raise ValueError("btreap page integrity")
     try:
         page = json.loads(raw)
-    except (TypeError, ValueError) as exc:
+        if canon(page) != raw or not isinstance(page, dict) or set(page) != {
+                "count", "depth", "format", "key", "left", "priority", "right",
+                "value"} or page["format"] != FORMAT:
+            raise ValueError("btreap page shape")
+        key = page["key"]
+        if not isinstance(key, str) or not key \
+                or page["priority"] != priority(seed, key) \
+                or not all(
+                    child == "" or valid_fid(child)
+                    for child in (page["left"], page["right"])) \
+                or type(page["count"]) is not int or page["count"] < 1 \
+                or type(page["depth"]) is not int \
+                or not 1 <= page["depth"] <= MAX_PAGE_DEPTH \
+                or len(canon(page["value"])) > MAX_VALUE_BYTES:
+            raise ValueError("btreap page shape")
+        return page
+    except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError("btreap page shape") from exc
-    if canon(page) != raw or not isinstance(page, dict) or set(page) != {
-            "count", "depth", "format", "key", "left", "priority", "right",
-            "value"} or page["format"] != FORMAT:
-        raise ValueError("btreap page shape")
-    key = page["key"]
-    if not isinstance(key, str) or not key \
-            or page["priority"] != priority(seed, key) \
-            or not all(
-                child == "" or valid_fid(child)
-                for child in (page["left"], page["right"])) \
-            or type(page["count"]) is not int or page["count"] < 1 \
-            or type(page["depth"]) is not int \
-            or not 1 <= page["depth"] <= MAX_PAGE_DEPTH \
-            or len(canon(page["value"])) > MAX_VALUE_BYTES \
-            or len(raw) > MAX_PAGE_BYTES:
-        raise ValueError("btreap page shape")
-    return page
 
 
 class Reader:

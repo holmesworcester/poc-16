@@ -25,8 +25,7 @@ from .object_store import (
     authoritative_key,
     validate_key,
 )
-
-PAGE_BATCH = 256
+from .limits import PAGE_BATCH
 
 
 class FsStore:

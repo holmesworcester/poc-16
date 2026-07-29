@@ -9,6 +9,7 @@ import json
 from dataclasses import dataclass, field
 
 from .crypto import h
+from .limits import MAX_OBJECT_BYTES, decode_json
 from .shape import key, valid_timestamp
 
 
@@ -110,11 +111,11 @@ def decode(raw: bytes) -> Fact:
     """Strictly decode one canonical fact blob and re-check its content id."""
     if not isinstance(raw, bytes):
         raise ValueError("fact bytes")
+    value = decode_json(raw, MAX_OBJECT_BYTES, "fact")
     try:
-        value = json.loads(raw)
-    except (TypeError, ValueError) as error:
+        fact = from_json(value)
+        if encode(fact) != raw:
+            raise ValueError("non-canonical fact encoding")
+        return fact
+    except RecursionError as error:
         raise ValueError("fact encoding") from error
-    fact = from_json(value)
-    if encode(fact) != raw:
-        raise ValueError("non-canonical fact encoding")
-    return fact

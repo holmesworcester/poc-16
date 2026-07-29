@@ -15,20 +15,46 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, manifest, mint as gate, peer_capability
+from . import cmds, manifest, mint as gate, peer_capability, shape
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
 from .grants import make_token as _make_token
+from .limits import (
+    MAX_CONTROL_BYTES,
+    MAX_MINT_FETCHES,
+    MAX_MINT_FETCH_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_PAGE_BATCH_BYTES,
+    MAX_PAGE_REQUEST_BYTES,
+    MAX_PILE_BYTES,
+    MAX_ROOT_BYTES,
+    PAGE_BATCH,
+    PayloadTooLarge,
+    decode_json,
+)
 from .node import Node, now_ms
 from .runtime import AuthorityRejected
-from .store import PAGE_BATCH
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
-MINT_MAX_FETCHES = int(os.environ.get("TINYP2P_MINT_MAX_FETCHES", 128))
-MINT_MAX_FETCH_BYTES = int(
-    os.environ.get("TINYP2P_MINT_MAX_FETCH_BYTES", 4 * 1024 * 1024))
+
+
+def _env_budget(name, ceiling):
+    try:
+        value = int(os.environ.get(name, ceiling))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"invalid {name}") from error
+    if not 0 <= value <= ceiling:
+        raise RuntimeError(f"invalid {name}")
+    return value
+
+
+MINT_MAX_FETCHES = _env_budget(
+    "TINYP2P_MINT_MAX_FETCHES", MAX_MINT_FETCHES)
+MINT_MAX_FETCH_BYTES = _env_budget(
+    "TINYP2P_MINT_MAX_FETCH_BYTES", MAX_MINT_FETCH_BYTES)
 CORE_COMMANDS = {
     "core.rebuild": "_command_rebuild",
     "core.status": "_command_status",
@@ -93,8 +119,23 @@ class Handler(BaseHTTPRequestHandler):
         return u.path.strip("/").split("/"), \
             {k: v[0] for k, v in parse_qs(u.query).items()}
 
-    def _body(self):
-        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+    def _body(self, limit):
+        """Read exactly one bounded, non-chunked request body."""
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("unsupported transfer encoding")
+        claimed = self.headers.get("Content-Length")
+        try:
+            length = 0 if claimed is None else int(claimed)
+        except (TypeError, ValueError) as error:
+            raise ValueError("content length") from error
+        if length < 0:
+            raise ValueError("content length")
+        if length > limit:
+            raise PayloadTooLarge("request body too large")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("short request body")
+        return body
 
     def _send(self, code, b=b"", ctype="application/json", etag=None):
         self.send_response(code)
@@ -106,7 +147,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def _json(self, code, o):
-        self._send(code, json.dumps(o).encode())
+        body = json.dumps(o, separators=(",", ":")).encode()
+        return self._send(code, body)
+
+    def _json_limited(self, code, o, limit):
+        body = json.dumps(o, separators=(",", ":")).encode()
+        if len(body) > limit:
+            return self._send(413)
+        return self._send(code, body)
 
     def _member(self, ws, *, require_push=False):
         return check_token(
@@ -122,21 +170,34 @@ class Handler(BaseHTTPRequestHandler):
         ws = q.get("ws", "")
         if parts[0] == "invite" and len(parts) == 2:  # the one ungated read
             b = self.node.store(ws).get("invite/" + parts[1]) if self._known(ws) else None
-            return self._send(200, b, "application/octet-stream") if b else self._send(404)
+            if b is None:
+                return self._send(404)
+            if len(b) > MAX_OBJECT_BYTES:
+                return self._send(503)
+            return self._send(200, b, "application/octet-stream")
         if not self._known(ws) or not self._member(ws):
             return self._send(401 if self._known(ws) else 404)
         if parts[0] == "root":
             self.node.turn(ws)  # a peer drains before serving its root
             b = self.node.store(ws).get("root") or b""
+            if len(b) > MAX_ROOT_BYTES:
+                return self._send(503)
             etag = h(b)
             if self.headers.get("If-None-Match") == etag:
                 return self._send(304)
             return self._send(200, b, etag=etag)
         if parts[0] == "page" and len(parts) == 2:  # store objects and blobs alike
+            if not shape.valid_fid(parts[1]):
+                return self._send(404)
             b = self.node.store(ws).get("obj/" + parts[1])
-            return self._send(200, b, "application/octet-stream") if b else self._send(404)
+            if b is None:
+                return self._send(404)
+            if len(b) > MAX_OBJECT_BYTES or h(b) != parts[1]:
+                return self._send(503)
+            return self._send(200, b, "application/octet-stream")
         if parts[0] == "pile":
-            return self._json(200, self.node.store(ws).list("pile/"))
+            return self._json_limited(
+                200, self.node.store(ws).list("pile/"), MAX_CONTROL_BYTES)
         self._send(404)
 
     def do_PUT(self):
@@ -146,7 +207,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._known(ws) or not m:
             return self._send(401 if self._known(ws) else 404)
         if parts[0] == "pile" and len(parts) == 3 and parts[1] == m:
-            b = self._body()
+            try:
+                b = self._body(MAX_PILE_BYTES)
+            except PayloadTooLarge:
+                return self._send(413)
+            except ValueError:
+                return self._send(400)
             if h(b) != parts[2]:
                 return self._send(400)
             self.node.store(ws).put(f"pile/{m}/{parts[2]}", b)
@@ -157,7 +223,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts, q = self._q()
         if parts[0] == "ctl":
-            return self.ctl_post(parts, self._body())
+            try:
+                body = self._body(MAX_CONTROL_BYTES)
+            except PayloadTooLarge:
+                return self._send(413)
+            except ValueError:
+                return self._send(400)
+            return self.ctl_post(parts, body)
         ws = q.get("ws", "")
         if not self._known(ws):
             return self._send(404)
@@ -165,26 +237,52 @@ class Handler(BaseHTTPRequestHandler):
             if not self._member(ws):
                 return self._send(401)
             try:
-                oids = json.loads(self._body())
-                if not isinstance(oids, list) or len(oids) > PAGE_BATCH \
-                        or not all(
-                        isinstance(oid, str) and len(oid) == 64
-                        and all(c in "0123456789abcdef" for c in oid)
+                oids = decode_json(
+                    self._body(MAX_PAGE_REQUEST_BYTES),
+                    MAX_PAGE_REQUEST_BYTES, "page request")
+                if not isinstance(oids, list) or not all(
+                        shape.valid_fid(oid)
                         for oid in oids):
                     raise ValueError
+                if len(oids) > PAGE_BATCH:
+                    return self._send(413)
+            except PayloadTooLarge:
+                return self._send(413)
             except (TypeError, ValueError):
                 return self._send(400)
             store = self.node.store(ws)
-            return self._json(200, [
-                base64.b64encode(raw).decode() if raw is not None else None
-                for raw in (store.get("obj/" + oid) for oid in oids)
-            ])
+            values, encoded_size = [], 2
+            for index, oid in enumerate(oids):
+                raw = store.get("obj/" + oid)
+                if raw is not None and (
+                        len(raw) > MAX_OBJECT_BYTES or h(raw) != oid):
+                    return self._send(503)
+                item_size = 4 if raw is None \
+                    else 2 + 4 * ((len(raw) + 2) // 3)
+                encoded_size += item_size + (1 if index else 0)
+                if encoded_size > MAX_PAGE_BATCH_BYTES:
+                    return self._send(413)
+                values.append(
+                    base64.b64encode(raw).decode()
+                    if raw is not None else None)
+            return self._json(200, values)
         if parts[0] == "poke":
+            try:
+                if self._body(MAX_CONTROL_BYTES):
+                    return self._send(400)
+            except PayloadTooLarge:
+                return self._send(413)
+            except ValueError:
+                return self._send(400)
             self.node.turn(ws)
             return self._send(204)
         if parts[0] == "mint":
             try:
-                return self.mint(json.loads(self._body()))
+                body = self._body(MAX_MINT_REQUEST_BYTES)
+                return self.mint(decode_json(
+                    body, MAX_MINT_REQUEST_BYTES, "mint request"))
+            except PayloadTooLarge:
+                return self._send(413)
             except (TypeError, ValueError):
                 return self._send(400)
         self._send(404)
@@ -239,7 +337,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parts != ["ctl", "command"]:
                 return self._send(404)
-            request = json.loads(body or b"{}")
+            request = decode_json(
+                body or b"{}", MAX_CONTROL_BYTES, "control request")
             if not isinstance(request, dict) \
                     or set(request) != {"path", "argv"} \
                     or not isinstance(request["path"], str) \
@@ -247,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
                     or not all(
                         isinstance(token, str) for token in request["argv"]):
                 raise TypeError
-        except (json.JSONDecodeError, TypeError):
+        except (TypeError, ValueError):
             return self._send(400)
 
         path, argv = request["path"], request["argv"]

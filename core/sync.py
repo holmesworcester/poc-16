@@ -8,13 +8,13 @@ cannot retract a fact ahead of its delivery. Every arriving fact is judged
 by the same ingress admission push and mint use; the kernel never learns
 where a pile came from.
 """
-import json
 import sqlite3
 
 from . import catalog, indexes, manifest, shape, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
+from .limits import MAX_OBJECT_BYTES, decode_json
 from .object_store import verified_object
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
@@ -341,7 +341,7 @@ def _sibling_keys(raw):
     """One closure sibling's key set (manifest.build's ``{"keys": [...]}``).
     Peer bytes leave as a ValueError or not at all — never a KeyError or a
     TypeError; ``":" in k`` guards ``shape.fid_of`` downstream."""
-    obj = json.loads(raw)
+    obj = decode_json(raw, MAX_OBJECT_BYTES, "closure sibling")
     keys = obj.get("keys") if isinstance(obj, dict) else None
     if not isinstance(keys, list) or not all(shape.is_key(k) for k in keys) \
             or keys != sorted(set(keys)):

@@ -3,10 +3,13 @@ import asyncio
 import base64
 import json
 
+import pytest
+
 from core import cmds, peer_capability
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
+from core.limits import MAX_OBJECT_BYTES
 from core.node import Node
 from deploy.gateway import AsyncFromSyncReader, Gateway
 from facts.auth import request
@@ -102,6 +105,25 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
         "POST", "/page", {"ws": workspace}, headers, request_body
     ).status == 413
 
+    one_body = json.dumps([h(first), "0" * 64]).encode()
+    exact_size = len(json.dumps(
+        [base64.b64encode(first).decode(), None],
+        sort_keys=True, separators=(",", ":")).encode())
+    exact = Gateway(
+        AsyncFromSyncReader(node.store(workspace)),
+        workspace, b"s" * 32, lambda: 100,
+        max_batch_bytes=exact_size)
+    below = Gateway(
+        AsyncFromSyncReader(node.store(workspace)),
+        workspace, b"s" * 32, lambda: 100,
+        max_batch_bytes=exact_size - 1)
+    assert call(
+        exact, "POST", "/page", {"ws": workspace}, headers, one_body
+    ).status == 200
+    assert call(
+        below, "POST", "/page", {"ws": workspace}, headers, one_body
+    ).status == 413
+
 
 def test_gateway_is_read_only_and_workspace_scoped(tmp_path):
     node, workspace, _, pile, gateway = world(tmp_path)
@@ -187,3 +209,13 @@ def test_gateway_pins_trusted_time_once_per_request(tmp_path):
 
     assert response.status == 200
     assert calls == [100]
+
+
+def test_gateway_rejects_deployment_limits_above_protocol_ceiling(tmp_path):
+    node, workspace, _, _, _ = world(tmp_path)
+
+    with pytest.raises(ValueError, match="gateway limits"):
+        Gateway(
+            AsyncFromSyncReader(node.store(workspace)),
+            workspace, b"s" * 32, lambda: 100,
+            max_object_bytes=MAX_OBJECT_BYTES + 1)
