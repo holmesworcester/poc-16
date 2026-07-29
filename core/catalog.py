@@ -336,19 +336,26 @@ class Catalog:
         received_set = set(received)
         shadows = self.shadows(received) if received else False
         rebuild = force or shadows or not received
-        action_before = suppression_state.snapshot(self.db) \
-            if rebuild or actions_dirty else None
-        before = self.eligible_ids() - received_set \
-            if rebuild or actions_dirty else None
         rebuild_fids = None
         if allowed_staged is not None:
             allowed_staged = set(allowed_staged)
+            # A failed pile leaves its receipts staged for an exact retry.
+            # Another pile must not accidentally publish them when its own
+            # change triggers a full canonical rebuild.
+            disallowed_staged = any(
+                fid not in allowed_staged
+                for (fid,) in self.db.execute("SELECT fid FROM staged"))
+            rebuild = rebuild or disallowed_staged
             rebuild_fids = tuple(
                 fid for fid, staged in self.db.execute(
                     "SELECT f.fid, s.fid IS NOT NULL "
                     "FROM facts f LEFT JOIN staged s ON s.fid=f.fid")
                 if not staged or fid in allowed_staged
             )
+        action_before = suppression_state.snapshot(self.db) \
+            if rebuild or actions_dirty else None
+        before = self.eligible_ids() - received_set \
+            if rebuild or actions_dirty else None
 
         def rebuild_all():
             return rebuild_proofs(

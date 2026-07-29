@@ -420,10 +420,14 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
         winning = pool.submit(bob.turn, workspace)
         winning.result(timeout=10)
         paused.release.set()
-        with pytest.raises(RootChanged):
-            losing.result(timeout=10)
+        losing.result(timeout=10)
 
     assert alice.store(workspace).list("pile/") == []
+    assert alice.ingress_attempt_failures(workspace)
+    # The winner retired every shared pile. A later strong listing lets the
+    # loser clear its node-local failure without performing another delete.
+    alice.turn(workspace)
+    assert alice.ingress_attempt_failures(workspace) == []
     streams = [
         _commit_facts(workspace, commit)
         for commit in bucket.commits

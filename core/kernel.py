@@ -25,6 +25,7 @@ class ResolvedEdge(NamedTuple):
 class Judgment(NamedTuple):
     ok: bool
     valids: tuple
+    failure: Exception | None = None
 
 
 class Context(NamedTuple):
@@ -160,7 +161,7 @@ def offer_src(db, name, a0, a1=None, requires=()):
     return source
 
 
-def resolve_edges(f: Fact, db):
+def resolve_edges(f: Fact, db, strict=False):
     """Resolve self-named refs and needs to deterministic dependency edges."""
     handler = facts.family_for(f.t)
     if handler is None:
@@ -177,6 +178,8 @@ def resolve_edges(f: Fact, db):
                 return None
             edges.append(ResolvedEdge(need.role, source, "need"))
     except Exception:
+        if strict:
+            raise
         return None
     roles = [edge.role for edge in edges]
     if not all(isinstance(role, str) and role for role in roles) \
@@ -213,7 +216,7 @@ def proof_rank(db, deps):
     return 1 + max(ranks[fid] for fid in deps)
 
 
-def accepts(fact, edges, ctx):
+def accepts(fact, edges, ctx, strict=False):
     """Run one family's shape and policy checks against resolved edges."""
     try:
         handler = facts.family_for(fact.t)
@@ -222,6 +225,8 @@ def accepts(fact, edges, ctx):
             and facts.validate_fact_policy(
                 handler.POLICY, fact, edges, ctx)
     except Exception:
+        if strict:
+            raise
         return False
 
 
@@ -376,11 +381,17 @@ def _judge(stream, ctx):
             handler = facts.family_for(fact.t)
             refs_seen = all(ctx.has_fact(fid) for _, fid in fact.refs())
             edges = resolve_edges(
-                fact, ctx) if handler is not None and refs_seen else None
+                fact, ctx, strict=True
+            ) if handler is not None and refs_seen else None
             deps = None if edges is None else [edge.fid for edge in edges]
-            good = edges is not None and accepts(fact, edges, ctx)
-        except Exception:
-            good = False  # hostile family bytes are litter, never poison
+            good = edges is not None and accepts(
+                fact, edges, ctx, strict=True)
+        except Exception as error:
+            # Stateless readers still fail closed. The client ingress runtime
+            # also needs the typed distinction: an unexpected family/program
+            # failure retains its pile instead of manufacturing a permanent
+            # rejection verdict.
+            return Judgment(False, tuple(valids), error)
         rank = proof_rank(ctx, deps) if good else None
         if rank is None:
             return Judgment(False, tuple(valids))
@@ -392,7 +403,7 @@ def _judge(stream, ctx):
 def kernel(stream, anchor):
     """Judge one bounded closure without a database or host state."""
     result = _judge(stream, MemoryContext(anchor))
-    return result if result.ok else Judgment(False, ())
+    return result if result.ok else Judgment(False, (), result.failure)
 
 
 def validate(stream, anchor):

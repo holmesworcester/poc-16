@@ -22,6 +22,7 @@ from . import catalog, indexes, manifest, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon
+from .ingress import PermanentIngressRejection
 from .keychain import Keychain
 from .kernel import (
     drain,
@@ -114,6 +115,7 @@ class Node:
         self._stores, self._idx = {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._sync_errors = {}
+        self._ingress_attempt_errors = {}
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
             self._sync_index(ws)
 
@@ -167,29 +169,88 @@ class Node:
     def _quarantine_ingress(self, ws, source, raw, error):
         """Retire one permanently failing ingress unit without losing bytes.
 
-        Piles are independent closed units.  Keeping a bad one under ``pile/``
-        retries it forever and prevents unrelated work from draining; moving it
-        to the node-local failure area makes the failure explicit and
-        recoverable while removing it from the live ingress queue.
+        Rejection evidence is deliberately shared by every worker on the
+        workspace prefix. Exact payload and typed metadata bytes become
+        immutable before the live workset obligation is retired.
         """
+        if not isinstance(error, PermanentIngressRejection):
+            raise TypeError("typed permanent ingress rejection required")
+        if not isinstance(raw, bytes):
+            raise TypeError("exact ingress bytes required")
         st = self.store(ws)
-        payload = raw if isinstance(raw, bytes) else b""
-        failure_id = h(payload or source.encode())
-        if payload:
-            st.put_if_absent("failed/pile/" + failure_id, payload)
-        st.put(
-            "failed/meta/" + failure_id,
-            canon({
+        failure_id = h(raw)
+        payload_key = "failed/pile/" + failure_id
+        st.put_if_absent(payload_key, raw)
+        if st.get(payload_key) != raw:
+            raise OSError("rejection payload was not preserved exactly")
+        record = canon({
+            "error": f"{type(error).__name__}: {error}",
+            "id": failure_id,
+            "source": source,
+        })
+        meta_key = "failed/meta/" + h(record)
+        st.put_if_absent(meta_key, record)
+        if st.get(meta_key) != record:
+            raise OSError("rejection metadata was not preserved exactly")
+        self._retire_ingress_exact(ws, source, raw)
+
+    def _retire_ingress_exact(self, ws, source, raw):
+        """Retire only the exact bytes observed, reconciling a lost reply."""
+        if not isinstance(raw, bytes):
+            raise TypeError("exact ingress bytes required")
+        st = self.store(ws)
+        current = st.get(source)
+        if current is None:
+            return  # another drainer already discharged the same obligation
+        if current != raw:
+            raise OSError("ingress source changed before retirement")
+        try:
+            st.delete(source)
+        except Exception as error:
+            try:
+                current = st.get(source)
+            except Exception:
+                raise error
+            if current is not None:
+                raise error
+        if st.get(source) is not None:
+            raise OSError("ingress retirement did not remove the source")
+
+    def record_ingress_attempt_failure(self, ws, source, error):
+        """Expose a retained retryable/program failure without deleting it."""
+        self._ingress_attempt_errors[(ws, source)] = (
+            error,
+            {
                 "error": f"{type(error).__name__}: {error}",
-                "id": failure_id,
                 "source": source,
                 "ts": now_ms(),
-            }),
+            },
         )
-        st.delete(source)
+
+    def clear_ingress_attempt_failure(self, ws, source):
+        self._ingress_attempt_errors.pop((ws, source), None)
+
+    def reconcile_ingress_attempt_failures(self, ws, live_sources):
+        """Drop local diagnostics whose shared durable intent is retired."""
+        live_sources = set(live_sources)
+        for workspace, source in tuple(self._ingress_attempt_errors):
+            if workspace == ws and source not in live_sources:
+                self.clear_ingress_attempt_failure(ws, source)
+
+    def ingress_attempt_failures(self, ws):
+        return [
+            dict(value)
+            for (workspace, _), (_, value)
+            in sorted(self._ingress_attempt_errors.items())
+            if workspace == ws
+        ]
+
+    def ingress_attempt_error(self, ws, source):
+        row = self._ingress_attempt_errors.get((ws, source))
+        return row[0] if row is not None else None
 
     def ingress_failures(self, ws):
-        """Durable summaries for quarantined piles; payloads stay local."""
+        """Shared immutable rejection evidence, projected as status rows."""
         out = []
         for name in self.store(ws).list("failed/meta"):
             try:

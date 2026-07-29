@@ -105,7 +105,8 @@ root                         one mutable, CAS-written composite root
 obj/<sha256>                 immutable pages, piles, facts, and blobs
 pile/<member>/<sha256>       idempotent ingress
 invite/<unguessable-id>      encrypted invite blob
-failed/...                   node-local quarantine diagnostics
+failed/pile/<sha256>         shared immutable rejected bytes
+failed/meta/<sha256>         shared immutable typed-rejection record
 ```
 
 The writable ObjectStore API enforces the authoritative-key rules: `root`
@@ -138,8 +139,16 @@ direct-API visibility. Current general-purpose S3 and direct R2 Worker/S3
 APIs provide the strong per-key reads and conditional writes this design
 uses. Cached custom domains and asynchronous replicas are not conforming
 authoritative adapters. LIST is strong but paginated, and several pages are
-not one transaction. Piles, invites, and quarantine records remain
-non-authoritative operations with explicitly idempotent handling.
+not one transaction. Piles, invites, and rejection records remain
+non-authoritative operations with explicitly idempotent handling. Rejection
+evidence nevertheless participates in a destructive safety obligation: exact
+pile bytes and a content-addressed typed-reason record are read back before
+any worker may retire malformed ingress. The evidence is shared because host
+workers share the workspace prefix; node-local status for retryable provider,
+publication, root, CAS, and program failures is a separate in-memory view.
+A later strong `pile/` listing clears a local attempt row when another worker
+has already retired that shared obligation; this changes presentation only
+and performs no deletion.
 
 The production profile also treats each provider's documented RFC 9110 strong
 ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must
@@ -591,12 +600,18 @@ not yet have a blob may still relay the fact so another source can complete
 it. Push happens before draining the pull so canonical pruning cannot remove
 a precomputed difference before delivery.
 
-Malformed ingress failures and sync failures are quarantined and visible
-through `status`. Malformed roots, pages, facts, selectors, action evidence,
-or authority rows fail closed. A root format mismatch may be republished from
-the current derived index only when its known snapshot fields equal the exact
-root bytes that index recorded; a different or unreadable snapshot is never
-clobbered. There is no ongoing dual decoder.
+Only typed, input-local pile-codec and immutable-kernel rejections are
+quarantined. Exact bytes plus content-addressed reason records become durable
+before retirement. Provider, publication, root, CAS, and unexpected program
+failures retain the exact live pile without a retry-count shortcut; they are
+visible as node-local attempt failures, and an authoritative restore isolates
+their staged candidates before the turn continues with another independent
+pile. Sync failures are likewise visible through `status`. Malformed roots,
+pages, facts, selectors, action evidence, or authority rows fail closed. A
+root format mismatch may be republished from the current derived index only
+when its known snapshot fields equal the exact root bytes that index recorded;
+a different or unreadable snapshot is never clobbered. There is no ongoing
+dual decoder.
 
 Rebuild replays authenticated resident facts together with the stable local
 catalog and reconstructs eligibility, action state, and selector reverse maps.

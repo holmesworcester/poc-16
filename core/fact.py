@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 
 from .crypto import h
-from .limits import MAX_OBJECT_BYTES, decode_json
+from .limits import InvalidEncoding, MAX_OBJECT_BYTES, decode_json
 from .shape import key, valid_timestamp
 
 
@@ -89,15 +89,19 @@ def _atoms_ok(atoms) -> bool:
 
 
 def from_json(o) -> Fact:
-    e = o.get("e") if isinstance(o, dict) else None
-    if not (isinstance(e, dict) and isinstance(e.get("t"), str)
-            and valid_timestamp(e.get("ts")) and isinstance(o.get("b"), dict)
-            and _atoms_ok(e.get("a"))):
-        raise ValueError("fact shape")
-    f = Fact(e["t"], e["ts"], e["a"], o["b"])
-    if f.fid != h(canon(e)) or f.bh != e.get("bh"):
-        raise ValueError("fact integrity")
-    return f
+    try:
+        e = o.get("e") if isinstance(o, dict) else None
+        if not (isinstance(e, dict) and isinstance(e.get("t"), str)
+                and valid_timestamp(e.get("ts"))
+                and isinstance(o.get("b"), dict)
+                and _atoms_ok(e.get("a"))):
+            raise InvalidEncoding("fact shape")
+        f = Fact(e["t"], e["ts"], e["a"], o["b"])
+        if f.fid != h(canon(e)) or f.bh != e.get("bh"):
+            raise InvalidEncoding("fact integrity")
+        return f
+    except (RecursionError, UnicodeError) as error:
+        raise InvalidEncoding("fact encoding") from error
 
 
 def encode(fact: Fact) -> bytes:
@@ -118,4 +122,4 @@ def decode(raw: bytes) -> Fact:
             raise ValueError("non-canonical fact encoding")
         return fact
     except RecursionError as error:
-        raise ValueError("fact encoding") from error
+        raise InvalidEncoding("fact encoding") from error

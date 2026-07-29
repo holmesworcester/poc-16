@@ -25,13 +25,17 @@ class PayloadTooLarge(ValueError):
     """A bounded protocol value exceeded its declared byte budget."""
 
 
+class InvalidEncoding(ValueError):
+    """Bytes violate an immutable protocol shape or integrity rule."""
+
+
 def decode_json(raw, limit, label):
     """Decode bounded JSON and expose every parser failure as ``ValueError``."""
     if not isinstance(raw, bytes):
-        raise ValueError(f"{label} bytes")
+        raise InvalidEncoding(f"{label} bytes")
     if len(raw) > limit:
         raise PayloadTooLarge(f"{label} too large")
     try:
         return json.loads(raw)
-    except (TypeError, ValueError, RecursionError) as error:
-        raise ValueError(f"{label} encoding") from error
+    except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+        raise InvalidEncoding(f"{label} encoding") from error

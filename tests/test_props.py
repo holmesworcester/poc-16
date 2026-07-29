@@ -486,13 +486,14 @@ def test_partial_stamp_failure_retries_in_the_same_process(
         original_stamp(publisher, root_bytes, admitted)
 
     monkeypatch.setattr(Publisher, "stamp", fail_once_after_root)
-    with pytest.raises(RuntimeError, match="simulated partial stamp"):
-        cmds.post(node, workspace, "general", "stamp retry", ts=2)
+    cmds.post(node, workspace, "general", "stamp retry", ts=2)
 
     assert not node.idx(workspace).in_transaction
     assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
         == ["stamp retry"]
     assert node.store(workspace).list("pile/")
+    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
+        "RuntimeError: simulated partial stamp"
 
     node.turn(workspace)
 

@@ -3,7 +3,7 @@
 Layout: root (the CAS'd workspace/index manifest), obj/<hash> (manifest
 shards, leaf piles, closure siblings, blobs — immutable),
 pile/<member>/<hash> (ingress), invite/<id> (public reads), and
-failed/{pile,meta}/<hash> (node-local rejected-ingress evidence).
+failed/{pile,meta}/<hash> (shared immutable rejected-ingress evidence).
 
 The public mutation contract rejects unconditional root/object replacement
 and authoritative deletion. Objects use atomic put-if-absent; root uses CAS.

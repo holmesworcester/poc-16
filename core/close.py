@@ -13,7 +13,13 @@ import binascii
 
 from .crypto import h
 from .fact import canon, from_json
-from .limits import MAX_PILE_BYTES, PayloadTooLarge, decode_json
+from .ingress import InvalidPile
+from .limits import (
+    InvalidEncoding,
+    MAX_PILE_BYTES,
+    PayloadTooLarge,
+    decode_json,
+)
 
 
 def close(news, deps_of, fact_of):
@@ -50,25 +56,31 @@ def encode_pile(facts, blobs=None) -> bytes:
 def decode_pile(b: bytes):
     """Hash-verify everything at the door — cheapest checks first.
 
-    Total over arbitrary JSON: foreign bytes leave here as a ValueError or
-    not at all, so a caller can say ``except ValueError`` and mean it.
+    Total over arbitrary JSON: foreign bytes leave here as ``InvalidPile`` or
+    ``PayloadTooLarge``. Unexpected exception types remain program failures
+    and must never become destructive quarantine verdicts.
     """
     try:
         o = decode_json(b, MAX_PILE_BYTES, "pile")
         if not isinstance(o, dict) or not isinstance(o.get("facts"), list) \
                 or not isinstance(o.get("blobs", {}), dict):
-            raise ValueError("pile shape")
+            raise InvalidEncoding("pile shape")
         facts = [
             from_json(fo) for fo in o["facts"]
         ]  # raises on integrity mismatch
         blobs = {}
         for k, v in o.get("blobs", {}).items():
             if not isinstance(k, str) or not isinstance(v, str):
-                raise ValueError("blob shape")
+                raise InvalidEncoding("blob shape")
             raw = base64.b64decode(v, validate=True)
             if h(raw) != k:
-                raise ValueError("blob integrity")
+                raise InvalidEncoding("blob integrity")
             blobs[k] = raw
         return facts, blobs
-    except (binascii.Error, RecursionError, UnicodeError) as error:
-        raise ValueError("pile encoding") from error
+    except PayloadTooLarge as error:
+        raise InvalidPile(str(error)) from error
+    except (
+            InvalidEncoding,
+            binascii.Error,
+    ) as error:
+        raise InvalidPile(str(error) or "pile encoding") from error

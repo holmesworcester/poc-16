@@ -1,14 +1,19 @@
 """Real ingress failures are isolated, durable and visible."""
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    btreap, close, cmds, daemon, fact, manifest, object_store, sync,
+    btreap, close, cmds, daemon, fact, manifest, object_store, runtime, sync,
 )
 from core.crypto import h
-from core.fact import canon
+from core.fact import Fact, canon
 from core.limits import PayloadTooLarge
 from core.node import Node
+from core.object_store import OutcomeUnknown
+from core.store import FsStore
+from facts.content import message as message_family
 from tests.util import closed_subset, deliver
 
 
@@ -42,7 +47,7 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     failures = cmds.status(destination)["workspaces"][workspace][
         "ingress_failures"]
     assert len(failures) == 1
-    assert failures[0]["error"] == "ValueError: fact shape"
+    assert failures[0]["error"] == "InvalidPile: fact shape"
     assert destination.store(workspace).get(
         "failed/pile/" + h(bad)) == bad
 
@@ -51,6 +56,354 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     assert restarted.store(workspace).list("pile/") == []
     assert cmds.status(restarted)["workspaces"][workspace][
         "ingress_failures"] == failures
+
+
+def queued_messages(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "source", ts=1)
+    first = cmds.post(source, workspace, "general", "first", ts=2)
+    second = cmds.post(source, workspace, "general", "second", ts=3)
+    destination = Node(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "source", [])
+    first_raw = closed_subset(source, workspace, [first])
+    second_raw = closed_subset(source, workspace, [second])
+    first_key = f"pile/0000000000000000/{h(first_raw)}"
+    second_key = f"pile/ffffffffffffffff/{h(second_raw)}"
+    deliver(
+        destination, workspace, first_raw, member="0000000000000000")
+    deliver(
+        destination, workspace, second_raw, member="ffffffffffffffff")
+    return (
+        destination, workspace,
+        (first, first_raw, first_key),
+        (second, second_raw, second_key),
+    )
+
+
+def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
+        tmp_path, monkeypatch):
+    node, workspace, first, second = queued_messages(tmp_path)
+    first_fid, first_raw, first_key = first
+    second_fid, _, second_key = second
+    decode = runtime.decode_pile
+
+    def program_failure(raw):
+        if raw == first_raw:
+            raise ValueError("simulated decoder programming failure")
+        return decode(raw)
+
+    monkeypatch.setattr(runtime, "decode_pile", program_failure)
+    node.turn(workspace)
+
+    assert node.store(workspace).get(first_key) == first_raw
+    assert node.store(workspace).get(second_key) is None
+    assert node.store(workspace).list("failed/pile/") == []
+    assert node.fact_of(workspace, first_fid) is None
+    assert node.fact_of(workspace, second_fid) is not None
+    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
+        "ValueError: simulated decoder programming failure"
+
+
+def test_untyped_fact_decoder_value_error_is_not_a_quarantine_verdict(
+        monkeypatch):
+    def program_failure(_value):
+        raise ValueError("simulated fact decoder programming failure")
+
+    monkeypatch.setattr(close, "from_json", program_failure)
+    raw = canon({"facts": [{}]})
+
+    with pytest.raises(
+            ValueError, match="simulated fact decoder programming failure"):
+        close.decode_pile(raw)
+
+
+def test_family_program_failure_retains_exact_pile_and_does_not_wedge(
+        tmp_path, monkeypatch):
+    node, workspace, first, second = queued_messages(tmp_path)
+    first_fid, first_raw, first_key = first
+    second_fid, _, second_key = second
+    needs = message_family.needs
+
+    def program_failure(item):
+        if item.fid == first_fid:
+            raise RuntimeError("simulated family programming failure")
+        return needs(item)
+
+    monkeypatch.setattr(message_family, "needs", program_failure)
+    node.turn(workspace)
+
+    assert node.store(workspace).get(first_key) == first_raw
+    assert node.store(workspace).get(second_key) is None
+    assert node.store(workspace).list("failed/pile/") == []
+    assert node.fact_of(workspace, first_fid) is None
+    assert node.fact_of(workspace, second_fid) is not None
+    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
+        "RuntimeError: simulated family programming failure"
+
+
+@pytest.mark.parametrize("boundary", ["program", "provider"])
+def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
+        tmp_path, monkeypatch, boundary):
+    node, workspace, first, second = queued_messages(tmp_path)
+    first_fid, first_raw, first_key = first
+    second_fid, _, second_key = second
+    store = node.store(workspace)
+    if boundary == "program":
+        original = node.commit
+        calls = 0
+
+        def fail_first(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated publication program failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(node, "commit", fail_first)
+    else:
+        original = store.cas
+        calls = 0
+
+        def fail_first(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                raise OutcomeUnknown("simulated provider CAS outage")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, "cas", fail_first)
+
+    node.turn(workspace)
+
+    assert store.get(first_key) == first_raw
+    assert store.get(second_key) is None
+    assert node.candidate_of(workspace, first_fid) is not None
+    assert node.fact_of(workspace, first_fid) is None
+    assert node.fact_of(workspace, second_fid) is not None
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM staged WHERE fid=?", (first_fid,)).fetchone() == (1,)
+    assert node.ingress_attempt_failures(workspace)
+
+    for index in node._idx.values():
+        index.close()
+    reopened = Node(node.dir)
+    reopened.turn(workspace)
+
+    assert reopened.fact_of(workspace, first_fid) is not None
+    assert reopened.store(workspace).list("pile/") == []
+    assert reopened.ingress_attempt_failures(workspace) == []
+
+
+def test_retryable_failure_never_ages_into_destructive_quarantine(
+        tmp_path, monkeypatch):
+    node, workspace, first, second = queued_messages(tmp_path)
+    first_fid, first_raw, first_key = first
+    second_fid, _, second_key = second
+    commit = node.commit
+
+    def fail_first_pile(*args, **kwargs):
+        if node.fact_of(workspace, first_fid) is not None:
+            raise OutcomeUnknown("persistent provider outage for this pile")
+        return commit(*args, **kwargs)
+
+    monkeypatch.setattr(node, "commit", fail_first_pile)
+
+    for _ in range(12):
+        node.turn(workspace)
+
+    assert node.store(workspace).get(first_key) == first_raw
+    assert node.store(workspace).get(second_key) is None
+    assert node.store(workspace).list("failed/") == []
+    assert node.fact_of(workspace, first_fid) is None
+    assert node.fact_of(workspace, second_fid) is not None
+    failure = node.ingress_attempt_failures(workspace)[0]
+    assert failure["error"] == \
+        "OutcomeUnknown: persistent provider outage for this pile"
+
+
+def test_failed_authoritative_restore_stops_before_the_next_pile(
+        tmp_path, monkeypatch):
+    node, workspace, first, second = queued_messages(tmp_path)
+    first_fid, first_raw, first_key = first
+    second_fid, second_raw, second_key = second
+
+    def fail_commit(*_args, **_kwargs):
+        raise RuntimeError("simulated publication failure")
+
+    def fail_restore(_workspace):
+        raise OutcomeUnknown("authoritative root unavailable")
+
+    monkeypatch.setattr(node, "commit", fail_commit)
+    monkeypatch.setattr(node, "_restore_authoritative_state", fail_restore)
+
+    with pytest.raises(
+            OutcomeUnknown, match="authoritative root unavailable"):
+        node.turn(workspace)
+
+    assert node.store(workspace).get(first_key) == first_raw
+    assert node.store(workspace).get(second_key) == second_raw
+    assert node.store(workspace).list("failed/") == []
+    assert node.fact_of(workspace, first_fid) is not None
+    assert node.fact_of(workspace, second_fid) is None
+    failure = node.ingress_attempt_failures(workspace)[0]
+    assert "publication failure" in failure["error"]
+    assert "authoritative restore failed" in failure["error"]
+
+
+@pytest.mark.parametrize(
+    ("boundary", "source_survives", "payload_exact"),
+    [
+        ("payload", True, False),
+        ("metadata", True, True),
+        ("delete-before", True, True),
+        ("delete-after", False, True),
+    ],
+)
+def test_rejection_retirement_requires_exact_durable_evidence(
+        tmp_path, monkeypatch, boundary, source_survives, payload_exact):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "source", ts=1)
+    survivor = cmds.post(source, workspace, "general", "survives", ts=2)
+    node = Node(str(tmp_path / "destination"))
+    node.add_workspace(workspace, "source", [])
+    bad = poisoned_timestamp_pile()
+    bad_key = f"pile/0000000000000000/{h(bad)}"
+    good = closed_subset(source, workspace, [survivor])
+    deliver(node, workspace, bad, member="0000000000000000")
+    deliver(node, workspace, good, member="ffffffffffffffff")
+    store = node.store(workspace)
+
+    if boundary == "payload":
+        put_if_absent = store.put_if_absent
+
+        def corrupt_payload(key, value):
+            if key.startswith("failed/pile/"):
+                return put_if_absent(key, b"wrong rejection bytes")
+            return put_if_absent(key, value)
+
+        monkeypatch.setattr(store, "put_if_absent", corrupt_payload)
+    elif boundary == "metadata":
+        put_if_absent = store.put_if_absent
+
+        def corrupt_metadata(key, value):
+            if key.startswith("failed/meta/"):
+                return put_if_absent(key, b"wrong metadata bytes")
+            return put_if_absent(key, value)
+
+        monkeypatch.setattr(store, "put_if_absent", corrupt_metadata)
+    else:
+        delete = store.delete
+
+        def ambiguous_delete(key):
+            if key == bad_key:
+                if boundary == "delete-after":
+                    delete(key)
+                raise OutcomeUnknown("simulated lost delete response")
+            return delete(key)
+
+        monkeypatch.setattr(store, "delete", ambiguous_delete)
+
+    node.turn(workspace)
+
+    assert node.fact_of(workspace, survivor) is not None
+    assert (store.get(bad_key) is not None) is source_survives
+    payload = store.get("failed/pile/" + h(bad))
+    assert (payload == bad) is payload_exact
+    if source_survives:
+        assert node.ingress_attempt_failures(workspace)
+    else:
+        assert node.ingress_attempt_failures(workspace) == []
+    if boundary == "delete-before":
+        for _ in range(4):
+            node.turn(workspace)
+        assert store.get(bad_key) == bad
+        assert len(store.list("failed/meta/")) == 1
+
+
+def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
+        tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "source", ts=1)
+    survivor = cmds.post(source, workspace, "general", "survives", ts=2)
+    node = Node(str(tmp_path / "destination"))
+    node.add_workspace(workspace, "source", [])
+    rejected = close.encode_pile([
+        Fact(
+            "signature", 3,
+            [["offer", "author", "not-a-fact", source.pk]], {}),
+    ])
+    deliver(node, workspace, rejected, member="0000000000000000")
+    deliver(
+        node, workspace,
+        closed_subset(source, workspace, [survivor]),
+        member="ffffffffffffffff")
+
+    node.turn(workspace)
+
+    assert node.fact_of(workspace, survivor) is not None
+    failure = node.ingress_failures(workspace)[0]
+    assert failure["error"] == "KernelRejected: ingress rejected"
+    assert node.store(workspace).get(
+        "failed/pile/" + h(rejected)) == rejected
+
+
+def test_two_workers_share_immutable_rejection_evidence_without_clobber(
+        tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    factory = lambda workspace: FsStore(str(shared / workspace))
+    first = Node(str(tmp_path / "first"), store_factory=factory)
+    workspace = cmds.create(first, "shared", ts=1)
+    second = Node(str(tmp_path / "second"), store_factory=factory)
+    second.add_workspace(workspace, "shared", [])
+    second.rebuild(workspace)
+    bad = poisoned_timestamp_pile()
+    source = f"pile/0000000000000000/{h(bad)}"
+    first.store(workspace).put(source, bad)
+
+    listed = threading.Barrier(2)
+    retiring = threading.Barrier(2)
+    for node in (first, second):
+        store = node.store(workspace)
+        list_keys = store.list
+        retire = node._retire_ingress_exact
+
+        def synchronized_list(prefix, list_keys=list_keys):
+            keys = list_keys(prefix)
+            if prefix == "pile/":
+                listed.wait(timeout=5)
+            return keys
+
+        def synchronized_retire(
+                ws, key, raw, retire=retire):
+            retiring.wait(timeout=5)
+            return retire(ws, key, raw)
+
+        monkeypatch.setattr(store, "list", synchronized_list)
+        monkeypatch.setattr(node, "_retire_ingress_exact",
+                            synchronized_retire)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            pool.submit(node.turn, workspace)
+            for node in (first, second)
+        ]
+        assert [future.result(timeout=10) for future in results] == [[], []]
+
+    store = first.store(workspace)
+    assert store.get(source) is None
+    assert store.get("failed/pile/" + h(bad)) == bad
+    meta_keys = store.list("failed/meta/")
+    assert len(meta_keys) == 1
+    records = [json.loads(store.get(key)) for key in meta_keys]
+    assert all(record["id"] == h(bad) for record in records)
+    assert all(record["source"] == source for record in records)
+    assert all(
+        record["error"] == "InvalidPile: fact shape"
+        for record in records)
+    assert first.ingress_attempt_failures(workspace) == []
+    assert second.ingress_attempt_failures(workspace) == []
+    assert first.ingress_failures(workspace) \
+        == second.ingress_failures(workspace)
 
 
 def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):

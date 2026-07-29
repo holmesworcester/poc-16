@@ -32,6 +32,8 @@ def status(node):
                 "peers": entry["peers"], "name": entry["name"],
                 "identity": entry["identity"],
                 "ingress_failures": node.ingress_failures(workspace),
+                "ingress_attempt_failures":
+                    node.ingress_attempt_failures(workspace),
                 "sync_failures": node.sync_failures(workspace),
             }
     return out
