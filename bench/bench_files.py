@@ -130,7 +130,7 @@ def spawn(base, who):
     log.close()
     for _ in range(300):
         try:
-            ctl(url(who), "GET", "status")
+            ctl(url(who), "core.status", [])
             return process
         except Exception:
             time.sleep(0.1)
@@ -155,12 +155,10 @@ def bench_download(size, timeout=3600):
             for who in PORTS:
                 processes[who] = spawn(scratch, who)
             workspace = ctl(
-                url("alice"), "POST", "create", {"name": "alice"})["ws"]
+                url("alice"), "auth.workspace.create", ["alice"])
             invite = ctl(
-                url("alice"), "POST", "invite", {"ws": workspace})["link"]
-            ctl(
-                url("bob"), "POST", "join",
-                {"link": invite, "name": "bob"})
+                url("alice"), "auth.user_invite.create", [workspace])
+            ctl(url("bob"), "auth.user.join", [invite, "bob"])
             input_path = source(os.path.join(scratch, "input"), size)
 
             peak = {who: 0.0 for who in PORTS}
@@ -176,14 +174,15 @@ def bench_download(size, timeout=3600):
             sampler.start()
             start = now()
             ctl(
-                url("alice"), "POST", "send",
-                {"ws": workspace, "path": input_path, "name": "big.bin"})
+                url("alice"), "content.file.send",
+                [workspace, "general", input_path, "big.bin"])
             sent = now()
 
             first = None
             deadline = time.time() + timeout
             while time.time() < deadline:
-                rows = ctl(url("bob"), "GET", "files", ws=workspace)
+                rows = ctl(
+                    url("bob"), "content.file.list", [workspace])
                 if rows:
                     record = rows[0]
                     if first is None and record["have"]:
@@ -201,8 +200,8 @@ def bench_download(size, timeout=3600):
 
             output_path = os.path.join(scratch, "output")
             result = ctl(
-                url("bob"), "POST", "save",
-                {"ws": workspace, "fid": record["fid"], "out": output_path})
+                url("bob"), "content.file.save",
+                [workspace, record["fid"], output_path])
             mb = size / 1e6
             return {
                 "mb": mb,

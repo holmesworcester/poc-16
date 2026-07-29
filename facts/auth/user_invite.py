@@ -77,3 +77,4 @@ def make(node, workspace):
 
 
 # QUERIES — none; invite ids deliberately cannot be listed.
+CLI = {"auth.user_invite.create": make}

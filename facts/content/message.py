@@ -63,7 +63,7 @@ def materialize(db, workspace, valid):
 def post(node, workspace, channel, text, ts=None):
     from core.node import now_ms
 
-    ts = ts or now_ms()
+    ts = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     item = message(public, channel, text, ts)
     return publish(node, workspace, item,
@@ -81,3 +81,6 @@ def messages(node, workspace, channel=None):
             "SELECT pk, name FROM members WHERE ws=?", (workspace,)))
     return [{"chan": chan, "from": names.get(pk, pk[:8]), "text": text,
              "ts": ts, "fid": fid} for chan, pk, text, ts, fid in rows]
+
+
+CLI = {"content.message.post": post, "content.message.list": messages}

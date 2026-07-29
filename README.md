@@ -43,38 +43,41 @@ python3 -m core daemon ./state/alice --port 7100
 In another shell:
 
 ```sh
-python3 -m core create alice
-python3 -m core status
+python3 -m core auth.workspace.create alice
+python3 -m core core.status
 ```
 
 `create` prints the workspace id. Commands accept a unique workspace-id
 prefix:
 
 ```sh
-python3 -m core post --ws WORKSPACE "hello"
-python3 -m core msgs --ws WORKSPACE
-python3 -m core send --ws WORKSPACE ./photo.jpg
-python3 -m core files --ws WORKSPACE
-python3 -m core get --ws WORKSPACE FILE_FID --out ./photo.jpg
-python3 -m core remove --ws WORKSPACE FACT_FID
-python3 -m core evict --ws WORKSPACE MEMBER_NAME
+python3 -m core content.message.post WORKSPACE general "hello"
+python3 -m core content.message.list WORKSPACE
+python3 -m core content.file.send WORKSPACE general ./photo.jpg
+python3 -m core content.file.list WORKSPACE
+python3 -m core content.file.save WORKSPACE FILE_FID ./photo.jpg
+python3 -m core content.delete.remove WORKSPACE FACT_FID
+python3 -m core auth.removal.evict WORKSPACE MEMBER_NAME
 ```
 
 To add a peer, create an invite on the existing node and redeem it against a
 second daemon:
 
 ```sh
-python3 -m core invite --ws WORKSPACE
-python3 -m core --node http://127.0.0.1:7200 join INVITE_LINK bob
+python3 -m core auth.user_invite.create WORKSPACE
+python3 -m core --node http://127.0.0.1:7200 auth.user.join INVITE_LINK bob
 ```
 
-Nodes synchronize on their daemon cadence. `sync --ws WORKSPACE` requests an
-immediate dial, and `rebuild --ws WORKSPACE` reconstructs eligibility,
-authenticated indexes, and application views around the stable local
-admission catalog and published root.
+Nodes synchronize on their daemon cadence. `python3 -m core core.sync
+WORKSPACE` requests an immediate dial, and `core.rebuild WORKSPACE`
+reconstructs eligibility, authenticated indexes, and application views around
+the stable local admission catalog and published root.
 
-The `ctl/*` endpoints are a trusted node-local control plane. Remote peers use
-the authenticated `root`, `page`, `pile`, `poke`, and `mint` protocol routes.
+The single `ctl/command` endpoint is a trusted node-local control plane.
+Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`
+protocol routes.
+Consequently `content.file.send` and `content.file.save` paths are resolved by
+the daemon process, just like the POC-17 local command model.
 
 ## Test and measure
 

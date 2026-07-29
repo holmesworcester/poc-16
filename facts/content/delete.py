@@ -123,7 +123,7 @@ def remove(node, workspace, target, ts=None):
     if policy is None or not _policy.allows_direct_target(
             policy, _policy.CONTENT_DELETE, SELF, _policy.OWNER):
         raise ValueError("fact type is not directly deleteable")
-    ts = ts or now_ms()
+    ts = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     with node.lock:
         actor_member = offer_source(node, workspace, "member", public)
@@ -155,3 +155,4 @@ def remove(node, workspace, target, ts=None):
 
 
 # QUERIES — none: deletion is visible only as the victim's absence.
+CLI = {"content.delete.remove": remove}

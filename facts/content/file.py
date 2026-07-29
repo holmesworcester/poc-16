@@ -249,3 +249,7 @@ def _cids(node, workspace, root):
         return dict(node.app.execute(
             "SELECT idx, cid FROM file_chunk_rows "
             "WHERE ws=? AND root=?", (workspace, root)).fetchall())
+
+
+CLI = {"content.file.send": send, "content.file.save": save,
+       "content.file.list": files}

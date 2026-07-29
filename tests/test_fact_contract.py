@@ -96,6 +96,11 @@ def test_router_covers_each_family_once():
         and module.POLICY is not None
         for module in facts.MODULES
     )
+    assert all(
+        command.__module__ == module.__name__
+        for module in facts.MODULES
+        for command in getattr(module, "CLI", {}).values()
+    )
 
 
 def test_core_fact_module_has_no_family_authors():
@@ -115,6 +120,12 @@ def test_core_judge_and_engine_do_not_name_family_policy():
                 '"admin"', '"device_key"', '"member"', '"removed"',
                 '"request"', '"workspace"'):
             assert vocabulary not in source, (name, vocabulary)
+
+
+def test_cli_and_daemon_have_no_application_command_inventory():
+    for name in ("cli.py", "daemon.py"):
+        source = (ROOT / "core" / name).read_text()
+        assert all(path not in source for path in facts.COMMANDS), name
 
 
 def test_only_ephemeral_families_have_worker_grants():

@@ -63,3 +63,4 @@ def evict(node, workspace, target):
 
 
 # QUERIES — member status is exposed by auth.user.members.
+CLI = {"auth.removal.evict": evict}

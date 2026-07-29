@@ -102,3 +102,6 @@ def members(node, workspace):
             (workspace,)).fetchall()
     return [{"pk": pk, "name": name, "role": role, "evicted": bool(evicted)}
             for pk, name, role, evicted in rows]
+
+
+CLI = {"auth.user.join": accept, "auth.user.list": members}

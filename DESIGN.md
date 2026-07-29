@@ -45,7 +45,10 @@ root + immutable-object fetches → WorkerView   database-free CF authorization
 boundaries. It does not define family policy. Sync and local authorship both
 enqueue the same pile bytes; `WorkspaceRuntime` is the normal coordinator,
 `Catalog` alone decides current standing, and `Publisher` alone advances
-`root`. The daemon handles HTTP, token sealing, and control dispatch.
+`root`. The daemon handles HTTP and token sealing. Its node-local control
+surface dispatches one qualified command path through the checked
+`facts.COMMANDS` registry; typed application commands remain beside their fact
+families, and adding one does not add a CLI or daemon branch.
 
 An engineer should read the running path in this order:
 

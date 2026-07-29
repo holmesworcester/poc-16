@@ -67,3 +67,4 @@ def create(node, name, ts=None):
 
 
 # QUERIES — none; membership observations belong to auth.user.
+CLI = {"auth.workspace.create": create}

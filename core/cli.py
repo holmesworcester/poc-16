@@ -1,107 +1,73 @@
-"""CLI: `core daemon` runs a node; every other command drives a running
-daemon over its control plane — the black-box seam the tests use too."""
+"""Launch a daemon or proxy one untouched command path and argv to it.
+
+Application verbs live with fact families; this process only renders replies.
+"""
 import argparse
-import base64
 import json
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
-
-def ctl(node_url, method, path, body=None, **q):
-    qs = urllib.parse.urlencode({k: v for k, v in q.items() if v})
-    req = urllib.request.Request(
-        f"{node_url}/ctl/{path}" + (f"?{qs}" if qs else ""),
-        data=json.dumps(body).encode() if body is not None else None, method=method)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
+DEFAULT_NODE = "http://127.0.0.1:7100"
+USAGE = (
+    "usage: core [--node URL] <scope.family.verb> [args...]\n"
+    "       core daemon <dir> [--port PORT]\n"
+    "       core --commands"
+)
 
 
-def run_command(a):
-    if a.cmd == "create":
-        return ctl(a.node, "POST", "create", {"name": a.name})
-    if a.cmd == "invite":
-        return ctl(a.node, "POST", "invite", {"ws": a.ws})
-    if a.cmd == "join":
-        return ctl(
-            a.node, "POST", "join", {"link": a.link, "name": a.name})
-    if a.cmd == "post":
-        return ctl(
-            a.node, "POST", "post",
-            {"ws": a.ws, "chan": a.chan or "general", "text": a.text})
-    if a.cmd == "send":
-        with open(a.path, "rb") as source:
-            data = source.read()
-        return ctl(
-            a.node, "POST", "send",
-            {"ws": a.ws, "chan": a.chan or "general",
-             "name": a.path.rsplit("/", 1)[-1],
-             "data": base64.b64encode(data).decode()})
-    if a.cmd == "get":
-        out = ctl(a.node, "GET", "file", ws=a.ws, fid=a.fid)
-        raw = base64.b64decode(out.pop("data"))
-        path = a.out or out["name"]
-        with open(path, "wb") as target:
-            target.write(raw)
-        out["wrote"] = path
-        return out
-    if a.cmd == "evict":
-        return ctl(
-            a.node, "POST", "evict", {"ws": a.ws, "member": a.member})
-    if a.cmd == "remove":
-        return ctl(
-            a.node, "POST", "remove", {"ws": a.ws, "fid": a.fid})
-    if a.cmd == "msgs":
-        return ctl(a.node, "GET", "msgs", ws=a.ws, chan=a.chan)
-    if a.cmd == "members":
-        return ctl(a.node, "GET", "members", ws=a.ws)
-    if a.cmd == "files":
-        return ctl(a.node, "GET", "files", ws=a.ws)
-    if a.cmd == "status":
-        return ctl(a.node, "GET", "status")
-    if a.cmd == "sync":
-        return ctl(a.node, "POST", "sync", {"ws": a.ws})
-    if a.cmd == "rebuild":
-        return ctl(a.node, "POST", "rebuild", {"ws": a.ws})
-    raise ValueError(f"unknown command: {a.cmd}")
+def ctl(node_url, path, argv):
+    """Send the control plane's one command envelope."""
+    request = urllib.request.Request(
+        f"{node_url}/ctl/command",
+        data=json.dumps({"path": path, "argv": argv}).encode(),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())
+
+
+def _serve(argv):
+    parser = argparse.ArgumentParser(prog="core daemon")
+    parser.add_argument("dir")
+    parser.add_argument("--port", type=int, default=7100)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--cadence", type=float, default=1.0)
+    parser.add_argument("--url")
+    args = parser.parse_args(argv)
+    from .daemon import serve
+    return serve(
+        args.dir, args.port, args.host, args.cadence, args.url)
+
+
+def _commands():
+    from .daemon import CORE_COMMANDS
+    from facts import COMMANDS
+    return tuple(sorted((*CORE_COMMANDS, *COMMANDS)))
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="core")
-    p.add_argument("--node", default="http://127.0.0.1:7100", help="daemon base URL")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    node_url = DEFAULT_NODE
+    if argv[:1] == ["--node"]:
+        if len(argv) < 2:
+            raise SystemExit("--node requires a URL")
+        node_url, argv = argv[1], argv[2:]
 
-    d = sub.add_parser("daemon")
-    d.add_argument("dir")
-    d.add_argument("--port", type=int, default=7100)
-    d.add_argument("--host", default="127.0.0.1")
-    d.add_argument("--cadence", type=float, default=1.0)
-    d.add_argument("--url")
+    if argv[:1] == ["daemon"]:
+        return _serve(argv[1:])
+    if argv == ["--commands"]:
+        print("\n".join(_commands()))
+        return 0
+    if argv in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if not argv:
+        raise SystemExit(USAGE)
 
-    for name, args in {
-        "create": [("name",)], "invite": [("--ws",)],
-        "join": [("link",), ("name",)],
-        "post": [("--ws",), ("--chan",), ("text",)],
-        "send": [("--ws",), ("--chan",), ("path",)],
-        "get": [("--ws",), ("fid",), ("--out",)],
-        "evict": [("--ws",), ("member",)],
-        "remove": [("--ws",), ("fid",)],
-        "msgs": [("--ws",), ("--chan",)], "members": [("--ws",)],
-        "files": [("--ws",)], "status": [], "sync": [("--ws",)],
-        "rebuild": [("--ws",)],
-    }.items():
-        s = sub.add_parser(name)
-        for (a,) in args:
-            s.add_argument(a) if not a.startswith("--") else s.add_argument(a, default="")
-
-    a = p.parse_args(argv)
-    if a.cmd == "daemon":
-        from .daemon import serve
-        return serve(a.dir, a.port, a.host, a.cadence, a.url)
-
+    path, *tokens = argv
     try:
-        out = run_command(a)
+        out = ctl(node_url, path, tokens)
     except urllib.error.HTTPError as error:
         try:
             detail = json.loads(error.read()).get("error", error.reason)
@@ -109,8 +75,11 @@ def main(argv=None):
             detail = error.reason
         print(f"core: {error.code}: {detail}", file=sys.stderr)
         return 1
-    json.dump(out, sys.stdout, indent=2)
-    print()
+    if isinstance(out, str):
+        print(out)
+    else:
+        json.dump(out, sys.stdout, indent=2)
+        print()
     return 0
 
 

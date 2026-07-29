@@ -11,10 +11,11 @@ import hashlib
 import hmac as hmaclib
 import json
 import os
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+import facts
 
 from . import cmds, manifest, mint as gate
 from .crypto import h, seal_to
@@ -24,6 +25,11 @@ from .store import PAGE_BATCH
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
+CORE_COMMANDS = {
+    "core.rebuild": "_command_rebuild",
+    "core.status": "_command_status",
+    "core.sync": "_command_sync",
+}
 
 
 class Syncer(threading.Thread):
@@ -115,8 +121,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parts, q = self._q()
         ws = q.get("ws", "")
-        if parts[0] == "ctl":
-            return self.ctl_get(parts, q)
         if parts[0] == "invite" and len(parts) == 2:  # the one ungated read
             b = self.node.store(ws).get("invite/" + parts[1]) if self._known(ws) else None
             return self._send(200, b, "application/octet-stream") if b else self._send(404)
@@ -223,116 +227,68 @@ class Handler(BaseHTTPRequestHandler):
             "etag": h(root)})
 
     # ---- node-local control plane (not part of the protocol) ----
-    def ctl_get(self, parts, q):
-        n = self.node
-        try:
-            if len(parts) != 2:
-                return self._send(404)
-            if parts[1] == "status":
-                return self._json(200, cmds.status(n))
-            ws = self._resolve(q.get("ws", ""))
-            if not self._known(ws):
-                return self._send(404)
-            if parts[1] == "msgs":
-                return self._json(200, cmds.msgs(n, ws, q.get("chan")))
-            if parts[1] == "members":
-                return self._json(200, cmds.members(n, ws))
-            if parts[1] == "files":
-                return self._json(200, cmds.files(n, ws))
-            if parts[1] == "file":
-                got = cmds.file_bytes(n, ws, q["fid"])
-                if not got or got[1] is None:
-                    return self._send(404)
-                return self._json(
-                    200, {"name": got[0],
-                          "data": base64.b64encode(got[1]).decode()})
-            return self._send(404)
-        except (KeyError, TypeError, ValueError):
-            return self._send(400)
-
     def ctl_post(self, parts, body):
         try:
-            if len(parts) != 2:
+            if parts != ["ctl", "command"]:
                 return self._send(404)
-            o = json.loads(body or b"{}")
-            if not isinstance(o, dict):
+            request = json.loads(body or b"{}")
+            if not isinstance(request, dict) \
+                    or set(request) != {"path", "argv"} \
+                    or not isinstance(request["path"], str) \
+                    or not isinstance(request["argv"], list) \
+                    or not all(
+                        isinstance(token, str) for token in request["argv"]):
                 raise TypeError
         except (json.JSONDecodeError, TypeError):
             return self._send(400)
-        n = self.node
+
+        path, argv = request["path"], request["argv"]
+        core_method = CORE_COMMANDS.get(path)
+        application = facts.COMMANDS.get(path)
+        if core_method is None and application is None:
+            return self._json(404, {"error": f"unknown command: {path}"})
         try:
-            if parts[1] == "create":
-                return self._json(200, {"ws": cmds.create(n, o["name"])})
-            if parts[1] == "join":
-                r = {"ws": cmds.join(n, o["link"], o["name"])}
+            if core_method is not None:
+                result = getattr(self, core_method)(argv)
+            else:
+                result = facts.invoke_command(self.node, path, argv)
                 self.syncer.kick()
-                return self._json(200, r)
-            ws = self._resolve(o.get("ws", ""))
-            if not self._known(ws):
-                return self._send(404)
-            if parts[1] == "invite":
-                return self._json(200, {"link": cmds.make_invite(n, ws)})
-            if parts[1] == "post":
-                r = {"fid": cmds.post(n, ws, o.get("chan", "general"), o["text"], o.get("ts"))}
-                self.syncer.kick()
-                return self._json(200, r)
-            if parts[1] == "send":
-                r = {"fid": self.send_file(n, ws, o)}
-                self.syncer.kick()
-                return self._json(200, r)
-            if parts[1] == "save":
-                return self._json(
-                    200, cmds.save_file(n, ws, o["fid"], o["out"]))
-            if parts[1] == "evict":
-                r = {"fid": cmds.evict(n, ws, o["member"])}
-                self.syncer.kick()
-                return self._json(200, r)
-            if parts[1] == "remove":
-                r = {"fid": cmds.remove(n, ws, o["fid"])}
-                self.syncer.kick()
-                return self._json(200, r)
-            if parts[1] == "sync":
-                for w in [ws]:
-                    for url in n.keyring["workspaces"][w]["peers"]:
-                        try:
-                            sync(n, w, url)
-                        except Exception as error:
-                            n.record_sync_failure(w, url, error)
-                            raise
-                        else:
-                            n.record_sync_success(w, url)
-                return self._json(200, {"ok": True})
-            if parts[1] == "rebuild":
-                n.rebuild(ws)
-                return self._json(200, {"ok": True})
+            return self._json(200, result)
         except AuthorityRejected as e:
             return self._json(403, {"error": f"{type(e).__name__}: {e}"})
+        except facts.WorkspaceNotFound as e:
+            return self._json(404, {"error": f"{type(e).__name__}: {e}"})
         except (KeyError, TypeError, ValueError) as e:
             return self._json(400, {"error": f"{type(e).__name__}: {e}"})
         except Exception as e:
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
-        self._send(404)
 
-    def send_file(self, node, ws, request):
-        """Use daemon-local paths for large files; spool inline control data."""
-        if request.get("path"):
-            return cmds.send_file(
-                node, ws, request.get("chan", "general"),
-                request["path"], request.get("name"))
-        handle, path = tempfile.mkstemp(prefix="poc-16-ctl-")
-        try:
-            with os.fdopen(handle, "wb") as spool:
-                spool.write(base64.b64decode(request["data"]))
-            return cmds.send_file(
-                node, ws, request.get("chan", "general"), path,
-                request.get("name") or "attachment")
-        finally:
-            os.unlink(path)
+    def _core_workspace(self, argv, usage):
+        if len(argv) != 1:
+            raise ValueError(f"usage: {usage}")
+        return facts.workspace_for(self.node, argv[0])
 
-    def _resolve(self, ws):
-        """Accept a unique workspace-id prefix on the control plane."""
-        hits = [w for w in self.node.workspaces() if w.startswith(ws)]
-        return hits[0] if len(hits) == 1 and ws else ws
+    def _command_status(self, argv):
+        if argv:
+            raise ValueError("usage: core.status")
+        return cmds.status(self.node)
+
+    def _command_sync(self, argv):
+        ws = self._core_workspace(argv, "core.sync <workspace>")
+        for url in self.node.keyring["workspaces"][ws]["peers"]:
+            try:
+                sync(self.node, ws, url)
+            except Exception as error:
+                self.node.record_sync_failure(ws, url, error)
+                raise
+            else:
+                self.node.record_sync_success(ws, url)
+        return {"ok": True}
+
+    def _command_rebuild(self, argv):
+        ws = self._core_workspace(argv, "core.rebuild <workspace>")
+        self.node.rebuild(ws)
+        return {"ok": True}
 
 
 def serve(dir, port, host="127.0.0.1", cadence=1.0, url=None):

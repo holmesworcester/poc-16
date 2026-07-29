@@ -3,7 +3,6 @@ sockets, talk through the CLI seam only, and sync is ongoing (cadence walks,
 no manual sync calls). Covers join-by-invite-link, symmetric convergence,
 large files as blobs, stragglers, eviction, and restart-with-wiped-index.
 """
-import base64
 import hashlib
 import os
 import random
@@ -44,6 +43,11 @@ def url(who):
     return f"http://127.0.0.1:{PORTS[who]}"
 
 
+def command(who, path, *argv):
+    """The one node-local control envelope used by CLI and tests alike."""
+    return ctl(url(who), path, [str(value) for value in argv])
+
+
 def spawn(tmp, who):
     log = open(tmp / f"{who}.log", "w")
     p = subprocess.Popen(
@@ -57,7 +61,7 @@ def spawn(tmp, who):
 
 def alive(who):
     try:
-        ctl(url(who), "GET", "status")
+        command(who, "core.status")
         return True
     except Exception:
         return False
@@ -76,11 +80,14 @@ def wait_until(pred, timeout, what):
 
 
 def root_of(who, ws):
-    return ctl(url(who), "GET", "status")["workspaces"][ws]["root"]
+    return command(who, "core.status")["workspaces"][ws]["root"]
 
 
 def texts(who, ws):
-    return [m["text"] for m in ctl(url(who), "GET", "msgs", ws=ws)]
+    return [
+        message["text"]
+        for message in command(who, "content.message.list", ws)
+    ]
 
 
 def converged(ws, *whos):
@@ -96,51 +103,58 @@ def test_alice_bob_carol(tmp_path):
 
         # -- malformed control requests fail closed without phantom state -----
         with pytest.raises(urllib.error.HTTPError) as unknown:
-            ctl(url("alice"), "POST", "rebuild", {"ws": "missing"})
+            command("alice", "core.rebuild", "missing")
         assert unknown.value.code == 404
-        assert ctl(url("alice"), "GET", "status")["workspaces"] == {}
+        assert command("alice", "core.status")["workspaces"] == {}
 
         # -- create + invite + join ------------------------------------------
-        ws = ctl(url("alice"), "POST", "create", {"name": "alice"})["ws"]
+        ws = command("alice", "auth.workspace.create", "alice")
         with pytest.raises(urllib.error.HTTPError) as malformed:
-            ctl(url("alice"), "GET", "file", ws=ws)
+            command("alice", "content.file.save", ws)
         assert malformed.value.code == 400
-        link_b = ctl(url("alice"), "POST", "invite", {"ws": ws})["link"]
-        link_c = ctl(url("alice"), "POST", "invite", {"ws": ws})["link"]
-        assert ctl(url("bob"), "POST", "join", {"link": link_b, "name": "bob"})["ws"] == ws
-        assert ctl(url("carol"), "POST", "join", {"link": link_c, "name": "carol"})["ws"] == ws
+        link_b = command("alice", "auth.user_invite.create", ws)
+        link_c = command("alice", "auth.user_invite.create", ws)
+        assert command("bob", "auth.user.join", link_b, "bob") == ws
+        assert command("carol", "auth.user.join", link_c, "carol") == ws
 
         # -- everyone talks; sync is ongoing (no manual sync anywhere) -------
-        welcome = ctl(
-            url("alice"), "POST", "post",
-            {"ws": ws, "text": "welcome"})["fid"]
-        bob_message = ctl(
-            url("bob"), "POST", "post",
-            {"ws": ws, "text": "hi from bob"})["fid"]
-        ctl(url("carol"), "POST", "post", {"ws": ws, "text": "hi from carol"})
+        welcome = command(
+            "alice", "content.message.post", ws, "general", "welcome")
+        bob_message = command(
+            "bob", "content.message.post", ws, "general", "hi from bob")
+        command(
+            "carol", "content.message.post", ws, "general", "hi from carol")
         wait_until(lambda: converged(ws, "alice", "bob", "carol"), 30, "3-way convergence")
         for who in PORTS:
             assert set(texts(who, ws)) == {"welcome", "hi from bob", "hi from carol"}
-            assert {m["name"] for m in ctl(url(who), "GET", "members", ws=ws)} == \
+            assert {
+                member["name"]
+                for member in command(who, "auth.user.list", ws)
+            } == \
                 {"alice", "bob", "carol"}
 
-        ctl(url("bob"), "POST", "post", {"ws": ws, "text": "again"})
+        command("bob", "content.message.post", ws, "general", "again")
         wait_until(lambda: "again" in texts("carol", ws) and
                    converged(ws, "alice", "bob", "carol"), 30, "ongoing sync")
 
         # -- large files as standalone blobs ---------------------------------
         big = random.Random(7).randbytes(3_000_000)
-        fid = ctl(url("alice"), "POST", "send",
-                  {"ws": ws, "name": "big.bin",
-                   "data": base64.b64encode(big).decode()})["fid"]
+        big_path = tmp_path / "big.bin"
+        big_path.write_bytes(big)
+        fid = command(
+            "alice", "content.file.send",
+            ws, "general", big_path, "big.bin")
         small = random.Random(8).randbytes(100_000)
-        fid2 = ctl(url("bob"), "POST", "send",
-                   {"ws": ws, "name": "small.bin",
-                    "data": base64.b64encode(small).decode()})["fid"]
+        small_path = tmp_path / "small.bin"
+        small_path.write_bytes(small)
+        fid2 = command(
+            "bob", "content.file.send",
+            ws, "general", small_path, "small.bin")
 
         def got_file(who, f, want):
-            o = ctl(url(who), "GET", "file", ws=ws, fid=f)
-            return hashlib.sha256(base64.b64decode(o["data"])).digest() == \
+            target = tmp_path / f"{who}-{f}.received"
+            command(who, "content.file.save", ws, f, target)
+            return hashlib.sha256(target.read_bytes()).digest() == \
                 hashlib.sha256(want).digest()
 
         wait_until(lambda: got_file("bob", fid, big) and got_file("carol", fid, big),
@@ -151,24 +165,26 @@ def test_alice_bob_carol(tmp_path):
         # -- real deletion route + CLI: owner and admin, message and file ----
         removed = subprocess.run(
             [sys.executable, "-m", "core", "--node", url("alice"),
-             "remove", "--ws", ws[:12], welcome],
+             "content.delete.remove", ws[:12], welcome],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert removed.returncode == 0, removed.stderr
         refused = subprocess.run(
             [sys.executable, "-m", "core", "--node", url("alice"),
-             "remove", "--ws", ws[:12], "0" * 64],
+             "content.delete.remove", ws[:12], "0" * 64],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert refused.returncode == 1
         assert "core: 400:" in refused.stderr
         assert "Traceback" not in refused.stderr
-        ctl(url("alice"), "POST", "remove", {"ws": ws, "fid": bob_message})
-        ctl(url("bob"), "POST", "remove", {"ws": ws, "fid": fid2})
-        ctl(url("alice"), "POST", "remove", {"ws": ws, "fid": fid})
+        command("alice", "content.delete.remove", ws, bob_message)
+        command("bob", "content.delete.remove", ws, fid2)
+        command("alice", "content.delete.remove", ws, fid)
 
         def deletions_visible(who):
             messages = texts(who, ws)
-            files = {row["fid"] for row in ctl(
-                url(who), "GET", "files", ws=ws)}
+            files = {
+                row["fid"]
+                for row in command(who, "content.file.list", ws)
+            }
             return "welcome" not in messages \
                 and "hi from bob" not in messages \
                 and fid not in files and fid2 not in files
@@ -178,41 +194,48 @@ def test_alice_bob_carol(tmp_path):
             and converged(ws, *PORTS),
             45, "message and attachment deletions converge")
         with pytest.raises(urllib.error.HTTPError) as gone:
-            ctl(url("carol"), "GET", "file", ws=ws, fid=fid)
-        assert gone.value.code == 404
+            command(
+                "carol", "content.file.save",
+                ws, fid, tmp_path / "removed.bin")
+        assert gone.value.code == 400
 
         # -- straggler: an old-ts fact mini-folds into promoted history ------
         old = int(time.time() * 1000) - 48 * 3600 * 1000
-        ctl(url("carol"), "POST", "post", {"ws": ws, "text": "late", "ts": old})
+        command(
+            "carol", "content.message.post",
+            ws, "general", "late", old)
         wait_until(lambda: "late" in texts("alice", ws) and
                    converged(ws, "alice", "bob", "carol"), 30, "straggler converges")
 
         # -- eviction: removal kills the mint; the door shuts ----------------
-        ctl(url("alice"), "POST", "evict", {"ws": ws, "member": "carol"})
+        command("alice", "auth.removal.evict", ws, "carol")
         wait_until(
             lambda: any(m["name"] == "carol" and m["evicted"]
-                        for m in ctl(
-                            url("bob"), "GET", "members", ws=ws)),
+                        for m in command("bob", "auth.user.list", ws)),
             30, "eviction reaches an authorized replica")
         time.sleep(2.5)  # let carol's cached grant expire: the designed
         # leakage window is exactly the grant TTL, nothing more
         wait_until(
             lambda: any(
                 "HTTP Error 403" in failure["error"]
-                for failure in ctl(url("carol"), "GET", "status")[
+                for failure in command("carol", "core.status")[
                     "workspaces"][ws]["sync_failures"]),
             10, "carol's remote mint is refused")
         # ctl is a trusted node-local surface, not the remote auth boundary:
         # a replica that received its own eviction rejects here too; one that
         # missed it may keep writing an isolated store, but cannot deliver it.
         try:
-            ctl(url("carol"), "POST", "post", {"ws": ws, "text": "ghost"})
+            command(
+                "carol", "content.message.post",
+                ws, "general", "ghost")
         except urllib.error.HTTPError as local_rejection:
             assert local_rejection.code == 403
         time.sleep(4)  # several cadences prove it cannot cross the door
         assert "ghost" not in texts("alice", ws)
         assert "ghost" not in texts("bob", ws)
-        ctl(url("alice"), "POST", "post", {"ws": ws, "text": "after evict"})
+        command(
+            "alice", "content.message.post",
+            ws, "general", "after evict")
         wait_until(lambda: "after evict" in texts("bob", ws) and
                    converged(ws, "alice", "bob"), 30, "alice+bob still converge")
 
@@ -225,14 +248,16 @@ def test_alice_bob_carol(tmp_path):
         procs["bob"] = spawn(tmp_path, "bob")
         assert "after evict" in texts("bob", ws)  # rebuilt read model, pre-walk
         assert deletions_visible("bob")
-        ctl(url("alice"), "POST", "post", {"ws": ws, "text": "post restart"})
+        command(
+            "alice", "content.message.post",
+            ws, "general", "post restart")
         wait_until(lambda: "post restart" in texts("bob", ws) and
                    converged(ws, "alice", "bob"), 30, "bob back after restart")
 
         # -- the actual CLI binary, end to end -------------------------------
         out = subprocess.run(
             [sys.executable, "-m", "core", "--node", url("alice"),
-             "msgs", "--ws", ws[:12]],
+             "content.message.list", ws[:12]],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert out.returncode == 0 and "post restart" in out.stdout
     finally:

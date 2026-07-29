@@ -3,6 +3,8 @@
 Core code dispatches through this table and contains no auth/content tags or
 projection SQL.  Scope packages are deliberately just tables of contents.
 """
+import inspect
+
 from . import auth, content
 from core.suppression import deathkey, is_deletion, scoped_id, suppkeys
 from ._policy import validate_fact_policy
@@ -23,6 +25,60 @@ def compile_families(modules):
 
 FAMILIES = compile_families(MODULES)
 MAX_AUTHORITY_SCOPES = 64
+
+
+class WorkspaceNotFound(LookupError):
+    """A command named no unique local workspace."""
+
+
+def compile_commands(modules):
+    """Merge the explicit family-owned ``scope.family.verb`` inventory."""
+    commands = {}
+    for module in modules:
+        declared = getattr(module, "CLI", {})
+        if not isinstance(declared, dict):
+            raise ValueError(f"{module.__name__} CLI must be a dict")
+        for path, handler in declared.items():
+            if not isinstance(path, str) or path.count(".") < 2 \
+                    or not path.replace(".", "_").isidentifier() \
+                    or path != path.lower() \
+                    or not callable(handler):
+                raise ValueError(f"bad CLI declaration: {path!r}")
+            if path in commands:
+                raise ValueError(f"duplicate CLI command: {path}")
+            commands[path] = handler
+    return commands
+
+
+COMMANDS = compile_commands(MODULES)
+
+
+def workspace_for(node, prefix):
+    """Resolve an exact workspace id or unique prefix at the host boundary."""
+    hits = [ws for ws in node.workspaces() if prefix and ws.startswith(prefix)]
+    if len(hits) != 1:
+        state = "ambiguous" if hits else "unknown"
+        raise WorkspaceNotFound(f"{state} workspace prefix: {prefix}")
+    return hits[0]
+
+
+def invoke_command(node, path, argv):
+    """Bind raw tokens; resolve ``workspace`` prefixes and parse ``ts``."""
+    command = COMMANDS[path]
+    try:
+        bound = inspect.signature(command).bind(node, *argv)
+    except TypeError as error:
+        raise ValueError(f"{path}: {error}") from None
+    if "workspace" in bound.arguments:
+        bound.arguments["workspace"] = workspace_for(
+            node, bound.arguments["workspace"])
+    if (value := bound.arguments.get("ts")) is not None:
+        try:
+            bound.arguments["ts"] = int(value)
+        except ValueError:
+            raise ValueError("ts must be an integer") from None
+    return command(*bound.args, **bound.kwargs)
+
 
 APP_SCHEMA = """
 CREATE TABLE IF NOT EXISTS projected(
