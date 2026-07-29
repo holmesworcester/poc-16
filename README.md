@@ -212,13 +212,16 @@ python3 deploy/aws_lambda/manage.py bucket-policy \
   --bucket BUCKET --prefix PREFIX
 ```
 
-Audit existing lifecycle rules, object tags, and ACLs first; existing tags can
-already influence lifecycle behavior. Prefer S3 Object Ownership's
-`BucketOwnerEnforced` setting so ACLs are disabled. An AWS administrator able
-to replace the bucket policy remains trusted. The narrower `--profile
-single-publisher --publisher-principal ARN` form is safe only when that ARN is
-the complete writer set and every other bucket writer and administrator is
-explicitly trusted.
+Audit existing lifecycle rules, object tags, ACLs, annotations, and annotation
+replication first; existing tags can already influence lifecycle behavior, and
+annotations are mutable sidecars whose changes do not alter the parent ETag.
+The guard denies direct annotation puts/deletes but does not administer S3
+replication, so principals allowed `s3:ReplicateObjectAnnotation` remain
+trusted. Prefer S3 Object Ownership's `BucketOwnerEnforced` setting so ACLs are
+disabled. An AWS administrator able to replace the bucket policy remains
+trusted. The narrower `--profile single-publisher --publisher-principal ARN`
+form is safe only when that ARN is the complete writer set and every other
+bucket writer, replication principal, and administrator is explicitly trusted.
 
 Deploy validates the bucket and prefix locally, builds in SAM's target
 container, installs the hash-locked dependency closure, and requires the

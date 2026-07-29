@@ -19,8 +19,9 @@ def policy(
     principal while the policy remains attached and freezes lifecycle-policy
     mutation for the whole bucket. AWS account administrators who can replace
     the bucket policy, and lifecycle rules that predate the guard, remain
-    outside what an S3 bucket policy can prove. Pre-existing object ACLs and
-    tags also need an operator audit before the guard is attached.
+    outside what an S3 bucket policy can prove. Pre-existing object ACLs,
+    tags, annotations, and annotation replication also need an operator audit
+    before the guard is attached.
 
     ``single-publisher`` is intentionally narrower. It is useful only when the
     named principal is the complete writer set and all other bucket writers
@@ -65,9 +66,11 @@ def policy(
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": [
+                    "s3:DeleteObjectAnnotation",
                     "s3:DeleteObjectTagging",
                     "s3:DeleteObjectVersionTagging",
                     "s3:PutObjectAcl",
+                    "s3:PutObjectAnnotation",
                     "s3:PutObjectTagging",
                     "s3:PutObjectVersionTagging",
                 ],
@@ -123,8 +126,9 @@ def main(argv=None):
     if args.profile == "bucket-wide":
         note = (
             "bucket-wide profile: audit existing lifecycle rules, object "
-            "ACLs, and tags before attaching; prefer BucketOwnerEnforced; "
-            "policy administrators remain trusted")
+            "ACLs, tags, annotations, and annotation replication before "
+            "attaching; prefer BucketOwnerEnforced; policy and replication "
+            "administrators remain trusted")
     else:
         note = (
             "single-publisher profile: all other writers and bucket-policy "

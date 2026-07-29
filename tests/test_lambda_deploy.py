@@ -483,9 +483,11 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
     assert deletion["Resource"] == authoritative_resources
     metadata = statements["DenyAuthoritativeMetadataMutation"]
     assert set(metadata["Action"]) == {
+        "s3:DeleteObjectAnnotation",
         "s3:DeleteObjectTagging",
         "s3:DeleteObjectVersionTagging",
         "s3:PutObjectAcl",
+        "s3:PutObjectAnnotation",
         "s3:PutObjectTagging",
         "s3:PutObjectVersionTagging",
     }
@@ -502,6 +504,9 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
         }}
     assert statements["DenyLifecycleMutation"]["Action"] \
         == "s3:PutLifecycleConfiguration"
+    assert all(
+        "s3:ReplicateObjectAnnotation" not in statement["Action"]
+        for statement in document["Statement"])
 
 
 def test_single_publisher_policy_names_its_residual_trust_boundary():

@@ -649,7 +649,8 @@ These numbers are diagnostic, not cross-machine service guarantees.
   read-only Lambda or Worker deployment is intentionally bound to one exact
   workspace and prefix. Publishing remains a separate host operation. A
   bucket-wide S3 guard can freeze lifecycle mutation plus authoritative-key
-  deletion, ACL mutation, and tag mutation while attached, but pre-existing
-  lifecycle rules, ACLs, tags, and administrators able to replace that policy
+  deletion, ACL mutation, tag mutation, and direct annotation mutation while
+  attached, but pre-existing lifecycle rules, ACLs, tags, annotations,
+  annotation replication, and administrators able to replace that policy
   remain trusted. Bucket garbage collection and a writable serverless
   publisher remain future work.
