@@ -179,6 +179,47 @@ An action, its `action:<sid>` slot, its `sid` suppression slot, the fact and
 authority updates, and the range manifest all become visible under the same
 root CAS.
 
+## Shared-bucket concurrency contract
+
+Concurrent database-free services are modeled as three pieces:
+
+```text
+O : oid → bytes       grow-only, content-addressed immutable objects
+R : root bytes        one linearizable compare-and-swap register
+H : root versions     the sequence of successful CAS values
+```
+
+A publisher pins one exact `(base root, base ETag)`, derives a deterministic
+candidate from that snapshot plus its durable intent, makes every object
+reachable from the candidate visible with atomic put-if-absent, and only then
+attempts `CAS(R, base ETag, candidate)`. The CAS is the sole linearization
+point. A loser retains its intent, rereads the winning root, derives the union,
+and retries. Objects written by a crash or losing attempt are harmless
+unreachable history; they are never overwritten or deleted.
+
+A reader pins root bytes once. A later root is allowed to make that decision
+stale, but every manifest, tree page, fact record, suppression slot, authority
+slot, and action witness used by the decision must remain explainable by the
+one pinned root. Re-reading `root` for individual components is incoherent,
+even when each component is independently valid.
+
+The safety laws are:
+
+1. every object key equals the hash of its bytes;
+2. the object map only grows and an existing key never changes;
+3. root changes only through one successful whole-value CAS;
+4. every successful root names a complete, hash-valid closure already in `O`;
+5. every successful read decodes under exactly one root from `H`; and
+6. every fair retry sequence converges to the deterministic union of the
+   surviving publishers' intents.
+
+`tests/shared_bucket_model.py` is the executable small-state definition.
+Its breadth-first explorer covers two writers and one reader and returns the
+shortest schedule for a violated law. Mutation tests prove the laws reject
+root-before-objects publication, split composite roots, and a reader that
+repins halfway through a decision. Concrete Store, Publisher, Worker, and
+authenticated-tree schedules refine this model.
+
 ## Explicit suppression
 
 Suppression is offered by the target fact, not guessed from arbitrary
