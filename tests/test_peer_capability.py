@@ -265,3 +265,28 @@ def test_read_only_grant_is_rejected_at_the_daemon_push_door(tmp_path):
 
         assert denied.value.code == 401
         assert observed["puts"]
+
+
+def test_push_grant_cannot_write_another_producer_segment(tmp_path):
+    remote, workspace, local = replicas(tmp_path)
+    raw = closed_subset(local, workspace, all_fids(local, workspace))
+
+    with serving(
+            remote, peer_capability.FULL) as (url, observed, edge):
+        member = local.member_for(workspace)
+        other = "0" * 16 if member != "0" * 16 else "f" * 16
+        token = daemon.make_token(
+            edge.secret, member, workspace,
+            capability=peer_capability.FULL)
+        request = urllib.request.Request(
+            f"{url}/pile/{other}/{h(raw)}?ws={workspace}",
+            data=raw, method="PUT",
+            headers={"Authorization": "Bearer " + token},
+        )
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(request)
+
+        assert denied.value.code == 403
+        assert remote.store(workspace).get(
+            f"pile/{other}/{h(raw)}") is None
+        assert observed["puts"]
