@@ -180,6 +180,17 @@ membership; the broker derives its exact key and signed constraints from a
 fresh workspace-bound authorization decision, and a publisher repeats all
 semantic validation before accepting the resulting pile.
 
+Exact-key attenuation is necessary but not sufficient. Before immutable
+creation, the provider must enforce that the request body has the SHA-256
+digest named by the key, as well as the signed create-only condition and byte
+bound. Otherwise an authorized but malicious uploader can occupy an absent
+legitimate object name with different bytes and turn immutability into a
+permanent denial of publication. A provider-checked SHA-256 checksum or
+equivalent signed-payload construction conforms; `Content-MD5` alone does not.
+When a provider cannot enforce this for a raw presigned PUT, the deployment
+uses a narrowly isolated upload verifier that has conditional-create access
+but still has no root, list, delete, or policy authority.
+
 The production profile also treats each provider's documented RFC 9110 strong
 ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must
 change when the root bytes change. Adapters reject missing, empty, and `W/`
