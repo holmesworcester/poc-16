@@ -89,8 +89,7 @@ class FsStore:
 
 class RemoteStore:
     """Read-only ObjectStore over a walk.Peer, so a remote store is fetched
-    through the same interface the local fetch(oid) driver wraps —
-    sync.py stops special-casing 'their side' (docs/SIMPLIFY.md §1)."""
+    through the same interface the local fetch(oid) driver wraps."""
 
     def __init__(self, peer):
         self.peer = peer

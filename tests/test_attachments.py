@@ -12,10 +12,7 @@ from core.crypto import h
 from core.node import Node
 from core.pump import pump
 from core.walk import _fetch_blobs
-from facts._commands import publish
-from facts.auth.signature import signature
 from facts.content import chunk, file as file_family
-from facts.content.legacy_file import legacy_file
 
 from .util import (
     all_fids,
@@ -59,52 +56,6 @@ def test_round_trip_survives_rebuild_and_projection_wipe(tmp_path):
     output = tmp_path / "saved.bin"
     assert cmds.save_file(rebuilt, workspace, fid, output)["bytes"] == len(data)
     assert output.read_bytes() == data
-
-
-def test_legacy_whole_blob_workspace_upgrades_and_remains_readable(tmp_path):
-    path = tmp_path / "node"
-    node = Node(str(path))
-    workspace = cmds.create(node, "alice")
-    secret, public = node.identity(workspace)
-    data = b"persisted before Bao"
-    item = legacy_file(
-        public, "general", "legacy.bin", len(data), h(data),
-        shape.FACT_TS_MAX)
-    signed = signature(secret, public, item, item.ts)
-    publish(node, workspace, item, signed, blobs={h(data): data})
-    old_root = node.store(workspace).get("root")
-
-    node.idx(workspace).execute(
-        "UPDATE meta SET v='family-contract-v8-ref-proofs' "
-        "WHERE k='index-version'")
-    node.idx(workspace).commit()
-    node.app.executescript("""
-        DROP VIEW file_progress;
-        DROP VIEW files;
-        CREATE VIEW files AS
-            SELECT src AS fid, ws, chan, name, size, root, width, n, pk, ts, src
-            FROM file_rows;
-        CREATE VIEW file_progress AS
-            SELECT f.ws, f.src AS fid, f.chan, f.name, f.size, f.root,
-                   f.n AS total, f.ts,
-                   (SELECT COUNT(DISTINCT c.idx) FROM file_chunk_rows c
-                    WHERE (c.ws, c.root) = (f.ws, f.root)) AS have
-            FROM file_rows f;
-        PRAGMA user_version=2;
-    """)
-    close_node(node)
-
-    upgraded = Node(str(path))
-    record = progress(upgraded, workspace)
-    assert upgraded.store(workspace).get("root") == old_root
-    assert record["encoding"] == "blob-v1"
-    assert record["complete"]
-    assert cmds.file_bytes(upgraded, workspace, item.fid) == (
-        "legacy.bin", data)
-
-    send_bytes(upgraded, workspace, "bao.bin", b"new")
-    assert {record["encoding"] for record in cmds.files(upgraded, workspace)} \
-        == {"blob-v1", "bao-v1"}
 
 
 def test_failed_manifest_publish_logs_no_arrival_and_retry_repairs_it(
@@ -290,4 +241,4 @@ def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     for fid in chunk_fids:
         for oid in facts.blob_refs(source.fact_of(workspace, fid)):
             source.store(workspace).delete("obj/" + oid)
-    assert _fetch_blobs(source, workspace, NoBlobPeer()) == []
+    assert _fetch_blobs(source, workspace, NoBlobPeer()) == ([], True)

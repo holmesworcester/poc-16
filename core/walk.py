@@ -107,7 +107,12 @@ def _push(node, ws, peer, push_fids):
 
 
 def _fetch_blobs(node, ws, peer):
-    """Fetch missing spilled objects and fold verified arrivals in batches."""
+    """Fetch missing spilled objects.
+
+    Return ``(landed_fids, complete)`` so a caller stamps an ETag only after
+    every live reference is present; a transient bad/missing proof must retry
+    on the next unchanged-root dial.
+    """
     st = node.store(ws)
     with node.lock:
         notified = {
@@ -122,7 +127,7 @@ def _fetch_blobs(node, ws, peer):
             refs = families.blob_refs(fact)
             if refs:
                 pending.append((fid, refs))
-    landed, batch = [], []
+    landed, batch, complete = [], [], True
     for fid, refs in pending:
         fetched = False
         whole = True
@@ -135,13 +140,14 @@ def _fetch_blobs(node, ws, peer):
                 fetched = True
             else:
                 whole = False
+                complete = False
         if whole and (fetched or fid not in notified):
             batch.append(fid)
         if len(batch) >= ARRIVAL_BATCH:
             landed += _land(node, ws, batch)
             batch = []
     landed += _land(node, ws, batch)
-    return landed
+    return landed, complete
 
 
 def _land(node, ws, fids):

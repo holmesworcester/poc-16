@@ -1,13 +1,10 @@
-"""Canonical immutable B-treap pages with bounded authenticated lookup.
+"""Canonical persistent Merkle treap with bounded authenticated lookup.
 
-Logical rows form the unique Cartesian treap induced by
-``priority(layout_seed, key)``.  Four binary treap levels are packed into one
-immutable page (at most fifteen rows), so a read authenticates a bounded page
-path while equal logical maps always produce byte-identical pages regardless
-of insertion history.
-
-This module knows nothing about facts, suppression, or authority.  Those are
-three schemas over this one codec.
+Each immutable page stores one logical row and two child object ids. Priority
+is a pure hash of ``(layout_seed, key)``, so the same map has one tree and one
+root regardless of insertion order. Updates rewrite only the search/rotation
+path; Workers fetch at most one object per binary level and never rebuild a
+database or enumerate the tree.
 """
 import json
 from dataclasses import dataclass
@@ -16,11 +13,10 @@ from .crypto import h
 from .fact import canon
 from .shape import valid_fid
 
-FORMAT = "btreap-v1"
-PAGE_LEVELS = 4
-MAX_PAGE_DEPTH = 17
+FORMAT = "btreap-v2"
+MAX_PAGE_DEPTH = 128
 MAX_VALUE_BYTES = 4 * 1024
-MAX_PAGE_BYTES = 64 * 1024
+MAX_PAGE_BYTES = 8 * 1024
 
 
 @dataclass
@@ -69,7 +65,7 @@ def _logical(rows, seed):
             stack[-1].right = node
         stack.append(node)
         nodes.append(node)
-    return stack[0] if stack else None, len(nodes)
+    return (stack[0] if stack else None), len(nodes)
 
 
 def _binary_depth(root):
@@ -84,160 +80,274 @@ def _binary_depth(root):
     return depth
 
 
+def _raw(key, value, claimed, left, right, count, depth):
+    raw = canon({
+        "count": count,
+        "depth": depth,
+        "format": FORMAT,
+        "key": key,
+        "left": left,
+        "priority": claimed,
+        "right": right,
+        "value": value,
+    })
+    if len(raw) > MAX_PAGE_BYTES:
+        raise ValueError("btreap page too large")
+    return raw
+
+
 def build(rows, seed, emit, *, max_page_depth=MAX_PAGE_DEPTH):
-    """Bulk-build the unique tree and emit canonical content-addressed pages."""
+    """Bulk-build the unique tree; every logical node is one immutable page."""
     root, count = _logical(tuple(rows), seed)
     if root is None:
         return Built("", 0, 0, 0)
-    binary_depth = _binary_depth(root)
-    page_depth = (binary_depth + PAGE_LEVELS - 1) // PAGE_LEVELS
-    if page_depth > max_page_depth:
+    depth = _binary_depth(root)
+    if depth > max_page_depth:
         raise ValueError("btreap depth budget")
     pages = 0
 
-    def page(node):
+    def store(node):
         nonlocal pages
-
-        def inline(item, level):
-            if item is None:
-                return None
-            if level == PAGE_LEVELS:
-                return {"page": page(item)}
-            return [
-                item.key,
-                item.value,
-                item.priority,
-                inline(item.left, level + 1),
-                inline(item.right, level + 1),
-            ]
-
-        raw = canon({"format": FORMAT, "tree": inline(node, 0)})
-        if len(raw) > MAX_PAGE_BYTES:
-            raise ValueError("btreap page too large")
+        if node is None:
+            return "", 0, 0
+        left, left_count, left_depth = store(node.left)
+        right, right_count, right_depth = store(node.right)
+        node_count = 1 + left_count + right_count
+        node_depth = 1 + max(left_depth, right_depth)
+        raw = _raw(
+            node.key, node.value, node.priority, left, right,
+            node_count, node_depth)
         oid = h(raw)
         emitted = emit(raw)
         if emitted is not None and emitted != oid:
             raise ValueError("btreap emitter changed object identity")
         pages += 1
-        return oid
+        return oid, node_count, node_depth
 
-    return Built(page(root), count, page_depth, pages)
+    root_oid, stored_count, stored_depth = store(root)
+    if stored_count != count or stored_depth != depth:
+        raise AssertionError("btreap metadata")
+    return Built(root_oid, count, depth, pages)
+
+
+def _decode(raw, oid, seed):
+    if raw is None or h(raw) != oid:
+        raise ValueError("btreap page integrity")
+    try:
+        page = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("btreap page shape") from exc
+    if canon(page) != raw or not isinstance(page, dict) or set(page) != {
+            "count", "depth", "format", "key", "left", "priority", "right",
+            "value"} or page["format"] != FORMAT:
+        raise ValueError("btreap page shape")
+    key = page["key"]
+    if not isinstance(key, str) or not key \
+            or page["priority"] != priority(seed, key) \
+            or not all(
+                child == "" or valid_fid(child)
+                for child in (page["left"], page["right"])) \
+            or type(page["count"]) is not int or page["count"] < 1 \
+            or type(page["depth"]) is not int \
+            or not 1 <= page["depth"] <= MAX_PAGE_DEPTH \
+            or len(canon(page["value"])) > MAX_VALUE_BYTES \
+            or len(raw) > MAX_PAGE_BYTES:
+        raise ValueError("btreap page shape")
+    return page
 
 
 class Reader:
-    """Hash-verifying exact reads; ``items`` is an off-request maintenance API."""
+    """Hash-verifying exact reads; ``items`` is maintenance-only."""
 
     def __init__(
             self, root, seed, fetch, *, max_page_depth=MAX_PAGE_DEPTH):
         if root and not valid_fid(root):
             raise ValueError("btreap root")
-        if not valid_fid(seed):
-            raise ValueError("btreap seed")
+        if not valid_fid(seed) or not 0 <= max_page_depth <= MAX_PAGE_DEPTH:
+            raise ValueError("btreap read budget")
         self.root = root
         self.seed = seed
         self.fetch = fetch
         self.max_page_depth = max_page_depth
         self.pages_read = 0
+        self._page_budget = max_page_depth
 
     def _page(self, oid):
         if not valid_fid(oid):
             raise ValueError("btreap page ref")
-        raw = self.fetch(oid)
-        if raw is None or h(raw) != oid:
-            raise ValueError("btreap page integrity")
-        try:
-            value = json.loads(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("btreap page shape") from exc
-        if canon(value) != raw or not isinstance(value, dict) \
-                or value.get("format") != FORMAT \
-                or set(value) != {"format", "tree"}:
-            raise ValueError("btreap page shape")
         self.pages_read += 1
-        if self.pages_read > self.max_page_depth:
+        if self.pages_read > self._page_budget:
             raise ValueError("btreap read budget")
-        self._validate_inline(value["tree"], None, None, 0)
-        return value["tree"]
+        return _decode(self.fetch(oid), oid, self.seed)
 
-    def _validate_inline(self, node, lo, hi, level):
-        if node is None:
-            return
-        if level == PAGE_LEVELS:
-            if not isinstance(node, dict) or set(node) != {"page"} \
-                    or not valid_fid(node["page"]):
-                raise ValueError("btreap child ref")
-            return
-        if not isinstance(node, list) or len(node) != 5:
-            raise ValueError("btreap node")
-        key, value, claimed, left, right = node
-        if not isinstance(key, str) or not key \
-                or lo is not None and key <= lo \
-                or hi is not None and key >= hi \
-                or claimed != priority(self.seed, key) \
-                or len(canon(value)) > MAX_VALUE_BYTES:
-            raise ValueError("btreap node")
-        self._validate_inline(left, lo, key, level + 1)
-        self._validate_inline(right, key, hi, level + 1)
+    @staticmethod
+    def _ordered(page, lo, hi, parent_priority):
+        key = page["key"]
+        rank = (page["priority"], key)
+        if (lo is not None and key <= lo) \
+                or (hi is not None and key >= hi) \
+                or (parent_priority is not None and rank < parent_priority):
+            raise ValueError("btreap global order")
+        return rank
 
     def get(self, key):
         if not isinstance(key, str) or not key:
             raise ValueError("btreap lookup key")
         self.pages_read = 0
-        node = self._page(self.root) if self.root else None
-        level = 0
-        while node is not None:
-            if level == PAGE_LEVELS:
-                node = self._page(node["page"])
-                level = 0
-                continue
-            row_key, value, _, left, right = node
-            if key == row_key:
-                return value
-            node = left if key < row_key else right
-            level += 1
+        self._page_budget = self.max_page_depth
+        oid, lo, hi, parent = self.root, None, None, None
+        while oid:
+            page = self._page(oid)
+            rank = self._ordered(page, lo, hi, parent)
+            if key == page["key"]:
+                return page["value"]
+            if key < page["key"]:
+                oid, hi = page["left"], page["key"]
+            else:
+                oid, lo = page["right"], page["key"]
+            parent = rank
         return None
 
     def items(self, *, max_pages=None):
-        """Decode the full logical map for certification/migration, never Worker."""
+        """Decode and structurally validate the complete logical map."""
         if not self.root:
             return ()
-        old_budget = self.max_page_depth
-        self.max_page_depth = max_pages or 1_000_000
         self.pages_read = 0
+        self._page_budget = max_pages or 1_000_000
         seen, out = set(), []
 
-        def walk_page(oid):
+        def walk(oid, lo, hi, parent):
+            if not oid:
+                return 0, 0
             if oid in seen:
                 raise ValueError("repeated btreap page")
             seen.add(oid)
-            walk_inline(self._page(oid), 0)
+            page = self._page(oid)
+            rank = self._ordered(page, lo, hi, parent)
+            left_count, left_depth = walk(
+                page["left"], lo, page["key"], rank)
+            out.append((page["key"], page["value"]))
+            right_count, right_depth = walk(
+                page["right"], page["key"], hi, rank)
+            count = 1 + left_count + right_count
+            depth = 1 + max(left_depth, right_depth)
+            if page["count"] != count or page["depth"] != depth:
+                raise ValueError("btreap page metadata")
+            return count, depth
 
-        def walk_inline(node, level):
-            if node is None:
-                return
-            if level == PAGE_LEVELS:
-                walk_page(node["page"])
-                return
-            key, value, _, left, right = node
-            walk_inline(left, level + 1)
-            out.append((key, value))
-            walk_inline(right, level + 1)
-
-        try:
-            walk_page(self.root)
-            if any(a[0] >= b[0] for a, b in zip(out, out[1:])):
-                raise ValueError("btreap global order")
-            return tuple(out)
-        finally:
-            self.max_page_depth = old_budget
+        walk(self.root, None, None, None)
+        return tuple(out)
 
 
 def update(root, seed, changes, fetch, emit):
-    """Canonical maintenance update; unchanged page bytes deduplicate at emit."""
-    rows = dict(Reader(root, seed, fetch).items()) if root else {}
+    """Apply map changes by persistent treap path-copying."""
+    cache = {}
+    writes = 0
+
+    def load(oid):
+        if not oid:
+            return None
+        if oid not in cache:
+            cache[oid] = _decode(fetch(oid), oid, seed)
+        return cache[oid]
+
+    def meta(oid):
+        page = load(oid)
+        return (0, 0) if page is None else (page["count"], page["depth"])
+
+    def store(key, value, left, right):
+        nonlocal writes
+        left_count, left_depth = meta(left)
+        right_count, right_depth = meta(right)
+        count = 1 + left_count + right_count
+        depth = 1 + max(left_depth, right_depth)
+        if depth > MAX_PAGE_DEPTH:
+            raise ValueError("btreap depth budget")
+        raw = _raw(
+            key, value, priority(seed, key), left, right, count, depth)
+        oid = h(raw)
+        emitted = emit(raw)
+        if emitted is not None and emitted != oid:
+            raise ValueError("btreap emitter changed object identity")
+        cache[oid] = json.loads(raw)
+        writes += 1
+        return oid
+
+    def split(oid, key):
+        if not oid:
+            return "", ""
+        page = load(oid)
+        if key < page["key"]:
+            left, middle = split(page["left"], key)
+            return left, store(
+                page["key"], page["value"], middle, page["right"])
+        middle, right = split(page["right"], key)
+        return store(
+            page["key"], page["value"], page["left"], middle), right
+
+    def merge(left, right):
+        if not left:
+            return right
+        if not right:
+            return left
+        a, b = load(left), load(right)
+        if (a["priority"], a["key"]) < (b["priority"], b["key"]):
+            return store(
+                a["key"], a["value"], a["left"],
+                merge(a["right"], right))
+        return store(
+            b["key"], b["value"], merge(left, b["left"]), b["right"])
+
+    def insert(oid, key, value):
+        if not oid:
+            return store(key, value, "", "")
+        page = load(oid)
+        if key == page["key"]:
+            if value == page["value"]:
+                return oid
+            return store(key, value, page["left"], page["right"])
+        if (priority(seed, key), key) < (page["priority"], page["key"]):
+            left, right = split(oid, key)
+            return store(key, value, left, right)
+        if key < page["key"]:
+            child = insert(page["left"], key, value)
+            if child == page["left"]:
+                return oid
+            return store(
+                page["key"], page["value"], child, page["right"])
+        child = insert(page["right"], key, value)
+        if child == page["right"]:
+            return oid
+        return store(page["key"], page["value"], page["left"], child)
+
+    def delete(oid, key):
+        if not oid:
+            return ""
+        page = load(oid)
+        if key == page["key"]:
+            return merge(page["left"], page["right"])
+        if key < page["key"]:
+            child = delete(page["left"], key)
+            if child == page["left"]:
+                return oid
+            return store(
+                page["key"], page["value"], child, page["right"])
+        child = delete(page["right"], key)
+        if child == page["right"]:
+            return oid
+        return store(page["key"], page["value"], page["left"], child)
+
+    current = root
     for key, value in changes:
+        if not isinstance(key, str) or not key:
+            raise ValueError("btreap row")
         if value is None:
-            rows.pop(key, None)
+            current = delete(current, key)
         else:
-            rows[key] = value
-    return build(tuple(rows.items()), seed, emit)
+            if len(canon(value)) > MAX_VALUE_BYTES:
+                raise ValueError("btreap value too large")
+            current = insert(current, key, value)
+    if not current:
+        return Built("", 0, 0, writes)
+    page = load(current)
+    return Built(current, page["count"], page["depth"], writes)

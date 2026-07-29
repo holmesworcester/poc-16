@@ -251,14 +251,16 @@ def reconcile(A, B, ws):
         pile = encode_pile(facts)
         push_bytes = len(pile)
         ingest(B, ws, [decode_pile(pile)[0]])  # B absorbs A's half
-        B.commit(ws)
+        # ingest() is the bulk benchmark seam and does not return Node.turn's
+        # exact new-fid delta; force the canonical full maintenance path.
+        B.commit(ws, reuse=False)
 
     # sync() pushes each local difference before draining its pulled ingress.
     # Preserve that order so canonical pruning cannot remove a fact before its
     # precomputed symmetric-difference pile reaches the peer.
     ingest(A, ws, pulled)  # A absorbs B's half
     if pulled:
-        A.commit(ws)
+        A.commit(ws, reuse=False)
     t1 = perf()
 
     match = A.store(ws).get("root") == B.store(ws).get("root")

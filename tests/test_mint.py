@@ -1,4 +1,4 @@
-"""Acceptance laws for the pure mint (docs/SIMPLIFY.md §4)."""
+"""Black-box and exact-tree contracts for the production mint path."""
 import base64
 import inspect
 import json
@@ -7,19 +7,19 @@ import random
 import pytest
 from nacl.exceptions import CryptoError
 
-from core import cmds, daemon, manifest, mint, shape
+from core import cmds, daemon, manifest, mint
 from core.close import decode_pile, encode_pile
-from core.crypto import h, keypair, unseal
+from core.crypto import keypair, unseal
 from core.fact import Fact, canon
-from core.kernel import drain
-from facts.auth.device import bind
-from facts.auth import request
-from facts.auth.signature import signature
-from core import node as node_module
 from core.node import Node, now_ms
+from core.worker import WorkerView
+from facts.auth import request
+from facts.auth.device import bind
+from facts.auth.signature import signature
 
 from .util import (
     add_member,
+    closed_subset,
     inject_device_claim,
     invoke_mint,
 )
@@ -44,28 +44,11 @@ def combine(*streams):
     return out
 
 
-def root_with(node, workspace, extra, deps_of=None):
-    """Build a self-hashed root over the current facts plus ``extra``,
-    optionally under non-canonical closure choices (``deps_of``)."""
+def authorize(node, workspace, pile, now, root=None, projection=None):
     store = node.store(workspace)
-    fetch = lambda oid: store.get("obj/" + oid)
-    _, _, man = manifest.decode_root(store.get("root"))
-    resident = list(node_module.resident(man, fetch))
-    unit = combine(resident, extra)
-    result = drain(unit, workspace)
-    assert result.ok
-    by_fid = {fact.fid: fact for fact in unit}
-    deps = {valid.fact.fid: list(valid.deps) for valid in result.valids}
-
-    def emit(raw):
-        oid = h(raw)
-        store.put("obj/" + oid, raw)
-        return oid
-
-    _, forged = manifest.build(
-        [fact.key for fact in unit], by_fid.__getitem__,
-        deps_of or deps.__getitem__, emit)
-    return manifest.encode_root(workspace, result.globals, forged)
+    root = root or store.get("root")
+    return mint.stateless(
+        pile, root, lambda oid: store.get("obj/" + oid), now, projection)
 
 
 def conflict_world(path, seed):
@@ -119,76 +102,51 @@ def conflict_world(path, seed):
 def test_mint_rejects_malformed_requests(world):
     node, workspace, _, _, pile = world
     handler, _ = invoke_mint(node, workspace, pile)
-
     for body in (
             None, [], {}, {"ws": []}, {"ws": workspace},
             {"ws": workspace, "pile": []}):
         assert handler.mint(body) == (400, None)
-
     handler._q = lambda: (["mint"], {"ws": workspace})
     handler._body = lambda: b"{"
     assert handler.do_POST() == (400, None)
 
 
-def test_mint_accepts_exactly_one_ephemeral_fact(world):
-    """A mint pile with zero or two DURABLE=False facts is refused; the
-    daemon's arity check now lives in the family."""
+def test_mint_accepts_exactly_one_ephemeral_request(world):
     node, workspace, now, facts, pile = world
-    root = node.store(workspace).get("root")
-    anchor, globals_ = mint.root_globals(root)
-    authority = node.idx(workspace)
     second = request.payload(
         node, workspace, "sync", now + 60_001, now + 1)
-
-    assert mint.mint(
-        pile, anchor, globals_, now, canonical_db=authority) \
-        == (node.pk, "sync")
-    assert mint.mint(
-        encode_pile([node.fact_of(workspace, workspace)]),
-        anchor, globals_, now, canonical_db=authority,
-    ) is None
-    assert mint.mint(
-        encode_pile(combine(facts, second)),
-        anchor, globals_, now, canonical_db=authority,
-    ) is None
+    assert authorize(node, workspace, pile, now) == (node.pk, "sync")
+    assert authorize(
+        node, workspace,
+        encode_pile([node.fact_of(workspace, workspace)]), now) is None
+    assert authorize(
+        node, workspace, encode_pile(combine(facts, second)), now) is None
 
 
-def test_family_owns_expiry_and_tag(world):
-    """Expired request / wrong tag is refused by request.evaluate under
-    globals ∪ {("now", ms)} — daemon.mint contains no body parsing."""
+def test_family_owns_expiry_tag_and_verb(world):
     node, workspace, now, _, _ = world
-    anchor, globals_ = mint.root_globals(
-        node.store(workspace).get("root"))
     expired = encode_pile(request.payload(
         node, workspace, "sync", now - 1, now))
     wrong_verb = encode_pile(request.payload(
         node, workspace, "write", now + 60_000, now))
     wrong = Fact(
         "not-a-request", now, [],
-        {"pk": node.pk, "verb": "sync", "exp": now + 60_000},
-    )
+        {"pk": node.pk, "verb": "sync", "exp": now + 60_000})
     wrong_sig = signature(node.sk, node.pk, wrong, now)
     wrong_tag = encode_pile([
         node.fact_of(workspace, workspace), wrong_sig, wrong])
-    authority = node.idx(workspace)
 
-    assert mint.mint(
-        expired, anchor, globals_, now, canonical_db=authority) is None
-    assert mint.mint(
-        wrong_verb, anchor, globals_, now, canonical_db=authority) is None
-    assert mint.mint(
-        wrong_tag, anchor, globals_, now, canonical_db=authority) is None
+    assert authorize(node, workspace, expired, now) is None
+    assert authorize(node, workspace, wrong_verb, now) is None
+    assert authorize(node, workspace, wrong_tag, now) is None
     assert ".body" not in inspect.getsource(daemon.Handler.mint)
 
 
-def test_grant_sealed_to_requester_pk(world):
-    """The grant unseals only with the requester's sk; replaying the
-    challenge yields nothing to anyone else."""
+def test_grant_is_sealed_to_requester(world):
     node, workspace, _, _, pile = world
     handler, (code, body) = invoke_mint(node, workspace, pile)
     token = unseal(
         node.sk, base64.b64decode(body["grant"])).decode()
-
     assert code == 200
     assert daemon.check_token(
         handler.secret, "Bearer " + token, workspace) == node.pk[:16]
@@ -197,9 +155,7 @@ def test_grant_sealed_to_requester_pk(world):
         unseal(other, base64.b64decode(body["grant"]))
 
 
-def test_mint_writes_nothing(world):
-    """Evaluate mode: no drain, no ingress writes, no idx/app rows — the
-    challenge is judged and forgotten."""
+def test_mint_is_read_only_and_does_not_touch_sqlite(world):
     node, workspace, _, _, pile = world
     store = node.store(workspace)
     before = (
@@ -207,91 +163,27 @@ def test_mint_writes_nothing(world):
         tuple(node.idx(workspace).iterdump()),
         tuple(node.app.iterdump()),
     )
-    node.globals = lambda _: pytest.fail("mint read the derived index")
-
+    node.idx(workspace).close()
+    node.app.close()
     code, _ = invoke_mint(node, workspace, pile)[1]
-    after = (
-        store.list(""),
-        tuple(node.idx(workspace).iterdump()),
-        tuple(node.app.iterdump()),
-    )
-
     assert code == 200
+
+    reopened = Node(node.dir)
+    after = (
+        reopened.store(workspace).list(""),
+        tuple(reopened.idx(workspace).iterdump()),
+        tuple(reopened.app.iterdump()),
+    )
     assert after == before
 
 
-def test_low_level_mint_requires_committed_authority(world):
+def test_missing_composite_trees_fail_closed(world):
     node, workspace, now, _, pile = world
-    anchor, globals_ = mint.root_globals(
-        node.store(workspace).get("root"))
-
-    with pytest.raises(TypeError):
-        mint.mint(pile, anchor, globals_, now)
-    assert mint.mint(
-        pile, anchor, globals_, now, canonical_db=None) is None
+    root = manifest.encode_root(workspace, frozenset(), "")
+    assert mint.stateless(pile, root, lambda oid: None, now) is None
 
 
-def test_stateless_mint_accepts_without_persistent_sqlite(world):
-    """A cold store projection accepts a new request and never reads app.db."""
-    node, workspace, now, _, pile = world
-    store = node.store(workspace)
-    root = store.get("root")
-    node.idx(workspace).close()
-    node.app.close()
-
-    anchor, _ = mint.root_globals(root)
-    fetch = lambda oid: store.get("obj/" + oid)
-
-    assert anchor == workspace
-    assert mint.stateless(pile, root, fetch, now) \
-        == (node.pk, "sync")
-
-
-def test_stateless_authority_rejects_a_noncanonical_leaf_pile(world):
-    """A published leaf pile must be the canonical key-ordered encoding of
-    its members; any other bytes fail resident()'s rebuild equality."""
-    node, workspace, now, _, pile = world
-    for tick in range(3):
-        cmds.post(node, workspace, "general", f"m{tick}", ts=now - 9 + tick)
-    store = node.store(workspace)
-    fetch = lambda oid: store.get("obj/" + oid)
-
-    def emit(raw):
-        oid = h(raw)
-        store.put("obj/" + oid, raw)
-        return oid
-
-    anchor, globals_, man = manifest.decode_root(store.get("root"))
-    entries = manifest.decode(fetch(man), fetch)
-    members = decode_pile(fetch(entries[0].leaf))[0]
-    assert len(members) > 1
-    shuffled = entries[0]._replace(
-        leaf=emit(encode_pile(list(reversed(members)))))
-    corrupt = manifest.encode_root(
-        anchor, globals_,
-        manifest.encode([shuffled] + list(entries[1:]), emit))
-
-    with pytest.raises(ValueError, match="invalid authority store"):
-        mint.Authority.from_root(corrupt, fetch)
-    assert mint.stateless(pile, corrupt, fetch, now) is None
-
-
-def test_stateless_authority_rejects_an_empty_root_without_its_anchor(
-        world):
-    node, workspace, now, _, pile = world
-    objects = {}
-    _, empty = manifest.build(
-        [], lambda fid: None, lambda fid: (),
-        lambda raw: objects.__setitem__(h(raw), raw))
-    root = manifest.encode_root(workspace, frozenset(), empty)
-
-    with pytest.raises(
-            ValueError, match="authority projection does not match root"):
-        mint.Authority.from_root(root, objects.get)
-    assert mint.stateless(pile, root, objects.get, now) is None
-
-
-def test_root_globals_cannot_override_an_eviction_action(tmp_path):
+def test_globals_cannot_override_an_eviction_action(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     founder = node.identity_id(workspace)
@@ -304,136 +196,83 @@ def test_root_globals_cannot_override_an_eviction_action(tmp_path):
     node.bind_identity(workspace, founder)
     cmds.evict(node, workspace, bob)
     store = node.store(workspace)
-    honest = store.get("root")
-    root = json.loads(honest)
+    root = json.loads(store.get("root"))
     assert root["globals"] == []
     root["globals"] = [["removal", bob]]
     forged = canon(root)
-    fetch = lambda oid: store.get("obj/" + oid)
 
-    anchor, globals_ = mint.root_globals(honest)
-    assert mint.mint(
-        pile, anchor, globals_, now,
-        canonical_db=node.idx(workspace)) is None
+    assert authorize(node, workspace, pile, now) is None
+    assert authorize(node, workspace, pile, now, root=forged) is None
     store.put("root", forged)
-
-    with pytest.raises(ValueError, match="invalid authority store"):
-        mint.Authority.from_root(forged, fetch)
-    assert mint.stateless(pile, forged, fetch, now) is None
     assert invoke_mint(node, workspace, pile)[1][0] == 403
     with pytest.raises(ValueError, match="invalid store facts"):
         node.rebuild(workspace)
 
 
-def test_published_authority_rejects_ephemeral_facts_at_every_boundary(
-        world):
-    node, workspace, now, request_facts, pile = world
-    store = node.store(workspace)
-    rogue_bytes = root_with(node, workspace, request_facts)
-    fetch = lambda oid: store.get("obj/" + oid)
-
-    with pytest.raises(ValueError, match="invalid authority store"):
-        mint.Authority.from_root(rogue_bytes, fetch)
-
-    store.put("root", rogue_bytes)
-    assert mint.stateless(pile, rogue_bytes, fetch, now) is None
-    assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="invalid store facts"):
-        node.rebuild(workspace)
-
-
-def test_published_roots_require_canonical_settle_placement(tmp_path):
-    """The same fact set under non-canonical closure choices (empty
-    siblings) is a different, rejected root: placement is not a publisher
-    freedom (was the tree-placement law; now resident()'s rebuild equality)."""
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    add_member(node, workspace, "bob", ts=10)
-    ts, cuts = 100, 0
-    while cuts < 2:  # several leaves, so closure siblings really exist
-        cuts += shape.boundary(
-            cmds.post(node, workspace, "general", f"m{ts}", ts=ts))
-        ts += 1
-    now = now_ms()
-    pile = encode_pile(request.payload(
-        node, workspace, "sync", now + 60_000, now))
-    store = node.store(workspace)
-    honest = store.get("root")
-    fetch = lambda oid: store.get("obj/" + oid)
-    wrong_bytes = root_with(
-        node, workspace, [], deps_of=lambda fid: [])
-
-    assert wrong_bytes != honest  # same facts, different closure bytes
-    with pytest.raises(ValueError, match="store placement"):
-        mint.Authority.from_root(wrong_bytes, fetch)
-
-    store.put("root", wrong_bytes)
-    assert mint.stateless(pile, wrong_bytes, fetch, now) is None
-    assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="store placement"):
-        node.rebuild(workspace)
-
-
-def test_stateless_authority_is_root_stamped_and_reusable(world):
+def test_cached_worker_view_is_root_stamped(world):
     node, workspace, now, _, pile = world
     store = node.store(workspace)
     old_root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
+    view = WorkerView.from_root(old_root, fetch)
+    assert mint.stateless(
+        pile, old_root,
+        lambda _: pytest.fail("matching view fetched the store"),
+        now, view) == (node.pk, "sync")
 
-    with mint.Authority.from_root(old_root, fetch) as projection:
-        assert mint.stateless(
-            pile, old_root,
-            lambda _: pytest.fail("warm projection fetched the store"),
-            now, projection) == (node.pk, "sync")
+    cmds.post(node, workspace, "general", "changes the root")
+    new_root, fetched = store.get("root"), []
 
-        cmds.post(node, workspace, "general", "changes the root")
-        new_root, fetched = store.get("root"), []
+    def tracked(oid):
+        fetched.append(oid)
+        return fetch(oid)
 
-        def tracked(oid):
-            fetched.append(oid)
-            return fetch(oid)
-
-        assert projection.etag != store.etag("root")
-        assert mint.stateless(
-            pile, new_root, tracked, now, projection) == (node.pk, "sync")
-        assert fetched
+    assert view.etag != store.etag("root")
+    assert mint.stateless(
+        pile, new_root, tracked, now, view) == (node.pk, "sync")
+    assert fetched
 
 
 @pytest.mark.parametrize("seed", range(5))
-def test_every_mint_path_matches_randomized_canonical_conflicts(
+def test_worker_matches_randomized_canonical_authority_conflicts(
         tmp_path, seed):
     node, workspace, now, founder, old_root, stale, fresh = \
         conflict_world(tmp_path / f"conflict-{seed}", seed)
-    store, root = node.store(workspace), node.store(workspace).get("root")
+    store = node.store(workspace)
+    root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    anchor, globals_ = mint.root_globals(root)
-    cases = ((stale, None), (fresh, (founder, "sync")))
+    old_view = WorkerView.from_root(old_root, fetch)
 
-    with mint.Authority.from_root(old_root, fetch) as old_projection:
-        assert mint.stateless(
-            stale, old_root,
-            lambda _: pytest.fail("matching old projection fetched the store"),
-            now, old_projection)
-        assert mint.stateless(
-            stale, root, fetch, now, old_projection) is None
-
-    with mint.Authority.from_root(root, fetch) as projection:
-        for pile, expected in cases:
-            assert mint.mint(
-                pile, anchor, globals_, now,
-                canonical_db=node.idx(workspace)) == expected
-            assert mint.stateless(pile, root, fetch, now) == expected
-            assert mint.stateless(
-                pile, root,
-                lambda _: pytest.fail("cached mint fetched the store"),
-                now, projection) == expected
-            assert invoke_mint(node, workspace, pile)[1][0] \
-                == (200 if expected else 403)
+    assert mint.stateless(
+        stale, old_root,
+        lambda _: pytest.fail("matching view fetched the store"),
+        now, old_view)
+    assert mint.stateless(stale, root, fetch, now, old_view) is None
+    for pile, expected in ((stale, None), (fresh, (founder, "sync"))):
+        assert mint.stateless(pile, root, fetch, now) == expected
+        assert invoke_mint(node, workspace, pile)[1][0] \
+            == (200 if expected else 403)
 
 
-@pytest.mark.skip(reason="poc-16-yez.9 decides the gate mask")
-def test_gate_mask_screens_whole_closure():
-    """gxz seam: a pile whose CLOSURE contains an evicted signer's fact is
-    refused at the gate even when the requester is in good standing — enable
-    once poc-16-yez.9 confirms the seam."""
-    raise NotImplementedError
+def test_gate_screens_the_whole_submitted_closure(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    bob_message = cmds.post(
+        node, workspace, "general", "historical but now inactive", ts=20)
+    bob_closure = decode_pile(
+        closed_subset(node, workspace, {bob_message}))[0]
+
+    node.bind_identity(workspace, founder)
+    cmds.evict(node, workspace, bob)
+    now = now_ms()
+    good = request.payload(
+        node, workspace, "sync", now + 60_000, now)
+    assert authorize(
+        node, workspace, encode_pile(good), now) == (node.pk, "sync")
+    assert authorize(
+        node, workspace,
+        encode_pile(combine(bob_closure, good)), now) is None

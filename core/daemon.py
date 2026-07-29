@@ -1,10 +1,10 @@
 """The daemon: a responder half (seven verbs, zero sync logic) plus an
 initiator half (cadence walks round-robin over the keyring, kicked on news).
 
-The gate is a parameter supplier: mint currys the workspace anchor and the
-removal set into the one kernel; every other verb just checks the grant at
-the door. Invite blobs are the one ungated read; LIST on them is denied
-absolutely (there is no route).
+The gate opens a root-stamped WorkerView and performs exact authority and
+suppression reads; every other remote verb checks the resulting grant at the
+door. Invite blobs are the one ungated read; LIST on them is denied absolutely
+(there is no route).
 """
 import base64
 import hashlib
@@ -16,7 +16,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import actions, cmds, mint as gate
+from . import actions, cmds, manifest, mint as gate
 from .crypto import h, seal_to
 from .node import Node, now_ms
 from .store import PAGE_BATCH
@@ -203,7 +203,7 @@ class Handler(BaseHTTPRequestHandler):
                 root = self.node.store(ws).get("root")
                 if not root:
                     return self._send(403)
-                anchor, _ = gate.root_globals(root)
+                anchor = manifest.decode_root(root)[0]
             except Exception:
                 return self._send(403)
             if anchor != ws:

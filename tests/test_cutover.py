@@ -9,7 +9,7 @@ import facts
 import core.manifest as manifest
 import core.shape as shape
 import core.sync as sync_module
-from core import cmds
+from core import btreap, cmds
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import canon
@@ -210,7 +210,7 @@ def test_root_atomically_names_manifest_and_three_logical_trees(world):
     assert all(
         set(descriptor) == {"root", "count", "depth"}
         and descriptor["root"] and descriptor["count"] > 0
-        and 0 < descriptor["depth"] <= 17
+            and 0 < descriptor["depth"] <= btreap.MAX_PAGE_DEPTH
         for descriptor in body["trees"].values())
     assert manifest.decode_root(raw) == (
         ws, node.globals(ws), body["manifest"])
@@ -470,6 +470,45 @@ def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
     assert fetched.isdisjoint(siblings)
     assert fetched <= leaves | shards  # leaf piles and manifest shards ONLY
     assert all(oid not in leaves for oid in singles)  # leaves ride batches
+
+
+def test_idle_sync_after_blob_completion_does_no_index_or_object_work(
+        tmp_path, monkeypatch):
+    """A 304 against an unchanged local root is a true O(1) idle dial.
+
+    The first dial records that blob reconciliation completed for that local
+    root. Every later 304 returns without scanning facts, decoding trees, or
+    probing objects.
+    """
+    source, ws, destination, _ = pair(tmp_path)
+
+    class ConditionalPeer:
+        def __init__(self, node, workspace, url):
+            self.node, self.ws = node, workspace
+            self.cache = node.sync_cache.setdefault((workspace, url), {})
+
+        def root(self, etag=None):
+            current = source.store(self.ws).etag("root")
+            if etag == current:
+                return None
+            return source.store(self.ws).get("root"), current
+
+        def obj(self, oid):
+            return source.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+        def put_pile(self, raw):
+            pytest.fail("converged dial unexpectedly pushed")
+
+    monkeypatch.setattr(sync_module, "Peer", ConditionalPeer)
+    assert sync_module.sync(destination, ws, "local://conditional") == (0, 0)
+    monkeypatch.setattr(
+        sync_module, "_fetch_blobs",
+        lambda *args: pytest.fail("idle dial rescanned blob demand"))
+    destination.keys = lambda *args: pytest.fail("idle dial scanned fact keys")
+    assert sync_module.sync(destination, ws, "local://conditional") == (0, 0)
     assert all_fids(destination, ws) == all_fids(source, ws)
 
 

@@ -1,8 +1,7 @@
-"""Pure key-discipline parameters: format, boundary, fingerprint."""
+"""Pure key-discipline parameters: format and stable boundary."""
 import pytest
 
 from core import shape
-from core.crypto import h
 from core.fact import Fact
 
 
@@ -66,13 +65,11 @@ def test_fact_constructor_rejects_noncanonical_timestamp(timestamp):
         Fact("sample", timestamp, [], {})
 
 
-def test_hash_derived_boundary_and_fingerprint(monkeypatch):
+def test_hash_derived_boundary(monkeypatch):
     monkeypatch.setattr(shape, "CUT", 8)
-    keys = ["a", "b"]
 
     assert shape.boundary(fid(16))
     assert not shape.boundary(fid(17))
-    assert shape.fingerprint(keys) == h(b"a|b")
 
 
 def test_stable_cuts_are_monotone(monkeypatch):

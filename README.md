@@ -1,36 +1,104 @@
 # POC-16
 
-One-sided range reconciliation over a passive object store. See
-[DESIGN.md](DESIGN.md); the two claims to prove are P1 (efficient sync from
-the published treap) and P2 (efficient engine: validate piles into the
-treap's tail range on request; promotion rides the same commit).
-[MODEL.md](docs/MODEL.md) holds the performance/cost model and
-the send/receive/compaction loop math.
+POC-16 is a small peer-to-peer workspace engine built around immutable,
+content-addressed facts. Peers reconcile through a passive object-store
+interface; a daemon or edge worker only authenticates requests and serves
+bytes. The implementation includes users and devices, delegated admins,
+messages, Bao-backed attachments, logical deletion, member eviction, rebuild,
+and one-sided synchronization.
 
-**tinyp2p** is the working build: ~2,000 lines of Python split between the
-family-neutral `core/` runtime and routed `facts/` policy
-implementing the whole semantic stack — kernel, closed piles, one-copy
-settle-node payloads (each root-to-node path is closed), a pure fat Merkle
-tree, one-sided walk, seven-verb daemon, invite links,
-eviction, and routed `facts/auth` + `facts/content` families — with black-box
-multi-daemon tests. [IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
-maps design to code, records the deviations, and carries the
-closed-path argument. `pytest tests/` runs it all.
+The current format is intentionally not backward compatible. `DESIGN.md`
+describes the running format and its remaining limits.
 
-## Setup
+> **Privacy warning:** ordinary fact bodies are plaintext JSON in the object
+> store. Signatures authenticate them but do not encrypt them. Invite blobs
+> are encrypted; message and attachment metadata are not. Do not treat this
+> prototype as an encrypted production messenger.
 
-The Python runtime needs PyNaCl:
+## Install
+
+Python 3 and PyNaCl are required:
 
 ```sh
-python3 -m pip install pynacl
+python3 -m pip install pynacl pytest
 ```
 
-Bao attachments additionally use the vendored Rust extension. From the
-project root (with a Rust toolchain installed), build and install it with:
+Attachments use the vendored Bao extension:
 
 ```sh
 python3 -m pip install ./native/bao_py
 ```
 
-The extension is loaded only when attachment I/O needs it; auth, messages,
-sync, and `import facts` work without this optional build.
+The extension is loaded only by attachment operations. Auth, messages, sync,
+and most tests run without it.
+
+## Run
+
+Start a node:
+
+```sh
+python3 -m core daemon ./state/alice --port 7100
+```
+
+In another shell:
+
+```sh
+python3 -m core create alice
+python3 -m core status
+```
+
+`create` prints the workspace id. Commands accept a unique workspace-id
+prefix:
+
+```sh
+python3 -m core post --ws WORKSPACE "hello"
+python3 -m core msgs --ws WORKSPACE
+python3 -m core send --ws WORKSPACE ./photo.jpg
+python3 -m core files --ws WORKSPACE
+python3 -m core get --ws WORKSPACE FILE_FID --out ./photo.jpg
+python3 -m core remove --ws WORKSPACE FACT_FID
+python3 -m core evict --ws WORKSPACE MEMBER_NAME
+```
+
+To add a peer, create an invite on the existing node and redeem it against a
+second daemon:
+
+```sh
+python3 -m core invite --ws WORKSPACE
+python3 -m core --node http://127.0.0.1:7200 join INVITE_LINK bob
+```
+
+Nodes synchronize on their daemon cadence. `sync --ws WORKSPACE` requests an
+immediate dial, and `rebuild --ws WORKSPACE` reconstructs the derived SQLite
+indexes and application views from the authenticated store.
+
+The `ctl/*` endpoints are a trusted node-local control plane. Remote peers use
+the authenticated `root`, `page`, `pile`, `poke`, and `mint` protocol routes.
+
+## Test and measure
+
+Run the full suite:
+
+```sh
+python3 -m pytest -q
+```
+
+The latency benchmark measures real hot-post and idle-sync paths:
+
+```sh
+python3 bench/bench_latency.py
+```
+
+The larger reconciliation benchmark is:
+
+```sh
+python3 bench/bench_sync.py 5000 10000
+```
+
+The repository tracks work with `bd`:
+
+```sh
+bd prime
+bd ready
+bd show ISSUE_ID
+```

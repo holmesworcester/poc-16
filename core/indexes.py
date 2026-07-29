@@ -38,11 +38,6 @@ def need_key(name, a0, a1=None, requires=()):
     ]).decode()
 
 
-def _previous(name, roots, seed, fetch):
-    root = roots.get(name, {}).get("root", "") if roots else ""
-    return dict(btreap.Reader(root, seed, fetch).items()) if root else {}
-
-
 def _activate(rows, key, action_fid):
     current = rows.get(key)
     winner = action_fid
@@ -51,23 +46,22 @@ def _activate(rows, key, action_fid):
     rows[key] = {"state": "active", "action": winner}
 
 
-def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
-    """Build Fact/Supp/Authority roots for the same logical commit."""
+def build(
+        anchor, idx, fact_of, emit, *, previous=None, fetch=None,
+        changed_fids=None):
+    """Build or path-update Fact/Supp/Authority for one logical commit.
+
+    ``changed_fids`` is an additions-only ordinary commit. Prune, restore,
+    proof-winner changes, and format upgrades pass ``None`` and take the
+    canonical bulk path.
+    """
     seed = layout_seed(anchor)
     previous = previous or {}
     fetch = fetch or (lambda oid: None)
-    # Each root is a pure function of its current logical set.  Historical
-    # retention belongs to immutable evidence objects, never to a hidden
-    # "whatever this replica once saw" row set.
-    fact_rows = {}
-    supp_rows = {}
+    incremental = changed_fids is not None and all(
+        previous.get(name, {}).get("root") for name in TREE_NAMES)
 
-    current = [
-        fact_of(fid)
-        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid")
-    ]
-
-    archived_actions, action_rows = {}, []
+    archived_actions, action_rows, action_evidence = {}, [], {}
     for sid, fid, raw, evidence in idx.execute(
             "SELECT sid, fid, j, evidence FROM actions ORDER BY sid"):
         fact = from_json(json.loads(raw))
@@ -75,10 +69,10 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
             raise ValueError("action archive integrity")
         archived_actions[fid] = fact
         action_rows.append((sid, fid))
-    action_evidence = dict(idx.execute(
-        "SELECT fid, evidence FROM actions ORDER BY fid"))
+        action_evidence[fid] = min(
+            evidence, action_evidence.get(fid, evidence))
 
-    def add_fact_record(fact):
+    def fact_record(fact):
         raw = canon(fact.to_json())
         if len(raw) > MAX_RAW_FACT_BYTES:
             raise ValueError("raw fact exceeds authenticated record budget")
@@ -101,7 +95,7 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
                 if provider is None:
                     raise ValueError("authority liveness edge")
                 liveness.update(actions.provider_scopes(provider))
-        fact_rows[fact_key(fact.fid)] = {
+        return {
             "edges": edges,
             "evidence": action_evidence.get(fact.fid, ""),
             "key": fact.key,
@@ -111,11 +105,22 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
             "selectors": selectors,
             "tag": fact.t,
         }
+
+    def active_slot(sid):
+        row = idx.execute(
+            "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone()
+        return {"state": "active", "action": row[0]} \
+            if row is not None else {"state": "clear"}
+
+    def reservations(fact):
+        fact_slots, supp_slots = {}, {}
+        selectors = actions.fact_scopes(fact)
         for sid in selectors:
-            supp_rows.setdefault(sid, {"state": "clear"})
+            supp_slots[sid] = active_slot(sid)
+        policy = facts.policy_for(fact.t)
         if policy is not None and policy.direct_targets:
             sid = fact_key(fact.fid)
-            fact_rows.setdefault(action_key(sid), {"state": "clear"})
+            fact_slots[action_key(sid)] = active_slot(sid)
         for name, public_key, _ in fact.offers():
             if name == "member":
                 sid = principal_sid("member", public_key)
@@ -123,34 +128,109 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
                 sid = principal_sid("device", public_key)
             else:
                 continue
-            fact_rows.setdefault(action_key(sid), {"state": "clear"})
+            fact_slots[action_key(sid)] = active_slot(sid)
+            supp_slots[sid] = active_slot(sid)
+        return fact_slots, supp_slots
 
+    def authority_value(address):
+        name, a0, a1 = address
+        if a1 is None:
+            row = idx.execute(
+                "SELECT p.rank, o.src FROM offers o "
+                "JOIN proofs p ON p.fid=o.src "
+                "WHERE o.name=? AND o.a0=? "
+                "ORDER BY p.rank, o.src LIMIT 1",
+                (name, a0),
+            ).fetchone()
+        else:
+            row = idx.execute(
+                "SELECT p.rank, o.src FROM offers o "
+                "JOIN proofs p ON p.fid=o.src "
+                "WHERE o.name=? AND o.a0=? AND o.a1=? "
+                "ORDER BY p.rank, o.src LIMIT 1",
+                (name, a0, a1),
+            ).fetchone()
+        if row is None:
+            return None
+        rank, source = row
+        return {
+            "state": "provider",
+            "fid": source,
+            "rank": rank,
+        }
+
+    if incremental:
+        fact_changes, supp_changes, addresses = {}, {}, set()
+        for fid in sorted(set(changed_fids)):
+            fact = fact_of(fid)
+            if fact is None:
+                continue
+            fact_changes[fact_key(fid)] = fact_record(fact)
+            fact_slots, supp_slots = reservations(fact)
+            fact_changes.update(fact_slots)
+            supp_changes.update(supp_slots)
+            for name, a0, a1 in fact.offers():
+                addresses.add((name, a0, a1))
+                addresses.add((name, a0, None))
+
+        # Action state is a small monotone set. Include it on every update so
+        # action-first sync can publish a witness not yet in the ordinary set.
+        for sid, fid in action_rows:
+            fact = archived_actions[fid]
+            fact_changes[fact_key(fid)] = fact_record(fact)
+            active = {"state": "active", "action": fid}
+            fact_changes[action_key(sid)] = active
+            supp_changes[sid] = active
+
+        authority_changes = {
+            need_key(*address): authority_value(address)
+            for address in sorted(
+                addresses,
+                key=lambda row: (
+                    row[0], row[1], row[2] is not None, row[2] or ""))
+        }
+        change_sets = {
+            FACT: tuple(sorted(fact_changes.items())),
+            SUPP: tuple(sorted(supp_changes.items())),
+            AUTHORITY: tuple(sorted(authority_changes.items())),
+        }
+        built = {}
+        for name in TREE_NAMES:
+            result = btreap.update(
+                previous[name]["root"], seed, change_sets[name], fetch, emit)
+            built[name] = {
+                "root": result.root,
+                "count": result.count,
+                "depth": result.page_depth,
+            }
+        return seed, built
+
+    # Full rebuild: a pure function of the current logical set. Historical
+    # action evidence remains explicit; no replica-local observation leaks in.
+    fact_rows, supp_rows = {}, {}
+    current = [
+        fact_of(fid)
+        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid")
+    ]
     for fact in current:
-        add_fact_record(fact)
+        fact_rows[fact_key(fact.fid)] = fact_record(fact)
+        fact_slots, supp_slots = reservations(fact)
+        for key, value in fact_slots.items():
+            fact_rows.setdefault(key, value)
+        for key, value in supp_slots.items():
+            supp_rows.setdefault(key, value)
     for fid, fact in archived_actions.items():
         if fact_key(fid) not in fact_rows:
-            add_fact_record(fact)
+            fact_rows[fact_key(fid)] = fact_record(fact)
 
-    for fid, sid in idx.execute("SELECT fid, k FROM supp ORDER BY fid, k"):
-        supp_rows.setdefault(sid, {"state": "clear"})
-
-    # Terminal principal slots are independent of provider arrival.  An
-    # eviction remains active for future providers with the same public key.
-    for name, public_key in idx.execute(
-            "SELECT DISTINCT name, a0 FROM offers "
-            "WHERE name IN ('member','device_key') ORDER BY name, a0"):
-        kind = "member" if name == "member" else "device"
-        supp_rows.setdefault(principal_sid(kind, public_key),
-                             {"state": "clear"})
+    for _, sid in idx.execute("SELECT fid, k FROM supp ORDER BY fid, k"):
+        supp_rows.setdefault(sid, active_slot(sid))
 
     for sid, fid in action_rows:
         _activate(supp_rows, sid, fid)
         _activate(fact_rows, action_key(sid), fid)
 
-    # Authority is current-state, not a grow-only archive.  Previously known
-    # NeedKeys remain explicit NO_PROVIDER rows so absence is authenticated.
-    authority_rows = {}
-    candidates = defaultdict(list)
+    authority_rows, candidates = {}, defaultdict(list)
     for name, a0, a1, src, rank in idx.execute(
             "SELECT o.name, o.a0, o.a1, o.src, p.rank "
             "FROM offers o JOIN proofs p ON p.fid=o.src "
@@ -160,10 +240,7 @@ def build(anchor, idx, fact_of, emit, *, previous=None, fetch=None):
     for address, choices in candidates.items():
         rank, source = min(choices)
         authority_rows[need_key(*address)] = {
-            "state": "provider",
-            "fid": source,
-            "rank": rank,
-        }
+            "state": "provider", "fid": source, "rank": rank}
 
     built = {}
     for name, rows in (

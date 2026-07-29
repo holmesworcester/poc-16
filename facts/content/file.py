@@ -156,16 +156,13 @@ def save(node, workspace, selector, out_path):
         raise ValueError(
             f"file incomplete: have {record['have']}/{record['total']} slices")
     store = node.store(workspace)
-    if record["encoding"] == "blob-v1":
-        parts = (_legacy_bytes(store, record),)
-    else:
-        cids = _cids(node, workspace, record["root"])
-        parts = (
-            bao.verify(
-                store.get("obj/" + cids[index]),
-                record["root"], index, record["size"])
-            for index in range(record["total"])
-        )
+    cids = _cids(node, workspace, record["root"])
+    parts = (
+        bao.verify(
+            store.get("obj/" + cids[index]),
+            record["root"], index, record["size"])
+        for index in range(record["total"])
+    )
     target = os.path.abspath(os.fspath(out_path))
     handle, temporary = tempfile.mkstemp(
         prefix=".tinyp2p-", dir=os.path.dirname(target) or ".")
@@ -231,8 +228,6 @@ def bytes_for(node, workspace, fid):
     if record["have"] < record["total"]:
         return record["name"], None
     store = node.store(workspace)
-    if record["encoding"] == "blob-v1":
-        return record["name"], _legacy_bytes(store, record)
     cids = _cids(node, workspace, record["root"])
     output = bytearray()
     for index in range(record["total"]):
@@ -240,14 +235,6 @@ def bytes_for(node, workspace, fid):
             store.get("obj/" + cids[index]),
             record["root"], index, record["size"])
     return record["name"], bytes(output)
-
-
-def _legacy_bytes(store, record):
-    blob = store.get("obj/" + record["blob"])
-    if blob is None or len(blob) != record["size"] \
-            or h(blob) != record["blob"]:
-        raise ValueError("legacy file object does not match its descriptor")
-    return blob
 
 
 def _cids(node, workspace, root):

@@ -183,3 +183,48 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
     assert destination.app.execute(
         "SELECT 1 FROM projected WHERE ws=? AND src=?",
         (workspace, target)).fetchone() is None
+
+
+def test_one_poisoned_action_witness_does_not_block_an_honest_action(
+        tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    poisoned_target = cmds.post(
+        source, workspace, "general", "poison witness", ts=10)
+    honest_target = cmds.post(
+        source, workspace, "general", "honest witness", ts=11)
+    before = closed_subset(source, workspace, all_fids(source, workspace))
+
+    destination = Node(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "alice", peers=[])
+    deliver(destination, workspace, before)
+    destination.turn(workspace)
+
+    cmds.remove(source, workspace, poisoned_target, ts=20)
+    cmds.remove(source, workspace, honest_target, ts=21)
+    rows = {
+        sid: (fid, evidence)
+        for sid, fid, evidence in _action_rows(source, workspace)
+    }
+    poisoned_sid = f"fact:{poisoned_target}"
+    honest_sid = f"fact:{honest_target}"
+    poisoned_evidence = rows[poisoned_sid][1]
+    store = source.store(workspace)
+
+    def fetch(oid):
+        return b"not the claimed object" if oid == poisoned_evidence \
+            else store.get("obj/" + oid)
+
+    accepted = sync_module.pull_actions(
+        destination, workspace, store.get("root"), fetch, rows)
+
+    assert rows[honest_sid][0] in accepted
+    assert rows[poisoned_sid][0] not in accepted
+    assert actions.active(destination.idx(workspace), honest_sid)
+    assert not actions.active(destination.idx(workspace), poisoned_sid)
+    assert destination.app.execute(
+        "SELECT 1 FROM projected WHERE ws=? AND src=?",
+        (workspace, honest_target)).fetchone() is None
+    assert destination.app.execute(
+        "SELECT 1 FROM projected WHERE ws=? AND src=?",
+        (workspace, poisoned_target)).fetchone() is not None

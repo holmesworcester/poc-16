@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from core import actions, cmds, indexes, manifest, mint
+from core import actions, btreap, cmds, indexes, manifest, mint
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -236,8 +236,8 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
 
 def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
     """The publisher never mints a root every reader must reject: rebuild and
-    mint.Authority.from_root both demand the anchor, so an index that lacks
-    it is not publishable — it stays ahead of the manifest instead."""
+    WorkerView both demand the anchor, so an index that lacks it is not
+    publishable — it stays ahead of the manifest instead."""
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     root = node.store(workspace).get("root")
@@ -544,8 +544,13 @@ def test_efficient_updates(world):
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
-    # One raw record plus at most one bounded path in each logical tree.
-    assert len(objs) <= 1 + 3 * 17, \
+    # A post adds a message and signature. Each can rewrite a search/rotation
+    # path in each of three persistent trees, plus bounded manifest/raw pages.
+    depth = max(
+        row["depth"] for row in
+        json.loads(st.get("root"))["trees"].values())
+    assert depth <= btreap.MAX_PAGE_DEPTH
+    assert len(objs) <= 4 + 6 * depth, \
         f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
@@ -688,7 +693,10 @@ def test_incremental_reuses_work(world, monkeypatch):
     assert total > 30
     assert scans == ["keys"]  # one index-only key scan per settle
     objects = [k for k in puts if k.startswith("obj/")]
-    assert len(objects) <= 2 + 3 * 17, \
+    depth = max(
+        row["depth"] for row in
+        json.loads(store.get("root"))["trees"].values())
+    assert len(objects) <= 4 + 6 * depth, \
         f"bounded manifest + three tree paths, got {objects}"
     assert len(set(resolved)) < total, \
         f"resolved {len(set(resolved))} of {total} closures — the memo " \

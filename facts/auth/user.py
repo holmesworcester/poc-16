@@ -7,7 +7,7 @@ from core.close import encode_pile
 from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
 from core.fact import Fact, from_json
 from .._policy import author_selectors
-from . import legacy_invite, signature, user_invite
+from . import signature, user_invite
 
 TAG = "user"
 TABLES = ("member_rows",)
@@ -82,9 +82,7 @@ def accept(node, link, name):
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
     bootstrap = [from_json(item) for item in blob["pile"]]
     invitation = [
-        fact for fact in bootstrap
-        if fact.t in {user_invite.TAG, legacy_invite.TAG}
-    ][-1]
+        fact for fact in bootstrap if fact.t == user_invite.TAG][-1]
     ts = now_ms()
     secret, public = node.identity()
     member = user(invitation, load_sk(blob["isk"]), public, name, ts)

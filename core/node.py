@@ -61,8 +61,8 @@ CREATE TABLE IF NOT EXISTS globals(name TEXT, value TEXT,
                                    PRIMARY KEY(name, value));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + actions.SCHEMA + "\n".join(SUPP_SCHEMA) + LOG_SCHEMA
-INDEX_VERSION = "family-contract-v17-action-slots"
-APP_VERSION = 3
+INDEX_VERSION = "family-contract-v18-current-families"
+APP_VERSION = 4
 
 
 def now_ms():
@@ -305,6 +305,7 @@ class Node:
     def _stamp(self, ws):
         idx = self.idx(ws)
         try:
+            idx.execute("DELETE FROM meta WHERE k='tree-rebuild'")
             idx.execute("INSERT OR REPLACE INTO meta VALUES('root', ?)",
                         (self.store(ws).etag("root"),))
             idx.execute("INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
@@ -314,7 +315,7 @@ class Node:
             idx.rollback()
             raise
 
-    def commit_index(self, ws):
+    def commit_index(self, ws, *, require_rebuild=True):
         """Commit direct derived-index writes as ahead of the manifest.
 
         The live merge path and bulk benchmark builders share this boundary so
@@ -324,6 +325,9 @@ class Node:
         idx = self.idx(ws)
         try:
             idx.execute("DELETE FROM meta WHERE k='root'")
+            if require_rebuild:
+                idx.execute(
+                    "INSERT OR REPLACE INTO meta VALUES('tree-rebuild','1')")
             idx.commit()
         except Exception:
             idx.rollback()
@@ -395,16 +399,6 @@ class Node:
         oid = h(raw)
         self.store(ws).put_if_absent("obj/" + oid, raw)
         return oid
-
-    def _backfill_current_actions(self, ws):
-        """One-format-cut helper: turn resident action facts into evidence."""
-        idx = self.idx(ws)
-        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid"):
-            fact = self.fact_of(ws, fid)
-            if not actions.action_sids(fact):
-                continue
-            evidence = self._action_evidence(ws, fact, {}, {})
-            actions.archive(idx, fact, evidence)
 
     def _restore_root_actions(self, ws, root_bytes, fetch):
         """Rebuild the local action projection from authenticated tree slots."""
@@ -828,15 +822,16 @@ class Node:
 
     def commit(self, ws, newfids=(), *, reuse=True):
         st, idx = self.store(ws), self.idx(ws)
-        # A root names its anchor — rebuild() and mint.Authority.from_root
-        # both reject one that doesn't, so never publish one. An index
+        forced_rebuild = idx.execute(
+            "SELECT 1 FROM meta WHERE k='tree-rebuild'").fetchone() is not None
+        # A root names its anchor — rebuild() and WorkerView both reject one
+        # that doesn't, so never publish one. An index
         # without it is not a store yet (an arrival order can land bare
         # signatures first): it stays ahead of the manifest, unpublished,
         # until a turn brings the anchor in. A rootless store is legal.
         if idx.execute(
                 "SELECT 1 FROM facts WHERE fid=?", (ws,)).fetchone() is None:
             return None
-        self._backfill_current_actions(ws)
         shadows = self._shadows(ws, newfids)
         # Bulk benchmark builders write the derived index directly, while the
         # live path can rank only its new offer sources in dependency order.
@@ -853,7 +848,7 @@ class Node:
                 newfids = tuple(sorted(
                     (set(newfids) | restored) - pruned))
             # merge() and the direct/bulk boundary have already indexed keys.
-            self.commit_index(ws)
+            self.commit_index(ws, require_rebuild=False)
             if restored:
                 self._invalidate_sync_cache(ws)
         except Exception:
@@ -882,9 +877,15 @@ class Node:
         # providers for an unchanged member set, so they drop the memo.
         if not (reuse and not shadows and not pruned and not restored):
             entries = ()
+        incremental = reuse and not forced_rebuild \
+            and not shadows and not pruned and not restored
+        changed_keys = {
+            self.fact_of(ws, fid).key
+            for fid in newfids if self.fact_of(ws, fid) is not None
+        } if incremental else None
         _, man = manifest.build(
             self.keys(ws), lambda fid: self.fact_of(ws, fid), deps_of, emit,
-            entries)
+            entries, changed=changed_keys)
         previous_trees = {}
         if prev:
             try:
@@ -893,7 +894,8 @@ class Node:
                 pass
         seed, trees = indexes.build(
             ws, idx, lambda fid: self.fact_of(ws, fid), emit,
-            previous=previous_trees, fetch=fetch)
+            previous=previous_trees, fetch=fetch,
+            changed_fids=newfids if incremental else None)
         root = manifest.encode_root(
             ws, self.globals(ws), man,
             action_summary=actions.summary(idx),
@@ -906,8 +908,7 @@ class Node:
     def _previous(self, ws, raw, fetch):
         """The previous root's manifest entries: a memo for the next settle.
         Bytes we cannot read — a foreign layout stamp, a missing shard —
-        settle from scratch; there is no read-compat path (docs/CUTOVER.md
-        §1)."""
+        settle from scratch; there is no read-compat path."""
         if not raw:
             return ()
         try:

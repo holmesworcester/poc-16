@@ -76,6 +76,30 @@ def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     assert len(fresh) <= initial.page_depth
 
 
+def test_sequential_insert_delete_and_bulk_have_one_root():
+    wanted = dict(rows(180))
+    order = list(wanted)
+    random.Random(91).shuffle(order)
+    objects = {}
+    current = ""
+    for key in order:
+        current = btreap.update(
+            current, SEED, [(key, wanted[key])], objects.get,
+            emitter(objects)).root
+    for key in order[::7]:
+        current = btreap.update(
+            current, SEED, [(key, None)], objects.get,
+            emitter(objects)).root
+        wanted.pop(key)
+
+    bulk_objects = {}
+    bulk = btreap.build(
+        tuple(wanted.items()), SEED, emitter(bulk_objects))
+    assert current == bulk.root
+    assert dict(
+        btreap.Reader(current, SEED, objects.get).items()) == wanted
+
+
 def test_missing_or_mutated_page_fails_closed():
     objects = {}
     built = btreap.build(rows(40), SEED, emitter(objects))

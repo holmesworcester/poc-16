@@ -8,8 +8,8 @@ when empty). Entries shard into manifest objects by the same
 ``shape.boundary`` rule that cuts the leaves, giving depth 0-2 at any
 realistic corpus. Equal content means equal oid (layout is canonical and
 history-independent), so **oid comparison is the entire one-sided diff** —
-no fingerprints, no n-counts, no per-node key arrays. Plan of record:
-docs/CUTOVER.md; economics: docs/COSTS.md.
+no fingerprints, no n-counts, no per-node key arrays. The composite root and
+cost posture are described in DESIGN.md.
 
 Determinism contract: every function of the committed key set is a pure
 function of that set. ``prev`` inputs only memoize — they may skip work,
@@ -20,6 +20,7 @@ import json
 from bisect import bisect_right
 from typing import NamedTuple
 
+from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
 from .close import encode_pile
 from .crypto import h
 from .fact import canon
@@ -27,8 +28,8 @@ from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
 
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
-# path exists, per docs/CUTOVER.md §1). Replaces tree.config/FAT_VERSION.
-LAYOUT = "composite-btreap-v2"
+# path exists. Replaces the pre-cutover tree configuration.
+LAYOUT = "composite-btreap-v3"
 TREE_NAMES = ("fact", "supp", "authority")
 
 
@@ -55,7 +56,7 @@ def _put(raw, emit):
     return h(raw)
 
 
-def build(keys, fact_of, deps_of, emit, prev=()):
+def build(keys, fact_of, deps_of, emit, prev=(), *, changed=None):
     """Settle the store: cut ``keys`` into leaves by ``shape.boundary``,
     emit each leaf pile (``close.encode_pile``, canonical key order) and its
     closure sibling, shard the entry list by the same rule, and return
@@ -73,9 +74,16 @@ def build(keys, fact_of, deps_of, emit, prev=()):
     # committed keys and the chunks partition every committed key, so the
     # only thing a shifted ``lo`` can move across is a gap holding none.
     known = {e.leaf: e.closure for e in prev}
+    previous = {e.sep: e for e in prev}
+    changed = None if changed is None else set(changed)
     loaded, entries, lo = {}, [], ""
     key_of = lambda fid: key(loaded.get(fid) or fact_of(fid))
     for chunk in _chunks(sorted(set(keys)), fid_of):
+        if changed is not None and not changed.intersection(chunk) \
+                and chunk[0] in previous:
+            entries.append(previous[chunk[0]])
+            lo = chunk[-1]
+            continue
         members = [fact_of(fid_of(k)) for k in chunk]
         loaded = {f.fid: f for f in members}
         leaf = _put(encode_pile(members), emit)
@@ -300,7 +308,7 @@ def _trees_ok(trees):
             and (not value["root"] or valid_fid(value["root"]))
             and type(value["count"]) is int and value["count"] >= 0
             and type(value["depth"]) is int
-            and 0 <= value["depth"] <= 17
+            and 0 <= value["depth"] <= MAX_TREE_DEPTH
             and bool(value["root"]) == bool(value["count"])
             for value in trees.values()
         )

@@ -1,4 +1,4 @@
-"""Read models as a cursored pure fold (docs/SIMPLIFY.md §5).
+"""Read models as a cursored pure fold.
 
     app.db = fold(step, ∅, log)      exactly-once, resumable, order-robust
     fold±(delivery order over D) == fold(canonical order over E)   THE theorem
@@ -184,7 +184,7 @@ def tables_of(family):
     Contract (AST-enforced, extends tests/test_fact_contract.py): every row
     carries its producing src fid; insert-only rows keyed by src; views for
     anything aggregate-shaped. Known fix bundled here: removal's
-    `UPDATE members SET evicted=1` becomes an insert-only removals row + a
+    `UPDATE members SET evicted=1` becomes an insert-only action row plus a
     view — display data, not fact suppression; S never lives in app.db."""
     handler = facts.handler_for(family) \
         if isinstance(family, str) else family

@@ -32,7 +32,7 @@ def test_one_registry_exhaustively_covers_the_router():
         for rule in policy.suppression or ()
     }
     assert kinds == {SELF, PARENT, ANCESTOR}
-    for tag in ("msg", "file", "file_bao", "chunk"):
+    for tag in ("msg", "file_bao", "chunk"):
         direct = _policy.policy_for(tag).direct_targets
         assert direct
         assert all(

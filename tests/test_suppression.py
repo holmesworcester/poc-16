@@ -70,9 +70,10 @@ def test_suppression_marker_survives_the_wire_codec():
 @pytest.mark.parametrize("fact", [
     Fact("msg", 1, [],
          {"pk": "pk", "chan": "general", "text": "markerless"}),
-    Fact("file", 1, [],
-         {"pk": "pk", "chan": "general", "name": "old.txt",
-          "size": 6, "blob": "blob"}),
+    Fact("file_bao", 1, [],
+         {"pk": "pk", "chan": "general", "name": "markerless",
+          "size": 0, "root": "0" * 64, "width": 1, "n": 0,
+          "enc": "clear-v1"}),
 ])
 def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
     node = Node(str(tmp_path / "node"))

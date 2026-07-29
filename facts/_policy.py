@@ -79,17 +79,6 @@ POLICIES = {
         need_roles=("author",),
         suppression=(Self(),),
     ),
-    "genesis": FamilyPolicy(),
-    "sig": FamilyPolicy(),
-    "invite": FamilyPolicy(
-        need_roles=("author", "admin"),
-        authorization_guards=("admin",),
-    ),
-    "join": FamilyPolicy(
-        ref_roles=("invite",),
-        need_roles=("author",),
-        suppression=(Self(),),
-    ),
     "admin": FamilyPolicy(
         need_roles=("author", "grantor_admin", "grantee_member"),
         authorization_guards=("grantor_admin",),
@@ -119,13 +108,6 @@ POLICIES = {
         authorization_guards=("member",),
     ),
     "msg": FamilyPolicy(
-        need_roles=("author", "member"),
-        suppression=(Self(),),
-        direct_targets=DELETE_SELF,
-        owner_edge="member",
-        authorization_guards=("member",),
-    ),
-    "file": FamilyPolicy(
         need_roles=("author", "member"),
         suppression=(Self(),),
         direct_targets=DELETE_SELF,

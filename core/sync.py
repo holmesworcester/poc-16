@@ -1,4 +1,4 @@
-"""Reconciliation over the one-store layout (docs/CUTOVER.md §2).
+"""Reconciliation over the one-store layout.
 
 One dial: the authenticated action leg first, then a manifest oid-diff
 splitting the key space, a push of the local-only keys,
@@ -29,7 +29,7 @@ def _object(oid, fetch):
 
 
 def _resolver(node, ws, extra):
-    """Own store first (docs/CUTOVER.md §2.2): a scratch kernel db — the
+    """Own store first: a scratch kernel db — the
     derived index plus ``extra`` arrivals, ranked so ``resolve_deps``
     answers over both. Returns ``(mem, fact_of, load)``; ``load`` folds
     later arrivals in and reports the fids it could not rank."""
@@ -92,8 +92,12 @@ def sync(node, ws, url):
     cache = peer.cache
     got = peer.root(cache.get("etag"))
     if got is None:
-        if node.store(ws).etag("root") == cache.get("local"):
-            _fetch_blobs(node, ws, peer)
+        local_etag = node.store(ws).etag("root")
+        if local_etag == cache.get("local"):
+            if cache.get("blobs") != local_etag:
+                _, complete = _fetch_blobs(node, ws, peer)
+                if complete:
+                    cache["blobs"] = local_etag
             return 0, 0
         remote_root, retag = cache.get("root"), cache.get("etag")
     else:
@@ -143,19 +147,24 @@ def sync(node, ws, url):
         node, ws, peer, remote_actions)
 
     local_root, mine = st.get("root"), ()
+    local_man = ""
     if local_root:
-        anchor, _, man = manifest.decode_root(local_root)
+        anchor, _, local_man = manifest.decode_root(local_root)
         if anchor != ws:
             raise ValueError("root anchor")
-        if man:
+        if local_man and local_man != their_man:
             fetch_local = lambda oid: st.get("obj/" + oid)
             mine = manifest.decode(
-                _object(man, fetch_local), fetch_local)
-    with node.lock:
-        my_keys = node.keys(ws)
+                _object(local_man, fetch_local), fetch_local)
 
-    pulled_piles, push_keys = [], set(my_keys)
-    if their_man:
+    pulled_piles, push_keys = [], set()
+    if local_man != their_man:
+        with node.lock:
+            my_keys = node.keys(ws)
+        push_keys = set(my_keys)
+    else:
+        my_keys = ()
+    if their_man and local_man != their_man:
         theirs = manifest.decode(
             _object(their_man, fetch_remote), fetch_remote)
         differing = set(manifest.diff(mine, their_man, fetch_remote))
@@ -184,11 +193,16 @@ def sync(node, ws, url):
         pull(node, ws, h(raw), raw)
         pulled = 1
         node.turn(ws)
-    _fetch_blobs(node, ws, peer)
+    _, blobs_complete = _fetch_blobs(node, ws, peer)
+    local_etag = node.store(ws).etag("root")
     cache.update({
         "etag": retag, "root": remote_root,
-        "local": node.store(ws).etag("root"),
+        "local": local_etag,
     })
+    if blobs_complete:
+        cache["blobs"] = local_etag
+    else:
+        cache.pop("blobs", None)
     return pulled, len(push_fids) + pushed_actions
 
 
@@ -353,7 +367,7 @@ def _deps(mem, fact_of):
 
 
 def assemble(node, ws, pulled_piles, entries, fetch):
-    """Two-wave closed-set assembly (docs/CUTOVER.md §2.2).
+    """Two-wave closed-set assembly.
 
     Wave 1 already happened: ``pulled_piles`` are the differing home-leaf
     piles from manifest.diff. For their member facts, resolve every dep from

@@ -1,17 +1,14 @@
 """The pure key discipline of the one store.
 
 Everything a reader or writer needs to know about WHERE a fact lives —
-canonical key format, content-derived chunk boundaries, range fingerprint —
+canonical key format and content-derived chunk boundaries —
 and nothing about what a fact means. Leaf piles (manifest.build) and manifest
 shards (manifest.encode) both cut on ``boundary``; there is no second
-chunking rule. docs/CUTOVER.md §3.
+chunking rule.
 """
 import re
 
-from .crypto import h
-
-CUT = 64  # home-leaf density: the knee where a whole fetch goes
-          # bandwidth-bound (docs/COSTS.md §6)
+CUT = 64  # home-leaf density: the measured whole-fetch knee
 FACT_TS_MIN = 0
 FACT_TS_MAX = 999_999_999_999_999
 FID_BYTES = 64
@@ -37,7 +34,7 @@ def valid_fid(fid):
 def parse_key(value):
     """Parse the exact 80-byte ``<15 decimal digits>:<64 lowercase hex>`` key.
 
-    This is the single address door used by manifests, removal indexes and
+    This is the single address door used by manifests, action targets and
     sync.  It intentionally rejects signs, whitespace, wider timestamps,
     Unicode digits, uppercase hex and extra colons.
     """
@@ -92,9 +89,3 @@ def stable_cut_positions(fids):
         for index, fid in enumerate(fids)
         if boundary(fid)
     ]
-
-
-def fingerprint(keys):
-    """fp over sorted keys only — the set identity the removal index
-    publishes beside its pile oid (docs/REMOVALS.md I4)."""
-    return h("|".join(keys).encode())

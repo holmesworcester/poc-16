@@ -386,9 +386,8 @@ def test_handlers_contain_no_suppression_logic():
 
 
 def test_removal_join_confluence(tmp_path):
-    """The known bug (docs/SIMPLIFY.md §5): removal before join in delivery order
-    still yields evicted=1 in the members view — insert-only removals row +
-    view, not UPDATE."""
+    """Removal before join in delivery order still yields evicted=1 in the
+    members view: an insert-only action row plus a view, never UPDATE."""
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice", ts=1)
     _, target, joined = add_member(source, workspace, "bob", ts=2)

@@ -42,4 +42,3 @@ def test_vendored_build_command_is_exact_and_documented():
     assert BUILD == bao.BUILD_COMMAND
     assert (ROOT / "native/bao_py/pyproject.toml").is_file()
     assert BUILD in (ROOT / "README.md").read_text()
-    assert BUILD in (ROOT / "docs/IMPLEMENTATION.md").read_text()

@@ -1,43 +1,34 @@
-# poc-16 — agent guide
+# POC-16 agent guide
 
-This project tracks work with **bd (beads)**, a dependency-aware issue graph.
-**Do not** use markdown TODO lists for task tracking — use bd.
+Read `README.md` for operation and `DESIGN.md` for the running model. Those
+files and this guide are the only Markdown authorities in the repository.
+Track unfinished work in beads, never in a Markdown TODO ledger.
 
-## Start here
-- **Temporary design and execution authority:** `docs/TODO.md`. The existing
-  README/DESIGN/docs corpus contains useful history but is known stale; S10 owns
-  consolidation after the recovery implementation lands.
-- **Current epic** (claimed through S10; use `bd ready --exclude-type=epic`
-  for the claimable implementation frontier):
-  - **`poc-16-kb6`** — post-cutover recovery: explicit type-owned suppression
-    selectors plus separate authorization guards, immutable removal admissions,
-    hard-capped fact/suppression/authority trees, service-exclusive
-    capacity-checked composite-root publication, and bounded Cloudflare Worker
-    reads with precomputed freshness witnesses rather than per-request rebuilds.
-    Temporary plan and bankruptcy ledger: `docs/TODO.md`.
+Start each session with:
 
-Bead bankruptcy was declared on 2026-07-27. Every bead that was active before
-`poc-16-kb6` is closed as superseded; closed history is evidence, not an
-implementation mandate. Do not reopen or copy dependencies from the old
-`808`/`jbg`/`yez`/`x1o`/`9fc`/`t9f` graphs. A requirement exists only when
-`docs/TODO.md` states it and a `poc-16-kb6.*` child owns it.
+```sh
+bd prime
+bd ready
+git status --short
+```
 
-## bd workflow
-- `bd prime` — load full workflow context (run first).
-- `bd ready --exclude-type=epic` — claimable implementation work (no active
-  blockers). The recovery epic stays claimed until S10 closes it.
-- `bd show <id>` — read a bead, e.g. `bd show poc-16-kb6.4`.
-- `bd update <id> --claim` — take a bead before starting it.
-- `bd close <id>` — mark done; releases its blocked dependents.
-- `bd dep tree poc-16-kb6` — the dependency graph.
+Use one module per fact family under `facts/auth/` or `facts/content/`.
+Families own construction, needs, validation, materialization, commands, and
+queries. Cross-family selector and authorization policy belongs in the
+exhaustive `facts/_policy.py` registry. Keep `core/` family-neutral.
 
-Each implementation bead names its `docs/TODO.md` section and dependencies.
-Do not revive bankrupt work because an older design document still describes
-it; S10 owns the final documentation consolidation.
+Every behavior change needs a realistic test. Prefer real daemon/socket
+coverage at product boundaries and direct hostile-input tests at codec and
+admission boundaries. A prose assertion is not proof of runtime behavior.
 
-## Style
-Keep poc-13 code idioms: one file per family under `facts/auth/`, the
-`SHAPE → NEEDS → VALIDATE → MODE → MATERIALIZE → COMMANDS → QUERIES` skeleton, "COMMANDS: build
-a fact, admit it, stop." See the fidelity rubric in `docs/CHAINED_AUTH_PLAN.md` §2. The port uses
-**poc-13 naming** (`workspace`/`user`/`user_invite`/`device`/…), applied as a
-mechanical first step (contract bead `poc-16-kb6.4`).
+When working in a worktree, edit only that worktree and commit completed work
+on its branch before handoff. Preserve unrelated changes and never use
+destructive checkout/reset commands against a shared workspace.
+
+Useful gates:
+
+```sh
+python3 -m pytest -q
+python3 bench/bench_latency.py 1000 5000 10000
+git diff --check
+```
