@@ -104,6 +104,11 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
         run.observe(pair.token, pair.value)
         run.record("paired read", pair)
 
+        ordinary = run.value("ordinary-put")
+        assert first.put("probe/put", ordinary) is None
+        assert second.get("probe/put") == ordinary
+        run.record("ordinary put/read", "visible")
+
         raw = run.value("immutable")
         oid = h(raw)
         assert first.put_if_absent("obj/" + oid, raw) is CREATED
@@ -203,6 +208,11 @@ async def exercise_async_store(
         assert pair == Versioned(root_a, created.token), run.diagnostic()
         run.observe(pair.token, pair.value)
         run.record("create/read root", pair)
+
+        ordinary = run.value("ordinary-put")
+        assert await first.put("probe/put", ordinary) is None
+        assert await second.get("probe/put") == ordinary
+        run.record("ordinary put/read", "visible")
 
         raw = run.value("immutable")
         oid = h(raw)

@@ -6,6 +6,7 @@ without sleeps.  The resulting history is replayable against the same small
 object-map/root-CAS state machine used by the abstract model.
 """
 from dataclasses import dataclass, field
+import random
 import threading
 
 from core.crypto import h
@@ -17,6 +18,8 @@ from core.object_store import (
     STALE,
     Versioned,
     VersionToken,
+    authoritative_key,
+    validate_key,
 )
 
 
@@ -62,16 +65,28 @@ class Commit:
     objects: tuple
 
 
-def _token(value):
-    """Opaque value token; deliberately not the content digest."""
-    return VersionToken("opaque:" + h(value)) \
-        if value is not None else ABSENT
-
-
 class ScriptedBucket:
-    def __init__(self, initial=None):
+    """Strong in-memory ObjectStore with deterministic concurrency gates.
+
+    Tokens are seeded opaque capabilities.  The default schedule deliberately
+    reuses a token when bytes return through value ABA, without deriving that
+    token from the bytes or requiring globally unique generations.
+    """
+
+    def __init__(self, initial=None, *, seed=0xC0F016):
+        if type(seed) is not int:
+            raise TypeError("integer seed required")
+        self.seed = seed
+        self._random = random.Random(seed)
+        self._value_tokens = {}
+        self._token_values = {}
         self.initial = dict(initial or {})
         self._data = dict(self.initial)
+        self._tokens = {
+            key: self._issue_token(key, value)
+            for key, value in sorted(self.initial.items())
+        }
+        self.initial_tokens = dict(self._tokens)
         self._lock = threading.Lock()
         self._rules_lock = threading.Lock()
         self._rules = []
@@ -122,43 +137,99 @@ class ScriptedBucket:
         self.history.append(event)
         return event
 
+    def _issue_token(self, key, value):
+        token = self._value_tokens.get(value)
+        if token is None:
+            while True:
+                token = VersionToken(
+                    f"opaque:{self._random.getrandbits(128):032x}")
+                incumbent = self._token_values.get(token.value)
+                if incumbent is None or incumbent == value:
+                    break
+            self._value_tokens[value] = token
+            self._token_values[token.value] = value
+        return token
+
+    def _current_token(self, key):
+        return self._tokens.get(key, ABSENT)
+
+    @staticmethod
+    def _cas_matches(key, expected, current):
+        return current == expected
+
+    def _after_cas_applied(self, key, expected, value, result):
+        pass
+
     def _get(self, actor, key):
+        validate_key(key)
         self._gate(actor, "get", key, "before")
         with self._lock:
-            before = _token(self._data.get(key))
+            before = self._current_token(key)
             result = self._data.get(key)
             self._record(
                 actor, "get", key, None, None, before, result, before)
         self._gate(actor, "get", key, "after")
         return result
 
+    def _read_versioned(self, actor, key):
+        validate_key(key)
+        self._gate(actor, "read_versioned", key, "before")
+        with self._lock:
+            before = self._current_token(key)
+            value = self._data.get(key)
+            result = ABSENT if value is None else Versioned(value, before)
+            self._record(
+                actor, "read_versioned", key, None, None,
+                before, result, before)
+        self._gate(actor, "read_versioned", key, "after")
+        return result
+
+    def _has(self, actor, key):
+        validate_key(key)
+        self._gate(actor, "has", key, "before")
+        with self._lock:
+            before = self._current_token(key)
+            result = key in self._data
+            self._record(
+                actor, "has", key, None, None,
+                before, result, before)
+        self._gate(actor, "has", key, "after")
+        return result
+
     def _put(self, actor, key, value):
-        if key == "root" or key.startswith("obj/"):
+        key = validate_key(key)
+        if not isinstance(value, bytes):
+            raise TypeError("object value must be bytes")
+        if authoritative_key(key):
             raise ValueError("authoritative keys require conditional writes")
         self._gate(actor, "put", key, "before")
         with self._lock:
-            before = _token(self._data.get(key))
+            before = self._current_token(key)
             self._data[key] = value
-            after = _token(value)
+            after = self._issue_token(key, value)
+            self._tokens[key] = after
             self._record(
                 actor, "put", key, value, None, before, after, after)
         self._gate(actor, "put", key, "after")
-        return after
 
     def _put_if_absent(self, actor, key, value):
-        addressed = key.startswith("obj/") and key[4:] == h(value) \
-            or key.startswith("pile/") and key.rsplit("/", 1)[-1] == h(value) \
-            or key.startswith("failed/pile/")
-        if not addressed:
+        key = validate_key(key)
+        if not isinstance(value, bytes):
+            raise TypeError("object value must be bytes")
+        if key == "root" or key.startswith("root/"):
+            raise ValueError("root requires compare-and-swap")
+        if key == "obj" or (
+                key.startswith("obj/") and key[4:] != h(value)):
             raise ValueError("immutable object address")
         self._gate(actor, "put_if_absent", key, "before")
         with self._lock:
-            before = _token(self._data.get(key))
+            before = self._current_token(key)
             existing = self._data.get(key)
             created = existing is None
             if created:
                 self._data[key] = value
-            after = _token(self._data.get(key))
+                self._tokens[key] = self._issue_token(key, value)
+            after = self._current_token(key)
             result = CREATED if created else EXISTS
             self._record(
                 actor, "put_if_absent", key, value, None,
@@ -167,17 +238,25 @@ class ScriptedBucket:
         return result
 
     def _cas(self, actor, key, expected, value):
+        key = validate_key(key)
+        if not isinstance(value, bytes):
+            raise TypeError("object value must be bytes")
         if key != "root":
             raise ValueError("only root is mutable by CAS")
+        if expected is not ABSENT and not isinstance(expected, VersionToken):
+            raise TypeError("version token")
         self._gate(actor, "cas", key, "before")
         with self._lock:
-            before = _token(self._data.get(key))
-            if before == expected:
+            before = self._current_token(key)
+            if self._cas_matches(key, expected, before):
                 self._data[key] = value
-                result = Applied(_token(value))
+                self._tokens[key] = self._issue_token(key, value)
+                result = Applied(self._tokens[key])
+                self._after_cas_applied(
+                    key, expected, value, result)
             else:
                 result = STALE
-            after = _token(self._data.get(key))
+            after = self._current_token(key)
             event = self._record(
                 actor, "cas", key, value, expected,
                 before, result, after)
@@ -191,6 +270,11 @@ class ScriptedBucket:
         return result
 
     def _list(self, actor, prefix):
+        if not isinstance(prefix, str):
+            raise ValueError("bad list prefix")
+        logical = prefix[:-1] if prefix.endswith("/") else prefix
+        if logical:
+            validate_key(logical)
         self._gate(actor, "list", prefix, "before")
         with self._lock:
             result = tuple(sorted(
@@ -202,12 +286,14 @@ class ScriptedBucket:
         return list(result)
 
     def _delete(self, actor, key):
-        if key == "root" or key.startswith("obj/"):
+        key = validate_key(key)
+        if authoritative_key(key):
             raise ValueError("authoritative keys are not deletable")
         self._gate(actor, "delete", key, "before")
         with self._lock:
-            before = _token(self._data.get(key))
+            before = self._current_token(key)
             existed = self._data.pop(key, None) is not None
+            self._tokens.pop(key, None)
             self._record(
                 actor, "delete", key, None, None,
                 before, existed, ABSENT)
@@ -216,42 +302,104 @@ class ScriptedBucket:
     def assert_valid_history(self):
         """Replay every completed operation and compare the terminal map."""
         data = dict(self.initial)
+        tokens = dict(self.initial_tokens)
+        token_values = {}
+        cursors = {}
+
+        def current(key):
+            return tokens.get(key, ABSENT)
+
+        def observe(key, token, value):
+            if token is ABSENT:
+                assert value is None
+                return
+            identity = (key, token.value)
+            incumbent = token_values.setdefault(identity, value)
+            assert incumbent == value
+
+        for key, value in data.items():
+            observe(key, tokens[key], value)
         for seq, event in enumerate(self.history, 1):
             assert event.seq == seq
-            before = _token(data.get(event.key)) \
-                if event.op != "list" else None
+            if event.op == "list":
+                before = None
+            elif event.op == "list_page":
+                request = event.expected
+                assert request.cursor is None \
+                    or cursors[request.cursor] == request.after_key
+                before = tuple(sorted(
+                    key for key in data
+                    if key.startswith(event.key)
+                    and (
+                        request.after_key is None
+                        or key > request.after_key)
+                ))
+            else:
+                before = current(event.key)
             assert event.before == before
             if event.op == "get":
                 assert event.result == data.get(event.key)
+                observe(event.key, before, event.result)
+            elif event.op == "read_versioned":
+                expected = ABSENT if event.key not in data else Versioned(
+                    data[event.key], before)
+                assert event.result == expected
+                if isinstance(expected, Versioned):
+                    observe(event.key, expected.token, expected.value)
+            elif event.op == "has":
+                assert event.result is (event.key in data)
+                observe(event.key, before, data.get(event.key))
             elif event.op == "put":
                 data[event.key] = event.value
-                assert event.result == _token(event.value)
+                tokens[event.key] = event.after
+                assert event.result == event.after
+                observe(event.key, event.after, event.value)
             elif event.op == "put_if_absent":
                 created = event.key not in data
                 assert event.result is (
                     CREATED if created else EXISTS)
                 if created:
                     data[event.key] = event.value
-                else:
-                    assert data[event.key] == event.value
+                    tokens[event.key] = event.after
+                observe(event.key, event.after, data[event.key])
             elif event.op == "cas":
                 if before == event.expected:
                     data[event.key] = event.value
-                    assert event.result == Applied(_token(event.value))
+                    tokens[event.key] = event.after
+                    assert event.result == Applied(event.after)
+                    observe(event.key, event.after, event.value)
                 else:
                     assert event.result is STALE
             elif event.op == "list":
                 assert event.result == tuple(sorted(
                     key for key in data if key.startswith(event.key)))
+            elif event.op == "list_page":
+                page = event.result
+                assert page.keys == before[:event.expected.limit]
+                assert page.truncated is (
+                    len(before) > event.expected.limit)
+                if page.truncated:
+                    assert page.keys
+                    assert isinstance(page.cursor, str) and page.cursor
+                    incumbent = cursors.setdefault(
+                        page.cursor, page.keys[-1])
+                    assert incumbent == page.keys[-1]
+                else:
+                    assert page.cursor is None
             elif event.op == "delete":
+                assert event.key != "root" \
+                    and not event.key.startswith("obj/")
                 assert event.result is (event.key in data)
                 data.pop(event.key, None)
+                tokens.pop(event.key, None)
             else:
                 raise AssertionError(f"unknown history operation {event.op}")
-            after = _token(data.get(event.key)) \
-                if event.op != "list" else None
+            after = before if event.op == "list_page" else (
+                current(event.key)
+                if event.op != "list" else None)
             assert event.after == after
         assert data == self._data
+        assert tokens == self._tokens
         return True
 
 
@@ -264,11 +412,10 @@ class BucketHandle:
         return self.bucket._get(self.actor, key)
 
     def read_versioned(self, key):
-        value = self.get(key)
-        return ABSENT if value is None else Versioned(value, _token(value))
+        return self.bucket._read_versioned(self.actor, key)
 
     def has(self, key):
-        return self.get(key) is not None
+        return self.bucket._has(self.actor, key)
 
     def put(self, key, value):
         return self.bucket._put(self.actor, key, value)

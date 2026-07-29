@@ -1,11 +1,13 @@
 """Deterministic provider contract and adapter fault probes."""
 import asyncio
+from itertools import count
 from pathlib import Path
 
 import pytest
 
 from adapters.r2 import R2BindingStore, R2S3Config, R2S3Store
 from adapters.s3 import S3Config, S3Store
+from core.crypto import h
 from core.object_store import (
     ABSENT,
     Applied,
@@ -28,11 +30,14 @@ from tests.provider_fakes import (
     OneShotAsyncBarrier,
     ProviderError,
 )
+from tests.shared_bucket import ScriptedBucket
 from tests.test_provider_live import (
     _cleanup_generated_store,
     _generated_prefix,
     _require_endpoint,
 )
+
+pytestmark = pytest.mark.unit
 
 
 def _s3_config(**changes):
@@ -60,6 +65,19 @@ def test_fs_store_runs_the_shared_contract(tmp_path):
     exercise_sync_store(
         lambda: FsStore(str(tmp_path)),
         ConformanceRun("fs", seed=0xF5))
+
+
+def test_scripted_bucket_runs_the_shared_contract_with_atomic_opaque_pairs():
+    bucket = ScriptedBucket(seed=0x5C71)
+    actors = count()
+
+    result = exercise_sync_store(
+        lambda: bucket.handle(f"handle-{next(actors)}"),
+        ConformanceRun("scripted-bucket", seed=0x5C71))
+
+    assert result["root"].token.value.startswith("opaque:")
+    assert result["root"].token.value != h(result["root"].value)
+    assert bucket.assert_valid_history()
 
 
 def test_s3_adapter_runs_the_shared_contract_with_opaque_aba_tokens():
