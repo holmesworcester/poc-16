@@ -414,16 +414,26 @@ opposite orders. Settlement therefore computes one deterministic fixed point:
 
 The earliest effective proposal wins a duplicate id. An action blocks an
 ordinary candidate whose canonical fact key is later; an earlier candidate
-remains admissible history. Retaining inactive receipts makes fact-first,
-action-first, and later canonical-winner changes converge without a
-descendant lookup or sender-selected edge.
+remains admissible history. Retaining inactive receipts locally makes
+fact-first, action-first, and later canonical-winner changes converge without
+a descendant lookup or sender-selected edge.
 
-This ordering is deterministic, but timestamps are author-controlled. A
-colluding live relay can therefore present a newly signed, backdated durable
-effect as historical. Remote minting still refuses the removed principal
-itself. Closing the stronger “authored before, not merely ordered before”
-distinction requires a service-issued admission frontier or receipt; it
-cannot be inferred from an asynchronous signed fact alone.
+This ordering is deterministic, but timestamps are author-controlled. That is
+intentional: removal is a knowledge and connectivity boundary, not a global
+authorship-time cutoff. A peer whose pinned snapshot still authorizes a member
+may accept that member’s fact, and the accepted fact is legitimate workspace
+history even if another peer already knows the member is removed. Once a peer
+learns the removal, grant expiry and exact Worker checks stop that member from
+directly opening a new authorized sharing channel to that peer. There is no
+serialized admission frontier and no attempt to distinguish signing time from
+first delivery.
+
+Inactive receipts are likewise local durable intent, not a second replicated
+fact set. They are absent from the eligible manifest and need not be copied to
+every fresh replica. If a retaining node later finds one eligible, ordinary
+publication can share it then; if every holder disappears first, losing that
+inactive candidate is acceptable. Convergence applies to facts replicas have
+actually exchanged, not to hypothetical equality of their latent candidates.
 
 ## Worker authorization
 
@@ -445,10 +455,12 @@ ETag matches.
 
 The daemon seals a short-lived bearer grant to the requester’s public key.
 The grant TTL is a deliberate revocation leakage window. After expiry, an
-evicted member cannot mint another remote grant. The trusted local `ctl/*`
-surface is not an authentication boundary: an evicted replica that missed its
-own action may continue writing isolated local state, but authorized peers
-refuse delivery.
+evicted member cannot mint another remote grant from a peer that knows the
+removal. The trusted local `ctl/*` surface is not an authentication boundary:
+an evicted replica that missed its own action may continue writing isolated
+local state. It need not receive a special terminal tombstone. A still-stale
+peer may legitimately accept that state; an informed peer refuses a new grant
+and therefore eventually closes the sharing boundary.
 
 ## Sync and recovery
 
@@ -502,11 +514,6 @@ These numbers are diagnostic, not cross-machine service guarantees.
 - Logical deletion stops query visibility, authorization, and future blob
   demand; it does not erase immutable objects already stored. Physical GC is
   unbuilt.
-- Strong authorship-time revocation needs serialized admission receipts, as
-  described under “Action timing.”
-- A removed node may not learn its own terminal action if it has no inbound
-  peer and its cached grant expires first. The remote door is still closed;
-  explicit tombstone delivery is a separate availability feature.
 - The current prototype assumes one workspace per store directory. Shared
   multi-workspace buckets, lifecycle policy, and production cloud deployment
   are out of scope.
