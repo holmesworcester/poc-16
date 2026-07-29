@@ -13,6 +13,7 @@ import facts
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, resolve_deps
+from .object_store import ensure_object
 
 
 class AuthorityRejected(ValueError):
@@ -32,6 +33,8 @@ class WorkspaceRuntime:
             store = node.store(ws)
             piles = store.list("pile/")
             if not piles:
+                if node.catalog(ws).staged_ids():
+                    node.commit(ws)
                 return []
             fresh_all = []
             for source in piles:
@@ -54,7 +57,7 @@ class WorkspaceRuntime:
                         valid for valid in judgment.valids
                         if node.fact_of(ws, valid.fact.fid) is not None)
                     for oid, blob in blobs.items():
-                        store.put_if_absent("obj/" + oid, blob)
+                        ensure_object(store, oid, blob)
                     node.commit(ws, settlement)
                 except Exception:
                     node._restore_authoritative_state(ws)
@@ -79,7 +82,7 @@ class WorkspaceRuntime:
                 return resolve_deps(fact_of(fid), idx) or []
 
             raw = encode_pile(close(news, deps_of, fact_of), blobs)
-            node.store(ws).put(
+            node.store(ws).put_if_absent(
                 f"pile/{node.member_for(ws)}/{h(raw)}", raw)
             fresh = self.turn()
             missing = [

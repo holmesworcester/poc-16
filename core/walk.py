@@ -10,6 +10,7 @@ from .crypto import h, unseal
 from facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
+from .object_store import ensure_object
 
 
 class Peer:
@@ -129,7 +130,8 @@ def _fetch_blobs(node, ws, peer):
                 continue
             blob = peer.obj(oid)
             if blob and h(blob) == oid:
-                fetched = st.put_if_absent("obj/" + oid, blob) or fetched
+                ensure_object(st, oid, blob)
+                fetched = True
             else:
                 whole = False
                 complete = False

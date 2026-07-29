@@ -15,17 +15,18 @@ import re
 import tempfile
 
 from .crypto import h
+from .object_store import (
+    ABSENT,
+    CREATED,
+    EXISTS,
+    Applied,
+    STALE,
+    Versioned,
+    VersionToken,
+)
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 PAGE_BATCH = 256
-
-
-def verified_object(oid, fetch):
-    """Fetch one content-addressed object and verify its name."""
-    raw = fetch(oid) if oid else None
-    if raw is None or h(raw) != oid:
-        raise ValueError("object integrity")
-    return raw
 
 
 class FsStore:
@@ -51,28 +52,47 @@ class FsStore:
         except FileNotFoundError:
             return None
 
+    def read_versioned(self, key):
+        """Read one atomic value/token pair.
+
+        A content digest is a valid opaque token for this local implementation
+        because replacement is serialized by ``_root_lock``. Provider
+        implementations return their own conditional-write token instead.
+        """
+        value = self.get(key)
+        return ABSENT if value is None else Versioned(
+            value, VersionToken(h(value)))
+
     def has(self, key):
         return os.path.exists(self._p(key))
-
-    def etag(self, key):
-        b = self.get(key)
-        return None if b is None else h(b)
 
     @staticmethod
     def _authoritative(key):
         return key == "root" or key.startswith("root/") \
             or key == "obj" or key.startswith("obj/")
 
-    def _replace(self, key, b):
-        """Atomic replacement used by CAS and deliberate fault injection."""
-        p = self._p(key)
-        directory = os.path.dirname(p)
-        os.makedirs(directory, exist_ok=True)
+    @staticmethod
+    def _temp(directory, b):
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(b)
-            os.replace(tmp, p)  # atomic
+            return tmp
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _replace(self, key, b):
+        """Atomic replacement used by CAS and fault injection."""
+        p = self._p(key)
+        directory = os.path.dirname(p)
+        os.makedirs(directory, exist_ok=True)
+        tmp = self._temp(directory, b)
+        try:
+            os.replace(tmp, p)
         except BaseException:
             try:
                 os.remove(tmp)
@@ -95,32 +115,31 @@ class FsStore:
         p = self._p(key)
         directory = os.path.dirname(p)
         os.makedirs(directory, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        tmp = self._temp(directory, b)
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(b)
             try:
                 os.link(tmp, p)
             except FileExistsError:
-                if key.startswith("obj/") and self.get(key) != b:
-                    raise ValueError("immutable object conflict")
-                return False
-            return True
+                return EXISTS
+            return CREATED
         finally:
             try:
                 os.remove(tmp)
             except FileNotFoundError:
                 pass
 
-    def cas(self, key, etag, b):
+    def cas(self, key, token, b):
         if key != "root":
             raise ValueError("only root is mutable by CAS")
         with open(self._root_lock, "a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if self.etag(key) != etag:
-                return None
+            current = self.read_versioned(key)
+            current_token = current.token \
+                if isinstance(current, Versioned) else ABSENT
+            if current_token != token:
+                return STALE
             self._replace(key, b)
-            return h(b)
+            return Applied(VersionToken(h(b)))
 
     def list(self, prefix):
         out = []
@@ -181,10 +200,6 @@ class RemoteStore:
 
     def has(self, key):
         return self.get(key) is not None
-
-    def etag(self, key):
-        value = self.get(key)
-        return h(value) if value is not None else None
 
     def list(self, prefix):
         raise TypeError("remote stores do not expose LIST")

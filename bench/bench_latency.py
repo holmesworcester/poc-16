@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bench.bench_sync import build_seed
 from core import cmds
 from core import sync as sync_module
+from core.crypto import h
+from core.object_store import CREATED
 
 
 def percentile(samples, fraction):
@@ -38,7 +40,8 @@ class SameStorePeer:
         self.cache = node.sync_cache.setdefault((workspace, url), {})
 
     def root(self, etag=None):
-        current = self.store.etag("root")
+        raw = self.store.get("root")
+        current = h(raw) if raw is not None else None
         if etag == current:
             return None
         return self.store.get("root"), current
@@ -78,7 +81,7 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
         if key.startswith("obj/"):
             touches.append((key, len(raw)))
         created = original_put_if_absent(key, raw)
-        if created and key.startswith("obj/"):
+        if created is CREATED and key.startswith("obj/"):
             writes.append((key, len(raw)))
         return created
 

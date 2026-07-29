@@ -108,12 +108,38 @@ invite/<unguessable-id>      encrypted invite blob
 failed/...                   node-local quarantine diagnostics
 ```
 
-The Store API enforces the authoritative-key rules: `root` rejects ordinary
-put and delete, `obj/*` rejects replacement and delete, object creation is
-atomic put-if-absent with hash equality, and only root CAS may replace the
-composite snapshot. The adapter's stable CAS-lock path is reserved from every
-public key operation. Piles, invites, and quarantine records remain ordinary
-non-authoritative keys.
+The writable ObjectStore API enforces the authoritative-key rules: `root`
+rejects ordinary put and delete, `obj/*` rejects replacement and delete,
+object creation is conditional, and only root CAS may replace the composite
+snapshot. A separate ObjectReader interface covers HTTP peer/root/object
+reads; its HTTP cache tag is never a writable-store CAS token. Provider SDKs
+and deployment code stay outside `core/`.
+
+`read_versioned(root)` atomically returns either `ABSENT` or exact root bytes
+paired with an opaque `VersionToken`. The token is only a comparison
+capability to pass back to CAS. It is not SHA-256, an HTTP cache tag, an ETag
+algorithm promise, or a globally unique generation. `cas` returns
+`Applied(new_token)` or definitive `STALE`; a mutation rejected before its
+linearization point raises `RetryableStoreError`, while a lost response after
+a possible mutation raises `OutcomeUnknown`.
+
+Immutable creation returns `CREATED` or `EXISTS`. The shared
+`ensure_object(oid, bytes)` boundary accepts `EXISTS` only after fetching and
+byte-verifying the incumbent. It reconciles an unknown outcome by direct read
+and never lets root CAS run until every referenced object is known present.
+FsStore refines atomic comparison/creation locally with a stable flock and
+atomic link/replace, but does not yet claim power-loss durability because it
+omits the required file and parent-directory fsync sequence. S3/R2 adapters
+use their acknowledged durable conditional writes; neither copies the POSIX
+mechanism.
+
+The authoritative access path requires acknowledged durability and strong
+direct-API visibility. Current general-purpose S3 and direct R2 Worker/S3
+APIs provide the strong per-key reads and conditional writes this design
+uses. Cached custom domains and asynchronous replicas are not conforming
+authoritative adapters. LIST is strong but paginated, and several pages are
+not one transaction. Piles, invites, and quarantine records remain
+non-authoritative operations with explicitly idempotent handling.
 
 Each workspace SQLite database contains one stable local fact catalog plus
 family-neutral derived indexes:
@@ -174,20 +200,21 @@ change but actions do not; Workers never trust it, and action evidence remains
 authoritative only through the authenticated trees.
 
 Catalog settlement returns a publication plan pinned to the exact root bytes
-and ETag that settlement read. Object and tree compilation never rereads
-`root` to adopt a newer base. A successful publisher stamps its local derived
-index with the exact bytes won by its own CAS; if another writer advances root
-before that stamp, the stamp is honestly stale and the next index
-synchronization rebuilds. It can never falsely label old local state as the
-later writer's root.
+and opaque provider token returned by one read. Object and tree compilation
+never rereads `root` to adopt a newer base. A successful publisher stores
+`h(root bytes)`, not the provider token, as its local derived-index stamp. If
+another writer advances root after that stamp, the stamp is honestly stale
+and the next index synchronization rebuilds. It can never falsely label old
+local state as the later writer's root.
 
-Rebuild force-settles the complete retained catalog, including currently
-inactive local receipts, then compiles that exact answer. If its bytes equal
-the pinned root, publication performs an ETag-checked no-op and stamps it. If
-local standing has changed, publication CASes the derived union from the
-pinned root instead. Thus a newly reactivated local receipt is either present
-in the stamped root or remains durable intent after a lost CAS; rebuild never
-stamps somebody else’s smaller snapshot as its own.
+Receipts staged before a failed or lost CAS remain in the catalog but are not
+eligible merely because a read triggers repair. Rebuild first restores the
+published root plus already committed local receipts and keeps staged intent
+behind that snapshot. The next explicit workspace turn retries the staged
+set—even if another worker already retired its original ingress key. On a
+successful CAS, only then are its staged markers cleared. A rebuild whose
+compiled bytes equal its pinned root performs a token-checked no-op before
+stamping it; a rootless no-op similarly rechecks that `root` is still absent.
 
 The range manifest partitions canonical fact keys with the stable boundary
 rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
@@ -268,16 +295,29 @@ Concurrent store users are modeled as three pieces:
 ```text
 O : oid → bytes       grow-only, content-addressed immutable objects
 R : root bytes        one linearizable compare-and-swap register
+T : opaque tokens     sound comparison capabilities for values of R
 H : root versions     the sequence of successful CAS values
 ```
 
-A publisher pins one exact `(base root, base ETag)`, derives a deterministic
+A publisher pins one exact `(base root, base token)`, derives a deterministic
 candidate from that snapshot plus its durable intent, makes every object
 reachable from the candidate visible with atomic put-if-absent, and only then
-attempts `CAS(R, base ETag, candidate)`. The CAS is the sole linearization
+attempts `CAS(R, base token, candidate)`. The CAS is the sole linearization
 point. A loser retains its intent, rereads the winning root, derives the union,
 and retries. Objects written by a crash or losing attempt are harmless
 unreachable history; they are never overwritten or deleted.
+
+Tokens obey one law: within one `(store, key)`, the same token never denotes
+different bytes. The converse is unnecessary. An `X → Y → X` value-ABA may
+reuse X's token and is safe here because root bytes completely define the
+published state and every referenced object is immutable. This must be
+revisited if later generations gain deletion, GC, or history-dependent side
+effects.
+
+A lost mutation response is not a stale precondition. Publication rereads:
+candidate bytes mean the CAS succeeded; the exact unchanged base permits one
+safe retry; any other value means rebase while retaining staged intent. If
+reconciliation itself fails, no receipt or ingress key is retired.
 
 A reader pins root bytes once. A later root is allowed to make that decision
 stale, but every manifest, tree page, fact record, suppression slot, authority
@@ -448,10 +488,10 @@ actually exchanged, not to hypothetical equality of their latent candidates.
 5. read the corresponding SuppTree slots; and
 6. return `(public_key, verb)` for sealing by the daemon.
 
-`core/mint.py` contains only this path. The CF path is `root bytes + immutable
+`core/mint.py` contains only this path. The edge path is `root bytes + immutable
 object fetches + submitted closure`: no SQLite, client catalog, client query
-state, or full-tree fallback. A cached view is reusable only while its root
-ETag matches.
+state, or full-tree fallback. A cached view is reusable only while its
+SHA-256 root content tag matches; provider CAS tokens never enter this path.
 
 The daemon seals a short-lived bearer grant to the requester’s public key.
 The grant TTL is a deliberate revocation leakage window. After expiry, an
@@ -465,7 +505,8 @@ and therefore eventually closes the sharing boundary.
 ## Sync and recovery
 
 A dial reads the remote root conditionally. A 304 against an unchanged local
-root is O(1) after blob completeness has been stamped for that ETag.
+root is O(1) after blob completeness has been stamped for that HTTP content
+tag.
 
 When roots differ, sync reconciles admitted actions first. Each ACTIVE slot and
 its evidence closure are hash-checked and kernel-validated independently; one

@@ -15,9 +15,15 @@ from . import catalog, indexes, manifest, shape, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
-from .store import RemoteStore, verified_object
+from .object_store import verified_object
+from .store import RemoteStore
 from .walk import Peer, _fetch_blobs, _push
 from .worker import WorkerView
+
+
+def _root_digest(store):
+    raw = store.get("root")
+    return h(raw) if raw is not None else None
 
 
 def _object(oid, fetch):
@@ -89,7 +95,7 @@ def sync(node, ws, url):
     cache = peer.cache
     got = peer.root(cache.get("etag"))
     if got is None:
-        local_etag = node.store(ws).etag("root")
+        local_etag = _root_digest(node.store(ws))
         if local_etag == cache.get("local"):
             if cache.get("blobs") != local_etag:
                 _, complete = _fetch_blobs(node, ws, peer)
@@ -193,7 +199,7 @@ def sync(node, ws, url):
         pulled = 1
         node.turn(ws)
     _, blobs_complete = _fetch_blobs(node, ws, peer)
-    local_etag = node.store(ws).etag("root")
+    local_etag = _root_digest(node.store(ws))
     cache.update({
         "etag": retag, "root": remote_root,
         "local": local_etag,
@@ -236,7 +242,8 @@ def pull(node, ws, oid, raw):
     """Put one verified path union into local ingress."""
     if raw is None or h(raw) != oid:
         raise ValueError("remote object integrity")
-    node.store(ws).put(f"pile/{node.member_for(ws)}/{oid}", raw)
+    node.store(ws).put_if_absent(
+        f"pile/{node.member_for(ws)}/{oid}", raw)
 
 
 def push(node, ws, peer, fids):

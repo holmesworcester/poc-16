@@ -381,7 +381,7 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
         def root(self, etag=None):
             return (
                 source.store(self.ws).get("root"),
-                source.store(self.ws).etag("root"),
+                h(source.store(self.ws).get("root")),
             )
 
         def obj(self, oid):

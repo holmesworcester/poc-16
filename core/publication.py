@@ -5,12 +5,30 @@ from typing import NamedTuple
 from . import catalog, indexes, manifest, suppression_state
 from .crypto import h
 from .kernel import resolve_deps
+from .object_store import (
+    ABSENT,
+    STALE,
+    Applied,
+    Absent,
+    OutcomeUnknown,
+    VersionToken,
+    Versioned,
+    ensure_object,
+)
 
 INDEX_VERSION = catalog.INDEX_VERSION
 
 
 class RootChanged(RuntimeError):
     """The mutable root no longer matches the snapshot this work read."""
+
+
+class RootBase(NamedTuple):
+    """One root read: logical bytes/digest plus its opaque CAS token."""
+
+    root: bytes | None
+    digest: str | None
+    token: VersionToken | Absent
 
 
 class PublicationPlan(NamedTuple):
@@ -22,7 +40,7 @@ class PublicationPlan(NamedTuple):
     authority_changed: bool
     changed_sids: tuple
     base_root: bytes | None
-    base_etag: str | None
+    base_token: VersionToken | Absent
 
 
 class Publisher:
@@ -33,8 +51,10 @@ class Publisher:
         self.workspace = workspace
 
     def root_base(self):
-        raw = self.node.store(self.workspace).get("root")
-        return raw, h(raw) if raw is not None else None
+        versioned = self.node.store(self.workspace).read_versioned("root")
+        if versioned is ABSENT:
+            return RootBase(None, None, ABSENT)
+        return RootBase(versioned.value, h(versioned.value), versioned.token)
 
     def base(self, *, pending=False):
         """Return the exact root represented by this local catalog."""
@@ -47,20 +67,20 @@ class Publisher:
             row = idx.execute(
                 "SELECT v FROM meta WHERE k='root'").fetchone()
         base = self.root_base()
-        if row != (base[1],):
+        if row != (base.digest,):
             raise RootChanged(f"{label} is not based on the current root")
         return base
 
     @staticmethod
     def plan(change, base):
-        return PublicationPlan(*change, *base)
+        return PublicationPlan(*change, base.root, base.token)
 
     def dirty(self, base):
         """Remember the publication base before catalog state moves ahead."""
         idx = self.node.idx(self.workspace)
         idx.execute(
             "INSERT OR REPLACE INTO meta VALUES('publish-base', ?)",
-            (base[1],))
+            (base.digest,))
         idx.execute("DELETE FROM meta WHERE k='root'")
 
     def same_snapshot_envelope(self, raw):
@@ -107,6 +127,9 @@ class Publisher:
         if idx.execute(
                 "SELECT 1 FROM proofs WHERE fid=?", (ws,)).fetchone() is None:
             if settlement.base_root is None:
+                if store.read_versioned("root") is not ABSENT:
+                    raise RootChanged(
+                        "root changed during rootless publication")
                 self.stamp(None, settlement.received)
             return None
 
@@ -125,7 +148,7 @@ class Publisher:
 
         def emit(raw):
             oid = h(raw)
-            store.put_if_absent("obj/" + oid, raw)
+            ensure_object(store, oid, raw)
             return oid
 
         objects = {}
@@ -177,14 +200,36 @@ class Publisher:
             action_etag=action_etag,
             layout_seed=seed, trees=trees)
         if root == settlement.base_root:
-            if store.etag("root") != settlement.base_etag:
+            current = store.read_versioned("root")
+            if current is ABSENT \
+                    or current.token != settlement.base_token \
+                    or current.value != settlement.base_root:
                 raise RootChanged("root changed during publication")
             self.stamp(root, settlement.received)
             return root
-        root_etag = store.cas("root", settlement.base_etag, root)
-        if root_etag is None:
-            raise RootChanged("root changed during publication")
-        if root_etag != h(root):
-            raise ValueError("root CAS returned the wrong version")
+        unknown = None
+        for _ in range(2):
+            try:
+                result = store.cas(
+                    "root", settlement.base_token, root)
+            except OutcomeUnknown as error:
+                unknown = error
+            else:
+                if isinstance(result, Applied):
+                    break
+                if result is not STALE:
+                    raise TypeError("conditional-replace result")
+            current = store.read_versioned("root")
+            if isinstance(current, Versioned) and current.value == root:
+                break
+            if current is ABSENT:
+                current_root, current_token = None, ABSENT
+            else:
+                current_root, current_token = current.value, current.token
+            if current_root != settlement.base_root \
+                    or current_token != settlement.base_token:
+                raise RootChanged("root changed during publication")
+        else:
+            raise unknown or RootChanged("root changed during publication")
         self.stamp(root, settlement.received)
         return root

@@ -4,6 +4,7 @@ import tempfile
 
 from core import bao, catalog
 from core.crypto import h
+from core.object_store import ensure_object
 from core.fact import Fact, Need
 from core.suppression import PARENT, selector_markers
 from .._policy import (
@@ -122,7 +123,7 @@ def send(node, workspace, channel, path, name=None, ts=None):
             if len(payload) != bao.span(index, size)[1]:
                 raise RuntimeError("Bao returned a short slice")
             cid = h(blob)
-            store.put_if_absent("obj/" + cid, blob)
+            ensure_object(store, cid, blob)
             cids.append(cid)
         if os.path.getsize(source) != size:
             raise ValueError("file changed while it was being proved")

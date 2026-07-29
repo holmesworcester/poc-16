@@ -12,6 +12,7 @@ import core.sync as sync_module
 from core import bao, cmds, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
+from core.object_store import Applied
 from core.fact import canon
 from core.node import Node
 from core.walk import _fetch_blobs
@@ -72,7 +73,8 @@ def test_v24_catalog_prebackfills_refs_before_a_republish_crash(
     foreign_value = json.loads(current)
     foreign_value["stamp"] = "composite-btreap-v4"
     foreign = canon(foreign_value)
-    assert store.cas("root", h(current), foreign) == h(foreign)
+    assert isinstance(store.cas(
+        "root", store.read_versioned("root").token, foreign), Applied)
 
     index = node.idx(workspace)
     index.execute(
@@ -312,7 +314,7 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
     url = "https://peer.invalid"
     destination.sync_cache[(workspace, url)] = {
         "etag": "unchanged",
-        "local": destination.store(workspace).etag("root"),
+        "local": h(destination.store(workspace).get("root")),
     }
 
     class CachedPeer:

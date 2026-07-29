@@ -132,13 +132,13 @@ def test_history_independence(tmp_path, world):
 
 def test_rebuild(world):
     n, ws = world
-    before = n.store(ws).etag("root")
+    before = h(n.store(ws).get("root"))
     n.idx(ws).executescript(
         "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
         "DELETE FROM meta;")
     n.rebuild(ws)
     n.commit(ws)
-    assert n.store(ws).etag("root") == before
+    assert h(n.store(ws).get("root")) == before
 
 
 def test_rebuild_rejects_a_corrupted_leaf(world):
@@ -249,11 +249,11 @@ def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
     assert all_fids(node, workspace) == [workspace]
 
 
-def test_pre_manifest_crash_replays_from_the_authoritative_root(
+def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
         tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    old_root = node.store(workspace).etag("root")
+    old_root = h(node.store(workspace).get("root"))
 
     secret, public = node.identity(workspace)
     item = message(public, "general", "survives retry", 2)
@@ -281,7 +281,7 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
 
     # Model process death at the exact merge/manifest boundary: no exception
     # handler gets to restore the derived index before its connections close.
-    assert node.store(workspace).etag("root") == old_root
+    assert h(node.store(workspace).get("root")) == old_root
     assert node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
     assert node.idx(workspace).execute(
@@ -294,7 +294,8 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
 
     reopened = Node(node.dir)
     assert reopened.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+        "SELECT COUNT(*) FROM facts").fetchone()[0] == 3
+    assert len(reopened.catalog(workspace).staged_ids()) == 2
     assert cmds.msgs(reopened, workspace) == []
     assert reopened.store(workspace).list("pile/")
 
@@ -308,8 +309,9 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
 
     assert [message["text"] for message in cmds.msgs(
         reopened, workspace)] == ["survives retry"]
+    assert reopened.catalog(workspace).staged_ids() == ()
     assert reopened.store(workspace).list("pile/") == []
-    root = reopened.store(workspace).etag("root")
+    root = h(reopened.store(workspace).get("root"))
     assert reopened.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
     assert reopened.idx(workspace).execute(
@@ -393,7 +395,7 @@ def test_failed_turn_restores_authoritative_state_before_return(
         proof_bytes, node.store(workspace).get("root"), fetch, ts)
 
     store = node.store(workspace)
-    old_root = store.etag("root")
+    old_root = h(store.get("root"))
     original_cas = store.cas
 
     def fail_manifest_cas(*args, **kwargs):
@@ -405,7 +407,7 @@ def test_failed_turn_restores_authoritative_state_before_return(
 
     # The daemon catches command failures and keeps serving. Before turn()
     # releases its lock, the old root must again govern mint and queries.
-    assert node.store(workspace).etag("root") == old_root
+    assert h(node.store(workspace).get("root")) == old_root
     assert mint.stateless(
         proof_bytes, node.store(workspace).get("root"), fetch, ts)
     assert next(
@@ -431,7 +433,7 @@ def test_failed_turn_restores_authoritative_state_before_return(
     )["evicted"] is True
     assert len(node.by_type(workspace, "evict")) == 1
     assert node.store(workspace).list("pile/") == []
-    root = node.store(workspace).etag("root")
+    root = h(node.store(workspace).get("root"))
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
     assert node.idx(workspace).execute(
@@ -497,20 +499,20 @@ def test_partial_stamp_failure_retries_in_the_same_process(
     assert [entry["text"] for entry in cmds.msgs(node, workspace)] \
         == ["stamp retry"]
     assert node.store(workspace).list("pile/") == []
-    root = node.store(workspace).etag("root")
+    root = h(node.store(workspace).get("root"))
     assert node.idx(workspace).execute(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
     assert node.idx(workspace).execute(
         "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
 
 
-def test_bulk_index_crash_cannot_preserve_unpublished_facts(
+def test_bulk_index_crash_retains_but_hides_unpublished_facts(
         tmp_path, monkeypatch):
     from bench.bench_sync import bulk_author
 
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    old_root = node.store(workspace).etag("root")
+    old_root = h(node.store(workspace).get("root"))
     bulk_author(
         node,
         workspace,
@@ -536,10 +538,14 @@ def test_bulk_index_crash_cannot_preserve_unpublished_facts(
         index.close()
 
     reopened = Node(node.dir)
-    assert reopened.store(workspace).etag("root") == old_root
+    assert h(reopened.store(workspace).get("root")) == old_root
     assert reopened.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts").fetchone() == (1,)
+        "SELECT COUNT(*) FROM facts").fetchone() == (3,)
+    assert len(reopened.catalog(workspace).staged_ids()) == 2
     assert cmds.msgs(reopened, workspace) == []
+    reopened.turn(workspace)
+    assert h(reopened.store(workspace).get("root")) != old_root
+    assert reopened.catalog(workspace).staged_ids() == ()
 
 
 def test_semantic_index_upgrade_preserves_the_published_snapshot(world):

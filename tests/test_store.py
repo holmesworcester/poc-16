@@ -10,6 +10,16 @@ import pytest
 
 from core import daemon
 from core.crypto import h
+from core.object_store import (
+    ABSENT,
+    CREATED,
+    EXISTS,
+    Applied,
+    OutcomeUnknown,
+    STALE,
+    VersionToken,
+    ensure_object,
+)
 from core.store import FsStore, RemoteStore
 from core.walk import Peer as WalkPeer
 
@@ -53,21 +63,65 @@ def test_fs_put_if_absent_is_one_atomic_immutable_create(tmp_path):
     with ThreadPoolExecutor(max_workers=len(stores)) as pool:
         results = list(pool.map(create, stores))
 
-    assert results.count(True) == 1
-    assert results.count(False) == len(stores) - 1
+    assert results.count(CREATED) == 1
+    assert results.count(EXISTS) == len(stores) - 1
     assert stores[0].get(key) == raw
     assert not tuple(tmp_path.rglob("*.tmp"))
 
     stores[0]._replace(key, b"corrupt")
     with pytest.raises(ValueError, match="conflict"):
-        stores[1].put_if_absent(key, raw)
+        ensure_object(stores[1], h(raw), raw)
     with pytest.raises(ValueError, match="address"):
         stores[1].put_if_absent("obj/" + "0" * 64, raw)
 
 
+def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
+    raw, other = b"wanted", b"wrong"
+    oid = h(raw)
+
+    class Store:
+        def __init__(self, outcomes, incumbent=None):
+            self.outcomes = list(outcomes)
+            self.value = incumbent
+            self.calls = 0
+
+        def put_if_absent(self, key, value):
+            self.calls += 1
+            outcome = self.outcomes.pop(0)
+            if outcome == "applied-unknown":
+                self.value = value
+                raise OutcomeUnknown("response lost")
+            if outcome == "unknown":
+                raise OutcomeUnknown("request state unknown")
+            if outcome is CREATED:
+                self.value = value
+            return outcome
+
+        def get(self, key):
+            return self.value
+
+    applied = Store(["applied-unknown"])
+    assert ensure_object(applied, oid, raw) is EXISTS
+    assert applied.calls == 1
+
+    retried = Store(["unknown", CREATED])
+    assert ensure_object(retried, oid, raw) is CREATED
+    assert retried.calls == 2
+
+    with pytest.raises(ValueError, match="conflict"):
+        ensure_object(Store([EXISTS], other), oid, raw)
+
+    absent = Store(["unknown", "unknown"])
+    with pytest.raises(OutcomeUnknown):
+        ensure_object(absent, oid, raw)
+    assert absent.calls == 2
+
+
 def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
     first, second = FsStore(str(tmp_path)), FsStore(str(tmp_path))
-    assert first.cas("root", None, b"base") == h(b"base")
+    result = first.cas("root", ABSENT, b"base")
+    assert result == Applied(VersionToken(h(b"base")))
+    base = first.read_versioned("root").token
 
     # Holding the bucket's stable lock prevents another handle from even
     # comparing the root. This distinguishes a shared CAS from two per-object
@@ -78,13 +132,13 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
         with pytest.raises(ValueError, match="reserved"):
             first.delete(".root.lock")
         attempt = pool.submit(
-            second.cas, "root", h(b"base"), b"after-lock")
+            second.cas, "root", base, b"after-lock")
         with pytest.raises(TimeoutError):
             attempt.result(timeout=0.1)
         fcntl.flock(held, fcntl.LOCK_UN)
-        assert attempt.result(timeout=5) == h(b"after-lock")
+        assert isinstance(attempt.result(timeout=5), Applied)
 
-    expected = h(b"after-lock")
+    expected = first.read_versioned("root").token
     start = threading.Barrier(2)
 
     def advance(store, value):
@@ -99,7 +153,8 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
                 pool.submit(advance, second, b"bob"),
             )
         ]
-    assert sum(result is not None for result in results) == 1
+    assert sum(isinstance(result, Applied) for result in results) == 1
+    assert sum(result is STALE for result in results) == 1
     assert first.get("root") in {b"alice", b"bob"}
     assert ".root.lock" not in first.list("")
     for key in (
@@ -108,7 +163,7 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
         with pytest.raises(ValueError, match="key"):
             first.put(key, b"clobber")
     with pytest.raises(ValueError, match="only root"):
-        first.cas("obj/" + h(b"x"), None, b"x")
+        first.cas("obj/" + h(b"x"), ABSENT, b"x")
     with pytest.raises(ValueError, match="conditional"):
         first.put("root", b"clobber")
     with pytest.raises(ValueError, match="compare-and-swap"):
@@ -136,7 +191,7 @@ def test_remote_store_adapts_peer_gets_without_exposing_list():
     assert store.get("root") == root
     assert store.get("obj/" + h(page)) == page
     assert store.has("obj/" + h(page))
-    assert store.etag("root") == h(root)
+    assert not hasattr(store, "read_versioned")
     with pytest.raises(TypeError, match="LIST"):
         store.list("obj/")
 

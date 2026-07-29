@@ -8,8 +8,9 @@ Winner changes replace proofs/edges; they never serialize, delete, or reinsert
 a receipt.
 
 Receipts enter with a row in ``staged``. Publication removes that marker only
-after the composite-root CAS. Recovery discards an uncommitted stage and
-replays the still-live pile, while a post-CAS crash recovers from the new root.
+after the composite-root CAS. Recovery retains uncommitted stages while
+rebuilding derived standing from the current root, so a lost CAS never depends
+on another process leaving the original ingress pile in place.
 """
 from typing import NamedTuple
 
@@ -246,7 +247,7 @@ class Catalog:
         )
 
     def stage(self, fact):
-        """Store one kernel-minted durable receipt once; return whether new."""
+        """Store one durable receipt; return whether it still awaits publish."""
         raw = encode(fact)
         row = self.db.execute(
             "SELECT blob FROM facts WHERE fid=?", (fact.fid,)).fetchone()
@@ -261,7 +262,10 @@ class Catalog:
             "INSERT OR IGNORE INTO fact_index VALUES(?,?,?,?)",
             _index_rows(fact),
         )
-        return fresh
+        return self.db.execute(
+            "SELECT 1 FROM staged WHERE fid=?",
+            (fact.fid,),
+        ).fetchone() is not None
 
     def reindex(self):
         """Rebuild the exact generic index from every retained fact blob."""
@@ -272,18 +276,6 @@ class Catalog:
             "DELETE FROM staged WHERE fid=?",
             ((fid,) for fid in fids),
         )
-
-    def discard_stage(self):
-        staged = [
-            fid for (fid,) in self.db.execute(
-                "SELECT fid FROM staged")
-        ]
-        self.db.executemany(
-            "DELETE FROM fact_index WHERE src=?", ((fid,) for fid in staged))
-        self.db.executemany(
-            "DELETE FROM facts WHERE fid=?", ((fid,) for fid in staged))
-        self.db.execute("DELETE FROM staged")
-        return tuple(staged)
 
     def shadows(self, fids):
         """Whether these receipts can change a canonical offer winner."""
@@ -336,7 +328,9 @@ class Catalog:
         )
         return tuple(fact.fid for fact in ordered if fact.fid in selected)
 
-    def settle(self, received, *, force=False, actions_dirty=False):
+    def settle(
+            self, received, *, force=False, actions_dirty=False,
+            allowed_staged=None):
         """Settle once and return the exact eligibility delta."""
         received = tuple(dict.fromkeys(received))
         received_set = set(received)
@@ -346,9 +340,23 @@ class Catalog:
             if rebuild or actions_dirty else None
         before = self.eligible_ids() - received_set \
             if rebuild or actions_dirty else None
+        rebuild_fids = None
+        if allowed_staged is not None:
+            allowed_staged = set(allowed_staged)
+            rebuild_fids = tuple(
+                fid for fid, staged in self.db.execute(
+                    "SELECT f.fid, s.fid IS NOT NULL "
+                    "FROM facts f LEFT JOIN staged s ON s.fid=f.fid")
+                if not staged or fid in allowed_staged
+            )
+
+        def rebuild_all():
+            return rebuild_proofs(
+                self.db, self.candidate, self.anchor, self._accept,
+                rebuild_fids)
+
         if rebuild:
-            rebuild_proofs(
-                self.db, self.candidate, self.anchor, self._accept)
+            rebuild_all()
         else:
             unresolved = extend_proofs(
                 self.db, received, self.candidate,
@@ -356,8 +364,7 @@ class Catalog:
             if unresolved:
                 action_before = suppression_state.snapshot(self.db)
                 before = self.eligible_ids() - received_set
-                rebuild_proofs(
-                    self.db, self.candidate, self.anchor, self._accept)
+                rebuild_all()
                 rebuild = True
             elif not actions_dirty:
                 return Eligibility(
@@ -380,8 +387,7 @@ class Catalog:
                     self.db, self.eligible, self._authorization_scopes)
                 if not changed:
                     break
-                rebuild_proofs(
-                    self.db, self.candidate, self.anchor, self._accept)
+                rebuild_all()
 
         after = self.eligible_ids()
         deactivated = before - after

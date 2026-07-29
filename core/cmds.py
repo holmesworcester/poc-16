@@ -15,14 +15,16 @@ from facts.content.file import bytes_for as file_bytes
 from facts.content.file import files, save as save_file, send as send_file
 from facts.content.message import messages as msgs
 from facts.content.message import post
+from .crypto import h
 
 
 def status(node):
     out = {"pk": node.pk, "member": node.member, "workspaces": {}}
     with node.lock:
         for workspace, entry in node.keyring["workspaces"].items():
+            root = node.store(workspace).get("root")
             out["workspaces"][workspace] = {
-                "root": node.store(workspace).etag("root"),
+                "root": h(root) if root is not None else None,
                 "facts": node.idx(workspace).execute(
                     "SELECT COUNT(*) FROM proofs").fetchone()[0],
                 "admitted": node.idx(workspace).execute(

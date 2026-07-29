@@ -9,7 +9,7 @@ from nacl.exceptions import CryptoError
 
 from core import cmds, daemon, manifest, mint
 from core.close import decode_pile, encode_pile
-from core.crypto import keypair, unseal
+from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
 from core.node import Node, now_ms
 from core.worker import WorkerView
@@ -224,7 +224,7 @@ def test_cached_worker_view_is_root_stamped(world):
         fetched.append(oid)
         return fetch(oid)
 
-    assert view.etag != store.etag("root")
+    assert view.etag != h(store.get("root"))
     assert mint.stateless(
         pile, new_root, tracked, now, view) == (node.pk, "sync")
     assert fetched

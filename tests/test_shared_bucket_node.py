@@ -11,7 +11,8 @@ from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.kernel import drain, offer_src, resolve_deps
 from core.node import Node, resident
-from core.publication import RootChanged
+from core.object_store import ABSENT, Applied, OutcomeUnknown
+from core.publication import PublicationPlan, Publisher, RootChanged
 from core.worker import WorkerView
 from facts import _policy
 from facts.auth import request
@@ -115,7 +116,7 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
 
     alice_plan = alice.merge(workspace, candidates(raw_a))
     bob_plan = bob.merge(workspace, candidates(raw_b))
-    assert alice_plan.base_etag == bob_plan.base_etag
+    assert alice_plan.base_token == bob_plan.base_token
 
     alice_root = alice.commit(workspace, alice_plan)
     with pytest.raises(RootChanged, match="root changed"):
@@ -135,6 +136,66 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
         "SELECT v FROM meta WHERE k='root'").fetchone() \
         == (h(final_root),)
     assert bucket.assert_valid_history()
+
+
+def test_opaque_token_is_not_root_content_identity(tmp_path):
+    seed = Node(str(tmp_path / "seed"))
+    workspace = cmds.create(seed, "alice", ts=1)
+    bucket, (writer,) = _shared_clones(
+        seed, workspace, tmp_path, "writer")
+
+    version = writer.store(workspace).read_versioned("root")
+    assert version.token.value.startswith("opaque:")
+    assert version.token.value != h(version.value)
+
+    cmds.post(writer, workspace, "general", "opaque CAS", ts=10)
+    stamp = writer.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone()[0]
+    current = writer.store(workspace).read_versioned("root")
+    assert stamp == h(current.value)
+    assert stamp != current.token.value
+    assert bucket.assert_valid_history()
+
+
+@pytest.mark.parametrize("applied_before_loss", (False, True))
+def test_publisher_reconciles_unknown_root_cas(
+        tmp_path, monkeypatch, applied_before_loss):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    store = node.store(workspace)
+    real_cas, calls = store.cas, 0
+
+    def ambiguous(key, token, value):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if applied_before_loss:
+                assert isinstance(real_cas(key, token, value), Applied)
+            raise OutcomeUnknown("conditional response lost")
+        return real_cas(key, token, value)
+
+    monkeypatch.setattr(store, "cas", ambiguous)
+    fid = cmds.post(node, workspace, "general", "survives ambiguity", ts=2)
+
+    assert node.fact_of(workspace, fid) is not None
+    assert node.catalog(workspace).staged_ids() == ()
+    assert store.list("pile/") == []
+    assert calls == (1 if applied_before_loss else 2)
+
+
+def test_rootless_publication_does_not_stamp_across_bootstrap(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = "f" * 64
+    node.add_workspace(workspace, "empty", [])
+    store = node.store(workspace)
+    assert isinstance(store.cas("root", ABSENT, b"foreign"), Applied)
+    plan = PublicationPlan(
+        (), (), (), False, (), None, ABSENT)
+
+    with pytest.raises(RootChanged, match="rootless"):
+        Publisher(node, workspace).publish(plan)
+    assert node.idx(workspace).execute(
+        "SELECT v FROM meta WHERE k='root'").fetchone() is None
 
 
 def test_post_cas_stamp_records_its_own_root_not_a_later_writers(tmp_path):

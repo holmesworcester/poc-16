@@ -30,7 +30,8 @@ from .kernel import (
 )
 from .publication import INDEX_VERSION, Publisher, RootChanged
 from .runtime import WorkspaceRuntime
-from .store import FsStore, verified_object
+from .object_store import ABSENT, ensure_object, verified_object
+from .store import FsStore
 
 SUPP_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS supp(fid TEXT, k TEXT, PRIMARY KEY(fid, k));",
@@ -94,10 +95,11 @@ def resident(man, fetch, anchor=None):
 
 
 class Node:
-    def __init__(self, dir, initial_secret=None):
+    def __init__(self, dir, initial_secret=None, *, store_factory=None):
         self.dir = dir
         os.makedirs(dir, exist_ok=True)
         self.lock = threading.RLock()
+        self._store_factory = store_factory
         self.url = None  # the daemon sets its advertised base URL
         self._kr_path = os.path.join(dir, "keyring.json")
         self.keychain = Keychain(self._kr_path, initial_secret)
@@ -223,9 +225,11 @@ class Node:
                 if workspace == ws
             ]
 
-    def store(self, ws) -> FsStore:
+    def store(self, ws):
         if ws not in self._stores:
-            self._stores[ws] = FsStore(os.path.join(self.dir, "ws", ws))
+            self._stores[ws] = self._store_factory(ws) \
+                if self._store_factory is not None \
+                else FsStore(os.path.join(self.dir, "ws", ws))
         return self._stores[ws]
 
     def idx(self, ws):
@@ -242,13 +246,15 @@ class Node:
     def _sync_index(self, ws):
         """Rebuild derived standing when the catalog's root stamp is stale."""
         for _ in range(8):
-            etag = self.store(ws).etag("root")
+            versioned = self.store(ws).read_versioned("root")
+            root_digest = None if versioned is ABSENT \
+                else h(versioned.value)
             idx = self.idx(ws)
             row = idx.execute("SELECT v FROM meta WHERE k='root'").fetchone()
             version = idx.execute(
                 "SELECT v FROM meta WHERE k='index-version'").fetchone()
             semantic_upgrade = version is None or version[0] != INDEX_VERSION
-            if row == (etag,) and not semantic_upgrade:
+            if row == (root_digest,) and not semantic_upgrade:
                 return
             try:
                 self.rebuild(ws, republish=semantic_upgrade)
@@ -313,7 +319,7 @@ class Node:
             fact_of,
         ))
         oid = h(raw)
-        self.store(ws).put_if_absent("obj/" + oid, raw)
+        ensure_object(self.store(ws), oid, raw)
         return oid
 
     def _refresh_action_evidence(self, ws, sids=None):
@@ -361,7 +367,9 @@ class Node:
     def turn(self, ws):
         return self.workspace(ws).turn()
 
-    def merge(self, ws, candidates, *, base=None, force=False):
+    def merge(
+            self, ws, candidates, *, base=None, force=False,
+            allowed_staged=None):
         publisher = Publisher(self, ws)
         base = publisher.base() if base is None else base
         idx, newfids = self.idx(ws), []
@@ -387,7 +395,8 @@ class Node:
                 and idx.execute(
                     "SELECT 1 FROM facts LIMIT 1").fetchone() is not None)
             change = admitted.settle(
-                newfids, force=force, actions_dirty=actions_dirty) \
+                newfids, force=force, actions_dirty=actions_dirty,
+                allowed_staged=allowed_staged) \
                 if newfids or force or actions_dirty \
                 else catalog.Eligibility((), (), (), False, ())
             changed_sids = set(change.changed_sids)
@@ -398,6 +407,11 @@ class Node:
                     self._refresh_action_evidence(ws, changed_sids))
             change = change._replace(
                 changed_sids=tuple(sorted(changed_sids)))
+            if force:
+                staged = self.catalog(ws).staged_ids()
+                change = change._replace(
+                    received=staged if allowed_staged is None else tuple(
+                        fid for fid in staged if fid in allowed_staged))
             restored = set(change.activated) - set(newfids)
             if restored:
                 self._invalidate_sync_cache(ws)
@@ -445,7 +459,7 @@ class Node:
             st, idx = self.store(ws), self.idx(ws)
             publisher = Publisher(self, ws)
             base = publisher.root_base()
-            raw, root, stream = base[0], None, []
+            raw, root, stream = base.root, None, []
             if raw:
                 try:
                     root = manifest.decode_root(raw)
@@ -456,11 +470,9 @@ class Node:
                     if not publisher.same_snapshot_envelope(raw):
                         raise ValueError(
                             "unreadable root does not match indexed snapshot")
-                    staged = self.catalog(ws).discard_stage()
-                    suppression_state.discard(idx, staged)
                     self.commit(ws, reuse=False, _base=base)
-                    raw = st.get("root")
-                    base = (raw, h(raw))
+                    base = publisher.root_base()
+                    raw = base.root
                     root = manifest.decode_root(raw)
             if root is not None:
                 if root.anchor != ws:
@@ -479,16 +491,14 @@ class Node:
                     # the foreign-stamp branch above) and read back what we
                     # just wrote.
                     self.commit(ws, reuse=False)
-                    raw = st.get("root")
-                    base = (raw, h(raw))
+                    base = publisher.root_base()
+                    raw = base.root
                     root = manifest.decode_root(raw)
                     stream = list(resident(root.manifest, fetch, ws))
                 if ws not in {fact.fid for fact in stream}:
                     raise ValueError("store fact set")
             idx.execute("BEGIN")
             try:
-                staged = self.catalog(ws).discard_stage()
-                suppression_state.discard(idx, staged)
                 # Facts and their generic index rows are the stable admitted
                 # catalog. Re-derive the generic rows exactly from canonical
                 # blobs, then rebuild root-derived eligibility, edges,
@@ -517,7 +527,8 @@ class Node:
                 idx.rollback()
                 raise
             settlement = self.merge(
-                ws, stream, base=base, force=True)
+                ws, stream, base=base, force=True,
+                allowed_staged={fact.fid for fact in stream})
             if root is not None:
                 try:
                     self._validate_root_actions(

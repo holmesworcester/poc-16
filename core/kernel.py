@@ -354,16 +354,15 @@ def extend_proofs(db, fids, fact_of, anchor=None, accept=None):
     return frozenset(unresolved)
 
 
-def rebuild_proofs(db, fact_of, anchor=None, accept=None):
+def rebuild_proofs(db, fact_of, anchor=None, accept=None, fids=None):
     """Derive eligibility and shortest ranks for the whole admitted catalog."""
     db.execute("DELETE FROM proofs")
     db.execute("DELETE FROM edges")
+    selected = fids if fids is not None else (
+        fid for (fid,) in db.execute("SELECT fid FROM facts")
+    )
     return extend_proofs(
-        db,
-        (fid for (fid,) in db.execute("SELECT fid FROM facts")),
-        fact_of,
-        anchor,
-        accept,
+        db, selected, fact_of, anchor, accept,
     )
 
 

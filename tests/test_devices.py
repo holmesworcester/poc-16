@@ -5,7 +5,7 @@ import pytest
 from core import cmds, mint
 import core.sync as sync_module
 from core.close import close, encode_pile
-from core.crypto import keypair, load_sk
+from core.crypto import h, keypair, load_sk
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import device_invite as device_invite_fact
 from facts.auth.device_invite import grant
@@ -883,7 +883,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
 
         def root(self, etag=None):
             current = remote.store(self.ws).get("root")
-            current_etag = remote.store(self.ws).etag("root")
+            current_etag = h(remote.store(self.ws).get("root"))
             return None if etag == current_etag else (
                 current, current_etag)
 

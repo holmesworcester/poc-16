@@ -4,6 +4,7 @@ import sqlite3
 
 from core import catalog, cmds, suppression_state
 from core.crypto import h
+from core.object_store import Applied
 from core.fact import Fact, canon, decode, encode
 from core.node import Node
 
@@ -202,7 +203,8 @@ def test_v23_blob_catalog_backfills_keys_before_foreign_root_republish(
     foreign_value = json.loads(current)
     foreign_value["stamp"] = "composite-btreap-v4"
     foreign = canon(foreign_value)
-    assert store.cas("root", h(current), foreign) == h(foreign)
+    assert isinstance(store.cas(
+        "root", store.read_versioned("root").token, foreign), Applied)
 
     index = node.idx(workspace)
     index.execute(

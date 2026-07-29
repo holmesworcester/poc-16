@@ -345,7 +345,7 @@ def peer_for(source, singles, batches, pushed=None):
 
         def root(self, etag=None):
             return (source.store(self.ws).get("root"),
-                    source.store(self.ws).etag("root"))
+                    h(source.store(self.ws).get("root")))
 
         def obj(self, oid):
             singles.append(oid)
@@ -512,7 +512,7 @@ def test_idle_sync_after_blob_completion_does_no_index_or_object_work(
             self.cache = node.sync_cache.setdefault((workspace, url), {})
 
         def root(self, etag=None):
-            current = source.store(self.ws).etag("root")
+            current = h(source.store(self.ws).get("root"))
             if etag == current:
                 return None
             return source.store(self.ws).get("root"), current

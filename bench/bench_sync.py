@@ -37,6 +37,7 @@ from core import catalog, cmds, manifest
 from core import node as node_module
 from core import sync as sync_module
 from core.close import close, decode_pile, encode_pile
+from core.crypto import h
 from core.fact import decode
 from facts.auth.signature import signature
 from facts.content.message import message
@@ -67,9 +68,10 @@ def _insert(idx, fact):
 def _commit_index(node, workspace):
     """Benchmark-only direct-write boundary; runtime code never uses it."""
     idx = node.idx(workspace)
+    root = node.store(workspace).get("root")
     idx.execute(
         "INSERT OR REPLACE INTO meta VALUES('publish-base', ?)",
-        (node.store(workspace).etag("root"),))
+        (h(root) if root is not None else None,))
     idx.execute("DELETE FROM meta WHERE k='root'")
     idx.execute(
         "INSERT OR REPLACE INTO meta VALUES('tree-rebuild','1')")

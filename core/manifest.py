@@ -17,7 +17,7 @@ from .close import decode_pile, encode_pile
 from .crypto import h
 from .fact import canon
 from .shape import boundary, fid_of, is_key, key, stable_cut_positions, valid_fid
-from .store import verified_object
+from .object_store import verified_object
 
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
