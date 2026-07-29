@@ -441,6 +441,38 @@ def test_bounded_get_accepts_legal_short_reads_and_detects_true_edges():
     assert over.closed
 
 
+def test_bounded_get_accumulates_realistic_one_byte_fragments():
+    class Fragmented:
+        def __init__(self, size):
+            self.value = b"x" * size
+            self.offset = 0
+            self.reads = 0
+            self.closed = False
+
+        def read(self, amount):
+            assert amount > 0
+            self.reads += 1
+            if self.offset == len(self.value):
+                return b""
+            chunk = self.value[self.offset:self.offset + 1]
+            self.offset += 1
+            return chunk
+
+        def close(self):
+            self.closed = True
+
+    size = 64 * 1024
+    body = Fragmented(size)
+    store = S3Store(config(), client=ScriptedClient(get_object=[{
+        "Body": body,
+        "ContentLength": size,
+    }]))
+
+    assert store.get_bounded("obj/" + "0" * 64, size) == b"x" * size
+    assert body.reads == size + 1
+    assert body.closed
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [

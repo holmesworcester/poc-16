@@ -387,10 +387,9 @@ class S3Store:
                 raise PayloadTooLarge(
                     f"S3 {operation} response exceeds byte limit")
             ceiling = declared if declared is not None else max_bytes
-            chunks = []
-            total = 0
+            value = bytearray()
             while True:
-                amount = ceiling - total + 1
+                amount = ceiling - len(value) + 1
                 chunk = body.read(amount)
                 if not isinstance(chunk, bytes):
                     raise StoreError(
@@ -400,18 +399,17 @@ class S3Store:
                         f"S3 {operation} response exceeded read request")
                 if not chunk:
                     break
-                chunks.append(chunk)
-                total += len(chunk)
-                if declared is not None and total > declared:
+                value.extend(chunk)
+                if declared is not None and len(value) > declared:
                     raise StoreError(
                         f"S3 {operation} response ContentLength mismatch")
-                if total > max_bytes:
+                if len(value) > max_bytes:
                     raise PayloadTooLarge(
                         f"S3 {operation} response exceeds byte limit")
-            if declared is not None and total != declared:
+            if declared is not None and len(value) != declared:
                 raise StoreError(
                     f"S3 {operation} response ContentLength mismatch")
-            value = b"".join(chunks)
+            value = bytes(value)
         except (PayloadTooLarge, StoreError):
             raise
         except Exception as error:
