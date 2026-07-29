@@ -28,6 +28,8 @@
     "MAX_BATCH_BYTES": 4194304,
     "MAX_MINT_FETCHES": 48,
     "MAX_MINT_FETCH_BYTES": 393216,
+    "MAX_QUERY_BYTES": 4096,
+    "MAX_QUERY_FIELDS": 8,
     "GRANT_TTL_MS": 60000
   },
   "secrets": {

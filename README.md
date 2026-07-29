@@ -113,22 +113,42 @@ export CF_STORE_PREFIX=workspaces/$CF_WORKSPACE
 export CF_R2_BUCKET=poc16-production
 export CF_R2_PREVIEW_BUCKET=poc16-preview
 export CF_WORKER_NAME=poc-16-readonly-gateway
+export CF_DEPLOYMENT_OWNER=my-stable-deployment-id
 export CF_ROUTE='gateway.example.com/*'
 export CF_ZONE_NAME=example.com
+export CLOUDFLARE_ACCOUNT_ID=32_LOWERCASE_HEX_CHARACTERS
+export CLOUDFLARE_API_TOKEN=WORKERS_SCRIPTS_READ_AND_WRITE_TOKEN
 export GRANT_SECRET=BASE64_OF_ONE_STABLE_32_BYTE_SECRET
 
 python3 deploy/cloudflare_worker/manage.py build
+CF_CREATE=1 python3 deploy/cloudflare_worker/manage.py deploy
 python3 deploy/cloudflare_worker/manage.py deploy
 python3 deploy/cloudflare_worker/manage.py remove
 ```
 
 `deploy` passes the secret through Wrangler's encrypted secret upload and
-never writes it to the generated config. The checked-in config has no public
-route and cannot accidentally target a real bucket. `smoke` is an explicit
-live test: set `CF_LIVE_SMOKE=1` and `CF_SMOKE_MINT_FILE` to a Python-generated
-mint request whose snapshot already exists at the configured prefix. It
-deploys a unique workers.dev Worker, verifies authorization, and removes that
-Worker in a `finally` path without changing or deleting R2 data.
+never writes it to the generated config. First creation additionally requires
+`CF_CREATE=1`; later deploys and every removal read the Worker settings through
+Cloudflare's direct API and require the exact non-secret
+`CF_DEPLOYMENT_OWNER` marker. Missing, malformed, and mismatched settings fail
+closed before Wrangler can overwrite or delete the named script, and every
+Wrangler mutation has a 120-second deadline. Cloudflare does not make the
+settings read and later script mutation one conditional operation: deploy and
+remove therefore assume one trusted deployment administrator and must be
+externally serialized. The ownership marker prevents accidental targeting; it
+is not a control-plane CAS against a concurrent administrator. The checked-in
+config has no public route and cannot accidentally target a real bucket.
+A deadline is a client-side bound, not proof that Cloudflare made no change;
+after a timeout, inspect the exact owned script state before deciding whether
+to retry.
+
+`smoke` is an explicit live test: set `CF_LIVE_SMOKE=1` and
+`CF_SMOKE_MINT_FILE` to a Python-generated mint request whose snapshot already
+exists at the configured prefix. It establishes that its random workers.dev
+name is absent before deployment, verifies authorization, and then removes
+that exact name even if Wrangler applied the deployment before reporting a
+failure. Primary and cleanup failures are both reported; neither path changes
+or deletes R2 data.
 
 ## Test and measure
 

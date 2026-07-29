@@ -11,7 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 PACKAGE = Path(__file__).resolve().parent
@@ -26,6 +27,13 @@ TEST_FILE = PACKAGE / "test_worker.py"
 FID = re.compile(r"^[0-9a-f]{64}$")
 STORE_KEY = re.compile(r"^[a-z0-9:._/-]+$")
 WORKERS_URL = re.compile(r"https://[a-z0-9.-]+\.workers\.dev")
+WORKER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
+OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
+API_RESPONSE_BYTES = 64 * 1024
+CONTROL_TIMEOUT_SECONDS = 120
+_ABSENT = object()
 
 CORE_MODULES = (
     "__init__.py",
@@ -125,7 +133,8 @@ def stage():
     pending.rename(WORKER)
 
 
-def _run(command, *, capture=False, input_text=None, env=None):
+def _run(
+        command, *, capture=False, input_text=None, env=None, timeout=None):
     try:
         return subprocess.run(
             command,
@@ -135,17 +144,19 @@ def _run(command, *, capture=False, input_text=None, env=None):
             text=True,
             input=input_text,
             env=env,
+            timeout=timeout,
         )
     except FileNotFoundError as error:
         raise RuntimeError(
             f"required executable is unavailable: {command[0]}") from error
 
 
-def _pywrangler(*arguments, capture=False, env=None):
+def _pywrangler(*arguments, capture=False, env=None, timeout=None):
     return _run(
         ["uv", "run", "pywrangler", *arguments],
         capture=capture,
         env=env,
+        timeout=timeout,
     )
 
 
@@ -173,14 +184,20 @@ def generated_config(environment=os.environ, *, smoke=False):
     config = json.loads(TEMPLATE.read_text())
     workspace = environment.get("CF_WORKSPACE")
     bucket = environment.get("CF_R2_BUCKET")
+    owner = environment.get("CF_DEPLOYMENT_OWNER")
     if not FID.fullmatch(workspace or ""):
         raise ValueError("CF_WORKSPACE must be 64 lowercase hex characters")
     if not bucket:
         raise ValueError("CF_R2_BUCKET is required")
+    if not OWNER.fullmatch(owner or ""):
+        raise ValueError(
+            "CF_DEPLOYMENT_OWNER must be 8-128 identifier characters")
     prefix = _store_prefix(environment.get(
         "CF_STORE_PREFIX", f"workspaces/{workspace}").strip("/"))
     config["name"] = environment.get(
         "CF_WORKER_NAME", "poc-16-readonly-gateway")
+    if not WORKER_NAME.fullmatch(config["name"]):
+        raise ValueError("CF_WORKER_NAME is not a safe Worker script name")
     config["r2_buckets"][0].update({
         "bucket_name": bucket,
         "preview_bucket_name": environment.get(
@@ -188,8 +205,9 @@ def generated_config(environment=os.environ, *, smoke=False):
     })
     config["vars"]["WORKSPACE"] = workspace
     config["vars"]["STORE_PREFIX"] = prefix
+    config["vars"][OWNER_BINDING] = owner
     if smoke:
-        config["name"] = f"poc16-smoke-{os.urandom(6).hex()}"
+        config["name"] = f"poc16-smoke-{os.urandom(16).hex()}"
         config["workers_dev"] = True
         config["routes"] = []
     else:
@@ -317,7 +335,9 @@ def dev(extra):
     _pywrangler("dev", *extra, env=os.environ)
 
 
-def _deploy(config, secret, *, capture=False):
+def _deploy(
+        config, secret, *, capture=False,
+        timeout=CONTROL_TIMEOUT_SECONDS):
     _write_config(config)
     with tempfile.NamedTemporaryFile(
             mode="w", prefix="poc16-secrets-", suffix=".json") as secrets:
@@ -329,22 +349,129 @@ def _deploy(config, secret, *, capture=False):
             "--secrets-file", secrets.name,
             capture=capture,
             env=os.environ,
+            timeout=timeout,
         )
 
 
-def deploy():
-    _deploy(generated_config(), _secret(os.environ))
+def _control_environment(environment=os.environ):
+    account = environment.get("CLOUDFLARE_ACCOUNT_ID", "")
+    token = environment.get("CLOUDFLARE_API_TOKEN", "")
+    if not ACCOUNT_ID.fullmatch(account):
+        raise ValueError(
+            "CLOUDFLARE_ACCOUNT_ID must be 32 lowercase hex characters")
+    if not token:
+        raise ValueError("CLOUDFLARE_API_TOKEN is required")
+    return account, token
 
 
-def remove(*, force=False, config=None):
-    config = generated_config() if config is None else config
+def _worker_settings(config, environment=os.environ):
+    """Read the deployed binding marker through Cloudflare's direct API."""
+    account, token = _control_environment(environment)
+    name = config["name"]
+    if not WORKER_NAME.fullmatch(name):
+        raise ValueError("unsafe Worker script name")
+    endpoint = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{quote(account, safe='')}/workers/scripts/"
+        f"{quote(name, safe='')}/settings"
+    )
+    request = Request(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            raw = response.read(API_RESPONSE_BYTES + 1)
+    except HTTPError as error:
+        if error.code == 404:
+            return _ABSENT
+        raise RuntimeError("Cloudflare Worker ownership lookup failed") \
+            from error
+    except (OSError, URLError) as error:
+        raise RuntimeError("Cloudflare Worker ownership lookup failed") \
+            from error
+    if len(raw) > API_RESPONSE_BYTES:
+        raise RuntimeError("Cloudflare Worker settings response is too large")
+    try:
+        document = json.loads(raw)
+        if not isinstance(document, dict) \
+                or document.get("success") is not True \
+                or not isinstance(document.get("result"), dict):
+            raise ValueError
+        bindings = document["result"].get("bindings")
+        if not isinstance(bindings, list):
+            raise ValueError
+        matches = [
+            binding for binding in bindings
+            if isinstance(binding, dict)
+            and binding.get("name") == OWNER_BINDING
+        ]
+        if len(matches) != 1 \
+                or matches[0].get("type") != "plain_text" \
+                or not isinstance(matches[0].get("text"), str):
+            return None
+        return matches[0]["text"]
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("malformed Cloudflare Worker settings response") \
+            from error
+
+
+def _expected_owner(config):
+    owner = config.get("vars", {}).get(OWNER_BINDING)
+    if not OWNER.fullmatch(owner or ""):
+        raise ValueError("generated Worker config has no valid owner")
+    return owner
+
+
+def _preflight_deploy(config, *, allow_create):
+    observed = _worker_settings(config)
+    if observed is _ABSENT:
+        if not allow_create:
+            raise RuntimeError(
+                "Worker is absent; set CF_CREATE=1 for explicit creation")
+        return
+    if observed != _expected_owner(config):
+        raise RuntimeError("refusing to overwrite an unowned Worker")
+
+
+def _require_owned(config):
+    if _worker_settings(config) != _expected_owner(config):
+        raise RuntimeError("refusing to mutate an absent or unowned Worker")
+
+
+def _delete(
+        config, *, force=False,
+        timeout=CONTROL_TIMEOUT_SECONDS):
     _write_config(config)
     arguments = [
         "delete", config["name"], "--config", str(GENERATED),
     ]
     if force:
         arguments.append("--force")
-    _pywrangler(*arguments, env=os.environ)
+    _pywrangler(
+        *arguments,
+        env=os.environ,
+        timeout=timeout,
+    )
+
+
+def deploy():
+    config = generated_config()
+    _preflight_deploy(
+        config,
+        allow_create=os.environ.get("CF_CREATE") == "1",
+    )
+    _deploy(config, _secret(os.environ))
+    _require_owned(config)
+
+
+def remove(*, force=False, config=None):
+    config = generated_config() if config is None else config
+    _require_owned(config)
+    _delete(config, force=force)
 
 
 def smoke():
@@ -356,10 +483,14 @@ def smoke():
         raise ValueError("CF_SMOKE_MINT_FILE is required")
     request_body = Path(request_path).read_bytes()
     config = generated_config(smoke=True)
-    deployed = False
+    if _worker_settings(config) is not _ABSENT:
+        raise RuntimeError("generated smoke Worker name already exists")
+    attempted = False
+    primary = None
     try:
+        attempted = True
         result = _deploy(config, _secret(os.environ), capture=True)
-        deployed = True
+        _require_owned(config)
         print(result.stdout, end="")
         match = WORKERS_URL.search(result.stdout + result.stderr)
         if match is None:
@@ -376,9 +507,23 @@ def smoke():
             if response.status != 200 \
                     or value.get("cap") != "sync-v1/read":
                 raise RuntimeError("live mint smoke failed")
-    finally:
-        if deployed:
-            remove(force=True, config=config)
+    except Exception as error:
+        primary = error
+    cleanup = None
+    if attempted:
+        try:
+            _delete(config, force=True, timeout=60)
+        except Exception as error:
+            cleanup = error
+    if primary is not None and cleanup is not None:
+        raise ExceptionGroup(
+            "Cloudflare smoke and cleanup both failed",
+            [primary, cleanup],
+        )
+    if primary is not None:
+        raise primary
+    if cleanup is not None:
+        raise cleanup
 
 
 def help_text():

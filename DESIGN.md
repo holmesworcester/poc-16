@@ -178,9 +178,22 @@ snapshot construction.
 The Worker receives one direct `BUCKET` R2 binding, one exact `WORKSPACE`,
 one exact `STORE_PREFIX`, and one required encrypted `GRANT_SECRET`. Production
 config generation requires an explicit route and leaves workers.dev disabled.
+The host-side deployment tool also puts a stable, non-secret ownership marker
+in the Worker bindings. It reads that marker through Cloudflare's direct
+settings API before every update or delete and verifies it after deployment;
+absence permits creation only with an explicit create flag. Smoke deployments
+use a random name whose absence was established before upload, then treat the
+upload as possibly applied until that exact name has been deleted.
+Cloudflare exposes no conditional script mutation coupled to that settings
+read, so this protects against accidental targets under one trusted,
+externally serialized deployment administrator; it does not claim safety
+against a concurrent administrator replacing a script in the preflight gap.
+All Wrangler mutation subprocesses have finite deadlines.
 The application caps request bodies at 512 KiB while streaming, root at
 64 KiB, individual objects at 4 MiB, object batches at 48 items/4 MiB, and
-mint authorization at 48 unique fetches/384 KiB. It exposes only health,
+mint authorization at 48 unique fetches/384 KiB. It rejects raw queries above
+4 KiB or eight fields before percent decoding or gateway/R2 work. It exposes
+only health,
 mint, invite, root, and authenticated object reads; the R2 capability passed
 to the gateway has only `get` and `has`. The opt-in live smoke command uses a
 unique workers.dev deployment, never mutates R2, and removes the Worker even

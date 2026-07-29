@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import pytest
 
@@ -267,6 +268,51 @@ def test_runtime_streams_request_body_only_to_its_hard_limit(
     assert declared.bytes_calls == 0
 
 
+def test_runtime_bounds_query_bytes_and_field_count_before_gateway_io(
+        tmp_path, monkeypatch):
+    _, workspace, _, bucket, environment = worker_world(
+        tmp_path, monkeypatch)
+    environment.MAX_QUERY_BYTES = 80
+    environment.MAX_QUERY_FIELDS = 3
+    before = list(bucket.calls)
+
+    exact_query = "ws=" + "a" * 77
+    exact = run(runtime.handle(Request(
+        "GET", f"https://worker.example/root?{exact_query}"), environment))
+    over = run(runtime.handle(Request(
+        "GET", f"https://worker.example/root?{exact_query}a"), environment))
+    fields = run(runtime.handle(Request(
+        "GET", "https://worker.example/healthz?a=1&b=2&c=3"),
+        environment))
+    too_many = run(runtime.handle(Request(
+        "GET", "https://worker.example/healthz?a=1&b=2&c=3&d=4"),
+        environment))
+
+    assert exact.status == 404
+    assert over.status == 414
+    assert fields.status == 200
+    assert too_many.status == 400
+    assert bucket.calls == before
+
+
+@pytest.mark.parametrize("query", (
+    "ws=%",
+    "ws=%2",
+    "ws=%GG",
+    "ws=%FF",
+))
+def test_runtime_rejects_malformed_query_encoding_before_gateway_io(
+        tmp_path, monkeypatch, query):
+    _, _, _, bucket, environment = worker_world(tmp_path, monkeypatch)
+    before = list(bucket.calls)
+
+    response = run(runtime.handle(Request(
+        "GET", f"https://worker.example/root?{query}"), environment))
+
+    assert response.status == 400
+    assert bucket.calls == before
+
+
 def test_workerd_sealed_box_is_wire_compatible_with_native_pynacl():
     secret = load_sk("24" * 32)
     public = secret.verify_key.encode().hex()
@@ -338,6 +384,7 @@ def test_generated_config_is_single_workspace_least_privilege():
         "CF_R2_BUCKET": "production",
         "CF_R2_PREVIEW_BUCKET": "preview",
         "CF_WORKER_NAME": "gateway",
+        "CF_DEPLOYMENT_OWNER": "production-primary",
         "CF_ROUTE": "gateway.example.com/*",
         "CF_ZONE_NAME": "example.com",
     }
@@ -358,6 +405,7 @@ def test_generated_config_is_single_workspace_least_privilege():
     }]
     assert config["vars"]["WORKSPACE"] == "a" * 64
     assert config["vars"]["STORE_PREFIX"] == f"workspaces/{'a' * 64}"
+    assert config["vars"][manage.OWNER_BINDING] == "production-primary"
     assert config["secrets"]["required"] == ["GRANT_SECRET"]
     assert "GRANT_SECRET" not in config["vars"]
 
@@ -386,13 +434,348 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     ("CF_R2_BUCKET", ""),
     ("CF_ROUTE", ""),
     ("CF_STORE_PREFIX", "../escape"),
+    ("CF_DEPLOYMENT_OWNER", "short"),
+    ("CF_WORKER_NAME", "Unsafe Worker"),
 ])
 def test_generated_config_rejects_ambiguous_deployment_input(field, value):
     environment = {
         "CF_WORKSPACE": "a" * 64,
         "CF_R2_BUCKET": "production",
+        "CF_DEPLOYMENT_OWNER": "production-primary",
         "CF_ROUTE": "gateway.example.com/*",
         field: value,
     }
     with pytest.raises(ValueError):
         manage.generated_config(environment)
+
+
+def deployment_config(name="gateway", owner="production-primary"):
+    return {
+        "name": name,
+        "vars": {manage.OWNER_BINDING: owner},
+    }
+
+
+class APIResponse:
+    def __init__(self, document):
+        self.raw = document if isinstance(document, bytes) else json.dumps(
+            document).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, amount):
+        assert amount == manage.API_RESPONSE_BYTES + 1
+        return self.raw[:amount]
+
+
+def api_document(owner="production-primary"):
+    binding = [] if owner is None else [{
+        "name": manage.OWNER_BINDING,
+        "type": "plain_text",
+        "text": owner,
+    }]
+    return {"success": True, "result": {"bindings": binding}}
+
+
+def control_environment():
+    return {
+        "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
+        "CLOUDFLARE_API_TOKEN": "not-logged",
+    }
+
+
+def test_worker_ownership_lookup_uses_bounded_direct_api_response(
+        monkeypatch):
+    seen = []
+
+    def open_api(request, timeout):
+        seen.append((request, timeout))
+        return APIResponse(api_document())
+
+    monkeypatch.setattr(manage, "urlopen", open_api)
+
+    owner = manage._worker_settings(
+        deployment_config(),
+        control_environment(),
+    )
+
+    assert owner == "production-primary"
+    request, timeout = seen[0]
+    assert request.full_url.endswith(
+        "/accounts/" + "a" * 32 + "/workers/scripts/gateway/settings")
+    assert request.get_header("Authorization") == "Bearer not-logged"
+    assert timeout == 15
+
+
+@pytest.mark.parametrize("response", (
+    b"{",
+    json.dumps({"success": False, "result": {}}).encode(),
+    json.dumps({"success": True, "result": []}).encode(),
+    b"x" * (manage.API_RESPONSE_BYTES + 1),
+))
+def test_worker_ownership_lookup_rejects_malformed_or_oversized_api(
+        monkeypatch, response):
+    monkeypatch.setattr(
+        manage,
+        "urlopen",
+        lambda *_args, **_kwargs: APIResponse(response),
+    )
+
+    with pytest.raises(RuntimeError):
+        manage._worker_settings(
+            deployment_config(),
+            control_environment(),
+        )
+
+
+def test_worker_ownership_lookup_distinguishes_absence(monkeypatch):
+    def missing(request, timeout):
+        raise HTTPError(request.full_url, 404, "missing", {}, None)
+
+    monkeypatch.setattr(manage, "urlopen", missing)
+
+    assert manage._worker_settings(
+        deployment_config(),
+        control_environment(),
+    ) is manage._ABSENT
+
+
+def test_deploy_and_remove_subprocesses_have_control_plane_deadlines(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(manage, "_write_config", lambda config: None)
+    monkeypatch.setattr(
+        manage,
+        "_pywrangler",
+        lambda *arguments, **options: calls.append((arguments, options)),
+    )
+
+    config = deployment_config()
+    manage._deploy(config, "secret")
+    manage._delete(config)
+
+    assert [options["timeout"] for _, options in calls] == [
+        manage.CONTROL_TIMEOUT_SECONDS,
+        manage.CONTROL_TIMEOUT_SECONDS,
+    ]
+
+
+@pytest.mark.parametrize("observed", (None, "someone-else", manage._ABSENT))
+def test_deploy_refuses_unowned_existing_or_implicit_creation(
+        monkeypatch, observed):
+    calls = []
+    monkeypatch.setattr(manage, "_worker_settings", lambda config: observed)
+    monkeypatch.setattr(
+        manage,
+        "_deploy",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError):
+        manage._preflight_deploy(
+            deployment_config(),
+            allow_create=False,
+        )
+    assert calls == []
+
+
+def test_deploy_allows_only_exact_owner_or_explicit_first_creation(
+        monkeypatch):
+    config = deployment_config()
+
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda candidate: "production-primary",
+    )
+    manage._preflight_deploy(config, allow_create=False)
+
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda candidate: manage._ABSENT,
+    )
+    manage._preflight_deploy(config, allow_create=True)
+
+
+def test_deploy_verifies_exact_owner_after_wrangle_upload(monkeypatch):
+    config = deployment_config()
+    observed = iter(("production-primary", "production-primary"))
+    calls = []
+    monkeypatch.setattr(manage, "generated_config", lambda: config)
+    monkeypatch.setattr(manage, "_secret", lambda environment: "secret")
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda candidate: next(observed),
+    )
+    monkeypatch.setattr(
+        manage,
+        "_deploy",
+        lambda candidate, secret: calls.append((candidate, secret)),
+    )
+
+    manage.deploy()
+
+    assert calls == [(config, "secret")]
+
+
+def test_deploy_reports_post_upload_owner_mismatch(monkeypatch):
+    config = deployment_config()
+    observed = iter(("production-primary", "someone-else"))
+    uploads = []
+    monkeypatch.setattr(manage, "generated_config", lambda: config)
+    monkeypatch.setattr(manage, "_secret", lambda environment: "secret")
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda candidate: next(observed),
+    )
+    monkeypatch.setattr(
+        manage,
+        "_deploy",
+        lambda candidate, secret: uploads.append(candidate),
+    )
+
+    with pytest.raises(RuntimeError, match="unowned Worker"):
+        manage.deploy()
+    assert uploads == [config]
+
+
+@pytest.mark.parametrize("observed", (None, "someone-else", manage._ABSENT))
+def test_remove_refuses_absent_or_unowned_worker(
+        monkeypatch, observed):
+    calls = []
+    monkeypatch.setattr(manage, "_worker_settings", lambda config: observed)
+    monkeypatch.setattr(
+        manage,
+        "_delete",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError):
+        manage.remove(config=deployment_config())
+    assert calls == []
+
+
+def test_remove_deletes_only_the_exact_owned_worker(monkeypatch):
+    config = deployment_config()
+    calls = []
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda candidate: "production-primary",
+    )
+    monkeypatch.setattr(
+        manage,
+        "_delete",
+        lambda candidate, **options: calls.append((candidate, options)),
+    )
+
+    manage.remove(force=True, config=config)
+
+    assert calls == [(config, {"force": True})]
+
+
+def smoke_environment(tmp_path, monkeypatch):
+    mint = tmp_path / "mint.json"
+    mint.write_bytes(b"{}")
+    values = {
+        "CF_LIVE_SMOKE": "1",
+        "CF_SMOKE_MINT_FILE": str(mint),
+        "CF_WORKSPACE": "a" * 64,
+        "CF_R2_BUCKET": "production",
+        "CF_DEPLOYMENT_OWNER": "smoke-owner",
+        "GRANT_SECRET": base64.b64encode(b"s" * 32).decode(),
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_smoke_cleans_exact_unique_worker_after_possibly_applied_deploy(
+        tmp_path, monkeypatch):
+    smoke_environment(tmp_path, monkeypatch)
+    applied, deleted = [], []
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda config: manage._ABSENT,
+    )
+
+    def fail_after_apply(config, secret, capture=False):
+        applied.append(config)
+        raise RuntimeError("deployment response was lost")
+
+    monkeypatch.setattr(manage, "_deploy", fail_after_apply)
+    monkeypatch.setattr(
+        manage,
+        "_delete",
+        lambda config, **options: deleted.append((config, options)),
+    )
+
+    with pytest.raises(RuntimeError, match="response was lost"):
+        manage.smoke()
+
+    assert len(deleted) == 1
+    config, options = deleted[0]
+    assert config is applied[0]
+    assert config["name"].startswith("poc16-smoke-")
+    assert len(config["name"].removeprefix("poc16-smoke-")) == 32
+    assert config["workers_dev"] is True
+    assert config["routes"] == []
+    assert options == {"force": True, "timeout": 60}
+
+
+def test_smoke_does_not_delete_when_absence_preflight_fails(
+        tmp_path, monkeypatch):
+    smoke_environment(tmp_path, monkeypatch)
+    deleted = []
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda config: (_ for _ in ()).throw(
+            RuntimeError("ambiguous preflight")),
+    )
+    monkeypatch.setattr(
+        manage,
+        "_delete",
+        lambda *args, **kwargs: deleted.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous preflight"):
+        manage.smoke()
+    assert deleted == []
+
+
+def test_smoke_reports_primary_and_cleanup_failures(
+        tmp_path, monkeypatch):
+    smoke_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        manage,
+        "_worker_settings",
+        lambda config: manage._ABSENT,
+    )
+    monkeypatch.setattr(
+        manage,
+        "_deploy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("primary deploy failure")),
+    )
+    monkeypatch.setattr(
+        manage,
+        "_delete",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("cleanup failure")),
+    )
+
+    with pytest.raises(ExceptionGroup) as caught:
+        manage.smoke()
+
+    assert [str(error) for error in caught.value.exceptions] == [
+        "primary deploy failure",
+        "cleanup failure",
+    ]

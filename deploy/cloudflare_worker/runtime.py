@@ -1,6 +1,7 @@
 """Cloudflare request and binding translation around the shared Gateway."""
 import base64
 from dataclasses import dataclass
+import re
 from time import time_ns
 from urllib.parse import parse_qs, urlsplit
 
@@ -33,6 +34,8 @@ MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
 MAX_MINT_FETCHES = min(48, CORE_MAX_MINT_FETCHES)
 MAX_MINT_FETCH_BYTES = min(
     MAX_MINT_FETCHES * 8 * 1024, CORE_MAX_MINT_FETCH_BYTES)
+MAX_QUERY_BYTES = 4 * 1024
+MAX_QUERY_FIELDS = 8
 MAX_GRANT_TTL_MS = 60_000
 
 _BUDGETS = {
@@ -43,9 +46,12 @@ _BUDGETS = {
     "MAX_BATCH_BYTES": MAX_BATCH_BYTES,
     "MAX_MINT_FETCHES": MAX_MINT_FETCHES,
     "MAX_MINT_FETCH_BYTES": MAX_MINT_FETCH_BYTES,
+    "MAX_QUERY_BYTES": MAX_QUERY_BYTES,
+    "MAX_QUERY_FIELDS": MAX_QUERY_FIELDS,
     "GRANT_TTL_MS": MAX_GRANT_TTL_MS,
 }
 
+_BAD_PERCENT = re.compile(r"%(?![0-9a-fA-F]{2})")
 
 _CRYPTO_READY = False
 
@@ -102,6 +108,8 @@ class Settings:
     max_batch_bytes: int
     max_mint_fetches: int
     max_mint_fetch_bytes: int
+    max_query_bytes: int
+    max_query_fields: int
     grant_ttl_ms: int
 
     @classmethod
@@ -164,6 +172,26 @@ def gateway(settings, clock=None):
         max_mint_fetch_bytes=settings.max_mint_fetch_bytes,
         grant_ttl_ms=settings.grant_ttl_ms,
         seal=seal_to,
+    )
+
+
+def _query(url, max_bytes, max_fields):
+    """Bound the encoded query before percent decoding or field allocation."""
+    raw = str(url)
+    start = raw.find("?")
+    encoded = "" if start < 0 else raw[start + 1:].split("#", 1)[0]
+    if len(encoded) > max_bytes \
+            or len(encoded.encode("utf-8")) > max_bytes:
+        raise OverflowError("query byte budget")
+    if _BAD_PERCENT.search(encoded):
+        raise ValueError("query percent encoding")
+    return parse_qs(
+        encoded,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=max_fields,
+        encoding="utf-8",
+        errors="strict",
     )
 
 
@@ -260,11 +288,21 @@ async def handle(request, env):
     if body is None:
         return _secured(Response(413))
 
-    url = urlsplit(str(request.url))
+    try:
+        query = _query(
+            request.url,
+            settings.max_query_bytes,
+            settings.max_query_fields,
+        )
+        url = urlsplit(str(request.url))
+    except OverflowError:
+        return _secured(Response(414))
+    except (TypeError, ValueError, UnicodeError):
+        return _secured(Response(400))
     result = await gateway(settings).handle(
         method,
         url.path,
-        parse_qs(url.query, keep_blank_values=True),
+        query,
         headers,
         body,
     )
