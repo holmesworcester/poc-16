@@ -319,8 +319,16 @@ def test_layout_stamp_forces_rebuild(tmp_path):
 
 
 def pair(tmp_path):
-    """A settled multi-leaf source and a converged destination replica."""
-    source = Node(str(tmp_path / "source"))
+    """A deterministic multi-leaf source and a converged destination replica.
+
+    The fixed source identity makes the fact addresses, range cuts, and treap
+    geometry stable.  In particular, the warm-sync cost test below then
+    exercises a delta that retains old manifest pages instead of depending on
+    a lucky fresh keypair.
+    """
+    source = Node(
+        str(tmp_path / "source"),
+        initial_secret=load_sk(f"{1:064x}"))
     ws = cmds.create(source, "alice", ts=1)
     ts, cuts = 100, 0
     while cuts < 2:  # several home leaves, so subtree pruning is real
