@@ -123,6 +123,16 @@ def test_mint_accepts_exactly_one_ephemeral_request(world):
         node, workspace, encode_pile(combine(facts, second)), now) is None
 
 
+def test_daemon_mint_fails_closed_at_aggregate_fetch_budget(
+        world, monkeypatch):
+    node, workspace, _, _, pile = world
+    monkeypatch.setattr(daemon, "MINT_MAX_FETCHES", 0)
+    handler, (code, body) = invoke_mint(node, workspace, pile)
+
+    assert code == 403
+    assert body is None
+
+
 def test_family_owns_expiry_tag_and_verb(world):
     node, workspace, now, _, _ = world
     expired = encode_pile(request.payload(

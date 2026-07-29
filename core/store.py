@@ -11,7 +11,6 @@ Kernel-valid durable receipts live in the client catalog, not object keys.
 """
 import fcntl
 import os
-import re
 import tempfile
 
 from .crypto import h
@@ -23,9 +22,10 @@ from .object_store import (
     STALE,
     Versioned,
     VersionToken,
+    authoritative_key,
+    validate_key,
 )
 
-KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 PAGE_BATCH = 256
 
 
@@ -36,14 +36,7 @@ class FsStore:
         self._root_lock = os.path.join(root, ".root.lock")
 
     def _p(self, key):
-        if not isinstance(key, str) or not KEY_RE.fullmatch(key):
-            raise ValueError(f"bad key {key!r}")
-        parts = key.split("/")
-        if any(not part or part in {".", ".."} for part in parts) \
-                or parts[0] == ".root.lock" \
-                or key.startswith("root/"):
-            raise ValueError(f"reserved key {key!r}")
-        return os.path.join(self.root, key)
+        return os.path.join(self.root, validate_key(key))
 
     def get(self, key):
         try:
@@ -68,8 +61,7 @@ class FsStore:
 
     @staticmethod
     def _authoritative(key):
-        return key == "root" or key.startswith("root/") \
-            or key == "obj" or key.startswith("obj/")
+        return authoritative_key(key)
 
     @staticmethod
     def _temp(directory, b):

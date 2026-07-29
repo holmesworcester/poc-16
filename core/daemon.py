@@ -7,8 +7,6 @@ door. Invite blobs are the one ungated read; LIST on them is denied absolutely
 (there is no route).
 """
 import base64
-import hashlib
-import hmac as hmaclib
 import json
 import os
 import threading
@@ -19,12 +17,18 @@ import facts
 
 from . import cmds, manifest, mint as gate
 from .crypto import h, seal_to
+from .fetch_budget import BudgetedFetch
+from .grants import check_token as _check_token
+from .grants import make_token as _make_token
 from .node import Node, now_ms
 from .runtime import AuthorityRejected
 from .store import PAGE_BATCH
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
+MINT_MAX_FETCHES = int(os.environ.get("TINYP2P_MINT_MAX_FETCHES", 128))
+MINT_MAX_FETCH_BYTES = int(
+    os.environ.get("TINYP2P_MINT_MAX_FETCH_BYTES", 4 * 1024 * 1024))
 CORE_COMMANDS = {
     "core.rebuild": "_command_rebuild",
     "core.status": "_command_status",
@@ -62,25 +66,12 @@ class Syncer(threading.Thread):
 
 
 def make_token(secret, member, ws, verb="sync"):
-    pj = json.dumps({
-        "exp": now_ms() + GRANT_TTL, "m": member, "v": verb, "ws": ws,
-    }, sort_keys=True)
-    mac = hmaclib.new(secret, pj.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(pj.encode()).decode() + "." + mac
+    return _make_token(
+        secret, member, ws, verb, issued_at=now_ms(), ttl_ms=GRANT_TTL)
 
 
 def check_token(secret, auth, ws, verb="sync"):
-    try:
-        body, mac = auth.split(" ", 1)[1].split(".")
-        pj = base64.urlsafe_b64decode(body)
-        if not hmaclib.compare_digest(
-                hmaclib.new(secret, pj, hashlib.sha256).hexdigest(), mac):
-            return None
-        g = json.loads(pj)
-        return g["m"] if g["ws"] == ws and g["v"] == verb \
-            and g["exp"] > now_ms() else None
-    except Exception:
-        return None
+    return _check_token(secret, auth, ws, verb, trusted_now=now_ms())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -214,8 +205,13 @@ class Handler(BaseHTTPRequestHandler):
             if anchor != ws:
                 return self._send(403)
             store = self.node.store(ws)
+            fetch = BudgetedFetch(
+                lambda oid: store.get("obj/" + oid),
+                max_fetches=MINT_MAX_FETCHES,
+                max_bytes=MINT_MAX_FETCH_BYTES,
+            )
             grant = gate.stateless(
-                pile, root, lambda oid: store.get("obj/" + oid), now_ms())
+                pile, root, fetch, now_ms())
         if grant is None:
             return self._send(403)
         public, verb = grant

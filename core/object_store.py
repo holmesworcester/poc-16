@@ -17,9 +17,30 @@ without files, locks, threads, or SQLite.
 """
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Protocol
 
 from .crypto import h
+
+KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
+
+
+def validate_key(key):
+    """Validate one provider-neutral relative object key."""
+    if not isinstance(key, str) or not KEY_RE.fullmatch(key):
+        raise ValueError(f"bad key {key!r}")
+    parts = key.split("/")
+    if any(not part or part in {".", ".."} for part in parts) \
+            or parts[0] == ".root.lock" \
+            or key.startswith("root/"):
+        raise ValueError(f"reserved key {key!r}")
+    return key
+
+
+def authoritative_key(key):
+    """Whether a public unconditional mutation must reject this key."""
+    return key == "root" or key.startswith("root/") \
+        or key == "obj" or key.startswith("obj/")
 
 
 @dataclass(frozen=True)
@@ -121,6 +142,33 @@ class ObjectStore(ObjectReader, Protocol):
     def delete(self, key: str): ...
 
 
+class AsyncObjectReader(Protocol):
+    """Awaited immutable reads used by edge bindings."""
+
+    async def get(self, key: str) -> bytes | None: ...
+
+    async def has(self, key: str) -> bool: ...
+
+
+class AsyncObjectStore(AsyncObjectReader, Protocol):
+    """Awaited equivalent of the writable ObjectStore contract."""
+
+    async def read_versioned(self, key: str) -> Versioned | Absent: ...
+
+    async def put(self, key: str, value: bytes): ...
+
+    async def put_if_absent(
+            self, key: str, value: bytes) -> CreateResult: ...
+
+    async def cas(
+            self, key: str, token: VersionToken | Absent,
+            value: bytes) -> Applied | Stale: ...
+
+    async def list(self, prefix: str) -> list[str]: ...
+
+    async def delete(self, key: str): ...
+
+
 def verified_object(oid, fetch):
     """Fetch one content-addressed object and verify its name."""
     raw = fetch(oid) if oid else None
@@ -158,6 +206,33 @@ def ensure_object(store, oid, raw):
             raise TypeError("conditional-create result")
         incumbent = store.get(key)
         if incumbent != raw:
+            raise ValueError("immutable object conflict")
+        return EXISTS
+    raise unknown
+
+
+async def ensure_object_async(store, oid, raw):
+    """Awaited equivalent of :func:`ensure_object` for edge bindings."""
+    if not isinstance(oid, str) or h(raw) != oid:
+        raise ValueError("immutable object address")
+    key = "obj/" + oid
+    unknown = None
+    for _ in range(2):
+        try:
+            result = await store.put_if_absent(key, raw)
+        except OutcomeUnknown as error:
+            unknown = error
+            incumbent = await store.get(key)
+            if incumbent == raw:
+                return EXISTS
+            if incumbent is not None:
+                raise ValueError("immutable object conflict") from error
+            continue
+        if result is CREATED:
+            return CREATED
+        if result is not EXISTS:
+            raise TypeError("conditional-create result")
+        if await store.get(key) != raw:
             raise ValueError("immutable object conflict")
         return EXISTS
     raise unknown
