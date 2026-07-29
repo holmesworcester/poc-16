@@ -8,7 +8,7 @@ from core.fact import Fact, canon, decode, encode
 from core.node import Node
 
 
-def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
+def test_catalog_stores_one_blob_and_indexes_type_refs_and_offers(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     message_fid = cmds.post(
@@ -29,6 +29,8 @@ def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
         assert rows == {
             (catalog.TYPE_INDEX, fact.t, ""),
             (catalog.KEY_INDEX, fact.key, ""),
+            *((catalog.REF_INDEX, role, target)
+              for role, target in fact.refs()),
             *fact.offers(),
         }
 
@@ -182,6 +184,8 @@ def test_rebuild_replaces_stale_and_missing_generic_index_rows(tmp_path):
         )) == {
             (catalog.TYPE_INDEX, fact.t, ""),
             (catalog.KEY_INDEX, fact.key, ""),
+            *((catalog.REF_INDEX, role, target)
+              for role, target in fact.refs()),
             *fact.offers(),
         }
     assert [row["fid"] for row in cmds.msgs(node, workspace)] == [message]
@@ -249,6 +253,10 @@ def test_old_boundary_directory_is_normalized_without_republishing(tmp_path):
     index.execute(
         "CREATE INDEX fact_keys ON fact_index(k0,src) "
         "WHERE kind='fact.key'"
+    )
+    index.execute(
+        "INSERT OR REPLACE INTO meta VALUES('index-version',?)",
+        ("admission-catalog-v24",),
     )
     index.commit()
     index.close()

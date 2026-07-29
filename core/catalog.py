@@ -1,10 +1,11 @@
 """Stable fact-blob catalog plus generic indexes and derived eligibility.
 
 ``facts(fid, blob)`` is the only stored fact representation. ``fact_index``
-indexes every fact by type, reconciliation key, and every dependency-key
-offer; it never copies a fact body. ``proofs`` is the current finite canonical
-DAG: a fact is publishable exactly when it has a proof row. Winner changes
-replace proofs/edges; they never serialize, delete, or reinsert a receipt.
+indexes every fact by type, reconciliation key, explicit reference, and
+dependency-key offer; it never copies a fact body. ``proofs`` is the current
+finite canonical DAG: a fact is publishable exactly when it has a proof row.
+Winner changes replace proofs/edges; they never serialize, delete, or reinsert
+a receipt.
 
 Receipts enter with a row in ``staged``. Publication removes that marker only
 after the composite-root CAS. Recovery discards an uncommitted stage and
@@ -24,9 +25,12 @@ from .kernel import (
     extend_proofs,
     rebuild_proofs,
 )
+
 TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
-INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX))
+REF_INDEX = "fact.ref"
+INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX, REF_INDEX))
+INDEX_VERSION = "admission-catalog-v25"
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -56,6 +60,8 @@ def _index_rows(fact):
     return (
         (TYPE_INDEX, fact.t, "", fact.fid),
         (KEY_INDEX, fact.key, "", fact.fid),
+        *((REF_INDEX, role, target, fact.fid)
+          for role, target in fact.refs()),
         *((*offer, fact.fid) for offer in fact.offers()),
     )
 
@@ -83,23 +89,19 @@ def upgrade_schema(db):
     if not columns:
         return
     if "blob" in columns:
-        # v23 predates reconciliation-key rows; early v24 key rows also
-        # carried a now-removed boundary marker. Normalize either local shape
-        # before _sync_index can republish an old root.
-        needs_key_reindex = db.execute(
-            "SELECT 1 FROM facts LIMIT 1").fetchone() is not None \
-            and (
-                db.execute(
-                    "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
-                    (KEY_INDEX,)).fetchone() is None
-                or db.execute(
-                    "SELECT 1 FROM fact_index "
-                    "WHERE kind=? AND k1!='' LIMIT 1",
-                    (KEY_INDEX,)).fetchone() is not None
-            )
+        # Derived rows must reach the running version before _sync_index can
+        # republish and stamp it. This also removes early-v24 boundary markers
+        # and closes a crash window where publication could look current while
+        # key/reference routes were still old.
+        has_meta = db.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='meta'").fetchone() is not None
+        version = db.execute(
+            "SELECT v FROM meta WHERE k='index-version'").fetchone() \
+            if has_meta else None
         try:
-            if needs_key_reindex:
-                db.execute("BEGIN")
+            db.execute("BEGIN")
+            if version != (INDEX_VERSION,):
                 _reindex(db)
             db.execute("DROP TABLE IF EXISTS offers")
             db.execute("DROP TABLE IF EXISTS log")
@@ -179,12 +181,16 @@ class Catalog:
         return self.db.execute(
             "SELECT 1 FROM proofs LIMIT 1").fetchone() is not None
 
-    def indexed(self, kind, k0=None, k1=None):
+    def indexed(
+            self, kind, k0=None, k1=None, *,
+            source_type=None, source_prefix=None):
         """Current facts at one generic index address, in canonical rank order.
 
         Type rows use ``kind=fact.type`` and key rows use ``kind=fact.key``.
-        Every other row is copied mechanically from a fact's declared offers.
-        Bodies are decoded only after the index has selected ids.
+        Reference rows use ``(fact.ref, role, target_fid)``. Every other row is
+        copied mechanically from a fact's declared offers. Optional source
+        filters intersect those rows with a family type or fid prefix before
+        bodies are decoded.
         """
         clauses, args = ["i.kind=?"], [kind]
         if k0 is not None:
@@ -193,6 +199,14 @@ class Catalog:
         if k1 is not None:
             clauses.append("i.k1=?")
             args.append(k1)
+        if source_type is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM fact_index t "
+                "WHERE t.src=i.src AND t.kind=? AND t.k0=? AND t.k1='')")
+            args.extend((TYPE_INDEX, source_type))
+        if source_prefix is not None:
+            clauses.extend(("i.src>=?", "i.src<?"))
+            args.extend((source_prefix, source_prefix + "\uffff"))
         rows = self.db.execute(
             "SELECT i.src, f.blob, p.rank "
             "FROM fact_index i "

@@ -298,11 +298,13 @@ def build(
         fact_rows[action_key(sid)] = active
 
     authority_rows, candidates = {}, defaultdict(list)
+    internal = tuple(sorted(INTERNAL_INDEXES))
     for name, a0, a1, src, rank in idx.execute(
             "SELECT o.kind, o.k0, o.k1, o.src, p.rank "
             "FROM fact_index o JOIN proofs p ON p.fid=o.src "
-            "WHERE o.kind NOT IN (?,?) ORDER BY p.rank, o.src",
-            tuple(sorted(INTERNAL_INDEXES))):
+            f"WHERE o.kind NOT IN ({','.join('?' for _ in internal)}) "
+            "ORDER BY p.rank, o.src",
+            internal):
         candidates[(name, a0, a1)].append((rank, src))
         candidates[(name, a0, None)].append((rank, src))
     for address, choices in candidates.items():

@@ -2,11 +2,11 @@
 import json
 from typing import NamedTuple
 
-from . import indexes, manifest, suppression_state
+from . import catalog, indexes, manifest, suppression_state
 from .crypto import h
 from .kernel import resolve_deps
 
-INDEX_VERSION = "admission-catalog-v24"
+INDEX_VERSION = catalog.INDEX_VERSION
 
 
 class RootChanged(RuntimeError):

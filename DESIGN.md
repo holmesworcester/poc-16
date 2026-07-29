@@ -38,7 +38,7 @@ Publisher.publish                              snapshot → one root CAS
 
 root + immutable-object fetches → WorkerView   database-free CF authorization
 
-generic type/offer index → family query        client read assembly
+generic type/ref/offer index → family query    client read assembly
 ```
 
 `Node` composes local identity, workspace handles, diagnostics, and these
@@ -120,7 +120,7 @@ family-neutral derived indexes:
 
 ```text
 facts(fid, blob)                 one canonical encoded body
-fact_index(kind, k0, k1, src)   key + type + every declared offer
+fact_index(kind, k0, k1, src)   key + type + explicit refs + declared offers
 proofs / edges                   current eligibility and resolved authority
 actions / supp                   suppression frontier and selector reverse map
 ```
@@ -128,11 +128,15 @@ actions / supp                   suppression frontier and selector reverse map
 There is no application projection database and no family-owned durable
 table. A kernel-valid durable receipt is stored once; losing canonical
 standing removes its proof row, not its bytes or index rows. Every fact gets a
-`fact.key` reconciliation row, a `fact.type` row, and one row for each
-declared offer. Family queries select candidate fids through that combined
-index, load the canonical blobs, apply suppression, and assemble their view.
-Deleting the workspace catalog can still lose node-local, currently
-ineligible receipts that were deliberately never published.
+`fact.key` reconciliation row, a `fact.type` row, one `fact.ref` row for each
+explicit `(role, target fid)` reference, and one row for each declared offer.
+Family queries intersect those generic addresses before loading canonical
+blobs, then apply suppression and assemble their view. For example, a file
+read selects only `chunk --file→ descriptor` rows and verifies those immutable
+Bao objects after releasing the catalog lock. The reference rows are local
+query routes, not dependency offers or additional authority. Deleting the
+workspace catalog can still lose node-local, currently ineligible receipts
+that were deliberately never published.
 
 ### Fact versions and derived replay
 
@@ -141,8 +145,9 @@ blob catalog remains an immutable record of the originally admitted bytes, but
 derived tables must never replay that historical shape directly. Replay first
 decodes and hydrates each blob through the current version adapter, in the
 same context and into the same current form exposed when that fact is supplied
-as context to another fact. Type and dependency-key index rows, eligibility,
-and query views are then derived from that hydrated form.
+as context to another fact. Type, dependency-key, and explicit-reference
+index rows, eligibility, and query views are then derived from that hydrated
+form.
 
 Thus a version/schema change is an explicit derived-index version change:
 discard the old derived rows and replay the retained canonical blobs through

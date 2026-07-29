@@ -2,7 +2,7 @@
 import os
 import tempfile
 
-from core import bao
+from core import bao, catalog
 from core.crypto import h
 from core.fact import Fact, Need
 from core.suppression import PARENT, selector_markers
@@ -152,13 +152,7 @@ def save(node, workspace, selector, out_path):
     if record["have"] < record["total"]:
         raise ValueError(
             f"file incomplete: have {record['have']}/{record['total']} slices")
-    store = node.store(workspace)
-    parts = (
-        bao.verify(
-            store.get("obj/" + cids[index]),
-            record["root"], index, record["size"])
-        for index in range(record["total"])
-    )
+    parts = _payloads(node, workspace, record, cids)
     target = os.path.abspath(os.fspath(out_path))
     handle, temporary = tempfile.mkstemp(
         prefix=".tinyp2p-", dir=os.path.dirname(target) or ".")
@@ -184,74 +178,105 @@ def save(node, workspace, selector, out_path):
 
 
 # QUERIES
-def _file_state(node, workspace):
-    """Decode descriptors and verify resident Bao slices on demand."""
-    with node.lock:
-        descriptors = {
-            fact.fid: fact for fact in node.by_type(workspace, TAG)
-        }
-        cids = {fid: {} for fid in descriptors}
-        store = node.store(workspace)
-        for fact in node.by_type(workspace, chunkfam.TAG):
-            descriptor = descriptors.get(dict(fact.refs()).get("file"))
-            if descriptor is None:
+def _state(store, descriptor, chunks):
+    """Verify only one descriptor's selected Bao slices."""
+    body, cids = descriptor.body, {}
+    for fact in chunks:
+        child = fact.body
+        if child["root"] != body["root"] \
+                or child["n"] != body["n"] \
+                or child["pk"] != body["pk"] \
+                or child["chan"] != body["chan"]:
+            continue
+        raw = store.get("obj/" + child["cid"])
+        try:
+            if raw is None or len(raw) > bao.MAX_PROOF_BYTES \
+                    or h(raw) != child["cid"]:
                 continue
-            body, parent = fact.body, descriptor.body
-            if body["root"] != parent["root"] \
-                    or body["n"] != parent["n"] \
-                    or body["pk"] != parent["pk"] \
-                    or body["chan"] != parent["chan"]:
-                continue
-            raw = store.get("obj/" + body["cid"])
-            try:
-                if raw is None or len(raw) > bao.MAX_PROOF_BYTES \
-                        or h(raw) != body["cid"]:
-                    continue
-                bao.verify(raw, parent["root"], body["i"], parent["size"])
-            except Exception:
-                continue
-            cids[descriptor.fid].setdefault(body["i"], body["cid"])
+            bao.verify(raw, body["root"], child["i"], body["size"])
+        except Exception:
+            continue
+        cids.setdefault(child["i"], child["cid"])
 
-        records = []
-        for fact in descriptors.values():
-            body = fact.body
-            have = len(cids[fact.fid])
-            total = body["n"]
-            records.append({
-                "fid": fact.fid,
-                "chan": body["chan"],
-                "name": body["name"],
-                "size": body["size"],
-                "root": body["root"],
-                "blob": None,
-                "encoding": "bao-v1",
-                "total": total,
-                "have": have,
-                "complete": have >= total,
-                "pct": 100 if total == 0 else have * 100 // total,
-                "ts": fact.ts,
+    have, total = len(cids), body["n"]
+    return {
+        "fid": descriptor.fid,
+        "chan": body["chan"],
+        "name": body["name"],
+        "size": body["size"],
+        "root": body["root"],
+        "blob": None,
+        "encoding": "bao-v1",
+        "total": total,
+        "have": have,
+        "complete": have >= total,
+        "pct": 100 if total == 0 else have * 100 // total,
+        "ts": descriptor.ts,
+    }, cids
+
+
+def _states(node, workspace, selector=None):
+    """Pin one catalog snapshot, then verify its immutable bytes unlocked."""
+    with node.lock:
+        node._sync_index(workspace)
+        admitted = node.catalog(workspace)
+        def select(kind, k0=None, k1=None, **filters):
+            return tuple(
+                fact for _, fact in admitted.indexed(
+                    kind, k0, k1, **filters)
+                if not node.suppressed(workspace, fact)
+            )
+
+        if selector is None:
+            descriptors, target = select(catalog.TYPE_INDEX, TAG), None
+        else:
+            prefixed = select(
+                catalog.TYPE_INDEX, TAG, "", source_prefix=selector)
+            direct = {
+                fact.fid: fact for fact in prefixed if fact.fid == selector
+            }
+            direct.update({
+                fact.fid: fact for fact in select(
+                    "file", selector, source_type=TAG)
             })
-    return (
-        sorted(records, key=lambda row: (row["ts"], row["fid"])),
-        cids,
-    )
+            descriptor = min(
+                direct.values(), key=lambda fact: (fact.ts, fact.fid)
+            ) if direct else (
+                prefixed[0] if len(prefixed) == 1 else None)
+            descriptors = () if descriptor is None else (descriptor,)
+            target = descriptor.fid if descriptor is not None else None
+        chunks = () if selector is not None and not descriptors else select(
+            catalog.REF_INDEX, "file", target, source_type=chunkfam.TAG)
+        store = node.store(workspace)
+
+    by_file = {fact.fid: [] for fact in descriptors}
+    for fact in chunks:
+        parent = dict(fact.refs()).get("file")
+        if parent in by_file:
+            by_file[parent].append(fact)
+    return sorted([
+        _state(store, descriptor, by_file[descriptor.fid])
+        for descriptor in descriptors
+    ], key=lambda item: (item[0]["ts"], item[0]["fid"]))
 
 
 def files(node, workspace):
-    return _file_state(node, workspace)[0]
+    return [record for record, _ in _states(node, workspace)]
 
 
 def _resolve_state(node, workspace, selector):
-    listing, cids = _file_state(node, workspace)
-    for record in listing:
-        if selector in (record["fid"], record["root"], record["blob"]):
-            return record, cids[record["fid"]]
-    matches = [
-        record for record in listing
-        if record["fid"].startswith(selector)
-    ]
-    record = matches[0] if len(matches) == 1 else None
-    return (record, cids[record["fid"]]) if record else (None, {})
+    states = _states(node, workspace, selector)
+    return states[0] if states else (None, {})
+
+
+def _payloads(node, workspace, record, cids):
+    store = node.store(workspace)
+    return (
+        bao.verify(
+            store.get("obj/" + cids[index]),
+            record["root"], index, record["size"])
+        for index in range(record["total"])
+    )
 
 
 def resolve(node, workspace, selector):
@@ -264,13 +289,8 @@ def bytes_for(node, workspace, fid):
         return None
     if record["have"] < record["total"]:
         return record["name"], None
-    store = node.store(workspace)
-    output = bytearray()
-    for index in range(record["total"]):
-        output += bao.verify(
-            store.get("obj/" + cids[index]),
-            record["root"], index, record["size"])
-    return record["name"], bytes(output)
+    return record["name"], b"".join(
+        _payloads(node, workspace, record, cids))
 
 
 CLI = {"content.file.send": send, "content.file.save": save,
