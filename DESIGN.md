@@ -150,6 +150,36 @@ A later strong `pile/` listing clears a local attempt row when another worker
 has already retired that shared obligation; this changes presentation only
 and performs no deletion.
 
+The running cloud deployment is read-only: a host daemon still receives remote
+object/pile PUTs and performs publication. The target write path removes that
+proxy without giving clients root authority. After authorization, a broker
+signs short-lived, exact-key conditional PUT capabilities. A client uploads
+content-addressed `obj/` values first and a `pile/<member>/` intent last.
+Provider object-created events, an authenticated poke, and a scheduled fallback
+may all wake interchangeable database-free publishers. Wakeups are advisory;
+the durable pile is the work item. Publishers verify workspace, uploader,
+checksums, closure, and referenced objects, then update the authenticated
+trees and CAS root. Missing objects, throttling, crashes, and CAS loss retain
+the pile. Clients can neither list/delete the prefix nor write root.
+
+The split follows the authority actually required by each step:
+
+```text
+client     exact create-only obj and pile PUT capabilities
+broker     validates upload authority and attenuates it to exact requests
+publisher  reads workspace ingress, derives pages, CASes root, proves retirement
+reader     reads only the pinned root and its authenticated closure
+```
+
+Proxying immutable bytes through the publisher adds bandwidth and failure
+surface but no serialization point: immutable creation is already safe at the
+object store. Publication is different. It combines a validated pile with the
+current authenticated snapshot and therefore remains behind the one root CAS
+authority. A presigned request is a bearer capability, not workspace
+membership; the broker derives its exact key and signed constraints from a
+fresh workspace-bound authorization decision, and a publisher repeats all
+semantic validation before accepting the resulting pile.
+
 The production profile also treats each provider's documented RFC 9110 strong
 ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must
 change when the root bytes change. Adapters reject missing, empty, and `W/`

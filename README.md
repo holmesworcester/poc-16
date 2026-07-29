@@ -125,6 +125,37 @@ After saving one of those documents as `store.json`, start the host with:
 python3 -m core daemon ./state/alice --store-config store.json
 ```
 
+### Upload path: current and target
+
+Today, a writable host daemon is the publication boundary. Remote peers upload
+hash-addressed file objects to its `page` route and then send a closed fact
+pile to its `pile` route. The host writes those values to its configured
+filesystem, S3, or R2 store, validates the pile, builds the authenticated
+indexes, and conditionally advances `root`. The Lambda and Cloudflare
+deployments below do not accept uploads and cannot publish a workspace by
+themselves.
+
+The intended cloud path is direct-to-object-store and is not implemented yet.
+After proving workspace upload authority, a client will receive short-lived
+capabilities for exact `obj/<sha256>` keys, upload immutable file objects
+first, and finally upload one exact `pile/<member>/<sha256>` publication
+intent. The signed PUTs will bind checksum, byte ceiling, expiry, and
+`If-None-Match: *`; clients will receive no LIST, DELETE, or `root` permission.
+An S3/R2 object-created event, authenticated poke, or scheduled scan will wake
+a database-free publisher. That publisher will validate the pile and objects,
+update the authenticated trees, CAS `root`, and retire the pile only after the
+committed root proves publication. A lost event or poke will affect latency,
+not durability.
+
+There is no correctness reason to proxy immutable bytes through the publisher.
+The object store can enforce the exact key, create-only condition, checksum,
+and expiry while carrying the data directly from the client. The narrower
+boundary is intentional: uploaders may create only the objects named by their
+grants, while publishers alone may list ingress, read workspace state, create
+derived index pages, retire proven piles, and CAS `root`. If a deployment
+cannot enforce those exact conditional requests, it must keep using the host
+daemon rather than grant a broader bucket credential.
+
 ## Cloudflare read-only gateway
 
 The Cloudflare Python Worker is isolated under `deploy/cloudflare_worker`. It
