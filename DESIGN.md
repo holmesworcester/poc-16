@@ -294,10 +294,14 @@ counterpart.
 RangeTree is an authenticated wire map for synchronization and store recovery,
 not a fourth authorization index. A read-only database-free Worker does not
 need it and never scans timestamp/fid keys: `WorkerView` exact-reads only
-FactTree, SuppTree, and AuthorityTree. A store-backed publisher, whether
-locally hosted or moved to an edge later, can use the same bounded RangeTree
-neighbor operation without constructing SQLite. An edge responder may also
-serve RangeTree objects by oid without interpreting them.
+FactTree, SuppTree, and AuthorityTree. The bounded RangeTree neighbor
+operation itself is store-only, and an edge responder may serve RangeTree
+objects by oid without interpreting them. That does not make the current
+publisher database-free: canonical eligibility, action state, and all four
+tree inputs are compiled from the client catalog. A future edge publisher
+must reconstruct an equivalent admitted-candidate and durable-intent view
+from authenticated objects before it can reuse this placement operation; it
+may not treat RangeTree alone as publication authority.
 FactTree cannot substitute for this map without also gaining ordered raw-fact
 residency and pile/closure routing; object-store LIST cannot substitute
 because object names are content hashes and include unreachable history.
@@ -385,10 +389,14 @@ slot, and action witness used by the decision must remain explainable by the
 one pinned root. Re-reading `root` for individual components is incoherent,
 even when each component is independently valid.
 
-The writer-side client catalog is an optimization and durable-intent cache;
-the CF authorization reader has no database at all. It needs only pinned root
+Published-state semantics do not depend on a private database, but the
+running writer implementation does: its SQLite catalog is both a derived
+eligibility index and the durable home of local staged intent. The checked-in
+Lambda and Cloudflare deployments are therefore readers, not publishers.
+Their authorization path has no database at all and needs only pinned root
 bytes, immutable object fetches, the submitted bounded closure, and trusted
-service time.
+service time. Moving publication to an edge is a separate construction, not
+an alternate configuration of the current Worker.
 
 The safety laws are:
 
