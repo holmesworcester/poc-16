@@ -872,9 +872,9 @@ def test_sdk_store_startup_rejects_an_old_model_before_client_creation(
 def test_injected_sdk_clients_do_not_run_the_installed_capability_probe(
         monkeypatch):
     monkeypatch.setattr(
-        "adapters.s3.store.require_s3_capabilities",
-        lambda *_args: (_ for _ in ()).throw(
-            AssertionError("injected clients probed the installed SDK")))
+        "adapters.s3.store.importlib.import_module",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("injected clients imported the installed SDK")))
 
     client = ScriptedClient()
     assert S3Store(config(), client=client)._read_client is client

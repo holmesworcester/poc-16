@@ -32,7 +32,6 @@ from core.object_store import (
     authoritative_key,
     validate_key,
 )
-from .sdk_smoke import require_s3_capabilities
 
 
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -288,6 +287,8 @@ class S3Store:
 
     @staticmethod
     def _sdk_clients(config, **provider_credentials):
+        from .sdk_smoke import require_s3_capabilities
+
         try:
             boto3 = importlib.import_module("boto3")
             botocore_config = importlib.import_module("botocore.config")
