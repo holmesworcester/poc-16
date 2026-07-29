@@ -153,7 +153,6 @@ class Publisher:
             _, manifest_oid = manifest.build(
                 node.keys(ws), lambda fid: node.fact_of(ws, fid),
                 deps_of, emit)
-        previous_trees = previous.trees if previous else {}
         seed, trees = indexes.build(
             ws, idx, lambda fid: node.fact_of(ws, fid), emit,
             previous=previous.trees if previous else {},

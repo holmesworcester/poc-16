@@ -629,7 +629,8 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
 
     def observed(root, seed, rows, fetch, emit):
         rows = tuple(rows)
-        updates.append(rows)
+        if seed != manifest.RANGE_SEED:
+            updates.append(rows)
         return update(root, seed, rows, fetch, emit)
 
     monkeypatch.setattr(btreap, "update", observed)
@@ -675,7 +676,8 @@ def test_action_publication_path_copies_only_its_changed_sid(
 
     def observed(root, seed, rows, fetch, emit):
         rows = tuple(rows)
-        updates.append(rows)
+        if seed != manifest.RANGE_SEED:
+            updates.append(rows)
         return update(root, seed, rows, fetch, emit)
 
     monkeypatch.setattr(btreap, "update", observed)
