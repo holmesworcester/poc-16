@@ -176,6 +176,8 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert observed["mints"] == 3
         with pytest.raises(PushUnsupported, match="pull-only"):
             cold.put_pile(b"unsupported")
+        with pytest.raises(PushUnsupported, match="pull-only"):
+            cold.put_obj(h(b"unsupported"), b"unsupported")
         assert observed["puts"] == []
 
         pending = cmds.post(
@@ -192,6 +194,30 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert remote.fact_of(workspace, pending) is not None
         assert "pending_push" not in local.sync_cache[(workspace, url)]
         assert len(observed["puts"]) == 1
+
+
+def test_full_peer_accepts_only_correctly_addressed_immutable_objects(
+        tmp_path):
+    remote, workspace, local = replicas(tmp_path)
+    raw = b"independent attachment proof"
+    oid = h(raw)
+
+    with serving(
+            remote, peer_capability.FULL) as (url, observed, _):
+        peer = Peer(local, workspace, url)
+        peer.put_obj(oid, raw)
+        assert remote.store(workspace).get("obj/" + oid) == raw
+
+        request = urllib.request.Request(
+            f"{url}/page/{oid}?ws={workspace}",
+            data=b"different bytes", method="PUT",
+            headers={"Authorization": "Bearer " + peer.cache["token"]},
+        )
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(request)
+        assert denied.value.code == 400
+        assert remote.store(workspace).get("obj/" + oid) == raw
+        assert len(observed["puts"]) == 2
 
 
 def test_capability_is_hmac_bound_and_unknown_signed_versions_are_rejected():

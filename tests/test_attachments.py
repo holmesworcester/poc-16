@@ -12,7 +12,7 @@ import core.sync as sync_module
 from core import bao, cmds, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
-from core.object_store import Applied
+from core.object_store import Applied, ensure_object
 from core.fact import canon
 from core.node import Node
 from core.walk import _fetch_blobs, _push
@@ -299,20 +299,36 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
         source, workspace, "separate-proof-path.bin",
         random.Random(31).randbytes(bao.WIDTH + 1))
 
+    events = []
+
     class Capture:
+        def put_obj(self, oid, raw):
+            assert h(raw) == oid
+            events.append(("object", oid, raw))
+
         def put_pile(self, raw):
+            events.append(("pile", raw))
             self.raw = raw
 
     capture = Capture()
     _push(source, workspace, capture, all_fids(source, workspace))
     stream, embedded = decode_pile(capture.raw)
     assert embedded == {}
+    object_events = [event for event in events if event[0] == "object"]
+    assert {
+        oid for _, oid, _ in object_events
+    } == {
+        oid for fact in stream for oid in facts.blob_refs(fact)
+    }
+    assert events[-1] == ("pile", capture.raw)
 
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
+    for _, oid, raw in object_events:
+        ensure_object(destination.store(workspace), oid, raw)
     deliver(destination, workspace, capture.raw)
     destination.turn(workspace)
-    assert progress(destination, workspace)["have"] == 0
+    assert progress(destination, workspace)["complete"]
 
     class SourceObjects:
         def obj(self, oid):
@@ -321,9 +337,29 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     landed, complete = _fetch_blobs(
         destination, workspace, SourceObjects())
     assert complete
-    assert len(landed) == len([
-        item for item in stream if item.t == "chunk"])
+    assert landed == []
     assert progress(destination, workspace)["complete"]
+
+
+def test_blob_push_failure_precedes_the_fact_delivery(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice")
+    send_bytes(
+        source, workspace, "one-way.bin",
+        random.Random(32).randbytes(bao.WIDTH + 1))
+
+    class BrokenObjectDoor:
+        @staticmethod
+        def put_obj(oid, raw):
+            raise ConnectionError(f"lost object {oid}")
+
+        @staticmethod
+        def put_pile(raw):
+            pytest.fail("facts were delivered after an object upload failed")
+
+    with pytest.raises(ConnectionError, match="lost object"):
+        _push(source, workspace, BrokenObjectDoor(), all_fids(
+            source, workspace))
 
 
 def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):

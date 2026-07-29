@@ -35,6 +35,7 @@ from .limits import (
     decode_json,
 )
 from .node import Node, now_ms
+from .object_store import ensure_object
 from .runtime import AuthorityRejected
 from .sync import sync
 
@@ -203,9 +204,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parts, q = self._q()
         ws = q.get("ws", "")
+        if not self._known(ws):
+            return self._send(404)
         m = self._member(ws, require_push=True)
-        if not self._known(ws) or not m:
-            return self._send(401 if self._known(ws) else 404)
+        if not m:
+            return self._send(401)
+        if parts[0] == "page" and len(parts) == 2:
+            if not shape.valid_fid(parts[1]):
+                return self._send(404)
+            try:
+                raw = self._body(MAX_OBJECT_BYTES)
+                ensure_object(self.node.store(ws), parts[1], raw)
+            except PayloadTooLarge:
+                return self._send(413)
+            except ValueError:
+                return self._send(400)
+            return self._send(204)
         if parts[0] == "pile" and len(parts) == 3 and parts[1] == m:
             try:
                 b = self._body(MAX_PILE_BYTES)

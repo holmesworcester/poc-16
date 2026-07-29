@@ -120,6 +120,15 @@ class Peer:
             "GET", f"/page/{oh}", response_limit=MAX_OBJECT_BYTES)
         return b
 
+    def put_obj(self, oid, value):
+        """Deliver one immutable object before facts that may name it."""
+        if not isinstance(value, bytes) or len(value) > MAX_OBJECT_BYTES \
+                or h(value) != oid:
+            raise ValueError("immutable object address")
+        self._http(
+            "PUT", f"/page/{oid}", data=value, require_push=True,
+            response_limit=MAX_CONTROL_BYTES)
+
     def objs(self, oids):
         """Fetch an ordered object batch, splitting a provider-sized 413."""
         oids = tuple(oids)
@@ -162,16 +171,29 @@ class Peer:
 
 def _push(node, ws, peer, push_fids):
     """Close one dial's push set into a pile and PUT it — the mirror of a
-    pull. Blob proofs stay in immutable objects and travel through
-    ``_fetch_blobs``; embedding every attachment here would make pile size
-    proportional to file size. The responder drains on receipt, so there is
-    no poke."""
+    pull. Available blob proofs travel as independently verified immutable
+    objects before the fact-only pile: if an upload fails, the peer cannot
+    publish a fact difference that only a one-way sender could satisfy.
+    Replicas that do not yet hold a proof still relay its fact, allowing a
+    receiver with another source to complete it. The responder drains the
+    pile on receipt, so there is no poke."""
     with node.lock:
         idx = node.idx(ws)
         facts = close([node.fact_of(ws, fid) for fid in push_fids],
                       lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or [],
                       lambda fid: node.fact_of(ws, fid))
+        blob_oids = sorted({
+            oid for fact in facts for oid in families.blob_refs(fact)
+        })
         b = encode_pile(facts)
+        st = node.store(ws)
+    for oid in blob_oids:
+        value = st.get("obj/" + oid)
+        if value is None:
+            continue
+        if h(value) != oid:
+            raise ValueError("local immutable object integrity")
+        peer.put_obj(oid, value)
     peer.put_pile(b)
     return tuple(fact.fid for fact in facts)
 
