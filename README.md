@@ -69,8 +69,9 @@ python3 -m core --node http://127.0.0.1:7200 join INVITE_LINK bob
 ```
 
 Nodes synchronize on their daemon cadence. `sync --ws WORKSPACE` requests an
-immediate dial, and `rebuild --ws WORKSPACE` reconstructs the derived SQLite
-indexes and application views from the authenticated store.
+immediate dial, and `rebuild --ws WORKSPACE` reconstructs eligibility,
+authenticated indexes, and application views around the stable local
+admission catalog and published root.
 
 The `ctl/*` endpoints are a trusted node-local control plane. Remote peers use
 the authenticated `root`, `page`, `pile`, `poke`, and `mint` protocol routes.

@@ -215,7 +215,7 @@ def test_suppression_stays_behind_the_manifest_commit(
         index = node.idx(workspace)
         index.executescript(
             "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
-            "DELETE FROM supp; DELETE FROM globals; DELETE FROM meta;")
+            "DELETE FROM supp; DELETE FROM meta;")
         index.commit()
         index.close()
         node.app.execute("PRAGMA user_version=0")

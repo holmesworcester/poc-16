@@ -1,4 +1,6 @@
 """Executable suppression, ownership, and liveness family contracts."""
+from types import SimpleNamespace
+
 import pytest
 
 import facts
@@ -22,18 +24,18 @@ from .util import add_member, member_src, send_bytes
 
 
 def test_one_registry_exhaustively_covers_the_router():
-    assert set(_policy.POLICIES) == set(facts.ROUTES)
-    assert _policy.policy_for("delete").suppression is _policy.NEVER
-    assert _policy.policy_for("evict").suppression is _policy.NEVER
+    assert all(module.POLICY is not None for module in facts.FAMILIES.values())
+    assert facts.family_for("delete").POLICY.suppression is _policy.NEVER
+    assert facts.family_for("evict").POLICY.suppression is _policy.NEVER
 
     kinds = {
         rule.kind
-        for policy in _policy.POLICIES.values()
-        for rule in policy.suppression or ()
+        for family in facts.FAMILIES.values()
+        for rule in family.POLICY.suppression or ()
     }
     assert kinds == {SELF, PARENT, ANCESTOR}
     for tag in ("msg", "file_bao", "chunk"):
-        direct = _policy.policy_for(tag).direct_targets
+        direct = facts.family_for(tag).POLICY.direct_targets
         assert direct
         assert all(
             row.action == _policy.CONTENT_DELETE
@@ -42,9 +44,33 @@ def test_one_registry_exhaustively_covers_the_router():
             for row in direct
         )
 
-    admin = _policy.policy_for("admin")
+    admin = facts.family_for("admin").POLICY
     assert admin.authorization_guards == ("grantor_admin",)
     assert admin.authority_liveness_guards == ("grantee_member",)
+
+
+def test_registry_rejects_duplicate_and_policyless_families():
+    policy = _policy.FamilyPolicy()
+    first = SimpleNamespace(TAG="example", POLICY=policy)
+    duplicate = SimpleNamespace(TAG="example", POLICY=policy)
+    policyless = SimpleNamespace(TAG="other")
+    with pytest.raises(ValueError, match="duplicate"):
+        facts.compile_families((first, duplicate))
+    with pytest.raises(ValueError, match="own its policy"):
+        facts.compile_families((policyless,))
+
+
+def test_new_principal_namespace_needs_no_core_change(monkeypatch):
+    family = SimpleNamespace(
+        TAG="example",
+        POLICY=_policy.FamilyPolicy(
+            principal_offers=(
+                _policy.SidOffer("account_key", "account"),)),
+    )
+    monkeypatch.setitem(facts.FAMILIES, family.TAG, family)
+    fact = Fact(
+        family.TAG, 1, [["offer", "account_key", "public"]], {})
+    assert facts.principal_sids(fact) == {"account:public"}
 
 
 @pytest.mark.parametrize("atoms", [

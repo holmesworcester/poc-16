@@ -1,13 +1,30 @@
 """facts/content/chunk.py — the signed name of one self-proving Bao slice."""
 from core import bao
 from core.crypto import h
-from core.fact import Fact
+from core.fact import Fact, Need
 from core.suppression import ANCESTOR, PARENT, selector_markers
-from .._policy import author_selectors
+from .._policy import (
+    Ancestor,
+    DELETE_SELF,
+    FamilyPolicy,
+    Parent,
+    Self,
+    author_selectors,
+)
 from ..auth import signature
 
 TAG = "chunk"
 TABLES = ("file_slice_rows", "file_chunk_rows")
+POLICY = FamilyPolicy(
+    suppression=(
+        Self(),
+        Parent("file"),
+        Ancestor("file", "member"),
+    ),
+    direct_targets=DELETE_SELF,
+    owner_edge="member",
+    authorization_guards=("member",),
+)
 
 
 # SHAPE
@@ -15,7 +32,7 @@ def chunk(pk, channel, root, index, count, cid, ts, file_fid, member_fid):
     return Fact(
         TAG, ts,
         author_selectors(
-            TAG,
+            POLICY,
             {"file": file_fid, "file/member": member_fid},
         ) + [["ref", "file", file_fid]],
         {"pk": pk, "chan": channel, "root": root,
@@ -29,8 +46,8 @@ def needs(f):
     body = f.body
     pk = body.get("pk", "")
     return (
-        ("author", f.fid, pk),
-        ("member", pk, None),
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
     )
 
 
@@ -80,10 +97,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
 
 
 def blob_refs(f):

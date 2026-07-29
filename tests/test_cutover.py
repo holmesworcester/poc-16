@@ -13,7 +13,7 @@ from core import btreap, cmds
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import canon
-from core.kernel import Valid, drain, resolve_deps
+from core.kernel import drain, resolve_deps
 from core.node import Node
 from facts._policy import OWNER
 from facts.auth.signature import signature
@@ -77,7 +77,7 @@ def read(node, ws):
     """``(entries, fetch)`` — the store as any reader sees it."""
     st = node.store(ws)
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man = manifest.decode_root(st.get("root"))
+    man = manifest.decode_root(st.get("root")).manifest
     return manifest.decode(fetch(man), fetch), fetch
 
 
@@ -89,7 +89,7 @@ def objects(node, ws):
         seen[oid] = st.get("obj/" + oid)
         return seen[oid]
 
-    _, _, man = manifest.decode_root(st.get("root"))
+    man = manifest.decode_root(st.get("root")).manifest
     for entry in manifest.decode(fetch(man), fetch):
         fetch(entry.leaf)
         if entry.closure:
@@ -201,19 +201,21 @@ def test_root_atomically_names_manifest_and_three_logical_trees(world):
     raw = node.store(ws).get("root")
     body = json.loads(raw)
     assert set(body) == {
-        "actions", "anchor", "globals", "layout_seed", "manifest", "stamp",
-        "trees"}
+        "action_etag", "anchor", "layout_seed", "manifest", "stamp", "trees"}
     assert body["anchor"] == ws and body["stamp"] == manifest.LAYOUT
     assert shape.valid_fid(body["layout_seed"])
     assert set(body["trees"]) == {"fact", "supp", "authority"}
-    assert set(body["actions"]) == {"count", "digest"}
     assert all(
         set(descriptor) == {"root", "count", "depth"}
         and descriptor["root"] and descriptor["count"] > 0
             and 0 < descriptor["depth"] <= btreap.MAX_PAGE_DEPTH
         for descriptor in body["trees"].values())
-    assert manifest.decode_root(raw) == (
-        ws, node.globals(ws), body["manifest"])
+    snapshot = manifest.decode_root(raw)
+    assert snapshot.anchor == ws
+    assert snapshot.manifest == body["manifest"]
+    assert snapshot.layout_seed == body["layout_seed"]
+    assert snapshot.trees == body["trees"]
+    assert snapshot.action_etag == body["action_etag"]
     entries, fetch = read(node, ws)
     assert all(len(entry) == 3 for entry in entries)  # no fp, no n-count
     assert b"fp" not in fetch(body["manifest"])
@@ -312,7 +314,7 @@ def test_layout_stamp_forces_rebuild(tmp_path):
     node._sync_index(ws)
     republished = node.store(ws).get("root")
     assert republished != foreign
-    assert manifest.decode_root(republished)[0] == ws  # readable again
+    assert manifest.decode_root(republished).anchor == ws  # readable again
     # Wholesale: the old bytes are never read. The republish settles the
     # derived index under the current stamp, and the rebuild that follows
     # reads only what that settle just wrote.
@@ -379,14 +381,14 @@ def test_oid_diff_prunes_equal_subtrees(tmp_path):
     reads = []
     fetch = lambda oid: (reads.append(oid) or src.get("obj/" + oid))
 
-    man = manifest.decode_root(src.get("root"))[2]
+    man = manifest.decode_root(src.get("root")).manifest
     assert manifest.diff(mine, man, fetch) == []
     assert reads == []  # equal root oid: pruned before a single GET
 
     cmds.post(source, ws, "general", "delta", ts=ts + 1)
     held = {entry.leaf for entry in mine}
     manifest.encode(mine, lambda raw: held.add(h(raw)))  # my shard oids too
-    man = manifest.decode_root(src.get("root"))[2]
+    man = manifest.decode_root(src.get("root")).manifest
     differing = manifest.diff(mine, man, fetch)
     theirs = read(source, ws)[0]
     shards = set()
@@ -561,8 +563,8 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     """The assembled closed set is judged by the same ingress path as a
     pushed pile; the kernel cannot tell pull from push (§2.3): a twin
     replica fed the captured union BYTES through deliver() lands in the
-    identical state, and an invalid fact riding a pulled range is rejected
-    by the same judge with the same (pile-whole) effect on both paths."""
+    identical state. Even direct calls below the runtime cannot publish an
+    invalid fact and manufacture a poisoned pull range."""
     source, ws, destination, ts = pair(tmp_path)
     twin = Node(str(tmp_path / "twin"))  # converged like destination
     deliver(twin, ws, closed_subset(source, ws, all_fids(source, ws)))
@@ -597,31 +599,32 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     assert all_fids(twin, ws) == all_fids(destination, ws)
     assert twin.store(ws).get("root") == destination.store(ws).get("root")
 
-    # A compromised source publishes a forged message — merge+commit skip
-    # its own judge, so the invalid fact sits in a real leaf pile and rides
-    # the next pull's assembled range. Both ingress paths reject the union
-    # pile whole, retire it, and land nothing: one judge, one effect.
+    # Direct merge/commit is not a judge bypass: canonical settlement
+    # revalidates local edges and retains these bytes only as inactive catalog
+    # receipts. The source root therefore cannot expose a poisoned pull range.
     secret, public = source.identity(ws)
     forged = message(public, "general", "forged", ts + 10)
     unsigned = signature(keypair()[0], public, forged, ts + 10)  # wrong sk
+    source_root = source.store(ws).get("root")
     with source.lock:
-        _, fresh = source.merge(ws, [
-            Valid(unsigned, ()),
-            Valid(forged, (unsigned.fid, member_src(source, ws, public)))])
-        source.commit(ws, fresh)
+        settlement = source.merge(ws, [unsigned, forged])
+        source.commit(ws, settlement)
     before = all_fids(destination, ws)
-    delivered.clear()
-    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
-    ((_, poisoned),) = delivered.items()
-    poisoned_stream = decode_pile(poisoned)[0]
-    assert forged.fid in {f.fid for f in poisoned_stream}  # it rode the pull
-    assert not drain(poisoned_stream, ws).ok  # the one judge says no
-    assert all_fids(destination, ws) == before  # same effect: nothing landed
-    assert destination.store(ws).list("pile/") == []  # rejected AND retired
-    deliver(twin, ws, poisoned)  # identical bytes through the push ingress
-    twin.turn(ws)
-    assert all_fids(twin, ws) == before
-    assert twin.store(ws).list("pile/") == []
+    assert source.candidate_of(ws, unsigned.fid) == unsigned
+    assert source.candidate_of(ws, forged.fid) == forged
+    assert source.fact_of(ws, forged.fid) is None
+    assert source.store(ws).get("root") == source_root
+    assert sync_module.sync(destination, ws, "local://source") == (0, 0)
+
+    # The ordinary pile door independently rejects the same forged unit on
+    # every replica and retires it whole.
+    poisoned = encode_pile((unsigned, forged))
+    assert not drain(decode_pile(poisoned)[0], ws).ok
+    for current in (destination, twin):
+        deliver(current, ws, poisoned)
+        current.turn(ws)
+        assert all_fids(current, ws) == before
+        assert current.store(ws).list("pile/") == []
 
 
 def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
@@ -652,7 +655,7 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
     (stream,) = delivered  # ONE closed union pile, not per-leaf bare leaves
     assert drain(stream, ws).ok  # deps-first: judges from empty
     st = source.store(ws)
-    entries = manifest.decode_root(st.get("root"))[2]
+    entries = manifest.decode_root(st.get("root")).manifest
     leaf_oids = {
         entry.leaf for entry in manifest.decode(
             st.get("obj/" + entries), lambda oid: st.get("obj/" + oid))}
@@ -703,7 +706,7 @@ def test_production_deletion_family(tmp_path):
     from facts.content import delete as delete_family
 
     assert delete_family in facts.MODULES
-    assert facts.handler_for(delete_family.TAG) is delete_family
+    assert facts.family_for(delete_family.TAG) is delete_family
     node = Node(str(tmp_path / "node"))
     ws = cmds.create(node, "alice", ts=1)
     victim_fid = cmds.post(node, ws, "general", "doomed", ts=10)

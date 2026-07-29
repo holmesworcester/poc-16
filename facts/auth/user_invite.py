@@ -8,12 +8,14 @@ import base64
 import os
 
 from core.crypto import box_encrypt, kdf, keypair
-from core.fact import Fact, canon
+from core.fact import Fact, Need, canon
 from .._commands import closer, offer_source
+from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "user_invite"
 TABLES = ()
+POLICY = FamilyPolicy(authorization_guards=("member",))
 
 
 # SHAPE
@@ -24,7 +26,10 @@ def user_invite(pk, invite_pk, ts):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("member", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
+    )
 
 
 # VALIDATE
@@ -43,17 +48,7 @@ def validate(f, ctx):
 DURABLE = True
 
 
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    return None
+# MATERIALIZE — no client read-model rows.
 
 
 # COMMANDS

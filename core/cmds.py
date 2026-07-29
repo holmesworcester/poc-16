@@ -24,11 +24,12 @@ def status(node):
             out["workspaces"][workspace] = {
                 "root": node.store(workspace).etag("root"),
                 "facts": node.idx(workspace).execute(
+                    "SELECT COUNT(*) FROM proofs").fetchone()[0],
+                "admitted": node.idx(workspace).execute(
                     "SELECT COUNT(*) FROM facts").fetchone()[0],
                 "peers": entry["peers"], "name": entry["name"],
                 "identity": entry["identity"],
                 "ingress_failures": node.ingress_failures(workspace),
-                "state_failures": node.state_failures(workspace),
                 "sync_failures": node.sync_failures(workspace),
             }
     return out

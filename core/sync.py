@@ -15,17 +15,17 @@ from . import indexes, manifest, shape, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
-from .store import RemoteStore
+from .store import RemoteStore, verified_object
 from .walk import Peer, _fetch_blobs, _push
 from .worker import WorkerView
 
 
 def _object(oid, fetch):
     """One immutable remote object, hash-verified at the door."""
-    raw = fetch(oid) if oid else None
-    if raw is None or h(raw) != oid:
-        raise ValueError("remote object integrity")
-    return raw
+    try:
+        return verified_object(oid, fetch)
+    except ValueError as error:
+        raise ValueError("remote object integrity") from error
 
 
 def _resolver(node, ws, extra):
@@ -44,7 +44,7 @@ def _resolver(node, ws, extra):
         facts = tuple(facts)
         extra.update({f.fid: f for f in facts})
         mem.executemany(
-            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
+            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?,1)",
             ((f.fid, f.ts, f.t, json.dumps(f.to_json())) for f in facts))
         mem.executemany(
             "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
@@ -55,7 +55,7 @@ def _resolver(node, ws, extra):
         # assembly after a shadow/restore window.  The scratch database is
         # bounded to this sync proof, so rebuild its ranks from the exact
         # current fact set before resolving any edge.
-        rebuild_proofs(mem, fact_of)
+        rebuild_proofs(mem, fact_of, ws)
         unresolved = set()
         for fact in facts:
             deps = resolve_deps(fact, mem)
@@ -125,13 +125,14 @@ def sync(node, ws, url):
     local_before = st.get("root")
     their_man = ""
     if remote_root:
-        anchor, _, their_man = manifest.decode_root(remote_root)
-        if anchor != ws:
+        remote_snapshot = manifest.decode_root(remote_root)
+        their_man = remote_snapshot.manifest
+        if remote_snapshot.anchor != ws:
             raise ValueError("root anchor")
 
     same_actions = remote_root and local_before \
-        and json.loads(remote_root)["actions"] \
-        == json.loads(local_before)["actions"]
+        and remote_snapshot.action_etag \
+        == manifest.decode_root(local_before).action_etag
     if same_actions:
         with node.lock:
             remote_actions = {
@@ -149,8 +150,9 @@ def sync(node, ws, url):
     local_root, mine = st.get("root"), ()
     local_man = ""
     if local_root:
-        anchor, _, local_man = manifest.decode_root(local_root)
-        if anchor != ws:
+        local_snapshot = manifest.decode_root(local_root)
+        local_man = local_snapshot.manifest
+        if local_snapshot.anchor != ws:
             raise ValueError("root anchor")
         if local_man and local_man != their_man:
             fetch_local = lambda oid: st.get("obj/" + oid)
@@ -268,20 +270,6 @@ def action_rows(root_bytes, fetch):
     return out
 
 
-def _validated_action(ws, sid, fid, evidence_oid, fetch):
-    raw = _object(evidence_oid, fetch)
-    stream, blobs = decode_pile(raw)
-    result = drain(stream, ws)
-    matches = [
-        valid.fact for valid in result.valids
-        if valid.fact.fid == fid \
-            and sid in suppression_state.action_sids(valid.fact)
-    ]
-    if blobs or not result.ok or len(matches) != 1:
-        raise ValueError("action evidence")
-    return matches[0], raw
-
-
 def pull_actions(node, ws, remote_root, fetch, rows=None):
     """Land independently validated action witnesses before ordinary ranges."""
     rows = action_rows(remote_root, fetch) if rows is None else rows
@@ -293,10 +281,10 @@ def pull_actions(node, ws, remote_root, fetch, rows=None):
                 "SELECT sid, fid, evidence FROM actions")
         }
     for sid, (fid, evidence_oid) in sorted(rows.items()):
-        if local.get(sid, ("~", "~")) <= (fid, evidence_oid):
+        if local.get(sid) == (fid, evidence_oid):
             continue
         try:
-            fact, raw = _validated_action(
+            fact, raw = suppression_state.validate_evidence(
                 ws, sid, fid, evidence_oid, fetch)
         except (TypeError, ValueError):
             continue
@@ -304,27 +292,11 @@ def pull_actions(node, ws, remote_root, fetch, rows=None):
     if not accepted:
         return ()
 
-    # A rootless join needs the evidence closure to establish its anchor.
-    if node.store(ws).get("root") is None:
-        for _, _, _, raw in accepted:
-            pull(node, ws, h(raw), raw)
-        node.turn(ws)
-        return tuple(fact.fid for _, fact, _, _ in accepted)
-
-    with node.lock:
-        try:
-            node._sync_index(ws)
-            for _, fact, evidence_oid, raw in accepted:
-                node.store(ws).put_if_absent("obj/" + evidence_oid, raw)
-                suppression_state.archive(
-                    node.idx(ws), fact, evidence_oid)
-            node.apply_actions(ws, [sid for sid, _, _, _ in accepted])
-            node.commit(ws)
-            from .pump import pump
-            pump(node, ws)
-        except Exception:
-            node._restore_authoritative_projections(ws)
-            raise
+    # Action evidence uses the same pile door and workspace turn as every
+    # other arrival. Sync does not gain a private archive/commit bypass.
+    for _, _, _, raw in accepted:
+        pull(node, ws, h(raw), raw)
+    node.turn(ws)
     return tuple(fact.fid for _, fact, _, _ in accepted)
 
 
@@ -333,10 +305,14 @@ def push_actions(node, ws, peer, remote_rows):
     with node.lock:
         rows = node.idx(ws).execute(
             "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
+        evidence_oids = {
+            evidence
+            for sid, fid, evidence in rows
+            if remote_rows.get(sid) != (fid, evidence)
+        }
         payloads = [
             node.store(ws).get("obj/" + evidence)
-            for sid, fid, evidence in rows
-            if remote_rows.get(sid, ("~", "~")) > (fid, evidence)
+            for evidence in sorted(evidence_oids)
         ]
     for raw in payloads:
         if raw is None:

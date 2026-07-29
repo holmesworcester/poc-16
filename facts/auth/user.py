@@ -5,25 +5,29 @@ import urllib.request
 
 from core.close import encode_pile
 from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
-from core.fact import Fact, from_json
-from .._policy import author_selectors
+from core.fact import Fact, Need, from_json
+from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from . import signature, user_invite
 
 TAG = "user"
 TABLES = ("member_rows",)
+POLICY = FamilyPolicy(
+    suppression=(Self(),),
+    principal_offers=(SidOffer("member", "member"),),
+)
 
 
 # SHAPE
 def user(invite_fact, invite_sk, pk, name, ts):
-    atoms = author_selectors(TAG, {}) + [
-        ["ref", invite_fact.ts, invite_fact.fid], ["offer", "member", pk]]
+    atoms = author_selectors(POLICY, {}) + [
+        ["ref", "invite", invite_fact.fid], ["offer", "member", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)})
 
 
 # NEEDS
 def needs(f):
-    return (("author", f.fid, f.body.get("pk", "")),)
+    return (Need("author", "author", f.fid, f.body.get("pk", "")),)
 
 
 # VALIDATE
@@ -33,14 +37,16 @@ def validate(f, ctx):
             return False
         if f.offers() != [("member", f.body["pk"], "")]:
             return False
-        ref_ts, ref_fid = f.refs()[0]
+        ref_role, ref_fid = f.refs()[0]
+        if ref_role != "invite":
+            return False
         invited = ctx.offers_from(ref_fid, "invitee")
         if len(invited) != 1:
             return False
         invite_pk = invited[0][0]
         shaped = Fact(TAG, f.ts,
-                      author_selectors(TAG, {}) + [
-                       ["ref", ref_ts, ref_fid],
+                      author_selectors(POLICY, {}) + [
+                       ["ref", "invite", ref_fid],
                        ["offer", "member", f.body["pk"]]],
                       dict(f.body))
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
@@ -50,14 +56,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

@@ -3,8 +3,8 @@
 Layout: root (the CAS'd workspace/index manifest, only mutable key besides
 piles/invites), obj/<hash> (manifest shards, leaf piles, closure siblings,
 blobs — immutable), pile/<member>/<hash> (ingress), invite/<id> (public
-reads), and quarantine/<fid> (node-local retention for a previously valid
-pruned fact).
+reads), and failed/{pile,meta}/<hash> (node-local rejected-ingress evidence).
+Kernel-valid durable receipts live in the client catalog, not object keys.
 """
 import os
 import re
@@ -15,6 +15,14 @@ from .crypto import h
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 PAGE_BATCH = 256
+
+
+def verified_object(oid, fetch):
+    """Fetch one content-addressed object and verify its name."""
+    raw = fetch(oid) if oid else None
+    if raw is None or h(raw) != oid:
+        raise ValueError("object integrity")
+    return raw
 
 
 class FsStore:

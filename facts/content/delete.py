@@ -6,7 +6,7 @@ offer/need paths: OWNER compares durable member principals (so sibling devices
 share ownership), while ADMIN requires an admin offer for the signing key.
 """
 
-from core.fact import Fact
+from core.fact import Fact, Need
 from core.shape import fid_of, key_parts
 from core.suppression import (
     SELF,
@@ -22,6 +22,9 @@ from ..auth import signature
 
 TAG = "delete"
 TABLES = ()  # no projection rows: this family only retracts others' rows
+POLICY = _policy.FamilyPolicy(
+    authorization_guards=("actor_authority",),
+)
 
 
 # SHAPE
@@ -41,7 +44,10 @@ def delete(pk, target_key, mode, ts):
 def needs(f):
     pk = f.body.get("pk", "")
     authority = "member" if f.body.get("mode") == _policy.OWNER else "admin"
-    return (("author", f.fid, pk), (authority, pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("actor_authority", authority, pk),
+    )
 
 
 # VALIDATE
@@ -55,12 +61,11 @@ def validate(f, ctx):
                 _policy.OWNER, _policy.ADMIN}:
             return False
         ((name, target),) = f.refs()
-        row = ctx.db.execute(
-            "SELECT ts, t FROM facts WHERE fid=?", (target,)).fetchone()
+        row = ctx.fact_meta(target)
         if row is None:
             return False
         target_ts, target_tag = row
-        victim = facts.handler_for(target_tag)
+        victim = facts.family_for(target_tag)
         target_key = action_target_key(f)
         if name != TARGET or victim is None or not victim.DURABLE \
                 or target_tag == TAG or target_key is None \
@@ -68,22 +73,20 @@ def validate(f, ctx):
                 or action_markers(f) != (
                     action(_policy.CONTENT_DELETE, SELF, target_key),) \
                 or not _policy.allows_direct_target(
-                    target_tag, _policy.CONTENT_DELETE, SELF, mode):
+                    victim.POLICY, _policy.CONTENT_DELETE, SELF, mode):
             return False
 
-        target_policy = _policy.policy_for(target_tag)
+        target_policy = victim.POLICY
         if mode == _policy.OWNER:
             target_provider = ctx.edge_source(target, target_policy.owner_edge)
             actor_provider = ctx.provider("member", pk)
             if target_provider is None or actor_provider is None:
                 return False
-            target_actor = ctx.db.execute(
-                "SELECT a0 FROM offers WHERE src=? AND name='member' "
-                "ORDER BY a0 LIMIT 1", (target_provider,)).fetchone()
-            if target_actor is None:
+            target_members = ctx.offers_from(target_provider, "member")
+            if not target_members:
                 return False
             target_principal = _policy.member_principal(
-                ctx, target_provider, target_actor[0])
+                ctx, target_provider, target_members[0][0])
             actor_principal = _policy.member_principal(
                 ctx, actor_provider, pk)
             if target_principal is None or target_principal != actor_principal:
@@ -98,22 +101,13 @@ def validate(f, ctx):
 DURABLE = True
 
 
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
-
-
-# MATERIALIZE — nothing to insert; victims' rows leave via pump.retract.
-def materialize(db, workspace, valid):
-    return None
+# MATERIALIZE — action effects retract the target's projection rows.
 
 
 # COMMANDS
 def remove(node, workspace, target, ts=None):
     """Choose OWNER when principals match, otherwise require ADMIN."""
+    import facts
     from core.node import now_ms
 
     with node.lock:
@@ -124,9 +118,10 @@ def remove(node, workspace, target, ts=None):
         raise ValueError("no such fact")
     if is_deletion(victim):
         raise ValueError("removals are never victims")
-    policy = _policy.policy_for(victim.t)
+    family = facts.family_for(victim.t)
+    policy = family.POLICY if family is not None else None
     if policy is None or not _policy.allows_direct_target(
-            victim.t, _policy.CONTENT_DELETE, SELF, _policy.OWNER):
+            policy, _policy.CONTENT_DELETE, SELF, _policy.OWNER):
         raise ValueError("fact type is not directly deleteable")
     ts = ts or now_ms()
     secret, public = node.identity(workspace)

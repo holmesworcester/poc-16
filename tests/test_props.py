@@ -13,6 +13,7 @@ import random
 import sqlite3
 
 import pytest
+import facts
 
 from core import btreap, cmds, indexes, manifest, mint, suppression_state
 from core.close import close, decode_pile, encode_pile
@@ -24,7 +25,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
-from core.kernel import Judgment, drain, evaluate, resolve_deps
+from core.kernel import drain, resolve_deps
 from core import node as node_module
 from core.node import Node, now_ms
 
@@ -75,7 +76,7 @@ def units_of(store):
     members plus its closure sibling's facts (each resolved at its own home
     leaf), serialized deps-first by the ordinary close()."""
     fetch = lambda oid: store.get("obj/" + oid)
-    _, _, man = manifest.decode_root(store.get("root"))
+    man = manifest.decode_root(store.get("root")).manifest
     entries = manifest.decode(fetch(man), fetch)
     piles = {
         entry.sep: decode_pile(fetch(entry.leaf))[0] for entry in entries}
@@ -132,7 +133,7 @@ def test_rebuild(world):
     n, ws = world
     before = n.store(ws).etag("root")
     n.idx(ws).executescript(
-        "DELETE FROM facts; DELETE FROM offers; DELETE FROM globals; DELETE FROM meta;")
+        "DELETE FROM facts; DELETE FROM offers; DELETE FROM meta;")
     n.rebuild(ws)
     n.commit(ws)
     assert n.store(ws).etag("root") == before
@@ -144,7 +145,7 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     before = all_fids(n, ws)
     root_bytes = st.get("root")
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man = manifest.decode_root(root_bytes)
+    man = manifest.decode_root(root_bytes).manifest
     entries = manifest.decode(fetch(man), fetch)
     st.put("obj/" + entries[0].leaf, encode_pile([]))
 
@@ -178,8 +179,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
     smuggled = entries[0]._replace(
         leaf=emit(encode_pile([hidden] + members)))
     man = manifest.encode([smuggled] + list(entries[1:]), emit)
-    st.put("root", manifest.encode_root(
-        ws, n.globals(ws), man))
+    st.put("root", manifest.encode_root(ws, man))
     with pytest.raises(ValueError, match="invalid store facts"):
         n.rebuild(ws)
 
@@ -191,7 +191,7 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         entries[1]._replace(leaf=emit(encode_pile([first[-1]] + second))),
     ] + list(entries[2:])
     st.put("root", manifest.encode_root(
-        ws, n.globals(ws), manifest.encode(moved, emit)))
+        ws, manifest.encode(moved, emit)))
     with pytest.raises(ValueError, match="store placement"):
         n.rebuild(ws)
 
@@ -199,18 +199,14 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
     assert all_fids(n, ws) == before
 
 
-def test_rebuild_uses_an_explicit_kernel_validity_gate(
+def test_rebuild_rejects_a_non_durable_resident_family(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     before = all_fids(node, workspace)
-    monkeypatch.setattr(
-        "core.node.drain_committed",
-        lambda stream, anchor, globals_: Judgment(
-            False, (), frozenset()),
-    )
+    monkeypatch.setattr(facts.family_for("workspace"), "DURABLE", False)
 
-    with pytest.raises(ValueError, match="invalid store facts"):
+    with pytest.raises(ValueError, match="ephemeral fact"):
         node.rebuild(workspace)
 
     assert all_fids(node, workspace) == before
@@ -226,7 +222,7 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
         [], lambda fid: None, lambda fid: (),
         lambda raw: store.put("obj/" + h(raw), raw))
     store.put(
-        "root", manifest.encode_root(workspace, frozenset(), empty))
+        "root", manifest.encode_root(workspace, empty))
 
     with pytest.raises(ValueError, match="store fact set"):
         node.rebuild(workspace)
@@ -277,7 +273,7 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
     stream, _ = decode_pile(pile)
     judgment = drain(stream, workspace)
     assert judgment.ok
-    node.merge(workspace, judgment.valids, judgment.globals)
+    node.merge(workspace, (valid.fact for valid in judgment.valids))
 
     # Model process death at the exact merge/manifest boundary: no exception
     # handler gets to restore the derived index before its connections close.
@@ -317,6 +313,62 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
         "SELECT MAX(seq) FROM log").fetchone()[0]
 
 
+def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
+    """The new root, not a pre-CAS catalog write, wins the crash boundary."""
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    secret, public = node.identity(workspace)
+    item = message(public, "general", "after-cas", 2)
+    signed = signature(secret, public, item, 2)
+    deps = {
+        signed.fid: [],
+        item.fid: [signed.fid, member_src(node, workspace, public)],
+    }
+    new = {fact.fid: fact for fact in (signed, item)}
+
+    def deps_of(fid):
+        if fid in deps:
+            return deps[fid]
+        return resolve_deps(
+            node.fact_of(workspace, fid), node.idx(workspace)) or ()
+
+    raw = encode_pile(close(
+        [signed, item],
+        deps_of,
+        lambda fid: new.get(fid) or node.fact_of(workspace, fid),
+    ))
+    deliver(node, workspace, raw)
+    judgment = drain(decode_pile(raw)[0], workspace)
+    settlement = node.merge(
+        workspace, (valid.fact for valid in judgment.valids))
+    old_root = node.store(workspace).get("root")
+
+    def die_after_cas(*args, **kwargs):
+        raise RuntimeError("simulated post-CAS death")
+
+    monkeypatch.setattr(node, "_stamp", die_after_cas)
+    with pytest.raises(RuntimeError, match="post-CAS death"):
+        node.commit(workspace, settlement)
+    assert node.store(workspace).get("root") != old_root
+    assert node.idx(workspace).execute(
+        "SELECT admitted FROM facts WHERE fid=?",
+        (item.fid,)).fetchone() == (0,)
+    for index in node._idx.values():
+        index.close()
+    node.app.close()
+
+    reopened = Node(node.dir)
+    assert reopened.fact_of(workspace, item.fid) == item
+    assert reopened.idx(workspace).execute(
+        "SELECT admitted FROM facts WHERE fid=?",
+        (item.fid,)).fetchone() == (1,)
+    assert reopened.store(workspace).list("pile/")
+    reopened.turn(workspace)
+    assert reopened.store(workspace).list("pile/") == []
+    assert [row["text"] for row in cmds.msgs(reopened, workspace)] \
+        == ["after-cas"]
+
+
 def test_failed_turn_restores_authoritative_state_before_return(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
@@ -329,13 +381,10 @@ def test_failed_turn_restores_authoritative_state_before_return(
     proof = request_payload(
         node, workspace, "sync", ts + 60_000, ts)
     node.bind_identity(workspace, founder)
-    door = node.globals(workspace) | {("now", ts)}
-    assert evaluate(
-        proof,
-        workspace,
-        door,
-        canonical_db=node.idx(workspace),
-    )
+    proof_bytes = encode_pile(proof)
+    fetch = lambda oid: node.store(workspace).get("obj/" + oid)
+    assert mint.stateless(
+        proof_bytes, node.store(workspace).get("root"), fetch, ts)
 
     store = node.store(workspace)
     old_root = store.etag("root")
@@ -349,15 +398,10 @@ def test_failed_turn_restores_authoritative_state_before_return(
         cmds.evict(node, workspace, bob)
 
     # The daemon catches command failures and keeps serving. Before turn()
-    # releases its lock, the old root must again govern mint, globals, and app.
+    # releases its lock, the old root must again govern mint and the app view.
     assert node.store(workspace).etag("root") == old_root
-    assert evaluate(
-        proof,
-        workspace,
-        door,
-        canonical_db=node.idx(workspace),
-    )
-    assert ("removal", bob) not in node.globals(workspace)
+    assert mint.stateless(
+        proof_bytes, node.store(workspace).get("root"), fetch, ts)
     assert next(
         member for member in cmds.members(node, workspace)
         if member["pk"] == bob
@@ -377,9 +421,8 @@ def test_failed_turn_restores_authoritative_state_before_return(
     node.turn(workspace)
 
     assert mint.stateless(
-        encode_pile(proof), store.get("root"),
+        proof_bytes, store.get("root"),
         lambda oid: store.get("obj/" + oid), ts) is None
-    assert ("removal", bob) not in node.globals(workspace)
     assert next(
         member for member in cmds.members(node, workspace)
         if member["pk"] == bob
@@ -426,7 +469,7 @@ def test_partial_stamp_failure_retries_in_the_same_process(
     original_stamp = node._stamp
     failed = False
 
-    def fail_once_after_root(stamped_workspace):
+    def fail_once_after_root(stamped_workspace, admitted=()):
         nonlocal failed
         if not failed:
             failed = True
@@ -435,7 +478,7 @@ def test_partial_stamp_failure_retries_in_the_same_process(
                 (node.store(stamped_workspace).etag("root"),),
             )
             raise RuntimeError("simulated partial stamp")
-        original_stamp(stamped_workspace)
+        original_stamp(stamped_workspace, admitted)
 
     monkeypatch.setattr(node, "_stamp", fail_once_after_root)
     with pytest.raises(RuntimeError, match="simulated partial stamp"):
@@ -501,20 +544,17 @@ def test_bulk_index_crash_cannot_preserve_unpublished_facts(
         (workspace,)).fetchone() == (0,)
 
 
-def test_old_index_rebuilds_generic_globals_on_open(world):
-    """An index stamped before the family/global split cannot silently lose
-    its removal rows when the code is upgraded."""
+def test_semantic_index_upgrade_preserves_the_published_snapshot(world):
     n, ws = world
-    expected = n.globals(ws)
+    expected = n.store(ws).get("root")
     idx = n.idx(ws)
-    idx.executescript(
-        "DELETE FROM globals; DELETE FROM meta WHERE k='index-version';")
+    idx.execute("DELETE FROM meta WHERE k='index-version'")
     idx.commit()
     idx.close()
     n.app.close()
 
     reopened = Node(n.dir)
-    assert reopened.globals(ws) == expected
+    assert reopened.store(ws).get("root") == expected
 
 
 def test_straggler_minifold(tmp_path, world):
@@ -570,8 +610,8 @@ def full_manifest(n, ws):
     seed, trees = indexes.build(
         ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
     return manifest.encode_root(
-        ws, n.globals(ws), man,
-        action_summary=suppression_state.summary(idx),
+        ws, man,
+        action_etag=suppression_state.etag(idx),
         layout_seed=seed, trees=trees)
 
 
@@ -714,16 +754,16 @@ def test_shadow_guard_keeps_identity(world):
     deliver(n, ws, encode_pile([s2]))
     n.turn(ws)  # commit's shadow guard drops the memo -> full recompute
     assert s2.fid in all_fids(n, ws)  # the duplicate sig validated and merged
-    assert n._shadows(ws, [s2.fid]) is True  # (author, m, alice) now has two providers
+    assert n.catalog(ws).shadows([s2.fid]) is True
     assert n.store(ws).get("root") == full_manifest(n, ws)  # still byte-identical
 
 
-def test_action_set_rides_the_root_without_removal_globals(world):
+def test_action_state_has_no_duplicate_root_metadata(world):
     n, ws = world
     root = json.loads(n.store(ws).get("root"))
-    assert manifest.decode_root(n.store(ws).get("root"))[1] == frozenset()
-    assert root["globals"] == []
-    assert root["actions"] == suppression_state.summary(n.idx(ws))
+    assert set(root) == {
+        "action_etag", "anchor", "layout_seed", "manifest", "stamp", "trees"}
+    assert "globals" not in root and "actions" not in root
 
 
 def test_poison_pile_is_litter_not_poison(world):

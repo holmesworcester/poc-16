@@ -10,6 +10,15 @@ ANCESTOR = "ancestor"
 ACTION = "action"
 
 
+def scoped_id(namespace, value):
+    """A typed suppression id whose namespace is declared by a fact family."""
+    if not isinstance(namespace, str) or not namespace \
+            or not isinstance(value, str) or not value \
+            or ":" in namespace:
+        raise ValueError("suppression id")
+    return f"{namespace}:{value}"
+
+
 def self_selector():
     """Non-circular SELF placeholder; readers expand it after fid integrity."""
     return [ATOM, SELF]

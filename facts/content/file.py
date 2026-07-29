@@ -4,15 +4,27 @@ import tempfile
 
 from core import bao
 from core.crypto import h
-from core.fact import Fact
+from core.fact import Fact, Need
 from core.suppression import PARENT, selector_markers
-from .._policy import author_selectors
+from .._policy import (
+    DELETE_SELF,
+    FamilyPolicy,
+    Parent,
+    Self,
+    author_selectors,
+)
 from .._commands import offer_source
 from ..auth import signature
 from . import chunk as chunkfam
 
 TAG = "file_bao"
 TABLES = ("file_rows",)
+POLICY = FamilyPolicy(
+    suppression=(Self(), Parent("member")),
+    direct_targets=DELETE_SELF,
+    owner_edge="member",
+    authorization_guards=("member",),
+)
 WIDTH = bao.WIDTH
 MAX_FILE_BYTES = bao.MAX_FILE_BYTES
 MAX_NAME = 255
@@ -23,7 +35,7 @@ ENCODING = "clear-v1"
 def file(pk, channel, name, size, root, count, ts, member_fid):
     return Fact(
         TAG, ts,
-        author_selectors(TAG, {"member": member_fid}) + [
+        author_selectors(POLICY, {"member": member_fid}) + [
             ["offer", "file", root, pk],
             ["offer", "slices", root, str(count)],
         ],
@@ -35,7 +47,10 @@ def file(pk, channel, name, size, root, count, ts, member_fid):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("member", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
+    )
 
 
 # VALIDATE
@@ -75,14 +90,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

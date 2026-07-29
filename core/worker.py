@@ -16,18 +16,17 @@ MAX_PROOF_FACTS = 64
 class WorkerView:
     etag: str
     anchor: str
-    globals_: frozenset
     seed: str
     trees: dict
     fetch: object
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        anchor, globals_, _ = manifest.decode_root(root_bytes)
-        seed, trees = manifest.decode_composite(root_bytes)
-        if not all(trees[name]["root"] for name in indexes.TREE_NAMES):
+        root = manifest.decode_root(root_bytes)
+        if not all(root.trees[name]["root"] for name in indexes.TREE_NAMES):
             raise ValueError("composite root is not Worker-readable")
-        return cls(h(root_bytes), anchor, globals_, seed, trees, fetch)
+        return cls(
+            h(root_bytes), root.anchor, root.layout_seed, root.trees, fetch)
 
     def _reader(self, name):
         descriptor = self.trees[name]
@@ -38,16 +37,14 @@ class WorkerView:
     def fact_record(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
         if not isinstance(row, dict) or set(row) != {
-                "edges", "evidence", "key", "liveness", "offers", "raw",
-                "selectors", "tag"}:
+                "evidence", "liveness", "offers", "selectors"}:
             raise ValueError("missing FactRecord")
         if not isinstance(row["selectors"], list) \
                 or len(row["selectors"]) > indexes.MAX_SELECTORS \
                 or not all(isinstance(sid, str) for sid in row["selectors"]) \
                 or not isinstance(row["liveness"], list) \
-                or len(row["liveness"]) > indexes.MAX_SELECTORS \
+                or len(row["liveness"]) > facts.MAX_AUTHORITY_SCOPES \
                 or not all(isinstance(sid, str) for sid in row["liveness"]) \
-                or not isinstance(row["edges"], dict) \
                 or not isinstance(row["offers"], list) \
                 or not isinstance(row["evidence"], str) \
                 or row["evidence"] and not valid_fid(row["evidence"]):
@@ -79,6 +76,15 @@ class WorkerView:
         return self.suppression(
             indexes.principal_sid(kind, public_key))["state"] == "clear"
 
+    def suppression_known(self, sid):
+        """Whether the published snapshot reserves this exact typed id."""
+        return self._reader(indexes.SUPP).get(sid) is not None
+
+    def authority_known(self, name, a0, a1=None):
+        """Whether this exact base offer address exists in the snapshot."""
+        return self._reader(indexes.AUTHORITY).get(
+            indexes.need_key(name, a0, a1)) is not None
+
     def authority_provider(self, name, a0, a1=None, requires=()):
         row = self._reader(indexes.AUTHORITY).get(
             indexes.need_key(name, a0, a1, requires))
@@ -108,20 +114,15 @@ class WorkerView:
         """
         authority = self._reader(indexes.AUTHORITY)
         for fact in stream:
-            handler = facts.handler_for(fact.t)
+            handler = facts.family_for(fact.t)
             for need in handler.needs(fact):
-                if len(need) == 3:
-                    name, a0, a1 = need
-                    requires = ()
-                elif len(need) == 4:
-                    name, a0, a1, requires = need
-                else:
-                    return False
-                address = indexes.need_key(name, a0, a1)
+                address = indexes.need_key(
+                    need.name, need.a0, need.a1)
                 row = authority.get(address)
                 if row is None:
                     continue
-                provider = self.authority_provider(name, a0, a1)
+                provider = self.authority_provider(
+                    need.name, need.a0, need.a1)
                 if provider is None:
                     return False
                 offered = {
@@ -132,7 +133,7 @@ class WorkerView:
                         (required_name, required_a0, required_a1 or "")
                         not in offered
                         for required_name, required_a0, required_a1
-                        in requires):
+                        in need.requires):
                     return False
         return True
 
@@ -147,39 +148,14 @@ class WorkerView:
                 return None
             ephemeral = [
                 valid for valid in result.valids
-                if not facts.handler_for(valid.fact.t).DURABLE
+                if not facts.family_for(valid.fact.t).DURABLE
             ]
             if len(ephemeral) != 1:
                 return None
             request = ephemeral[0]
-            body = request.fact.body
-            from facts.auth import request as request_family
-            if request.fact.t != request_family.TAG \
-                    or body["verb"] not in request_family.VERBS \
-                    or body["exp"] < trusted_now:
-                return None
-            edges = {edge.role: edge.fid for edge in request.edges}
-            presented = edges.get("member")
-            by_fid = {fact.fid: fact for fact in stream}
-            provider = by_fid.get(presented)
-            if provider is None or (
-                    "member", body["pk"], "") not in provider.offers():
-                return None
-            authority_row = self._reader(indexes.AUTHORITY).get(
-                indexes.need_key("member", body["pk"]))
-            if authority_row is None:
-                # A never-seen address may bootstrap from its validated
-                # self-contained closure. A terminal pre-tombstone, or a
-                # known address whose slot was omitted, must fail closed.
-                principal_row = self._reader(indexes.SUPP).get(
-                    indexes.principal_sid("member", body["pk"]))
-                if principal_row is not None:
-                    return None
-            else:
-                canonical = self.authority_provider("member", body["pk"])
-                if canonical is None \
-                        or not self.principal_active("member", body["pk"]):
-                    return None
-            return body["pk"], body["verb"]
+            family = facts.family_for(request.fact.t)
+            authorize = getattr(family, "authorize", None)
+            return authorize(self, request, stream, trusted_now) \
+                if authorize is not None else None
         except Exception:
             return None

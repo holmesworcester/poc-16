@@ -173,7 +173,11 @@ def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
 
 
 def all_fids(n, ws):
-    return [fid for (fid,) in n.idx(ws).execute("SELECT fid FROM facts ORDER BY ts, fid")]
+    return [
+        fid for (fid,) in n.idx(ws).execute(
+            "SELECT f.fid FROM facts f JOIN proofs p ON p.fid=f.fid "
+            "ORDER BY f.ts, f.fid")
+    ]
 
 
 def send_bytes(node, workspace, name, data, channel="general", ts=None):

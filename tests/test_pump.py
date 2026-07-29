@@ -4,7 +4,7 @@ import pytest
 
 import facts
 
-from core import cmds
+from core import catalog, cmds
 from core.close import decode_pile
 from core.crypto import keypair
 from core.node import Node
@@ -49,7 +49,7 @@ def test_pump_crash_resume(tmp_path, monkeypatch):
     """Kill between any two rows: rerun continues cleanly — row application
     and cursor advance share ONE transaction; no handler needs
     INSERT OR IGNORE to survive it."""
-    from core import node as runtime
+    from core import runtime
 
     monkeypatch.setattr(runtime, "pump", lambda *args: 0)
     node = Node(str(tmp_path / "node"))
@@ -121,7 +121,7 @@ def test_restart_discards_index_ahead_of_root(tmp_path, monkeypatch):
 
 def test_restart_resumes_rows_after_root_publish(tmp_path, monkeypatch):
     """A published root with an unadvanced cursor is pumped on startup."""
-    from core import node as runtime
+    from core import runtime
 
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
@@ -171,8 +171,9 @@ def test_reproject_marker_survives_restart(world, monkeypatch):
     """A commit-only restore remains durable until the next pump."""
     node, workspace, restored = world
     monkeypatch.setattr(
-        node, "_update_proofs",
-        lambda *args: (set(), {restored}),
+        "core.catalog.Catalog.settle",
+        lambda *args, **kwargs: catalog.Eligibility(
+            (), (restored,), (), True),
     )
     node.commit(workspace)
 
@@ -218,7 +219,6 @@ def test_missing_cursor_rebuilds(world, monkeypatch, historical_minus):
         clear(app, ws)
 
     monkeypatch.setattr(facts, "clear", track_clear)
-    node._reproject.clear()
     assert pump(node, workspace) > 0
     assert cleared == [workspace]
     assert [item["text"] for item in cmds.msgs(node, workspace)] == ["hello"]
@@ -228,7 +228,8 @@ def test_missing_cursor_rebuilds(world, monkeypatch, historical_minus):
 def test_dependent_facts_follow_source_at_every_projection_boundary(
         tmp_path, monkeypatch, boundary):
     """Dependent facts materialize after their source across every boundary."""
-    from core import node as runtime
+    from core import node as node_runtime
+    from core import runtime
 
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice")
@@ -238,7 +239,7 @@ def test_dependent_facts_follow_source_at_every_projection_boundary(
         clock[0] += 10
         return clock[0]
 
-    monkeypatch.setattr(runtime, "now_ms", tick)
+    monkeypatch.setattr(node_runtime, "now_ms", tick)
     for ordinal in range(64):
         _, target, joined = add_member(
             source, workspace, f"member-{ordinal}", ts=tick())
@@ -380,7 +381,10 @@ def test_handlers_contain_no_suppression_logic():
     """AST check: no materialize handler reads S, removals, or evicted state
     — suppression reaches app.db only as pump '−' rows."""
     for module in facts.MODULES:
-        names = module.materialize.__code__.co_names
+        materialize = getattr(module, "materialize", None)
+        if materialize is None:
+            continue
+        names = materialize.__code__.co_names
         assert "retract" not in names
         assert "victims" not in names
 

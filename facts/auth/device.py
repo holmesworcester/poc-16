@@ -4,20 +4,26 @@ An enrolled member may bind its own signing key into a flat device set. This
 is the poc-13 device authority edge with poc-10 transport atoms omitted; all
 devices are equal peers and the fact carries no endpoint policy.
 """
-from core.fact import Fact
-from .._policy import author_selectors
+from core.fact import Fact, Need
+from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from .._commands import offer_source, publish
 from . import signature
 
 TAG = "device"
 TABLES = ("device_rows",)
+POLICY = FamilyPolicy(
+    suppression=(Self(),),
+    authorization_guards=("member",),
+    authority_liveness_guards=("member",),
+    principal_offers=(SidOffer("device_key", "device"),),
+)
 
 
 # SHAPE
 def device(pk, label, ts):
     return Fact(
         TAG, ts,
-        author_selectors(TAG, {}) + [
+        author_selectors(POLICY, {}) + [
          ["offer", "device_key", pk],
          ["offer", "device", pk, pk]],
         {"pk": pk, "label": label})
@@ -26,7 +32,10 @@ def device(pk, label, ts):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("member", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
+    )
 
 
 # VALIDATE
@@ -42,14 +51,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

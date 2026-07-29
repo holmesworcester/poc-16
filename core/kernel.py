@@ -1,42 +1,14 @@
 """The family-neutral streaming judge.
 
-``validate(stream, anchor) -> bool`` is the small trustless-consumer path.
-``drain(stream, anchor)`` additionally returns kernel-minted ``Valid`` values
-and monotone global rows for the engine.  ``evaluate(stream, anchor, globals)``
-applies optional ephemeral family gates and returns only a boolean.  All three
-share the same one-pass seen-set judge; input is already canonical-topological,
-so the kernel never sorts or waits.
-
-Families under :mod:`facts` own exact shapes, declared needs, immutable
-boolean validation, mode policy, global deltas, and materialization.  The core
-only resolves relationships and dispatches.
+``validate`` is the boolean trustless-consumer door; ``drain`` exposes the
+same judgment as kernel-minted ``Valid`` values to a client runtime. Families
+own exact shapes, named needs, and immutable validity. Ephemeral authorization
+is a separate family-owned Worker grant over authenticated point reads.
 """
-import sqlite3
-from dataclasses import dataclass
 from typing import NamedTuple
 
 import facts
 from .fact import Fact
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS facts(fid TEXT PRIMARY KEY, ts INT, t TEXT);
-CREATE TABLE IF NOT EXISTS offers(name TEXT, a0 TEXT, a1 TEXT, src TEXT,
-                                  PRIMARY KEY(name, a0, a1, src));
-CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
-CREATE TABLE IF NOT EXISTS edges(
-    src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
-    PRIMARY KEY(src, role));
--- src-leading covering index: offers_from() matches on (src, name), which the
--- PK index (src last) can't serve, so without this it full-scans the offers
--- table per lookup -> O(joins * offers) rebuild/validate. We have a db; seek.
-CREATE INDEX IF NOT EXISTS offers_by_src ON offers(src, name, a0, a1);
-"""
-
-DRAIN = "drain"
-VALIDATE = "validate"
-EVALUATE = "evaluate"
-MODES = {DRAIN, VALIDATE, EVALUATE}
-
 
 class Valid(NamedTuple):
     fact: Fact
@@ -50,48 +22,98 @@ class ResolvedEdge(NamedTuple):
     kind: str
 
 
-class Global(NamedTuple):
-    name: str
-    value: str
-
-
 class Judgment(NamedTuple):
     ok: bool
     valids: tuple
-    globals: frozenset
 
 
-@dataclass(frozen=True)
-class Context:
+class Context(NamedTuple):
     """Immutable in-pile context visible to every family validator.
 
-    Mutable globals are intentionally absent.  Only a family's optional
-    evaluate hook receives them, which makes persistent validity incapable of
-    depending on time-varying state.
+    Mutable host state is intentionally absent. Time and current suppression
+    belong to the database-free Worker authorization boundary.
     """
 
     db: object
     anchor: str
+
+    def fact_meta(self, fid):
+        return self.db.execute(
+            "SELECT ts, t FROM facts WHERE fid=?", (fid,)).fetchone()
 
     def offers_from(self, source, name):
         return self.db.execute(
             "SELECT a0, a1 FROM offers WHERE src=? AND name=? ORDER BY a0, a1",
             (source, name)).fetchall()
 
-    def has_offer_value(self, name, value):
-        """Whether any accepted in-pile offer has ``value`` in its a1 slot."""
-        return self.db.execute(
-            "SELECT 1 FROM offers WHERE name=? AND a1=? LIMIT 1",
-            (name, value)).fetchone() is not None
-
     def edge_source(self, source, role):
-        rows = self.db.execute(
-            "SELECT dst FROM edges WHERE src=? AND role=? ORDER BY dst",
-            (source, role)).fetchall()
-        return rows[0][0] if len(rows) == 1 else None
+        row = self.db.execute(
+            "SELECT dst FROM edges WHERE src=? AND role=?",
+            (source, role)).fetchone()
+        return row[0] if row else None
 
     def provider(self, name, a0, a1=None, requires=()):
         return offer_src(self.db, name, a0, a1, requires)
+
+
+class MemoryContext:
+    """Bounded database-free relationship state for CF authorization."""
+
+    def __init__(self, anchor):
+        self.anchor = anchor
+        self.facts = {}
+        self.proofs = {}
+        self.edges = {}
+
+    def has_fact(self, fid):
+        return fid in self.facts
+
+    def fact_meta(self, fid):
+        fact = self.facts.get(fid)
+        return (fact.ts, fact.t) if fact is not None else None
+
+    def offers_from(self, source, name):
+        fact = self.facts.get(source)
+        return sorted(
+            (a0, a1) for offer, a0, a1 in (fact.offers() if fact else ())
+            if offer == name
+        )
+
+    def edge_source(self, source, role):
+        return self.edges.get((source, role))
+
+    def provider(self, name, a0, a1=None, requires=()):
+        return self.resolve_offer(name, a0, a1, requires)
+
+    def resolve_offer(self, name, a0, a1=None, requires=()):
+        candidates = []
+        for fid, fact in self.facts.items():
+            if fid not in self.proofs or not any(
+                    offer == name and value0 == a0
+                    and (a1 is None or value1 == a1)
+                    for offer, value0, value1 in fact.offers()):
+                continue
+            candidates.append((self.proofs[fid], fid))
+        if not candidates:
+            return None
+        source = min(candidates)[1]
+        offered = set(self.facts[source].offers())
+        return source if all(
+            (required_name, required_a0, required_a1 or "") in offered
+            for required_name, required_a0, required_a1 in requires
+        ) else None
+
+    def rank(self, deps):
+        if not deps:
+            return 0
+        if any(fid not in self.proofs for fid in deps):
+            return None
+        return 1 + max(self.proofs[fid] for fid in deps)
+
+    def admit(self, fact, rank, edges):
+        self.facts[fact.fid], self.proofs[fact.fid] = fact, rank
+        self.edges.update(
+            ((fact.fid, edge.role), edge.fid) for edge in edges)
 
 
 def offer_src(db, name, a0, a1=None, requires=()):
@@ -108,6 +130,8 @@ def offer_src(db, name, a0, a1=None, requires=()):
     a key) while also checking the claim's associated value without allowing
     a losing claimant to become authoritative.
     """
+    if hasattr(db, "resolve_offer"):
+        return db.resolve_offer(name, a0, a1, requires)
     query = (
         "SELECT o.src FROM offers o "
         "JOIN proofs p ON p.fid=o.src "
@@ -131,46 +155,27 @@ def offer_src(db, name, a0, a1=None, requires=()):
     return source
 
 
-def _need_parts(need):
-    """Normalize the public three-field need and its optional co-offers."""
-    if len(need) == 3:
-        return (*need, ())
-    if len(need) == 4:
-        name, a0, a1, requires = need
-        return name, a0, a1, tuple(requires)
-    raise ValueError("a need must have three fields plus optional co-offers")
-
-
 def resolve_edges(f: Fact, db):
-    """Resolve refs and needs to deterministic, family-declared named edges."""
-    handler = facts.handler_for(f.t)
+    """Resolve self-named refs and needs to deterministic dependency edges."""
+    handler = facts.family_for(f.t)
     if handler is None:
         return None
-    policy = facts.policy_for(f.t)
-    refs = list(f.refs())
-    needs = list(handler.needs(f))
-    if policy is None:
-        ref_roles = tuple(
-            f"ref:{name}:{ordinal}" for ordinal, (name, _) in enumerate(refs))
-        need_roles = tuple(
-            f"need:{need[0]}:{ordinal}"
-            for ordinal, need in enumerate(needs))
-    else:
-        ref_roles, need_roles = policy.ref_roles, policy.need_roles
-        if len(refs) != len(ref_roles) or len(needs) != len(need_roles):
-            return None
     edges = [
         ResolvedEdge(role, fid, "ref")
-        for role, (_, fid) in zip(ref_roles, refs)
+        for role, fid in f.refs()
     ]
     try:
-        for role, need in zip(need_roles, needs):
-            name, a0, a1, requires = _need_parts(need)
-            source = offer_src(db, name, a0, a1, requires)
+        for need in handler.needs(f):
+            source = offer_src(
+                db, need.name, need.a0, need.a1, need.requires)
             if source is None:
                 return None
-            edges.append(ResolvedEdge(role, source, "need"))
+            edges.append(ResolvedEdge(need.role, source, "need"))
     except Exception:
+        return None
+    roles = [edge.role for edge in edges]
+    if not all(isinstance(role, str) and role for role in roles) \
+            or len(roles) != len(set(roles)):
         return None
     return tuple(edges)
 
@@ -188,6 +193,8 @@ def resolve_deps(f: Fact, db):
 
 def proof_rank(db, deps):
     """Return one plus the maximum dependency rank (or zero at a root)."""
+    if hasattr(db, "rank"):
+        return db.rank(deps)
     if not deps:
         return 0
     rows = db.execute(
@@ -201,7 +208,19 @@ def proof_rank(db, deps):
     return 1 + max(ranks[fid] for fid in deps)
 
 
-def extend_proofs(db, fids, fact_of):
+def accepts(fact, edges, ctx):
+    """Run one family's shape and policy checks against resolved edges."""
+    try:
+        handler = facts.family_for(fact.t)
+        return handler is not None \
+            and handler.validate(fact, ctx) is True \
+            and facts.validate_fact_policy(
+                handler.POLICY, fact, edges, ctx)
+    except Exception:
+        return False
+
+
+def extend_proofs(db, fids, fact_of, anchor=None, accept=None):
     """Add shortest authority proofs with work proportional to ``fids``.
 
     Existing proofs and offers are consulted by indexed point/range lookups;
@@ -212,6 +231,12 @@ def extend_proofs(db, fids, fact_of):
     participate in the canonical ``(rank, fid)`` choice before dependents run.
     """
     ranked = {}
+    context = Context(db, anchor) if anchor is not None else None
+    accept = accept or (
+        (lambda fact, edges: accepts(fact, edges, context))
+        if context is not None else
+        (lambda _fact, _edges: True)
+    )
 
     def has_proof(fid):
         if fid not in ranked:
@@ -246,14 +271,16 @@ def extend_proofs(db, fids, fact_of):
             if not has_proof(ref)
         }
         try:
-            handler = facts.handler_for(fact.t)
+            handler = facts.family_for(fact.t)
             if handler is None:
                 continue
             for need in handler.needs(fact):
-                name, a0, a1, requires = _need_parts(need)
-                if offer_src(db, name, a0, a1, requires) is None:
+                if offer_src(
+                        db, need.name, need.a0, need.a1,
+                        need.requires) is None:
                     conditions.add(
-                        ("offer", name, a0, a1, requires))
+                        ("offer", need.name, need.a0, need.a1,
+                         need.requires))
         except Exception:
             continue
         missing[fid] = conditions
@@ -268,15 +295,28 @@ def extend_proofs(db, fids, fact_of):
     while candidates:
         ready = []
         for fid in sorted(candidates):
-            deps = resolve_deps(unresolved[fid], db)
+            fact = unresolved[fid]
+            edges = resolve_edges(fact, db)
+            deps = None if edges is None else [edge.fid for edge in edges]
             rank = proof_rank(db, deps) if deps is not None else None
-            if rank is not None:
-                ready.append((fid, rank))
+            if rank is not None and accept(fact, edges):
+                ready.append((fid, rank, edges))
         if not ready:
             break
-        db.executemany("INSERT OR REPLACE INTO proofs VALUES(?,?)", ready)
+        db.executemany(
+            "INSERT OR REPLACE INTO proofs VALUES(?,?)",
+            ((fid, rank) for fid, rank, _ in ready),
+        )
+        db.executemany(
+            "INSERT OR REPLACE INTO edges VALUES(?,?,?,?)",
+            (
+                (fid, edge.role, edge.fid, edge.kind)
+                for fid, _, edges in ready
+                for edge in edges
+            ),
+        )
         candidates = set()
-        for fid, _ in ready:
+        for fid, _, _ in ready:
             ranked[fid] = True
             for dependent in ref_waiters.pop(fid, ()):
                 if dependent not in unresolved or dependent not in missing:
@@ -309,190 +349,53 @@ def extend_proofs(db, fids, fact_of):
     return frozenset(unresolved)
 
 
-def proof_sources(fids, fact_of):
-    """Facts whose ranks must persist: offer providers and ref targets."""
-    sources = set()
-    for fid in fids:
-        fact = fact_of(fid)
-        if fact is None:
-            continue
-        if fact.offers():
-            sources.add(fid)
-        sources.update(ref for _, ref in fact.refs())
-    return sources
-
-
-def rebuild_proofs(db, fact_of):
-    """Recompute shortest authority proofs for every persistent source.
-
-    Facts are admitted in rank waves.  A fact in wave ``r`` can depend only on
-    providers from earlier waves, which gives every accepted set one
-    history-independent dependency DAG even when offers shadow one another.
-    Facts that neither provide an offer nor anchor a reference cannot
-    authorize anything and need no persistent rank; the streaming kernel
-    still ranks them while judging.
-
-    Returns the source ids that have no finite proof.
-    """
+def rebuild_proofs(db, fact_of, anchor=None, accept=None):
+    """Derive eligibility and shortest ranks for the whole admitted catalog."""
     db.execute("DELETE FROM proofs")
+    db.execute("DELETE FROM edges")
     return extend_proofs(
-        db, proof_sources(
-            (fid for (fid,) in db.execute("SELECT fid FROM facts")),
-            fact_of),
+        db,
+        (fid for (fid,) in db.execute("SELECT fid FROM facts")),
         fact_of,
+        anchor,
+        accept,
     )
 
 
-def unresolved_facts(db, fact_of):
-    """Rebuild proof ranks and return every fact outside the finite DAG."""
-    unresolved = set(rebuild_proofs(db, fact_of))
-    for (fid,) in db.execute("SELECT fid FROM facts ORDER BY fid"):
-        if fid in unresolved:
-            continue
-        deps = resolve_deps(fact_of(fid), db)
-        if deps is None or proof_rank(db, deps) is None:
-            unresolved.add(fid)
-    return frozenset(unresolved)
-
-
-def _globals(rows):
-    """Normalize the family-neutral public ``(name, value)`` row shape."""
-    return frozenset(Global(*row) for row in (rows or ()))
-
-
-def _matches_committed_authority(fact, committed):
-    """Require the committed winner to satisfy every already-known need.
-
-    A genuinely new address may bootstrap through its self-contained payload.
-    Once an address exists, its committed raw winner must satisfy the need's
-    co-offers. Equivalent presented winners remain valid so honest peers can
-    authenticate the walk that converges them.
-    """
-    handler = facts.handler_for(fact.t)
-    for need in handler.needs(fact):
-        name, a0, a1, requires = _need_parts(need)
-        raw_source = offer_src(committed, name, a0, a1)
-        if raw_source is not None and offer_src(
-                committed, name, a0, a1, requires) is None:
-            return False
-    return True
-
-
-def _admit(con, fact, rank, edges):
-    con.execute(
-        "INSERT OR IGNORE INTO facts VALUES(?,?,?)",
-        (fact.fid, fact.ts, fact.t),
-    )
-    con.executemany(
-        "INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
-        ((*offer, fact.fid) for offer in fact.offers()),
-    )
-    con.execute(
-        "INSERT OR IGNORE INTO proofs VALUES(?,?)",
-        (fact.fid, rank),
-    )
-    con.executemany(
-        "INSERT OR REPLACE INTO edges VALUES(?,?,?,?)",
-        ((fact.fid, edge.role, edge.fid, edge.kind) for edge in edges),
-    )
-
-
-def _judge(
-        stream, ctx, mode=VALIDATE, supplied=frozenset(),
-        canonical_db=None):
-    """The one streaming judge, with transaction policy left to its caller."""
-    con = ctx.db
-    valids, emitted = [], set()
+def _judge(stream, ctx):
+    """The one streaming judge over one bounded, topological closure."""
+    valids = []
     for fact in stream:
-        if con.execute(
-                "SELECT 1 FROM facts WHERE fid=?",
-                (fact.fid,)).fetchone():
+        if ctx.has_fact(fact.fid):
             continue
         try:
-            handler = facts.handler_for(fact.t)
-            refs_seen = all(con.execute(
-                "SELECT 1 FROM facts WHERE fid=?", (fid,)).fetchone()
-                for _, fid in fact.refs())
+            handler = facts.family_for(fact.t)
+            refs_seen = all(ctx.has_fact(fid) for _, fid in fact.refs())
             edges = resolve_edges(
-                fact, con) if handler is not None and refs_seen else None
+                fact, ctx) if handler is not None and refs_seen else None
             deps = None if edges is None else [edge.fid for edge in edges]
-            good = edges is not None and handler.validate(fact, ctx) is True \
-                and facts.validate_fact_policy(fact, edges, ctx)
-            if good and mode == EVALUATE and canonical_db is not None:
-                good = _matches_committed_authority(
-                    fact, canonical_db)
-            if good and mode == EVALUATE and hasattr(handler, "evaluate"):
-                good = handler.evaluate(fact, supplied, ctx) is True
+            good = edges is not None and accepts(fact, edges, ctx)
         except Exception:
             good = False  # hostile family bytes are litter, never poison
-        rank = proof_rank(con, deps) if good else None
+        rank = proof_rank(ctx, deps) if good else None
         if rank is None:
-            return Judgment(False, tuple(valids), frozenset())
-        _admit(con, fact, rank, edges)
-        if mode == DRAIN:
-            emitted.update(
-                Global(*row) for row in handler.global_rows(fact))
+            return Judgment(False, tuple(valids))
+        ctx.admit(fact, rank, edges)
         valids.append(Valid(fact, tuple(deps), tuple(edges)))
-    return Judgment(True, tuple(valids), frozenset(emitted))
+    return Judgment(True, tuple(valids))
 
 
-def kernel(
-        stream, anchor, *, mode=VALIDATE, globals_=(), db=None,
-        canonical_db=None):
-    """Run the shared judge and return its complete internal result.
-
-    Most callers should use :func:`validate`, :func:`drain`, or
-    :func:`evaluate`, whose return values make their side-effect contract
-    explicit.
-    """
-    if mode not in MODES:
-        raise ValueError(f"unknown kernel mode {mode!r}")
-    supplied = _globals(globals_)
-    con = db or sqlite3.connect(":memory:")
-    con.executescript(SCHEMA)
-    con.execute("BEGIN")
-    result = _judge(
-        stream, Context(con, anchor), mode, supplied, canonical_db)
-    if not result.ok:
-        con.rollback()
-        if db is None:
-            con.close()
-        return Judgment(False, (), frozenset())
-    con.commit()
-    if db is None:
-        con.close()
-    return result
+def kernel(stream, anchor):
+    """Judge one bounded closure without a database or host state."""
+    result = _judge(stream, MemoryContext(anchor))
+    return result if result.ok else Judgment(False, ())
 
 
-def validate(stream, anchor, *, db=None):
+def validate(stream, anchor):
     """Validate one already-topological closed unit; return exactly ``bool``."""
-    return kernel(stream, anchor, mode=VALIDATE, db=db).ok
+    return kernel(stream, anchor).ok
 
 
-def drain(stream, anchor, *, db=None):
-    """Validate persistent ingress and expose Valid values plus global deltas."""
-    return kernel(stream, anchor, mode=DRAIN, db=db)
-
-
-def drain_committed(stream, anchor, globals_):
-    """Validate a published durable stream and its derived root metadata."""
-    unit = tuple(stream)
-    handlers = tuple(facts.handler_for(fact.t) for fact in unit)
-    try:
-        expected = _globals(globals_)
-    except (TypeError, ValueError):
-        return Judgment(False, (), frozenset())
-    if any(
-            handler is None or not handler.DURABLE
-            for handler in handlers):
-        return Judgment(False, (), frozenset())
-    result = drain(unit, anchor)
-    return result if result.ok and result.globals == expected \
-        else Judgment(False, (), frozenset())
-
-
-def evaluate(stream, anchor, globals_, *, db=None, canonical_db=None):
-    """Validate an ephemeral payload against committed globals; return bool."""
-    return kernel(
-        stream, anchor, mode=EVALUATE, globals_=globals_, db=db,
-        canonical_db=canonical_db).ok
+def drain(stream, anchor):
+    """Validate ingress and expose kernel-minted named dependency edges."""
+    return kernel(stream, anchor)

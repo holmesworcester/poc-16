@@ -21,6 +21,42 @@ blobs are encrypted with a secret carried in the invite link. Attachment bytes
 are content addressed and Bao verified, but the surrounding file facts are not
 encrypted.
 
+## Authority flow and code map
+
+The runtime is a downward authority chain, not a collection of peer managers:
+
+```text
+daemon / local command                         host adapters
+        ↓
+WorkspaceRuntime.turn                          one socket-free turn
+        ↓
+kernel → registered fact family                judgment and policy
+        ↓
+Catalog.settle                                 admitted receipt → eligibility
+        ↓
+Publisher.publish                              snapshot → one root CAS
+        ↓
+pump                                            disposable client read model
+
+root + immutable-object fetches → WorkerView   database-free CF authorization
+```
+
+`Node` composes local identity, workspace handles, diagnostics, and these
+boundaries. It does not define family policy. Sync and local authorship both
+enqueue the same pile bytes; `WorkspaceRuntime` is the normal coordinator,
+`Catalog` alone decides current standing, and `Publisher` alone advances
+`root`. The daemon handles HTTP, token sealing, and control dispatch.
+
+An engineer should read the running path in this order:
+
+1. `core/fact.py` and `core/suppression.py`;
+2. `facts/__init__.py`, then one auth and one content family;
+3. `core/kernel.py`;
+4. `core/runtime.py` and `core/catalog.py`;
+5. `core/publication.py`, `core/manifest.py`, and `core/indexes.py`;
+6. `core/worker.py` and `core/mint.py`;
+7. `core/sync.py`, `core/walk.py`, then `core/daemon.py`.
+
 ## Facts and the kernel
 
 A fact is a canonical JSON value containing:
@@ -39,17 +75,23 @@ A pile is a canonical, topologically ordered, dependency-closed collection of
 facts plus optional blobs. The same pile codec is used for ingress, sync, and
 resident leaf objects.
 
-The family-neutral kernel processes a pile in one pass. A reference must name
-an earlier fact. Each family declares needs such as `member`, `admin`, or
-`author`; the kernel selects the canonical provider by shortest proof rank and
-then fid. Families validate their own shapes and values. `facts/_policy.py`
-independently verifies the cross-family contract: named edge roles, exact
-suppression selectors, direct target modes, admission guards, and continuing
-authority liveness.
+The family-neutral kernel processes a pile in one pass. A `ref` carries its
+own role and must name an earlier fact. Each family returns named `Need`
+values; the kernel selects each canonical provider by shortest proof rank and
+then fid. There is no second tag-indexed role table. Every family module owns
+one `POLICY` beside its behavior, and `facts/__init__.py` is the one checked
+registry. `facts/_policy.py` supplies the vocabulary for selectors, direct
+targets, guards, liveness, and typed principal/action offers.
 
-Persistent validity is immutable and does not read wall-clock or removal
-globals. An ephemeral `req` additionally checks its verb and expiry against the
-service’s trusted current time.
+Persistent validity is immutable and does not read wall-clock state. An
+ephemeral request family owns its database-free Worker authorization hook,
+including verb and expiry checks against trusted service time.
+
+Ingress dependency choices are hints, not authority. The client catalog
+resolves every named edge again against its complete local candidate set and
+runs the same family validator before granting standing. A sender therefore
+cannot preserve a losing ownership or membership edge when the receiver has a
+better canonical provider.
 
 ## Store and publication
 
@@ -63,24 +105,29 @@ invite/<unguessable-id>      encrypted invite blob
 failed/...                   node-local quarantine diagnostics
 ```
 
-SQLite files are derived indexes and read models. Deleting them and reopening
-the node rebuilds them from the objects named by `root`.
+The workspace SQLite database contains a stable local admission catalog plus
+derived eligibility and reverse indexes. A kernel-valid durable receipt is
+stored once; losing canonical standing removes its proof row, not its bytes or
+offers. The separate application database is disposable and rebuilt by the
+projection pump. Deleting the workspace catalog can lose node-local,
+currently ineligible receipts that were deliberately never published.
 
-The root uses layout stamp `composite-btreap-v3` and atomically binds:
+The root uses layout stamp `composite-btreap-v4` and atomically binds:
 
 ```text
 anchor          workspace genesis fid
-globals         non-suppression kernel globals
 manifest        range-sync manifest root
 layout_seed     deterministic authenticated-tree seed
 trees           FactTree, SuppTree, AuthorityTree descriptors
-actions         count and digest of the admitted action set
+action_etag     non-authoritative cache key for active-action sync
 stamp           exact format identity
 ```
 
 One compare-and-swap publishes the range manifest and all three authenticated
 trees. There is no second mutable removal root and therefore no two-root
-transaction.
+transaction. `action_etag` only avoids enumerating SuppTree when ordinary facts
+change but actions do not; Workers never trust it, and action evidence remains
+authoritative only through the authenticated trees.
 
 The range manifest partitions sorted fact keys with the shared stable boundary
 rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
@@ -99,21 +146,34 @@ tree.
 
 The schemas are:
 
-- **FactTree** — `fact:<fid>` maps to a bounded `FactRecord` containing the
-  raw-object id, named edges, offers, selectors, continuing liveness scopes,
-  and optional action evidence. `action:<sid>` is a reserved CLEAR/ACTIVE
-  action slot.
+- **FactTree** — `fact:<fid>` maps to the bounded Worker record it consumes:
+  offers, selectors, continuing liveness scopes, and optional action evidence.
+  `action:<sid>` mirrors a known direct/principal action slot so sync can
+  corroborate a SuppTree witness through an independently addressed record.
+  Raw facts remain in manifest piles and are not emitted again as one object
+  per record.
 - **SuppTree** — a suppression id maps directly to CLEAR or to ACTIVE with its
-  canonical action fid.
-- **AuthorityTree** — a canonical `NeedKey` maps to the selected provider or
-  authenticates absence.
+  effective action fid. CLEAR is a positive authenticated statement that this
+  known, reserved id has no effective action in this snapshot; it is not the
+  same as a missing row. ACTIVE names the action whose evidence is named by
+  its FactRecord. Missing required rows fail closed.
+- **AuthorityTree** — a canonical `NeedKey` maps to the selected provider and
+  rank. A missing address is not inferred from submitted facts; family
+  authorization decides whether bootstrap absence is allowed.
 
-This answers two different lookup directions without duplicating authority.
-The authoritative read path is keyed by suppression id. The immutable action
-fid and evidence are reachable from its ACTIVE slot and FactRecord. Local
-SQLite keeps `actions(sid, fid, evidence)` and `supp(fid, sid)` as rebuildable
-reverse projections so a node can retract already-resident victims. Those
-tables are not a second published index and Workers never read them.
+This answers distinct bounded questions rather than keeping two mutable
+suppression roots. SuppTree answers “is this explicit id active?”; FactTree
+answers “what does this exact fact require and offer?” and corroborates the
+action witness; AuthorityTree answers “which committed fact provides this
+need?” The immutable action fid and evidence are reachable from the ACTIVE
+slots and FactRecord.
+
+Local SQLite retains `action_proposals` and their targets alongside the stable
+catalog. It derives `actions(sid, fid, evidence)` as the current effective
+frontier and `supp(fid, sid)` as the reverse map used to retract resident
+victims. Only the proposals are retained input; the latter two tables are
+rebuildable projections. None is a second published authority index, and the
+database-free Worker never reads them.
 
 An action, its `action:<sid>` slot, its `sid` suppression slot, the fact and
 authority updates, and the range manifest all become visible under the same
@@ -175,8 +235,9 @@ The ordinary fact graph authorizes the action:
   every directly deletable family;
 - an unrelated ordinary member satisfies neither path.
 
-These checks live in the content-delete handler and the exhaustive policy
-registry. The core does not special-case message or file ownership.
+These checks live in the content-delete handler and family-owned policies
+compiled by the checked registry. The core does not special-case message or
+file ownership.
 
 Member eviction is an admin-authored fact offering `removed(target_pk)`. It
 activates `member:<target_pk>`, a terminal key-wide tombstone that covers
@@ -192,41 +253,63 @@ Authorization has two intentionally distinct concepts:
 
 A delegated admin grant uses the grantor admin as a one-time admission guard
 and the grantee membership as its continuing liveness guard. Evicting the
-grantee disables the grant. Later loss of the grantor does not retroactively
-undo a grant that was validly committed.
+grantee disables the grant. Liveness follows only the family-declared guard
+edges, transitively and under a hard bound, so an admin grant to a child device
+also inherits that device set's user liveness. Later loss of the grantor does
+not retroactively undo a grant that was validly committed.
 
 ## Action timing
 
-The admitted action set is monotone. Workers enforce current state strictly:
-an ACTIVE principal or selector always refuses the request.
+Validated action proposal bytes are retained monotonically in the local
+catalog; effective action state is derived and is not assumed monotone across
+root versions. For example, a later-arriving, shallower ownership claim can
+make a previously plausible OWNER deletion ineligible. The next root then
+publishes CLEAR for that id and restores the victim to the active client view.
+Workers enforce each current snapshot strictly: an ACTIVE principal or
+selector always refuses the request.
 
 Replica admission must also converge when an old fact and an action arrive in
-opposite orders. Without a linearizable receipt service, the running rule uses
-the canonical fact key: an action blocks a candidate ordered after it, while a
-candidate ordered before it remains admissible as history. This avoids an
-arrival-order graph walk and is deterministic, but timestamps are
-author-controlled. A colluding live relay can therefore present a newly signed,
-backdated durable effect as historical. Remote minting still refuses the
-removed principal itself. Closing the stronger “authored before, not merely
-ordered before” distinction requires a service-issued admission frontier or
-receipt; it cannot be inferred from an asynchronous signed fact alone.
+opposite orders. Settlement therefore computes one deterministic fixed point:
+
+1. resolve and validate canonical local edges for every candidate;
+2. fold currently eligible action proposals in canonical `(fact key, fid,
+   evidence)` order;
+3. accept a proposal only if an earlier active target does not intersect its
+   transitive, family-declared authorization scopes;
+4. let each accepted proposal activate all of its explicit target ids; and
+5. rebuild eligibility under that frontier until neither proofs nor actions
+   change, failing closed on a cycle.
+
+The earliest effective proposal wins a duplicate id. An action blocks an
+ordinary candidate whose canonical fact key is later; an earlier candidate
+remains admissible history. Retaining inactive receipts makes fact-first,
+action-first, and later canonical-winner changes converge without a
+descendant lookup or sender-selected edge.
+
+This ordering is deterministic, but timestamps are author-controlled. A
+colluding live relay can therefore present a newly signed, backdated durable
+effect as historical. Remote minting still refuses the removed principal
+itself. Closing the stronger “authored before, not merely ordered before”
+distinction requires a service-issued admission frontier or receipt; it
+cannot be inferred from an asynchronous signed fact alone.
 
 ## Worker authorization
 
 `WorkerView` opens the composite root and performs exact authenticated reads:
 
 1. decode and kernel-validate the submitted closure (maximum 64 facts);
-2. require exactly one ephemeral request with an allowed verb and unexpired
-   service-time deadline;
+2. dispatch exactly one ephemeral family authorization hook, which checks its
+   allowed verb and service-time deadline;
 3. check committed authority winners and family-required co-offers;
 4. read only the request/provider FactRecords and their declared liveness
    scopes;
 5. read the corresponding SuppTree slots; and
 6. return `(public_key, verb)` for sealing by the daemon.
 
-`core/mint.py` contains only this path. There is no compatibility projection,
-SQLite reconstruction, or full-tree fallback. A cached view is reusable only
-while its root ETag matches.
+`core/mint.py` contains only this path. The CF path is `root bytes + immutable
+object fetches + submitted closure`: no SQLite, client catalog, compatibility
+projection, or full-tree fallback. A cached view is reusable only while its
+root ETag matches.
 
 The daemon seals a short-lived bearer grant to the requester’s public key.
 The grant TTL is a deliberate revocation leakage window. After expiry, an
@@ -248,15 +331,16 @@ one closed pile, remote ranges are assembled, and missing live blobs are
 fetched. Push happens before draining the pull so canonical pruning cannot
 remove a precomputed difference before delivery.
 
-Ingress failures and sync failures are quarantined and visible through
+Malformed ingress failures and sync failures are quarantined and visible through
 `status`. Malformed roots, pages, facts, selectors, action evidence, or
 authority rows fail closed. A root format mismatch forces a wholesale rebuild
 from the current derived index; there is no ongoing dual decoder.
 
 Application tables are insert-only source rows plus a projection cursor.
 Suppression appends retractions to the delivery log. Rebuild replays the
-authenticated resident facts, reconstructs action and selector reverse maps,
-and then reproduces the application view.
+authenticated resident facts together with the stable local catalog,
+reconstructs eligibility, action and selector reverse maps, and then
+reproduces the application view.
 
 ## Performance
 

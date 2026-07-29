@@ -161,7 +161,7 @@ def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
 
     monkeypatch.setattr(kernel_module, "resolve_deps", counted)
     unresolved = kernel_module.rebuild_proofs(
-        index, lambda fid: node.fact_of(workspace, fid))
+        index, lambda fid: node.candidate_of(workspace, fid), workspace)
 
     assert not unresolved
     assert calls["count"] <= membership_facts

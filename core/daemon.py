@@ -16,9 +16,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import cmds, manifest, mint as gate, suppression_state
+from . import cmds, manifest, mint as gate
 from .crypto import h, seal_to
 from .node import Node, now_ms
+from .runtime import AuthorityRejected
 from .store import PAGE_BATCH
 from .sync import sync
 
@@ -186,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404)
 
     def mint(self, o):
-        """Evaluate mode: the payload proves itself; no drain, no writes."""
+        """Read-only gate: judge the bounded proof without admitting it."""
         try:
             if not isinstance(o, dict):
                 raise TypeError
@@ -203,7 +204,7 @@ class Handler(BaseHTTPRequestHandler):
                 root = self.node.store(ws).get("root")
                 if not root:
                     return self._send(403)
-                anchor = manifest.decode_root(root)[0]
+                anchor = manifest.decode_root(root).anchor
             except Exception:
                 return self._send(403)
             if anchor != ws:
@@ -304,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
             if parts[1] == "rebuild":
                 n.rebuild(ws)
                 return self._json(200, {"ok": True})
-        except suppression_state.ScreenRejected as e:
+        except AuthorityRejected as e:
             return self._json(403, {"error": f"{type(e).__name__}: {e}"})
         except (KeyError, TypeError, ValueError) as e:
             return self._json(400, {"error": f"{type(e).__name__}: {e}"})

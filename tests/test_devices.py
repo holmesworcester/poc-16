@@ -17,7 +17,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace as workspace_fact
-from core.kernel import drain, evaluate, offer_src, resolve_deps
+from core.kernel import drain, offer_src, resolve_deps
 from core.node import Node, now_ms
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
@@ -346,8 +346,10 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     ts = now_ms()
     stale_request = request_payload(
         node, workspace, "sync", ts + 120_000, ts)
-    door = node.globals(workspace) | {("now", ts)}
-    assert evaluate(stale_request, workspace, door)
+    stale_bytes = encode_pile(stale_request)
+    assert mint.stateless(
+        stale_bytes, node.store(workspace).get("root"),
+        lambda oid: node.store(workspace).get("obj/" + oid), ts)
     node.bind_identity(workspace, target)
     target_chain = closed_subset(
         node, workspace, [target_claim.fid, child_claim.fid])
@@ -397,12 +399,9 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     accepted = node.ingest_new(
         workspace, [conflict_sig, conflict], conflict_deps)
     assert any(valid.fact.fid == conflict.fid for valid in accepted)
-    assert not evaluate(
-        stale_request,
-        workspace,
-        door,
-        canonical_db=node.idx(workspace),
-    )
+    assert mint.stateless(
+        stale_bytes, node.store(workspace).get("root"),
+        lambda oid: node.store(workspace).get("obj/" + oid), ts) is None
 
     for current in (node, peer):
         assert current.fact_of(workspace, conflict.fid) == conflict
@@ -427,6 +426,81 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     assert node.store(workspace).list("pile/") == []
     posted = cmds.post(node, workspace, "general", "still authorized")
     assert node.fact_of(workspace, posted) is not None
+
+
+def test_delete_rechecks_canonical_owner_after_device_claim_conflict(
+        tmp_path):
+    """A sender's losing ownership edge cannot keep its delete effective."""
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    founder_secret, founder = source.identity(workspace)
+    cmds.bind_device(source, workspace, "alice-phone")
+
+    bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
+    source.keychain.add_identity(bob_secret)
+    source.bind_identity(workspace, bob)
+    cmds.bind_device(source, workspace, "bob-phone")
+    common = closed_subset(source, workspace, all_fids(source, workspace))
+
+    target_secret, target = keypair()
+    source.keychain.add_identity(target_secret)
+    bob_claim = _inject_device_claim(
+        source, workspace, bob_secret, bob, bob, target, "bob-target", 100)
+    source.bind_identity(workspace, target)
+    posted = cmds.post(
+        source, workspace, "general", "ownership must be local", ts=110)
+    source.bind_identity(workspace, bob)
+    deletion = cmds.remove(source, workspace, posted, ts=120)
+    bob_first = closed_subset(
+        source, workspace, [bob_claim.fid, posted, deletion])
+    assert cmds.msgs(source, workspace) == []
+
+    # Alice's equally valid but shallower claim becomes the canonical
+    # ownership provider for ``target``. Build it as an independent closed
+    # unit so another peer can receive this winner before Bob's stale chain.
+    conflict = device_invite_fact(
+        founder, founder, target, "alice-target", 130)
+    conflict_sig = signature(founder_secret, founder, conflict, 130)
+    conflict_deps = {
+        conflict_sig.fid: (),
+        conflict.fid: (
+            conflict_sig.fid,
+            member_src(source, workspace, founder),
+            offer_src(
+                source.idx(workspace), "device_key", founder,
+                requires=(("device", founder, founder),)),
+        ),
+    }
+    new = {fact.fid: fact for fact in (conflict_sig, conflict)}
+    conflict_pile = encode_pile(close(
+        [conflict_sig, conflict],
+        lambda fid: conflict_deps[fid] if fid in conflict_deps else
+        resolve_deps(source.fact_of(workspace, fid), source.idx(workspace)),
+        lambda fid: new.get(fid) or source.fact_of(workspace, fid),
+    ))
+
+    # Source sees Bob's delete first. Peer sees Alice's winning claim first.
+    # Both must recompute dependencies locally, reject the now-invalid OWNER
+    # proposal, restore the message, and publish the same finite snapshot.
+    source.ingest_new(
+        workspace, [conflict_sig, conflict], conflict_deps)
+    peer = Node(str(tmp_path / "peer"))
+    peer.add_workspace(workspace, "alice", peers=[])
+    for pile in (common, conflict_pile, bob_first):
+        deliver(peer, workspace, pile)
+        peer.turn(workspace)
+
+    for current in (source, peer):
+        assert current.candidate_of(workspace, deletion) is not None
+        assert current.fact_of(workspace, deletion) is None
+        assert current.fact_of(workspace, posted) is not None
+        assert [row["fid"] for row in cmds.msgs(current, workspace)] == [posted]
+        assert current.idx(workspace).execute(
+            "SELECT 1 FROM actions WHERE fid=?", (deletion,)).fetchone() is None
+        current.rebuild(workspace)
+        assert [row["fid"] for row in cmds.msgs(current, workspace)] == [posted]
+    assert source.store(workspace).get("root") \
+        == peer.store(workspace).get("root")
 
 
 def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
@@ -514,18 +588,6 @@ def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
     remote_request = request_payload(
         remote, workspace, "sync", ts + 120_000, ts)
 
-    assert evaluate(
-        source_request,
-        workspace,
-        remote.globals(workspace) | {("now", ts)},
-        canonical_db=remote.idx(workspace),
-    )
-    assert evaluate(
-        remote_request,
-        workspace,
-        source.globals(workspace) | {("now", ts)},
-        canonical_db=source.idx(workspace),
-    )
     source_root = source.store(workspace).get("root")
     remote_root = remote.store(workspace).get("root")
     assert mint.stateless(
@@ -590,7 +652,7 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
 
 def test_rank_only_shadow_projection_survives_retry_and_stale_replay(
         tmp_path, monkeypatch):
-    from core import node as runtime
+    from core import runtime
 
     original_pump = runtime.pump
     node = Node(str(tmp_path / "node"))
@@ -717,7 +779,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
 
     The short claim first beats the deep claim and orphans its child. A later
     direct rejoin shortens the deep proof enough to win again. Both delivery
-    orders, including an index rebuild while the child is quarantined, must
+    orders, including an eligibility rebuild while the child is inactive, must
     publish the same restored set.
     """
     source = Node(str(tmp_path / "source"))
@@ -759,8 +821,11 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
         "from-short", 400)
     short_pile = closed_subset(source, workspace, [short_claim.fid])
     assert source.fact_of(workspace, child_claim.fid) is None
-    assert source.store(workspace).has(
-        "quarantine/" + child_claim.fid)
+    assert source.candidate_of(workspace, child_claim.fid) == child_claim
+    assert source.idx(workspace).execute(
+        "SELECT admitted FROM facts WHERE fid=?",
+        (child_claim.fid,)).fetchone() == (1,)
+    assert source.store(workspace).list("quarantine/") == []
 
     invite_secret, invite_public = keypair()
     invitation = user_invite(root, invite_public, 500)
@@ -785,32 +850,10 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     rejoin_pile = closed_subset(source, workspace, [rejoined.fid])
     assert source.fact_of(workspace, child_claim.fid) == child_claim
 
-    # Quarantine bodies remain as recovery material after restoration. Normal
-    # signatures must consult the in-memory offer index, not list and decode
-    # the retained history twice per post (merge + commit).
-    retained_reads = []
-    store = source.store(workspace)
-    original_get, original_list = store.get, store.list
-
-    def tracked_get(key):
-        if key.startswith("quarantine/"):
-            retained_reads.append(("get", key))
-        return original_get(key)
-
-    def tracked_list(prefix):
-        if prefix == "quarantine/":
-            retained_reads.append(("list", prefix))
-        return original_list(prefix)
-
-    store.get, store.list = tracked_get, tracked_list
-    try:
-        ordinary = [
-            cmds.post(source, workspace, "general", f"after-restore-{ordinal}")
-            for ordinal in range(2)
-        ]
-    finally:
-        store.get, store.list = original_get, original_list
-    assert not retained_reads
+    ordinary = [
+        cmds.post(source, workspace, "general", f"after-restore-{ordinal}")
+        for ordinal in range(2)
+    ]
     ordinary_pile = closed_subset(source, workspace, ordinary)
 
     first = Node(str(tmp_path / "first"))
@@ -818,16 +861,13 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
         deliver(
             first, workspace, pile,
             member=f"first{ordinal}".ljust(16, "a"))
-        first.turn(workspace)
+    first.turn(workspace)
     assert first.fact_of(workspace, child_claim.fid) is None
-    assert first.store(workspace).has(
-        "quarantine/" + child_claim.fid)
+    assert first.candidate_of(workspace, child_claim.fid) == child_claim
 
-    # Both SQLite databases are derived. Rebuilding the fact index from the
-    # manifest must retain the local, previously kernel-valid quarantine.
+    # Eligibility and edges are derived around the stable admitted catalog.
     first.idx(workspace).executescript(
-        "DELETE FROM facts; DELETE FROM offers; DELETE FROM proofs; "
-        "DELETE FROM globals; DELETE FROM meta;")
+        "DELETE FROM proofs; DELETE FROM edges; DELETE FROM meta;")
     first.idx(workspace).commit()
     first.rebuild(workspace)
     assert first.fact_of(workspace, child_claim.fid) is None
@@ -861,7 +901,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
 
 def test_restoration_forces_a_followup_walk_for_the_restored_fact(
         tmp_path, monkeypatch):
-    """A pull that restores quarantine must not leave a valid 304 cache."""
+    """A pull that reactivates a catalog fact must invalidate a 304 cache."""
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "root", ts=1)
     root_secret, root = source.identity(workspace)

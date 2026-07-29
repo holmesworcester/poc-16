@@ -17,6 +17,17 @@ def canon(o) -> bytes:
 
 
 @dataclass(frozen=True)
+class Need:
+    """A named dependency on the canonical provider of an offer address."""
+
+    role: str
+    name: str
+    a0: str
+    a1: str | None = None
+    requires: tuple = ()
+
+
+@dataclass(frozen=True)
 class Fact:
     t: str
     ts: int

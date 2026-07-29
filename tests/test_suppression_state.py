@@ -4,10 +4,11 @@ import os
 
 import pytest
 
+import facts
 from core import cmds, suppression_state
 from core.close import close, encode_pile
-from core.crypto import h
-from core.kernel import resolve_deps
+from core.crypto import h, keypair
+from core.kernel import offer_src, resolve_deps
 from core.node import Node
 from core import sync as sync_module
 from facts.auth.removal import removal
@@ -17,8 +18,10 @@ from facts.content.message import message
 from .util import (
     add_member,
     all_fids,
+    author_msg,
     closed_subset,
     deliver,
+    inject_device_claim,
     member_src,
 )
 
@@ -39,6 +42,17 @@ def _signed_pile(node, workspace, fact, signed, deps):
     ))
 
 
+def _author_eviction(node, workspace, target, ts):
+    secret, public = node.identity(workspace)
+    item = removal(public, target, ts)
+    signed = signature(secret, public, item, ts)
+    admin = offer_src(node.idx(workspace), "admin", public)
+    node.ingest_new(
+        workspace, [signed, item],
+        {signed.fid: (), item.fid: (signed.fid, admin)})
+    return item
+
+
 def test_composite_root_has_no_legacy_removal_object(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
@@ -47,8 +61,7 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
 
     root = json.loads(node.store(workspace).get("root"))
     assert set(root) == {
-        "actions", "anchor", "globals", "layout_seed", "manifest", "stamp",
-        "trees"}
+        "action_etag", "anchor", "layout_seed", "manifest", "stamp", "trees"}
     assert "removals" not in root
     assert _action_rows(node, workspace)[0][:2] == (
         f"fact:{target}", action_fid)
@@ -91,15 +104,11 @@ def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
         {signed.fid: (), item.fid: (signed.fid, provider)})
     deliver(node, workspace, pile)
 
-    with pytest.raises(
-            suppression_state.ScreenRejected,
-            match="suppressed authority"):
-        node.turn(workspace)
+    node.turn(workspace)
+    assert node.candidate_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) is None
     assert node.store(workspace).list("pile/") == []
-    assert any(
-        "ScreenRejected" in row["error"]
-        for row in node.ingress_failures(workspace))
+    assert node.ingress_failures(workspace) == []
 
 
 def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
@@ -118,11 +127,11 @@ def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
         {signed.fid: (), item.fid: (signed.fid, admin_fid)})
     deliver(node, workspace, pile)
 
-    with pytest.raises(
-            suppression_state.ScreenRejected,
-            match="suppressed authority"):
-        node.turn(workspace)
+    node.turn(workspace)
+    assert node.candidate_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) is None
+    assert not suppression_state.active(
+        node.idx(workspace), facts.principal_sid("member", carol))
 
 
 def test_terminal_member_action_covers_a_future_provider(tmp_path):
@@ -142,7 +151,217 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
     assert len(providers) == 2
     assert suppression_state.active(
         node.idx(workspace),
-        suppression_state.principal_sid("member", bob))
+        facts.principal_sid("member", bob))
+
+
+def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
+    """An earlier action deactivates a later fact even when it arrives last."""
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
+    base = closed_subset(source, workspace, all_fids(source, workspace))
+
+    posted = author_msg(
+        source, workspace, bob_secret, bob, "post-action", ts=30)
+    message_pile = closed_subset(source, workspace, [posted.fid])
+    action = _author_eviction(source, workspace, bob, 20)
+    action_pile = closed_subset(source, workspace, [action.fid])
+
+    peers = []
+    for name, order in (
+            ("fact-first", (message_pile, action_pile)),
+            ("action-first", (action_pile, message_pile))):
+        peer = Node(str(tmp_path / name))
+        peer.add_workspace(workspace, "alice", peers=[])
+        deliver(peer, workspace, base)
+        peer.turn(workspace)
+        for pile in order:
+            deliver(peer, workspace, pile)
+            peer.turn(workspace)
+        peers.append(peer)
+
+    assert all(
+        peer.candidate_of(workspace, posted.fid) == posted
+        and peer.fact_of(workspace, posted.fid) is None
+        and cmds.msgs(peer, workspace) == []
+        for peer in peers
+    )
+    assert peers[0].store(workspace).get("root") \
+        == peers[1].store(workspace).get("root") \
+        == source.store(workspace).get("root")
+
+
+def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
+    base = closed_subset(source, workspace, all_fids(source, workspace))
+
+    first = _author_eviction(source, workspace, bob, 20)
+    first_pile = closed_subset(source, workspace, [first.fid])
+    later = next(
+        removal(source.identity_id(workspace), bob, ts)
+        for ts in range(41, 500)
+        if removal(source.identity_id(workspace), bob, ts).fid < first.fid
+    )
+    secret, public = source.identity(workspace)
+    later_sig = signature(secret, public, later, later.ts)
+    source.ingest_new(
+        workspace, [later_sig, later],
+        {later_sig.fid: (), later.fid: (later_sig.fid, workspace)})
+    later_pile = closed_subset(source, workspace, [later.fid])
+
+    posted = message(bob, "general", "between actions", 30)
+    posted_sig = signature(bob_secret, bob, posted, 30)
+    message_pile = _signed_pile(
+        source, workspace, posted, posted_sig,
+        {
+            posted_sig.fid: (),
+            posted.fid: (
+                posted_sig.fid, member_src(source, workspace, bob)),
+        },
+    )
+
+    roots = []
+    for name, order in (
+            ("early-first", (first_pile, later_pile)),
+            ("late-first", (later_pile, first_pile))):
+        peer = Node(str(tmp_path / name))
+        peer.add_workspace(workspace, "alice", peers=[])
+        deliver(peer, workspace, base)
+        peer.turn(workspace)
+        for pile in (*order, message_pile):
+            deliver(peer, workspace, pile)
+            peer.turn(workspace)
+        sid = facts.principal_sid("member", bob)
+        assert peer.idx(workspace).execute(
+            "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
+            == (first.fid,)
+        assert peer.candidate_of(workspace, posted.fid) == posted
+        assert peer.fact_of(workspace, posted.fid) is None
+        roots.append(peer.store(workspace).get("root"))
+    assert roots[0] == roots[1]
+
+
+def test_action_sync_compares_witnesses_not_fact_id_order(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    founder_secret, founder = source.identity(workspace)
+    _, bob, _ = add_member(source, workspace, "bob", ts=10)
+    common = closed_subset(source, workspace, all_fids(source, workspace))
+    first = _author_eviction(source, workspace, bob, 20)
+
+    destination = Node(str(tmp_path / "destination"))
+    destination.keychain.add_identity(founder_secret)
+    destination.add_workspace(
+        workspace, "alice", peers=[], identity=founder)
+    deliver(destination, workspace, common)
+    destination.turn(workspace)
+    later_ts = next(
+        ts for ts in range(41, 500)
+        if removal(destination.identity_id(workspace), bob, ts).fid < first.fid
+    )
+    later = _author_eviction(destination, workspace, bob, later_ts)
+    assert later.fid < first.fid  # the obsolete tuple-order shortcut
+
+    store = source.store(workspace)
+    root = store.get("root")
+    fetch = lambda oid: store.get("obj/" + oid)
+    pulled = sync_module.pull_actions(
+        destination, workspace, root, fetch,
+        sync_module.action_rows(root, fetch),
+    )
+
+    assert first.fid in pulled
+    sid = facts.principal_sid("member", bob)
+    assert destination.idx(workspace).execute(
+        "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
+        == (first.fid,)
+
+
+def test_action_evidence_recanonicalizes_across_equivalent_providers(
+        tmp_path):
+    """Proof closure bytes follow the union, not the sender's winning edge."""
+    base = Node(str(tmp_path / "base"))
+    workspace = cmds.create(base, "alice", ts=1)
+    founder_secret, founder = base.identity(workspace)
+    cmds.bind_device(base, workspace, "alice-primary")
+    common = closed_subset(base, workspace, all_fids(base, workspace))
+
+    target_secret, target = keypair()
+    peers = []
+    for name, label, claim_ts in (
+            ("left", "left-claim", 100),
+            ("right", "right-claim", 101)):
+        peer = Node(str(tmp_path / name))
+        peer.keychain.add_identity(founder_secret)
+        peer.keychain.add_identity(target_secret)
+        peer.add_workspace(
+            workspace, "alice", peers=[], identity=founder)
+        deliver(peer, workspace, common)
+        peer.turn(workspace)
+        claim = inject_device_claim(
+            peer, workspace, founder_secret, founder, founder,
+            target, label, claim_ts)
+
+        peer.bind_identity(workspace, target)
+        posted = cmds.post(
+            peer, workspace, "general", "same immutable message", ts=200)
+        peer.bind_identity(workspace, founder)
+        deletion = cmds.remove(peer, workspace, posted, ts=210)
+        peers.append((peer, claim, posted, deletion))
+
+    left, right = peers
+    assert left[2:] == right[2:]
+    left_evidence = _action_rows(left[0], workspace)[0][2]
+    right_evidence = _action_rows(right[0], workspace)[0][2]
+    assert left_evidence != right_evidence
+
+    left_claim = closed_subset(left[0], workspace, [left[1].fid])
+    right_claim = closed_subset(right[0], workspace, [right[1].fid])
+    deliver(left[0], workspace, right_claim)
+    left[0].turn(workspace)
+    deliver(right[0], workspace, left_claim)
+    right[0].turn(workspace)
+
+    evidence = [
+        _action_rows(peer, workspace)[0][2]
+        for peer, _, _, _ in peers
+    ]
+    assert evidence[0] == evidence[1]
+    assert left[0].store(workspace).get("root") \
+        == right[0].store(workspace).get("root")
+    for peer, _, posted, _ in peers:
+        peer.rebuild(workspace)
+        assert _action_rows(peer, workspace)[0][2] == evidence[0]
+        assert peer.app.execute(
+            "SELECT 1 FROM projected WHERE ws=? AND src=?",
+            (workspace, posted)).fetchone() is None
+
+
+def test_child_device_admin_inherits_user_liveness(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    _, carol, _ = add_member(node, workspace, "carol", ts=20)
+
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    cmds.bind_device(node, workspace, "bob-primary")
+    child_secret, child = keypair()
+    node.keychain.add_identity(child_secret)
+    cmds.grant_device(node, workspace, bob, child, "bob-child")
+
+    node.bind_identity(workspace, founder)
+    cmds.grant_admin(node, workspace, child)
+    cmds.evict(node, workspace, bob)
+
+    node.bind_identity(workspace, child)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        cmds.evict(node, workspace, carol)
+    assert not suppression_state.active(
+        node.idx(workspace), facts.principal_sid("member", carol))
 
 
 def test_action_leg_converges_before_the_ordinary_fact_diff(

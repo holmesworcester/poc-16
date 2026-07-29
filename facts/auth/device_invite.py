@@ -4,13 +4,22 @@ A device-set peer names a known sibling key and immediately declares it both a
 device and workspace member. There is no bearer secret or follow-up join; the
 poc-13 two-family flow collapses to the direct-key form settled for poc-16.
 """
-from core.fact import Fact
-from .._policy import author_selectors
+from core.fact import Fact, Need
+from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from .._commands import offer_source
 from . import signature
 
 TAG = "device_invite"
 TABLES = ("device_rows", "member_rows")
+POLICY = FamilyPolicy(
+    suppression=(Self(),),
+    authorization_guards=("member", "device"),
+    authority_liveness_guards=("member", "device"),
+    principal_offers=(
+        SidOffer("member", "member"),
+        SidOffer("device_key", "device"),
+    ),
+)
 
 
 # SHAPE
@@ -19,7 +28,7 @@ def device_invite(pk, user, device_pk, label, ts):
         raise ValueError("a device grant must target another key")
     return Fact(
         TAG, ts,
-        author_selectors(TAG, {}) + [
+        author_selectors(POLICY, {}) + [
          ["offer", "member", device_pk],
          ["offer", "device_key", device_pk],
          ["offer", "device", user, device_pk]],
@@ -32,10 +41,10 @@ def needs(f):
     signer = body.get("pk", "")
     user = body.get("user", "")
     return (
-        ("author", f.fid, signer),
-        ("member", signer, None),
-        (
-            "device_key", signer, None,
+        Need("author", "author", f.fid, signer),
+        Need("member", "member", signer),
+        Need(
+            "device", "device_key", signer, None,
             (("device", user, signer),),
         ),
     )
@@ -56,14 +65,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

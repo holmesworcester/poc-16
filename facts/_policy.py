@@ -51,99 +51,27 @@ class DirectTarget:
 
 
 @dataclass(frozen=True)
+class SidOffer:
+    """An offer whose a0 value reserves or activates a typed suppression id."""
+
+    name: str
+    namespace: str
+
+
+@dataclass(frozen=True)
 class FamilyPolicy:
-    ref_roles: tuple[str, ...] = ()
-    need_roles: tuple[str, ...] = ()
     suppression: tuple[SelectorRule, ...] | None = NEVER
     direct_targets: tuple[DirectTarget, ...] = ()
     owner_edge: str | None = None
     authorization_guards: tuple[str, ...] = ()
     authority_liveness_guards: tuple[str, ...] = ()
+    principal_offers: tuple[SidOffer, ...] = ()
+    action_offers: tuple[SidOffer, ...] = ()
 
 
 DELETE_SELF = (
     DirectTarget(CONTENT_DELETE, SELF, (OWNER, ADMIN)),
 )
-
-# This table is intentionally keyed by wire tag rather than importing handler
-# modules.  facts.__init__ checks exact coverage after the router is assembled.
-POLICIES = {
-    "workspace": FamilyPolicy(),
-    "signature": FamilyPolicy(),
-    "user_invite": FamilyPolicy(
-        need_roles=("author", "member"),
-        authorization_guards=("member",),
-    ),
-    "user": FamilyPolicy(
-        ref_roles=("invite",),
-        need_roles=("author",),
-        suppression=(Self(),),
-    ),
-    "admin": FamilyPolicy(
-        need_roles=("author", "grantor_admin", "grantee_member"),
-        authorization_guards=("grantor_admin",),
-        # A committed delegated-admin offer lives exactly as long as its
-        # grantee membership.  Grantor authority is an admission-time guard,
-        # not ambient liveness inherited from the whole proof closure.
-        authority_liveness_guards=("grantee_member",),
-    ),
-    "device": FamilyPolicy(
-        need_roles=("author", "member"),
-        suppression=(Self(),),
-        authorization_guards=("member",),
-        authority_liveness_guards=("member",),
-    ),
-    "device_invite": FamilyPolicy(
-        need_roles=("author", "member", "device"),
-        suppression=(Self(),),
-        authorization_guards=("member", "device"),
-        authority_liveness_guards=("member", "device"),
-    ),
-    "evict": FamilyPolicy(
-        need_roles=("author", "admin"),
-        authorization_guards=("admin",),
-    ),
-    "req": FamilyPolicy(
-        need_roles=("author", "member"),
-        authorization_guards=("member",),
-    ),
-    "msg": FamilyPolicy(
-        need_roles=("author", "member"),
-        suppression=(Self(),),
-        direct_targets=DELETE_SELF,
-        owner_edge="member",
-        authorization_guards=("member",),
-    ),
-    "file_bao": FamilyPolicy(
-        need_roles=("author", "member"),
-        suppression=(Self(), Parent("member")),
-        direct_targets=DELETE_SELF,
-        owner_edge="member",
-        authorization_guards=("member",),
-    ),
-    "chunk": FamilyPolicy(
-        ref_roles=("file",),
-        need_roles=("author", "member"),
-        suppression=(
-            Self(),
-            Parent("file"),
-            Ancestor("file", "member"),
-        ),
-        direct_targets=DELETE_SELF,
-        owner_edge="member",
-        authorization_guards=("member",),
-    ),
-    "delete": FamilyPolicy(
-        ref_roles=("target",),
-        need_roles=("author", "actor_authority"),
-        authorization_guards=("actor_authority",),
-    ),
-}
-
-
-def policy_for(tag):
-    return POLICIES.get(tag)
-
 
 def _edge_map(edges):
     out = {}
@@ -154,50 +82,7 @@ def _edge_map(edges):
     return out
 
 
-def _follow(ctx, edges, path):
-    current = _edge_map(edges).get(path[0])
-    if current is None:
-        raise ValueError(f"missing dependency role {path[0]!r}")
-    for role in path[1:]:
-        current = ctx.edge_source(current, role)
-        if current is None:
-            raise ValueError(f"missing dependency path {'/'.join(path)!r}")
-    return current
-
-
-def expected_selectors(tag, edges, ctx):
-    """Canonical selector atoms independently recomputed at admission."""
-    policy = policy_for(tag)
-    if policy is None:
-        return None
-    if policy.suppression is NEVER:
-        return ()
-    direct = _edge_map(edges)
-    out = []
-    for rule in policy.suppression:
-        if rule.kind == SELF:
-            out.append(self_selector())
-        elif rule.kind == PARENT:
-            fid = direct.get(rule.path[0])
-            if fid is None:
-                raise ValueError(f"missing dependency role {rule.path[0]!r}")
-            out.append(parent_selector(rule.path[0], fid))
-        elif rule.kind == ANCESTOR:
-            out.append(ancestor_selector("/".join(rule.path),
-                                         _follow(ctx, edges, rule.path)))
-        else:
-            raise ValueError("unknown selector policy")
-    return tuple(out)
-
-
-def author_selectors(tag, edges):
-    """Build the selector atoms an honest family constructor must serialize.
-
-    ``edges`` maps a direct role (``member`` or ``file``) and, for an
-    ancestor, its slash-separated path (``file/member``) to exact fids.
-    Admission still derives these values independently.
-    """
-    policy = POLICIES[tag]
+def _selectors(policy, resolve):
     if policy.suppression is NEVER:
         return []
     out = []
@@ -206,26 +91,46 @@ def author_selectors(tag, edges):
         if rule.kind == SELF:
             out.append(self_selector())
         elif rule.kind == PARENT:
-            out.append(parent_selector(path, edges[path]))
+            out.append(parent_selector(path, resolve(rule.path)))
         elif rule.kind == ANCESTOR:
-            out.append(ancestor_selector(path, edges[path]))
+            out.append(ancestor_selector(path, resolve(rule.path)))
+        else:
+            raise ValueError("unknown selector policy")
     return out
 
 
-def validate_fact_policy(fact, edges, ctx):
-    policy = policy_for(fact.t)
-    if policy is None:
-        return True  # test-only/extension families keep their own contract
+def expected_selectors(policy, edges, ctx):
+    """Canonical selector atoms independently recomputed at admission."""
+    direct = _edge_map(edges)
+
+    def resolve(path):
+        current = direct.get(path[0])
+        if current is None:
+            raise ValueError(f"missing dependency role {path[0]!r}")
+        for role in path[1:]:
+            current = ctx.edge_source(current, role)
+            if current is None:
+                raise ValueError(f"missing dependency path {'/'.join(path)!r}")
+        return current
+
+    return tuple(_selectors(policy, resolve))
+
+
+def author_selectors(policy, edges):
+    """Serialize selectors from constructor-supplied canonical path ids."""
+    return _selectors(policy, lambda path: edges["/".join(path)])
+
+
+def validate_fact_policy(policy, fact, edges, ctx):
     try:
         return tuple(selector_markers(fact)) == expected_selectors(
-            fact.t, edges, ctx)
+            policy, edges, ctx)
     except (KeyError, TypeError, ValueError):
         return False
 
 
-def allows_direct_target(target_tag, action, selector, mode):
-    policy = policy_for(target_tag)
-    return policy is not None and any(
+def allows_direct_target(policy, action, selector, mode):
+    return any(
         row.action == action
         and row.selector == selector
         and mode in row.modes

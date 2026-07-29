@@ -1,17 +1,28 @@
 """facts/content/message.py — a member-signed channel message."""
-from core.fact import Fact
-from .._policy import author_selectors
+from core.fact import Fact, Need
+from .._policy import (
+    DELETE_SELF,
+    FamilyPolicy,
+    Self,
+    author_selectors,
+)
 from .._commands import publish
 from ..auth import signature
 
 TAG = "msg"
 TABLES = ("message_rows",)
+POLICY = FamilyPolicy(
+    suppression=(Self(),),
+    direct_targets=DELETE_SELF,
+    owner_edge="member",
+    authorization_guards=("member",),
+)
 
 
 # SHAPE
 def message(pk, channel, text, ts):
     return Fact(
-        TAG, ts, author_selectors(TAG, {}),
+        TAG, ts, author_selectors(POLICY, {}),
         {"pk": pk, "chan": channel, "text": text},
     )
 
@@ -19,7 +30,10 @@ def message(pk, channel, text, ts):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("member", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
+    )
 
 
 # VALIDATE
@@ -35,14 +49,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

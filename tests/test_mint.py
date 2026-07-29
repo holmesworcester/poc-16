@@ -179,11 +179,11 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
 
 def test_missing_composite_trees_fail_closed(world):
     node, workspace, now, _, pile = world
-    root = manifest.encode_root(workspace, frozenset(), "")
+    root = manifest.encode_root(workspace, "")
     assert mint.stateless(pile, root, lambda oid: None, now) is None
 
 
-def test_globals_cannot_override_an_eviction_action(tmp_path):
+def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     founder = node.identity_id(workspace)
@@ -197,7 +197,6 @@ def test_globals_cannot_override_an_eviction_action(tmp_path):
     cmds.evict(node, workspace, bob)
     store = node.store(workspace)
     root = json.loads(store.get("root"))
-    assert root["globals"] == []
     root["globals"] = [["removal", bob]]
     forged = canon(root)
 
@@ -205,8 +204,9 @@ def test_globals_cannot_override_an_eviction_action(tmp_path):
     assert authorize(node, workspace, pile, now, root=forged) is None
     store.put("root", forged)
     assert invoke_mint(node, workspace, pile)[1][0] == 403
-    with pytest.raises(ValueError, match="invalid store facts"):
-        node.rebuild(workspace)
+    node.rebuild(workspace)
+    assert "globals" not in json.loads(store.get("root"))
+    assert authorize(node, workspace, pile, now) is None
 
 
 def test_cached_worker_view_is_root_stamped(world):

@@ -9,6 +9,9 @@ Rebuild is the clean side of the theorem: replay computes S through the same
 exact suppression-id consult as live admission, folds over E = V∖S in
 canonical order, and fires zero retractions.
 """
+import os
+import sqlite3
+
 import facts
 from .close import close
 from .kernel import Valid, resolve_deps
@@ -27,6 +30,23 @@ CREATE TABLE IF NOT EXISTS cursors(
     ws TEXT NOT NULL, projector TEXT NOT NULL, seq INT NOT NULL,
     PRIMARY KEY(ws, projector));
 """
+APP_VERSION = 4
+
+
+def open_projection(path):
+    """Open the disposable client read model, rebuilding across cutovers."""
+    app = sqlite3.connect(path, check_same_thread=False)
+    if app.execute("PRAGMA user_version").fetchone()[0] != APP_VERSION:
+        app.close()
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        app = sqlite3.connect(path, check_same_thread=False)
+    app.executescript(
+        facts.APP_SCHEMA + CURSOR_SCHEMA
+        + f"PRAGMA user_version={APP_VERSION};")
+    return app
 
 
 def append_admitted(idx, fids):
@@ -74,8 +94,7 @@ def pump(node, ws, projector="app"):
         marker = idx.execute(
             "SELECT CAST(v AS INT) FROM meta WHERE k='reproject'"
         ).fetchone()
-        rebuilding = ws in node._reproject \
-            or marker is not None and marker[0] > cursor \
+        rebuilding = marker is not None and marker[0] > cursor \
             or row is None
         if not rows and not rebuilding:
             return 0
@@ -106,7 +125,7 @@ def pump(node, ws, projector="app"):
                 facts.clear(app, ws)
                 valid_facts = [
                     node.fact_of(ws, fid)
-                    for (fid,) in idx.execute("SELECT fid FROM facts")
+                    for (fid,) in idx.execute("SELECT fid FROM proofs")
                 ]
                 suppressed = {  # E = V∖S by the one consult (CUTOVER §2.4)
                     fact.fid for fact in valid_facts
@@ -153,8 +172,6 @@ def pump(node, ws, projector="app"):
         except Exception:
             app.rollback()
             raise
-        if rebuilding:
-            node._reproject.discard(ws)
         return len(rows)
 
 
@@ -186,7 +203,7 @@ def tables_of(family):
     anything aggregate-shaped. Known fix bundled here: removal's
     `UPDATE members SET evicted=1` becomes an insert-only action row plus a
     view — display data, not fact suppression; S never lives in app.db."""
-    handler = facts.handler_for(family) \
+    handler = facts.family_for(family) \
         if isinstance(family, str) else family
     if handler is None:
         raise ValueError(f"unknown fact family {family!r}")

@@ -120,7 +120,7 @@ def _fetch_blobs(node, ws, peer):
                 "SELECT DISTINCT fid FROM log WHERE op='*'")
         }
         pending = []
-        for (fid,) in node.idx(ws).execute("SELECT fid FROM facts"):
+        for (fid,) in node.idx(ws).execute("SELECT fid FROM proofs"):
             fact = node.fact_of(ws, fid)
             if node.suppressed(ws, fact):
                 continue

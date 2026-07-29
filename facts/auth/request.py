@@ -1,10 +1,12 @@
 """facts/auth/request.py — ephemeral proof of workspace access."""
-from core.fact import Fact
+from core.fact import Fact, Need
 from .._commands import closer, offer_source
+from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "req"
 TABLES = ()
+POLICY = FamilyPolicy(authorization_guards=("member",))
 VERBS = frozenset({"sync"})
 
 
@@ -16,10 +18,13 @@ def request(pk, verb, exp, ts):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("member", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("member", "member", pk),
+    )
 
 
-# VALIDATE — stable fact validity has no access to mutable globals.
+# VALIDATE — stable shape and relationship validity only.
 def validate(f, ctx):
     try:
         body = f.body
@@ -31,33 +36,38 @@ def validate(f, ctx):
         return False
 
 
-# MODE — evaluate adds the current door policy; drain treats requests as litter.
+# MODE — requests are judged but never enter the durable client catalog.
 DURABLE = False
 
 
-def global_rows(f):
-    return ()
+def authorize(view, valid, stream, trusted_now):
+    """Authorize this ephemeral closure using only bounded Worker reads.
+
+    ``view`` is the database-free CF capability: authenticated Fact,
+    Authority, and Suppression tree point reads over one root.
+    """
+    import facts
+
+    body = valid.fact.body
+    if body["verb"] not in VERBS or body["exp"] < trusted_now:
+        return None
+    edges = {edge.role: edge.fid for edge in valid.edges}
+    provider = {fact.fid: fact for fact in stream}.get(edges.get("member"))
+    if provider is None or ("member", body["pk"], "") not in provider.offers():
+        return None
+    sid = facts.principal_sid("member", body["pk"])
+    if not view.authority_known("member", body["pk"]):
+        # A never-seen address may bootstrap from its self-contained closure.
+        # A terminal pre-tombstone must fail closed.
+        if view.suppression_known(sid):
+            return None
+    elif view.authority_provider("member", body["pk"]) is None \
+            or view.suppression(sid)["state"] != "clear":
+        return None
+    return body["pk"], body["verb"]
 
 
-def evaluate(f, globals_, ctx):
-    now = [value for name, value in globals_ if name == "now"]
-    return f.t == TAG and f.body["verb"] in VERBS \
-        and len(now) == 1 and f.body["exp"] >= now[0] \
-        and isinstance(f.body["pk"], str)
-
-
-def grant(f):
-    """The sealed capability subject after successful evaluation."""
-    return f.body["pk"], f.body["verb"]
-
-
-def blob_refs(f):
-    return ()
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    return None
+# MATERIALIZE — ephemeral families never enter client projections.
 
 
 # COMMANDS — build the already-topological request + auth closure for a mint.

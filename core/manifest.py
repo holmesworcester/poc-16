@@ -29,7 +29,7 @@ from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
-LAYOUT = "composite-btreap-v3"
+LAYOUT = "composite-btreap-v4"
 TREE_NAMES = ("fact", "supp", "authority")
 
 
@@ -38,6 +38,16 @@ class Entry(NamedTuple):
     sep: str
     leaf: str
     closure: str
+
+
+class Root(NamedTuple):
+    """One fully checked published snapshot named by the mutable root key."""
+
+    anchor: str
+    manifest: str
+    layout_seed: str
+    trees: dict
+    action_etag: str
 
 
 def _chunks(items, fid):
@@ -232,31 +242,26 @@ def decode(raw, fetch):
 
 
 def encode_root(
-        anchor, globals_, manifest_oid, *,
-        action_summary=None, layout_seed=None, trees=None):
+        anchor, manifest_oid, *, action_etag=None, layout_seed=None, trees=None):
     """The mutable root — the only non-content-addressed fact-layer key:
 
-        canon({"anchor": ..., "globals": [[name, value], ...],
-               "manifest": <transport manifest oid or "">,
+        canon({"anchor": ..., "manifest": <transport manifest oid or "">,
+               "action_etag": <non-authoritative sync cache key>,
                "trees": {fact, supp, authority},
                "stamp": LAYOUT})
 
     Suppression and action evidence live in the authenticated logical trees;
-    there is deliberately no separately published removal object."""
+    there is deliberately no duplicate summary or removal object."""
     layout_seed = layout_seed or h(canon(
         ["composite-layout-seed-v1", anchor]))
     trees = trees or {
         name: {"root": "", "count": 0, "depth": 0}
         for name in TREE_NAMES
     }
-    action_summary = action_summary or {
-        "count": 0,
-        "digest": h(canon(["action-set-v1", []])),
-    }
+    action_etag = action_etag or h(canon(["active-actions-v1", []]))
     return canon({
-        "actions": action_summary,
+        "action_etag": action_etag,
         "anchor": anchor,
-        "globals": sorted([list(row) for row in globals_]),
         "layout_seed": layout_seed,
         "manifest": manifest_oid or "",
         "stamp": LAYOUT,
@@ -265,37 +270,31 @@ def encode_root(
 
 
 def decode_root(raw):
-    """``(anchor, globals_, manifest_oid)`` back out of root bytes;
-    raises ValueError on any malformation or on ``stamp != LAYOUT`` (the
-    rebuild trigger — there is deliberately no other answer)."""
+    """Decode and validate one published snapshot.
+
+    Any malformed shape or foreign stamp is the wholesale-rebuild trigger;
+    there is deliberately no compatibility path.
+    """
     o = json.loads(raw)
     if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
         raise ValueError("root stamp")
-    rows = o.get("globals")
     trees = o.get("trees")
-    action_summary = o.get("actions")
     if not (set(o) == {
-                "actions", "anchor", "globals", "layout_seed", "manifest",
-                "stamp", "trees"}
+                "action_etag", "anchor", "layout_seed", "manifest", "stamp",
+                "trees"}
+            and valid_fid(o.get("action_etag"))
             and valid_fid(o.get("anchor"))
             and valid_fid(o.get("layout_seed"))
             and isinstance(o.get("manifest"), str)
             and (not o["manifest"] or valid_fid(o["manifest"]))
-            and isinstance(rows, list)
-            and all(isinstance(row, list) and len(row) == 2
-                    and all(isinstance(part, str) for part in row)
-                    for row in rows)
-            and isinstance(action_summary, dict)
-            and set(action_summary) == {"count", "digest"}
-            and type(action_summary["count"]) is int
-            and action_summary["count"] >= 0
-            and valid_fid(action_summary["digest"])
             and _trees_ok(trees)):
         raise ValueError("root shape")
-    return (
+    return Root(
         o["anchor"],
-        frozenset(tuple(row) for row in rows),
         o["manifest"],
+        o["layout_seed"],
+        {name: dict(trees[name]) for name in TREE_NAMES},
+        o["action_etag"],
     )
 
 
@@ -312,12 +311,3 @@ def _trees_ok(trees):
             and bool(value["root"]) == bool(value["count"])
             for value in trees.values()
         )
-
-
-def decode_composite(raw):
-    """Return ``(layout_seed, tree descriptors)`` after the root door."""
-    decode_root(raw)
-    value = json.loads(raw)
-    return value["layout_seed"], {
-        name: dict(value["trees"][name]) for name in TREE_NAMES
-    }

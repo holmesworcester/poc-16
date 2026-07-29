@@ -32,8 +32,7 @@ def test_every_family_has_the_new_contract_in_order():
         tree = ast.parse(source)
         functions = {node.name: node for node in tree.body
                      if isinstance(node, ast.FunctionDef)}
-        for name, arity in {"needs": 1, "validate": 2, "global_rows": 1,
-                            "blob_refs": 1, "materialize": 3}.items():
+        for name, arity in {"needs": 1, "validate": 2}.items():
             assert name in functions, (path, name)
             assert len(functions[name].args.args) == arity, (path, name)
 
@@ -47,6 +46,9 @@ def test_every_family_has_the_new_contract_in_order():
         assert all(isinstance(item, ast.Constant)
                    and isinstance(item.value, str)
                    for item in assignments["TABLES"].elts), path
+        if assignments["TABLES"].elts:
+            assert "materialize" in functions, path
+            assert len(functions["materialize"].args.args) == 3, path
 
         validation_names = {node.id for node in ast.walk(functions["validate"])
                             if isinstance(node, ast.Name)}
@@ -72,10 +74,12 @@ def test_projector_tables_are_source_keyed_and_handlers_are_insert_only():
 
     for path in family_files():
         tree = ast.parse(path.read_text())
-        materialize = next(
+        materialize = next((
             node for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "materialize")
+            and node.name == "materialize"), None)
+        if materialize is None:
+            continue
         sql = " ".join(
             node.value.upper() for node in ast.walk(materialize)
             if isinstance(node, ast.Constant)
@@ -85,9 +89,13 @@ def test_projector_tables_are_source_keyed_and_handlers_are_insert_only():
 
 def test_router_covers_each_family_once():
     paths = family_files()
-    assert len(facts.MODULES) == len(paths) == len(facts.ROUTES)
-    assert set(facts.ROUTES) == {module.TAG for module in facts.MODULES}
-    assert all(facts.handler_for(module.TAG) is module for module in facts.MODULES)
+    assert len(facts.MODULES) == len(paths) == len(facts.FAMILIES)
+    assert set(facts.FAMILIES) == {module.TAG for module in facts.MODULES}
+    assert all(
+        facts.family_for(module.TAG) is module
+        and module.POLICY is not None
+        for module in facts.MODULES
+    )
 
 
 def test_core_fact_module_has_no_family_authors():
@@ -98,16 +106,21 @@ def test_core_fact_module_has_no_family_authors():
 
 
 def test_core_judge_and_engine_do_not_name_family_policy():
-    for name in ("fact.py", "kernel.py", "node.py", "manifest.py"):
+    for name in (
+            "catalog.py", "fact.py", "indexes.py", "kernel.py", "manifest.py",
+            "node.py", "publication.py", "runtime.py",
+            "suppression_state.py", "worker.py"):
         source = (ROOT / "core" / name).read_text()
-        assert '"removal"' not in source, name
-        assert '"workspace"' not in source, name
-        assert '"member"' not in source, name
+        for vocabulary in (
+                '"admin"', '"device_key"', '"member"', '"removed"',
+                '"request"', '"workspace"'):
+            assert vocabulary not in source, (name, vocabulary)
 
 
-def test_only_ephemeral_families_have_evaluate_hooks():
-    evaluators = [module for module in facts.MODULES if hasattr(module, "evaluate")]
-    assert evaluators
-    assert all(module.DURABLE is False for module in evaluators)
-    assert all(module.evaluate.__code__.co_argcount == 3
-               for module in evaluators)
+def test_only_ephemeral_families_have_worker_grants():
+    grants = [
+        module for module in facts.MODULES if hasattr(module, "authorize")
+    ]
+    assert grants
+    assert all(module.DURABLE is False for module in grants)
+    assert all(module.authorize.__code__.co_argcount == 4 for module in grants)

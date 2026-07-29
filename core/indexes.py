@@ -6,21 +6,22 @@ to decide whether one principal or fact is live. This module projects the
 same admitted snapshot into three maps over the history-independent B-treap:
 
 ``FactTree``
-    ``fact:<fid>`` maps to the bounded data needed for an exact read: the raw
-    object id, resolved named edges, offers, explicit suppression selectors,
-    continuing liveness ids, and optional action evidence. ``action:<sid>``
-    maps to the same CLEAR/ACTIVE value as SuppTree for known direct and
-    principal targets. That second binding is deliberate: sync may enumerate
-    active SuppTree entries, but accepts one only when FactTree independently
-    binds the same sid-to-action witness.
+    ``fact:<fid>`` maps only to the bounded data needed for an exact Worker
+    read: offers, explicit suppression selectors, continuing liveness ids,
+    and optional action evidence. Raw facts remain in manifest piles.
+    ``action:<sid>`` maps to the same CLEAR/ACTIVE value as SuppTree for known
+    direct and principal targets. That second binding is deliberate: sync may
+    enumerate active SuppTree entries, but accepts one only when FactTree
+    independently binds the same sid-to-action witness.
 
 ``SuppTree``
     A typed suppression id maps to ``{"state": "clear"}`` or
     ``{"state": "active", "action": <fid>}``. CLEAR is a positive,
     authenticated reservation saying that this known id has no admitted
     action. It is not a missing row: a missing required slot makes Worker
-    authorization fail closed. ACTIVE is monotone and names the canonical
-    action fact whose evidence can be reached through FactTree.
+    authorization fail closed. ACTIVE names the effective action in this
+    snapshot; a later root may return to CLEAR if canonical settlement makes
+    that proposal ineligible. Its evidence can be reached through FactTree.
 
 ``AuthorityTree``
     A canonical base NeedKey maps to the kernel's selected provider and proof
@@ -50,7 +51,6 @@ SUPP = "supp"
 AUTHORITY = "authority"
 TREE_NAMES = (FACT, SUPP, AUTHORITY)
 MAX_SELECTORS = 8
-MAX_RAW_FACT_BYTES = 64 * 1024
 
 
 def layout_seed(anchor):
@@ -68,7 +68,7 @@ def action_key(sid):
     return "action:" + sid
 
 
-principal_sid = suppression_state.principal_sid
+principal_sid = facts.principal_sid
 
 
 def need_key(name, a0, a1=None, requires=()):
@@ -113,7 +113,7 @@ def build(
             "SELECT sid, fid, j, evidence FROM actions ORDER BY sid"):
         fact = from_json(json.loads(raw))
         if fact.fid != fid \
-                or sid not in suppression_state.action_sids(fact):
+                or sid not in facts.action_sids(fact):
             raise ValueError("action archive integrity")
         archived_actions[fid] = fact
         action_rows.append((sid, fid))
@@ -121,42 +121,24 @@ def build(
             evidence, action_evidence.get(fid, evidence))
 
     def fact_record(fact):
-        raw = canon(fact.to_json())
-        if len(raw) > MAX_RAW_FACT_BYTES:
-            raise ValueError("raw fact exceeds authenticated record budget")
-        selectors = sorted(suppression_state.fact_scopes(fact))
+        selectors = sorted(facts.fact_scopes(fact))
         if len(selectors) > MAX_SELECTORS:
             raise ValueError("fact selector budget")
-        raw_oid = h(raw)
-        emitted = emit(raw)
-        if emitted is not None and emitted != raw_oid:
-            raise ValueError("fact emitter changed object identity")
-        edges = dict(idx.execute(
-            "SELECT role, dst FROM edges WHERE src=? ORDER BY role",
-            (fact.fid,)).fetchall())
-        policy = facts.policy_for(fact.t)
+        def edges_of(fid):
+            return dict(idx.execute(
+                "SELECT role, dst FROM edges WHERE src=? ORDER BY role",
+                (fid,)).fetchall())
+
         # Selectors answer whether this fact is suppressed. Liveness ids
         # answer whether authority it depends on remains usable. Keeping both
         # in the record makes Worker reads explicit and bounded.
-        liveness = set(
-            suppression_state.provider_scopes(fact)) - set(selectors)
-        if policy is not None:
-            for role in policy.authority_liveness_guards:
-                provider_fid = edges.get(role)
-                provider = fact_of(provider_fid) if provider_fid else None
-                if provider is None:
-                    raise ValueError("authority liveness edge")
-                liveness.update(
-                    suppression_state.provider_scopes(provider))
+        liveness = set(facts.authority_scopes(
+            fact, edges_of, fact_of)) - set(selectors)
         return {
-            "edges": edges,
             "evidence": action_evidence.get(fact.fid, ""),
-            "key": fact.key,
             "liveness": sorted(liveness),
             "offers": [list(row) for row in fact.offers()],
-            "raw": raw_oid,
             "selectors": selectors,
-            "tag": fact.t,
         }
 
     def active_slot(sid):
@@ -175,20 +157,15 @@ def build(
         action sync can cross-check an enumerated ACTIVE entry.
         """
         fact_slots, supp_slots = {}, {}
-        selectors = suppression_state.fact_scopes(fact)
+        selectors = facts.fact_scopes(fact)
         for sid in selectors:
             supp_slots[sid] = active_slot(sid)
-        policy = facts.policy_for(fact.t)
+        family = facts.family_for(fact.t)
+        policy = family.POLICY if family is not None else None
         if policy is not None and policy.direct_targets:
             sid = fact_key(fact.fid)
             fact_slots[action_key(sid)] = active_slot(sid)
-        for name, public_key, _ in fact.offers():
-            if name == "member":
-                sid = principal_sid("member", public_key)
-            elif name == "device_key":
-                sid = principal_sid("device", public_key)
-            else:
-                continue
+        for sid in facts.principal_sids(fact):
             fact_slots[action_key(sid)] = active_slot(sid)
             supp_slots[sid] = active_slot(sid)
         return fact_slots, supp_slots
@@ -272,7 +249,7 @@ def build(
     fact_rows, supp_rows = {}, {}
     current = [
         fact_of(fid)
-        for (fid,) in idx.execute("SELECT fid FROM facts ORDER BY fid")
+        for (fid,) in idx.execute("SELECT fid FROM proofs ORDER BY fid")
     ]
     for fact in current:
         fact_rows[fact_key(fact.fid)] = fact_record(fact)
@@ -285,7 +262,9 @@ def build(
         if fact_key(fid) not in fact_rows:
             fact_rows[fact_key(fid)] = fact_record(fact)
 
-    for _, sid in idx.execute("SELECT fid, k FROM supp ORDER BY fid, k"):
+    for _, sid in idx.execute(
+            "SELECT s.fid, s.k FROM supp s "
+            "JOIN proofs p ON p.fid=s.fid ORDER BY s.fid, s.k"):
         supp_rows.setdefault(sid, active_slot(sid))
 
     for sid, fid in action_rows:

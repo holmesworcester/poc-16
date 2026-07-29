@@ -16,7 +16,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench.bench_sync import MEMBERS, YEARS, _insert, bulk_author
+from bench.bench_sync import (
+    MEMBERS,
+    YEARS,
+    _commit_index,
+    _insert,
+    bulk_author,
+)
 from core import cmds
 from core.crypto import keypair, load_sk
 from facts.auth.device import device
@@ -113,7 +119,7 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
             parents[member_pk] = inviter_pk
             depths[member_pk] = depths[inviter_pk] + 1
             users[member_pk] = joined.fid
-        node.commit_index(workspace)
+        _commit_index(node, workspace)
         node.keychain.save()
     except Exception:
         idx.rollback()
@@ -161,7 +167,7 @@ def grow_devices(
                 device_to_user[sibling_public] = user_public
                 ts += 1
             all_devices.extend(device_set)
-        node.commit_index(workspace)
+        _commit_index(node, workspace)
         node.keychain.save()
     except Exception:
         idx.rollback()
@@ -211,6 +217,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         content_ts, window, content_rng)
     authored = time.perf_counter()
     node.commit(workspace)
+    node.workspace(workspace).project()
     finished = time.perf_counter()
 
     total = node.idx(workspace).execute(

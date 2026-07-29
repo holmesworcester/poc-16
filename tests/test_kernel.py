@@ -1,5 +1,4 @@
 """Adversarial kernel tests: the judge rejects what it must, whole units."""
-import sqlite3
 
 import pytest
 
@@ -17,11 +16,7 @@ from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
 from facts.content.message import message
 from core.kernel import (
-    SCHEMA,
-    Global,
     drain,
-    evaluate,
-    resolve_deps,
     validate,
 )
 from core.node import now_ms
@@ -34,13 +29,8 @@ def anchor_chain():
     return sk, pk, g
 
 
-def judge(facts, anchor, g=None):
-    if g is None:
-        return validate(facts, anchor)
-    globals_ = set(g)
-    if not any(name == "now" for name, _ in globals_):
-        globals_.add(Global("now", now_ms()))
-    return evaluate(facts, anchor, globals_)
+def judge(facts, anchor):
+    return validate(facts, anchor)
 
 
 def test_genesis_and_msg(anchor_chain):
@@ -265,14 +255,16 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
     ]
 
     for stream in (admin_stream, device_stream):
-        db = sqlite3.connect(":memory:")
-        db.executescript(SCHEMA)
-        result = drain(stream, root.fid, db=db)
+        result = drain(stream, root.fid)
         assert result.ok
         by_fid = {fact.fid: fact for fact in stream}
+        deps = {
+            valid.fact.fid: valid.deps
+            for valid in result.valids
+        }
         closed = close(
             stream,
-            lambda fid: resolve_deps(by_fid[fid], db) or [],
+            lambda fid: deps[fid],
             by_fid.get,
         )
         # The delivery-order theorem (was test_suppression_proof
@@ -285,31 +277,28 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
             for fact in closed for _, ref in fact.refs()
         )
         assert drain(closed, root.fid).ok
-        db.close()
 
 
-def test_request_gate_uses_only_ephemeral_time_metadata(anchor_chain):
-    """Suppression moved to authenticated slots; globals cannot mask facts."""
+def test_request_time_is_not_persistent_kernel_state(anchor_chain):
+    """Expiry is enforced by the Worker grant, not immutable fact validity."""
     sk, pk, g = anchor_chain
     ts = now_ms()
     m = message(pk, "c", "still valid", ts)
     s = signature(sk, pk, m, ts)
     rq = request(pk, "sync", ts + 9999, ts)
     sr = signature(sk, pk, rq, ts)
-    globals_ = {Global("removal", pk), Global("now", ts)}
-    assert validate([g, s, m], g.fid)                  # persistent: globals-blind
-    assert judge([g, sr, rq], g.fid, g=globals_)
-    assert judge([g, sr, rq], g.fid, g=set())
+    assert validate([g, s, m], g.fid)
+    assert judge([g, sr, rq], g.fid)
 
 
-def test_drain_does_not_emit_removal_globals(anchor_chain):
+def test_drain_returns_only_valids(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
     ev = removal(pk, pk, ts)
     se = signature(sk, pk, ev, ts)
     result = drain([g, se, ev], g.fid)
     assert result.ok
-    assert result.globals == frozenset()
+    assert len(result.valids) == 3
     assert isinstance(validate([g, se, ev], g.fid), bool)
 
 

@@ -1,9 +1,13 @@
 """facts/auth/workspace.py — the self-signed workspace and authority root."""
 from core.crypto import h, sign, verify
 from core.fact import Fact, canon
+from .._policy import FamilyPolicy, SidOffer
 
 TAG = "workspace"
 TABLES = ("member_rows",)
+POLICY = FamilyPolicy(
+    principal_offers=(SidOffer("member", "member"),),
+)
 
 
 # SHAPE — constructors are the only place this family's atoms are chosen.
@@ -37,16 +41,8 @@ def validate(f, ctx):
         return False
 
 
-# MODE — drain may emit globals; evaluate may add an ephemeral gate.
+# MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE — receives only kernel-minted Valid values.

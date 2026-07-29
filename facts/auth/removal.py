@@ -1,10 +1,15 @@
-"""facts/auth/removal.py — admin-signed, monotone connection removal."""
-from core.fact import Fact
+"""facts/auth/removal.py — an admin-signed terminal-removal proposal."""
+from core.fact import Fact, Need
 from .._commands import member_key, publish
+from .._policy import FamilyPolicy, SidOffer
 from . import signature
 
 TAG = "evict"
 TABLES = ("removal_rows",)
+POLICY = FamilyPolicy(
+    authorization_guards=("admin",),
+    action_offers=(SidOffer("removed", "member"),),
+)
 
 
 # SHAPE
@@ -15,7 +20,10 @@ def removal(pk, target_pk, ts):
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
-    return (("author", f.fid, pk), ("admin", pk, None))
+    return (
+        Need("author", "author", f.fid, pk),
+        Need("admin", "admin", pk),
+    )
 
 
 # VALIDATE
@@ -32,14 +40,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE

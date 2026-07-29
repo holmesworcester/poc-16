@@ -42,6 +42,7 @@ from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import extend_proofs, kernel, resolve_deps
 from core.node import Node, now_ms
+from core.pump import pump
 from core.shape import fid_of
 
 from tests.util import add_member, all_fids
@@ -60,11 +61,20 @@ perf = time.perf_counter
 # ---- bulk seed building ------------------------------------------------------
 
 def _insert(idx, fact):
-    idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)",
+    idx.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?,0)",
                 (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json())))
     for name, a0, a1 in fact.offers():
         idx.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)",
                     (name, a0, a1, fact.fid))
+
+
+def _commit_index(node, workspace):
+    """Benchmark-only direct-write boundary; runtime code never uses it."""
+    idx = node.idx(workspace)
+    idx.execute("DELETE FROM meta WHERE k='root'")
+    idx.execute(
+        "INSERT OR REPLACE INTO meta VALUES('tree-rebuild','1')")
+    idx.commit()
 
 
 def build_members(node, ws, n_members, base_ts):
@@ -85,7 +95,7 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
     idx = node.idx(ws)
     idx.execute("BEGIN")
     try:
-        signatures = []
+        signatures, authored = [], []
         for i in range(n_msgs):
             sk, pk = rng.choice(members)
             ts = first_ts + rng.randrange(window)
@@ -94,11 +104,12 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
             _insert(idx, signed)
             _insert(idx, f)
             signatures.append(signed.fid)
+            authored.extend((signed.fid, f.fid))
         unresolved = extend_proofs(
-            idx, signatures, lambda fid: node.fact_of(ws, fid))
-        if unresolved:
+            idx, authored, lambda fid: node.candidate_of(ws, fid), ws)
+        if set(signatures).intersection(unresolved):
             raise ValueError("bulk-authored signatures could not be ranked")
-        node.commit_index(ws)
+        _commit_index(node, ws)
     except Exception:
         idx.rollback()
         raise
@@ -118,6 +129,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
     t_layout = perf()
     n.commit(ws)  # one full manifest build over the whole set
+    n.workspace(ws).project()
     t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
@@ -132,16 +144,17 @@ def manifest_objs(store):
     manifest shards, leaf piles, and closure siblings."""
     oids = []
     fetch = lambda oid: (oids.append(oid) or store.get("obj/" + oid))
-    _, _, man = manifest.decode_root(store.get("root"))
+    man = manifest.decode_root(store.get("root")).manifest
     entries = manifest.decode(fetch(man), fetch)
     oids += [e.leaf for e in entries]
     oids += [e.closure for e in entries if e.closure]
     return man, oids
 
 
-def seed_units(store, man):
+def seed_units(store, man, workspace):
     """The production full-sync unit: one closed stream, each fact once."""
-    stream = node_module.resident(man, lambda oid: store.get("obj/" + oid))
+    stream = node_module.resident(
+        man, lambda oid: store.get("obj/" + oid), workspace)
     if stream:
         yield stream
 
@@ -155,10 +168,10 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
         buf = []
 
         def flush(bb):
-            for ok, vs, _ in ex.map(lambda u: kernel(u, ws), bb):
-                assert ok, "a published unit failed the kernel"
-                out, _ = node.merge(ws, vs)
-                node.materialize(ws, out)
+            for judgment in ex.map(lambda u: kernel(u, ws), bb):
+                assert judgment.ok, "a published unit failed the kernel"
+                node.merge(ws, (valid.fact for valid in judgment.valids))
+                pump(node, ws)
 
         for u in units:
             streamed += len(u)
@@ -180,7 +193,7 @@ def catchup(seed, ws, fresh_dir):
     dl_bytes = len(src.get("root")) + sum(len(src.get("obj/" + oh)) for oh in ohs)
 
     t0 = perf()
-    streamed = ingest(fresh, ws, seed_units(src, man))
+    streamed = ingest(fresh, ws, seed_units(src, man, ws))
     fresh.commit(ws)
     t1 = perf()
 
@@ -188,7 +201,7 @@ def catchup(seed, ws, fresh_dir):
     match = fresh.store(ws).get("root") == src.get("root")
     return {"ingest_s": t1 - t0, "facts": total, "streamed": streamed,
             "dl_bytes": dl_bytes, "objs": len(ohs), "match": match,
-            "pages": sum(1 for _ in seed_units(src, man))}
+            "pages": sum(1 for _ in seed_units(src, man, ws))}
 
 
 # ---- the bidi benchmark ------------------------------------------------------
@@ -197,11 +210,14 @@ def copy_facts(dst, ws, src, fids):
     di, si = dst.idx(ws), src.idx(ws)
     di.execute("BEGIN")
     for fid in fids:
-        row = si.execute("SELECT fid,ts,t,j FROM facts WHERE fid=?", (fid,)).fetchone()
-        di.execute("INSERT OR IGNORE INTO facts VALUES(?,?,?,?)", row)
+        row = si.execute(
+            "SELECT fid,ts,t,j,admitted FROM facts WHERE fid=?",
+            (fid,)).fetchone()
+        di.execute(
+            "INSERT OR IGNORE INTO facts VALUES(?,?,?,?,0)", row[:4])
         for name, a0, a1 in from_json(json.loads(row[3])).offers():
             di.execute("INSERT OR IGNORE INTO offers VALUES(?,?,?,?)", (name, a0, a1, fid))
-    dst.commit_index(ws)
+    _commit_index(dst, ws)
 
 
 def reconcile(A, B, ws):
@@ -220,8 +236,8 @@ def reconcile(A, B, ws):
 
     t0 = perf()
     fetch_local = lambda oid: astore.get("obj/" + oid)
-    _, _, my_man = manifest.decode_root(astore.get("root"))
-    _, _, their_man = manifest.decode_root(bstore.get("root"))
+    my_man = manifest.decode_root(astore.get("root")).manifest
+    their_man = manifest.decode_root(bstore.get("root")).manifest
     mine = manifest.decode(fetch_local(my_man), fetch_local)
     theirs = manifest.decode(fetch_remote(their_man), fetch_remote)
     differing = set(manifest.diff(mine, their_man, fetch_remote))
@@ -291,6 +307,11 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
             "min": min(depths.values()),
             "max": max(depths.values()),
         }
+        # ``grow_tree`` is a benchmark-only direct catalog writer. Settle it
+        # before taking the shared membership snapshot; otherwise all but the
+        # anchor are still staged and a one-round reconciliation can expose
+        # previously invisible content only after its frontier was computed.
+        A.commit(ws)
     membership = all_fids(A, ws)
 
     B = Node(os.path.join(base_dir, "B"))
@@ -380,7 +401,7 @@ def check_leaves(seed, ws):
     """Every published leaf plus its closure sibling still judges alone."""
     st = seed.store(ws)
     fetch = lambda oid: st.get("obj/" + oid)
-    _, _, man = manifest.decode_root(st.get("root"))
+    man = manifest.decode_root(st.get("root")).manifest
     entries = manifest.decode(fetch(man), fetch)
     piles = {e.leaf: decode_pile(fetch(e.leaf))[0] for e in entries}
     n = 0
@@ -393,8 +414,8 @@ def check_leaves(seed, ws):
                     f.fid: f for f in piles[home.leaf] if f.key == key})
         deps = node_module._edges(items)
         stream = close(items.values(), deps.__getitem__, items.__getitem__)
-        ok, _, _ = kernel(stream, ws)
-        assert ok, "a leaf plus its closure sibling failed the kernel"
+        assert kernel(stream, ws).ok, \
+            "a leaf plus its closure sibling failed the kernel"
         n += 1
     return n
 

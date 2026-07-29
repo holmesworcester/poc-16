@@ -1,6 +1,7 @@
 """Bounded Worker reads over the atomically committed composite root."""
 import inspect
 import json
+import sqlite3
 
 from core import btreap, cmds, indexes, manifest
 from core.close import encode_pile
@@ -34,7 +35,7 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
         node, workspace, "sync", now + 60_000, now))
     store = node.store(workspace)
     root = store.get("root")
-    manifest_oid = manifest.decode_root(root)[2]
+    manifest_oid = manifest.decode_root(root).manifest
     fetched = []
 
     def fetch(oid):
@@ -48,6 +49,24 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
     assert "sqlite" not in inspect.getsource(WorkerView).lower()
 
 
+def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
+    """The deployed CF auth path remains usable when SQLite is unavailable."""
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    now = now_ms()
+    pile = encode_pile(request.payload(
+        node, workspace, "sync", now + 60_000, now))
+    store = node.store(workspace)
+    view = WorkerView.from_root(
+        store.get("root"), lambda oid: store.get("obj/" + oid))
+
+    def database_forbidden(*_args, **_kwargs):
+        raise AssertionError("CF Worker authorization opened a database")
+
+    monkeypatch.setattr(sqlite3, "connect", database_forbidden)
+    assert view.mint(pile, now) == (node.identity_id(workspace), "sync")
+
+
 def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
         tmp_path):
     node = Node(str(tmp_path / "node"))
@@ -58,7 +77,8 @@ def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
         node, workspace, "sync", now + 60_000, now))
     store = node.store(workspace)
     root = store.get("root")
-    seed, trees = manifest.decode_composite(root)
+    snapshot = manifest.decode_root(root)
+    seed, trees = snapshot.layout_seed, snapshot.trees
     public = node.identity_id(workspace)
     removed = btreap.update(
         trees[indexes.SUPP]["root"], seed,
@@ -123,8 +143,8 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     active = {"state": "active", "action": action_fid}
     assert new.suppression(sid) == active
     assert new._reader(indexes.FACT).get(indexes.action_key(sid)) == active
-    assert new.fact_record(action_fid)["tag"] == "delete"
+    assert new.fact_record(action_fid)["evidence"]
 
-    _, trees = manifest.decode_composite(new_root)
+    trees = manifest.decode_root(new_root).trees
     assert set(trees) == set(indexes.TREE_NAMES)
     assert "removal" not in trees

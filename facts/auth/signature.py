@@ -1,9 +1,11 @@
 """facts/auth/signature.py — detached Ed25519 authorship evidence."""
 from core.crypto import sign, verify
 from core.fact import Fact
+from .._policy import FamilyPolicy
 
 TAG = "signature"
 TABLES = ()
+POLICY = FamilyPolicy()
 
 
 # SHAPE
@@ -35,17 +37,7 @@ def validate(f, ctx):
 DURABLE = True
 
 
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
-
-
-# MATERIALIZE
-def materialize(db, workspace, valid):
-    return None
+# MATERIALIZE — no client read-model rows.
 
 
 # COMMANDS — ``signature`` is the command helper used by signed families.

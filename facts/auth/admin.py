@@ -4,12 +4,19 @@ An existing admin may elevate an enrolled member, beginning with the founder
 admin embedded in the workspace root. This follows the poc-13 admin edge while
 making its authority recursively usable in poc-16's offers-and-needs kernel.
 """
-from core.fact import Fact
+from core.fact import Fact, Need
 from .._commands import member_key, offer_source
+from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "admin"
 TABLES = ("admin_rows",)
+POLICY = FamilyPolicy(
+    authorization_guards=("grantor_admin",),
+    # Grantor authority is checked when the grant is admitted. The resulting
+    # admin authority remains live only while the grantee remains a member.
+    authority_liveness_guards=("grantee_member",),
+)
 
 
 # SHAPE
@@ -27,9 +34,9 @@ def needs(f):
     signer = body.get("pk", "")
     target = body.get("target", "")
     return (
-        ("author", f.fid, signer),
-        ("admin", signer, None),
-        ("member", target, None),
+        Need("author", "author", f.fid, signer),
+        Need("grantor_admin", "admin", signer),
+        Need("grantee_member", "member", target),
     )
 
 
@@ -46,14 +53,6 @@ def validate(f, ctx):
 
 # MODE
 DURABLE = True
-
-
-def global_rows(f):
-    return ()
-
-
-def blob_refs(f):
-    return ()
 
 
 # MATERIALIZE
