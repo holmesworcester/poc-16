@@ -19,12 +19,12 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def admin(pk, target_pk, ts):
+def admin(workspace, pk, target_pk, ts):
     if pk == target_pk:
         raise ValueError("an admin grant must target another member")
     return Fact(
         TAG, ts, [["offer", "admin", target_pk]],
-        {"pk": pk, "target": target_pk})
+        {"pk": pk, "target": target_pk}, workspace)
 
 
 # NEEDS
@@ -45,7 +45,7 @@ def validate(f, ctx):
         body = f.body
         return set(body) == {"pk", "target"} \
             and all(isinstance(body[key], str) for key in body) \
-            and f == admin(body["pk"], body["target"], f.ts)
+            and f == admin(f.ws, body["pk"], body["target"], f.ts)
     except Exception:
         return False
 
@@ -68,7 +68,7 @@ def grant(node, workspace, target):
         raise ValueError("target is not a workspace member")
 
     ts = now_ms()
-    item = admin(public, target_pk, ts)
+    item = admin(workspace, public, target_pk, ts)
     signed = signature.signature(secret, public, item, ts)
     deps = {
         item.fid: [signed.fid, signer_admin, target_member],

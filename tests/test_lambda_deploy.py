@@ -154,6 +154,28 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
               headers=headers), None))[0] == 405
 
 
+def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    first = cmds.create(node, "first", ts=1)
+    second = cmds.create(node, "second", ts=2)
+    now = 100
+    pile = encode_pile(
+        request.payload(node, first, "sync", now + 60_000, now),
+        workspace=first,
+    )
+    app._gateway_cache = Gateway(
+        AsyncFromSyncReader(node.store(second)),
+        second, b"s" * 32, lambda: now)
+    request_body = json.dumps({
+        "ws": second,
+        "pile": base64.b64encode(pile).decode(),
+    }).encode()
+
+    status, _, _ = response(app.handler(
+        event("POST", "/mint", second, request_body), None))
+    assert status == 403
+
+
 def test_lambda_denies_bad_proofs_and_malformed_function_events(tmp_path):
     _, workspace, _, _ = world(tmp_path)
     denied = json.dumps({

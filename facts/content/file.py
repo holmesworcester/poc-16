@@ -32,7 +32,7 @@ ENCODING = "clear-v1"
 
 
 # SHAPE
-def file(pk, channel, name, size, root, count, ts, member_fid):
+def file(workspace, pk, channel, name, size, root, count, ts, member_fid):
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {"member": member_fid}) + [
@@ -41,6 +41,7 @@ def file(pk, channel, name, size, root, count, ts, member_fid):
         ],
         {"pk": pk, "chan": channel, "name": name, "size": size,
          "root": root, "width": WIDTH, "n": count, "enc": ENCODING},
+        workspace,
     )
 
 
@@ -82,7 +83,7 @@ def validate(f, ctx):
             if marker[1] == PARENT and marker[2] == "member"
         ]
         return len(parents) == 1 and f == file(
-            body["pk"], body["chan"], body["name"], body["size"],
+            f.ws, body["pk"], body["chan"], body["name"], body["size"],
             body["root"], body["n"], f.ts, parents[0])
     except Exception:
         return False
@@ -129,14 +130,16 @@ def send(node, workspace, channel, path, name=None, ts=None):
             raise ValueError("file changed while it was being proved")
 
     descriptor = file(
-        public, channel, label, size, root, count, timestamp, member)
+        workspace, public, channel, label, size, root, count, timestamp,
+        member)
     signed = signature.signature(
         secret, public, descriptor, timestamp)
     news = [signed, descriptor]
     deps = {signed.fid: [], descriptor.fid: [signed.fid, member]}
     for index, cid in enumerate(cids):
         item, item_signature = chunkfam.author(
-            secret, public, channel, root, index, count, cid, timestamp,
+            workspace, secret, public, channel, root, index, count, cid,
+            timestamp,
             descriptor.fid, member)
         news += [item_signature, item]
         deps[item_signature.fid] = []

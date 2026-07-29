@@ -265,7 +265,8 @@ def test_failed_manifest_publish_keeps_objects_and_retry_exposes_them(
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
 
     pile = node.store(workspace).list("pile/")[0]
-    stream, _ = decode_pile(node.store(workspace).get(pile))
+    stream, _ = decode_pile(
+        node.store(workspace).get(pile), workspace)
     descriptor = next(fact for fact in stream if fact.t == file_family.TAG)
     chunks = [fact for fact in stream if fact.t == "chunk"]
     assert node.store(workspace).get("root") == old_root
@@ -312,7 +313,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
 
     capture = Capture()
     _push(source, workspace, capture, all_fids(source, workspace))
-    stream, embedded = decode_pile(capture.raw)
+    stream, embedded = decode_pile(capture.raw, workspace)
     assert embedded == {}
     object_events = [event for event in events if event[0] == "object"]
     assert {
@@ -415,7 +416,7 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     secret, public = source.identity(workspace)
     invalid = b"not a Bao proof"
     item, signed = chunk.author(
-        secret, public, "general", descriptor.body["root"], 0, 1,
+        workspace, secret, public, "general", descriptor.body["root"], 0, 1,
         h(invalid), descriptor.ts + 1, descriptor.fid,
         member_src(source, workspace, public))
     source.ingest_new(
@@ -428,7 +429,7 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
         blobs={h(invalid): invalid},
     )
     pile, _ = decode_pile(
-        closed_subset(source, workspace, [item.fid]))
+        closed_subset(source, workspace, [item.fid]), workspace)
 
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])

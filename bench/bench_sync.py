@@ -61,8 +61,8 @@ perf = time.perf_counter
 
 # ---- bulk seed building ------------------------------------------------------
 
-def _insert(idx, fact):
-    catalog.Catalog(idx, "").stage(fact)
+def _insert(idx, workspace, fact):
+    catalog.Catalog(idx, workspace).stage(fact)
 
 
 def _commit_index(node, workspace):
@@ -100,10 +100,10 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
         for i in range(n_msgs):
             sk, pk = rng.choice(members)
             ts = first_ts + rng.randrange(window)
-            f = message(pk, "general", f"{tag}m{i}", ts)
+            f = message(ws, pk, "general", f"{tag}m{i}", ts)
             signed = signature(sk, pk, f, ts)
-            _insert(idx, signed)
-            _insert(idx, f)
+            _insert(idx, ws, signed)
+            _insert(idx, ws, f)
             signatures.append(signed.fid)
             authored.extend((signed.fid, f.fid))
         unresolved = extend_proofs(
@@ -214,7 +214,7 @@ def copy_facts(dst, ws, src, fids):
     for fid in fids:
         raw = si.execute(
             "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()[0]
-        _insert(di, decode(raw))
+        _insert(di, ws, decode(raw))
     _commit_index(dst, ws)
 
 
@@ -240,7 +240,7 @@ def reconcile(A, B, ws):
     theirs, changed = manifest.compare(mine, their_man, fetch_remote)
     differing = set(changed)
     my_keys = A.keys(ws)
-    members_of = lambda e: manifest.range_members(e, fetch_remote)
+    members_of = lambda e: manifest.range_members(e, fetch_remote, ws)
     pulled_piles, push_keys = sync_module.frontier(
         my_keys, theirs, differing, members_of)
     held = set(my_keys)
@@ -262,9 +262,9 @@ def reconcile(A, B, ws):
         facts = close(news, lambda fid: resolve_deps(A.fact_of(ws, fid), idx) or [],
                       lambda fid: A.fact_of(ws, fid))
         push_streamed = len(facts)
-        pile = encode_pile(facts)
+        pile = encode_pile(facts, workspace=ws)
         push_bytes = len(pile)
-        ingest(B, ws, [decode_pile(pile)[0]])  # B absorbs A's half
+        ingest(B, ws, [decode_pile(pile, ws)[0]])  # B absorbs A's half
         # ingest() is the bulk benchmark seam and does not return Node.turn's
         # exact new-fid delta; force the canonical full maintenance path.
         B.commit(ws, reuse=False)
@@ -404,7 +404,7 @@ def check_leaves(seed, ws):
     fetch = lambda oid: st.get("obj/" + oid)
     man = manifest.decode_root(st.get("root")).manifest
     entries = manifest.decode(fetch(man), fetch)
-    piles = {e.leaf: decode_pile(fetch(e.leaf))[0] for e in entries}
+    piles = {e.leaf: decode_pile(fetch(e.leaf), ws)[0] for e in entries}
     n = 0
     for entry in entries:
         items = {f.fid: f for f in piles[entry.leaf]}
@@ -413,7 +413,7 @@ def check_leaves(seed, ws):
                 home = manifest.locate(entries, key)
                 items.update({
                     f.fid: f for f in piles[home.leaf] if f.key == key})
-        deps = node_module._edges(items)
+        deps = node_module._edges(items, ws)
         stream = close(items.values(), deps.__getitem__, items.__getitem__)
         assert kernel(stream, ws).ok, \
             "a leaf plus its closure sibling failed the kernel"

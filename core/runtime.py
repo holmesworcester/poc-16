@@ -46,7 +46,7 @@ class WorkspaceRuntime:
                 raw = None
                 try:
                     raw = store.get(source)
-                    stream, blobs = decode_pile(raw)
+                    stream, blobs = decode_pile(raw, ws)
                     judgment = drain(stream, ws)
                     if not judgment.ok:
                         if judgment.failure is not None:
@@ -118,7 +118,8 @@ class WorkspaceRuntime:
                     return deps_new[fid]
                 return resolve_deps(fact_of(fid), idx) or []
 
-            raw = encode_pile(close(news, deps_of, fact_of), blobs)
+            raw = encode_pile(
+                close(news, deps_of, fact_of), blobs, workspace=ws)
             source = f"pile/{node.member_for(ws)}/{h(raw)}"
             node.store(ws).put_if_absent(source, raw)
             fresh = self.turn()

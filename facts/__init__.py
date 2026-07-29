@@ -20,6 +20,8 @@ def compile_families(modules):
         raise ValueError("duplicate fact tag")
     if any(not hasattr(module, "POLICY") for module in modules):
         raise ValueError("every fact family must own its policy")
+    if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
+        raise ValueError("exactly one genesis family required")
     return families
 
 
@@ -83,6 +85,12 @@ def invoke_command(node, path, argv):
 def family_for(tag):
     """The one checked dispatch table: behavior and policy travel together."""
     return FAMILIES.get(tag)
+
+
+def is_genesis(tag):
+    """Whether ``tag`` owns the registry's sole ws-less fact shape."""
+    family = family_for(tag)
+    return family is not None and bool(getattr(family, "GENESIS", False))
 
 
 def _offer_sids(fact, declarations):

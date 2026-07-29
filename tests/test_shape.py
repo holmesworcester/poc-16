@@ -4,13 +4,15 @@ import pytest
 from core import shape
 from core.fact import Fact
 
+WORKSPACE = "0" * 64
+
 
 def fid(prefix):
     return f"{prefix:08x}" + "0" * 56
 
 
 def test_fact_key_round_trips_through_fact_shape():
-    fact = Fact("sample", 7, [], {})
+    fact = Fact("sample", 7, [], {}, WORKSPACE)
     expected = f"{fact.ts:015d}:{fact.fid}"
 
     assert fact.key == shape.key(fact) == expected
@@ -62,7 +64,7 @@ def test_fact_address_door_is_exact_and_bounded():
 )
 def test_fact_constructor_rejects_noncanonical_timestamp(timestamp):
     with pytest.raises(ValueError, match="fact timestamp"):
-        Fact("sample", timestamp, [], {})
+        Fact("sample", timestamp, [], {}, WORKSPACE)
 
 
 def test_hash_derived_boundary(monkeypatch):

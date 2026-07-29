@@ -60,7 +60,7 @@ def test_suppression_facts_not_suppressible(tmp_path):
     with pytest.raises(ValueError, match="never victims"):
         cmds.remove(node, workspace, deletions[0], ts=200)
     secret, public = node.identity(workspace)
-    recursive = delete(public, first.key, OWNER, 200)
+    recursive = delete(workspace, public, first.key, OWNER, 200)
     sig = signature(secret, public, recursive, 200)
 
     with pytest.raises(ValueError, match="outside the canonical set"):
@@ -101,9 +101,10 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
     source, workspace, targets, deletions = suppression_world(
         tmp_path / "source")
     target = targets[1]
-    alone, _ = decode_pile(closed_subset(source, workspace, [target]))
+    alone, _ = decode_pile(
+        closed_subset(source, workspace, [target]), workspace)
     with_deletion, _ = decode_pile(closed_subset(
-        source, workspace, [deletions[0]]))
+        source, workspace, [deletions[0]]), workspace)
 
     alone_result = drain(alone, workspace)
     deletion_result = drain(with_deletion, workspace)
@@ -122,7 +123,7 @@ def test_suppression_stays_behind_the_manifest_commit(
         node, workspace, "unpublished", "target", ts=300)
     target = node.fact_of(workspace, target_fid)
     deletion = delete(  # the fid cmds.remove(ts=301) authors below
-        node.identity_id(workspace), target.key, OWNER, 301)
+        workspace, node.identity_id(workspace), target.key, OWNER, 301)
     store = node.store(workspace)
     old_root = store.get("root")
 

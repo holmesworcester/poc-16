@@ -3,9 +3,9 @@ import base64
 import json
 import urllib.request
 
-from core.close import encode_pile
+from core.close import decode_pile, encode_pile
 from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
-from core.fact import Fact, Need, from_json
+from core.fact import Fact, Need, workspace_of
 from core import suppression_state
 from core.suppression import scoped_id
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
@@ -23,7 +23,8 @@ def user(invite_fact, invite_sk, pk, name, ts):
     atoms = author_selectors(POLICY, {}) + [
         ["ref", "invite", invite_fact.fid], ["offer", "member", pk]]
     return Fact(TAG, ts, atoms,
-                {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)})
+                {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)},
+                workspace_of(invite_fact))
 
 
 # NEEDS
@@ -49,7 +50,7 @@ def validate(f, ctx):
                       author_selectors(POLICY, {}) + [
                        ["ref", "invite", ref_fid],
                        ["offer", "member", f.body["pk"]]],
-                      dict(f.body))
+                      dict(f.body), f.ws)
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
     except Exception:
         return False
@@ -62,6 +63,7 @@ DURABLE = True
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
+    from core.kernel import drain
     from core.node import now_ms
     from core.sync import sync
 
@@ -71,16 +73,29 @@ def accept(node, link, name):
     encrypted = urllib.request.urlopen(
         f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15).read()
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
-    bootstrap = [from_json(item) for item in blob["pile"]]
-    invitation = [
-        fact for fact in bootstrap if fact.t == user_invite.TAG][-1]
+    if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
+            or blob.get("ws") != workspace:
+        raise ValueError("invite workspace")
+    bootstrap, _ = decode_pile(
+        base64.b64decode(blob["pile"], validate=True), workspace)
+    judgment = drain(bootstrap, workspace)
+    invitations = [
+        valid.fact for valid in judgment.valids
+        if valid.fact.t == user_invite.TAG
+    ]
+    if not judgment.ok or len(invitations) != 1:
+        raise ValueError("invite bootstrap")
+    invitation = invitations[0]
     ts = now_ms()
     secret, public = node.identity()
     member = user(invitation, load_sk(blob["isk"]), public, name, ts)
     sig = signature.signature(secret, public, member, ts)
     node.add_workspace(
         workspace, name, peers=[url], identity=node.keychain.default_id())
-    pile = encode_pile(bootstrap + [sig, member])  # bootstrap is already closed/topo
+    pile = encode_pile(
+        bootstrap + [sig, member],
+        workspace=workspace,
+    )  # bootstrap is already closed/topo
     node.store(workspace).put(f"pile/{node.member_for(workspace)}/{h(pile)}", pile)
     node.turn(workspace)
     sync(node, workspace, url)

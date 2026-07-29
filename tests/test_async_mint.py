@@ -44,7 +44,7 @@ def snapshots(tmp_path):
     message = cmds.post(
         node, workspace, "general", "later suppressed", ts=20)
     message_closure = decode_pile(
-        closed_subset(node, workspace, {message}))[0]
+        closed_subset(node, workspace, {message}), workspace)[0]
 
     now = now_ms()
     bob_pile = encode_pile(request.payload(

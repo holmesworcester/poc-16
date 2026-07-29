@@ -84,6 +84,7 @@ def test_public_queries_restart_directly_from_catalog(tmp_path):
 
 
 def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
+    workspace = "0" * 64
     db = sqlite3.connect(":memory:")
     db.executescript("""
         CREATE TABLE facts(
@@ -93,8 +94,9 @@ def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
             PRIMARY KEY(name, a0, a1, src));
     """)
     committed = Fact(
-        "legacy", 1, [["offer", "legacy-key", "one"]], {"value": 1})
-    pending = Fact("legacy", 2, [], {"value": 2})
+        "legacy", 1, [["offer", "legacy-key", "one"]], {"value": 1},
+        workspace)
+    pending = Fact("legacy", 2, [], {"value": 2}, workspace)
     db.executemany(
         "INSERT INTO facts VALUES(?,?,?,?,?)",
         (
@@ -105,7 +107,7 @@ def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
     db.commit()
     db.executescript(catalog.SCHEMA)
 
-    catalog.upgrade_schema(db)
+    catalog.upgrade_schema(db, workspace)
 
     assert {
         name for _, name, *_ in db.execute("PRAGMA table_info(facts)")

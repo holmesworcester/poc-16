@@ -175,7 +175,7 @@ class Publisher:
                 changed_ranges = manifest.changed_ranges(
                     previous.manifest,
                     (node.fact_of(ws, fid).key for fid in changed),
-                    fetch)
+                    fetch, ws)
                 manifest_oid = manifest.update(
                     previous.manifest, changed_ranges,
                     lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)

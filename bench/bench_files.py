@@ -71,7 +71,8 @@ def bench_overhead(sizes):
                 len(bao.proof(path, outboard, index, size))
                 for index in range(count))
             descriptor = file_family.file(
-                "a" * 64, "general", "x.bin", size, root, count, 1)
+                "0" * 64, "a" * 64, "general", "x.bin",
+                size, root, count, 1)
             rows.append({
                 "mb": size / 1e6,
                 "chunks": count,

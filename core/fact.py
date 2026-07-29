@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from .crypto import h
 from .limits import InvalidEncoding, MAX_OBJECT_BYTES, decode_json
-from .shape import key, valid_timestamp
+from .shape import key, valid_fid, valid_timestamp
 
 
 def canon(o) -> bytes:
@@ -34,18 +34,29 @@ class Fact:
     ts: int
     atoms: list
     body: dict
+    ws: str | None
     bh: str = field(init=False)
     fid: str = field(init=False)
 
     def __post_init__(self):
         if not valid_timestamp(self.ts):
             raise ValueError("fact timestamp")
+        if self.ws is not None and not valid_fid(self.ws):
+            raise ValueError("fact workspace")
         object.__setattr__(self, "bh", h(canon(self.body)))
         object.__setattr__(self, "fid", h(canon(self.env)))
 
     @property
     def env(self):
-        return {"a": self.atoms, "bh": self.bh, "t": self.t, "ts": self.ts}
+        envelope = {
+            "a": self.atoms,
+            "bh": self.bh,
+            "t": self.t,
+            "ts": self.ts,
+        }
+        if self.ws is not None:
+            envelope["ws"] = self.ws
+        return envelope
 
     @property
     def key(self) -> str:
@@ -90,13 +101,20 @@ def _atoms_ok(atoms) -> bool:
 
 def from_json(o) -> Fact:
     try:
-        e = o.get("e") if isinstance(o, dict) else None
-        if not (isinstance(e, dict) and isinstance(e.get("t"), str)
+        e = o.get("e") if isinstance(o, dict) and set(o) == {"e", "b"} \
+            else None
+        fields = set(e) if isinstance(e, dict) else set()
+        if not (fields in (
+                    {"a", "bh", "t", "ts"},
+                    {"a", "bh", "t", "ts", "ws"},
+                )
+                and isinstance(e.get("t"), str)
                 and valid_timestamp(e.get("ts"))
                 and isinstance(o.get("b"), dict)
-                and _atoms_ok(e.get("a"))):
+                and _atoms_ok(e.get("a"))
+                and ("ws" not in e or valid_fid(e.get("ws")))):
             raise InvalidEncoding("fact shape")
-        f = Fact(e["t"], e["ts"], e["a"], o["b"])
+        f = Fact(e["t"], e["ts"], e["a"], o["b"], e.get("ws"))
         if f.fid != h(canon(e)) or f.bh != e.get("bh"):
             raise InvalidEncoding("fact integrity")
         return f
@@ -109,6 +127,24 @@ def encode(fact: Fact) -> bytes:
     if not isinstance(fact, Fact):
         raise ValueError("not a fact")
     return canon(fact.to_json())
+
+
+def workspace_of(fact: Fact) -> str:
+    """The one workspace named by a fact envelope.
+
+    The sole ws-less value is the genesis whose own fid defines the anchor.
+    Kernel/family judgment decides whether that ws-less value is the declared
+    genesis family; every other path can compare this value before dispatch.
+    """
+    return fact.fid if fact.ws is None else fact.ws
+
+
+def bound_to(fact: Fact, workspace: str) -> bool:
+    """Whether exact fact bytes name ``workspace`` without ambient inference."""
+    return valid_fid(workspace) and (
+        fact.ws == workspace
+        or fact.ws is None and fact.fid == workspace
+    )
 
 
 def decode(raw: bytes) -> Fact:

@@ -140,7 +140,7 @@ class WorkerView:
     def mint(self, pile_bytes, trusted_now):
         """Validate only the submitted bounded closure, then exact-read state."""
         try:
-            stream, blobs = decode_pile(pile_bytes)
+            stream, blobs = decode_pile(pile_bytes, self.anchor)
             if blobs or len(stream) > MAX_PROOF_FACTS:
                 return None
             result = drain(stream, self.anchor)

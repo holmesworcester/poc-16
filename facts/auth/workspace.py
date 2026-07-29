@@ -4,6 +4,7 @@ from core.fact import Fact, canon
 from .._policy import FamilyPolicy, SidOffer
 
 TAG = "workspace"
+GENESIS = True
 POLICY = FamilyPolicy(
     principal_offers=(SidOffer("member", "member"),),
 )
@@ -17,7 +18,8 @@ def _presig(ts, atoms):
 def workspace(sk, pk, name, ts):
     atoms = [["offer", "member", pk], ["offer", "admin", pk]]
     return Fact(TAG, ts, atoms,
-                {"name": name, "pk": pk, "sig": sign(sk, _presig(ts, atoms))})
+                {"name": name, "pk": pk, "sig": sign(sk, _presig(ts, atoms))},
+                None)
 
 
 # NEEDS — normalized offer addresses; refs remain in the generic envelope.
@@ -33,7 +35,9 @@ def validate(f, ctx):
             return False
         pk, name, signature = body["pk"], body["name"], body["sig"]
         atoms = [["offer", "member", pk], ["offer", "admin", pk]]
-        shaped = Fact(TAG, f.ts, atoms, {"name": name, "pk": pk, "sig": signature})
+        shaped = Fact(
+            TAG, f.ts, atoms, {"name": name, "pk": pk, "sig": signature},
+            None)
         return f == shaped and f.fid == ctx.anchor \
             and verify(pk, _presig(f.ts, atoms), signature)
     except Exception:

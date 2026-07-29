@@ -22,7 +22,7 @@ from .object_store import verified_object
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
-LAYOUT = "composite-btreap-v5"
+LAYOUT = "composite-btreap-v6-workspace-bound"
 TREE_NAMES = ("fact", "supp", "authority")
 RANGE_SEED = h(canon(["range-tree-v1"]))
 
@@ -92,9 +92,10 @@ def _range(keys, fact_of, deps_of, emit):
     return Entry(keys[0], leaf, closure)
 
 
-def range_members(entry, fetch):
+def range_members(entry, fetch, workspace):
     """Verify and decode one RangeTree row's canonical home-leaf pile."""
-    held, blobs = decode_pile(verified_object(entry.leaf, fetch))
+    held, blobs = decode_pile(
+        verified_object(entry.leaf, fetch), workspace)
     keys = [key(fact) for fact in held]
     if blobs or not keys or keys != sorted(set(keys)) \
             or entry.sep != keys[0] \
@@ -112,7 +113,7 @@ def build(keys, fact_of, deps_of, emit):
     return entries, encode(entries, emit)
 
 
-def changed_ranges(root, keys, fetch):
+def changed_ranges(root, keys, fetch, workspace):
     """Verified old leaves plus new keys for an additions-only update.
 
     A new key has no exact row yet, so locate its predecessor and successor in
@@ -135,7 +136,8 @@ def changed_ranges(root, keys, fetch):
     def member_keys(found):
         if found.sep not in members:
             members[found.sep] = tuple(
-                key(fact) for fact in range_members(found, fetch))
+                key(fact) for fact in range_members(
+                    found, fetch, workspace))
         return members[found.sep]
 
     for item in changed:

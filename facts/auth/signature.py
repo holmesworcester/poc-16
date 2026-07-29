@@ -1,6 +1,6 @@
 """facts/auth/signature.py — detached Ed25519 authorship evidence."""
 from core.crypto import sign, verify
-from core.fact import Fact
+from core.fact import Fact, workspace_of
 from .._policy import FamilyPolicy
 
 TAG = "signature"
@@ -10,7 +10,7 @@ POLICY = FamilyPolicy()
 # SHAPE
 def signature(sk, pk, target, ts):
     return Fact(TAG, ts, [["offer", "author", target.fid, pk]],
-                {"sig": sign(sk, target.fid)})
+                {"sig": sign(sk, target.fid)}, workspace_of(target))
 
 
 # NEEDS
@@ -25,7 +25,7 @@ def validate(f, ctx):
             return False
         name, target, pk = f.offers()[0]
         shaped = Fact(TAG, f.ts, [["offer", "author", target, pk]],
-                      {"sig": f.body["sig"]})
+                      {"sig": f.body["sig"]}, f.ws)
         return name == "author" and f == shaped \
             and verify(pk, target, f.body["sig"])
     except Exception:

@@ -19,6 +19,8 @@ from core.suppression import (
 )
 from facts._policy import CONTENT_DELETE
 
+WS = "0" * 64
+
 
 class EnvelopeOnly:
     def __init__(self, atoms):
@@ -31,9 +33,9 @@ class EnvelopeOnly:
 
 def test_type_owned_selectors_are_envelope_visible_and_exact():
     member = "cd" * 32
-    msg = message("pk", "general", "hello", 1)
+    msg = message(WS, "pk", "general", "hello", 1)
     attachment = file(
-        "pk", "general", "a.txt", 3, "ab" * 32, 1, 2, member)
+        WS, "pk", "general", "a.txt", 3, "ab" * 32, 1, 2, member)
 
     assert suppkeys(msg) == {"fact:" + msg.fid}
     assert suppkeys(attachment) == {
@@ -46,7 +48,7 @@ def test_type_owned_selectors_are_envelope_visible_and_exact():
 
 
 def test_deathkey_is_body_free():
-    target = message("pk", "general", "hello", 1)
+    target = message(WS, "pk", "general", "hello", 1)
     deletion = EnvelopeOnly([
         action(CONTENT_DELETE, SELF, target.key)])
 
@@ -56,11 +58,12 @@ def test_deathkey_is_body_free():
 
 
 def test_suppression_marker_survives_the_wire_codec():
-    target = message("pk", "general", "hello", 2)
+    target = message(WS, "pk", "general", "hello", 2)
     deletion = Fact(
         "sample_delete", 3,
-        [action(CONTENT_DELETE, SELF, target.key)], {})
-    decoded, _ = decode_pile(encode_pile([deletion]))
+        [action(CONTENT_DELETE, SELF, target.key)], {}, WS)
+    decoded, _ = decode_pile(
+        encode_pile([deletion], workspace=WS), WS)
 
     assert decoded == [deletion]
     assert is_deletion(decoded[0])
@@ -69,11 +72,11 @@ def test_suppression_marker_survives_the_wire_codec():
 
 @pytest.mark.parametrize("fact", [
     Fact("msg", 1, [],
-         {"pk": "pk", "chan": "general", "text": "markerless"}),
+         {"pk": "pk", "chan": "general", "text": "markerless"}, WS),
     Fact("file_bao", 1, [],
          {"pk": "pk", "chan": "general", "name": "markerless",
           "size": 0, "root": "0" * 64, "width": 1, "n": 0,
-          "enc": "clear-v1"}),
+          "enc": "clear-v1"}, WS),
 ])
 def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
     node = Node(str(tmp_path / "node"))
@@ -81,7 +84,8 @@ def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
     secret, public = node.identity(workspace)
     member = offer_src(node.idx(workspace), "member", public)
     body = {**fact.body, "pk": public}
-    markerless = Fact(fact.t, node.fact_of(workspace, member).ts + 1, [], body)
+    markerless = Fact(
+        fact.t, node.fact_of(workspace, member).ts + 1, [], body, workspace)
     proof = signature(secret, public, markerless, markerless.ts)
 
     with pytest.raises(ValueError, match="outside the canonical set"):
@@ -99,7 +103,7 @@ def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
     [["supp", "chan", "general", 1]],
 ])
 def test_malformed_suppression_atoms_are_rejected_at_the_door(atoms):
-    fact = Fact("sample", 1, atoms, {})
+    fact = Fact("sample", 1, atoms, {}, WS)
     with pytest.raises(ValueError, match="fact shape"):
         from_json(fact.to_json())
 

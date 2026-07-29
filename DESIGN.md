@@ -66,17 +66,30 @@ A fact is a canonical JSON value containing:
 
 - a type tag;
 - an integer timestamp;
+- a workspace genesis fid `ws`;
 - clear-envelope atoms for references, offers, and suppression policy; and
 - a family-owned body.
 
-Its `fid` is the SHA-256 hash of those canonical bytes. Its reconciliation key
-is the fixed-width string `(timestamp, fid)`. Timestamps primarily provide
-locality and deterministic ordering; the prospective admission rule described
-under “Action timing” also compares that key.
+The workspace-genesis fact is the sole exception: it has no `ws`, and its own
+`fid` defines the workspace anchor. The checked family registry requires
+exactly one family to declare that genesis role. Every ordinary fact carries
+`ws=W` in its clear envelope, so the workspace participates in the `fid` and
+in every signature over that fid. Consequently the same author, timestamp,
+atoms, and body in two workspaces produce different facts and signatures.
+
+Its `fid` is the SHA-256 hash of the canonical envelope bytes. Its
+reconciliation key is the fixed-width string `(timestamp, fid)`. Timestamps
+primarily provide locality and deterministic ordering; the prospective
+admission rule described under “Action timing” also compares that key.
 
 A pile is a canonical, topologically ordered, dependency-closed collection of
 facts plus optional blobs. The same pile codec is used for ingress, sync, and
-resident leaf objects.
+resident leaf objects. Its outer envelope names exactly one `ws=W`; every fact
+must carry `ws=W`, except the sole genesis fact whose `fid` must equal `W`.
+There is no decoder for the previous workspace-ambient fact or pile format.
+Invite bootstraps carry this same canonical pile, rather than a second raw fact
+list, and must pass outer-link/inner-pile workspace equality plus a complete
+kernel judgment before local workspace or keyring state is mutated.
 
 The family-neutral kernel processes a pile in one pass. A `ref` carries its
 own role and must name an earlier fact. Each family returns named `Need`
@@ -95,6 +108,16 @@ resolves every named edge again against its complete local candidate set and
 runs the same family validator before granting standing. A sender therefore
 cannot preserve a losing ownership or membership edge when the receiver has a
 better canonical provider.
+
+Workspace identity is checked before those choices or family dispatch can
+matter. At an authenticated write door, request workspace, grant workspace,
+uploader path, pile workspace, and every ordinary fact workspace must agree.
+Foreign and mixed piles are typed permanent rejections before catalog staging.
+The same expected-anchor pile decoder is used by host ingress, sync, invite
+redemption, manifest leaves, suppression evidence, database-free mint, and
+rebuild. The kernel remains database-free and family-neutral: it compares the
+canonical anchor, then asks the one registered genesis family whether the
+single ws-less exception is actually genesis.
 
 ## Store and publication
 
@@ -296,7 +319,9 @@ decodes and hydrates each blob through the current version adapter, in the
 same context and into the same current form exposed when that fact is supplied
 as context to another fact. Type, dependency-key, and explicit-reference
 index rows, eligibility, and query views are then derived from that hydrated
-form.
+form. Hydration must preserve the immutable workspace binding: an ordinary
+fact's current contextual form still names the `ws` committed by its original
+bytes, while genesis remains the sole ws-less form whose fid is the anchor.
 
 Thus a version/schema change is an explicit derived-index version change:
 discard the old derived rows and replay the retained canonical blobs through
@@ -305,7 +330,8 @@ consumer sees one current contextual form. A future adapter must be
 deterministic and must not consult replica-local arrival order or wall-clock
 state.
 
-The root uses layout stamp `composite-btreap-v5` and atomically binds:
+The root uses layout stamp `composite-btreap-v6-workspace-bound` and atomically
+binds:
 
 ```text
 anchor          workspace genesis fid

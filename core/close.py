@@ -12,7 +12,7 @@ import base64
 import binascii
 
 from .crypto import h
-from .fact import canon, from_json
+from .fact import bound_to, canon, from_json, workspace_of
 from .ingress import InvalidPile
 from .limits import (
     InvalidEncoding,
@@ -20,6 +20,7 @@ from .limits import (
     PayloadTooLarge,
     decode_json,
 )
+from .shape import valid_fid
 
 
 def close(news, deps_of, fact_of):
@@ -43,8 +44,22 @@ def close(news, deps_of, fact_of):
     return out
 
 
-def encode_pile(facts, blobs=None) -> bytes:
-    o = {"facts": [f.to_json() for f in facts]}
+def encode_pile(facts, blobs=None, *, workspace=None) -> bytes:
+    """Encode one workspace-bound closed unit.
+
+    ``workspace`` is inferred from non-empty fact bytes when omitted. Empty
+    diagnostic/corruption fixtures must name it explicitly.
+    """
+    facts = tuple(facts)
+    if workspace is None:
+        if not facts:
+            raise ValueError("pile workspace")
+        workspace = workspace_of(facts[0])
+    if not valid_fid(workspace):
+        raise ValueError("pile workspace")
+    if not all(bound_to(fact, workspace) for fact in facts):
+        raise ValueError("mixed workspace pile")
+    o = {"ws": workspace, "facts": [f.to_json() for f in facts]}
     if blobs:
         o["blobs"] = {k: base64.b64encode(v).decode() for k, v in blobs.items()}
     raw = canon(o)
@@ -53,7 +68,7 @@ def encode_pile(facts, blobs=None) -> bytes:
     return raw
 
 
-def decode_pile(b: bytes):
+def decode_pile(b: bytes, workspace):
     """Hash-verify everything at the door — cheapest checks first.
 
     Total over arbitrary JSON: foreign bytes leave here as ``InvalidPile`` or
@@ -61,13 +76,23 @@ def decode_pile(b: bytes):
     and must never become destructive quarantine verdicts.
     """
     try:
+        if not valid_fid(workspace):
+            raise InvalidEncoding("pile workspace")
         o = decode_json(b, MAX_PILE_BYTES, "pile")
-        if not isinstance(o, dict) or not isinstance(o.get("facts"), list) \
+        if not isinstance(o, dict) \
+                or set(o) not in ({"ws", "facts"}, {"ws", "facts", "blobs"}) \
+                or not valid_fid(o.get("ws")) \
+                or not isinstance(o.get("facts"), list) \
                 or not isinstance(o.get("blobs", {}), dict):
             raise InvalidEncoding("pile shape")
+        pile_workspace = o["ws"]
         facts = [
             from_json(fo) for fo in o["facts"]
         ]  # raises on integrity mismatch
+        if pile_workspace != workspace:
+            raise InvalidEncoding("pile workspace")
+        if not all(bound_to(fact, pile_workspace) for fact in facts):
+            raise InvalidEncoding("mixed workspace pile")
         blobs = {}
         for k, v in o.get("blobs", {}).items():
             if not isinstance(k, str) or not isinstance(v, str):

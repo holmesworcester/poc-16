@@ -19,10 +19,10 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def message(pk, channel, text, ts):
+def message(workspace, pk, channel, text, ts):
     return Fact(
         TAG, ts, author_selectors(POLICY, {}),
-        {"pk": pk, "chan": channel, "text": text},
+        {"pk": pk, "chan": channel, "text": text}, workspace,
     )
 
 
@@ -41,7 +41,8 @@ def validate(f, ctx):
         body = f.body
         return set(body) == {"pk", "chan", "text"} \
             and all(isinstance(body[key], str) for key in body) \
-            and f == message(body["pk"], body["chan"], body["text"], f.ts)
+            and f == message(
+                f.ws, body["pk"], body["chan"], body["text"], f.ts)
     except Exception:
         return False
 
@@ -56,7 +57,7 @@ def post(node, workspace, channel, text, ts=None):
 
     ts = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
-    item = message(public, channel, text, ts)
+    item = message(workspace, public, channel, text, ts)
     return publish(node, workspace, item,
                    signature.signature(secret, public, item, ts))
 

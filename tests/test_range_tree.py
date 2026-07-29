@@ -8,10 +8,15 @@ from core import btreap, manifest, shape
 from core.crypto import h
 from core.fact import Fact
 
+WORKSPACE = "0" * 64
+
 
 def _facts(count):
     return [
-        Fact("sample", ordinal * 7 + 1, [], {"ordinal": ordinal})
+        Fact(
+            "sample", ordinal * 7 + 1, [],
+            {"ordinal": ordinal}, WORKSPACE,
+        )
         for ordinal in range(count)
     ]
 
@@ -57,7 +62,8 @@ def test_randomized_batches_match_clean_full_build_and_touch_bounded_paths():
                 before_depth = json.loads(objects[root])["depth"]
                 root = manifest.update(
                     root, manifest.changed_ranges(
-                        root, (fact.key for fact in batch), objects.get),
+                        root, (fact.key for fact in batch), objects.get,
+                        WORKSPACE),
                     active.get, lambda fid: (), objects.get,
                     _emitter(objects, fresh))
                 assert len(fresh) <= len(batch) * (
@@ -88,7 +94,7 @@ def test_new_key_discovery_reads_one_authenticated_path_not_the_map(
     entries, root = manifest.build(
         (fact.key for fact in corpus), active.get, lambda fid: (),
         _emitter(objects))
-    candidate = Fact("sample", 500, [], {"new": True})
+    candidate = Fact("sample", 500, [], {"new": True}, WORKSPACE)
     assert candidate.fid not in active
     touched = []
 
@@ -100,11 +106,12 @@ def test_new_key_discovery_reads_one_authenticated_path_not_the_map(
         btreap.Reader, "items",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("range discovery enumerated the tree")))
-    ranges = manifest.changed_ranges(root, (candidate.key,), fetch)
+    ranges = manifest.changed_ranges(
+        root, (candidate.key,), fetch, WORKSPACE)
 
     assert any(candidate.key in keys for _, keys in ranges)
     assert sum(len(keys) for _, keys in ranges) < len(corpus)
     assert len(set(touched)) <= json.loads(objects[root])["depth"] + 2
     assert len(entries) > 2
     with pytest.raises(ValueError, match="changed range key"):
-        manifest.changed_ranges(root, (None,), objects.get)
+        manifest.changed_ranges(root, (None,), objects.get, WORKSPACE)

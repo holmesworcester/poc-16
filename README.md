@@ -10,6 +10,14 @@ and one-sided synchronization.
 The current format is intentionally not backward compatible. `DESIGN.md`
 describes the running format and its remaining limits.
 
+Every ordinary fact and every closed pile canonically names one workspace.
+The sole exception is workspace genesis: it omits `ws` because its own fact id
+is the workspace id. This binding is covered by fact ids and signatures and is
+checked before family dispatch, catalog staging, sync, invite redemption, and
+database-free edge authorization. State written by the earlier ambient-
+workspace format must be rebuilt or migrated out of band; there is no dual
+decoder.
+
 > **Privacy warning:** ordinary fact bodies are plaintext JSON in the object
 > store. Signatures authenticate them but do not encrypt them. Invite blobs
 > are encrypted; message and attachment metadata are not. Do not treat this

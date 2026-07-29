@@ -141,7 +141,8 @@ def test_family_owns_expiry_tag_and_verb(world):
         node, workspace, "write", now + 60_000, now))
     wrong = Fact(
         "not-a-request", now, [],
-        {"pk": node.pk, "verb": "sync", "exp": now + 60_000})
+        {"pk": node.pk, "verb": "sync", "exp": now + 60_000},
+        workspace)
     wrong_sig = signature(node.sk, node.pk, wrong, now)
     wrong_tag = encode_pile([
         node.fact_of(workspace, workspace), wrong_sig, wrong])
@@ -271,7 +272,7 @@ def test_gate_screens_the_whole_submitted_closure(tmp_path):
     bob_message = cmds.post(
         node, workspace, "general", "historical but now inactive", ts=20)
     bob_closure = decode_pile(
-        closed_subset(node, workspace, {bob_message}))[0]
+        closed_subset(node, workspace, {bob_message}), workspace)[0]
 
     node.bind_identity(workspace, founder)
     cmds.evict(node, workspace, bob)

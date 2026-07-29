@@ -99,8 +99,8 @@ def objects(node, ws):
     return seen
 
 
-def members_of(entry, fetch):
-    facts, blobs = decode_pile(fetch(entry.leaf))
+def members_of(entry, fetch, workspace):
+    facts, blobs = decode_pile(fetch(entry.leaf), workspace)
     assert not blobs
     return facts
 
@@ -112,10 +112,10 @@ def test_one_pile_codec_serves_wire_and_residence(world):
     entries, fetch = read(node, ws)
     assert len(entries) > 1
     for entry in entries:
-        members = members_of(entry, fetch)
+        members = members_of(entry, fetch, ws)
         keys = [fact.key for fact in members]
         assert keys == sorted(keys) and keys[0] == entry.sep
-        assert h(encode_pile(members)) == entry.leaf  # the wire codec, verbatim
+        assert h(encode_pile(members, workspace=ws)) == entry.leaf
 
 
 def test_manifest_history_independence(tmp_path, world):
@@ -184,7 +184,7 @@ def test_locate_maps_key_to_home_leaf(world):
     node, ws = world
     entries, fetch = read(node, ws)
     for entry in entries:
-        for fact in members_of(entry, fetch):
+        for fact in members_of(entry, fetch, ws):
             assert manifest.locate(entries, fact.key) == entry
     assert manifest.locate(entries, "") is None  # below every separator
     assert manifest.locate(entries, "~") == entries[-1]
@@ -225,7 +225,7 @@ def test_closure_sibling_is_exactly_out_of_range(world):
     deps_of = lambda fid: resolve_deps(fact_of(fid), idx) or []
     lo, siblings = "", 0
     for entry in entries:
-        members = members_of(entry, fetch)
+        members = members_of(entry, fetch, ws)
         hi = members[-1].key
         closed = {fact.key for fact in close(members, deps_of, fact_of)}
         assert {k for k in closed if lo < k <= hi} \
@@ -251,14 +251,15 @@ def test_refs_carry_dep_keys(world):
             continue
         for key in json.loads(fetch(entry.closure))["keys"]:
             home = manifest.locate(entries, key)  # parse and place, no index
-            held = {fact.key: fact for fact in members_of(home, fetch)}
+            held = {
+                fact.key: fact for fact in members_of(home, fetch, ws)}
             assert held[key].fid == shape.fid_of(key)  # self-certifying
             assert held[key] == node.fact_of(ws, shape.fid_of(key))
             stamp, fid = key.split(":", 1)
             wrong = shape.key_parts(int(stamp) + 1, fid)  # same fid, bad ts
             elsewhere = manifest.locate(entries, wrong)
             assert elsewhere is None or wrong not in {
-                fact.key for fact in members_of(elsewhere, fetch)}
+                fact.key for fact in members_of(elsewhere, fetch, ws)}
             resolved += 1
     assert resolved
 
@@ -268,7 +269,8 @@ def test_store_closure_invariant(world):
     own home leaf: closure(store) == store (COSTS §5)."""
     node, ws = world
     entries, fetch = read(node, ws)
-    piles = {entry: {fact.key: fact for fact in members_of(entry, fetch)}
+    piles = {entry: {
+        fact.key: fact for fact in members_of(entry, fetch, ws)}
              for entry in entries}
     resident = {fact.fid: fact
                 for held in piles.values() for fact in held.values()}
@@ -423,7 +425,7 @@ def test_oid_diff_compares_the_full_mapping_at_the_same_separator(world):
     assert differing == hostile[:2]
     for entry in differing:
         with pytest.raises(ValueError, match="manifest range"):
-            manifest.range_members(entry, fetch)
+            manifest.range_members(entry, fetch, ws)
 
 
 def test_oid_diff_fetches_exactly_the_difference(tmp_path, monkeypatch):
@@ -452,7 +454,10 @@ def test_oid_diff_fetches_exactly_the_difference(tmp_path, monkeypatch):
 
 def test_local_only_keys_still_push(tmp_path, monkeypatch):
     """A leaf whose oid differs because WE hold extra keys produces a push,
-    not a fetch loop: the one dial still converges both sides (§2.1)."""
+    not a fetch loop: the one dial still converges both sides (§2.1).
+    This also ratchets the free-function boundary: ``walk._push`` must pass
+    its explicit ``ws`` argument to the pile codec, not an imagined
+    ``self.ws`` from the neighboring ``Peer`` methods."""
     source, ws, destination, ts = pair(tmp_path)
     secret, public = source.identity(ws)
     local_only = author_msg(
@@ -467,7 +472,8 @@ def test_local_only_keys_still_push(tmp_path, monkeypatch):
 
     assert (pulled, count) == (0, len(extra))
     assert len(pushed) == 1  # ONE closed pile, the ordinary wire codec
-    assert local_only.fid in {f.fid for f in decode_pile(pushed[0])[0]}
+    assert local_only.fid in {
+        f.fid for f in decode_pile(pushed[0], ws)[0]}
     assert source.fact_of(ws, local_only.fid) == local_only
     assert destination.store(ws).get("root") == source.store(ws).get("root")
     assert sync_module.sync(  # converged: the next dial is a no-op
@@ -555,7 +561,7 @@ def test_cold_partial_fetch_depth_two(tmp_path, world):
     entries, fetch_src = read(source, ws)
     entry = next(  # a content range far from its auth closure
         e for e in reversed(entries) if e.closure)
-    members, _ = decode_pile(fetch_src(entry.leaf))
+    members, _ = decode_pile(fetch_src(entry.leaf), ws)
 
     idx, depths = source.idx(ws), {}
 
@@ -618,7 +624,8 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     assert sync_module.sync(destination, ws, "local://source") == (1, 0)
 
     ((oid, raw),) = delivered.items()
-    stream, blobs = decode_pile(raw)  # the ordinary wire codec, verbatim
+    stream, blobs = decode_pile(
+        raw, ws)  # the ordinary wire codec, verbatim
     assert not blobs
     assert drain(stream, ws).ok  # one judge; no source annotation anywhere
     assert destination.store(ws).list("pile/") == []  # retired by turn()
@@ -633,7 +640,7 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     # revalidates local edges and retains these bytes only as inactive catalog
     # receipts. The source root therefore cannot expose a poisoned pull range.
     secret, public = source.identity(ws)
-    forged = message(public, "general", "forged", ts + 10)
+    forged = message(ws, public, "general", "forged", ts + 10)
     unsigned = signature(keypair()[0], public, forged, ts + 10)  # wrong sk
     source_root = source.store(ws).get("root")
     with source.lock:
@@ -648,8 +655,8 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
 
     # The ordinary pile door independently rejects the same forged unit on
     # every replica and retires it whole.
-    poisoned = encode_pile((unsigned, forged))
-    assert not drain(decode_pile(poisoned)[0], ws).ok
+    poisoned = encode_pile((unsigned, forged), workspace=ws)
+    assert not drain(decode_pile(poisoned, ws)[0], ws).ok
     for current in (destination, twin):
         deliver(current, ws, poisoned)
         current.turn(ws)
@@ -673,7 +680,7 @@ def test_sync_pulls_one_closed_path_union_not_a_bare_leaf(
     actual_pull = sync_module.pull
 
     def capture_pull(node, w, oid, raw):
-        delivered.append(decode_pile(raw)[0])
+        delivered.append(decode_pile(raw, w)[0])
         return actual_pull(node, w, oid, raw)
 
     monkeypatch.setattr(sync_module, "pull", capture_pull)
@@ -714,7 +721,7 @@ def test_sync_pushes_one_closed_deduplicated_pile(tmp_path, monkeypatch):
 
     seen = set()
     for raw in pushed_piles:
-        unit = decode_pile(raw)[0]
+        unit = decode_pile(raw, ws)[0]
         fids = {fact.fid for fact in unit}
         assert drain(unit, ws).ok
         assert seen.isdisjoint(fids)
@@ -750,7 +757,7 @@ def test_production_deletion_family(tmp_path):
     fid = cmds.remove(node, ws, victim_fid, ts=20)
     removal = node.fact_of(ws, fid)
     assert removal == delete_family.delete(
-        node.identity_id(ws), victim.key, OWNER, 20)
+        ws, node.identity_id(ws), victim.key, OWNER, 20)
     action = node.idx(ws).execute(
         "SELECT fid, evidence FROM actions WHERE sid=?",
         (f"fact:{victim_fid}",)).fetchone()

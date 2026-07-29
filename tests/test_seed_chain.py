@@ -44,7 +44,8 @@ def test_random_seed_is_deep_and_its_leaf_closes_over_the_real_path(tmp_path):
     assert inviter_user in resolve_deps(
         node.fact_of(workspace, invite_fid), node.idx(workspace))
 
-    stream, _ = decode_pile(closed_subset(node, workspace, [user_fid]))
+    stream, _ = decode_pile(
+        closed_subset(node, workspace, [user_fid]), workspace)
     assert drain(stream, workspace).ok
 
 
@@ -176,8 +177,8 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     discovered = []
     changed_ranges = manifest.changed_ranges
 
-    def bounded_ranges(root, keys, fetch):
-        ranges = changed_ranges(root, keys, fetch)
+    def bounded_ranges(root, keys, fetch, expected_workspace):
+        ranges = changed_ranges(root, keys, fetch, expected_workspace)
         discovered.append(sum(len(current) for _, current in ranges))
         return ranges
 

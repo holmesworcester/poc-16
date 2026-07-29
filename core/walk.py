@@ -90,8 +90,11 @@ class Peer:
         with n.lock:
             ts = now_ms()
             facts = auth_request.payload(n, self.ws, "sync", ts + 120_000, ts)
-        body = json.dumps({"ws": self.ws,
-                           "pile": base64.b64encode(encode_pile(facts)).decode()}).encode()
+        body = json.dumps({
+            "ws": self.ws,
+            "pile": base64.b64encode(
+                encode_pile(facts, workspace=self.ws)).decode(),
+        }).encode()
         if len(body) > MAX_MINT_REQUEST_BYTES:
             raise ValueError("mint request too large")
         _, resp, _ = self._http(
@@ -185,7 +188,7 @@ def _push(node, ws, peer, push_fids):
         blob_oids = sorted({
             oid for fact in facts for oid in families.blob_refs(fact)
         })
-        b = encode_pile(facts)
+        b = encode_pile(facts, workspace=ws)
         st = node.store(ws)
     for oid in blob_oids:
         value = st.get("obj/" + oid)

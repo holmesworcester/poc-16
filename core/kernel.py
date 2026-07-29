@@ -8,7 +8,7 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
-from .fact import Fact, decode
+from .fact import Fact, bound_to, decode
 
 class Valid(NamedTuple):
     fact: Fact
@@ -220,7 +220,9 @@ def accepts(fact, edges, ctx, strict=False):
     """Run one family's shape and policy checks against resolved edges."""
     try:
         handler = facts.family_for(fact.t)
-        return handler is not None \
+        return bound_to(fact, ctx.anchor) \
+            and handler is not None \
+            and (fact.ws is not None or facts.is_genesis(fact.t)) \
             and handler.validate(fact, ctx) is True \
             and facts.validate_fact_policy(
                 handler.POLICY, fact, edges, ctx)
@@ -262,6 +264,8 @@ def extend_proofs(db, fids, fact_of, anchor=None, accept=None):
             continue
         fact = fact_of(fid)
         if fact is None:
+            continue
+        if anchor is not None and not bound_to(fact, anchor):
             continue
         unresolved[fid] = fact
         pending.extend(ref for _, ref in fact.refs())
@@ -375,6 +379,10 @@ def _judge(stream, ctx):
     """The one streaming judge over one bounded, topological closure."""
     valids = []
     for fact in stream:
+        # Prove the ambient anchor from authenticated fact bytes before
+        # family lookup, needs resolution, policy, or staging can run.
+        if not bound_to(fact, ctx.anchor):
+            return Judgment(False, tuple(valids))
         if ctx.has_fact(fact.fid):
             continue
         try:

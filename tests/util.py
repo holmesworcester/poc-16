@@ -128,7 +128,7 @@ def add_member(
         raise ValueError("invite timestamp must follow the inviter's membership")
     user_ts = invite_ts + 1
     isk, ipk = keypair()
-    inv = user_invite(inviter_pk, ipk, invite_ts)
+    inv = user_invite(ws, inviter_pk, ipk, invite_ts)
     si = signature(inviter_sk, inviter_pk, inv, invite_ts)
     bsk, bpk = member_identity or keypair()
     joined = user(inv, isk, bpk, name, user_ts)
@@ -142,7 +142,7 @@ def add_member(
 def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):
     """A message from an arbitrary member key, via the ordinary ingress."""
     ts = ts or now_ms()
-    f = message(pk, chan, text, ts)
+    f = message(ws, pk, chan, text, ts)
     s = signature(sk, pk, f, ts)
     deps = {f.fid: [s.fid, member_src(n, ws, pk)], s.fid: []}
     n.ingest_new(ws, [s, f], deps)
@@ -157,7 +157,8 @@ def member_src(n, ws, pk):
 def inject_device_claim(
         node, workspace, secret, public, user, target, label, ts):
     """Author a valid direct-device claim past command duplicate checks."""
-    item = device_invite(public, user, target, label, ts)
+    item = device_invite(
+        workspace, public, user, target, label, ts)
     signed = signature(secret, public, item, ts)
     node.ingest_new(
         workspace,
@@ -183,7 +184,7 @@ def closed_subset(n, ws, fids):
         facts = close([n.fact_of(ws, fid) for fid in fids],
                       lambda fid: resolve_deps(n.fact_of(ws, fid), idx) or [],
                       lambda fid: n.fact_of(ws, fid))
-    return encode_pile(facts)
+    return encode_pile(facts, workspace=ws)
 
 
 def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):

@@ -74,6 +74,29 @@ def test_gateway_mints_then_serves_one_pinned_snapshot(tmp_path):
     ).status == 304
 
 
+def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    first = cmds.create(node, "first", ts=1)
+    second = cmds.create(node, "second", ts=2)
+    now = 100
+    foreign = encode_pile(
+        request.payload(node, first, "sync", now + 60_000, now),
+        workspace=first,
+    )
+    gateway = Gateway(
+        AsyncFromSyncReader(node.store(second)),
+        second, b"s" * 32, lambda: now)
+    body = json.dumps({
+        "ws": second,
+        "pile": base64.b64encode(foreign).decode(),
+    }).encode()
+
+    assert call(
+        gateway, "POST", "/mint", {"ws": second}, {}, body
+    ).status == 403
+
+
 def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
     node, workspace, _, pile, gateway = world(tmp_path)
     _, _, token = mint(node, workspace, pile, gateway)

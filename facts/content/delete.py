@@ -27,7 +27,7 @@ POLICY = _policy.FamilyPolicy(
 
 
 # SHAPE
-def delete(pk, target_key, mode, ts):
+def delete(workspace, pk, target_key, mode, ts):
     """Exact target address + selector token + hard target dependency."""
     target = fid_of(target_key)
     return Fact(
@@ -36,7 +36,7 @@ def delete(pk, target_key, mode, ts):
             action(_policy.CONTENT_DELETE, SELF, target_key),
             ["ref", TARGET, target],
         ],
-        {"pk": pk, "mode": mode})
+        {"pk": pk, "mode": mode}, workspace)
 
 
 # NEEDS — OWNER and ADMIN are distinct conjunctive authority modes.
@@ -91,7 +91,8 @@ def validate(f, ctx):
             if target_principal is None or target_principal != actor_principal:
                 return False
 
-        return is_deletion(f) and f == delete(pk, target_key, mode, f.ts)
+        return is_deletion(f) and f == delete(
+            f.ws, pk, target_key, mode, f.ts)
     except Exception:
         return False
 
@@ -145,7 +146,7 @@ def remove(node, workspace, target, ts=None):
         if mode == _policy.ADMIN and offer_source(
                 node, workspace, "admin", public) is None:
             raise ValueError("only the owner or an admin may delete this fact")
-    item = delete(public, victim.key, mode, ts)
+    item = delete(workspace, public, victim.key, mode, ts)
     return publish(node, workspace, item,
                    signature.signature(secret, public, item, ts),
                    role="member" if mode == _policy.OWNER else "admin")

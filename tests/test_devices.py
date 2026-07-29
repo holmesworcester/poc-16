@@ -93,7 +93,9 @@ def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
     # on whichever proof currently wins.
     alternate = None
     for ordinal in range(256):
-        candidate = device(founder, f"alternate-{ordinal}", 10_000 + ordinal)
+        candidate = device(
+            workspace, founder, f"alternate-{ordinal}",
+            10_000 + ordinal)
         if candidate.fid < original_device:
             alternate = candidate
             break
@@ -193,7 +195,8 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
             (bob_secret, bob, bob),
     )):
         item = device_invite_fact(
-            public, user, sibling, f"{user[:8]}-sibling", 100 + ordinal)
+            workspace, public, user, sibling,
+            f"{user[:8]}-sibling", 100 + ordinal)
         signed = signature(secret, public, item, 100 + ordinal)
         device_source = node.idx(workspace).execute(
             "SELECT o.src FROM fact_index o JOIN proofs p ON p.fid=o.src "
@@ -271,7 +274,7 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     # target. In the union it makes target's child grant lose the required
     # (Bob, target) co-offer.
     conflict = device_invite_fact(
-        founder, founder, target, "alice-target", 102)
+        workspace, founder, founder, target, "alice-target", 102)
     conflict_sig = signature(founder_secret, founder, conflict, 102)
     conflict_deps = {
         conflict_sig.fid: [],
@@ -366,7 +369,7 @@ def test_delete_rechecks_canonical_owner_after_device_claim_conflict(
     # ownership provider for ``target``. Build it as an independent closed
     # unit so another peer can receive this winner before Bob's stale chain.
     conflict = device_invite_fact(
-        founder, founder, target, "alice-target", 130)
+        workspace, founder, founder, target, "alice-target", 130)
     conflict_sig = signature(founder_secret, founder, conflict, 130)
     conflict_deps = {
         conflict_sig.fid: (),
@@ -419,7 +422,7 @@ def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
     for ordinal in range(2):
         invite_secret, invite_public = keypair()
         invitation = user_invite(
-            root, invite_public, 10 + 2 * ordinal)
+            workspace, root, invite_public, 10 + 2 * ordinal)
         invitation_sig = signature(
             root_secret, root, invitation, invitation.ts)
         joined = user(
@@ -524,7 +527,7 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
         node, workspace, target_secret, target, bob, child, "child", 101)
 
     conflict = device_invite_fact(
-        founder, founder, target, "alice-target", 102)
+        workspace, founder, founder, target, "alice-target", 102)
     conflict_sig = signature(founder_secret, founder, conflict, 102)
     deps = {
         conflict_sig.fid: [],
@@ -582,9 +585,9 @@ def test_rank_only_shadow_query_tracks_winner_and_stale_replay(tmp_path):
     deep_item = short_item = None
     for ordinal in range(1024):
         candidate_deep = device_invite_fact(
-            deep, deep, target, f"from-deep-{ordinal}", 200)
+            workspace, deep, deep, target, f"from-deep-{ordinal}", 200)
         candidate_short = device_invite_fact(
-            short, short, target, f"from-short-{ordinal}", 201)
+            workspace, short, short, target, f"from-short-{ordinal}", 201)
         if candidate_short.fid < candidate_deep.fid:
             deep_item, short_item = candidate_deep, candidate_short
             break
@@ -607,7 +610,7 @@ def test_rank_only_shadow_query_tracks_winner_and_stale_replay(tmp_path):
     # proof enough to become the canonical target winner.
     invite_secret, invite_public = keypair()
     ts = now_ms() + 10
-    invitation = user_invite(root, invite_public, ts)
+    invitation = user_invite(workspace, root, invite_public, ts)
     invitation_sig = signature(root_secret, root, invitation, ts)
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", ts + 1)
@@ -718,7 +721,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert source.store(workspace).list("quarantine/") == []
 
     invite_secret, invite_public = keypair()
-    invitation = user_invite(root, invite_public, 500)
+    invitation = user_invite(workspace, root, invite_public, 500)
     invitation_sig = signature(root_secret, root, invitation, 500)
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", 501)
@@ -843,7 +846,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
     assert source.fact_of(workspace, child_claim.fid) is None
 
     invite_secret, invite_public = keypair()
-    invitation = user_invite(root, invite_public, 500)
+    invitation = user_invite(workspace, root, invite_public, 500)
     invitation_sig = signature(root_secret, root, invitation, 500)
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", 501)

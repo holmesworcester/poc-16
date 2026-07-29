@@ -10,8 +10,9 @@ VERBS = frozenset({"sync"})
 
 
 # SHAPE
-def request(pk, verb, exp, ts):
-    return Fact(TAG, ts, [], {"pk": pk, "verb": verb, "exp": exp})
+def request(workspace, pk, verb, exp, ts):
+    return Fact(
+        TAG, ts, [], {"pk": pk, "verb": verb, "exp": exp}, workspace)
 
 
 # NEEDS
@@ -30,7 +31,8 @@ def validate(f, ctx):
         return set(body) == {"pk", "verb", "exp"} \
             and isinstance(body["pk"], str) and isinstance(body["verb"], str) \
             and isinstance(body["exp"], int) \
-            and f == request(body["pk"], body["verb"], body["exp"], f.ts)
+            and f == request(
+                f.ws, body["pk"], body["verb"], body["exp"], f.ts)
     except Exception:
         return False
 
@@ -69,7 +71,7 @@ def authorize(view, valid, stream, trusted_now):
 # COMMANDS — build the already-topological request + auth closure for a mint.
 def payload(node, workspace, verb, exp, ts):
     secret, public = node.identity(workspace)
-    item = request(public, verb, exp, ts)
+    item = request(workspace, public, verb, exp, ts)
     sig = signature.signature(secret, public, item, ts)
     member = offer_source(node, workspace, "member", public)
     if member is None:

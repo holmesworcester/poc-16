@@ -12,8 +12,9 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def removal(pk, target_pk, ts):
-    return Fact(TAG, ts, [["offer", "removed", target_pk]], {"pk": pk})
+def removal(workspace, pk, target_pk, ts):
+    return Fact(
+        TAG, ts, [["offer", "removed", target_pk]], {"pk": pk}, workspace)
 
 
 # NEEDS
@@ -32,7 +33,7 @@ def validate(f, ctx):
             return False
         name, target, empty = f.offers()[0]
         return name == "removed" and empty == "" \
-            and f == removal(f.body["pk"], target, f.ts)
+            and f == removal(f.ws, f.body["pk"], target, f.ts)
     except Exception:
         return False
 
@@ -48,7 +49,7 @@ def evict(node, workspace, target):
     target_pk = member_key(node, workspace, target)
     ts = now_ms()
     secret, public = node.identity(workspace)
-    item = removal(public, target_pk, ts)
+    item = removal(workspace, public, target_pk, ts)
     return publish(node, workspace, item,
                    signature.signature(secret, public, item, ts), role="admin")
 

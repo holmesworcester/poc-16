@@ -50,7 +50,7 @@ def _closed_signed(node, workspace, item, *, role="member"):
         new.values(), deps_of, fact_of,
     )
     raw = encode_pile(stream)
-    judgment = drain(decode_pile(raw)[0], workspace)
+    judgment = drain(decode_pile(raw, workspace)[0], workspace)
     assert judgment.ok
     return raw, item
 
@@ -97,7 +97,7 @@ def _commit_facts(workspace, commit):
 def _message_pile(node, workspace, text, ts):
     public = node.identity_id(workspace)
     return _closed_signed(
-        node, workspace, message(public, "general", text, ts))
+        node, workspace, message(workspace, public, "general", text, ts))
 
 
 def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
@@ -110,7 +110,7 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
         seed, workspace, tmp_path, "alice", "bob")
 
     def candidates(raw):
-        judged = drain(decode_pile(raw)[0], workspace)
+        judged = drain(decode_pile(raw, workspace)[0], workspace)
         assert judged.ok
         return tuple(valid.fact for valid in judged.valids)
 
@@ -207,7 +207,7 @@ def test_post_cas_stamp_records_its_own_root_not_a_later_writers(tmp_path):
         seed, workspace, tmp_path, "alice", "bob")
 
     def plan(node, raw):
-        judged = drain(decode_pile(raw)[0], workspace)
+        judged = drain(decode_pile(raw, workspace)[0], workspace)
         return node.merge(
             workspace, (valid.fact for valid in judged.valids))
 
@@ -331,7 +331,7 @@ def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
     bob._sync_index(workspace)
     assert bob.candidate_of(workspace, child_claim.fid) is None
     invite_secret, invite_public = keypair()
-    invitation = user_invite(root, invite_public, 500)
+    invitation = user_invite(workspace, root, invite_public, 500)
     invitation_sig = signature(root_secret, root, invitation, 500)
     rejoined = user(
         invitation, invite_secret, deep, "deep-direct", 501)
@@ -394,7 +394,7 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
     proposals = [
         _closed_signed(
             seed, workspace,
-            delete(public, target.key, _policy.OWNER, ts))
+            delete(workspace, public, target.key, _policy.OWNER, ts))
         for ts in range(20, 36)
     ]
     ordered = sorted((h(raw), item.key, raw, item) for raw, item in proposals)

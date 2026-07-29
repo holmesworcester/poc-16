@@ -77,10 +77,12 @@ def units_of(store):
     members plus its closure sibling's facts (each resolved at its own home
     leaf), serialized deps-first by the ordinary close()."""
     fetch = lambda oid: store.get("obj/" + oid)
-    man = manifest.decode_root(store.get("root")).manifest
+    snapshot = manifest.decode_root(store.get("root"))
+    man, ws = snapshot.manifest, snapshot.anchor
     entries = manifest.decode(fetch(man), fetch)
     piles = {
-        entry.sep: decode_pile(fetch(entry.leaf))[0] for entry in entries}
+        entry.sep: decode_pile(fetch(entry.leaf), ws)[0]
+        for entry in entries}
 
     def at(key):
         home = manifest.locate(entries, key)
@@ -92,7 +94,8 @@ def units_of(store):
             if entry.closure else []
         items = {f.fid: f for f in members}
         items.update((f.fid, f) for f in map(at, outside))
-        deps = node_module._edges(items)  # unit-local canonical providers
+        deps = node_module._edges(
+            items, ws)  # unit-local canonical providers
         yield entry, close(members, deps.__getitem__, items.__getitem__)
 
 
@@ -149,7 +152,9 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     fetch = lambda oid: st.get("obj/" + oid)
     man = manifest.decode_root(root_bytes).manifest
     entries = manifest.decode(fetch(man), fetch)
-    st._replace("obj/" + entries[0].leaf, encode_pile([]))
+    st._replace(
+        "obj/" + entries[0].leaf,
+        encode_pile([], workspace=ws))
 
     with pytest.raises(ValueError, match="object integrity"):
         n.rebuild(ws)
@@ -176,21 +181,24 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         return oid
 
     # A smuggled fact with no proof chain breaks store closure.
-    hidden = Fact("sample", 0, [], {"hidden": True})
-    members = decode_pile(fetch(entries[0].leaf))[0]
+    hidden = Fact("sample", 0, [], {"hidden": True}, ws)
+    members = decode_pile(fetch(entries[0].leaf), ws)[0]
     smuggled = entries[0]._replace(
-        leaf=emit(encode_pile([hidden] + members)))
+        leaf=emit(encode_pile([hidden] + members, workspace=ws)))
     man = manifest.encode([smuggled] + list(entries[1:]), emit)
     st._replace("root", manifest.encode_root(ws, man))
     with pytest.raises(ValueError, match="invalid store facts"):
         n.rebuild(ws)
 
     # The same members shuffled across leaves break the rebuild equality.
-    first = decode_pile(fetch(entries[0].leaf))[0]
-    second = decode_pile(fetch(entries[1].leaf))[0]
+    first = decode_pile(fetch(entries[0].leaf), ws)[0]
+    second = decode_pile(fetch(entries[1].leaf), ws)[0]
     moved = [
-        entries[0]._replace(leaf=emit(encode_pile(first[:-1]))),
-        entries[1]._replace(leaf=emit(encode_pile([first[-1]] + second))),
+        entries[0]._replace(
+            leaf=emit(encode_pile(first[:-1], workspace=ws))),
+        entries[1]._replace(
+            leaf=emit(encode_pile(
+                [first[-1]] + second, workspace=ws))),
     ] + list(entries[2:])
     st._replace("root", manifest.encode_root(
         ws, manifest.encode(moved, emit)))
@@ -256,7 +264,7 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
     old_root = h(node.store(workspace).get("root"))
 
     secret, public = node.identity(workspace)
-    item = message(public, "general", "survives retry", 2)
+    item = message(workspace, public, "general", "survives retry", 2)
     signed = signature(secret, public, item, 2)
     new = {fact.fid: fact for fact in (signed, item)}
     deps = {
@@ -274,7 +282,7 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
         fact_of,
     ))
     deliver(node, workspace, pile)
-    stream, _ = decode_pile(pile)
+    stream, _ = decode_pile(pile, workspace)
     judgment = drain(stream, workspace)
     assert judgment.ok
     node.merge(workspace, (valid.fact for valid in judgment.valids))
@@ -325,7 +333,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     secret, public = node.identity(workspace)
-    item = message(public, "general", "after-cas", 2)
+    item = message(workspace, public, "general", "after-cas", 2)
     signed = signature(secret, public, item, 2)
     deps = {
         signed.fid: [],
@@ -345,7 +353,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
         lambda fid: new.get(fid) or node.fact_of(workspace, fid),
     ))
     deliver(node, workspace, raw)
-    judgment = drain(decode_pile(raw)[0], workspace)
+    judgment = drain(decode_pile(raw, workspace)[0], workspace)
     settlement = node.merge(
         workspace, (valid.fact for valid in judgment.valids))
     old_root = node.store(workspace).get("root")
@@ -713,7 +721,8 @@ def test_resident_action_winner_delta_matches_full_fact_tree(tmp_path):
 
     victim = node.fact_of(workspace, target)
     secret, public = node.identity(workspace)
-    proposal = delete(public, victim.key, _policy.OWNER, 30)
+    proposal = delete(
+        workspace, public, victim.key, _policy.OWNER, 30)
     signed = signature(secret, public, proposal, 30)
     node.ingest_new(
         workspace, [signed, proposal], {
@@ -785,7 +794,8 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     assert bob.fid in deps
     assert bob.ts < invitation.ts < carol.ts
 
-    pile, _ = decode_pile(closed_subset(n, ws, [carol.fid]))
+    pile, _ = decode_pile(
+        closed_subset(n, ws, [carol.fid]), ws)
     assert drain(pile, ws).ok
 
     outsider = keypair()
@@ -810,7 +820,7 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
     for offset in range(1000):
         invite_secret, invite_public = keypair()
         invitation = user_invite(
-            bob_public, invite_public, base_ts + 2 * offset)
+            ws, bob_public, invite_public, base_ts + 2 * offset)
         recursive = user(
             invitation, invite_secret, bob_public, "bob-again",
             base_ts + 2 * offset + 1)
@@ -854,8 +864,8 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
     real = node_module.resolve_deps
     real_ranges = manifest.changed_ranges
 
-    def observed_ranges(root, changed, fetch):
-        ranges = real_ranges(root, changed, fetch)
+    def observed_ranges(root, changed, fetch, workspace):
+        ranges = real_ranges(root, changed, fetch, workspace)
         discovered.append(sum(len(current) for _, current in ranges))
         return ranges
 
@@ -905,7 +915,8 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
 def test_one_fact_hot_commit_never_enters_the_full_key_path(world):
     """A valid detached signature can arrive before its target as one fact."""
     n, ws = world
-    target = message(n.pk, "general", "signed before delivery", 3_100_000)
+    target = message(
+        ws, n.pk, "general", "signed before delivery", 3_100_000)
     detached = signature(n.sk, n.pk, target, 3_100_000)
     deliver(n, ws, encode_pile([detached]))
     keys = n.keys
@@ -947,10 +958,18 @@ def test_poison_pile_is_litter_not_poison(world):
     n, ws = world
     before = len(cmds.msgs(n, ws))
     poisons = [
-        Fact("msg", now_ms(), [["offer"]], {"pk": n.pk, "chan": "c", "text": "x"}),
-        Fact("msg", now_ms(), [[]], {"pk": n.pk, "chan": "c", "text": "x"}),
-        Fact("signature", now_ms(), [["offer", "author", "de", n.pk]], {}),
-        Fact("workspace", now_ms(), [["offer", "member", n.pk]], {}),
+        Fact(
+            "msg", now_ms(), [["offer"]],
+            {"pk": n.pk, "chan": "c", "text": "x"}, ws),
+        Fact(
+            "msg", now_ms(), [[]],
+            {"pk": n.pk, "chan": "c", "text": "x"}, ws),
+        Fact(
+            "signature", now_ms(),
+            [["offer", "author", "de", n.pk]], {}, ws),
+        Fact(
+            "workspace", now_ms(),
+            [["offer", "member", n.pk]], {}, ws),
     ]
     for p in poisons:
         deliver(n, ws, encode_pile([p]))
@@ -966,7 +985,10 @@ def test_poison_alongside_honest(world):
     from core.close import encode_pile
     n, ws = world
     deliver(n, ws, encode_pile(
-        [Fact("signature", now_ms(), [["offer", "author", "de", n.pk]], {})]),
+        [Fact(
+            "signature", now_ms(),
+            [["offer", "author", "de", n.pk]], {}, ws)],
+        workspace=ws),
             member="poison0poison00")
     fid = cmds.post(n, ws, "general", "survivor")  # own ingress + turn
     assert fid in all_fids(n, ws)
@@ -978,13 +1000,20 @@ def test_ephemeral_never_persists(world):
     from core.close import encode_pile
     n, ws = world
     ts = now_ms()
-    rq = request(n.pk, "sync", ts + 9999, ts)
+    rq = request(ws, n.pk, "sync", ts + 9999, ts)
     s = signature(n.sk, n.pk, rq, ts)
-    pile = decode_pile(closed_subset(n, ws, [n.fact_of(ws, all_fids(n, ws)[0]).fid]))[0]
+    pile = decode_pile(
+        closed_subset(
+            n, ws, [n.fact_of(ws, all_fids(n, ws)[0]).fid]),
+        ws,
+    )[0]
     with n.lock:
         from core.kernel import offer_src
-        chain = decode_pile(closed_subset(
-            n, ws, [offer_src(n.idx(ws), "member", n.pk)]))[0]
-    deliver(n, ws, encode_pile(chain + [s, rq]))
+        chain = decode_pile(
+            closed_subset(
+                n, ws, [offer_src(n.idx(ws), "member", n.pk)]),
+            ws,
+        )[0]
+    deliver(n, ws, encode_pile(chain + [s, rq], workspace=ws))
     n.turn(ws)
     assert rq.fid not in all_fids(n, ws)

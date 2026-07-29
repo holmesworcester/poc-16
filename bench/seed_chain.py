@@ -104,7 +104,8 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
             user_ts = invite_ts + 1
 
             invite_sk, invite_pk = keys.next() if keys else keypair()
-            invitation = user_invite(inviter_pk, invite_pk, invite_ts)
+            invitation = user_invite(
+                workspace, inviter_pk, invite_pk, invite_ts)
             invitation_sig = signature(
                 inviter_sk, inviter_pk, invitation, invite_ts)
             member_sk, member_pk = keys.next() if keys else keypair()
@@ -113,7 +114,7 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
             joined_sig = signature(member_sk, member_pk, joined, user_ts)
 
             for fact in (invitation_sig, invitation, joined_sig, joined):
-                _insert(idx, fact)
+                _insert(idx, workspace, fact)
             node.keychain.add_identity(member_sk, persist=False)
             identities.append((member_sk, member_pk))
             parents[member_pk] = inviter_pk
@@ -140,11 +141,12 @@ def grow_devices(
     try:
         ts = base_ts
         for user_number, (user_secret, user_public) in enumerate(identities):
-            primary = device(user_public, f"u{user_number}-d0", ts)
+            primary = device(
+                workspace, user_public, f"u{user_number}-d0", ts)
             primary_sig = signature(
                 user_secret, user_public, primary, ts)
-            _insert(idx, primary_sig)
-            _insert(idx, primary)
+            _insert(idx, workspace, primary_sig)
+            _insert(idx, workspace, primary)
             device_set = [(user_secret, user_public)]
             devices_by_user[user_public] = [user_public]
             device_to_user[user_public] = user_public
@@ -155,12 +157,12 @@ def grow_devices(
                 sibling_secret, sibling_public = \
                     keys.next() if keys else keypair()
                 grant = device_invite(
-                    inviter_public, user_public, sibling_public,
+                    workspace, inviter_public, user_public, sibling_public,
                     f"u{user_number}-d{device_number}", ts)
                 grant_sig = signature(
                     inviter_secret, inviter_public, grant, ts)
-                _insert(idx, grant_sig)
-                _insert(idx, grant)
+                _insert(idx, workspace, grant_sig)
+                _insert(idx, workspace, grant)
                 node.keychain.add_identity(sibling_secret, persist=False)
                 device_set.append((sibling_secret, sibling_public))
                 devices_by_user[user_public].append(sibling_public)

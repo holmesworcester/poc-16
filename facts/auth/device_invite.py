@@ -22,7 +22,7 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def device_invite(pk, user, device_pk, label, ts):
+def device_invite(workspace, pk, user, device_pk, label, ts):
     if pk == device_pk:
         raise ValueError("a device grant must target another key")
     return Fact(
@@ -31,7 +31,8 @@ def device_invite(pk, user, device_pk, label, ts):
          ["offer", "member", device_pk],
          ["offer", "device_key", device_pk],
          ["offer", "device", user, device_pk]],
-        {"pk": pk, "user": user, "device": device_pk, "label": label})
+        {"pk": pk, "user": user, "device": device_pk, "label": label},
+        workspace)
 
 
 # NEEDS
@@ -56,7 +57,7 @@ def validate(f, ctx):
         return set(body) == {"pk", "user", "device", "label"} \
             and all(isinstance(body[key], str) for key in body) \
             and f == device_invite(
-                body["pk"], body["user"], body["device"],
+                f.ws, body["pk"], body["user"], body["device"],
                 body["label"], f.ts)
     except Exception:
         return False
@@ -82,7 +83,8 @@ def grant(node, workspace, user, device_pk, label):
         # stable bytes even if an authority proof winner later changes;
         # refs/needs and close() carry the actual relation.
         ts = node.fact_of(workspace, workspace).ts
-        item = device_invite(public, user, device_pk, label, ts)
+        item = device_invite(
+            workspace, public, user, device_pk, label, ts)
         if node.fact_of(workspace, item.fid) is not None:
             return item.fid
 

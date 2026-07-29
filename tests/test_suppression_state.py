@@ -45,7 +45,7 @@ def _signed_pile(node, workspace, fact, signed, deps):
 
 def _author_eviction(node, workspace, target, ts):
     secret, public = node.identity(workspace)
-    item = removal(public, target, ts)
+    item = removal(workspace, public, target, ts)
     signed = signature(secret, public, item, ts)
     admin = offer_src(node.idx(workspace), "admin", public)
     node.ingest_new(
@@ -94,7 +94,7 @@ def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
     eviction = cmds.evict(node, workspace, bob)
 
     ts = node.fact_of(workspace, eviction).ts + 1
-    item = message(bob, "general", "must not land", ts)
+    item = message(workspace, bob, "general", "must not land", ts)
     signed = signature(bob_secret, bob, item, ts)
     pile = _signed_pile(
         node, workspace, item, signed,
@@ -117,7 +117,7 @@ def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
     eviction = cmds.evict(node, workspace, bob)
 
     ts = node.fact_of(workspace, eviction).ts + 1
-    item = removal(bob, carol, ts)
+    item = removal(workspace, bob, carol, ts)
     signed = signature(bob_secret, bob, item, ts)
     pile = _signed_pile(
         node, workspace, item, signed,
@@ -198,9 +198,11 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     first = _author_eviction(source, workspace, bob, 20)
     first_pile = closed_subset(source, workspace, [first.fid])
     later = next(
-        removal(source.identity_id(workspace), bob, ts)
+        removal(workspace, source.identity_id(workspace), bob, ts)
         for ts in range(41, 500)
-        if removal(source.identity_id(workspace), bob, ts).fid < first.fid
+        if removal(
+            workspace, source.identity_id(workspace), bob, ts
+        ).fid < first.fid
     )
     secret, public = source.identity(workspace)
     later_sig = signature(secret, public, later, later.ts)
@@ -209,7 +211,8 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
         {later_sig.fid: (), later.fid: (later_sig.fid, workspace)})
     later_pile = closed_subset(source, workspace, [later.fid])
 
-    posted = message(bob, "general", "between actions", 30)
+    posted = message(
+        workspace, bob, "general", "between actions", 30)
     posted_sig = signature(bob_secret, bob, posted, 30)
     message_pile = _signed_pile(
         source, workspace, posted, posted_sig,
@@ -257,7 +260,9 @@ def test_action_sync_compares_witnesses_not_fact_id_order(tmp_path):
     destination.turn(workspace)
     later_ts = next(
         ts for ts in range(41, 500)
-        if removal(destination.identity_id(workspace), bob, ts).fid < first.fid
+        if removal(
+            workspace, destination.identity_id(workspace), bob, ts
+        ).fid < first.fid
     )
     later = _author_eviction(destination, workspace, bob, later_ts)
     assert later.fid < first.fid  # the obsolete tuple-order shortcut

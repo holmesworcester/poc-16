@@ -26,7 +26,9 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def chunk(pk, channel, root, index, count, cid, ts, file_fid, member_fid):
+def chunk(
+        workspace, pk, channel, root, index, count, cid, ts,
+        file_fid, member_fid):
     return Fact(
         TAG, ts,
         author_selectors(
@@ -35,6 +37,7 @@ def chunk(pk, channel, root, index, count, cid, ts, file_fid, member_fid):
         ) + [["ref", "file", file_fid]],
         {"pk": pk, "chan": channel, "root": root,
          "i": index, "n": count, "cid": cid},
+        workspace,
     )
 
 
@@ -86,7 +89,7 @@ def validate(f, ctx):
             if marker[1] == ANCESTOR and marker[2] == "file/member"
         ]
         return len(parents) == len(ancestors) == 1 and f == chunk(
-            body["pk"], body["chan"], body["root"],
+            f.ws, body["pk"], body["chan"], body["root"],
             body["i"], body["n"], body["cid"], f.ts,
             parents[0], ancestors[0])
     except Exception:
@@ -103,10 +106,10 @@ def blob_refs(f):
 
 # COMMANDS
 def author(
-        secret, public, channel, root, index, count, cid, ts,
+        workspace, secret, public, channel, root, index, count, cid, ts,
         file_fid, member_fid):
     item = chunk(
-        public, channel, root, index, count, cid, ts,
+        workspace, public, channel, root, index, count, cid, ts,
         file_fid, member_fid)
     return item, signature.signature(secret, public, item, ts)
 

@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 import facts
 
-from .fact import decode, encode, from_json
+from .fact import bound_to, decode, encode, from_json
 from . import suppression_state
 from .close import close
 from .kernel import (
@@ -31,7 +31,7 @@ TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"
 INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX, REF_INDEX))
-INDEX_VERSION = "admission-catalog-v25"
+INDEX_VERSION = "admission-catalog-v26-workspace-bound"
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -67,14 +67,20 @@ def _index_rows(fact):
     )
 
 
-def _reindex(db):
+def _bound_receipt(fact, anchor):
+    """Catalog defense in depth for the registry's sole ws-less exception."""
+    return bound_to(fact, anchor) \
+        and (fact.ws is not None or facts.is_genesis(fact.t))
+
+
+def _reindex(db, anchor):
     """Replace generic rows with the exact contribution of every fact blob."""
     rows = db.execute(
         "SELECT fid, blob FROM facts ORDER BY fid").fetchall()
     db.execute("DELETE FROM fact_index")
     for fid, raw in rows:
         fact = decode(raw)
-        if fact.fid != fid:
+        if fact.fid != fid or not _bound_receipt(fact, anchor):
             raise ValueError("fact catalog integrity")
         db.executemany(
             "INSERT INTO fact_index VALUES(?,?,?,?)",
@@ -82,7 +88,7 @@ def _reindex(db):
         )
 
 
-def upgrade_schema(db):
+def upgrade_schema(db, anchor):
     """Preserve old local receipts while cutting over to canonical blobs."""
     columns = {
         row[1] for row in db.execute("PRAGMA table_info(facts)")
@@ -103,7 +109,7 @@ def upgrade_schema(db):
         try:
             db.execute("BEGIN")
             if version != (INDEX_VERSION,):
-                _reindex(db)
+                _reindex(db, anchor)
             db.execute("DROP TABLE IF EXISTS offers")
             db.execute("DROP TABLE IF EXISTS log")
             db.commit()
@@ -126,7 +132,7 @@ def upgrade_schema(db):
         db.execute("DELETE FROM fact_index")
         for fid, raw_json, admitted in rows:
             fact = from_json(json.loads(raw_json))
-            if fact.fid != fid:
+            if fact.fid != fid or not _bound_receipt(fact, anchor):
                 raise ValueError("legacy fact catalog integrity")
             db.execute("INSERT INTO facts VALUES(?,?)", (fid, encode(fact)))
             if not admitted:
@@ -248,6 +254,8 @@ class Catalog:
 
     def stage(self, fact):
         """Store one durable receipt; return whether it still awaits publish."""
+        if not _bound_receipt(fact, self.anchor):
+            raise ValueError("fact workspace")
         raw = encode(fact)
         row = self.db.execute(
             "SELECT blob FROM facts WHERE fid=?", (fact.fid,)).fetchone()
@@ -269,7 +277,7 @@ class Catalog:
 
     def reindex(self):
         """Rebuild the exact generic index from every retained fact blob."""
-        _reindex(self.db)
+        _reindex(self.db, self.anchor)
 
     def commit_stage(self, fids):
         self.db.executemany(

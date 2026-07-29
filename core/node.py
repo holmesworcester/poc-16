@@ -69,7 +69,7 @@ def _edges(items, anchor=None):
     return deps
 
 
-def resident(man, fetch, anchor=None):
+def resident(man, fetch, anchor):
     """Every committed fact, deps-first, from the manifest alone.
 
     Leaf piles decode with the ONE pile codec (close.decode_pile); the member
@@ -80,7 +80,8 @@ def resident(man, fetch, anchor=None):
     items = {}
     entries = manifest.decode(verified_object(man, fetch), fetch) if man else ()
     for entry in entries:
-        members, _ = decode_pile(verified_object(entry.leaf, fetch))
+        members, _ = decode_pile(
+            verified_object(entry.leaf, fetch), anchor)
         items.update({f.fid: f for f in members})
     if any(
             (family := facts.family_for(fact.t)) is None
@@ -299,7 +300,7 @@ class Node:
             con = sqlite3.connect(os.path.join(self.dir, "ws", ws + ".idx.db"),
                                   check_same_thread=False)
             con.executescript(IDX_SCHEMA)
-            catalog.upgrade_schema(con)
+            catalog.upgrade_schema(con, ws)
             suppression_state.upgrade_schema(con)
             self._idx[ws] = con
         return self._idx[ws]
@@ -374,11 +375,14 @@ class Node:
         """Persist the action's current canonical proof closure."""
         idx = self.idx(ws)
         fact_of = lambda fid: self.fact_of(ws, fid)
-        raw = encode_pile(close(
-            [fact],
-            lambda fid: resolve_deps(fact_of(fid), idx),
-            fact_of,
-        ))
+        raw = encode_pile(
+            close(
+                [fact],
+                lambda fid: resolve_deps(fact_of(fid), idx),
+                fact_of,
+            ),
+            workspace=ws,
+        )
         oid = h(raw)
         ensure_object(self.store(ws), oid, raw)
         return oid

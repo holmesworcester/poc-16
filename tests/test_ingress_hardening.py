@@ -17,7 +17,7 @@ from facts.content import message as message_family
 from tests.util import closed_subset, deliver
 
 
-def poisoned_timestamp_pile():
+def poisoned_timestamp_pile(workspace):
     body = {}
     envelope = {
         "a": [],
@@ -25,7 +25,10 @@ def poisoned_timestamp_pile():
         "t": "msg",
         "ts": -1,
     }
-    return canon({"facts": [{"b": body, "e": envelope}]})
+    return canon({
+        "ws": workspace,
+        "facts": [{"b": body, "e": envelope}],
+    })
 
 
 def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
@@ -36,7 +39,7 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "source", [])
     good = closed_subset(source, workspace, [survivor])
-    bad = poisoned_timestamp_pile()
+    bad = poisoned_timestamp_pile(workspace)
     deliver(destination, workspace, bad, member="0000000000000000")
     deliver(destination, workspace, good, member="ffffffffffffffff")
 
@@ -87,10 +90,10 @@ def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
     second_fid, _, second_key = second
     decode = runtime.decode_pile
 
-    def program_failure(raw):
+    def program_failure(raw, expected_workspace):
         if raw == first_raw:
             raise ValueError("simulated decoder programming failure")
-        return decode(raw)
+        return decode(raw, expected_workspace)
 
     monkeypatch.setattr(runtime, "decode_pile", program_failure)
     node.turn(workspace)
@@ -110,11 +113,12 @@ def test_untyped_fact_decoder_value_error_is_not_a_quarantine_verdict(
         raise ValueError("simulated fact decoder programming failure")
 
     monkeypatch.setattr(close, "from_json", program_failure)
-    raw = canon({"facts": [{}]})
+    workspace = "0" * 64
+    raw = canon({"ws": workspace, "facts": [{}]})
 
     with pytest.raises(
             ValueError, match="simulated fact decoder programming failure"):
-        close.decode_pile(raw)
+        close.decode_pile(raw, workspace)
 
 
 def test_family_program_failure_retains_exact_pile_and_does_not_wedge(
@@ -266,7 +270,7 @@ def test_rejection_retirement_requires_exact_durable_evidence(
     survivor = cmds.post(source, workspace, "general", "survives", ts=2)
     node = Node(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
-    bad = poisoned_timestamp_pile()
+    bad = poisoned_timestamp_pile(workspace)
     bad_key = f"pile/0000000000000000/{h(bad)}"
     good = closed_subset(source, workspace, [survivor])
     deliver(node, workspace, bad, member="0000000000000000")
@@ -330,8 +334,8 @@ def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
     rejected = close.encode_pile([
         Fact(
             "signature", 3,
-            [["offer", "author", "not-a-fact", source.pk]], {}),
-    ])
+            [["offer", "author", "not-a-fact", source.pk]], {}, workspace),
+    ], workspace=workspace)
     deliver(node, workspace, rejected, member="0000000000000000")
     deliver(
         node, workspace,
@@ -356,7 +360,7 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     second = Node(str(tmp_path / "second"), store_factory=factory)
     second.add_workspace(workspace, "shared", [])
     second.rebuild(workspace)
-    bad = poisoned_timestamp_pile()
+    bad = poisoned_timestamp_pile(workspace)
     source = f"pile/0000000000000000/{h(bad)}"
     first.store(workspace).put(source, bad)
 
@@ -444,7 +448,10 @@ def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
     nested = b"[" * 5_000 + b"0" + b"]" * 5_000
 
     with pytest.raises(ValueError):
-        decoder(nested)
+        if decoder is close.decode_pile:
+            decoder(nested, "0" * 64)
+        else:
+            decoder(nested)
 
 
 def test_btreap_parser_recursion_is_also_a_value_error():
@@ -455,8 +462,13 @@ def test_btreap_parser_recursion_is_also_a_value_error():
 
 
 def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
+    workspace = "0" * 64
     cases = (
-        (close, "MAX_PILE_BYTES", close.decode_pile, b'{"facts":[]}'),
+        (
+            close, "MAX_PILE_BYTES",
+            lambda raw: close.decode_pile(raw, workspace),
+            canon({"ws": workspace, "facts": []}),
+        ),
         (manifest, "MAX_ROOT_BYTES", manifest.decode_root, b'{"stamp":"x"}'),
         (sync, "MAX_OBJECT_BYTES", sync._sibling_keys, b'{"keys":[]}'),
     )
@@ -468,10 +480,11 @@ def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
 
 def test_pile_encoder_and_object_publisher_enforce_the_reader_bounds(
         monkeypatch):
-    empty = close.encode_pile(())
+    workspace = "0" * 64
+    empty = close.encode_pile((), workspace=workspace)
     monkeypatch.setattr(close, "MAX_PILE_BYTES", len(empty) - 1)
     with pytest.raises(PayloadTooLarge):
-        close.encode_pile(())
+        close.encode_pile((), workspace=workspace)
 
     class NeverWritten:
         def put_if_absent(self, *_args):

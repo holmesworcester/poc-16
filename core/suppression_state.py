@@ -199,7 +199,7 @@ def validate_evidence(workspace, sid, fid, evidence_oid, fetch):
     raw = fetch(evidence_oid) if evidence_oid else None
     if raw is None or h(raw) != evidence_oid:
         raise ValueError("action evidence object")
-    stream, blobs = decode_pile(raw)
+    stream, blobs = decode_pile(raw, workspace)
     result = drain(stream, workspace)
     matches = [
         valid for valid in result.valids

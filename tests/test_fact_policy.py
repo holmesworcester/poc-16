@@ -69,7 +69,7 @@ def test_new_principal_namespace_needs_no_core_change(monkeypatch):
     )
     monkeypatch.setitem(facts.FAMILIES, family.TAG, family)
     fact = Fact(
-        family.TAG, 1, [["offer", "account_key", "public"]], {})
+        family.TAG, 1, [["offer", "account_key", "public"]], {}, "0" * 64)
     assert facts.principal_sids(fact) == {"account:public"}
 
 
@@ -86,6 +86,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
     malformed = Fact(
         "msg", 10, atoms,
         {"pk": public, "chan": "general", "text": "hostile"},
+        workspace,
     )
     signed = signature(secret, public, malformed, malformed.ts)
     monkeypatch.setattr(message_family, "validate", lambda fact, ctx: True)
@@ -113,7 +114,7 @@ def test_runtime_policy_rejects_a_forged_nonancestor(
         ) else [*marker[:3], "f" * 64]
         for marker in original.atoms
     ]
-    forged = Fact(original.t, 11, atoms, dict(original.body))
+    forged = Fact(original.t, 11, atoms, dict(original.body), workspace)
     secret, public = node.identity(workspace)
     signed = signature(secret, public, forged, forged.ts)
     monkeypatch.setattr(chunk_family, "validate", lambda fact, ctx: True)

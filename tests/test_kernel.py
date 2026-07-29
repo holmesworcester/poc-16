@@ -36,7 +36,7 @@ def judge(facts, anchor):
 def test_genesis_and_msg(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = message(pk, "c", "hi", ts)
+    m = message(g.fid, pk, "c", "hi", ts)
     s = signature(sk, pk, m, ts)
     assert judge([g, s, m], g.fid)
 
@@ -50,10 +50,10 @@ def test_wrong_anchor_rejects(anchor_chain):
 def test_bad_sig_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = message(pk, "c", "hi", ts)
+    m = message(g.fid, pk, "c", "hi", ts)
     other_sk, _ = keypair()
     forged = Fact("signature", ts, [["offer", "author", m.fid, pk]],
-                  {"sig": sign(other_sk, m.fid)})
+                  {"sig": sign(other_sk, m.fid)}, g.fid)
     assert not judge([g, forged, m], g.fid)
 
 
@@ -61,7 +61,7 @@ def test_nonmember_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     esk, epk = keypair()
     ts = now_ms()
-    m = message(epk, "c", "intruder", ts)
+    m = message(g.fid, epk, "c", "intruder", ts)
     s = signature(esk, epk, m, ts)
     assert not judge([g, s, m], g.fid)
 
@@ -70,7 +70,7 @@ def test_unresolved_ref_rejects(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
     dangling = Fact("user", ts, [["ref", ts, "f" * 64], ["offer", "member", pk]],
-                    {"name": "x", "pk": pk, "countersig": "00"})
+                    {"name": "x", "pk": pk, "countersig": "00"}, g.fid)
     assert not judge([g, dangling], g.fid)
 
 
@@ -80,7 +80,7 @@ def test_offer_smuggling_rejects(anchor_chain):
     esk, epk = keypair()
     ts = now_ms()
     evil = Fact("msg", ts, [["offer", "admin", epk]],
-                {"pk": pk, "chan": "c", "text": "x"})
+                {"pk": pk, "chan": "c", "text": "x"}, g.fid)
     s = signature(sk, pk, evil, ts)
     assert not judge([g, s, evil], g.fid)
 
@@ -89,10 +89,10 @@ def test_all_or_nothing(anchor_chain):
     """A valid fact sinks with its bad batch; it returns on the next walk."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    good = message(pk, "c", "good", ts)
+    good = message(g.fid, pk, "c", "good", ts)
     sg = signature(sk, pk, good, ts)
     esk, epk = keypair()
-    bad = message(epk, "c", "bad", ts)
+    bad = message(g.fid, epk, "c", "bad", ts)
     sb = signature(esk, epk, bad, ts)
     result = drain([g, sg, good, sb, bad], g.fid)
     assert not result.ok and result.valids == ()
@@ -102,12 +102,13 @@ def test_evict_needs_admin(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
     isk, ipk = keypair()
-    inv = user_invite(pk, ipk, ts)
+    inv = user_invite(g.fid, pk, ipk, ts)
     si = signature(sk, pk, inv, ts)
     bsk, bpk = keypair()
     j = user(inv, isk, bpk, "bob", ts)
     sj = signature(bsk, bpk, j, ts)
-    ev = removal(bpk, pk, ts)  # bob (mere member) tries to evict alice
+    ev = removal(
+        g.fid, bpk, pk, ts)  # bob (mere member) tries to evict alice
     se = signature(bsk, bpk, ev, ts)
     assert judge([g, si, inv, sj, j], g.fid)
     assert not judge([g, si, inv, sj, j, se, ev], g.fid)
@@ -118,7 +119,8 @@ def test_member_can_invite_but_nonmember_cannot(anchor_chain):
     founder_sk, founder_pk, root = anchor_chain
     ts = now_ms()
     first_invite_sk, first_invite_pk = keypair()
-    first_invite = user_invite(founder_pk, first_invite_pk, ts + 1)
+    first_invite = user_invite(
+        root.fid, founder_pk, first_invite_pk, ts + 1)
     first_invite_sig = signature(
         founder_sk, founder_pk, first_invite, ts + 1)
     member_sk, member_pk = keypair()
@@ -128,14 +130,16 @@ def test_member_can_invite_but_nonmember_cannot(anchor_chain):
     base = [root, first_invite_sig, first_invite, member_sig, member]
 
     _, next_invite_pk = keypair()
-    member_invite = user_invite(member_pk, next_invite_pk, ts + 3)
+    member_invite = user_invite(
+        root.fid, member_pk, next_invite_pk, ts + 3)
     member_invite_sig = signature(
         member_sk, member_pk, member_invite, ts + 3)
     assert judge(base + [member_invite_sig, member_invite], root.fid)
 
     outsider_sk, outsider_pk = keypair()
     _, forged_invite_pk = keypair()
-    forged = user_invite(outsider_pk, forged_invite_pk, ts + 3)
+    forged = user_invite(
+        root.fid, outsider_pk, forged_invite_pk, ts + 3)
     forged_sig = signature(outsider_sk, outsider_pk, forged, ts + 3)
     assert not judge(base + [forged_sig, forged], root.fid)
 
@@ -143,25 +147,25 @@ def test_member_can_invite_but_nonmember_cannot(anchor_chain):
 def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
     founder_sk, founder_pk, root = anchor_chain
     ts = now_ms()
-    primary = device(founder_pk, "phone", ts + 1)
+    primary = device(root.fid, founder_pk, "phone", ts + 1)
     primary_sig = signature(founder_sk, founder_pk, primary, ts + 1)
 
     sibling_sk, sibling_pk = keypair()
     sibling = device_invite(
-        founder_pk, founder_pk, sibling_pk, "laptop", ts + 2)
+        root.fid, founder_pk, founder_pk, sibling_pk, "laptop", ts + 2)
     sibling_sig = signature(founder_sk, founder_pk, sibling, ts + 2)
     first = [root, primary_sig, primary, sibling_sig, sibling]
     assert judge(first, root.fid)
 
     _, third_pk = keypair()
     third = device_invite(
-        sibling_pk, founder_pk, third_pk, "tablet", ts + 3)
+        root.fid, sibling_pk, founder_pk, third_pk, "tablet", ts + 3)
     third_sig = signature(sibling_sk, sibling_pk, third, ts + 3)
     assert judge(first + [third_sig, third], root.fid)
 
     outsider_sk, outsider_pk = keypair()
     forged = device_invite(
-        outsider_pk, founder_pk, third_pk, "forged", ts + 3)
+        root.fid, outsider_pk, founder_pk, third_pk, "forged", ts + 3)
     forged_sig = signature(outsider_sk, outsider_pk, forged, ts + 3)
     assert not judge(first + [forged_sig, forged], root.fid)
 
@@ -169,7 +173,7 @@ def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
 def test_authority_facts_cannot_satisfy_their_own_prerequisite(anchor_chain):
     founder_sk, founder_pk, root = anchor_chain
     ts = now_ms()
-    primary = device(founder_pk, "phone", ts + 1)
+    primary = device(root.fid, founder_pk, "phone", ts + 1)
     primary_sig = signature(founder_sk, founder_pk, primary, ts + 1)
 
     self_device = Fact(
@@ -185,6 +189,7 @@ def test_authority_facts_cannot_satisfy_their_own_prerequisite(anchor_chain):
             "device": founder_pk,
             "label": "self",
         },
+        root.fid,
     )
     self_device_sig = signature(
         founder_sk, founder_pk, self_device, ts + 2)
@@ -197,6 +202,7 @@ def test_authority_facts_cannot_satisfy_their_own_prerequisite(anchor_chain):
         ts + 2,
         [["offer", "admin", founder_pk]],
         {"pk": founder_pk, "target": founder_pk},
+        root.fid,
     )
     self_admin_sig = signature(
         founder_sk, founder_pk, self_admin, ts + 2)
@@ -209,16 +215,16 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
     ts = now_ms()
 
     invite_secret, invite_public = keypair()
-    invitation = user_invite(founder, invite_public, ts + 1)
+    invitation = user_invite(root.fid, founder, invite_public, ts + 1)
     invitation_sig = signature(
         founder_secret, founder, invitation, ts + 1)
     bob_secret, bob = keypair()
     joined = user(invitation, invite_secret, bob, "bob", ts + 2)
     joined_sig = signature(bob_secret, bob, joined, ts + 2)
-    promote_bob = admin(founder, bob, ts + 3)
+    promote_bob = admin(root.fid, founder, bob, ts + 3)
     promote_bob_sig = signature(
         founder_secret, founder, promote_bob, ts + 3)
-    promote_founder = admin(bob, founder, ts + 4)
+    promote_founder = admin(root.fid, bob, founder, ts + 4)
     promote_founder_sig = signature(
         bob_secret, bob, promote_founder, ts + 4)
     admin_stream = [
@@ -233,15 +239,15 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
         promote_founder,
     ]
 
-    primary = device(founder, "phone", ts + 1)
+    primary = device(root.fid, founder, "phone", ts + 1)
     primary_sig = signature(founder_secret, founder, primary, ts + 1)
     laptop_secret, laptop = keypair()
     laptop_grant = device_invite(
-        founder, founder, laptop, "laptop", ts + 2)
+        root.fid, founder, founder, laptop, "laptop", ts + 2)
     laptop_grant_sig = signature(
         founder_secret, founder, laptop_grant, ts + 2)
     founder_back_grant = device_invite(
-        laptop, founder, founder, "founder-again", ts + 3)
+        root.fid, laptop, founder, founder, "founder-again", ts + 3)
     founder_back_grant_sig = signature(
         laptop_secret, laptop, founder_back_grant, ts + 3)
     device_stream = [
@@ -283,9 +289,9 @@ def test_request_time_is_not_persistent_kernel_state(anchor_chain):
     """Expiry is enforced by the Worker grant, not immutable fact validity."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = message(pk, "c", "still valid", ts)
+    m = message(g.fid, pk, "c", "still valid", ts)
     s = signature(sk, pk, m, ts)
-    rq = request(pk, "sync", ts + 9999, ts)
+    rq = request(g.fid, pk, "sync", ts + 9999, ts)
     sr = signature(sk, pk, rq, ts)
     assert validate([g, s, m], g.fid)
     assert judge([g, sr, rq], g.fid)
@@ -294,7 +300,7 @@ def test_request_time_is_not_persistent_kernel_state(anchor_chain):
 def test_drain_returns_only_valids(anchor_chain):
     sk, pk, g = anchor_chain
     ts = now_ms()
-    ev = removal(pk, pk, ts)
+    ev = removal(g.fid, pk, pk, ts)
     se = signature(sk, pk, ev, ts)
     result = drain([g, se, ev], g.fid)
     assert result.ok
@@ -306,7 +312,7 @@ def test_order_matters_seen_set(anchor_chain):
     """The seen-set rule: providers must precede dependents in the stream."""
     sk, pk, g = anchor_chain
     ts = now_ms()
-    m = message(pk, "c", "hi", ts)
+    m = message(g.fid, pk, "c", "hi", ts)
     s = signature(sk, pk, m, ts)
     assert not judge([g, m, s], g.fid)  # sig after its dependent: unmet need
 

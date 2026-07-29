@@ -19,13 +19,13 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def device(pk, label, ts):
+def device(workspace, pk, label, ts):
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [
          ["offer", "device_key", pk],
          ["offer", "device", pk, pk]],
-        {"pk": pk, "label": label})
+        {"pk": pk, "label": label}, workspace)
 
 
 # NEEDS
@@ -43,7 +43,7 @@ def validate(f, ctx):
         body = f.body
         return set(body) == {"pk", "label"} \
             and all(isinstance(body[key], str) for key in body) \
-            and f == device(body["pk"], body["label"], f.ts)
+            and f == device(f.ws, body["pk"], body["label"], f.ts)
     except Exception:
         return False
 
@@ -61,7 +61,7 @@ def bind(node, workspace, label):
             node, workspace, "device_key", public) is not None:
         raise ValueError("local identity is already in a device set")
     ts = now_ms()
-    item = device(public, label, ts)
+    item = device(workspace, public, label, ts)
     return publish(
         node, workspace, item,
         signature.signature(secret, public, item, ts))

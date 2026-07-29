@@ -7,6 +7,7 @@ the poc-10/poc-16 offers-and-needs kernel.
 import base64
 import os
 
+from core.close import encode_pile
 from core.crypto import box_encrypt, kdf, keypair
 from core.fact import Fact, Need, canon
 from .._commands import closer, offer_source
@@ -18,8 +19,9 @@ POLICY = FamilyPolicy(authorization_guards=("member",))
 
 
 # SHAPE
-def user_invite(pk, invite_pk, ts):
-    return Fact(TAG, ts, [["offer", "invitee", invite_pk]], {"pk": pk})
+def user_invite(workspace, pk, invite_pk, ts):
+    return Fact(
+        TAG, ts, [["offer", "invitee", invite_pk]], {"pk": pk}, workspace)
 
 
 # NEEDS
@@ -38,7 +40,7 @@ def validate(f, ctx):
             return False
         name, invite_pk, empty = f.offers()[0]
         return name == "invitee" and empty == "" \
-            and f == user_invite(f.body["pk"], invite_pk, f.ts)
+            and f == user_invite(f.ws, f.body["pk"], invite_pk, f.ts)
     except Exception:
         return False
 
@@ -59,7 +61,7 @@ def make(node, workspace):
     invite_sk, invite_pk = keypair()
     ts = now_ms()
     secret, public = node.identity(workspace)
-    item = user_invite(public, invite_pk, ts)
+    item = user_invite(workspace, public, invite_pk, ts)
     sig = signature.signature(secret, public, item, ts)
     member = offer_source(node, workspace, "member", public)
     if member is None:
@@ -67,7 +69,8 @@ def make(node, workspace):
     with node.lock:
         facts = closer(node, workspace, {sig.fid: sig, item.fid: item},
                        {item.fid: [sig.fid, member], sig.fid: []})
-    blob = canon({"pile": [fact.to_json() for fact in facts],
+    blob = canon({"pile": base64.b64encode(
+                      encode_pile(facts, workspace=workspace)).decode(),
                   "isk": invite_sk.encode().hex(), "ws": workspace})
     node.store(workspace).put("invite/" + kdf(seed, "id").hex(),
                               box_encrypt(kdf(seed, "key"), blob))

@@ -82,7 +82,7 @@ def _extract(node, ws, extra, entries, keys, fetch):
     raws = fetch.many(list(plan))
     out = []
     for (leaf, wanted), raw in zip(plan.items(), raws):
-        members, _ = decode_pile(_object(leaf, lambda oid: raw))
+        members, _ = decode_pile(_object(leaf, lambda oid: raw), ws)
         held = {shape.key(f): f for f in members}
         out += [held[k] for k in wanted if k in held]
     return out
@@ -181,7 +181,7 @@ def sync(node, ws, url):
             fetch_remote.many(
                 [e.leaf for e in theirs if e in differing])))
         members_of = lambda e: manifest.range_members(
-            e, lambda oid: raws[oid])
+            e, lambda oid: raws[oid], ws)
         pulled_piles, push_keys = frontier(
             my_keys, theirs, differing, members_of)
 
@@ -199,7 +199,7 @@ def sync(node, ws, url):
     pulled = 0
     if pulled_piles:
         stream = assemble(node, ws, pulled_piles, theirs, fetch_remote)
-        raw = encode_pile(stream)
+        raw = encode_pile(stream, workspace=ws)
         pull(node, ws, h(raw), raw)
         pulled = 1
         node.turn(ws)
