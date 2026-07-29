@@ -412,8 +412,10 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True}
 
 
-def serve(dir, port, host="127.0.0.1", cadence=1.0, url=None):
-    node = Node(dir)
+def serve(
+        dir, port, host="127.0.0.1", cadence=1.0, url=None, *,
+        store_factory=None):
+    node = Node(dir, store_factory=store_factory)
     node.url = url or f"http://{host}:{port}"
     syncer = Syncer(node, cadence)
     syncer.start()

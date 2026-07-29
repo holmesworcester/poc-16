@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import base64
 import hashlib
 import importlib
+import math
 import re
 
 from core.crypto import h
@@ -224,7 +225,7 @@ class S3Config:
                 (self.connect_timeout, "connect_timeout"),
                 (self.read_timeout, "read_timeout")):
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                    or value <= 0:
+                    or not math.isfinite(value) or value <= 0:
                 raise ValueError(name)
         _positive_int(self.max_pool_connections, "max_pool_connections")
         _positive_int(

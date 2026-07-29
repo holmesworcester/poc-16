@@ -118,6 +118,9 @@ def config(**changes):
          "bucket_key_enabled": True},
         {"list_page_size": 1001},
         {"read_total_max_attempts": 0},
+        {"connect_timeout": float("nan")},
+        {"connect_timeout": float("inf")},
+        {"read_timeout": float("-inf")},
     ])
 def test_config_rejects_ambiguous_or_unsupported_provider_settings(changes):
     with pytest.raises((TypeError, ValueError)):

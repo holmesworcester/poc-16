@@ -11,9 +11,24 @@ import urllib.request
 DEFAULT_NODE = "http://127.0.0.1:7100"
 USAGE = (
     "usage: core [--node URL] <scope.family.verb> [args...]\n"
-    "       core daemon <dir> [--port PORT]\n"
+    "       core daemon <dir> [--port PORT] [--store-config PATH]\n"
     "       core --commands"
 )
+STORE_HELP = """\
+Cloud object stores use a strict JSON file passed with --store-config.
+Credentials are not allowed in that file; boto uses its normal environment,
+shared-config, container, or instance credential chain.
+
+Amazon S3:
+  {"schema":"poc16-host-store-v1","backend":"s3",
+   "bucket":"my-bucket","base_prefix":"poc16/tenant",
+   "region_name":"us-west-2"}
+
+Cloudflare R2 (use the direct account endpoint derived from account_id):
+  {"schema":"poc16-host-store-v1","backend":"r2",
+   "account_id":"0123456789abcdef0123456789abcdef",
+   "bucket":"my-bucket","base_prefix":"poc16/tenant"}
+"""
 
 
 def ctl(node_url, path, argv):
@@ -28,16 +43,29 @@ def ctl(node_url, path, argv):
 
 
 def _serve(argv):
-    parser = argparse.ArgumentParser(prog="core daemon")
+    parser = argparse.ArgumentParser(
+        prog="core daemon",
+        description="Run one local client node and its HTTP responder.",
+        epilog=STORE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("dir")
     parser.add_argument("--port", type=int, default=7100)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cadence", type=float, default=1.0)
     parser.add_argument("--url")
+    parser.add_argument(
+        "--store-config", metavar="PATH",
+        help="strict S3/R2 host-store JSON (default: local filesystem)")
     args = parser.parse_args(argv)
+    store_factory = None
+    if args.store_config is not None:
+        from adapters.host import load_store_factory
+        store_factory = load_store_factory(args.store_config)
     from .daemon import serve
     return serve(
-        args.dir, args.port, args.host, args.cadence, args.url)
+        args.dir, args.port, args.host, args.cadence, args.url,
+        store_factory=store_factory)
 
 
 def _commands():

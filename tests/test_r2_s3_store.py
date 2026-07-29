@@ -75,6 +75,8 @@ def test_r2_config_can_only_name_the_direct_account_endpoint():
     assert configured.as_s3().expected_bucket_owner is None
     with pytest.raises(ValueError, match="account"):
         config(account_id="https://cached.example")
+    with pytest.raises(ValueError, match="connect_timeout"):
+        config(connect_timeout=float("nan"))
 
 
 def test_r2_host_path_uses_content_md5_and_s3_conditionals():
