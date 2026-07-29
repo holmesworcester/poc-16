@@ -3,7 +3,7 @@ import asyncio
 import base64
 import json
 
-from core import cmds
+from core import cmds, peer_capability
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
@@ -52,7 +52,7 @@ def test_gateway_mints_then_serves_one_pinned_snapshot(tmp_path):
         node, workspace, pile, gateway)
 
     assert response.status == 200
-    assert body["capabilities"] == {"push": False}
+    assert body["cap"] == peer_capability.READ_ONLY
     assert body["etag"] == h(node.store(workspace).get("root"))
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,

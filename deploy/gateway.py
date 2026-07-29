@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 import re
 
-from core import manifest, mint
+from core import manifest, mint, peer_capability
 from core.crypto import h, seal_to
 from core.grants import check_token, make_token
 
@@ -42,7 +42,7 @@ class Gateway:
 
     def __init__(
             self, store, workspace, secret, now,
-            *, capabilities=None,
+            *, sync_profile=peer_capability.READ_ONLY,
             max_request_bytes=512 * 1024,
             max_root_bytes=1024 * 1024,
             max_object_bytes=8 * 1024 * 1024,
@@ -57,7 +57,9 @@ class Gateway:
             raise ValueError("grant secret")
         self.store, self.workspace = store, workspace
         self.secret, self.now = secret, now
-        self.capabilities = dict(capabilities or {"push": False})
+        if not peer_capability.known(sync_profile):
+            raise ValueError("sync profile")
+        self.sync_profile = sync_profile
         self.max_request_bytes = max_request_bytes
         self.max_root_bytes = max_root_bytes
         self.max_object_bytes = max_object_bytes
@@ -140,9 +142,10 @@ class Gateway:
         public, verb = grant
         token = make_token(
             self.secret, public[:16], self.workspace, verb,
+            capability=self.sync_profile,
             issued_at=trusted_now, ttl_ms=self.grant_ttl_ms)
         return self._json(200, {
-            "capabilities": self.capabilities,
+            "cap": self.sync_profile,
             "etag": h(root),
             "grant": base64.b64encode(
                 seal_to(public, token.encode())).decode(),

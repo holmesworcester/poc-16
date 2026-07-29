@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, manifest, mint as gate
+from . import cmds, manifest, mint as gate, peer_capability
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
@@ -65,17 +65,23 @@ class Syncer(threading.Thread):
                         self.node.record_sync_success(ws, url)
 
 
-def make_token(secret, member, ws, verb="sync"):
+def make_token(
+        secret, member, ws, verb="sync",
+        capability=peer_capability.FULL):
     return _make_token(
-        secret, member, ws, verb, issued_at=now_ms(), ttl_ms=GRANT_TTL)
+        secret, member, ws, verb,
+        capability=capability, issued_at=now_ms(), ttl_ms=GRANT_TTL)
 
 
-def check_token(secret, auth, ws, verb="sync"):
-    return _check_token(secret, auth, ws, verb, trusted_now=now_ms())
+def check_token(secret, auth, ws, verb="sync", *, require_push=False):
+    return _check_token(
+        secret, auth, ws, verb,
+        trusted_now=now_ms(), require_push=require_push)
 
 
 class Handler(BaseHTTPRequestHandler):
     node = secret = syncer = None
+    sync_profile = peer_capability.FULL
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
@@ -102,8 +108,10 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, o):
         self._send(code, json.dumps(o).encode())
 
-    def _member(self, ws):
-        return check_token(self.secret, self.headers.get("Authorization", ""), ws)
+    def _member(self, ws, *, require_push=False):
+        return check_token(
+            self.secret, self.headers.get("Authorization", ""), ws,
+            require_push=require_push)
 
     def _known(self, ws):
         return ws in self.node.keyring["workspaces"]
@@ -134,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parts, q = self._q()
         ws = q.get("ws", "")
-        m = self._member(ws)
+        m = self._member(ws, require_push=True)
         if not self._known(ws) or not m:
             return self._send(401 if self._known(ws) else 404)
         if parts[0] == "pile" and len(parts) == 3 and parts[1] == m:
@@ -215,12 +223,16 @@ class Handler(BaseHTTPRequestHandler):
         if grant is None:
             return self._send(403)
         public, verb = grant
-        token = make_token(self.secret, public[:16], ws, verb)
-        return self._json(200, {
+        token = make_token(
+            self.secret, public[:16], ws, verb, self.sync_profile)
+        response = {
             "grant": base64.b64encode(
                 seal_to(public, token.encode())).decode(),
             "root": base64.b64encode(root).decode(),
-            "etag": h(root)})
+            "etag": h(root)}
+        if self.sync_profile is not None:
+            response["cap"] = self.sync_profile
+        return self._json(200, response)
 
     # ---- node-local control plane (not part of the protocol) ----
     def ctl_post(self, parts, body):

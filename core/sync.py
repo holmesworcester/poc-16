@@ -1,7 +1,7 @@
 """Reconciliation over the one-store layout.
 
 One dial: the authenticated action leg first, then a manifest oid-diff
-splitting the key space, a push of the local-only keys,
+splitting the key space, a capability-gated push of the local-only keys,
 then two-wave closure assembly of the pulled ranges — the push lands
 before the pulled pile is drained, so canonical pruning during the turn
 cannot retract a fact ahead of its delivery. Every arriving fact is judged
@@ -94,9 +94,11 @@ def sync(node, ws, url):
     remote = RemoteStore(peer)
     cache = peer.cache
     got = peer.root(cache.get("etag"))
+    accepts_push = getattr(peer, "accepts_push", True)
     if got is None:
         local_etag = _root_digest(node.store(ws))
-        if local_etag == cache.get("local"):
+        if local_etag == cache.get("local") and not (
+                cache.get("pending_push") and accepts_push):
             if cache.get("blobs") != local_etag:
                 _, complete = _fetch_blobs(node, ws, peer)
                 if complete:
@@ -147,8 +149,9 @@ def sync(node, ws, url):
         remote_actions = action_rows(remote_root, fetch_remote) \
             if remote_root else {}
     pull_actions(node, ws, remote_root, fetch_remote, remote_actions)
-    pushed_actions = push_actions(
-        node, ws, peer, remote_actions)
+    action_difference = push_actions(
+        node, ws, peer, remote_actions, deliver=accepts_push)
+    pushed_actions = action_difference if accepts_push else 0
 
     local_root, mine = st.get("root"), ()
     local_man = ""
@@ -186,10 +189,12 @@ def sync(node, ws, url):
     # must never retract a fact ahead of its precomputed difference pile
     # reaching the peer (bench_sync.reconcile keeps the same order).
     push_fids = sorted({shape.fid_of(k) for k in push_keys})
-    if push_fids:
+    pushed_facts = 0
+    if push_fids and accepts_push:
         sent = set(push(node, ws, peer, push_fids))
         if not set(push_fids) <= sent:
             raise ValueError("local range is missing committed facts")
+        pushed_facts = len(push_fids)
         retag = None
     pulled = 0
     if pulled_piles:
@@ -204,11 +209,17 @@ def sync(node, ws, url):
         "etag": retag, "root": remote_root,
         "local": local_etag,
     })
+    if not accepts_push and (push_fids or action_difference):
+        # This edge is a reader, not a delivery receipt.  Preserve the dirty
+        # marker so a later full-profile remint can deliver unchanged intent.
+        cache["pending_push"] = True
+    else:
+        cache.pop("pending_push", None)
     if blobs_complete:
         cache["blobs"] = local_etag
     else:
         cache.pop("blobs", None)
-    return pulled, len(push_fids) + pushed_actions
+    return pulled, pushed_facts + pushed_actions
 
 
 def frontier(my_keys, theirs, differing, members_of):
@@ -304,8 +315,8 @@ def pull_actions(node, ws, remote_root, fetch, rows=None):
     return tuple(fact.fid for _, fact, _, _ in accepted)
 
 
-def push_actions(node, ws, peer, remote_rows):
-    """Push local witnesses missing from the peer; reverse state stays derived."""
+def push_actions(node, ws, peer, remote_rows, *, deliver=True):
+    """Find local witnesses missing from the peer and optionally deliver them."""
     with node.lock:
         rows = node.idx(ws).execute(
             "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
@@ -321,7 +332,8 @@ def push_actions(node, ws, peer, remote_rows):
     for raw in payloads:
         if raw is None:
             raise ValueError("local action evidence")
-        peer.put_pile(raw)
+        if deliver:
+            peer.put_pile(raw)
     return len(payloads)
 
 

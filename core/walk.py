@@ -5,27 +5,45 @@ import urllib.error
 import urllib.request
 
 import facts as families
+from facts.auth import request as auth_request
+
+from . import peer_capability
 from .close import close, encode_pile
 from .crypto import h, unseal
-from facts.auth import request as auth_request
 from .kernel import resolve_deps
 from .node import now_ms
 from .object_store import ensure_object
 
 
+class PushUnsupported(RuntimeError):
+    """The authenticated peer profile does not accept pile delivery."""
+
+
 class Peer:
-    """HTTP client for one (workspace, responder) pair; grants are opaque
-    request decorators, re-minted on 401."""
+    """HTTP client for one (workspace, responder) pair.
+
+    Bearer authority stays opaque.  The sole decoded field is the fail-closed
+    sync profile repeated by mint; both are replaced together on a 401.
+    """
 
     def __init__(self, node, ws, url):
         self.node, self.ws, self.url = node, ws, url
         self.cache = node.sync_cache.setdefault((ws, url), {})
 
-    def _http(self, method, path, data=None, etag=None, auth=True, retry=True):
+    @property
+    def accepts_push(self):
+        return "sync_profile" not in self.cache or peer_capability.allows_push(
+            self.cache["sync_profile"])
+
+    def _http(
+            self, method, path, data=None, etag=None, auth=True, retry=True,
+            require_push=False):
         req = urllib.request.Request(f"{self.url}{path}?ws={self.ws}", data=data, method=method)
         if auth:
             if "token" not in self.cache:
                 self.mint()
+            if require_push and not self.accepts_push:
+                raise PushUnsupported("peer advertises pull-only sync")
             req.add_header("Authorization", "Bearer " + self.cache["token"])
         if etag:
             req.add_header("If-None-Match", etag)
@@ -37,7 +55,10 @@ class Peer:
                 return 304, b"", {}
             if e.code == 401 and auth and retry:
                 self.cache.pop("token", None)
-                return self._http(method, path, data, etag, auth, retry=False)
+                self.cache.pop("sync_profile", None)
+                return self._http(
+                    method, path, data, etag, auth, retry=False,
+                    require_push=require_push)
             raise
 
     def mint(self):
@@ -53,8 +74,11 @@ class Peer:
         _, resp, _ = self._http("POST", "/mint", body, auth=False)
         o = json.loads(resp)
         secret, _ = self.node.identity(self.ws)
-        self.cache["token"] = unseal(
-            secret, base64.b64decode(o["grant"])).decode()
+        token = unseal(secret, base64.b64decode(o["grant"])).decode()
+        self.cache.update({
+            "token": token,
+            "sync_profile": peer_capability.negotiate(token, o),
+        })
 
     def root(self, etag=None):
         status, b, hdr = self._http("GET", "/root", etag=etag)
@@ -80,7 +104,8 @@ class Peer:
 
     def put_pile(self, b):
         self._http(
-            "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b)
+            "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b,
+            require_push=True)
 
     def poke(self):
         self._http("POST", "/poke", data=b"", auth=False)
