@@ -1,36 +1,30 @@
-"""Manifest spine: a content-addressed index of home-leaf piles.
+"""Canonical RangeTree over closed home-leaf piles.
 
-One entry per leaf: ``(sep, leaf, closure)`` — the leaf's first key, the oid
-of its pile (``encode_pile`` of the members, canonical key order: the same
-codec the wire uses), and the oid of its closure sibling (the keys of the
-members' transitive closure that fall outside the leaf's key range; ``""``
-when empty). Entries shard into manifest objects by the same
-``shape.boundary`` rule that cuts the leaves, giving depth 0-2 at any
-realistic corpus. Equal content means equal oid (layout is canonical and
-history-independent), so **oid comparison is the entire one-sided diff** —
-no fingerprints, no n-counts, no per-node key arrays. The composite root and
-cost posture are described in DESIGN.md.
-
-Determinism contract: every function of the committed key set is a pure
-function of that set. ``prev`` inputs only memoize — they may skip work,
-never change an output byte (see ``build`` for the closure precondition
-that makes the one memo sound).
+One entry maps a leaf's first opaque canonical key to its pile oid and closure
+sibling oid. The RangeTree uses the same persistent authenticated treap as the
+Worker indexes: full build defines one history-independent root, while an
+additions-only commit encodes SQLite-selected ranges and path-copies only its
+tree paths. Equal RangeTree subtrees and equal leaf piles have equal oids, so
+one-sided sync still prunes by oid alone.
 """
 import json
 from bisect import bisect_right
 from typing import NamedTuple
 
+from . import btreap
 from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
-from .close import encode_pile
+from .close import decode_pile, encode_pile
 from .crypto import h
 from .fact import canon
 from .shape import fid_of, is_key, key, stable_cut_positions, valid_fid
+from .store import verified_object
 
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
-LAYOUT = "composite-btreap-v4"
+LAYOUT = "composite-btreap-v5"
 TREE_NAMES = ("fact", "supp", "authority")
+RANGE_SEED = h(canon(["range-tree-v1"]))
 
 
 class Entry(NamedTuple):
@@ -66,45 +60,74 @@ def _put(raw, emit):
     return h(raw)
 
 
-def build(keys, fact_of, deps_of, emit, prev=(), *, changed=None):
-    """Settle the store: cut ``keys`` into leaves by ``shape.boundary``,
-    emit each leaf pile (``close.encode_pile``, canonical key order) and its
-    closure sibling, shard the entry list by the same rule, and return
-    ``(entries, root_oid)``.
+def _value(entry):
+    return [entry.leaf, entry.closure]
 
-    ``prev`` is the previous commit's entries: a chunk whose pile oid is
-    unchanged skips the closure walk and reuses its old ``closure`` oid. The
-    pile is always re-encoded — that re-encoding is what proves the member
-    set unchanged. Output is byte-identical with or without ``prev`` over a
-    closed key set (every member's deps committed) — the only kind a store
-    ever settles.
-    """
-    # Memo by pile oid: equal oid IS equal member set. Over a committed key
-    # set the sibling is then a pure function of that set — closure keys are
-    # committed keys and the chunks partition every committed key, so the
-    # only thing a shifted ``lo`` can move across is a gap holding none.
-    known = {e.leaf: e.closure for e in prev}
-    previous = {e.sep: e for e in prev}
-    changed = None if changed is None else set(changed)
-    loaded, entries, lo = {}, [], ""
-    key_of = lambda fid: key(loaded.get(fid) or fact_of(fid))
-    for chunk in _chunks(sorted(set(keys)), fid_of):
-        if changed is not None and not changed.intersection(chunk) \
-                and chunk[0] in previous:
-            entries.append(previous[chunk[0]])
-            lo = chunk[-1]
-            continue
-        members = [fact_of(fid_of(k)) for k in chunk]
-        loaded = {f.fid: f for f in members}
-        leaf = _put(encode_pile(members), emit)
-        if leaf in known:
-            closure = known[leaf]
-        else:
-            out = closure_keys(members, deps_of, key_of, lo, chunk[-1])
-            closure = _put(canon({"keys": out}), emit) if out else ""
-        entries.append(Entry(chunk[0], leaf, closure))
-        lo = chunk[-1]
+
+def _entry(sep, value):
+    if not is_key(sep) or not isinstance(value, list) or len(value) != 2 \
+            or not valid_fid(value[0]) or not isinstance(value[1], str) \
+            or value[1] and not valid_fid(value[1]):
+        raise ValueError("manifest entry")
+    return Entry(sep, *value)
+
+
+def _range(keys, fact_of, deps_of, emit):
+    members = []
+    for wanted in keys:
+        fact = fact_of(fid_of(wanted))
+        if fact is None or key(fact) != wanted:
+            raise ValueError("manifest member")
+        members.append(fact)
+    leaf = _put(encode_pile(members), emit)
+
+    def key_of(fid):
+        fact = fact_of(fid)
+        if fact is None:
+            raise ValueError("manifest closure")
+        return key(fact)
+
+    outside = closure_keys(members, deps_of, key_of)
+    closure = _put(canon({"keys": outside}), emit) if outside else ""
+    return Entry(keys[0], leaf, closure)
+
+
+def range_members(entry, fetch):
+    """Verify and decode one RangeTree row's canonical home-leaf pile."""
+    held, blobs = decode_pile(verified_object(entry.leaf, fetch))
+    keys = [key(fact) for fact in held]
+    if blobs or not keys or keys != sorted(set(keys)) \
+            or entry.sep != keys[0] \
+            or len(_chunks(keys, fid_of)) != 1:
+        raise ValueError("manifest range")
+    return held
+
+
+def build(keys, fact_of, deps_of, emit):
+    """Full canonical rebuild; repair/cutover reference for ``update``."""
+    entries = [
+        _range(chunk, fact_of, deps_of, emit)
+        for chunk in _chunks(sorted(set(keys)), fid_of)
+    ]
     return entries, encode(entries, emit)
+
+
+def update(root, changed_ranges, fact_of, deps_of, fetch, emit):
+    """Encode SQLite-selected range replacements into the wire RangeTree."""
+    if not root:
+        raise ValueError("missing RangeTree")
+    changes = {}
+    for old_sep, keys in changed_ranges:
+        if old_sep is not None:
+            if not is_key(old_sep):
+                raise ValueError("manifest separator")
+            changes[old_sep] = None
+        for chunk in _chunks(tuple(keys), fid_of):
+            entry = _range(chunk, fact_of, deps_of, emit)
+            changes[entry.sep] = _value(entry)
+    return btreap.update(
+        root, RANGE_SEED, sorted(changes.items()), fetch,
+        lambda raw: _put(raw, emit)).root
 
 
 def locate(entries, key):
@@ -113,35 +136,25 @@ def locate(entries, key):
     return entries[at - 1] if at else None
 
 
-def diff(mine, theirs, fetch):
-    """One-sided diff by oid: walk ``theirs`` top-down, prune subtrees whose
-    oid we already hold, and return the entries whose leaf piles must be
-    fetched (which includes leaves where only *we* have extra keys — the
-    caller compares key sets for the push direction). Separator agreement is
-    checked where it can be — in ``_rows``, over shards actually read; a
-    pruned subtree is never fetched, so there is nothing to align it against.
-    The walk is bounded by the objects the peer really serves: ``_shard``
-    decodes each oid once."""
-    held = {e.leaf for e in mine}
-    encode(mine, lambda raw: held.add(h(raw)))  # our own shard oids
-    out, stack, seen = [], [theirs], set()
-    while stack:
-        oid = stack.pop()
-        if not oid or oid in held:  # equal content, equal oid: prune
-            continue
-        shard = _shard(oid, fetch, seen)
-        if "shards" in shard:
-            stack += [child for _, child in _list(shard, "shards", 2)]
-        else:
-            out += [e for e in _rows(shard, fetch, seen)
-                    if e.leaf not in held]
-    return sorted(out)
+def compare(mine, theirs, fetch):
+    """Remote RangeTree rows and the exact mappings not held locally.
+
+    Shared authenticated pages are decoded from the local object map, so the
+    complete logical remote map is available without fetching those pages.
+    """
+    held = {entry.sep: entry for entry in mine}
+    known = {}
+    encode(mine, lambda raw: known.setdefault(h(raw), raw))
+    rows = btreap.Reader(
+        theirs, RANGE_SEED, fetch).items(known)
+    entries = sorted(_entry(*row) for row in rows)
+    return entries, [
+        entry for entry in entries if held.get(entry.sep) != entry]
 
 
-def closure_keys(members, deps_of, key_of, lo, hi):
-    """Sorted keys of the members' transitive closure outside ``(lo, hi]`` —
-    everything a reader of this range must fetch from elsewhere. Transitive,
-    so a fetch plan over these keys never needs a third wave."""
+def closure_keys(members, deps_of, key_of):
+    """Sorted transitive dependency keys not resident in this exact leaf."""
+    inside = {fact.fid for fact in members}
     seen, stack = set(), [f.fid for f in members]
     while stack:
         fid = stack.pop()
@@ -149,7 +162,7 @@ def closure_keys(members, deps_of, key_of, lo, hi):
             continue
         seen.add(fid)
         stack.extend(deps_of(fid))
-    return sorted(k for k in map(key_of, seen) if not lo < k <= hi)
+    return sorted(key_of(fid) for fid in seen - inside)
 
 
 def fetch_plan(entries, missing_keys):
@@ -164,81 +177,21 @@ def fetch_plan(entries, missing_keys):
 
 
 def encode(entries, emit):
-    """Canonical manifest bytes: ``canon({"entries": [[sep, leaf, closure],
-    ...]})`` per shard, ``canon({"shards": [[sep, oid], ...]})`` per branch
-    level, sharded when ``shape.boundary`` says so; emits shard objects and
-    returns the root shard's oid."""
-    level = [
-        (chunk[0].sep if chunk else "",
-         _put(canon({"entries": [list(e) for e in chunk]}), emit))
-        for chunk in _chunks(entries, lambda e: fid_of(e.sep)) or [[]]
-    ]
-    while len(level) > 1:
-        groups = _chunks(level, lambda s: fid_of(s[0]))
-        if len(groups) == len(level):  # every sep a boundary: one root
-            groups = [level]
-        level = [
-            (g[0][0], _put(canon({"shards": [list(s) for s in g]}), emit))
-            for g in groups
-        ]
-    return level[0][1]
-
-
-def _shard(oid, fetch, seen):
-    """One manifest object, hash-verified at the door and decoded at most
-    once: a canonical manifest never repeats a shard (separators are unique,
-    so equal content cannot occur twice), and a repeat is how a handful of
-    hostile objects would otherwise expand into an unbounded walk."""
-    if not valid_fid(oid):
-        raise ValueError("manifest integrity")
-    raw = fetch(oid)
-    if raw is None or h(raw) != oid or oid in seen:
-        raise ValueError("manifest integrity")
-    seen.add(oid)
-    return json.loads(raw)
-
-
-def _list(shard, name, width):
-    """One shard's rows — ``width`` strings each. Peer bytes leave this
-    module as a ValueError or not at all: never a KeyError or a TypeError."""
-    rows = shard.get(name) if isinstance(shard, dict) else None
-    if not isinstance(rows, list) or not all(
-            isinstance(row, list) and len(row) == width
-            and all(isinstance(part, str) for part in row) for row in rows):
-        raise ValueError("manifest shape")
-    return rows
-
-
-def _rows(shard, fetch, seen):
-    """Entries under one shard, depth-first; separators must agree."""
-    if not isinstance(shard, dict):
-        raise ValueError("manifest shape")
-    if "shards" not in shard:
-        rows = [Entry(*row) for row in _list(shard, "entries", 3)]
-        if any(
-                not is_key(row.sep) or not valid_fid(row.leaf)
-                or row.closure and not valid_fid(row.closure)
-                for row in rows):
-            raise ValueError("manifest entry")
-        return rows
-    out = []
-    for sep, oid in _list(shard, "shards", 2):
-        if not is_key(sep) or not valid_fid(oid):
-            raise ValueError("manifest shard")
-        rows = _rows(_shard(oid, fetch, seen), fetch, seen)
-        if not rows or rows[0].sep != sep:
-            raise ValueError("manifest separator")
-        out += rows
-    return out
+    """Bulk-build the canonical authenticated RangeTree."""
+    checked = [_entry(entry.sep, _value(entry)) for entry in entries]
+    rows = tuple((entry.sep, _value(entry)) for entry in checked)
+    return btreap.build(
+        rows, RANGE_SEED, lambda raw: _put(raw, emit)).root
 
 
 def decode(raw, fetch):
-    """Entries back out of a root shard, resolving child shards via
-    ``fetch``, with integrity (oid) and sort-order checks."""
-    out = _rows(json.loads(raw), fetch, set())
-    if any(a.sep >= b.sep for a, b in zip(out, out[1:])):
-        raise ValueError("manifest order")
-    return out
+    """Decode and validate every RangeTree entry."""
+    root = h(raw)
+    rooted = lambda oid: raw if oid == root else fetch(oid)
+    return [
+        _entry(*row) for row in
+        btreap.Reader(root, RANGE_SEED, rooted).items()
+    ]
 
 
 def encode_root(

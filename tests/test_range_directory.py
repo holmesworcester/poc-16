@@ -1,0 +1,89 @@
+"""Canonical bulk/path-copy equivalence for RangeTree."""
+import json
+import random
+import sqlite3
+
+from core import catalog, manifest, shape
+from core.crypto import h
+from core.fact import Fact
+
+
+def _facts(count):
+    return [
+        Fact("sample", ordinal * 7 + 1, [], {"ordinal": ordinal})
+        for ordinal in range(count)
+    ]
+
+
+def _corpus():
+    facts = _facts(192)
+    while sum(shape.boundary(fact.fid) for fact in facts) < 4:
+        facts.extend(_facts(len(facts) + 64)[len(facts):])
+    return facts
+
+
+def _emitter(objects, fresh=None):
+    def emit(raw):
+        oid = h(raw)
+        if fresh is not None and oid not in objects:
+            fresh.add(oid)
+        objects.setdefault(oid, raw)
+        return oid
+    return emit
+
+
+def test_randomized_batches_match_clean_full_build_and_touch_bounded_paths():
+    """Insertion order/batching cannot affect bytes; one batch stays local."""
+    corpus = _corpus()
+    canonical = None
+
+    for seed in range(4):
+        order = corpus[:]
+        rng = random.Random(seed)
+        rng.shuffle(order)
+        active, objects, root, largest_touch = {}, {}, "", 0
+        db = sqlite3.connect(":memory:")
+        db.executescript(catalog.SCHEMA)
+        ranges = catalog.Catalog(db, "")
+        at = 0
+        while at < len(order):
+            batch = order[at:at + rng.randint(1, 7)]
+            at += len(batch)
+            active.update((fact.fid, fact) for fact in batch)
+            for fact in batch:
+                ranges.stage(fact)
+            ranges.commit_stage(fact.fid for fact in batch)
+            db.executemany(
+                "INSERT INTO proofs VALUES(?,0)",
+                ((fact.fid,) for fact in batch))
+            fresh = set()
+            if not root:
+                _, root = manifest.build(
+                    (fact.key for fact in active.values()), active.get,
+                    lambda fid: (), _emitter(objects, fresh))
+            else:
+                before_depth = json.loads(objects[root])["depth"]
+                root = manifest.update(
+                    root, ranges.changed_ranges(
+                        fact.key for fact in batch),
+                    active.get, lambda fid: (), objects.get,
+                    _emitter(objects, fresh))
+                assert len(fresh) <= len(batch) * (
+                    2 + 4 * (before_depth + 1))
+            largest_touch = max(largest_touch, len(fresh))
+
+            _, clean = manifest.build(
+                (fact.key for fact in active.values()), active.get,
+                lambda fid: (), lambda raw: h(raw))
+            assert root == clean
+
+        decoded = manifest.decode(objects[root], objects.get)
+        expected, _ = manifest.build(
+            (fact.key for fact in corpus),
+            {fact.fid: fact for fact in corpus}.get,
+            lambda fid: (), lambda raw: h(raw))
+        assert decoded == expected
+        assert largest_touch < len(corpus)
+        canonical = canonical or root
+        assert root == canonical
+        db.close()

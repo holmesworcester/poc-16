@@ -1,9 +1,9 @@
 """Measure the two latency paths that must stay cheap after the tree cutover.
 
-Hot posts report total latency, the share spent scanning sorted fact keys, and
-immutable object writes. Idle dials report the local engine cost after a 304;
-the first dial establishes blob completeness and every measured dial must do
-no fact/index/blob work.
+Hot posts report total latency and immutable path-copy touches; calling the
+corpus-wide ``Node.keys`` reference path is a benchmark failure. Idle dials
+report local engine cost after a 304; the first dial establishes blob
+completeness and every measured dial must do no fact/index/blob work.
 
 Run:
     python3 bench/bench_latency.py
@@ -62,27 +62,27 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
         for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
     )
 
-    scan_times = []
+    key_scans = 0
     original_keys = node.keys
 
-    def timed_keys(*args):
-        started = time.perf_counter()
-        try:
-            return original_keys(*args)
-        finally:
-            scan_times.append(time.perf_counter() - started)
+    def counted_keys(*args):
+        nonlocal key_scans
+        key_scans += 1
+        return original_keys(*args)
 
-    writes = []
+    touches, writes = [], []
     store = node.store(workspace)
     original_put_if_absent = store.put_if_absent
 
     def counted_put_if_absent(key, raw):
+        if key.startswith("obj/"):
+            touches.append((key, len(raw)))
         created = original_put_if_absent(key, raw)
         if created and key.startswith("obj/"):
             writes.append((key, len(raw)))
         return created
 
-    node.keys = timed_keys
+    node.keys = counted_keys
     store.put_if_absent = counted_put_if_absent
     post_times = []
     try:
@@ -95,6 +95,8 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
     finally:
         node.keys = original_keys
         store.put_if_absent = original_put_if_absent
+    if key_scans:
+        raise AssertionError("hot posts entered the full fact-key path")
 
     old_peer = sync_module.Peer
     old_fetch_blobs = sync_module._fetch_blobs
@@ -130,8 +132,8 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
             "samples": len(post_times),
             "p50_ms": 1000 * statistics.median(post_times),
             "p95_ms": 1000 * percentile(post_times, .95),
-            "key_scan_p50_ms": 1000 * statistics.median(scan_times),
-            "key_scans": len(scan_times),
+            "key_scans": key_scans,
+            "object_touches_per_post": len(touches) / posts,
             "object_writes": len(writes),
             "unique_object_writes": len(unique_writes),
             "object_kib_per_post": sum(size for _, size in writes)
@@ -162,7 +164,7 @@ def main(argv=None):
         base = temporary.name
     try:
         print(
-            "seed  facts  post_p50  post_p95  keyscan  KiB/post  "
+            "seed  facts  post_p50  post_p95  obj/post  KiB/post  "
             "idle_p50  idle_p95")
         for scale in scales:
             result = measure_scale(
@@ -171,7 +173,7 @@ def main(argv=None):
             print(
                 f"{scale:4d} {result['facts']:6d} "
                 f"{post['p50_ms']:9.2f} {post['p95_ms']:9.2f} "
-                f"{post['key_scan_p50_ms']:7.2f} "
+                f"{post['object_touches_per_post']:8.1f} "
                 f"{post['object_kib_per_post']:9.1f} "
                 f"{idle['p50_ms']:9.3f} {idle['p95_ms']:9.3f}")
     finally:

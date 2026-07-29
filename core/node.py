@@ -76,7 +76,8 @@ def resident(man, fetch, anchor=None):
     single equality (replaces tree.validate_view).
     """
     items = {}
-    for entry in manifest.decode(verified_object(man, fetch), fetch):
+    entries = manifest.decode(verified_object(man, fetch), fetch) if man else ()
+    for entry in entries:
         members, _ = decode_pile(verified_object(entry.leaf, fetch))
         items.update({f.fid: f for f in members})
     if any(
@@ -294,9 +295,13 @@ class Node:
         return self.select(ws, catalog.TYPE_INDEX, tag, **options)
 
     def keys(self, ws):
-        return sorted(
-            self.fact_of(ws, fid).key
-            for (fid,) in self.idx(ws).execute("SELECT fid FROM proofs"))
+        """Canonical eligible keys for repair/full sync, read from SQLite."""
+        return [
+            fact_key for (fact_key,) in self.idx(ws).execute(
+                "SELECT i.k0 FROM fact_index i INDEXED BY fact_keys "
+                "JOIN proofs p ON p.fid=i.src "
+                "WHERE i.kind='fact.key' ORDER BY i.k0")
+        ]
 
     def _action_evidence(self, ws, fact):
         """Persist the action's current canonical proof closure."""

@@ -5,9 +5,8 @@ from typing import NamedTuple
 from . import indexes, manifest, suppression_state
 from .crypto import h
 from .kernel import resolve_deps
-from .store import verified_object
 
-INDEX_VERSION = "admission-catalog-v23"
+INDEX_VERSION = "admission-catalog-v24"
 
 
 class RootChanged(RuntimeError):
@@ -97,21 +96,6 @@ class Publisher:
             idx.rollback()
             raise
 
-    def _previous_entries(self, raw, fetch):
-        if not raw:
-            return ()
-        try:
-            root = manifest.decode_root(raw)
-        except ValueError:
-            return ()
-        if root.anchor != self.workspace:
-            raise ValueError("root anchor")
-        try:
-            return manifest.decode(
-                verified_object(root.manifest, fetch), fetch)
-        except ValueError:
-            return ()
-
     def publish(self, settlement, *, reuse=True):
         node, ws = self.node, self.workspace
         store, idx = node.store(ws), node.idx(ws)
@@ -145,34 +129,39 @@ class Publisher:
             return oid
 
         fetch = lambda oid: store.get("obj/" + oid)
-        entries = self._previous_entries(previous_root, fetch)
-        if not (reuse and not authority_changed and not deactivated):
-            entries = ()
         incremental = reuse and not forced_rebuild \
-            and not authority_changed and not deactivated
-        changed_keys = {
-            fact.key
-            for fid in changed
-            if (fact := node.fact_of(ws, fid)) is not None
-        } if incremental else None
-        _, manifest_oid = manifest.build(
-            node.keys(ws), lambda fid: node.fact_of(ws, fid), deps_of, emit,
-            entries, changed=changed_keys)
+            and not authority_changed and not deactivated \
+            and previous_root is not None
+        changed_ranges = node.catalog(ws).changed_ranges(
+            node.fact_of(ws, fid).key for fid in changed) \
+            if incremental else None
 
-        previous_snapshot = None
+        previous = None
         if previous_root:
             try:
-                previous_snapshot = manifest.decode_root(previous_root)
+                previous = manifest.decode_root(previous_root)
             except ValueError:
                 pass
+            if previous is not None and previous.anchor != ws:
+                raise ValueError("root anchor")
+        if incremental and previous and previous.manifest:
+            manifest_oid = manifest.update(
+                previous.manifest, changed_ranges,
+                lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)
+        else:
+            incremental = False
+            _, manifest_oid = manifest.build(
+                node.keys(ws), lambda fid: node.fact_of(ws, fid),
+                deps_of, emit)
+        previous_trees = previous.trees if previous else {}
         seed, trees = indexes.build(
             ws, idx, lambda fid: node.fact_of(ws, fid), emit,
-            previous=previous_snapshot.trees if previous_snapshot else {},
+            previous=previous.trees if previous else {},
             fetch=fetch,
             changed_fids=changed if incremental else None,
             changed_sids=changed_sids if incremental else ())
-        action_etag = previous_snapshot.action_etag \
-            if incremental and not changed_sids and previous_snapshot \
+        action_etag = previous.action_etag \
+            if incremental and not changed_sids and previous \
             else suppression_state.etag(idx)
         root = manifest.encode_root(
             ws, manifest_oid,

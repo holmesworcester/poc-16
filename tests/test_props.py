@@ -298,7 +298,13 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
     assert cmds.msgs(reopened, workspace) == []
     assert reopened.store(workspace).list("pile/")
 
-    reopened.turn(workspace)
+    keys = reopened.keys
+    reopened.keys = lambda *args: pytest.fail(
+        "recovered hot commit called Node.keys")
+    try:
+        reopened.turn(workspace)
+    finally:
+        reopened.keys = keys
 
     assert [message["text"] for message in cmds.msgs(
         reopened, workspace)] == ["survives retry"]
@@ -308,6 +314,8 @@ def test_pre_manifest_crash_replays_from_the_authoritative_root(
         "SELECT v FROM meta WHERE k='root'").fetchone() == (root,)
     assert reopened.idx(workspace).execute(
         "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
+    assert reopened.store(workspace).get("root") \
+        == full_manifest(reopened, workspace)
 
 
 def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
@@ -567,22 +575,25 @@ def test_straggler_minifold(tmp_path, world):
 
 
 def test_efficient_updates(world):
-    """Content addressing is the incrementality: one post writes O(1) objects."""
+    """One post touches bounded tree/range paths, not the object corpus."""
     n, ws = world
     st = n.store(ws)
     puts = []
-    orig = st.put
-    st.put = lambda k, b: (puts.append(k), orig(k, b))[1]
+    orig = st.put_if_absent
+    st.put_if_absent = lambda k, b: (puts.append(k), orig(k, b))[1]
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
     # A post adds a message and signature. Each can rewrite a search/rotation
     # path in each of three persistent trees, plus bounded manifest/raw pages.
-    depth = max(
+    tree_depth = max(
         row["depth"] for row in
         json.loads(st.get("root"))["trees"].values())
+    range_root = manifest.decode_root(st.get("root")).manifest
+    range_depth = json.loads(st.get("obj/" + range_root))["depth"]
+    depth = max(tree_depth, range_depth)
     assert depth <= btreap.MAX_PAGE_DEPTH
-    assert len(objs) <= 4 + 6 * depth, \
+    assert len(objs) <= 6 + 10 * depth, \
         f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
@@ -822,39 +833,69 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
         assert drain(stream, ws).ok
 
 
-def test_incremental_reuses_work(world, monkeypatch):
-    """Reuse is real: a post into a settled store walks the closure of the
-    touched leaf only, not every range. (Pile bytes are always re-encoded —
-    manifest.build's member-set proof — so the incremental win is the
-    closure walk and the O(1) object writes, not fact loads.)"""
+def test_hot_commit_uses_range_tree_without_corpus_scan(
+        world, monkeypatch):
+    """SQLite selects one range; publication path-copies wire-tree pages."""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    resolved, scans, puts = [], [], []
+    resolved, puts, statements = [], [], []
     keys = n.keys
     store = n.store(ws)
-    real_put = store.put
+    real_put = store.put_if_absent
     real = node_module.resolve_deps
     monkeypatch.setattr(
         node_module, "resolve_deps",
         lambda fact, db: (resolved.append(fact.fid), real(fact, db))[1])
     monkeypatch.setattr(
-        store, "put", lambda k, b: (puts.append(k), real_put(k, b))[1])
-    n.keys = lambda *args: (scans.append("keys"), keys(*args))[1]
+        store, "put_if_absent",
+        lambda k, b: (puts.append(k), real_put(k, b))[1])
+    n.keys = lambda *args: pytest.fail("hot commit called Node.keys")
+    n.idx(ws).set_trace_callback(statements.append)
     try:
         cmds.post(n, ws, "general", "incremental", ts=3_000_000)
     finally:
         n.keys = keys
+        n.idx(ws).set_trace_callback(None)
     assert total > 30
-    assert scans == ["keys"]  # one index-only key scan per settle
+    ordered = [
+        statement.lower() for statement in statements
+        if "from fact_index" in statement.lower()
+        and "i.kind='fact.key'" in statement.lower()
+        and "join proofs" in statement.lower()
+        and "order by" in statement.lower()
+    ]
+    assert ordered
+    assert all("indexed by fact_" in statement for statement in ordered)
+    assert any("fact_boundaries" in statement for statement in ordered)
+    assert any("fact_keys" in statement for statement in ordered)
     objects = [k for k in puts if k.startswith("obj/")]
-    depth = max(
+    tree_depth = max(
         row["depth"] for row in
         json.loads(store.get("root"))["trees"].values())
-    assert len(objects) <= 4 + 6 * depth, \
-        f"bounded manifest + three tree paths, got {objects}"
+    range_root = manifest.decode_root(store.get("root")).manifest
+    range_depth = json.loads(store.get("obj/" + range_root))["depth"]
+    depth = max(tree_depth, range_depth)
+    assert len(objects) <= 6 + 10 * depth, \
+        f"bounded range + authenticated paths, got {objects}"
+    assert len(objects) < total
     assert len(set(resolved)) < total, \
         f"resolved {len(set(resolved))} of {total} closures — the memo " \
-        "isn't skipping settled ranges"
+        "isn't localizing the changed range"
+
+
+def test_one_fact_hot_commit_never_enters_the_full_key_path(world):
+    """A valid detached signature can arrive before its target as one fact."""
+    n, ws = world
+    target = message(n.pk, "general", "signed before delivery", 3_100_000)
+    detached = signature(n.sk, n.pk, target, 3_100_000)
+    deliver(n, ws, encode_pile([detached]))
+    keys = n.keys
+    n.keys = lambda *args: pytest.fail("one-fact commit called Node.keys")
+    try:
+        n.turn(ws)
+    finally:
+        n.keys = keys
+    assert n.fact_of(ws, detached.fid) == detached
 
 
 def test_shadow_guard_keeps_identity(world):

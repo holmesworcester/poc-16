@@ -1,4 +1,5 @@
 """Golden and hostile vectors for the one authenticated tree codec."""
+import json
 import random
 
 import pytest
@@ -74,6 +75,54 @@ def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     assert updated.root == bulk.root
     assert {oid: objects[oid] for oid in bulk_objects} == bulk_objects
     assert len(fresh) <= initial.page_depth
+
+
+def test_items_prunes_remote_reads_and_validates_changed_paths():
+    objects = {}
+    initial = btreap.build(rows(), SEED, emitter(objects))
+    known = dict(objects)
+    updated = btreap.update(
+        initial.root, SEED,
+        [("key:00128", {"n": 128, "text": "changed"})],
+        objects.get, emitter(objects))
+    reader = btreap.Reader(updated.root, SEED, objects.get)
+
+    merged = dict(reader.items(known))
+    assert merged["key:00128"]["text"] == "changed"
+    assert len(merged) == initial.count
+    assert reader.pages_read < initial.count
+
+
+def test_pruned_subtree_is_still_validated_against_inherited_bounds():
+    """A shared hash-valid subtree cannot be grafted below a tighter bound."""
+    objects = {}
+    btreap.build(rows(80), SEED, emitter(objects))
+    known = dict(objects)
+
+    shared_oid = shared = None
+    for oid, raw in objects.items():
+        page = json.loads(raw)
+        if page["right"]:
+            shared_oid, shared = oid, page
+            break
+    assert shared_oid is not None
+
+    parent_key = None
+    for suffix in range(10_000):
+        candidate = f"{shared['key']}:{suffix}"
+        if btreap.priority(SEED, candidate) <= shared["priority"]:
+            parent_key = candidate
+            break
+    assert parent_key is not None
+    raw = btreap._raw(
+        parent_key, {"hostile": True}, btreap.priority(SEED, parent_key),
+        shared_oid, "", shared["count"] + 1, shared["depth"] + 1)
+    hostile_root = h(raw)
+    objects[hostile_root] = raw
+
+    with pytest.raises(ValueError, match="btreap global order"):
+        btreap.Reader(
+            hostile_root, SEED, objects.get).items(known)
 
 
 def test_sequential_insert_delete_and_bulk_have_one_root():

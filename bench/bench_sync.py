@@ -139,7 +139,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 
 def manifest_objs(store):
     """``(manifest oid, live oids)`` — every object a cold reader fetches:
-    manifest shards, leaf piles, and closure siblings."""
+    RangeTree pages, leaf piles, and closure siblings."""
     oids = []
     fetch = lambda oid: (oids.append(oid) or store.get("obj/" + oid))
     man = manifest.decode_root(store.get("root")).manifest
@@ -235,10 +235,10 @@ def reconcile(A, B, ws):
     my_man = manifest.decode_root(astore.get("root")).manifest
     their_man = manifest.decode_root(bstore.get("root")).manifest
     mine = manifest.decode(fetch_local(my_man), fetch_local)
-    theirs = manifest.decode(fetch_remote(their_man), fetch_remote)
-    differing = set(manifest.diff(mine, their_man, fetch_remote))
+    theirs, changed = manifest.compare(mine, their_man, fetch_remote)
+    differing = set(changed)
     my_keys = A.keys(ws)
-    members_of = lambda e: decode_pile(fetch_remote(e.leaf))[0]
+    members_of = lambda e: manifest.range_members(e, fetch_remote)
     pulled_piles, push_keys = sync_module.frontier(
         my_keys, theirs, differing, members_of)
     held = set(my_keys)

@@ -3,8 +3,10 @@ import json
 import sqlite3
 
 from core import catalog, cmds, suppression_state
-from core.fact import Fact, decode, encode
+from core.crypto import h
+from core.fact import Fact, canon, decode, encode
 from core.node import Node
+from core.shape import boundary
 
 
 def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
@@ -27,6 +29,8 @@ def test_catalog_stores_one_blob_and_indexes_type_plus_every_offer(tmp_path):
             "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)))
         assert rows == {
             (catalog.TYPE_INDEX, fact.t, ""),
+            (catalog.KEY_INDEX, fact.key,
+             "1" if boundary(fact.fid) else ""),
             *fact.offers(),
         }
 
@@ -115,6 +119,10 @@ def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
     )) == {
         (catalog.TYPE_INDEX, "legacy", "", committed.fid),
         (catalog.TYPE_INDEX, "legacy", "", pending.fid),
+        (catalog.KEY_INDEX, committed.key,
+         "1" if boundary(committed.fid) else "", committed.fid),
+        (catalog.KEY_INDEX, pending.key,
+         "1" if boundary(pending.fid) else "", pending.fid),
         ("legacy-key", "one", "", committed.fid),
     }
     assert db.execute(
@@ -177,9 +185,51 @@ def test_rebuild_replaces_stale_and_missing_generic_index_rows(tmp_path):
             "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)
         )) == {
             (catalog.TYPE_INDEX, fact.t, ""),
+            (catalog.KEY_INDEX, fact.key,
+             "1" if boundary(fact.fid) else ""),
             *fact.offers(),
         }
     assert [row["fid"] for row in cmds.msgs(node, workspace)] == [message]
+
+
+def test_v23_blob_catalog_backfills_keys_before_foreign_root_republish(
+        tmp_path):
+    directory = tmp_path / "node"
+    node = Node(str(directory))
+    workspace = cmds.create(node, "alice", ts=1)
+    message = cmds.post(node, workspace, "general", "survives", ts=2)
+    store = node.store(workspace)
+    current = store.get("root")
+    foreign_value = json.loads(current)
+    foreign_value["stamp"] = "composite-btreap-v4"
+    foreign = canon(foreign_value)
+    assert store.cas("root", h(current), foreign) == h(foreign)
+
+    index = node.idx(workspace)
+    index.execute(
+        "DELETE FROM fact_index WHERE kind=?", (catalog.KEY_INDEX,))
+    index.execute(
+        "INSERT OR REPLACE INTO meta VALUES('root',?)", (h(foreign),))
+    index.execute(
+        "INSERT OR REPLACE INTO meta VALUES('root-bytes',?)", (foreign,))
+    index.execute(
+        "INSERT OR REPLACE INTO meta VALUES('index-version',?)",
+        ("admission-catalog-v23",),
+    )
+    index.commit()
+    index.close()
+
+    reopened = Node(str(directory))
+
+    assert reopened.store(workspace).get("root") != foreign
+    assert reopened.fact_of(workspace, message) is not None
+    assert [row["fid"] for row in cmds.msgs(reopened, workspace)] == [message]
+    assert reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM fact_index WHERE kind=?",
+        (catalog.KEY_INDEX,),
+    ).fetchone() == reopened.idx(workspace).execute(
+        "SELECT COUNT(*) FROM facts"
+    ).fetchone()
 
 
 def test_index_lookup_decodes_only_selected_fact_bodies(tmp_path, monkeypatch):

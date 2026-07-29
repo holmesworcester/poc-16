@@ -5,7 +5,7 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from core import cmds
+from core import catalog, cmds
 from core import kernel as kernel_module
 from core.close import close, decode_pile
 from core.kernel import drain, resolve_deps
@@ -165,12 +165,29 @@ def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
         == 2 * (members - 1)
 
 
-def test_ordinary_append_does_not_scan_all_proofs_or_offers(tmp_path):
+def test_ordinary_append_does_not_scan_all_proofs_or_offers(
+        tmp_path, monkeypatch):
     node, workspace, _ = build_seed(
         str(tmp_path / "incremental-proof"), 2047,
         n_members=48, shape="random", seed=16)
     statements = []
     index = node.idx(workspace)
+    total = index.execute("SELECT COUNT(*) FROM proofs").fetchone()[0]
+    discovered = []
+    changed_ranges = catalog.Catalog.changed_ranges
+
+    def bounded_ranges(self, keys):
+        ranges = changed_ranges(self, keys)
+        discovered.append(sum(len(current) for _, current in ranges))
+        return ranges
+
+    monkeypatch.setattr(catalog.Catalog, "changed_ranges", bounded_ranges)
+    monkeypatch.setattr(
+        catalog.Catalog, "eligible_ids",
+        lambda *_: pytest.fail("ordinary append enumerated all proofs"))
+    monkeypatch.setattr(
+        node, "keys",
+        lambda *_: pytest.fail("ordinary append enumerated all fact keys"))
     index.set_trace_callback(statements.append)
     try:
         cmds.post(
@@ -192,6 +209,7 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(tmp_path):
     assert any(
         statement.startswith("select 1 from proofs where fid=")
         for statement in normalized)
+    assert discovered and 0 < max(discovered) < total // 4
 
 
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):

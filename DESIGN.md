@@ -120,7 +120,7 @@ family-neutral derived indexes:
 
 ```text
 facts(fid, blob)                 one canonical encoded body
-fact_index(kind, k0, k1, src)   type + every declared offer
+fact_index(kind, k0, k1, src)   key + type + every declared offer
 proofs / edges                   current eligibility and resolved authority
 actions / supp                   suppression frontier and selector reverse map
 ```
@@ -128,8 +128,8 @@ actions / supp                   suppression frontier and selector reverse map
 There is no application projection database and no family-owned durable
 table. A kernel-valid durable receipt is stored once; losing canonical
 standing removes its proof row, not its bytes or index rows. Every fact gets a
-`fact.type` index row, and each declared offer becomes another row
-mechanically. Family queries select candidate fids through that combined
+`fact.key` reconciliation row, a `fact.type` row, and one row for each
+declared offer. Family queries select candidate fids through that combined
 index, load the canonical blobs, apply suppression, and assemble their view.
 Deleting the workspace catalog can still lose node-local, currently
 ineligible receipts that were deliberately never published.
@@ -151,7 +151,7 @@ consumer sees one current contextual form. A future adapter must be
 deterministic and must not consult replica-local arrival order or wall-clock
 state.
 
-The root uses layout stamp `composite-btreap-v4` and atomically binds:
+The root uses layout stamp `composite-btreap-v5` and atomically binds:
 
 ```text
 anchor          workspace genesis fid
@@ -184,20 +184,38 @@ pinned root instead. Thus a newly reactivated local receipt is either present
 in the stamped root or remains durable intent after a lost CAS; rebuild never
 stamps somebody else’s smaller snapshot as its own.
 
-The range manifest partitions sorted fact keys with the shared stable boundary
+The range manifest partitions canonical fact keys with the stable boundary
 rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
-whose home is outside the leaf. Equal subtrees have equal object ids, so sync
-prunes them by oid. On append, unchanged ranges are reused without decoding
-their facts.
+whose home is outside that exact leaf. **RangeTree** is a logical map from each
+opaque ordered range separator to its leaf and closure oids. It uses the same
+persistent Merkle-treap primitive as every other authenticated tree; it is not
+a second tree implementation. On an additions-only commit SQLite's
+`fact_boundaries` partial index finds the old stable-boundary window and
+`fact_keys` reads only its current members. The publisher rebuilds those
+leaves and path-copies their wire-map rows; it never traverses RangeTree to
+discover local ranges, enumerates RangeTree entries, calls `Node.keys`, or runs
+the unconditional corpus-wide ordered fact-key query. Equal subtrees have
+equal object ids, so sync descends only remote paths whose oids are not present
+in the local RangeTree. Repair, format cutover, deactivation, and
+canonical-authority changes deliberately retain the full reference build.
+
+RangeTree is an authenticated wire map for synchronization and store recovery,
+not a fourth local or Worker index. A database-free Worker does not open it
+and never scans timestamp/fid keys: `WorkerView` exact-reads only FactTree,
+SuppTree, and AuthorityTree. An edge responder may serve RangeTree objects by
+oid, but it does not interpret them; the CF Worker never traverses RangeTree.
+FactTree cannot substitute for this map without also gaining ordered raw-fact
+residency and pile/closure routing; object-store LIST cannot substitute
+because object names are content hashes and include unreachable history.
 
 ## The three authenticated trees
 
-All logical indexes use one persistent Merkle treap codec. The priority of a
-row is `H(layout_seed, key)`, which gives a unique Cartesian tree independent
-of insertion history. Each immutable page stores one row and its child object
-ids. An update path-copies only search and rotation paths. A Worker read is
-bounded by the published depth and the hard depth cap; it never enumerates a
-tree.
+Wire RangeTree and the three Worker indexes share one persistent Merkle-treap
+codec, but only the latter are Worker-readable. The priority of a row is
+`H(seed, key)`, which gives a unique Cartesian tree independent of insertion
+history. Each immutable page stores one row and its child object ids. An
+update path-copies only search and rotation paths. A Worker read is bounded by
+the published depth and the hard depth cap; it never enumerates a tree.
 
 The schemas are:
 
@@ -412,9 +430,9 @@ cannot be inferred from an asynchronous signed fact alone.
 6. return `(public_key, verb)` for sealing by the daemon.
 
 `core/mint.py` contains only this path. The CF path is `root bytes + immutable
-object fetches + submitted closure`: no SQLite, client catalog, compatibility
-projection, or full-tree fallback. A cached view is reusable only while its
-root ETag matches.
+object fetches + submitted closure`: no SQLite, client catalog, client query
+state, or full-tree fallback. A cached view is reusable only while its root
+ETag matches.
 
 The daemon seals a short-lived bearer grant to the requester’s public key.
 The grant TTL is a deliberate revocation leakage window. After expiry, an
@@ -431,10 +449,11 @@ root is O(1) after blob completeness has been stamped for that ETag.
 When roots differ, sync reconciles admitted actions first. Each ACTIVE slot and
 its evidence closure are hash-checked and kernel-validated independently; one
 missing or poisoned witness is skipped without blocking honest actions. The
-ordinary range manifest is then diffed by oid, local-only facts are pushed as
-one closed pile, remote ranges are assembled, and missing live blobs are
-fetched. Push happens before draining the pull so canonical pruning cannot
-remove a precomputed difference before delivery.
+RangeTree is then compared by oid: shared pages are read from the authenticated
+local tree, while only novel remote paths and their changed piles are fetched.
+Local-only facts are pushed as one closed pile, remote ranges are assembled,
+and missing live blobs are fetched. Push happens before draining the pull so
+canonical pruning cannot remove a precomputed difference before delivery.
 
 Malformed ingress failures and sync failures are quarantined and visible
 through `status`. Malformed roots, pages, facts, selectors, action evidence,
@@ -453,29 +472,28 @@ bytes on demand.
 ## Performance
 
 `bench/bench_latency.py` measures the running paths. On the development host on
-2026-07-28, five hot posts at each scale produced:
+2026-07-29, five hot posts at each scale produced:
 
-| Seed facts | Post p50 | Post p95 | sorted-key scan p50 | immutable KiB/post |
+| Seed facts | Post p50 | Post p95 | object touches/post | immutable KiB/post |
 |---:|---:|---:|---:|---:|
-| 1,000 | 20.55 ms | 21.20 ms | 0.98 ms | 58.6 |
-| 5,000 | 36.34 ms | 37.30 ms | 5.07 ms | 74.6 |
-| 10,000 | 50.42 ms | 58.11 ms | 10.60 ms | 69.5 |
+| 1,000 | 22.12 ms | 22.28 ms | 92.0 | 62.3 |
+| 5,000 | 17.38 ms | 19.28 ms | 109.6 | 49.6 |
+| 10,000 | 27.13 ms | 28.52 ms | 114.6 | 80.1 |
 
-The authenticated trees and changed manifest ranges update in logarithmic
-paths. One index-only sorted-key scan remains to derive the canonical range
-partition, so post time is not perfectly flat; the benchmark makes that slope
-visible. A primed same-root idle dial measured about 0.007 ms p50/p95 locally
-and performed no fact, tree, object, or blob-demand scan. These numbers are
-diagnostic, not cross-machine service guarantees.
+Every measured post performed zero `Node.keys` calls. Authenticated-tree and
+RangeTree touches grow with their paths (92–115 here), not with the
+1,000–10,000-fact corpus. A primed same-root idle dial measured about
+0.008 ms p50 and 0.012–0.014 ms p95 locally and performed no fact, tree,
+object, or blob-demand scan. These numbers are diagnostic, not cross-machine
+service guarantees.
 
 ## Limits and future decisions
 
 - Ordinary bodies are plaintext. End-to-end body encryption needs a separate
   design and implementation.
-- Logical deletion stops query visibility, authorization, and future blob demand; it
-  does not erase immutable objects already stored. Physical GC is unbuilt.
-- The canonical range manifest still performs an O(n) index-only key scan per
-  commit.
+- Logical deletion stops query visibility, authorization, and future blob
+  demand; it does not erase immutable objects already stored. Physical GC is
+  unbuilt.
 - Strong authorship-time revocation needs serialized admission receipts, as
   described under “Action timing.”
 - A removed node may not learn its own terminal action if it has no inbound

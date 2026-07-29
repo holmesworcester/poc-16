@@ -74,7 +74,7 @@ def test_hash_derived_boundary(monkeypatch):
 
 def test_stable_cuts_are_monotone(monkeypatch):
     """Adding keys never removes a boundary — the settle's licence to
-    rebuild only the touched leaf and shard."""
+    rebuild only the touched leaf and RangeTree path."""
     monkeypatch.setattr(shape, "CUT", 2)
     fids = [fid(number) for number in range(1, 11)]
 
@@ -83,3 +83,11 @@ def test_stable_cuts_are_monotone(monkeypatch):
         prefix = shape.stable_cut_positions(fids[:stop])
         assert prefix == [
             cut for cut in shape.stable_cut_positions(fids) if cut <= stop]
+
+
+def test_sql_boundary_suffix_is_exactly_the_shape_rule():
+    """Catalog's partial SQLite index is the CUT=64 boundary predicate."""
+    for suffix in range(256):
+        content_id = f"123456{suffix:02x}" + "0" * 56
+        assert shape.boundary(content_id) \
+            == (suffix in {0x00, 0x40, 0x80, 0xC0})

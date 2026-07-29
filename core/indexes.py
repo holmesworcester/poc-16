@@ -42,7 +42,7 @@ from collections import defaultdict
 import facts
 
 from . import btreap
-from .catalog import TYPE_INDEX
+from .catalog import INTERNAL_INDEXES
 from .crypto import h
 from .fact import canon
 
@@ -301,8 +301,8 @@ def build(
     for name, a0, a1, src, rank in idx.execute(
             "SELECT o.kind, o.k0, o.k1, o.src, p.rank "
             "FROM fact_index o JOIN proofs p ON p.fid=o.src "
-            "WHERE o.kind != ? ORDER BY p.rank, o.src",
-            (TYPE_INDEX,)):
+            "WHERE o.kind NOT IN (?,?) ORDER BY p.rank, o.src",
+            tuple(sorted(INTERNAL_INDEXES))):
         candidates[(name, a0, a1)].append((rank, src))
         candidates[(name, a0, None)].append((rank, src))
     for address, choices in candidates.items():

@@ -164,15 +164,15 @@ def sync(node, ws, url):
     else:
         my_keys = ()
     if their_man and local_man != their_man:
-        theirs = manifest.decode(
-            _object(their_man, fetch_remote), fetch_remote)
-        differing = set(manifest.diff(mine, their_man, fetch_remote))
+        theirs, changed = manifest.compare(
+            mine, their_man, fetch_remote)
+        differing = set(changed)
         raws = dict(zip(
             (e.leaf for e in theirs if e in differing),
             fetch_remote.many(
                 [e.leaf for e in theirs if e in differing])))
-        members_of = lambda e: decode_pile(
-            _object(e.leaf, lambda oid: raws[oid]))[0]
+        members_of = lambda e: manifest.range_members(
+            e, lambda oid: raws[oid])
         pulled_piles, push_keys = frontier(
             my_keys, theirs, differing, members_of)
 
@@ -209,8 +209,8 @@ def frontier(my_keys, theirs, differing, members_of):
     """Split the key space at the differing leaves: ``(pulled piles, push
     keys)`` — theirs-minus-mine feeds pull, mine-minus-theirs feeds push.
 
-    Every remote leaf is either in ``differing`` (fetch and compare member
-    keys) or byte-identical to one of ours (oid pruned by the diff) — in
+    Every remote row is either in ``differing`` (fetch and compare member
+    keys) or exactly one of ours (RangeTree page pruned by the compare) — in
     which case its members are exactly our chunk starting at its separator,
     so the whole remote key set is known without touching cold ranges."""
     chunks, start = {}, 0
@@ -345,8 +345,8 @@ def assemble(node, ws, pulled_piles, entries, fetch):
     """Two-wave closed-set assembly.
 
     Wave 1 already happened: ``pulled_piles`` are the differing home-leaf
-    piles from manifest.diff. For their member facts, resolve every dep from
-    our own store first (kernel.resolve_deps against the index); the
+    piles from the RangeTree compare. For their member facts, resolve every
+    dep from our own store first (kernel.resolve_deps against the index); the
     remainder is the union of the leaves' closure-sibling keys, filtered to
     keys we don't hold. Wave 2: manifest.fetch_plan groups those keys by
     home leaf; one batched GET wave (fetch.many / store.PAGE_BATCH); extract

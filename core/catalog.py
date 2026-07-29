@@ -1,10 +1,10 @@
 """Stable fact-blob catalog plus generic indexes and derived eligibility.
 
 ``facts(fid, blob)`` is the only stored fact representation. ``fact_index``
-indexes every fact by type and every dependency-key offer; it never copies a
-fact body. ``proofs`` is the current finite canonical DAG: a fact is
-publishable exactly when it has a proof row. Winner changes replace
-proofs/edges; they never serialize, delete, or reinsert a receipt.
+indexes every fact by type, reconciliation key, and every dependency-key
+offer; it never copies a fact body. ``proofs`` is the current finite canonical
+DAG: a fact is publishable exactly when it has a proof row. Winner changes
+replace proofs/edges; they never serialize, delete, or reinsert a receipt.
 
 Receipts enter with a row in ``staged``. Publication removes that marker only
 after the composite-root CAS. Recovery discards an uncommitted stage and
@@ -24,8 +24,11 @@ from .kernel import (
     extend_proofs,
     rebuild_proofs,
 )
+from .shape import boundary, parse_key
 
 TYPE_INDEX = "fact.type"
+KEY_INDEX = "fact.key"
+INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX))
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -39,6 +42,11 @@ CREATE TABLE IF NOT EXISTS fact_index(
     PRIMARY KEY(kind, k0, k1, src));
 CREATE INDEX IF NOT EXISTS fact_index_by_src
     ON fact_index(src, kind, k0, k1);
+CREATE INDEX IF NOT EXISTS fact_keys
+    ON fact_index(k0, src) WHERE kind='fact.key';
+CREATE INDEX IF NOT EXISTS fact_boundaries
+    ON fact_index(k0, src)
+    WHERE kind='fact.key' AND k1='1';
 CREATE TABLE IF NOT EXISTS proofs(fid TEXT PRIMARY KEY, rank INT NOT NULL);
 CREATE TABLE IF NOT EXISTS edges(
     src TEXT NOT NULL, role TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
@@ -48,12 +56,28 @@ CREATE TABLE IF NOT EXISTS edges(
 
 def _index_rows(fact):
     """The complete derived index contribution of one canonical fact."""
-    if any(name == TYPE_INDEX for name, _, _ in fact.offers()):
+    if any(name in INTERNAL_INDEXES for name, _, _ in fact.offers()):
         raise ValueError("reserved fact index kind")
     return (
         (TYPE_INDEX, fact.t, "", fact.fid),
+        (KEY_INDEX, fact.key, "1" if boundary(fact.fid) else "", fact.fid),
         *((*offer, fact.fid) for offer in fact.offers()),
     )
+
+
+def _reindex(db):
+    """Replace generic rows with the exact contribution of every fact blob."""
+    rows = db.execute(
+        "SELECT fid, blob FROM facts ORDER BY fid").fetchall()
+    db.execute("DELETE FROM fact_index")
+    for fid, raw in rows:
+        fact = decode(raw)
+        if fact.fid != fid:
+            raise ValueError("fact catalog integrity")
+        db.executemany(
+            "INSERT INTO fact_index VALUES(?,?,?,?)",
+            _index_rows(fact),
+        )
 
 
 def upgrade_schema(db):
@@ -61,10 +85,26 @@ def upgrade_schema(db):
     columns = {
         row[1] for row in db.execute("PRAGMA table_info(facts)")
     }
-    if not columns or "blob" in columns:
-        db.execute("DROP TABLE IF EXISTS offers")
-        db.execute("DROP TABLE IF EXISTS log")
-        db.commit()
+    if not columns:
+        return
+    if "blob" in columns:
+        # v23 already used canonical blobs but predates reconciliation-key
+        # rows. Backfill before _sync_index can republish an old root.
+        needs_key_rows = db.execute(
+            "SELECT 1 FROM facts LIMIT 1").fetchone() is not None \
+            and db.execute(
+                "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
+                (KEY_INDEX,)).fetchone() is None
+        try:
+            if needs_key_rows:
+                db.execute("BEGIN")
+                _reindex(db)
+            db.execute("DROP TABLE IF EXISTS offers")
+            db.execute("DROP TABLE IF EXISTS log")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         return
     if not {"fid", "j", "admitted"} <= columns:
         raise ValueError("unknown fact catalog schema")
@@ -140,9 +180,9 @@ class Catalog:
     def indexed(self, kind, k0=None, k1=None):
         """Current facts at one generic index address, in canonical rank order.
 
-        Type rows use ``kind=fact.type`` and ``k0=<tag>``. Every other row is
-        copied mechanically from a fact's declared offers. Bodies are loaded
-        once from ``facts`` and decoded only after the index has selected ids.
+        Type rows use ``kind=fact.type`` and key rows use ``kind=fact.key``.
+        Every other row is copied mechanically from a fact's declared offers.
+        Bodies are decoded only after the index has selected ids.
         """
         clauses, args = ["i.kind=?"], [kind]
         if k0 is not None:
@@ -173,6 +213,60 @@ class Catalog:
     def by_type(self, tag):
         """Current facts of one type, selected through the generic index."""
         return self.indexed(TYPE_INDEX, tag)
+
+    def changed_ranges(self, keys):
+        """Affected ``(old separator, current keys)`` wire ranges.
+
+        SQLite's generic key rows own local discovery. The RangeTree remains
+        only the authenticated wire map served to other database-backed peers.
+        """
+        changed = frozenset(keys)
+        if not changed:
+            return ()
+        for fact_key in changed:
+            _, fid = parse_key(fact_key)
+            if self.db.execute(
+                    "SELECT 1 FROM fact_index i "
+                    "JOIN proofs p ON p.fid=i.src "
+                    "WHERE i.kind='fact.key' AND i.k0=? AND i.src=?",
+                    (fact_key, fid)).fetchone() is None:
+                raise ValueError("changed range fact")
+
+        def edge(fact_key, before):
+            op, order = ("<", "DESC") if before else (">", "ASC")
+            candidates = self.db.execute(
+                "SELECT i.k0 FROM fact_index i "
+                "INDEXED BY fact_boundaries "
+                "JOIN proofs p ON p.fid=i.src "
+                "WHERE i.kind='fact.key' AND i.k1='1' "
+                f"AND i.k0 {op} ? ORDER BY i.k0 {order} LIMIT ?",
+                (fact_key, len(changed) + 1),
+            )
+            return next((
+                item for (item,) in candidates if item not in changed
+            ), None)
+
+        windows = {
+            (edge(fact_key, True), edge(fact_key, False))
+            for fact_key in changed
+        }
+        out = []
+        for left, right in sorted(windows, key=lambda pair: pair[0] or ""):
+            rows = tuple(
+                fact_key for (fact_key,) in self.db.execute(
+                    "SELECT i.k0 FROM fact_index i INDEXED BY fact_keys "
+                    "JOIN proofs p ON p.fid=i.src "
+                    "WHERE i.kind='fact.key' AND i.k0>? AND i.k0<=? "
+                    "ORDER BY i.k0",
+                    (left or "", right or "\uffff"),
+                )
+            )
+            old = next(
+                (fact_key for fact_key in rows if fact_key not in changed),
+                None,
+            )
+            out.append((old, rows))
+        return tuple(out)
 
     def staged_ids(self):
         return tuple(
@@ -209,17 +303,7 @@ class Catalog:
 
     def reindex(self):
         """Rebuild the exact generic index from every retained fact blob."""
-        rows = self.db.execute(
-            "SELECT fid, blob FROM facts ORDER BY fid").fetchall()
-        self.db.execute("DELETE FROM fact_index")
-        for fid, raw in rows:
-            fact = decode(raw)
-            if fact.fid != fid:
-                raise ValueError("fact catalog integrity")
-            self.db.executemany(
-                "INSERT INTO fact_index VALUES(?,?,?,?)",
-                _index_rows(fact),
-            )
+        _reindex(self.db)
 
     def commit_stage(self, fids):
         self.db.executemany(

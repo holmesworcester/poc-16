@@ -208,27 +208,32 @@ class Reader:
             parent = rank
         return None
 
-    def items(self, *, max_pages=None):
-        """Decode and structurally validate the complete logical map."""
+    def items(self, known=None, *, max_pages=None):
+        """The complete map, sourcing shared pages from ``known`` locally."""
+        known = known or {}
         if not self.root:
             return ()
         self.pages_read = 0
         self._page_budget = max_pages or 1_000_000
         seen, out = set(), []
 
-        def walk(oid, lo, hi, parent):
+        def walk(oid, lo, hi, parent, shared=False):
             if not oid:
                 return 0, 0
             if oid in seen:
                 raise ValueError("repeated btreap page")
             seen.add(oid)
-            page = self._page(oid)
+            shared = shared or oid in known
+            if shared and oid not in known:
+                raise ValueError("incomplete known btreap subtree")
+            page = _decode(known[oid], oid, self.seed) \
+                if shared else self._page(oid)
             rank = self._ordered(page, lo, hi, parent)
             left_count, left_depth = walk(
-                page["left"], lo, page["key"], rank)
+                page["left"], lo, page["key"], rank, shared)
             out.append((page["key"], page["value"]))
             right_count, right_depth = walk(
-                page["right"], page["key"], hi, rank)
+                page["right"], page["key"], hi, rank, shared)
             count = 1 + left_count + right_count
             depth = 1 + max(left_depth, right_depth)
             if page["count"] != count or page["depth"] != depth:

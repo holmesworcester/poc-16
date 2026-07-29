@@ -148,9 +148,8 @@ def test_history_independence_holds_with_actions(tmp_path):
         assert other.store(ws).get("root") == root  # byte-equal, slot too
 
 
-def test_boundary_rule_shared_by_leaves_and_manifest(world):
-    """Leaf cuts and manifest shards both come from shape.boundary; no
-    second chunking rule exists (§3)."""
+def test_stable_boundary_leaves_have_one_canonical_range_tree(world):
+    """Stable leaves are exactly the rows of one canonical Merkle treap."""
     def chunks(items, fid_of):
         cuts = shape.stable_cut_positions([fid_of(item) for item in items])
         return [items[start:stop]
@@ -163,20 +162,15 @@ def test_boundary_rule_shared_by_leaves_and_manifest(world):
     assert [chunk[0] for chunk in chunks(keys, shape.fid_of)] \
         == [entry.sep for entry in entries]
 
-    rng = random.Random(7)
-    wide = sorted(
-        manifest.Entry(
-            shape.key_parts(index, f"{rng.getrandbits(256):064x}"), "", "")
-        for index in range(400)
-    )
     emitted = {}
-    manifest.encode(wide, lambda raw: emitted.setdefault(h(raw), raw))
-    shards = sorted(
-        ([manifest.Entry(*row) for row in body["entries"]]
-         for body in map(json.loads, emitted.values()) if "entries" in body),
-        key=lambda rows: rows[0].sep)
-    assert len(shards) > 1  # the entry list really did shard
-    assert shards == chunks(wide, lambda entry: shape.fid_of(entry.sep))
+    root = manifest.encode(
+        entries, lambda raw: emitted.setdefault(h(raw), raw))
+    assert root == manifest.decode_root(
+        node.store(ws).get("root")).manifest
+    assert len(emitted) == len(entries)  # one authenticated page per range
+    assert all(json.loads(raw)["format"] == btreap.FORMAT
+               for raw in emitted.values())
+    assert manifest.decode(emitted[root], emitted.get) == entries
 
 
 def test_cut_is_64():
@@ -223,8 +217,7 @@ def test_root_atomically_names_manifest_and_three_logical_trees(world):
 
 
 def test_closure_sibling_is_exactly_out_of_range(world):
-    """closure_keys() == keys of close(members) minus keys in (lo, hi]; no
-    in-range entry, no missing out-of-range entry (§1; COSTS §5)."""
+    """The sibling is exactly close(members) minus that leaf's member ids."""
     node, ws = world
     entries, fetch = read(node, ws)
     idx = node.idx(ws)
@@ -237,7 +230,7 @@ def test_closure_sibling_is_exactly_out_of_range(world):
         closed = {fact.key for fact in close(members, deps_of, fact_of)}
         assert {k for k in closed if lo < k <= hi} \
             == {fact.key for fact in members}
-        outside = sorted(k for k in closed if not lo < k <= hi)
+        outside = sorted(closed - {fact.key for fact in members})
         if outside:
             assert json.loads(fetch(entry.closure))["keys"] == outside
             siblings += 1
@@ -374,8 +367,8 @@ def peer_for(source, singles, batches, pushed=None):
     return LocalPeer
 
 
-def test_oid_diff_prunes_equal_subtrees(tmp_path):
-    """diff() never descends into a shard or leaf whose oid we hold (§1)."""
+def test_oid_compare_prunes_equal_subtrees(tmp_path):
+    """compare() never remotely reads a RangeTree page or held leaf (§1)."""
     source, ws, destination, ts = pair(tmp_path)
     mine, _ = read(destination, ws)
     src = source.store(ws)
@@ -383,23 +376,46 @@ def test_oid_diff_prunes_equal_subtrees(tmp_path):
     fetch = lambda oid: (reads.append(oid) or src.get("obj/" + oid))
 
     man = manifest.decode_root(src.get("root")).manifest
-    assert manifest.diff(mine, man, fetch) == []
+    assert manifest.compare(mine, man, fetch)[1] == []
     assert reads == []  # equal root oid: pruned before a single GET
 
     cmds.post(source, ws, "general", "delta", ts=ts + 1)
     held = {entry.leaf for entry in mine}
-    manifest.encode(mine, lambda raw: held.add(h(raw)))  # my shard oids too
+    manifest.encode(mine, lambda raw: held.add(h(raw)))  # RangeTree pages too
     man = manifest.decode_root(src.get("root")).manifest
-    differing = manifest.diff(mine, man, fetch)
+    differing = manifest.compare(mine, man, fetch)[1]
     theirs = read(source, ws)[0]
-    shards = set()
-    manifest.encode(theirs, lambda raw: shards.add(h(raw)))
+    pages = set()
+    manifest.encode(theirs, lambda raw: pages.add(h(raw)))
     assert differing  # the delta's home leaf really differs
     assert {e.leaf for e in differing} \
         == {e.leaf for e in theirs} - {e.leaf for e in mine}  # exactly it
-    assert set(reads) == shards - held  # unheld shards read, held pruned
+    assert set(reads) == pages - held  # unheld pages read, held pruned
     assert len(reads) == len(set(reads))  # and each descended into once
     assert set(reads).isdisjoint({e.leaf for e in theirs})  # never a pile
+
+
+def test_oid_diff_compares_the_full_mapping_at_the_same_separator(world):
+    """A held leaf moved under a different separator is not 'unchanged'."""
+    node, ws = world
+    mine, fetch = read(node, ws)
+    first, second = mine[:2]
+    hostile = list(mine)
+    hostile[:2] = [
+        first._replace(leaf=second.leaf),
+        second._replace(leaf=first.leaf),
+    ]
+    pages = {}
+    root = manifest.encode(
+        hostile, lambda raw: pages.setdefault(h(raw), raw))
+
+    theirs, differing = manifest.compare(mine, root, pages.get)
+
+    assert theirs == hostile
+    assert differing == hostile[:2]
+    for entry in differing:
+        with pytest.raises(ValueError, match="manifest range"):
+            manifest.range_members(entry, fetch)
 
 
 def test_oid_diff_fetches_exactly_the_difference(tmp_path, monkeypatch):
@@ -451,10 +467,13 @@ def test_local_only_keys_still_push(tmp_path, monkeypatch):
 
 
 def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
-    """A warm delta pull touches leaf piles and manifest shards only; the
+    """A warm delta pull touches leaf piles and novel RangeTree pages only; the
     sibling objects are for cold-partial readers, and the modes that never
     use them must not pay for them (COSTS §5)."""
     source, ws, destination, ts = pair(tmp_path)
+    held_pages = set()
+    manifest.encode(
+        read(destination, ws)[0], lambda raw: held_pages.add(h(raw)))
     for tick in range(3):
         cmds.post(source, ws, "general", f"delta {tick}", ts=ts + 1 + tick)
 
@@ -466,13 +485,15 @@ def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
     entries, _ = read(source, ws)
     siblings = {entry.closure for entry in entries if entry.closure}
     leaves = {entry.leaf for entry in entries}
-    shards = set()
-    manifest.encode(entries, lambda raw: shards.add(h(raw)))
+    pages = set()
+    manifest.encode(entries, lambda raw: pages.add(h(raw)))
     assert siblings  # the store really has out-of-range closure to skip
     fetched = set(singles) | {oid for batch in batches for oid in batch}
     assert fetched.isdisjoint(siblings)
-    assert fetched <= leaves | shards  # leaf piles and manifest shards ONLY
+    assert fetched <= leaves | pages  # leaf piles and RangeTree pages ONLY
     assert all(oid not in leaves for oid in singles)  # leaves ride batches
+    assert held_pages & pages  # this delta really has shared tree pages
+    assert fetched & pages == pages - held_pages  # no eager remote decode
 
 
 def test_idle_sync_after_blob_completion_does_no_index_or_object_work(

@@ -17,7 +17,8 @@ Families own construction, needs, validation, commands, query assembly, and
 the family’s `POLICY`. `facts/__init__.py` is the one checked dispatch
 inventory; `facts/_policy.py` defines policy vocabulary but contains no
 parallel tag registry. Keep `core/` family-neutral. Durable facts live once as
-canonical blobs; the generic index mechanically covers type and every offer.
+canonical blobs; the generic index mechanically covers reconciliation key,
+type, and every offer.
 
 Read and change the write path in authority order:
 

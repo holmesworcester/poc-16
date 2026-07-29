@@ -1,10 +1,9 @@
 """The pure key discipline of the one store.
 
-Everything a reader or writer needs to know about WHERE a fact lives —
-canonical key format and content-derived chunk boundaries —
-and nothing about what a fact means. Leaf piles (manifest.build) and manifest
-shards (manifest.encode) both cut on ``boundary``; there is no second
-chunking rule.
+Everything a reader or writer needs to know about WHERE a fact lives:
+canonical key format and content-derived leaf boundaries, and nothing about
+what a fact means. The RangeTree treats canonical keys as ordered opaque
+addresses; only leaf construction asks this module where a stable cut falls.
 """
 import re
 
@@ -83,7 +82,7 @@ def boundary(fid):
 
 def stable_cut_positions(fids):
     """Monotone content cuts: adding keys never removes a boundary, so a
-    settle rebuilds only the touched leaf and shard."""
+    settle rebuilds only the touched leaf and path-copies its RangeTree."""
     return [
         index + 1
         for index, fid in enumerate(fids)
