@@ -323,7 +323,7 @@ def test_typed_exact_rejection_evidence_supports_the_other_delete_path(
     workspace = cmds.create(seed, "alice", ts=1)
     bucket, (worker, _other) = _shared_nodes(
         seed, workspace, tmp_path, ("worker", "other"))
-    bad = poisoned_timestamp_pile()
+    bad = poisoned_timestamp_pile(workspace)
     source = _put_pile(
         worker.store(workspace), bad,
         member="0000000000000000")
@@ -344,11 +344,15 @@ def test_real_kernel_rejection_supports_typed_exact_retirement(
     workspace = cmds.create(seed, "alice", ts=1)
     bucket, (worker,) = _shared_nodes(
         seed, workspace, tmp_path, ("worker",))
-    rejected = encode_pile([
-        Fact(
-            "signature", 3,
-            [["offer", "author", "not-a-fact", seed.pk]], {}),
-    ])
+    rejected = encode_pile(
+        [
+            Fact(
+                "signature", 3,
+                [["offer", "author", "not-a-fact", seed.pk]], {},
+                workspace),
+        ],
+        workspace=workspace,
+    )
     source = _put_pile(worker.store(workspace), rejected)
     trace = ObligationTrace(bucket, workspace)
     _observe_retirements(monkeypatch, trace, worker)
@@ -483,7 +487,7 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         )
         for site in deletes
     ] == [(
-        "core/node.py", "_retire_ingress_exact", 208, "st", "direct")]
+        "core/node.py", "_retire_ingress_exact", 209, "st", "direct")]
     assert [
         (
             site.path, site.function, site.line,
@@ -492,7 +496,7 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         for site in retirements
     ] == [
         (
-            "core/node.py", "_quarantine_ingress", 195,
+            "core/node.py", "_quarantine_ingress", 196,
             "self", "direct"),
         ("core/runtime.py", "turn", 97, "node", "direct"),
     ]
