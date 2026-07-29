@@ -358,8 +358,23 @@ def test_successful_cas_without_etag_is_an_unknown_applied_mutation():
     store = S3Store(
         config(), client=ScriptedClient(put_object=[{}]))
 
-    with pytest.raises(OutcomeUnknown, match="without a usable ETag"):
+    with pytest.raises(OutcomeUnknown, match="without a usable strong ETag"):
         store.cas("root", ABSENT, b"root")
+
+
+def test_weak_etags_are_never_accepted_as_root_cas_tokens():
+    read = S3Store(config(), client=ScriptedClient(get_object=[{
+        "Body": Body(b"root"),
+        "ETag": 'W/"weak-read"',
+    }]))
+    with pytest.raises(StoreError, match="no usable strong ETag"):
+        read.read_versioned("root")
+
+    mutation = S3Store(config(), client=ScriptedClient(put_object=[{
+        "ETag": 'W/"weak-write"',
+    }]))
+    with pytest.raises(OutcomeUnknown, match="without a usable strong ETag"):
+        mutation.cas("root", ABSENT, b"candidate")
 
 
 def test_non_authoritative_put_and_delete_use_direct_scoped_requests():

@@ -116,10 +116,10 @@ class R2BindingStore:
     def _token(obj):
         value = getattr(obj, "etag", None)
         if value is None:
-            raise StoreError("R2 response has no ETag")
+            raise StoreError("R2 response has no usable strong ETag")
         value = str(value)
-        if not value:
-            raise StoreError("R2 response has no ETag")
+        if not value or value.startswith("W/"):
+            raise StoreError("R2 response has no usable strong ETag")
         return VersionToken(value)
 
     @staticmethod

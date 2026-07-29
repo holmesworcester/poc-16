@@ -344,13 +344,15 @@ class S3Store:
     @staticmethod
     def _response_etag(response, operation, *, mutation):
         etag = response.get("ETag") if isinstance(response, dict) else None
-        if not isinstance(etag, str) or not etag:
-            error = ValueError("successful response has no ETag")
+        if not isinstance(etag, str) or not etag or etag.startswith("W/"):
+            error = ValueError(
+                "successful response has no usable strong ETag")
             if mutation:
                 raise OutcomeUnknown(
-                    f"S3 {operation} applied without a usable ETag") from error
+                    f"S3 {operation} applied without a usable strong ETag"
+                ) from error
             raise StoreError(
-                f"S3 {operation} response has no usable ETag") from error
+                f"S3 {operation} response has no usable strong ETag") from error
         return etag
 
     @staticmethod

@@ -164,21 +164,21 @@ def test_native_r2_list_rejects_unbounded_unique_cursors():
     ]) == 3
 
 
-@pytest.mark.parametrize("etag", (None, ""))
-def test_native_r2_rejects_missing_or_empty_root_etag(etag):
+@pytest.mark.parametrize("etag", (None, "", 'W/"weak"'))
+def test_native_r2_rejects_unusable_root_etag(etag):
     bucket = Bucket()
     bucket.data["root"] = b"root"
     bucket.etags["root"] = etag
     store = R2BindingStore(bucket)
 
-    with pytest.raises(StoreError, match="no ETag"):
+    with pytest.raises(StoreError, match="no usable strong ETag"):
         run(store.read_versioned("root"))
 
     class ResultWithoutToken(Bucket):
         async def put(self, key, value, **options):
             return R2Object(key, b"", etag)
 
-    with pytest.raises(StoreError, match="no ETag"):
+    with pytest.raises(StoreError, match="no usable strong ETag"):
         run(R2BindingStore(ResultWithoutToken()).cas(
             "root", ABSENT, b"candidate"))
 
