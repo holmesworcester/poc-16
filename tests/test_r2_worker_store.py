@@ -14,6 +14,7 @@ from core.object_store import (
     OutcomeUnknown,
     RetryableStoreError,
     STALE,
+    StoreError,
     ensure_object_async,
 )
 
@@ -146,6 +147,42 @@ def test_native_r2_list_uses_truncation_and_opaque_cursors():
     ] == [None, "2", "4"]
 
 
+def test_native_r2_list_rejects_unbounded_unique_cursors():
+    class Endless(Bucket):
+        async def list(self, prefix, limit, cursor=None):
+            self.calls.append(("list", prefix, limit, cursor))
+            ordinal = int(cursor or 0)
+            return Page([], True, str(ordinal + 1))
+
+    bucket = Endless()
+    store = R2BindingStore(bucket, max_list_pages=3)
+
+    with pytest.raises(StoreError, match="page budget"):
+        run(store.list("pile/"))
+    assert len([
+        call for call in bucket.calls if call[0] == "list"
+    ]) == 3
+
+
+@pytest.mark.parametrize("etag", (None, ""))
+def test_native_r2_rejects_missing_or_empty_root_etag(etag):
+    bucket = Bucket()
+    bucket.data["root"] = b"root"
+    bucket.etags["root"] = etag
+    store = R2BindingStore(bucket)
+
+    with pytest.raises(StoreError, match="no ETag"):
+        run(store.read_versioned("root"))
+
+    class ResultWithoutToken(Bucket):
+        async def put(self, key, value, **options):
+            return R2Object(key, b"", etag)
+
+    with pytest.raises(StoreError, match="no ETag"):
+        run(R2BindingStore(ResultWithoutToken()).cas(
+            "root", ABSENT, b"candidate"))
+
+
 def test_native_r2_never_maps_throttle_or_transport_to_stale():
     class Error(Exception):
         def __init__(self, status=None):
@@ -170,3 +207,5 @@ def test_native_r2_guards_authoritative_mutations_and_prefixes():
         run(store.delete("obj/" + "0" * 64))
     with pytest.raises(ValueError, match="key"):
         R2BindingStore(Bucket(), "../escape")
+    with pytest.raises(ValueError, match="page budget"):
+        R2BindingStore(Bucket(), max_list_pages=0)
