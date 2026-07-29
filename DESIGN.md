@@ -649,8 +649,21 @@ These numbers are diagnostic, not cross-machine service guarantees.
   read-only Lambda or Worker deployment is intentionally bound to one exact
   workspace and prefix. Publishing remains a separate host operation. A
   bucket-wide S3 guard can freeze lifecycle mutation plus authoritative-key
-  deletion, ACL mutation, tag mutation, and direct annotation mutation while
-  attached, but pre-existing lifecycle rules, ACLs, tags, annotations,
-  annotation replication, and administrators able to replace that policy
-  remain trusted. Bucket garbage collection and a writable serverless
-  publisher remain future work.
+  deletion, ACL mutation, tag mutation, direct annotation mutation, and
+  ETag-preserving encryption-key mutation while attached. Pre-existing
+  lifecycle rules and metadata, replication principals, KMS administrators,
+  and administrators able to replace that policy remain trusted at the
+  provider substrate.
+- That provider boundary is distinct from application-level infrastructure
+  authority. The intended control plane is a two-community link. A separate
+  operations workspace admits infrastructure principals; a target workspace
+  invites one of those principals for an exact service scope; and the node
+  accepts and publishes its deployment binding. The binding remains active
+  only while both DAGs support it, and either the workspace or the
+  infrastructure node may end it through ordinary facts. This role does not
+  imply content membership. An idempotent external reconciler must turn that
+  desired state into IAM/R2 credentials, grant-secret rotation, deployment
+  creation, and teardown. Until revocation has been observed at that external
+  plane, an in-band leave fact alone cannot make a former provider credential
+  harmless. Bucket garbage collection and a writable serverless publisher
+  remain future work.
