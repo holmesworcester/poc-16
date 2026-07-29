@@ -267,7 +267,7 @@ class S3Store:
         self._mutation_client = mutation_client
 
     @staticmethod
-    def _sdk_clients(config):
+    def _sdk_clients(config, **provider_credentials):
         try:
             boto3 = importlib.import_module("boto3")
             botocore_config = importlib.import_module("botocore.config")
@@ -295,7 +295,7 @@ class S3Store:
                 "mode": config.retry_mode,
                 "total_max_attempts": 1,
             })
-        client_args = {}
+        client_args = dict(provider_credentials)
         if config.region_name is not None:
             client_args["region_name"] = config.region_name
         if config.endpoint_url is not None:
