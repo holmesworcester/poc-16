@@ -20,7 +20,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.bench_sync import build_seed
-from core import cmds, snapshot
+import facts
+
+from core import snapshot
 from core import sync as sync_module
 from core.crypto import h
 from core.object_store import CREATED
@@ -93,7 +95,7 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
     try:
         for step in range(posts):
             started = time.perf_counter()
-            cmds.post(
+            facts.content.message.post(
                 node, workspace, "general", f"latency-{step}",
                 ts=high_ts + step + 1)
             post_times.append(time.perf_counter() - started)

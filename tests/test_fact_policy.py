@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import facts
-from core import cmds, indexes
+from core import indexes
 from core.crypto import keypair
 from core.fact import Fact
 from core.node import Node
@@ -124,7 +124,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
         tmp_path, monkeypatch, atoms):
     """The registry check remains load-bearing if shape validation is lax."""
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     secret, public = node.identity(workspace)
     malformed = Fact(
         "msg", 10, atoms,
@@ -147,7 +147,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
 def test_runtime_policy_rejects_a_forged_nonancestor(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     descriptor_fid = send_bytes(
         node, workspace, "one.bin", b"ancestor", ts=10)
     original = node.by_type(workspace, "chunk")[0]
@@ -177,7 +177,7 @@ def test_runtime_policy_rejects_a_forged_nonancestor(
 
 def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     alice_secret, alice = node.identity(workspace)
 
     bob_secret, bob, _ = add_member(
@@ -185,24 +185,24 @@ def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
         inviter=(alice_secret, alice))
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    cmds.bind_device(node, workspace, "bob-primary")
+    facts.auth.device.bind(node, workspace, "bob-primary")
 
     devices = []
     for label in ("bob-phone", "bob-laptop"):
         secret, public = keypair()
         node.keychain.add_identity(secret)
-        cmds.grant_device(node, workspace, bob, public, label)
+        facts.auth.device_invite.grant(node, workspace, bob, public, label)
         devices.append((secret, public))
 
     node.bind_identity(workspace, devices[0][1])
-    first = cmds.post(node, workspace, "general", "owned on phone", ts=30)
+    first = facts.content.message.post(node, workspace, "general", "owned on phone", ts=30)
     node.bind_identity(workspace, devices[1][1])
     owner_action = node.fact_of(
-        workspace, cmds.remove(node, workspace, first, ts=31))
+        workspace, facts.content.delete.remove(node, workspace, first, ts=31))
     assert owner_action.body["mode"] == _policy.OWNER
 
     node.bind_identity(workspace, devices[0][1])
-    second = cmds.post(node, workspace, "general", "owned on phone 2", ts=32)
+    second = facts.content.message.post(node, workspace, "general", "owned on phone 2", ts=32)
     charlie_secret, charlie, _ = add_member(
         node, workspace, "Charlie", ts=40,
         inviter=(alice_secret, alice))
@@ -210,22 +210,22 @@ def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
     node.bind_identity(workspace, charlie)
     with pytest.raises(
             ValueError, match="only the owner or an admin"):
-        cmds.remove(node, workspace, second, ts=42)
+        facts.content.delete.remove(node, workspace, second, ts=42)
 
     node.bind_identity(workspace, alice)
     admin_action = node.fact_of(
-        workspace, cmds.remove(node, workspace, second, ts=43))
+        workspace, facts.content.delete.remove(node, workspace, second, ts=43))
     assert admin_action.body["mode"] == _policy.ADMIN
 
 
 def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    posted = cmds.post(
+    posted = facts.content.message.post(
         node, workspace, "general", "Bob's message", ts=20)
     descriptor = send_bytes(
         node, workspace, "bob.bin", b"Bob's bytes", ts=21)
@@ -251,7 +251,7 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     # first; every action still travels through the ordinary fact pipeline.
     for ts, tag in enumerate(("chunk", "msg", "file_bao"), start=30):
         target = targets[tag]
-        action_fid = cmds.remove(
+        action_fid = facts.content.delete.remove(
             node, workspace, target, ts=ts)
         action = node.fact_of(workspace, action_fid)
         assert action.body == {

@@ -11,7 +11,9 @@ from urllib.error import HTTPError
 
 import pytest
 
-from core import cmds, limits
+import facts
+
+from core import limits
 from core.close import encode_pile
 from core.crypto import (
     h,
@@ -109,7 +111,7 @@ def run(awaitable):
 
 def worker_world(tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request_fact.payload(
         node, workspace, "sync", now + 60_000, now))

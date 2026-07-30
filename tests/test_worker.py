@@ -5,7 +5,9 @@ import sqlite3
 
 import pytest
 
-from core import cmds, indexes, merkle_map, snapshot
+import facts
+
+from core import indexes, merkle_map, snapshot
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon
@@ -26,10 +28,10 @@ def putter(store):
 
 def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "keeps another slot", ts=2)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "keeps another slot", ts=2)
     for ordinal in range(100):
-        cmds.post(
+        facts.content.message.post(
             node, workspace, "general", f"message-{ordinal}",
             ts=10 + ordinal)
     now = now_ms()
@@ -55,7 +57,7 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
 def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
     """The deployed CF auth path remains usable when SQLite is unavailable."""
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = now_ms()
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
@@ -75,7 +77,7 @@ def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
 def test_worker_mint_rejects_forged_outer_map_metadata(
         tmp_path, name, field):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = now_ms()
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
@@ -111,8 +113,8 @@ def test_worker_mint_rejects_forged_outer_map_metadata(
 def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "keeps another slot", ts=2)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "keeps another slot", ts=2)
     now = now_ms()
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
@@ -141,7 +143,7 @@ def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
 def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)
     node.keychain.add_identity(bob_secret)
@@ -156,7 +158,7 @@ def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
     assert before.mint(pile, now) == (bob, "sync")
 
     node.bind_identity(workspace, founder)
-    cmds.evict(node, workspace, bob)
+    facts.auth.removal.evict(node, workspace, bob)
     after = WorkerView.from_root(
         store.get("root"), lambda oid: store.get("obj/" + oid))
     assert not after.principal_active("member", bob)
@@ -165,8 +167,8 @@ def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
 
 def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    target = cmds.post(node, workspace, "general", "doomed", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
     store = node.store(workspace)
     old_root = store.get("root")
     old = WorkerView.from_root(
@@ -176,7 +178,7 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     assert old._reader(indexes.FACT).get(
         indexes.action_key(sid)) == {"state": "clear"}
 
-    action_fid = cmds.remove(node, workspace, target, ts=20)
+    action_fid = facts.content.delete.remove(node, workspace, target, ts=20)
     new_root = store.get("root")
     assert new_root != old_root
     new = WorkerView.from_root(

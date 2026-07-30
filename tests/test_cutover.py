@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from core import cmds, indexes, legacy_v7, snapshot
+import facts
+
+from core import indexes, legacy_v7, snapshot
 from core.candidate_archive import reconstruct
 from core.close import encode_pile
 from core.crypto import h
@@ -75,8 +77,8 @@ def _outside(members, deps):
 
 def test_root_atomically_names_four_uniform_bounded_maps(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "indexed", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "indexed", ts=10)
     raw = node.store(workspace).get("root")
     body = json.loads(raw)
     committed = snapshot.decode_root(raw)
@@ -92,9 +94,9 @@ def test_root_atomically_names_four_uniform_bounded_maps(tmp_path):
 
 def test_incremental_and_full_compilation_are_byte_identical(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     for ordinal in range(30):
-        cmds.post(
+        facts.content.message.post(
             node, workspace, "general", f"message-{ordinal}",
             ts=10 + ordinal)
     expected = node.store(workspace).get("root")
@@ -104,7 +106,7 @@ def test_incremental_and_full_compilation_are_byte_identical(tmp_path):
 
 def test_unknown_stamp_can_republish_only_the_exact_known_envelope(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     honest = node.store(workspace).get("root")
     body = json.loads(honest)
 
@@ -132,15 +134,15 @@ def test_unknown_stamp_can_republish_only_the_exact_known_envelope(tmp_path):
 
 def test_real_v7_pile_leaves_cut_over_through_legacy_decoder_only(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     cuts, timestamp = 0, 10
     while cuts < 1:
-        fid = cmds.post(
+        fid = facts.content.message.post(
             node, workspace, "general", f"legacy-{timestamp}",
             ts=timestamp)
         cuts += int(fid[:8], 16) % legacy_v7.CUT == 0
         timestamp += 1
-    cmds.post(node, workspace, "general", "after-cut", ts=timestamp)
+    facts.content.message.post(node, workspace, "general", "after-cut", ts=timestamp)
 
     store = node.store(workspace)
     facts = {
@@ -206,7 +208,7 @@ def test_empty_v7_manifest_cannot_supply_or_replace_the_anchor(
         tmp_path, local_catalog):
     node = Node(str(tmp_path / "node"))
     if local_catalog:
-        workspace = cmds.create(node, "alice", ts=1)
+        workspace = facts.auth.workspace.create(node, "alice", ts=1)
     else:
         workspace = "a" * 64
         node.add_workspace(workspace, "empty-v7", peers=[])
@@ -235,7 +237,7 @@ def test_present_empty_root_is_never_treated_as_rootless(
         tmp_path, local_catalog):
     node = Node(str(tmp_path / "node"))
     if local_catalog:
-        workspace = cmds.create(node, "alice", ts=1)
+        workspace = facts.auth.workspace.create(node, "alice", ts=1)
     else:
         workspace = "b" * 64
         node.add_workspace(workspace, "empty-root", peers=[])

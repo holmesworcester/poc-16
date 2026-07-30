@@ -5,7 +5,7 @@ import os
 import pytest
 
 import facts
-from core import cmds, suppression_state
+from core import suppression_state
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
@@ -61,9 +61,9 @@ def _author_eviction(node, workspace, target, ts):
 
 def test_composite_root_has_no_legacy_removal_object(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    target = cmds.post(node, workspace, "general", "doomed", ts=10)
-    action_fid = cmds.remove(node, workspace, target, ts=20)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
+    action_fid = facts.content.delete.remove(node, workspace, target, ts=20)
 
     root = json.loads(node.store(workspace).get("root"))
     assert set(root) == {
@@ -78,9 +78,9 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
 def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
-    target = cmds.post(node, workspace, "general", "doomed", ts=10)
-    cmds.remove(node, workspace, target, ts=20)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
+    facts.content.delete.remove(node, workspace, target, ts=20)
     expected_root = node.store(workspace).get("root")
     expected_actions = _action_rows(node, workspace)
 
@@ -95,10 +95,10 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
 
 def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     provider = member_src(node, workspace, bob)
-    eviction = cmds.evict(node, workspace, bob)
+    eviction = facts.auth.removal.evict(node, workspace, bob)
 
     ts = node.fact_of(workspace, eviction).ts + 1
     item = message(workspace, bob, "general", "must not land", ts)
@@ -117,11 +117,11 @@ def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
 
 def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     _, carol, _ = add_member(node, workspace, "carol", ts=20)
-    admin_fid = cmds.grant_admin(node, workspace, bob)
-    eviction = cmds.evict(node, workspace, bob)
+    admin_fid = facts.auth.admin.grant(node, workspace, bob)
+    eviction = facts.auth.removal.evict(node, workspace, bob)
 
     ts = node.fact_of(workspace, eviction).ts + 1
     item = removal(workspace, bob, carol, ts)
@@ -140,10 +140,10 @@ def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
 
 def test_terminal_member_action_covers_a_future_provider(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_identity = add_member(node, workspace, "bob", ts=10)[:2]
     bob_secret, bob = bob_identity
-    cmds.evict(node, workspace, bob)
+    facts.auth.removal.evict(node, workspace, bob)
 
     _, rejoined, _ = add_member(
         node, workspace, "bob-again", ts=30,
@@ -162,7 +162,7 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
 def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
     """An earlier action deactivates a later fact even when it arrives last."""
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
     base = closed_subset(source, workspace, all_fids(source, workspace))
 
@@ -188,7 +188,7 @@ def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
     assert all(
         peer.candidate_of(workspace, posted.fid) == posted
         and peer.fact_of(workspace, posted.fid) is None
-        and cmds.msgs(peer, workspace) == []
+        and facts.content.message.messages(peer, workspace) == []
         for peer in peers
     )
     assert peers[0].store(workspace).get("root") \
@@ -198,7 +198,7 @@ def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
 
 def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
     base = closed_subset(source, workspace, all_fids(source, workspace))
 
@@ -253,7 +253,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
 
 def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder = source.identity(workspace)
     _, bob, _ = add_member(source, workspace, "bob", ts=10)
     common = closed_subset(source, workspace, all_fids(source, workspace))
@@ -292,9 +292,9 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
         tmp_path):
     """Current dependency settlement never rewrites historical admission."""
     base = Node(str(tmp_path / "base"))
-    workspace = cmds.create(base, "alice", ts=1)
+    workspace = facts.auth.workspace.create(base, "alice", ts=1)
     founder_secret, founder = base.identity(workspace)
-    cmds.bind_device(base, workspace, "alice-primary")
+    facts.auth.device.bind(base, workspace, "alice-primary")
     common = closed_subset(base, workspace, all_fids(base, workspace))
 
     target_secret, target = keypair()
@@ -314,10 +314,10 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
             target, label, claim_ts)
 
         peer.bind_identity(workspace, target)
-        posted = cmds.post(
+        posted = facts.content.message.post(
             peer, workspace, "general", "same immutable message", ts=200)
         peer.bind_identity(workspace, founder)
-        deletion = cmds.remove(peer, workspace, posted, ts=210)
+        deletion = facts.content.delete.remove(peer, workspace, posted, ts=210)
         peers.append((peer, claim, posted, deletion))
 
     left, right = peers
@@ -369,25 +369,25 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     _, carol, _ = add_member(node, workspace, "carol", ts=20)
 
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    cmds.bind_device(node, workspace, "bob-primary")
+    facts.auth.device.bind(node, workspace, "bob-primary")
     child_secret, child = keypair()
     node.keychain.add_identity(child_secret)
-    cmds.grant_device(node, workspace, bob, child, "bob-child")
+    facts.auth.device_invite.grant(node, workspace, bob, child, "bob-child")
 
     node.bind_identity(workspace, founder)
-    cmds.grant_admin(node, workspace, child)
-    cmds.evict(node, workspace, bob)
+    facts.auth.admin.grant(node, workspace, child)
+    facts.auth.removal.evict(node, workspace, bob)
 
     node.bind_identity(workspace, child)
     with pytest.raises(ValueError, match="outside the canonical set"):
-        cmds.evict(node, workspace, carol)
+        facts.auth.removal.evict(node, workspace, carol)
     assert not suppression_state.active(
         node.idx(workspace), facts.principal_sid("member", carol))
 
@@ -395,15 +395,15 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
 def test_candidate_proof_sync_carries_actions_and_their_projection(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
-    target = cmds.post(source, workspace, "general", "doomed", ts=10)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    target = facts.content.message.post(source, workspace, "general", "doomed", ts=10)
     before = closed_subset(source, workspace, all_fids(source, workspace))
 
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", peers=[])
     deliver(destination, workspace, before)
     destination.turn(workspace)
-    action_fid = cmds.remove(source, workspace, target, ts=20)
+    action_fid = facts.content.delete.remove(source, workspace, target, ts=20)
 
     class LocalPeer:
         accepts_push = True
@@ -441,10 +441,10 @@ def test_candidate_proof_sync_carries_actions_and_their_projection(
 def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
-    poisoned_target = cmds.post(
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    poisoned_target = facts.content.message.post(
         source, workspace, "general", "poison witness", ts=10)
-    honest_target = cmds.post(
+    honest_target = facts.content.message.post(
         source, workspace, "general", "honest witness", ts=11)
     before = closed_subset(source, workspace, all_fids(source, workspace))
 
@@ -453,8 +453,8 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
     deliver(destination, workspace, before)
     destination.turn(workspace)
 
-    cmds.remove(source, workspace, poisoned_target, ts=20)
-    cmds.remove(source, workspace, honest_target, ts=21)
+    facts.content.delete.remove(source, workspace, poisoned_target, ts=20)
+    facts.content.delete.remove(source, workspace, honest_target, ts=21)
     rows = {
         sid: (fid, evidence)
         for sid, fid, evidence in _action_rows(source, workspace)

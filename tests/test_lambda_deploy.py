@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 import pytest
 
 from adapters.s3 import S3Config
-from core import cmds
+import facts
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
@@ -101,7 +101,7 @@ def deployment_args(**changes):
 
 def world(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
@@ -158,8 +158,8 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
 
 def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
     node = Node(str(tmp_path / "node"))
-    first = cmds.create(node, "first", ts=1)
-    second = cmds.create(node, "second", ts=2)
+    first = facts.auth.workspace.create(node, "first", ts=1)
+    second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
     pile = encode_pile(
         request.payload(node, first, "sync", now + 60_000, now),

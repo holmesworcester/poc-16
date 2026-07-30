@@ -7,7 +7,9 @@ import sys
 import pytest
 
 from adapters import host
-from core import cli, cmds, daemon
+import facts
+
+from core import cli, daemon
 from core.crypto import keypair
 from core.node import Node
 from core.store import FsStore
@@ -62,8 +64,8 @@ def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
     first = Node(
         str(tmp_path / "first"), initial_secret=secret,
         store_factory=factory)
-    workspace = cmds.create(first, "shared", ts=1)
-    fid = cmds.post(
+    workspace = facts.auth.workspace.create(first, "shared", ts=1)
+    fid = facts.content.message.post(
         first, workspace, "general", "provider-backed", ts=2)
 
     second = Node(
@@ -73,7 +75,7 @@ def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
     second.rebuild(workspace)
 
     assert second.fact_of(workspace, fid).body["text"] == "provider-backed"
-    assert cmds.msgs(second, workspace) == cmds.msgs(first, workspace)
+    assert facts.content.message.messages(second, workspace) == facts.content.message.messages(first, workspace)
     assert len(clients) >= 2
     physical = f"tenant/integration/workspace/{workspace}/root"
     assert physical in bucket.data
@@ -82,8 +84,8 @@ def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
 def test_full_workspace_ids_create_disjoint_bucket_namespaces(tmp_path):
     factory, bucket, _ = _injected_factory(S3)
     node = Node(str(tmp_path), store_factory=factory)
-    first = cmds.create(node, "first", ts=1)
-    second = cmds.create(node, "second", ts=2)
+    first = facts.auth.workspace.create(node, "first", ts=1)
+    second = facts.auth.workspace.create(node, "second", ts=2)
     assert first != second
 
     prefixes = {
@@ -226,7 +228,7 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     state = tmp_path / "state"
     bootstrap = Node(
         str(state), initial_secret=secret, store_factory=factory)
-    workspace = cmds.create(bootstrap, "daemon", ts=1)
+    workspace = facts.auth.workspace.create(bootstrap, "daemon", ts=1)
     config_path = tmp_path / "store.json"
     config_path.write_text(json.dumps(S3))
     seen = {}

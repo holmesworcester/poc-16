@@ -5,7 +5,9 @@ import os
 import random
 import tempfile
 
-from core import cmds, daemon
+import facts
+
+from core import daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.ingress import stage_pile
@@ -32,11 +34,11 @@ def invoke_mint(node, workspace, pile):
 
 def suppression_world(path, initial_secret=None):
     """A valid set with targets and PRODUCTION deletions
-    (facts/content/delete.py via cmds.remove), authored in one fixed order."""
+    (facts/content/delete.py via facts.content.delete.remove), authored in one fixed order."""
     node = Node(str(path), initial_secret=initial_secret)
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     targets = [
-        cmds.post(
+        facts.content.message.post(
             node, workspace, f"channel-{ordinal % 2}",
             f"message-{ordinal}", ts=10 + ordinal)
         for ordinal in range(8)
@@ -45,10 +47,10 @@ def suppression_world(path, initial_secret=None):
         node, workspace, "suppression.bin",
         b"attachment-cascade-" * 4096, channel="channel-0", ts=30)
     deletions = [
-        cmds.remove(node, workspace, targets[ordinal], ts=100 + ordinal)
+        facts.content.delete.remove(node, workspace, targets[ordinal], ts=100 + ordinal)
         for ordinal in (1, 4, 6)
     ]
-    deletions.append(cmds.remove(node, workspace, attachment, ts=110))
+    deletions.append(facts.content.delete.remove(node, workspace, attachment, ts=110))
     return node, workspace, targets, deletions
 
 
@@ -81,11 +83,11 @@ def query_state(node, workspace=None):
             raise ValueError("query_state needs one workspace")
         workspace = known[0]
     queries = (
-        ("admins", cmds.admins),
-        ("devices", cmds.devices),
-        ("files", cmds.files),
-        ("members", cmds.members),
-        ("messages", cmds.msgs),
+        ("admins", facts.auth.admin.admins),
+        ("devices", facts.auth.device.devices),
+        ("files", facts.content.file.files),
+        ("members", facts.auth.user.members),
+        ("messages", facts.content.message.messages),
     )
     return tuple(
         (
@@ -207,7 +209,7 @@ def send_bytes(node, workspace, name, data, channel="general", ts=None):
     try:
         with os.fdopen(handle, "wb") as spool:
             spool.write(data)
-        return cmds.send_file(
+        return facts.content.file.send(
             node, workspace, channel, path, name=name, ts=ts)
     finally:
         os.unlink(path)

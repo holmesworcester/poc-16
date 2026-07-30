@@ -18,7 +18,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import bao, cmds
+import facts
+
+from core import bao
 from core.cli import ctl
 from core.node import Node
 from facts.content import file as file_family
@@ -91,7 +93,7 @@ def bench_send(size):
     """Author and save through the real in-process command path."""
     with tempfile.TemporaryDirectory(dir=WORK) as scratch:
         node = Node(os.path.join(scratch, "node"))
-        workspace = cmds.create(node, "alice")
+        workspace = facts.auth.workspace.create(node, "alice")
         input_path = source(os.path.join(scratch, "input"), size)
         start = now()
         fid = file_family.send(

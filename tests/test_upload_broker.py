@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from core import cmds
+import facts
 from core.close import encode_pile
 from core.crypto import h
 from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES, PAGE_BATCH
@@ -109,7 +109,7 @@ def world(
         nonce=lambda count: SESSION if count == 16 else b""):
     clock = clock or Clock()
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     public = node.identity_id(workspace)
     proof = encode_pile(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
@@ -780,7 +780,7 @@ def test_broker_distinguishes_provider_failure_from_bad_proof(tmp_path):
         asyncio.run(broker.open(proof, vector.manifest, pile()))
 
     foreign = Node(str(tmp_path / "foreign"))
-    foreign_workspace = cmds.create(foreign, "mallory", ts=1)
+    foreign_workspace = facts.auth.workspace.create(foreign, "mallory", ts=1)
     foreign_root = foreign.store(foreign_workspace).get("root")
 
     class ForeignRoot:

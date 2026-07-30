@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlsplit
 import pytest
 
 import facts
-from core import bao, cmds
+from core import bao
 from core.close import encode_pile
 from core.crypto import h
 from core.node import Node
@@ -158,7 +158,7 @@ def UploadClient(source, broker, puts, now, **options):
 def world(tmp_path, provider="s3", objects=()):
     clock, nonces = Clock(), Nonces()
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     member = node.member_for(workspace)
     signer = Signer(provider, clock)
     policy = UploadSessionPolicy(

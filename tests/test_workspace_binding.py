@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import facts
-from core import catalog, cmds, daemon
+from core import catalog, daemon
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
@@ -26,8 +26,8 @@ from facts.content.message import message
 
 def two_workspaces(tmp_path):
     node = Node(str(tmp_path / "node"))
-    first = cmds.create(node, "first", ts=1)
-    second = cmds.create(node, "second", ts=2)
+    first = facts.auth.workspace.create(node, "first", ts=1)
+    second = facts.auth.workspace.create(node, "second", ts=2)
     assert node.identity_id(first) == node.identity_id(second)
     return node, first, second
 
@@ -241,7 +241,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
 
 def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "workspace", ts=1)
+    workspace = facts.auth.workspace.create(node, "workspace", ts=1)
     root = node.store(workspace).get("root")
     foreign = Fact(
         "sample", 2, [], {"foreign": True}, "f" * 64)

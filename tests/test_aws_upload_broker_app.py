@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from core import cmds
+import facts
 from core.close import encode_pile
 from core.crypto import h
 from core.node import Node
@@ -147,7 +147,7 @@ def function_event(
 
 def world(tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
     backing = node.store(workspace)

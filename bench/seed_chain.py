@@ -23,7 +23,7 @@ from bench.bench_sync import (
     admit_batch,
     bulk_author,
 )
-from core import cmds
+import facts
 from core.crypto import keypair, load_sk
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
@@ -198,7 +198,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     root_secret, _ = keys.next()
     node = Node(node_dir, initial_secret=root_secret)
     started = time.perf_counter()
-    workspace = cmds.create(node, "alice", ts=keys.timestamp())
+    workspace = facts.auth.workspace.create(node, "alice", ts=keys.timestamp())
     root_ts = node.fact_of(workspace, workspace).ts
     identities, parents, depths, users = grow_tree(
         node, workspace, n_members, root_ts + 1, topology_rng,

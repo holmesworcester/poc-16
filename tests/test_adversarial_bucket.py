@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from adapters.r2 import R2BindingStore
-from core import cmds
+import facts
 from core.crypto import h
 from core.object_store import (
     ABSENT,
@@ -523,7 +523,7 @@ def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
 
     node_dir = tmp_path / "node"
     node = Node(str(node_dir))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     old_root = node.store(workspace).get("root")
     for index in node._idx.values():
         index.close()
@@ -531,7 +531,7 @@ def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
     script = r"""
 import os
 import sys
-from core import cmds
+import facts
 from core.node import Node
 from core.repository_applier import RepositoryApplier
 
@@ -542,7 +542,7 @@ async def die_before_retirement(*args, **kwargs):
     os._exit(73)
 
 RepositoryApplier.retire = die_before_retirement
-cmds.post(node, workspace, "general", "process crash", ts=2)
+facts.content.message.post(node, workspace, "general", "process crash", ts=2)
 raise AssertionError("applier did not reach retirement")
 """
     completed = _run_python(script, node_dir, workspace)
@@ -550,7 +550,7 @@ raise AssertionError("applier did not reach retirement")
 
     reopened = Node(str(node_dir))
     assert reopened.store(workspace).get("root") != old_root
-    assert [entry["text"] for entry in cmds.msgs(
+    assert [entry["text"] for entry in facts.content.message.messages(
         reopened, workspace)] == ["process crash"]
     pending = reopened.store(workspace).list("pile/")
     assert len(pending) == 1

@@ -3,7 +3,7 @@ import random
 
 import facts
 
-from core import catalog, cmds, indexes, merkle_map, snapshot
+from core import catalog, indexes, merkle_map, snapshot
 from core.crypto import h, keypair
 from core.fact import encode
 from core.kernel import offer_src
@@ -93,10 +93,10 @@ def _catalog_scopes(node, workspace, fid):
 def test_type_key_ref_and_offer_ranges_match_catalog_without_manifest_reads(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    message = cmds.post(
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    message = facts.content.message.post(
         node, workspace, "general", "indexed", ts=10)
-    action = cmds.remove(node, workspace, message, ts=20)
+    action = facts.content.delete.remove(node, workspace, message, ts=20)
     target = node.candidate_of(workspace, message)
     public = node.identity_id(workspace)
     fetched = []
@@ -128,9 +128,9 @@ def test_type_key_ref_and_offer_ranges_match_catalog_without_manifest_reads(
 def test_losing_then_winning_offer_rewires_reverse_dependency_posting(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     secret, public = node.identity(workspace)
-    message = cmds.post(
+    message = facts.content.message.post(
         node, workspace, "general", "authority target", ts=10)
     target = node.fact_of(workspace, message)
     original = offer_src(
@@ -184,7 +184,7 @@ def test_losing_then_winning_offer_rewires_reverse_dependency_posting(
         == _canonical_root(node, workspace)
 
     before = tuple((row.rank, row.fid) for row in winning)
-    cmds.post(node, workspace, "general", "unrelated", ts=30)
+    facts.content.message.post(node, workspace, "general", "unrelated", ts=30)
     after, _ = _postings(
         _view(node, workspace), "author", message, public)
     assert tuple((row.rank, row.fid) for row in after) == before
@@ -195,7 +195,7 @@ def test_losing_then_winning_offer_rewires_reverse_dependency_posting(
 def test_scope_route_finds_suppression_cascade_and_next_active_offer(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder_secret, founder = node.identity(workspace)
     first = send_bytes(
         node, workspace, "same-a.bin", b"same payload" * 2048, ts=20)
@@ -218,7 +218,7 @@ def test_scope_route_finds_suppression_cascade_and_next_active_offer(
 
     node.keychain.add_identity(founder_secret)
     node.bind_identity(workspace, founder)
-    action = cmds.remove(node, workspace, winner, ts=100)
+    action = facts.content.delete.remove(node, workspace, winner, ts=100)
     after = _view(node, workspace)
     sid = indexes.fact_key(winner)
     assert after.suppression(sid) == {
@@ -260,9 +260,9 @@ def test_scope_route_finds_suppression_cascade_and_next_active_offer(
 
 def test_authority_winner_cache_still_saves_conflict_range_fetches(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     secret, public = node.identity(workspace)
-    message = cmds.post(
+    message = facts.content.message.post(
         node, workspace, "general", "many signatures", ts=10)
     target = node.fact_of(workspace, message)
     duplicates = [
@@ -294,15 +294,15 @@ def test_transitive_liveness_postings_follow_same_rank_provider_rewire(
         tmp_path):
     """A grandchild's direct edges stay fixed while an ancestor winner moves."""
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
-    cmds.bind_device(node, workspace, "primary")
+    facts.auth.device.bind(node, workspace, "primary")
 
     device_secrets = []
     for label in ("sibling-a", "sibling-b"):
         secret, public = keypair()
         node.keychain.add_identity(secret)
-        cmds.grant_device(node, workspace, founder, public, label)
+        facts.auth.device_invite.grant(node, workspace, founder, public, label)
         device_secrets.append((secret, public))
 
     target_secret, target = keypair()
@@ -367,15 +367,15 @@ def test_seeded_suppression_histories_keep_incremental_and_full_roots_equal(
     for seed in range(3):
         rng = random.Random(seed)
         node = Node(str(tmp_path / f"node-{seed}"))
-        workspace = cmds.create(node, f"alice-{seed}", ts=1)
+        workspace = facts.auth.workspace.create(node, f"alice-{seed}", ts=1)
         live = []
         for ordinal in range(8):
-            live.append(cmds.post(
+            live.append(facts.content.message.post(
                 node, workspace, "general",
                 f"seed-{seed}-{ordinal}", ts=10 + ordinal))
             if len(live) > 2 and rng.randrange(3) == 0:
                 victim = live.pop(rng.randrange(len(live)))
-                cmds.remove(
+                facts.content.delete.remove(
                     node, workspace, victim,
                     ts=100 + ordinal)
             assert node.store(workspace).get("root") \

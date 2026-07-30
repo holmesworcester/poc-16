@@ -4,10 +4,11 @@ import json
 
 import pytest
 
+import facts
+
 from core import (
     admission_proof,
     catalog,
-    cmds,
     indexes,
     merkle_map,
     repository_applier,
@@ -133,8 +134,8 @@ def _forged_archive(node, workspace, mutate):
 def test_cold_reconstruction_rejects_forged_map_metadata(
         tmp_path, name, field):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "descriptor", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "descriptor", ts=10)
     store = node.store(workspace)
     body = json.loads(store.get("root"))
     assert body["maps"][name]["root"]
@@ -152,8 +153,8 @@ def test_cold_reconstruction_rejects_forged_map_metadata(
 def test_candidate_sync_read_rejects_forged_fact_descriptor(
         tmp_path, field):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "descriptor", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "descriptor", ts=10)
     store = node.store(workspace)
     body = json.loads(store.get("root"))
     descriptor = body["maps"][indexes.FACT]
@@ -182,8 +183,8 @@ def test_candidate_sync_read_rejects_forged_fact_descriptor(
 def test_repository_applier_rejects_forged_base_map_metadata(
         tmp_path, name, field):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "before forgery", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "before forgery", ts=10)
     _, raw = _message_pile(
         node, workspace, "must not heal forged root", 20)
     store = node.store(workspace)
@@ -205,10 +206,10 @@ def test_repository_applier_rejects_forged_base_map_metadata(
 def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     provider = member_src(node, workspace, bob)
-    eviction = cmds.evict(node, workspace, bob)
+    eviction = facts.auth.removal.evict(node, workspace, bob)
     first_ts = node.candidate_of(workspace, eviction).ts + 1
     raw, dormant = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 11, first_ts)
@@ -238,7 +239,7 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     assert replay.retired is True
     assert store.get("root") == before_noop
 
-    live_fid = cmds.post(
+    live_fid = facts.content.message.post(
         node, workspace, "general", "one eligible", ts=first_ts + 100)
     view = _root_view(node, workspace)
     for fact in dormant:
@@ -301,13 +302,13 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
         tmp_path, attack, error):
     """Hash-valid trees cannot substitute arbitrary state for derivation."""
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    live = cmds.post(node, workspace, "general", "live record", ts=10)
-    cmds.remove(node, workspace, live, ts=20)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    live = facts.content.message.post(node, workspace, "general", "live record", ts=10)
+    facts.content.delete.remove(node, workspace, live, ts=20)
     bob_secret, bob, _ = add_member(
         node, workspace, "bob", ts=30)
     provider = member_src(node, workspace, bob)
-    eviction = cmds.evict(node, workspace, bob)
+    eviction = facts.auth.removal.evict(node, workspace, bob)
     first_ts = node.candidate_of(workspace, eviction).ts + 1
     raw, dormant_messages = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 1, first_ts)
@@ -351,9 +352,9 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
 
 def test_admission_proofs_are_raw_free_and_hash_authenticated(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     marker = "raw-body-must-not-be-in-the-proof"
-    fid = cmds.post(node, workspace, "general", marker, ts=10)
+    fid = facts.content.message.post(node, workspace, "general", marker, ts=10)
     store = node.store(workspace)
     view = _root_view(node, workspace)
     record = view.fact_record(fid)
@@ -375,8 +376,8 @@ def test_admission_proofs_are_raw_free_and_hash_authenticated(tmp_path):
 def test_admission_proof_traversal_enforces_every_budget_and_graph_guard(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    fid = cmds.post(node, workspace, "general", "bounded proof", ts=10)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    fid = facts.content.message.post(node, workspace, "general", "bounded proof", ts=10)
     store = node.store(workspace)
     view = _root_view(node, workspace)
     proof_oid = view.fact_record(fid)["admission"]
@@ -563,10 +564,10 @@ def test_admission_proof_traversal_enforces_every_budget_and_graph_guard(
 def test_candidate_proof_min_join_converges_without_a_range_difference(
         tmp_path, monkeypatch, dormant):
     seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
+    workspace = facts.auth.workspace.create(seed, "alice", ts=1)
     bob_secret, bob, _ = add_member(seed, workspace, "bob", ts=10)
     provider = member_src(seed, workspace, bob)
-    eviction = cmds.evict(seed, workspace, bob) if dormant else None
+    eviction = facts.auth.removal.evict(seed, workspace, bob) if dormant else None
     base = closed_subset(seed, workspace, all_fids(seed, workspace))
 
     item = message(
@@ -649,8 +650,8 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
 def test_registered_rootless_workspace_pulls_the_remote_candidate_archive(
         tmp_path, monkeypatch):
     remote = Node(str(tmp_path / "remote"))
-    workspace = cmds.create(remote, "alice", ts=1)
-    fid = cmds.post(
+    workspace = facts.auth.workspace.create(remote, "alice", ts=1)
+    fid = facts.content.message.post(
         remote, workspace, "general", "rootless catch-up", ts=10)
     local = Node(str(tmp_path / "local"))
     local.add_workspace(workspace, "registered", peers=[])
@@ -686,7 +687,7 @@ def test_registered_rootless_workspace_pulls_the_remote_candidate_archive(
 def test_compiler_omission_cannot_advance_root_or_retire_pile(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = _message_pile(
         node, workspace, "must be represented", 10)
     store = node.store(workspace)
@@ -729,7 +730,7 @@ def test_compiler_omission_cannot_advance_root_or_retire_pile(
 
 def test_f10_retirement_is_exact_per_generation_and_noop(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = _message_pile(node, workspace, "receipt", 10)
     store = node.store(workspace)
     applier = node.applier(workspace)
@@ -757,7 +758,7 @@ def test_f10_retirement_is_exact_per_generation_and_noop(tmp_path):
 def test_concurrent_appliers_rebase_without_retiring_the_stale_pile(
         tmp_path):
     seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
+    workspace = facts.auth.workspace.create(seed, "alice", ts=1)
     base = closed_subset(seed, workspace, all_fids(seed, workspace))
     first, first_raw = _message_pile(seed, workspace, "pile A", 10)
     second, second_raw = _message_pile(seed, workspace, "pile B", 11)
@@ -799,7 +800,7 @@ def test_concurrent_appliers_rebase_without_retiring_the_stale_pile(
 
 def test_empty_closed_pile_retires_after_root_checked_noop(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     raw = encode_pile((), workspace=workspace)
     store = node.store(workspace)
     root = store.get("root")
@@ -814,7 +815,7 @@ def test_empty_closed_pile_retires_after_root_checked_noop(tmp_path):
 
 def test_rootless_pile_retries_after_bootstrap_and_then_retires(tmp_path):
     seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
+    workspace = facts.auth.workspace.create(seed, "alice", ts=1)
     bootstrap = closed_subset(seed, workspace, all_fids(seed, workspace))
 
     store = FsStore(str(tmp_path / "rootless"))
@@ -841,7 +842,7 @@ def test_rootless_pile_retries_after_bootstrap_and_then_retires(tmp_path):
 
 def test_crash_after_apply_survives_a_later_root_advance(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = _message_pile(
         node, workspace, "definite CAS", 10)
     later, later_raw = _message_pile(

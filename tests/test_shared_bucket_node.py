@@ -5,7 +5,9 @@ import sqlite3
 
 import pytest
 
-from core import bao, cmds, indexes
+import facts
+
+from core import bao, indexes
 from core.close import close
 from core.crypto import h, keypair
 from core.node import Node
@@ -121,7 +123,7 @@ def _commit_facts(workspace, commit):
 def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
         tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
     first, first_raw = _message_pile(
         author, workspace, "alice", 10)
     second, second_raw = _message_pile(
@@ -166,7 +168,7 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
 
 def test_opaque_token_is_not_root_content_identity(tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
     item, raw = _message_pile(
         author, workspace, "opaque CAS", 10)
     bucket = ScriptedBucket(_snapshot(author.store(workspace)))
@@ -191,7 +193,7 @@ def test_opaque_token_is_not_root_content_identity(tmp_path):
 def test_applier_reconciles_unknown_root_cas(
         tmp_path, monkeypatch, applied_before_loss):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = _message_pile(
         node, workspace, "survives ambiguity", 10)
     store = node.store(workspace)
@@ -232,7 +234,7 @@ def test_applier_reconciles_unknown_root_cas(
 def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
         tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
     first, first_raw = _message_pile(
         author, workspace, "ambiguous", 10)
     second, second_raw = _message_pile(
@@ -278,7 +280,7 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
 def test_database_free_reader_stays_pinned_during_later_eviction(
         tmp_path, monkeypatch):
     writer = Node(str(tmp_path / "writer"))
-    workspace = cmds.create(writer, "alice", ts=1)
+    workspace = facts.auth.workspace.create(writer, "alice", ts=1)
     founder = writer.identity_id(workspace)
     bob_secret, bob, _ = add_member(
         writer, workspace, "bob", ts=10)
@@ -294,7 +296,7 @@ def test_database_free_reader_stays_pinned_during_later_eviction(
 
     pinned_root = store.get("root")
     pinned = _reader(workspace, store, pinned_root)
-    cmds.evict(writer, workspace, bob)
+    facts.auth.removal.evict(writer, workspace, bob)
     current_root = store.get("root")
     current = _reader(workspace, store, current_root)
     assert current_root != pinned_root
@@ -324,7 +326,7 @@ def test_database_free_reader_stays_pinned_during_later_eviction(
 def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
         tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "root", ts=1)
+    workspace = facts.auth.workspace.create(author, "root", ts=1)
     root_secret, root = author.identity(workspace)
     q_secret, q, _ = add_member(
         author, workspace, "q", ts=10)
@@ -345,7 +347,7 @@ def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
             (deep_secret, deep, "deep-primary")):
         author.keychain.add_identity(secret)
         author.bind_identity(workspace, public)
-        cmds.bind_device(author, workspace, label)
+        facts.auth.device.bind(author, workspace, label)
 
     target_secret, target = keypair()
     author.keychain.add_identity(target_secret)
@@ -446,8 +448,8 @@ def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
 def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
         tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
-    target_fid = cmds.post(
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    target_fid = facts.content.message.post(
         author, workspace, "general", "target", ts=10)
     target = author.reader(workspace).candidates().fact(target_fid)
     public = author.identity_id(workspace)

@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, peer_capability, shape
+from . import peer_capability, shape, status
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
@@ -389,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
     def _command_status(self, argv):
         if argv:
             raise ValueError("usage: core.status")
-        return cmds.status(self.node)
+        return status.describe(self.node)
 
     def _command_sync(self, argv):
         ws = self._core_workspace(argv, "core.sync <workspace>")

@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import cmds
+import facts
 from core.candidate_archive import CandidateView
 from core import sync as sync_module
 from core.close import close, encode_pile
@@ -130,7 +130,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     rng = random.Random(seed)
     n = Node(node_dir)
     t0 = perf()
-    ws = cmds.create(n, "alice")
+    ws = facts.auth.workspace.create(n, "alice")
     base_ts = now_ms()
     window = years * 365 * 24 * 3600 * 1000
     members = build_members(n, ws, n_members, base_ts)
@@ -285,7 +285,7 @@ def reconcile(A, B, ws):
 def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
          shape=None, seed=16):
     A = Node(os.path.join(base_dir, "A"))
-    ws = cmds.create(A, "alice")
+    ws = facts.auth.workspace.create(A, "alice")
     base_ts = now_ms()
     window = years * 365 * 24 * 3600 * 1000
     depth = None
@@ -453,7 +453,7 @@ def measure_write_cost(node_dir, scale, posts=200):
 
     def one(text, ts):
         acc["b"] = 0
-        cmds.post(seed, ws, "general", text, ts=ts)
+        facts.content.message.post(seed, ws, "general", text, ts=ts)
         return acc["b"]
 
     steady = [one(f"h{i}", hi + 1 + i) for i in range(posts)]      # hot-end append

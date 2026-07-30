@@ -136,6 +136,19 @@ def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
     assert handler.syncer.kicks == 1
 
 
+def test_core_status_is_local_control_not_a_fact_family_command(tmp_path):
+    node = Node(str(tmp_path))
+    handler = _handler(node)
+
+    assert _request(handler, "core.status", []) == (200, {
+        "pk": node.pk,
+        "member": node.member,
+        "workspaces": {},
+    })
+    assert "core.status" not in facts.COMMANDS
+    assert handler.syncer.kicks == 0
+
+
 def test_process_cli_forwards_path_and_tokens_without_application_parsing(
         monkeypatch, capsys):
     calls = []

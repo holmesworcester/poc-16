@@ -3,7 +3,9 @@ import sqlite3
 
 import pytest
 
-from core import catalog, cmds
+import facts
+
+from core import catalog
 from core.fact import encode
 from core.node import Node
 from facts.content.message import message
@@ -23,8 +25,8 @@ def _receipt_edges(reader, fid):
 def test_combined_edge_rows_match_authenticated_admission_semantics(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    fid = cmds.post(
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    fid = facts.content.message.post(
         node, workspace, "general", "admitted", ts=2)
     reader = node.reader(workspace)
     expected = _receipt_edges(reader, fid)
@@ -78,7 +80,7 @@ def test_legacy_local_authority_rows_are_discarded_not_blessed(
         tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     root = node.reader(workspace).root_bytes
     forged = message(
         workspace,

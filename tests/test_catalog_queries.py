@@ -4,7 +4,9 @@ import sqlite3
 
 import pytest
 
-from core import catalog, cmds, settlement
+import facts
+
+from core import catalog, settlement
 from core.fact import Fact, canon, decode, encode
 from core.node import Node
 
@@ -93,12 +95,12 @@ def _assert_exact_projection(node, workspace):
 
 def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    kept = cmds.post(
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    kept = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
-    removed = cmds.post(
+    removed = facts.content.message.post(
         node, workspace, "general", "removed", ts=3)
-    action = cmds.remove(node, workspace, removed, ts=4)
+    action = facts.content.delete.remove(node, workspace, removed, ts=4)
     db = node.idx(workspace)
 
     assert [
@@ -128,14 +130,14 @@ def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
 def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
-    keep = cmds.post(node, workspace, "general", "keep", ts=2)
-    remove = cmds.post(node, workspace, "general", "remove", ts=3)
-    cmds.remove(node, workspace, remove, ts=4)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    keep = facts.content.message.post(node, workspace, "general", "keep", ts=2)
+    remove = facts.content.message.post(node, workspace, "general", "remove", ts=3)
+    facts.content.delete.remove(node, workspace, remove, ts=4)
     root = node.reader(workspace).root_bytes
     expected = {
-        "members": cmds.members(node, workspace),
-        "messages": cmds.msgs(node, workspace),
+        "members": facts.auth.user.members(node, workspace),
+        "messages": facts.content.message.messages(node, workspace),
     }
     expected_facts, expected_rows = _expected_projection(
         node, workspace)
@@ -145,8 +147,8 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     reopened = Node(str(directory))
 
     assert reopened.reader(workspace).root_bytes == root
-    assert cmds.members(reopened, workspace) == expected["members"]
-    assert cmds.msgs(reopened, workspace) == expected["messages"]
+    assert facts.auth.user.members(reopened, workspace) == expected["members"]
+    assert facts.content.message.messages(reopened, workspace) == expected["messages"]
     assert dict(reopened.idx(workspace).execute(
         "SELECT fid, blob FROM facts")) == expected_facts
     assert set(reopened.idx(workspace).execute(
@@ -159,8 +161,8 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
-    message_fid = cmds.post(
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    message_fid = facts.content.message.post(
         node, workspace, "general", "survives cut", ts=2)
     root = node.reader(workspace).root_bytes
     path = directory / "ws" / f"{workspace}.idx.db"
@@ -230,8 +232,8 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
 
 def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    message_fid = cmds.post(
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    message_fid = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
     root = node.reader(workspace).root_bytes
     db = node.idx(workspace)
@@ -249,7 +251,7 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
 
     assert node.reader(workspace).root_bytes == root
     _assert_exact_projection(node, workspace)
-    assert [row["fid"] for row in cmds.msgs(
+    assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [message_fid]
 
 
@@ -257,8 +259,8 @@ def test_foreign_root_format_fails_closed_without_local_republish(
         tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "kept", ts=2)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(node, workspace, "general", "kept", ts=2)
     store = node.store(workspace)
     value = json.loads(store.get("root"))
     value["stamp"] = "obsolete-or-foreign-layout"
@@ -275,9 +277,9 @@ def test_foreign_root_format_fails_closed_without_local_republish(
 def test_index_lookup_decodes_only_selected_fact_bodies(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     for timestamp in range(2, 7):
-        cmds.post(
+        facts.content.message.post(
             node,
             workspace,
             "general",

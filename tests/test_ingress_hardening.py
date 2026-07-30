@@ -5,8 +5,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import facts
+
+from core import status
 from core import (
-    admission_proof, close, cmds, daemon, fact, merkle_map, object_store,
+    admission_proof, close, daemon, fact, merkle_map, object_store,
     repository_applier as repository_applier_module, snapshot,
 )
 from core.crypto import h
@@ -39,8 +42,8 @@ def poisoned_timestamp_pile(workspace):
 
 def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "source", ts=1)
-    survivor = cmds.post(source, workspace, "general", "survives", ts=2)
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
 
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "source", [])
@@ -53,7 +56,7 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
 
     assert destination.fact_of(workspace, survivor) is not None
     assert destination.store(workspace).list("pile/") == []
-    failures = cmds.status(destination)["workspaces"][workspace][
+    failures = status.describe(destination)["workspaces"][workspace][
         "ingress_failures"]
     assert len(failures) == 1
     assert failures[0]["error"] == "InvalidPile: fact shape"
@@ -63,15 +66,15 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     restarted = Node(str(tmp_path / "destination"))
     assert restarted.fact_of(workspace, survivor) is not None
     assert restarted.store(workspace).list("pile/") == []
-    assert cmds.status(restarted)["workspaces"][workspace][
+    assert status.describe(restarted)["workspaces"][workspace][
         "ingress_failures"] == failures
 
 
 def queued_messages(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "source", ts=1)
-    first = cmds.post(source, workspace, "general", "first", ts=2)
-    second = cmds.post(source, workspace, "general", "second", ts=3)
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    first = facts.content.message.post(source, workspace, "general", "first", ts=2)
+    second = facts.content.message.post(source, workspace, "general", "second", ts=3)
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "source", [])
     first_raw = closed_subset(source, workspace, [first])
@@ -278,8 +281,8 @@ def test_failed_root_read_is_isolated_from_the_next_pile(
 def test_rejection_retirement_requires_exact_durable_evidence(
         tmp_path, monkeypatch, boundary, source_survives, payload_exact):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "source", ts=1)
-    survivor = cmds.post(source, workspace, "general", "survives", ts=2)
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
     node = Node(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     bad = poisoned_timestamp_pile(workspace)
@@ -339,8 +342,8 @@ def test_rejection_retirement_requires_exact_durable_evidence(
 def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "source", ts=1)
-    survivor = cmds.post(source, workspace, "general", "survives", ts=2)
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
     node = Node(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     rejected = close.encode_pile([
@@ -377,7 +380,7 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     shared = tmp_path / "shared"
     factory = lambda workspace: FsStore(str(shared / workspace))
     first = Node(str(tmp_path / "first"), store_factory=factory)
-    workspace = cmds.create(first, "shared", ts=1)
+    workspace = facts.auth.workspace.create(first, "shared", ts=1)
     second = Node(str(tmp_path / "second"), store_factory=factory)
     second.add_workspace(workspace, "shared", [])
     second.rebuild(workspace)
@@ -433,24 +436,24 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
 
 def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "node", ts=1)
+    workspace = facts.auth.workspace.create(node, "node", ts=1)
     peer = "https://peer.invalid"
 
     node.record_sync_failure(
         workspace, peer, ValueError("remote object integrity"))
-    row = cmds.status(node)["workspaces"][workspace]["sync_failures"]
+    row = status.describe(node)["workspaces"][workspace]["sync_failures"]
     assert len(row) == 1
     assert row[0]["peer"] == peer
     assert row[0]["error"] == "ValueError: remote object integrity"
 
     node.record_sync_success(workspace, peer)
-    assert cmds.status(node)["workspaces"][workspace][
+    assert status.describe(node)["workspaces"][workspace][
         "sync_failures"] == []
 
 
 def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "node", ts=1)
+    workspace = facts.auth.workspace.create(node, "node", ts=1)
     store = node.store(workspace)
     root = json.loads(store.get("root"))
     root["removals"] = {"oid": "", "fp": ""}
@@ -542,7 +545,7 @@ def test_daemon_body_rejects_claimed_oversize_without_reading():
 def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     raw = close.encode_pile((), workspace=workspace)
     source = node.stage_received_pile(
         workspace, node.member_for(workspace), raw)
@@ -573,11 +576,11 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
 def test_distinct_failed_applies_retain_only_store_bound_pile_bytes(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bootstrap = closed_subset(
         source, workspace, all_fids(source, workspace))
     fids = [
-        cmds.post(
+        facts.content.message.post(
             source, workspace, "general", f"failed-{ordinal}",
             ts=10 + ordinal)
         for ordinal in range(8)

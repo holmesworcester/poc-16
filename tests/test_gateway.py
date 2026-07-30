@@ -5,7 +5,9 @@ import json
 
 import pytest
 
-from core import cmds, peer_capability
+import facts
+
+from core import peer_capability
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
@@ -17,7 +19,7 @@ from facts.auth import request
 
 def world(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
@@ -77,8 +79,8 @@ def test_gateway_mints_then_serves_one_pinned_snapshot(tmp_path):
 def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    first = cmds.create(node, "first", ts=1)
-    second = cmds.create(node, "second", ts=2)
+    first = facts.auth.workspace.create(node, "first", ts=1)
+    second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
     foreign = encode_pile(
         request.payload(node, first, "sync", now + 60_000, now),
@@ -102,7 +104,7 @@ def test_gateway_rejects_a_misbound_or_malformed_repository_root(tmp_path):
     _, _, token = mint(node, workspace, pile, healthy)
     headers = {"Authorization": "Bearer " + token}
     foreign = Node(str(tmp_path / "foreign"))
-    foreign_workspace = cmds.create(foreign, "mallory", ts=1)
+    foreign_workspace = facts.auth.workspace.create(foreign, "mallory", ts=1)
     foreign_root = foreign.store(foreign_workspace).get("root")
     request_body = json.dumps({
         "pile": base64.b64encode(pile).decode(),
