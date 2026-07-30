@@ -145,18 +145,27 @@ python3 -m core daemon ./state/alice --store-config store.json
 
 ### Upload path: current and target
 
-Today, a writable host daemon is the publication boundary. Remote peers upload
-hash-addressed file objects to its `page` route and then send a closed fact
-pile to its `pile` route. The host writes those values to its configured
-filesystem, S3, or R2 store, validates the pile, builds the authenticated
-indexes, and conditionally advances `root`. The Lambda and Cloudflare
-deployments below do not accept uploads and cannot publish a workspace by
-themselves.
+The status boundary is:
 
-The end-to-end direct-to-object-store cloud path is not deployed yet. The
-kernel-authorized broker core, its strict transport-neutral HTTP endpoint,
-the resumable multi-batch client, and exact AWS and R2 SigV4 translators now
-exist under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
+- **Complete writable production path:** a host daemon receives file objects
+  on its `page` route and a closed fact pile on its `pile` route, then validates,
+  indexes, and publishes them to its configured filesystem, S3, or R2 store.
+- **Implemented but not deployed:** the resumable client sends bodies directly
+  to exact S3/R2 ingress PUT URLs returned by the database-free broker protocol.
+  The strict provider-neutral broker HTTP membrane and both SigV4 translators
+  exist and have realistic fake-provider coverage.
+- **Still required for a writable serverless path:** AWS Lambda and Cloudflare
+  Worker event adapters and deployment wiring, the database-free publisher,
+  notification/scheduled draining, and live provider conformance.
+
+Consequently, the Lambda and Cloudflare deployments below remain read-only and
+the writable host daemon is still the only complete production publication
+boundary.
+
+The end-to-end direct-to-object-store cloud path is not deployed yet. Its
+kernel-authorized broker core, strict transport-neutral HTTP membrane,
+resumable multi-batch client, and exact AWS and R2 SigV4 translators now exist
+under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
 `deploy/upload_wire.py`, `deploy/upload_client.py`,
 `deploy/upload_journal.py`, `deploy/aws_upload_broker`, and
 `deploy/cloudflare_upload`. The endpoint serves only canonical, bounded
@@ -331,7 +340,8 @@ digest fixed when the session opened. Replayed or forked cursors may reissue
 already committed exact keys, but cannot enlarge or replace the finite
 authority set. This keeps the broker database-free. A client that loses its
 opaque cursor starts a new session, and lifecycle collection removes the
-abandoned ingress. The deployed endpoint, end-user multi-batch uploader, and
+abandoned ingress. The client and transport-neutral broker HTTP membrane are
+built; provider event adapters, deployed broker routes, and the database-free
 publisher remain unbuilt.
 
 This is a provider boundary, not a Python convention: compromising the

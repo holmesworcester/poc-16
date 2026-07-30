@@ -177,11 +177,16 @@ has already retired that shared obligation; this changes presentation only
 and performs no deletion.
 
 The running cloud deployment is read-only: a host daemon still receives remote
-object/pile PUTs and performs publication. The target write path removes that
-proxy without giving clients root authority. After authorization, a broker
-signs short-lived, exact-key conditional PUT capabilities. A client uploads
-objects first and a closed-pile intent last into session-scoped isolated
-ingress on both S3 and R2. This is the one selected client protocol.
+object/pile PUTs and performs publication. The resumable client, stateless
+broker protocol, strict provider-neutral HTTP membrane, and S3/R2 signing
+translators are implemented, but the provider event adapters and database-free
+publisher are not. The target write path removes the host proxy without giving
+clients root authority. After authorization, a broker signs short-lived,
+exact-key conditional PUT capabilities. A client uploads objects first and a
+closed-pile intent last into session-scoped isolated ingress on both S3 and R2.
+No object or pile body transits the broker, Lambda, Worker, or publisher during
+upload; those components handle authority metadata or later publication. This
+is the one selected client protocol.
 Provider object-created events, an authenticated poke, and a scheduled fallback
 may all wake interchangeable database-free publishers. Wakeups are advisory;
 the durable pile is the work item. Publishers verify workspace, uploader,
