@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, manifest, mint as gate, peer_capability, shape
+from . import cmds, mint as gate, peer_capability, shape, snapshot
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
@@ -323,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
                 root = self.node.store(ws).get("root")
                 if not root:
                     return self._send(403)
-                anchor = manifest.decode_root(root).anchor
+                anchor = snapshot.decode_root(root).anchor
             except Exception:
                 return self._send(403)
             if anchor != ws:

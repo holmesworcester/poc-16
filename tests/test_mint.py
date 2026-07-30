@@ -7,7 +7,7 @@ import random
 import pytest
 from nacl.exceptions import CryptoError
 
-from core import cmds, daemon, manifest, mint
+from core import cmds, daemon, mint, snapshot
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
@@ -187,7 +187,7 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
 
 def test_missing_composite_trees_fail_closed(world):
     node, workspace, now, _, pile = world
-    root = manifest.encode_root(workspace, "")
+    root = snapshot.encode_root(workspace)
     assert mint.stateless(pile, root, lambda oid: None, now) is None
 
 

@@ -3,9 +3,10 @@ import json
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from . import catalog, indexes, manifest, suppression_state
+from . import catalog, indexes, snapshot
 from .crypto import h
-from .kernel import resolve_deps
+from .fact import encode as encode_fact
+from .shape import fid_of
 from .object_store import (
     ABSENT,
     STALE,
@@ -133,9 +134,7 @@ class Publisher:
             old, foreign = json.loads(previous[0]), json.loads(raw)
             return all(
                 old.get(key) == foreign.get(key)
-                for key in (
-                    "action_etag", "anchor", "layout_seed",
-                    "manifest", "trees"))
+                for key in ("anchor", "layout_seed", "maps"))
         except (AttributeError, TypeError, ValueError):
             return False
 
@@ -205,22 +204,7 @@ class Publisher:
 
         changed = settlement.activated
         deactivated = set(settlement.deactivated)
-        transitioned = set(changed) | deactivated
-        # A dormant witness-only update changes FactTree but has no RangeTree
-        # residence to refresh.
-        updated = tuple(
-            fid for fid in settlement.updated
-            if fid not in transitioned
-            and node.fact_of(ws, fid) is not None
-        )
         changed_sids = settlement.changed_sids
-        cache = {}
-
-        def deps_of(fid):
-            if fid not in cache:
-                cache[fid] = resolve_deps(node.fact_of(ws, fid), idx) or []
-            return cache[fid]
-
         previous_root = settlement.base_root
 
         def emit(raw):
@@ -238,38 +222,11 @@ class Publisher:
         previous = None
         if previous_root:
             try:
-                previous = manifest.decode_root(previous_root)
+                previous = snapshot.decode_root(previous_root)
             except ValueError:
                 pass
             if previous is not None and previous.anchor != ws:
                 raise ValueError("root anchor")
-        incremental = reuse and not forced_rebuild \
-            and previous is not None and bool(previous.manifest)
-        if incremental:
-            changed_ranges = manifest.changed_ranges(
-                previous.manifest,
-                (node.fact_of(ws, fid).key for fid in changed),
-                fetch,
-                ws,
-                removed=(
-                    node.candidate_of(ws, fid).key
-                    for fid in deactivated
-                ),
-                refreshed=(
-                    node.fact_of(ws, fid).key for fid in updated
-                ),
-            )
-            if changed_ranges:
-                manifest_oid = manifest.update(
-                    previous.manifest, changed_ranges,
-                    lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)
-            else:
-                manifest_oid = previous.manifest
-        else:
-            incremental = False
-            _, manifest_oid = manifest.build(
-                node.keys(ws), lambda fid: node.fact_of(ws, fid),
-                deps_of, emit)
         tree_incremental = reuse and not forced_rebuild \
             and previous is not None and previous_root is not None
         candidate_changes = tuple(sorted(set(
@@ -283,7 +240,10 @@ class Publisher:
             node.catalog(ws).publication_ids(settlement.received)
         built_indexes = indexes.build(
             ws, idx, emit,
-            previous=previous.trees if previous else {},
+            previous={
+                name: previous.maps[name]
+                for name in indexes.TREE_NAMES
+            } if previous else {},
             fetch=fetch,
             changed_fids=candidate_changes if tree_incremental else None,
             changed_sids=changed_sids if tree_incremental else (),
@@ -300,13 +260,43 @@ class Publisher:
         if not set(settlement.admitted) <= represented \
                 or not must_compile <= set(built_indexes.represented):
             raise ValueError("publication omitted admitted candidate")
-        action_etag = previous.action_etag \
-            if previous is not None and not changed_sids \
-            else suppression_state.etag(idx)
-        root = manifest.encode_root(
-            ws, manifest_oid,
-            action_etag=action_etag,
-            layout_seed=seed, trees=trees)
+
+        if tree_incremental:
+            order_changes = []
+            for fid in sorted(set(changed)):
+                fact = node.fact_of(ws, fid)
+                if fact is None:
+                    raise ValueError("missing activated fact")
+                order_changes.append((fact.key, h(encode_fact(fact))))
+            for fid in sorted(deactivated):
+                fact = node.candidate_of(ws, fid)
+                if fact is None:
+                    raise ValueError("missing deactivated fact")
+                order_changes.append((fact.key, None))
+            fact_order = snapshot.update_fact_order(
+                previous.maps[snapshot.FACT_ORDER],
+                tuple(order_changes),
+                seed,
+                fetch,
+                emit,
+            ) if order_changes else previous.maps[snapshot.FACT_ORDER]
+        else:
+            rows = []
+            for address in node.keys(ws):
+                fact = node.fact_of(ws, fid_of(address))
+                if fact is None or fact.key != address:
+                    raise ValueError("missing eligible fact")
+                rows.append((address, h(encode_fact(fact))))
+            fact_order = snapshot.build_fact_order(rows, seed, emit)
+
+        root = snapshot.encode_root(
+            ws,
+            {
+                snapshot.FACT_ORDER: fact_order,
+                **trees,
+            },
+            seed=seed,
+        )
         if root == settlement.base_root:
             current = store.read_versioned("root")
             if current is ABSENT \

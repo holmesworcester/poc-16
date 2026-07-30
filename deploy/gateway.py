@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 import re
 
-from core import manifest, mint, peer_capability
+from core import mint, peer_capability, snapshot
 from core.crypto import h, seal_to
 from core.grants import check_token, make_token
 from core.limits import (
@@ -174,7 +174,7 @@ class Gateway:
             return Response(400)
         try:
             root = await self._root()
-            if not root or manifest.decode_root(root).anchor != self.workspace:
+            if not root or snapshot.decode_root(root).anchor != self.workspace:
                 return Response(503)
         except Exception:
             return Response(503)
@@ -276,7 +276,7 @@ class Gateway:
             try:
                 root = await self._root()
                 if not root \
-                        or manifest.decode_root(root).anchor != self.workspace:
+                        or snapshot.decode_root(root).anchor != self.workspace:
                     raise ValueError("root readiness")
             except Exception:
                 return self._json(503, {"ok": False})
@@ -312,8 +312,8 @@ class Gateway:
             try:
                 root = await self._root() or b""
                 if root:
-                    snapshot = manifest.decode_root(root)
-                    if snapshot.anchor != self.workspace:
+                    committed = snapshot.decode_root(root)
+                    if committed.anchor != self.workspace:
                         raise ValueError("root anchor")
             except Exception:
                 return Response(503)

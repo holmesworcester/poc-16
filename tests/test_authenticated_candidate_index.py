@@ -3,10 +3,12 @@ import random
 
 import facts
 
-from core import merkle_map, catalog, cmds, indexes, manifest, suppression_state
+from core import catalog, cmds, indexes, merkle_map, snapshot
 from core.crypto import h, keypair
-from core.kernel import offer_src, resolve_deps
+from core.fact import encode
+from core.kernel import offer_src
 from core.node import Node
+from core.shape import fid_of
 from core.suppression import TARGET
 from core.worker import WorkerView
 from facts.auth.device_invite import device_invite
@@ -48,28 +50,26 @@ def _catalog_rows(node, workspace, kind, k0=None, k1=None):
 
 def _canonical_root(node, workspace):
     """Reference full build independent of every incremental index path."""
-    index, cache = node.idx(workspace), {}
-
-    def deps(fid):
-        if fid not in cache:
-            cache[fid] = resolve_deps(
-                node.fact_of(workspace, fid), index) or []
-        return cache[fid]
-
-    _, range_root = manifest.build(
-        node.keys(workspace),
-        lambda fid: node.fact_of(workspace, fid),
-        deps,
-        lambda raw: h(raw),
-    )
+    index = node.idx(workspace)
     seed, trees = indexes.build(
         workspace, index, lambda raw: h(raw),
     )
-    return manifest.encode_root(
-        workspace, range_root,
-        action_etag=suppression_state.etag(index),
-        layout_seed=seed,
-        trees=trees,
+    order = snapshot.build_fact_order(
+        (
+            (fact.key, h(encode(fact)))
+            for fact in (
+                node.fact_of(workspace, fid_of(address))
+                for address in node.keys(workspace)
+            )
+            if fact is not None
+        ),
+        seed,
+        lambda raw: h(raw),
+    )
+    return snapshot.encode_root(
+        workspace,
+        {snapshot.FACT_ORDER: order, **trees},
+        seed=seed,
     )
 
 
@@ -120,8 +120,9 @@ def test_type_key_ref_and_offer_ranges_match_catalog_without_manifest_reads(
     assert view.fact_location(message) == target.key
     assert view.fact_location(action) \
         == node.candidate_of(workspace, action).key
-    assert manifest.decode_root(
-        node.store(workspace).get("root")).manifest not in fetched
+    assert snapshot.decode_root(
+        node.store(workspace).get("root")
+    ).maps[snapshot.FACT_ORDER]["root"] not in fetched
 
 
 def test_losing_then_winning_offer_rewires_reverse_dependency_posting(

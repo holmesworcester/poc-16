@@ -6,15 +6,74 @@ rows before republishing them through :mod:`core.merkle_map`.  In particular
 there is deliberately no legacy build or update implementation.
 """
 import json
+from typing import NamedTuple
 
 from .crypto import h
 from .fact import canon
-from .shape import valid_fid
+from .limits import MAX_ROOT_BYTES, decode_json
+from .shape import is_key, valid_fid
 
 FORMAT = "btreap-v2"
+LAYOUT = "composite-btreap-v7-generic-candidate-index"
 MAX_PAGE_DEPTH = 128
 MAX_VALUE_BYTES = 4 * 1024
 MAX_PAGE_BYTES = 8 * 1024
+MAX_ROWS = 1_000_000
+TREE_NAMES = ("fact", "supp", "authority")
+RANGE_SEED = h(canon(["range-tree-v1"]))
+CUT = 64
+
+
+class Root(NamedTuple):
+    anchor: str
+    manifest: str
+    layout_seed: str
+    trees: dict
+    action_etag: str
+
+
+class RangeEntry(NamedTuple):
+    sep: str
+    leaf: str
+    closure: str
+
+
+def _trees_ok(trees):
+    return isinstance(trees, dict) and set(trees) == set(TREE_NAMES) \
+        and all(
+            isinstance(value, dict)
+            and set(value) == {"root", "count", "depth"}
+            and isinstance(value["root"], str)
+            and (not value["root"] or valid_fid(value["root"]))
+            and type(value["count"]) is int and value["count"] >= 0
+            and type(value["depth"]) is int
+            and 0 <= value["depth"] <= MAX_PAGE_DEPTH
+            and bool(value["root"]) == bool(value["count"])
+            for value in trees.values()
+        )
+
+
+def decode_root(raw):
+    """Decode only the immediately preceding production root format."""
+    value = decode_json(raw, MAX_ROOT_BYTES, "legacy v7 root")
+    if not isinstance(value, dict) or set(value) != {
+            "action_etag", "anchor", "layout_seed", "manifest", "stamp",
+            "trees"} \
+            or value.get("stamp") != LAYOUT \
+            or not valid_fid(value.get("action_etag")) \
+            or not valid_fid(value.get("anchor")) \
+            or not valid_fid(value.get("layout_seed")) \
+            or not isinstance(value.get("manifest"), str) \
+            or value["manifest"] and not valid_fid(value["manifest"]) \
+            or not _trees_ok(value.get("trees")):
+        raise ValueError("legacy v7 root shape")
+    return Root(
+        value["anchor"],
+        value["manifest"],
+        value["layout_seed"],
+        {name: dict(value["trees"][name]) for name in TREE_NAMES},
+        value["action_etag"],
+    )
 
 
 def _priority(seed, key):
@@ -107,3 +166,36 @@ class Reader:
 
         walk(self.root, None, None, None)
         return tuple(out)
+
+
+def items(root, seed, fetch):
+    """Traverse one legacy map under its authenticated root count budget."""
+    if not root:
+        return ()
+    first = _decode(fetch(root), root, seed)
+    if first["count"] > MAX_ROWS:
+        raise ValueError("legacy v7 read budget")
+    return Reader(
+        root, seed, fetch, max_pages=first["count"]).items()
+
+
+def range_entries(root, seed, fetch):
+    """Strict old RangeTree rows for the one v7-to-current rebuild."""
+    out = []
+    for sep, value in items(root, seed, fetch):
+        if not is_key(sep) or not isinstance(value, list) or len(value) != 2 \
+                or not valid_fid(value[0]) \
+                or not isinstance(value[1], str) \
+                or value[1] and not valid_fid(value[1]):
+            raise ValueError("legacy v7 RangeTree row")
+        out.append(RangeEntry(sep, value[0], value[1]))
+    return tuple(out)
+
+
+def stable_cut_positions(fids):
+    """The removed v7 content-cut rule, retained only for migration checks."""
+    return [
+        index + 1
+        for index, fid in enumerate(fids)
+        if int(fid[:8], 16) % CUT == 0
+    ]

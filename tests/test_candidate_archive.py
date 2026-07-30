@@ -7,11 +7,11 @@ import pytest
 
 from core import (
     admission_proof,
-    btreap,
     catalog,
     cmds,
     indexes,
-    manifest,
+    merkle_map,
+    snapshot,
 )
 from core.candidate_archive import CandidateView, reconstruct
 from core.close import close, encode_pile
@@ -77,19 +77,18 @@ def _root_view(node, workspace):
 def _forged_archive(node, workspace, mutate):
     """Rebuild every authenticated tree honestly around one logical lie."""
     store = node.store(workspace)
-    snapshot = manifest.decode_root(store.get("root"))
+    committed = snapshot.decode_root(store.get("root"))
     fetch = lambda oid: store.get("obj/" + oid)
     rows = {}
     for name in indexes.TREE_NAMES:
-        descriptor = snapshot.trees[name]
-        rows[name] = dict(btreap.Reader(
+        descriptor = committed.maps[name]
+        rows[name] = dict(merkle_map.Reader(
             descriptor["root"],
-            snapshot.layout_seed,
+            committed.layout_seed,
             fetch,
             max_page_depth=descriptor["depth"],
-        ).items(max_pages=descriptor["count"]))
-    envelope = {"action_etag": snapshot.action_etag}
-    mutate(rows, envelope)
+        ).items(max_pages=max(1, 2 * descriptor["count"] - 1)))
+    mutate(rows)
 
     objects = {}
 
@@ -100,19 +99,20 @@ def _forged_archive(node, workspace, mutate):
 
     trees = {}
     for name in indexes.TREE_NAMES:
-        built = btreap.build(
-            tuple(rows[name].items()), snapshot.layout_seed, emit)
+        built = merkle_map.build(
+            tuple(rows[name].items()), committed.layout_seed, emit)
         trees[name] = {
             "root": built.root,
             "count": built.count,
             "depth": built.page_depth,
         }
-    root = manifest.encode_root(
+    root = snapshot.encode_root(
         workspace,
-        snapshot.manifest,
-        action_etag=envelope["action_etag"],
-        layout_seed=snapshot.layout_seed,
-        trees=trees,
+        {
+            snapshot.FACT_ORDER: committed.maps[snapshot.FACT_ORDER],
+            **trees,
+        },
+        seed=committed.layout_seed,
     )
     return root, lambda oid: objects[oid] if oid in objects else fetch(oid)
 
@@ -207,14 +207,13 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     (
         ("extra-supp-clear", "SuppTree projection"),
         ("forged-authority", "AuthorityTree projection"),
-        ("eligible-to-dormant", "candidate residence partition"),
-        ("dormant-to-eligible", "candidate residence partition"),
+        ("eligible-to-dormant", "FactOrder projection"),
+        ("dormant-to-eligible", "FactOrder projection"),
         ("rank-relabel", "eligible FactRecord judgment"),
         ("dependency-relabel", "eligible FactRecord judgment"),
         ("arbitrary-action-slot", "FactTree projection"),
-        ("wrong-action-etag", "action etag projection"),
-        ("residence-mismatch", "candidate residence identity"),
-        ("residence-missing", "object integrity"),
+        ("residence-mismatch", "FactOrder projection"),
+        ("residence-missing", "FactOrder projection"),
     ),
 )
 def test_cold_reconstruction_rejects_authenticated_projection_lies(
@@ -235,7 +234,7 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
     node.turn(workspace)
     dormant = dormant_messages[0].fid
 
-    def mutate(rows, envelope):
+    def mutate(rows):
         fact_rows = rows[indexes.FACT]
         if attack == "extra-supp-clear":
             rows[indexes.SUPP]["forged:suppression"] = {"state": "clear"}
@@ -256,8 +255,6 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
         elif attack == "arbitrary-action-slot":
             fact_rows[indexes.action_key("forged:suppression")] = {
                 "state": "clear"}
-        elif attack == "wrong-action-etag":
-            envelope["action_etag"] = "0" * 64
         elif attack == "residence-mismatch":
             fact_rows[indexes.fact_key(live)]["fact_oid"] = \
                 fact_rows[indexes.fact_key(workspace)]["fact_oid"]
@@ -393,9 +390,9 @@ def test_admission_proof_traversal_enforces_every_budget_and_graph_guard(
         verify()
     monkeypatch.setattr(admission_proof, "MAX_PROOF_BYTES", byte_limit)
 
-    # The real database-free path also charges the FactTree/RangeTree pages
-    # and residences fetched while resolving facts. Exact N succeeds; N-1
-    # fails for both dimensions on an otherwise identical cold view.
+    # The real database-free path also charges bounded FactTree pages and
+    # residences fetched while resolving facts. Exact N succeeds; N-1 fails
+    # for both dimensions on an otherwise identical cold view.
     def cold_verify():
         return CandidateView(
             store.get("root"),
@@ -545,11 +542,12 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
         assert current.candidate_of(workspace, item.fid) == item
         nodes.append(current)
     local, remote = nodes
-    local_snapshot = manifest.decode_root(
+    local_snapshot = snapshot.decode_root(
         local.store(workspace).get("root"))
-    remote_snapshot = manifest.decode_root(
+    remote_snapshot = snapshot.decode_root(
         remote.store(workspace).get("root"))
-    assert local_snapshot.manifest == remote_snapshot.manifest
+    assert local_snapshot.maps[snapshot.FACT_ORDER] \
+        == remote_snapshot.maps[snapshot.FACT_ORDER]
     assert local.store(workspace).get("root") \
         != remote.store(workspace).get("root")
     assert _root_view(local, workspace).fact_record(
@@ -578,6 +576,9 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
             deliver(remote, self.ws, raw)
             remote.turn(self.ws)
 
+        def put_obj(self, oid, raw):
+            remote.store(self.ws).put_if_absent("obj/" + oid, raw)
+
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     pulled, pushed = sync_module.sync(
         local, workspace, "local://remote")
@@ -587,6 +588,43 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
         == remote.store(workspace).get("root")
     assert sync_module.sync(
         local, workspace, "local://remote") == (0, 0)
+
+
+def test_registered_rootless_workspace_pulls_the_remote_candidate_archive(
+        tmp_path, monkeypatch):
+    remote = Node(str(tmp_path / "remote"))
+    workspace = cmds.create(remote, "alice", ts=1)
+    fid = cmds.post(
+        remote, workspace, "general", "rootless catch-up", ts=10)
+    local = Node(str(tmp_path / "local"))
+    local.add_workspace(workspace, "registered", peers=[])
+    assert local.store(workspace).get("root") is None
+
+    class PullOnlyPeer:
+        accepts_push = False
+
+        def __init__(self, node, ws, url):
+            self.ws = ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
+
+        def root(self, etag=None):
+            raw = remote.store(self.ws).get("root")
+            current = h(raw)
+            return None if etag == current else (raw, current)
+
+        def obj(self, oid):
+            return remote.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+    monkeypatch.setattr(sync_module, "Peer", PullOnlyPeer)
+
+    assert sync_module.sync(
+        local, workspace, "local://remote") == (1, 0)
+    assert local.fact_of(workspace, fid) == remote.fact_of(workspace, fid)
+    assert local.store(workspace).get("root") \
+        == remote.store(workspace).get("root")
 
 
 def test_compiler_omission_cannot_advance_root_or_retire_pile(

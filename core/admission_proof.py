@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import facts
 
-from .btreap import MAX_PAGE_BYTES, MAX_PAGE_DEPTH
+from .merkle_map import MAX_PAGE_BYTES, MAX_PAGE_DEPTH
 from .crypto import h
 from .fact import canon, encode as encode_fact
 from .kernel import ResolvedEdge, drain, valid_resolved_edges

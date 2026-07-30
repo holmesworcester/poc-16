@@ -3,17 +3,16 @@
 Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
-            "download + ingestion" number: fetch the manifest's leaf piles
-            and closure siblings, judge each unit through the kernel, admit
-            by id, then one commit. facts/s here is directly comparable to
-            the 2000-5000 facts/s poc-7..13 have gotten.
+            "download + ingestion" number: fetch every selected historical
+            admission proof, judge each proof through the kernel, admit its
+            candidates, then one commit. facts/s here is directly comparable
+            to the 2000-5000 facts/s poc-7..13 have gotten.
 
   bidi      Two peers with shared membership and disjoint message sets do
-            one one-sided walk (pull differing ranges as closed units, push
-            the symmetric difference as one closed pile). Both converge; we
-            measure the diff.
+            one candidate/proof join in both directions. Both converge; we
+            measure the exact selected proof closures transferred.
 
-The seed is kernel-admitted in bounded batches with one manifest build at the
+The seed is kernel-admitted in bounded batches with one snapshot build at the
 end, so setup is O(n log n), not O(n^2) — building 500k facts by replaying
 250k turns would be hopeless. The measured paths are the honest ones.
 
@@ -22,7 +21,6 @@ Run:   python3 bench/bench_sync.py                 # 5k/10k/50k/100k facts
        python3 bench/bench_sync.py 5000 10000      # explicit scales
 """
 import gc
-import json
 import os
 import random
 import shutil
@@ -32,17 +30,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import cmds, manifest
-from core import node as node_module
+from core import cmds
+from core.candidate_archive import CandidateView
 from core import sync as sync_module
-from core.close import close, decode_pile, encode_pile
+from core.close import close, encode_pile
 from core.crypto import h
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import kernel, offer_src, resolve_deps
 from core.node import Node, now_ms
 from core.publication import Publisher
-from core.shape import fid_of
 
 from tests.util import add_member, all_fids
 
@@ -142,7 +139,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     t_auth = perf()
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
     t_layout = perf()
-    n.commit(ws)  # one full manifest build over the whole set
+    n.commit(ws)  # one full snapshot build over the whole set
     t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
@@ -152,24 +149,28 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 
 # ---- unit streaming ----------------------------------------------------------
 
-def manifest_objs(store):
-    """``(manifest oid, live oids)`` — every object a cold reader fetches:
-    RangeTree pages, leaf piles, and closure siblings."""
+def snapshot_objs(store):
+    """``(root bytes, unique cold object reads)`` for the candidate archive."""
+    root = store.get("root")
     oids = []
-    fetch = lambda oid: (oids.append(oid) or store.get("obj/" + oid))
-    man = manifest.decode_root(store.get("root")).manifest
-    entries = manifest.decode(fetch(man), fetch)
-    oids += [e.leaf for e in entries]
-    oids += [e.closure for e in entries if e.closure]
-    return man, oids
+
+    def fetch(oid):
+        oids.append(oid)
+        return store.get("obj/" + oid)
+
+    view = CandidateView(root, fetch)
+    for fid in view.candidate_ids():
+        view.verify(fid)
+    return root, tuple(dict.fromkeys(oids))
 
 
-def seed_units(store, man, workspace):
-    """The production full-sync unit: one closed stream, each fact once."""
-    stream = node_module.resident(
-        man, lambda oid: store.get("obj/" + oid), workspace)
-    if stream:
-        yield stream
+def seed_units(store, root, workspace):
+    """The production sync units: selected historical proof closures."""
+    view = CandidateView(root, lambda oid: store.get("obj/" + oid))
+    if view.root.anchor != workspace:
+        raise ValueError("benchmark snapshot workspace")
+    for fid in view.candidate_ids():
+        yield view.verify(fid).facts
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -205,11 +206,11 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 def catchup(seed, ws, fresh_dir):
     fresh = Node(fresh_dir)
     src = seed.store(ws)
-    man, ohs = manifest_objs(src)
+    root, ohs = snapshot_objs(src)
     dl_bytes = len(src.get("root")) + sum(len(src.get("obj/" + oh)) for oh in ohs)
 
     t0 = perf()
-    streamed = ingest(fresh, ws, seed_units(src, man, ws))
+    streamed = ingest(fresh, ws, seed_units(src, root, ws))
     fresh.commit(ws)
     t1 = perf()
 
@@ -217,7 +218,7 @@ def catchup(seed, ws, fresh_dir):
     match = fresh.store(ws).get("root") == src.get("root")
     return {"ingest_s": t1 - t0, "facts": total, "streamed": streamed,
             "dl_bytes": dl_bytes, "objs": len(ohs), "match": match,
-            "pages": sum(1 for _ in seed_units(src, man, ws))}
+            "pages": sum(1 for _ in seed_units(src, root, ws))}
 
 
 # ---- the bidi benchmark ------------------------------------------------------
@@ -236,9 +237,7 @@ def copy_facts(dst, ws, src, fids):
 
 
 def reconcile(A, B, ws):
-    """One one-sided dial, exactly as sync(): A diffs B's manifest by oid,
-    assembles the differing leaves into one closed union, and pushes the
-    local-only keys as one closed pile that B ingests. Both converge."""
+    """One candidate/proof join in both directions, as the sync core does."""
     astore, bstore = A.store(ws), B.store(ws)
     remote_objects = {}
 
@@ -247,49 +246,28 @@ def reconcile(A, B, ws):
             remote_objects[oid] = bstore.get("obj/" + oid)
         return remote_objects[oid]
 
-    fetch_remote.many = lambda oids: tuple(fetch_remote(oid) for oid in oids)
-
     t0 = perf()
     fetch_local = lambda oid: astore.get("obj/" + oid)
-    my_man = manifest.decode_root(astore.get("root")).manifest
-    their_man = manifest.decode_root(bstore.get("root")).manifest
-    mine = manifest.decode(fetch_local(my_man), fetch_local)
-    theirs, changed = manifest.compare(mine, their_man, fetch_remote)
-    differing = set(changed)
-    my_keys = A.keys(ws)
-    members_of = lambda e: manifest.range_members(e, fetch_remote, ws)
-    pulled_piles, push_keys = sync_module.frontier(
-        my_keys, theirs, differing, members_of)
-    held = set(my_keys)
-    pull_fids = {
-        fact.fid for _, members in pulled_piles for fact in members
-        if fact.key not in held}
-
-    pulled = []
-    if pulled_piles:
-        pulled.append(tuple(sync_module.assemble(
-            A, ws, pulled_piles, theirs, fetch_remote)))
+    mine = CandidateView(astore.get("root"), fetch_local)
+    theirs = CandidateView(bstore.get("root"), fetch_remote)
+    delta = sync_module._delta(mine, theirs)
+    pull_fids, push_fids = set(delta.pull), set(delta.push)
+    pulled = [theirs.verify(fid).facts for fid in delta.pull]
+    pushed = [mine.verify(fid).facts for fid in delta.push]
     pull_bytes = sum(
         len(raw) for raw in remote_objects.values() if raw is not None)
-    push_bytes = push_streamed = 0
-    push_fids = {fid_of(key) for key in push_keys}
-    if push_fids:
-        idx = A.idx(ws)
-        news = [A.fact_of(ws, fid) for fid in sorted(push_fids)]
-        facts = close(news, lambda fid: resolve_deps(A.fact_of(ws, fid), idx) or [],
-                      lambda fid: A.fact_of(ws, fid))
-        push_streamed = len(facts)
-        pile = encode_pile(facts, workspace=ws)
-        push_bytes = len(pile)
-        ingest(B, ws, [decode_pile(pile, ws)[0]])  # B absorbs A's half
+    push_streamed = sum(len(unit) for unit in pushed)
+    push_bytes = sum(
+        len(encode_pile(unit, workspace=ws)) for unit in pushed)
+    if pushed:
+        ingest(B, ws, pushed)
         # ingest() is the bulk benchmark seam and does not return Node.turn's
         # exact new-fid delta; force the canonical full maintenance path.
         B.commit(ws, reuse=False)
 
-    # sync() pushes each local difference before draining its pulled ingress.
-    # Preserve that order so canonical pruning cannot remove a fact before its
-    # precomputed symmetric-difference pile reaches the peer.
-    ingest(A, ws, pulled)  # A absorbs B's half
+    # Preserve sync's push-before-pull order so both deltas were computed
+    # against the same two pinned roots.
+    ingest(A, ws, pulled)
     if pulled:
         A.commit(ws, reuse=False)
     t1 = perf()
@@ -356,10 +334,9 @@ def mb(b):
 
 
 def run_catchup(scales):
-    import core.shape as shape
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          f"workers, one-store manifest with monotone CUT={shape.CUT}\n")
+          "workers, one four-map candidate snapshot\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -416,26 +393,15 @@ def run_bidi(scales):
 
 
 def check_leaves(seed, ws):
-    """Every published leaf plus its closure sibling still judges alone."""
+    """Every selected historical candidate proof still judges alone."""
     st = seed.store(ws)
     fetch = lambda oid: st.get("obj/" + oid)
-    man = manifest.decode_root(st.get("root")).manifest
-    entries = manifest.decode(fetch(man), fetch)
-    piles = {e.leaf: decode_pile(fetch(e.leaf), ws)[0] for e in entries}
-    n = 0
-    for entry in entries:
-        items = {f.fid: f for f in piles[entry.leaf]}
-        if entry.closure:
-            for key in json.loads(fetch(entry.closure))["keys"]:
-                home = manifest.locate(entries, key)
-                items.update({
-                    f.fid: f for f in piles[home.leaf] if f.key == key})
-        deps = node_module._edges(items, ws)
-        stream = close(items.values(), deps.__getitem__, items.__getitem__)
-        assert kernel(stream, ws).ok, \
-            "a leaf plus its closure sibling failed the kernel"
-        n += 1
-    return n
+    view = CandidateView(st.get("root"), fetch)
+    fids = view.candidate_ids()
+    for fid in fids:
+        assert kernel(view.verify(fid).facts, ws).ok, \
+            "a selected historical proof failed the kernel"
+    return len(fids)
 
 
 def chained_guard(scale, base_dir, shapes=("star", "wide", "random", "chain"),

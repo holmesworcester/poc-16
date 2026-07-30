@@ -5,8 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    close, cmds, daemon, fact, manifest, merkle_map, node as node_module,
-    object_store, runtime, sync,
+    admission_proof, close, cmds, daemon, fact, merkle_map,
+    node as node_module,
+    object_store, runtime, snapshot, sync,
 )
 from core.crypto import h
 from core.fact import Fact, canon
@@ -444,13 +445,13 @@ def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
     root["removals"] = {"oid": "", "fp": ""}
 
     with pytest.raises(ValueError, match="root shape"):
-        manifest.decode_root(canon(root))
+        snapshot.decode_root(canon(root))
 
 
 @pytest.mark.parametrize("decoder", [
     close.decode_pile,
-    manifest.decode_root,
-    sync._sibling_keys,
+    snapshot.decode_root,
+    admission_proof.decode,
     fact.decode,
 ])
 def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
@@ -470,7 +471,7 @@ def test_merkle_map_parser_recursion_is_also_a_value_error():
         merkle_map._decode(nested, h(nested), h(b"seed"))
 
 
-def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
+def test_pile_root_and_proof_codecs_reject_size_before_parsing(monkeypatch):
     workspace = "0" * 64
     cases = (
         (
@@ -478,8 +479,13 @@ def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
             lambda raw: close.decode_pile(raw, workspace),
             canon({"ws": workspace, "facts": []}),
         ),
-        (manifest, "MAX_ROOT_BYTES", manifest.decode_root, b'{"stamp":"x"}'),
-        (sync, "MAX_OBJECT_BYTES", sync._sibling_keys, b'{"keys":[]}'),
+        (snapshot, "MAX_ROOT_BYTES", snapshot.decode_root, b'{"stamp":"x"}'),
+        (
+            admission_proof,
+            "MAX_OBJECT_BYTES",
+            admission_proof.decode,
+            b'{"schema":"admission-proof-v1"}',
+        ),
     )
     for module, limit, decoder, raw in cases:
         monkeypatch.setattr(module, limit, len(raw) - 1)

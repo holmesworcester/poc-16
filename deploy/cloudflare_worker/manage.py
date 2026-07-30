@@ -46,7 +46,7 @@ CORE_MODULES = (
     "grants.py",
     "indexes.py",
     "kernel.py",
-    "manifest.py",
+    "snapshot.py",
     "mint.py",
     "object_store.py",
     "limits.py",

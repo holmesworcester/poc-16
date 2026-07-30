@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from core import bao, cmds, indexes, manifest, mint
+from core import bao, cmds, indexes, mint, snapshot
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.kernel import drain, offer_src, resolve_deps
@@ -80,18 +80,19 @@ def _shared_clones(seed, workspace, path, *actors):
 def _commit_facts(workspace, commit):
     objects = dict(commit.objects)
     fetch = objects.get
-    root = manifest.decode_root(commit.root)
+    root = snapshot.decode_root(commit.root)
     assert root.anchor == workspace
-    stream = tuple(resident(root.manifest, fetch, workspace))
+    stream = tuple(resident(commit.root, fetch))
 
     view = WorkerView.from_root(commit.root, fetch)
     for name in indexes.TREE_NAMES:
-        descriptor = root.trees[name]
+        descriptor = root.maps[name]
         page = json.loads(fetch(descriptor["root"]))
         assert (page["count"], page["depth"]) == (
             descriptor["count"], descriptor["depth"])
         assert len(view._reader(name).items(
-            max_pages=descriptor["count"])) == descriptor["count"]
+            max_pages=max(1, 2 * descriptor["count"] - 1))
+        ) == descriptor["count"]
     return stream
 
 
@@ -499,15 +500,13 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
     assert winners[-1] == second[3].fid
 
     final_root = alice.store(workspace).get("root")
-    final_snapshot = manifest.decode_root(final_root)
     final_objects = dict(bucket.commits[-1].objects)
     serial = Node(str(tmp_path / "serial"))
     stage_pile(
         serial.store(workspace), "serial", encode_pile(final))
     serial.turn(workspace)
     assert serial.store(workspace).get("root") == final_root
-    assert tuple(resident(
-        final_snapshot.manifest, final_objects.get, workspace)) == final
+    assert tuple(resident(final_root, final_objects.get)) == final
     assert bucket.assert_valid_history()
 
 
@@ -517,7 +516,14 @@ def test_foreign_root_cannot_clobber_a_different_snapshot(tmp_path):
     body = json.loads(node.store(workspace).get("root"))
     foreign = json.dumps({
         **body,
-        "manifest": "0" * 64,
+        "maps": {
+            **body["maps"],
+            snapshot.FACT_ORDER: {
+                "root": "0" * 64,
+                "count": body["maps"][snapshot.FACT_ORDER]["count"],
+                "depth": body["maps"][snapshot.FACT_ORDER]["depth"],
+            },
+        },
         "stamp": "future-layout",
     }, sort_keys=True, separators=(",", ":")).encode()
     node.store(workspace)._replace("root", foreign)

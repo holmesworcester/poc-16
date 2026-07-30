@@ -13,9 +13,6 @@ vocabulary. This module is the stateful half: it folds validated proposals
 and answers admission and suppression queries against the derived index.
 An action's selected historical witness lives once in its FactRecord.
 """
-from .crypto import h
-from .fact import canon
-
 ACTION_PROPOSALS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS action_proposals(
     fid TEXT PRIMARY KEY,
@@ -161,34 +158,6 @@ def settle(idx, fact_of, guards_of):
 def active(idx, sid):
     return idx.execute(
         "SELECT 1 FROM actions WHERE sid=?", (sid,)).fetchone() is not None
-
-
-def etag(idx):
-    """Non-authoritative sync hint for the exact active action set."""
-    rows = list(idx.execute(
-        "SELECT a.sid, a.fid, r.proof "
-        "FROM actions a JOIN admission_receipts r ON r.fid=a.fid "
-        "ORDER BY a.sid"))
-    return h(canon(["active-actions-v1", rows]))
-
-
-def validate_evidence(
-        workspace, sid, fid, evidence_oid, root_bytes, fetch):
-    """Verify one raw-free action witness against canonical residences."""
-    import facts
-    from .candidate_archive import CandidateView
-
-    view = CandidateView(root_bytes, fetch)
-    if view.root.anchor != workspace:
-        raise ValueError("action evidence workspace")
-    result = view.verify(fid, evidence_oid)
-    matches = [
-        valid for valid in result.valids
-        if valid.fact.fid == fid and sid in facts.action_sids(valid.fact)
-    ]
-    if len(matches) != 1:
-        raise ValueError("action evidence")
-    return matches[0].fact, result.facts
 
 
 def blocks(idx, sid, candidate_key, fact_of):

@@ -12,6 +12,7 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 from core import cmds, daemon, peer_capability
+from core import sync as sync_module
 from core.crypto import h
 from core.node import Node, now_ms
 from core.sync import sync
@@ -89,7 +90,8 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         assert pushed > 0
         assert remote.fact_of(workspace, local_fid) \
             == local.fact_of(workspace, local_fid)
-        assert len(observed["puts"]) == 1
+        assert observed["puts"]
+        assert all(path.startswith("/pile/") for path in observed["puts"])
 
         remote_fid = cmds.post(
             remote, workspace, "general", "from remote", ts=20)
@@ -129,6 +131,42 @@ def test_read_only_peer_pulls_when_behind_idles_when_equal_and_never_pushes(
         assert local.sync_cache[(workspace, url)]["sync_profile"] \
             == peer_capability.READ_ONLY
         assert observed["puts"] == []
+
+
+def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
+        tmp_path, monkeypatch):
+    """The cache blesses the compared root, never a later local commit."""
+    remote, workspace, local = replicas(tmp_path)
+    real_reconcile = sync_module.reconcile_candidates
+    raced = {}
+
+    def reconcile_then_commit(*args, **kwargs):
+        answer = real_reconcile(*args, **kwargs)
+        if not raced:
+            raced["fid"] = cmds.post(
+                local,
+                workspace,
+                "general",
+                "authored after the pinned comparison",
+                ts=10,
+            )
+        return answer
+
+    monkeypatch.setattr(
+        sync_module, "reconcile_candidates", reconcile_then_commit)
+    with serving(
+            remote, peer_capability.FULL) as (url, observed, _):
+        assert sync(local, workspace, url) == (0, 0)
+        assert remote.fact_of(workspace, raced["fid"]) is None
+        assert observed["puts"] == []
+        compared = local.sync_cache[(workspace, url)]["local"]
+        assert compared != h(local.store(workspace).get("root"))
+
+        pulled, pushed = sync(local, workspace, url)
+        assert pulled == 0
+        assert pushed > 0
+        assert remote.fact_of(workspace, raced["fid"]) is not None
+        assert observed["puts"]
 
 
 @pytest.mark.parametrize(
@@ -193,7 +231,8 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert pushed > 0
         assert remote.fact_of(workspace, pending) is not None
         assert "pending_push" not in local.sync_cache[(workspace, url)]
-        assert len(observed["puts"]) == 1
+        assert observed["puts"]
+        assert all(path.startswith("/pile/") for path in observed["puts"])
 
 
 def test_full_peer_accepts_only_correctly_addressed_immutable_objects(

@@ -220,7 +220,7 @@ def resolve_deps(f: Fact, db):
     """Resolve refs and family needs to deterministic provider ids.
 
     ``None`` means an unmet need or unknown family.  The same resolver is used
-    during judgment and by the closure paths (manifest build, sync), so closure
+    during judgment and by proof-based sync, so closure
     edges are a pure function of the accepted set.
     """
     edges = resolve_edges(f, db)

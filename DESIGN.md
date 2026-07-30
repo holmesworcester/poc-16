@@ -56,7 +56,7 @@ An engineer should read the running path in this order:
 2. `facts/__init__.py`, then one auth and one content family;
 3. `core/kernel.py`;
 4. `core/runtime.py` and `core/catalog.py`;
-5. `core/publication.py`, `core/manifest.py`, and `core/indexes.py`;
+5. `core/publication.py`, `core/snapshot.py`, and `core/indexes.py`;
 6. `core/worker.py` and `core/mint.py`;
 7. `core/sync.py`, `core/walk.py`, then `core/daemon.py`.
 
@@ -113,11 +113,11 @@ Workspace identity is checked before those choices or family dispatch can
 matter. At an authenticated write door, request workspace, grant workspace,
 uploader path, pile workspace, and every ordinary fact workspace must agree.
 Foreign and mixed piles are typed permanent rejections before catalog staging.
-The same expected-anchor pile decoder is used by host ingress, sync, invite
-redemption, manifest leaves, suppression evidence, database-free mint, and
-rebuild. The kernel remains database-free and family-neutral: it compares the
-canonical anchor, then asks the one registered genesis family whether the
-single ws-less exception is actually genesis.
+The same expected-anchor pile decoder is used by host ingress, candidate-proof
+sync, invite redemption, database-free mint, and rebuild. The kernel remains
+database-free and family-neutral: it compares the canonical anchor, then asks
+the one registered genesis family whether the single ws-less exception is
+actually genesis.
 
 ## Store and publication
 
@@ -565,19 +565,16 @@ The root uses layout stamp
 
 ```text
 anchor          workspace genesis fid
-manifest        range-sync manifest root
-layout_seed     deterministic authenticated-tree seed
-trees           FactTree, SuppTree, AuthorityTree descriptors
-action_etag     non-authoritative cache key for active-action sync
+layout_seed     deterministic authenticated-map seed
+maps            FactOrder, FactTree, SuppTree, AuthorityTree descriptors
 stamp           exact format identity
 ```
 
-One compare-and-swap publishes the range manifest and all three authenticated
-trees. There is no second mutable removal root and therefore no two-root
-transaction. `action_etag` only avoids enumerating SuppTree when neither an
-effective action nor an active action's selected historical witness changes.
-Workers never trust it; the ACTIVE action fid and that fact's authenticated
-admission pointer form the evidence chain.
+Each map descriptor has the same exact `{root, count, depth}` shape and uses
+the same bounded Merkle-map codec. One compare-and-swap publishes all four
+maps. There is no range directory, grouped fact leaf, action cache identity,
+second mutable removal root, or two-root transaction. The root bytes are the
+complete snapshot identity; provider CAS tokens never become content identity.
 
 Catalog settlement returns a publication plan pinned to the exact root bytes
 and opaque provider token returned by one read. Object and tree compilation
@@ -596,54 +593,32 @@ successful CAS, only then are its staged markers cleared. A rebuild whose
 compiled bytes equal its pinned root performs a token-checked no-op before
 stamping it; a rootless no-op similarly rechecks that `root` is still absent.
 
-The range manifest partitions canonical fact keys with the stable boundary
-rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
-whose home is outside that exact leaf. **RangeTree** is a logical map from each
-opaque ordered range separator to its leaf and closure oids. It uses the same
-persistent bounded Merkle map primitive as every other authenticated tree; it is not
-a second tree implementation. An ordinary commit passes the exact added,
-removed, and edge/closure-refreshed keys derived by settlement. Each key needs
-one bounded authenticated predecessor/successor search and one verified old
-leaf pile. Addition splits at a content-derived boundary; ordinary removal
-rewrites one home leaf; removing the fact that formed a boundary joins only
-that leaf and its immediate successor. Refresh keeps the same members and
-re-encodes their fact/closure bytes. Overlapping windows merge before one
-path-copy batch, while unrelated windows remain independent.
+**FactOrder** is the direct eligible-order projection:
+`fact.key -> obj/H(encode(fact))`. Activation inserts the exact key/object
+pair; deactivation deletes the exact key. An ordinary publication path-copies
+those bounded map paths and never calls `Node.keys` or runs a corpus-wide
+ordered-key query. Repair and format cutover retain the full reference build.
+FactOrder is not admission authority: it must equal the eligible subset
+derived from FactTree candidate records and current settlement. It contains no
+fact duplicates, closed piles, or closure siblings.
 
-This works for activation, deactivation, restoration, and canonical-authority
-rewiring. The ordinary publisher neither enumerates RangeTree nor consults a
-SQLite range directory, calls `Node.keys`, or runs an unconditional
-corpus-wide ordered fact-key query. Only repair and format cutover retain the
-full SQLite-backed reference build. Equal subtrees have equal object ids, so
-sync descends only remote paths whose oids are not present in the local
-RangeTree. The three Worker indexes are separate: once settlement has derived
-the same exact transition sets, their logical rows path-copy those deltas.
-Incremental and full compilation produce byte-identical roots.
-
-RangeTree is an authenticated wire map for synchronization and store recovery,
-not a fourth authorization index. A read-only database-free Worker does not
-need it and never scans timestamp/fid keys: `WorkerView` exact-reads only
-FactTree, SuppTree, and AuthorityTree. The bounded RangeTree neighbor
-operation itself is store-only, and an edge responder may serve RangeTree
-objects by oid without interpreting them. The current client publisher still
-compiles from its catalog, but cold `candidate_archive.reconstruct` derives
-the complete admitted-candidate input from authenticated objects alone: it
-verifies all tree descriptors, the eligible RangeTree partition, every
-candidate's stable blob residence, generic postings, action witnesses, and
-every selected admission
-proof before rerunning current eligibility. An edge publisher may consume that
-verified archive but may not treat RangeTree alone as publication authority.
-Object-store LIST cannot substitute because object names are content hashes
-and include unreachable history.
+Cold `candidate_archive.reconstruct` derives the complete replicated input
+from authenticated objects alone. It verifies all four descriptors, every
+candidate's stable residence and selected admission proof, the exact FactOrder
+eligible projection, generic postings, suppression slots, and authority
+winners before rerunning current settlement. Object-store LIST cannot
+substitute because object names include unreachable history. An edge
+publisher may consume that verified archive but may not treat FactOrder alone
+as authority.
 
 ### Dormant-candidate retention
 
 The retention law is stronger than “keep the bytes.” The committed root
 authenticates a monotone set of **kernel-admitted** durable candidates, and
 eligibility is a reversible derived subset of that set. Every candidate has
-one canonical exact-byte residence at `obj/H(encode(fact))`. An eligible
-candidate is additionally materialized in a derived RangeTree leaf for range
-reconciliation. That checked duplicate is not a second admission source.
+one canonical exact-byte residence at `obj/H(encode(fact))`. Eligible
+candidates are referenced by FactOrder; their bytes are not duplicated in a
+second transfer representation.
 
 Old immutable objects may remain as unreachable history. SQLite, provider
 events, and object-store LIST are never admission evidence or candidate
@@ -681,15 +656,13 @@ rows, so dormant history cannot hide or delay a live result. Dormant rows have
 an explicit dormant state and fid ordering; they never carry a sentinel or
 stale value that could be mistaken for a current proof rank.
 
-Publication writes the stable blob before the first CAS that admits a
-candidate, and writes every new RangeTree leaf before a CAS that activates or
-restores one.
-The single composite-root CAS atomically binds residence, admission proof,
-candidate postings, current eligibility, suppression, and authority. Ingress
-retirement is allowed only when that root represents every durable `Valid`
-receipt in the exact pile, whether eligible or dormant. Candidate deletion is
-out of scope until a separate proof can establish that a candidate can never
-regain standing.
+Publication writes the stable blob and every derived map page before the CAS
+that first references them. The single composite-root CAS atomically binds
+residence, admission proof, candidate postings, current eligibility and
+ordering, suppression, and authority. Ingress retirement is allowed only when
+that root represents every durable `Valid` receipt in the exact pile, whether
+eligible or dormant. Candidate deletion is out of scope until a separate proof
+can establish that a candidate can never regain standing.
 
 Admission-proof traversal has explicit edge, node, depth, object-fetch, and
 combined proof/fact/cold-read byte budgets. One proof root is internally
@@ -697,28 +670,40 @@ self-contained: each child pins the
 parent proof used by that same kernel judgment, rather than consulting the
 independently selected FactRecord proof for the parent. Multiple complete
 witnesses for every eligible or dormant candidate converge by lexicographic
-minimum proof oid. Once eligible RangeTree manifests match, the
-correctness-first implementation pages the authenticated `fact:` record range
-and sends each winning verified closure through ordinary pile ingress; it
-does not gain a private catalog-write door. This is linear maintenance I/O,
-not an ordinary Worker or publisher scan.
-`poc-16-x1p.17.8.1` separately tracks a Merkle witness-difference protocol
-that avoids this correctness-first full candidate scan.
-`poc-16-x1p.17.11.2.1` tracks bounded multiproof transfer for the scattered
-cold closure reads that remain after candidates have been identified.
+minimum proof oid.
+
+That join is the sole fact-state synchronization protocol:
+
+```text
+fid -> (exact canonical fact bytes, minimum complete verified proof oid)
+```
+
+The correctness-first implementation pages each pinned root's authenticated
+`fact:` record range, compares selected proof oids, and sends each winning
+verified closure through ordinary pile ingress. FactOrder, eligibility,
+resolved edges, action state, suppression, and authority are deterministic
+projections of the joined candidate map; they have no separate sync channels.
+A registered rootless replica can pull the archive directly. Independent good
+proofs land even when another selected proof is poisoned, but the dial then
+raises and records no convergence stamp, so the unresolved difference retries.
+This is linear maintenance I/O, not an ordinary Worker or hot-publisher scan.
+An authenticated candidate-difference protocol and bounded multiproof transfer
+remain performance work; neither may add another authority path.
 
 ## The authenticated map
 
-Wire RangeTree and the three Worker indexes share one persistent bounded
-Merkle-map codec, but only the latter are Worker-readable. Its shape has no
-priority function and does not rely on key entropy. Authenticated logical keys
-are nonempty ASCII strings of at most 384 bytes and values are non-null
-canonical JSON of at most 4 KiB. A subtree is one sorted leaf exactly when all
-of its rows fit both the 32-row ceiling and the exact 8 KiB leaf encoding.
-Otherwise it is a compressed Patricia branch at the first distinguishing
-five-bit digit. A branch has no unary node, has at most 32 children, and is at
-most 48 KiB; its authenticated child descriptors bind oid, row count, encoded
-row bytes, depth, and first/last key. The hard page-depth bound is 770.
+FactOrder and the three Worker indexes share one persistent bounded Merkle-map
+codec. Worker authorization reads FactTree, SuppTree, and AuthorityTree;
+FactOrder is the publisher-maintained eligible-order projection used by
+maintenance and client iteration. The map shape has no priority function and
+does not rely on key entropy. Authenticated logical keys are nonempty ASCII
+strings of at most 384 bytes and values are non-null canonical JSON of at most
+4 KiB. A subtree is one sorted leaf exactly when all of its rows fit both the
+32-row ceiling and the exact 8 KiB leaf encoding. Otherwise it is a compressed
+Patricia branch at the first distinguishing five-bit digit. A branch has no
+unary node, has at most 32 children, and is at most 48 KiB; its authenticated
+child descriptors bind oid, row count, encoded row bytes, depth, and first/last
+key. The hard page-depth bound is 770.
 
 Those rules define one byte-identical root for a logical map and seed,
 independent of build, insertion, deletion, restoration, or batching history.
@@ -744,6 +729,11 @@ API. No current Worker, publisher, query, or root writer imports it.
 
 The schemas are:
 
+- **FactOrder** — an eligible fact's canonical reconciliation key maps directly
+  to its stable `obj/H(encode(fact))` oid. It is the authenticated ordered
+  projection of current eligibility, not a second admission authority.
+  Publication must make it equal the eligible subset derived by settlement
+  from FactTree candidates. Dormant candidates have no FactOrder row.
 - **FactTree** — `fact:<fid>` maps to one bounded record containing the
   reconciliation key, selected admission-proof oid, explicit
   eligible/dormant state, current raw residence, proof rank or null, resolved
@@ -759,10 +749,10 @@ The schemas are:
   an unbounded candidate list. A paged half-open range fetches at most two
   boundary paths, the returned rows, and one continuation lookahead, with a
   hard 256-row page ceiling. Every record points to its stable
-  `obj/H(encode(fact))` blob; eligible bytes also occur in derived RangeTree
-  leaves.
-  `action:<sid>` mirrors a known direct/principal action slot so sync can
-  corroborate a SuppTree witness through an independently addressed record.
+  `obj/H(encode(fact))` blob.
+  `action:<sid>` mirrors a known direct/principal action slot so a bounded
+  Worker decision can corroborate a SuppTree witness through an independently
+  addressed record.
   The action fact's `admission` pointer is the sole action witness.
 - **SuppTree** — a suppression id maps directly to CLEAR or to ACTIVE with its
   effective action fid. CLEAR is a positive authenticated statement that this
@@ -798,9 +788,8 @@ are retained input; the latter two tables are rebuildable indexes. None is a
 second published authority index, and the database-free Worker never reads
 them.
 
-An action, its `action:<sid>` slot, its `sid` suppression slot, the fact and
-authority updates, and the range manifest all become visible under the same
-root CAS.
+An action, its `action:<sid>` slot, its `sid` suppression slot, FactOrder, and
+the fact and authority updates all become visible under the same root CAS.
 
 ## Shared-bucket concurrency contract
 
@@ -850,10 +839,10 @@ under the same no-op receipt. If reconciliation itself fails, no receipt or
 ingress key is retired.
 
 A reader pins root bytes once. A later root is allowed to make that decision
-stale, but every manifest, tree page, fact record, suppression slot, authority
-slot, and action witness used by the decision must remain explainable by the
-one pinned root. Re-reading `root` for individual components is incoherent,
-even when each component is independently valid.
+stale, but every map descriptor, tree page, fact record, suppression slot,
+authority slot, and action witness used by the decision must remain explainable
+by the one pinned root. Re-reading `root` for individual components is
+incoherent, even when each component is independently valid.
 
 Published candidate state no longer depends on a private database:
 `candidate_archive.reconstruct` cold-rebuilds it from one pinned root and its
@@ -1004,9 +993,9 @@ serialized admission frontier and no attempt to distinguish signing time from
 first delivery.
 
 Dormant receipts are committed replicated candidate state, not local
-projection litter. They are absent from the eligible RangeTree manifest but
-remain in FactTree with stable blobs and selected historical witnesses.
-Reconciliation joins both eligible and dormant candidate/witness values.
+projection litter. They are absent from FactOrder but remain in FactTree with
+stable blobs and selected historical witnesses. Reconciliation joins both
+eligible and dormant candidate/witness values.
 
 ## Worker authorization
 
@@ -1041,23 +1030,26 @@ A dial reads the remote root conditionally. A 304 against an unchanged local
 root is O(1) after blob completeness has been stamped for that HTTP content
 tag.
 
-When roots differ, sync reconciles admitted actions first. Each ACTIVE slot and
-the action FactRecord's admission closure are hash-checked and
-kernel-validated independently; one
-missing or poisoned witness is skipped without blocking honest actions. The
-RangeTree is then compared by oid: shared pages are read from the authenticated
-local tree, while only novel remote paths and their changed piles are fetched.
-Local-only facts are pushed as one closed pile, remote ranges are assembled,
-and missing live blobs are fetched. Once eligible manifests agree, sync also
-pages candidate FactRecords and min-joins differing historical witnesses for
-eligible and dormant facts. A full-profile sender first delivers each
-locally available referenced blob as an idempotent, hash-verified immutable
-object, then delivers the fact-only pile. That order matters in a directed
-peer graph: an object-transfer failure cannot leave the receiver with a fact
-difference that only the one-way sender could satisfy. A replica that does
-not yet have a blob may still relay the fact so another source can complete
-it. Push happens before draining the pull so canonical pruning cannot remove
-a precomputed difference before delivery.
+When roots differ, sync pages both pinned roots' authenticated FactTree
+candidate records and joins each fid to the exact fact bytes and
+lexicographically minimum complete proof oid. Every selected proof is
+hash-checked and kernel-validated, then its closure enters through ordinary
+pile ingress. Eligible and dormant candidates use the same channel; FactOrder,
+actions, dependency edges, suppression, and authority are rebuilt as derived
+state. Independent good proofs land even if another selected proof is
+poisoned, but poison makes the dial fail before it records a root/content-tag
+cache stamp, so the unresolved difference retries.
+
+A full-profile sender first delivers each locally available referenced blob as
+an idempotent, hash-verified immutable object, then delivers the selected proof
+piles. That order matters in a directed peer graph: an object-transfer failure
+cannot leave the receiver with a fact difference that only the one-way sender
+could satisfy. A replica that does not yet have a blob may still relay the fact
+so another source can complete it. Push is computed from one pinned local root
+and happens before draining the pull. The dial caches only that exact compared
+local root; if a concurrent local commit lands afterward, even an HTTP 304 on
+the remote forces the next dial to push the new local difference. A registered
+rootless replica can pull the remote candidate archive directly.
 
 Only typed, input-local pile-codec and immutable-kernel rejections are
 quarantined. Exact bytes plus content-addressed reason records become durable
@@ -1082,20 +1074,20 @@ bytes on demand.
 
 ## Performance
 
-`bench/bench_latency.py` measures the running paths. On the development host on
-2026-07-29, five hot posts at each scale produced:
+`bench/bench_latency.py` measures hot publication and primed idle sync on the
+running paths. A hot post performs zero `Node.keys` calls: settlement returns
+the exact affected projection and publication path-copies bounded paths in the
+four authenticated maps. A primed same-root HTTP 304 is O(1) after its exact
+root/blob-completeness stamp and performs no candidate, tree, object, or
+blob-demand scan.
 
-| Seed facts | Post p50 | Post p95 | object touches/post | immutable KiB/post |
-|---:|---:|---:|---:|---:|
-| 1,000 | 15.41 ms | 16.34 ms | 84.9 | 48.0 |
-| 5,000 | 27.98 ms | 31.10 ms | 114.1 | 67.0 |
-| 10,000 | 19.40 ms | 27.24 ms | 127.1 | 55.4 |
-
-Every measured post performed zero `Node.keys` calls. Authenticated-tree and
-RangeTree touches grow with their paths (85–127 here), not with the
-1,000–10,000-fact corpus. A primed same-root idle dial measured 0.008–0.013 ms
-p50/p95 locally and performed no fact, tree, object, or blob-demand scan.
-These numbers are diagnostic, not cross-machine service guarantees.
+Correctness-first candidate reconciliation currently pages the complete
+candidate records of both differing roots and can therefore be linear in
+candidate count. Authenticated candidate diff and bounded multiproof transfer
+are explicit performance work. They must optimize the one candidate/proof join
+rather than introduce an action-specific or eligibility-specific authority
+channel. Benchmark output is diagnostic and is not a cross-machine service
+guarantee.
 
 ## Limits and future decisions
 

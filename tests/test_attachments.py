@@ -249,17 +249,17 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
     assert cmds.files(node, workspace) == []
 
 
-def test_failed_manifest_publish_keeps_objects_and_retry_exposes_them(
+def test_failed_snapshot_publish_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     old_root = node.store(workspace).get("root")
-    commit = node.commit
+    commit = node.commit_ingress
 
-    def fail_commit(*args, **kwargs):
+    def fail_commit_ingress(*args, **kwargs):
         raise RuntimeError("injected CAS failure")
 
-    monkeypatch.setattr(node, "commit", fail_commit)
+    monkeypatch.setattr(node, "commit_ingress", fail_commit_ingress)
 
     with pytest.raises(RuntimeError, match="injected CAS failure"):
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
@@ -276,7 +276,7 @@ def test_failed_manifest_publish_keeps_objects_and_retry_exposes_them(
     assert all(node.store(workspace).has("obj/" + item.body["cid"])
                for item in chunks)
 
-    monkeypatch.setattr(node, "commit", commit)
+    monkeypatch.setattr(node, "commit_ingress", commit)
     node.turn(workspace)
     assert progress(node, workspace)["have"] == len(chunks)
 
@@ -389,6 +389,8 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
     }
 
     class CachedPeer:
+        accepts_push = True
+
         def __init__(self, node, ws, peer_url):
             self.cache = node.sync_cache[(ws, peer_url)]
 

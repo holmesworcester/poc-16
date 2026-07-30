@@ -20,13 +20,27 @@ from typing import NamedTuple
 
 import facts
 
-from . import admission_proof, catalog, manifest, shape, suppression_state
+from . import (
+    admission_proof,
+    catalog,
+    legacy_v7,
+    shape,
+    snapshot,
+    suppression_state,
+)
 from .close import close, decode_pile, encode_pile
 from .crypto import h
-from .fact import Fact, canon
+from .fact import (
+    Fact,
+    bound_to,
+    canon,
+    decode as decode_fact,
+    encode as encode_fact,
+)
 from .ingress import (
     KernelRejected,
     _retire_published,
+    check_source,
     preserve_rejection,
     retire_rejected,
 )
@@ -98,36 +112,41 @@ def _edges(items, anchor=None):
     return deps
 
 
-def resident(man, fetch, anchor):
-    """Every committed fact, deps-first, from the manifest alone.
-
-    Reference leaves resolve each fact through its sole content-addressed
-    residence. The member set is then proved by rebuilding the manifest from
-    the keys we read and comparing its root oid — placement, chunking,
-    reference and sibling bytes in a single equality.
-    """
+def resident(root_bytes, fetch):
+    """Every eligible fact, deps-first, from one direct FactOrder map."""
+    root = snapshot.decode_root(root_bytes)
+    anchor = root.anchor
     items = {}
-    entries = manifest.decode(verified_object(man, fetch), fetch) if man else ()
-    for entry in entries:
-        members = manifest.range_members(entry, fetch, anchor)
-        items.update({f.fid: f for f in members})
+    rows = snapshot.fact_order_rows(
+        root.maps[snapshot.FACT_ORDER], root.layout_seed, fetch)
+    for address, oid in rows:
+        raw = verified_object(oid, fetch)
+        fact = decode_fact(raw)
+        if encode_fact(fact) != raw or fact.key != address \
+                or not bound_to(fact, anchor) or fact.fid in items:
+            raise ValueError("FactOrder residence")
+        items[fact.fid] = fact
     if any(
             (family := facts.family_for(fact.t)) is None
             or not family.DURABLE
             for fact in items.values()):
         raise ValueError("store contains an ephemeral fact")
     deps = _edges(items, anchor)
-    if manifest.build(
-            sorted(f.key for f in items.values()), items.__getitem__,
-            deps.__getitem__, lambda raw: None)[1] != man:
-        raise ValueError("store placement")
+    rebuilt = snapshot.build_fact_order(
+        ((fact.key, h(encode_fact(fact))) for fact in items.values()),
+        root.layout_seed,
+        lambda raw: None,
+    )
+    if rebuilt != root.maps[snapshot.FACT_ORDER]:
+        raise ValueError("FactOrder placement")
     return close(items.values(), deps.__getitem__, items.__getitem__)
 
 
 def _legacy_resident(man, fetch, anchor):
     """Decode the sole v7 pile-leaf layout during the explicit v8 cutover."""
     items, leaf_raw = {}, {}
-    entries = manifest.decode(verified_object(man, fetch), fetch) if man else ()
+    entries = legacy_v7.range_entries(
+        man, legacy_v7.RANGE_SEED, fetch) if man else ()
     for entry in entries:
         raw = verified_object(entry.leaf, fetch)
         members, blobs = decode_pile(raw, anchor)
@@ -145,7 +164,7 @@ def _legacy_resident(man, fetch, anchor):
         raise ValueError("store contains an ephemeral fact")
     deps = _edges(items, anchor)
     keys = sorted(fact.key for fact in items.values())
-    cuts = shape.stable_cut_positions(
+    cuts = legacy_v7.stable_cut_positions(
         [shape.fid_of(address) for address in keys])
     chunks = [
         keys[start:stop]
@@ -156,11 +175,17 @@ def _legacy_resident(man, fetch, anchor):
     for addresses in chunks:
         members = [items[shape.fid_of(address)] for address in addresses]
         raw = encode_pile(members, workspace=anchor)
-        outside = manifest.closure_keys(
-            members, deps.__getitem__,
-            lambda fid: items[fid].key)
+        inside = {fact.fid for fact in members}
+        seen, stack = set(), [fact.fid for fact in members]
+        while stack:
+            fid = stack.pop()
+            if fid in seen:
+                continue
+            seen.add(fid)
+            stack.extend(deps[fid])
+        outside = sorted(items[fid].key for fid in seen - inside)
         closure_raw = canon({"keys": outside}) if outside else None
-        entry = manifest.Entry(
+        entry = legacy_v7.RangeEntry(
             addresses[0],
             h(raw),
             h(closure_raw) if closure_raw is not None else "",
@@ -171,8 +196,7 @@ def _legacy_resident(man, fetch, anchor):
                 entry.closure, fetch) != closure_raw:
             raise ValueError("legacy store placement")
         expected.append(entry)
-    if expected != entries or manifest.encode(
-            expected, lambda _raw: None) != man:
+    if tuple(expected) != entries:
         raise ValueError("legacy store placement")
     return close(items.values(), deps.__getitem__, items.__getitem__)
 
@@ -268,6 +292,10 @@ class Node:
         readback, or a token-verified no-op. Once minted, a later root cannot
         undo that historical event because candidate retention is monotone.
         """
+        # Reject malformed/free-form names at the same exact-value door as
+        # every other retirement path, before consulting process-local
+        # publication capabilities.
+        check_source(source, raw)
         key = (ws, source, h(raw))
         registered = self._publication_receipts.get(key)
         if registered is None or registered is not receipt:
@@ -680,10 +708,10 @@ class Node:
             fetch = lambda oid: st.get("obj/" + oid)
             if raw:
                 try:
-                    root = manifest.decode_root(raw)
+                    root = snapshot.decode_root(raw)
                 except ValueError:
                     try:
-                        previous = manifest.decode_previous_root(raw)
+                        previous = legacy_v7.decode_root(raw)
                     except ValueError:
                         # Tests and operator repair may rewrite only a format
                         # stamp. Republish such an exact known envelope from a
@@ -695,9 +723,11 @@ class Node:
                         self.commit(ws, reuse=False, _base=base)
                         base = publisher.root_base()
                         raw = base.root
-                        root = manifest.decode_root(raw)
+                        root = snapshot.decode_root(raw)
                     else:
-                        if previous.anchor != ws:
+                        if previous.anchor != ws \
+                                or previous.layout_seed \
+                                != snapshot.layout_seed(ws):
                             raise ValueError("root anchor")
                         # The one explicit v7→v8 cut: only raw facts already
                         # authenticated by the old RangeTree are rejudged.

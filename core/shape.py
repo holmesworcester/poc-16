@@ -1,13 +1,6 @@
-"""The pure key discipline of the one store.
-
-Everything a reader or writer needs to know about WHERE a fact lives:
-canonical key format and content-derived leaf boundaries, and nothing about
-what a fact means. The RangeTree treats canonical keys as ordered opaque
-addresses; only leaf construction asks this module where a stable cut falls.
-"""
+"""Canonical fact-key parsing and construction."""
 import re
 
-CUT = 64  # home-leaf density: the measured whole-fetch knee
 FACT_TS_MIN = 0
 FACT_TS_MAX = 999_999_999_999_999
 FID_BYTES = 64
@@ -33,8 +26,8 @@ def valid_fid(fid):
 def parse_key(value):
     """Parse the exact 80-byte ``<15 decimal digits>:<64 lowercase hex>`` key.
 
-    This is the single address door used by manifests, action targets and
-    sync.  It intentionally rejects signs, whitespace, wider timestamps,
+    This is the single address door used by authenticated maps, action
+    targets, and sync. It rejects signs, whitespace, wider timestamps,
     Unicode digits, uppercase hex and extra colons.
     """
     if not isinstance(value, str) or len(value.encode("utf-8")) != FACT_KEY_BYTES \
@@ -72,19 +65,3 @@ def key_parts(ts, fid):
 def fid_of(k):
     """Inverse projection: the fid inside a key."""
     return parse_key(k)[1]
-
-
-def boundary(fid):
-    """A key ends a chunk iff its own hash mod CUT == 0.
-    Reads only the key's own hash => history independence."""
-    return int(fid[:8], 16) % CUT == 0
-
-
-def stable_cut_positions(fids):
-    """Monotone content cuts: adding keys never removes a boundary, so a
-    settle rebuilds only the touched leaf and path-copies its RangeTree."""
-    return [
-        index + 1
-        for index, fid in enumerate(fids)
-        if boundary(fid)
-    ]

@@ -1,26 +1,25 @@
-"""Exact authenticated read views over the committed fact set.
+"""Exact authenticated read views over the committed candidate join.
 
-The range manifest is shaped for reconciliation, not point authorization. A
-Worker should not download it, enumerate facts, or reconstruct SQLite merely
-to decide whether one principal or fact is live. This module projects the
-same admitted snapshot into three maps over the history-independent Merkle map:
+A Worker reads these maps directly and never reconstructs SQLite merely to
+decide whether one principal or fact is live. This module projects the same
+admitted candidate/proof state into three bounded Merkle maps:
 
 ``FactTree``
     ``fact:<fid>`` maps to the bounded data needed for an exact Worker or
     publisher read: reconciliation key, selected admission proof, explicit
     eligibility state, canonical fact oid, resolved dependencies, offers,
     suppression selectors, and continuing liveness ids. Every raw fact lives
-    at its content address; RangeTree leaves additionally group eligible
-    facts for reconciliation. ``index:...`` rows are authenticated
-    counterpart of the client catalog's generic index. One row per
+    at its content address; the separate direct FactOrder projection carries
+    only eligible key-to-object references. ``index:...`` rows are the
+    authenticated counterpart of the client catalog's generic index. One row per
     ``(kind, k0, k1, state, rank, fid)`` supports bounded type, key,
     explicit-ref, offer-candidate, suppression-scope, and reverse-dependency
     ranges without hiding an unbounded posting list in one value. Ordinary
     application ranges select only the eligible prefix.
     ``action:<sid>`` maps to the same CLEAR/ACTIVE value as SuppTree for known
-    direct and principal targets. That second binding is deliberate: sync may
-    enumerate active SuppTree entries, but accepts one only when FactTree
-    independently binds the same sid-to-action witness.
+    direct and principal targets. That second binding lets a bounded
+    authorization read corroborate an active action without trusting an
+    on-request claim.
 
 ``SuppTree``
     A typed suppression id maps to ``{"state": "clear"}`` or
@@ -367,10 +366,10 @@ def build(
     upgrades pass ``None`` and take the canonical bulk path. ``previous`` is
     only a path-copy optimization: it cannot affect logical rows or roots.
 
-    The caller supplies one derived-index snapshot and publishes the returned
-    descriptors together with the range manifest. Candidate deletion is not a
-    standing transition and is deliberately unsupported. This function emits
-    immutable objects but never advances the mutable root itself.
+    The caller publishes the returned descriptors in the same composite root
+    as FactOrder. Candidate deletion is not a standing transition and is
+    deliberately unsupported. This function emits immutable objects but never
+    advances the mutable root itself.
     """
     seed = layout_seed(anchor)
     previous = previous or {}
@@ -486,8 +485,9 @@ def build(
         """Precreate every slot whose absence must not mean permission.
 
         Explicit selectors reserve SuppTree ids. Directly deletable facts and
-        principal providers also reserve FactTree corroboration slots so
-        action sync can cross-check an enumerated ACTIVE entry.
+        principal providers also reserve FactTree corroboration slots so a
+        bounded Worker read can authenticate both the target and its current
+        CLEAR/ACTIVE suppression state under the same root.
         """
         fact_slots, supp_slots = {}, {}
         selectors = facts.fact_scopes(fact)

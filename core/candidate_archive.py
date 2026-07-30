@@ -1,21 +1,19 @@
 """Database-free reads and full verification of the admitted candidate set.
 
-``CandidateView`` is the authenticated point/range surface used by action and
-candidate-witness sync and cold Workers. ``reconstruct`` is the maintenance
-path: it walks only
-objects reachable from one authenticated root, proves residence and generic
-posting completeness, reruns the current kernel over the eligible set, and
-reruns each selected historical admission witness.
+``CandidateView`` is the authenticated point/range surface used by the one
+candidate/proof sync path and cold Workers. ``reconstruct`` is the maintenance
+path: it walks only objects reachable from one authenticated root, proves
+residence and generic posting completeness, reruns the current kernel over
+the eligible set, and reruns each selected historical admission witness.
 """
 from dataclasses import dataclass
 
 import facts
 
-from . import admission_proof, btreap, indexes, manifest, settlement
-from .crypto import h
-from .fact import canon, decode, encode
+from . import admission_proof, indexes, merkle_map, settlement, snapshot
+from .fact import decode, encode
 from .object_store import verified_object
-from .shape import valid_fid
+from .shape import fid_of, valid_fid
 
 
 @dataclass(frozen=True)
@@ -32,11 +30,12 @@ class CandidateView:
 
     def __init__(self, root_bytes, fetch):
         self._root_bytes = root_bytes
-        self.root = manifest.decode_root(root_bytes)
+        self.root = snapshot.decode_root(root_bytes)
         if self.root.layout_seed != indexes.layout_seed(self.root.anchor):
             raise ValueError("composite layout seed")
-        if not self.root.manifest or not all(
-                self.root.trees[name]["root"] for name in indexes.TREE_NAMES):
+        if not all(
+                self.root.maps[name]["root"]
+                for name in snapshot.MAP_NAMES):
             raise ValueError("candidate archive is incomplete")
         self._source_fetch = fetch
         self._objects = {}
@@ -56,8 +55,8 @@ class CandidateView:
         return self._objects[oid]
 
     def _reader(self, name):
-        descriptor = self.root.trees[name]
-        return btreap.Reader(
+        descriptor = self.root.maps[name]
+        return merkle_map.Reader(
             descriptor["root"], self.root.layout_seed, self.fetch,
             max_page_depth=descriptor["depth"])
 
@@ -129,7 +128,7 @@ class CandidateView:
         cursor, fids, seen = None, [], set()
         while True:
             page = reader.range_page(
-                start, stop, after=cursor, limit=btreap.MAX_RANGE_ROWS)
+                start, stop, after=cursor, limit=merkle_map.MAX_RANGE_ROWS)
             for key, value in page.rows:
                 fid = key[len("fact:"):]
                 if indexes.fact_key(fid) != key or fid in seen:
@@ -137,31 +136,18 @@ class CandidateView:
                 indexes.checked_fact_record(value, fid)
                 fids.append(fid)
                 seen.add(fid)
-            if len(fids) > self.root.trees[indexes.FACT]["count"]:
+            if len(fids) > self.root.maps[indexes.FACT]["count"]:
                 raise ValueError("candidate FactRecord count")
             cursor = page.cursor
             if cursor is None:
                 break
         return tuple(fids)
 
-    def dormant_ids(self):
-        """Compatibility maintenance view over the canonical record range."""
-        return tuple(
-            fid for fid in self.candidate_ids()
-            if self.fact_record(fid)["state"] == "dormant"
-        )
-
-
 def _tree_rows(view, name):
-    descriptor = view.root.trees[name]
-    if btreap.root_metadata(
-            descriptor["root"], view.root.layout_seed, view.fetch) != (
-                descriptor["count"], descriptor["depth"]):
-        raise ValueError(f"{name} descriptor metadata")
+    descriptor = view.root.maps[name]
     reader = view._reader(name)
-    rows = reader.items(max_pages=descriptor["count"])
-    if len(rows) != descriptor["count"] \
-            or reader.pages_read != descriptor["count"]:
+    rows = reader.items(max_pages=max(1, 2 * descriptor["count"] - 1))
+    if len(rows) != descriptor["count"]:
         raise ValueError(f"{name} descriptor count")
     return rows
 
@@ -240,7 +226,6 @@ def _derived_rows(projected, records, facts_by_fid):
             fact_actions[indexes.action_key(sid)] = slot(sid)
             supp[sid] = slot(sid)
 
-    action_rows = []
     for sid, fid in sorted(projected.actions.items()):
         record = records[fid]
         if record["state"] != "eligible" \
@@ -249,7 +234,6 @@ def _derived_rows(projected, records, facts_by_fid):
         active = {"state": "active", "action": fid}
         supp[sid] = active
         fact_actions[indexes.action_key(sid)] = active
-        action_rows.append((sid, fid, record["admission"]))
 
     choices = {}
     for fid, (rank, _) in projected.standing.items():
@@ -263,8 +247,7 @@ def _derived_rows(projected, records, facts_by_fid):
         rank, fid = min(candidates)
         authority[indexes.need_key(*address)] = {
             "state": "provider", "fid": fid, "rank": rank}
-    action_etag = h(canon(["active-actions-v1", action_rows]))
-    return fact_actions, supp, authority, action_etag
+    return fact_actions, supp, authority
 
 
 def reconstruct(root_bytes, fetch):
@@ -280,21 +263,31 @@ def reconstruct(root_bytes, fetch):
     if not records or view.root.anchor not in records:
         raise ValueError("candidate archive anchor")
 
-    entries = manifest.decode(
-        verified_object(view.root.manifest, fetch), fetch)
     ranged = {}
-    for entry in entries:
-        for fact in manifest.range_members(
-                entry, fetch, view.root.anchor):
-            if fact.fid in ranged:
-                raise ValueError("duplicate eligible residence")
-            ranged[fact.fid] = fact
+    order = snapshot.fact_order_rows(
+        view.root.maps[snapshot.FACT_ORDER],
+        view.root.layout_seed,
+        fetch,
+    )
+    for address, oid in order:
+        fid = fid_of(address)
+        record = view.fact_record(fid)
+        if record["state"] != "eligible" \
+                or record["key"] != address \
+                or record["fact_oid"] != oid:
+            raise ValueError("FactOrder projection")
+        fact = view.fact(fid)
+        if fact.key != address:
+            raise ValueError("FactOrder projection")
+        if fid in ranged:
+            raise ValueError("duplicate eligible residence")
+        ranged[fid] = fact
     expected_eligible = {
         fid for fid, record in records.items()
         if record["state"] == "eligible"
     }
     if set(ranged) != expected_eligible:
-        raise ValueError("candidate residence partition")
+        raise ValueError("FactOrder projection")
 
     facts_by_fid = dict(ranged)
     view._facts.update(ranged)
@@ -308,18 +301,16 @@ def reconstruct(root_bytes, fetch):
     _check_record_projection(records, facts_by_fid)
     projected = _canonical_projection(
         view.root.anchor, records, facts_by_fid)
-    current_edges = {
-        fid: tuple(edge.fid for edge in edges)
-        for fid, (_, edges) in projected.standing.items()
-    }
-    rebuilt_manifest = manifest.build(
-        sorted(fact.key for fact in ranged.values()),
-        ranged.__getitem__,
-        current_edges.__getitem__,
+    rebuilt_order = snapshot.build_fact_order(
+        (
+            (fact.key, records[fid]["fact_oid"])
+            for fid, fact in ranged.items()
+        ),
+        view.root.layout_seed,
         lambda raw: None,
-    )[1]
-    if rebuilt_manifest != view.root.manifest:
-        raise ValueError("eligible RangeTree placement")
+    )
+    if rebuilt_order != view.root.maps[snapshot.FACT_ORDER]:
+        raise ValueError("FactOrder projection")
 
     expected_postings = {}
     for fid, record in records.items():
@@ -333,7 +324,7 @@ def reconstruct(root_bytes, fetch):
             for key in indexes.record_postings(
                 facts_by_fid[fid], record)
         })
-    fact_actions, expected_supp, expected_authority, action_etag = \
+    fact_actions, expected_supp, expected_authority = \
         _derived_rows(projected, records, facts_by_fid)
     expected_fact = {
         indexes.fact_key(fid): record for fid, record in records.items()}
@@ -345,8 +336,6 @@ def reconstruct(root_bytes, fetch):
         raise ValueError("SuppTree projection")
     if dict(authority_rows) != expected_authority:
         raise ValueError("AuthorityTree projection")
-    if view.root.action_etag != action_etag:
-        raise ValueError("action etag projection")
 
     receipt_proofs = {}
     for fid, record in records.items():

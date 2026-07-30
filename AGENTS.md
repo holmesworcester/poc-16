@@ -38,8 +38,9 @@ workspace-bound runtime; do not add another admission route in daemon or sync.
 Preserve read isomorphism: if both client and CF paths ask the same published
 state question, both must use the authenticated-tree answer. SQLite is for
 client-only durable intent, query assembly, and full repair—not a parallel
-answer or range directory. New fact placement uses bounded RangeTree neighbor
-reads over immutable objects.
+answer or range directory. FactOrder is a direct bounded map from eligible
+fact keys to stable fact objects; candidate/proof sync is the sole replicated
+join.
 
 Every behavior change needs a realistic test. Prefer real daemon/socket
 coverage at product boundaries and direct hostile-input tests at codec and

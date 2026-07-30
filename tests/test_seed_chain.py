@@ -5,10 +5,12 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from core import catalog, cmds, manifest
+from core import catalog, cmds, merkle_map
 from core import kernel as kernel_module
 from core.close import close, decode_pile
+from core.ingress import KernelRejected
 from core.kernel import drain, resolve_deps
+from core.limits import MAX_CLOSURE_FACTS
 
 from .util import all_fids, closed_subset
 
@@ -140,7 +142,7 @@ def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
 
 def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
         tmp_path, monkeypatch):
-    members = 128
+    members = 64
     membership_facts = 1 + 4 * (members - 1)
     node, workspace, _ = build_seed(
         str(tmp_path / "proof-worklist"), membership_facts,
@@ -174,17 +176,14 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     statements = []
     index = node.idx(workspace)
     total = index.execute("SELECT COUNT(*) FROM proofs").fetchone()[0]
-    discovered = []
-    changed_ranges = manifest.changed_ranges
+    changed_rows = []
+    update = merkle_map.update
 
-    def bounded_ranges(
-            root, keys, fetch, expected_workspace, **transitions):
-        ranges = changed_ranges(
-            root, keys, fetch, expected_workspace, **transitions)
-        discovered.append(sum(len(current) for _, current in ranges))
-        return ranges
+    def bounded_update(root, seed, changes, fetch, emit):
+        changed_rows.append(len(changes))
+        return update(root, seed, changes, fetch, emit)
 
-    monkeypatch.setattr(manifest, "changed_ranges", bounded_ranges)
+    monkeypatch.setattr(merkle_map, "update", bounded_update)
     monkeypatch.setattr(
         catalog.Catalog, "eligible_ids",
         lambda *_: pytest.fail("ordinary append enumerated all proofs"))
@@ -212,7 +211,7 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     assert any(
         statement.startswith("select 1 from proofs where fid=")
         for statement in normalized)
-    assert discovered and 0 < max(discovered) < total // 4
+    assert changed_rows and 0 < max(changed_rows) < total // 4
 
 
 def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
@@ -237,13 +236,11 @@ def test_chained_bidirectional_reconciliation_converges(tmp_path):
     assert result["push_streamed"] > result["push_useful"]
 
 
-def test_chain_seed_is_stack_safe_beyond_python_recursion_depth(tmp_path):
-    members = 520
+def test_chain_seed_rejects_a_proof_beyond_the_protocol_closure_bound(
+        tmp_path):
+    members = 2 + (MAX_CLOSURE_FACTS - 1) // 4
     membership_facts = 1 + 4 * (members - 1)
-    node, workspace, stats = build_seed(
-        str(tmp_path / "deep"), membership_facts,
-        n_members=members, shape="chain", seed=16)
-
-    assert stats["facts"] == membership_facts
-    assert stats["depth"]["max"] == members - 1
-    assert check_leaves(node, workspace) > 1
+    with pytest.raises(KernelRejected, match="ingress rejected"):
+        build_seed(
+            str(tmp_path / "too-deep"), membership_facts,
+            n_members=members, shape="chain", seed=16)

@@ -382,7 +382,7 @@ def _readiness(url):
 
 def _smoke_endpoint(url, state, workspace):
     """Exercise the deployed database-free gate using a client identity."""
-    from core import manifest
+    from core import snapshot
     from core.crypto import h
     from core.node import Node, now_ms
     from core.walk import Peer
@@ -401,12 +401,12 @@ def _smoke_endpoint(url, state, workspace):
     if got is None or not got[0]:
         raise RuntimeError("serverless peer returned no root")
     root, etag = got
-    snapshot = manifest.decode_root(root)
-    if snapshot.anchor != workspace or etag != h(root):
+    committed = snapshot.decode_root(root)
+    if committed.anchor != workspace or etag != h(root):
         raise RuntimeError("serverless root identity mismatch")
-    oid = snapshot.manifest or next(
-        (tree["root"] for tree in snapshot.trees.values()
-         if tree["root"]),
+    oid = next(
+        (descriptor["root"] for descriptor in committed.maps.values()
+         if descriptor["root"]),
         "",
     )
     raw = peer.obj(oid) if oid else None

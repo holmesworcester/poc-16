@@ -522,7 +522,7 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         for site in rejected
     ] == [
                     (
-                    "core/node.py", "_quarantine_ingress", 260,
+                    "core/node.py", "_quarantine_ingress", 284,
                     "self", "direct"),
     ]
 

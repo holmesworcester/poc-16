@@ -98,10 +98,11 @@ It maps a fid to its reconciliation key, rank, resolved dependencies, offers,
 and suppression scopes, and carries ordered posting rows for fact type, key,
 explicit reference, offer candidates, reverse dependencies, and suppression
 impact. A store-only reader can page one address in bounded
-`O(tree depth + returned rows)` object reads; it does not enumerate FactTree,
-RangeTree, or rebuild SQLite. AuthorityTree remains the exact winner cache for
-ordinary authorization, where reading every conflicting candidate would be
-wasteful.
+`O(tree depth + returned rows)` object reads without rebuilding SQLite.
+FactOrder is a separate direct `fact.key -> fact object oid` projection for
+eligible ordering and transfer. SuppTree answers exact suppression state, and
+AuthorityTree remains the exact winner cache for ordinary authorization,
+where reading every conflicting candidate would be wasteful.
 
 All four authenticated maps use one canonical bounded radix codec. Leaves
 have hard row and encoded-byte ceilings; larger subtrees split by key bytes,
@@ -273,13 +274,15 @@ remain a separate live obligation.
 
 Every valid candidate that may later regain standing remains durably
 root-reachable. Every kernel-admitted candidate has a stable canonical blob at
-`obj/H(encode(fact))`; eligible facts are also materialized in derived
-RangeTree sync piles. Its authenticated FactTree record names the
+`obj/H(encode(fact))`; an eligible fact's key maps directly to that oid in
+FactOrder. Its authenticated FactTree record names the
 lexicographically smallest complete historical admission-proof DAG the
 replica has verified. Candidate state is exact bytes plus that selected
 witness; current eligibility and dependency edges are a separate derived
-projection. Sync min-joins witnesses for eligible and dormant candidates, and
-a cold reader verifies each selected proof by rerunning the actual kernel.
+projection. Sync performs that one min-join for eligible and dormant
+candidates; there is no separate action channel or grouped range-pile
+protocol. A cold reader verifies each selected proof by rerunning the actual
+kernel.
 
 Ingress retirement uses a typed compiler/publication result. Every durable
 `Valid` in the exact pile must be constructed into the proposal or inherited

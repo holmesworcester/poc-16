@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import facts
 
-from . import merkle_map, indexes, manifest
+from . import indexes, merkle_map, snapshot
 from .close import decode_pile
 from .crypto import h
 from .kernel import drain
@@ -21,13 +21,19 @@ class WorkerView:
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        root = manifest.decode_root(root_bytes)
+        root = snapshot.decode_root(root_bytes)
         if root.layout_seed != indexes.layout_seed(root.anchor):
             raise ValueError("composite layout seed")
-        if not all(root.trees[name]["root"] for name in indexes.TREE_NAMES):
+        if not all(root.maps[name]["root"] for name in indexes.TREE_NAMES):
             raise ValueError("composite root is not Worker-readable")
         return cls(
-            h(root_bytes), root.anchor, root.layout_seed, root.trees, fetch)
+            h(root_bytes), root.anchor, root.layout_seed,
+            {
+                name: root.maps[name]
+                for name in indexes.TREE_NAMES
+            },
+            fetch,
+        )
 
     def _reader(self, name):
         descriptor = self.trees[name]

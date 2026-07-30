@@ -3,7 +3,7 @@ import inspect
 import json
 import sqlite3
 
-from core import merkle_map, cmds, indexes, manifest
+from core import cmds, indexes, merkle_map, snapshot
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon
@@ -35,7 +35,8 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
         node, workspace, "sync", now + 60_000, now))
     store = node.store(workspace)
     root = store.get("root")
-    manifest_oid = manifest.decode_root(root).manifest
+    fact_order_oid = snapshot.decode_root(
+        root).maps[snapshot.FACT_ORDER]["root"]
     fetched = []
 
     def fetch(oid):
@@ -44,7 +45,7 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
 
     view = WorkerView.from_root(root, fetch)
     assert view.mint(pile, now) == (node.identity_id(workspace), "sync")
-    assert manifest_oid not in fetched
+    assert fact_order_oid not in fetched
     assert len(set(fetched)) <= 6 * merkle_map.MAX_PAGE_DEPTH
     assert "sqlite" not in inspect.getsource(WorkerView).lower()
 
@@ -77,15 +78,15 @@ def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
         node, workspace, "sync", now + 60_000, now))
     store = node.store(workspace)
     root = store.get("root")
-    snapshot = manifest.decode_root(root)
-    seed, trees = snapshot.layout_seed, snapshot.trees
+    committed = snapshot.decode_root(root)
+    seed, maps = committed.layout_seed, committed.maps
     public = node.identity_id(workspace)
     removed = merkle_map.update(
-        trees[indexes.SUPP]["root"], seed,
+        maps[indexes.SUPP]["root"], seed,
         [(indexes.principal_sid("member", public), None)],
         lambda oid: store.get("obj/" + oid), putter(store))
     body = json.loads(root)
-    body["trees"][indexes.SUPP] = {
+    body["maps"][indexes.SUPP] = {
         "root": removed.root,
         "count": removed.count,
         "depth": removed.page_depth,
@@ -145,6 +146,6 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     assert new._reader(indexes.FACT).get(indexes.action_key(sid)) == active
     assert new.fact_record(action_fid)["admission"]
 
-    trees = manifest.decode_root(new_root).trees
-    assert set(trees) == set(indexes.TREE_NAMES)
-    assert "removal" not in trees
+    maps = snapshot.decode_root(new_root).maps
+    assert set(maps) == set(snapshot.MAP_NAMES)
+    assert "removal" not in maps
