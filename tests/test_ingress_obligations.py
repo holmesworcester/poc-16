@@ -486,8 +486,14 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
             site.receiver, site.use,
         )
         for site in deletes
-    ] == [(
-        "core/object_store.py", "retire_exact", 236, "store", "direct")]
+    ] == [
+        (
+            "core/object_store.py", "retire_exact", 236,
+            "store", "direct"),
+        (
+            "core/object_store.py", "retire_exact_async", 297,
+            "store", "direct"),
+    ]
     assert [
         (
             site.path, site.function, site.line,
