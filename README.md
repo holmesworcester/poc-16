@@ -349,6 +349,42 @@ published root is the durable workspace acknowledgement.
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 [r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
 
+### Target mobile push delivery
+
+Mobile push is not implemented. The selected design does not add a PushTree
+and does not make APNs or FCM part of fact publication. Endpoint registrations
+and subscriptions are ordinary validated facts. Subscription selectors are
+published as generic offers, so the cloud publisher can derive routing
+addresses from newly activated facts and page the matching FactTree postings
+without scanning every subscription.
+
+After a successful root CAS, the publication turn materializes the resolved
+deliveries as a separate, bounded, create-only
+`push/pile/<push-node>/<generation>/<sha256>` work item. It verifies that
+durable handoff—or proves that the publication has no matching deliveries—
+before retiring the corresponding fact-ingress pile. The push pile is
+self-contained: it neither contains nor depends on the original fact pile,
+and subsequent provider delay or failure cannot hold fact publication open.
+A crash before the handoff leaves the fact pile available to retry; a failed
+root CAS creates no deliverable push work.
+
+A separately deployed push worker owns the token-decryption key and the APNs
+and FCM provider credentials. Object-created events may wake it, while a
+scheduled `push/pile/` scan is the durability fallback. It sends Apple
+endpoints directly to APNs and Android endpoints directly to FCM. APNs `200`
+or an FCM message id ends POC-16's delivery obligation; device receipt remains
+best effort under the provider's expiration/TTL rules. Network failures,
+timeouts, `429`, and `5xx` retain the push pile for bounded
+exponential-backoff retry. Invalid-token responses terminate that endpoint's
+work and feed endpoint invalidation; other permanent failures retain bounded
+diagnostic evidence. Delivery is at-least-once because a provider may accept a
+request whose response is lost.
+
+Push piles are operational queue records, not canonical facts, sync input, or
+published application state. A managed queue may consume the same records for
+leases, rate limiting, and dead-letter handling, but it is an acceleration of
+the object-store workset rather than a second subscription database.
+
 ### Prepared AWS upload broker
 
 `deploy/aws_upload_broker/` is a real metadata-only Lambda adapter, not a body
