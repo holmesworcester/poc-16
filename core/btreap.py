@@ -17,6 +17,7 @@ FORMAT = "btreap-v2"
 MAX_PAGE_DEPTH = 128
 MAX_VALUE_BYTES = 4 * 1024
 MAX_PAGE_BYTES = 8 * 1024
+MAX_RANGE_ROWS = 256
 
 
 @dataclass
@@ -34,6 +35,18 @@ class Built:
     count: int
     page_depth: int
     pages: int
+
+
+@dataclass(frozen=True)
+class RangePage:
+    """One bounded authenticated half-open range page.
+
+    ``cursor`` is the last returned key when another matching row exists.
+    Supplying it as ``after`` resumes without repeating that row.
+    """
+
+    rows: tuple
+    cursor: str | None
 
 
 def priority(seed, key):
@@ -221,6 +234,54 @@ class Reader:
             parent = rank
         return before, after
 
+    def range_page(self, start, stop, *, after=None, limit=MAX_RANGE_ROWS):
+        """Read one authenticated ``[start, stop)`` page in key order.
+
+        A contiguous BST range needs only its two boundary paths plus the
+        returned rows.  One extra matching row proves whether a continuation
+        exists, so the hard fetch budget is ``2 * depth + limit + 1``.  This
+        is the query primitive for posting lists; callers never need
+        maintenance-only ``items()`` or one exact lookup per result.
+        """
+        if not isinstance(start, str) or not start \
+                or not isinstance(stop, str) or start >= stop \
+                or after is not None and (
+                    not isinstance(after, str) or not after
+                    or after < start or after >= stop
+                ) \
+                or type(limit) is not int \
+                or not 1 <= limit <= MAX_RANGE_ROWS:
+            raise ValueError("btreap range")
+        self.pages_read = 0
+        self._page_budget = 2 * self.max_page_depth + limit + 1
+        found = []
+
+        def walk(oid, lo, hi, parent):
+            if not oid or len(found) > limit:
+                return
+            page = self._page(oid)
+            rank = self._ordered(page, lo, hi, parent)
+            key = page["key"]
+            if key < start or after is not None and key <= after:
+                walk(page["right"], key, hi, rank)
+                return
+            if key >= stop:
+                walk(page["left"], lo, key, rank)
+                return
+            walk(page["left"], lo, key, rank)
+            if len(found) > limit:
+                return
+            found.append((key, page["value"]))
+            walk(page["right"], key, hi, rank)
+
+        walk(self.root, None, None, None)
+        more = len(found) > limit
+        rows = tuple(found[:limit])
+        return RangePage(
+            rows,
+            rows[-1][0] if more else None,
+        )
+
     def items(self, known=None, *, max_pages=None):
         """The complete map, sourcing shared pages from ``known`` locally."""
         known = known or {}
@@ -258,9 +319,8 @@ class Reader:
 
 
 def update(root, seed, changes, fetch, emit):
-    """Apply map changes by persistent treap path-copying."""
-    cache = {}
-    writes = 0
+    """Apply one batch and emit only its final reachable path-copy union."""
+    cache, pending = {}, {}
 
     def load(oid):
         if not oid:
@@ -274,7 +334,6 @@ def update(root, seed, changes, fetch, emit):
         return (0, 0) if page is None else (page["count"], page["depth"])
 
     def store(key, value, left, right):
-        nonlocal writes
         left_count, left_depth = meta(left)
         right_count, right_depth = meta(right)
         count = 1 + left_count + right_count
@@ -284,11 +343,8 @@ def update(root, seed, changes, fetch, emit):
         raw = _raw(
             key, value, priority(seed, key), left, right, count, depth)
         oid = h(raw)
-        emitted = emit(raw)
-        if emitted is not None and emitted != oid:
-            raise ValueError("btreap emitter changed object identity")
         cache[oid] = json.loads(raw)
-        writes += 1
+        pending[oid] = raw
         return oid
 
     def split(oid, key):
@@ -366,6 +422,28 @@ def update(root, seed, changes, fetch, emit):
                 raise ValueError("btreap value too large")
             current = insert(current, key, value)
     if not current:
-        return Built("", 0, 0, writes)
+        return Built("", 0, 0, 0)
+
+    # Sequential splits/merges can construct intermediate immutable pages
+    # which no final row references. Publishing them is safe but turns one
+    # logical batch into avoidable object-store litter and write load. Every
+    # changed descendant has a changed ancestor, so walking only pending
+    # children from the final root finds the complete path-copy union.
+    emitted, writes = set(), 0
+
+    def publish(oid):
+        nonlocal writes
+        if oid not in pending or oid in emitted:
+            return
+        emitted.add(oid)
+        page = cache[oid]
+        publish(page["left"])
+        publish(page["right"])
+        answer = emit(pending[oid])
+        if answer is not None and answer != oid:
+            raise ValueError("btreap emitter changed object identity")
+        writes += 1
+
+    publish(current)
     page = load(current)
     return Built(current, page["count"], page["depth"], writes)

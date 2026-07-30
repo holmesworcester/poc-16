@@ -93,6 +93,16 @@ from that catalog. Published-state decisions shared with the CF path use the
 same authenticated trees; SQLite is reserved for client-local intent, query
 assembly, and full repair.
 
+FactTree is also the authenticated generic query index for current standing.
+It maps a fid to its reconciliation key, rank, resolved dependencies, offers,
+and suppression scopes, and carries ordered posting rows for fact type, key,
+explicit reference, offer candidates, reverse dependencies, and suppression
+impact. A store-only reader can page one address in bounded
+`O(tree depth + returned rows)` object reads; it does not enumerate FactTree,
+RangeTree, or rebuild SQLite. AuthorityTree remains the exact winner cache for
+ordinary authorization, where reading every conflicting candidate would be
+wasteful.
+
 The single `ctl/command` endpoint is a trusted node-local control plane.
 Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`
 protocol routes.
@@ -158,6 +168,14 @@ scan wakes a database-free publisher. That publisher validates the pile and
 objects, updates the authenticated trees, CASes `root`, and retires ingress
 only after the committed root proves publication. A lost event or poke affects
 latency, not durability.
+
+That target also requires every valid candidate that may later regain standing
+to remain durably reachable. The current client keeps losing/inactive receipts
+only in its local catalog and may retire their original pile after publishing
+the eligible subset. The generic authenticated index bounds discovery for
+rooted/eligible candidates, but it does not manufacture missing dormant
+bytes. A serverless publisher is not complete until ingress retirement or a
+root-reachable candidate archive closes that retention boundary.
 
 There is no correctness reason to proxy immutable bytes through the publisher
 when the provider can enforce the complete request. The narrower boundary is

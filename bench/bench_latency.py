@@ -20,7 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.bench_sync import build_seed
-from core import cmds
+from core import cmds, manifest
 from core import sync as sync_module
 from core.crypto import h
 from core.object_store import CREATED
@@ -127,9 +127,12 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
     unique_writes = {}
     for oid, size in writes:
         unique_writes[oid] = size
+    snapshot = manifest.decode_root(store.get("root"))
     return {
         "facts": node.idx(workspace).execute(
             "SELECT COUNT(*) FROM facts").fetchone()[0],
+        "authenticated_rows": sum(
+            tree["count"] for tree in snapshot.trees.values()),
         "seed_facts": built["facts"],
         "post": {
             "samples": len(post_times),

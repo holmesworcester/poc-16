@@ -77,6 +77,143 @@ def test_neighbor_reads_are_bounded_and_match_ordered_map():
     assert reader.pages_read <= built.page_depth
 
 
+def test_range_pages_are_complete_ordered_and_depth_plus_rows_bounded():
+    objects = {}
+    built = btreap.build(rows(), SEED, emitter(objects))
+    reader = btreap.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+    wanted = rows()[37:231]
+    cursor, found, fetches = None, [], 0
+    while True:
+        page = reader.range_page(
+            "key:00037", "key:00231", after=cursor, limit=17)
+        found.extend(page.rows)
+        fetches += reader.pages_read
+        assert reader.pages_read <= 2 * built.page_depth + 18
+        if page.cursor is None:
+            break
+        cursor = page.cursor
+
+    assert found == wanted
+    assert len(found) == 194
+    assert fetches < len(found) * built.page_depth
+
+
+def test_range_page_fetches_one_lookahead_and_never_crosses_prefix():
+    objects = {}
+    mixed = [
+        ("before", 0),
+        *((f"posting:a:{ordinal:04d}", ordinal) for ordinal in range(20)),
+        *((f"posting:b:{ordinal:04d}", ordinal) for ordinal in range(20)),
+        ("z", 1),
+    ]
+    built = btreap.build(mixed, SEED, emitter(objects))
+    reader = btreap.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+
+    first = reader.range_page(
+        "posting:a:", "posting:a:\uffff", limit=7)
+    assert [value for _, value in first.rows] == list(range(7))
+    assert first.cursor == first.rows[-1][0]
+    assert reader.pages_read <= 2 * built.page_depth + 8
+
+    tail = reader.range_page(
+        "posting:a:", "posting:a:\uffff",
+        after=first.cursor, limit=20)
+    assert [value for _, value in tail.rows] == list(range(7, 20))
+    assert tail.cursor is None
+    assert all(key.startswith("posting:a:") for key, _ in tail.rows)
+
+
+def test_range_page_rejects_unbounded_or_ambiguous_requests():
+    reader = btreap.Reader("", SEED, lambda _oid: None)
+    for args in (
+            ("same", "same", None, 1),
+            ("b", "a", None, 1),
+            ("a", "b", "z", 1),
+            ("a", "b", None, 0),
+            ("a", "b", None, btreap.MAX_RANGE_ROWS + 1)):
+        start, stop, after, limit = args
+        with pytest.raises(ValueError, match="btreap range"):
+            reader.range_page(
+                start, stop, after=after, limit=limit)
+
+
+def test_range_page_seeded_differential_covers_boundaries_and_cursors():
+    def expected_page(source, start, stop, after, limit):
+        matching = tuple(
+            row for row in source
+            if start <= row[0] < stop
+            and (after is None or row[0] > after)
+        )
+        selected = matching[:limit]
+        return btreap.RangePage(
+            selected,
+            selected[-1][0] if len(matching) > limit else None,
+        )
+
+    empty = btreap.Reader("", SEED, lambda _oid: None)
+    assert empty.range_page("a", "z", limit=3) == btreap.RangePage((), None)
+    assert empty.pages_read == 0
+
+    for seed in range(12):
+        rng = random.Random(seed)
+        source = tuple(sorted(
+            (f"k:{number:04d}", {"n": number})
+            for number in rng.sample(range(100, 700), 83)
+        ))
+        objects = {}
+        built = btreap.build(source, SEED, emitter(objects))
+        reader = btreap.Reader(
+            built.root, SEED, objects.get,
+            max_page_depth=built.page_depth)
+
+        # Explicit edge cases: a cursor before the first row, one after the
+        # last row, and a range containing exactly one full page.
+        cases = [
+            ("k:0000", "k:0800", "k:0001", 11),
+            ("k:0000", "k:0800", "k:0799", 11),
+            (source[9][0], source[20][0], None, 11),
+        ]
+        for _ in range(20):
+            lo, hi = sorted(rng.sample(range(0, 801), 2))
+            start, stop = f"k:{lo:04d}", f"k:{hi:04d}"
+            after = None
+            if rng.randrange(2):
+                after = f"k:{rng.randrange(lo, hi):04d}:cursor"
+            cases.append((start, stop, after, rng.randrange(1, 18)))
+
+        for start, stop, after, limit in cases:
+            expected = expected_page(source, start, stop, after, limit)
+            assert reader.range_page(
+                start, stop, after=after, limit=limit) == expected
+            assert reader.pages_read <= 2 * built.page_depth + limit + 1
+
+        # Differentially consume arbitrary intervals through every returned
+        # continuation. This exercises cursors that land on actual rows and
+        # proves exact-limit pages do not invent a continuation.
+        for _ in range(12):
+            lo, hi = sorted(rng.sample(range(0, 801), 2))
+            start, stop = f"k:{lo:04d}", f"k:{hi:04d}"
+            limit = rng.randrange(1, 14)
+            expected = tuple(
+                row for row in source if start <= row[0] < stop)
+            found, cursor = [], None
+            while True:
+                page = reader.range_page(
+                    start, stop, after=cursor, limit=limit)
+                found.extend(page.rows)
+                assert reader.pages_read \
+                    <= 2 * built.page_depth + limit + 1
+                if page.cursor is None:
+                    break
+                assert page.cursor == page.rows[-1][0]
+                cursor = page.cursor
+            assert tuple(found) == expected
+
+
 def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     objects = {}
     initial = btreap.build(rows(), SEED, emitter(objects))
@@ -93,6 +230,59 @@ def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     assert updated.root == bulk.root
     assert {oid: objects[oid] for oid in bulk_objects} == bulk_objects
     assert len(fresh) <= initial.page_depth
+
+
+def test_batch_update_emits_exactly_the_new_final_reachable_union():
+    original = rows()
+    objects = {}
+    initial = btreap.build(original, SEED, emitter(objects))
+    original_oids = set(objects)
+    changed = {
+        original[index][0]: None
+        for index in range(0, len(original), 11)
+    }
+    changed.update({
+        original[index][0]: {"n": index, "text": "changed"}
+        for index in range(3, len(original), 13)
+    })
+    changed.update({
+        f"key:new:{index:03d}": {"new": index}
+        for index in range(31)
+    })
+    changes = sorted(changed.items())
+    emitted = []
+
+    def emit(raw):
+        oid = h(raw)
+        emitted.append(oid)
+        objects.setdefault(oid, raw)
+        return oid
+
+    updated = btreap.update(
+        initial.root, SEED, changes, objects.get, emit)
+    final = dict(original)
+    for key, value in changes:
+        if value is None:
+            final.pop(key, None)
+        else:
+            final[key] = value
+    bulk = btreap.build(
+        tuple(final.items()), SEED, lambda raw: h(raw))
+    assert updated.root == bulk.root
+
+    reachable = set()
+
+    def visit(oid):
+        if not oid or oid in reachable:
+            return
+        reachable.add(oid)
+        page = json.loads(objects[oid])
+        visit(page["left"])
+        visit(page["right"])
+
+    visit(updated.root)
+    assert len(emitted) == len(set(emitted)) == updated.pages
+    assert set(emitted) == reachable - original_oids
 
 
 def test_items_prunes_remote_reads_and_validates_changed_paths():

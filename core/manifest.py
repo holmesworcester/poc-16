@@ -22,7 +22,7 @@ from .object_store import verified_object
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
-LAYOUT = "composite-btreap-v6-workspace-bound"
+LAYOUT = "composite-btreap-v7-generic-candidate-index"
 TREE_NAMES = ("fact", "supp", "authority")
 RANGE_SEED = h(canon(["range-tree-v1"]))
 

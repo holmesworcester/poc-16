@@ -345,8 +345,8 @@ consumer sees one current contextual form. A future adapter must be
 deterministic and must not consult replica-local arrival order or wall-clock
 state.
 
-The root uses layout stamp `composite-btreap-v6-workspace-bound` and atomically
-binds:
+The root uses layout stamp
+`composite-btreap-v7-generic-candidate-index` and atomically binds:
 
 ```text
 anchor          workspace genesis fid
@@ -393,9 +393,11 @@ consults a SQLite range directory, calls `Node.keys`, or runs an unconditional
 corpus-wide ordered fact-key query. Equal subtrees have equal object ids, so
 sync descends only remote paths whose oids are not present in the local
 RangeTree. Repair, format cutover, deactivation, and canonical-authority
-changes deliberately retain the full SQLite-backed reference build: those
-operations reconstruct client-local standing and have no CF authorization
-counterpart.
+changes deliberately retain the full SQLite-backed RangeTree reference build.
+The three Worker indexes are separate: once Catalog has derived the exact
+activated, deactivated, rank/edge-changed, and transitively liveness-affected
+fid sets, their logical rows path-copy only those deltas. Incremental and full
+compilation still produce byte-identical roots.
 
 RangeTree is an authenticated wire map for synchronization and store recovery,
 not a fourth authorization index. A read-only database-free Worker does not
@@ -407,7 +409,12 @@ publisher database-free: canonical eligibility, action state, and all four
 tree inputs are compiled from the client catalog. A future edge publisher
 must reconstruct an equivalent admitted-candidate and durable-intent view
 from authenticated objects before it can reuse this placement operation; it
-may not treat RangeTree alone as publication authority.
+may not treat RangeTree alone as publication authority. FactTree now bounds
+discovery for current rooted/eligible candidates, but it does not authenticate
+every receipt retained only in a client's SQLite catalog. Today a losing or
+inactive receipt can outlive its retired ingress pile only on that client.
+Cold database-free publication therefore remains incomplete until dormant,
+restorable candidate bytes have a durable root-or-intent retention law.
 FactTree cannot substitute for this map without also gaining ordered raw-fact
 residency and pile/closure routing; object-store LIST cannot substitute
 because object names are content hashes and include unreachable history.
@@ -423,8 +430,19 @@ the published depth and the hard depth cap; it never enumerates a tree.
 
 The schemas are:
 
-- **FactTree** — `fact:<fid>` maps to the bounded Worker record it consumes:
-  offers, selectors, continuing liveness scopes, and optional action evidence.
+- **FactTree** — `fact:<fid>` maps to one bounded record containing the
+  reconciliation key, proof rank, resolved dependency edges, offers,
+  selectors, continuing liveness scopes, and optional action evidence.
+  Collision-free `index:...` rows are ordered by
+  `(kind, k0, k1, rank, fid)`. The immutable contribution mechanically mirrors
+  client `fact_index`: type, reconciliation key, every explicit role/target
+  reference, and every declared offer. Two family-neutral derived kinds add
+  `suppression scope -> fid` and `resolved dependency target -> fid`, so a
+  changed suppression id or authority winner can discover its reverse impact
+  without a corpus scan. There is one row per posting; no B-tree page contains
+  an unbounded candidate list. A paged half-open range fetches at most two
+  boundary paths, the returned rows, and one continuation lookahead, with a
+  hard 256-row page ceiling.
   `action:<sid>` mirrors a known direct/principal action slot so sync can
   corroborate a SuppTree witness through an independently addressed record.
   Raw facts remain in manifest piles and are not emitted again as one object
@@ -436,14 +454,25 @@ The schemas are:
   its FactRecord. Missing required rows fail closed.
 - **AuthorityTree** — a canonical `NeedKey` maps to the selected provider and
   rank. A missing address is not inferred from submitted facts; family
-  authorization decides whether bootstrap absence is allowed.
+  authorization decides whether bootstrap absence is allowed. This cache is
+  deliberate: an exact winner read costs one tree path, while deriving it from
+  the generic index costs the boundary paths plus every conflicting candidate.
+  It stays until measurements show that ordinary reads do not benefit.
 
 This answers distinct bounded questions rather than keeping two mutable
 suppression roots. SuppTree answers “is this explicit id active?”; FactTree
-answers “what does this exact fact require and offer?” and corroborates the
-action witness; AuthorityTree answers “which committed fact provides this
-need?” The immutable action fid and evidence are reachable from the ACTIVE
-slots and FactRecord.
+answers “what does this exact fact require and offer?”, “which current facts
+have this type/key/ref/offer/scope or dependency?”, and corroborates the action
+witness; AuthorityTree answers “which committed fact provides this need?” The
+immutable action fid and evidence are reachable from the ACTIVE slots and
+FactRecord.
+
+Catalog settlement compares both proof ranks and resolved edges before and
+after a rebuild, then transitively closes that delta over reverse dependencies.
+The closure is required even when a descendant's direct edge and rank do not
+change: its declared authority-liveness guards can inherit different scopes
+through a rewired ancestor. FactRecord and `fact.scope` postings are updated
+for that entire affected closure, while unrelated rows remain shared by oid.
 
 Local SQLite retains `action_proposals` and their targets alongside the stable
 catalog. It derives `actions(sid, fid, evidence)` as the current effective

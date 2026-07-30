@@ -37,6 +37,7 @@ class PublicationPlan(NamedTuple):
     received: tuple
     activated: tuple
     deactivated: tuple
+    updated: tuple
     authority_changed: bool
     changed_sids: tuple
     base_root: bytes | None
@@ -135,6 +136,7 @@ class Publisher:
 
         changed = settlement.activated
         deactivated = set(settlement.deactivated)
+        updated = settlement.updated
         authority_changed = settlement.authority_changed
         changed_sids = settlement.changed_sids
         cache = {}
@@ -186,12 +188,17 @@ class Publisher:
             _, manifest_oid = manifest.build(
                 node.keys(ws), lambda fid: node.fact_of(ws, fid),
                 deps_of, emit)
+        tree_incremental = reuse and not forced_rebuild \
+            and previous is not None and previous_root is not None
         seed, trees = indexes.build(
-            ws, idx, lambda fid: node.fact_of(ws, fid), emit,
+            ws, idx, lambda fid: node.candidate_of(ws, fid), emit,
             previous=previous.trees if previous else {},
             fetch=fetch,
-            changed_fids=changed if incremental else None,
-            changed_sids=changed_sids if incremental else ())
+            changed_fids=tuple((*changed, *updated))
+            if tree_incremental else None,
+            removed_fids=tuple(sorted(deactivated))
+            if tree_incremental else (),
+            changed_sids=changed_sids if tree_incremental else ())
         action_etag = previous.action_etag \
             if incremental and not changed_sids and previous \
             else suppression_state.etag(idx)

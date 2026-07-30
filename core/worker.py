@@ -7,7 +7,6 @@ from . import btreap, indexes, manifest
 from .close import decode_pile
 from .crypto import h
 from .kernel import drain
-from .shape import valid_fid
 
 MAX_PROOF_FACTS = 64
 
@@ -36,20 +35,21 @@ class WorkerView:
 
     def fact_record(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
-        if not isinstance(row, dict) or set(row) != {
-                "evidence", "liveness", "offers", "selectors"}:
+        if row is None:
             raise ValueError("missing FactRecord")
-        if not isinstance(row["selectors"], list) \
-                or len(row["selectors"]) > indexes.MAX_SELECTORS \
-                or not all(isinstance(sid, str) for sid in row["selectors"]) \
-                or not isinstance(row["liveness"], list) \
-                or len(row["liveness"]) > facts.MAX_AUTHORITY_SCOPES \
-                or not all(isinstance(sid, str) for sid in row["liveness"]) \
-                or not isinstance(row["offers"], list) \
-                or not isinstance(row["evidence"], str) \
-                or row["evidence"] and not valid_fid(row["evidence"]):
-            raise ValueError("FactRecord shape")
-        return row
+        return indexes.checked_fact_record(row, fid)
+
+    def postings(
+            self, kind, k0=None, k1=None, *, after=None,
+            limit=btreap.MAX_RANGE_ROWS):
+        """One bounded generic-index page for a cold publisher/query."""
+        return indexes.posting_page(
+            self._reader(indexes.FACT), kind, k0, k1,
+            after=after, limit=limit)
+
+    def fact_location(self, fid):
+        """Canonical reconciliation key locating this fact's home range."""
+        return self.fact_record(fid)["key"]
 
     def suppression(self, sid):
         row = self._reader(indexes.SUPP).get(sid)

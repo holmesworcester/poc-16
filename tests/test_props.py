@@ -906,7 +906,10 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
     depth = max(tree_depth, range_depth)
     assert len(objects) <= 6 + 10 * depth, \
         f"bounded range + authenticated paths, got {objects}"
-    assert len(objects) < total
+    authenticated_rows = sum(
+        row["count"]
+        for row in json.loads(store.get("root"))["trees"].values())
+    assert len(objects) < authenticated_rows
     assert len(set(resolved)) < total, \
         f"resolved {len(set(resolved))} of {total} closures — the memo " \
         "isn't localizing the changed range"

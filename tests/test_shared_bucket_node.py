@@ -190,7 +190,7 @@ def test_rootless_publication_does_not_stamp_across_bootstrap(tmp_path):
     store = node.store(workspace)
     assert isinstance(store.cas("root", ABSENT, b"foreign"), Applied)
     plan = PublicationPlan(
-        (), (), (), False, (), None, ABSENT)
+        (), (), (), (), False, (), None, ABSENT)
 
     with pytest.raises(RootChanged, match="rootless"):
         Publisher(node, workspace).publish(plan)

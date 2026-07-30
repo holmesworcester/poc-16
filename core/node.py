@@ -461,7 +461,7 @@ class Node:
                 newfids, force=force, actions_dirty=actions_dirty,
                 allowed_staged=allowed_staged) \
                 if newfids or force or actions_dirty \
-                else catalog.Eligibility((), (), (), False, ())
+                else catalog.Eligibility((), (), (), (), False, ())
             changed_sids = set(change.changed_sids)
             if change.authority_changed:
                 changed_sids.update(self._refresh_action_evidence(ws))

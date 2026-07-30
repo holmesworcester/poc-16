@@ -31,7 +31,7 @@ TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"
 INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX, REF_INDEX))
-INDEX_VERSION = "admission-catalog-v26-workspace-bound"
+INDEX_VERSION = "admission-catalog-v27-generic-candidate-index"
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS edges(
 """
 
 
-def _index_rows(fact):
+def index_rows(fact):
     """The complete derived index contribution of one canonical fact."""
     if any(name in INTERNAL_INDEXES for name, _, _ in fact.offers()):
         raise ValueError("reserved fact index kind")
@@ -84,7 +84,7 @@ def _reindex(db, anchor):
             raise ValueError("fact catalog integrity")
         db.executemany(
             "INSERT INTO fact_index VALUES(?,?,?,?)",
-            _index_rows(fact),
+            index_rows(fact),
         )
 
 
@@ -139,7 +139,7 @@ def upgrade_schema(db, anchor):
                 db.execute("INSERT INTO staged VALUES(?)", (fid,))
             db.executemany(
                 "INSERT INTO fact_index VALUES(?,?,?,?)",
-                _index_rows(fact),
+                index_rows(fact),
             )
         db.execute("DROP TABLE facts_legacy")
         if db.execute(
@@ -159,6 +159,7 @@ class Eligibility(NamedTuple):
     received: tuple
     activated: tuple
     deactivated: tuple
+    updated: tuple
     authority_changed: bool
     changed_sids: tuple
 
@@ -268,7 +269,7 @@ class Catalog:
             self.db.execute("INSERT INTO staged VALUES(?)", (fact.fid,))
         self.db.executemany(
             "INSERT OR IGNORE INTO fact_index VALUES(?,?,?,?)",
-            _index_rows(fact),
+            index_rows(fact),
         )
         return self.db.execute(
             "SELECT 1 FROM staged WHERE fid=?",
@@ -360,10 +361,27 @@ class Catalog:
                     "FROM facts f LEFT JOIN staged s ON s.fid=f.fid")
                 if not staged or fid in allowed_staged
             )
+        def standing():
+            by_fid = {
+                fid: [rank, []]
+                for fid, rank in self.db.execute(
+                    "SELECT fid, rank FROM proofs ORDER BY fid")
+            }
+            for source, role, target, kind in self.db.execute(
+                    "SELECT src, role, dst, kind FROM edges "
+                    "ORDER BY src, role"):
+                if source in by_fid:
+                    by_fid[source][1].append((role, target, kind))
+            return {
+                fid: (value[0], tuple(value[1]))
+                for fid, value in by_fid.items()
+            }
+
+        standing_before = standing() if rebuild or actions_dirty else None
         action_before = suppression_state.snapshot(self.db) \
-            if rebuild or actions_dirty else None
+            if standing_before is not None else None
         before = self.eligible_ids() - received_set \
-            if rebuild or actions_dirty else None
+            if standing_before is not None else None
 
         def rebuild_all():
             return rebuild_proofs(
@@ -377,6 +395,11 @@ class Catalog:
                 self.db, received, self.candidate,
                 self.anchor, self._accept)
             if unresolved:
+                standing_before = {
+                    fid: value
+                    for fid, value in standing().items()
+                    if fid not in received_set
+                }
                 action_before = suppression_state.snapshot(self.db)
                 before = self.eligible_ids() - received_set
                 rebuild_all()
@@ -385,6 +408,7 @@ class Catalog:
                 return Eligibility(
                     tuple(sorted(received)),
                     self._proof_order(received),
+                    (),
                     (),
                     False,
                     (),
@@ -404,16 +428,41 @@ class Catalog:
                     break
                 rebuild_all()
 
-        after = self.eligible_ids()
+        standing_after = standing()
+        after = set(standing_after)
         deactivated = before - after
         activated = after - before
+        updated = {
+            fid for fid in before.intersection(after)
+            if standing_before[fid] != standing_after[fid]
+        }
+        # FactRecord liveness follows declared authority guards transitively.
+        # A source can therefore keep the same rank/direct edge tuple while a
+        # provider below that edge acquires different liveness scopes. Close
+        # the exact standing delta over current reverse dependencies so every
+        # derived record/posting on that chain is path-copied as well.
+        reverse = {}
+        for source, (_, edges) in standing_after.items():
+            for _, target, _ in edges:
+                reverse.setdefault(target, set()).add(source)
+        pending = list(activated | deactivated | updated)
+        seen = set(pending)
+        while pending:
+            target = pending.pop()
+            for source in reverse.get(target, ()):
+                if source not in before or source in seen:
+                    continue
+                seen.add(source)
+                updated.add(source)
+                pending.append(source)
         changed_sids = suppression_state.changed(
             action_before, suppression_state.snapshot(self.db))
         return Eligibility(
             tuple(sorted(received)),
             self._proof_order(activated),
             tuple(sorted(deactivated)),
+            tuple(sorted(updated)),
             shadows or bool(
-                deactivated or (activated - received_set)),
+                deactivated or updated or (activated - received_set)),
             tuple(sorted(changed_sids)),
         )
