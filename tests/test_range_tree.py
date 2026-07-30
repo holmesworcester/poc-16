@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from core import btreap, manifest, shape
+from core import merkle_map, manifest, shape
 from core.crypto import h
 from core.fact import Fact
 
@@ -103,7 +103,7 @@ def test_new_key_discovery_reads_one_authenticated_path_not_the_map(
         return objects.get(oid)
 
     monkeypatch.setattr(
-        btreap.Reader, "items",
+        merkle_map.Reader, "items",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("range discovery enumerated the tree")))
     ranges = manifest.changed_ranges(
@@ -239,7 +239,7 @@ def test_boundary_removal_reads_only_two_neighboring_leaves(monkeypatch):
         return objects.get(oid)
 
     monkeypatch.setattr(
-        btreap.Reader,
+        merkle_map.Reader,
         "items",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("range removal enumerated the tree")),

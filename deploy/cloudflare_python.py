@@ -6,7 +6,7 @@ import shutil
 MINT_CORE_MODULES = (
     "__init__.py",
     "bao.py",
-    "btreap.py",
+    "merkle_map.py",
     "catalog.py",
     "close.py",
     "crypto.py",

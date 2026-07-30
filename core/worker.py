@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import facts
 
-from . import btreap, indexes, manifest
+from . import merkle_map, indexes, manifest
 from .close import decode_pile
 from .crypto import h
 from .kernel import drain
@@ -29,7 +29,7 @@ class WorkerView:
 
     def _reader(self, name):
         descriptor = self.trees[name]
-        return btreap.Reader(
+        return merkle_map.Reader(
             descriptor["root"], self.seed, self.fetch,
             max_page_depth=descriptor["depth"])
 
@@ -41,7 +41,7 @@ class WorkerView:
 
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
-            limit=btreap.MAX_RANGE_ROWS):
+            limit=merkle_map.MAX_RANGE_ROWS):
         """One bounded generic-index page for a cold publisher/query."""
         return indexes.posting_page(
             self._reader(indexes.FACT), kind, k0, k1,

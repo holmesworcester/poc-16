@@ -547,7 +547,7 @@ deterministic and must not consult replica-local arrival order or wall-clock
 state.
 
 The root uses layout stamp
-`composite-btreap-v7-generic-candidate-index` and atomically binds:
+`composite-merkle-map-v8-bounded-radix` and atomically binds:
 
 ```text
 anchor          workspace genesis fid
@@ -585,7 +585,7 @@ The range manifest partitions canonical fact keys with the stable boundary
 rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
 whose home is outside that exact leaf. **RangeTree** is a logical map from each
 opaque ordered range separator to its leaf and closure oids. It uses the same
-persistent Merkle-treap primitive as every other authenticated tree; it is not
+persistent bounded Merkle map primitive as every other authenticated tree; it is not
 a second tree implementation. An ordinary commit passes the exact added,
 removed, and edge/closure-refreshed keys derived by settlement. Each key needs
 one bounded authenticated predecessor/successor search and one verified old
@@ -671,14 +671,40 @@ receipt in the exact pile, whether eligible or dormant. Candidate deletion is
 out of scope until a separate proof can establish that a candidate can never
 regain standing.
 
-## The three authenticated trees
+## The authenticated map
 
-Wire RangeTree and the three Worker indexes share one persistent Merkle-treap
-codec, but only the latter are Worker-readable. The priority of a row is
-`H(seed, key)`, which gives a unique Cartesian tree independent of insertion
-history. Each immutable page stores one row and its child object ids. An
-update path-copies only search and rotation paths. A Worker read is bounded by
-the published depth and the hard depth cap; it never enumerates a tree.
+Wire RangeTree and the three Worker indexes share one persistent bounded
+Merkle-map codec, but only the latter are Worker-readable. Its shape has no
+priority function and does not rely on key entropy. Authenticated logical keys
+are nonempty ASCII strings of at most 384 bytes and values are non-null
+canonical JSON of at most 4 KiB. A subtree is one sorted leaf exactly when all
+of its rows fit both the 32-row ceiling and the exact 8 KiB leaf encoding.
+Otherwise it is a compressed Patricia branch at the first distinguishing
+five-bit digit. A branch has no unary node, has at most 32 children, and is at
+most 48 KiB; its authenticated child descriptors bind oid, row count, encoded
+row bytes, depth, and first/last key. The hard page-depth bound is 770.
+
+Those rules define one byte-identical root for a logical map and seed,
+independent of build, insertion, deletion, restoration, or batching history.
+The seed domain-separates maps but does not choose their geometry. One update
+path-copies its branch path and at most one bounded leaf neighborhood. A split
+cannot shift another key interval; a collapse reads at most the rows that fit
+one leaf. Full build and incremental update invoke the same recursive
+partition rule.
+
+Exact reads fetch at most the descriptor depth. Neighbor reads fetch one
+search path and at most two boundary paths. A half-open range page has a
+256-row ceiling and a remote-page budget of
+`2 * depth + 2 * (limit + 1)`. Root-to-root diff uses the same bounded,
+resumable page shape and prunes an oid only when both pinned current roots
+reach it at the aligned radix route. Merely finding an old oid in the
+grow-only bucket is not equality evidence. Parent-bound child ranges make
+missing-label nonmembership fail closed before an unvisited child can hide a
+row.
+
+`core/legacy_v7.py` is the sole old B-treap surface. It is a finite,
+read-only decoder used by the explicit v7 cutover and has no build or update
+API. No current Worker, publisher, query, or root writer imports it.
 
 The schemas are:
 

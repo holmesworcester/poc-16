@@ -9,7 +9,7 @@ import facts
 import core.manifest as manifest
 import core.shape as shape
 import core.sync as sync_module
-from core import btreap, cmds
+from core import merkle_map, cmds
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import canon
@@ -150,7 +150,7 @@ def test_history_independence_holds_with_actions(tmp_path):
 
 
 def test_stable_boundary_leaves_have_one_canonical_range_tree(world):
-    """Stable leaves are exactly the rows of one canonical Merkle treap."""
+    """Stable ranges are rows of one canonical bounded Merkle map."""
     def chunks(items, fid_of):
         cuts = shape.stable_cut_positions([fid_of(item) for item in items])
         return [items[start:stop]
@@ -168,8 +168,8 @@ def test_stable_boundary_leaves_have_one_canonical_range_tree(world):
         entries, lambda raw: emitted.setdefault(h(raw), raw))
     assert root == manifest.decode_root(
         node.store(ws).get("root")).manifest
-    assert len(emitted) == len(entries)  # one authenticated page per range
-    assert all(json.loads(raw)["format"] == btreap.FORMAT
+    assert 1 <= len(emitted) <= 2 * len(entries) - 1
+    assert all(json.loads(raw)["format"] == merkle_map.FORMAT
                for raw in emitted.values())
     assert manifest.decode(emitted[root], emitted.get) == entries
 
@@ -204,7 +204,7 @@ def test_root_atomically_names_manifest_and_three_logical_trees(world):
     assert all(
         set(descriptor) == {"root", "count", "depth"}
         and descriptor["root"] and descriptor["count"] > 0
-            and 0 < descriptor["depth"] <= btreap.MAX_PAGE_DEPTH
+            and 0 < descriptor["depth"] <= merkle_map.MAX_PAGE_DEPTH
         for descriptor in body["trees"].values())
     snapshot = manifest.decode_root(raw)
     assert snapshot.anchor == ws
@@ -324,7 +324,7 @@ def test_layout_stamp_forces_rebuild(tmp_path):
 def pair(tmp_path):
     """A deterministic multi-leaf source and a converged destination replica.
 
-    The fixed source identity makes the fact addresses, range cuts, and treap
+    The fixed source identity makes the fact addresses, range cuts, and map
     geometry stable.  In particular, the warm-sync cost test below then
     exercises a delta that retains old manifest pages instead of depending on
     a lucky fresh keypair.

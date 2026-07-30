@@ -11,6 +11,7 @@ Values are opaque canonical-JSON values.  In particular this codec knows
 nothing about facts, piles, or closures; a FactOrderMap may store
 ``fact.key -> raw_oid`` without teaching the generic map a fact-body format.
 """
+import base64
 import bisect
 import json
 from dataclasses import dataclass
@@ -26,24 +27,25 @@ FORMAT = "merkle-map-v1"
 # base64url components.  The catalog-side pre-admission ratchet for every
 # future family remains tracked by poc-16-x1p.17.12; this boundary ensures the
 # map itself never emits an unbounded page.
-MAX_KEY_BYTES = 256
+MAX_KEY_BYTES = 384
 MAX_VALUE_BYTES = 4 * 1024
 
 LEAF_MAX_ROWS = 32
 LEAF_MAX_BYTES = 8 * 1024
 
-# A byte branch has at most 128 ASCII children plus the terminal symbol.
-# Child summaries make collapse decisions local.  The exact encoder check is
-# authoritative; this ceiling includes the worst legal prefix and fanout.
-MAX_FANOUT = 129
-MAX_PAGE_BYTES = 32 * 1024
+# Each ASCII byte is represented by two order-preserving five-bit digits.
+# A branch therefore has at most 32 digit children plus the terminal symbol.
+# This leaves room for authenticated child bounds without a wide page.
+MAX_FANOUT = 32
+MAX_PAGE_BYTES = 48 * 1024
 
-# A compressed Patricia path has at most one branch for each key byte, then a
+# A compressed Patricia path has at most two branches per key byte, then a
 # leaf.  The extra slot makes descriptor validation deliberately conservative.
-MAX_PAGE_DEPTH = MAX_KEY_BYTES + 2
+MAX_PAGE_DEPTH = 2 * MAX_KEY_BYTES + 2
 MAX_RANGE_ROWS = 256
 
 _TERMINAL = -1
+_DIGITS = "0123456789abcdefghijklmnopqrstuv"
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,8 @@ def _query_key(key):
 
 def _row_item(key, value):
     key_bytes = _stored_key(key)
+    if value is None:
+        raise ValueError("merkle map null value")
     value_bytes = canon(value)
     if len(value_bytes) > MAX_VALUE_BYTES:
         raise ValueError("merkle map value too large")
@@ -125,9 +129,11 @@ def _row_item(key, value):
 
 
 def _leaf_size(count, items):
-    # The seed is fixed-width, so the empty rows encoding is a constant.
     empty = len(canon({
+        "count": count,
+        "depth": 1,
         "format": FORMAT,
+        "items": items,
         "kind": "leaf",
         "rows": [],
         "seed": "0" * 64,
@@ -140,23 +146,87 @@ def _fits_leaf(count, items):
         and _leaf_size(count, items) <= LEAF_MAX_BYTES
 
 
-def _label(key_bytes, prefix_len):
-    return _TERMINAL if prefix_len == len(key_bytes) \
-        else key_bytes[prefix_len]
+def _byte_tokens(raw):
+    out = []
+    for byte in raw:
+        out.extend((byte >> 5, byte & 31))
+    out.append(_TERMINAL)
+    return tuple(out)
+
+
+def _tokens(key):
+    return _byte_tokens(_stored_key(key))
+
+
+def _query_tokens(key):
+    return _byte_tokens(_query_key(key))
+
+
+def _label(tokens, prefix_len):
+    return tokens[prefix_len]
+
+
+def _matches_route(key, prefix, label):
+    tokens = _tokens(key)
+    return len(tokens) > len(prefix) \
+        and tokens[:len(prefix)] == prefix \
+        and tokens[len(prefix)] == label
 
 
 def _common_prefix(first, last):
-    a, b = _stored_key(first), _stored_key(last)
+    a, b = _tokens(first), _tokens(last)
     at = 0
     stop = min(len(a), len(b))
     while at < stop and a[at] == b[at]:
         at += 1
+    # Distinct keys cannot share a terminal token.
     return a[:at]
 
 
+def _prefix_text(prefix):
+    return "".join(_DIGITS[digit] for digit in prefix)
+
+
+def _decode_prefix(value):
+    if not isinstance(value, str):
+        raise ValueError("merkle map page shape")
+    try:
+        prefix = tuple(_DIGITS.index(char) for char in value)
+    except ValueError as error:
+        raise ValueError("merkle map page shape") from error
+    return prefix
+
+
+def _bound_text(key):
+    return base64.urlsafe_b64encode(
+        _stored_key(key)).decode("ascii").rstrip("=")
+
+
+def _decode_bound(value):
+    try:
+        if not isinstance(value, str):
+            raise ValueError("merkle map page shape")
+        raw = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_", validate=True)
+        key = raw.decode("ascii")
+        if _bound_text(key) != value:
+            raise ValueError("merkle map page shape")
+        return key
+    except (UnicodeError, ValueError) as error:
+        if isinstance(error, ValueError) \
+                and str(error).startswith("merkle map"):
+            raise
+        raise ValueError("merkle map page shape") from error
+
+
 def _leaf_raw(rows, seed):
+    items = sum(len(canon([key, value])) for key, value in rows)
     raw = canon({
+        "count": len(rows),
+        "depth": 1,
         "format": FORMAT,
+        "items": items,
         "kind": "leaf",
         "rows": [[key, value] for key, value in rows],
         "seed": seed,
@@ -169,6 +239,7 @@ def _leaf_raw(rows, seed):
 def _child_row(label, child):
     return [
         label, child.oid, child.count, child.items, child.depth,
+        _bound_text(child.first), _bound_text(child.last),
     ]
 
 
@@ -183,12 +254,12 @@ def _branch_raw(prefix, children, first, last, seed):
         ],
         "count": count,
         "depth": depth,
-        "first": first,
+        "first": _bound_text(first),
         "format": FORMAT,
         "items": items,
         "kind": "branch",
-        "last": last,
-        "prefix": prefix.decode("ascii"),
+        "last": _bound_text(last),
+        "prefix": _prefix_text(prefix),
         "seed": seed,
     })
     if len(raw) > MAX_PAGE_BYTES:
@@ -240,7 +311,7 @@ def _build_rows(checked, seed, emit):
     groups = {}
     for row in checked:
         groups.setdefault(
-            _label(_stored_key(row[0]), len(prefix)), []).append(row)
+            _label(_tokens(row[0]), len(prefix)), []).append(row)
     if not 2 <= len(groups) <= MAX_FANOUT:
         raise ValueError("merkle map branch fanout")
     children = {
@@ -283,7 +354,10 @@ def build(rows, seed, emit, *, max_page_depth=MAX_PAGE_DEPTH):
 
 
 def _descriptor(child):
-    return child.oid, child.count, child.items, child.depth
+    return (
+        child.oid, child.count, child.items, child.depth,
+        child.first, child.last,
+    )
 
 
 def _decode(raw, oid, seed):
@@ -298,7 +372,9 @@ def _decode(raw, oid, seed):
             raise ValueError("merkle map page shape")
         kind = page.get("kind")
         if kind == "leaf":
-            if set(page) != {"format", "kind", "rows", "seed"} \
+            if set(page) != {
+                    "count", "depth", "format", "items", "kind", "rows",
+                    "seed"} \
                     or not isinstance(page["rows"], list) \
                     or not page["rows"] \
                     or len(page["rows"]) > LEAF_MAX_ROWS \
@@ -315,7 +391,9 @@ def _decode(raw, oid, seed):
                 raise ValueError("merkle map global order")
             count = len(checked)
             items = sum(row[2] for row in checked)
-            if not _fits_leaf(count, items):
+            if page["count"] != count or page["depth"] != 1 \
+                    or page["items"] != items \
+                    or not _fits_leaf(count, items):
                 raise ValueError("merkle map noncanonical leaf")
             return page, _Summary(
                 oid, count, items, 1, checked[0][0], checked[-1][0])
@@ -325,34 +403,42 @@ def _decode(raw, oid, seed):
                 "kind", "last", "prefix", "seed"}:
             raise ValueError("merkle map page shape")
         children = page["children"]
-        first, last, prefix = page["first"], page["last"], page["prefix"]
-        first_bytes, last_bytes = _stored_key(first), _stored_key(last)
-        if first >= last or not isinstance(prefix, str) \
-                or prefix.encode("ascii") != _common_prefix(first, last) \
+        first = _decode_bound(page["first"])
+        last = _decode_bound(page["last"])
+        prefix = _decode_prefix(page["prefix"])
+        if first >= last or prefix != _common_prefix(first, last) \
                 or not isinstance(children, list) \
                 or not 2 <= len(children) <= MAX_FANOUT:
             raise ValueError("merkle map page shape")
-        labels, count, items, depths = [], 0, 0, []
+        labels, count, items, depths, bounds = [], 0, 0, [], []
         for child in children:
-            if not isinstance(child, list) or len(child) != 5:
+            if not isinstance(child, list) or len(child) != 7:
                 raise ValueError("merkle map page shape")
-            label, child_oid, child_count, child_items, child_depth = child
+            (label, child_oid, child_count, child_items, child_depth,
+             child_first_text, child_last_text) = child
+            child_first = _decode_bound(child_first_text)
+            child_last = _decode_bound(child_last_text)
             if type(label) is not int \
-                    or not _TERMINAL <= label <= 127 \
+                    or not _TERMINAL <= label <= 31 \
                     or not valid_fid(child_oid) \
                     or type(child_count) is not int or child_count < 1 \
                     or type(child_items) is not int or child_items < 1 \
                     or type(child_depth) is not int \
-                    or not 1 <= child_depth < MAX_PAGE_DEPTH:
+                    or not 1 <= child_depth < MAX_PAGE_DEPTH \
+                    or child_first > child_last \
+                    or not _matches_route(child_first, prefix, label) \
+                    or not _matches_route(child_last, prefix, label):
                 raise ValueError("merkle map page shape")
             labels.append(label)
+            bounds.append((child_first, child_last))
             count += child_count
             items += child_items
             depths.append(child_depth)
-        prefix_bytes = prefix.encode("ascii")
         if labels != sorted(set(labels)) \
-                or labels[0] != _label(first_bytes, len(prefix_bytes)) \
-                or labels[-1] != _label(last_bytes, len(prefix_bytes)) \
+                or any(a[1] >= b[0] for a, b in zip(bounds, bounds[1:])) \
+                or first != bounds[0][0] or last != bounds[-1][1] \
+                or labels[0] != _label(_tokens(first), len(prefix)) \
+                or labels[-1] != _label(_tokens(last), len(prefix)) \
                 or page["count"] != count \
                 or page["items"] != items \
                 or page["depth"] != 1 + max(depths) \
@@ -371,9 +457,15 @@ def _decode(raw, oid, seed):
 
 def _children(page):
     return {
-        row[0]: _Summary(row[1], row[2], row[3], row[4], "", "")
+        row[0]: _summary_row(row)
         for row in page["children"]
     }
+
+
+def _summary_row(row):
+    return _Summary(
+        row[1], row[2], row[3], row[4],
+        _decode_bound(row[5]), _decode_bound(row[6]))
 
 
 class Reader:
@@ -406,9 +498,7 @@ class Reader:
         if route is not None:
             prefix, label = route
             for edge in (summary.first, summary.last):
-                raw = _stored_key(edge)
-                if not raw.startswith(prefix) \
-                        or _label(raw, len(prefix)) != label:
+                if not _matches_route(edge, prefix, label):
                     raise ValueError("merkle map child route")
         return page, summary
 
@@ -419,8 +509,7 @@ class Reader:
         at = bisect.bisect_left(labels, label)
         if at == len(rows) or rows[at][0] != label:
             return None, at
-        row = rows[at]
-        return _Summary(row[1], row[2], row[3], row[4], "", ""), at
+        return _summary_row(rows[at]), at
 
     def _root(self):
         if not self.root:
@@ -428,7 +517,7 @@ class Reader:
         return self._page(self.root)
 
     def get(self, key):
-        raw_key = _query_key(key)
+        key_tokens = _query_tokens(key)
         self.pages_read = 0
         self._page_budget = self.max_page_depth
         oid, expected, route = self.root, None, None
@@ -441,10 +530,10 @@ class Reader:
                 at = bisect.bisect_left(keys, key)
                 return page["rows"][at][1] \
                     if at < len(keys) and keys[at] == key else None
-            prefix = page["prefix"].encode("ascii")
-            if not raw_key.startswith(prefix):
+            prefix = _decode_prefix(page["prefix"])
+            if key_tokens[:len(prefix)] != prefix:
                 return None
-            label = _label(raw_key, len(prefix))
+            label = _label(key_tokens, len(prefix))
             child, _ = self._child(page, label)
             if child is None:
                 return None
@@ -460,9 +549,8 @@ class Reader:
                 row = page["rows"][0 if first else -1]
                 return row[0], row[1]
             selected = page["children"][0 if first else -1]
-            child = _Summary(
-                selected[1], selected[2], selected[3], selected[4], "", "")
-            prefix = page["prefix"].encode("ascii")
+            child = _summary_row(selected)
+            prefix = _decode_prefix(page["prefix"])
             route = (prefix, selected[0])
             oid, expected = child.oid, _descriptor(child)
         return None
@@ -473,7 +561,7 @@ class Reader:
         One search path plus at most two boundary paths are read.  This is a
         hard ``3 * descriptor depth`` bound independent of map cardinality.
         """
-        raw_key = _query_key(key)
+        key_tokens = _query_tokens(key)
         self.pages_read = 0
         self._page_budget = 3 * self.max_page_depth
         if not self.root:
@@ -481,28 +569,28 @@ class Reader:
         oid, expected, route = self.root, None, None
         before_child = after_child = None
         before_route = after_route = None
+
+        def loaded_edge(page, first):
+            if page["kind"] == "leaf":
+                row = page["rows"][0 if first else -1]
+                return row[0], row[1]
+            row = page["children"][0 if first else -1]
+            return self._edge(
+                _summary_row(row), first,
+                (_decode_prefix(page["prefix"]), row[0]))
+
         while oid:
             page, summary = self._page(oid, expected, route)
             if key < summary.first:
-                if page["kind"] == "leaf":
-                    row = page["rows"][0]
-                    return None, (row[0], row[1])
-                row = page["children"][0]
-                child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
-                return None, self._edge(
-                    child, True,
-                    (page["prefix"].encode("ascii"), row[0]))
+                before = self._edge(
+                    before_child, False, before_route
+                ) if before_child is not None else None
+                return before, loaded_edge(page, True)
             if key > summary.last:
-                if page["kind"] == "leaf":
-                    row = page["rows"][-1]
-                    return (row[0], row[1]), None
-                row = page["children"][-1]
-                child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
-                return self._edge(
-                    child, False,
-                    (page["prefix"].encode("ascii"), row[0])), None
+                after = self._edge(
+                    after_child, True, after_route
+                ) if after_child is not None else None
+                return loaded_edge(page, False), after
             if page["kind"] == "leaf":
                 keys = [row[0] for row in page["rows"]]
                 at = bisect.bisect_left(keys, key)
@@ -518,24 +606,22 @@ class Reader:
                     after = self._edge(after_child, True, after_route)
                 return before, after
 
-            prefix = page["prefix"].encode("ascii")
-            if not raw_key.startswith(prefix):
+            prefix = _decode_prefix(page["prefix"])
+            if key_tokens[:len(prefix)] != prefix:
                 # Being inside [first,last] implies the shared prefix for
-                # well-formed UTF-8 order.  Treat any contradiction as shape.
+                # a well-formed radix interval. Treat contradiction as shape.
                 raise ValueError("merkle map global order")
-            label = _label(raw_key, len(prefix))
+            label = _label(key_tokens, len(prefix))
             children = page["children"]
             labels = [row[0] for row in children]
             at = bisect.bisect_left(labels, label)
             if at and (at == len(labels) or labels[at] != label):
                 row = children[at - 1]
-                before_child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                before_child = _summary_row(row)
                 before_route = (prefix, row[0])
             if at < len(labels) and labels[at] != label:
                 row = children[at]
-                after_child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                after_child = _summary_row(row)
                 after_route = (prefix, row[0])
             if at == len(labels) or labels[at] != label:
                 before = self._edge(
@@ -546,27 +632,23 @@ class Reader:
                 return before, after
             if at:
                 row = children[at - 1]
-                before_child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                before_child = _summary_row(row)
                 before_route = (prefix, row[0])
             if at + 1 < len(children):
                 row = children[at + 1]
-                after_child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                after_child = _summary_row(row)
                 after_route = (prefix, row[0])
             row = children[at]
-            child = _Summary(row[1], row[2], row[3], row[4], "", "")
+            child = _summary_row(row)
             oid, expected, route = (
                 child.oid, _descriptor(child), (prefix, label))
         return None, None
 
-    def _range_rows(self, start, stop, after, limit, known=None):
+    def _range_rows(self, start, stop, after, limit):
         found = []
         stack = [(self.root, None, None)] if self.root else []
         while stack and len(found) <= limit:
             oid, expected, route = stack.pop()
-            if known is not None and oid in known:
-                continue
             page, summary = self._page(oid, expected, route)
             if summary.last < start or summary.first >= stop \
                     or after is not None and summary.last <= after:
@@ -579,10 +661,12 @@ class Reader:
                         if len(found) > limit:
                             break
                 continue
-            prefix = page["prefix"].encode("ascii")
+            prefix = _decode_prefix(page["prefix"])
             for row in reversed(page["children"]):
-                child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                child = _summary_row(row)
+                if child.last < start or child.first >= stop \
+                        or after is not None and child.last <= after:
+                    continue
                 stack.append((
                     child.oid, _descriptor(child), (prefix, row[0])))
         return found
@@ -609,18 +693,17 @@ class Reader:
         rows = tuple(found[:limit])
         return RangePage(rows, rows[-1][0] if more else None)
 
-    def diff_page(
-            self, known, *, local=None, after=None,
-            limit=MAX_RANGE_ROWS):
+    def diff_page(self, local, *, after=None, limit=MAX_RANGE_ROWS):
         """Return one resumable oid-pruned page of a remote map.
 
-        ``known`` is a set or mapping of locally held page oids.  Equal
-        subtrees cost no fetch and yield no rows.  Rewritten leaves are small
-        by construction, so unchanged neighbors in such a leaf are returned
-        alongside changed rows; ``local`` optionally classifies the exact
-        logical differences.  The cursor is the last returned key.
+        Pruning compares subtrees reachable from the two supplied *current
+        roots*.  Merely possessing an oid is not a reachability witness:
+        immutable stores retain stale pages from old roots.  Rewritten leaves
+        are small by construction, so unchanged neighbors in such a leaf are
+        returned alongside the exact ``differing`` rows.  Run the operation in
+        both directions to discover deletions.
         """
-        if not hasattr(known, "__contains__") \
+        if not isinstance(local, Reader) or local.seed != self.seed \
                 or after is not None and (
                     not isinstance(after, str) or not after):
             raise ValueError("merkle map diff")
@@ -631,15 +714,86 @@ class Reader:
         self.pages_read = 0
         self._page_budget = (
             2 * self.max_page_depth + 2 * (limit + 1))
-        rows = self._range_rows(
-            "", "\uffff", after, limit, known=known)
+        local_pages = 0
+
+        def local_page(ref):
+            nonlocal local_pages
+            oid, expected, route = ref
+            local_pages += 1
+            page, summary = _decode(local.fetch(oid), oid, local.seed)
+            if expected is not None and _descriptor(summary) != expected:
+                raise ValueError("merkle map child metadata")
+            if route is not None:
+                prefix, label = route
+                if any(
+                        not _matches_route(edge, prefix, label)
+                        for edge in (summary.first, summary.last)):
+                    raise ValueError("merkle map child route")
+            return page, summary
+
+        remote_root = (self.root, None, None) if self.root else None
+        local_root = (local.root, None, None) if local.root else None
+        stack = [(remote_root, local_root)] if remote_root else []
+        rows = []
+        while stack and len(rows) <= limit:
+            remote_ref, local_ref = stack.pop()
+            oid, expected, route = remote_ref
+            # Equal content hashes authenticate equality only when the two
+            # current parents also authenticate the same descriptor and route.
+            # A hostile parent may reuse a genuine child oid beside forged
+            # bounds/counts; that child must be opened and rejected.
+            if local_ref is not None and remote_ref == local_ref:
+                continue
+            page, summary = self._page(oid, expected, route)
+            if after is not None and summary.last <= after:
+                continue
+            if page["kind"] == "leaf":
+                for key, value in page["rows"]:
+                    if after is None or key > after:
+                        rows.append((key, value))
+                        if len(rows) > limit:
+                            break
+                continue
+
+            local_children = {}
+            if local_ref is not None:
+                local_node, _ = local_page(local_ref)
+                if local_node["kind"] == "branch" \
+                        and local_node["prefix"] == page["prefix"]:
+                    local_children = {
+                        row[0]: (
+                            row[1],
+                            _descriptor(_summary_row(row)),
+                            (_decode_prefix(local_node["prefix"]), row[0]),
+                        )
+                        for row in local_node["children"]
+                    }
+            prefix = _decode_prefix(page["prefix"])
+            for row in reversed(page["children"]):
+                child = _summary_row(row)
+                if after is not None and child.last <= after:
+                    continue
+                stack.append((
+                    (
+                        child.oid, _descriptor(child),
+                        (prefix, row[0]),
+                    ),
+                    local_children.get(row[0]),
+                ))
+
         more = len(rows) > limit
         selected = tuple(rows[:limit])
-        differing = selected if local is None else tuple(
-            row for row in selected if local.get(row[0]) != row[1])
+        differing = []
+        lookup_pages = 0
+        for row in selected:
+            incumbent = local.get(row[0])
+            lookup_pages += local.pages_read
+            if incumbent != row[1]:
+                differing.append(row)
+        local.pages_read = local_pages + lookup_pages
         return DiffPage(
             selected,
-            differing,
+            tuple(differing),
             selected[-1][0] if more else None,
         )
 
@@ -654,14 +808,28 @@ class Reader:
         if not self.root:
             return ()
         self.pages_read = 0
-        self._page_budget = max_pages or 1_000_000
+        prefetched = {}
+        if max_pages is None:
+            if self.root in known:
+                root_page, root_summary = _decode(
+                    known[self.root], self.root, self.seed)
+            else:
+                self._page_budget = 1
+                root_page, root_summary = self._page(self.root)
+            max_pages = 2 * root_summary.count - 1
+            prefetched[self.root] = (root_page, root_summary)
+        if type(max_pages) is not int or max_pages < 1:
+            raise ValueError("merkle map read budget")
+        self._page_budget = max_pages
         seen, out = set(), []
 
         def walk(oid, expected=None, route=None):
             if oid in seen:
                 raise ValueError("repeated merkle map page")
             seen.add(oid)
-            if oid in known:
+            if oid in prefetched:
+                page, summary = prefetched[oid]
+            elif oid in known:
                 page, summary = _decode(known[oid], oid, self.seed)
                 if expected is not None \
                         and _descriptor(summary) != expected:
@@ -669,8 +837,7 @@ class Reader:
                 if route is not None:
                     prefix, label = route
                     if any(
-                            not _stored_key(edge).startswith(prefix)
-                            or _label(_stored_key(edge), len(prefix)) != label
+                            not _matches_route(edge, prefix, label)
                             for edge in (summary.first, summary.last)):
                         raise ValueError("merkle map child route")
             else:
@@ -678,11 +845,10 @@ class Reader:
             if page["kind"] == "leaf":
                 out.extend((row[0], row[1]) for row in page["rows"])
                 return summary
-            prefix = page["prefix"].encode("ascii")
+            prefix = _decode_prefix(page["prefix"])
             children = []
             for row in page["children"]:
-                child = _Summary(
-                    row[1], row[2], row[3], row[4], "", "")
+                child = _summary_row(row)
                 children.append(walk(
                     child.oid, _descriptor(child), (prefix, row[0])))
             if summary.first != children[0].first \
@@ -729,8 +895,7 @@ def update(root, seed, changes, fetch, emit):
         if route is not None:
             prefix, label = route
             if any(
-                    not _stored_key(edge).startswith(prefix)
-                    or _label(_stored_key(edge), len(prefix)) != label
+                    not _matches_route(edge, prefix, label)
                     for edge in (actual.first, actual.last)):
                 raise ValueError("merkle map child route")
         return page, actual
@@ -763,11 +928,10 @@ def update(root, seed, changes, fetch, emit):
         page, actual = load(summary, route)
         if page["kind"] == "leaf":
             return [(row[0], row[1]) for row in page["rows"]]
-        prefix = page["prefix"].encode("ascii")
+        prefix = _decode_prefix(page["prefix"])
         rows = []
         for row in page["children"]:
-            child = _Summary(
-                row[1], row[2], row[3], row[4], "", "")
+            child = _summary_row(row)
             rows.extend(collect(child, (prefix, row[0])))
             if len(rows) > LEAF_MAX_ROWS:
                 raise ValueError("merkle map collapse budget")
@@ -791,27 +955,26 @@ def update(root, seed, changes, fetch, emit):
                 rows.insert(at, (key, value))
             return build_local(rows) if rows else None
 
-        prefix = page["prefix"].encode("ascii")
-        key_bytes = _stored_key(key)
-        if not key_bytes.startswith(prefix):
+        prefix = _decode_prefix(page["prefix"])
+        key_tokens = _tokens(key)
+        if key_tokens[:len(prefix)] != prefix:
             if value is None:
                 return actual
             one = build_local(((key, value),))
             new_prefix = _common_prefix(
                 min(key, actual.first), max(key, actual.last))
             groups = {
-                _label(_stored_key(one.first), len(new_prefix)): one,
-                _label(_stored_key(actual.first), len(new_prefix)): actual,
+                _label(_tokens(one.first), len(new_prefix)): one,
+                _label(_tokens(actual.first), len(new_prefix)): actual,
             }
             if len(groups) != 2:
                 raise ValueError("merkle map branch split")
             return store_branch(new_prefix, groups)
 
-        label = _label(key_bytes, len(prefix))
+        label = _label(key_tokens, len(prefix))
         children = {}
         for row in page["children"]:
-            children[row[0]] = _Summary(
-                row[1], row[2], row[3], row[4], "", "")
+            children[row[0]] = _summary_row(row)
         child = children.get(label)
         if child is None:
             if value is None:

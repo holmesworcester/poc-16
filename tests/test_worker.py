@@ -3,7 +3,7 @@ import inspect
 import json
 import sqlite3
 
-from core import btreap, cmds, indexes, manifest
+from core import merkle_map, cmds, indexes, manifest
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon
@@ -45,7 +45,7 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
     view = WorkerView.from_root(root, fetch)
     assert view.mint(pile, now) == (node.identity_id(workspace), "sync")
     assert manifest_oid not in fetched
-    assert len(set(fetched)) <= 6 * btreap.MAX_PAGE_DEPTH
+    assert len(set(fetched)) <= 6 * merkle_map.MAX_PAGE_DEPTH
     assert "sqlite" not in inspect.getsource(WorkerView).lower()
 
 
@@ -80,7 +80,7 @@ def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
     snapshot = manifest.decode_root(root)
     seed, trees = snapshot.layout_seed, snapshot.trees
     public = node.identity_id(workspace)
-    removed = btreap.update(
+    removed = merkle_map.update(
         trees[indexes.SUPP]["root"], seed,
         [(indexes.principal_sid("member", public), None)],
         lambda oid: store.get("obj/" + oid), putter(store))

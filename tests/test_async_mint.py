@@ -4,7 +4,7 @@ from collections import Counter
 
 import pytest
 
-from core import btreap, cmds, mint
+from core import merkle_map, cmds, mint
 from core.close import decode_pile, encode_pile
 from core.node import Node, now_ms
 from facts.auth import request
@@ -12,7 +12,7 @@ from facts.auth import request
 from .util import add_member, closed_subset
 
 UNIQUE_FETCH_BUDGET = 49
-FETCH_BYTE_BUDGET = UNIQUE_FETCH_BUDGET * btreap.MAX_PAGE_BYTES
+FETCH_BYTE_BUDGET = UNIQUE_FETCH_BUDGET * merkle_map.MAX_PAGE_BYTES
 
 
 def combine(*streams):

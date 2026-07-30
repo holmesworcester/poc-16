@@ -423,7 +423,9 @@ class Node:
 
         view = WorkerView.from_root(root_bytes, fetch)
         fact_tree = view._reader(indexes.FACT)
-        for sid, slot in view._reader(indexes.SUPP).items():
+        supp = view.trees[indexes.SUPP]
+        for sid, slot in view._reader(indexes.SUPP).items(
+                max_pages=max(1, 2 * supp["count"] - 1)):
             if not isinstance(slot, dict) or slot.get("state") != "active":
                 continue
             fid = slot.get("action")

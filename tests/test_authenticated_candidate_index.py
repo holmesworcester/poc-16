@@ -3,7 +3,7 @@ import random
 
 import facts
 
-from core import btreap, catalog, cmds, indexes, manifest, suppression_state
+from core import merkle_map, catalog, cmds, indexes, manifest, suppression_state
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
 from core.node import Node
