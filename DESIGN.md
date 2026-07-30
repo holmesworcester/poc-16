@@ -181,14 +181,16 @@ object/pile PUTs and performs publication. The resumable client, stateless
 broker protocol, strict provider-neutral HTTP membrane, and S3/R2 signing
 translators are implemented. AWS additionally has a separate Function URL
 adapter and least-privilege SAM broker stack; it is not live-deployed.
-Cloudflare still has a fail-closed broker stub, and neither provider has the
-database-free publisher. The target write path removes the host proxy without
-giving clients root authority. After authorization, a broker signs short-lived,
-exact-key conditional PUT capabilities. A client uploads objects first and a
-closed-pile intent last into session-scoped isolated ingress on both S3 and R2.
-No object or pile body transits the broker, Lambda, Worker, or publisher during
-upload; those components handle authority metadata or later publication. This
-is the one selected client protocol.
+Cloudflare additionally has a real database-free broker Worker that builds
+through pywrangler and loads under local workerd; it has no public route and
+has not been live-deployed. Neither provider has the database-free publisher.
+The target write path removes the host proxy without giving clients root
+authority. After authorization, a broker signs short-lived, exact-key
+conditional PUT capabilities. A client uploads objects first and a closed-pile
+intent last into session-scoped isolated ingress on both S3 and R2. No object
+or pile body transits the broker, Lambda, Worker, or publisher during upload;
+those components handle authority metadata or later publication. This is the
+one selected client protocol.
 Provider object-created events, an authenticated poke, and a scheduled fallback
 may all wake interchangeable database-free publishers. Wakeups are advisory;
 the durable pile is the work item. Publishers verify workspace, uploader,
@@ -341,9 +343,9 @@ transport-neutral server membrane: it accepts only those three exact paths
 and bounded canonical JSON/base64 documents, calls the existing
 `UploadBroker`, and returns body-free errors. AWS Lambda and Cloudflare Worker
 event normalization is a deployment adapter around this membrane; the AWS
-Function URL v2 adapter is implemented under `deploy/aws_upload_broker`, while
-the Cloudflare adapter remains open. Neither provider body nor
-provider-specific request object enters the broker.
+Function URL v2 adapter is implemented under `deploy/aws_upload_broker`, and
+the Python Worker adapter is implemented under `deploy/cloudflare_upload`.
+Neither provider body nor provider-specific request object enters the broker.
 
 The constant-size cursor binds protocol version, issuer/provider, key id,
 workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
@@ -358,9 +360,10 @@ broker/PUT transports, while `deploy/upload_journal.py` owns only the
 filesystem durability boundary. Fact-family commands author the same message,
 file, chunk, signature, and closed-pile bytes used by local publication;
 `core/cli.py` remains a generic passthrough. The AWS event adapter exists but
-has not been live-deployed; there is not yet a Cloudflare broker adapter or a
-database-free publisher. These client commands therefore do not make the
-current read-only Lambda/Worker gateway deployments writable.
+has not been live-deployed; the Cloudflare broker adapter exists but likewise
+has no live route. There is not yet a database-free publisher. These client
+commands therefore do not make the current read-only Lambda/Worker gateway
+deployments writable.
 
 `deploy/upload_keyring.py` gives AWS and Cloudflare one canonical bounded
 secret-document meaning. Rotation is distribute, activate, then retire: every
@@ -427,10 +430,12 @@ before broker, stops broker before publisher, and deletes only Workers whose
 exact owner and role markers were observed before the first delete. Applying
 and live-verifying the lifecycle remains a separate privileged provisioning
 step because replacing a bucket's whole lifecycle document from a compute
-deploy could clobber unrelated rules. The current entries are non-public
-fail-closed stubs. These generated documents, frozen SigV4 vectors, an
-independent verifier, and credential-free mutation tests establish the
-intended authority shape, not a live-provider or completed-publisher claim.
+deploy could clobber unrelated rules. The current broker entry is real but
+non-public; the separately staged publisher entry is fail-closed. These
+generated documents, frozen SigV4 vectors, production-adapter session tests,
+a local-workerd load, an independent verifier, and credential-free mutation
+tests establish the intended authority shape, not a live-provider or
+completed-publisher claim.
 Cloudflare documents `PutObject` `If-None-Match`, but its presign page does not
 explicitly guarantee signed `Content-Length`; the opt-in direct-provider seam
 remains required before claiming that boundary, and it is not browser

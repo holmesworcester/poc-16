@@ -3,13 +3,21 @@
 import json
 import os
 from pathlib import Path
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from deploy.cloudflare_python import (
+    MINT_CORE_MODULES,
+    copy_python_modules,
+    patch_pynacl,
+)
 from deploy.cloudflare_upload.boundary import (
     BROKER_SECRET_NAMES,
     OWNER_BINDING,
@@ -18,18 +26,43 @@ from deploy.cloudflare_upload.boundary import (
     generated_boundary,
 )
 from deploy.cloudflare_upload.signer import R2UploadSigner
-from deploy.upload_keyring import decode_keyring
+from deploy.upload_keyring import (
+    UploadKeyring,
+    decode_keyring,
+    encode_keyring,
+)
+from deploy.upload_session import SessionKey, UploadSessionPolicy
 
 
 PACKAGE = Path(__file__).resolve().parent
 REPOSITORY = PACKAGE.parents[1]
 GENERATED = PACKAGE / "generated"
+BUILD = PACKAGE / "build"
+BROKER_WORKER = BUILD / "broker"
+PUBLISHER_WORKER = BUILD / "publisher"
+VENDORED = PACKAGE / "python_modules"
 CONTROL_TIMEOUT_SECONDS = 120
 SETTINGS_TIMEOUT_SECONDS = 15
 API_RESPONSE_BYTES = 64 * 1024
 _ABSENT = object()
 ROLE_ORDER = ("publisher", "broker")
 REMOVE_ORDER = tuple(reversed(ROLE_ORDER))
+BROKER_CORE_MODULES = MINT_CORE_MODULES + ("staged_intent.py",)
+BROKER_DEPLOY_MODULES = (
+    "__init__.py",
+    "gateway.py",
+    "upload_broker.py",
+    "upload_broker_http.py",
+    "upload_keyring.py",
+    "upload_session.py",
+    "upload_wire.py",
+)
+BROKER_PROVIDER_MODULES = (
+    "__init__.py",
+    "boundary.py",
+    "reader.py",
+    "signer.py",
+)
 
 
 def _write_json(path, value):
@@ -43,15 +76,77 @@ def _write_json(path, value):
     pending_path.replace(path)
 
 
+def _copy(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+
+
+def stage_broker():
+    """Stage the exact DB-free broker import tree for pywrangler."""
+    patch_pynacl(VENDORED)
+    pending = BUILD / "broker.pending"
+    if pending.exists():
+        shutil.rmtree(pending)
+    pending.mkdir(parents=True)
+    _copy(
+        PACKAGE / "worker" / "broker.py",
+        pending / "entry.py",
+    )
+    _copy(
+        PACKAGE / "worker" / "runtime.py",
+        pending / "runtime.py",
+    )
+    for name in BROKER_CORE_MODULES:
+        _copy(
+            REPOSITORY / "core" / name,
+            pending / "core" / name,
+        )
+    shutil.copytree(
+        REPOSITORY / "facts",
+        pending / "facts",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    for name in BROKER_DEPLOY_MODULES:
+        _copy(
+            REPOSITORY / "deploy" / name,
+            pending / "deploy" / name,
+        )
+    for name in BROKER_PROVIDER_MODULES:
+        _copy(
+            PACKAGE / name,
+            pending / "deploy" / "cloudflare_upload" / name,
+        )
+    if BROKER_WORKER.exists():
+        shutil.rmtree(BROKER_WORKER)
+    pending.rename(BROKER_WORKER)
+    return BROKER_WORKER
+
+
+def stage_publisher():
+    """Stage only the fail-closed placeholder for the unfinished publisher."""
+    pending = BUILD / "publisher.pending"
+    if pending.exists():
+        shutil.rmtree(pending)
+    pending.mkdir(parents=True)
+    _copy(
+        PACKAGE / "worker" / "publisher_stub.py",
+        pending / "entry.py",
+    )
+    if PUBLISHER_WORKER.exists():
+        shutil.rmtree(PUBLISHER_WORKER)
+    pending.rename(PUBLISHER_WORKER)
+    return PUBLISHER_WORKER
+
+
 def render(deployment):
     """Write non-secret Worker configs and provider-policy inputs."""
     boundary = generated_boundary(deployment)
     paths = {}
     for role in ROLE_ORDER:
-        path = GENERATED / f"wrangler.{role}.json"
+        path = GENERATED / role / "wrangler.json"
         config = dict(boundary[role])
-        config["main"] = f"../{config['main']}"
-        config["base_dir"] = "../worker"
+        config["main"] = f"../../{config['main']}"
+        config["base_dir"] = f"../../{config['base_dir']}"
         _write_json(path, config)
         paths[role] = path
     for name, value in (
@@ -62,6 +157,14 @@ def render(deployment):
         _write_json(path, value)
         paths[name] = path
     return paths
+
+
+def stage_broker_dependencies():
+    """Put the patched locked dependencies beside the broker's config."""
+    target = GENERATED / "broker" / "python_modules"
+    if target.exists():
+        shutil.rmtree(target)
+    copy_python_modules(VENDORED, target)
 
 
 def _run(command):
@@ -76,7 +179,13 @@ def _run(command):
 def build(deployment, *, runner=None):
     """Dry-run both exact generated configs through locked pywrangler."""
     runner = _run if runner is None else runner
+    runner([
+        "uv", "run", "pywrangler", "sync", "--allow-build",
+    ])
+    stage_broker()
+    stage_publisher()
     paths = render(deployment)
+    stage_broker_dependencies()
     with tempfile.TemporaryDirectory(
             prefix="poc16-cloudflare-upload-build-") as output:
         output = Path(output)
@@ -88,18 +197,155 @@ def build(deployment, *, runner=None):
                 "--outdir", str(target),
                 "--config", str(paths[role]),
             ])
-            entry = target / f"{role}_stub.py"
-            if not entry.is_file():
+            if role == "broker":
+                _verify_broker_bundle(target)
+            elif not (target / "entry.py").is_file():
                 raise RuntimeError(
-                    f"pywrangler omitted the {role} entrypoint")
+                    "pywrangler omitted the publisher entrypoint")
+
+
+def _verify_broker_bundle(directory):
+    paths = {
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*") if path.is_file()
+    }
+    required = {
+        "entry.py",
+        "runtime.py",
+        "core/mint.py",
+        "core/staged_intent.py",
+        "facts/auth/request.py",
+        "deploy/upload_broker.py",
+        "deploy/upload_broker_http.py",
+        "deploy/upload_keyring.py",
+        "deploy/cloudflare_upload/reader.py",
+        "deploy/cloudflare_upload/signer.py",
+    }
+    missing = required - paths
+    if missing:
+        raise RuntimeError(
+            f"pywrangler omitted broker modules: {sorted(missing)}")
+    forbidden = {
+        "core/node.py",
+        "core/daemon.py",
+        "core/runtime.py",
+        "adapters/r2/worker.py",
+        "adapters/r2/s3.py",
+        "adapters/s3/store.py",
+    } & paths
+    if forbidden:
+        raise RuntimeError(
+            f"broker artifact contains host modules: {sorted(forbidden)}")
+    sodium = tuple(
+        directory.glob("python_modules/nacl/_sodium*.so"))
+    if len(sodium) != 1 \
+            or b"__start_em_asm" in sodium[0].read_bytes():
+        raise RuntimeError(
+            "broker artifact omitted the patched PyNaCl runtime")
+
+
+def _workerd_secrets(deployment):
+    ingress_id = "workerd-ingress-parent"
+    ingress_secret = "workerd-ingress-secret"
+    provider = R2UploadSigner(
+        deployment,
+        ingress_id,
+        ingress_secret,
+        clock=lambda: 0,
+    ).provider_binding
+    key = SessionKey("key00001", b"k" * 32, 0, 9_000_000_000_000)
+    keyring = encode_keyring(UploadKeyring(
+        provider,
+        UploadSessionPolicy(
+            deployment.upload_issuer,
+            key.key_id,
+            (key,),
+        ),
+    )).decode("ascii")
+    return {
+        "CANONICAL_READ_ACCESS_KEY_ID": "workerd-canonical-reader",
+        "CANONICAL_READ_SECRET_ACCESS_KEY": "workerd-reader-secret",
+        "INGRESS_PARENT_ACCESS_KEY_ID": ingress_id,
+        "INGRESS_PARENT_SECRET_ACCESS_KEY": ingress_secret,
+        "UPLOAD_SESSION_KEYRING": keyring,
+    }
+
+
+def workerd_test(deployment):
+    """Load the production broker entrypoint in local workerd."""
+    runner = _run
+    runner([
+        "uv", "run", "pywrangler", "sync", "--allow-build",
+    ])
+    stage_broker()
+    paths = render(deployment)
+    stage_broker_dependencies()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    environment = {**os.environ, **_workerd_secrets(deployment)}
+    with tempfile.NamedTemporaryFile(
+            mode="w+", prefix="poc16-upload-workerd-",
+            suffix=".log") as log:
+        process = subprocess.Popen(
+            [
+                "uv", "run", "pywrangler", "dev",
+                "--ip", "127.0.0.1",
+                "--port", str(port),
+                "--config", str(paths["broker"]),
+            ],
+            cwd=PACKAGE,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline, error = time.monotonic() + 30, None
+        try:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                try:
+                    urlopen(
+                        f"http://127.0.0.1:{port}/not-an-upload-route",
+                        timeout=1,
+                    )
+                    error = RuntimeError(
+                        "unknown upload route unexpectedly succeeded")
+                except HTTPError as caught:
+                    if caught.code == 404 \
+                            and caught.read() == b"" \
+                            and caught.headers.get(
+                                "Cache-Control") == "no-store" \
+                            and caught.headers.get(
+                                "X-Content-Type-Options") == "nosniff":
+                        return
+                    error = RuntimeError(
+                        "unexpected upload route response")
+                except (OSError, URLError) as caught:
+                    error = caught
+                time.sleep(0.1)
+            log.seek(0)
+            raise RuntimeError(
+                f"upload broker workerd test failed: {error}\n{log.read()}")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def test(deployment):
     _run([
         "uv", "run", "python", "-m", "pytest", "-q",
         str(REPOSITORY / "tests" / "test_cloudflare_upload_boundary.py"),
+        str(REPOSITORY / "tests" / "test_cloudflare_upload_worker.py"),
+        str(REPOSITORY / "tests" / "test_r2_upload_signer.py"),
     ])
     build(deployment)
+    workerd_test(deployment)
 
 
 def _control_token(environment):
@@ -218,6 +464,7 @@ def _broker_secrets(deployment, environment):
 def _deploy_one(role, path, runner, broker_secrets):
     command = [
         "uv", "run", "pywrangler", "deploy",
+        "--strict",
         "--config", str(path),
     ]
     if role == "broker":
@@ -236,13 +483,13 @@ def deploy(
         runner=None, identity_reader=None):
     """Deploy publisher then broker after checking both exact identities.
 
-    The checked-in entries are deliberately non-public, fail-closed stubs.
-    Requiring an explicit opt-in prevents this boundary package from being
-    mistaken for the still-unbuilt upload service.
+    The broker is real, but the publisher is deliberately fail-closed and
+    neither generated role has a public route. Requiring an explicit opt-in
+    prevents this partial pair from being mistaken for the complete service.
     """
-    if environment.get("CF_UPLOAD_ENABLE_STUB_DEPLOY") != "1":
+    if environment.get("CF_UPLOAD_ENABLE_PARTIAL_DEPLOY") != "1":
         raise ValueError(
-            "set CF_UPLOAD_ENABLE_STUB_DEPLOY=1 for boundary deployment")
+            "set CF_UPLOAD_ENABLE_PARTIAL_DEPLOY=1 for partial deployment")
     runner = _run if runner is None else runner
     identity_reader = (
         _worker_identity if identity_reader is None else identity_reader)
@@ -250,7 +497,6 @@ def deploy(
     # first provider mutation. A malformed broker key ring must not leave a
     # half-installed role pair.
     broker_secrets = _broker_secrets(deployment, environment)
-    paths = render(deployment)
     boundary = generated_boundary(deployment)
     configs = {role: boundary[role] for role in ROLE_ORDER}
     _preflight(
@@ -260,6 +506,13 @@ def deploy(
         create=environment.get("CF_UPLOAD_CREATE") == "1",
         identity_reader=identity_reader,
     )
+    runner([
+        "uv", "run", "pywrangler", "sync", "--allow-build",
+    ])
+    stage_broker()
+    stage_publisher()
+    paths = render(deployment)
+    stage_broker_dependencies()
     for role in ROLE_ORDER:
         _deploy_one(
             role, paths[role], runner, broker_secrets)
@@ -304,8 +557,8 @@ def help_text():
 Commands:
   render  generate non-secret broker/publisher configs and R2 policy inputs
   build   dry-run both generated configs through locked pywrangler/Workers
-  test    run the credential-free corpus and both pywrangler dry-runs
-  deploy  opt-in deployment of non-public fail-closed boundary stubs
+  test    run host, clean-bundle, and local-workerd broker checks
+  deploy  opt-in deployment of the broker plus fail-closed publisher
   remove  remove the two exactly owned Workers while preserving both buckets
   help    show this help
 """

@@ -1,8 +1,8 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "poc16-upload-boundary-placeholder",
-  "main": "worker/broker_stub.py",
-  "base_dir": "worker",
+  "main": "build/broker/entry.py",
+  "base_dir": "build/broker",
   "compatibility_date": "2026-07-29",
   "compatibility_flags": [
     "python_workers"

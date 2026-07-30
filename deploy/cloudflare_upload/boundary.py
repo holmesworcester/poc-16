@@ -19,6 +19,7 @@ ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
 BUCKET = re.compile(
     r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 HEX_ID = re.compile(r"^[0-9a-f]{32}$")
+ISSUER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$")
 OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 WORKER = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
@@ -69,6 +70,7 @@ class Deployment:
     publisher_name: str
     read_permission_group_id: str
     write_permission_group_id: str
+    upload_issuer: str = "cloudflare-upload-production"
     jurisdiction: str = "default"
     canonical_bucket_profile: str = "dedicated-workspace"
     canonical_prefix: str | None = None
@@ -97,6 +99,9 @@ class Deployment:
             raise ValueError("broker and publisher Worker names must differ")
         if self.jurisdiction not in JURISDICTIONS:
             raise ValueError("R2 jurisdiction")
+        if not isinstance(self.upload_issuer, str) \
+                or ISSUER.fullmatch(self.upload_issuer) is None:
+            raise ValueError("upload issuer")
         if self.canonical_bucket_profile != "dedicated-workspace":
             raise ValueError(
                 "canonical bucket must use the dedicated-workspace profile")
@@ -157,6 +162,7 @@ class Deployment:
                 "CF_R2_BUCKET_ITEM_READ_PERMISSION_ID", ""),
             write_permission_group_id=environment.get(
                 "CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID", ""),
+            upload_issuer=environment.get("CF_UPLOAD_ISSUER", ""),
             jurisdiction=environment.get(
                 "CF_R2_JURISDICTION", "default"),
             canonical_bucket_profile=environment.get(
@@ -285,8 +291,9 @@ def broker_config(deployment):
         deployment,
         role="broker",
         name=deployment.broker_name,
-        main="worker/broker_stub.py",
+        main="build/broker/entry.py",
     )
+    config["base_dir"] = "build/broker"
     config["r2_buckets"] = []
     config["vars"].update({
         "R2_ENDPOINT": deployment.endpoint,
@@ -295,6 +302,7 @@ def broker_config(deployment):
         "INGRESS_BUCKET": deployment.ingress_bucket,
         "INGRESS_PREFIX": deployment.ingress_prefix,
         "PRESIGN_TTL_SECONDS": deployment.presign_ttl_seconds,
+        "UPLOAD_ISSUER": deployment.upload_issuer,
         "CANONICAL_READ_POLICY_SHA256": _policy_digest(
             policies["broker_canonical_reader"]),
         "INGRESS_PARENT_POLICY_SHA256": _policy_digest(
@@ -310,8 +318,9 @@ def publisher_config(deployment):
         deployment,
         role="publisher",
         name=deployment.publisher_name,
-        main="worker/publisher_stub.py",
+        main="build/publisher/entry.py",
     )
+    config["base_dir"] = "build/publisher"
     config["vars"].update({
         "CANONICAL_PREFIX": deployment.canonical_prefix,
         "INGRESS_PREFIX": deployment.ingress_prefix,

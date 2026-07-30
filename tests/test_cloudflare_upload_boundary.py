@@ -87,6 +87,7 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
         "INGRESS_BUCKET": candidate.ingress_bucket,
         "INGRESS_PREFIX": candidate.ingress_prefix,
         "PRESIGN_TTL_SECONDS": candidate.presign_ttl_seconds,
+        "UPLOAD_ISSUER": candidate.upload_issuer,
         "CANONICAL_READ_POLICY_SHA256":
             broker["vars"]["CANONICAL_READ_POLICY_SHA256"],
         "INGRESS_PARENT_POLICY_SHA256":
@@ -110,21 +111,26 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     assert publisher["vars"][ROLE_BINDING] == "publisher"
     assert broker["routes"] == publisher["routes"] == []
     assert broker["workers_dev"] is publisher["workers_dev"] is False
-    assert broker["base_dir"] == publisher["base_dir"] == "worker"
+    assert broker["main"] == "build/broker/entry.py"
+    assert broker["base_dir"] == "build/broker"
+    assert publisher["main"] == "build/publisher/entry.py"
+    assert publisher["base_dir"] == "build/publisher"
 
 
-def test_checked_in_wrangler_input_is_an_inert_fail_closed_placeholder():
+def test_checked_in_wrangler_input_cannot_expose_the_real_broker():
     package = Path(__file__).parents[1] / "deploy" / "cloudflare_upload"
     config = json.loads((package / "wrangler.jsonc").read_text())
 
     assert config["name"] == "poc16-upload-boundary-placeholder"
-    assert config["main"] == "worker/broker_stub.py"
-    assert config["base_dir"] == "worker"
+    assert config["main"] == "build/broker/entry.py"
+    assert config["base_dir"] == "build/broker"
     assert config["r2_buckets"] == []
     assert config["routes"] == []
     assert config["workers_dev"] is False
     assert (package / "pylock.toml").read_text().count(
         'name = "workers-runtime-sdk"') == 1
+    assert (package / "pylock.toml").read_text().count(
+        'name = "pynacl"') == 1
     assert (package / "uv.lock").is_file()
 
 
@@ -269,7 +275,7 @@ def _deploy_environment():
         ),
     )).decode("ascii")
     return {
-        "CF_UPLOAD_ENABLE_STUB_DEPLOY": "1",
+        "CF_UPLOAD_ENABLE_PARTIAL_DEPLOY": "1",
         "CF_UPLOAD_CREATE": "1",
         "CLOUDFLARE_API_TOKEN": "not-logged",
         "CANONICAL_READ_ACCESS_KEY_ID": "reader-id",
@@ -285,6 +291,12 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     candidate = deployment()
     generated = tmp_path / "generated"
     monkeypatch.setattr(manage, "GENERATED", generated)
+    monkeypatch.setattr(
+        manage, "stage_broker", lambda: tmp_path / "broker")
+    monkeypatch.setattr(
+        manage, "stage_publisher", lambda: tmp_path / "publisher")
+    monkeypatch.setattr(
+        manage, "stage_broker_dependencies", lambda: None)
     workers = {}
     buckets = {
         candidate.canonical_bucket: {"root": b"canonical-root"},
@@ -298,6 +310,8 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
 
     def runner(command):
         calls.append(tuple(command))
+        if command[3] == "sync":
+            return
         if command[3] == "deploy":
             path = Path(command[command.index("--config") + 1])
             config = json.loads(path.read_text())
@@ -325,7 +339,14 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         (candidate.owner, "publisher"),
         (candidate.owner, "broker"),
     ]
-    assert [call[3] for call in calls] == ["deploy", "deploy"]
+    assert [call[3] for call in calls] == [
+        "sync", "deploy", "deploy",
+    ]
+    assert all(
+        "--strict" in call
+        for call in calls
+        if call[3] == "deploy"
+    )
     assert json.loads(paths["broker"].read_text())["r2_buckets"] == []
     assert secret_documents == [{
         "CANONICAL_READ_ACCESS_KEY_ID": "reader-id",
@@ -336,7 +357,10 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
             _deploy_environment()["UPLOAD_SESSION_KEYRING"],
     }]
     generated_bytes = b"".join(
-        path.read_bytes() for path in generated.iterdir())
+        path.read_bytes()
+        for path in generated.rglob("*")
+        if path.is_file()
+    )
     assert b"reader-secret" not in generated_bytes
     assert b"parent-secret" not in generated_bytes
     assert _deploy_environment()[
@@ -354,7 +378,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     assert workers == {}
     assert buckets == before
     assert [call[3] for call in calls] == [
-        "deploy", "deploy", "delete", "delete",
+        "sync", "deploy", "deploy", "delete", "delete",
     ]
     assert [call[4] for call in calls[-2:]] == [
         candidate.broker_name, candidate.publisher_name,
@@ -409,31 +433,138 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
         tmp_path, monkeypatch):
     candidate = deployment()
     monkeypatch.setattr(manage, "GENERATED", tmp_path / "generated")
+    monkeypatch.setattr(
+        manage, "stage_broker", lambda: tmp_path / "broker")
+    monkeypatch.setattr(
+        manage, "stage_publisher", lambda: tmp_path / "publisher")
+    monkeypatch.setattr(
+        manage, "stage_broker_dependencies", lambda: None)
     calls = []
 
     def runner(command):
         calls.append(tuple(command))
+        if command[3] == "sync":
+            return
         target = Path(command[command.index("--outdir") + 1])
         config = json.loads(Path(
             command[command.index("--config") + 1]).read_text())
         role = config["vars"][ROLE_BINDING]
         target.mkdir(parents=True)
-        (target / f"{role}_stub.py").write_text("dry-run artifact")
+        if role == "publisher":
+            (target / "entry.py").write_text(
+                "dry-run artifact")
+            return
+        for relative in (
+                "entry.py",
+                "runtime.py",
+                "core/mint.py",
+                "core/staged_intent.py",
+                "facts/auth/request.py",
+                "deploy/upload_broker.py",
+                "deploy/upload_broker_http.py",
+                "deploy/upload_keyring.py",
+                "deploy/cloudflare_upload/reader.py",
+                "deploy/cloudflare_upload/signer.py",
+                "python_modules/nacl/_sodium.fake.so"):
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(
+                b"\x00asm patched"
+                if relative.endswith(".so") else b"artifact")
 
     manage.build(candidate, runner=runner)
 
-    assert len(calls) == 2
+    assert calls[0] == (
+        "uv", "run", "pywrangler", "sync", "--allow-build",
+    )
+    deploy_calls = calls[1:]
+    assert len(deploy_calls) == 2
     assert all(call[:4] == (
-        "uv", "run", "pywrangler", "deploy") for call in calls)
-    assert all("--dry-run" in call for call in calls)
+        "uv", "run", "pywrangler", "deploy") for call in deploy_calls)
+    assert all("--dry-run" in call for call in deploy_calls)
     configs = [
         json.loads(Path(
             call[call.index("--config") + 1]).read_text())
-        for call in calls
+        for call in deploy_calls
     ]
     assert [config["vars"][ROLE_BINDING] for config in configs] == [
         "publisher", "broker",
     ]
+
+
+def test_stage_broker_is_db_free_and_uses_shared_mint_sources(
+        tmp_path, monkeypatch):
+    build = tmp_path / "build"
+    monkeypatch.setattr(manage, "BUILD", build)
+    monkeypatch.setattr(manage, "BROKER_WORKER", build / "broker")
+    patched = []
+    monkeypatch.setattr(
+        manage, "patch_pynacl",
+        lambda vendored: patched.append(vendored),
+    )
+
+    staged = manage.stage_broker()
+
+    for relative in (
+            "entry.py",
+            "runtime.py",
+            "core/mint.py",
+            "core/staged_intent.py",
+            "facts/auth/request.py",
+            "deploy/upload_broker.py",
+            "deploy/upload_broker_http.py",
+            "deploy/cloudflare_upload/reader.py",
+            "deploy/cloudflare_upload/signer.py"):
+        assert (staged / relative).is_file()
+    for forbidden in (
+            "core/node.py",
+            "core/daemon.py",
+            "core/runtime.py",
+            "adapters/r2/worker.py",
+            "adapters/r2/s3.py",
+            "adapters/s3/store.py"):
+        assert not (staged / forbidden).exists()
+    assert patched == [manage.VENDORED]
+
+
+def test_stage_publisher_contains_only_the_fail_closed_entry(
+        tmp_path, monkeypatch):
+    build = tmp_path / "build"
+    monkeypatch.setattr(manage, "BUILD", build)
+    monkeypatch.setattr(
+        manage, "PUBLISHER_WORKER", build / "publisher")
+
+    staged = manage.stage_publisher()
+
+    assert {
+        path.relative_to(staged).as_posix()
+        for path in staged.rglob("*")
+        if path.is_file()
+    } == {"entry.py"}
+    assert staged.joinpath("entry.py").read_bytes() == (
+        manage.PACKAGE / "worker" / "publisher_stub.py").read_bytes()
+
+
+def test_stage_broker_dependencies_are_role_local_and_drop_build_markers(
+        tmp_path, monkeypatch):
+    generated = tmp_path / "generated"
+    vendored = tmp_path / "python_modules"
+    sodium = vendored / "nacl" / "_sodium.test.so"
+    sodium.parent.mkdir(parents=True)
+    sodium.write_bytes(b"\x00asm patched")
+    (vendored / ".synced").write_text("workers-py")
+    (vendored / "pyvenv.cfg").write_text("")
+    monkeypatch.setattr(manage, "GENERATED", generated)
+    monkeypatch.setattr(manage, "VENDORED", vendored)
+
+    manage.stage_broker_dependencies()
+
+    target = generated / "broker" / "python_modules"
+    assert (target / "nacl" / "_sodium.test.so").read_bytes() == (
+        b"\x00asm patched")
+    assert not (target / ".synced").exists()
+    assert not (target / "pyvenv.cfg").exists()
+    assert not (generated / "publisher" / "python_modules").exists()
 
 
 def test_remove_resolves_both_owned_targets_before_first_delete(
@@ -527,6 +658,7 @@ def test_environment_requires_explicit_dedicated_canonical_profile():
         "CF_UPLOAD_CANONICAL_BUCKET": "poc16-canonical",
         "CF_UPLOAD_INGRESS_BUCKET": "poc16-ingress",
         "CF_UPLOAD_DEPLOYMENT_OWNER": "production-west",
+        "CF_UPLOAD_ISSUER": "cloudflare-upload-production",
         "CF_R2_BUCKET_ITEM_READ_PERMISSION_ID": "c" * 32,
         "CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID": "d" * 32,
     }

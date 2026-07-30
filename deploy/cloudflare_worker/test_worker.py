@@ -642,6 +642,7 @@ def test_deploy_and_remove_subprocesses_have_control_plane_deadlines(
         manage.CONTROL_TIMEOUT_SECONDS,
         manage.CONTROL_TIMEOUT_SECONDS,
     ]
+    assert calls[0][0][0:2] == ("deploy", "--strict")
 
 
 @pytest.mark.parametrize("observed", (None, "someone-else", manage._ABSENT))

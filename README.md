@@ -153,14 +153,16 @@ The status boundary is:
 - **Implemented but not deployed:** the resumable client sends bodies directly
   to exact S3/R2 ingress PUT URLs returned by the database-free broker protocol.
   The strict provider-neutral broker HTTP membrane and both SigV4 translators
-  exist and have realistic fake-provider coverage. An isolated AWS Lambda
-  Function URL adapter and least-privilege SAM stack now serve that membrane.
-- **Still required for a writable serverless path:** the Cloudflare Worker
-  broker adapter, the database-free publisher on both providers,
-  notification/scheduled draining, and live end-to-end conformance.
+  exist and have realistic fake-provider coverage. Isolated AWS Lambda and
+  Cloudflare Python Worker adapters now serve that membrane; both build as
+  provider artifacts, and the Worker also loads under local workerd.
+- **Still required for a writable serverless path:** the database-free
+  publisher on both providers, notification/scheduled draining, public
+  front-door configuration, and live end-to-end conformance.
 
-Consequently, the Lambda and Cloudflare deployments below remain read-only and
-the writable host daemon is still the only complete production publication
+Consequently, the production Lambda and Cloudflare gateways below remain
+read-only, the upload brokers are separate metadata-only deployments, and the
+writable host daemon is still the only complete production publication
 boundary.
 
 The end-to-end direct-to-object-store cloud path is not deployed yet. Its
@@ -174,11 +176,12 @@ under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
 documents and returns the broker's exact bearer PUT requests; provider object
 and pile bodies never cross it.
 
-The endpoint is now wired into a separate AWS upload-broker Lambda package but
-has not been live-deployed; the Cloudflare broker still has a fail-closed stub.
-Neither provider has the database-free publisher yet. The broker and publisher
-remain absent from the read-only serverless gateway artifacts, so the writable
-host path above remains the only complete production path today.
+The endpoint is now wired into separate AWS upload-broker Lambda and Cloudflare
+upload-broker Worker packages, but neither has been live-deployed. Neither
+provider has the database-free publisher yet, and the generated Cloudflare
+broker intentionally has no public route. The broker and publisher remain
+absent from the read-only serverless gateway artifacts, so the writable host
+path above remains the only complete production path today.
 
 Once such an endpoint is deployed, the existing generic command transport
 exposes family-owned direct commands:
@@ -369,16 +372,17 @@ attachment smoke yet.
 
 ### Prepared Cloudflare upload boundary
 
-`deploy/cloudflare_upload/` now renders the provider boundary for the
-isolated-ingress choice, but it is not yet a working upload service. The
-broker config has no native R2 binding. It expects one S3-compatible
-credential created from an exact-bucket `Object Read only` policy for
-canonical DAG reads, plus one separate parent credential created from an exact
-ingress-bucket `Object Read & Write` policy. The segregated stdlib signer uses
-only that ingress parent to derive one short-lived URL for one exact
-session-scoped `PutObject`; no temporary credential or S3 client is returned
-to the uploader. The publisher config is the only role with native `INGRESS`
-and `CANONICAL` bindings.
+`deploy/cloudflare_upload/` contains a real metadata-only Python Worker around
+the shared broker membrane, plus the generated provider boundary for the
+isolated-ingress choice. It is not yet a complete upload service because its
+publisher remains fail-closed. The broker config has no native R2 binding. It
+expects one S3-compatible credential created from an exact-bucket
+`Object Read only` policy for canonical DAG reads, plus one separate parent
+credential created from an exact ingress-bucket `Object Read & Write` policy.
+The segregated stdlib signer uses only that ingress parent to derive one
+short-lived URL for one exact session-scoped `PutObject`; no temporary
+credential or S3 client is returned to the uploader. The publisher config is
+the only role with native `INGRESS` and `CANONICAL` bindings.
 
 Both providers use one logical staging grammar:
 
@@ -405,9 +409,9 @@ digest fixed when the session opened. Replayed or forked cursors may reissue
 already committed exact keys, but cannot enlarge or replace the finite
 authority set. This keeps the broker database-free. A client that loses its
 opaque cursor starts a new session, and lifecycle collection removes the
-abandoned ingress. The client, transport-neutral broker HTTP membrane, and AWS
-Function URL adapter are built; the Cloudflare adapter, deployed live routes,
-and database-free publisher remain unbuilt.
+abandoned ingress. The client, transport-neutral broker HTTP membrane, AWS
+Function URL adapter, and Cloudflare Python Worker adapter are built. Deployed
+live routes and the database-free publisher remain unbuilt.
 
 This is a provider boundary, not a Python convention: compromising the
 write-capable ingress parent still cannot address the canonical bucket. It is
@@ -430,24 +434,53 @@ export CF_UPLOAD_INGRESS_BUCKET=poc16-untrusted-ingress
 export CF_UPLOAD_DEPLOYMENT_OWNER=my-stable-deployment-id
 export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_GROUP_ID
 export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_GROUP_ID
+export CF_UPLOAD_ISSUER=cloudflare-upload-production
 # Canonical JSON produced by deploy.upload_keyring; keep the old key through
 # every issued cursor's expiry plus clock skew during rotation.
 export UPLOAD_SESSION_KEYRING='...'
 
 python3 -m deploy.cloudflare_upload.manage render
+python3 -m deploy.cloudflare_upload.manage build
 python3 -m deploy.cloudflare_upload.manage test
 ```
 
-The checked-in broker and publisher entries return 503 and have no public
-route. An explicit `CF_UPLOAD_ENABLE_STUB_DEPLOY=1` can deploy that fail-closed
-binding skeleton for infrastructure testing; `remove` preflights both exact
-owner/role markers, removes broker then publisher, and never deletes or
-reconfigures either bucket. The real authorization endpoint, store-only
-publisher, queue/schedule wakes, lifecycle installation/conformance check,
-and live R2 proof remain tracked work. Cloudflare documents that action-level
-presigned URLs are generated locally and grant one operation on one object;
-the optional direct-provider test checks the exact signed PUT, header
-substitution, key substitution, create-only replay, and privileged readback.
+`test` exercises complete stateless sessions through the production request and
+R2-fetch adapters, performs clean Wrangler bundle checks, and loads the actual
+broker under local workerd. The generated broker is real, but it has no public
+route; the generated publisher is a dedicated fail-closed artifact. After
+`render`, use `generated/access-policies.json` to provision one exact
+canonical-reader token and one exact ingress-parent token through Cloudflare's
+R2 token control plane. Keep their returned S3-compatible access IDs and
+secrets in the deployment secret store, then supply the five broker secrets
+and a Workers control token only to the deploy process:
+
+```sh
+export CANONICAL_READ_ACCESS_KEY_ID='...'
+export CANONICAL_READ_SECRET_ACCESS_KEY='...'
+export INGRESS_PARENT_ACCESS_KEY_ID='...'
+export INGRESS_PARENT_SECRET_ACCESS_KEY='...'
+export UPLOAD_SESSION_KEYRING='...'
+export CLOUDFLARE_API_TOKEN='...'
+
+CF_UPLOAD_CREATE=1 CF_UPLOAD_ENABLE_PARTIAL_DEPLOY=1 \
+  python3 -m deploy.cloudflare_upload.manage deploy
+```
+
+The explicit partial-deploy flag acknowledges that this installs a real
+metadata broker and a fail-closed publisher, with no public route. It is for
+infrastructure testing, not a writable workspace deployment. `remove`
+preflights both exact owner/role markers,
+removes broker then publisher, and never deletes or reconfigures either bucket.
+Deploys also request Wrangler's strict conflict check. That narrows remote
+clobbering but does not make the earlier settings read and later upload one
+atomic operation; concurrent deployment administrators still require the
+external fence tracked in beads.
+The store-only publisher, queue/schedule wakes, lifecycle
+installation/conformance check, public front door, and live R2 proof remain
+tracked work. Cloudflare documents that action-level presigned URLs are
+generated locally and grant one operation on one object; the optional
+direct-provider test checks the exact signed PUT, header substitution, key
+substitution, create-only replay, and privileged readback.
 
 ## Cloudflare read-only gateway
 
@@ -503,7 +536,9 @@ Wrangler mutation has a 120-second deadline. Cloudflare does not make the
 settings read and later script mutation one conditional operation: deploy and
 remove therefore assume one trusted deployment administrator and must be
 externally serialized. The ownership marker prevents accidental targeting; it
-is not a control-plane CAS against a concurrent administrator. The checked-in
+is not a control-plane CAS against a concurrent administrator. Deploy asks
+Wrangler for its strict remote-conflict check, but that check does not replace
+the missing end-to-end control-plane fence. The checked-in
 config has no public route and cannot accidentally target a real bucket.
 A deadline is a client-side bound, not proof that Cloudflare made no change;
 after a timeout, inspect the exact owned script state before deciding whether

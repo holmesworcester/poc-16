@@ -3,6 +3,25 @@ created-by = "uv"
 requires-python = ">=3.13.2"
 
 [[packages]]
+name = "cffi"
+version = "1.17.1"
+sdist = { url = "https://files.pythonhosted.org/packages/fc/97/c783634659c2920c3fc70419e3af40972dbaf758daa229a7d6ea6135c90d/cffi-1.17.1.tar.gz", hashes = { sha256 = "1c39c6016c32bc48dd54561950ebd6836e1670f2ae46128f67cf49e789c52824" } }
+wheels = [{ url = "https://cdn.jsdelivr.net/pyodide/v0.28.3/full/cffi-1.17.1-cp313-cp313-pyodide_2025_0_wasm32.whl", hashes = { sha256 = "06e0410221cf8e0c94af920a242c756deb8353e211feac8306ea199df51a7d94" } }]
+
+[[packages]]
+name = "pycparser"
+version = "3.0"
+sdist = { url = "https://files.pythonhosted.org/packages/1b/7d/92392ff7815c21062bea51aa7b87d45576f649f16458d78b7cf94b9ab2e6/pycparser-3.0.tar.gz", upload-time = 2026-01-21T14:26:51Z, size = 103492, hashes = { sha256 = "600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29" } }
+wheels = [{ url = "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl", upload-time = 2026-01-21T14:26:50Z, size = 48172, hashes = { sha256 = "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992" } }]
+
+[[packages]]
+name = "pynacl"
+version = "1.5.0"
+sdist = { url = "https://files.pythonhosted.org/packages/a7/22/27582568be639dfe22ddb3902225f91f2f17ceff88ce80e4db396c8986da/PyNaCl-1.5.0.tar.gz", hashes = { sha256 = "8ac7448f09ab85811607bdd21ec2464495ac8b7c66d146bf545b0f08fb9220ba" } }
+wheels = [{ url = "https://cdn.jsdelivr.net/pyodide/v0.28.3/full/pynacl-1.5.0-cp313-cp313-pyodide_2025_0_wasm32.whl", hashes = { sha256 = "187d51e89ddbcd109974aa8834a8d9b606ebe68ac17fa5d856122114997c5c92" } }]
+
+[[packages]]
 name = "workers-runtime-sdk"
 version = "1.6.3"
+sdist = { url = "https://files.pythonhosted.org/packages/96/2e/c2cc2ff860de0902e6295019ea0b5381f6380304bb6e5261e8f12243b672/workers_runtime_sdk-1.6.3.tar.gz", upload-time = 2026-07-17T08:24:12Z, size = 43261, hashes = { sha256 = "b476c0111e7fdc266f1ba77ab546c21e9b77cf32fef8faa0079a0b67c26c8f57" } }
 wheels = [{ url = "https://files.pythonhosted.org/packages/b7/66/71a67674314fcc78709bfe6dc2ac6739d8411515afd3e532157376bd722d/workers_runtime_sdk-1.6.3-py3-none-any.whl", upload-time = 2026-07-17T08:24:11Z, size = 32252, hashes = { sha256 = "d0645a1a03c3422c8a9cac33577ae73c76f02d390df20261d4c11d60cff057f9" } }]

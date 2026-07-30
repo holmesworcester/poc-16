@@ -17,6 +17,14 @@ from urllib.request import Request, urlopen
 
 PACKAGE = Path(__file__).resolve().parent
 REPOSITORY = PACKAGE.parents[1]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
+
+from deploy.cloudflare_python import (  # noqa: E402
+    MINT_CORE_MODULES,
+    patch_pynacl as patch_vendored_pynacl,
+)
+
 BUILD = PACKAGE / "build"
 WORKER = BUILD / "worker"
 VENDORED = PACKAGE / "python_modules"
@@ -35,27 +43,7 @@ API_RESPONSE_BYTES = 64 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
 _ABSENT = object()
 
-CORE_MODULES = (
-    "__init__.py",
-    "bao.py",
-    "btreap.py",
-    "catalog.py",
-    "close.py",
-    "crypto.py",
-    "fact.py",
-    "grants.py",
-    "indexes.py",
-    "kernel.py",
-    "manifest.py",
-    "mint.py",
-    "object_store.py",
-    "limits.py",
-    "peer_capability.py",
-    "shape.py",
-    "suppression.py",
-    "suppression_state.py",
-    "worker.py",
-)
+CORE_MODULES = MINT_CORE_MODULES
 
 
 def _copy(source, destination):
@@ -71,35 +59,7 @@ def patch_pynacl():
     ``crypto_compat`` instead: randomness comes from Python's runtime-backed
     ``os.urandom`` and PyNaCl supplies only deterministic box primitives.
     """
-    matches = tuple((VENDORED / "nacl").glob("_sodium*.so"))
-    if len(matches) != 1:
-        raise RuntimeError("expected one vendored PyNaCl _sodium module")
-    module = matches[0]
-    raw = module.read_bytes()
-    if not raw.startswith(b"\x00asm"):
-        raise RuntimeError("vendored PyNaCl _sodium is not WebAssembly")
-    pairs = (
-        (b"__start_em_asm", b"__start_em_xsm"),
-        (b"__stop_em_asm", b"__stop_em_xsm"),
-    )
-    for original, disabled in pairs:
-        if raw.count(original) == 1 and disabled not in raw:
-            raw = raw.replace(original, disabled)
-        elif raw.count(disabled) != 1 or original in raw:
-            raise RuntimeError("unexpected PyNaCl EM_ASM export layout")
-    temporary = module.with_suffix(".patched")
-    temporary.write_bytes(raw)
-    temporary.replace(module)
-
-    bindings = VENDORED / "nacl" / "bindings" / "__init__.py"
-    source = bindings.read_text()
-    initializer = "# Initialize Sodium\nsodium_init()\n"
-    disabled = "# Workerd compatibility: deterministic primitives need no RNG init.\n"
-    if initializer in source and disabled not in source:
-        source = source.replace(initializer, disabled)
-        bindings.write_text(source)
-    elif source.count(disabled) != 1 or initializer in source:
-        raise RuntimeError("unexpected PyNaCl sodium initializer layout")
+    patch_vendored_pynacl(VENDORED)
 
 
 def stage():
@@ -345,6 +305,7 @@ def _deploy(
         secrets.flush()
         return _pywrangler(
             "deploy",
+            "--strict",
             "--config", str(GENERATED),
             "--secrets-file", secrets.name,
             capture=capture,

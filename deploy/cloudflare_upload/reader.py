@@ -1,0 +1,169 @@
+"""Bounded canonical R2 reads for the database-free upload broker Worker."""
+from dataclasses import dataclass, field
+import re
+
+from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.object_store import validate_key
+from deploy.cloudflare_upload.signer import R2SigV4
+
+
+_BUCKET = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+_ENDPOINT = re.compile(
+    r"^https://[0-9a-f]{32}(?:\.(?:eu|fedramp))?"
+    r"\.r2\.cloudflarestorage\.com$")
+_PREFIX = re.compile(r"^[a-z0-9:._-]+(?:/[a-z0-9:._-]+)*$")
+
+GET_TTL_SECONDS = 30
+MAX_RESPONSE_CHUNKS = 65_536
+
+
+@dataclass(frozen=True)
+class R2ReadConfig:
+    endpoint: str
+    bucket: str
+    prefix: str
+    ttl_seconds: int = GET_TTL_SECONDS
+
+    def __post_init__(self):
+        if not isinstance(self.endpoint, str) \
+                or _ENDPOINT.fullmatch(self.endpoint) is None \
+                or not isinstance(self.bucket, str) \
+                or _BUCKET.fullmatch(self.bucket) is None \
+                or not isinstance(self.prefix, str) \
+                or _PREFIX.fullmatch(self.prefix) is None \
+                or len(self.prefix.encode("ascii")) > 768 \
+                or type(self.ttl_seconds) is not int \
+                or not 1 <= self.ttl_seconds <= 60:
+            raise ValueError("R2 canonical read config")
+
+
+@dataclass(frozen=True)
+class R2FetchRequest:
+    """One internal GET. Its short-lived bearer URL must never be logged."""
+
+    method: str
+    url: str = field(repr=False)
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
+    redirect: str = "error"
+    cache: str = "no-store"
+
+
+def _chunk_bytes(value):
+    if isinstance(value, bytes):
+        return value
+    if hasattr(value, "to_bytes"):
+        return value.to_bytes()
+    if hasattr(value, "to_py"):
+        value = value.to_py()
+    return bytes(value)
+
+
+def _content_length(response):
+    headers = getattr(response, "headers", None)
+    get = getattr(headers, "get", None)
+    value = get("content-length") if callable(get) else None
+    if value is None or str(value) == "":
+        return None
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("R2 canonical Content-Length") from error
+    if parsed < 0 or str(parsed) != str(value):
+        raise RuntimeError("R2 canonical Content-Length")
+    return parsed
+
+
+async def _bounded_response(response, maximum):
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError("R2 canonical response bound")
+    declared = _content_length(response)
+    if declared is not None and declared > maximum:
+        raise PayloadTooLarge("R2 canonical object")
+    stream = getattr(response, "body", None)
+    if stream is None or not hasattr(stream, "getReader"):
+        array_buffer = getattr(response, "arrayBuffer", None)
+        if not callable(array_buffer):
+            raise RuntimeError("R2 canonical response body")
+        raw = _chunk_bytes(await array_buffer())
+        if len(raw) > maximum:
+            raise PayloadTooLarge("R2 canonical object")
+        if declared is not None and len(raw) != declared:
+            raise RuntimeError("R2 canonical response length")
+        return raw
+    reader = stream.getReader()
+    chunks, total = [], 0
+    try:
+        for _ in range(MAX_RESPONSE_CHUNKS):
+            result = await reader.read()
+            if result.done:
+                raw = b"".join(chunks)
+                if declared is not None and len(raw) != declared:
+                    raise RuntimeError("R2 canonical response length")
+                return raw
+            chunk = _chunk_bytes(result.value)
+            total += len(chunk)
+            if total > maximum:
+                await reader.cancel("canonical response limit")
+                raise PayloadTooLarge("R2 canonical object")
+            chunks.append(chunk)
+        await reader.cancel("canonical response chunk limit")
+        raise RuntimeError("R2 canonical response chunk limit")
+    finally:
+        reader.releaseLock()
+
+
+class R2CanonicalReader:
+    """Expose only bounded GET over one exact canonical bucket prefix."""
+
+    __slots__ = ("config", "_fetch", "_signer")
+
+    def __init__(
+            self, config, access_key_id, secret_access_key, fetch, *,
+            clock):
+        if not isinstance(config, R2ReadConfig) or not callable(fetch):
+            raise ValueError("R2 canonical reader")
+        self.config = config
+        self._fetch = fetch
+        self._signer = R2SigV4(
+            config.endpoint,
+            access_key_id,
+            secret_access_key,
+            clock=clock,
+        )
+
+    def _physical(self, key):
+        key = validate_key(key)
+        physical = f"{self.config.prefix}/{key}"
+        if len(physical.encode("ascii")) > 1024:
+            raise ValueError("R2 canonical key")
+        return physical
+
+    async def get(self, key):
+        return await self.get_bounded(key, MAX_OBJECT_BYTES)
+
+    async def get_bounded(self, key, maximum):
+        signed = self._signer.sign(
+            "GET",
+            self.config.bucket,
+            self._physical(key),
+            {},
+            self.config.ttl_seconds,
+        )
+        response = await self._fetch(R2FetchRequest(
+            signed.method,
+            signed.url,
+            signed.headers,
+        ))
+        status = getattr(response, "status", None)
+        if status == 404:
+            return None
+        if status != 200:
+            raise RuntimeError("R2 canonical GET failed")
+        return await _bounded_response(response, maximum)
+
+
+__all__ = (
+    "R2CanonicalReader",
+    "R2FetchRequest",
+    "R2ReadConfig",
+)

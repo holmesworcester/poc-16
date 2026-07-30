@@ -24,5 +24,6 @@ deploy/cloudflare_upload/.env*
 deploy/cloudflare_upload/.venv/
 deploy/cloudflare_upload/.venv-workers/
 deploy/cloudflare_upload/.wrangler/
+deploy/cloudflare_upload/build/
 deploy/cloudflare_upload/generated/
 deploy/cloudflare_upload/python_modules/
