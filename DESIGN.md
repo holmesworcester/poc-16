@@ -1038,17 +1038,19 @@ and therefore eventually closes the sharing boundary.
 
 Mobile push is not running behavior yet. The target is a derived,
 at-least-once notification service, not another fact-admission route or a
-mutable answer to workspace state. It adds no PushTree. Canonical
-endpoint and subscription facts remain in the ordinary candidate archive and
-generic FactTree index; transient delivery work lives in a disjoint
-object-store workset.
+mutable answer to workspace state. It adds no PushTree. Canonical endpoint
+and subscription facts remain in the ordinary candidate archive and generic
+FactTree index. Subscription matching is part of authenticated fact
+processing. Resolved notification intents then cross a durable object-store
+outbox into a managed at-least-once queue; neither the outbox nor queue
+attempts are published application state.
 
 An endpoint fact binds one app installation to its owning live device, one
 selected push-node public key, provider (`apns` or `fcm`), application and
 environment ids, and a provider token sealed to that push node. APNs signing
 keys and FCM service credentials never enter workspace facts or queue bytes;
-they remain deployment secrets of the selected push worker. Endpoint policy
-makes the fact explicitly suppressible and carries the continuing
+they remain deployment secrets of the selected provider consumer. Endpoint
+policy makes the fact explicitly suppressible and carries the continuing
 member/device liveness required to reject an evicted or revoked installation.
 
 A subscription fact names one exact endpoint dependency and one normalized
@@ -1068,33 +1070,50 @@ anchor and pass a family-owned residual check rather than introduce a general
 predicate engine.
 
 For every fact that settlement reports as newly activated, its family derives
-a bounded set of route addresses. The publisher pages the exact FactTree
-posting range at each address, unions subscription fids, checks each
-subscription's selectors and continuing liveness through SuppTree, follows
-its exact `endpoint` dependency, and checks the endpoint record the same way.
-Multiple selectors that reach the same endpoint coalesce to one delivery.
+a bounded set of route addresses. As part of the same publication turn, the
+publisher pages the candidate snapshot's exact FactTree posting range at each
+address, unions subscription fids, checks each subscription's selector and
+continuing liveness through the candidate SuppTree, follows its exact
+`endpoint` dependency, and checks the endpoint record the same way. Multiple
+selectors that reach the same endpoint coalesce to one notification intent.
 This is an indexed incremental join:
 
 ```text
-newly activated facts
+newly activated trigger facts
     -> bounded routing addresses
     -> matching subscription postings
     -> live exact endpoint dependencies
-    -> delivery intents
+    -> resolved notification intents
 ```
 
 The ordinary hot path is therefore proportional to route probes plus returned
 matches, not all valid facts times all subscriptions. A correctness repair may
 replay the same join from authenticated state and delivery ids, but it may not
 invent a SQLite-only subscription answer. Mentions require a canonical
-mentioned-principal field or fact relation; parsing display text in the push
-worker is not an authoritative route.
+mentioned-principal field or fact relation; parsing display text in a queue
+consumer is not an authoritative route.
 
-The publisher may compute that delivery plan while constructing the candidate
-snapshot, but it cannot expose the plan before the candidate root wins. A
-failed CAS creates no deliverable notification. After a successful CAS, the
-same publication turn writes one or more bounded, canonical, create-only work
-items:
+The trigger set is the facts newly activated by the turn; the recipient set is
+the subscriptions and endpoints active in that turn's post-settlement
+candidate snapshot. An event and subscription activated together therefore
+match, a subscription suppressed in the same turn does not match, and a
+subscription activated later does not backfill an old event. The join
+completes while constructing the candidate, but its result cannot become
+deliverable before that candidate root wins. A failed CAS creates no
+notification obligation. After a successful CAS, the same publication turn
+materializes the resolved plan as one or more bounded, deterministic,
+create-only outbox items:
+
+```text
+fact pile
+    -> candidate settlement + indexed subscription join
+    -> winning root CAS
+    -> push outbox
+    -> outbox dispatcher
+    -> managed at-least-once queue
+    -> provider consumer
+    -> APNs or FCM
+```
 
 ```text
 push/pile/<push-node>/<generation>/<sha256>
@@ -1102,59 +1121,76 @@ push/done/<push-node>/<delivery-id>
 push/failed/<push-node>/<sha256>
 ```
 
-Each push pile contains a sorted unique vector of delivery records with
-workspace, deterministic delivery id, triggering fact fid, endpoint fid,
-provider/application routing, sealed endpoint token or its immutable object
-reference, bounded payload, and expiry. A delivery id is domain-separated
-over at least `(workspace, event fid, endpoint fid, payload version)`.
-Generations keep destructive retirement bound to one exact work item; the
-delivery id provides retry/deduplication identity across repeated handoff.
-Large fanout splits into bounded piles without changing the individual ids.
+Each push pile is a transactional outbox batch containing a sorted unique
+vector of already-resolved notification intents. A record carries workspace,
+deterministic delivery id, triggering fact fid, endpoint fid, provider and
+application routing, the sealed endpoint token, bounded payload, and expiry.
+It may retain the sorted matching subscription fids as provenance, but no
+later worker needs them for routing. A delivery id is domain-separated over
+at least `(workspace, event fid, endpoint fid, payload version)`. Generations
+keep destructive retirement bound to one exact outbox item; the delivery id
+supplies stable identity across repeated queue submissions and deliveries.
+Large fanout splits into bounded piles without changing individual ids.
 `push/done` is immutable discharge evidence for an accepted or terminal
-delivery id. `push/failed` preserves bounded typed evidence for a malformed or
-permanently misconfigured item before its live work record retires. Neither
-namespace is canonical fact state.
+delivery id. `push/failed` preserves bounded typed evidence for a poison
+message or exhausted permanent failure. None of these namespaces is canonical
+fact state.
 
 Fact validity and root publication never wait for APNs or FCM. The only
-ordering constraint is the durable handoff: after the root CAS, the
-publication turn verifies creation of every derived push pile—or a typed
-empty result—before using its fact-pile retirement capability. A crash before
-that handoff leaves the original fact pile as publication-turn retry intent.
-Once the handoff exists, the push pile is self-contained and has no reference
-to, closure dependency on, or retention claim over the fact pile. Provider
-outages can accumulate push work without reopening or blocking canonical fact
-state. If a retry finds that the root already represents its retained fact
-pile but no handoff result exists, it repeats routing for the eligible,
-routable facts in that exact pile and relies on deterministic delivery ids and
-`push/done` to suppress work already discharged. Push is advisory; this retry
-uses one newly pinned current root rather than pretending to recover a lost
-historical subscription snapshot.
+publication-side ordering constraint is the durable outbox handoff: after the
+root CAS, the publication turn verifies creation of every derived push pile,
+or a typed empty result, before using its fact-pile retirement capability. A
+crash before that handoff leaves the original fact pile as publication-turn
+retry intent. Once the outbox exists, it is self-contained and has no
+reference to, closure dependency on, or retention claim over the fact pile.
+Queue or provider outages can accumulate push work without reopening or
+blocking canonical fact state. If a retry finds that the root already
+represents its retained fact pile but no outbox result exists, it repeats the
+indexed join for the eligible trigger facts in that exact pile against one
+newly pinned current root. Push is advisory: deterministic delivery ids and
+`push/done` suppress known repeats, but the retry does not pretend to recover
+a lost historical subscription snapshot.
 
-A push worker lists only its selected `push/pile/` prefix or consumes an
-equivalent managed-queue wake. Object-created events are latency hints; a
-scheduled bounded scan is the lost-event fallback. The worker verifies the
-hash-bound pile and delivery ids, decrypts each token, selects deployment
-credentials by provider/application/environment, and sends Apple endpoints
-directly to APNs and Android endpoints directly to FCM. FCM is not an iOS
+An outbox dispatcher lists only its selected `push/pile/` prefix. Object
+creation may wake it, and a scheduled bounded scan is the lost-wakeup
+fallback. This scan recovers undispatched outbox batches; it is not the
+provider delivery queue and requires no durable global LIST cursor. The
+dispatcher verifies the hash-bound pile and delivery ids, copies each
+resolved intent into one managed-queue delivery job, and never queries
+subscriptions or endpoints. Queue payloads are bounded and self-contained.
+
+The managed queue is the primary delivery workset. Its provider-neutral
+contract requires durable acceptance, at-least-once redelivery, visibility
+leases, delayed retry, per-item acknowledgement, and a dead-letter path.
+Deployments may implement that contract with Cloudflare Queues, SQS Standard,
+or Google Pub/Sub. FCM is a destination, not an implementation of this queue.
+Queue acceptance is the terminal boundary for the outbox dispatcher, not for
+the notification: the dispatcher retires an outbox generation only after the
+queue has durably accepted every contained job. A partial or ambiguous batch
+response produces a bounded residual pile before the original generation
+retires; retrying an ambiguously accepted job is safe and may duplicate it.
+
+A provider consumer owns the selected push-node private key and the APNs and
+FCM deployment credentials. It reads a delivery job, checks its deterministic
+identity and any existing `push/done` evidence, decrypts the sealed token,
+selects credentials by provider, application, and environment, and sends
+Apple endpoints directly to APNs and Android endpoints directly to FCM. It
+does not read workspace state to rediscover the recipient. FCM is not an iOS
 intermediary in this design.
 
 Provider acceptance is the terminal success boundary: HTTP `200` from APNs or
 an FCM message id means the provider owns store-and-forward under the
 notification's expiration or TTL. It does not prove device receipt or display.
-On acceptance the worker durably records the delivery id as discharged before
-exactly retiring the queue item. Network errors, ambiguous timeouts, `429`,
-and `5xx` retain or requeue the item with bounded exponential backoff and
-jitter until expiry. APNs `410` and FCM unregistered-token responses terminate
-that endpoint's pending work and produce endpoint-invalidation input.
-Malformed jobs, credential/configuration errors, and other permanent failures
-retain bounded typed evidence rather than retry forever.
-
-A batch with mixed outcomes is not retired wholesale. The worker first writes
-all accepted or terminal `push/done` rows and a bounded replacement pile for
-the still-retryable records, verifies those immutable writes, and only then
-exactly retires the consumed generation. A crash may leave both generations
-visible; delivery-id checks make that ordinary at-least-once queue replay
-rather than a lost obligation.
+On acceptance the consumer durably records the delivery id as discharged,
+then acknowledges that queue job. Network errors, ambiguous timeouts, `429`,
+and `5xx` leave the job unacknowledged or explicitly delayed for bounded
+exponential-backoff retry with jitter until expiry. APNs `410` and FCM
+unregistered-token responses terminally discharge the job and produce
+endpoint-invalidation input. Malformed jobs, exhausted
+credential/configuration failures, and other poison messages retain bounded
+typed evidence and enter the dead-letter path rather than retry forever. A
+provider batch with mixed outcomes uses per-item acknowledgement and retry;
+one success never retires another delivery's obligation.
 
 The external boundary is at-least-once. A worker can crash after the provider
 accepted a request but before the discharge record became durable, so a retry
@@ -1162,15 +1198,13 @@ may duplicate a visible notification. Deterministic delivery ids and provider
 collapse identifiers reduce known duplicates but do not claim exactly-once
 delivery.
 
-A managed queue may sit behind the same push worker to supply visibility
-leases, rate limiting, delayed retry, and a dead-letter queue. It is an
-operational projection of the durable push-pile workset, not a subscription or
-endpoint database. Queue acknowledgement means durable acceptance by that
-queue, not APNs/FCM delivery, and losing a queue wake cannot erase the
-object-store work item. Keeping queue attempts and credentials outside the
-composite workspace root avoids root-CAS churn for every retry while retaining
-the ordinary authenticated fact state as the sole source of recipient
-selection.
+The dispatcher and provider consumer are distinct logical roles even if one
+initial deployment contains both. The object-store push pile bridges root
+publication to durable queue acceptance; the managed queue owns delivery
+leases and retries after that handoff. Keeping both queue attempts and
+provider credentials outside the composite workspace root avoids root-CAS
+churn for every retry while retaining authenticated fact settlement as the
+sole source of recipient selection.
 
 ## Sync and recovery
 

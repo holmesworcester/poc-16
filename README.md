@@ -179,8 +179,9 @@ The status boundary is:
   Cloudflare Python Worker adapters now serve that membrane; both build as
   provider artifacts, and the Worker also loads under local workerd.
 - **Still required for a writable serverless path:** the database-free
-  publisher on both providers, notification/scheduled draining, public
-  front-door configuration, and live end-to-end conformance.
+  publisher on both providers, notification-outbox dispatch and managed-queue
+  consumption, public front-door configuration, and live end-to-end
+  conformance.
 
 Consequently, the production Lambda and Cloudflare gateways below remain
 read-only, the upload brokers are separate metadata-only deployments, and the
@@ -354,36 +355,47 @@ published root is the durable workspace acknowledgement.
 Mobile push is not implemented. The selected design does not add a PushTree
 and does not make APNs or FCM part of fact publication. Endpoint registrations
 and subscriptions are ordinary validated facts. Subscription selectors are
-published as generic offers, so the cloud publisher can derive routing
-addresses from newly activated facts and page the matching FactTree postings
-without scanning every subscription.
+published as generic offers. During authenticated fact processing, the cloud
+publisher derives routing addresses from newly activated facts and performs
+an indexed join against the subscriptions and endpoints active in that exact
+post-settlement candidate snapshot. It therefore produces already-resolved
+notification intents without scanning every subscription. Queue workers never
+interpret selectors or rediscover recipients.
 
 After a successful root CAS, the publication turn materializes the resolved
 deliveries as a separate, bounded, create-only
-`push/pile/<push-node>/<generation>/<sha256>` work item. It verifies that
-durable handoff—or proves that the publication has no matching deliveries—
-before retiring the corresponding fact-ingress pile. The push pile is
-self-contained: it neither contains nor depends on the original fact pile,
-and subsequent provider delay or failure cannot hold fact publication open.
-A crash before the handoff leaves the fact pile available to retry; a failed
-root CAS creates no deliverable push work.
+`push/pile/<push-node>/<generation>/<sha256>` transactional-outbox item. It
+verifies that durable handoff—or proves that the publication has no matching
+deliveries—before retiring the corresponding fact-ingress pile. The outbox is
+self-contained and independent of the original fact pile. A crash before the
+handoff leaves the fact pile available to retry; a failed root CAS creates no
+deliverable notification.
 
-A separately deployed push worker owns the token-decryption key and the APNs
-and FCM provider credentials. Object-created events may wake it, while a
-scheduled `push/pile/` scan is the durability fallback. It sends Apple
-endpoints directly to APNs and Android endpoints directly to FCM. APNs `200`
-or an FCM message id ends POC-16's delivery obligation; device receipt remains
-best effort under the provider's expiration/TTL rules. Network failures,
-timeouts, `429`, and `5xx` retain the push pile for bounded
-exponential-backoff retry. Invalid-token responses terminate that endpoint's
-work and feed endpoint invalidation; other permanent failures retain bounded
-diagnostic evidence. Delivery is at-least-once because a provider may accept a
-request whose response is lost.
+An outbox dispatcher verifies each pile and submits one resolved delivery job
+per endpoint to a managed at-least-once queue. Object-created events may wake
+the dispatcher, while a scheduled bounded `push/pile/` scan recovers lost
+wakeups. That scan is only outbox recovery; the managed queue is the primary
+delivery workset. The dispatcher retires a pile only after durable queue
+acceptance, preserving a residual pile after partial or ambiguous batch
+submission. A duplicate submission carries the same deterministic delivery
+id.
 
-Push piles are operational queue records, not canonical facts, sync input, or
-published application state. A managed queue may consume the same records for
-leases, rate limiting, and dead-letter handling, but it is an acceleration of
-the object-store workset rather than a second subscription database.
+A provider consumer owns the token-decryption key and APNs/FCM credentials.
+It reads the managed queue and sends Apple endpoints directly to APNs and
+Android endpoints directly to FCM. APNs `200` or an FCM message id ends
+POC-16's delivery obligation; device receipt remains best effort under the
+provider's expiration/TTL rules. Timeouts, `429`, and `5xx` use queue
+redelivery with bounded exponential backoff. Invalid-token responses
+terminally discharge the job and feed endpoint invalidation; poison jobs enter
+a dead-letter path with bounded diagnostic evidence. Delivery is at-least-once
+because a provider may accept a request before the consumer crashes without
+acknowledging it.
+
+Push piles, managed-queue jobs, retry leases, and discharge records are
+operational state, not canonical facts, sync input, or published application
+state. Authenticated settlement is the sole subscription and recipient
+authority; neither the dispatcher nor provider consumer maintains another
+subscription database.
 
 ### Prepared AWS upload broker
 
