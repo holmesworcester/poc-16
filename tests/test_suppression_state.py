@@ -5,12 +5,10 @@ import os
 import pytest
 
 import facts
-from core import catalog, cmds, suppression_state
-from core.candidate_archive import CandidateView
+from core import cmds, suppression_state
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
-from core.ingress import stage_pile
 from core.node import Node
 from core import sync as sync_module
 from facts.auth.removal import removal
@@ -30,11 +28,13 @@ from .util import (
 
 
 def _action_rows(node, workspace):
-    return node.idx(workspace).execute(
-        "SELECT a.sid, a.fid, r.proof "
-        "FROM actions a "
-        "JOIN admission_receipts r ON r.fid=a.fid "
-        "ORDER BY a.sid").fetchall()
+    actions = node.idx(workspace).execute(
+        "SELECT sid, fid FROM actions ORDER BY sid").fetchall()
+    candidates = node.reader(workspace).candidates()
+    return [
+        (sid, fid, candidates.fact_record(fid)["admission"])
+        for sid, fid in actions
+    ]
 
 
 def _signed_pile(node, workspace, fact, signed, deps):
@@ -289,7 +289,7 @@ def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
 
 
 def test_action_witness_remains_historical_across_current_provider_rewire(
-        tmp_path, monkeypatch):
+        tmp_path):
     """Current dependency settlement never rewrites historical admission."""
     base = Node(str(tmp_path / "base"))
     workspace = cmds.create(base, "alice", ts=1)
@@ -345,20 +345,11 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
     # direct eligible order and the two semantic projections do not change.
     lower = 0 if evidence[0] < evidence[1] else 1
     source, target_peer = peers[lower][0], peers[1 - lower][0]
-    source_store = source.store(workspace)
-    selected = CandidateView(
-        source_store.get("root"),
-        lambda oid: source_store.get("obj/" + oid),
-    ).verify(left[3])
+    selected = source.reader(workspace).candidates().verify(left[3])
     raw = encode_pile(selected.facts, workspace=workspace)
     before = json.loads(target_peer.store(workspace).get("root"))
-    with monkeypatch.context() as context:
-        context.setattr(
-            catalog, "rebuild_proofs",
-            lambda *_args, **_kwargs: pytest.fail(
-                "witness-only join rebuilt current standing"))
-        deliver(target_peer, workspace, raw)
-        target_peer.turn(workspace)
+    deliver(target_peer, workspace, raw)
+    target_peer.turn(workspace)
     after = json.loads(target_peer.store(workspace).get("root"))
 
     assert before["maps"]["fact_order"] == after["maps"]["fact_order"]
@@ -367,7 +358,7 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
     assert before["maps"]["authority"] == after["maps"]["authority"]
     assert _action_rows(target_peer, workspace)[0][2] == evidence[lower]
     full = target_peer.store(workspace).get("root")
-    target_peer.admission(workspace).publish(reuse=False)
+    target_peer.rebuild(workspace)
     assert target_peer.store(workspace).get("root") == full
 
     for peer, _, posted, _ in peers:
@@ -434,11 +425,10 @@ def test_candidate_proof_sync_carries_actions_and_their_projection(
             return tuple(self.obj(oid) for oid in oids)
 
         def put_pile(self, raw):
-            stage_pile(source.store(self.ws), "peer", raw)
-            source.turn(self.ws)
+            source.receive_pile(self.ws, "peer", raw)
 
         def put_obj(self, oid, raw):
-            source.store(self.ws).put_if_absent("obj/" + oid, raw)
+            source.receive_object(self.ws, oid, raw)
 
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     sync_module.sync(destination, workspace, "local")
@@ -506,8 +496,7 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
         destination.idx(workspace), poisoned_sid)
     assert honest_target not in visible_fids(destination, workspace)
     assert poisoned_target in visible_fids(destination, workspace)
-    cache = destination.sync_cache[(workspace, url)]
-    assert {"etag", "local", "root"}.isdisjoint(cache)
+    assert (workspace, url) not in destination.sync_cache
 
     PoisonedPeer.poisoned = False
     assert sync_module.sync(destination, workspace, url) == (1, 0)

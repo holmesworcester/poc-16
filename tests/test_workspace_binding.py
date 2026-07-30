@@ -1,4 +1,5 @@
 """Canonical workspace identity is proved at every fact and pile door."""
+import asyncio
 import ast
 import base64
 import json
@@ -12,9 +13,10 @@ from core import catalog, cmds, daemon
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
-from core.ingress import InvalidPile, KernelRejected, stage_pile
+from core.ingress import InvalidPile
 from core.node import Node
-from core.worker import WorkerView
+from core.repository_applier import RepositoryApplier
+from core.store import FsStore
 from facts.auth import request
 from facts.auth import user as user_family
 from facts.auth.signature import signature
@@ -28,6 +30,10 @@ def two_workspaces(tmp_path):
     second = cmds.create(node, "second", ts=2)
     assert node.identity_id(first) == node.identity_id(second)
     return node, first, second
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
 
 
 def test_same_author_and_form_have_distinct_workspace_bound_ids(tmp_path):
@@ -54,7 +60,7 @@ def test_same_author_and_form_have_distinct_workspace_bound_ids(tmp_path):
         assert "ws" not in genesis.env
 
 
-def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_stage(
+def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
         tmp_path, monkeypatch):
     node, first, second = two_workspaces(tmp_path)
     public = node.identity_id(first)
@@ -78,31 +84,27 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_stage(
         decode_pile(hostile, second)
 
     family_calls = []
-    admission_calls = []
     real_family_for = facts.family_for
-    real_admit = catalog.Catalog._admit_valid
 
     def observed_family(tag):
         family_calls.append(tag)
         return real_family_for(tag)
 
-    def observed_admit(self, receipt, proof_oid):
-        admission_calls.append(receipt.fact.fid)
-        return real_admit(self, receipt, proof_oid)
-
     monkeypatch.setattr(facts, "family_for", observed_family)
-    monkeypatch.setattr(catalog.Catalog, "_admit_valid", observed_admit)
-    source = stage_pile(
-        node.store(second), node.member_for(second), hostile)
+    store = FsStore(str(tmp_path / "receiver"))
+    applier = RepositoryApplier(second, store)
+    source = run(applier.stage(node.member_for(second), hostile))
 
-    node.turn(second)
+    result = run(applier.apply(source))
 
     assert family_calls == []
-    assert admission_calls == []
-    assert node.candidate_of(second, foreign.fid) is None
-    assert node.store(second).get(source) is None
-    assert node.store(second).get("failed/pile/" + h(hostile)) == hostile
-    assert node.ingress_failures(second)[0]["error"] \
+    assert result.status == "rejected"
+    assert result.admitted == ()
+    assert result.retired is True
+    assert store.get("root") is None
+    assert store.get(source) is None
+    assert store.get("failed/pile/" + h(hostile)) == hostile
+    assert json.loads(result.rejection.record)["error"] \
         == "InvalidPile: mixed workspace pile"
 
 
@@ -150,7 +152,8 @@ def test_uploader_token_workspace_and_pile_path_must_match(tmp_path):
     assert sent[-1] == 403
 
 
-def test_database_free_mint_and_catalog_enforce_the_same_anchor(tmp_path):
+def test_database_free_reader_applier_and_projection_enforce_same_anchor(
+        tmp_path):
     node, first, second = two_workspaces(tmp_path)
     now = 100
     first_pile = encode_pile(request.payload(
@@ -158,25 +161,40 @@ def test_database_free_mint_and_catalog_enforce_the_same_anchor(tmp_path):
     second_pile = encode_pile(request.payload(
         node, second, "sync", now + 60_000, now), workspace=second)
     store = node.store(second)
-    view = WorkerView.from_root(
-        store.get("root"), lambda oid: store.get("obj/" + oid))
+    reader = node.reader(second)
 
-    assert view.mint(first_pile, now) is None
-    assert view.mint(second_pile, now) \
+    assert reader.mint(first_pile, now) is None
+    assert reader.mint(second_pile, now) \
         == (node.identity_id(second), "sync")
 
     foreign = message(
         first, node.identity_id(first), "general", "not second", 101)
-    with pytest.raises(KernelRejected, match="ingress rejected"):
-        node.admission(second).admit([foreign])
+    foreign_pile = encode_pile([foreign], workspace=first)
+    root = store.get("root")
+    source = run(node.applier(second).stage(
+        node.member_for(second), foreign_pile))
+    result = run(node.applier(second).apply(source))
+
+    assert result.status == "rejected"
+    assert result.retired is True
+    assert json.loads(result.rejection.record)["error"] \
+        == "InvalidPile: pile workspace"
+    assert store.get("root") == root
     assert node.candidate_of(second, foreign.fid) is None
 
     ws_less_ordinary = Fact("msg", 102, [], {}, None)
-    db = sqlite3.connect(":memory:")
-    db.executescript(catalog.SCHEMA)
-    with pytest.raises(ValueError, match="fact workspace"):
-        catalog.ScratchCatalog(
-            db, ws_less_ordinary.fid).load(ws_less_ordinary)
+    index = node.idx(second)
+    index.execute(
+        "INSERT INTO facts VALUES(?,?)",
+        (ws_less_ordinary.fid, encode(ws_less_ordinary)),
+    )
+    index.commit()
+    with pytest.raises(ValueError, match="fact projection integrity"):
+        node.catalog(second).candidate(ws_less_ordinary.fid)
+
+    node.rebuild(second)
+    assert node.candidate_of(second, ws_less_ordinary.fid) is None
+    assert store.get("root") == root
 
 
 @pytest.mark.parametrize("case", ("foreign-inner-pile", "incomplete-proof"))
@@ -221,9 +239,10 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
     assert json.dumps(node.keyring, sort_keys=True) == before
 
 
-def test_catalog_reindex_and_reopen_reject_foreign_receipts(tmp_path):
+def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "workspace", ts=1)
+    root = node.store(workspace).get("root")
     foreign = Fact(
         "sample", 2, [], {"foreign": True}, "f" * 64)
     index = node.idx(workspace)
@@ -232,22 +251,22 @@ def test_catalog_reindex_and_reopen_reject_foreign_receipts(tmp_path):
         (foreign.fid, encode(foreign)),
     )
 
-    with pytest.raises(ValueError, match="fact catalog integrity"):
-        node.catalog(workspace).reindex()
+    with pytest.raises(ValueError, match="fact projection integrity"):
+        node.catalog(workspace).candidate(foreign.fid)
 
     index.execute(
-        "INSERT OR REPLACE INTO meta(k, v) VALUES('index-version', ?)",
-        ("force-reindex",),
+        "DELETE FROM meta WHERE k='root'",
     )
     index.commit()
     index.close()
     node._idx.clear()
 
-    with pytest.raises(ValueError, match="fact catalog integrity"):
-        Node(node.dir)
+    reopened = Node(node.dir)
+    assert reopened.candidate_of(workspace, foreign.fid) is None
+    assert reopened.store(workspace).get("root") == root
 
 
-def test_legacy_catalog_upgrade_rejects_ws_less_ordinary_receipt():
+def test_legacy_projection_upgrade_discards_ws_less_ordinary_row():
     workspace = "0" * 64
     db = sqlite3.connect(":memory:")
     db.executescript("""
@@ -265,10 +284,13 @@ def test_legacy_catalog_upgrade_rejects_ws_less_ordinary_receipt():
         ),
     )
     db.commit()
-    db.executescript(catalog.SCHEMA)
 
-    with pytest.raises(ValueError, match="legacy fact catalog integrity"):
-        catalog.upgrade_schema(db, workspace)
+    catalog.upgrade_schema(db, workspace)
+
+    assert {
+        row[1] for row in db.execute("PRAGMA table_info(facts)")
+    } == {"fid", "blob"}
+    assert db.execute("SELECT * FROM facts").fetchall() == []
 
 
 def test_only_genesis_family_may_construct_a_ws_less_fact():

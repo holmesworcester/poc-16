@@ -1,13 +1,11 @@
 """Adversarial kernel tests: the judge rejects what it must, whole units."""
-import sqlite3
 
 import pytest
 
 import facts
-from core import catalog
 from core.close import close
 from core.crypto import keypair, sign
-from core.fact import Fact, Need, encode
+from core.fact import Fact, Need
 from core import settlement
 from facts.auth.admin import admin
 from facts.auth.device import device
@@ -20,9 +18,7 @@ from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
 from facts.content.message import message
 from core.kernel import (
-    ResolvedEdge,
     drain,
-    rebuild_proofs,
     validate,
 )
 from core.node import now_ms
@@ -352,14 +348,14 @@ def test_single_judge_loop():
     ("chain_length", "consumer_is_eligible"),
     ((254, True), (255, False)),
 )
-def test_provider_rewire_obeys_same_256_fact_closure_bound_hot_and_cold(
+def test_provider_rewire_obeys_256_fact_bound_in_canonical_projection(
         monkeypatch, chain_length, consumer_is_eligible):
-    """A longer canonical winner cannot create a hot-only proof.
+    """A longer canonical winner cannot create an oversized proof.
 
-    The consumer is first admitted through a rank-zero provider.  Removing
-    that winner rewires its one named need to a provider whose own proof is
-    still legal.  At 254 ancestors the resulting consumer closure is exactly
-    256 facts; at 255 it would be 257 and must become dormant in both engines.
+    The canonical projection first selects a rank-zero provider.  Projecting a
+    candidate set without that provider rewires the named need to a provider
+    whose own proof is still legal.  At 254 ancestors the resulting consumer
+    closure is exactly 256 facts; at 255 it would be 257 and must be dormant.
     """
     tag = "test_closure_rewire"
     anchor = "a" * 64
@@ -415,44 +411,15 @@ def test_provider_rewire_obeys_same_256_fact_closure_bound_hot_and_cold(
         for fact in (*chain, short, long, consumer)
     }
 
-    db = sqlite3.connect(":memory:")
-    db.executescript(catalog.SCHEMA)
-    for fact in all_candidates.values():
-        db.execute(
-            "INSERT INTO facts VALUES(?,?)", (fact.fid, encode(fact)))
-        db.executemany(
-            "INSERT INTO fact_index VALUES(?,?,?,?)",
-            catalog.index_rows(fact),
-        )
-
-    def hot_standing():
-        ranks = dict(db.execute(
-            "SELECT fid, rank FROM proofs ORDER BY fid"))
-        edges = {}
-        for source, role, target, kind in db.execute(
-                "SELECT src, role, dst, kind FROM edges ORDER BY src, role"):
-            edges.setdefault(source, []).append(
-                ResolvedEdge(role, target, kind))
-        return {
-            fid: (rank, tuple(edges.get(fid, ())))
-            for fid, rank in ranks.items()
-        }
-
-    assert not rebuild_proofs(
-        db, all_candidates.get, anchor, fids=all_candidates)
-    assert hot_standing() == settlement.project(
-        anchor, all_candidates).standing
-    assert consumer.fid in hot_standing()
+    initial = settlement.project(anchor, all_candidates)
+    assert consumer.fid in initial.standing
+    assert long.fid in initial.standing
 
     rewired = dict(all_candidates)
     rewired.pop(short.fid)
-    db.execute("DELETE FROM fact_index WHERE src=?", (short.fid,))
-    db.execute("DELETE FROM facts WHERE fid=?", (short.fid,))
-    unresolved = rebuild_proofs(
-        db, rewired.get, anchor, fids=rewired)
     projected = settlement.project(anchor, rewired)
 
-    assert hot_standing() == projected.standing
-    assert (consumer.fid in hot_standing()) is consumer_is_eligible
-    assert (consumer.fid in unresolved) is not consumer_is_eligible
-    assert long.fid in hot_standing()
+    assert (consumer.fid in projected.standing) is consumer_is_eligible
+    assert long.fid in projected.standing
+    assert set(rewired) - set(projected.standing) == (
+        set() if consumer_is_eligible else {consumer.fid})
