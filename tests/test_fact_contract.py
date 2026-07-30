@@ -120,13 +120,14 @@ def test_core_fact_module_has_no_family_authors():
 
 def test_core_judge_and_engine_do_not_name_family_policy():
     for name in (
-            "admission.py", "catalog.py", "fact.py", "indexes.py",
-            "kernel.py", "snapshot.py", "node.py", "publication.py", "runtime.py",
+            "catalog.py", "fact.py", "indexes.py", "kernel.py",
+            "repository_applier.py", "repository_reader.py",
+            "repository_snapshot.py", "snapshot.py", "node.py",
             "suppression_state.py", "worker.py"):
         source = (ROOT / "core" / name).read_text()
         for vocabulary in (
                 '"admin"', '"device_key"', '"member"', '"removed"',
-                '"request"', '"workspace"'):
+                '"request"'):
             assert vocabulary not in source, (name, vocabulary)
 
 

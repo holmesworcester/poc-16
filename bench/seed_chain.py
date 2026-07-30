@@ -3,8 +3,8 @@
 The four shapes keep the authority facts identical and vary only who invites
 each user: ``star`` is the old founder-only low bar, ``wide`` models a small
 set of prolific inviters, ``random`` is a uniform random recursive tree, and
-``chain`` is the adversarial spine. Membership and content are kernel-admitted
-in bounded batches; the finished fact set receives one layout commit.
+``chain`` is the adversarial spine. Membership and content are received as
+bounded exact piles through the shared RepositoryApplier.
 """
 import collections
 import hashlib
@@ -14,16 +14,16 @@ import statistics
 import sys
 import time
 
+import facts
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench.bench_sync import (
     MEMBERS,
     YEARS,
-    _commit_index,
     admit_batch,
     bulk_author,
 )
-import facts
 from core.crypto import keypair, load_sk
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
@@ -124,7 +124,6 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
         depths[member_pk] = depths[inviter_pk] + 1
         users[member_pk] = joined.fid
     admit_batch(node, workspace, authored, deps)
-    _commit_index(node, workspace)
     node.keychain.save()
     return identities, parents, depths, users
 
@@ -182,7 +181,6 @@ def grow_devices(
             ts += 1
         all_devices.extend(device_set)
     admit_batch(node, workspace, authored, deps)
-    _commit_index(node, workspace)
     node.keychain.save()
     return all_devices, devices_by_user, device_to_user
 
@@ -232,7 +230,6 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         node, workspace, content_identities, n_messages,
         content_ts, window, content_rng)
     authored = time.perf_counter()
-    node.admission(workspace).publish()
     finished = time.perf_counter()
 
     total = node.idx(workspace).execute(

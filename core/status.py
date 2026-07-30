@@ -1,6 +1,7 @@
 """Read-only local host status for the daemon control plane."""
 from .crypto import h
 from .fact_index import STATE_INDEX
+from .limits import MAX_ROOT_BYTES
 
 
 def describe(node):
@@ -9,7 +10,8 @@ def describe(node):
     with node.lock:
         for workspace, entry in node.keyring["workspaces"].items():
             database = node.idx(workspace)
-            root = node.store(workspace).get("root")
+            root = node.store(workspace).get_bounded(
+                "root", MAX_ROOT_BYTES)
             out["workspaces"][workspace] = {
                 "root": h(root) if root is not None else None,
                 "facts": database.execute(

@@ -4,17 +4,16 @@ Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
             "download + ingestion" number: fetch every selected historical
-            admission proof, judge each proof through the kernel, admit its
-            candidates, then one commit. facts/s here is directly comparable
-            to the 2000-5000 facts/s poc-7..13 have gotten.
+            proof and judge bounded piles through the shared
+            RepositoryApplier. facts/s is measured at that real boundary.
 
   bidi      Two peers with shared membership and disjoint message sets do
             one candidate/proof join in both directions. Both converge; we
             measure the exact selected proof closures transferred.
 
-The seed is kernel-admitted in bounded batches with one snapshot build at the
-end, so setup is O(n log n), not O(n^2) — building 500k facts by replaying
-250k turns would be hopeless. The measured paths are the honest ones.
+The seed and measured catchup both use the production PileSender →
+RepositoryApplier transition. There is no benchmark-only SQL admission or
+snapshot publication seam.
 
 Run:   python3 bench/bench_sync.py                 # 5k/10k/50k/100k facts
        python3 bench/bench_sync.py 500000          # add the 500k run
@@ -26,20 +25,20 @@ import random
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import facts
-from core.candidate_archive import CandidateView
+
+from core import snapshot
 from core import sync as sync_module
-from core.close import close, encode_pile
-from core.crypto import h
+from core.close import close
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import kernel, offer_src, resolve_deps
+from core.limits import MAX_CLOSURE_FACTS
 from core.node import Node, now_ms
-from core.publication import Publisher
+from core.repository_reader import RepositoryReader
 
 from tests.util import add_member, all_fids
 
@@ -57,44 +56,8 @@ perf = time.perf_counter
 # ---- bulk seed building ------------------------------------------------------
 
 def admit_batch(node, workspace, news, deps_new):
-    """Benchmark setup through the same running-kernel durable entrance.
-
-    This is the production local-authoring pattern at benchmark scale:
-    family-known edges close only ``news`` over existing standing, then the
-    database-free kernel judges that bounded closure from empty.
-    """
-    news = tuple(news)
-    newmap = {fact.fid: fact for fact in news}
-
-    def fact_of(fid):
-        return newmap.get(fid) or node.fact_of(workspace, fid)
-
-    def deps_of(fid):
-        return deps_new[fid] if fid in deps_new else (
-            resolve_deps(fact_of(fid), node.idx(workspace)) or ())
-
-    stream = close(news, deps_of, fact_of)
-    pending = node.idx(workspace).execute(
-        "SELECT 1 FROM meta WHERE k='publish-base'").fetchone() is not None
-    if not pending:
-        node._sync_index(workspace)
-    publisher = Publisher(node, workspace)
-    return node.admission(workspace).admit(
-        stream,
-        base=publisher.base(pending=pending))
-
-
-def _commit_index(node, workspace):
-    """Defer layout by changing only benchmark-local publication metadata."""
-    idx = node.idx(workspace)
-    root = node.store(workspace).get("root")
-    idx.execute(
-        "INSERT OR REPLACE INTO meta VALUES('publish-base', ?)",
-        (h(root) if root is not None else None,))
-    idx.execute("DELETE FROM meta WHERE k='root'")
-    idx.execute(
-        "INSERT OR REPLACE INTO meta VALUES('tree-rebuild','1')")
-    idx.commit()
+    """Author one bounded batch through the production sender and applier."""
+    return node.ingest_new(workspace, tuple(news), deps_new)
 
 
 def build_members(node, ws, n_members, base_ts):
@@ -108,9 +71,16 @@ def build_members(node, ws, n_members, base_ts):
 
 
 def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
-    """Kernel-admit ``n_msgs`` messages in one bounded unpublished batch."""
+    """Author ``n_msgs`` messages in production-sized exact piles."""
     authored, deps = [], {}
     index = node.idx(ws)
+
+    def flush():
+        if authored:
+            admit_batch(node, ws, authored, deps)
+            authored.clear()
+            deps.clear()
+
     for i in range(n_msgs):
         sk, pk = rng.choice(members)
         ts = first_ts + rng.randrange(window)
@@ -122,8 +92,11 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
         authored.extend((signed, fact))
         deps[signed.fid] = ()
         deps[fact.fid] = (signed.fid, member)
-    admit_batch(node, ws, authored, deps)
-    _commit_index(node, ws)
+        # Leave room for the shared membership/signature closure while making
+        # benchmark seeds pay only production-sized Applier commits.
+        if len(authored) >= MAX_CLOSURE_FACTS // 2:
+            flush()
+    flush()
 
 
 def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
@@ -138,9 +111,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     n_msgs = max(0, (total_facts - base) // 2)
     t_auth = perf()
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
-    t_layout = perf()
-    n.admission(ws).publish()  # one full snapshot build over the whole set
-    t_end = perf()
+    t_layout = t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
                    "author_s": t_layout - t_auth, "layout_s": t_end - t_layout,
@@ -158,7 +129,10 @@ def snapshot_objs(store):
         oids.append(oid)
         return store.get("obj/" + oid)
 
-    view = CandidateView(root, fetch)
+    # This helper intentionally receives only a store. Construct the public
+    # Reader and use its subordinate CandidateView rather than bypassing it.
+    workspace = snapshot.decode_root(root).anchor
+    view = RepositoryReader(workspace, root, fetch).candidates()
     for fid in view.candidate_ids():
         view.verify(fid)
     return root, tuple(dict.fromkeys(oids))
@@ -166,7 +140,9 @@ def snapshot_objs(store):
 
 def seed_units(store, root, workspace):
     """The production sync units: selected historical proof closures."""
-    view = CandidateView(root, lambda oid: store.get("obj/" + oid))
+    view = RepositoryReader(
+        workspace, root,
+        lambda oid: store.get("obj/" + oid)).candidates()
     if view.root.anchor != workspace:
         raise ValueError("benchmark snapshot workspace")
     for fid in view.candidate_ids():
@@ -174,30 +150,27 @@ def seed_units(store, root, workspace):
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
-    """Decode is serial; kernel work is parallel; catalog admission is serial.
-
-    Returns streamed-record count. No commit: the caller lays out once.
-    """
-    node._sync_index(ws)
-    base = Publisher(node, ws).base()
+    """Receive bounded batches through the exact production Applier."""
+    _ = workers  # retained for benchmark-call compatibility
     streamed = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        buf = []
+    buf = []
 
-        def flush(bb):
-            judged = ex.map(lambda unit: (unit, kernel(unit, ws)), bb)
-            for unit, judgment in judged:
-                assert judgment.ok, "a published unit failed the kernel"
-                node.admission(ws).admit(unit, base=base)
+    def flush(bb):
+        ordered = {}
+        for unit in bb:
+            for fact in unit:
+                ordered.setdefault(fact.fid, fact)
+        raw = node.sender(ws).pack(tuple(ordered.values()))
+        node.receive_pile(ws, "benchmark", raw)
 
-        for u in units:
-            streamed += len(u)
-            buf.append(u)
-            if len(buf) >= batch:
-                flush(buf)
-                buf = []
-        if buf:
+    for unit in units:
+        streamed += len(unit)
+        buf.append(unit)
+        if len(buf) >= batch:
             flush(buf)
+            buf = []
+    if buf:
+        flush(buf)
     return streamed
 
 
@@ -205,13 +178,13 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 
 def catchup(seed, ws, fresh_dir):
     fresh = Node(fresh_dir)
+    fresh.add_workspace(ws, "benchmark-catchup", peers=[])
     src = seed.store(ws)
     root, ohs = snapshot_objs(src)
     dl_bytes = len(src.get("root")) + sum(len(src.get("obj/" + oh)) for oh in ohs)
 
     t0 = perf()
     streamed = ingest(fresh, ws, seed_units(src, root, ws))
-    fresh.admission(ws).publish()
     t1 = perf()
 
     total = fresh.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
@@ -231,9 +204,9 @@ def copy_facts(dst, ws, src, fids):
             src.fact_of(ws, fid), src.idx(ws)) or (),
         lambda fid: src.fact_of(ws, fid),
     )
-    dst._sync_index(ws)
-    dst.admission(ws).admit(facts)
-    _commit_index(dst, ws)
+    if ws not in dst.workspaces():
+        dst.add_workspace(ws, "benchmark-copy", peers=[])
+    dst.receive_pile(ws, "benchmark", dst.sender(ws).pack(facts))
 
 
 def reconcile(A, B, ws):
@@ -247,9 +220,9 @@ def reconcile(A, B, ws):
         return remote_objects[oid]
 
     t0 = perf()
-    fetch_local = lambda oid: astore.get("obj/" + oid)
-    mine = CandidateView(astore.get("root"), fetch_local)
-    theirs = CandidateView(bstore.get("root"), fetch_remote)
+    mine = A.reader(ws).candidates()
+    theirs = RepositoryReader(
+        ws, bstore.get("root"), fetch_remote).candidates()
     delta = sync_module._delta(mine, theirs)
     pull_fids, push_fids = set(delta.pull), set(delta.push)
     pulled = [theirs.verify(fid).facts for fid in delta.pull]
@@ -258,18 +231,13 @@ def reconcile(A, B, ws):
         len(raw) for raw in remote_objects.values() if raw is not None)
     push_streamed = sum(len(unit) for unit in pushed)
     push_bytes = sum(
-        len(encode_pile(unit, workspace=ws)) for unit in pushed)
+        len(A.sender(ws).pack(unit)) for unit in pushed)
     if pushed:
         ingest(B, ws, pushed)
-        # ingest() is the bulk benchmark seam and does not return Node.turn's
-        # exact new-fid delta; force the canonical full maintenance path.
-        B.admission(ws).publish(reuse=False)
 
     # Preserve sync's push-before-pull order so both deltas were computed
     # against the same two pinned roots.
     ingest(A, ws, pulled)
-    if pulled:
-        A.admission(ws).publish(reuse=False)
     t1 = perf()
 
     match = A.store(ws).get("root") == B.store(ws).get("root")
@@ -300,11 +268,6 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
             "min": min(depths.values()),
             "max": max(depths.values()),
         }
-        # ``grow_tree`` leaves one benchmark-sized admitted batch staged.
-        # Settle it before taking the shared membership snapshot; otherwise
-        # non-anchor facts are still staged and one-round reconciliation can
-        # expose previously invisible content after its frontier was computed.
-        A.admission(ws).publish()
     membership = all_fids(A, ws)
 
     B = Node(os.path.join(base_dir, "B"))
@@ -317,8 +280,6 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
     ) + 1
     bulk_author(A, ws, members, per_side, first, window, random.Random(1), "A")
     bulk_author(B, ws, members, per_side, first, window, random.Random(2), "B")
-    A.admission(ws).publish()
-    B.admission(ws).publish()
     a_facts = A.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     b_facts = B.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     st = reconcile(A, B, ws)
@@ -394,9 +355,7 @@ def run_bidi(scales):
 
 def check_leaves(seed, ws):
     """Every selected historical candidate proof still judges alone."""
-    st = seed.store(ws)
-    fetch = lambda oid: st.get("obj/" + oid)
-    view = CandidateView(st.get("root"), fetch)
+    view = seed.reader(ws).candidates()
     fids = view.candidate_ids()
     for fid in fids:
         assert kernel(view.verify(fid).facts, ws).ok, \

@@ -4,7 +4,7 @@ This module describes provider resources; it does not pretend that a Wrangler
 binding is read-only.  The broker receives no native R2 binding.  Its
 canonical reads use a separately provisioned Object Read-only S3 credential,
 and its only write-capable parent credential is scoped to the distinct ingress
-bucket.  The publisher alone receives native bindings to both buckets.
+bucket.  The RepositoryApplier alone receives native bindings to both buckets.
 """
 from dataclasses import dataclass
 import hashlib
@@ -67,7 +67,7 @@ class Deployment:
     ingress_bucket: str
     owner: str
     broker_name: str
-    publisher_name: str
+    applier_name: str
     read_permission_group_id: str
     write_permission_group_id: str
     upload_issuer: str = "cloudflare-upload-production"
@@ -86,7 +86,7 @@ class Deployment:
             (BUCKET, self.ingress_bucket, "ingress bucket"),
             (OWNER, self.owner, "deployment owner"),
             (WORKER, self.broker_name, "broker Worker name"),
-            (WORKER, self.publisher_name, "publisher Worker name"),
+            (WORKER, self.applier_name, "applier Worker name"),
             (HEX_ID, self.read_permission_group_id, "read permission id"),
             (HEX_ID, self.write_permission_group_id, "write permission id"),
         )
@@ -95,8 +95,8 @@ class Deployment:
                 raise ValueError(label)
         if self.canonical_bucket == self.ingress_bucket:
             raise ValueError("canonical and ingress buckets must differ")
-        if self.broker_name == self.publisher_name:
-            raise ValueError("broker and publisher Worker names must differ")
+        if self.broker_name == self.applier_name:
+            raise ValueError("broker and applier Worker names must differ")
         if self.jurisdiction not in JURISDICTIONS:
             raise ValueError("R2 jurisdiction")
         if not isinstance(self.upload_issuer, str) \
@@ -156,8 +156,8 @@ class Deployment:
             owner=environment.get("CF_UPLOAD_DEPLOYMENT_OWNER", ""),
             broker_name=environment.get(
                 "CF_UPLOAD_BROKER_NAME", "poc16-upload-broker"),
-            publisher_name=environment.get(
-                "CF_UPLOAD_PUBLISHER_NAME", "poc16-upload-publisher"),
+            applier_name=environment.get(
+                "CF_UPLOAD_APPLIER_NAME", "poc16-repository-applier"),
             read_permission_group_id=environment.get(
                 "CF_R2_BUCKET_ITEM_READ_PERMISSION_ID", ""),
             write_permission_group_id=environment.get(
@@ -312,15 +312,15 @@ def broker_config(deployment):
     return config
 
 
-def publisher_config(deployment):
-    """Generate the only role with native write paths to both buckets."""
+def applier_config(deployment):
+    """Generate the hosted repository's DB-free mutation compartment."""
     config = _worker_base(
         deployment,
-        role="publisher",
-        name=deployment.publisher_name,
-        main="build/publisher/entry.py",
+        role="applier",
+        name=deployment.applier_name,
+        main="build/applier/entry.py",
     )
-    config["base_dir"] = "build/publisher"
+    config["base_dir"] = "build/applier"
     config["vars"].update({
         "CANONICAL_PREFIX": deployment.canonical_prefix,
         "INGRESS_PREFIX": deployment.ingress_prefix,
@@ -337,6 +337,7 @@ def publisher_config(deployment):
             "jurisdiction": deployment.jurisdiction,
         },
     ]
+    config["triggers"] = {"crons": ["*/1 * * * *"]}
     return config
 
 
@@ -365,7 +366,7 @@ def ingress_lifecycle(deployment):
 def generated_boundary(deployment):
     return {
         "broker": broker_config(deployment),
-        "publisher": publisher_config(deployment),
+        "applier": applier_config(deployment),
         "access_policies": access_policies(deployment),
         "ingress_lifecycle": ingress_lifecycle(deployment),
         "provider_claim": {

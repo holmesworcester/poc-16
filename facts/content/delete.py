@@ -7,6 +7,7 @@ share ownership), while ADMIN requires an admin offer for the signing key.
 """
 
 from core.fact import Fact, Need
+from core.fact_index import EDGE_INDEX
 from core.shape import fid_of, key_parts
 from core.suppression import (
     SELF,
@@ -123,8 +124,13 @@ def remove(node, workspace, target, ts=None):
     with node.lock:
         actor_member = offer_source(node, workspace, "member", public)
         target_provider = node.idx(workspace).execute(
-            "SELECT dst FROM edges WHERE src=? AND role=?",
-            (victim.fid, policy.owner_edge)).fetchone()
+            "SELECT k1 FROM fact_index "
+            "WHERE kind=? AND src=? AND k0=?",
+            (
+                EDGE_INDEX,
+                victim.fid,
+                "need:" + policy.owner_edge,
+            )).fetchone()
         actor_principal = _policy.member_principal(
             node.idx(workspace), actor_member, public) if actor_member else None
         target_member = node.fact_of(

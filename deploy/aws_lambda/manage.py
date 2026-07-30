@@ -327,8 +327,8 @@ def bucket_policy(args):
         "--profile", args.policy_profile,
         "--partition", args.partition,
         *(
-            ["--publisher-principal", args.publisher_principal]
-            if args.publisher_principal else []
+            ["--applier-principal", args.applier_principal]
+            if args.applier_principal else []
         ),
     ])
 
@@ -547,9 +547,9 @@ def parser():
     policy_cmd.add_argument("--prefix", required=True)
     policy_cmd.add_argument(
         "--profile", dest="policy_profile",
-        choices=("bucket-wide", "single-publisher"),
+        choices=("bucket-wide", "single-applier"),
         default="bucket-wide")
-    policy_cmd.add_argument("--publisher-principal")
+    policy_cmd.add_argument("--applier-principal")
     policy_cmd.add_argument(
         "--partition", choices=("aws", "aws-us-gov", "aws-cn"),
         default="aws")

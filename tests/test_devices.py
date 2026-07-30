@@ -719,6 +719,12 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert source.candidate_of(workspace, child_claim.fid) == child_claim
     assert source.reader(workspace).candidates().fact_record(
         child_claim.fid)["state"] == "dormant"
+    dormant_reader = source.reader(workspace)
+    dormant_record = dormant_reader.candidates().fact_record(
+        child_claim.fid)
+    for sid in dormant_record["selectors"]:
+        assert dormant_reader.worker().suppression(sid) == {
+            "state": "clear"}
     assert source.store(workspace).list("quarantine/") == []
 
     invite_secret, invite_public = keypair()

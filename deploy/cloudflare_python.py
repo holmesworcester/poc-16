@@ -2,14 +2,6 @@
 from pathlib import Path
 import shutil
 
-from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
-
-
-# Compatibility for build scripts outside this repository.  The tuple is the
-# exact RepositoryReader import closure; it no longer contains core.mint.
-MINT_CORE_MODULES = REPOSITORY_READER_CORE_MODULES
-
-
 def patch_pynacl(vendored):
     """Disable eager EM_ASM registration in a vendored Workers PyNaCl."""
     vendored = Path(vendored)

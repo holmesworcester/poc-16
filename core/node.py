@@ -246,7 +246,6 @@ class Node:
                                   check_same_thread=False)
             con.executescript(IDX_SCHEMA)
             catalog.upgrade_schema(con, ws)
-            suppression_state.upgrade_schema(con)
             self._idx[ws] = con
         return self._idx[ws]
 

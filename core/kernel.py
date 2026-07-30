@@ -8,7 +8,8 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
-from .fact import Fact, bound_to, decode
+from .fact_index import EDGE_INDEX, STATE_INDEX
+from .fact import Fact, bound_to
 from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
 from .shape import valid_fid
 
@@ -45,40 +46,6 @@ def valid_resolved_edges(deps, edges):
         and all(valid_fid(edge.fid) for edge in edges) \
         and all(edge.kind in ("need", "ref") for edge in edges) \
         and tuple(deps) == tuple(edge.fid for edge in edges)
-
-
-class Context(NamedTuple):
-    """Immutable in-pile context visible to every family validator.
-
-    Mutable host state is intentionally absent. Time and current suppression
-    belong to the database-free Worker authorization boundary.
-    """
-
-    db: object
-    anchor: str
-
-    def fact_meta(self, fid):
-        row = self.db.execute(
-            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
-        if row is None:
-            return None
-        fact = decode(row[0])
-        return fact.ts, fact.t
-
-    def offers_from(self, source, name):
-        return self.db.execute(
-            "SELECT k0, k1 FROM fact_index "
-            "WHERE src=? AND kind=? ORDER BY k0, k1",
-            (source, name)).fetchall()
-
-    def edge_source(self, source, role):
-        row = self.db.execute(
-            "SELECT dst FROM edges WHERE src=? AND role=?",
-            (source, role)).fetchone()
-        return row[0] if row else None
-
-    def provider(self, name, a0, a1=None, requires=()):
-        return offer_src(self.db, name, a0, a1, requires)
 
 
 class MemoryContext:
@@ -168,14 +135,17 @@ def offer_src(db, name, a0, a1=None, requires=()):
         return db.resolve_offer(name, a0, a1, requires)
     query = (
         "SELECT o.src FROM fact_index o "
-        "JOIN proofs p ON p.fid=o.src "
+        "JOIN fact_index p ON p.src=o.src "
+        "AND p.kind=? AND p.k0='eligible' "
         "WHERE o.kind=? AND o.k0=?"
     )
-    args = [name, a0]
+    args = [STATE_INDEX, name, a0]
     if a1 is not None:
         query, args = query + " AND o.k1=?", args + [a1]
     row = db.execute(
-        query + " ORDER BY p.rank, o.src LIMIT 1", args).fetchone()
+        query + " ORDER BY CAST(p.k1 AS INTEGER), o.src LIMIT 1",
+        args,
+    ).fetchone()
     if row is None:
         return None
     source = row[0]
@@ -234,9 +204,10 @@ def proof_rank(db, deps):
     if not deps:
         return 0
     rows = db.execute(
-        f"SELECT fid, rank FROM proofs WHERE fid IN "
+        f"SELECT src, CAST(k1 AS INTEGER) FROM fact_index "
+        f"WHERE kind=? AND k0='eligible' AND src IN "
         f"({','.join('?' for _ in deps)})",
-        tuple(deps),
+        (STATE_INDEX, *deps),
     ).fetchall()
     ranks = {fid: rank for fid, rank in rows}
     if any(fid not in ranks for fid in deps):
@@ -268,9 +239,11 @@ def proof_closure_size(db, deps, *, stop_after=None):
         "WITH RECURSIVE closure(fid) AS ("
         f"VALUES {seeds} "
         "UNION "
-        "SELECT e.dst FROM edges e JOIN closure c ON e.src=c.fid"
+        "SELECT e.k1 FROM fact_index e JOIN closure c ON e.src=c.fid "
+        "WHERE e.kind=?"
         ") SELECT fid FROM closure" + limit,
-        args,
+        (*deps, EDGE_INDEX) if stop_after is None
+        else (*deps, EDGE_INDEX, stop_after + 1),
     ).fetchall()
     return len(rows)
 
@@ -289,156 +262,6 @@ def accepts(fact, edges, ctx, strict=False):
         if strict:
             raise
         return False
-
-
-def extend_proofs(db, fids, fact_of, anchor=None, accept=None):
-    """Add shortest authority proofs with work proportional to ``fids``.
-
-    Existing proofs and offers are consulted by indexed point/range lookups;
-    they are never materialized wholesale on the append path.  A fact becomes
-    a candidate exactly when all of its references have ranks and each family
-    need has a ranked canonical provider.  Providers that become ready
-    together are installed as one rank wave, so equal-rank conflicts
-    participate in the canonical ``(rank, fid)`` choice before dependents run.
-    """
-    ranked = {}
-    context = Context(db, anchor) if anchor is not None else None
-    accept = accept or (
-        (lambda fact, edges: accepts(fact, edges, context))
-        if context is not None else
-        (lambda _fact, _edges: True)
-    )
-
-    def has_proof(fid):
-        if fid not in ranked:
-            ranked[fid] = db.execute(
-                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone() \
-                is not None
-        return ranked[fid]
-
-    unresolved, pending = {}, list(fids)
-    while pending:
-        fid = pending.pop()
-        if fid in unresolved or has_proof(fid):
-            continue
-        fact = fact_of(fid)
-        if fact is None:
-            continue
-        if anchor is not None and not bound_to(fact, anchor):
-            continue
-        unresolved[fid] = fact
-        pending.extend(ref for _, ref in fact.refs())
-
-    ref_waiters, offer_waiters = {}, {}
-    missing, candidates = {}, set()
-
-    def wait_for_offer(fid, condition):
-        _, name, a0, a1, _ = condition
-        offer_waiters.setdefault((name, a0, a1), set()).add(
-            (fid, condition))
-
-    for fid, fact in unresolved.items():
-        conditions = {
-            ("ref", ref)
-            for _, ref in fact.refs()
-            if not has_proof(ref)
-        }
-        try:
-            handler = facts.family_for(fact.t)
-            if handler is None:
-                continue
-            for need in handler.needs(fact):
-                if offer_src(
-                        db, need.name, need.a0, need.a1,
-                        need.requires) is None:
-                    conditions.add(
-                        ("offer", need.name, need.a0, need.a1,
-                         need.requires))
-        except Exception:
-            continue
-        missing[fid] = conditions
-        if not conditions:
-            candidates.add(fid)
-        for condition in conditions:
-            if condition[0] == "ref":
-                ref_waiters.setdefault(condition[1], set()).add(fid)
-            else:
-                wait_for_offer(fid, condition)
-
-    while candidates:
-        ready = []
-        for fid in sorted(candidates):
-            fact = unresolved[fid]
-            edges = resolve_edges(fact, db)
-            deps = None if edges is None else [edge.fid for edge in edges]
-            rank = proof_rank(db, deps) if deps is not None else None
-            closure_size = proof_closure_size(
-                db, deps, stop_after=MAX_CLOSURE_FACTS - 1
-            ) if rank is not None else None
-            if rank is not None \
-                    and closure_size is not None \
-                    and closure_size + 1 <= MAX_CLOSURE_FACTS \
-                    and len(edges) <= MAX_RESOLVED_EDGES \
-                    and accept(fact, edges):
-                ready.append((fid, rank, edges))
-        if not ready:
-            break
-        db.executemany(
-            "INSERT OR REPLACE INTO proofs VALUES(?,?)",
-            ((fid, rank) for fid, rank, _ in ready),
-        )
-        db.executemany(
-            "INSERT OR REPLACE INTO edges VALUES(?,?,?,?)",
-            (
-                (fid, edge.role, edge.fid, edge.kind)
-                for fid, _, edges in ready
-                for edge in edges
-            ),
-        )
-        candidates = set()
-        for fid, _, _ in ready:
-            ranked[fid] = True
-            for dependent in ref_waiters.pop(fid, ()):
-                if dependent not in unresolved or dependent not in missing:
-                    continue
-                missing[dependent].discard(("ref", fid))
-                if not missing[dependent]:
-                    candidates.add(dependent)
-            for name, a0, a1 in unresolved[fid].offers():
-                for address in ((name, a0, a1), (name, a0, None)):
-                    waiting = tuple(offer_waiters.get(address, ()))
-                    for dependent, condition in waiting:
-                        if dependent not in unresolved \
-                                or dependent not in missing:
-                            offer_waiters[address].discard(
-                                (dependent, condition))
-                            continue
-                        _, needed_name, needed_a0, needed_a1, requires = \
-                            condition
-                        if offer_src(
-                                db, needed_name, needed_a0, needed_a1,
-                                requires) is None:
-                            continue
-                        missing[dependent].discard(condition)
-                        offer_waiters[address].discard(
-                            (dependent, condition))
-                        if not missing[dependent]:
-                            candidates.add(dependent)
-            unresolved.pop(fid)
-            missing.pop(fid, None)
-    return frozenset(unresolved)
-
-
-def rebuild_proofs(db, fact_of, anchor=None, accept=None, fids=None):
-    """Derive eligibility and shortest ranks for the whole admitted catalog."""
-    db.execute("DELETE FROM proofs")
-    db.execute("DELETE FROM edges")
-    selected = fids if fids is not None else (
-        fid for (fid,) in db.execute("SELECT fid FROM facts")
-    )
-    return extend_proofs(
-        db, selected, fact_of, anchor, accept,
-    )
 
 
 def _judge(stream, ctx):

@@ -1,9 +1,9 @@
 """The node-local plural identity holder and workspace bindings."""
 import json
 
+import facts
 import pytest
 
-import facts
 from core.crypto import keypair
 from core.node import Node, now_ms
 

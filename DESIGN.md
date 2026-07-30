@@ -1,1303 +1,780 @@
 # POC-16 design
 
-This document describes the code on `main`. It distinguishes running behavior
-from limits and future work; it is not a backlog.
+This document states the current architecture and its correctness boundary.
+It is descriptive of running code unless a section is explicitly marked
+future work.
 
-## Goal and trust boundary
+## 1. Authority map
 
-POC-16 asks whether peers can reconcile an authenticated workspace against a
-counterpart that mostly serves immutable bytes. The active peer performs the
-walk, verifies hashes, validates fact closures, and settles its local catalog.
-The responder supplies a small authentication gate plus an object-store-shaped
-HTTP surface.
-
-The prototype provides integrity, deterministic reconciliation, logical
-suppression, and bounded request-time authorization reads. It does not provide
-body confidentiality, physical erasure, production-grade garbage collection,
-or compatibility across format stamps.
-
-Fact bodies are plaintext JSON. Signatures authenticate facts. Only invite
-blobs are encrypted with a secret carried in the invite link. Attachment bytes
-are content addressed and Bao verified, but the surrounding file facts are not
-encrypted.
-
-## Authority flow and code map
-
-The runtime is a downward authority chain, not a collection of peer managers:
+The system has exactly three capabilities:
 
 ```text
-daemon / local command                         host adapters
-        ↓
-WorkspaceRuntime.turn                          one socket-free turn
-        ↓
-AdmissionMembrane.process                     exact pile → retirement capability
-        ↓
-kernel → registered fact family                judgment and policy
-        ↓
-Catalog.settle                                 admitted receipt → eligibility
-        ↓
-Publisher.publish                              snapshot → one root CAS
+PileSender
+    local intent -> one ordinary closed pile
 
-root + immutable-object fetches → WorkerView   database-free CF authorization
+RepositoryApplier
+    exact ordinary pile -> immutable objects -> one root CAS
 
-generic type/ref/offer index → family query    client read assembly
+RepositoryReader
+    one exact root -> authenticated, side-effect-free answers
 ```
 
-`Node` composes local identity, stores, indexes, diagnostics, and one cached
-workspace-bound `AdmissionMembrane`; it does not run the admission pipeline or
-define family policy. Sync and local authorship both enqueue the same pile
-bytes. `WorkspaceRuntime` orders independent work units, the membrane alone
-turns an exact source into a kernel proof, catalog settlement, root-CAS result,
-and one-use retirement capability, `Catalog` alone decides current standing,
-and `Publisher` alone advances `root`. The daemon handles HTTP and token
-sealing. Its node-local control surface dispatches one qualified command path
-through the checked `facts.COMMANDS` registry; typed application commands
-remain beside their fact families, and adding one does not add a CLI or daemon
-branch.
-
-An engineer should read the running path in this order:
-
-1. `core/fact.py` and `core/suppression.py`;
-2. `facts/__init__.py`, then one auth and one content family;
-3. `core/kernel.py`;
-4. `core/runtime.py`, `core/admission.py`, and `core/catalog.py`;
-5. `core/publication.py`, `core/snapshot.py`, and `core/indexes.py`;
-6. `core/worker.py` and `core/mint.py`;
-7. `core/sync.py`, `core/walk.py`, then `core/daemon.py`.
-
-## Facts and the kernel
-
-A fact is a canonical JSON value containing:
-
-- a type tag;
-- an integer timestamp;
-- a workspace genesis fid `ws`;
-- clear-envelope atoms for references, offers, and suppression policy; and
-- a family-owned body.
-
-The workspace-genesis fact is the sole exception: it has no `ws`, and its own
-`fid` defines the workspace anchor. The checked family registry requires
-exactly one family to declare that genesis role. Every ordinary fact carries
-`ws=W` in its clear envelope, so the workspace participates in the `fid` and
-in every signature over that fid. Consequently the same author, timestamp,
-atoms, and body in two workspaces produce different facts and signatures.
-
-Its `fid` is the SHA-256 hash of the canonical envelope bytes. Its
-reconciliation key is the fixed-width string `(timestamp, fid)`. Timestamps
-primarily provide locality and deterministic ordering; the prospective
-admission rule described under “Action timing” also compares that key.
-
-A pile is a canonical, topologically ordered, dependency-closed collection of
-facts plus optional blobs. The same pile codec is used for ingress, sync, and
-resident leaf objects. Its outer envelope names exactly one `ws=W`; every fact
-must carry `ws=W`, except the sole genesis fact whose `fid` must equal `W`.
-There is no decoder for the previous workspace-ambient fact or pile format.
-Invite bootstraps carry this same canonical pile, rather than a second raw fact
-list, and must pass outer-link/inner-pile workspace equality plus a complete
-kernel judgment before local workspace or keyring state is mutated.
-
-The family-neutral kernel processes a pile in one pass. A `ref` carries its
-own role and must name an earlier fact. Each family returns named `Need`
-values; the kernel selects each canonical provider by shortest proof rank and
-then fid. There is no second tag-indexed role table. Every family module owns
-one `POLICY` beside its behavior, and `facts/__init__.py` is the one checked
-registry. `facts/_policy.py` supplies the vocabulary for selectors, direct
-targets, guards, liveness, and typed principal/action offers.
-
-Persistent validity is immutable and does not read wall-clock state. An
-ephemeral request family owns its database-free Worker authorization hook,
-including verb and expiry checks against trusted service time.
-
-Ingress dependency choices are hints, not authority. The client catalog
-resolves every named edge again against its complete local candidate set and
-runs the same family validator before granting standing. A sender therefore
-cannot preserve a losing ownership or membership edge when the receiver has a
-better canonical provider.
-
-Workspace identity is checked before those choices or family dispatch can
-matter. At an authenticated write door, request workspace, grant workspace,
-uploader path, pile workspace, and every ordinary fact workspace must agree.
-Foreign and mixed piles are typed permanent rejections before catalog staging.
-The same expected-anchor pile decoder is used by host ingress, candidate-proof
-sync, invite redemption, database-free mint, and rebuild. The kernel remains
-database-free and family-neutral: it compares the canonical anchor, then asks
-the one registered genesis family whether the single ws-less exception is
-actually genesis.
-
-## Store and publication
-
-Each workspace store exposes:
+They form exactly two actors:
 
 ```text
-root                         one mutable, CAS-written composite root
-obj/<sha256>                 immutable pages, piles, facts, and blobs
-pile/<member>/<gen32>/<sha256>
-                             internal create-only publication work
-invite/<unguessable-id>      encrypted invite blob
-failed/pile/<sha256>         shared immutable rejected bytes
-failed/meta/<sha256>         shared immutable typed-rejection record
+hosted repository = RepositoryApplier + RepositoryReader
+
+full P2P node     = PileSender + RepositoryApplier + RepositoryReader
 ```
 
-The writable ObjectStore API enforces the authoritative-key rules: `root`
-rejects ordinary put and delete, `obj/*` rejects replacement and delete,
-object creation is conditional, and only root CAS may replace the composite
-snapshot. A separate ObjectReader interface covers HTTP peer/root/object
-reads; its HTTP cache tag is never a writable-store CAS token. Provider SDKs
-and deployment code stay outside `core/`.
+`PileSender` may use SQLite. `RepositoryApplier` and `RepositoryReader` may
+not. A full node does not gain a second receiving algorithm: its receiving
+side calls the same `RepositoryApplier` used by Lambda and Workers.
 
-`read_versioned(root)` atomically returns either `ABSENT` or exact root bytes
-paired with an opaque `VersionToken`. The token is only a comparison
-capability to pass back to CAS. It is not SHA-256, an HTTP cache tag, an ETag
-algorithm promise, or a globally unique generation. `cas` returns
-`Applied(new_token)` or definitive `STALE`; a mutation rejected before its
-linearization point raises `RetryableStoreError`, while a lost response after
-a possible mutation raises `OutcomeUnknown`.
+Provider least-privilege packaging may place the hosted repository's
+Reader-facing broker and Applier in separate processes. They remain two
+compartments of the one hosted composition: the broker has no repository
+mutation state, while the Applier has no alternative read/query authority.
+Physical deployment separation is not a third repository actor.
 
-Immutable creation returns `CREATED` or `EXISTS`. The shared
-`ensure_object(oid, bytes)` boundary accepts `EXISTS` only after fetching and
-byte-verifying the incumbent. It reconciles an unknown outcome by direct read
-and never lets root CAS run until every immutable page reachable from that
-candidate root is known present. Detached attachment blobs are not
-root-reachable pages: their absence makes a file incomplete, not its signed
-facts invalid.
-FsStore refines atomic comparison/creation locally with a stable flock and
-atomic link/replace, but does not yet claim power-loss durability because it
-omits the required file and parent-directory fsync sequence. S3/R2 adapters
-use their acknowledged durable conditional writes; neither copies the POSIX
-mechanism.
+Subordinate views do not add authority:
 
-The authoritative access path requires acknowledged durability and strong
-direct-API visibility. Current general-purpose S3 and direct R2 Worker/S3
-APIs provide the strong per-key reads and conditional writes this design
-uses. Cached custom domains and asynchronous replicas are not conforming
-authoritative adapters. LIST is strong but paginated, and several pages are
-not one transaction. Piles, invites, and rejection records remain
-non-authoritative operations with explicit create-only/idempotent handling.
-Every host/peer pile receives a fresh internally generated 128-bit generation;
-the authenticated HTTP peer names only member and body hash, and cannot choose
-or recreate that durable generation. Rejection
-evidence nevertheless participates in a destructive safety obligation: exact
-pile bytes and a content-addressed typed-reason record are read back before
-any worker may retire malformed ingress. The evidence is shared because host
-workers share the workspace prefix; node-local status for retryable provider,
-publication, root, CAS, and program failures is a separate in-memory view.
-A later strong `pile/` listing clears a local attempt row when another worker
-has already retired that shared obligation; this changes presentation only
-and performs no deletion.
+- `WorkerView` is a bounded policy/query view under one `RepositoryReader`.
+- `CandidateView` reads retained candidate records under the same root.
+- a broker is one `RepositoryReader` plus a provider-specific upload signer.
 
-The running cloud deployment is read-only: a host daemon still receives remote
-object/pile PUTs and performs publication. The resumable client, stateless
-broker protocol, strict provider-neutral HTTP membrane, and S3/R2 signing
-translators are implemented. AWS additionally has a separate Function URL
-adapter and least-privilege SAM broker stack; it is not live-deployed.
-Cloudflare additionally has a real database-free broker Worker that builds
-through pywrangler and loads under local workerd; it has no public route and
-has not been live-deployed. Neither provider has the database-free publisher.
-The target write path removes the host proxy without giving clients root
-authority. After authorization, a broker signs short-lived, exact-key
-conditional PUT capabilities. A client uploads objects first and a closed-pile
-intent last into session-scoped isolated ingress on both S3 and R2. No object
-or pile body transits the broker, Lambda, Worker, or publisher during upload;
-those components handle authority metadata or later publication. This is the
-one selected client protocol.
-Provider object-created events, an authenticated poke, and a scheduled fallback
-may all wake interchangeable database-free publishers. Wakeups are advisory.
-The client-writable session marker is durable input, but it is never a
-canonical retirement target. Publishers verify workspace, uploader, checksums,
-and closure; promote every present referenced attachment object; then copy the
-verified pile bytes with create-only semantics to a fresh internal
-`pile/<member>/<generation>/<sha256>` key that no client capability can name.
-That internal generation updates the authenticated trees, CASes root, and
-retires only under its exact typed receipt. A missing detached blob does
-not block valid facts—the file remains incomplete exactly as it does after
-ordinary peer sync. Throttling, crashes, and CAS loss retain the work item.
-Clients can neither list/delete the namespace nor write root or an internal
-pile generation.
+The following operations have one owner:
 
-The split follows the authority actually required by each step:
+| operation | owner |
+| --- | --- |
+| close and encode outbound facts | `PileSender` |
+| judge one exact incoming pile | `RepositoryApplier` via `kernel` |
+| establish immutable canonical objects | `RepositoryApplier` |
+| compile repository state | `repository_snapshot.compile_snapshot` |
+| compare-and-swap `root` | `RepositoryApplier` |
+| retire an internal pile generation | `RepositoryApplier` |
+| answer from a pinned root | `RepositoryReader` |
+| assemble client presentation | fact-family queries over the disposable index |
+
+`Node` is a composition root and turn coordinator. It may construct these
+capabilities and translate results into client diagnostics. It does not own
+fact policy, settlement, storage layout, root publication, or a second
+receiving loop.
+
+## 2. Facts and families
+
+A fact is a canonical serialization of:
 
 ```text
-client     exact create-only object and closed-pile upload capabilities
-broker     validates upload authority and attenuates it to exact requests
-publisher  verifies/promotes ingress, derives pages, CASes root, proves retirement
-reader     reads only the pinned root and its authenticated closure
+(workspace, type, timestamp, clear-envelope atoms, body)
 ```
 
-The target implementation keeps that authority flow visible in the module
-graph:
+Its `fid` is the SHA-256 address of that serialization. Ordinary facts carry
+their workspace ID. The workspace-genesis family is the sole exception: its
+own `fid` is the workspace anchor, so it may omit `ws`.
+
+The clear envelope contains:
+
+- named refs;
+- named offers;
+- explicit suppression selectors or actions.
+
+Bodies are family-shaped but are not inspected to discover generic refs,
+offers, or suppression IDs.
+
+Every fact type is a module under `facts/`. A family owns:
+
+- construction and shape validation;
+- named needs and offers;
+- durable versus ephemeral mode;
+- suppression-selector policy;
+- direct-action and owner policy;
+- continuing authority-liveness guards;
+- commands and queries.
+
+Core dispatches through the family registry. Adding a family should not add a
+type branch to `Node`, the CLI, the repository compiler, or the object-store
+adapters.
+
+### 2.1 Closed piles
+
+A pile is one canonical, workspace-bound, topologically ordered closure.
+Dependencies precede dependents. Running code bounds pile bytes and each
+fact's resolved-edge and transitive-closure size. An aggregate fact-count
+limit for a byte-valid pile is additional resource hardening tracked in
+beads; it is not an admission invariant today.
+
+The database-free kernel builds a `MemoryContext` while streaming the pile:
 
 ```text
-core/staged_intent     untrusted ingress key + bytes -> typed workspace intent
-core/settlement        pure admitted-candidate fixed point
-core/snapshot          pure authenticated-tree proposal + immutable outbox
-core/store_publisher   async outbox/CAS/F10/retirement interpreter
-deploy/*               provider events, configuration, and store construction
+known facts
+proof rank
+resolved named edges
+transitive closure
+canonical offers
 ```
 
-The client catalog and the database-free publisher use the same family
-registry, kernel rules, and canonical ordering. The cold/reference
-`settlement.project` operates directly over authenticated candidates; the
-client catalog preserves an affected-closure incremental path so an ordinary
-append is not O(all facts). Full cold reconstruction checks its answer against
-the committed projection. SQLite may answer a client query; authenticated
-FactTree postings and candidate residences answer the cloud query. Neither
-path owns a second family-validity or authorization policy. `Node` is not
-packaged into Lambda or a Worker, and an in-memory SQLite reconstruction is
-not the edge implementation. Missing root, proof, fact-residence, or tree-page
-objects suspend the pure computation
-through a bounded cache-miss driver, are awaited exactly once, and then rerun
-the same function. A missing attachment blob does not suspend fact
-settlement. Provider entrypoints contain no family policy, tree construction,
-staging grammar, or retirement decision.
+For each fact it:
 
-Proxying the client upload through the publisher adds bandwidth and failure
-surface but no serialization point: the client writes its exact granted
-object-store key directly. A staging deployment may require the publisher to
-read, verify, and promote that stored value before it becomes canonical; that
-is a bounded validation step, not a client-to-function upload path.
-Publication itself is different. It combines a validated pile with the current
-authenticated snapshot and therefore remains behind the one root CAS
-authority. A presigned request is a bearer capability, not workspace
-membership; the broker derives its exact key and signed constraints from a
-fresh workspace-bound authorization decision, and a publisher repeats all
-semantic validation before accepting the resulting pile.
+1. proves workspace binding;
+2. resolves refs and family-declared needs;
+3. runs family validation;
+4. checks family policy;
+5. assigns a well-founded rank;
+6. emits a `Valid` receipt with exact named edges.
 
-Exact-key attenuation is sufficient only for the untrusted ingress boundary.
-The capability binds the staging key containing the declared digest, the
-create-only condition, and the byte bound, but a provider need not prove that
-the received body has that digest. Before immutable canonical creation, the
-publisher streams and hashes the staged body under the same bound. Otherwise
-an authorized but malicious uploader could occupy an absent legitimate
-`obj/<sha256>` name with different bytes and turn immutability into a permanent
-denial of publication. A provider-checked SHA-256 checksum is useful defense in
-depth; `Content-MD5` alone is not the canonical content-address proof.
+An unexpected family/program error is retryable work, not permission to
+destroy the pile. A permanent malformed or semantically invalid pile receives
+typed rejection evidence before its internal generation can be retired.
 
-The current Cloudflare primitives make the distinction concrete. R2's
-[S3-compatible `PutObject` surface][r2-s3-api] advertises `Content-MD5`, not a
-flexible SHA-256 checksum, while the [native Worker binding][r2-worker-api]
-accepts a `sha256` put option and a conditional. Thus a raw presigned canonical
-R2 PUT is not assumed safe or needed: Cloudflare accepts the exact PUT into
-isolated staging, and the publisher verifies it before canonical promotion.
+## 3. Suppression and actions
 
-Provider credentials must preserve the same separation. AWS can give a
-presigner a PutObject-only resource policy. R2
-[presigned URLs][r2-presigned] likewise bind one operation and object, but the
-long-lived parent Object Read and Write token is
-bucket-scoped and also reads, lists, and deletes objects. A Cloudflare broker
-therefore holds that parent only for a separate ingress bucket, never the
-canonical workspace bucket, and derives exact staging PUTs locally. Only the
-publisher can validate/promote those objects into the canonical bucket and CAS
-its root. The extra bucket is an authority boundary, not a second database. It
-protects canonical integrity, but does not protect pre-root staging from a
-compromised parent: an upload response is a retryable staging receipt, while
-observed root publication is the durable workspace acknowledgement.
+Suppression is explicit, typed, and family-owned.
 
-The generated Cloudflare isolated-ingress package refines that split into
-three provider identities:
+A family can declare:
+
+- `Self()`;
+- `Parent(role)`;
+- `Ancestor(role, ..., role)`;
+- several selectors;
+- no selectors.
+
+At authorship the fact serializes the exact IDs resolved along those named
+paths. Ancestors already exist because piles are topological. A later deleter
+does not enumerate descendants. A child can therefore carry SELF plus a
+parent or grandparent ID, while a family that offers no selector is
+unsuppressible.
+
+This is not a guess based on fact type at read time. Admission independently
+recomputes the selector list from the family policy and resolved edges and
+requires exact equality.
+
+### 3.1 SuppTree
+
+For every declared suppression ID, `SuppTree` contains exactly one state:
 
 ```text
-broker canonical reader  exact canonical bucket, Object Read only, no writes
-broker ingress parent    exact ingress bucket, bucket-item read/write/list
-publisher bindings       ingress read/retire + canonical promote/root CAS
+CLEAR
+ACTIVE(action_fid)
 ```
 
-The broker Worker has no native R2 binding. Its only write-capable secret is
-the ingress parent; a distinct read-only S3 credential supplies canonical DAG
-reads. A segregated pure-stdlib SigV4 translator binds `PUT`, the path-style
-account endpoint, ingress bucket, one exact key, `Content-Length`,
-`Content-Type`, `If-None-Match: *`, credential scope
-`auto/s3/aws4_request`, and session-bounded expiry. It returns an ordinary
-`UploadCapability`, never a temporary credential. Its payload mode is
-explicitly `UNSIGNED-PAYLOAD`, so it is not a body-integrity proof. It targets
-only
-`ingress/v1/workspaces/<workspace>/objects/<session>/<digest>` or
-`.../piles/<session>/<member>/<digest>`, whose bytes remain untrusted until
-the publisher hashes and validates them. Object class precedes session so a
-provider lifecycle prefix can collect loose objects without ever matching a
-durable pile marker, and scheduled work discovery can list only piles. The
-broker mints and pins the session; it is not a caller-selected path fragment.
-Objects arrive first. The closed pile/intention arrives last, commits the
-workspace, member, session, and declared object digests, and is the only
-durable ready marker; loose staged objects and event notifications are not
-publication work by themselves.
+`CLEAR` means the ID is authenticated and no action is effective at this
+root. `ACTIVE(action_fid)` names the exact effective immutable action.
+Missing is distinct from `CLEAR`; a reader requiring a missing slot fails
+closed.
 
-Objects-first/pile-last is a client delivery guarantee, not a new fact
-validity rule. The publisher verifies and promotes each referenced staged
-object that is present, one at a time, but it may settle and root the canonical
-facts when a detached Bao object is absent. The authenticated chunk facts then
-express the durable missing-object demand and file queries report incomplete,
-just as they do on an ordinary replica. Once F10 proves that every admitted
-fact from the copied pile is represented by the committed root, only that
-internal generation may retire. The client-writable staging marker is outside
-this destructive door. Capability expiry does not prove it safe to delete:
-providers may accept a request before expiry and complete it later. Staging
-retention/lifecycle is therefore a separate provider policy
-(`poc-16-x1p.17.15`), and the fail-safe current rule is to retain pile markers.
-A replay or late completion can at most trigger another fresh internal
-generation and an idempotent publication; it cannot recreate a retired
-generation or authorize root mutation.
+This map supports:
 
-The logical protocol uses isolated ingress on both providers. “Direct” means
-the client sends immutable bytes to S3 or R2 itself; the authorization broker
-does not proxy the body, and the later publisher only validates and promotes
-the stored value. Provider-specific signing and wakeup mechanics do not create
-a second client protocol.
+- an exact fact-liveness check by `fid`;
+- member/device liveness during authentication;
+- parent and ancestor cascades;
+- multiple independent suppression keys;
+- a bounded Worker read without loading all facts.
 
-Large sessions stay database-free by fixing their complete authority set
-before any PUT is issued:
+The old split between a direct removal index and another suppression index
+does not exist. The explicit suppression ID is the lookup key; the action
+`fid` is the authenticated value.
 
-1. `OPEN` validates one workspace-bound `upload` proof and commits a bounded,
-   strictly digest-sorted, unique vector of `(sha256, size)` leaves, its count
-   and total bytes, and one pile digest and size. The broker chooses the
-   session nonce and fixed expiry and returns an authenticated cursor at index
-   zero.
-2. `ISSUE` accepts a contiguous range of at most `PAGE_BATCH` leaves plus a
-   Merkle range proof against that fixed commitment. It derives exact object
-   keys and advances only the committed prefix. Every signer request carries
-   the session's fixed `not_after_ms`; provider capabilities must expire no
-   later. Provider SigV4 lifetimes are rounded down to whole seconds and
-   issuance fails closed when less than one signed second remains.
-3. `FINALIZE` requires the complete committed prefix and derives the sole pile
-   key fixed by `OPEN`; it accepts no replacement descriptor or path.
+### 3.2 Deletion
 
-`deploy/upload_wire.py` is the single canonical request codec on both sides
-of that protocol. `deploy/upload_broker_http.py` is its hostile,
-transport-neutral server membrane: it accepts only those three exact paths
-and bounded canonical JSON/base64 documents, calls the existing
-`UploadBroker`, and returns body-free errors. AWS Lambda and Cloudflare Worker
-event normalization is a deployment adapter around this membrane; the AWS
-Function URL v2 adapter is implemented under `deploy/aws_upload_broker`, and
-the Python Worker adapter is implemented under `deploy/cloudflare_upload`.
-Neither provider body nor provider-specific request object enters the broker.
+A deletion is an ordinary `delete` fact, not a privileged imperative.
 
-The constant-size cursor binds protocol version, issuer/provider, key id,
-workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
-next index, issued bytes, last digest, issued time, and fixed expiry under an
-HMAC-SHA-256 deployment key. Old keys remain available for at least the
-maximum session lifetime plus skew. Merkle leaves and internal nodes are
-domain-separated and include the leaf position; the wrapped root also commits
-count and total bytes. This provider-neutral authority state machine runs in
-`deploy/upload_session.py` and `deploy/upload_broker.py`; it has no database or
-provider session state. `deploy/upload_client.py` drives it through narrow
-broker/PUT transports, while `deploy/upload_journal.py` owns only the
-filesystem durability boundary. Fact-family commands author the same message,
-file, chunk, signature, and closed-pile bytes used by local publication;
-`core/cli.py` remains a generic passthrough. The AWS event adapter exists but
-has not been live-deployed; the Cloudflare broker adapter exists but likewise
-has no live route. There is not yet a database-free publisher. These client
-commands therefore do not make the current read-only Lambda/Worker gateway
-deployments writable.
+It contains:
 
-`deploy/upload_keyring.py` gives AWS and Cloudflare one canonical bounded
-secret-document meaning. Rotation is distribute, activate, then retire: every
-cold instance first receives old plus new verification keys; new issuance
-switches only after propagation; the old key cannot be removed before its
-declared verification window ends. The cursor's fixed expiry means changing
-the default lifetime affects only newly opened sessions. Provider binding is
-also authenticated in every cursor, so copying the same secret bytes across
-AWS and R2 cannot resume a session on the other provider.
+- an exact target ref;
+- the target's canonical key;
+- a suppression action offered to the target's SELF ID;
+- named needs proving its author and OWNER or ADMIN authority.
 
-The client persists four logically distinct values: the immutable complete
-source manifest, the most advanced authenticated cursor, `cursor_index`, and
-`delivered_index`. The cursor and its covered prefix are durable before any
-PUT in that range; each provider receipt advances `delivered_index` by exactly
-one. Thus a crash after `ISSUE` but before PUT resumes at
-`delivered_index` and asks the stateless broker to reissue already-covered
-authority. Replayed responses may not lower the retained cursor index. Only
-after all present object bodies are acknowledged does the client ask for the
-precommitted pile capability and PUT the pile last.
+Validation requires the offered action to match a direct target permitted by
+the victim family's policy.
 
-Create-only staging has intentionally conservative recovery. A PUT-only
-capability cannot read an incumbent, so HTTP 409/412 never proves equality.
-The client starts a fresh broker session; timeout-before-apply can reuse the
-same exact capability, while timeout-after-apply safely leaves at most
-abandoned staging in the old session. Source bytes and progress survive
-process restart without SQLite or provider credentials. The complete vector
-contains only detached bytes the client can actually supply: valid pile facts
-may name additional missing Bao objects, which remain an incomplete-file
-condition for the publisher rather than an authorization or pile-delivery
-failure.
+- ADMIN may delete every family marked directly deletable.
+- OWNER may delete a fact whose `owner_edge` resolves to the same durable
+  member principal.
+- devices linked to one member share that principal, so a user may delete
+  their facts written by any of their devices.
+- deletions and other families with no direct-target policy cannot be deleted.
 
-The exact provider HTTPS origin is trusted client configuration, separate
-from the broker URL. A capability must match that scheme, host, and port as
-well as the broker-derived staging path before the client opens the body.
-Provider PUTs do not follow redirects. This keeps the broker on the metadata
-path even if it is compromised; path suffix validation alone would permit
-body exfiltration or HTTPS SSRF.
+These are ordinary family handlers over named reqs/offers. No special
+deletion permission branch belongs in `Node`.
 
-An advancing rolling HMAC without the fixed Merkle vector is insufficient: an
-old cursor can be replay-forked into arbitrarily many different suffixes under
-one session. With the fixed vector, all forks are confined to the same finite
-keys and valid batch partitions converge to the same cursor. Exact batch and
-finalization replay deliberately reissue the same authority so a lost response
-is recoverable. Rejecting such replay while remaining stateless is impossible;
-provider state is introduced only if the product later requires exactly-once
-quota charging or recovery after a client loses its cursor. Authorization
-order does not prove network completion and does not need to: missing detached
-blob bytes affect file completeness, while the pile remains sufficient to
-publish its independently authenticated facts.
+### 3.3 Removal and delegated admins
 
-R2 long-lived bucket-item credentials cannot be restricted to a workspace
-prefix. `Object Read only` also includes LIST. Consequently the generated
-read policy is tenant-safe only when the canonical bucket is dedicated to the
-one configured workspace. A string `CANONICAL_PREFIX` narrows application
-lookups but is not provider enforcement. A shared canonical bucket requires a
-different provider-enforced read path before a broker compromise can be
-claimed workspace-confined.
+Member removal activates the family-declared member principal ID. It affects
+future authorization once observed; it does not rewrite history or declare
+every fact authored after some wall-clock point illegitimate. A peer that
+validly accepted a message before learning the removal has accepted a
+workspace fact.
 
-The package also emits one lifecycle input scoped only to that workspace's
-`objects/` staging prefix; the disjoint `piles/` prefix is excluded because
-provider lifecycle is not an F10 witness. Compute deploy/remove never owns
-either bucket or applies or removes bucket configuration: it deploys publisher
-before broker, stops broker before publisher, and deletes only Workers whose
-exact owner and role markers were observed before the first delete. Applying
-and live-verifying the lifecycle remains a separate privileged provisioning
-step because replacing a bucket's whole lifecycle document from a compute
-deploy could clobber unrelated rules. The current broker entry is real but
-non-public; the separately staged publisher entry is fail-closed. These
-generated documents, frozen SigV4 vectors, production-adapter session tests,
-a local-workerd load, an independent verifier, and credential-free mutation
-tests establish the intended authority shape, not a live-provider or
-completed-publisher claim.
-Cloudflare documents `PutObject` `If-None-Match`, but its presign page does not
-explicitly guarantee signed `Content-Length`; the opt-in direct-provider seam
-remains required before claiming that boundary, and it is not browser
-evidence.
-
-[r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
-[r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
-[r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-
-The production profile also treats each provider's documented RFC 9110 strong
-ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must
-change when the root bytes change. Adapters reject missing, empty, and `W/`
-weak validators, and the conformance harness records every observed
-token-to-bytes pairing so a fake that aliases one token across distinct bytes
-fails deterministically. This is the same kind of provider assumption as
-acknowledged durability; a live test can exercise it but cannot prove it for
-all values. Deliberately constructing a collision in a provider's underlying
-ETag algorithm is outside this profile. That stronger threat model would need
-an independent conditional generation register, such as DynamoDB on AWS or a
-Durable Object on Cloudflare, because a content hash or R2's non-conditional
-`version` field is not itself a CAS capability.
-
-The Cloudflare authorization deployment is a Python Worker at compatibility
-date `2026-07-29`, selecting Python 3.13 and the Pyodide 0.28.3 dependency
-index through `workers-py` 1.16.0. This choice was made only after a clean
-pywrangler artifact and local workerd loaded the real `core`, `facts`, R2
-adapter, and shared gateway, then completed Ed25519 sign/verify and a
-sealed-box round trip. A generated build stage copies the selected canonical
-source files on every build; there is no checked-in security-core fork.
-Its import-graph ratchet excludes `fcntl`, `sqlite3`, `threading`, and
-`multiprocessing`, plus the host-only S3 compatibility adapters.
-
-Pyodide's PyNaCl 1.5.0 wheel contains libsodium browser-randomness `EM_ASM`
-exports. Workerd deliberately rejects their eager dynamic registration.
-The deployment build checks the pinned wheel layout, disables only those
-exports and PyNaCl's eager RNG initialization, and obtains ephemeral
-sealed-box seeds from request-context `os.urandom`. Ed25519 and the
-deterministic Curve25519/XSalsa20-Poly1305 box operations remain PyNaCl
-primitives, and interoperability tests compare both directions with native
-PyNaCl's sealed-box wire format. The first request runs the cryptographic
-self-test because Workers intentionally deny entropy during top-level
-snapshot construction.
-
-The Worker receives one direct `BUCKET` R2 binding, one exact `WORKSPACE`,
-one exact `STORE_PREFIX`, and one required encrypted `GRANT_SECRET`. Production
-config generation requires an explicit route and leaves workers.dev disabled.
-The host-side deployment tool also puts a stable, non-secret ownership marker
-in the Worker bindings. It reads that marker through Cloudflare's direct
-settings API before every update or delete and verifies it after deployment;
-absence permits creation only with an explicit create flag. Smoke deployments
-use a random name whose absence was established before upload, then treat the
-upload as possibly applied until that exact name has been deleted.
-Cloudflare exposes no conditional script mutation coupled to that settings
-read, so this protects against accidental targets under one trusted,
-externally serialized deployment administrator; it does not claim safety
-against a concurrent administrator replacing a script in the preflight gap.
-All Wrangler mutation subprocesses have finite deadlines.
-The application caps request bodies at 512 KiB while streaming, root at
-64 KiB, individual objects at 4 MiB, object batches at 48 items/4 MiB, and
-mint authorization at 48 unique fetches/384 KiB. It rejects raw queries above
-4 KiB or eight fields before percent decoding or gateway/R2 work. It exposes
-only health,
-mint, invite, root, and authenticated object reads; the R2 capability passed
-to the gateway has only `get` and `has`. The opt-in live smoke command uses a
-unique workers.dev deployment, never mutates R2, and removes the Worker even
-when authorization fails.
-
-Each workspace SQLite database contains one stable local fact catalog plus
-family-neutral derived indexes:
+An admin grant proves the grantor's admin authority at admission, but its
+continuing liveness follows the grantee:
 
 ```text
-facts(fid, blob)                 one canonical encoded body
-fact_index(kind, k0, k1, src)   key + type + explicit refs + declared offers
-proofs / edges                   current eligibility and resolved authority
-actions / supp                   suppression frontier and selector reverse map
+admin grant
+    named admission Need -> grantor_admin
+    liveness guard       -> grantee_member
 ```
 
-There is no application projection database and no family-owned durable
-table. A kernel-valid durable receipt is stored once; losing canonical
-standing removes its proof row, not its bytes or index rows. Every fact gets a
-`fact.key` reconciliation row, a `fact.type` row, one `fact.ref` row for each
-explicit `(role, target fid)` reference, and one row for each declared offer.
-Family queries intersect those generic addresses before loading canonical
-blobs, then apply suppression and assemble their view. For example, a file
-read selects only `chunk --file→ descriptor` rows and verifies those immutable
-Bao objects after releasing the catalog lock. The reference rows are local
-query routes, not dependency offers or additional authority. Every
-proof-backed candidate is published, including currently ineligible ones, so
-deleting the workspace catalog loses only unpublished staged intent;
-committed candidate state rebuilds from the authenticated root.
+Removing the grantor does not revoke every delegated admin. Removing the
+grantee does remove that grantee's live admin authority. Device-derived admin
+use also follows the device/user liveness declared by the device families.
+Every current command and remote mint resolves authority through the pinned
+repository's liveness rows before it can author or accept new work.
 
-### Fact versions and derived replay
+Infrastructure-provider membership is a separate concern from content-admin
+authority. The current deploy adapters receive an operational workspace and
+least-privilege provider configuration out of band. A future in-band provider
+community can model support as an invitation for an infrastructure node:
+joining grants service for a workspace; leaving severs support. That provider
+community does not silently become a content admin in the serviced workspace.
 
-POC-16 does not yet accept multiple fact versions. When it does, the canonical
-blob catalog remains an immutable record of the originally admitted bytes, but
-derived tables must never replay that historical shape directly. Replay first
-decodes and hydrates each blob through the current version adapter, in the
-same context and into the same current form exposed when that fact is supplied
-as context to another fact. Type, dependency-key, and explicit-reference
-index rows, eligibility, and query views are then derived from that hydrated
-form. Hydration must preserve the immutable workspace binding: an ordinary
-fact's current contextual form still names the `ws` committed by its original
-bytes, while genesis remains the sole ws-less form whose fid is the anchor.
+## 4. Candidate state and settlement
 
-Thus a version/schema change is an explicit derived-index version change:
-discard the old derived rows and replay the retained canonical blobs through
-the new hydrator. The original bytes and fid do not change, while every
-consumer sees one current contextual form. A future adapter must be
-deterministic and must not consult replica-local arrival order or wall-clock
-state.
+Historical admission and current authority are different. In the serialized
+candidate record, the legacy state label `eligible` means *structurally
+standing*; it does not mean currently usable:
 
-The root uses layout stamp
-`composite-merkle-map-v8-admission-proof-archive` and atomically binds:
+- a candidate is a durable, valid fact plus its admission proof and exact
+  named edges;
+- a structurally standing candidate has canonical standing under immutable
+  validation, its named needs, and deterministic provider selection;
+- a dormant candidate remains retained because it cannot currently fit that
+  canonical dependency graph, and may become structurally standing after
+  another valid arrival changes provider selection;
+- suppression and authority-liveness rows describe what may be used now.
+  They do not retroactively change an admitted candidate's standing.
+
+Settlement is a pure, one-way projection over the candidate set:
 
 ```text
-anchor          workspace genesis fid
-layout_seed     deterministic authenticated-map seed
-maps            FactOrder, FactTree, SuppTree, AuthorityTree descriptors
-stamp           exact format identity
+candidate set
+    -> canonical standing and ranks
+    -> effective actions
+    -> authenticated suppression and authority-liveness rows
 ```
 
-Each map descriptor has the same exact `{root, count, depth}` shape and uses
-the same bounded Merkle-map codec. One compare-and-swap publishes all four
-maps. There is no range directory, grouped fact leaf, action cache identity,
-second mutable removal root, or two-root transaction. The root bytes are the
-complete snapshot identity; provider CAS tokens never become content identity.
+The earliest canonical action wins a suppression ID. Provider selection is by
+proof rank and then `fid`, making it independent of delivery order. A
+candidate's selected named edges are its historical admission witness. A
+later member-removal action can stop current authoring, minting, or delegated
+authority without making that candidate dormant. A genuinely different
+canonical provider may still change the dependency graph and therefore
+eligibility; that is not removal screening.
 
-Catalog settlement returns a publication plan pinned to the exact root bytes
-and opaque provider token returned by one read. Object and tree compilation
-never rereads `root` to adopt a newer base. A successful publisher stores
-`h(root bytes)`, not the provider token, as its local derived-index stamp. If
-another writer advances root after that stamp, the stamp is honestly stale
-and the next index synchronization rebuilds. It can never falsely label old
-local state as the later writer's root.
+## 5. Published repository
 
-Receipts staged before a failed or lost CAS remain in the catalog but are not
-eligible merely because a read triggers repair. Rebuild first restores the
-published root plus already committed local receipts and keeps staged intent
-behind that snapshot. The next explicit workspace turn retries the staged
-set—even if another worker already retired its original ingress key. On a
-successful CAS, only then are its staged markers cleared. A rebuild whose
-compiled bytes equal its pinned root performs a token-checked no-op before
-stamping it; a rootless no-op similarly rechecks that `root` is still absent.
-
-**FactOrder** is the direct eligible-order projection:
-`fact.key -> obj/H(encode(fact))`. Activation inserts the exact key/object
-pair; deactivation deletes the exact key. An ordinary publication path-copies
-those bounded map paths and never calls `Node.keys` or runs a corpus-wide
-ordered-key query. Repair and format cutover retain the full reference build.
-FactOrder is not admission authority: it must equal the eligible subset
-derived from FactTree candidate records and current settlement. It contains no
-fact duplicates, closed piles, or closure siblings.
-
-Cold `candidate_archive.reconstruct` derives the complete replicated input
-from authenticated objects alone. It verifies all four descriptors, every
-candidate's stable residence and selected admission proof, the exact FactOrder
-eligible projection, generic postings, suppression slots, and authority
-winners before rerunning current settlement. Object-store LIST cannot
-substitute because object names include unreachable history. An edge
-publisher may consume that verified archive but may not treat FactOrder alone
-as authority.
-
-### Dormant-candidate retention
-
-The retention law is stronger than “keep the bytes.” The committed root
-authenticates a monotone set of **kernel-admitted** durable candidates, and
-eligibility is a reversible derived subset of that set. Every candidate has
-one canonical exact-byte residence at `obj/H(encode(fact))`. Eligible
-candidates are referenced by FactOrder; their bytes are not duplicated in a
-second transfer representation.
-
-Old immutable objects may remain as unreachable history. SQLite, provider
-events, and object-store LIST are never admission evidence or candidate
-authority.
-
-A candidate blob pointer proves only that some bytes exist. It does not prove
-that those bytes passed the family-neutral kernel. Durable admission must
-therefore consume the kernel's `Valid` receipt rather than a raw `Fact`.
-Scratch loading and tests may not share an unchecked route that can populate
-the durable candidate catalog.
-
-Each candidate record also names a content-addressed, raw-free admission-proof
-DAG node. A node binds the workspace and fid to the exact resolved dependency
-edges from one kernel judgment; every edge pins the corresponding parent proof
-oid from that same judgment. This path-shares old closure, prevents unrelated
-parent witnesses from being spliced into a proof, and avoids retaining another
-copy of a closed pile. A cold verifier follows the pinned proof DAG, obtains
-each fact from its canonical blob residence, and reruns the actual kernel. An
-abstract proof mirror is not sufficient.
-
-The replicated candidate value is `(exact fact bytes, selected historical
-witness)`. A candidate may be admitted through more than one complete valid
-closure; replicas join those observations by choosing the lexicographically
-smallest verified proof-root oid. Equal fact sets alone therefore need not
-have equal composite roots, while equal joined candidate/witness maps do. The
-witness records the edges under which admission actually succeeded.
-FactRecord's current dependency edges are a distinct settlement result and
-may later rewire without rewriting history.
-
-FactTree covers both eligible and dormant candidates. Its generic postings
-remain a mechanical projection of every candidate, while application reads
-read only the `index:` eligible namespace. Maintenance and reconciliation
-explicitly opt into `dormant-index:`; eligible rows always page before dormant
-rows, so dormant history cannot hide or delay a live result. Dormant rows have
-an explicit dormant state and fid ordering; they never carry a sentinel or
-stale value that could be mistaken for a current proof rank.
-
-Publication writes the stable blob and every derived map page before the CAS
-that first references them. The single composite-root CAS atomically binds
-residence, admission proof, candidate postings, current eligibility and
-ordering, suppression, and authority. Ingress retirement is allowed only when
-that root represents every durable `Valid` receipt in the exact pile, whether
-eligible or dormant. Candidate deletion is out of scope until a separate proof
-can establish that a candidate can never regain standing.
-
-Admission-proof traversal has explicit edge, node, depth, object-fetch, and
-combined proof/fact/cold-read byte budgets. One proof root is internally
-self-contained: each child pins the
-parent proof used by that same kernel judgment, rather than consulting the
-independently selected FactRecord proof for the parent. Multiple complete
-witnesses for every eligible or dormant candidate converge by lexicographic
-minimum proof oid.
-
-That join is the sole fact-state synchronization protocol:
+The canonical store contains:
 
 ```text
-fid -> (exact canonical fact bytes, minimum complete verified proof oid)
+root                       one mutable CAS register
+obj/<sha256>               immutable content-addressed objects
+pile/<member>/<gen>/<hash> Applier-owned internal work
+failed/...                 noncanonical immutable rejection evidence
+staged/...                 noncanonical immutable staging receipts
+applier/cursor/...         nonauthoritative discovery hints
 ```
 
-The correctness-first implementation pages each pinned root's authenticated
-`fact:` record range, compares selected proof oids, and sends each winning
-verified closure through ordinary pile ingress. FactOrder, eligibility,
-resolved edges, action state, suppression, and authority are deterministic
-projections of the joined candidate map; they have no separate sync channels.
-A registered rootless replica can pull the archive directly. Independent good
-proofs land even when another selected proof is poisoned, but the dial then
-raises and records no convergence stamp, so the unresolved difference retries.
-This is linear maintenance I/O, not an ordinary Worker or hot-publisher scan.
-An authenticated candidate-difference protocol and bounded multiproof transfer
-remain performance work; neither may add another authority path.
-
-## The authenticated map
-
-FactOrder and the three Worker indexes share one persistent bounded Merkle-map
-codec. Worker authorization reads FactTree, SuppTree, and AuthorityTree;
-FactOrder is the publisher-maintained eligible-order projection used by
-maintenance and client iteration. The map shape has no priority function and
-does not rely on key entropy. Authenticated logical keys are nonempty ASCII
-strings of at most 384 bytes and values are non-null canonical JSON of at most
-4 KiB. A subtree is one sorted leaf exactly when all of its rows fit both the
-32-row ceiling and the exact 8 KiB leaf encoding. Otherwise it is a compressed
-Patricia branch at the first distinguishing five-bit digit. A branch has no
-unary node, has at most 32 children, and is at most 48 KiB; its authenticated
-child descriptors bind oid, row count, encoded row bytes, depth, and first/last
-key. The hard page-depth bound is 770.
-
-Those rules define one byte-identical root for a logical map and seed,
-independent of build, insertion, deletion, restoration, or batching history.
-The seed domain-separates maps but does not choose their geometry. One update
-path-copies its branch path and at most one bounded leaf neighborhood. A split
-cannot shift another key interval; a collapse reads at most the rows that fit
-one leaf. Full build and incremental update invoke the same recursive
-partition rule.
-
-Exact reads fetch at most the descriptor depth. Neighbor reads fetch one
-search path and at most two boundary paths. A half-open range page has a
-256-row ceiling and a remote-page budget of
-`2 * depth + 2 * (limit + 1)`. Root-to-root diff uses the same bounded,
-resumable page shape and prunes an oid only when both pinned current roots
-reach it at the aligned radix route. Merely finding an old oid in the
-grow-only bucket is not equality evidence. Parent-bound child ranges make
-missing-label nonmembership fail closed before an unvisited child can hide a
-row.
-
-`core/legacy_v7.py` is the sole old B-treap surface. It is a finite,
-read-only decoder used by the explicit v7 cutover and has no build or update
-API. No current Worker, publisher, query, or root writer imports it.
-
-The schemas are:
-
-- **FactOrder** — an eligible fact's canonical reconciliation key maps directly
-  to its stable `obj/H(encode(fact))` oid. It is the authenticated ordered
-  projection of current eligibility, not a second admission authority.
-  Publication must make it equal the eligible subset derived by settlement
-  from FactTree candidates. Dormant candidates have no FactOrder row.
-- **FactTree** — `fact:<fid>` maps to one bounded record containing the
-  reconciliation key, selected admission-proof oid, explicit
-  eligible/dormant state, current raw residence, proof rank or null, resolved
-  dependency edges, offers, selectors, and continuing liveness scopes.
-  Collision-free eligible `index:...` and dormant
-  `dormant-index:...` rows are ordered by
-  `(kind, k0, k1, state, rank, fid)`. The immutable contribution mechanically mirrors
-  client `fact_index`: type, reconciliation key, every explicit role/target
-  reference, and every declared offer. Two family-neutral derived kinds add
-  `suppression scope -> fid` and `resolved dependency target -> fid`, so a
-  changed suppression id or authority winner can discover its reverse impact
-  without a corpus scan. There is one row per posting; no B-tree page contains
-  an unbounded candidate list. A paged half-open range fetches at most two
-  boundary paths, the returned rows, and one continuation lookahead, with a
-  hard 256-row page ceiling. Every record points to its stable
-  `obj/H(encode(fact))` blob.
-  `action:<sid>` mirrors a known direct/principal action slot so a bounded
-  Worker decision can corroborate a SuppTree witness through an independently
-  addressed record.
-  The action fact's `admission` pointer is the sole action witness.
-- **SuppTree** — a suppression id maps directly to CLEAR or to ACTIVE with its
-  effective action fid. CLEAR is a positive authenticated statement that this
-  known, reserved id has no effective action in this snapshot; it is not the
-  same as a missing row. ACTIVE names the action whose evidence is named by
-  its FactRecord. Missing required rows fail closed.
-- **AuthorityTree** — a canonical `NeedKey` maps to the selected provider and
-  rank. A missing address is not inferred from submitted facts; family
-  authorization decides whether bootstrap absence is allowed. This cache is
-  deliberate: an exact winner read costs one tree path, while deriving it from
-  the generic index costs the boundary paths plus every conflicting candidate.
-  It stays until measurements show that ordinary reads do not benefit.
-
-This answers distinct bounded questions rather than keeping two mutable
-suppression roots. SuppTree answers “is this explicit id active?”; FactTree
-answers “what does this exact fact require and offer?”, “which current facts
-have this type/key/ref/offer/scope or dependency?”, and corroborates the action
-witness; AuthorityTree answers “which committed fact provides this need?” The
-immutable action fid and evidence are reachable from the ACTIVE slots and
-FactRecord.
-
-Catalog settlement compares both proof ranks and resolved edges before and
-after a rebuild, then transitively closes that delta over reverse dependencies.
-The closure is required even when a descendant's direct edge and rank do not
-change: its declared authority-liveness guards can inherit different scopes
-through a rewired ancestor. FactRecord and `fact.scope` postings are updated
-for that entire affected closure, while unrelated rows remain shared by oid.
-
-Local SQLite retains `action_proposals` and their targets alongside the stable
-catalog. It derives `actions(sid, fid)` as the current effective
-frontier and `supp(fid, sid)` as the selector reverse map. Only the proposals
-are retained input; the latter two tables are rebuildable indexes. None is a
-second published authority index, and the database-free Worker never reads
-them.
-
-An action, its `action:<sid>` slot, its `sid` suppression slot, FactOrder, and
-the fact and authority updates all become visible under the same root CAS.
-
-## Shared-bucket concurrency contract
-
-Concurrent store users are modeled as three pieces:
+The root authenticates four descriptors:
 
 ```text
-O : oid → bytes       grow-only, content-addressed immutable objects
-R : root bytes        one linearizable compare-and-swap register
-T : opaque tokens     sound comparison capabilities for values of R
-H : root versions     the sequence of successful CAS values
+FactTree
+SuppTree
+AuthorityTree
+FactOrder
 ```
 
-A publisher pins one exact `(base root, base token)`, derives a deterministic
-candidate from that snapshot plus its durable intent, makes every object
-reachable from the candidate visible with atomic put-if-absent, and only then
-attempts `CAS(R, base token, candidate)`. The CAS is the sole linearization
-point. A loser retains its intent, rereads the winning root, derives the union,
-and retries. Objects written by a crash or losing attempt are harmless
-unreachable history; they are never overwritten or deleted.
+Every descriptor uses the same bounded Merkle-map shape. Readers descend the
+tree directly; no range directory and no rebuilt database are required.
 
-A typed index-compiler result lists candidate records that invocation actually
-constructed. Before CAS, the publisher requires every newly staged candidate
-and every winning witness-only join from the exact kernel judgment in that
-set. Exact duplicates or losing higher witnesses may instead inherit the
-pinned authorized base. This running compiler invariant replaces an
-unbounded post-CAS point scan.
+### 5.1 FactTree
 
-Tokens obey one law: within one `(store, key)`, the same token never denotes
-different bytes. The converse is unnecessary. An `X → Y → X` value-ABA may
-reuse X's token and is safe here because root bytes completely define the
-published state and every referenced object is immutable. This must be
-revisited if later generations gain deletion, GC, or history-dependent side
-effects. The direct S3/R2 implementation refines this law under the strong-ETag
-provider axiom above; the abstract model itself does not assume any ETag
-algorithm.
+`FactTree` is the candidate and generic posting map.
 
-A lost mutation response is not a stale precondition. Publication rereads:
-candidate bytes mean the CAS succeeded; the exact unchanged base permits one
-safe retry; any other value means rebase while retaining staged intent. Only
-Applied, byte-identical readback after an unknown outcome, or a
-token-and-byte-verified no-op returns a typed publication receipt bound to the
-workspace, exact source key, payload hash, root bytes, and complete durable
-Valid set. Because candidate retention is monotone, a later authorized root
-does not invalidate a receipt already minted by one of those outcomes. A
-canonical empty pile has an empty, vacuously covered durable set and retires
-under the same no-op receipt. If reconciliation itself fails, no receipt or
-ingress key is retired.
+For each candidate it authenticates a bounded record containing:
 
-A reader pins root bytes once. A later root is allowed to make that decision
-stale, but every map descriptor, tree page, fact record, suppression slot,
-authority slot, and action witness used by the decision must remain explainable
-by the one pinned root. Re-reading `root` for individual components is
-incoherent, even when each component is independently valid.
+- fact object ID and canonical fact key;
+- structurally-standing/dormant state and proof rank;
+- admission-proof object ID;
+- exact named dependencies;
+- declared suppression and authority-liveness IDs;
+- clear-envelope offers.
 
-Published candidate state no longer depends on a private database:
-`candidate_archive.reconstruct` cold-rebuilds it from one pinned root and its
-reachable immutable objects. The running client writer still uses SQLite as
-an accelerator and as the durable home of local staged intent. The checked-in
-Lambda and Cloudflare deployments are therefore readers, not publishers.
-Their authorization path has no database at all and needs only pinned root
-bytes, immutable object fetches, the submitted bounded closure, and trusted
-service time. Moving the turn coordinator and staged-intent consumption to an
-edge remains a separate construction, not an alternate client configuration.
+It also contains mechanical postings by:
 
-The safety laws are:
+- type;
+- canonical fact key;
+- every ref;
+- every offer;
+- suppression scope;
+- dependency target.
 
-1. every object key equals the hash of its bytes;
-2. the object map only grows and an existing key never changes;
-3. root changes only through one successful whole-value CAS;
-4. every successful root names a complete, hash-valid closure already in `O`;
-5. every successful read decodes under exactly one root from `H`; and
-6. every fair retry sequence converges to the deterministic union of the
-   surviving publishers' intents.
+Why it exists:
 
-`tests/shared_bucket_model.py` is the executable small-state definition.
-Its breadth-first explorer covers two writers and one reader and returns the
-shortest schedule for a violated law. Mutation tests prove the laws reject
-root-before-objects publication, split composite roots, and a reader that
-repins halfway through a decision. Concrete Store, Publisher, Worker, and
-authenticated-tree schedules refine this model in
-`tests/test_shared_bucket_node.py`: every successful root is fully walked,
-competing suppression winners are observed under whole roots, a stale mint is
-run with SQLite disabled, and the terminal concurrent result must equal a
-serial canonical rebuild.
+- exact fact lookup without a manifest scan;
+- bounded typed and offer queries;
+- candidate sync and dormant reactivation;
+- deterministic closure and range comparison.
 
-## Explicit suppression
+Invariant: every posting is a mechanical function of one checked candidate
+record and fact serialization. A forged extra posting or omitted required
+posting invalidates reconstruction.
 
-Suppression is offered by the target fact, not guessed from arbitrary
-dependencies. A registered family declares either no suppression policy or an
-exact list composed from:
+### 5.2 SuppTree
+
+`SuppTree` maps each explicit suppression ID directly to `CLEAR` or
+`ACTIVE(action_fid)`.
+
+Why it exists:
+
+- exact authentication/liveness reads by ID;
+- descendant suppression through explicit parent/ancestor IDs;
+- no read-time fact-DAG walk;
+- no full fact-set or SQL dependency at an edge.
+
+Invariant: every ID declared by any retained candidate has a row. Required
+absence fails closed. Every active value is corroborated by the corresponding
+candidate/action state.
+
+### 5.3 AuthorityTree
+
+`AuthorityTree` maps a canonical base family-need address to the selected
+provider and rank.
+
+The authenticated address is exactly:
 
 ```text
-SELF
-PARENT(named_role, parent_fid)
-ANCESTOR(named/path, ancestor_fid)
+(offer name, a0, optional a1)
 ```
 
-`SELF` is serialized as a non-circular marker and expands to the fact’s fid
-after hash integrity succeeds. All selectors resolve into one typed namespace:
+Why it exists:
+
+- authorization can resolve member/admin/device providers by point read;
+- provider choice is visible and authenticated;
+- a Worker need not enumerate all offerers.
+
+Invariant: the selected provider is the minimum structurally-standing
+`(rank, fid)` for the base address. A need's required co-offers are
+conjunctive checks against that exact selected provider's authenticated
+`FactTree` record. They do not create a second address and do not permit
+fallback to a later provider.
+
+### 5.4 FactOrder
+
+`FactOrder` maps canonical fact key to fact object ID for structurally
+standing facts.
+
+Why it exists:
+
+- deterministic ordered reconciliation;
+- bounded range diff;
+- fact bodies have one canonical content-addressed residence;
+- no second pile/body serialization is introduced.
+
+Invariant: keys are direct fact keys, values name exact verified fact bytes,
+and the order contains precisely structurally standing facts. Current
+suppression and authority liveness are separate authenticated lookups; they
+do not rewrite historical order.
+
+### 5.5 Candidate archive
+
+The root-reachable archive is enough for a cold `RepositoryApplier` to
+reconstruct every candidate, admission witness, and edge without SQLite. Its
+reconstruction cross-checks all four maps rather than trusting one map as a
+manifest for the others.
+
+## 6. Root compilation and CAS
+
+`compile_snapshot(workspace, candidates)` is pure. Given the same candidate
+set it returns byte-identical:
+
+- immutable object outbox;
+- tree descriptors;
+- root bytes;
+- checked candidate records.
+
+`RepositoryApplier` interprets that result:
 
 ```text
-SELF(f)                 -> fact:<fid(f)>
-PARENT(_, p)            -> fact:<p>
-ANCESTOR(_, a)          -> fact:<a>
-member principal        -> member:<public-key>
-device principal        -> device:<public-key>
+read exact (root bytes, opaque version token)
+load root-reachable candidate archive
+join valid candidates from the exact pile
+compile
+conditionally establish every outbox object
+CAS root using the token from the original read
+mint exact internal-retirement authority
 ```
 
-A fact may offer several selectors. A family with no policy offers none and
-cannot be a direct suppression target. This is separate from authorization:
-an untargetable action fact can still require live admin authority.
+The Applier never repins midway through a proposal. If root changes, its CAS
+loses and the exact pile remains for a fresh proposal.
 
-Current content policies are explicit:
+Only one literal semantic `cas("root", ...)` exists in production. Provider
+adapters implement the token mechanics; they do not compile or choose facts.
 
-- messages and file descriptors offer `SELF`;
-- Bao files additionally carry their member parent;
-- chunks offer `SELF`, their file parent, and their file/member ancestor;
-- deleting a file descriptor therefore suppresses its chunks without the
-  deleter enumerating descendants;
-- deletion and eviction facts offer no selector and cannot themselves be
-  deleted.
+### 6.1 Apply outcomes
 
-The selector count is capped and checked both when authored and independently
-at admission.
+The typed outcomes are:
 
-## Deletion, eviction, and authority
+- `applied`: CAS definitely installed the proposed root;
+- `confirmed`: CAS response was lost and an exact read found that root;
+- `noop`: the candidate set was already present and the original root token
+  still identifies the same root;
+- `stale`: another root won; retain and rebase;
+- `rejected`: immutable typed rejection evidence exists;
+- retryable error: exact work remains.
 
-An exact content deletion contains an exact target key, a hard target ref, and
-the `SELF` selector token. The target family’s `DIRECT_TARGETS` entry must allow
-that action and mode. Supplying a bare suppression id is not a capability.
+An ephemeral `ApplyProposal` is bound to:
 
-The ordinary fact graph authorizes the action:
+- workspace;
+- exact pile payload hash;
+- exact base root/token;
+- minting Applier instance.
 
-- `OWNER` requires an author signature and a member provider whose durable
-  principal equals the target’s owner principal;
-- all devices belonging to one user resolve to that user principal, so sibling
-  devices can remove the user’s content;
-- `ADMIN` requires an author signature and a live admin provider and can remove
-  every directly deletable family;
-- an unrelated ordinary member satisfies neither path.
+It cannot commit another pile, another workspace, or through another
+Applier.
 
-These checks live in the content-delete handler and family-owned policies
-compiled by the checked registry. The core does not special-case message or
-file ownership.
+## 7. Exact retirement
 
-Member eviction is an admin-authored fact offering `removed(target_pk)`. It
-activates `member:<target_pk>`, a terminal key-wide tombstone that covers
-existing and future membership providers. A Worker checks that exact key when
-minting a grant, so it does not load the fact set or rebuild a database.
+Retirement is a capability, not “DELETE after trying.”
 
-Authorization has two intentionally distinct concepts:
+For an internal pile generation, deletion is permitted only after:
 
-- an `authorization_guard` must be live when admitting a new irreversible
-  effect;
-- an `authority_liveness_guard` continues to mask an already-published
-  authority provider.
+1. `applied`, `confirmed`, or token-checked `noop`; or
+2. durable typed rejection evidence for that exact source and payload.
 
-A delegated admin grant uses the grantor admin as a one-time admission guard
-and the grantee membership as its continuing liveness guard. Evicting the
-grantee disables the grant. Liveness follows only the family-declared guard
-edges, transitively and under a hard bound, so an admin grant to a child device
-also inherits that device set's user liveness. Later loss of the grantor does
-not retroactively undo a grant that was validly committed.
-
-## Action timing
-
-Validated action proposal bytes are retained monotonically in the local
-catalog; effective action state is derived and is not assumed monotone across
-root versions. For example, a later-arriving, shallower ownership claim can
-make a previously plausible OWNER deletion ineligible. The next root then
-publishes CLEAR for that id and restores the victim to the active client view.
-Workers enforce each current snapshot strictly: an ACTIVE principal or
-selector always refuses the request.
-
-Replica admission must also converge when an old fact and an action arrive in
-opposite orders. Settlement therefore computes one deterministic fixed point:
-
-1. resolve and validate canonical local edges for every candidate;
-2. fold currently eligible action proposals in canonical `(fact key, fid)`
-   order;
-3. accept a proposal only if an earlier active target does not intersect its
-   transitive, family-declared authorization scopes;
-4. let each accepted proposal activate all of its explicit target ids; and
-5. rebuild eligibility under that frontier until neither proofs nor actions
-   change, failing closed on a cycle.
-
-The earliest effective proposal wins a duplicate id. An action blocks an
-ordinary candidate whose canonical fact key is later; an earlier candidate
-remains admissible history. Retaining dormant receipts in committed state makes
-fact-first, action-first, and later canonical-winner changes converge without
-a descendant lookup or sender-selected edge.
-
-This ordering is deterministic, but timestamps are author-controlled. That is
-intentional: removal is a knowledge and connectivity boundary, not a global
-authorship-time cutoff. A peer whose pinned snapshot still authorizes a member
-may accept that member’s fact, and the accepted fact is legitimate workspace
-history even if another peer already knows the member is removed. Once a peer
-learns the removal, grant expiry and exact Worker checks stop that member from
-directly opening a new authorized sharing channel to that peer. There is no
-serialized admission frontier and no attempt to distinguish signing time from
-first delivery.
-
-Dormant receipts are committed replicated candidate state, not local
-projection litter. They are absent from FactOrder but remain in FactTree with
-stable blobs and selected historical witnesses. Reconciliation joins both
-eligible and dormant candidate/witness values.
-
-## Worker authorization
-
-`WorkerView` opens the composite root and performs exact authenticated reads:
-
-1. decode and kernel-validate the submitted closure (maximum 64 facts);
-2. dispatch exactly one ephemeral family authorization hook, which checks its
-   allowed verb and service-time deadline;
-3. check committed authority winners and family-required co-offers;
-4. read only the request/provider FactRecords and their declared liveness
-   scopes;
-5. read the corresponding SuppTree slots; and
-6. return `(public_key, verb)` for sealing by the daemon.
-
-`core/mint.py` contains only this path. The edge path is `root bytes + immutable
-object fetches + submitted closure`: no SQLite, client catalog, client query
-state, or full-tree fallback. A cached view is reusable only while its
-SHA-256 root content tag matches; provider CAS tokens never enter this path.
-
-The daemon seals a short-lived bearer grant to the requester’s public key.
-The grant TTL is a deliberate revocation leakage window. After expiry, an
-evicted member cannot mint another remote grant from a peer that knows the
-removal. The trusted local `ctl/*` surface is not an authentication boundary:
-an evicted replica that missed its own action may continue writing isolated
-local state. It need not receive a special terminal tombstone. A still-stale
-peer may legitimately accept that state; an informed peer refuses a new grant
-and therefore eventually closes the sharing boundary.
-
-## Target mobile push delivery
-
-Mobile push is not running behavior yet. The target is a derived,
-at-least-once notification service, not another fact-admission route or a
-mutable answer to workspace state. It adds no PushTree. Canonical endpoint
-and subscription facts remain in the ordinary candidate archive and generic
-FactTree index. Subscription matching is part of authenticated fact
-processing. Resolved notification intents then cross a durable object-store
-outbox into a managed at-least-once queue; neither the outbox nor queue
-attempts are published application state.
-
-An endpoint fact binds one app installation to its owning live device, one
-selected push-node public key, provider (`apns` or `fcm`), application and
-environment ids, and a provider token sealed to that push node. APNs signing
-keys and FCM service credentials never enter workspace facts or queue bytes;
-they remain deployment secrets of the selected provider consumer. Endpoint
-policy makes the fact explicitly suppressible and carries the continuing
-member/device liveness required to reject an evicted or revoked installation.
-
-A subscription fact names one exact endpoint dependency and one normalized
-selector. Its constructor emits the corresponding generic offer, for example:
+The capability binds:
 
 ```text
-type selector       -> ("push.type", <fact tag>, "")
-explicit reference  -> ("push.ref", <role>, <target fid>)
-family route        -> ("push.<family route>", <a0>, <a1>)
+(workspace, source key, payload hash, generation, root/outcome, issuer)
 ```
 
-The subscription family reconstructs that offer during validation and checks
-that the signer controls the referenced endpoint. Other families cannot mint
-subscription offers through an unchecked envelope. One selector per
-subscription gives OR semantics; richer predicates must designate an indexed
-anchor and pass a family-owned residual check rather than introduce a general
-predicate engine.
+It is ephemeral and one-use. A crash after root CAS leaves the immutable
+internal pile. A cold Applier reconstructs the same result as `noop`, obtains
+a fresh capability, and retires it.
 
-For every fact that settlement reports as newly activated, its family derives
-a bounded set of route addresses. As part of the same publication turn, the
-publisher pages the candidate snapshot's exact FactTree posting range at each
-address, unions subscription fids, checks each subscription's selector and
-continuing liveness through the candidate SuppTree, follows its exact
-`endpoint` dependency, and checks the endpoint record the same way. Multiple
-selectors that reach the same endpoint coalesce to one notification intent.
-This is an indexed incremental join:
+Running code binds and rechecks every field above plus the exact current
+source bytes. Provider stores do not yet expose an atomic
+delete-if-incarnation operation, however. Recreating identical bytes at the
+identical source key after deletion would therefore be an ABA that those
+checks cannot distinguish. Until the tracked F10 incarnation work lands,
+exact internal-generation key non-reuse is an explicit store/Applier
+assumption, not an enforced theorem.
+
+Client ingress is different. `RepositoryApplier` does not delete client
+markers or staged objects. Their retention/lifecycle is an isolated-ingress
+policy and is never justified by the internal retirement capability.
+
+Operational `failed/*`, `staged/*`, and cursors are not part of
+`RepositoryReader`. An admin diagnostic adapter may inspect them, but pinned
+repository answers depend only on `root` and `obj/`.
+
+## 8. Direct upload
+
+Direct upload uses two provider compartments:
 
 ```text
-newly activated trigger facts
-    -> bounded routing addresses
-    -> matching subscription postings
-    -> live exact endpoint dependencies
-    -> resolved notification intents
+canonical bucket
+    reader: exact root/object reads
+    applier: root/object/internal-work authority
+
+isolated ingress bucket
+    client: broker-issued exact create-only PUTs
+    broker parent: minting only
+    applier: bounded LIST + exact GET
 ```
 
-The ordinary hot path is therefore proportional to route probes plus returned
-matches, not all valid facts times all subscriptions. A correctness repair may
-replay the same join from authenticated state and delivery ids, but it may not
-invent a SQLite-only subscription answer. Mentions require a canonical
-mentioned-principal field or fact relation; parsing display text in a queue
-consumer is not an authoritative route.
-
-The trigger set is the facts newly activated by the turn; the recipient set is
-the subscriptions and endpoints active in that turn's post-settlement
-candidate snapshot. An event and subscription activated together therefore
-match, a subscription suppressed in the same turn does not match, and a
-subscription activated later does not backfill an old event. The join
-completes while constructing the candidate, but its result cannot become
-deliverable before that candidate root wins. A failed CAS creates no
-notification obligation. After a successful CAS, the same publication turn
-materializes the resolved plan as one or more bounded, deterministic,
-create-only outbox items:
+The client uploads objects first and the exact pile marker last:
 
 ```text
-fact pile
-    -> candidate settlement + indexed subscription join
-    -> winning root CAS
-    -> push outbox
-    -> outbox dispatcher
-    -> managed at-least-once queue
-    -> provider consumer
-    -> APNs or FCM
+ingress/v1/workspaces/<ws>/objects/<session>/<sha256>
+ingress/v1/workspaces/<ws>/piles/<session>/<member>/<pile-sha256>
 ```
+
+The marker, not a notification, is durable intent. A notification or poke can
+reduce latency. A bounded scheduled scan recovers dropped, duplicated,
+reordered, or delayed hints.
+
+The ordinary pile inside the marker has exactly `ws` and `facts`. It cannot
+embed an object map. Detached bytes have one ingress path: exact object
+delivery through `RepositoryApplier`, either directly or through validated
+same-session staging.
+
+### 8.1 Staging door
+
+For one marker the Applier proves:
+
+- configured workspace equals the key workspace;
+- key digest equals exact marker bytes;
+- marker is canonical;
+- envelope workspace is exact;
+- every ordinary fact is bound to that workspace;
+- only the workspace-genesis family may omit `ws`;
+- the key's session/member components are canonical and remain bound to the
+  exact broker-granted ingress capability and the Applier-minted internal
+  source;
+- every attachment key is derived from a blob ref and the same session.
+
+The member component identifies the authenticated uploader session; it does
+not claim that uploader authored every dependency relayed in the pile.
+Family needs and signatures judge each fact's authority. The marker is then
+copied behind one fresh internal generation. A durable claim ensures
+concurrent/replayed handlers recover that same generation. Fact application
+uses the ordinary `RepositoryApplier.apply` path.
+
+### 8.2 Attachment completion
+
+Facts commit before detached attachment promotion. This prevents a slow or
+missing file body from blocking otherwise valid workspace facts.
+
+Attachment work is bounded:
+
+- at most one fixed-size object page is processed per marker turn;
+- each object gets immutable promoted/poisoned evidence;
+- each fully terminal page gets an immutable page receipt;
+- a mutable cursor is only a round-robin liveness hint;
+- completion is recorded only after every page receipt exists.
+
+Concurrent Workers may process the same object/page and may briefly regress
+the cursor. They cannot falsely complete a page, skip an unfinished page
+forever once interference stops, overwrite a canonical object, or corrupt a
+tree.
+
+## 9. Object-store mathematics
+
+For each key, model the provider as a linearizable register. The repository
+requires:
+
+### 9.1 Bounded exact read
 
 ```text
-push/pile/<push-node>/<generation>/<sha256>
-push/done/<push-node>/<delivery-id>
-push/failed/<push-node>/<sha256>
+get_bounded(k, max_bytes) -> bytes | absent | over-limit
 ```
 
-Each push pile is a transactional outbox batch containing a sorted unique
-vector of already-resolved notification intents. A record carries workspace,
-deterministic delivery id, triggering fact fid, endpoint fid, provider and
-application routing, the sealed endpoint token, bounded payload, and expiry.
-It may retain the sorted matching subscription fids as provenance, but no
-later worker needs them for routing. A delivery id is domain-separated over
-at least `(workspace, event fid, endpoint fid, payload version)`. Generations
-keep destructive retirement bound to one exact outbox item; the delivery id
-supplies stable identity across repeated queue submissions and deliveries.
-Large fanout splits into bounded piles without changing individual ids.
-`push/done` is immutable discharge evidence for an accepted or terminal
-delivery id. `push/failed` preserves bounded typed evidence for a poison
-message or exhausted permanent failure. None of these namespaces is canonical
-fact state.
+The implementation must enforce the bound while reading. Fetching an
+unbounded body and checking its length afterward does not satisfy this
+operation.
 
-Fact validity and root publication never wait for APNs or FCM. The only
-publication-side ordering constraint is the durable outbox handoff: after the
-root CAS, the publication turn verifies creation of every derived push pile,
-or a typed empty result, before using its fact-pile retirement capability. A
-crash before that handoff leaves the original fact pile as publication-turn
-retry intent. Once the outbox exists, it is self-contained and has no
-reference to, closure dependency on, or retention claim over the fact pile.
-Queue or provider outages can accumulate push work without reopening or
-blocking canonical fact state. If a retry finds that the root already
-represents its retained fact pile but no outbox result exists, it repeats the
-indexed join for the eligible trigger facts in that exact pile against one
-newly pinned current root. Push is advisory: deterministic delivery ids and
-`push/done` suppress known repeats, but the retry does not pretend to recover
-a lost historical subscription snapshot.
+### 9.2 Immutable create
 
-An outbox dispatcher lists only its selected `push/pile/` prefix. Object
-creation may wake it, and a scheduled bounded scan is the lost-wakeup
-fallback. This scan recovers undispatched outbox batches; it is not the
-provider delivery queue and requires no durable global LIST cursor. The
-dispatcher verifies the hash-bound pile and delivery ids, copies each
-resolved intent into one managed-queue delivery job, and never queries
-subscriptions or endpoints. Queue payloads are bounded and self-contained.
+```text
+put_if_absent(k, v) -> CREATED | EXISTS | unknown
+```
 
-The managed queue is the primary delivery workset. Its provider-neutral
-contract requires durable acceptance, at-least-once redelivery, visibility
-leases, delayed retry, per-item acknowledgement, and a dead-letter path.
-Deployments may implement that contract with Cloudflare Queues, SQS Standard,
-or Google Pub/Sub. FCM is a destination, not an implementation of this queue.
-Queue acceptance is the terminal boundary for the outbox dispatcher, not for
-the notification: the dispatcher retires an outbox generation only after the
-queue has durably accepted every contained job. A partial or ambiguous batch
-response produces a bounded residual pile before the original generation
-retires; retrying an ambiguously accepted job is safe and may duplicate it.
+`EXISTS` is success only after a strong read proves the incumbent bytes equal
+`v`. An unknown response is reconciled by an exact read. `obj/<h(v)>` is never
+overwritten.
 
-A provider consumer owns the selected push-node private key and the APNs and
-FCM deployment credentials. It reads a delivery job, checks its deterministic
-identity and any existing `push/done` evidence, decrypts the sealed token,
-selects credentials by provider, application, and environment, and sends
-Apple endpoints directly to APNs and Android endpoints directly to FCM. It
-does not read workspace state to rediscover the recipient. FCM is not an iOS
-intermediary in this design.
+### 9.3 Root CAS
 
-Provider acceptance is the terminal success boundary: HTTP `200` from APNs or
-an FCM message id means the provider owns store-and-forward under the
-notification's expiration or TTL. It does not prove device receipt or display.
-On acceptance the consumer durably records the delivery id as discharged,
-then acknowledges that queue job. Network errors, ambiguous timeouts, `429`,
-and `5xx` leave the job unacknowledged or explicitly delayed for bounded
-exponential-backoff retry with jitter until expiry. APNs `410` and FCM
-unregistered-token responses terminally discharge the job and produce
-endpoint-invalidation input. Malformed jobs, exhausted
-credential/configuration failures, and other poison messages retain bounded
-typed evidence and enter the dead-letter path rather than retry forever. A
-provider batch with mixed outcomes uses per-item acknowledgement and retry;
-one success never retires another delivery's obligation.
+```text
+read_versioned(root) -> ABSENT | (bytes, opaque_token)
+cas(root, opaque_token_or_ABSENT, new_bytes) -> APPLIED | STALE | unknown
+```
 
-The external boundary is at-least-once. A worker can crash after the provider
-accepted a request but before the discharge record became durable, so a retry
-may duplicate a visible notification. Deterministic delivery ids and provider
-collapse identifiers reduce known duplicates but do not claim exactly-once
-delivery.
+The token is a comparison capability for the exact read, not a content hash.
+An unknown result is reconciled by reading root:
 
-The dispatcher and provider consumer are distinct logical roles even if one
-initial deployment contains both. The object-store push pile bridges root
-publication to durable queue acceptance; the managed queue owns delivery
-leases and retries after that handoff. Keeping both queue attempts and
-provider credentials outside the composite workspace root avoids root-CAS
-churn for every retry while retaining authenticated fact settlement as the
-sole source of recipient selection.
+- proposed bytes present -> `confirmed`;
+- exact base still present -> retryable unknown;
+- another root present -> `stale`.
 
-## Sync and recovery
+### 9.4 LIST
 
-A dial reads the remote root conditionally. A 304 against an unchanged local
-root is O(1) after blob completeness has been stamped for that HTTP content
-tag.
+LIST is discovery only:
 
-When roots differ, sync pages both pinned roots' authenticated FactTree
-candidate records and joins each fid to the exact fact bytes and
-lexicographically minimum complete proof oid. Every selected proof is
-hash-checked and kernel-validated, then its closure enters through ordinary
-pile ingress. Eligible and dormant candidates use the same channel; FactOrder,
-actions, dependency edges, suppression, and authority are rebuilt as derived
-state. Independent good proofs land even if another selected proof is
-poisoned, but poison makes the dial fail before it records a root/content-tag
-cache stamp, so the unresolved difference retries.
+```text
+list_page(prefix, opaque_cursor, limit) -> bounded keys + cursor
+```
 
-A full-profile sender first delivers each locally available referenced blob as
-an idempotent, hash-verified immutable object, then delivers the selected proof
-piles. That order matters in a directed peer graph: an object-transfer failure
-cannot leave the receiver with a fact difference that only the one-way sender
-could satisfy. A replica that does not yet have a blob may still relay the fact
-so another source can complete it. Push is computed from one pinned local root
-and happens before draining the pull. The dial caches only that exact compared
-local root; if a concurrent local commit lands afterward, even an HTTP 304 on
-the remote forces the next dial to push the new local difference. A registered
-rootless replica can pull the remote candidate archive directly.
+Correctness is not derived from a single complete listing. Cursors are
+persisted as hints, scans wrap, each item is isolated, and retained work plus
+immutable receipts make replay safe. `list_page` is mandatory; an adapter may
+not implement it by materializing and sorting a whole LIST.
 
-Only typed, input-local pile-codec and immutable-kernel rejections are
-quarantined. Exact bytes plus content-addressed reason records become durable
-before retirement. Provider, publication, root, CAS, and unexpected program
-failures retain the exact live pile without a retry-count shortcut; they are
-visible as node-local attempt failures, and an authoritative restore isolates
-their staged candidates before the turn continues with another independent
-pile. Sync failures are likewise visible through `status`. Malformed roots,
-pages, facts, selectors, action witnesses, or authority rows fail closed. A
-root format mismatch may be republished from the current derived index only
-when its known snapshot fields equal the exact root bytes that index recorded;
-a different or unreadable snapshot is never clobbered. There is no ongoing
-dual decoder.
+### 9.5 Concurrent-worker theorem
 
-Rebuild cold-verifies the root-authenticated candidate archive, then
-reconstructs the stable local catalog, eligibility, action state, and selector
-reverse maps. Unpublished staged local intent remains separate.
-Queries need no replay phase or cursor: once the workspace index is stamped
-for the pinned root, they select and decode the same canonical catalog rows
-used by settlement. Blob-bearing queries verify currently resident object
-bytes on demand.
+Let `O` be the content-addressed object map and `R` the root register.
 
-## Performance
+- `O` grows monotonically by verified conditional create.
+- a committed `R` references only objects already established in `O`.
+- successful root CAS operations impose a total order on roots.
+- a stale worker does not delete its exact work.
+- replay from any later root computes a serial union or remains retryable.
 
-`bench/bench_latency.py` measures hot publication and primed idle sync on the
-running paths. A hot post performs zero `Node.keys` calls: settlement returns
-the exact affected projection and publication path-copies bounded paths in the
-four authenticated maps. A primed same-root HTTP 304 is O(1) after its exact
-root/blob-completeness stamp and performs no candidate, tree, object, or
-blob-demand scan.
+Therefore concurrent Appliers can waste work but cannot produce a root that
+references absent compiler output, clobber an immutable object, or lose an
+unapplied pile. Readers pin one root and never mix answers across that total
+order.
 
-Correctness-first candidate reconciliation currently pages the complete
-candidate records of both differing roots and can therefore be linear in
-candidate count. Authenticated candidate diff and bounded multiproof transfer
-are explicit performance work. They must optimize the one candidate/proof join
-rather than introduce an action-specific or eligibility-specific authority
-channel. Benchmark output is diagnostic and is not a cross-machine service
-guarantee.
+The filesystem adapter provides stronger local behavior but runs the same
+algorithm. S3 and R2 adapters must pass both a deterministic adversarial
+contract suite and a small live-provider conformance suite.
 
-## Limits and future decisions
+## 10. RepositoryReader
 
-- Ordinary bodies are plaintext. End-to-end body encryption needs a separate
-  design and implementation.
-- Logical deletion stops query visibility, authorization, and future blob
-  demand; it does not erase immutable objects already stored. Physical GC is
-  unbuilt.
-- A local filesystem workspace still has its own store directory. Provider
-  adapters isolate workspaces under validated bucket prefixes, while each
-  read-only Lambda or Worker deployment is intentionally bound to one exact
-  workspace and prefix. Publishing remains a separate host operation. A
-  bucket-wide S3 guard can freeze lifecycle mutation plus authoritative-key
-  deletion, ACL mutation, tag mutation, direct annotation mutation, and
-  ETag-preserving encryption-key mutation while attached. Pre-existing
-  lifecycle rules and metadata, replication principals, KMS administrators,
-  and administrators able to replace that policy remain trusted at the
-  provider substrate.
-- That provider boundary is distinct from application-level infrastructure
-  authority. The intended control plane is a two-community link. A separate
-  operations workspace admits infrastructure principals; a target workspace
-  invites one of those principals for an exact service scope; and the node
-  accepts and publishes its deployment binding. The binding remains active
-  only while both DAGs support it, and either the workspace or the
-  infrastructure node may end it through ordinary facts. This role does not
-  imply content membership. An idempotent external reconciler must turn that
-  desired state into IAM/R2 credentials, grant-secret rotation, deployment
-  creation, and teardown. Until revocation has been observed at that external
-  plane, an in-band leave fact alone cannot make a former provider credential
-  harmless. Bucket garbage collection and a writable serverless publisher
-  remain future work.
+A reader is constructed from:
+
+```text
+(workspace, exact root bytes, immutable-object fetch)
+```
+
+It validates the root anchor at construction. It has no store-wide handle,
+LIST, PUT, DELETE, CAS, turn, or SQL connection.
+
+A read decision pins this root for its whole duration. Even if another
+Applier commits concurrently, the decision either completes against the
+pinned object graph or fails closed. It never adopts a later root halfway
+through authentication.
+
+Workers answer:
+
+- exact fact and candidate reads;
+- suppression state by explicit ID;
+- selected authority provider;
+- bounded generic postings;
+- upload/auth minting policy.
+
+They walk the authenticated Merkle trees directly. Rebuilding a database on
+each request is neither required nor allowed.
+
+## 11. Disposable client projection
+
+The full node may maintain SQLite:
+
+```sql
+facts(fid PRIMARY KEY, blob)
+fact_index(kind, k0, k1, src,
+           PRIMARY KEY(kind, k0, k1, src))
+meta(k PRIMARY KEY, v)
+```
+
+`facts.blob` is the canonical serialization produced by the same fact codec
+used everywhere else.
+
+`fact_index` contains:
+
+- `fact.type`;
+- `fact.key`;
+- `fact.ref`;
+- every family offer kind;
+- `projection.state` with eligibility and rank;
+- `projection.edge` with exact typed named edges;
+- `projection.action` with current suppression-action bindings.
+
+There are no application tables and no separate proofs, edges, actions, or
+suppression databases. Queries join the generic index and assemble their own
+views.
+
+The projection is replaced from one `RepositoryReader`. It is never an input
+to incoming pile judgment, repository settlement, canonical object creation,
+root CAS, or retirement. Deleting it cannot change repository state.
+
+### 11.1 Versioning
+
+Current fact IDs bind the current serialization. When contextual fact-form
+versioning is added, projection rebuild must:
+
+1. read the historical root-reachable fact;
+2. hydrate it as the form current in the context of surrounding facts;
+3. serialize and store that current hydrated form in `facts.blob`;
+4. derive index rows from that form.
+
+The original obsolete form is not copied into the current projection merely
+because it was the first encoding received. Repository-format migration and
+client projection migration remain separate decisions.
+
+## 12. P2P sync
+
+Reconciliation pins a `RepositoryReader` on each side, compares their
+authenticated `CandidateView`s, selects the lower complete admission witness
+for each difference, and asks `PileSender` to coalesce the verified closures
+into bounded ordinary piles. Coalescing is legal only when judging the union
+preserves every fact's exact named dependency edges from its selected
+historical witness. A merely valid union is insufficient: if canonical offer
+selection would rewire a fact, or make the union invalid, the closures remain
+separate ordinary piles. Candidate/proof state and newly authored facts
+therefore use the same wire unit without manufacturing new admission proofs.
+
+`PileSender` owns every outbound peer object/pile delivery. The receiving side
+always stages those bytes for `RepositoryApplier`; it never installs a remote
+root, candidate record, page, or diff result directly. A hosted recipient and
+a full P2P peer therefore land the same pile with the same database-free
+algorithm and produce the same root.
+
+The current correctness baseline enumerates candidate IDs from the pinned
+views. Future range-diff optimization may descend the same authenticated
+Merkle maps, but it must select the same witnesses and emit the same ordinary
+piles; it does not become another receiving protocol.
+
+Detached objects are sent before the fact-only pile when pushed directly.
+Missing objects may be fetched later by hash. No alternative fact-application
+path is introduced for sync.
+
+## 13. Provider packaging
+
+Provider code is segregated:
+
+- `adapters/s3/`: S3 request/response and opaque-token translation;
+- `adapters/r2/worker.py`: native R2 binding translation;
+- `deploy/aws_repository_applier/`: DB-free Lambda artifact and SAM template;
+- `deploy/cloudflare_upload/worker/applier*.py`: DB-free Worker entry/runtime;
+- `deploy/aws_upload_broker/` and Cloudflare broker modules: signer/front door.
+
+Provider packages do not contain `Node`, SQLite projection code, daemon code,
+or a second compiler.
+
+AWS installs scheduled bounded recovery; the Lambda handler also accepts S3
+event records as hints. Cloudflare installs a one-minute cron. Both use
+separate canonical and ingress buckets.
+
+Deploy artifacts are implemented and build-tested. Live-provider correctness
+is claimed only after the selected account passes the conformance suite;
+generated Cloudflare claims retain `live_verified: false` until then.
+
+## 14. Invariants
+
+The test suite and structural ratchets enforce:
+
+1. exactly three capability class definitions;
+2. exactly two actor compositions;
+3. one outbound pile encoder owner;
+4. one root compiler;
+5. one semantic root CAS call;
+6. only `RepositoryApplier` establishes canonical objects;
+7. only `RepositoryApplier` retires internal generations;
+8. `RepositoryReader` is side-effect-free and database-free;
+9. a full-node turn delegates to exactly one Applier turn;
+10. every ordinary fact is workspace-bound;
+11. proposals bind workspace, payload, base, and issuer;
+12. root references are established before CAS;
+13. CAS losers retain exact work;
+14. rejection retirement follows immutable exact evidence;
+15. client ingress is never retired by application/F10 code;
+16. concurrent replay converges to a serial union;
+17. explicit suppression IDs map to authenticated `CLEAR`/`ACTIVE` states;
+18. required missing suppression state fails closed;
+19. SQLite has one fact table and one combined index only;
+20. root docs are exactly `README.md`, `DESIGN.md`, and `AGENTS.md`.
+
+Item 7 enforces ownership of the retirement call. Items 11, 14, and the
+running source-byte checks enforce its current evidence binding. They do not
+yet prove exact storage incarnation across identical key/byte recreation; the
+open F10 ABA work described in §7 is the remaining boundary.
+
+## 15. Open performance work
+
+The current compiler reconstructs and recompiles the complete candidate
+archive for each accepted pile. This gives a simple deterministic reference
+implementation, but repeated commits become expensive as the archive grows.
+
+The incremental compiler must:
+
+- update only authenticated affected paths;
+- remain byte-identical to a full compile for every arrival order;
+- preserve stale-CAS retry behavior;
+- eliminate commit-time whole-key scans;
+- report facts/s at 50k and 200k facts;
+- report file throughput in MiB/s.
+
+Until those criteria pass, the full compiler remains the correctness oracle
+and no optimistic large-scale number belongs in the documentation.

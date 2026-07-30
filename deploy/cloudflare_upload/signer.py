@@ -4,7 +4,7 @@ The long-lived parent credential never leaves this translator.  Each result is
 the same ``UploadCapability`` used by the AWS path: one bearer URL, one exact
 method/header set, and one session-bounded expiry.  R2 receives
 ``UNSIGNED-PAYLOAD`` deliberately; staged bytes remain untrusted until the
-publisher verifies their SHA-256 address before canonical promotion.
+applier verifies their SHA-256 address before canonical promotion.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone

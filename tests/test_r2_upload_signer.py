@@ -55,7 +55,7 @@ def deployment(**changes):
         "ingress_bucket": "poc16-untrusted-ingress",
         "owner": "production-west",
         "broker_name": "poc16-upload-broker",
-        "publisher_name": "poc16-upload-publisher",
+        "applier_name": "poc16-repository-applier",
         "read_permission_group_id": "c" * 32,
         "write_permission_group_id": "d" * 32,
         "presign_ttl_seconds": 60,
@@ -368,7 +368,7 @@ def test_create_only_replay_and_length_mutation_never_clobber_staging():
     assert store.data == {key: b"x" * 42}
 
 
-def test_unsigned_payload_is_explicit_and_requires_publisher_verification():
+def test_unsigned_payload_is_explicit_and_requires_applier_verification():
     capability = signer().sign(authorized())
     query = dict(parse_qsl(urlsplit(capability.url).query))
     store = Staging()

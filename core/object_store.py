@@ -1,6 +1,6 @@
 """Pure object-store contract shared by local and remote implementations.
 
-The authoritative layout needs only two storage objects:
+The root-authoritative snapshot uses only two namespaces:
 
 ``obj/<sha256>``
     A grow-only content-addressed map. Conditional creation may report either
@@ -10,6 +10,13 @@ The authoritative layout needs only two storage objects:
     One linearizable value-CAS register. A version token is an opaque
     comparison capability for the exact bytes returned by the same read; it is
     not a content digest or a globally unique generation.
+
+The same canonical bucket may also contain Applier-owned operational work:
+internal ``pile/`` generations, immutable ``failed/`` rejection evidence,
+``staged/`` receipts/claims, and ``applier/cursor/`` liveness hints. Those
+objects are not repository answers and are never read through
+``RepositoryReader``. Client-writable ``ingress/v1/`` markers and detached
+objects live in the separate ingress compartment.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes

@@ -5,7 +5,7 @@ import os
 import pytest
 
 import facts
-from core import suppression_state
+from core import catalog, suppression_state
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
@@ -29,7 +29,10 @@ from .util import (
 
 def _action_rows(node, workspace):
     actions = node.idx(workspace).execute(
-        "SELECT sid, fid FROM actions ORDER BY sid").fetchall()
+        "SELECT k0, src FROM fact_index "
+        "WHERE kind=? ORDER BY k0",
+        (catalog.ACTION_INDEX,),
+    ).fetchall()
     candidates = node.reader(workspace).candidates()
     return [
         (sid, fid, candidates.fact_record(fid)["admission"])
@@ -284,7 +287,9 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
             peer.turn(workspace)
         sid = facts.principal_sid("member", bob)
         assert peer.idx(workspace).execute(
-            "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
+            "SELECT src FROM fact_index WHERE kind=? AND k0=?",
+            (catalog.ACTION_INDEX, sid),
+        ).fetchone() \
             == (first.fid,)
         assert peer.candidate_of(workspace, posted.fid) == posted
         assert peer.fact_of(workspace, posted.fid) == posted
@@ -325,7 +330,9 @@ def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
     assert (pulled, pushed, pending) == (1, 0, True)
     sid = facts.principal_sid("member", bob)
     assert destination.idx(workspace).execute(
-        "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
+        "SELECT src FROM fact_index WHERE kind=? AND k0=?",
+        (catalog.ACTION_INDEX, sid),
+    ).fetchone() \
         == (first.fid,)
 
 
@@ -406,6 +413,72 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
         peer.rebuild(workspace)
         assert _action_rows(peer, workspace)[0][2] == evidence[lower]
         assert posted not in visible_fids(peer, workspace)
+
+
+def test_sender_never_coalesces_closures_that_rewire_a_historical_witness(
+        tmp_path):
+    """Batching cannot replace a selected proof with a newly valid proof."""
+    base = Node(str(tmp_path / "base"))
+    workspace = facts.auth.workspace.create(base, "alice", ts=1)
+    founder_secret, founder = base.identity(workspace)
+    facts.auth.device.bind(base, workspace, "alice-primary")
+    common = closed_subset(base, workspace, all_fids(base, workspace))
+
+    target_secret, target = keypair()
+    peers = []
+    for name, label, claim_ts in (
+            ("left", "left-claim", 100),
+            ("right", "right-claim", 101)):
+        peer = Node(str(tmp_path / name))
+        peer.keychain.add_identity(founder_secret)
+        peer.keychain.add_identity(target_secret)
+        peer.add_workspace(
+            workspace, "alice", peers=[], identity=founder)
+        deliver(peer, workspace, common)
+        peer.turn(workspace)
+        claim = inject_device_claim(
+            peer, workspace, founder_secret, founder, founder,
+            target, label, claim_ts)
+        peer.bind_identity(workspace, target)
+        posted = facts.content.message.post(
+            peer, workspace, "general", "same immutable message", ts=200)
+        peer.bind_identity(workspace, founder)
+        deletion = facts.content.delete.remove(peer, workspace, posted, ts=210)
+        peers.append((peer, claim, posted, deletion))
+
+    left, right = peers
+    assert left[2:] == right[2:]
+    higher, lower = (
+        (left, right) if left[1].fid > right[1].fid else (right, left)
+    )
+    lower_claim = lower[1]
+    deliver(
+        higher[0], workspace,
+        closed_subset(lower[0], workspace, [lower_claim.fid]))
+    higher[0].turn(workspace)
+
+    source = higher[0]
+    candidates = source.reader(workspace).candidates()
+    expected = candidates.fact_record(higher[3])["admission"]
+    batches = source.sender(workspace).pack_batches((
+        candidates.verify(lower_claim.fid).facts,
+        candidates.verify(higher[3]).facts,
+    ))
+
+    # The union is kernel-valid, but it would resolve the deletion through the
+    # lower claim and manufacture a proof the source never selected.
+    assert len(batches) == 2
+    destination = Node(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "alice", peers=[])
+    for raw in batches:
+        destination.receive_pile(workspace, "peer", raw)
+    destination.turn(workspace)
+
+    actual = destination.reader(workspace).candidates() \
+        .fact_record(higher[3])["admission"]
+    assert actual == expected
+    assert destination.store(workspace).get("root") \
+        == source.store(workspace).get("root")
 
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):

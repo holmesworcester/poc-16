@@ -4,7 +4,7 @@ import facts
 from .close import close, encode_pile
 from .crypto import h
 from .kernel import drain, resolve_deps
-from .limits import PayloadTooLarge
+from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
 
 
 class AuthorityRejected(ValueError):
@@ -137,7 +137,8 @@ class PileSender:
             for oid in facts.blob_refs(fact)
         })
         for oid in object_ids:
-            raw = store.get("obj/" + oid)
+            raw = store.get_bounded(
+                "obj/" + oid, MAX_OBJECT_BYTES)
             if raw is None:
                 continue
             if h(raw) != oid:

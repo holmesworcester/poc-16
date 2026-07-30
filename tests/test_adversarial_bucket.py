@@ -5,10 +5,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+import facts
 import pytest
 
 from adapters.r2 import R2BindingStore
-import facts
 from core.crypto import h
 from core.object_store import (
     ABSENT,

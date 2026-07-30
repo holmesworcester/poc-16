@@ -5,12 +5,11 @@ import random
 import facts
 import pytest
 
-from core import catalog, indexes, merkle_map, snapshot
-from core.crypto import h, keypair
-from core.fact import encode
+from core import catalog, indexes, snapshot
+from core.crypto import keypair
 from core.kernel import offer_src
 from core.node import Node
-from core.shape import fid_of
+from core.repository_snapshot import Candidate, compile_snapshot
 from core.suppression import TARGET
 from core.worker import WorkerView
 from facts.auth.device_invite import device_invite
@@ -52,37 +51,30 @@ def _catalog_rows(node, workspace, kind, k0=None, k1=None):
 
 def _canonical_root(node, workspace):
     """Reference full build independent of every incremental index path."""
-    index = node.idx(workspace)
-    seed, trees = indexes.build(
-        workspace, index, lambda raw: h(raw),
-    )
-    order = snapshot.build_fact_order(
-        (
-            (fact.key, h(encode(fact)))
-            for fact in (
-                node.fact_of(workspace, fid_of(address))
-                for address in node.keys(workspace)
-            )
-            if fact is not None
-        ),
-        seed,
-        lambda raw: h(raw),
-    )
-    return snapshot.encode_root(
-        workspace,
-        {snapshot.FACT_ORDER: order, **trees},
-        seed=seed,
-    )
+    archive = node.reader(workspace).archive()
+    receipts = {
+        receipt.fact.fid: (receipt, proof)
+        for receipt, proof in archive.receipt_proofs
+    }
+    candidates = {
+        fid: Candidate(
+            archive.facts[fid],
+            proof,
+            tuple(receipt.edges),
+        )
+        for fid, (receipt, proof) in receipts.items()
+    }
+    return compile_snapshot(workspace, candidates).root
 
 
 def _catalog_scopes(node, workspace, fid):
     fact = node.fact_of(workspace, fid)
-    index = node.idx(workspace)
 
     def edges_of(source):
-        return dict(index.execute(
-            "SELECT role, dst FROM edges WHERE src=? ORDER BY role",
-            (source,)))
+        return {
+            edge.role: edge.fid
+            for edge in node.catalog(workspace).edges(source)
+        }
 
     selectors = set(facts.fact_scopes(fact))
     liveness = set(facts.authority_scopes(
@@ -179,8 +171,9 @@ def test_losing_then_winning_offer_rewires_reverse_dependency_posting(
     assert message in {row.fid for row in new_dependents}
     assert {row.fid for row in new_dependents} == {
         source for (source,) in node.idx(workspace).execute(
-            "SELECT src FROM edges WHERE dst=? ORDER BY src",
-            (lower.fid,))
+            "SELECT src FROM fact_index "
+            "WHERE kind=? AND k1=? ORDER BY src",
+            (catalog.EDGE_INDEX, lower.fid))
     }
     assert node.store(workspace).get("root") \
         == _canonical_root(node, workspace)
@@ -228,8 +221,7 @@ def test_scope_route_finds_suppression_cascade_and_next_active_offer(
 
     scoped, _ = _postings(after, indexes.SCOPE_INDEX, sid, "")
     expected_scoped = {
-        fid for (fid,) in node.idx(workspace).execute(
-            "SELECT fid FROM proofs")
+        fid for fid in node.catalog(workspace).eligible_ids()
         if sid in _catalog_scopes(node, workspace, fid)
     }
     assert {row.fid for row in scoped} == expected_scoped
@@ -253,8 +245,9 @@ def test_scope_route_finds_suppression_cascade_and_next_active_offer(
         after, indexes.DEPENDENCY_INDEX, winner)
     assert {row.fid for row in dependents} == {
         source for (source,) in node.idx(workspace).execute(
-            "SELECT src FROM edges WHERE dst=? ORDER BY src",
-            (winner,))
+            "SELECT src FROM fact_index "
+            "WHERE kind=? AND k1=? ORDER BY src",
+            (catalog.EDGE_INDEX, winner))
     }
     assert node.store(workspace).get("root") \
         == _canonical_root(node, workspace)

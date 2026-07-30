@@ -113,7 +113,11 @@ def derived_rows(projection, records, facts_by_fid):
             "state": "active", "action": action}
 
     fact_actions, supp = {}, {}
-    for fid in projection.standing:
+    # Retention reserves the key universe.  A candidate may be dormant today
+    # and regain standing later, so every family-declared selector/principal
+    # remains an authenticated CLEAR/ACTIVE slot even while that candidate is
+    # absent from FactOrder and AuthorityTree.
+    for fid in records:
         fact, record = facts_by_fid[fid], records[fid]
         for sid in record["selectors"]:
             supp[sid] = slot(sid)

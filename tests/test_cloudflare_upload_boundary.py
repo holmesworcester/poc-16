@@ -21,7 +21,7 @@ from deploy.cloudflare_upload.boundary import (
     bucket_resource,
     generated_boundary,
     ingress_lifecycle,
-    publisher_config,
+    applier_config,
 )
 from deploy.cloudflare_upload.signer import R2UploadSigner
 from deploy.upload_keyring import (
@@ -44,7 +44,7 @@ def deployment(**changes):
         "ingress_bucket": "poc16-untrusted-ingress",
         "owner": "production-west",
         "broker_name": "poc16-upload-broker",
-        "publisher_name": "poc16-upload-publisher",
+        "applier_name": "poc16-repository-applier",
         "read_permission_group_id": "c" * 32,
         "write_permission_group_id": "d" * 32,
     }
@@ -74,7 +74,7 @@ def _policy_allows(candidate, policy, bucket, action):
 def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     candidate = deployment()
     broker = broker_config(candidate)
-    publisher = publisher_config(candidate)
+    applier = applier_config(candidate)
 
     assert broker["r2_buckets"] == []
     assert broker["secrets"]["required"] == list(BROKER_SECRET_NAMES)
@@ -100,7 +100,7 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     assert len(broker["vars"]["CANONICAL_READ_POLICY_SHA256"]) == 64
     assert len(broker["vars"]["INGRESS_PARENT_POLICY_SHA256"]) == 64
 
-    assert publisher["r2_buckets"] == [
+    assert applier["r2_buckets"] == [
         {
             "binding": "INGRESS",
             "bucket_name": candidate.ingress_bucket,
@@ -112,13 +112,14 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
             "jurisdiction": "default",
         },
     ]
-    assert publisher["vars"][ROLE_BINDING] == "publisher"
-    assert broker["routes"] == publisher["routes"] == []
-    assert broker["workers_dev"] is publisher["workers_dev"] is False
+    assert applier["vars"][ROLE_BINDING] == "applier"
+    assert broker["routes"] == applier["routes"] == []
+    assert broker["workers_dev"] is applier["workers_dev"] is False
     assert broker["main"] == "build/broker/entry.py"
     assert broker["base_dir"] == "build/broker"
-    assert publisher["main"] == "build/publisher/entry.py"
-    assert publisher["base_dir"] == "build/publisher"
+    assert applier["main"] == "build/applier/entry.py"
+    assert applier["base_dir"] == "build/applier"
+    assert applier["triggers"] == {"crons": ["*/1 * * * *"]}
 
 
 def test_checked_in_wrangler_input_cannot_expose_the_real_broker():
@@ -180,7 +181,7 @@ def test_ingress_parent_cannot_address_any_canonical_operation():
 
 @pytest.mark.parametrize("changes", (
     {"canonical_bucket": "same", "ingress_bucket": "same"},
-    {"broker_name": "same-worker", "publisher_name": "same-worker"},
+    {"broker_name": "same-worker", "applier_name": "same-worker"},
     {"canonical_bucket": "UPPERCASE"},
     {"canonical_bucket": "ab"},
     {"canonical_bucket": "a" * 64},
@@ -298,9 +299,9 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     monkeypatch.setattr(
         manage, "stage_broker", lambda: tmp_path / "broker")
     monkeypatch.setattr(
-        manage, "stage_publisher", lambda: tmp_path / "publisher")
+        manage, "stage_applier", lambda: tmp_path / "applier")
     monkeypatch.setattr(
-        manage, "stage_broker_dependencies", lambda: None)
+        manage, "stage_dependencies", lambda: None)
     workers = {}
     buckets = {
         candidate.canonical_bucket: {"root": b"canonical-root"},
@@ -340,7 +341,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         identity_reader=identity_reader,
     )
     assert list(workers.values()) == [
-        (candidate.owner, "publisher"),
+        (candidate.owner, "applier"),
         (candidate.owner, "broker"),
     ]
     assert [call[3] for call in calls] == [
@@ -385,7 +386,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         "sync", "deploy", "deploy", "delete", "delete",
     ]
     assert [call[4] for call in calls[-2:]] == [
-        candidate.broker_name, candidate.publisher_name,
+        candidate.broker_name, candidate.applier_name,
     ]
     assert all("r2" not in call[3:] for call in calls)
 
@@ -440,9 +441,9 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
     monkeypatch.setattr(
         manage, "stage_broker", lambda: tmp_path / "broker")
     monkeypatch.setattr(
-        manage, "stage_publisher", lambda: tmp_path / "publisher")
+        manage, "stage_applier", lambda: tmp_path / "applier")
     monkeypatch.setattr(
-        manage, "stage_broker_dependencies", lambda: None)
+        manage, "stage_dependencies", lambda: None)
     calls = []
 
     def runner(command):
@@ -454,9 +455,18 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
             command[command.index("--config") + 1]).read_text())
         role = config["vars"][ROLE_BINDING]
         target.mkdir(parents=True)
-        if role == "publisher":
-            (target / "entry.py").write_text(
-                "dry-run artifact")
+        if role == "applier":
+            for relative in (
+                    "entry.py",
+                    "applier_runtime.py",
+                    "core/repository_applier.py",
+                    "core/repository_snapshot.py",
+                    "core/staged_intent.py",
+                    "adapters/r2/worker.py",
+                    "facts/auth/workspace.py"):
+                path = target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("dry-run artifact")
             return
         for relative in (
                 "entry.py",
@@ -493,7 +503,7 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
         for call in deploy_calls
     ]
     assert [config["vars"][ROLE_BINDING] for config in configs] == [
-        "publisher", "broker",
+        "applier", "broker",
     ]
 
 
@@ -550,25 +560,37 @@ def test_stage_broker_is_db_free_and_uses_shared_reader_sources(
     assert patched == [manage.VENDORED]
 
 
-def test_stage_publisher_contains_only_the_fail_closed_entry(
+def test_stage_applier_contains_shared_engine_and_no_host_or_sql_authority(
         tmp_path, monkeypatch):
     build = tmp_path / "build"
     monkeypatch.setattr(manage, "BUILD", build)
     monkeypatch.setattr(
-        manage, "PUBLISHER_WORKER", build / "publisher")
+        manage, "APPLIER_WORKER", build / "applier")
 
-    staged = manage.stage_publisher()
+    staged = manage.stage_applier()
 
-    assert {
-        path.relative_to(staged).as_posix()
-        for path in staged.rglob("*")
-        if path.is_file()
-    } == {"entry.py"}
-    assert staged.joinpath("entry.py").read_bytes() == (
-        manage.PACKAGE / "worker" / "publisher_stub.py").read_bytes()
+    for relative in (
+            "entry.py",
+            "applier_runtime.py",
+            "core/repository_applier.py",
+            "core/repository_snapshot.py",
+            "core/staged_intent.py",
+            "adapters/r2/worker.py",
+            "facts/auth/workspace.py"):
+        assert (staged / relative).is_file()
+    for forbidden in (
+            "core/catalog.py",
+            "core/client_projection.py",
+            "core/node.py",
+            "core/daemon.py",
+            "core/runtime.py",
+            "core/admission.py",
+            "core/publication.py",
+            "adapters/s3/store.py"):
+        assert not (staged / forbidden).exists()
 
 
-def test_stage_broker_dependencies_are_role_local_and_drop_build_markers(
+def test_stage_dependencies_are_role_local_and_drop_build_markers(
         tmp_path, monkeypatch):
     generated = tmp_path / "generated"
     vendored = tmp_path / "python_modules"
@@ -580,14 +602,14 @@ def test_stage_broker_dependencies_are_role_local_and_drop_build_markers(
     monkeypatch.setattr(manage, "GENERATED", generated)
     monkeypatch.setattr(manage, "VENDORED", vendored)
 
-    manage.stage_broker_dependencies()
+    manage.stage_dependencies()
 
-    target = generated / "broker" / "python_modules"
-    assert (target / "nacl" / "_sodium.test.so").read_bytes() == (
-        b"\x00asm patched")
-    assert not (target / ".synced").exists()
-    assert not (target / "pyvenv.cfg").exists()
-    assert not (generated / "publisher" / "python_modules").exists()
+    for role in ("broker", "applier"):
+        target = generated / role / "python_modules"
+        assert (target / "nacl" / "_sodium.test.so").read_bytes() == (
+            b"\x00asm patched")
+        assert not (target / ".synced").exists()
+        assert not (target / "pyvenv.cfg").exists()
 
 
 def test_remove_resolves_both_owned_targets_before_first_delete(
@@ -596,11 +618,11 @@ def test_remove_resolves_both_owned_targets_before_first_delete(
     monkeypatch.setattr(manage, "GENERATED", tmp_path / "generated")
     calls = []
     identities = {
-        candidate.publisher_name: ("someone-else", "publisher"),
+        candidate.applier_name: ("someone-else", "applier"),
         candidate.broker_name: (candidate.owner, "broker"),
     }
 
-    with pytest.raises(RuntimeError, match="unowned publisher"):
+    with pytest.raises(RuntimeError, match="unowned applier"):
         manage.remove(
             candidate,
             _deploy_environment(),

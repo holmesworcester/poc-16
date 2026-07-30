@@ -37,7 +37,7 @@ from deploy.upload_session import (
     UploadSessionPolicy,
 )
 from deploy.gateway import AsyncFromSyncReader
-from facts._commands import closer, offer_source
+from facts._commands import offer_source
 from facts.auth import request
 from facts.content import file as file_family
 from facts.content import message as message_family
@@ -588,17 +588,12 @@ def test_real_message_and_multichunk_pile_derives_missing_bao_object(
         signed.fid: [],
         message.fid: [signed.fid, provider],
     })
-    with node.lock:
-        stream = closer(
-            node, workspace,
-            {fact.fid: fact for fact in news},
-            deps,
-        )
+    stream = node.sender(workspace).close(news, deps)
     # Deliberately spool only one of two available Bao proofs. Fact validity
     # and the pile marker are independent of detached byte completeness.
     assert len(blobs) == 2
     builder.add(blobs[0][1])
-    source = builder.finish(encode_pile(stream, workspace=workspace))
+    source = builder.finish(node.sender(workspace).pack(stream))
     bucket = FakeProvider()
 
     UploadClient(source, broker, bucket, clock).run(proof)

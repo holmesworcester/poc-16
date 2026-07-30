@@ -6,9 +6,9 @@ import json
 import urllib.error
 from urllib.parse import urlsplit
 
+import facts
 import pytest
 
-import facts
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon

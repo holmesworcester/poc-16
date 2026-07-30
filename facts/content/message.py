@@ -6,9 +6,7 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from core.close import encode_pile
 from .._commands import (
-    closer,
     offer_source,
     publish,
     upload_builder,
@@ -81,14 +79,11 @@ def upload(
     member = offer_source(node, workspace, "member", public)
     if member is None:
         raise ValueError("publishing identity is not a workspace member")
-    newmap = {item.fid: item, signed.fid: signed}
     deps = {item.fid: [signed.fid, member], signed.fid: []}
-    with node.lock:
-        stream = closer(node, workspace, newmap, deps)
     builder = upload_builder(node, workspace)
     try:
-        source = builder.finish(
-            encode_pile(stream, workspace=workspace))
+        source = builder.finish(node.sender(workspace).pile(
+            [signed, item], deps))
     except BaseException:
         builder.discard()
         raise

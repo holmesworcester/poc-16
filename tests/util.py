@@ -1,4 +1,5 @@
 """Test helpers: author facts directly (bypassing HTTP) to build fixtures."""
+import asyncio
 import base64
 import json
 import os
@@ -10,7 +11,6 @@ import facts
 from core import daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
-from core.ingress import stage_pile
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
@@ -104,8 +104,7 @@ def visible_fids(node, workspace):
     with node.lock:
         return {
             fid
-            for (fid,) in node.idx(workspace).execute(
-                "SELECT fid FROM proofs")
+            for fid in node.catalog(workspace).eligible_ids()
             if not node.suppressed(workspace, node.fact_of(workspace, fid))
         }
 
@@ -191,14 +190,14 @@ def closed_subset(n, ws, fids):
 
 
 def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
-    return stage_pile(dst.store(ws), member, pile_bytes)
+    return asyncio.run(dst.applier(ws).stage(member, pile_bytes))
 
 
 def all_fids(n, ws):
     with n.lock:
         facts = [
             n.fact_of(ws, fid)
-            for (fid,) in n.idx(ws).execute("SELECT fid FROM proofs")
+            for fid in n.catalog(ws).eligible_ids()
         ]
     return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
 

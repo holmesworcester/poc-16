@@ -356,7 +356,7 @@ def violation(before, after, action):
     if len(after.history) != len(before.history) \
             and action.verb not in {"cas", "swap"}:
         return "commit history changed outside CAS"
-    # Snapshot token sets only grow and publishers do not emit no-op roots, so
+    # Snapshot token sets only grow and appliers do not emit no-op roots, so
     # this bounded protocol has neither ABA nor a legitimate second X -> X CAS.
     expected = [etag for etag, _ in after.commits]
     if len(expected) != len(set(expected)):

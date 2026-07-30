@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render and operate the fail-closed Cloudflare upload role boundary."""
+"""Build and operate Cloudflare broker plus hosted repository compartments."""
 import json
 import os
 from pathlib import Path
@@ -14,7 +14,6 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from deploy.cloudflare_python import (
-    MINT_CORE_MODULES,
     copy_python_modules,
     patch_pynacl,
 )
@@ -32,6 +31,7 @@ from deploy.upload_keyring import (
     encode_keyring,
 )
 from deploy.upload_session import SessionKey, UploadSessionPolicy
+from deploy.python_role_modules import UPLOAD_BROKER_CORE_MODULES
 
 
 PACKAGE = Path(__file__).resolve().parent
@@ -39,15 +39,15 @@ REPOSITORY = PACKAGE.parents[1]
 GENERATED = PACKAGE / "generated"
 BUILD = PACKAGE / "build"
 BROKER_WORKER = BUILD / "broker"
-PUBLISHER_WORKER = BUILD / "publisher"
+APPLIER_WORKER = BUILD / "applier"
 VENDORED = PACKAGE / "python_modules"
 CONTROL_TIMEOUT_SECONDS = 120
 SETTINGS_TIMEOUT_SECONDS = 15
 API_RESPONSE_BYTES = 64 * 1024
 _ABSENT = object()
-ROLE_ORDER = ("publisher", "broker")
+ROLE_ORDER = ("applier", "broker")
 REMOVE_ORDER = tuple(reversed(ROLE_ORDER))
-BROKER_CORE_MODULES = MINT_CORE_MODULES + ("staged_intent.py",)
+BROKER_CORE_MODULES = UPLOAD_BROKER_CORE_MODULES
 BROKER_DEPLOY_MODULES = (
     "__init__.py",
     "gateway.py",
@@ -62,6 +62,29 @@ BROKER_PROVIDER_MODULES = (
     "boundary.py",
     "reader.py",
     "signer.py",
+)
+APPLIER_CORE_MODULES = (
+    "__init__.py",
+    "admission_proof.py",
+    "bao.py",
+    "candidate_archive.py",
+    "close.py",
+    "crypto.py",
+    "fact.py",
+    "fact_index.py",
+    "indexes.py",
+    "ingress.py",
+    "kernel.py",
+    "limits.py",
+    "merkle_map.py",
+    "object_store.py",
+    "repository_applier.py",
+    "repository_snapshot.py",
+    "settlement.py",
+    "shape.py",
+    "snapshot.py",
+    "staged_intent.py",
+    "suppression.py",
 )
 
 
@@ -122,20 +145,43 @@ def stage_broker():
     return BROKER_WORKER
 
 
-def stage_publisher():
-    """Stage only the fail-closed placeholder for the unfinished publisher."""
-    pending = BUILD / "publisher.pending"
+def stage_applier():
+    """Stage the exact DB-free RepositoryApplier import closure."""
+    pending = BUILD / "applier.pending"
     if pending.exists():
         shutil.rmtree(pending)
     pending.mkdir(parents=True)
     _copy(
-        PACKAGE / "worker" / "publisher_stub.py",
+        PACKAGE / "worker" / "applier.py",
         pending / "entry.py",
     )
-    if PUBLISHER_WORKER.exists():
-        shutil.rmtree(PUBLISHER_WORKER)
-    pending.rename(PUBLISHER_WORKER)
-    return PUBLISHER_WORKER
+    _copy(
+        PACKAGE / "worker" / "applier_runtime.py",
+        pending / "applier_runtime.py",
+    )
+    for name in APPLIER_CORE_MODULES:
+        _copy(
+            REPOSITORY / "core" / name,
+            pending / "core" / name,
+        )
+    shutil.copytree(
+        REPOSITORY / "facts",
+        pending / "facts",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    _copy(
+        REPOSITORY / "adapters" / "__init__.py",
+        pending / "adapters" / "__init__.py",
+    )
+    for name in ("__init__.py", "worker.py"):
+        _copy(
+            REPOSITORY / "adapters" / "r2" / name,
+            pending / "adapters" / "r2" / name,
+        )
+    if APPLIER_WORKER.exists():
+        shutil.rmtree(APPLIER_WORKER)
+    pending.rename(APPLIER_WORKER)
+    return APPLIER_WORKER
 
 
 def render(deployment):
@@ -159,12 +205,13 @@ def render(deployment):
     return paths
 
 
-def stage_broker_dependencies():
-    """Put the patched locked dependencies beside the broker's config."""
-    target = GENERATED / "broker" / "python_modules"
-    if target.exists():
-        shutil.rmtree(target)
-    copy_python_modules(VENDORED, target)
+def stage_dependencies():
+    """Put the patched locked dependencies beside both exact configs."""
+    for role in ROLE_ORDER:
+        target = GENERATED / role / "python_modules"
+        if target.exists():
+            shutil.rmtree(target)
+        copy_python_modules(VENDORED, target)
 
 
 def _run(command):
@@ -183,9 +230,9 @@ def build(deployment, *, runner=None):
         "uv", "run", "pywrangler", "sync", "--allow-build",
     ])
     stage_broker()
-    stage_publisher()
+    stage_applier()
     paths = render(deployment)
-    stage_broker_dependencies()
+    stage_dependencies()
     with tempfile.TemporaryDirectory(
             prefix="poc16-cloudflare-upload-build-") as output:
         output = Path(output)
@@ -199,9 +246,44 @@ def build(deployment, *, runner=None):
             ])
             if role == "broker":
                 _verify_broker_bundle(target)
-            elif not (target / "entry.py").is_file():
-                raise RuntimeError(
-                    "pywrangler omitted the publisher entrypoint")
+            else:
+                _verify_applier_bundle(target)
+
+
+def _verify_applier_bundle(directory):
+    paths = {
+        path.relative_to(directory).as_posix()
+        for path in directory.rglob("*") if path.is_file()
+    }
+    required = {
+        "entry.py",
+        "applier_runtime.py",
+        "core/repository_applier.py",
+        "core/repository_snapshot.py",
+        "core/staged_intent.py",
+        "adapters/r2/worker.py",
+        "facts/auth/workspace.py",
+    }
+    missing = required - paths
+    if missing:
+        raise RuntimeError(
+            f"pywrangler omitted applier modules: {sorted(missing)}")
+    forbidden = {
+        "core/catalog.py",
+        "core/node.py",
+        "core/client_projection.py",
+        "core/store.py",
+        "core/daemon.py",
+        "core/runtime.py",
+        "core/admission.py",
+        "core/publication.py",
+        "adapters/r2/s3.py",
+        "adapters/s3/store.py",
+    } & paths
+    if forbidden:
+        raise RuntimeError(
+            f"applier artifact contains forbidden modules: "
+            f"{sorted(forbidden)}")
 
 
 def _verify_broker_bundle(directory):
@@ -280,7 +362,7 @@ def workerd_test(deployment):
     ])
     stage_broker()
     paths = render(deployment)
-    stage_broker_dependencies()
+    stage_dependencies()
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -482,19 +564,11 @@ def _deploy_one(role, path, runner, broker_secrets):
 def deploy(
         deployment, environment=os.environ, *,
         runner=None, identity_reader=None):
-    """Deploy publisher then broker after checking both exact identities.
-
-    The broker is real, but the publisher is deliberately fail-closed and
-    neither generated role has a public route. Requiring an explicit opt-in
-    prevents this partial pair from being mistaken for the complete service.
-    """
-    if environment.get("CF_UPLOAD_ENABLE_PARTIAL_DEPLOY") != "1":
-        raise ValueError(
-            "set CF_UPLOAD_ENABLE_PARTIAL_DEPLOY=1 for partial deployment")
+    """Deploy Applier then broker after checking both exact identities."""
     runner = _run if runner is None else runner
     identity_reader = (
         _worker_identity if identity_reader is None else identity_reader)
-    # Resolve and validate every required secret before the publisher is the
+    # Resolve and validate every required secret before the Applier is the
     # first provider mutation. A malformed broker key ring must not leave a
     # half-installed role pair.
     broker_secrets = _broker_secrets(deployment, environment)
@@ -511,9 +585,9 @@ def deploy(
         "uv", "run", "pywrangler", "sync", "--allow-build",
     ])
     stage_broker()
-    stage_publisher()
+    stage_applier()
     paths = render(deployment)
-    stage_broker_dependencies()
+    stage_dependencies()
     for role in ROLE_ORDER:
         _deploy_one(
             role, paths[role], runner, broker_secrets)
@@ -556,10 +630,10 @@ def help_text():
     return """usage: python -m deploy.cloudflare_upload.manage COMMAND
 
 Commands:
-  render  generate non-secret broker/publisher configs and R2 policy inputs
+  render  generate non-secret broker/applier configs and R2 policy inputs
   build   dry-run both generated configs through locked pywrangler/Workers
-  test    run host, clean-bundle, and local-workerd broker checks
-  deploy  opt-in deployment of the broker plus fail-closed publisher
+  test    run host, clean-bundle, and local-workerd checks
+  deploy  deploy the broker plus database-free RepositoryApplier
   remove  remove the two exactly owned Workers while preserving both buckets
   help    show this help
 """

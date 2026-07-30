@@ -199,7 +199,8 @@ def test_history_independence_across_order_and_turn_batching(
                 if item.error is None:
                     continue
                 assert isinstance(item.error, RepositoryAnchorPending)
-                assert str(item.error) == "repository anchor candidate"
+                assert str(item.error) == \
+                    "repository anchor candidate is not available yet"
                 assert store.get(item.source) is not None
 
         # The anchor has now arrived. Discharge any proof that was attempted

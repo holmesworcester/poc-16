@@ -72,14 +72,9 @@ class RepositoryReader:
         """Read one hash-verified immutable object through the pinned reader."""
         return verified_object(oid, self.fetch)
 
-    def mint(
-            self, pile_bytes, trusted_now, *, purpose="sync",
-            worker_view=None):
+    def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
         """Run the family authorization hook against this exact root."""
-        worker = worker_view if isinstance(worker_view, WorkerView) \
-            and worker_view.etag == self.etag \
-            and worker_view.anchor == self.workspace else self.worker()
-        return worker.mint(
+        return self.worker().mint(
             pile_bytes, trusted_now, purpose=purpose)
 
     @classmethod

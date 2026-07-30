@@ -148,7 +148,7 @@ def test_atomic_s3_response_keeps_body_and_token_from_one_version():
 
 def test_s3_applied_response_loss_is_unknown_and_recoverable_by_direct_read():
     bucket = FakeS3Bucket()
-    store = S3Store(_s3_config(), client=bucket.client("publisher"))
+    store = S3Store(_s3_config(), client=bucket.client("applier"))
     first = store.cas("root", ABSENT, b"base")
     bucket.drop_after_apply = 1
 

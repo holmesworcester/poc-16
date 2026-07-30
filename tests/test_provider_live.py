@@ -320,7 +320,7 @@ def test_live_r2_presigned_staging_put():
         ingress_bucket=bucket,
         owner="live-provider-conformance",
         broker_name="poc16-live-upload-broker",
-        publisher_name="poc16-live-upload-publisher",
+        applier_name="poc16-live-repository-applier",
         read_permission_group_id="c" * 32,
         write_permission_group_id="d" * 32,
         presign_ttl_seconds=30,

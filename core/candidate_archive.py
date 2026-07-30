@@ -10,7 +10,14 @@ from dataclasses import dataclass
 
 import facts
 
-from . import admission_proof, indexes, merkle_map, settlement, snapshot
+from . import (
+    admission_proof,
+    indexes,
+    merkle_map,
+    repository_snapshot,
+    settlement,
+    snapshot,
+)
 from .fact import decode, encode
 from .object_store import verified_object
 from .shape import fid_of, valid_fid
@@ -208,57 +215,13 @@ def _check_record_projection(records, facts_by_fid):
             raise ValueError("FactRecord projection")
 
 
-def _derived_rows(projected, records, facts_by_fid):
-    def slot(sid):
-        action = projected.actions.get(sid)
-        return {"state": "clear"} if action is None else {
-            "state": "active", "action": action}
-
-    fact_actions, supp = {}, {}
-    for fid in projected.standing:
-        fact, record = facts_by_fid[fid], records[fid]
-        for sid in record["selectors"]:
-            supp[sid] = slot(sid)
-        family = facts.family_for(fact.t)
-        policy = family.POLICY if family is not None else None
-        if policy is not None and policy.direct_targets:
-            sid = indexes.fact_key(fid)
-            fact_actions[indexes.action_key(sid)] = slot(sid)
-        for sid in facts.principal_sids(fact):
-            fact_actions[indexes.action_key(sid)] = slot(sid)
-            supp[sid] = slot(sid)
-
-    for sid, fid in sorted(projected.actions.items()):
-        record = records[fid]
-        if record["state"] != "eligible" \
-                or sid not in facts.action_sids(facts_by_fid[fid]):
-            raise ValueError("action evidence binding")
-        active = {"state": "active", "action": fid}
-        supp[sid] = active
-        fact_actions[indexes.action_key(sid)] = active
-
-    choices = {}
-    for fid, (rank, _) in projected.standing.items():
-        for name, a0, a1 in facts_by_fid[fid].offers():
-            if name in indexes.INTERNAL_INDEXES:
-                raise ValueError("reserved authority offer")
-            for address in ((name, a0, a1), (name, a0, None)):
-                choices.setdefault(address, []).append((rank, fid))
-    authority = {}
-    for address, candidates in choices.items():
-        rank, fid = min(candidates)
-        authority[indexes.need_key(*address)] = {
-            "state": "provider", "fid": fid, "rank": rank}
-    return fact_actions, supp, authority
-
-
 def reconstruct(root_bytes, fetch):
     """Verify and return the complete root-reachable candidate archive."""
     view = CandidateView(root_bytes, fetch)
     fact_rows = _tree_rows(view, indexes.FACT)
     # The other descriptors are part of the same root CAS. Full traversal is
     # maintenance-only, but proves their advertised count/depth metadata before
-    # this snapshot is allowed to seed a new publisher.
+    # this snapshot is allowed to seed a new repository proposal.
     supp_rows = _tree_rows(view, indexes.SUPP)
     authority_rows = _tree_rows(view, indexes.AUTHORITY)
     records = _candidate_records(fact_rows)
@@ -327,7 +290,8 @@ def reconstruct(root_bytes, fetch):
                 facts_by_fid[fid], record)
         })
     fact_actions, expected_supp, expected_authority = \
-        _derived_rows(projected, records, facts_by_fid)
+        repository_snapshot.derived_rows(
+            projected, records, facts_by_fid)
     expected_fact = {
         indexes.fact_key(fid): record for fid, record in records.items()}
     expected_fact.update(expected_postings)

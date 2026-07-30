@@ -10,10 +10,10 @@ import sys
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
+import facts
 import pytest
 
 from adapters.s3 import S3Config
-import facts
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
@@ -511,7 +511,7 @@ def test_list_permission_is_limited_to_gateway_read_namespaces():
     assert "s3:max-keys: 1" in block
 
 
-def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
+def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
     document = policy(
         "workspace-bucket", "tenant", profile="bucket-wide")
     statements = {
@@ -570,23 +570,23 @@ def test_publisher_bucket_guard_denies_deletes_and_unconditional_writes():
     assert guarded_actions.isdisjoint(trusted_replication_actions)
 
 
-def test_single_publisher_policy_names_its_residual_trust_boundary():
-    principal = "arn:aws:iam::123456789012:role/poc16-publisher"
+def test_single_applier_policy_names_its_residual_trust_boundary():
+    principal = "arn:aws:iam::123456789012:role/poc16-applier"
     document = policy(
         "workspace-bucket", "tenant", principal,
-        profile="single-publisher")
+        profile="single-applier")
 
     assert all(
         statement["Principal"] == {"AWS": principal}
         for statement in document["Statement"])
-    with pytest.raises(ValueError, match="does not accept one publisher"):
+    with pytest.raises(ValueError, match="does not accept one applier"):
         policy(
             "workspace-bucket", "tenant", principal,
             profile="bucket-wide")
     with pytest.raises(ValueError, match="principal"):
         policy(
             "workspace-bucket", "tenant",
-            profile="single-publisher")
+            profile="single-applier")
 
 
 def test_deploy_validates_inputs_and_requires_readiness(monkeypatch):

@@ -1,747 +1,360 @@
-# POC-16
-
-POC-16 is a small peer-to-peer workspace engine built around immutable,
-content-addressed facts. Peers reconcile through a passive object-store
-interface; a daemon or edge worker only authenticates requests and serves
-bytes. The implementation includes users and devices, delegated admins,
-messages, Bao-backed attachments, logical deletion, member eviction, rebuild,
-and one-sided synchronization.
-
-The current format is intentionally not backward compatible. `DESIGN.md`
-describes the running format and its remaining limits.
-
-Every ordinary fact and every closed pile canonically names one workspace.
-The sole exception is workspace genesis: it omits `ws` because its own fact id
-is the workspace id. This binding is covered by fact ids and signatures and is
-checked before family dispatch, catalog staging, sync, invite redemption, and
-database-free edge authorization. State written by the earlier ambient-
-workspace format must be rebuilt or migrated out of band; there is no dual
-decoder.
-
-> **Privacy warning:** ordinary fact bodies are plaintext JSON in the object
-> store. Signatures authenticate them but do not encrypt them. Invite blobs
-> are encrypted; message and attachment metadata are not. Do not treat this
-> prototype as an encrypted production messenger.
-
-## Install
-
-Python 3 and PyNaCl are required:
-
-```sh
-python3 -m pip install pynacl pytest
-```
-
-Attachments use the vendored Bao extension:
-
-```sh
-python3 -m pip install ./native/bao_py
-```
-
-The extension is loaded only by attachment operations. Auth, messages, sync,
-and most tests run without it.
-
-The local filesystem and Cloudflare Worker do not import AWS SDK packages.
-Only a host daemon configured for S3 or R2's S3-compatible API needs the
-optional, known-capable provider pair:
-
-```sh
-python3 -m pip install "boto3==1.43.51" "botocore==1.43.51"
-python3 -m adapters.s3.sdk_smoke
-```
-
-## Run
-
-Start a node:
-
-```sh
-python3 -m core daemon ./state/alice --port 7100
-```
-
-In another shell:
-
-```sh
-python3 -m core auth.workspace.create alice
-python3 -m core core.status
-```
-
-`create` prints the workspace id. Commands accept a unique workspace-id
-prefix:
-
-```sh
-python3 -m core content.message.post WORKSPACE general "hello"
-python3 -m core content.message.list WORKSPACE
-python3 -m core content.file.send WORKSPACE general ./photo.jpg
-python3 -m core content.file.list WORKSPACE
-python3 -m core content.file.save WORKSPACE FILE_FID ./photo.jpg
-python3 -m core content.delete.remove WORKSPACE FACT_FID
-python3 -m core auth.removal.evict WORKSPACE MEMBER_NAME
-```
-
-To add a peer, create an invite on the existing node and redeem it against a
-second daemon:
-
-```sh
-python3 -m core auth.user_invite.create WORKSPACE
-python3 -m core --node http://127.0.0.1:7200 auth.user.join INVITE_LINK bob
-```
-
-Nodes synchronize on their daemon cadence. `python3 -m core core.sync
-WORKSPACE` requests an immediate dial, and `core.rebuild WORKSPACE`
-reconstructs eligibility and authenticated/generic indexes around the stable
-local fact catalog and published root. Family queries assemble views directly
-from that catalog. Published-state decisions shared with the CF path use the
-same authenticated trees; SQLite is reserved for client-local intent, query
-assembly, and full repair.
-
-On the host write path, `Node` is a resource container rather than the
-admission engine. `WorkspaceRuntime` orders live pile work and calls one
-workspace-bound `AdmissionMembrane`: that component binds the exact source,
-runs the kernel, retains the historical proof, settles the catalog, obtains
-the root-CAS result, and mints the one-use retirement capability. The daemon,
-sync, and fact families do not own parallel durable entrances.
-
-FactTree is also the authenticated generic query index for current standing.
-It maps a fid to its reconciliation key, rank, resolved dependencies, offers,
-and suppression scopes, and carries ordered posting rows for fact type, key,
-explicit reference, offer candidates, reverse dependencies, and suppression
-impact. A store-only reader can page one address in bounded
-`O(tree depth + returned rows)` object reads without rebuilding SQLite.
-FactOrder is a separate direct `fact.key -> fact object oid` projection for
-eligible ordering and transfer. SuppTree answers exact suppression state, and
-AuthorityTree remains the exact winner cache for ordinary authorization,
-where reading every conflicting candidate would be wasteful.
-
-All four authenticated maps use one canonical bounded radix codec. Leaves
-have hard row and encoded-byte ceilings; larger subtrees split by key bytes,
-not by an author-grindable priority. Exact, neighbor, range-page, and
-root-to-root diff reads verify hashes, authenticated child bounds, and finite
-fetch budgets. Full and incremental construction of the same rows produce the
-same root.
-
-All four authenticated maps use one canonical bounded radix codec. Leaves
-have hard row and encoded-byte ceilings; larger subtrees split by key bytes,
-not by an author-grindable priority. Exact, neighbor, range-page, and
-root-to-root diff reads verify hashes, authenticated child bounds, and finite
-fetch budgets. Full and incremental construction of the same rows produce the
-same root.
-
-The single `ctl/command` endpoint is a trusted node-local control plane.
-Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`
-protocol routes.
-Consequently `content.file.send` and `content.file.save` paths are resolved by
-the daemon process, just like the POC-17 local command model.
-
-### Host S3/R2 object stores
-
-Pass a strict JSON file to `--store-config`; credentials stay outside the file
-and come from boto's environment, shared-config, container, or instance
-credential chain. An Amazon S3 configuration is:
-
-```json
-{
-  "schema": "poc16-host-store-v1",
-  "backend": "s3",
-  "bucket": "my-bucket",
-  "base_prefix": "poc16/tenant",
-  "region_name": "us-west-2"
-}
-```
-
-R2 uses the direct account endpoint derived from `account_id`:
-
-```json
-{
-  "schema": "poc16-host-store-v1",
-  "backend": "r2",
-  "account_id": "0123456789abcdef0123456789abcdef",
-  "bucket": "my-bucket",
-  "base_prefix": "poc16/tenant"
-}
-```
-
-After saving one of those documents as `store.json`, start the host with:
-
-```sh
-python3 -m core daemon ./state/alice --store-config store.json
-```
-
-### Upload path: current and target
-
-The status boundary is:
-
-- **Complete writable production path:** a host daemon receives file objects
-  on its `page` route and a closed fact pile on its `pile` route, then validates,
-  indexes, and publishes them to its configured filesystem, S3, or R2 store.
-- **Implemented but not deployed:** the resumable client sends bodies directly
-  to exact S3/R2 ingress PUT URLs returned by the database-free broker protocol.
-  The strict provider-neutral broker HTTP membrane and both SigV4 translators
-  exist and have realistic fake-provider coverage. Isolated AWS Lambda and
-  Cloudflare Python Worker adapters now serve that membrane; both build as
-  provider artifacts, and the Worker also loads under local workerd.
-- **Still required for a writable serverless path:** the database-free
-  publisher on both providers, notification-outbox dispatch and managed-queue
-  consumption, public front-door configuration, and live end-to-end
-  conformance.
-
-Consequently, the production Lambda and Cloudflare gateways below remain
-read-only, the upload brokers are separate metadata-only deployments, and the
-writable host daemon is still the only complete production publication
-boundary.
-
-The end-to-end direct-to-object-store cloud path is not deployed yet. Its
-kernel-authorized broker core, strict transport-neutral HTTP membrane,
-resumable multi-batch client, and exact AWS and R2 SigV4 translators now exist
-under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
-`deploy/upload_wire.py`, `deploy/upload_client.py`,
-`deploy/upload_journal.py`, `deploy/aws_upload_broker`, and
-`deploy/cloudflare_upload`. The endpoint serves only canonical, bounded
-`POST /upload/open`, `/upload/issue`, and `/upload/finalize` metadata
-documents and returns the broker's exact bearer PUT requests; provider object
-and pile bodies never cross it.
-
-The endpoint is now wired into separate AWS upload-broker Lambda and Cloudflare
-upload-broker Worker packages, but neither has been live-deployed. Neither
-provider has the database-free publisher yet, and the generated Cloudflare
-broker intentionally has no public route. The broker and publisher remain
-absent from the read-only serverless gateway artifacts, so the writable host
-path above remains the only complete production path today.
-
-Once such an endpoint is deployed, the existing generic command transport
-exposes family-owned direct commands:
-
-```sh
-python3 -m core content.message.upload WORKSPACE general "hello" \
-  BROKER_URL PROVIDER_ORIGIN
-python3 -m core content.file.upload WORKSPACE general ./photo.jpg \
-  BROKER_URL PROVIDER_ORIGIN
-python3 -m core content.file.resume_upload WORKSPACE UPLOAD_ID \
-  BROKER_URL PROVIDER_ORIGIN
-```
-
-The local client process authors the ordinary fact closure and keeps an
-immutable source journal under its node directory; it does not admit those
-facts locally or need S3/R2 credentials. The source manifest is separate from
-the mutable session record. That record retains the most advanced
-authenticated cursor, the prefix covered by it, and the smaller prefix whose
-PUTs were acknowledged. A crash after `ISSUE` therefore reissues covered
-authority instead of skipping unuploaded bytes. A create precondition failure
-is never guessed to mean equal: because the PUT capability has no read
-authority, the client abandons that staging session and opens a fresh one.
-`PROVIDER_ORIGIN` is the independently configured exact HTTPS provider
-endpoint for this deployment and ingress bucket (the account endpoint for
-R2). The client rejects a capability for any other origin before opening
-source bytes, so even a compromised broker cannot redirect a PUT to itself or
-an internal HTTPS service.
-
-After proving workspace upload authority, the client receives short-lived
-capabilities for exact broker-chosen upload keys, upload file objects first,
-and finally upload one exact closed-pile publication intent. The selected
-common flow uses session-scoped isolated ingress on both S3 and R2, then lets
-the publisher promote only verified SHA-256 objects. This is the one cloud
-upload protocol, not a fallback from an AWS-specific canonical-write path:
-abandoned and adversarial client bytes remain outside the canonical namespace,
-and clients have one recovery model on both providers.
-
-This is still direct-to-object-store upload: the file and pile bytes travel
-from the client to the ingress bucket, not through the broker, Lambda, or
-Worker. The broker handles only a bounded authorization proof and returns
-bearer PUT requests. Each request binds the exact staging key containing the
-declared SHA-256, an exact length or hard byte ceiling, expiry, and create-only
-semantics; clients receive no LIST, DELETE, or `root` permission. S3 may also
-verify a signed SHA-256 checksum. R2 staging bytes are deliberately treated as
-untrusted until publication. An S3/R2 object-created event, authenticated poke,
-or scheduled scan wakes a database-free publisher. That publisher hashes every
-present object before canonical promotion and validates the pile. It then
-copies the exact verified pile to a fresh internal
-`pile/<member>/<generation>/<sha256>` key that client credentials cannot name.
-The internal generation updates the authenticated trees, CASes `root`, and
-retires only after the committed root proves publication. The original
-client-writable session marker is retained for a separate provider lifecycle
-policy; capability expiry alone is not a deletion proof because a request may
-start before expiry and complete afterward. A lost event or poke affects
-latency, not durability.
-
-Attachment bytes remain detached from fact validity. A missing Bao object
-does not block signed file/chunk facts from publication; the file is simply
-incomplete until a later direct upload or peer sync supplies it. This is the
-same rule used by ordinary replicas. F10 retirement therefore proves durable
-coverage of every admitted fact, not that every attachment byte exists.
-Client-writable staging is not retired by this receipt; its retention and
-eventual cleanup are a separate provider lifecycle obligation.
-
-The AWS translator signs the exact `Content-Length`, `Content-Type`,
-`If-None-Match: *`, and `x-amz-checksum-sha256` headers of one S3 `PutObject`
-request. Browser JavaScript cannot set `Content-Length` itself, so browser
-support remains an opt-in live conformance check: the user agent must emit the
-signed length and the configured S3 CORS policy must admit every
-client-controlled signed header. The deterministic botocore tests do not
-claim to prove that browser/provider boundary.
-
-The pure-stdlib R2 translator returns the same bearer `PUT` shape. It signs the
-path-style account endpoint, ingress bucket, exact class-first key,
-`Content-Length`, `Content-Type`, `If-None-Match: *`, credential scope
-`auto/s3/aws4_request`, and a lifetime rounded down beneath the session
-deadline. Its canonical payload is explicitly `UNSIGNED-PAYLOAD`: the URL is
-an exact staging capability, not proof of the declared SHA-256. Cloudflare's
-[presigned URL documentation][r2-presigned] recommends this single-operation,
-single-object shape and documents `Content-Type`; its presign page does not
-explicitly guarantee signed `Content-Length`, so the checked-in opt-in live
-test remains the direct-provider conformance gate for that header. That urllib
-probe is not browser evidence; browser `Content-Length` and CORS behavior
-remain a separate live obligation.
-
-Every valid candidate that may later regain standing remains durably
-root-reachable. Every kernel-admitted candidate has a stable canonical blob at
-`obj/H(encode(fact))`; an eligible fact's key maps directly to that oid in
-FactOrder. Its authenticated FactTree record names the
-lexicographically smallest complete historical admission-proof DAG the
-replica has verified. Candidate state is exact bytes plus that selected
-witness; current eligibility and dependency edges are a separate derived
-projection. Sync performs that one min-join for eligible and dormant
-candidates; there is no separate action channel or grouped range-pile
-protocol. A cold reader verifies each selected proof by rerunning the actual
-kernel.
-
-Ingress retirement uses a typed compiler/publication result. Every durable
-`Valid` in the exact pile must be constructed into the proposal or inherited
-from its pinned authorized base; only Applied, byte-identical ambiguous-CAS
-readback, or a token-verified no-op can mint the exact source/hash-bound
-retirement receipt. No post-CAS fact scan grants deletion authority. Wiping
-SQLite and rebuilding from root-reachable objects preserves dormant
-candidates and later restoration; proof-less legacy rows are never inferred
-admitted.
-
-The archive removes the persistence blocker for a database-free publisher,
-but the checked-in Lambda and Cloudflare artifacts are not yet wired as
-publishers. They remain readers until their turn coordinator consumes this
-archive, stages direct-upload intent, emits the derived objects, and performs
-the same root-CAS/retirement protocol as the client runtime.
-
-There is no correctness reason to proxy immutable bytes through the publisher
-when the client can write an isolated ingress object directly. The narrower
-boundary is intentional: uploaders may create only the staging objects named
-by their grants, while publishers alone may list ingress, read workspace
-state, create canonical objects and derived index pages, retire proven internal
-piles,
-and CAS `root`. If a provider cannot enforce the exact staging key,
-create-only condition, byte bound, and expiry, the deployment must keep the
-host daemon or put a narrow streaming upload verifier in front of the object
-store rather than grant a broader bucket credential.
-
-The canonical boundary is stricter. As checked on 2026-07-29, R2's
-[S3-compatible `PutObject` table][r2-s3-api] advertises conditional writes and
-`Content-MD5`, but not the flexible SHA-256 checksum needed to protect a
-canonical `obj/<sha256>` name. The [native R2 Worker `put` API][r2-worker-api]
-does accept a SHA-256 checksum and a conditional. POC-16 does not require
-either primitive on the client path: the client writes only isolated ingress,
-and the publisher hashes the stored value before it conditionally creates a
-canonical `obj/<sha256>`. Raw presigned canonical R2 PUTs remain outside the
-selected protocol.
-
-Cloudflare also requires provider-level separation. The broker's parent
-read/write token can read, list, and delete within its bucket even though each
-returned presigned URL authorizes only one exact `PUT`. The parent therefore
-targets only the separate ingress bucket and never the canonical workspace
-bucket. Parent compromise could still erase pre-publication staging. A
-successful staging `PUT` is only a retryable receipt; observation of the
-published root is the durable workspace acknowledgement.
-
-[r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
-[r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
-[r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
-
-### Target mobile push delivery
-
-Mobile push is not implemented. The selected design does not add a PushTree
-and does not make APNs or FCM part of fact publication. Endpoint registrations
-and subscriptions are ordinary validated facts. Subscription selectors are
-published as generic offers. During authenticated fact processing, the cloud
-publisher derives routing addresses from newly activated facts and performs
-an indexed join against the subscriptions and endpoints active in that exact
-post-settlement candidate snapshot. It therefore produces already-resolved
-notification intents without scanning every subscription. Queue workers never
-interpret selectors or rediscover recipients.
-
-After a successful root CAS, the publication turn materializes the resolved
-deliveries as a separate, bounded, create-only
-`push/pile/<push-node>/<generation>/<sha256>` transactional-outbox item. It
-verifies that durable handoff—or proves that the publication has no matching
-deliveries—before retiring the corresponding fact-ingress pile. The outbox is
-self-contained and independent of the original fact pile. A crash before the
-handoff leaves the fact pile available to retry; a failed root CAS creates no
-deliverable notification.
-
-An outbox dispatcher verifies each pile and submits one resolved delivery job
-per endpoint to a managed at-least-once queue. Object-created events may wake
-the dispatcher, while a scheduled bounded `push/pile/` scan recovers lost
-wakeups. That scan is only outbox recovery; the managed queue is the primary
-delivery workset. The dispatcher retires a pile only after durable queue
-acceptance, preserving a residual pile after partial or ambiguous batch
-submission. A duplicate submission carries the same deterministic delivery
-id.
-
-A provider consumer owns the token-decryption key and APNs/FCM credentials.
-It reads the managed queue and sends Apple endpoints directly to APNs and
-Android endpoints directly to FCM. APNs `200` or an FCM message id ends
-POC-16's delivery obligation; device receipt remains best effort under the
-provider's expiration/TTL rules. Timeouts, `429`, and `5xx` use queue
-redelivery with bounded exponential backoff. Invalid-token responses
-terminally discharge the job and feed endpoint invalidation; poison jobs enter
-a dead-letter path with bounded diagnostic evidence. Delivery is at-least-once
-because a provider may accept a request before the consumer crashes without
-acknowledging it.
-
-Push piles, managed-queue jobs, retry leases, and discharge records are
-operational state, not canonical facts, sync input, or published application
-state. Authenticated settlement is the sole subscription and recipient
-authority; neither the dispatcher nor provider consumer maintains another
-subscription database.
-
-### Prepared AWS upload broker
-
-`deploy/aws_upload_broker/` is a real metadata-only Lambda adapter, not a body
-proxy. It normalizes bounded Function URL v2 events into the shared
-`UploadBrokerEndpoint`, reads the canonical authorization closure through a
-narrow S3 reader, loads one provider-bound session key ring from an external
-Secrets Manager secret, and returns exact S3 ingress PUTs. Its role can
-`GetObject` only under the canonical root/object prefix and query-presign
-create-only `PutObject` only under this workspace's isolated ingress prefixes.
-It cannot read, list, or delete ingress; write canonical objects; or CAS root.
-
-The key-ring secret and both buckets are external inputs and survive compute
-removal. Create a provider-bound initial key ring without putting secret bytes
-in argv, stdout, a template, or stack state:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage keyring-create \
-  --name poc16/upload-west-2/session-keyring \
-  --deployment-id upload-west-2 \
-  --issuer aws-upload-production \
-  --ingress-bucket ISOLATED_INGRESS_BUCKET \
-  --expected-owner AWS_ACCOUNT_ID \
-  --region us-west-2
-```
-
-The command returns only the secret ARN and exact version ID needed below.
-Two-phase control-plane rotation remains tracked work. Local tests and a SAM
-build are:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage test
-python3 -m deploy.aws_upload_broker.manage build
-```
-
-Deploy or update the separately owned broker stack with:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage deploy --create \
-  --stack poc16-upload --deployment-id upload-west-2 \
-  --workspace WORKSPACE_ID \
-  --canonical-bucket CANONICAL_BUCKET \
-  --prefix workspaces/WORKSPACE_ID \
-  --ingress-bucket ISOLATED_INGRESS_BUCKET \
-  --issuer aws-upload-production \
-  --keyring-secret-arn SESSION_KEYRING_SECRET_ARN \
-  --keyring-version-id SESSION_KEYRING_VERSION_ID \
-  --expected-owner AWS_ACCOUNT_ID \
-  --region us-west-2
-```
-
-Use `--update` instead of `--create` only for that exactly tagged stack. Safe
-removal targets the observed stack ID and leaves both buckets and the external
-key-ring secret intact:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage remove \
-  --stack poc16-upload --deployment-id upload-west-2 \
-  --region us-west-2
-```
-
-This makes the authorization endpoint deployable, but not the full writable
-cloud path: there is no store-only publisher, event/scheduled drain, or live
-attachment smoke yet.
-
-### Prepared Cloudflare upload boundary
-
-`deploy/cloudflare_upload/` contains a real metadata-only Python Worker around
-the shared broker membrane, plus the generated provider boundary for the
-isolated-ingress choice. It is not yet a complete upload service because its
-publisher remains fail-closed. The broker config has no native R2 binding. It
-expects one S3-compatible credential created from an exact-bucket
-`Object Read only` policy for canonical DAG reads, plus one separate parent
-credential created from an exact ingress-bucket `Object Read & Write` policy.
-The segregated stdlib signer uses only that ingress parent to derive one
-short-lived URL for one exact session-scoped `PutObject`; no temporary
-credential or S3 client is returned to the uploader. The publisher config is
-the only role with native `INGRESS` and `CANONICAL` bindings.
-
-Both providers use one logical staging grammar:
-
-```text
-ingress/v1/workspaces/<ws64>/objects/<nonce32>/<sha256>
-ingress/v1/workspaces/<ws64>/piles/<nonce32>/<member16>/<sha256>
-```
-
-The broker chooses the lowercase-hex session nonce and derives every path
-from validated descriptor authority; the client does not supply a free-form
-key. Objects are uploaded first. The closed pile/intention is uploaded last
-and is the sole durable ready marker. Loose objects do not cause publication,
-and an event for the final pile only reduces wake latency. Object class comes
-before session deliberately: provider lifecycle can collect abandoned
-`objects/` without ever matching an F10-governed `piles/` marker, while a
-scheduled publisher can scan only the marker prefix.
-
-These staging paths never become canonical pile paths. After validation, the
-publisher performs a trusted create-only copy to an independently random
-internal generation. Replaying the same session marker—including a PUT that
-started before credential expiry but completed later—therefore produces, at
-worst, another fresh no-op publication attempt. It cannot recreate a retired
-internal key or make an old receipt destructive. Cleanup of client-writable
-staging is tracked separately; the current lifecycle input still excludes
-`piles/`.
-
-The provider-neutral broker core now implements `OPEN`, `ISSUE`, and
-`FINALIZE`. `OPEN` commits a finite, sorted `(digest, size)` vector under a
-domain-separated Merkle root. A constant-size authenticated cursor then proves
-and issues contiguous batches of at most `PAGE_BATCH`; finalization is
-possible only after the whole committed vector and can issue only the one pile
-digest fixed when the session opened. Replayed or forked cursors may reissue
-already committed exact keys, but cannot enlarge or replace the finite
-authority set. This keeps the broker database-free. A client that loses its
-opaque cursor starts a new session, and lifecycle collection removes the
-abandoned ingress. The client, transport-neutral broker HTTP membrane, AWS
-Function URL adapter, and Cloudflare Python Worker adapter are built. Deployed
-live routes and the database-free publisher remain unbuilt.
-
-This is a provider boundary, not a Python convention: compromising the
-write-capable ingress parent still cannot address the canonical bucket. It is
-also deliberately honest about two limits. Cloudflare's bucket-item write
-parent can overwrite or delete acknowledged staging, and its bucket-item
-read policy includes LIST over the selected bucket. Therefore a deployment
-must use a canonical bucket dedicated to that workspace until a
-provider-enforced workspace-prefix read path exists; setting
-`CANONICAL_PREFIX` alone is not tenant isolation.
-
-Render the two Worker configs, the two exact R2 token-policy inputs, and the
-loose-object-only seven-day lifecycle input with:
-
-```sh
-export CLOUDFLARE_ACCOUNT_ID=32_LOWERCASE_HEX_CHARACTERS
-export CF_UPLOAD_WORKSPACE=64_LOWERCASE_HEX_CHARACTERS
-export CF_UPLOAD_CANONICAL_BUCKET=poc16-one-workspace-canonical
-export CF_UPLOAD_CANONICAL_BUCKET_PROFILE=dedicated-workspace
-export CF_UPLOAD_INGRESS_BUCKET=poc16-untrusted-ingress
-export CF_UPLOAD_DEPLOYMENT_OWNER=my-stable-deployment-id
-export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_GROUP_ID
-export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_GROUP_ID
-export CF_UPLOAD_ISSUER=cloudflare-upload-production
-# Canonical JSON produced by deploy.upload_keyring; keep the old key through
-# every issued cursor's expiry plus clock skew during rotation.
-export UPLOAD_SESSION_KEYRING='...'
-
-python3 -m deploy.cloudflare_upload.manage render
-python3 -m deploy.cloudflare_upload.manage build
-python3 -m deploy.cloudflare_upload.manage test
-```
-
-`test` exercises complete stateless sessions through the production request and
-R2-fetch adapters, performs clean Wrangler bundle checks, and loads the actual
-broker under local workerd. The generated broker is real, but it has no public
-route; the generated publisher is a dedicated fail-closed artifact. After
-`render`, use `generated/access-policies.json` to provision one exact
-canonical-reader token and one exact ingress-parent token through Cloudflare's
-R2 token control plane. Keep their returned S3-compatible access IDs and
-secrets in the deployment secret store, then supply the five broker secrets
-and a Workers control token only to the deploy process:
-
-```sh
-export CANONICAL_READ_ACCESS_KEY_ID='...'
-export CANONICAL_READ_SECRET_ACCESS_KEY='...'
-export INGRESS_PARENT_ACCESS_KEY_ID='...'
-export INGRESS_PARENT_SECRET_ACCESS_KEY='...'
-export UPLOAD_SESSION_KEYRING='...'
-export CLOUDFLARE_API_TOKEN='...'
-
-CF_UPLOAD_CREATE=1 CF_UPLOAD_ENABLE_PARTIAL_DEPLOY=1 \
-  python3 -m deploy.cloudflare_upload.manage deploy
-```
-
-The explicit partial-deploy flag acknowledges that this installs a real
-metadata broker and a fail-closed publisher, with no public route. It is for
-infrastructure testing, not a writable workspace deployment. `remove`
-preflights both exact owner/role markers,
-removes broker then publisher, and never deletes or reconfigures either bucket.
-Deploys also request Wrangler's strict conflict check. That narrows remote
-clobbering but does not make the earlier settings read and later upload one
-atomic operation; concurrent deployment administrators still require the
-external fence tracked in beads.
-The store-only publisher, queue/schedule wakes, lifecycle
-installation/conformance check, public front door, and live R2 proof remain
-tracked work. Cloudflare documents that action-level presigned URLs are
-generated locally and grant one operation on one object; the optional
-direct-provider test checks the exact signed PUT, header substitution, key
-substitution, create-only replay, and privileged readback.
-
-## Cloudflare read-only gateway
-
-The Cloudflare Python Worker is isolated under `deploy/cloudflare_worker`. It
-uses a direct R2 binding for one workspace prefix, imports the canonical
-Python authorization code, and advertises `{"cap":"sync-v1/read"}`. It never
-writes R2, opens SQLite, or exposes pile/poke/control mutations.
-
-Install `uv`, then run its complete host, clean-bundle, and local-workerd
-checks:
-
-```sh
-python3 deploy/cloudflare_worker/manage.py test
-```
-
-Local development uses the placeholder workspace and local R2 bucket in the
-checked-in config. Supply a stable 32-byte base64 grant secret:
-
-```sh
-export GRANT_SECRET=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-python3 deploy/cloudflare_worker/manage.py dev
-```
-
-Production commands generate an ignored Wrangler config and require every
-deployment identity explicitly:
-
-```sh
-export CF_WORKSPACE=64_LOWERCASE_HEX_CHARACTERS
-export CF_STORE_PREFIX=workspaces/$CF_WORKSPACE
-export CF_R2_BUCKET=poc16-production
-export CF_R2_PREVIEW_BUCKET=poc16-preview
-export CF_WORKER_NAME=poc-16-readonly-gateway
-export CF_DEPLOYMENT_OWNER=my-stable-deployment-id
-export CF_ROUTE='gateway.example.com/*'
-export CF_ZONE_NAME=example.com
-export CLOUDFLARE_ACCOUNT_ID=32_LOWERCASE_HEX_CHARACTERS
-export CLOUDFLARE_API_TOKEN=WORKERS_SCRIPTS_READ_AND_WRITE_TOKEN
-export GRANT_SECRET=BASE64_OF_ONE_STABLE_32_BYTE_SECRET
-
-python3 deploy/cloudflare_worker/manage.py build
-CF_CREATE=1 python3 deploy/cloudflare_worker/manage.py deploy
-python3 deploy/cloudflare_worker/manage.py deploy
-python3 deploy/cloudflare_worker/manage.py remove
-```
-
-`deploy` passes the secret through Wrangler's encrypted secret upload and
-never writes it to the generated config. First creation additionally requires
-`CF_CREATE=1`; later deploys and every removal read the Worker settings through
-Cloudflare's direct API and require the exact non-secret
-`CF_DEPLOYMENT_OWNER` marker. Missing, malformed, and mismatched settings fail
-closed before Wrangler can overwrite or delete the named script, and every
-Wrangler mutation has a 120-second deadline. Cloudflare does not make the
-settings read and later script mutation one conditional operation: deploy and
-remove therefore assume one trusted deployment administrator and must be
-externally serialized. The ownership marker prevents accidental targeting; it
-is not a control-plane CAS against a concurrent administrator. Deploy asks
-Wrangler for its strict remote-conflict check, but that check does not replace
-the missing end-to-end control-plane fence. The checked-in
-config has no public route and cannot accidentally target a real bucket.
-A deadline is a client-side bound, not proof that Cloudflare made no change;
-after a timeout, inspect the exact owned script state before deciding whether
-to retry.
-
-`smoke` is an explicit live test: set `CF_LIVE_SMOKE=1` and
-`CF_SMOKE_MINT_FILE` to a Python-generated mint request whose snapshot already
-exists at the configured prefix. It establishes that its random workers.dev
-name is absent before deployment, verifies authorization, and then removes
-that exact name even if Wrangler applied the deployment before reporting a
-failure. Primary and cleanup failures are both reported; neither path changes
-or deletes R2 data.
-
-## AWS Lambda read-only gateway
-
-The AWS package is isolated under `deploy/aws_lambda/`. It requires the AWS
-and SAM CLIs plus Docker. Build and execute the exact SAM artifact under the
-Lambda Python 3.13 x86_64 runtime with:
-
-```sh
-python3 deploy/aws_lambda/manage.py package-smoke
-```
-
-Before publishing, merge a storage-law guard into the existing bucket policy.
-The default profile applies authoritative-key denies to every principal and
-freezes lifecycle-policy mutation for the whole bucket:
-
-```sh
-python3 deploy/aws_lambda/manage.py bucket-policy \
-  --bucket BUCKET --prefix PREFIX
-```
-
-Audit existing lifecycle rules, object tags, ACLs, annotations, and replication
-first; existing tags can already influence lifecycle behavior, and annotations
-are mutable sidecars whose changes do not alter the parent ETag. The guard
-denies direct annotation puts/deletes, both versioned and unversioned ACL
-changes, and ETag-preserving encryption-key changes. Prefer S3 Object
-Ownership's `BucketOwnerEnforced` setting so ACLs are disabled.
-
-The guard does not administer S3 replication. Principals allowed
-`s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:ReplicateTags`,
-`s3:ReplicateObjectAnnotation`, or `s3:ObjectOwnerOverrideToBucketOwner` remain
-trusted. So do administrators able to replace the bucket policy or revoke the
-gateway's KMS-key access. The narrower
-`--profile single-publisher --publisher-principal ARN` form is safe only when
-that ARN is the complete writer set and every other bucket writer, replication
-principal, and administrator is explicitly trusted.
-
-Deploy validates the bucket and prefix locally, builds in SAM's target
-container, installs the hash-locked dependency closure, and requires the
-Function URL to pass a root-backed readiness check:
-
-```sh
-python3 deploy/aws_lambda/manage.py deploy \
-  --create --stack poc16-edge --deployment-id edge-west-2 \
-  --workspace WORKSPACE_ID \
-  --bucket BUCKET --prefix PREFIX --region us-west-2
-```
-
-For a customer-managed SSE-KMS bucket, add the exact `--kms-key-arn`; to
-notify on handled Function URL 5xx responses and invocation-budget alarms,
-add `--alarm-action-arn`. Later deployments use `--update` and refuse to
-target a stack without the original ownership markers. Removal retains the
-external bucket and its objects,
-and refuses to act unless the named stack has the expected account, region,
-deployment tag, and template marker:
-
-```sh
-python3 deploy/aws_lambda/manage.py remove \
-  --stack poc16-edge --deployment-id edge-west-2 --region us-west-2
-```
-
-The deployment ID is a stable, non-secret operator identity stored in both
-stack tags and outputs; another valid POC-16 stack does not match it. Create
-mode proves the name absent immediately before SAM, but that check and SAM's
-create are not one CloudFormation transaction. Operators must serialize
-creation of a chosen friendly name; automated callers should use high-entropy
-names.
-
-## Test and measure
-
-Run the full suite:
+# tiny p2p, POC-16
+
+POC-16 is a fact-DAG repository with one storage format and one receiving
+algorithm across a full peer, AWS Lambda, and a Cloudflare Worker. A hosted
+recipient needs an object store but no database. SQLite exists only as a
+disposable full-client query and authorship accelerator.
+
+The implementation is deliberately strict about authority:
+
+- `PileSender` is the only close/encode/delivery capability. It may use the
+  client projection.
+- `RepositoryApplier` is the only fact-pile-to-root capability. It is
+  database-free and owns immutable establishment, the root CAS, rejection
+  evidence, and retirement of its own internal pile generations.
+- `RepositoryReader` is a pinned, database-free, side-effect-free read
+  capability.
+
+There are two actor compositions:
+
+| actor | capabilities |
+| --- | --- |
+| hosted repository | `RepositoryApplier` + `RepositoryReader` |
+| full P2P node | `PileSender` + the same `RepositoryApplier` + the same `RepositoryReader` |
+
+There is no second receiving path in the full node. A hosted deployment may
+put its Reader-facing broker and Applier in separate least-privilege processes
+or stacks. That is a physical security boundary inside the hosted repository,
+not a third repository actor or state machine.
+
+## Read the code in this order
+
+1. `core/fact.py`, then `facts/`: wire facts and family-owned policy.
+2. `core/kernel.py`: the bounded, database-free closed-pile judgment.
+3. `core/repository_snapshot.py`: the pure candidate-set-to-root compiler.
+4. `core/repository_applier.py`: storage effects and the sole root CAS.
+5. `core/repository_reader.py`, `core/worker.py`: pinned authenticated reads.
+6. `core/pile_sender.py`: client authorship and closure.
+7. `core/node.py`: the full-node composition, not a policy owner.
+8. `deploy/` and `adapters/`: provider translation and packaging only.
+
+[DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
+semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
+
+## Local use
+
+Run the tests:
 
 ```sh
 python3 -m pytest -q
 ```
 
-The latency benchmark measures real hot-post and idle-sync paths:
+Build the optional native Bao verifier used by attachment I/O:
 
 ```sh
-python3 bench/bench_latency.py
+python3 -m pip install ./native/bao_py
 ```
 
-The larger reconciliation benchmark is:
+Start a local node:
 
 ```sh
-python3 bench/bench_sync.py 5000 10000
+python3 -m core daemon ./state --port 7100
 ```
 
-The repository tracks work with `bd`:
+List family-owned commands:
 
 ```sh
-bd prime
-bd ready
-bd show ISSUE_ID
+python3 -m core --commands
 ```
+
+The CLI passes a command path and raw arguments through one generic binder.
+Fact-family modules declare their own commands; `core/cli.py` does not grow a
+branch for every new family.
+
+For example:
+
+```sh
+python3 -m core auth.workspace.create ./alice
+python3 -m core content.message.post WORKSPACE_PREFIX general hello
+python3 -m core content.message.list WORKSPACE_PREFIX
+```
+
+Use `--node URL` to target a non-default local daemon.
+
+## Repository flow
+
+An authored unit follows one path:
+
+```text
+facts command
+    -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
+    -> RepositoryApplier stages a fresh internal generation
+    -> kernel judges the exact closed pile
+    -> pure compiler derives FactTree, SuppTree, AuthorityTree, FactOrder
+    -> immutable objects are conditionally established
+    -> one CAS advances root
+    -> only that exact internal generation may be retired
+    -> RepositoryReader pins the resulting root
+```
+
+Root-CAS losers keep their exact work and retry from the newer root. A lost
+CAS response is reconciled by reading the root. A crash after CAS but before
+retirement replays as a token-checked no-op and then retires. One bad pile
+cannot wedge later pile generations.
+
+## Facts, suppression, and deletion
+
+Each fact family declares its own:
+
+- shape and validation;
+- named needs, refs, and offers;
+- durability;
+- explicit suppression selectors;
+- ownership and direct-action policy;
+- continuing authority liveness.
+
+A suppressible family serializes the exact IDs that may suppress each fact.
+Selectors can name SELF, a parent, a grandparent/ancestor path, or several
+such IDs. A family with no suppression policy serializes no suppression key
+and its facts cannot be suppressed.
+
+`SuppTree` maps a known suppression ID to one of:
+
+- `CLEAR`: the ID exists and has no effective action at this root;
+- `ACTIVE(action_fid)`: the named immutable action is effective.
+
+Absence is not `CLEAR`; a reader that needs an absent slot fails closed.
+This lets a Worker answer exact liveness or suppression questions without
+loading the fact set or rebuilding a database.
+
+Deletion is an ordinary fact. Its named needs prove the actor, its action
+offer names the exact target selector, and the target family must permit that
+action. An admin may delete every directly deletable fact. An owner may
+delete facts owned by the same durable member principal, including facts
+written by any of that member's devices. These are ordinary family checks,
+not special cases in `Node`.
+
+Removal does not retroactively make every later fact invalid. Once removal
+has propagated, peers stop granting that principal new sharing authority.
+Facts accepted by a peer that had not yet learned the removal remain
+legitimate workspace facts. Named needs and their exact admission edges prove
+the historical judgment; commands and remote minting separately consult the
+pinned root's current authority-liveness rows.
+
+## Client persistence
+
+The SQLite client projection is intentionally small:
+
+```text
+facts(fid, blob)                  one current canonical serialization
+fact_index(kind, k0, k1, src)    every lookup and derived projection row
+meta(k, v)                        pinned-root/cache version only
+```
+
+The combined index includes type, canonical fact key, every ref, every family
+offer, structural standing/rank, resolved edges, and active suppression
+actions. Structural standing records historical canonical admission;
+suppression and authority-liveness decide current use. Family queries assemble
+views from those rows. There are no family-specific application tables and no
+SQL receiving authority.
+
+The database can be deleted and rebuilt from a pinned `RepositoryReader`
+without changing `root`. When fact-form versioning is introduced, rebuild
+must hydrate a fact in the current surrounding context and store the current
+serialized form, not preserve an obsolete original encoding.
+
+## Direct object-store upload
+
+Peers do not proxy file bytes through Lambda or a Worker. A broker reads a
+pinned repository root to authorize an upload and returns exact, short-lived,
+create-only PUT capabilities. The client uploads:
+
+1. detached objects to an isolated ingress bucket;
+2. one exact fact pile marker last.
+
+The marker is the durable work item. Notifications and LIST results are
+discovery hints; scheduled bounded rescans are the progress path, and only an
+exact bounded marker read can establish work.
+
+`RepositoryApplier` then:
+
+1. fetches and validates the exact marker;
+2. checks the exact key/session/member/digest binding and that every ordinary
+   fact names the configured workspace (the workspace-genesis fact is the
+   sole ws-less exception);
+3. copies it behind one Applier-minted internal generation;
+4. commits facts through the ordinary pile path;
+5. retires only the internal generation;
+6. promotes referenced attachments in bounded round-robin pages.
+
+The Applier never deletes the client marker. Marker lifecycle is an ingress
+retention policy, separate from the repository's exact internal-retirement
+rule. Missing attachments do not block valid fact admission; immutable page
+receipts and a non-authoritative cursor let concurrent Workers duplicate
+bounded work without skipping completion or corrupting the tree.
+
+The marker's member component names the broker-authenticated upload session,
+not the author of every fact in a relayed closure. Per-fact signatures and
+family needs remain the authority proof.
+
+The broker is a `RepositoryReader` plus a provider signer. It has read-only
+canonical credentials and exposes only exact create-only ingress PUT grants;
+it has no repository mutation route. The Applier alone can mutate the
+canonical bucket.
+
+## Object-store contract
+
+The algorithm depends on properties available from current S3 and R2
+adapters:
+
+- bounded strong reads of an exact key, rejecting one-over before full
+  materialization;
+- create-only immutable writes with collision verification;
+- one linearizable conditional replace of `root`;
+- an opaque version token returned with the exact root bytes;
+- bounded, paginated LIST for discovery only.
+
+`get_bounded` and `list_page` are mandatory store operations, not compatibility
+wrappers around whole-object GET or whole-result LIST.
+
+The opaque provider version token is not the root content hash. Readers use
+the content hash as snapshot identity; Appliers use the opaque token only as
+the compare capability for CAS. Correctness never depends on ETag being
+MD5-like, on LIST ordering beyond the adapter contract, or on a database.
+
+The filesystem adapter is a stronger local implementation of the same
+contract. S3 uses conditional requests through `adapters/s3`; the Cloudflare
+runtime uses the native R2 binding through `adapters/r2/worker.py`.
+
+## AWS deployment
+
+AWS uses two externally owned buckets:
+
+- canonical: `root`, immutable `obj/`, internal `pile/`, and evidence;
+- ingress: client-created objects and pile markers.
+
+The upload broker and repository Applier are separate Lambda stacks so their
+IAM authorities do not overlap.
+
+Prerequisites:
+
+- Python 3.13, AWS CLI, SAM CLI, and credentials for the target account;
+- two distinct buckets;
+- a Secrets Manager upload-session key ring;
+- bucket policies that allow clients only their broker-issued create-only
+  PUTs and allow the Applier role the exact canonical/ingress operations in
+  its template.
+
+Create the broker key ring:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage keyring-create \
+  --name poc16/upload-keyring \
+  --deployment-id DEPLOYMENT \
+  --issuer ISSUER \
+  --ingress-bucket INGRESS_BUCKET \
+  --region REGION \
+  --expected-owner ACCOUNT_ID
+```
+
+That command prints the secret ARN and version ID. Deploy the broker with
+those values:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage deploy --create \
+  --stack poc16-upload-broker \
+  --deployment-id DEPLOYMENT \
+  --workspace WS64 \
+  --canonical-bucket CANONICAL_BUCKET \
+  --prefix workspaces/WS64 \
+  --ingress-bucket INGRESS_BUCKET \
+  --issuer ISSUER \
+  --keyring-secret-arn SECRET_ARN \
+  --keyring-version-id VERSION_ID \
+  --expected-owner ACCOUNT_ID \
+  --region REGION
+```
+
+Deploy the database-free Applier:
+
+```sh
+python3 -m deploy.aws_repository_applier.manage deploy \
+  --stack-name poc16-repository-applier \
+  --deployment-id DEPLOYMENT \
+  --workspace WS64 \
+  --canonical-bucket CANONICAL_BUCKET \
+  --canonical-prefix workspaces/WS64 \
+  --ingress-bucket INGRESS_BUCKET \
+  --expected-owner ACCOUNT_ID \
+  --region REGION
+```
+
+The template installs a one-minute recovery schedule. The handler also
+accepts bounded S3 notification records as hints. Stack removal deletes
+compute and logs only; it does not delete either bucket or the external
+secret.
+
+## Cloudflare deployment
+
+Cloudflare likewise uses distinct canonical and ingress R2 buckets. The
+broker has no native R2 binding: it receives a read-only canonical S3 token
+and an ingress S3 signing token, while its code surface mints only exact
+create-only PUTs. R2 currently gives that parent credential broader object
+mutation authority than the grants the broker exposes; eliminating or
+externally fencing that credential-level gap is tracked as a P0 provider
+hardening bead. The Applier has native bindings to both buckets and a
+one-minute cron.
+
+Set the non-secret deployment inputs:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=ACCOUNT32
+export CF_UPLOAD_WORKSPACE=WS64
+export CF_UPLOAD_CANONICAL_BUCKET=CANONICAL_BUCKET
+export CF_UPLOAD_INGRESS_BUCKET=INGRESS_BUCKET
+export CF_UPLOAD_DEPLOYMENT_OWNER=OWNER
+export CF_UPLOAD_CANONICAL_BUCKET_PROFILE=dedicated-workspace
+export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_PERMISSION_ID32
+export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_PERMISSION_ID32
+export CF_UPLOAD_ISSUER=ISSUER
+```
+
+Set `CLOUDFLARE_API_TOKEN`, the two canonical/ingress S3 credential pairs,
+and `UPLOAD_SESSION_KEYRING`. For first creation set:
+
+```sh
+export CF_UPLOAD_CREATE=1
+```
+
+Render and inspect the exact Worker configs and policy inputs, then test and
+deploy:
+
+```sh
+python3 -m deploy.cloudflare_upload.manage render
+python3 -m deploy.cloudflare_upload.manage test
+python3 -m deploy.cloudflare_upload.manage deploy
+```
+
+Deployment order is Applier then broker. Removal reverses that order and
+preserves both R2 buckets:
+
+```sh
+python3 -m deploy.cloudflare_upload.manage remove
+```
+
+Generated provider claims intentionally say `live_verified: false` until the
+live S3/R2 conformance suite has been run for the selected account and
+credential profile. Building the adapters and deploy artifacts is not a claim
+that this checkout has deployed them.
+
+## Current performance status
+
+The honest `PileSender -> RepositoryApplier -> RepositoryReader` benchmark
+path is wired. It exposed that the snapshot compiler still reconstructs the
+full candidate archive for each commit. That is a correctness-preserving but
+expensive baseline. Incremental compilation must be byte-identical to a full
+compile before it replaces the baseline.
+
+No 50k/200k fact-rate or file-throughput number is asserted here until the
+incremental compiler lands and the benchmark is rerun. The corresponding bead
+requires facts/s at both sizes and MiB/s for file transfer.

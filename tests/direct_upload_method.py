@@ -1389,9 +1389,9 @@ INTEGRATION_SEAMS = (
         "decode_pile",
         "production signed-pile codec refinement"),
     IntegrationSeam(
-        "core/mint.py",
-        "stateless",
-        "production workspace/member/closure authorization refinement"),
+        "facts/__init__.py",
+        "proof_payload",
+        "family-owned ephemeral authorization dispatch"),
     IntegrationSeam(
         "core/pile_sender.py",
         "PileSender",
@@ -1407,7 +1407,7 @@ INTEGRATION_SEAMS = (
     IntegrationSeam(
         "core/daemon.py",
         "Handler.do_PUT",
-        "legacy writable proxy compatibility"),
+        "full-P2P transport into the shared RepositoryApplier"),
     IntegrationSeam(
         "adapters/s3/store.py",
         "S3Store",
@@ -1423,7 +1423,11 @@ INTEGRATION_SEAMS = (
     IntegrationSeam(
         "deploy/aws_lambda/app.py",
         "handler",
-        "segregated future AWS entrypoint"),
+        "segregated AWS RepositoryReader entrypoint"),
+    IntegrationSeam(
+        "deploy/aws_repository_applier/app.py",
+        "handler",
+        "segregated AWS RepositoryApplier entrypoint"),
     IntegrationSeam(
         "deploy/upload_broker.py",
         "UploadBroker",
@@ -1435,7 +1439,11 @@ INTEGRATION_SEAMS = (
     IntegrationSeam(
         "deploy/cloudflare_worker/runtime.py",
         "handle",
-        "segregated future Cloudflare entrypoint"),
+        "segregated Cloudflare RepositoryReader entrypoint"),
+    IntegrationSeam(
+        "deploy/cloudflare_upload/worker/applier_runtime.py",
+        "drain",
+        "segregated Cloudflare RepositoryApplier entrypoint"),
 )
 
 

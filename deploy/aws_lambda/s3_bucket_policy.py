@@ -1,4 +1,4 @@
-"""Render the deny guard to merge into a publisher bucket policy."""
+"""Render the deny guard to merge into a repository bucket policy."""
 import argparse
 import json
 import re
@@ -11,9 +11,9 @@ ARN_RE = re.compile(r"^arn:[^:]+:iam::[0-9]{12}:(?:role|user)/.+$")
 
 
 def policy(
-        bucket, prefix, publisher_principal=None, *,
+        bucket, prefix, applier_principal=None, *,
         profile="bucket-wide", partition="aws"):
-    """Return explicit denies for one declared publisher threat profile.
+    """Return explicit denies for one declared applier threat profile.
 
     ``bucket-wide`` protects the configured authoritative keys from every
     principal while the policy remains attached and freezes lifecycle-policy
@@ -25,29 +25,29 @@ def policy(
     ``ReplicateDelete``, ``ReplicateTags``, ``ReplicateObjectAnnotation``, or
     ``ObjectOwnerOverrideToBucketOwner`` remain trusted.
 
-    ``single-publisher`` is intentionally narrower. It is useful only when the
+    ``single-applier`` is intentionally narrower. It is useful only when the
     named principal is the complete writer set and all other bucket writers
     and administrators are trusted.
     """
     S3Config(bucket=bucket, prefix=prefix)
     validate_key(prefix)
-    if profile not in {"bucket-wide", "single-publisher"}:
+    if profile not in {"bucket-wide", "single-applier"}:
         raise ValueError("bucket policy profile")
     if partition not in {"aws", "aws-us-gov", "aws-cn"}:
         raise ValueError("AWS partition")
-    if profile == "single-publisher":
-        if not isinstance(publisher_principal, str) \
-                or not ARN_RE.fullmatch(publisher_principal):
-            raise ValueError("publisher principal ARN")
-        principal_partition = publisher_principal.split(":", 2)[1]
+    if profile == "single-applier":
+        if not isinstance(applier_principal, str) \
+                or not ARN_RE.fullmatch(applier_principal):
+            raise ValueError("applier principal ARN")
+        principal_partition = applier_principal.split(":", 2)[1]
         if partition != principal_partition:
-            raise ValueError("publisher principal partition")
-        principal = {"AWS": publisher_principal}
-        lifecycle_sid = "DenyPublisherLifecycleMutation"
+            raise ValueError("applier principal partition")
+        principal = {"AWS": applier_principal}
+        lifecycle_sid = "DenyApplierLifecycleMutation"
     else:
-        if publisher_principal is not None:
+        if applier_principal is not None:
             raise ValueError(
-                "bucket-wide profile does not accept one publisher")
+                "bucket-wide profile does not accept one applier")
         principal = "*"
         lifecycle_sid = "DenyLifecycleMutation"
     bucket_arn = f"arn:{partition}:s3:::{bucket}"
@@ -120,9 +120,9 @@ def main(argv=None):
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument(
-        "--profile", choices=("bucket-wide", "single-publisher"),
+        "--profile", choices=("bucket-wide", "single-applier"),
         default="bucket-wide")
-    parser.add_argument("--publisher-principal")
+    parser.add_argument("--applier-principal")
     parser.add_argument(
         "--partition", choices=("aws", "aws-us-gov", "aws-cn"),
         default="aws")
@@ -137,13 +137,13 @@ def main(argv=None):
             "administrators remain trusted")
     else:
         note = (
-            "single-publisher profile: all other writers, replication "
+            "single-applier profile: all other writers, replication "
             "principals, bucket-policy administrators, and KMS-key "
             "administrators remain trusted")
     print(note, file=sys.stderr)
     print(json.dumps(
         policy(
-            args.bucket, args.prefix, args.publisher_principal,
+            args.bucket, args.prefix, args.applier_principal,
             profile=args.profile, partition=args.partition),
         indent=2, sort_keys=True))
 
