@@ -180,12 +180,11 @@ The running cloud deployment is read-only: a host daemon still receives remote
 object/pile PUTs and performs publication. The target write path removes that
 proxy without giving clients root authority. After authorization, a broker
 signs short-lived, exact-key conditional PUT capabilities. A client uploads
-objects first and a closed-pile intent last. A provider-verified deployment
-may write canonical content addresses; an isolated-ingress deployment writes
-session-scoped staging keys and promotes only verified values. Provider
-object-created events, an authenticated poke, and a scheduled fallback may all
-wake interchangeable database-free publishers. Wakeups are advisory; the
-durable pile is the work item. Publishers verify workspace, uploader,
+objects first and a closed-pile intent last into session-scoped isolated
+ingress on both S3 and R2. This is the one selected client protocol.
+Provider object-created events, an authenticated poke, and a scheduled fallback
+may all wake interchangeable database-free publishers. Wakeups are advisory;
+the durable pile is the work item. Publishers verify workspace, uploader,
 checksums, and closure; promote every present referenced attachment object;
 then update the authenticated trees and CAS root. A missing detached blob does
 not block valid facts—the file remains incomplete exactly as it does after
@@ -236,24 +235,22 @@ membership; the broker derives its exact key and signed constraints from a
 fresh workspace-bound authorization decision, and a publisher repeats all
 semantic validation before accepting the resulting pile.
 
-Exact-key attenuation is necessary but not sufficient. Before immutable
-creation, the provider must enforce that the request body has the SHA-256
-digest named by the key, as well as the signed create-only condition and byte
-bound. Otherwise an authorized but malicious uploader can occupy an absent
-legitimate object name with different bytes and turn immutability into a
-permanent denial of publication. A provider-checked SHA-256 checksum or
-equivalent signed-payload construction conforms; `Content-MD5` alone does not.
-When a provider cannot enforce this for a raw presigned PUT, the deployment
-uses a narrowly isolated upload verifier that has conditional-create access
-but still has no root, list, delete, or policy authority.
+Exact-key attenuation is sufficient only for the untrusted ingress boundary.
+The capability binds the staging key containing the declared digest, the
+create-only condition, and the byte bound, but a provider need not prove that
+the received body has that digest. Before immutable canonical creation, the
+publisher streams and hashes the staged body under the same bound. Otherwise
+an authorized but malicious uploader could occupy an absent legitimate
+`obj/<sha256>` name with different bytes and turn immutability into a permanent
+denial of publication. A provider-checked SHA-256 checksum is useful defense in
+depth; `Content-MD5` alone is not the canonical content-address proof.
 
 The current Cloudflare primitives make the distinction concrete. R2's
 [S3-compatible `PutObject` surface][r2-s3-api] advertises `Content-MD5`, not a
 flexible SHA-256 checksum, while the [native Worker binding][r2-worker-api]
 accepts a `sha256` put option and a conditional. Thus a raw presigned canonical
-R2 PUT is not assumed safe: Cloudflare either streams it through an
-upload-only verifier or accepts it directly into isolated staging for later
-verified promotion.
+R2 PUT is not assumed safe or needed: Cloudflare accepts the exact PUT into
+isolated staging, and the publisher verifies it before canonical promotion.
 
 Provider credentials must preserve the same separation. AWS can give a
 presigner a PutObject-only resource policy. R2 can attenuate a child
@@ -309,8 +306,8 @@ new session or ordinary peer blob sync.
 The logical protocol uses isolated ingress on both providers. “Direct” means
 the client sends immutable bytes to S3 or R2 itself; the authorization broker
 does not proxy the body, and the later publisher only validates and promotes
-the stored value. AWS-native canonical PUT remains a possible measured
-optimization, not a second client protocol.
+the stored value. Provider-specific signing and wakeup mechanics do not create
+a second client protocol.
 
 Large sessions stay database-free by fixing their complete authority set
 before any PUT is issued:

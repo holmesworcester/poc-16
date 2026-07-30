@@ -164,23 +164,23 @@ After proving workspace upload authority, a client will receive short-lived
 capabilities for exact broker-chosen upload keys, upload file objects first,
 and finally upload one exact closed-pile publication intent. The selected
 common flow uses session-scoped isolated ingress on both S3 and R2, then lets
-the publisher promote only verified SHA-256 objects. AWS could enforce a
-canonical content-addressed PUT directly, but using that provider-specific
-shortcut would give clients two recovery protocols and put abandoned,
-unvalidated uploads in the canonical namespace; it remains an optimization to
-justify with measurements rather than the default design.
+the publisher promote only verified SHA-256 objects. This is the one cloud
+upload protocol, not a fallback from an AWS-specific canonical-write path:
+abandoned and adversarial client bytes remain outside the canonical namespace,
+and clients have one recovery model on both providers.
 
 This is still direct-to-object-store upload: the file and pile bytes travel
 from the client to the ingress bucket, not through the broker, Lambda, or
 Worker. The broker handles only a bounded authorization proof and returns
-bearer PUT requests. Each request binds a collision-resistant body digest, an
-exact length or hard byte ceiling, expiry, and create-only semantics; clients
-receive no LIST, DELETE, or `root` permission. An S3/R2 object-created event,
-authenticated poke, or scheduled scan wakes a database-free publisher. That
-publisher validates the pile, promotes present verified objects, updates the
-authenticated trees, CASes `root`, and retires ingress only after the
-committed root proves publication. A lost event or poke affects latency, not
-durability.
+bearer PUT requests. Each request binds the exact staging key containing the
+declared SHA-256, an exact length or hard byte ceiling, expiry, and create-only
+semantics; clients receive no LIST, DELETE, or `root` permission. S3 may also
+verify a signed SHA-256 checksum. R2 staging bytes are deliberately treated as
+untrusted until publication. An S3/R2 object-created event, authenticated poke,
+or scheduled scan wakes a database-free publisher. That publisher hashes every
+present object before canonical promotion, validates the pile, updates the
+authenticated trees, CASes `root`, and retires ingress only after the committed
+root proves publication. A lost event or poke affects latency, not durability.
 
 Attachment bytes remain detached from fact validity. A missing Bao object
 does not block signed file/chunk facts from publication; the file is simply
@@ -212,23 +212,24 @@ ingress retirement proves that every durable valid in the pile is represented,
 not only the currently eligible subset.
 
 There is no correctness reason to proxy immutable bytes through the publisher
-when the provider can enforce the complete request. The narrower boundary is
-intentional: uploaders may create only the objects named by their grants,
-while publishers alone may list ingress, read workspace state, create derived
-index pages, retire proven piles, and CAS `root`. If a deployment cannot
-enforce the exact key, create-only condition, body digest, byte bound, and
-expiry, it must use isolated staging, keep the host daemon, or put a narrow
-streaming upload verifier in front of the object store rather than grant a
-broader bucket credential.
+when the client can write an isolated ingress object directly. The narrower
+boundary is intentional: uploaders may create only the staging objects named
+by their grants, while publishers alone may list ingress, read workspace
+state, create canonical objects and derived index pages, retire proven piles,
+and CAS `root`. If a provider cannot enforce the exact staging key,
+create-only condition, byte bound, and expiry, the deployment must keep the
+host daemon or put a narrow streaming upload verifier in front of the object
+store rather than grant a broader bucket credential.
 
-That fallback is concrete on Cloudflare. As checked on 2026-07-29, R2's
+The canonical boundary is stricter. As checked on 2026-07-29, R2's
 [S3-compatible `PutObject` table][r2-s3-api] advertises conditional writes and
 `Content-MD5`, but not the flexible SHA-256 checksum needed to protect a
 canonical `obj/<sha256>` name. The [native R2 Worker `put` API][r2-worker-api]
-does accept a SHA-256 checksum and a conditional, so a write-only streaming
-Worker can verify a canonical upload without owning `root`; alternatively the
-client uploads directly into an isolated ingress bucket and the publisher
-verifies and promotes it. Raw presigned canonical R2 PUTs remain unproven.
+does accept a SHA-256 checksum and a conditional. POC-16 does not require
+either primitive on the client path: the client writes only isolated ingress,
+and the publisher hashes the stored value before it conditionally creates a
+canonical `obj/<sha256>`. Raw presigned canonical R2 PUTs remain outside the
+selected protocol.
 
 Cloudflare also requires provider-level separation. A child R2 credential can
 be limited to `PutObject`, but the broker's current parent read/write token can
