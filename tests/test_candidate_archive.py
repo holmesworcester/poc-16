@@ -1,7 +1,6 @@
 """Authenticated retention and reconstruction of dormant fact candidates."""
+import asyncio
 import json
-import os
-from dataclasses import replace
 
 import pytest
 
@@ -11,43 +10,48 @@ from core import (
     cmds,
     indexes,
     merkle_map,
+    repository_applier,
+    repository_snapshot,
     snapshot,
 )
 from core.candidate_archive import CandidateView, reconstruct
-from core.close import close, encode_pile
+from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon, encode
-from core.ingress import pile_source
-from core.kernel import drain, resolve_deps
 from core.node import Node
-from core.publication import PublicationReceipt
+from core.repository_applier import RepositoryApplier
+from core.repository_reader import RepositoryReader
+from core.store import FsStore
 import core.sync as sync_module
-from core.worker import WorkerView
 from facts.auth.signature import signature
 from facts.content.message import message
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
 
 
-def _source(member, raw):
-    return pile_source(member, raw, h(member.encode() + raw)[:32])
+def run(awaitable):
+    return asyncio.run(awaitable)
+
+
+def _stage_apply(applier, raw, member="feed7feed7feed7f", **options):
+    source = run(applier.stage(member, raw))
+    return source, run(applier.apply(source, **options))
 
 
 def _closed_with(node, workspace, facts, dependencies):
-    new = {fact.fid: fact for fact in facts}
+    """Author a fixture pile through the SQL-permitted sender role."""
+    return node.sender(workspace).pile(facts, dependencies)
 
-    def fact_of(fid):
-        return new.get(fid) or node.candidate_of(workspace, fid)
 
-    def deps_of(fid):
-        if fid in dependencies:
-            return dependencies[fid]
-        fact = fact_of(fid)
-        return resolve_deps(fact, node.idx(workspace)) or ()
-
-    stream = close(facts, deps_of, fact_of)
-    assert drain(stream, workspace).ok
-    return encode_pile(stream, workspace=workspace)
+def _message_pile(node, workspace, text, ts):
+    secret, public = node.identity(workspace)
+    item = message(workspace, public, "general", text, ts)
+    signed = signature(secret, public, item, item.ts)
+    return item, _closed_with(node, workspace, (signed, item), {
+        signed.fid: (),
+        item.fid: (
+            signed.fid, member_src(node, workspace, public)),
+    })
 
 
 def _removed_member_messages(
@@ -69,9 +73,13 @@ def _removed_member_messages(
 
 
 def _root_view(node, workspace):
-    store = node.store(workspace)
-    return CandidateView(
-        store.get("root"), lambda oid: store.get("obj/" + oid))
+    return node.reader(workspace).candidates()
+
+
+def _reader(workspace, store, root=None):
+    root = store.get("root") if root is None else root
+    return RepositoryReader(
+        workspace, root, lambda oid: store.get("obj/" + oid))
 
 
 def _forged_archive(node, workspace, mutate):
@@ -171,53 +179,27 @@ def test_candidate_sync_read_rejects_forged_fact_descriptor(
     (snapshot.FACT_ORDER, *indexes.TREE_NAMES),
 )
 @pytest.mark.parametrize("field", ("count", "depth"))
-def test_incremental_publication_rejects_forged_map_metadata(
+def test_repository_applier_rejects_forged_base_map_metadata(
         tmp_path, name, field):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     cmds.post(node, workspace, "general", "before forgery", ts=10)
+    _, raw = _message_pile(
+        node, workspace, "must not heal forged root", 20)
     store = node.store(workspace)
     body = json.loads(store.get("root"))
     body["maps"][name][field] += 1
     forged = canon(body)
     store._replace("root", forged)
+    source = run(node.applier(workspace).stage(
+        "forgedmetadata00", raw))
+    objects = tuple(store.list("obj/"))
 
     with pytest.raises(ValueError, match="merkle map root metadata"):
-        cmds.post(node, workspace, "general", "must not heal", ts=20)
+        run(node.applier(workspace).apply(source))
     assert store.get("root") == forged
-
-
-@pytest.mark.parametrize("name", indexes.TREE_NAMES)
-@pytest.mark.parametrize("field", ("count", "depth"))
-def test_incremental_index_wiring_rejects_forged_descriptor(
-        tmp_path, name, field):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "before forgery", ts=10)
-    store = node.store(workspace)
-    committed = snapshot.decode_root(store.get("root"))
-    previous = {
-        tree: dict(committed.maps[tree])
-        for tree in indexes.TREE_NAMES
-    }
-    previous[name][field] += 1
-    emitted = []
-
-    def emit(raw):
-        emitted.append(raw)
-        return h(raw)
-
-    with pytest.raises(ValueError, match="merkle map root metadata"):
-        indexes.build(
-            workspace,
-            node.idx(workspace),
-            emit,
-            previous=previous,
-            fetch=lambda oid: store.get("obj/" + oid),
-            changed_fids=(),
-            candidate_fids=(),
-        )
-    assert emitted == []
+    assert store.get(source) == raw
+    assert tuple(store.list("obj/")) == objects
 
 
 def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
@@ -230,25 +212,31 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     first_ts = node.candidate_of(workspace, eviction).ts + 1
     raw, dormant = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 11, first_ts)
-    source = _source("hostile00000000", raw)
-    node.store(workspace).put_if_absent(source, raw)
+    applier = node.applier(workspace)
+    source = run(applier.stage("hostile00000000", raw))
+    store = node.store(workspace)
 
     # F10 covers every durable kernel Valid, not only current eligibility.
     # The old root has no FactRecord for this independently valid pile, so it
     # cannot authorize destructive retirement.
-    with pytest.raises(ValueError, match="published ingress capability"):
-        node.admission(workspace).retire(source, raw, None)
-    assert node.store(workspace).get(source) == raw
+    with pytest.raises(ValueError, match="repository retirement receipt"):
+        run(applier.retire(source, raw, None))
+    assert store.get(source) == raw
 
-    node.turn(workspace)
-    assert node.store(workspace).get(source) is None
-    assert all(node.fact_of(workspace, fact.fid) is None for fact in dormant)
-    assert all(
-        node.candidate_of(workspace, fact.fid) == fact for fact in dormant)
+    result = run(applier.apply(source))
+    assert result.status == "applied"
+    assert result.retired is True
+    assert store.get(source) is None
+    cold = _reader(workspace, store)
+    for fact in dormant:
+        assert cold.candidates().fact_record(fact.fid)["state"] == "dormant"
+        assert cold.candidates().fact(fact.fid) == fact
 
-    before_full = node.store(workspace).get("root")
-    node.admission(workspace).publish(reuse=False)
-    assert node.store(workspace).get("root") == before_full
+    before_noop = store.get("root")
+    _, replay = _stage_apply(applier, raw, member="hostile00000000")
+    assert replay.status == "noop"
+    assert replay.retired is True
+    assert store.get("root") == before_noop
 
     live_fid = cmds.post(
         node, workspace, "general", "one eligible", ts=first_ts + 100)
@@ -260,10 +248,7 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         assert view.fact(fact.fid) == fact
         view.verify(fact.fid)
 
-    worker = WorkerView.from_root(
-        node.store(workspace).get("root"),
-        lambda oid: node.store(workspace).get("obj/" + oid),
-    )
+    worker = node.reader(workspace).worker()
     ordinary = worker.postings(
         catalog.TYPE_INDEX, "msg", "", limit=1)
     assert [(row.state, row.fid) for row in ordinary.rows] == [
@@ -284,24 +269,18 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         fact.fid for fact in dormant}
     assert len(rows) == len(dormant) + 1
 
-    expected_root = node.store(workspace).get("root")
-    expected = reconstruct(
-        expected_root,
-        lambda oid: node.store(workspace).get("obj/" + oid),
-    )
+    expected_root = store.get("root")
+    expected = _reader(workspace, store, expected_root).archive()
     assert set(expected.records) >= {fact.fid for fact in dormant}
 
-    # SQLite is a rebuildable accelerator. The root, trees, proof DAGs, range
-    # leaves, and dormant blobs alone reconstruct the same retained catalog.
-    index_path = tmp_path / "node" / "ws" / f"{workspace}.idx.db"
-    node.idx(workspace).close()
-    node._idx.pop(workspace)
-    os.unlink(index_path)
-    node.rebuild(workspace)
-    assert node.store(workspace).get("root") == expected_root
-    assert all(
-        node.candidate_of(workspace, fact.fid) == fact for fact in dormant)
-    assert all(node.fact_of(workspace, fact.fid) is None for fact in dormant)
+    # A fresh recipient reader reconstructs dormant bodies and eligibility
+    # using only the pinned root and immutable object fetches.
+    rebuilt = _reader(workspace, store, expected_root)
+    assert rebuilt.root_bytes == expected_root
+    for fact in dormant:
+        assert rebuilt.candidates().fact(fact.fid) == fact
+        assert rebuilt.candidates().fact_record(fact.fid)[
+            "state"] == "dormant"
 
 
 @pytest.mark.parametrize(
@@ -332,8 +311,8 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
     first_ts = node.candidate_of(workspace, eviction).ts + 1
     raw, dormant_messages = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 1, first_ts)
-    deliver(node, workspace, raw)
-    node.turn(workspace)
+    _, admitted = _stage_apply(node.applier(workspace), raw)
+    assert admitted.status == "applied"
     dormant = dormant_messages[0].fid
 
     def mutate(rows):
@@ -370,8 +349,7 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
         reconstruct(forged, fetch)
 
 
-def test_admission_proofs_are_raw_free_and_legacy_rows_are_not_blessed(
-        tmp_path):
+def test_admission_proofs_are_raw_free_and_hash_authenticated(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     marker = "raw-body-must-not-be-in-the-proof"
@@ -392,30 +370,6 @@ def test_admission_proofs_are_raw_free_and_legacy_rows_are_not_blessed(
     with pytest.raises(ValueError, match="object integrity"):
         _root_view(node, workspace).verify(fid)
     store._replace("obj/" + record["admission"], proof_raw)
-
-    # A locally retained pre-cut row with no kernel proof remains visible only
-    # as distinguishable legacy data. Rebuild cannot infer admission from raw.
-    secret, public = node.identity(workspace)
-    legacy = message(workspace, public, "general", "proofless", 20)
-    index = node.idx(workspace)
-    index.execute(
-        "INSERT INTO facts VALUES(?,?)", (legacy.fid, encode(legacy)))
-    index.executemany(
-        "INSERT INTO fact_index VALUES(?,?,?,?)",
-        catalog.index_rows(legacy),
-    )
-    index.commit()
-    root = store.get("root")
-    assert node.candidate_of(workspace, legacy.fid) == legacy
-    assert node.catalog(workspace).admitted(legacy.fid) is None
-
-    node.rebuild(workspace)
-
-    assert store.get("root") == root
-    assert node.candidate_of(workspace, legacy.fid) == legacy
-    assert node.catalog(workspace).admitted(legacy.fid) is None
-    with pytest.raises(ValueError, match="missing FactRecord"):
-        _root_view(node, workspace).fact_record(legacy.fid)
 
 
 def test_admission_proof_traversal_enforces_every_budget_and_graph_guard(
@@ -733,247 +687,127 @@ def test_compiler_omission_cannot_advance_root_or_retire_pile(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    secret, public = node.identity(workspace)
-    item = message(workspace, public, "general", "must be represented", 10)
-    signed = signature(secret, public, item, item.ts)
-    raw = _closed_with(node, workspace, (signed, item), {
-        signed.fid: (),
-        item.fid: (
-            signed.fid, member_src(node, workspace, public)),
-    })
-    source = _source("compiler000000", raw)
+    item, raw = _message_pile(
+        node, workspace, "must be represented", 10)
     store = node.store(workspace)
-    store.put_if_absent(source, raw)
+    applier = node.applier(workspace)
+    source = run(applier.stage("compiler000000", raw))
     root = store.get("root")
-    build = indexes.build
+    objects = tuple(store.list("obj/"))
+    compile_snapshot = repository_applier.compile_snapshot
     cas = store.cas
     cas_calls = []
 
     def omit(*args, **kwargs):
-        result = build(*args, **kwargs)
-        return indexes.IndexBuild(
-            result.seed,
-            result.trees,
-            result.represented - {item.fid},
+        result = compile_snapshot(*args, **kwargs)
+        records = dict(result.records)
+        records.pop(item.fid)
+        return repository_snapshot.CompiledSnapshot(
+            result.root,
+            result.outbox,
+            records,
+            result.projection,
         )
 
     def observed_cas(*args, **kwargs):
         cas_calls.append((args, kwargs))
         return cas(*args, **kwargs)
 
-    monkeypatch.setattr(indexes, "build", omit)
+    monkeypatch.setattr(repository_applier, "compile_snapshot", omit)
     monkeypatch.setattr(store, "cas", observed_cas)
 
-    assert node.turn(workspace) == []
+    with pytest.raises(
+            ValueError, match="repository proposal omitted admission"):
+        run(applier.apply(source))
     assert store.get("root") == root
     assert store.get(source) == raw
     assert cas_calls == []
-    assert node.fact_of(workspace, item.fid) is None
+    assert tuple(store.list("obj/")) == objects
+    with pytest.raises(ValueError, match="missing FactRecord"):
+        _reader(workspace, store).candidates().fact_record(item.fid)
 
 
-def test_incremental_publication_does_not_enumerate_candidate_corpus(
-        tmp_path, monkeypatch):
+def test_f10_retirement_is_exact_per_generation_and_noop(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    monkeypatch.setattr(
-        catalog.Catalog,
-        "publication_ids",
-        lambda *_args, **_kwargs: pytest.fail(
-            "incremental publication enumerated all candidates"),
-    )
-
-    fid = cmds.post(
-        node, workspace, "general", "point delta", ts=10)
-
-    assert node.fact_of(workspace, fid) is not None
-
-
-def test_incremental_publication_does_not_reensure_old_fact_bodies(
-        tmp_path, monkeypatch):
-    """A changed range inherits point residences from its pinned old root."""
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    for ts in range(2, 18):
-        cmds.post(node, workspace, "general", f"old-{ts}", ts=ts)
-    before = set(node.catalog(workspace).admitted_ids())
-    old_objects = {
-        "obj/" + h(encode(node.candidate_of(workspace, fid)))
-        for fid in before
-    }
+    item, raw = _message_pile(node, workspace, "receipt", 10)
     store = node.store(workspace)
-    put_if_absent = store.put_if_absent
-    creates = []
+    applier = node.applier(workspace)
+    first = run(applier.stage("first00000000000", raw))
+    applied = run(applier.apply(first, retire=False))
+    assert applied.status == "applied"
+    assert store.get(first) == raw
 
-    def observed(key, raw):
-        creates.append(key)
-        return put_if_absent(key, raw)
+    second = run(applier.stage("wrong00000000000", raw))
+    noop = run(applier.apply(second))
+    assert noop.status == "noop"
+    assert noop.retired is True
+    assert store.get(second) is None
+    assert store.get(first) == raw
 
-    monkeypatch.setattr(store, "put_if_absent", observed)
-    cmds.post(node, workspace, "general", "one delta", ts=20)
-
-    after = set(node.catalog(workspace).admitted_ids())
-    new_objects = {
-        "obj/" + h(encode(node.candidate_of(workspace, fid)))
-        for fid in after - before
-    }
-    assert old_objects.isdisjoint(creates)
-    assert new_objects
-    assert all(creates.count(key) == 1 for key in new_objects)
-
-
-def test_exact_publication_receipt_binds_source_and_noop(
-        tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    secret, public = node.identity(workspace)
-    item = message(workspace, public, "general", "receipt", 10)
-    signed = signature(secret, public, item, item.ts)
-    raw = _closed_with(node, workspace, (signed, item), {
-        signed.fid: (),
-        item.fid: (
-            signed.fid, member_src(node, workspace, public)),
-    })
-    first = _source("first00000000000", raw)
-    store = node.store(workspace)
-    store.put_if_absent(first, raw)
-    admission = node.admission(workspace).admit_ingress(first, raw)
-
-    receipt = node.admission(workspace).commit_ingress(admission)
-    assert receipt.outcome == "applied"
-
-    wrong = _source("wrong00000000000", raw)
-    store.put_if_absent(wrong, raw)
-    with pytest.raises(ValueError, match="published ingress capability"):
-        node.admission(workspace).retire(wrong, raw, receipt)
-    assert store.get(wrong) == raw
-    node.admission(workspace).retire(first, raw, receipt)
+    # A cold applier can discharge the retained exact generation only by
+    # proving its admitted candidate through the current root.
+    replay = run(RepositoryApplier(workspace, store).apply(first))
+    assert replay.status == "noop"
+    assert replay.retired is True
     assert store.get(first) is None
-
-    admission = node.admission(workspace).admit_ingress(wrong, raw)
-    noop = node.admission(workspace).commit_ingress(admission)
-    assert noop.outcome == "noop"
-    node.admission(workspace).retire(wrong, raw, noop)
-    assert store.get(wrong) is None
+    assert _reader(workspace, store).candidates().fact(item.fid) == item
 
 
-def test_caller_constructed_publication_receipt_cannot_retire_ingress(
+def test_concurrent_appliers_rebase_without_retiring_the_stale_pile(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    raw = encode_pile((), workspace=workspace)
-    source = _source("forged0000000000", raw)
-    store = node.store(workspace)
-    store.put_if_absent(source, raw)
-
-    forged = PublicationReceipt(
-        workspace=workspace,
-        root=store.get("root"),
-        admitted=(),
-        outcome="noop",
-        source=source,
-        payload=h(raw),
-        generation=source.split("/")[2],
-        issuer=object(),
-    )
-    with pytest.raises(ValueError, match="published ingress capability"):
-        node.admission(workspace).retire(source, raw, forged)
-    assert store.get(source) == raw
-
-    genuine = node.admission(workspace).commit_ingress(
-        node.admission(workspace).admit_ingress(source, raw))
-    # Copying all fields, including the hidden issuer, still does not mint a
-    # second capability: only the exact object registered by commit_ingress
-    # crosses the destructive door.
-    copied = replace(genuine)
-    with pytest.raises(ValueError, match="published ingress capability"):
-        node.admission(workspace).retire(source, raw, copied)
-    assert store.get(source) == raw
-
-    node.admission(workspace).retire(source, raw, genuine)
-    assert store.get(source) is None
-
-
-def test_bound_admissions_cannot_cross_nodes_or_piles(
-        tmp_path, monkeypatch):
     seed = Node(str(tmp_path / "seed"))
     workspace = cmds.create(seed, "alice", ts=1)
-    secret, public = seed.identity(workspace)
-    provider = member_src(seed, workspace, public)
     base = closed_subset(seed, workspace, all_fids(seed, workspace))
-    raws = []
-    for text, ts in (("pile A", 10), ("pile B", 11)):
-        item = message(workspace, public, "general", text, ts)
-        signed = signature(secret, public, item, item.ts)
-        raws.append(_closed_with(seed, workspace, (signed, item), {
-            signed.fid: (),
-            item.fid: (signed.fid, provider),
-        }))
+    first, first_raw = _message_pile(seed, workspace, "pile A", 10)
+    second, second_raw = _message_pile(seed, workspace, "pile B", 11)
 
-    nodes, admissions, sources = [], [], []
-    for ordinal, raw in enumerate(raws):
-        node = Node(str(tmp_path / f"worker-{ordinal}"))
-        node.add_workspace(workspace, "shared", [])
-        deliver(node, workspace, base)
-        node.turn(workspace)
-        source = _source(f"worker{ordinal:010d}", raw)
-        node.store(workspace).put_if_absent(source, raw)
-        nodes.append(node)
-        sources.append(source)
-        admissions.append(
-            node.admission(workspace).admit_ingress(source, raw))
+    store = FsStore(str(tmp_path / "shared"))
+    bootstrap = RepositoryApplier(workspace, store)
+    _, bootstrapped = _stage_apply(bootstrap, base)
+    assert bootstrapped.status == "applied"
 
-    first, second = nodes
-    first_store, second_store = (
-        first.store(workspace), second.store(workspace))
-    first_store.put_if_absent(sources[1], raws[1])
-    first_root = first_store.get("root")
-    first_objects = tuple(first_store.list("obj/"))
-    cas = first_store.cas
-    cas_calls = []
+    worker_a = RepositoryApplier(workspace, store)
+    worker_b = RepositoryApplier(workspace, store)
+    source_a = run(worker_a.stage("worker0000000000", first_raw))
+    source_b = run(worker_b.stage("worker0000000001", second_raw))
+    proposal_a = run(worker_a.propose(first_raw))
+    proposal_b = run(worker_b.propose(second_raw))
 
-    def observed_cas(*args, **kwargs):
-        cas_calls.append((args, kwargs))
-        return cas(*args, **kwargs)
+    won = run(worker_a.commit(source_a, first_raw, proposal_a))
+    lost = run(worker_b.commit(source_b, second_raw, proposal_b))
+    assert won.status == "applied"
+    assert lost.status == "stale"
+    assert store.get(source_a) == first_raw
+    assert store.get(source_b) == second_raw
 
-    monkeypatch.setattr(first_store, "cas", observed_cas)
-    forged = replace(
-        admissions[0],
-        source=sources[1],
-        raw=raws[1],
-    )
-    with pytest.raises(ValueError, match="bound ingress capability"):
-        first.admission(workspace).commit_ingress(forged)
-    assert first.admission(workspace).pending(
-        sources[1], raws[1]) is None
+    retried = run(RepositoryApplier(
+        workspace, store).apply(source_b))
+    assert retried.status == "applied"
+    assert retried.retired is True
+    assert store.get(source_b) is None
+    assert store.get(source_a) == first_raw
 
-    with pytest.raises(ValueError, match="bound ingress capability"):
-        first.admission(workspace).commit_ingress(admissions[1])
-
-    assert cas_calls == []
-    assert first_store.get("root") == first_root
-    assert tuple(first_store.list("obj/")) == first_objects
-    assert first_store.get(sources[0]) == raws[0]
-    assert first_store.get(sources[1]) == raws[1]
-    assert second_store.get(sources[1]) == raws[1]
-
-    first_receipt = first.admission(workspace).commit_ingress(admissions[0])
-    first.admission(workspace).retire(
-        sources[0], raws[0], first_receipt)
-    assert first_store.get(sources[0]) is None
-    assert second_store.get(sources[1]) == raws[1]
+    recovered = run(RepositoryApplier(
+        workspace, store).apply(source_a))
+    assert recovered.status == "noop"
+    assert recovered.retired is True
+    assert store.get(source_a) is None
+    archive = _reader(workspace, store).archive()
+    assert {first.fid, second.fid} <= set(archive.records)
 
 
-def test_empty_closed_pile_retires_under_typed_noop_receipt(tmp_path):
+def test_empty_closed_pile_retires_after_root_checked_noop(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     raw = encode_pile((), workspace=workspace)
-    source = _source("empty0000000000", raw)
     store = node.store(workspace)
     root = store.get("root")
-    store.put_if_absent(source, raw)
+    source, result = _stage_apply(
+        node.applier(workspace), raw, member="empty0000000000")
 
-    assert node.turn(workspace) == []
-
+    assert result.status == "noop"
+    assert result.retired is True
     assert store.get(source) is None
     assert store.get("root") == root
 
@@ -983,60 +817,57 @@ def test_rootless_pile_retries_after_bootstrap_and_then_retires(tmp_path):
     workspace = cmds.create(seed, "alice", ts=1)
     bootstrap = closed_subset(seed, workspace, all_fids(seed, workspace))
 
-    node = Node(str(tmp_path / "rootless"))
-    node.add_workspace(workspace, "rootless", peers=[])
+    store = FsStore(str(tmp_path / "rootless"))
+    applier = RepositoryApplier(workspace, store)
     raw = encode_pile((), workspace=workspace)
-    source = _source("rootless00000000", raw)
-    store = node.store(workspace)
-    store.put_if_absent(source, raw)
-
-    assert node.turn(workspace) == []
+    source = run(applier.stage("rootless00000000", raw))
+    pending = run(applier.apply(source))
+    assert pending.status == "rootless"
+    assert pending.retired is False
     assert store.get("root") is None
     assert store.get(source) == raw
-    assert node.admission(workspace).pending(source, raw) is None
 
-    deliver(node, workspace, bootstrap, member="0000000000000000")
-    node.turn(workspace)
-    node.turn(workspace)
+    _, bootstrapped = _stage_apply(
+        applier, bootstrap, member="0000000000000000")
+    assert bootstrapped.status == "applied"
+    retried = run(RepositoryApplier(workspace, store).apply(source))
 
     assert store.get("root") is not None
+    assert retried.status == "noop"
+    assert retried.retired is True
     assert store.get(source) is None
     assert store.list("pile/") == []
 
 
-def test_applied_receipt_survives_a_later_root_advance(tmp_path):
+def test_crash_after_apply_survives_a_later_root_advance(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    secret, public = node.identity(workspace)
-    item = message(workspace, public, "general", "definite CAS", 10)
-    signed = signature(secret, public, item, item.ts)
-    raw = _closed_with(node, workspace, (signed, item), {
-        signed.fid: (),
-        item.fid: (
-            signed.fid, member_src(node, workspace, public)),
-    })
-    source = _source("applied000000000", raw)
+    item, raw = _message_pile(
+        node, workspace, "definite CAS", 10)
+    later, later_raw = _message_pile(
+        node, workspace, "later root", 11)
     store = node.store(workspace)
-    store.put_if_absent(source, raw)
-    receipt = node.admission(workspace).commit_ingress(
-        node.admission(workspace).admit_ingress(source, raw))
-    assert receipt.outcome == "applied"
+    applier = node.applier(workspace)
+    source = run(applier.stage("applied000000000", raw))
+    applied = run(applier.apply(source, retire=False))
+    assert applied.status == "applied"
+    assert store.get(source) == raw
 
-    # Candidate retention is monotone. A second real publication cannot undo
-    # the definite Applied event that discharged the first pile obligation.
-    later = message(workspace, public, "general", "later root", 11)
-    later_signature = signature(secret, public, later, later.ts)
-    later_raw = _closed_with(node, workspace, (later_signature, later), {
-        later_signature.fid: (),
-        later.fid: (
-            later_signature.fid, member_src(node, workspace, public)),
-    })
-    later_source = _source("later00000000000", later_raw)
-    store.put_if_absent(later_source, later_raw)
-    later_receipt = node.admission(workspace).commit_ingress(
-        node.admission(workspace).admit_ingress(later_source, later_raw))
-    assert later_receipt.root != receipt.root
-    node.admission(workspace).retire(source, raw, receipt)
+    later_source, advanced = _stage_apply(
+        RepositoryApplier(workspace, store),
+        later_raw,
+        member="later00000000000",
+    )
+    assert advanced.status == "applied"
+    assert advanced.root != applied.root
+    assert store.get(later_source) is None
+
+    # Candidate retention is monotone. A cold replay after the later CAS
+    # proves the first pile represented and retires only that generation.
+    replay = run(RepositoryApplier(workspace, store).apply(source))
+    assert replay.status == "noop"
+    assert replay.retired is True
     assert store.get(source) is None
-    node.admission(workspace).retire(
-        later_source, later_raw, later_receipt)
+    reader = _reader(workspace, store)
+    assert reader.candidates().fact(item.fid) == item
+    assert reader.candidates().fact(later.fid) == later
