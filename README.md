@@ -270,17 +270,17 @@ before session deliberately: provider lifecycle can collect abandoned
 `objects/` without ever matching an F10-governed `piles/` marker, while a
 scheduled publisher can scan only the marker prefix.
 
-One broker call is currently bounded to `PAGE_BATCH` descriptors and creates a
-fresh session, so it is not yet the multi-thousand-object client protocol. The
-target opens a session by committing a finite, sorted `(digest, size)` vector
-under a domain-separated Merkle root. A constant-size authenticated cursor
-then proves and issues contiguous batches of at most `PAGE_BATCH`; finalization
-is possible only after the whole committed vector and can issue only the one
-pile digest fixed when the session opened. Replayed or forked cursors may
-reissue already committed exact keys, but cannot enlarge or replace the finite
+The provider-neutral broker core now implements `OPEN`, `ISSUE`, and
+`FINALIZE`. `OPEN` commits a finite, sorted `(digest, size)` vector under a
+domain-separated Merkle root. A constant-size authenticated cursor then proves
+and issues contiguous batches of at most `PAGE_BATCH`; finalization is
+possible only after the whole committed vector and can issue only the one pile
+digest fixed when the session opened. Replayed or forked cursors may reissue
+already committed exact keys, but cannot enlarge or replace the finite
 authority set. This keeps the broker database-free. A client that loses its
 opaque cursor starts a new session, and lifecycle collection removes the
-abandoned ingress.
+abandoned ingress. The deployed endpoint, end-user multi-batch uploader, and
+publisher remain unbuilt.
 
 This is a provider boundary, not a Python convention: compromising the
 write-capable ingress parent still cannot address the canonical bucket. It is

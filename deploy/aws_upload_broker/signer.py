@@ -6,11 +6,11 @@ import re
 from urllib.parse import parse_qs, urlsplit
 
 from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
+from core.staged_intent import staging_key
 from deploy.upload_broker import (
     AuthorizedPut,
     UPLOAD_CONTENT_TYPE,
     UploadCapability,
-    staging_key,
 )
 
 
@@ -145,7 +145,7 @@ def _endpoint_host(client):
     return parsed.hostname
 
 
-def _inspect_url(url, put, config, client, headers):
+def _inspect_url(url, put, config, client, headers, ttl_seconds):
     try:
         parsed = urlsplit(url)
         query = parse_qs(
@@ -163,7 +163,7 @@ def _inspect_url(url, put, config, client, headers):
         raise RuntimeError("S3 presigner query shape")
     if any(len(values) != 1 for values in query.values()) \
             or _one(query, "X-Amz-Algorithm") != "AWS4-HMAC-SHA256" \
-            or _one(query, "X-Amz-Expires") != str(config.ttl_seconds) \
+            or _one(query, "X-Amz-Expires") != str(ttl_seconds) \
             or not _SIGNATURE_RE.fullmatch(
                 _one(query, "X-Amz-Signature")):
         raise RuntimeError("S3 presigner query authority")
@@ -188,9 +188,23 @@ def _inspect_url(url, put, config, client, headers):
     except (TypeError, ValueError) as error:
         raise RuntimeError("S3 presigner timestamp") from error
     expires_at_ms = (
-        int(issued.timestamp()) + config.ttl_seconds) * 1000
+        int(issued.timestamp()) + ttl_seconds) * 1000
     return UploadCapability(
         "PUT", url, headers, expires_at_ms)
+
+
+def _presign(client, put, config, headers, ttl_seconds):
+    try:
+        url = client.generate_presigned_url(
+            "put_object",
+            Params=_params(put, config, headers),
+            ExpiresIn=ttl_seconds,
+            HttpMethod="PUT",
+        )
+    except Exception as error:
+        raise RuntimeError("S3 presigning failed") from error
+    return _inspect_url(
+        url, put, config, client, headers, ttl_seconds)
 
 
 class S3UploadSigner:
@@ -200,6 +214,12 @@ class S3UploadSigner:
         if not isinstance(config, S3UploadConfig):
             raise TypeError("S3 upload config")
         self.config = config
+        self.provider_binding = ":".join((
+            "aws-s3-v1",
+            config.region_name,
+            config.bucket,
+            config.expected_bucket_owner or "bucket-owner-unpinned",
+        ))
         self.client = _new_client(config) if client is None else client
         if not callable(
                 getattr(self.client, "generate_presigned_url", None)):
@@ -216,21 +236,41 @@ class S3UploadSigner:
                     put.digest,
                 ) \
                 or put.content_type != UPLOAD_CONTENT_TYPE \
-                or type(put.size) is not int or put.size < 0:
+                or type(put.size) is not int or put.size < 0 \
+                or type(put.not_after_ms) is not int \
+                or put.not_after_ms < 0:
             raise ValueError("authorized S3 upload")
         maximum = MAX_OBJECT_BYTES \
             if put.object_class == "obj" else MAX_PILE_BYTES
         if put.size > maximum:
             raise ValueError("authorized S3 upload size")
         headers = _headers(put, self.config)
-        try:
-            url = self.client.generate_presigned_url(
-                "put_object",
-                Params=_params(put, self.config, headers),
-                ExpiresIn=self.config.ttl_seconds,
-                HttpMethod="PUT",
-            )
-        except Exception as error:
-            raise RuntimeError("S3 presigning failed") from error
-        return _inspect_url(
-            url, put, self.config, self.client, headers)
+        capability = _presign(
+            self.client,
+            put,
+            self.config,
+            headers,
+            self.config.ttl_seconds,
+        )
+        if capability.expires_at_ms <= put.not_after_ms:
+            return capability
+
+        # SigV4 exposes only whole-second lifetimes. Derive the presigner's
+        # actual issue second from its checked response, round the remaining
+        # authority down, and fail closed when no full second remains.
+        issued_at_ms = (
+            capability.expires_at_ms - self.config.ttl_seconds * 1000)
+        ttl_seconds = (put.not_after_ms - issued_at_ms) // 1000
+        if ttl_seconds < 1:
+            raise RuntimeError(
+                "S3 session deadline leaves no whole-second capability")
+        capability = _presign(
+            self.client,
+            put,
+            self.config,
+            headers,
+            ttl_seconds,
+        )
+        if capability.expires_at_ms > put.not_after_ms:
+            raise RuntimeError("S3 presigner exceeded session deadline")
+        return capability

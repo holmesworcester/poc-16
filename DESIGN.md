@@ -322,17 +322,23 @@ before any PUT is issued:
    zero.
 2. `ISSUE` accepts a contiguous range of at most `PAGE_BATCH` leaves plus a
    Merkle range proof against that fixed commitment. It derives exact object
-   keys and advances only the committed prefix.
+   keys and advances only the committed prefix. Every signer request carries
+   the session's fixed `not_after_ms`; provider capabilities must expire no
+   later. S3 lifetimes are rounded down to whole seconds and issuance fails
+   closed when less than one whole second remains.
 3. `FINALIZE` requires the complete committed prefix and derives the sole pile
    key fixed by `OPEN`; it accepts no replacement descriptor or path.
 
 The constant-size cursor binds protocol version, issuer/provider, key id,
 workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
-next index, issued bytes, last digest, and fixed expiry under an
+next index, issued bytes, last digest, issued time, and fixed expiry under an
 HMAC-SHA-256 deployment key. Old keys remain available for at least the
 maximum session lifetime plus skew. Merkle leaves and internal nodes are
 domain-separated and include the leaf position; the wrapped root also commits
-count and total bytes.
+count and total bytes. This provider-neutral state machine now runs in
+`deploy/upload_session.py` and `deploy/upload_broker.py`; it has no database or
+provider session state. There is not yet a deployed broker route, end-user
+uploader, or database-free publisher.
 
 An advancing rolling HMAC without the fixed Merkle vector is insufficient: an
 old cursor can be replay-forked into arbitrarily many different suffixes under

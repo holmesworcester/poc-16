@@ -19,12 +19,14 @@ from deploy.aws_upload_broker.signer import (
     S3UploadConfig,
     S3UploadSigner,
 )
-from deploy.upload_broker import AuthorizedPut, staging_key
+from core.staged_intent import staging_key
+from deploy.upload_broker import AuthorizedPut
 
 
 ACCESS_KEY = "AKIDEXAMPLE"
 SECRET_KEY = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
 FIXED_TIME = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_TIME_MS = int(FIXED_TIME.timestamp() * 1000)
 WORKSPACE = "a" * 64
 MEMBER = "b" * 16
 SESSION = "d" * 32
@@ -32,7 +34,9 @@ BODY = b"provider-enforced collision-resistant body"
 DIGEST = hashlib.sha256(BODY).hexdigest()
 
 
-def authorized(object_class="pile", body=BODY):
+def authorized(
+        object_class="pile", body=BODY,
+        not_after_ms=FIXED_TIME_MS + 60_000):
     digest = hashlib.sha256(body).hexdigest()
     return AuthorizedPut(
         WORKSPACE,
@@ -44,6 +48,7 @@ def authorized(object_class="pile", body=BODY):
         "application/octet-stream",
         staging_key(
             WORKSPACE, MEMBER, SESSION, object_class, digest),
+        not_after_ms,
     )
 
 
@@ -175,6 +180,65 @@ class DeterministicS3:
         return 200
 
 
+class FixedPresigner:
+    """A checked SigV4 response surface with a fixed provider clock."""
+
+    class Meta:
+        endpoint_url = "https://s3.us-west-2.amazonaws.com"
+
+    meta = Meta()
+
+    def __init__(self):
+        self.ttls = []
+
+    def generate_presigned_url(
+            self, operation, *, Params, ExpiresIn, HttpMethod):
+        assert operation == "put_object"
+        assert HttpMethod == "PUT"
+        self.ttls.append(ExpiresIn)
+        signed_headers = (
+            "content-length;content-type;host;if-none-match;"
+            "x-amz-checksum-sha256"
+        )
+        query = urlencode({
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential":
+                "AKID/20260729/us-west-2/s3/aws4_request",
+            "X-Amz-Date": "20260729T120000Z",
+            "X-Amz-Expires": str(ExpiresIn),
+            "X-Amz-Signature": "a" * 64,
+            "X-Amz-SignedHeaders": signed_headers,
+        })
+        return (
+            f"https://{Params['Bucket']}.s3.us-west-2.amazonaws.com/"
+            f"{Params['Key']}?{query}"
+        )
+
+
+def test_signer_attenuates_to_deadline_and_rejects_subsecond_window():
+    client = FixedPresigner()
+    signer = S3UploadSigner(
+        S3UploadConfig("direct-upload-bucket", "us-west-2"),
+        client,
+    )
+
+    capability = signer.sign(authorized(
+        not_after_ms=FIXED_TIME_MS + 5_500))
+
+    assert client.ttls == [60, 5]
+    assert parse_qs(urlsplit(capability.url).query)[
+        "X-Amz-Expires"] == ["5"]
+    assert capability.expires_at_ms == FIXED_TIME_MS + 5_000
+
+    too_late = FixedPresigner()
+    with pytest.raises(RuntimeError, match="no whole-second capability"):
+        S3UploadSigner(
+            S3UploadConfig("direct-upload-bucket", "us-west-2"),
+            too_late,
+        ).sign(authorized(not_after_ms=FIXED_TIME_MS + 999))
+    assert too_late.ttls == [60]
+
+
 def test_botocore_generates_the_exact_signed_put_request_shape():
     client = actual_client()
     captured = []
@@ -192,10 +256,12 @@ def test_botocore_generates_the_exact_signed_put_request_shape():
     with patch(
             "botocore.auth.get_current_datetime",
             return_value=FIXED_TIME):
-        capability = S3UploadSigner(config, Capturing()).sign(
-            authorized())
+        signer = S3UploadSigner(config, Capturing())
+        capability = signer.sign(authorized())
 
     method, request = captured[0]
+    assert signer.provider_binding == (
+        "aws-s3-v1:us-west-2:direct-upload-bucket:123456789012")
     assert method == ("put_object",)
     assert request == {
         "ExpiresIn": 60,
@@ -326,15 +392,19 @@ def test_signer_rejects_a_provider_response_that_drops_constraints():
         lambda value: AuthorizedPut(
             value.workspace, value.member, value.session,
             value.object_class, value.digest, value.size,
-            value.content_type, "root"),
+            value.content_type, "root", value.not_after_ms),
         lambda value: AuthorizedPut(
             value.workspace, value.member, value.session,
             value.object_class, value.digest, -1,
-            value.content_type, value.key),
+            value.content_type, value.key, value.not_after_ms),
         lambda value: AuthorizedPut(
             value.workspace, value.member, value.session,
             value.object_class, value.digest, value.size,
-            "text/plain", value.key),
+            "text/plain", value.key, value.not_after_ms),
+        lambda value: AuthorizedPut(
+            value.workspace, value.member, value.session,
+            value.object_class, value.digest, value.size,
+            value.content_type, value.key, "later"),
     ),
 )
 def test_signer_does_not_treat_forged_internal_values_as_authority(put):
