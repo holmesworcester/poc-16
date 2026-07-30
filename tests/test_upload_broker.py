@@ -102,16 +102,16 @@ def test_broker_uses_kernel_proof_then_derives_one_pile_last_session(
     assert plan.pile.descriptor == descriptors[-1]
     assert [put.key for put in signer.puts] == [
         (
-            f"ingress/v1/workspaces/{workspace}/sessions/{plan.session}/"
-            f"obj/{h(first)}"
+            f"ingress/v1/workspaces/{workspace}/objects/{plan.session}/"
+            f"{h(first)}"
         ),
         (
-            f"ingress/v1/workspaces/{workspace}/sessions/{plan.session}/"
-            f"obj/{h(second)}"
+            f"ingress/v1/workspaces/{workspace}/objects/{plan.session}/"
+            f"{h(second)}"
         ),
         (
-            f"ingress/v1/workspaces/{workspace}/sessions/{plan.session}/"
-            f"pile/{member}/{h(pile)}"
+            f"ingress/v1/workspaces/{workspace}/piles/{plan.session}/"
+            f"{member}/{h(pile)}"
         ),
     ]
     assert all(put.workspace == workspace for put in signer.puts)

@@ -12,6 +12,8 @@ import json
 import re
 from urllib.parse import urlsplit
 
+from core.staged_intent import staging_prefix
+
 
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
 BUCKET = re.compile(
@@ -104,13 +106,10 @@ class Deployment:
         )
         ingress = _safe_prefix(
             self.ingress_prefix
-            or (
-                f"ingress/v1/workspaces/{self.workspace}/sessions"
-            ),
+            or f"ingress/v1/workspaces/{self.workspace}",
             "ingress prefix",
         )
-        expected_ingress = (
-            f"ingress/v1/workspaces/{self.workspace}/sessions")
+        expected_ingress = f"ingress/v1/workspaces/{self.workspace}"
         if ingress != expected_ingress:
             raise ValueError(
                 "ingress prefix must use the selected logical protocol")
@@ -166,7 +165,7 @@ class Deployment:
                 f"workspaces/{workspace}"),
             ingress_prefix=environment.get(
                 "CF_UPLOAD_INGRESS_PREFIX",
-                f"ingress/v1/workspaces/{workspace}/sessions"),
+                f"ingress/v1/workspaces/{workspace}"),
             child_ttl_seconds=_integer(
                 environment.get(
                     "CF_UPLOAD_CHILD_TTL_SECONDS",
@@ -332,7 +331,7 @@ def publisher_config(deployment):
 
 
 def ingress_lifecycle(deployment):
-    """Bound abandoned staging without granting the broker deletion."""
+    """Collect only loose object bytes; durable pile markers are excluded."""
     suffix = hashlib.sha256(
         f"{deployment.owner}:{deployment.ingress_prefix}".encode()
     ).hexdigest()[:16]
@@ -341,7 +340,7 @@ def ingress_lifecycle(deployment):
             "id": f"poc16-abandoned-stage-{suffix}",
             "enabled": True,
             "conditions": {
-                "prefix": deployment.ingress_prefix + "/",
+                "prefix": staging_prefix(deployment.workspace, "obj"),
             },
             "deleteObjectsTransition": {
                 "condition": {
@@ -367,12 +366,12 @@ def generated_boundary(deployment):
             "upload_order": UPLOAD_ORDER,
             "session_nonce": "32-lowercase-hex",
             "object_key": (
-                "ingress/v1/workspaces/<ws64>/sessions/<nonce32>/"
-                "obj/<sha256>"
+                "ingress/v1/workspaces/<ws64>/objects/"
+                "<nonce32>/<sha256>"
             ),
             "ready_marker_key": (
-                "ingress/v1/workspaces/<ws64>/sessions/<nonce32>/"
-                "pile/<member16>/<sha256>"
+                "ingress/v1/workspaces/<ws64>/piles/"
+                "<nonce32>/<member16>/<sha256>"
             ),
             "ready_marker_is_sole_durable_intent": True,
         },

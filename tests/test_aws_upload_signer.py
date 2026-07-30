@@ -240,8 +240,8 @@ def test_actual_sigv4_and_s3_checks_reject_every_authority_mutation():
         "direct-upload-bucket.s3.",
         "foreign-upload-bucket.s3.")
     foreign_member = capability.url.replace(
-        f"/pile/{MEMBER}/",
-        f"/pile/{'e' * 16}/")
+        f"/piles/{SESSION}/{MEMBER}/",
+        f"/piles/{SESSION}/{'e' * 16}/")
     wrong_key = capability.url.replace(
         f"/{DIGEST}?", f"/{'f' * 64}?")
     root_key = capability.url.replace(
@@ -354,9 +354,16 @@ def test_presigner_role_and_cors_expose_only_exact_put_authority():
     statement = document["Statement"][0]
 
     assert statement["Action"] == "s3:PutObject"
-    assert statement["Resource"] == (
-        "arn:aws:s3:::direct-upload-bucket/"
-        f"ingress/v1/workspaces/{WORKSPACE}/sessions/*")
+    assert statement["Resource"] == [
+        (
+            "arn:aws:s3:::direct-upload-bucket/"
+            f"ingress/v1/workspaces/{WORKSPACE}/objects/*"
+        ),
+        (
+            "arn:aws:s3:::direct-upload-bucket/"
+            f"ingress/v1/workspaces/{WORKSPACE}/piles/*"
+        ),
+    ]
     assert statement["Condition"] == {
         "Null": {"s3:if-none-match": "false"},
         "NumericLessThanEquals": {"s3:signatureAge": 90_000},

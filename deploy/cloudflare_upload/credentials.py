@@ -13,13 +13,12 @@ import json
 import re
 import secrets
 
+from core.staged_intent import staging_key as logical_staging_key
 from .boundary import Deployment, endpoint_host
 
 
-HEX_16 = re.compile(r"^[0-9a-f]{16}$")
 HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
-KINDS = frozenset({"obj", "pile"})
 SCOPE = "object-read-write"
 ACTION = "PutObject"
 
@@ -61,21 +60,13 @@ def new_session_id():
 
 def staging_key(
         deployment, *, member, session, kind, digest):
-    fields = (
-        (HEX_16, member, "member"),
-        (HEX_32, session, "session"),
-        (HEX_64, digest, "digest"),
-    )
-    for pattern, value, label in fields:
-        if not isinstance(value, str) or not pattern.fullmatch(value):
-            raise ValueError(label)
-    if kind not in KINDS:
-        raise ValueError("staging kind")
-    if kind == "obj":
-        suffix = f"obj/{digest}"
-    else:
-        suffix = f"pile/{member}/{digest}"
-    return f"{deployment.ingress_prefix}/{session}/{suffix}"
+    if not isinstance(deployment, Deployment):
+        raise TypeError("deployment")
+    key = logical_staging_key(
+        deployment.workspace, member, session, kind, digest)
+    if not key.startswith(deployment.ingress_prefix + "/"):
+        raise ValueError("staging deployment prefix")
+    return key
 
 
 @dataclass(frozen=True)

@@ -28,13 +28,17 @@ from core.limits import (
     PayloadTooLarge,
 )
 from core.shape import valid_fid
+from core.staged_intent import (
+    MEMBER_HEX_BYTES,
+    SESSION_HEX_BYTES,
+    STAGING_PREFIX,
+    staging_key,
+)
 
 
 UPLOAD_PURPOSE = "upload"
 UPLOAD_CONTENT_TYPE = "application/octet-stream"
-SESSION_BYTES = 16
-SESSION_HEX_BYTES = 2 * SESSION_BYTES
-STAGING_PREFIX = "ingress/v1"
+SESSION_BYTES = SESSION_HEX_BYTES // 2
 
 
 class UploadUnavailable(RuntimeError):
@@ -99,7 +103,7 @@ class UploadPlan:
 
 def _valid_member(value):
     return isinstance(value, str) \
-        and len(value) == 16 \
+        and len(value) == MEMBER_HEX_BYTES \
         and all(character in "0123456789abcdef" for character in value)
 
 
@@ -107,22 +111,6 @@ def _valid_session(value):
     return isinstance(value, str) \
         and len(value) == SESSION_HEX_BYTES \
         and all(character in "0123456789abcdef" for character in value)
-
-
-def staging_key(
-        workspace, member, session, object_class, digest):
-    """Derive the one versioned isolated-ingress grammar."""
-    if not valid_fid(workspace) or not _valid_member(member) \
-            or not _valid_session(session) or not valid_fid(digest):
-        raise ValueError("staging key component")
-    base = (
-        f"{STAGING_PREFIX}/workspaces/{workspace}/"
-        f"sessions/{session}")
-    if object_class == "obj":
-        return f"{base}/obj/{digest}"
-    if object_class == "pile":
-        return f"{base}/pile/{member}/{digest}"
-    raise ValueError("staging object class")
 
 
 def _valid_descriptor(descriptor, workspace, member):

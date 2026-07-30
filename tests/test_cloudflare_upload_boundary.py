@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from core.staged_intent import staging_prefix
 from deploy.cloudflare_upload import manage
 from deploy.cloudflare_upload.boundary import (
     BROKER_SECRET_NAMES,
@@ -209,7 +210,8 @@ def test_child_credential_is_one_exact_put_until_one_exact_expiry():
         now=1_000,
     )
     expected_key = (
-        f"{candidate.ingress_prefix}/{'f' * 32}/obj/{'1' * 64}"
+        f"{candidate.ingress_prefix}/objects/"
+        f"{'f' * 32}/{'1' * 64}"
     )
 
     assert credentials.bucket == candidate.ingress_bucket
@@ -270,8 +272,7 @@ def test_selected_logical_key_grammar_is_exact_for_objects_and_pile_marker():
     member = "e" * 16
     session = "f" * 32
     digest = "1" * 64
-    base = (
-        f"ingress/v1/workspaces/{candidate.workspace}/sessions/{session}")
+    base = f"ingress/v1/workspaces/{candidate.workspace}"
 
     assert staging_key(
         candidate,
@@ -279,14 +280,14 @@ def test_selected_logical_key_grammar_is_exact_for_objects_and_pile_marker():
         session=session,
         kind="obj",
         digest=digest,
-    ) == f"{base}/obj/{digest}"
+    ) == f"{base}/objects/{session}/{digest}"
     assert staging_key(
         candidate,
         member=member,
         session=session,
         kind="pile",
         digest=digest,
-    ) == f"{base}/pile/{member}/{digest}"
+    ) == f"{base}/piles/{session}/{member}/{digest}"
     sessions = {new_session_id() for _ in range(16)}
     assert len(sessions) == 16
     assert all(
@@ -385,25 +386,25 @@ def test_staging_capability_makes_no_false_canonical_body_binding_claim():
         "upload_order": "objects-first-pile-last",
         "session_nonce": "32-lowercase-hex",
         "object_key": (
-            "ingress/v1/workspaces/<ws64>/sessions/<nonce32>/"
-            "obj/<sha256>"
+            "ingress/v1/workspaces/<ws64>/objects/"
+            "<nonce32>/<sha256>"
         ),
         "ready_marker_key": (
-            "ingress/v1/workspaces/<ws64>/sessions/<nonce32>/"
-            "pile/<member16>/<sha256>"
+            "ingress/v1/workspaces/<ws64>/piles/"
+            "<nonce32>/<member16>/<sha256>"
         ),
         "ready_marker_is_sole_durable_intent": True,
     }
 
 
-def test_lifecycle_is_bounded_to_abandoned_ingress_not_canonical_data():
+def test_lifecycle_collects_loose_objects_but_never_durable_pile_markers():
     candidate = deployment()
     lifecycle = ingress_lifecycle(candidate)
     rule = lifecycle["rules"][0]
 
     assert rule["enabled"] is True
     assert rule["conditions"] == {
-        "prefix": candidate.ingress_prefix + "/",
+        "prefix": staging_prefix(candidate.workspace, "obj"),
     }
     assert rule["deleteObjectsTransition"]["condition"] == {
         "type": "Age",
@@ -411,6 +412,9 @@ def test_lifecycle_is_bounded_to_abandoned_ingress_not_canonical_data():
     }
     assert candidate.canonical_bucket not in json.dumps(lifecycle)
     assert rule["conditions"]["prefix"] != candidate.canonical_prefix + "/"
+    assert not staging_prefix(
+        candidate.workspace, "pile").startswith(
+            rule["conditions"]["prefix"])
 
 
 def _deploy_environment():

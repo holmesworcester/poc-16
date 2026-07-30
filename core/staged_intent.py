@@ -51,14 +51,23 @@ def staging_key(workspace, member, session, object_class, digest):
             or not _lower_hex(session, SESSION_HEX_BYTES) \
             or not valid_fid(digest):
         raise ValueError("staging key component")
-    base = (
-        f"{STAGING_PREFIX}/workspaces/{workspace}/"
-        f"sessions/{session}"
-    )
+    base = f"{STAGING_PREFIX}/workspaces/{workspace}"
     if object_class == "obj":
-        return f"{base}/obj/{digest}"
+        return f"{base}/objects/{session}/{digest}"
     if object_class == "pile":
-        return f"{base}/pile/{member}/{digest}"
+        return f"{base}/piles/{session}/{member}/{digest}"
+    raise ValueError("staging object class")
+
+
+def staging_prefix(workspace, object_class):
+    """Return the disjoint provider prefix for data or durable work markers."""
+    if not valid_fid(workspace):
+        raise ValueError("staging workspace")
+    base = f"{STAGING_PREFIX}/workspaces/{workspace}"
+    if object_class == "obj":
+        return base + "/objects/"
+    if object_class == "pile":
+        return base + "/piles/"
     raise ValueError("staging object class")
 
 
@@ -67,16 +76,15 @@ def parse_staging_key(key):
     if not isinstance(key, str):
         raise InvalidStagedIntent("staging key")
     parts = key.split("/")
-    if len(parts) == 8 and parts[6] == "obj":
+    if len(parts) == 7 and parts[4] == "objects":
         workspace, session, object_class, member, digest = (
-            parts[3], parts[5], "obj", None, parts[7])
-    elif len(parts) == 9 and parts[6] == "pile":
+            parts[3], parts[5], "obj", None, parts[6])
+    elif len(parts) == 8 and parts[4] == "piles":
         workspace, session, object_class, member, digest = (
-            parts[3], parts[5], "pile", parts[7], parts[8])
+            parts[3], parts[5], "pile", parts[6], parts[7])
     else:
         raise InvalidStagedIntent("staging key")
     if parts[:3] != ["ingress", "v1", "workspaces"] \
-            or parts[4] != "sessions" \
             or not valid_fid(workspace) \
             or not _lower_hex(session, SESSION_HEX_BYTES) \
             or not valid_fid(digest) \
@@ -219,4 +227,5 @@ __all__ = (
     "decode_staged_pile",
     "parse_staging_key",
     "staging_key",
+    "staging_prefix",
 )

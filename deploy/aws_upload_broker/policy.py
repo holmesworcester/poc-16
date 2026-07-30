@@ -2,8 +2,8 @@
 from urllib.parse import urlsplit
 
 from core.shape import valid_fid
+from core.staged_intent import staging_prefix
 from deploy.aws_upload_broker.signer import S3UploadConfig
-from deploy.upload_broker import STAGING_PREFIX
 
 
 _PARTITIONS = frozenset({"aws", "aws-cn", "aws-us-gov"})
@@ -17,9 +17,13 @@ def presigner_policy(config, workspace, *, partition="aws"):
         raise ValueError("workspace")
     if partition not in _PARTITIONS:
         raise ValueError("AWS partition")
-    resource = (
-        f"arn:{partition}:s3:::{config.bucket}/"
-        f"{STAGING_PREFIX}/workspaces/{workspace}/sessions/*")
+    resources = [
+        (
+            f"arn:{partition}:s3:::{config.bucket}/"
+            f"{staging_prefix(workspace, object_class)}*"
+        )
+        for object_class in ("obj", "pile")
+    ]
     return {
         "Statement": [{
             "Action": "s3:PutObject",
@@ -35,7 +39,7 @@ def presigner_policy(config, workspace, *, partition="aws"):
                 },
             },
             "Effect": "Allow",
-            "Resource": resource,
+            "Resource": resources,
             "Sid": "PresignOneWorkspaceIngressPut",
         }],
         "Version": "2012-10-17",

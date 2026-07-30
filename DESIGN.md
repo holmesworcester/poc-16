@@ -150,7 +150,10 @@ a possible mutation raises `OutcomeUnknown`.
 Immutable creation returns `CREATED` or `EXISTS`. The shared
 `ensure_object(oid, bytes)` boundary accepts `EXISTS` only after fetching and
 byte-verifying the incumbent. It reconciles an unknown outcome by direct read
-and never lets root CAS run until every referenced object is known present.
+and never lets root CAS run until every immutable page reachable from that
+candidate root is known present. Detached attachment blobs are not
+root-reachable pages: their absence makes a file incomplete, not its signed
+facts invalid.
 FsStore refines atomic comparison/creation locally with a stable flock and
 atomic link/replace, but does not yet claim power-loss durability because it
 omits the required file and parent-directory fsync sequence. S3/R2 adapters
@@ -183,9 +186,11 @@ session-scoped staging keys and promotes only verified values. Provider
 object-created events, an authenticated poke, and a scheduled fallback may all
 wake interchangeable database-free publishers. Wakeups are advisory; the
 durable pile is the work item. Publishers verify workspace, uploader,
-checksums, closure, and referenced objects, then update the authenticated
-trees and CAS root. Missing objects, throttling, crashes, and CAS loss retain
-the pile. Clients can neither list/delete the namespace nor write root.
+checksums, and closure; promote every present referenced attachment object;
+then update the authenticated trees and CAS root. A missing detached blob does
+not block valid facts—the file remains incomplete exactly as it does after
+ordinary peer sync. Throttling, crashes, and CAS loss retain the pile. Clients
+can neither list/delete the namespace nor write root.
 
 The split follows the authority actually required by each step:
 
@@ -213,10 +218,11 @@ answer a client query; authenticated FactTree postings and candidate
 residences answer the cloud query. Neither adapter owns a second validity or
 settlement rule. `Node` is not packaged into Lambda or a Worker, and an
 in-memory SQLite reconstruction is not the edge implementation. Missing
-immutable objects suspend the pure computation through a bounded cache-miss
-driver, are awaited exactly once, and then rerun the same function. Provider
-entrypoints contain no family policy, tree construction, staging grammar, or
-retirement decision.
+root, proof, fact-residence, or tree-page objects suspend the pure computation
+through a bounded cache-miss driver, are awaited exactly once, and then rerun
+the same function. A missing attachment blob does not suspend fact
+settlement. Provider entrypoints contain no family policy, tree construction,
+staging grammar, or retirement decision.
 
 Proxying the client upload through the publisher adds bandwidth and failure
 surface but no serialization point: the client writes its exact granted
@@ -278,13 +284,27 @@ reads. Local HS256 temporary-credential signing fixes each child JWT to the
 ingress bucket, one `objectPath`, `actions=[PutObject]`, issuer, audience,
 issued time, and expiry. The child is not a body-integrity proof. It targets
 only
-`ingress/v1/workspaces/<workspace>/sessions/<session>/obj/<digest>` or
-`.../pile/<member>/<digest>`, whose bytes remain untrusted until the publisher
-hashes and validates them. The broker mints and pins the session; it is not a
-caller-selected path fragment. Objects arrive first. The closed pile/intention
-arrives last, commits the workspace, member, session, and declared object
-digests, and is the only durable ready marker; loose staged objects and event
-notifications are not publication work by themselves.
+`ingress/v1/workspaces/<workspace>/objects/<session>/<digest>` or
+`.../piles/<session>/<member>/<digest>`, whose bytes remain untrusted until
+the publisher hashes and validates them. Object class precedes session so a
+provider lifecycle prefix can collect loose objects without ever matching a
+durable pile marker, and scheduled work discovery can list only piles. The
+broker mints and pins the session; it is not a caller-selected path fragment.
+Objects arrive first. The closed pile/intention arrives last, commits the
+workspace, member, session, and declared object digests, and is the only
+durable ready marker; loose staged objects and event notifications are not
+publication work by themselves.
+
+Objects-first/pile-last is a client delivery guarantee, not a new fact
+validity rule. The publisher verifies and promotes each referenced staged
+object that is present, one at a time, but it may settle and root the canonical
+facts when a detached Bao object is absent. The authenticated chunk facts then
+express the durable missing-object demand and file queries report incomplete,
+just as they do on an ordinary replica. Once F10 proves that every admitted
+fact from the pile is represented by the committed root, the pile may retire;
+an object that lands only afterward is unreachable staging garbage and cannot
+manufacture work without a marker. The client can retry that content through a
+new session or ordinary peer blob sync.
 
 The logical protocol uses isolated ingress on both providers. “Direct” means
 the client sends immutable bytes to S3 or R2 itself; the authorization broker
@@ -322,8 +342,9 @@ finalization replay deliberately reissue the same authority so a lost response
 is recoverable. Rejecting such replay while remaining stateless is impossible;
 provider state is introduced only if the product later requires exactly-once
 quota charging or recovery after a client loses its cursor. Authorization
-order does not prove network completion. A publisher that sees the pile first
-retains it until every referenced object is present and valid.
+order does not prove network completion and does not need to: missing detached
+blob bytes affect file completeness, while the pile remains sufficient to
+publish its independently authenticated facts.
 
 R2 long-lived bucket-item credentials cannot be restricted to a workspace
 prefix. `Object Read only` also includes LIST. Consequently the generated
@@ -334,15 +355,17 @@ different provider-enforced read path before a broker compromise can be
 claimed workspace-confined.
 
 The package also emits one lifecycle input scoped only to that workspace's
-staging prefix. Compute deploy/remove never owns either bucket or applies or
-removes bucket configuration: it deploys publisher before broker, stops broker
-before publisher, and deletes only Workers whose exact owner and role markers
-were observed before the first delete. Applying and live-verifying the
-lifecycle remains a separate privileged provisioning step because replacing a
-bucket's whole lifecycle document from a compute deploy could clobber
-unrelated rules. The current entries are non-public fail-closed stubs. These
-generated documents and credential-free JWT mutation tests establish the
-intended authority shape, not a live-provider or completed-publisher claim.
+`objects/` staging prefix; the disjoint `piles/` prefix is excluded because
+provider lifecycle is not an F10 witness. Compute deploy/remove never owns
+either bucket or applies or removes bucket configuration: it deploys publisher
+before broker, stops broker before publisher, and deletes only Workers whose
+exact owner and role markers were observed before the first delete. Applying
+and live-verifying the lifecycle remains a separate privileged provisioning
+step because replacing a bucket's whole lifecycle document from a compute
+deploy could clobber unrelated rules. The current entries are non-public
+fail-closed stubs. These generated documents and credential-free JWT mutation
+tests establish the intended authority shape, not a live-provider or
+completed-publisher claim.
 
 [r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/

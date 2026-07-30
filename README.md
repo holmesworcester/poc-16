@@ -177,9 +177,18 @@ bearer PUT requests. Each request binds a collision-resistant body digest, an
 exact length or hard byte ceiling, expiry, and create-only semantics; clients
 receive no LIST, DELETE, or `root` permission. An S3/R2 object-created event,
 authenticated poke, or scheduled scan wakes a database-free publisher. That
-publisher validates the pile and objects, updates the authenticated trees,
-CASes `root`, and retires ingress only after the committed root proves
-publication. A lost event or poke affects latency, not durability.
+publisher validates the pile, promotes present verified objects, updates the
+authenticated trees, CASes `root`, and retires ingress only after the
+committed root proves publication. A lost event or poke affects latency, not
+durability.
+
+Attachment bytes remain detached from fact validity. A missing Bao object
+does not block signed file/chunk facts from publication; the file is simply
+incomplete until a later direct upload or peer sync supplies it. This is the
+same rule used by ordinary replicas. F10 retirement therefore proves durable
+coverage of every admitted fact, not that every attachment byte exists. A
+staged object that arrives only after its marker has safely retired is an
+unreachable orphan and cannot create work by itself.
 
 The AWS translator signs the exact `Content-Length`, `Content-Type`,
 `If-None-Match: *`, and `x-amz-checksum-sha256` headers of one S3 `PutObject`
@@ -248,15 +257,18 @@ bindings.
 Both providers use one logical staging grammar:
 
 ```text
-ingress/v1/workspaces/<ws64>/sessions/<nonce32>/obj/<sha256>
-ingress/v1/workspaces/<ws64>/sessions/<nonce32>/pile/<member16>/<sha256>
+ingress/v1/workspaces/<ws64>/objects/<nonce32>/<sha256>
+ingress/v1/workspaces/<ws64>/piles/<nonce32>/<member16>/<sha256>
 ```
 
 The broker chooses the lowercase-hex session nonce and derives every path
 from validated descriptor authority; the client does not supply a free-form
 key. Objects are uploaded first. The closed pile/intention is uploaded last
 and is the sole durable ready marker. Loose objects do not cause publication,
-and an event for the final pile only reduces wake latency.
+and an event for the final pile only reduces wake latency. Object class comes
+before session deliberately: provider lifecycle can collect abandoned
+`objects/` without ever matching an F10-governed `piles/` marker, while a
+scheduled publisher can scan only the marker prefix.
 
 One broker call is currently bounded to `PAGE_BATCH` descriptors and creates a
 fresh session, so it is not yet the multi-thousand-object client protocol. The
@@ -280,7 +292,7 @@ provider-enforced workspace-prefix read path exists; setting
 `CANONICAL_PREFIX` alone is not tenant isolation.
 
 Render the two Worker configs, the two exact R2 token-policy inputs, and the
-ingress-only seven-day lifecycle input with:
+loose-object-only seven-day lifecycle input with:
 
 ```sh
 export CLOUDFLARE_ACCOUNT_ID=32_LOWERCASE_HEX_CHARACTERS

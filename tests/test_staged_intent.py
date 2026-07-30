@@ -15,6 +15,7 @@ from core.staged_intent import (
     decode_staged_pile,
     parse_staging_key,
     staging_key,
+    staging_prefix,
 )
 from facts.content import chunk
 from tests.util import closed_subset, send_bytes
@@ -65,6 +66,12 @@ def test_real_multi_chunk_pile_derives_exact_same_session_object_set(
         staging_key(workspace, MEMBER, SESSION, "obj", digest)
         for digest in expected_refs
     )
+    assert first.key.startswith(staging_prefix(workspace, "pile"))
+    assert all(
+        key.startswith(staging_prefix(workspace, "obj"))
+        for key in first.object_keys)
+    assert not staging_prefix(workspace, "pile").startswith(
+        staging_prefix(workspace, "obj"))
     for object_key, digest in zip(first.object_keys, expected_refs):
         blob = node.store(workspace).get("obj/" + digest)
         assert blob is not None and h(blob) == digest
@@ -99,7 +106,7 @@ def test_object_confirmation_separates_retryable_delay_from_poison(
     lambda key: key.replace("/v1/", "/v2/"),
     lambda key: "/" + key,
     lambda key: key + "/extra",
-    lambda key: key.replace("/sessions/", "//sessions/"),
+    lambda key: key.replace("/piles/", "//piles/"),
     lambda key: key.replace("c" * 32, "c" * 31),
     lambda key: key.replace("c" * 32, "C" * 32),
     lambda key: key.replace("d" * 16, "d" * 15),
