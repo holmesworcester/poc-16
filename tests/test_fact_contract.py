@@ -95,8 +95,8 @@ def test_core_fact_module_has_no_family_authors():
 
 def test_core_judge_and_engine_do_not_name_family_policy():
     for name in (
-            "catalog.py", "fact.py", "indexes.py", "kernel.py", "snapshot.py",
-            "node.py", "publication.py", "runtime.py",
+            "admission.py", "catalog.py", "fact.py", "indexes.py",
+            "kernel.py", "snapshot.py", "node.py", "publication.py", "runtime.py",
             "suppression_state.py", "worker.py"):
         source = (ROOT / "core" / name).read_text()
         for vocabulary in (

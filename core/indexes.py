@@ -577,7 +577,11 @@ def build(
             raise ValueError("unpublished candidate index delta")
         fact_changes, supp_changes, addresses = {}, {}, set()
         represented = set()
-        fact_reader = merkle_map.Reader(previous[FACT]["root"], seed, fetch)
+        fact_reader = merkle_map.Reader(
+            previous[FACT]["root"], seed, fetch,
+            max_page_depth=previous[FACT]["depth"],
+            expected_count=previous[FACT]["count"],
+            expected_depth=previous[FACT]["depth"])
         for fid in sorted(changed_set):
             fact = admitted.admitted(fid)
             if fact is None:
@@ -665,7 +669,9 @@ def build(
         built = {}
         for name in TREE_NAMES:
             result = merkle_map.update(
-                previous[name]["root"], seed, change_sets[name], fetch, emit)
+                previous[name]["root"], seed, change_sets[name], fetch, emit,
+                expected_count=previous[name]["count"],
+                expected_depth=previous[name]["depth"])
             built[name] = {
                 "root": result.root,
                 "count": result.count,

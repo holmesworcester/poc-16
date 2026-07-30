@@ -136,7 +136,9 @@ def update_fact_order(descriptor_value, changes, seed, fetch, emit):
             raise ValueError("FactOrder change")
         checked.append(row)
     built = merkle_map.update(
-        descriptor_value["root"], seed, tuple(checked), fetch, emit)
+        descriptor_value["root"], seed, tuple(checked), fetch, emit,
+        expected_count=descriptor_value["count"],
+        expected_depth=descriptor_value["depth"])
     return descriptor(built)
 
 
@@ -151,10 +153,11 @@ def fact_order_rows(descriptor_value, seed, fetch):
         return ()
     reader = merkle_map.Reader(
         descriptor_value["root"], seed, fetch,
-        max_page_depth=descriptor_value["depth"])
+        max_page_depth=descriptor_value["depth"],
+        expected_count=descriptor_value["count"],
+        expected_depth=descriptor_value["depth"])
     rows = reader.items(max_pages=max(1, 2 * count - 1))
     checked = tuple(_fact_order_row(row) for row in rows)
     if len(checked) != count:
         raise ValueError("FactOrder descriptor count")
     return checked
-

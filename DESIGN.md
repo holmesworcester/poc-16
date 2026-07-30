@@ -30,6 +30,8 @@ daemon / local command                         host adapters
         ↓
 WorkspaceRuntime.turn                          one socket-free turn
         ↓
+AdmissionMembrane.process                     exact pile → retirement capability
+        ↓
 kernel → registered fact family                judgment and policy
         ↓
 Catalog.settle                                 admitted receipt → eligibility
@@ -41,21 +43,24 @@ root + immutable-object fetches → WorkerView   database-free CF authorization
 generic type/ref/offer index → family query    client read assembly
 ```
 
-`Node` composes local identity, workspace handles, diagnostics, and these
-boundaries. It does not define family policy. Sync and local authorship both
-enqueue the same pile bytes; `WorkspaceRuntime` is the normal coordinator,
-`Catalog` alone decides current standing, and `Publisher` alone advances
-`root`. The daemon handles HTTP and token sealing. Its node-local control
-surface dispatches one qualified command path through the checked
-`facts.COMMANDS` registry; typed application commands remain beside their fact
-families, and adding one does not add a CLI or daemon branch.
+`Node` composes local identity, stores, indexes, diagnostics, and one cached
+workspace-bound `AdmissionMembrane`; it does not run the admission pipeline or
+define family policy. Sync and local authorship both enqueue the same pile
+bytes. `WorkspaceRuntime` orders independent work units, the membrane alone
+turns an exact source into a kernel proof, catalog settlement, root-CAS result,
+and one-use retirement capability, `Catalog` alone decides current standing,
+and `Publisher` alone advances `root`. The daemon handles HTTP and token
+sealing. Its node-local control surface dispatches one qualified command path
+through the checked `facts.COMMANDS` registry; typed application commands
+remain beside their fact families, and adding one does not add a CLI or daemon
+branch.
 
 An engineer should read the running path in this order:
 
 1. `core/fact.py` and `core/suppression.py`;
 2. `facts/__init__.py`, then one auth and one content family;
 3. `core/kernel.py`;
-4. `core/runtime.py` and `core/catalog.py`;
+4. `core/runtime.py`, `core/admission.py`, and `core/catalog.py`;
 5. `core/publication.py`, `core/snapshot.py`, and `core/indexes.py`;
 6. `core/worker.py` and `core/mint.py`;
 7. `core/sync.py`, `core/walk.py`, then `core/daemon.py`.

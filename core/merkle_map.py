@@ -468,11 +468,25 @@ def _summary_row(row):
         _decode_bound(row[5]), _decode_bound(row[6]))
 
 
+def _expected_metadata(root, count, depth, max_depth):
+    if count is None or depth is None:
+        if count is not None or depth is not None:
+            raise ValueError("merkle map expected metadata")
+        return None
+    if type(count) is not int or count < 0 \
+            or type(depth) is not int or not 0 <= depth <= max_depth \
+            or bool(root) != bool(count) \
+            or bool(root) != bool(depth):
+        raise ValueError("merkle map expected metadata")
+    return count, depth
+
+
 class Reader:
     """Hash-verifying exact, neighbor, range, and resumable diff reads."""
 
     def __init__(
-            self, root, seed, fetch, *, max_page_depth=MAX_PAGE_DEPTH):
+            self, root, seed, fetch, *, max_page_depth=MAX_PAGE_DEPTH,
+            expected_count=None, expected_depth=None):
         if root and not valid_fid(root):
             raise ValueError("merkle map root")
         _validate_seed(seed)
@@ -483,8 +497,21 @@ class Reader:
         self.seed = seed
         self.fetch = fetch
         self.max_page_depth = max_page_depth
+        self.expected_root = _expected_metadata(
+            root, expected_count, expected_depth, max_page_depth)
         self.pages_read = 0
         self._page_budget = max_page_depth
+
+    def _check_root(self, summary):
+        if self.expected_root is not None \
+                and (summary.count, summary.depth) != self.expected_root:
+            raise ValueError("merkle map root metadata")
+
+    def _decode_page(self, raw, oid):
+        page, summary = _decode(raw, oid, self.seed)
+        if oid == self.root:
+            self._check_root(summary)
+        return page, summary
 
     def _page(self, oid, expected=None, route=None):
         if not valid_fid(oid):
@@ -492,7 +519,7 @@ class Reader:
         self.pages_read += 1
         if self.pages_read > self._page_budget:
             raise ValueError("merkle map read budget")
-        page, summary = _decode(self.fetch(oid), oid, self.seed)
+        page, summary = self._decode_page(self.fetch(oid), oid)
         if expected is not None and _descriptor(summary) != expected:
             raise ValueError("merkle map child metadata")
         if route is not None:
@@ -720,7 +747,7 @@ class Reader:
             nonlocal local_pages
             oid, expected, route = ref
             local_pages += 1
-            page, summary = _decode(local.fetch(oid), oid, local.seed)
+            page, summary = local._decode_page(local.fetch(oid), oid)
             if expected is not None and _descriptor(summary) != expected:
                 raise ValueError("merkle map child metadata")
             if route is not None:
@@ -733,6 +760,11 @@ class Reader:
 
         remote_root = (self.root, None, None) if self.root else None
         local_root = (local.root, None, None) if local.root else None
+        if remote_root is not None and remote_root == local_root and (
+                self.expected_root is not None
+                or local.expected_root is not None):
+            _, summary = self._page(self.root)
+            local._check_root(summary)
         stack = [(remote_root, local_root)] if remote_root else []
         rows = []
         while stack and len(rows) <= limit:
@@ -811,8 +843,8 @@ class Reader:
         prefetched = {}
         if max_pages is None:
             if self.root in known:
-                root_page, root_summary = _decode(
-                    known[self.root], self.root, self.seed)
+                root_page, root_summary = self._decode_page(
+                    known[self.root], self.root)
             else:
                 self._page_budget = 1
                 root_page, root_summary = self._page(self.root)
@@ -830,7 +862,7 @@ class Reader:
             if oid in prefetched:
                 page, summary = prefetched[oid]
             elif oid in known:
-                page, summary = _decode(known[oid], oid, self.seed)
+                page, summary = self._decode_page(known[oid], oid)
                 if expected is not None \
                         and _descriptor(summary) != expected:
                     raise ValueError("merkle map child metadata")
@@ -862,9 +894,13 @@ class Reader:
         return tuple(out)
 
 
-def update(root, seed, changes, fetch, emit):
+def update(
+        root, seed, changes, fetch, emit, *,
+        expected_count=None, expected_depth=None):
     """Apply a canonical batch by path-copying only affected radix paths."""
     _validate_seed(seed)
+    expected_root = _expected_metadata(
+        root, expected_count, expected_depth, MAX_PAGE_DEPTH)
     checked_changes = []
     for change in changes:
         if not isinstance(change, tuple) or len(change) != 2:
@@ -1009,6 +1045,9 @@ def update(root, seed, changes, fetch, emit):
 
     if root:
         page, current = _decode(fetch(root), root, seed)
+        if expected_root is not None \
+                and (current.count, current.depth) != expected_root:
+            raise ValueError("merkle map root metadata")
         cache[root] = (page, current)
     else:
         current = None

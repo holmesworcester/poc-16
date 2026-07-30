@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    admission_proof, close, cmds, daemon, fact, merkle_map,
-    node as node_module,
+    admission as admission_module, admission_proof, close, cmds, daemon,
+    fact, merkle_map,
     object_store, runtime, snapshot, sync,
 )
 from core.crypto import h
@@ -17,7 +17,7 @@ from core.node import Node
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from facts.content import message as message_family
-from tests.util import closed_subset, deliver
+from tests.util import all_fids, closed_subset, deliver
 
 
 def poisoned_timestamp_pile(workspace):
@@ -89,14 +89,14 @@ def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    decode = node_module.decode_pile
+    decode = admission_module.decode_pile
 
     def program_failure(raw, expected_workspace):
         if raw == first_raw:
             raise ValueError("simulated decoder programming failure")
         return decode(raw, expected_workspace)
 
-    monkeypatch.setattr(node_module, "decode_pile", program_failure)
+    monkeypatch.setattr(admission_module, "decode_pile", program_failure)
     node.turn(workspace)
 
     assert node.store(workspace).get(first_key) == first_raw
@@ -154,7 +154,8 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
     second_fid, _, second_key = second
     store = node.store(workspace)
     if boundary == "program":
-        original = node.commit_ingress
+        membrane = node.admission(workspace)
+        original = membrane.commit_ingress
         calls = 0
 
         def fail_first(*args, **kwargs):
@@ -164,7 +165,7 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
                 raise RuntimeError("simulated publication program failure")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(node, "commit_ingress", fail_first)
+        monkeypatch.setattr(membrane, "commit_ingress", fail_first)
     else:
         original = store.cas
         calls = 0
@@ -204,14 +205,15 @@ def test_retryable_failure_never_ages_into_destructive_quarantine(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    commit = node.commit_ingress
+    membrane = node.admission(workspace)
+    commit = membrane.commit_ingress
 
     def fail_first_pile(admission, *args, **kwargs):
         if admission.source == first_key:
             raise OutcomeUnknown("persistent provider outage for this pile")
         return commit(admission, *args, **kwargs)
 
-    monkeypatch.setattr(node, "commit_ingress", fail_first_pile)
+    monkeypatch.setattr(membrane, "commit_ingress", fail_first_pile)
 
     for _ in range(12):
         node.turn(workspace)
@@ -235,11 +237,12 @@ def test_failed_authoritative_restore_stops_before_the_next_pile(
     def fail_commit(*_args, **_kwargs):
         raise RuntimeError("simulated publication failure")
 
-    def fail_restore(_workspace):
+    def fail_restore():
         raise OutcomeUnknown("authoritative root unavailable")
 
-    monkeypatch.setattr(node, "commit_ingress", fail_commit)
-    monkeypatch.setattr(node, "_restore_authoritative_state", fail_restore)
+    membrane = node.admission(workspace)
+    monkeypatch.setattr(membrane, "commit_ingress", fail_commit)
+    monkeypatch.setattr(membrane, "restore", fail_restore)
 
     with pytest.raises(
             OutcomeUnknown, match="authoritative root unavailable"):
@@ -378,8 +381,9 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     retiring = threading.Barrier(2)
     for node in (first, second):
         store = node.store(workspace)
+        membrane = node.admission(workspace)
         list_keys = store.list
-        retire = node._retire_rejected_ingress
+        retire = membrane._retire_rejected
 
         def synchronized_list(prefix, list_keys=list_keys):
             keys = list_keys(prefix)
@@ -387,13 +391,12 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
                 listed.wait(timeout=5)
             return keys
 
-        def synchronized_retire(
-                ws, key, raw, receipt, retire=retire):
+        def synchronized_retire(key, raw, receipt, retire=retire):
             retiring.wait(timeout=5)
-            return retire(ws, key, raw, receipt)
+            return retire(key, raw, receipt)
 
         monkeypatch.setattr(store, "list", synchronized_list)
-        monkeypatch.setattr(node, "_retire_rejected_ingress",
+        monkeypatch.setattr(membrane, "_retire_rejected",
                             synchronized_retire)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -533,7 +536,8 @@ def test_repeated_retirement_failures_reuse_one_publication_capability(
         node.store(workspace), node.member_for(workspace), raw)
     store = node.store(workspace)
     real_delete = store.delete
-    real_admit = node.admit_ingress
+    membrane = node.admission(workspace)
+    real_admit = membrane.admit_ingress
     admits = {"count": 0}
 
     def observed_admit(*args, **kwargs):
@@ -543,7 +547,7 @@ def test_repeated_retirement_failures_reuse_one_publication_capability(
     def failed_delete(_key):
         raise OSError("injected retirement outage")
 
-    monkeypatch.setattr(node, "admit_ingress", observed_admit)
+    monkeypatch.setattr(membrane, "admit_ingress", observed_admit)
     monkeypatch.setattr(store, "delete", failed_delete)
 
     for _ in range(5):
@@ -551,9 +555,55 @@ def test_repeated_retirement_failures_reuse_one_publication_capability(
 
     assert store.get(source) == raw
     assert admits["count"] == 1
-    assert len(node._publication_receipts) == 1
+    assert len(membrane._receipts) == 1
 
     monkeypatch.setattr(store, "delete", real_delete)
     node.turn(workspace)
     assert store.get(source) is None
-    assert node._publication_receipts == {}
+    assert membrane._receipts == {}
+
+
+def test_distinct_failed_admissions_do_not_accumulate_bound_pile_bytes(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    bootstrap = closed_subset(
+        source, workspace, all_fids(source, workspace))
+    fids = [
+        cmds.post(
+            source, workspace, "general", f"failed-{ordinal}",
+            ts=10 + ordinal)
+        for ordinal in range(8)
+    ]
+    raws = [
+        closed_subset(source, workspace, [fid])
+        for fid in fids
+    ]
+    assert len(set(raws)) == 8
+
+    node = Node(str(tmp_path / "node"))
+    node.add_workspace(workspace, "alice", peers=[])
+    deliver(node, workspace, bootstrap)
+    node.turn(workspace)
+    store = node.store(workspace)
+    queued = {
+        deliver(
+            node, workspace, raw,
+            member=f"{ordinal:016x}",
+        ): raw
+        for ordinal, raw in enumerate(raws)
+    }
+    assert len(queued) == 8
+    membrane = node.admission(workspace)
+
+    def fail_publish(_admission, **_options):
+        raise OSError("injected publication outage")
+
+    monkeypatch.setattr(membrane, "commit_ingress", fail_publish)
+    node.turn(workspace)
+
+    assert set(store.list("pile/")) == set(queued)
+    assert all(store.get(key) == raw for key, raw in queued.items())
+    assert membrane._bounds == {}
+    assert membrane._receipts == {}
+    assert len(node.ingress_attempt_failures(workspace)) == len(queued)

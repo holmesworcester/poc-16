@@ -48,25 +48,24 @@ def _shared_nodes(
 
 def _observe_retirements(
         monkeypatch, trace, node, before_retire=None):
-    published = node._retire_published_ingress
-    rejected = node._retire_rejected_ingress
+    membrane = node.admission(trace.workspace)
+    published = membrane.retire
+    rejected = membrane._retire_rejected
 
-    def observe_published(workspace, key, raw, receipt):
+    def observe_published(key, raw, receipt):
         trace.observe_node_retirement(
-            node, workspace, key, raw)
+            node, trace.workspace, key, raw)
         if before_retire is not None:
             before_retire()
-        return published(workspace, key, raw, receipt)
+        return published(key, raw, receipt)
 
-    def observe_rejected(workspace, key, raw, receipt):
+    def observe_rejected(key, raw, receipt):
         if before_retire is not None:
             before_retire()
-        return rejected(workspace, key, raw, receipt)
+        return rejected(key, raw, receipt)
 
-    monkeypatch.setattr(
-        node, "_retire_published_ingress", observe_published)
-    monkeypatch.setattr(
-        node, "_retire_rejected_ingress", observe_rejected)
+    monkeypatch.setattr(membrane, "retire", observe_published)
+    monkeypatch.setattr(membrane, "_retire_rejected", observe_rejected)
 
 
 def _put_pile(store, raw, member="shared"):
@@ -486,9 +485,9 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
     root = __file__.rsplit("/tests/", 1)[0]
     deletes = production_call_sites(root, "delete")
     published = production_call_sites(
-        root, "_retire_published_ingress")
+        root, "_retire_published")
     rejected = production_call_sites(
-        root, "_retire_rejected_ingress")
+        root, "retire_rejected")
 
     assert [
         (
@@ -511,8 +510,9 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         )
             for site in published
         ] == [
-        ("core/runtime.py", "turn", 73, "node", "direct"),
-        ("core/runtime.py", "turn", 110, "node", "direct"),
+        (
+            "core/admission.py", "retire", 100,
+            "ingress", "direct"),
     ]
     assert [
         (
@@ -521,9 +521,9 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         )
         for site in rejected
     ] == [
-                    (
-                    "core/node.py", "_quarantine_ingress", 284,
-                    "self", "direct"),
+        (
+            "core/admission.py", "_retire_rejected", 74,
+            "ingress", "direct"),
     ]
 
 

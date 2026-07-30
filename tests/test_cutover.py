@@ -98,7 +98,7 @@ def test_incremental_and_full_compilation_are_byte_identical(tmp_path):
             node, workspace, "general", f"message-{ordinal}",
             ts=10 + ordinal)
     expected = node.store(workspace).get("root")
-    node.commit(workspace, reuse=False)
+    node.admission(workspace).publish(reuse=False)
     assert node.store(workspace).get("root") == expected
 
 
@@ -199,6 +199,53 @@ def test_real_v7_pile_leaves_cut_over_through_legacy_decoder_only(tmp_path):
     assert set(rebuilt.facts) == set(facts)
     assert all(node.candidate_of(workspace, fid) == fact
                for fid, fact in facts.items())
+
+
+@pytest.mark.parametrize("local_catalog", (False, True))
+def test_empty_v7_manifest_cannot_supply_or_replace_the_anchor(
+        tmp_path, local_catalog):
+    node = Node(str(tmp_path / "node"))
+    if local_catalog:
+        workspace = cmds.create(node, "alice", ts=1)
+    else:
+        workspace = "a" * 64
+        node.add_workspace(workspace, "empty-v7", peers=[])
+    empty = {"root": "", "count": 0, "depth": 0}
+    old_root = canon({
+        "action_etag": h(canon(["legacy-actions", []])),
+        "anchor": workspace,
+        "layout_seed": snapshot.layout_seed(workspace),
+        "manifest": "",
+        "stamp": legacy_v7.LAYOUT,
+        "trees": {
+            name: dict(empty)
+            for name in legacy_v7.TREE_NAMES
+        },
+    })
+    node.store(workspace)._replace("root", old_root)
+
+    with pytest.raises(ValueError, match="store fact set"):
+        node.rebuild(workspace)
+
+    assert node.store(workspace).get("root") == old_root
+
+
+@pytest.mark.parametrize("local_catalog", (False, True))
+def test_present_empty_root_is_never_treated_as_rootless(
+        tmp_path, local_catalog):
+    node = Node(str(tmp_path / "node"))
+    if local_catalog:
+        workspace = cmds.create(node, "alice", ts=1)
+    else:
+        workspace = "b" * 64
+        node.add_workspace(workspace, "empty-root", peers=[])
+    store = node.store(workspace)
+    store._replace("root", b"")
+
+    with pytest.raises(ValueError, match="unreadable root does not match"):
+        node.rebuild(workspace)
+
+    assert store.get("root") == b""
 
 
 def test_frozen_production_v7_snapshot_cuts_over_to_candidate_archive(

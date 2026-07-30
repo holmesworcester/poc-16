@@ -3,6 +3,8 @@ import inspect
 import json
 import sqlite3
 
+import pytest
+
 from core import cmds, indexes, merkle_map, snapshot
 from core.close import encode_pile
 from core.crypto import h
@@ -66,6 +68,44 @@ def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sqlite3, "connect", database_forbidden)
     assert view.mint(pile, now) == (node.identity_id(workspace), "sync")
+
+
+@pytest.mark.parametrize("name", indexes.TREE_NAMES)
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_worker_mint_rejects_forged_outer_map_metadata(
+        tmp_path, name, field):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    now = now_ms()
+    pile = encode_pile(request.payload(
+        node, workspace, "sync", now + 60_000, now))
+    store = node.store(workspace)
+    body = json.loads(store.get("root"))
+    descriptor = body["maps"][name]
+    target_root = descriptor["root"]
+    descriptor[field] += 1
+    fetched = []
+
+    def fetch(oid):
+        fetched.append(oid)
+        return store.get("obj/" + oid)
+
+    forged = canon(body)
+    view = WorkerView.from_root(forged, fetch)
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        if name == indexes.FACT:
+            view.fact_record(workspace)
+        elif name == indexes.SUPP:
+            view.principal_active(
+                "member", node.identity_id(workspace))
+        else:
+            view.authority_known(
+                "member", node.identity_id(workspace))
+    assert target_root in fetched
+
+    fetched.clear()
+    assert WorkerView.from_root(forged, fetch).mint(pile, now) is None
+    assert target_root in fetched
 
 
 def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(

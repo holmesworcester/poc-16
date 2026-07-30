@@ -140,7 +140,7 @@ def test_rebuild(world):
         "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
         "DELETE FROM meta;")
     n.rebuild(ws)
-    n.commit(ws)
+    n.admission(ws).publish()
     assert h(n.store(ws).get("root")) == before
 
 
@@ -249,7 +249,7 @@ def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
     root = node.store(workspace).get("root")
     node.idx(workspace).executescript("DELETE FROM facts;")
 
-    assert node.commit(workspace) is None
+    assert node.admission(workspace).publish() is None
     assert node.store(workspace).get("root") == root
     assert node.idx(workspace).execute(
         "SELECT 1 FROM meta WHERE k='root'").fetchone() is None
@@ -285,7 +285,7 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
     stream, _ = decode_pile(pile, workspace)
     judgment = drain(stream, workspace)
     assert judgment.ok
-    node.admit(workspace, stream)
+    node.admission(workspace).admit(stream)
 
     # Model process death at the exact admission/manifest boundary: no exception
     # handler gets to restore the derived index before its connections close.
@@ -354,7 +354,8 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     ))
     deliver(node, workspace, raw)
     judgment = drain(decode_pile(raw, workspace)[0], workspace)
-    admission = node.admit(workspace, decode_pile(raw, workspace)[0])
+    admission = node.admission(workspace).admit(
+        decode_pile(raw, workspace)[0])
     old_root = node.store(workspace).get("root")
 
     def die_after_cas(*args, **kwargs):
@@ -363,7 +364,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     original_stamp = Publisher.stamp
     monkeypatch.setattr(Publisher, "stamp", die_after_cas)
     with pytest.raises(RuntimeError, match="post-CAS death"):
-        node.commit(workspace, admission.settlement)
+        node.admission(workspace).publish(admission.settlement)
     assert node.store(workspace).get("root") != old_root
     assert node.idx(workspace).execute(
         "SELECT 1 FROM staged WHERE fid=?",
@@ -540,7 +541,7 @@ def test_bulk_index_crash_retains_but_hides_unpublished_facts(
 
     monkeypatch.setattr(node.store(workspace), "cas", fail_before_manifest)
     with pytest.raises(RuntimeError, match="bulk pre-manifest failure"):
-        node.commit(workspace)
+        node.admission(workspace).publish()
 
     for index in node._idx.values():
         index.close()
@@ -641,10 +642,10 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
     index.set_trace_callback(statements.append)
     update = merkle_map.update
 
-    def observed(root, seed, rows, fetch, emit):
+    def observed(root, seed, rows, fetch, emit, **kwargs):
         rows = tuple(rows)
         updates.append(rows)
-        return update(root, seed, rows, fetch, emit)
+        return update(root, seed, rows, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", observed)
     try:
@@ -686,10 +687,10 @@ def test_action_publication_path_copies_only_its_changed_sid(
     updates = []
     update = merkle_map.update
 
-    def observed(root, seed, rows, fetch, emit):
+    def observed(root, seed, rows, fetch, emit, **kwargs):
         rows = tuple(rows)
         updates.append(rows)
-        return update(root, seed, rows, fetch, emit)
+        return update(root, seed, rows, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", observed)
     action = cmds.remove(node, workspace, target, ts=200)
@@ -860,10 +861,10 @@ def test_hot_commit_path_copies_four_maps_without_corpus_scan(
     real_put = store.put_if_absent
     real_update = merkle_map.update
 
-    def observed_update(root, seed, rows, fetch, emit):
+    def observed_update(root, seed, rows, fetch, emit, **kwargs):
         rows = tuple(rows)
         updates.append(rows)
-        return real_update(root, seed, rows, fetch, emit)
+        return real_update(root, seed, rows, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", observed_update)
     monkeypatch.setattr(

@@ -179,9 +179,9 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     changed_rows = []
     update = merkle_map.update
 
-    def bounded_update(root, seed, changes, fetch, emit):
+    def bounded_update(root, seed, changes, fetch, emit, **kwargs):
         changed_rows.append(len(changes))
-        return update(root, seed, changes, fetch, emit)
+        return update(root, seed, changes, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", bounded_update)
     monkeypatch.setattr(

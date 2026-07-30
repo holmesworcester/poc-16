@@ -41,7 +41,6 @@ class PublicationPlan(NamedTuple):
     deactivated: tuple
     updated: tuple
     witnesses: tuple
-    authority_changed: bool
     changed_sids: tuple
     admitted: tuple
     base_root: bytes | None
@@ -51,7 +50,6 @@ class PublicationPlan(NamedTuple):
 class PublicationResult(NamedTuple):
     """Exact authorized-root outcome without ingress-retirement authority."""
 
-    workspace: str
     root: bytes | None
     admitted: tuple
     outcome: str
@@ -112,7 +110,6 @@ class Publisher:
 
     def _result(self, root, admitted, outcome):
         return PublicationResult(
-            self.workspace,
             root,
             tuple(sorted(set(admitted))),
             outcome,
@@ -160,29 +157,6 @@ class Publisher:
     def publish(self, settlement, *, reuse=True):
         """Publish ordinary local/repair state without retirement authority."""
         return self._publish(settlement, reuse=reuse)
-
-    def _publish_ingress(self, admission, *, reuse=True):
-        """Publish one already-bound admission and bind the exact result."""
-        from .ingress import check_source
-
-        if admission.workspace != self.workspace:
-            raise ValueError("publication ingress workspace")
-        binding = check_source(admission.source, admission.raw)
-        if admission.payload != h(admission.raw):
-            raise ValueError("publication ingress payload")
-        if admission.generation != binding.generation:
-            raise ValueError("publication ingress generation")
-        result = self._publish(admission.settlement, reuse=reuse)
-        return PublicationReceipt(
-            result.workspace,
-            result.root,
-            result.admitted,
-            result.outcome,
-            admission.source,
-            admission.payload,
-            admission.generation,
-            admission.issuer,
-        )
 
     def _publish(self, settlement, *, reuse=True):
         node, ws = self.node, self.workspace

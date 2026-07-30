@@ -254,12 +254,13 @@ def test_failed_snapshot_publish_keeps_objects_and_retry_exposes_them(
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
     old_root = node.store(workspace).get("root")
-    commit = node.commit_ingress
+    membrane = node.admission(workspace)
+    commit = membrane.commit_ingress
 
     def fail_commit_ingress(*args, **kwargs):
         raise RuntimeError("injected CAS failure")
 
-    monkeypatch.setattr(node, "commit_ingress", fail_commit_ingress)
+    monkeypatch.setattr(membrane, "commit_ingress", fail_commit_ingress)
 
     with pytest.raises(RuntimeError, match="injected CAS failure"):
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
@@ -276,7 +277,7 @@ def test_failed_snapshot_publish_keeps_objects_and_retry_exposes_them(
     assert all(node.store(workspace).has("obj/" + item.body["cid"])
                for item in chunks)
 
-    monkeypatch.setattr(node, "commit_ingress", commit)
+    monkeypatch.setattr(membrane, "commit_ingress", commit)
     node.turn(workspace)
     assert progress(node, workspace)["have"] == len(chunks)
 

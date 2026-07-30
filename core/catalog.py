@@ -217,7 +217,6 @@ class Eligibility(NamedTuple):
     deactivated: tuple
     updated: tuple
     witnesses: tuple
-    authority_changed: bool
     changed_sids: tuple
 
 
@@ -587,7 +586,6 @@ class Catalog:
                     (),
                     (),
                     (),
-                    False,
                     (),
                 )
 
@@ -640,8 +638,6 @@ class Catalog:
             tuple(sorted(deactivated)),
             tuple(sorted(updated)),
             (),
-            shadows or bool(
-                deactivated or updated or (activated - received_set)),
             tuple(sorted(changed_sids)),
         )
 

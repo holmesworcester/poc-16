@@ -16,7 +16,7 @@ from core import (
 from core.candidate_archive import CandidateView, reconstruct
 from core.close import close, encode_pile
 from core.crypto import h
-from core.fact import encode
+from core.fact import canon, encode
 from core.ingress import pile_source
 from core.kernel import drain, resolve_deps
 from core.node import Node
@@ -117,6 +117,109 @@ def _forged_archive(node, workspace, mutate):
     return root, lambda oid: objects[oid] if oid in objects else fetch(oid)
 
 
+@pytest.mark.parametrize(
+    "name",
+    (snapshot.FACT_ORDER, *indexes.TREE_NAMES),
+)
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_cold_reconstruction_rejects_forged_map_metadata(
+        tmp_path, name, field):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "descriptor", ts=10)
+    store = node.store(workspace)
+    body = json.loads(store.get("root"))
+    assert body["maps"][name]["root"]
+    body["maps"][name][field] += 1
+    forged = canon(body)
+
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        reconstruct(
+            forged,
+            lambda oid: store.get("obj/" + oid),
+        )
+
+
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_candidate_sync_read_rejects_forged_fact_descriptor(
+        tmp_path, field):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "descriptor", ts=10)
+    store = node.store(workspace)
+    body = json.loads(store.get("root"))
+    descriptor = body["maps"][indexes.FACT]
+    descriptor[field] += 1
+    fetched = []
+
+    def fetch(oid):
+        fetched.append(oid)
+        return store.get("obj/" + oid)
+
+    forged = canon(body)
+    for read in (
+            lambda view: view.candidate_ids(),
+            lambda view: view.fact_record(workspace)):
+        fetched.clear()
+        with pytest.raises(ValueError, match="merkle map root metadata"):
+            read(CandidateView(forged, fetch))
+        assert fetched == [descriptor["root"]]
+
+
+@pytest.mark.parametrize(
+    "name",
+    (snapshot.FACT_ORDER, *indexes.TREE_NAMES),
+)
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_incremental_publication_rejects_forged_map_metadata(
+        tmp_path, name, field):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "before forgery", ts=10)
+    store = node.store(workspace)
+    body = json.loads(store.get("root"))
+    body["maps"][name][field] += 1
+    forged = canon(body)
+    store._replace("root", forged)
+
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        cmds.post(node, workspace, "general", "must not heal", ts=20)
+    assert store.get("root") == forged
+
+
+@pytest.mark.parametrize("name", indexes.TREE_NAMES)
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_incremental_index_wiring_rejects_forged_descriptor(
+        tmp_path, name, field):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "before forgery", ts=10)
+    store = node.store(workspace)
+    committed = snapshot.decode_root(store.get("root"))
+    previous = {
+        tree: dict(committed.maps[tree])
+        for tree in indexes.TREE_NAMES
+    }
+    previous[name][field] += 1
+    emitted = []
+
+    def emit(raw):
+        emitted.append(raw)
+        return h(raw)
+
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        indexes.build(
+            workspace,
+            node.idx(workspace),
+            emit,
+            previous=previous,
+            fetch=lambda oid: store.get("obj/" + oid),
+            changed_fids=(),
+            candidate_fids=(),
+        )
+    assert emitted == []
+
+
 def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         tmp_path):
     node = Node(str(tmp_path / "node"))
@@ -134,8 +237,7 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     # The old root has no FactRecord for this independently valid pile, so it
     # cannot authorize destructive retirement.
     with pytest.raises(ValueError, match="published ingress capability"):
-        node._retire_published_ingress(
-            workspace, source, raw, None)
+        node.admission(workspace).retire(source, raw, None)
     assert node.store(workspace).get(source) == raw
 
     node.turn(workspace)
@@ -145,7 +247,7 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         node.candidate_of(workspace, fact.fid) == fact for fact in dormant)
 
     before_full = node.store(workspace).get("root")
-    node.commit(workspace, reuse=False)
+    node.admission(workspace).publish(reuse=False)
     assert node.store(workspace).get("root") == before_full
 
     live_fid = cmds.post(
@@ -734,28 +836,23 @@ def test_exact_publication_receipt_binds_source_and_noop(
     first = _source("first00000000000", raw)
     store = node.store(workspace)
     store.put_if_absent(first, raw)
-    admission = node.admit_ingress(
-        workspace, first, raw)
+    admission = node.admission(workspace).admit_ingress(first, raw)
 
-    receipt = node.commit_ingress(admission)
+    receipt = node.admission(workspace).commit_ingress(admission)
     assert receipt.outcome == "applied"
 
     wrong = _source("wrong00000000000", raw)
     store.put_if_absent(wrong, raw)
     with pytest.raises(ValueError, match="published ingress capability"):
-        node._retire_published_ingress(
-            workspace, wrong, raw, receipt)
+        node.admission(workspace).retire(wrong, raw, receipt)
     assert store.get(wrong) == raw
-    node._retire_published_ingress(
-        workspace, first, raw, receipt)
+    node.admission(workspace).retire(first, raw, receipt)
     assert store.get(first) is None
 
-    admission = node.admit_ingress(
-        workspace, wrong, raw)
-    noop = node.commit_ingress(admission)
+    admission = node.admission(workspace).admit_ingress(wrong, raw)
+    noop = node.admission(workspace).commit_ingress(admission)
     assert noop.outcome == "noop"
-    node._retire_published_ingress(
-        workspace, wrong, raw, noop)
+    node.admission(workspace).retire(wrong, raw, noop)
     assert store.get(wrong) is None
 
 
@@ -779,23 +876,20 @@ def test_caller_constructed_publication_receipt_cannot_retire_ingress(
         issuer=object(),
     )
     with pytest.raises(ValueError, match="published ingress capability"):
-        node._retire_published_ingress(
-            workspace, source, raw, forged)
+        node.admission(workspace).retire(source, raw, forged)
     assert store.get(source) == raw
 
-    genuine = node.commit_ingress(
-        node.admit_ingress(workspace, source, raw))
+    genuine = node.admission(workspace).commit_ingress(
+        node.admission(workspace).admit_ingress(source, raw))
     # Copying all fields, including the hidden issuer, still does not mint a
     # second capability: only the exact object registered by commit_ingress
     # crosses the destructive door.
     copied = replace(genuine)
     with pytest.raises(ValueError, match="published ingress capability"):
-        node._retire_published_ingress(
-            workspace, source, raw, copied)
+        node.admission(workspace).retire(source, raw, copied)
     assert store.get(source) == raw
 
-    node._retire_published_ingress(
-        workspace, source, raw, genuine)
+    node.admission(workspace).retire(source, raw, genuine)
     assert store.get(source) is None
 
 
@@ -825,11 +919,13 @@ def test_bound_admissions_cannot_cross_nodes_or_piles(
         node.store(workspace).put_if_absent(source, raw)
         nodes.append(node)
         sources.append(source)
-        admissions.append(node.admit_ingress(workspace, source, raw))
+        admissions.append(
+            node.admission(workspace).admit_ingress(source, raw))
 
     first, second = nodes
     first_store, second_store = (
         first.store(workspace), second.store(workspace))
+    first_store.put_if_absent(sources[1], raws[1])
     first_root = first_store.get("root")
     first_objects = tuple(first_store.list("obj/"))
     cas = first_store.cas
@@ -840,18 +936,29 @@ def test_bound_admissions_cannot_cross_nodes_or_piles(
         return cas(*args, **kwargs)
 
     monkeypatch.setattr(first_store, "cas", observed_cas)
-    with pytest.raises(ValueError, match="bound ingress issuer"):
-        first.commit_ingress(admissions[1])
+    forged = replace(
+        admissions[0],
+        source=sources[1],
+        raw=raws[1],
+    )
+    with pytest.raises(ValueError, match="bound ingress capability"):
+        first.admission(workspace).commit_ingress(forged)
+    assert first.admission(workspace).pending(
+        sources[1], raws[1]) is None
+
+    with pytest.raises(ValueError, match="bound ingress capability"):
+        first.admission(workspace).commit_ingress(admissions[1])
 
     assert cas_calls == []
     assert first_store.get("root") == first_root
     assert tuple(first_store.list("obj/")) == first_objects
     assert first_store.get(sources[0]) == raws[0]
+    assert first_store.get(sources[1]) == raws[1]
     assert second_store.get(sources[1]) == raws[1]
 
-    first_receipt = first.commit_ingress(admissions[0])
-    first._retire_published_ingress(
-        workspace, sources[0], raws[0], first_receipt)
+    first_receipt = first.admission(workspace).commit_ingress(admissions[0])
+    first.admission(workspace).retire(
+        sources[0], raws[0], first_receipt)
     assert first_store.get(sources[0]) is None
     assert second_store.get(sources[1]) == raws[1]
 
@@ -871,6 +978,32 @@ def test_empty_closed_pile_retires_under_typed_noop_receipt(tmp_path):
     assert store.get("root") == root
 
 
+def test_rootless_pile_retries_after_bootstrap_and_then_retires(tmp_path):
+    seed = Node(str(tmp_path / "seed"))
+    workspace = cmds.create(seed, "alice", ts=1)
+    bootstrap = closed_subset(seed, workspace, all_fids(seed, workspace))
+
+    node = Node(str(tmp_path / "rootless"))
+    node.add_workspace(workspace, "rootless", peers=[])
+    raw = encode_pile((), workspace=workspace)
+    source = _source("rootless00000000", raw)
+    store = node.store(workspace)
+    store.put_if_absent(source, raw)
+
+    assert node.turn(workspace) == []
+    assert store.get("root") is None
+    assert store.get(source) == raw
+    assert node.admission(workspace).pending(source, raw) is None
+
+    deliver(node, workspace, bootstrap, member="0000000000000000")
+    node.turn(workspace)
+    node.turn(workspace)
+
+    assert store.get("root") is not None
+    assert store.get(source) is None
+    assert store.list("pile/") == []
+
+
 def test_applied_receipt_survives_a_later_root_advance(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
@@ -885,8 +1018,8 @@ def test_applied_receipt_survives_a_later_root_advance(tmp_path):
     source = _source("applied000000000", raw)
     store = node.store(workspace)
     store.put_if_absent(source, raw)
-    receipt = node.commit_ingress(
-        node.admit_ingress(workspace, source, raw))
+    receipt = node.admission(workspace).commit_ingress(
+        node.admission(workspace).admit_ingress(source, raw))
     assert receipt.outcome == "applied"
 
     # Candidate retention is monotone. A second real publication cannot undo
@@ -900,11 +1033,10 @@ def test_applied_receipt_survives_a_later_root_advance(tmp_path):
     })
     later_source = _source("later00000000000", later_raw)
     store.put_if_absent(later_source, later_raw)
-    later_receipt = node.commit_ingress(
-        node.admit_ingress(workspace, later_source, later_raw))
+    later_receipt = node.admission(workspace).commit_ingress(
+        node.admission(workspace).admit_ingress(later_source, later_raw))
     assert later_receipt.root != receipt.root
-    node._retire_published_ingress(
-        workspace, source, raw, receipt)
+    node.admission(workspace).retire(source, raw, receipt)
     assert store.get(source) is None
-    node._retire_published_ingress(
-        workspace, later_source, later_raw, later_receipt)
+    node.admission(workspace).retire(
+        later_source, later_raw, later_receipt)

@@ -93,6 +93,13 @@ from that catalog. Published-state decisions shared with the CF path use the
 same authenticated trees; SQLite is reserved for client-local intent, query
 assembly, and full repair.
 
+On the host write path, `Node` is a resource container rather than the
+admission engine. `WorkspaceRuntime` orders live pile work and calls one
+workspace-bound `AdmissionMembrane`: that component binds the exact source,
+runs the kernel, retains the historical proof, settles the catalog, obtains
+the root-CAS result, and mints the one-use retirement capability. The daemon,
+sync, and fact families do not own parallel durable entrances.
+
 FactTree is also the authenticated generic query index for current standing.
 It maps a fid to its reconciliation key, rank, resolved dependencies, offers,
 and suppression scopes, and carries ordered posting rows for fact type, key,

@@ -133,16 +133,17 @@ class _History:
         shutil.copytree(self.path / "template", target)
         node = Node(str(target))
         node._stores[self.workspace] = self.bucket.handle(name)
-        retire = node._retire_published_ingress
+        membrane = node.admission(self.workspace)
+        retire = membrane.retire
 
-        def observed(workspace, key, raw, receipt):
+        def observed(key, raw, receipt):
             self.trace.observe_node_retirement(
-                node, workspace, key, raw)
+                node, self.workspace, key, raw)
             if before_retire is not None:
                 before_retire()
-            return retire(workspace, key, raw, receipt)
+            return retire(key, raw, receipt)
 
-        node._retire_published_ingress = observed
+        membrane.retire = observed
         self._actors[name] = node
         return node
 
@@ -536,8 +537,8 @@ def test_node_retirement_call_boundary_requires_hash_bound_pile(tmp_path):
         with pytest.raises(
                 ValueError,
                 match="ingress source is not bound to exact bytes"):
-            node._retire_published_ingress(
-                history.workspace, wrong, history.pile_raw, None)
+            node.admission(history.workspace).retire(
+                wrong, history.pile_raw, None)
         assert not [
             event for event in history.bucket.history
             if event.op == "delete" and event.key == wrong

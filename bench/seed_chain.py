@@ -232,7 +232,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
         node, workspace, content_identities, n_messages,
         content_ts, window, content_rng)
     authored = time.perf_counter()
-    node.commit(workspace)
+    node.admission(workspace).publish()
     finished = time.perf_counter()
 
     total = node.idx(workspace).execute(

@@ -168,7 +168,7 @@ def test_database_free_mint_and_catalog_enforce_the_same_anchor(tmp_path):
     foreign = message(
         first, node.identity_id(first), "general", "not second", 101)
     with pytest.raises(KernelRejected, match="ingress rejected"):
-        node.admit(second, [foreign])
+        node.admission(second).admit([foreign])
     assert node.candidate_of(second, foreign.fid) is None
 
     ws_less_ordinary = Fact("msg", 102, [], {}, None)

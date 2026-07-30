@@ -7,11 +7,12 @@ import sqlite3
 import pytest
 
 from core import bao, cmds, indexes, mint, snapshot
+from core.candidate_archive import reconstruct
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.kernel import drain, offer_src, resolve_deps
 from core.ingress import pile_source, stage_pile
-from core.node import Node, resident
+from core.node import Node
 from core.object_store import ABSENT, Applied, OutcomeUnknown
 from core.publication import PublicationPlan, Publisher, RootChanged
 from core.worker import WorkerView
@@ -77,12 +78,30 @@ def _shared_clones(seed, workspace, path, *actors):
     return bucket, nodes
 
 
+def _resident(root_bytes, fetch):
+    """Eligible deps-first facts from the stronger candidate verifier."""
+    archive = reconstruct(root_bytes, fetch)
+    eligible = {
+        fid: archive.facts[fid]
+        for fid, record in archive.records.items()
+        if record["state"] == "eligible"
+    }
+    return tuple(close(
+        eligible.values(),
+        lambda fid: tuple(
+            parent
+            for _, parent, _ in archive.records[fid]["dependencies"]
+        ),
+        eligible.__getitem__,
+    ))
+
+
 def _commit_facts(workspace, commit):
     objects = dict(commit.objects)
     fetch = objects.get
     root = snapshot.decode_root(commit.root)
     assert root.anchor == workspace
-    stream = tuple(resident(commit.root, fetch))
+    stream = _resident(commit.root, fetch)
 
     view = WorkerView.from_root(commit.root, fetch)
     for name in indexes.TREE_NAMES:
@@ -112,21 +131,21 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
         seed, workspace, tmp_path, "alice", "bob")
 
     def admit(node, raw):
-        return node.admit(
-            workspace, decode_pile(raw, workspace)[0]).settlement
+        return node.admission(workspace).admit(
+            decode_pile(raw, workspace)[0]).settlement
 
     alice_plan = admit(alice, raw_a)
     bob_plan = admit(bob, raw_b)
     assert alice_plan.base_token == bob_plan.base_token
 
-    alice_root = alice.commit(workspace, alice_plan)
+    alice_root = alice.admission(workspace).publish(alice_plan)
     with pytest.raises(RootChanged, match="root changed"):
-        bob.commit(workspace, bob_plan)
+        bob.admission(workspace).publish(bob_plan)
     assert bob.store(workspace).get("root") == alice_root
 
-    bob._restore_authoritative_state(workspace)
+    bob.admission(workspace).restore()
     retry = admit(bob, raw_b)
-    final_root = bob.commit(workspace, retry)
+    final_root = bob.admission(workspace).publish(retry)
     assert {fact.fid for fact in _commit_facts(
         workspace, bucket.commits[-1])} >= {
             workspace, fact_a.fid, fact_b.fid}
@@ -202,9 +221,9 @@ def test_unknown_cas_followed_by_different_authorized_root_keeps_exact_pile(
         applied = real_cas(key, token, value)
         assert isinstance(applied, Applied)
         bob._sync_index(workspace)
-        later = bob.admit(
-            workspace, decode_pile(raw_b, workspace)[0]).settlement
-        winner.append(bob.commit(workspace, later))
+        later = bob.admission(workspace).admit(
+            decode_pile(raw_b, workspace)[0]).settlement
+        winner.append(bob.admission(workspace).publish(later))
         assert winner[-1] != value
         raise OutcomeUnknown("response lost after a later root won")
 
@@ -236,7 +255,7 @@ def test_rootless_publication_does_not_stamp_across_bootstrap(tmp_path):
     store = node.store(workspace)
     assert isinstance(store.cas("root", ABSENT, b"foreign"), Applied)
     plan = PublicationPlan(
-        (), (), (), (), (), False, (), (), None, ABSENT)
+        (), (), (), (), (), (), (), None, ABSENT)
 
     with pytest.raises(RootChanged, match="rootless"):
         Publisher(node, workspace).publish(plan)
@@ -253,18 +272,19 @@ def test_post_cas_stamp_records_its_own_root_not_a_later_writers(tmp_path):
         seed, workspace, tmp_path, "alice", "bob")
 
     def plan(node, raw):
-        return node.admit(
-            workspace, decode_pile(raw, workspace)[0]).settlement
+        return node.admission(workspace).admit(
+            decode_pile(raw, workspace)[0]).settlement
 
     plan_a = plan(alice, raw_a)
     cas_won = bucket.pause("alice", "cas", "root", when="after")
     with ThreadPoolExecutor(max_workers=1) as pool:
-        publishing = pool.submit(alice.commit, workspace, plan_a)
+        publishing = pool.submit(
+            alice.admission(workspace).publish, plan_a)
         cas_won.wait()
         root_a = alice.store(workspace).get("root")
 
         bob._sync_index(workspace)
-        root_b = bob.commit(workspace, plan(bob, raw_b))
+        root_b = bob.admission(workspace).publish(plan(bob, raw_b))
         assert root_b != root_a
         cas_won.release.set()
         assert publishing.result(timeout=5) == root_a
@@ -506,7 +526,7 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
         serial.store(workspace), "serial", encode_pile(final))
     serial.turn(workspace)
     assert serial.store(workspace).get("root") == final_root
-    assert tuple(resident(final_root, final_objects.get)) == final
+    assert _resident(final_root, final_objects.get) == final
     assert bucket.assert_valid_history()
 
 

@@ -367,7 +367,7 @@ def test_action_witness_remains_historical_across_current_provider_rewire(
     assert before["maps"]["authority"] == after["maps"]["authority"]
     assert _action_rows(target_peer, workspace)[0][2] == evidence[lower]
     full = target_peer.store(workspace).get("root")
-    target_peer.commit(workspace, reuse=False)
+    target_peer.admission(workspace).publish(reuse=False)
     assert target_peer.store(workspace).get("root") == full
 
     for peer, _, posted, _ in peers:

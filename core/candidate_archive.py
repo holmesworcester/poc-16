@@ -58,7 +58,9 @@ class CandidateView:
         descriptor = self.root.maps[name]
         return merkle_map.Reader(
             descriptor["root"], self.root.layout_seed, self.fetch,
-            max_page_depth=descriptor["depth"])
+            max_page_depth=descriptor["depth"],
+            expected_count=descriptor["count"],
+            expected_depth=descriptor["depth"])
 
     def fact_record(self, fid):
         if not valid_fid(fid):

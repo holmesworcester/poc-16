@@ -6,12 +6,19 @@ rows before republishing them through :mod:`core.merkle_map`.  In particular
 there is deliberately no legacy build or update implementation.
 """
 import json
+import sqlite3
 from typing import NamedTuple
 
+import facts
+
+from . import catalog
+from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import canon
+from .kernel import rebuild_proofs, resolve_deps
 from .limits import MAX_ROOT_BYTES, decode_json
-from .shape import is_key, valid_fid
+from .object_store import verified_object
+from .shape import fid_of, is_key, valid_fid
 
 FORMAT = "btreap-v2"
 LAYOUT = "composite-btreap-v7-generic-candidate-index"
@@ -199,3 +206,95 @@ def stable_cut_positions(fids):
         for index, fid in enumerate(fids)
         if int(fid[:8], 16) % CUT == 0
     ]
+
+
+def _resolved_edges(items, anchor):
+    """Rejudge canonical v7 dependencies without trusting its derived trees."""
+    deps, db = {}, sqlite3.connect(":memory:")
+    try:
+        db.executescript(catalog.SCHEMA)
+        admitted = catalog.ScratchCatalog(db, anchor)
+        for fact in items.values():
+            admitted.load(fact)
+        admitted.commit_stage(items)
+        if rebuild_proofs(db, items.get, anchor):
+            raise ValueError("store closure")
+        for fid, fact in items.items():
+            resolved = resolve_deps(fact, db)
+            if resolved is None or any(parent not in items for parent in resolved):
+                raise ValueError("store closure")
+            deps[fid] = resolved
+    finally:
+        db.close()
+    return deps
+
+
+def recover(root, fetch):
+    """Recover and fully validate the eligible facts from one decoded v7 root.
+
+    This is the whole migration surface.  Current-format code receives only a
+    closed fact stream and cannot inspect old tree pages or placement rules.
+    """
+    if not isinstance(root, Root):
+        raise TypeError("legacy v7 root")
+    items, leaf_raw = {}, {}
+    entries = range_entries(root.manifest, RANGE_SEED, fetch) \
+        if root.manifest else ()
+    for entry in entries:
+        raw = verified_object(entry.leaf, fetch)
+        members, blobs = decode_pile(raw, root.anchor)
+        if blobs:
+            raise ValueError("legacy store placement")
+        for fact in members:
+            if fact.fid in items:
+                raise ValueError("legacy store placement")
+            items[fact.fid] = fact
+        leaf_raw[entry.leaf] = raw
+    if any(
+            (family := facts.family_for(fact.t)) is None
+            or not family.DURABLE
+            for fact in items.values()):
+        raise ValueError("store contains an ephemeral fact")
+
+    deps = _resolved_edges(items, root.anchor)
+    keys = sorted(fact.key for fact in items.values())
+    cuts = stable_cut_positions(
+        [fid_of(address) for address in keys])
+    chunks = [
+        keys[start:stop]
+        for start, stop in zip([0] + cuts, cuts + [len(keys)])
+        if stop > start
+    ]
+    expected = []
+    for addresses in chunks:
+        members = [
+            items[fid_of(address)]
+            for address in addresses
+        ]
+        raw = encode_pile(members, workspace=root.anchor)
+        inside = {fact.fid for fact in members}
+        seen, stack = set(), [fact.fid for fact in members]
+        while stack:
+            fid = stack.pop()
+            if fid in seen:
+                continue
+            seen.add(fid)
+            stack.extend(deps[fid])
+        outside = sorted(items[fid].key for fid in seen - inside)
+        closure_raw = canon({"keys": outside}) if outside else None
+        entry = RangeEntry(
+            addresses[0],
+            h(raw),
+            h(closure_raw) if closure_raw is not None else "",
+        )
+        if leaf_raw.get(entry.leaf) != raw:
+            raise ValueError("legacy store placement")
+        if closure_raw is not None and verified_object(
+                entry.closure, fetch) != closure_raw:
+            raise ValueError("legacy store placement")
+        expected.append(entry)
+    if tuple(expected) != entries:
+        raise ValueError("legacy store placement")
+    if root.anchor not in items:
+        raise ValueError("store fact set")
+    return close(items.values(), deps.__getitem__, items.__getitem__)

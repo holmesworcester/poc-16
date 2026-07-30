@@ -107,8 +107,8 @@ def test_staging_replay_and_concurrent_promotions_cannot_recreate_generation(
     store = node.store(workspace)
 
     first = promote_staged_pile(store, intent)
-    old_receipt = node.commit_ingress(
-        node.admit_ingress(workspace, first, raw))
+    old_receipt = node.admission(workspace).commit_ingress(
+        node.admission(workspace).admit_ingress(first, raw))
     # Another worker wins retirement while this process still holds its
     # genuine historical receipt.
     store.delete(first)
@@ -126,8 +126,8 @@ def test_staging_replay_and_concurrent_promotions_cannot_recreate_generation(
     for source in promoted:
         with pytest.raises(
                 ValueError, match="published ingress capability"):
-            node._retire_published_ingress(
-                workspace, source, raw, old_receipt)
+            node.admission(workspace).retire(
+                source, raw, old_receipt)
         assert store.get(source) == raw
 
     node.turn(workspace)

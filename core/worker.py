@@ -39,7 +39,9 @@ class WorkerView:
         descriptor = self.trees[name]
         return merkle_map.Reader(
             descriptor["root"], self.seed, self.fetch,
-            max_page_depth=descriptor["depth"])
+            max_page_depth=descriptor["depth"],
+            expected_count=descriptor["count"],
+            expected_depth=descriptor["depth"])
 
     def fact_record(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))

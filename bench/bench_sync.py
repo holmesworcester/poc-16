@@ -79,8 +79,8 @@ def admit_batch(node, workspace, news, deps_new):
     if not pending:
         node._sync_index(workspace)
     publisher = Publisher(node, workspace)
-    return node.admit(
-        workspace, stream,
+    return node.admission(workspace).admit(
+        stream,
         base=publisher.base(pending=pending))
 
 
@@ -139,7 +139,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     t_auth = perf()
     bulk_author(n, ws, members, n_msgs, base_ts + n_members + 1, window, rng)
     t_layout = perf()
-    n.commit(ws)  # one full snapshot build over the whole set
+    n.admission(ws).publish()  # one full snapshot build over the whole set
     t_end = perf()
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     return n, ws, {"members": n_members, "msgs": n_msgs, "facts": total,
@@ -188,7 +188,7 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
             judged = ex.map(lambda unit: (unit, kernel(unit, ws)), bb)
             for unit, judgment in judged:
                 assert judgment.ok, "a published unit failed the kernel"
-                node.admit(ws, unit, base=base)
+                node.admission(ws).admit(unit, base=base)
 
         for u in units:
             streamed += len(u)
@@ -211,7 +211,7 @@ def catchup(seed, ws, fresh_dir):
 
     t0 = perf()
     streamed = ingest(fresh, ws, seed_units(src, root, ws))
-    fresh.commit(ws)
+    fresh.admission(ws).publish()
     t1 = perf()
 
     total = fresh.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
@@ -232,7 +232,7 @@ def copy_facts(dst, ws, src, fids):
         lambda fid: src.fact_of(ws, fid),
     )
     dst._sync_index(ws)
-    dst.admit(ws, facts)
+    dst.admission(ws).admit(facts)
     _commit_index(dst, ws)
 
 
@@ -263,13 +263,13 @@ def reconcile(A, B, ws):
         ingest(B, ws, pushed)
         # ingest() is the bulk benchmark seam and does not return Node.turn's
         # exact new-fid delta; force the canonical full maintenance path.
-        B.commit(ws, reuse=False)
+        B.admission(ws).publish(reuse=False)
 
     # Preserve sync's push-before-pull order so both deltas were computed
     # against the same two pinned roots.
     ingest(A, ws, pulled)
     if pulled:
-        A.commit(ws, reuse=False)
+        A.admission(ws).publish(reuse=False)
     t1 = perf()
 
     match = A.store(ws).get("root") == B.store(ws).get("root")
@@ -304,7 +304,7 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
         # Settle it before taking the shared membership snapshot; otherwise
         # non-anchor facts are still staged and one-round reconciliation can
         # expose previously invisible content after its frontier was computed.
-        A.commit(ws)
+        A.admission(ws).publish()
     membership = all_fids(A, ws)
 
     B = Node(os.path.join(base_dir, "B"))
@@ -317,8 +317,8 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
     ) + 1
     bulk_author(A, ws, members, per_side, first, window, random.Random(1), "A")
     bulk_author(B, ws, members, per_side, first, window, random.Random(2), "B")
-    A.commit(ws)
-    B.commit(ws)
+    A.admission(ws).publish()
+    B.admission(ws).publish()
     a_facts = A.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     b_facts = B.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     st = reconcile(A, B, ws)

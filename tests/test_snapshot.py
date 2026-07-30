@@ -83,6 +83,21 @@ def test_fact_order_is_direct_and_every_page_obeys_map_bounds():
                 for item in value["rows"])
 
 
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_fact_order_incremental_wiring_rejects_forged_descriptor(field):
+    objects = {}
+    descriptor = snapshot.build_fact_order(
+        (row(0), row(1)), SEED, emitter(objects))
+    forged = dict(descriptor)
+    forged[field] += 1
+    emitted = []
+
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        snapshot.update_fact_order(
+            forged, (), SEED, objects.get, emitted.append)
+    assert emitted == []
+
+
 def test_root_has_four_uniform_descriptors_and_no_cache_identity():
     objects = {}
     order = snapshot.build_fact_order(
