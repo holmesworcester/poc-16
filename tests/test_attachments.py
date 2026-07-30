@@ -1,5 +1,4 @@
 """Bao attachment policy and query-time object verification."""
-import json
 import os
 import random
 import threading
@@ -12,11 +11,8 @@ import core.sync as sync_module
 from core import bao, cmds, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
-from core.object_store import Applied, ensure_object
-from core.fact import canon
 from core.node import Node
 from core.walk import _fetch_blobs, _push
-from core.worker import WorkerView
 from facts.content import chunk, file as file_family
 
 from .util import (
@@ -62,19 +58,13 @@ def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     assert output.read_bytes() == data
 
 
-def test_v24_catalog_prebackfills_refs_before_a_republish_crash(
-        tmp_path, monkeypatch):
+def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
     workspace = cmds.create(node, "alice", ts=1)
     fid = send_bytes(node, workspace, "upgrade.bin", b"upgrade", ts=2)
     store = node.store(workspace)
-    current = store.get("root")
-    foreign_value = json.loads(current)
-    foreign_value["stamp"] = "composite-btreap-v4"
-    foreign = canon(foreign_value)
-    assert isinstance(store.cas(
-        "root", store.read_versioned("root").token, foreign), Applied)
+    root = store.get("root")
 
     index = node.idx(workspace)
     index.execute(
@@ -85,27 +75,14 @@ def test_v24_catalog_prebackfills_refs_before_a_republish_crash(
     index.commit()
     close_node(node)
 
-    def crash_after_republish(_catalog):
-        raise RuntimeError("crash after the early version stamp")
+    refreshed = Node(str(directory))
 
-    monkeypatch.setattr(
-        catalog_module.Catalog, "reindex", crash_after_republish)
-    with pytest.raises(RuntimeError, match="early version stamp"):
-        Node(str(directory))
-
-    # The failed rebuild stamped v25 before reaching Catalog.reindex. Schema
-    # opening must already have rebuilt ref rows, so a restart that now skips
-    # the semantic rebuild still has a complete query index.
-    upgraded = Node(str(directory))
-
-    assert file_family.resolve(upgraded, workspace, fid)["complete"]
-    assert upgraded.idx(workspace).execute(
+    assert refreshed.store(workspace).get("root") == root
+    assert file_family.resolve(refreshed, workspace, fid)["complete"]
+    assert refreshed.idx(workspace).execute(
         "SELECT COUNT(*) FROM fact_index WHERE kind=?",
         (catalog_module.REF_INDEX,)).fetchone()[0] > 0
-    store = upgraded.store(workspace)
-    view = WorkerView.from_root(
-        store.get("root"), lambda oid: store.get("obj/" + oid))
-    assert not view.authority_known(
+    assert not refreshed.reader(workspace).worker().authority_known(
         catalog_module.REF_INDEX, "file", fid)
 
 
@@ -249,36 +226,37 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
     assert cmds.files(node, workspace) == []
 
 
-def test_failed_snapshot_publish_keeps_objects_and_retry_exposes_them(
+def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice")
-    old_root = node.store(workspace).get("root")
-    membrane = node.admission(workspace)
-    commit = membrane.commit_ingress
+    store = node.store(workspace)
+    old_root = store.get("root")
+    applier = node.applier(workspace)
+    commit = applier.commit
 
-    def fail_commit_ingress(*args, **kwargs):
+    async def fail_commit(*_args, **_kwargs):
         raise RuntimeError("injected CAS failure")
 
-    monkeypatch.setattr(membrane, "commit_ingress", fail_commit_ingress)
+    monkeypatch.setattr(applier, "commit", fail_commit)
 
-    with pytest.raises(RuntimeError, match="injected CAS failure"):
+    with pytest.raises(ValueError, match="outside the canonical set"):
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
 
-    pile = node.store(workspace).list("pile/")[0]
-    stream, _ = decode_pile(
-        node.store(workspace).get(pile), workspace)
+    pile = store.list("pile/")[0]
+    stream, _ = decode_pile(store.get(pile), workspace)
     descriptor = next(fact for fact in stream if fact.t == file_family.TAG)
     chunks = [fact for fact in stream if fact.t == "chunk"]
-    assert node.store(workspace).get("root") == old_root
+    assert store.get("root") == old_root
     assert node.fact_of(workspace, descriptor.fid) is None
-    assert node.idx(workspace).execute(
-        "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
-    assert all(node.store(workspace).has("obj/" + item.body["cid"])
+    assert node.ingress_attempt_error(workspace, pile).args \
+        == ("injected CAS failure",)
+    assert all(store.has("obj/" + item.body["cid"])
                for item in chunks)
 
-    monkeypatch.setattr(membrane, "commit_ingress", commit)
+    monkeypatch.setattr(applier, "commit", commit)
     node.turn(workspace)
+    assert store.get(pile) is None
     assert progress(node, workspace)["have"] == len(chunks)
 
 
@@ -327,7 +305,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
     for _, oid, raw in object_events:
-        ensure_object(destination.store(workspace), oid, raw)
+        destination.receive_object(workspace, oid, raw)
     deliver(destination, workspace, capture.raw)
     destination.turn(workspace)
     assert progress(destination, workspace)["complete"]

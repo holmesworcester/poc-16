@@ -517,7 +517,7 @@ os._exit(72)
             b"replacement" if when == "after" else b"base")
 
 
-def test_real_process_exit_after_root_cas_before_catalog_stamp_recovers(
+def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
         tmp_path):
     from core.node import Node
 
@@ -533,17 +533,17 @@ import os
 import sys
 from core import cmds
 from core.node import Node
-from core.publication import Publisher
+from core.repository_applier import RepositoryApplier
 
 directory, workspace = sys.argv[1:]
 node = Node(directory)
 
-def die_before_stamp(*args, **kwargs):
+async def die_before_retirement(*args, **kwargs):
     os._exit(73)
 
-Publisher.stamp = die_before_stamp
+RepositoryApplier.retire = die_before_retirement
 cmds.post(node, workspace, "general", "process crash", ts=2)
-raise AssertionError("publication did not reach stamp")
+raise AssertionError("applier did not reach retirement")
 """
     completed = _run_python(script, node_dir, workspace)
     assert completed.returncode == 73
@@ -552,8 +552,17 @@ raise AssertionError("publication did not reach stamp")
     assert reopened.store(workspace).get("root") != old_root
     assert [entry["text"] for entry in cmds.msgs(
         reopened, workspace)] == ["process crash"]
-    assert reopened.store(workspace).list("pile/")
-    reopened.turn(workspace)
+    pending = reopened.store(workspace).list("pile/")
+    assert len(pending) == 1
+    committed_root = reopened.store(workspace).get("root")
+
+    report = asyncio.run(reopened.applier(workspace).turn())
+
+    assert len(report) == 1
+    assert report[0].source == pending[0]
+    assert report[0].result.status == "noop"
+    assert report[0].result.retired is True
+    assert reopened.store(workspace).get("root") == committed_root
     assert reopened.store(workspace).list("pile/") == []
 
 
