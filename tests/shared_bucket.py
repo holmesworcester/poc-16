@@ -16,11 +16,13 @@ from core.object_store import (
     EXISTS,
     Applied,
     STALE,
+    ListPage as ObjectListPage,
     Versioned,
     VersionToken,
     authoritative_key,
     validate_key,
 )
+from core.limits import PAGE_BATCH, PayloadTooLarge
 
 
 class InjectedCrash(RuntimeError):
@@ -63,6 +65,20 @@ class Commit:
     seq: int
     root: bytes
     objects: tuple
+
+
+@dataclass(frozen=True)
+class _ListRequest:
+    cursor: str | None
+    after_key: str | None
+    limit: int
+
+
+@dataclass(frozen=True)
+class _HistoryListPage:
+    keys: tuple[str, ...]
+    cursor: str | None
+    truncated: bool
 
 
 class ScriptedBucket:
@@ -285,6 +301,35 @@ class ScriptedBucket:
         self._gate(actor, "list", prefix, "after")
         return list(result)
 
+    def _list_page(self, actor, prefix, cursor, limit):
+        """Return one genuinely bounded page for applier contract tests."""
+        if not isinstance(prefix, str):
+            raise ValueError("bad list prefix")
+        logical = prefix[:-1] if prefix.endswith("/") else prefix
+        if logical:
+            validate_key(logical)
+        if cursor is not None:
+            validate_key(cursor)
+        if type(limit) is not int or not 0 < limit <= PAGE_BATCH:
+            raise ValueError("list page limit")
+        self._gate(actor, "list_page", prefix, "before")
+        with self._lock:
+            eligible = tuple(sorted(
+                key for key in self._data
+                if key.startswith(prefix)
+                and (cursor is None or key > cursor)
+            ))
+            keys = eligible[:limit]
+            truncated = len(eligible) > limit
+            next_cursor = keys[-1] if truncated else None
+            request = _ListRequest(cursor, cursor, limit)
+            page = _HistoryListPage(keys, next_cursor, truncated)
+            self._record(
+                actor, "list_page", prefix, None, request,
+                eligible, page, eligible)
+        self._gate(actor, "list_page", prefix, "after")
+        return ObjectListPage(keys, next_cursor)
+
     def _delete(self, actor, key):
         key = validate_key(key)
         if authoritative_key(key):
@@ -411,6 +456,14 @@ class BucketHandle:
     def get(self, key):
         return self.bucket._get(self.actor, key)
 
+    def get_bounded(self, key, maximum):
+        if type(maximum) is not int or maximum < 1:
+            raise ValueError("bounded read limit")
+        value = self.bucket._get(self.actor, key)
+        if value is not None and len(value) > maximum:
+            raise PayloadTooLarge("bucket read exceeds byte limit")
+        return value
+
     def read_versioned(self, key):
         return self.bucket._read_versioned(self.actor, key)
 
@@ -428,6 +481,10 @@ class BucketHandle:
 
     def list(self, prefix):
         return self.bucket._list(self.actor, prefix)
+
+    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        return self.bucket._list_page(
+            self.actor, prefix, cursor, limit)
 
     def delete(self, key):
         return self.bucket._delete(self.actor, key)

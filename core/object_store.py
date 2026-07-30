@@ -21,7 +21,7 @@ import re
 from typing import Protocol
 
 from .crypto import h
-from .limits import MAX_OBJECT_BYTES
+from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 
@@ -75,6 +75,22 @@ class Applied:
     token: VersionToken
 
 
+@dataclass(frozen=True, slots=True)
+class ListPage:
+    """One bounded discovery page and its provider-opaque continuation."""
+
+    keys: tuple[str, ...]
+    cursor: str | None
+
+    def __post_init__(self):
+        if not isinstance(self.keys, tuple) \
+                or any(not isinstance(key, str) for key in self.keys) \
+                or tuple(sorted(set(self.keys))) != self.keys \
+                or self.cursor is not None and (
+                    not isinstance(self.cursor, str) or not self.cursor):
+            raise ValueError("object-store list page")
+
+
 class Absent(Enum):
     """The key was absent at the linearization point of a read."""
 
@@ -125,7 +141,10 @@ class ObjectReader(Protocol):
 
 
 class ObjectStore(ObjectReader, Protocol):
-    """The S3/R2-shaped operations used by a writable publisher."""
+    """The S3/R2-shaped operations used by a RepositoryApplier."""
+
+    def get_bounded(
+            self, key: str, max_bytes: int) -> bytes | None: ...
 
     def read_versioned(self, key: str) -> Versioned | Absent: ...
 
@@ -138,7 +157,9 @@ class ObjectStore(ObjectReader, Protocol):
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
 
-    def list(self, prefix: str) -> list[str]: ...
+    def list_page(
+            self, prefix: str, cursor: str | None,
+            limit: int) -> ListPage: ...
 
     def delete(self, key: str): ...
 
@@ -154,6 +175,9 @@ class AsyncObjectReader(Protocol):
 class AsyncObjectStore(AsyncObjectReader, Protocol):
     """Awaited equivalent of the writable ObjectStore contract."""
 
+    async def get_bounded(
+            self, key: str, max_bytes: int) -> bytes | None: ...
+
     async def read_versioned(self, key: str) -> Versioned | Absent: ...
 
     async def put(self, key: str, value: bytes): ...
@@ -165,7 +189,9 @@ class AsyncObjectStore(AsyncObjectReader, Protocol):
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
 
-    async def list(self, prefix: str) -> list[str]: ...
+    async def list_page(
+            self, prefix: str, cursor: str | None,
+            limit: int) -> ListPage: ...
 
     async def delete(self, key: str): ...
 
@@ -197,7 +223,7 @@ def ensure_object(store, oid, raw):
             result = store.put_if_absent(key, raw)
         except OutcomeUnknown as error:
             unknown = error
-            incumbent = store.get(key)
+            incumbent = store.get_bounded(key, MAX_OBJECT_BYTES)
             if incumbent == raw:
                 return EXISTS
             if incumbent is not None:
@@ -207,7 +233,7 @@ def ensure_object(store, oid, raw):
             return CREATED
         if result is not EXISTS:
             raise TypeError("conditional-create result")
-        incumbent = store.get(key)
+        incumbent = store.get_bounded(key, MAX_OBJECT_BYTES)
         if incumbent != raw:
             raise ValueError("immutable object conflict")
         return EXISTS
@@ -264,7 +290,8 @@ async def ensure_object_async(store, oid, raw):
             result = await store.put_if_absent(key, raw)
         except OutcomeUnknown as error:
             unknown = error
-            incumbent = await store.get(key)
+            incumbent = await store.get_bounded(
+                key, MAX_OBJECT_BYTES)
             if incumbent == raw:
                 return EXISTS
             if incumbent is not None:
@@ -274,21 +301,31 @@ async def ensure_object_async(store, oid, raw):
             return CREATED
         if result is not EXISTS:
             raise TypeError("conditional-create result")
-        if await store.get(key) != raw:
+        if await store.get_bounded(key, MAX_OBJECT_BYTES) != raw:
             raise ValueError("immutable object conflict")
         return EXISTS
     raise unknown
 
 
 async def retire_exact_async(store, key, raw):
-    """Awaited equivalent of :func:`retire_exact` for edge publishers.
+    """Awaited equivalent of :func:`retire_exact` for hosted appliers.
 
     This helper reconciles deletion mechanics only. The caller must first
     prove through F10 that the exact durable work item may be retired.
     """
     if not isinstance(raw, bytes):
         raise TypeError("exact retirement bytes required")
-    current = await store.get(key)
+    if len(raw) > MAX_OBJECT_BYTES:
+        raise PayloadTooLarge("exact retirement bytes exceed limit")
+    maximum = max(1, len(raw))
+
+    async def current_value():
+        try:
+            return await store.get_bounded(key, maximum)
+        except PayloadTooLarge as error:
+            raise OSError("retirement source changed") from error
+
+    current = await current_value()
     if current is None:
         return False
     if current != raw:
@@ -297,7 +334,9 @@ async def retire_exact_async(store, key, raw):
         await store.delete(key)
     except Exception as error:
         try:
-            current = await store.get(key)
+            current = await store.get_bounded(key, maximum)
+        except PayloadTooLarge as changed:
+            raise OSError("retirement source changed") from changed
         except Exception:
             raise error
         if current is None:
@@ -305,7 +344,7 @@ async def retire_exact_async(store, key, raw):
         if current != raw:
             raise OSError("retirement source changed") from error
         raise error
-    current = await store.get(key)
+    current = await current_value()
     if current is None:
         return True
     if current != raw:

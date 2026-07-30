@@ -11,6 +11,7 @@ and authoritative deletion. Objects use atomic put-if-absent; root uses CAS.
 Kernel-valid durable receipts live in the client catalog, not object keys.
 """
 import fcntl
+import heapq
 import os
 import tempfile
 
@@ -23,10 +24,16 @@ from .object_store import (
     STALE,
     Versioned,
     VersionToken,
+    ListPage,
     authoritative_key,
     validate_key,
 )
-from .limits import PAGE_BATCH
+from .limits import (
+    MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PAGE_BATCH,
+    PayloadTooLarge,
+)
 
 
 class FsStore:
@@ -45,6 +52,20 @@ class FsStore:
         except FileNotFoundError:
             return None
 
+    def get_bounded(self, key, max_bytes):
+        """Read at most one byte beyond the caller's explicit budget."""
+        if type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+            raise ValueError("filesystem read byte limit")
+        try:
+            with open(self._p(key), "rb") as f:
+                value = f.read(max_bytes + 1)
+        except FileNotFoundError:
+            return None
+        if len(value) > max_bytes:
+            raise PayloadTooLarge("filesystem read exceeds byte limit")
+        return value
+
     def read_versioned(self, key):
         """Read one atomic value/token pair.
 
@@ -52,7 +73,8 @@ class FsStore:
         because replacement is serialized by ``_root_lock``. Provider
         implementations return their own conditional-write token instead.
         """
-        value = self.get(key)
+        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        value = self.get_bounded(key, limit)
         return ABSENT if value is None else Versioned(
             value, VersionToken(h(value)))
 
@@ -146,6 +168,35 @@ class FsStore:
                     out.append(os.path.relpath(os.path.join(dirpath, n), self.root))
         return sorted(out)
 
+    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        """Scan one bounded logical page using the last key as an opaque cursor."""
+        if type(limit) is not int or not 0 < limit <= PAGE_BATCH:
+            raise ValueError("filesystem list page limit")
+        if cursor is not None:
+            validate_key(cursor)
+        if prefix:
+            prefix = prefix[:-1] if prefix.endswith("/") else prefix
+            if not prefix:
+                raise ValueError("bad list prefix")
+        base = self._p(prefix) if prefix else self.root
+
+        def candidates():
+            for dirpath, _, names in os.walk(base):
+                for name in names:
+                    if name.endswith(".tmp") or name == ".root.lock":
+                        continue
+                    key = os.path.relpath(
+                        os.path.join(dirpath, name), self.root)
+                    if cursor is None or key > cursor:
+                        yield key
+
+        selected = heapq.nsmallest(limit + 1, candidates())
+        keys = tuple(selected[:limit])
+        return ListPage(
+            keys,
+            keys[-1] if len(selected) > limit else None,
+        )
+
     def delete(self, key):
         if self._authoritative(key):
             raise ValueError("authoritative keys are not deletable")
@@ -193,5 +244,5 @@ class RemoteStore:
     def has(self, key):
         return self.get(key) is not None
 
-    def list(self, prefix):
+    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
         raise TypeError("remote stores do not expose LIST")

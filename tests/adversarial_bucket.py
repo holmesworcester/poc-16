@@ -19,6 +19,7 @@ from core.object_store import (
     ABSENT,
     CREATED,
     Applied,
+    ListPage as ObjectListPage,
     OutcomeUnknown,
     RetryableStoreError,
     StoreError,
@@ -26,6 +27,7 @@ from core.object_store import (
     VersionToken,
     validate_key,
 )
+from core.limits import PAGE_BATCH
 
 from .shared_bucket import InjectedCrash, ScriptedBucket
 
@@ -306,40 +308,54 @@ class AdversarialBucket(ScriptedBucket):
         cursor = None
         out = []
         for _ in range(self.max_list_pages):
-            self._gate(actor, "list_page", prefix, "before")
-            with self._lock:
-                if cursor is None:
-                    after_key = None
-                else:
-                    try:
-                        after_key = self._cursor_positions[cursor]
-                    except KeyError as error:
-                        raise StoreError("unknown LIST cursor") from error
-                width = self._list_width()
-                eligible = tuple(sorted(
-                    key for key in self._data
-                    if key.startswith(prefix)
-                    and (after_key is None or key > after_key)
-                ))
-                keys = eligible[:width]
-                truncated = len(eligible) > width
-                next_cursor = self._new_cursor(keys[-1]) \
-                    if truncated else None
-                request = ListRequest(cursor, after_key, width)
-                page = ListPage(keys, next_cursor, truncated)
-                self._record(
-                    actor, "list_page", prefix, None, request,
-                    eligible, page, eligible)
-            self._gate(actor, "list_page", prefix, "after")
+            page = self._list_page(
+                actor, prefix, cursor,
+                min(self.list_page_size, PAGE_BATCH))
             out.extend(page.keys)
-            if not page.truncated:
+            if page.cursor is None:
                 result = sorted(out)
                 self._gate(actor, "list", prefix, "after")
                 return result
-            if not page.cursor or page.cursor == cursor:
+            if page.cursor == cursor:
                 raise StoreError("LIST returned a repeated cursor")
             cursor = page.cursor
         raise StoreError("LIST exceeded page budget")
+
+    def _list_page(self, actor, prefix, cursor, limit):
+        """Expose one provider-shaped page without draining the namespace."""
+        if not isinstance(prefix, str):
+            raise ValueError("bad list prefix")
+        logical = prefix[:-1] if prefix.endswith("/") else prefix
+        if logical:
+            validate_key(logical)
+        if type(limit) is not int or not 0 < limit <= PAGE_BATCH:
+            raise ValueError("list page limit")
+        self._gate(actor, "list_page", prefix, "before")
+        with self._lock:
+            if cursor is None:
+                after_key = None
+            else:
+                try:
+                    after_key = self._cursor_positions[cursor]
+                except KeyError as error:
+                    raise StoreError("unknown LIST cursor") from error
+            width = min(limit, self._list_width())
+            eligible = tuple(sorted(
+                key for key in self._data
+                if key.startswith(prefix)
+                and (after_key is None or key > after_key)
+            ))
+            keys = eligible[:width]
+            truncated = len(eligible) > width
+            next_cursor = self._new_cursor(keys[-1]) \
+                if truncated else None
+            request = ListRequest(cursor, after_key, width)
+            history_page = ListPage(keys, next_cursor, truncated)
+            self._record(
+                actor, "list_page", prefix, None, request,
+                eligible, history_page, eligible)
+        self._gate(actor, "list_page", prefix, "after")
+        return ObjectListPage(keys, next_cursor)
 
     def _delete(self, actor, key):
         if not (

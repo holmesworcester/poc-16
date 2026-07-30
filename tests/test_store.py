@@ -23,6 +23,7 @@ from core.object_store import (
     VersionToken,
     ensure_object,
 )
+from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
 from core.store import FsStore, RemoteStore
 from core.walk import Peer as WalkPeer
 
@@ -78,6 +79,29 @@ def test_fs_put_if_absent_is_one_atomic_immutable_create(tmp_path):
         stores[1].put_if_absent("obj/" + "0" * 64, raw)
 
 
+def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
+        tmp_path, monkeypatch):
+    store = FsStore(str(tmp_path))
+    store.put("pile/member/value", b"12345")
+    store.cas("root", ABSENT, b"root")
+
+    assert store.get_bounded("pile/member/value", 5) == b"12345"
+    assert store.get_bounded("pile/member/missing", 5) is None
+    with pytest.raises(PayloadTooLarge, match="read exceeds"):
+        store.get_bounded("pile/member/value", 4)
+    for invalid in (0, -1, True, MAX_OBJECT_BYTES + 1):
+        with pytest.raises(ValueError, match="read byte limit"):
+            store.get_bounded("pile/member/value", invalid)
+
+    monkeypatch.setattr(
+        store,
+        "get",
+        lambda _key: pytest.fail("bounded read called whole-object get"),
+    )
+    assert store.get_bounded("pile/member/value", 5) == b"12345"
+    assert store.read_versioned("root").value == b"root"
+
+
 def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
     raw, other = b"wanted", b"wrong"
     oid = h(raw)
@@ -102,6 +126,12 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
 
         def get(self, key):
             return self.value
+
+        def get_bounded(self, key, maximum):
+            value = self.get(key)
+            if value is not None and len(value) > maximum:
+                raise PayloadTooLarge("test value exceeds byte limit")
+            return value
 
     applied = Store(["applied-unknown"])
     assert ensure_object(applied, oid, raw) is EXISTS
@@ -196,7 +226,7 @@ def test_remote_store_adapts_peer_gets_without_exposing_list():
     assert store.has("obj/" + h(page))
     assert not hasattr(store, "read_versioned")
     with pytest.raises(TypeError, match="LIST"):
-        store.list("obj/")
+        store.list_page("obj/", None, 1)
 
 
 def test_remote_store_batches_object_gets_in_bounded_order():
