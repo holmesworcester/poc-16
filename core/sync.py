@@ -153,25 +153,29 @@ def sync(node, ws, url):
         node, ws, peer, remote_actions, deliver=accepts_push)
     pushed_actions = action_difference if accepts_push else 0
 
-    local_root, mine = st.get("root"), ()
-    local_man = ""
-    if local_root:
-        local_snapshot = manifest.decode_root(local_root)
-        local_man = local_snapshot.manifest
-        if local_snapshot.anchor != ws:
-            raise ValueError("root anchor")
-        if local_man and local_man != their_man:
-            fetch_local = lambda oid: st.get("obj/" + oid)
-            mine = manifest.decode(
-                _object(local_man, fetch_local), fetch_local)
+    # Root and eligible keys are one local snapshot. A command may commit
+    # while this dial performs remote I/O; mixing its later keys with this
+    # root can falsely classify new local intent as already reconciled.
+    with node.lock:
+        local_root = st.get("root")
+        local_man = ""
+        if local_root:
+            local_snapshot = manifest.decode_root(local_root)
+            local_man = local_snapshot.manifest
+            if local_snapshot.anchor != ws:
+                raise ValueError("root anchor")
+        my_keys = tuple(node.keys(ws)) \
+            if local_man != their_man else ()
+    compared_local_etag = h(local_root) if local_root is not None else None
+    mine = ()
+    if local_man and local_man != their_man:
+        fetch_local = lambda oid: st.get("obj/" + oid)
+        mine = manifest.decode(
+            _object(local_man, fetch_local), fetch_local)
 
     pulled_piles, push_keys = [], set()
     if local_man != their_man:
-        with node.lock:
-            my_keys = node.keys(ws)
         push_keys = set(my_keys)
-    else:
-        my_keys = ()
     if their_man and local_man != their_man:
         theirs, changed = manifest.compare(
             mine, their_man, fetch_remote)
@@ -207,7 +211,10 @@ def sync(node, ws, url):
     local_etag = _root_digest(node.store(ws))
     cache.update({
         "etag": retag, "root": remote_root,
-        "local": local_etag,
+        # This is the root whose keys were actually compared. If pull or a
+        # concurrent local command advanced it, the next 304 must re-enter
+        # reconciliation instead of blessing unseen local intent.
+        "local": compared_local_etag,
     })
     if not accepts_push and (push_fids or action_difference):
         # This edge is a reader, not a delivery receipt.  Preserve the dirty

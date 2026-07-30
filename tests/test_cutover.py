@@ -325,9 +325,9 @@ def pair(tmp_path):
     """A deterministic multi-leaf source and a converged destination replica.
 
     The fixed source identity makes the fact addresses, range cuts, and map
-    geometry stable.  In particular, the warm-sync cost test below then
-    exercises a delta that retains old manifest pages instead of depending on
-    a lucky fresh keypair.
+    geometry stable, so the warm-sync cost assertions do not depend on a lucky
+    fresh keypair. A small bounded-map leaf may be rewritten as one page; page
+    sharing itself is covered by the larger codec fixtures.
     """
     source = Node(
         str(tmp_path / "source"),
@@ -481,6 +481,55 @@ def test_local_only_keys_still_push(tmp_path, monkeypatch):
         destination, ws, "local://source") == (0, 0)
 
 
+def test_sync_retries_a_local_commit_after_its_pinned_snapshot(
+        tmp_path, monkeypatch):
+    """A 304 cannot bless local intent authored after this dial's key read."""
+    source, ws, destination, ts = pair(tmp_path)
+    cmds.post(source, ws, "general", "remote delta", ts=ts + 1)
+
+    class ConditionalPeer:
+        def __init__(self, node, workspace, url):
+            self.node, self.ws = node, workspace
+            self.cache = node.sync_cache.setdefault((workspace, url), {})
+
+        def root(self, etag=None):
+            raw = source.store(self.ws).get("root")
+            current = h(raw)
+            return None if etag == current else (raw, current)
+
+        def obj(self, oid):
+            return source.store(self.ws).get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+        def put_pile(self, raw):
+            deliver(source, self.ws, raw)
+            source.turn(self.ws)
+
+    real_compare = manifest.compare
+    raced = {}
+    secret, public = source.identity(ws)
+
+    def compare_then_commit(*args):
+        answer = real_compare(*args)
+        if not raced:
+            raced["fact"] = author_msg(
+                destination, ws, secret, public, "local during dial",
+                ts=ts + 2)
+        return answer
+
+    monkeypatch.setattr(sync_module, "Peer", ConditionalPeer)
+    monkeypatch.setattr(manifest, "compare", compare_then_commit)
+
+    assert sync_module.sync(destination, ws, "local://source") == (1, 0)
+    assert source.fact_of(ws, raced["fact"].fid) is None
+    # The remote root is unchanged, so this is a 304. The cached local stamp
+    # names the pre-race snapshot and forces the unseen local fact to push.
+    sync_module.sync(destination, ws, "local://source")
+    assert source.fact_of(ws, raced["fact"].fid) is not None
+
+
 def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
     """A warm delta pull touches leaf piles and novel RangeTree pages only; the
     sibling objects are for cold-partial readers, and the modes that never
@@ -507,7 +556,6 @@ def test_warm_sync_fetches_no_closure_siblings(tmp_path, monkeypatch):
     assert fetched.isdisjoint(siblings)
     assert fetched <= leaves | pages  # leaf piles and RangeTree pages ONLY
     assert all(oid not in leaves for oid in singles)  # leaves ride batches
-    assert held_pages & pages  # this delta really has shared tree pages
     assert fetched & pages == pages - held_pages  # no eager remote decode
 
 
