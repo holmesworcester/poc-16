@@ -1,4 +1,5 @@
 """AWS upload-broker packaging, IAM, and safe lifecycle tests."""
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -25,6 +26,7 @@ from deploy.aws_upload_broker.signer import (
     S3UploadConfig,
     s3_provider_binding,
 )
+from deploy.python_role_modules import UPLOAD_BROKER_CORE_MODULES
 from deploy.upload_keyring import decode_keyring
 
 
@@ -121,7 +123,8 @@ def test_stage_is_an_explicit_importable_broker_only_allowlist(tmp_path):
     staged = manage.stage(tmp_path / "stage")
 
     for relative in (
-            "core/mint.py",
+            "core/candidate_archive.py",
+            "core/repository_reader.py",
             "facts/auth/request.py",
             "adapters/s3/store.py",
             "deploy/upload_broker.py",
@@ -133,6 +136,19 @@ def test_stage_is_an_explicit_importable_broker_only_allowlist(tmp_path):
             "deploy/aws_upload_broker/config.py",
             "deploy/aws_upload_broker/signer.py"):
         assert (staged / relative).is_file()
+    assert {
+        path.name for path in (staged / "core").glob("*.py")
+    } == set(UPLOAD_BROKER_CORE_MODULES)
+    for forbidden in (
+            "catalog.py",
+            "client_projection.py",
+            "mint.py",
+            "node.py",
+            "pile_sender.py",
+            "repository_applier.py",
+            "store.py",
+            "suppression_state.py"):
+        assert not (staged / "core" / forbidden).exists()
     assert not (staged / "deploy" / "upload_client.py").exists()
     assert not (staged / "adapters" / "host.py").exists()
     assert not (staged / "adapters" / "r2").exists()
@@ -146,6 +162,7 @@ def test_stage_is_an_explicit_importable_broker_only_allowlist(tmp_path):
             "import deploy.aws_upload_broker.app; print('broker-import-ok')",
         ],
         cwd=staged,
+        env={**os.environ, "PYTHONPATH": str(staged)},
         check=True,
         capture_output=True,
         text=True,

@@ -21,8 +21,10 @@ if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
 from deploy.cloudflare_python import (  # noqa: E402
-    MINT_CORE_MODULES,
     patch_pynacl as patch_vendored_pynacl,
+)
+from deploy.python_role_modules import (  # noqa: E402
+    REPOSITORY_READER_CORE_MODULES,
 )
 
 BUILD = PACKAGE / "build"
@@ -43,7 +45,7 @@ API_RESPONSE_BYTES = 64 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
 _ABSENT = object()
 
-CORE_MODULES = MINT_CORE_MODULES
+CORE_MODULES = REPOSITORY_READER_CORE_MODULES
 
 
 def _copy(source, destination):
@@ -196,7 +198,8 @@ def _verify_bundle(directory):
         "entry.py",
         "runtime.py",
         "crypto_compat.py",
-        "core/mint.py",
+        "core/candidate_archive.py",
+        "core/repository_reader.py",
         "core/worker.py",
         "facts/auth/request.py",
         "adapters/r2/worker.py",

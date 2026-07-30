@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from core.crypto import (
 )
 from core.node import Node
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
+from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request as request_fact
 
 
@@ -442,16 +444,29 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     manage.stage()
 
     staged = build / "worker"
-    assert (staged / "core" / "mint.py").read_bytes() == (
-        manage.REPOSITORY / "core" / "mint.py").read_bytes()
+    assert (staged / "core" / "repository_reader.py").read_bytes() == (
+        manage.REPOSITORY / "core" / "repository_reader.py").read_bytes()
+    assert {
+        path.name for path in (staged / "core").glob("*.py")
+    } == set(REPOSITORY_READER_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").read_bytes() == (
         manage.REPOSITORY / "facts" / "auth" / "request.py").read_bytes()
     assert (staged / "adapters" / "r2" / "worker.py").read_bytes() == (
         manage.REPOSITORY / "adapters" / "r2" / "worker.py").read_bytes()
     assert not (staged / "core" / "store.py").exists()
     assert not (staged / "core" / "node.py").exists()
+    assert not (staged / "core" / "mint.py").exists()
+    assert not (staged / "core" / "repository_applier.py").exists()
     assert not (staged / "adapters" / "r2" / "s3.py").exists()
     assert not (staged / "adapters" / "s3").exists()
+    subprocess.run(
+        [sys.executable, "-c", "import deploy.gateway"],
+        cwd=staged,
+        env={**os.environ, "PYTHONPATH": str(staged)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     patched = sodium.read_bytes()
     assert b"__start_em_asm" not in patched
     assert b"__start_em_xsm" in patched

@@ -1,6 +1,9 @@
 """Cloudflare R2 ingress-role policy, signer, and lifecycle tests."""
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -30,6 +33,7 @@ from deploy.upload_session import (
     SessionKey,
     UploadSessionPolicy,
 )
+from deploy.python_role_modules import UPLOAD_BROKER_CORE_MODULES
 
 
 def deployment(**changes):
@@ -457,7 +461,8 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
         for relative in (
                 "entry.py",
                 "runtime.py",
-                "core/mint.py",
+                "core/candidate_archive.py",
+                "core/repository_reader.py",
                 "core/staged_intent.py",
                 "facts/auth/request.py",
                 "deploy/upload_broker.py",
@@ -492,7 +497,7 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
     ]
 
 
-def test_stage_broker_is_db_free_and_uses_shared_mint_sources(
+def test_stage_broker_is_db_free_and_uses_shared_reader_sources(
         tmp_path, monkeypatch):
     build = tmp_path / "build"
     monkeypatch.setattr(manage, "BUILD", build)
@@ -508,7 +513,8 @@ def test_stage_broker_is_db_free_and_uses_shared_mint_sources(
     for relative in (
             "entry.py",
             "runtime.py",
-            "core/mint.py",
+            "core/candidate_archive.py",
+            "core/repository_reader.py",
             "core/staged_intent.py",
             "facts/auth/request.py",
             "deploy/upload_broker.py",
@@ -516,7 +522,12 @@ def test_stage_broker_is_db_free_and_uses_shared_mint_sources(
             "deploy/cloudflare_upload/reader.py",
             "deploy/cloudflare_upload/signer.py"):
         assert (staged / relative).is_file()
+    assert {
+        path.name for path in (staged / "core").glob("*.py")
+    } == set(UPLOAD_BROKER_CORE_MODULES)
     for forbidden in (
+            "core/catalog.py",
+            "core/mint.py",
             "core/node.py",
             "core/daemon.py",
             "core/runtime.py",
@@ -524,6 +535,18 @@ def test_stage_broker_is_db_free_and_uses_shared_mint_sources(
             "adapters/r2/s3.py",
             "adapters/s3/store.py"):
         assert not (staged / forbidden).exists()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import deploy.upload_broker, deploy.upload_broker_http",
+        ],
+        cwd=staged,
+        env={**os.environ, "PYTHONPATH": str(staged)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     assert patched == [manage.VENDORED]
 
 

@@ -212,7 +212,8 @@ def _verify_broker_bundle(directory):
     required = {
         "entry.py",
         "runtime.py",
-        "core/mint.py",
+        "core/candidate_archive.py",
+        "core/repository_reader.py",
         "core/staged_intent.py",
         "facts/auth/request.py",
         "deploy/upload_broker.py",

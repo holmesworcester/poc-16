@@ -294,6 +294,50 @@ def test_protocol_front_doors_route_semantic_reads_through_one_reader():
     assert bypasses == []
 
 
+def test_deployed_reader_core_allowlists_equal_their_import_closures():
+    from deploy.python_role_modules import (
+        REPOSITORY_READER_CORE_MODULES,
+        UPLOAD_BROKER_CORE_MODULES,
+    )
+
+    script = """
+import importlib
+import json
+import sys
+for module in sys.argv[1:]:
+    importlib.import_module(module)
+print(json.dumps(sorted(
+    name for name in sys.modules
+    if name == "core"
+    or name.startswith("core.") and name.count(".") == 1
+)))
+"""
+
+    def expected(modules):
+        return sorted(
+            "core" if name == "__init__.py" else "core." + name[:-3]
+            for name in modules
+        )
+
+    for imports, modules in (
+            (
+                ("deploy.gateway",),
+                REPOSITORY_READER_CORE_MODULES,
+            ),
+            (
+                ("deploy.upload_broker", "deploy.upload_broker_http"),
+                UPLOAD_BROKER_CORE_MODULES,
+            )):
+        result = subprocess.run(
+            [sys.executable, "-c", script, *imports],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert json.loads(result.stdout) == expected(modules)
+
+
 def test_applier_and_reader_import_closures_are_database_and_role_clean():
     script = """
 import json

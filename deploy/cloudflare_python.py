@@ -2,29 +2,12 @@
 from pathlib import Path
 import shutil
 
+from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 
-MINT_CORE_MODULES = (
-    "__init__.py",
-    "bao.py",
-    "merkle_map.py",
-    "catalog.py",
-    "close.py",
-    "crypto.py",
-    "fact.py",
-    "grants.py",
-    "indexes.py",
-    "ingress.py",
-    "kernel.py",
-    "limits.py",
-    "mint.py",
-    "object_store.py",
-    "peer_capability.py",
-    "shape.py",
-    "snapshot.py",
-    "suppression.py",
-    "suppression_state.py",
-    "worker.py",
-)
+
+# Compatibility for build scripts outside this repository.  The tuple is the
+# exact RepositoryReader import closure; it no longer contains core.mint.
+MINT_CORE_MODULES = REPOSITORY_READER_CORE_MODULES
 
 
 def patch_pynacl(vendored):

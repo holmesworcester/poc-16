@@ -2,6 +2,7 @@
 import base64
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -40,6 +41,7 @@ from deploy.aws_lambda.config import (
 )
 from deploy.aws_lambda.s3_bucket_policy import policy
 from deploy.gateway import AsyncFromSyncReader, Gateway, Response
+from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -370,7 +372,10 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     manage = load_manage()
     staged = manage.stage(tmp_path / "stage")
 
-    assert (staged / "core" / "mint.py").is_file()
+    assert (staged / "core" / "repository_reader.py").is_file()
+    assert {
+        path.name for path in (staged / "core").glob("*.py")
+    } == set(REPOSITORY_READER_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").is_file()
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
@@ -380,6 +385,18 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
         staged / "deploy" / "aws_lambda" / "s3_bucket_policy.py").is_file()
     assert not (staged / "deploy" / "upload_broker.py").exists()
     assert not (staged / "deploy" / "aws_upload_broker").exists()
+    for forbidden in (
+            "catalog.py",
+            "client_projection.py",
+            "mint.py",
+            "node.py",
+            "pile_sender.py",
+            "repository_applier.py",
+            "store.py",
+            "suppression_state.py"):
+        assert not (staged / "core" / forbidden).exists()
+    assert not (staged / "adapters" / "host.py").exists()
+    assert not (staged / "adapters" / "r2").exists()
     assert not (staged / "tests").exists()
     assert not (staged / "native").exists()
     assert not (staged / "README.md").exists()
@@ -388,7 +405,12 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
             sys.executable, "-c",
             "import deploy.aws_lambda.app; print('lambda-import-ok')",
         ],
-        cwd=staged, check=True, capture_output=True, text=True)
+        cwd=staged,
+        env={**os.environ, "PYTHONPATH": str(staged)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_lambda_template_is_read_only_bounded_and_reproducible():

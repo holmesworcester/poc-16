@@ -52,13 +52,18 @@ from deploy.upload_session import (  # noqa: E402
     SessionKey,
     UploadSessionPolicy,
 )
+from deploy.python_role_modules import (  # noqa: E402
+    UPLOAD_BROKER_CORE_MODULES,
+)
 
 
 STAGE = HERE / "stage"
 BUILD = HERE / ".aws-sam"
-DIRECTORIES = ("core", "facts", "adapters/s3")
+DIRECTORIES = ("facts",)
 FILES = (
     "adapters/__init__.py",
+    "adapters/s3/__init__.py",
+    "adapters/s3/store.py",
     "deploy/__init__.py",
     "deploy/gateway.py",
     "deploy/upload_broker.py",
@@ -125,6 +130,10 @@ def stage(destination=STAGE):
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
+    for name in UPLOAD_BROKER_CORE_MODULES:
+        target = destination / "core" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPOSITORY / "core" / name, target)
     for relative in DIRECTORIES:
         shutil.copytree(
             REPOSITORY / relative,

@@ -36,10 +36,16 @@ from deploy.aws_lambda.config import (  # noqa: E402
     MAX_STORE_PREFIX_LENGTH,
     WORKSPACE_RE,
 )
+from deploy.python_role_modules import (  # noqa: E402
+    REPOSITORY_READER_CORE_MODULES,
+)
 STAGE = HERE / "stage"
 BUILD = HERE / ".aws-sam"
-DIRECTORIES = ("core", "facts", "adapters")
+DIRECTORIES = ("facts",)
 FILES = (
+    "adapters/__init__.py",
+    "adapters/s3/__init__.py",
+    "adapters/s3/store.py",
     "deploy/__init__.py",
     "deploy/gateway.py",
     "deploy/aws_lambda/__init__.py",
@@ -92,6 +98,10 @@ def stage(destination=STAGE):
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
+    for name in REPOSITORY_READER_CORE_MODULES:
+        target = destination / "core" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / "core" / name, target)
     for relative in DIRECTORIES:
         shutil.copytree(
             REPO / relative, destination / relative,
