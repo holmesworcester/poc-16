@@ -153,10 +153,11 @@ The status boundary is:
 - **Implemented but not deployed:** the resumable client sends bodies directly
   to exact S3/R2 ingress PUT URLs returned by the database-free broker protocol.
   The strict provider-neutral broker HTTP membrane and both SigV4 translators
-  exist and have realistic fake-provider coverage.
-- **Still required for a writable serverless path:** AWS Lambda and Cloudflare
-  Worker event adapters and deployment wiring, the database-free publisher,
-  notification/scheduled draining, and live provider conformance.
+  exist and have realistic fake-provider coverage. An isolated AWS Lambda
+  Function URL adapter and least-privilege SAM stack now serve that membrane.
+- **Still required for a writable serverless path:** the Cloudflare Worker
+  broker adapter, the database-free publisher on both providers,
+  notification/scheduled draining, and live end-to-end conformance.
 
 Consequently, the Lambda and Cloudflare deployments below remain read-only and
 the writable host daemon is still the only complete production publication
@@ -173,11 +174,11 @@ under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
 documents and returns the broker's exact bearer PUT requests; provider object
 and pile bodies never cross it.
 
-That endpoint is not yet wired into either provider's event format or
-deployed. The broker and publisher remain deliberately absent from the
-read-only serverless artifacts, and the database-free publisher is not yet
-implemented, so the writable host path above remains the only complete
-production path today.
+The endpoint is now wired into a separate AWS upload-broker Lambda package but
+has not been live-deployed; the Cloudflare broker still has a fail-closed stub.
+Neither provider has the database-free publisher yet. The broker and publisher
+remain absent from the read-only serverless gateway artifacts, so the writable
+host path above remains the only complete production path today.
 
 Once such an endpoint is deployed, the existing generic command transport
 exposes family-owned direct commands:
@@ -302,6 +303,70 @@ published root is the durable workspace acknowledgement.
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 [r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
 
+### Prepared AWS upload broker
+
+`deploy/aws_upload_broker/` is a real metadata-only Lambda adapter, not a body
+proxy. It normalizes bounded Function URL v2 events into the shared
+`UploadBrokerEndpoint`, reads the canonical authorization closure through a
+narrow S3 reader, loads one provider-bound session key ring from an external
+Secrets Manager secret, and returns exact S3 ingress PUTs. Its role can
+`GetObject` only under the canonical root/object prefix and query-presign
+create-only `PutObject` only under this workspace's isolated ingress prefixes.
+It cannot read, list, or delete ingress; write canonical objects; or CAS root.
+
+The key-ring secret and both buckets are external inputs and survive compute
+removal. Create a provider-bound initial key ring without putting secret bytes
+in argv, stdout, a template, or stack state:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage keyring-create \
+  --name poc16/upload-west-2/session-keyring \
+  --deployment-id upload-west-2 \
+  --issuer aws-upload-production \
+  --ingress-bucket ISOLATED_INGRESS_BUCKET \
+  --expected-owner AWS_ACCOUNT_ID \
+  --region us-west-2
+```
+
+The command returns only the secret ARN and exact version ID needed below.
+Two-phase control-plane rotation remains tracked work. Local tests and a SAM
+build are:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage test
+python3 -m deploy.aws_upload_broker.manage build
+```
+
+Deploy or update the separately owned broker stack with:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage deploy --create \
+  --stack poc16-upload --deployment-id upload-west-2 \
+  --workspace WORKSPACE_ID \
+  --canonical-bucket CANONICAL_BUCKET \
+  --prefix workspaces/WORKSPACE_ID \
+  --ingress-bucket ISOLATED_INGRESS_BUCKET \
+  --issuer aws-upload-production \
+  --keyring-secret-arn SESSION_KEYRING_SECRET_ARN \
+  --keyring-version-id SESSION_KEYRING_VERSION_ID \
+  --expected-owner AWS_ACCOUNT_ID \
+  --region us-west-2
+```
+
+Use `--update` instead of `--create` only for that exactly tagged stack. Safe
+removal targets the observed stack ID and leaves both buckets and the external
+key-ring secret intact:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage remove \
+  --stack poc16-upload --deployment-id upload-west-2 \
+  --region us-west-2
+```
+
+This makes the authorization endpoint deployable, but not the full writable
+cloud path: there is no store-only publisher, event/scheduled drain, or live
+attachment smoke yet.
+
 ### Prepared Cloudflare upload boundary
 
 `deploy/cloudflare_upload/` now renders the provider boundary for the
@@ -340,9 +405,9 @@ digest fixed when the session opened. Replayed or forked cursors may reissue
 already committed exact keys, but cannot enlarge or replace the finite
 authority set. This keeps the broker database-free. A client that loses its
 opaque cursor starts a new session, and lifecycle collection removes the
-abandoned ingress. The client and transport-neutral broker HTTP membrane are
-built; provider event adapters, deployed broker routes, and the database-free
-publisher remain unbuilt.
+abandoned ingress. The client, transport-neutral broker HTTP membrane, and AWS
+Function URL adapter are built; the Cloudflare adapter, deployed live routes,
+and database-free publisher remain unbuilt.
 
 This is a provider boundary, not a Python convention: compromising the
 write-capable ingress parent still cannot address the canonical bucket. It is

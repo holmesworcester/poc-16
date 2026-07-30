@@ -14,12 +14,13 @@ from deploy.upload_broker import (
 )
 
 
-_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+S3_UPLOAD_BUCKET_PATTERN = (
+    r"^(?!amzn-s3-demo-)(?!xn--)(?!sthree-)"
+    r"(?!.*(?:-s3alias|--ol-s3|\.mrap|--x-s3|--table-s3)$)"
+    r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+_BUCKET_RE = re.compile(S3_UPLOAD_BUCKET_PATTERN)
 _REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
-_RESERVED_BUCKET_PREFIXES = ("amzn-s3-demo-", "xn--", "sthree-")
-_RESERVED_BUCKET_SUFFIXES = (
-    "-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3")
 _REQUIRED_QUERY = frozenset({
     "X-Amz-Algorithm",
     "X-Amz-Credential",
@@ -49,9 +50,7 @@ class S3UploadConfig:
 
     def __post_init__(self):
         if not isinstance(self.bucket, str) \
-                or not _BUCKET_RE.fullmatch(self.bucket) \
-                or self.bucket.startswith(_RESERVED_BUCKET_PREFIXES) \
-                or self.bucket.endswith(_RESERVED_BUCKET_SUFFIXES):
+                or not _BUCKET_RE.fullmatch(self.bucket):
             raise ValueError("S3 ingress bucket")
         if not isinstance(self.region_name, str) \
                 or not _REGION_RE.fullmatch(self.region_name):
@@ -145,6 +144,18 @@ def _endpoint_host(client):
     return parsed.hostname
 
 
+def s3_provider_binding(config):
+    """Return the cursor scope independently of any boto3 client instance."""
+    if not isinstance(config, S3UploadConfig):
+        raise TypeError("S3 upload config")
+    return ":".join((
+        "aws-s3-v1",
+        config.region_name,
+        config.bucket,
+        config.expected_bucket_owner or "bucket-owner-unpinned",
+    ))
+
+
 def _inspect_url(url, put, config, client, headers, ttl_seconds):
     try:
         parsed = urlsplit(url)
@@ -214,12 +225,7 @@ class S3UploadSigner:
         if not isinstance(config, S3UploadConfig):
             raise TypeError("S3 upload config")
         self.config = config
-        self.provider_binding = ":".join((
-            "aws-s3-v1",
-            config.region_name,
-            config.bucket,
-            config.expected_bucket_owner or "bucket-owner-unpinned",
-        ))
+        self.provider_binding = s3_provider_binding(config)
         self.client = _new_client(config) if client is None else client
         if not callable(
                 getattr(self.client, "generate_presigned_url", None)):

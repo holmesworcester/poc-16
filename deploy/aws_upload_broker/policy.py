@@ -24,6 +24,13 @@ def presigner_policy(config, workspace, *, partition="aws"):
         )
         for object_class in ("obj", "pile")
     ]
+    string_equals = {
+        "s3:authType": "REST-QUERY-STRING",
+        "s3:signatureversion": "AWS4-HMAC-SHA256",
+    }
+    if config.expected_bucket_owner is not None:
+        string_equals["s3:ResourceAccount"] = (
+            config.expected_bucket_owner)
     return {
         "Statement": [{
             "Action": "s3:PutObject",
@@ -33,10 +40,7 @@ def presigner_policy(config, workspace, *, partition="aws"):
                     "s3:signatureAge": (
                         config.ttl_seconds * 1000),
                 },
-                "StringEquals": {
-                    "s3:authType": "REST-QUERY-STRING",
-                    "s3:signatureversion": "AWS4-HMAC-SHA256",
-                },
+                "StringEquals": string_equals,
             },
             "Effect": "Allow",
             "Resource": resources,

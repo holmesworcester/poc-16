@@ -179,9 +179,11 @@ and performs no deletion.
 The running cloud deployment is read-only: a host daemon still receives remote
 object/pile PUTs and performs publication. The resumable client, stateless
 broker protocol, strict provider-neutral HTTP membrane, and S3/R2 signing
-translators are implemented, but the provider event adapters and database-free
-publisher are not. The target write path removes the host proxy without giving
-clients root authority. After authorization, a broker signs short-lived,
+translators are implemented. AWS additionally has a separate Function URL
+adapter and least-privilege SAM broker stack; it is not live-deployed.
+Cloudflare still has a fail-closed broker stub, and neither provider has the
+database-free publisher. The target write path removes the host proxy without
+giving clients root authority. After authorization, a broker signs short-lived,
 exact-key conditional PUT capabilities. A client uploads objects first and a
 closed-pile intent last into session-scoped isolated ingress on both S3 and R2.
 No object or pile body transits the broker, Lambda, Worker, or publisher during
@@ -338,8 +340,10 @@ of that protocol. `deploy/upload_broker_http.py` is its hostile,
 transport-neutral server membrane: it accepts only those three exact paths
 and bounded canonical JSON/base64 documents, calls the existing
 `UploadBroker`, and returns body-free errors. AWS Lambda and Cloudflare Worker
-event normalization remain deployment adapters around this membrane; neither
-provider body nor provider-specific request object enters the broker.
+event normalization is a deployment adapter around this membrane; the AWS
+Function URL v2 adapter is implemented under `deploy/aws_upload_broker`, while
+the Cloudflare adapter remains open. Neither provider body nor
+provider-specific request object enters the broker.
 
 The constant-size cursor binds protocol version, issuer/provider, key id,
 workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
@@ -353,10 +357,10 @@ provider session state. `deploy/upload_client.py` drives it through narrow
 broker/PUT transports, while `deploy/upload_journal.py` owns only the
 filesystem durability boundary. Fact-family commands author the same message,
 file, chunk, signature, and closed-pile bytes used by local publication;
-`core/cli.py` remains a generic passthrough. There is not yet a provider event
-adapter or deployed broker route, nor a database-free publisher, so these
-client commands do not make the current read-only Lambda/Worker deployments
-writable.
+`core/cli.py` remains a generic passthrough. The AWS event adapter exists but
+has not been live-deployed; there is not yet a Cloudflare broker adapter or a
+database-free publisher. These client commands therefore do not make the
+current read-only Lambda/Worker gateway deployments writable.
 
 `deploy/upload_keyring.py` gives AWS and Cloudflare one canonical bounded
 secret-document meaning. Rotation is distribute, activate, then retire: every

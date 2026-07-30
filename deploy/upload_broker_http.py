@@ -48,7 +48,13 @@ class UnsupportedUploadMediaType(InvalidUploadWire):
     pass
 
 
-def _error(status, headers=None):
+def upload_request_body_limit(path):
+    """Return the exact shared route ceiling, or ``None`` for no route."""
+    return _ROUTES.get(path) if isinstance(path, str) else None
+
+
+def upload_error_response(status, headers=None):
+    """Return the shared body-free upload error with non-cacheable headers."""
     return Response(status, headers={**_SAFE_HEADERS, **(headers or {})})
 
 
@@ -118,27 +124,27 @@ class UploadBrokerEndpoint:
             method = _bounded_ascii(
                 method, MAX_UPLOAD_HTTP_METHOD_BYTES)
         except InvalidUploadWire:
-            return _error(400)
+            return upload_error_response(400)
         if isinstance(path, str):
             try:
                 path_bytes = path.encode("ascii")
             except UnicodeEncodeError:
-                return _error(400)
+                return upload_error_response(400)
             if len(path_bytes) > MAX_UPLOAD_HTTP_PATH_BYTES:
-                return _error(414)
+                return upload_error_response(414)
         try:
             path = _bounded_ascii(path, MAX_UPLOAD_HTTP_PATH_BYTES)
         except InvalidUploadWire:
-            return _error(400)
+            return upload_error_response(400)
         body_limit = _ROUTES.get(path)
         if body_limit is None:
-            return _error(404)
+            return upload_error_response(404)
         if method != "POST":
-            return _error(405, {"Allow": "POST"})
+            return upload_error_response(405, {"Allow": "POST"})
         if not isinstance(body, bytes):
-            return _error(400)
+            return upload_error_response(400)
         if len(body) > body_limit:
-            return _error(413)
+            return upload_error_response(413)
         try:
             _request_headers(
                 {} if headers is None else headers,
@@ -158,21 +164,26 @@ class UploadBrokerEndpoint:
                     decode_finalize_request(body))
                 encoded = encode_finalize(result)
         except PayloadTooLarge:
-            return _error(413)
+            return upload_error_response(413)
         except UnsupportedUploadMediaType:
-            return _error(415)
+            return upload_error_response(415)
         except InvalidUploadWire:
-            return _error(400)
+            return upload_error_response(400)
         except InvalidUploadSession:
             # OPEN has no session yet, so a broker rejection is failed
             # workspace authorization/policy. Later failures abandon the
             # presented cursor conservatively; neither path exposes why.
-            return _error(403 if path == "/upload/open" else 409)
+            return upload_error_response(
+                403 if path == "/upload/open" else 409)
         except UploadUnavailable:
-            return _error(503)
+            return upload_error_response(503)
         except Exception:
-            return _error(503)
+            return upload_error_response(503)
         return _success(encoded)
 
 
-__all__ = ("UploadBrokerEndpoint",)
+__all__ = (
+    "UploadBrokerEndpoint",
+    "upload_error_response",
+    "upload_request_body_limit",
+)

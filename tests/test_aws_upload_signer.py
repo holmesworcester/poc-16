@@ -419,7 +419,11 @@ def test_signer_does_not_treat_forged_internal_values_as_authority(put):
 
 def test_presigner_role_and_cors_expose_only_exact_put_authority():
     config = S3UploadConfig(
-        "direct-upload-bucket", "us-west-2", ttl_seconds=90)
+        "direct-upload-bucket",
+        "us-west-2",
+        ttl_seconds=90,
+        expected_bucket_owner="123456789012",
+    )
     document = presigner_policy(config, WORKSPACE)
     statement = document["Statement"][0]
 
@@ -438,6 +442,7 @@ def test_presigner_role_and_cors_expose_only_exact_put_authority():
         "Null": {"s3:if-none-match": "false"},
         "NumericLessThanEquals": {"s3:signatureAge": 90_000},
         "StringEquals": {
+            "s3:ResourceAccount": "123456789012",
             "s3:authType": "REST-QUERY-STRING",
             "s3:signatureversion": "AWS4-HMAC-SHA256",
         },
