@@ -1,4 +1,4 @@
-"""The future direct-upload design fails closed under authority mutations."""
+"""Direct-upload broker and provider models fail closed under mutations."""
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -14,34 +14,24 @@ from tests.direct_upload_method import (
     BrokerImplementation,
     BrokerBoundaryViolation,
     BrokerMintViolation,
-    IngressRetirementViolation,
     NotificationImplementation,
     NotificationViolation,
-    PromotionCase,
-    PromotionImplementation,
-    PromotionViolation,
     WirePut,
     WirePutCapability,
     WirePutImplementation,
     WirePutViolation,
     broker_mint_mutations,
-    check_promotion_history,
     exact_broker_mint,
     exact_wire_put,
     exercise_broker_parent_boundary,
     exercise_broker_mint_corpus,
-    exercise_ingress_retirement_boundary,
     exercise_notification_corpus,
-    exercise_promotion_corpus,
     exercise_wire_put_corpus,
     integration_inventory,
     isolated_broker_parent,
     notification_corpus,
-    promotion_corpus,
-    promotion_history,
-    retirement_safe_broker_parent,
+    put_only_ingress_parent,
     single_bucket_broker_parent,
-    unbuilt_direct_upload_symbols,
     wire_put_mutations,
 )
 from tests.provider_conformance import ConformanceRun
@@ -449,7 +439,7 @@ def test_notification_corpus_is_seeded_bounded_and_covers_every_fault():
         == NOTIFICATION_FAULTS
 
 
-def test_notifications_are_hints_and_fair_scan_drains_durable_piles():
+def test_notifications_are_hints_and_fair_scan_applies_durable_piles():
     run = ConformanceRun("notification-contract", seed=0xE7E)
 
     report = exercise_notification_corpus(
@@ -459,6 +449,9 @@ def test_notifications_are_hints_and_fair_scan_drains_durable_piles():
         script.name for script in notification_corpus(0xE7E)}
     assert any("response-lost" in event for event in run.history)
     assert any("scan" in event for event in run.history)
+    assert any("apply-root" in event for event in run.history)
+    assert any("apply-noop" in event for event in run.history)
+    assert not any(" delete " in event for event in run.history)
 
 
 @pytest.mark.parametrize(
@@ -474,8 +467,9 @@ def test_notifications_are_hints_and_fair_scan_drains_durable_piles():
             "ready durable pile"),
         (
             NotificationImplementation(
-                name="delete-on-event", delete_before_publish=True),
-            "retirement order"),
+                name="repeat-root-application",
+                repeat_root_application=True),
+            "repeated a root application"),
     ],
 )
 def test_weak_notification_consumers_emit_first_failing_trace(
@@ -513,34 +507,15 @@ def test_broker_parent_compromise_cannot_reach_canonical_workspace(provider):
 
 
 @pytest.mark.parametrize("provider", ("s3", "r2"))
-def test_put_only_parent_preserves_acknowledged_ingress(provider):
-    credential = retirement_safe_broker_parent(provider)
-    run = ConformanceRun(
-        f"{provider}-put-only-parent", seed=0xF10)
+def test_client_ingress_parent_is_put_only(provider):
+    credential = put_only_ingress_parent(provider)
 
-    attacks = exercise_ingress_retirement_boundary(credential, run)
-
-    assert set(attacks) == {
-        "delete-acknowledged-object",
-        "delete-acknowledged-pile",
-    }
+    assert dict(credential.scopes) == {
+        credential.ingress_bucket: frozenset({"PUT"})}
     assert credential.allows(credential.ingress_bucket, "PUT")
-    assert not credential.allows(credential.ingress_bucket, "DELETE")
-
-
-@pytest.mark.parametrize("provider", ("s3", "r2"))
-def test_broad_ingress_parent_can_erase_acknowledged_work(provider):
-    run = ConformanceRun(
-        f"{provider}-broad-ingress-parent", seed=0xF10)
-
-    with pytest.raises(IngressRetirementViolation) as caught:
-        exercise_ingress_retirement_boundary(
-            isolated_broker_parent(provider), run)
-
-    violation = caught.value
-    assert violation.attack.operation == "DELETE"
-    assert violation.seed == 0xF10
-    assert violation.prefix
+    assert all(
+        not credential.allows(credential.ingress_bucket, operation)
+        for operation in ("GET", "LIST", "DELETE"))
 
 
 @pytest.mark.parametrize("provider", ("s3", "r2"))
@@ -567,204 +542,14 @@ def test_single_bucket_parent_is_a_replayable_negative_control(provider):
     assert replayed.value.prefix == violation.prefix
 
 
-def test_promotion_corpus_is_seeded_bounded_and_covers_crash_boundaries():
-    first = promotion_corpus(seed=31)
-    replay = promotion_corpus(seed=31)
-    alternate = promotion_corpus(seed=32)
-
-    assert first == replay
-    assert [case.name for case in first] != [
-        case.name for case in alternate]
-    assert {case.name for case in first} == {
-        "clean",
-        "crash-after-validate",
-        "crash-after-promote",
-        "crash-after-root",
-        "crash-after-pile-delete",
-        "crash-after-object-delete",
-        "poison-staging-key",
-        "foreign-workspace-intent",
-        "foreign-member-intent",
-        "unauthorized-member-intent",
-        "missing-staged-object",
-        "canonical-object-collision",
-    }
-
-
-@pytest.mark.parametrize("provider", ("s3", "r2"))
-def test_staging_promotion_obeys_abstract_retirement_order(provider):
-    run = ConformanceRun(
-        f"{provider}-staging-promotion", seed=0x570A6E)
-
-    report = exercise_promotion_corpus(
-        PromotionImplementation(), provider, run)
-
-    assert report.provider == provider
-    assert set(report.cases) == {
-        case.name for case in promotion_corpus(0x570A6E)}
-    assert any(
-        event.startswith("crash-after-validate actor-1 crash")
-        for event in run.history)
-    assert any(
-        event.startswith("crash-after-promote actor-1 crash")
-        for event in run.history)
-    assert any(
-        event.startswith("crash-after-root actor-1 crash")
-        for event in run.history)
-
-
-def test_retry_after_root_crash_uses_a_fresh_actor_and_durable_root():
-    run = ConformanceRun("cold-retry", seed=0x570A6E)
-    events, _expected = promotion_history(
-        PromotionImplementation(),
-        PromotionCase("crash-after-root", crash_after="root"),
-        "r2",
-        run,
-    )
-
-    turns = [
-        event.generation
-        for event in events if event.operation == "start-turn"
-    ]
-    committed = next(
-        event for event in events if event.operation == "commit-root")
-    retired = next(
-        event for event in events
-        if event.operation == "delete-stage-pile")
-    assert turns == [1, 2]
-    assert committed.generation == 1
-    assert retired.generation == 2
-
-
-@pytest.mark.parametrize(
-    ("operation", "bucket_field"),
-    [
-        ("promote", "ingress_bucket"),
-        ("commit-root", "ingress_bucket"),
-        ("delete-stage-pile", "canonical_bucket"),
-    ],
-)
-def test_promotion_oracle_rejects_wrong_bucket_state_transitions(
-        operation, bucket_field):
-    run = ConformanceRun("wrong-bucket", seed=7)
-    case = PromotionCase("clean")
-    events, expected = promotion_history(
-        PromotionImplementation(), case, "r2", run)
-    events = list(events)
-    index = next(
-        index for index, event in enumerate(events)
-        if event.operation == operation)
-    events[index] = replace(
-        events[index], bucket=expected[bucket_field])
-
-    with pytest.raises(
-            PromotionViolation,
-            match=r"escaped its exact bucket/key"):
-        check_promotion_history(
-            run, case, tuple(events), expected)
-
-
-def test_promotion_oracle_rejects_undeclared_cross_workspace_copy():
-    run = ConformanceRun("undeclared-copy", seed=8)
-    case = PromotionCase("clean")
-    events, expected = promotion_history(
-        PromotionImplementation(), case, "r2", run)
-    events = list(events)
-    index = next(
-        index for index, event in enumerate(events)
-        if event.operation == "promote")
-    legitimate = events[index]
-    digest = legitimate.key.rsplit("/", 1)[-1]
-    events.insert(
-        index + 1,
-        replace(
-            legitimate,
-            key=f"workspaces/{'f' * 64}/obj/{digest}"),
-    )
-
-    with pytest.raises(
-            PromotionViolation,
-            match=r"declared-digest authority"):
-        check_promotion_history(
-            run, case, tuple(events), expected)
-
-
-def test_promotion_oracle_rejects_unknown_state_transition():
-    run = ConformanceRun("unknown-transition", seed=9)
-    case = PromotionCase("clean")
-    events, expected = promotion_history(
-        PromotionImplementation(), case, "r2", run)
-    events = list(events)
-    index = next(
-        index for index, event in enumerate(events)
-        if event.operation == "validate")
-    events[index] = replace(
-        events[index], operation="overwrite-root")
-
-    with pytest.raises(
-            PromotionViolation,
-            match=r"unknown promotion operation"):
-        check_promotion_history(
-            run, case, tuple(events), expected)
-
-
-@pytest.mark.parametrize(
-    ("implementation", "reason"),
-    [
-        (
-            PromotionImplementation(
-                name="unchecked-staging-bytes", verify_sha256=False),
-            "canonical object key does not bind promoted bytes",
-        ),
-        (
-            PromotionImplementation(
-                name="early-pile-retirement", delete_before_root=True),
-            "retirement lacks an abstract durable root commit",
-        ),
-        (
-            PromotionImplementation(
-                name="process-cache-root", durable_root=False),
-            "retirement lacks an abstract durable root commit",
-        ),
-        (
-            PromotionImplementation(
-                name="unchecked-staged-intent", validate_intent=False),
-            "unauthorized staged intent reached promotion",
-        ),
-        (
-            PromotionImplementation(
-                name="overwrite-canonical", overwrite_canonical=True),
-            "promotion overwrote canonical immutable bytes",
-        ),
-    ],
-)
-def test_weak_promotion_policies_emit_first_failing_trace(
-        implementation, reason):
-    run = ConformanceRun(implementation.name, seed=0x570A6E)
-
-    with pytest.raises(PromotionViolation) as caught:
-        exercise_promotion_corpus(implementation, "r2", run)
-
-    violation = caught.value
-    assert reason in violation.reason
-    assert violation.seed == 0x570A6E
-    assert violation.prefix
-    assert "direct-upload contract-model failure" in str(violation)
-
-    replay = ConformanceRun(implementation.name, seed=0x570A6E)
-    with pytest.raises(PromotionViolation) as replayed:
-        exercise_promotion_corpus(implementation, "r2", replay)
-    assert replayed.value.case == violation.case
-    assert replayed.value.reason == violation.reason
-    assert replayed.value.prefix == violation.prefix
-
-
-def test_current_integration_seams_name_built_broker_and_unbuilt_roles():
+def test_current_integration_seams_name_built_repository_roles():
     root = Path(__file__).parents[1]
 
     assert integration_inventory(root) == INTEGRATION_SEAMS
-    assert any(
-        seam.symbol == "UploadBroker"
-        and seam.path == "deploy/upload_broker.py"
-        for seam in INTEGRATION_SEAMS)
-    assert unbuilt_direct_upload_symbols(root) == ()
+    by_symbol = {seam.symbol: seam.path for seam in INTEGRATION_SEAMS}
+    assert by_symbol["UploadBroker"] == "deploy/upload_broker.py"
+    assert by_symbol["PileSender"] == "core/pile_sender.py"
+    assert by_symbol["RepositoryApplier"] == \
+        "core/repository_applier.py"
+    assert by_symbol["RepositoryReader"] == \
+        "core/repository_reader.py"
