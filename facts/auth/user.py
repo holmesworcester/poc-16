@@ -3,10 +3,9 @@ import base64
 import json
 import urllib.request
 
-from core.close import decode_pile, encode_pile
+from core.close import decode_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
-from core import suppression_state
 from core.suppression import scoped_id
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from . import signature, user_invite
@@ -64,7 +63,6 @@ DURABLE = True
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
     from core.kernel import drain
-    from core.ingress import stage_pile
     from core.node import now_ms
     from core.sync import sync
 
@@ -77,7 +75,7 @@ def accept(node, link, name):
     if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
             or blob.get("ws") != workspace:
         raise ValueError("invite workspace")
-    bootstrap, _ = decode_pile(
+    bootstrap = decode_pile(
         base64.b64decode(blob["pile"], validate=True), workspace)
     judgment = drain(bootstrap, workspace)
     invitations = [
@@ -93,12 +91,11 @@ def accept(node, link, name):
     sig = signature.signature(secret, public, member, ts)
     node.add_workspace(
         workspace, name, peers=[url], identity=node.keychain.default_id())
-    pile = encode_pile(
-        bootstrap + [sig, member],
-        workspace=workspace,
-    )  # bootstrap is already closed/topo
-    stage_pile(node.store(workspace), node.member_for(workspace), pile)
-    node.turn(workspace)
+    # The bootstrap is already closed/topological; PileSender owns the one
+    # outbound wire encoding before the shared receiving boundary.
+    pile = node.sender(workspace).pack(bootstrap + [sig, member])
+    node.receive_pile(
+        workspace, node.member_for(workspace), pile)
     sync(node, workspace, url)
     return workspace
 
@@ -106,6 +103,8 @@ def accept(node, link, name):
 # QUERIES
 def members(node, workspace):
     """Assemble the roster from current ``member`` and ``admin`` offers."""
+    from core import suppression_state
+
     with node.lock:
         candidates = {}
         role_order = {"admin": 0, "member": 1, "device": 2}

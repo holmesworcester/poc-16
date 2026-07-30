@@ -1,17 +1,14 @@
 """close(): the canonical-topo serializer, and the wire ingress unit codec.
 
 Ingress, request, invite, and sync-push piles use the same ordered fact-list
-codec (+ attached blobs). Published fact bodies instead have one canonical
-content-addressed residence; FactOrder stores only key-to-object references
-and deliberately does not introduce a second body or pile codec.
+codec. Detached immutable objects have their own object-ingress capability;
+they are never smuggled through a pile. Published fact bodies instead have one
+canonical content-addressed residence; FactOrder stores only key-to-object
+references and deliberately does not introduce a second body or pile codec.
 close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
 """
-import base64
-import binascii
-
-from .crypto import h
 from .fact import bound_to, canon, from_json, workspace_of
 from .ingress import InvalidPile
 from .limits import (
@@ -44,7 +41,7 @@ def close(news, deps_of, fact_of):
     return out
 
 
-def encode_pile(facts, blobs=None, *, workspace=None) -> bytes:
+def encode_pile(facts, *, workspace=None) -> bytes:
     """Encode one workspace-bound closed unit.
 
     ``workspace`` is inferred from non-empty fact bytes when omitted. Empty
@@ -59,10 +56,10 @@ def encode_pile(facts, blobs=None, *, workspace=None) -> bytes:
         raise ValueError("pile workspace")
     if not all(bound_to(fact, workspace) for fact in facts):
         raise ValueError("mixed workspace pile")
-    o = {"ws": workspace, "facts": [f.to_json() for f in facts]}
-    if blobs:
-        o["blobs"] = {k: base64.b64encode(v).decode() for k, v in blobs.items()}
-    raw = canon(o)
+    raw = canon({
+        "ws": workspace,
+        "facts": [f.to_json() for f in facts],
+    })
     if len(raw) > MAX_PILE_BYTES:
         raise PayloadTooLarge("pile too large")
     return raw
@@ -80,10 +77,9 @@ def decode_pile(b: bytes, workspace):
             raise InvalidEncoding("pile workspace")
         o = decode_json(b, MAX_PILE_BYTES, "pile")
         if not isinstance(o, dict) \
-                or set(o) not in ({"ws", "facts"}, {"ws", "facts", "blobs"}) \
+                or set(o) != {"ws", "facts"} \
                 or not valid_fid(o.get("ws")) \
-                or not isinstance(o.get("facts"), list) \
-                or not isinstance(o.get("blobs", {}), dict):
+                or not isinstance(o.get("facts"), list):
             raise InvalidEncoding("pile shape")
         pile_workspace = o["ws"]
         facts = [
@@ -93,19 +89,8 @@ def decode_pile(b: bytes, workspace):
             raise InvalidEncoding("pile workspace")
         if not all(bound_to(fact, pile_workspace) for fact in facts):
             raise InvalidEncoding("mixed workspace pile")
-        blobs = {}
-        for k, v in o.get("blobs", {}).items():
-            if not isinstance(k, str) or not isinstance(v, str):
-                raise InvalidEncoding("blob shape")
-            raw = base64.b64decode(v, validate=True)
-            if h(raw) != k:
-                raise InvalidEncoding("blob integrity")
-            blobs[k] = raw
-        return facts, blobs
+        return facts
     except PayloadTooLarge as error:
         raise InvalidPile(str(error)) from error
-    except (
-            InvalidEncoding,
-            binascii.Error,
-    ) as error:
+    except InvalidEncoding as error:
         raise InvalidPile(str(error) or "pile encoding") from error

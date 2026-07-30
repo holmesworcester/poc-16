@@ -21,7 +21,9 @@ import sqlite3
 
 import pytest
 
-from core import cmds, snapshot
+import facts
+
+from core import snapshot
 from core.close import decode_pile
 from core.crypto import keypair, load_sk
 from core.fact import Fact, canon
@@ -29,7 +31,10 @@ from core.kernel import drain, offer_src
 from core.node import Node, now_ms
 from core.object_store import OutcomeUnknown
 from core.pile_sender import PileSender
-from core.repository_applier import RepositoryApplier
+from core.repository_applier import (
+    RepositoryAnchorPending,
+    RepositoryApplier,
+)
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
 from facts.auth.request import request
@@ -123,7 +128,7 @@ def world(tmp_path, monkeypatch):
         str(tmp_path / "alice"),
         initial_secret=load_sk(f"{1:064x}"),
     )
-    workspace = cmds.create(node, "alice", ts=1_000_000)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1_000_000)
     t0 = 1_000_010
     bob_secret, bob, _ = add_member(
         node, workspace, "bob", t0 + 1)
@@ -148,7 +153,7 @@ def world(tmp_path, monkeypatch):
     send_bytes(
         node, workspace, "blob.bin",
         rng.randbytes(4_096), ts=t0 + 30)
-    cmds.evict(node, workspace, carol)
+    facts.auth.removal.evict(node, workspace, carol)
     return node, workspace
 
 
@@ -193,7 +198,7 @@ def test_history_independence_across_order_and_turn_batching(
             for item in report:
                 if item.error is None:
                     continue
-                assert isinstance(item.error, ValueError)
+                assert isinstance(item.error, RepositoryAnchorPending)
                 assert str(item.error) == "repository anchor candidate"
                 assert store.get(item.source) is not None
 
@@ -215,7 +220,7 @@ def test_history_independence_across_order_and_turn_batching(
 
 def test_sender_authors_but_only_applier_advances_root(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     sender = node.sender(workspace)
     applier = node.applier(workspace)
     assert isinstance(sender, PileSender)
@@ -241,8 +246,8 @@ def test_sender_authors_but_only_applier_advances_root(tmp_path):
 def test_cold_applier_and_reader_are_database_free(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
-    cmds.post(source, workspace, "general", "database-free", ts=10)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    facts.content.message.post(source, workspace, "general", "database-free", ts=10)
     raw = closed_subset(
         source, workspace, all_fids(source, workspace))
     expected = source.reader(workspace).root_bytes
@@ -262,7 +267,7 @@ def test_cold_applier_and_reader_are_database_free(
 
 def test_repository_reader_remains_pinned_during_later_apply(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     pinned = node.reader(workspace)
     item, raw = message_pile(node, workspace, "later root", ts=10)
 
@@ -285,7 +290,7 @@ def test_restart_rebuilds_presentation_from_reader_without_changing_root(
     node, workspace = world
     expected_root = node.reader(workspace).root_bytes
     expected_messages = [
-        row["text"] for row in cmds.msgs(node, workspace)]
+        row["text"] for row in facts.content.message.messages(node, workspace)]
     index_path = (
         tmp_path / "alice" / "ws" / f"{workspace}.idx.db")
 
@@ -294,7 +299,7 @@ def test_restart_rebuilds_presentation_from_reader_without_changing_root(
     reopened = Node(node.dir)
 
     assert reopened.reader(workspace).root_bytes == expected_root
-    assert [row["text"] for row in cmds.msgs(
+    assert [row["text"] for row in facts.content.message.messages(
         reopened, workspace)] == expected_messages
     assert reopened.store(workspace).get("root") == expected_root
 
@@ -335,7 +340,7 @@ def test_reader_rejects_forged_root_metadata_without_building_a_root(world):
 
 def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "blocked by corrupt base", ts=10)
     store = node.store(workspace)
@@ -356,7 +361,7 @@ def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
 
 def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
     target = message(
         workspace, author.pk, "general", "detached", ts=10)
     detached = signature(author.sk, author.pk, target, ts=10)
@@ -365,18 +370,30 @@ def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
     applier = RepositoryApplier(workspace, store)
     source = run(applier.stage(MEMBER, raw))
 
-    with pytest.raises(ValueError, match="repository anchor candidate"):
+    with pytest.raises(
+            RepositoryAnchorPending,
+            match="repository anchor candidate"):
         run(applier.apply(source))
 
     assert store.get("root") is None
     assert store.get(source) == raw
     assert store.list("obj/") == []
 
+    _, anchored = stage_apply(
+        applier, candidate_pile(author, workspace, workspace))
+    retried = run(applier.apply(source))
+
+    assert anchored.status == "applied"
+    assert retried.status == "applied"
+    assert store.get(source) is None
+    assert reader_for(store, workspace).candidates().fact(
+        detached.fid) == detached
+
 
 def test_pre_cas_crash_retains_work_and_cold_retry_applies(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "survives pre-CAS", ts=10)
     store = node.store(workspace)
@@ -407,7 +424,7 @@ def test_pre_cas_crash_retains_work_and_cold_retry_applies(
 def test_ambiguous_cas_is_confirmed_before_exact_retirement(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "confirmed CAS", ts=10)
     store = node.store(workspace)
@@ -431,7 +448,7 @@ def test_ambiguous_cas_is_confirmed_before_exact_retirement(
 def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "after-CAS replay", ts=10)
     store = node.store(workspace)
@@ -454,14 +471,14 @@ def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
     assert report[0].result.retired is True
     assert reopened.store(workspace).get(source) is None
     reopened.rebuild(workspace)
-    assert [row["text"] for row in cmds.msgs(
+    assert [row["text"] for row in facts.content.message.messages(
         reopened, workspace)] == ["after-CAS replay"]
 
 
 def test_failed_turn_keeps_old_root_and_retries_same_generation(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "turn retry", ts=10)
     store = node.store(workspace)
@@ -491,7 +508,7 @@ def test_failed_turn_keeps_old_root_and_retries_same_generation(
 def test_concurrent_appliers_rebase_without_retiring_the_cas_loser(
         tmp_path):
     author = Node(str(tmp_path / "author"))
-    workspace = cmds.create(author, "alice", ts=1)
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
     bootstrap_raw = closed_subset(
         author, workspace, all_fids(author, workspace))
     first, first_raw = message_pile(
@@ -551,7 +568,7 @@ def test_suppression_is_authenticated_and_reader_pinned(tmp_path):
 
     survivor = targets[0]
     assert pinned_worker.fact_active(survivor)
-    cmds.remove(node, workspace, survivor, ts=300)
+    facts.content.delete.remove(node, workspace, survivor, ts=300)
 
     assert pinned.worker().fact_active(survivor)
     assert not node.reader(workspace).worker().fact_active(survivor)
@@ -560,13 +577,13 @@ def test_suppression_is_authenticated_and_reader_pinned(tmp_path):
 
 def test_suppression_converges_in_both_pile_orders(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     base = closed_subset(
         source, workspace, all_fids(source, workspace))
-    target = cmds.post(
+    target = facts.content.message.post(
         source, workspace, "general", "suppressed", ts=10)
     target_raw = candidate_pile(source, workspace, target)
-    action = cmds.remove(source, workspace, target, ts=20)
+    action = facts.content.delete.remove(source, workspace, target, ts=20)
     action_raw = candidate_pile(source, workspace, action)
     expected = source.reader(workspace).root_bytes
 
@@ -621,7 +638,7 @@ def test_straggler_replay_converges_byte_for_byte(tmp_path, world):
 def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     """PileSender follows the real member-authority spine."""
     node = Node(str(tmp_path / "chain"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     ts = now_ms()
     bob_secret, bob, bob_fact = add_member(
         node, workspace, "bob", ts=ts + 1)
@@ -644,7 +661,7 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     assert bob_fact.fid in dependencies
     assert bob_fact.ts < invitation.ts < carol.ts
 
-    stream, _ = decode_pile(
+    stream = decode_pile(
         candidate_pile(node, workspace, carol.fid),
         workspace,
     )
@@ -663,7 +680,7 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
 
 def test_rejoining_key_cannot_shadow_its_invite_into_a_cycle(tmp_path):
     node = Node(str(tmp_path / "shadow"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     bob_secret, bob_public, original = add_member(
         node, workspace, "bob")
     base_ts = now_ms() + 10
@@ -758,7 +775,19 @@ def test_duplicate_witness_join_is_history_independent(tmp_path, world):
     ]
     random.Random(91).shuffle(shuffled)
     for raw in shuffled:
-        stage_apply(applier, raw)
+        run(applier.stage(MEMBER, raw))
+
+    for _ in range(len(shuffled) + 1):
+        report = run(applier.turn())
+        assert all(
+            item.error is None
+            or isinstance(item.error, RepositoryAnchorPending)
+            for item in report
+        )
+        if not store.list("pile/"):
+            break
+    else:
+        raise AssertionError("retained pre-anchor candidates did not converge")
 
     reader = reader_for(store, workspace)
     assert reader.root_bytes == expected
@@ -840,7 +869,7 @@ def test_ephemeral_request_never_enters_repository_candidates(world):
     chain = decode_pile(
         candidate_pile(node, workspace, member),
         workspace,
-    )[0]
+    )
     raw = node.sender(workspace).pack(
         tuple(chain) + (signed, ephemeral))
     _, result = stage_apply(node.applier(workspace), raw)

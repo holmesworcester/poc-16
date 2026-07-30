@@ -1,550 +1,157 @@
-"""Destructive ingress retirement is justified by durable trace evidence."""
-from concurrent.futures import ThreadPoolExecutor
-import shutil
-import threading
+"""F10 retirement is exact, witnessed, generation-bound, and replay-safe."""
+import asyncio
 
+import facts
 import pytest
 
-from core import cmds
-from core.close import encode_pile
 from core.crypto import h
-from core.fact import Fact, canon
-from core.ingress import stage_pile
+from core.fact import canon
+from core.ingress import RejectionReceipt, check_source
 from core.node import Node
-from core.object_store import Applied
-from facts.content import message as message_family
+from core.repository_applier import RepositoryApplier
+from core.store import FsStore
 
-from .adversarial_bucket import AdversarialBucket, Fault
-from .ingress_obligations import (
-    ObligationTrace,
-    ObligationViolation,
-    production_call_sites,
-)
-from .shared_bucket import ScriptedBucket
-from .test_ingress_hardening import poisoned_timestamp_pile
-from .test_shared_bucket_node import _message_pile
+from .util import closed_subset
 
 
-def _snapshot(store):
-    return {key: store.get(key) for key in store.list("")}
+def run(awaitable):
+    return asyncio.run(awaitable)
 
 
-def _shared_nodes(
-        seed, workspace, path, actors, *,
-        bucket_type=ScriptedBucket, **bucket_options):
-    initial = _snapshot(seed.store(workspace))
-    for index in seed._idx.values():
-        index.close()
-    bucket = bucket_type(initial, **bucket_options)
-    nodes = []
-    for actor in actors:
-        target = path / actor
-        shutil.copytree(seed.dir, target)
-        node = Node(str(target))
-        node._stores[workspace] = bucket.handle(actor)
-        nodes.append(node)
-    return bucket, tuple(nodes)
+def _message_pile(directory, text, ts):
+    node = Node(str(directory))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    fid = facts.content.message.post(node, workspace, "general", text, ts=ts)
+    return workspace, closed_subset(node, workspace, [fid]), fid
 
 
-def _observe_retirements(
-        monkeypatch, trace, node, before_retire=None):
-    membrane = node.admission(trace.workspace)
-    published = membrane.retire
-    rejected = membrane._retire_rejected
+def test_applied_and_already_represented_generations_retire_exactly(
+        tmp_path):
+    workspace, raw, fid = _message_pile(
+        tmp_path / "source", "one logical fact", 10)
+    store = FsStore(str(tmp_path / "recipient"))
+    first = RepositoryApplier(workspace, store)
+    first_source = run(first.stage("first", raw))
 
-    def observe_published(key, raw, receipt):
-        trace.observe_node_retirement(
-            node, trace.workspace, key, raw)
-        if before_retire is not None:
-            before_retire()
-        return published(key, raw, receipt)
+    applied = run(first.apply(first_source))
 
-    def observe_rejected(key, raw, receipt):
-        if before_retire is not None:
-            before_retire()
-        return rejected(key, raw, receipt)
+    assert applied.status == "applied"
+    assert applied.retired is True
+    assert store.get(first_source) is None
+    root = store.get("root")
 
-    monkeypatch.setattr(membrane, "retire", observe_published)
-    monkeypatch.setattr(membrane, "_retire_rejected", observe_rejected)
+    second = RepositoryApplier(workspace, store)
+    second_source = run(second.stage("second", raw))
+    replay = run(second.apply(second_source))
 
-
-def _put_pile(store, raw, member="shared"):
-    return stage_pile(store, member, raw)
+    assert replay.status == "noop"
+    assert replay.retired is True
+    assert store.get(second_source) is None
+    assert store.get("root") == root
+    assert fid in replay.admitted
 
 
-def _forge_rejection(store, source, raw, error_type):
-    payload = "failed/pile/" + h(raw)
-    store.put_if_absent(payload, raw)
-    assert store.get(payload) == raw
+def test_stale_apply_receipt_cannot_delete_a_recreated_generation(tmp_path):
+    workspace, raw, _ = _message_pile(
+        tmp_path / "source", "ABA source", 10)
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("member", raw))
+    proposal = run(applier.propose(raw))
+    result = run(applier.commit(source, raw, proposal))
+    receipt = applier._receipts[(source, h(raw))]
+
+    assert result.status == "applied"
+    assert run(applier.retire(source, raw, receipt)) is True
+    store.put_if_absent(source, raw)
+
+    with pytest.raises(ValueError, match="retirement receipt"):
+        run(applier.retire(source, raw, receipt))
+
+    assert store.get(source) == raw
+    assert store.get("root") == result.root
+
+
+def test_forged_rejection_receipt_cannot_authorize_retirement(tmp_path):
+    workspace, raw, _ = _message_pile(
+        tmp_path / "source", "not rejected", 10)
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("member", raw))
+    binding = check_source(source, raw)
     record = canon({
-        "error": f"{error_type}: forged",
+        "error": "KernelRejected: forged",
         "id": h(raw),
         "source": source,
     })
-    metadata = "failed/meta/" + h(record)
-    store.put_if_absent(metadata, record)
-    assert store.get(metadata) == record
-    store.delete(source)
+    forged = RejectionReceipt(
+        source, h(raw), record, binding.generation)
+
+    with pytest.raises(ValueError, match="rejection witness"):
+        run(applier.retire_rejection(source, raw, forged))
+
+    assert store.get(source) == raw
+    assert store.get("failed/pile/" + h(raw)) is None
+    assert store.get("root") is None
 
 
-def test_winning_worker_delete_has_authenticated_publication_witness(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, item = _message_pile(
-        seed, workspace, "winner publishes", 10)
-    bucket, (winner, _other) = _shared_nodes(
-        seed, workspace, tmp_path, ("winner", "other"))
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, winner)
-    source = _put_pile(winner.store(workspace), raw)
-
-    winner.turn(workspace)
-
-    report = trace.check()
-    assert report.live == ()
-    assert [(row.key, row.witness) for row in report.discharges] == [
-        (source, "publication")]
-    assert winner.fact_of(workspace, item.fid) == item
-
-
-def test_already_represented_pile_retires_without_republishing(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, item = _message_pile(
-        seed, workspace, "already represented", 10)
-    source = _put_pile(seed.store(workspace), raw)
-    seed.turn(workspace)
-    assert seed.store(workspace).get(source) is None
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",))
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-    source = _put_pile(worker.store(workspace), raw)
-
-    worker.turn(workspace)
-
-    report = trace.check()
-    assert report.live == ()
-    assert bucket.commits == []
-    assert [(row.key, row.witness_seq) for row in report.discharges] == [
-        (source, 0)]
-    assert worker.fact_of(workspace, item.fid) == item
-
-
-def test_cas_loser_may_retire_only_after_reconciling_identical_winner_root(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, item = _message_pile(
-        seed, workspace, "same candidate", 10)
-    bucket, (alice, bob) = _shared_nodes(
-        seed, workspace, tmp_path, ("alice", "bob"))
-    source = _put_pile(alice.store(workspace), raw)
-    trace = ObligationTrace(bucket, workspace)
-
-    listed = threading.Barrier(2)
-    for node in (alice, bob):
-        store = node.store(workspace)
-        list_keys = store.list
-
-        def synchronized_list(prefix, list_keys=list_keys):
-            keys = list_keys(prefix)
-            if prefix == "pile/":
-                listed.wait(timeout=5)
-            return keys
-
-        monkeypatch.setattr(store, "list", synchronized_list)
-
-    alice_before_cas = bucket.pause(
-        "alice", "cas", "root", when="before")
-    bob_cas = bob.store(workspace).cas
-
-    def bob_waits_for_alice(key, expected, value):
-        alice_before_cas.wait()
-        return bob_cas(key, expected, value)
-
-    monkeypatch.setattr(bob.store(workspace), "cas", bob_waits_for_alice)
-
-    bob_at_retirement = threading.Event()
-    release_bob = threading.Event()
-
-    def hold_bob_after_commit():
-        bob_at_retirement.set()
-        if not release_bob.wait(timeout=5):
-            raise AssertionError("Bob was not released")
-
-    _observe_retirements(monkeypatch, trace, alice)
-    _observe_retirements(
-        monkeypatch, trace, bob, hold_bob_after_commit)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        alice_turn = pool.submit(alice.turn, workspace)
-        bob_turn = pool.submit(bob.turn, workspace)
-        assert bob_at_retirement.wait(timeout=10)
-        alice_before_cas.release.set()
-        alice_turn.result(timeout=10)
-        release_bob.set()
-        bob_turn.result(timeout=10)
-
-    report = trace.check()
-    assert report.live == ()
-    assert [(row.key, row.witness) for row in report.discharges] == [
-        (source, "publication")]
-    applied = [
-        event for event in bucket.history
-        if event.op == "cas" and isinstance(event.result, Applied)]
-    deletes = [
-        event for event in bucket.history
-        if event.op == "delete" and event.key == source]
-    assert [event.actor for event in applied] == ["bob"]
-    assert [event.actor for event in deletes] == ["alice"]
-    assert alice.fact_of(workspace, item.fid) == item
-
-
-def test_lost_applied_cas_response_reconciles_before_retirement(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, item = _message_pile(
-        seed, workspace, "response was lost", 10)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",),
-        bucket_type=AdversarialBucket)
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-    source = _put_pile(worker.store(workspace), raw)
-    bucket.fail(
-        "worker", "cas", "root", Fault.RESPONSE_LOST,
-        when="after", nth=1)
-
-    with bucket.capture():
-        worker.turn(workspace)
-        report = trace.check()
-
-    assert report.live == ()
-    assert [(row.key, row.witness) for row in report.discharges] == [
-        (source, "publication")]
-    assert worker.fact_of(workspace, item.fid) == item
-    assert any(
-        event.op == "cas" and isinstance(event.result, Applied)
-        for event in bucket.history)
-
-
-def test_unknown_unapplied_cas_and_retry_count_never_support_delete(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, _item = _message_pile(
-        seed, workspace, "not committed", 10)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",),
-        bucket_type=AdversarialBucket)
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-    source = _put_pile(worker.store(workspace), raw)
-    bucket.fail(
-        "worker", "cas", "root", Fault.TRANSPORT,
-        when="before", nth=1)
-    bucket.fail(
-        "worker", "cas", "root", Fault.TRANSPORT,
-        when="before", nth=2)
-
-    worker.turn(workspace)
-    assert worker.store(workspace).get(source) == raw
-    assert worker.ingress_attempt_failures(workspace)
-
-    # Mutation control: a retry counter or local error record is not proof.
-    worker.store(workspace).delete(source)
-    with pytest.raises(
-            ObligationViolation,
-            match=r"unsupported DELETE.*no post-create runtime"):
-        trace.check()
-
-
-def test_paginated_insertion_is_delayed_then_a_restarted_worker_drains_it(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    middle_raw, middle = _message_pile(
-        seed, workspace, "first page", 10)
-    late_raw, late = _message_pile(
-        seed, workspace, "second page", 11)
-    early_raw, early = _message_pile(
-        seed, workspace, "inserted behind cursor", 12)
-    bucket, (worker, stale) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker", "stale"),
-        bucket_type=AdversarialBucket, list_page_size=1)
-    uploader = bucket.handle("uploader")
-    middle_key = _put_pile(
-        uploader, middle_raw, member="8000000000000000")
-    late_key = _put_pile(
-        uploader, late_raw, member="ffffffffffffffff")
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-    first_page = bucket.pause(
-        "worker", "list_page", "pile/", when="after", nth=1)
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        first_turn = pool.submit(worker.turn, workspace)
-        first_page.wait()
-        early_key = _put_pile(
-            uploader, early_raw, member="0000000000000000")
-        first_page.release.set()
-        first_turn.result(timeout=10)
-
-    delayed = trace.check()
-    assert [row.key for row in delayed.live] == [early_key]
-    assert [row.key for row in delayed.discharges] == [
-        middle_key, late_key]
-    assert worker.fact_of(workspace, middle.fid) == middle
-    assert worker.fact_of(workspace, late.fid) == late
-    assert worker.fact_of(workspace, early.fid) is None
-
-    # This process held the initial catalog while another Worker published.
-    # Reopening forces it to understand the written root before its next turn.
-    for index in stale._idx.values():
-        index.close()
-    restarted = Node(
-        stale.dir,
-        store_factory=lambda _workspace: bucket.handle("restarted"))
-    _observe_retirements(monkeypatch, trace, restarted)
-    restarted.turn(workspace)
-
-    final = trace.check()
-    assert final.live == ()
-    assert [(row.key, row.witness) for row in final.discharges] == [
-        (middle_key, "publication"),
-        (late_key, "publication"),
-        (early_key, "publication"),
-    ]
-    assert restarted.fact_of(workspace, middle.fid) == middle
-    assert restarted.fact_of(workspace, late.fid) == late
-    assert restarted.fact_of(workspace, early.fid) == early
-
-
-def test_typed_exact_rejection_evidence_supports_the_other_delete_path(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    bucket, (worker, _other) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker", "other"))
-    bad = poisoned_timestamp_pile(workspace)
-    source = _put_pile(
-        worker.store(workspace), bad,
-        member="0000000000000000")
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-
-    worker.turn(workspace)
-
-    report = trace.check()
-    assert report.live == ()
-    assert [(row.key, row.witness) for row in report.discharges] == [
-        (source, "rejection")]
-
-
-def test_real_kernel_rejection_supports_typed_exact_retirement(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",))
-    rejected = encode_pile(
-        [
-            Fact(
-                "signature", 3,
-                [["offer", "author", "not-a-fact", seed.pk]], {},
-                workspace),
-        ],
-        workspace=workspace,
-    )
-    source = _put_pile(worker.store(workspace), rejected)
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-
-    worker.turn(workspace)
-
-    report = trace.check()
-    assert report.live == ()
-    assert [(row.key, row.witness) for row in report.discharges] == [
-        (source, "rejection")]
-
-
-def test_valid_pile_with_forged_invalid_pile_record_is_not_rejection(
+def test_typed_permanent_rejection_records_evidence_before_retirement(
         tmp_path):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, _item = _message_pile(seed, workspace, "valid", 10)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",))
-    store = worker.store(workspace)
-    source = _put_pile(store, raw)
-    _forge_rejection(store, source, raw, "InvalidPile")
+    source_node = Node(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source_node, "alice", ts=1)
+    raw = b"{}"
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("member", raw))
 
-    with pytest.raises(
-            ObligationViolation,
-            match=r"exact bytes pass.*rejection is forged"):
-        ObligationTrace(bucket, workspace).check()
+    result = run(applier.apply(source))
 
-
-def test_program_failure_with_forged_kernel_rejection_is_not_input_local(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, item = _message_pile(
-        seed, workspace, "family failure", 10)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",))
-    needs = message_family.needs
-
-    def program_failure(fact):
-        if fact.fid == item.fid:
-            raise RuntimeError("family bug")
-        return needs(fact)
-
-    monkeypatch.setattr(message_family, "needs", program_failure)
-    store = worker.store(workspace)
-    source = _put_pile(store, raw)
-    _forge_rejection(store, source, raw, "KernelRejected")
-
-    with pytest.raises(
-            ObligationViolation,
-            match=r"family/program failure.*RuntimeError: family bug"):
-        ObligationTrace(bucket, workspace).check()
+    assert result.status == "rejected"
+    assert result.retired is True
+    assert store.get(source) is None
+    assert store.get("failed/pile/" + h(raw)) == raw
+    assert store.get(
+        "failed/meta/" + h(result.rejection.record)
+    ) == result.rejection.record
 
 
-def test_recreated_key_needs_a_new_post_create_witness(
-        tmp_path, monkeypatch):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    raw, _item = _message_pile(
-        seed, workspace, "recreated obligation", 10)
-    bucket, (worker,) = _shared_nodes(
-        seed, workspace, tmp_path, ("worker",))
-    trace = ObligationTrace(bucket, workspace)
-    _observe_retirements(monkeypatch, trace, worker)
-    source = _put_pile(worker.store(workspace), raw)
-    worker.turn(workspace)
-    assert trace.check().live == ()
+def test_bounded_cursor_wrap_eventually_sees_insertion_behind_it(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    middle_fid = facts.content.message.post(
+        source, workspace, "general", "middle", ts=10)
+    middle_raw = closed_subset(source, workspace, [middle_fid])
+    late_fid = facts.content.message.post(
+        source, workspace, "general", "late", ts=11)
+    late_raw = closed_subset(source, workspace, [late_fid])
+    early_fid = facts.content.message.post(
+        source, workspace, "general", "early", ts=12)
+    early_raw = closed_subset(source, workspace, [early_fid])
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    middle = run(applier.stage("8" * 16, middle_raw))
+    late = run(applier.stage("f" * 16, late_raw))
 
-    # Same address and bytes are safe to republish as intent, but this is a
-    # new acknowledged lifetime. Stale cleanup from the first must not erase
-    # it without observing the new obligation.
-    worker.store(workspace).put_if_absent(source, raw)
-    worker.store(workspace).delete(source)
+    first = run(applier.turn(limit=1))
+    early = run(applier.stage("0" * 16, early_raw))
+    second = run(RepositoryApplier(
+        workspace, store).turn(limit=1))
 
-    with pytest.raises(
-            ObligationViolation,
-            match=r"unsupported DELETE.*no post-create runtime"):
-        trace.check()
+    assert [item.source for item in first] == [middle]
+    assert [item.source for item in second] == [late]
+    assert store.get(early) == early_raw
 
+    wrapped = run(RepositoryApplier(
+        workspace, store).turn(limit=1))
 
-def test_obsolete_good_root_cannot_mask_bad_current_authority(tmp_path):
-    seed = Node(str(tmp_path / "seed"))
-    workspace = cmds.create(seed, "alice", ts=1)
-    bucket = ScriptedBucket(_snapshot(seed.store(workspace)))
-    store = bucket.handle("mutation")
-    raw = b"classification supplied explicitly"
-    source = _put_pile(store, raw)
-    current = store.read_versioned("root")
-    assert isinstance(store.cas(
-        "root", current.token, b"malformed-current-root"), Applied)
-    trace = ObligationTrace(bucket, workspace)
-    trace.observe_publication(source, raw, {workspace})
-    store.delete(source)
-
-    with pytest.raises(
-            ObligationViolation,
-            match=r"current root.*is not authenticated"):
-        trace.check()
-
-
-def test_failure_reports_first_unsupported_delete_and_replay_prefix():
-    bucket = ScriptedBucket(seed=0xF10)
-    store = bucket.handle("mutation")
-    first = _put_pile(store, b"first", member="0000000000000000")
-    store.delete(first)
-    second = _put_pile(store, b"second", member="ffffffffffffffff")
-    store.delete(second)
-
-    with pytest.raises(ObligationViolation) as caught:
-        ObligationTrace(bucket, "f" * 64).check()
-
-    error = caught.value
-    assert error.event.key == first
-    assert error.event.seq < next(
-        event.seq for event in bucket.history
-        if event.op == "delete" and event.key == second)
-    assert error.prefix[-1] == error.event
-    assert len(error.prefix) == error.event.seq
-
-
-def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
-    root = __file__.rsplit("/tests/", 1)[0]
-    deletes = production_call_sites(root, "delete")
-    published = production_call_sites(
-        root, "_retire_published")
-    rejected = production_call_sites(
-        root, "retire_rejected")
-
-    assert [
-        (
-            site.path, site.function, site.line,
-            site.receiver, site.use,
-        )
-        for site in deletes
-    ] == [
-        (
-            "core/object_store.py", "retire_exact", 236,
-            "store", "direct"),
-        (
-            "core/object_store.py", "retire_exact_async", 297,
-            "store", "direct"),
-    ]
-    assert [
-        (
-            site.path, site.function, site.line,
-            site.receiver, site.use,
-        )
-            for site in published
-        ] == [
-        (
-            "core/admission.py", "retire", 100,
-            "ingress", "direct"),
-    ]
-    assert [
-        (
-            site.path, site.function, site.line,
-            site.receiver, site.use,
-        )
-        for site in rejected
-    ] == [
-        (
-            "core/admission.py", "_retire_rejected", 74,
-            "ingress", "direct"),
-    ]
-
-
-def test_delete_inventory_reports_alias_and_dynamic_capability(tmp_path):
-    core = tmp_path / "core"
-    core.mkdir()
-    (core / "probe.py").write_text(
-        "def alias(store, source):\n"
-        "    deleter = store.delete\n"
-        "    deleter(source)\n"
-        "\n"
-        "def dynamic(store, source):\n"
-        "    deleter = getattr(store, 'delete')\n"
-        "    deleter(source)\n")
-
-    sites = production_call_sites(tmp_path, "delete")
-
-    assert [
-        (site.function, site.receiver, site.use)
-        for site in sites
-    ] == [
-        ("alias", "store", "alias"),
-        ("dynamic", "store", "getattr"),
-    ]
+    assert [item.source for item in wrapped] == [early]
+    assert store.get(early) is None
+    assert store.get(middle) is None
+    assert store.get(late) is None
+    reader = Node(str(tmp_path / "reader"))
+    reader.add_workspace(workspace, "copy", peers=[])
+    reader._stores[workspace] = store
+    reader.rebuild(workspace)
+    assert reader.fact_of(workspace, middle_fid) is not None
+    assert reader.fact_of(workspace, late_fid) is not None
+    assert reader.fact_of(workspace, early_fid) is not None

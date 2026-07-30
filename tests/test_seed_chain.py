@@ -5,7 +5,9 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from core import catalog, cmds
+import facts
+
+from core import catalog
 from core.close import close, decode_pile
 from core.ingress import KernelRejected
 from core.kernel import drain, resolve_deps
@@ -45,7 +47,7 @@ def test_random_seed_is_deep_and_its_leaf_closes_over_the_real_path(tmp_path):
     assert inviter_user in resolve_deps(
         node.fact_of(workspace, invite_fid), node.idx(workspace))
 
-    stream, _ = decode_pile(
+    stream = decode_pile(
         closed_subset(node, workspace, [user_fid]), workspace)
     assert drain(stream, workspace).ok
 
@@ -186,7 +188,7 @@ def test_ordinary_seed_append_aligns_projection_with_committed_reader(
         n_members=12, shape="random", seed=16)
     root = node.store(workspace).get("root")
 
-    fid = cmds.post(
+    fid = facts.content.message.post(
         node, workspace, "general", "one conflict-free live append")
 
     assert node.store(workspace).get("root") != root

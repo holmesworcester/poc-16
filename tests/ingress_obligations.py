@@ -111,7 +111,7 @@ class ObligationTrace:
         if workspace != self.workspace:
             raise AssertionError("workspace mismatch")
         try:
-            stream, _ = decode_pile(raw, workspace)
+            stream = decode_pile(raw, workspace)
             judgment = drain(stream, workspace)
         except PermanentIngressRejection:
             return None
@@ -317,7 +317,7 @@ class ObligationTrace:
 def _classify_permanent_rejection(raw, workspace):
     """Re-run the immutable input door; a type-name string is not authority."""
     try:
-        stream, _ = decode_pile(raw, workspace)
+        stream = decode_pile(raw, workspace)
     except PermanentIngressRejection as error:
         return type(error).__name__, ""
     except Exception as error:

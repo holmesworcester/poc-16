@@ -2,10 +2,9 @@
 import os
 import tempfile
 
-from core import bao, catalog
-from core.close import encode_pile
+from core import bao
+from core.fact_index import REF_INDEX, TYPE_INDEX
 from core.crypto import h
-from core.object_store import ensure_object
 from core.fact import Fact, Need
 from core.shape import valid_fid
 from core.suppression import PARENT, selector_markers
@@ -16,12 +15,7 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from .._commands import (
-    closer,
-    offer_source,
-    upload_builder,
-    upload_source,
-)
+from .._commands import offer_source, upload_builder, upload_source
 from ..auth import signature
 from . import chunk as chunkfam
 
@@ -102,7 +96,7 @@ DURABLE = True
 
 # COMMANDS
 def _prepare(node, workspace, channel, path, name, ts, put_object):
-    """Author the one file/chunk fact set; choose only where blobs land."""
+    """Author one file/chunk fact set; choose its detached object sink."""
     from core.node import now_ms
 
     timestamp = now_ms() if ts is None else ts
@@ -155,10 +149,9 @@ def _prepare(node, workspace, channel, path, name, ts, put_object):
 
 def send(node, workspace, channel, path, name=None, ts=None):
     """Prove every slice locally, spill it, then publish one closed pile."""
-    store = node.store(workspace)
     descriptor, news, deps = _prepare(
         node, workspace, channel, path, name, ts,
-        lambda cid, blob: ensure_object(store, cid, blob),
+        lambda cid, blob: node.receive_object(workspace, cid, blob),
     )
     node.ingest_new(workspace, news, deps)
     return descriptor.fid
@@ -179,14 +172,8 @@ def upload(
             node, workspace, channel, path, name, ts,
             spool,
         )
-        with node.lock:
-            stream = closer(
-                node, workspace,
-                {fact.fid: fact for fact in news},
-                deps,
-            )
         source = builder.finish(
-            encode_pile(stream, workspace=workspace))
+            node.sender(workspace).pile(news, deps))
     except BaseException:
         builder.discard()
         raise
@@ -292,10 +279,10 @@ def _states(node, workspace, selector=None):
             )
 
         if selector is None:
-            descriptors, target = select(catalog.TYPE_INDEX, TAG), None
+            descriptors, target = select(TYPE_INDEX, TAG), None
         else:
             prefixed = select(
-                catalog.TYPE_INDEX, TAG, "", source_prefix=selector)
+                TYPE_INDEX, TAG, "", source_prefix=selector)
             direct = {
                 fact.fid: fact for fact in prefixed if fact.fid == selector
             }
@@ -310,7 +297,7 @@ def _states(node, workspace, selector=None):
             descriptors = () if descriptor is None else (descriptor,)
             target = descriptor.fid if descriptor is not None else None
         chunks = () if selector is not None and not descriptors else select(
-            catalog.REF_INDEX, "file", target, source_type=chunkfam.TAG)
+            REF_INDEX, "file", target, source_type=chunkfam.TAG)
         store = node.store(workspace)
 
     by_file = {fact.fid: [] for fact in descriptors}

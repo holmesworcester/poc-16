@@ -11,8 +11,12 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from core import cmds, daemon, peer_capability
+import facts
+
+from core import daemon, peer_capability
+from core import close as close_module
 from core import sync as sync_module
+from core.close import decode_pile
 from core.crypto import h
 from core.node import Node, now_ms
 from core.sync import sync
@@ -23,7 +27,7 @@ from .util import all_fids, closed_subset, deliver
 
 def replicas(tmp_path):
     remote = Node(str(tmp_path / "remote"))
-    workspace = cmds.create(remote, "alice", ts=1)
+    workspace = facts.auth.workspace.create(remote, "alice", ts=1)
     local = Node(
         str(tmp_path / "local"),
         initial_secret=remote.identity(workspace)[0])
@@ -35,6 +39,40 @@ def replicas(tmp_path):
     assert local.store(workspace).get("root") \
         == remote.store(workspace).get("root")
     return remote, workspace, local
+
+
+def test_sender_batches_verified_closures_at_the_wire_limit(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    first = facts.content.message.post(
+        source, workspace, "general", "first batch", ts=10)
+    second = facts.content.message.post(
+        source, workspace, "general", "second batch", ts=11)
+    view = source.reader(workspace).candidates()
+    units = (
+        view.verify(first).facts,
+        view.verify(second).facts,
+    )
+    sender = source.sender(workspace)
+    single_limit = max(len(sender.pack(unit)) for unit in units)
+    assert len(sender.pack((*units[0], *units[1]))) > single_limit
+    monkeypatch.setattr(close_module, "MAX_PILE_BYTES", single_limit)
+
+    batches = sender.pack_batches(units)
+
+    assert len(batches) == 2
+    assert all(len(raw) <= single_limit for raw in batches)
+    assert all(decode_pile(raw, workspace) for raw in batches)
+    assert all(
+        set(json.loads(raw)) == {"ws", "facts"}
+        for raw in batches)
+    destination = Node(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "alice", [])
+    for raw in batches:
+        destination.receive_pile(workspace, "peer", raw)
+    assert destination.store(workspace).get("root") \
+        == source.store(workspace).get("root")
 
 
 @contextmanager
@@ -82,7 +120,7 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         tmp_path, profile):
     remote, workspace, local = replicas(tmp_path)
     with serving(remote, profile) as (url, observed, _):
-        local_fid = cmds.post(
+        local_fid = facts.content.message.post(
             local, workspace, "general", "from local", ts=10)
         pulled, pushed = sync(local, workspace, url)
 
@@ -90,12 +128,23 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         assert pushed > 0
         assert remote.fact_of(workspace, local_fid) \
             == local.fact_of(workspace, local_fid)
-        assert observed["puts"]
+        # The signature and message are two candidates but one verified,
+        # closed outbound batch and therefore one receiver settlement.
+        assert len(observed["puts"]) == 1
         assert all(path.startswith("/pile/") for path in observed["puts"])
 
-        remote_fid = cmds.post(
+        staged = []
+        real_stage = local.stage_received_pile
+
+        def record_stage(ws, member, raw):
+            staged.append(raw)
+            return real_stage(ws, member, raw)
+
+        local.stage_received_pile = record_stage
+        remote_fid = facts.content.message.post(
             remote, workspace, "general", "from remote", ts=20)
         assert sync(local, workspace, url) == (1, 0)
+        assert len(staged) == 1
         assert local.fact_of(workspace, remote_fid) \
             == remote.fact_of(workspace, remote_fid)
         assert local.store(workspace).get("root") \
@@ -110,14 +159,14 @@ def test_read_only_peer_pulls_when_behind_idles_when_equal_and_never_pushes(
         assert sync(local, workspace, url) == (0, 0)
         assert observed["puts"] == []
 
-        remote_fid = cmds.post(
+        remote_fid = facts.content.message.post(
             remote, workspace, "general", "remote news", ts=10)
         assert sync(local, workspace, url) == (1, 0)
         assert local.fact_of(workspace, remote_fid) is not None
 
-        local_fid = cmds.post(
+        local_fid = facts.content.message.post(
             local, workspace, "general", "pending local news", ts=20)
-        action_fid = cmds.remove(local, workspace, remote_fid, ts=21)
+        action_fid = facts.content.delete.remove(local, workspace, remote_fid, ts=21)
         remote_root = remote.store(workspace).get("root")
 
         assert sync(local, workspace, url) == (0, 0)
@@ -143,7 +192,7 @@ def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
     def reconcile_then_commit(*args, **kwargs):
         answer = real_reconcile(*args, **kwargs)
         if not raced:
-            raced["fid"] = cmds.post(
+            raced["fid"] = facts.content.message.post(
                 local,
                 workspace,
                 "general",
@@ -159,8 +208,9 @@ def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
         assert sync(local, workspace, url) == (0, 0)
         assert remote.fact_of(workspace, raced["fid"]) is None
         assert observed["puts"] == []
-        compared = local.sync_cache[(workspace, url)]["local"]
-        assert compared != h(local.store(workspace).get("root"))
+        # A concurrent local commit invalidates the whole peer comparison.
+        # The next dial must recompare instead of blessing either snapshot.
+        assert (workspace, url) not in local.sync_cache
 
         pulled, pushed = sync(local, workspace, url)
         assert pulled == 0
@@ -179,7 +229,7 @@ def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
 def test_mint_capability_mismatch_is_a_safe_pull_only_default(
         tmp_path, profile, tampered):
     remote, workspace, local = replicas(tmp_path)
-    local_fid = cmds.post(
+    local_fid = facts.content.message.post(
         local, workspace, "general", "must remain local", ts=10)
 
     with serving(
@@ -218,7 +268,7 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
             cold.put_obj(h(b"unsupported"), b"unsupported")
         assert observed["puts"] == []
 
-        pending = cmds.post(
+        pending = facts.content.message.post(
             local, workspace, "general", "survives pull-only", ts=10)
         assert sync(local, workspace, url) == (0, 0)
         assert local.sync_cache[(workspace, url)]["pending_push"] is True

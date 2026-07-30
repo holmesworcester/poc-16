@@ -4,7 +4,9 @@ from collections import Counter
 
 import pytest
 
-from core import merkle_map, cmds, mint
+import facts
+
+from core import merkle_map
 from core.close import decode_pile, encode_pile
 from core.node import Node, now_ms
 from core.repository_reader import RepositoryReader
@@ -25,10 +27,10 @@ def combine(*streams):
     return out
 
 
-def run_async(pile, root, fetch, now, *,
+def run_async(workspace, pile, root, fetch, now, *,
               unique=UNIQUE_FETCH_BUDGET, byte_limit=FETCH_BYTE_BUDGET):
-    return asyncio.run(mint.async_stateless(
-        pile, root, fetch, now,
+    return asyncio.run(RepositoryReader.mint_awaited(
+        workspace, root, fetch, pile, now,
         max_unique_fetches=unique,
         max_fetch_bytes=byte_limit,
     ))
@@ -37,15 +39,15 @@ def run_async(pile, root, fetch, now, *,
 @pytest.fixture
 def snapshots(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    message = cmds.post(
+    message = facts.content.message.post(
         node, workspace, "general", "later suppressed", ts=20)
     message_closure = decode_pile(
-        closed_subset(node, workspace, {message}), workspace)[0]
+        closed_subset(node, workspace, {message}), workspace)
 
     now = now_ms()
     bob_pile = encode_pile(request.payload(
@@ -57,11 +59,11 @@ def snapshots(tmp_path):
     expired = encode_pile(request.payload(
         node, workspace, "sync", now - 1, now + 2))
 
-    cmds.remove(node, workspace, message, ts=now + 3)
+    facts.content.delete.remove(node, workspace, message, ts=now + 3)
     suppressed_root = node.store(workspace).get("root")
     suppressed_pile = encode_pile(combine(message_closure, founder_facts))
 
-    cmds.evict(node, workspace, bob)
+    facts.auth.removal.evict(node, workspace, bob)
     removed_root = node.store(workspace).get("root")
     return {
         "node": node,
@@ -102,8 +104,11 @@ def test_async_driver_matches_sync_decisions_from_real_snapshots(snapshots):
     )
 
     for name, pile, root, expected in cases:
-        sync = mint.stateless(
-            pile, root, lambda oid: store.get("obj/" + oid), now)
+        sync = RepositoryReader(
+            snapshots["workspace"],
+            root,
+            lambda oid: store.get("obj/" + oid),
+        ).mint(pile, now)
         calls = []
 
         async def fetch(oid):
@@ -111,7 +116,8 @@ def test_async_driver_matches_sync_decisions_from_real_snapshots(snapshots):
             return store.get("obj/" + oid)
 
         assert sync == expected, name
-        assert run_async(pile, root, fetch, now) == sync, name
+        assert run_async(
+            snapshots["workspace"], pile, root, fetch, now) == sync, name
         assert len(calls) == len(set(calls)), name
 
 
@@ -122,12 +128,12 @@ def test_async_driver_memoizes_repeated_tree_paths(snapshots):
     now = snapshots["now"]
     sync_calls = []
 
-    expected = mint.stateless(
-        pile, root,
+    expected = RepositoryReader(
+        snapshots["workspace"],
+        root,
         lambda oid: (
             sync_calls.append(oid) or store.get("obj/" + oid)),
-        now,
-    )
+    ).mint(pile, now)
     repeated = {
         oid for oid, count in Counter(sync_calls).items() if count > 1}
     assert repeated
@@ -138,7 +144,8 @@ def test_async_driver_memoizes_repeated_tree_paths(snapshots):
         async_calls.append(oid)
         return store.get("obj/" + oid)
 
-    assert run_async(pile, root, fetch, now) == expected
+    assert run_async(
+        snapshots["workspace"], pile, root, fetch, now) == expected
     assert async_calls == list(dict.fromkeys(sync_calls))
     assert repeated.isdisjoint(
         oid for oid, count in Counter(async_calls).items() if count > 1)
@@ -177,12 +184,12 @@ def test_missing_and_corrupt_pages_are_fetched_once_and_fail_closed(snapshots):
     root = snapshots["removed_root"]
     now = snapshots["now"]
     sync_calls = []
-    assert mint.stateless(
-        pile, root,
+    assert RepositoryReader(
+        snapshots["workspace"],
+        root,
         lambda oid: (
             sync_calls.append(oid) or store.get("obj/" + oid)),
-        now,
-    )
+    ).mint(pile, now)
     target = next(
         oid for oid, count in Counter(sync_calls).items() if count > 1)
 
@@ -193,7 +200,8 @@ def test_missing_and_corrupt_pages_are_fetched_once_and_fail_closed(snapshots):
             calls.append(oid)
             return replacement if oid == target else store.get("obj/" + oid)
 
-        assert run_async(pile, root, fetch, now) is None
+        assert run_async(
+            snapshots["workspace"], pile, root, fetch, now) is None
         assert Counter(calls)[target] == 1
         assert len(calls) == len(set(calls))
 
@@ -209,7 +217,8 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
         ordered.append(oid)
         return store.get("obj/" + oid)
 
-    expected = run_async(pile, root, baseline_fetch, now)
+    expected = run_async(
+        snapshots["workspace"], pile, root, baseline_fetch, now)
     assert expected == (snapshots["founder"], "sync")
     sizes = [len(store.get("obj/" + oid)) for oid in ordered]
     total = sum(sizes)
@@ -223,7 +232,7 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
         return store.get("obj/" + oid)
 
     assert run_async(
-        pile, root, exact_fetch, now,
+        snapshots["workspace"], pile, root, exact_fetch, now,
         unique=len(ordered), byte_limit=total) == expected
     assert exact_calls == ordered
 
@@ -234,7 +243,7 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
         return store.get("obj/" + oid)
 
     assert run_async(
-        pile, root, unique_fetch, now,
+        snapshots["workspace"], pile, root, unique_fetch, now,
         unique=len(ordered) - 1, byte_limit=total) is None
     assert unique_calls == ordered[:-1]
 
@@ -247,7 +256,7 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
         return store.get("obj/" + oid)
 
     assert run_async(
-        pile, root, byte_fetch, now,
+        snapshots["workspace"], pile, root, byte_fetch, now,
         unique=len(ordered), byte_limit=byte_limit) is None
     transferred = [
         len(store.get("obj/" + oid)) for oid in byte_calls]
@@ -257,7 +266,7 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
 
 def test_async_driver_never_repins_root_during_an_await(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     node.keychain.add_identity(bob_secret)
@@ -280,15 +289,15 @@ def test_async_driver_never_repins_root_during_an_await(tmp_path):
                 await release_fetch.wait()
             return store.get("obj/" + oid)
 
-        decision = asyncio.create_task(mint.async_stateless(
-            pile, pinned_root, fetch, now,
+        decision = asyncio.create_task(RepositoryReader.mint_awaited(
+            workspace, pinned_root, fetch, pile, now,
             max_unique_fetches=UNIQUE_FETCH_BUDGET,
             max_fetch_bytes=FETCH_BYTE_BUDGET,
         ))
         await first_fetch.wait()
         node.bind_identity(workspace, founder)
         try:
-            cmds.evict(node, workspace, bob)
+            facts.auth.removal.evict(node, workspace, bob)
         finally:
             release_fetch.set()
         return await decision, calls
@@ -298,8 +307,10 @@ def test_async_driver_never_repins_root_during_an_await(tmp_path):
     fetch = lambda oid: store.get("obj/" + oid)
     assert current_root != pinned_root
     assert decision == (bob, "sync")
-    assert mint.stateless(pile, pinned_root, fetch, now) == decision
-    assert mint.stateless(pile, current_root, fetch, now) is None
+    assert RepositoryReader(
+        workspace, pinned_root, fetch).mint(pile, now) == decision
+    assert RepositoryReader(
+        workspace, current_root, fetch).mint(pile, now) is None
     assert calls and all(len(oid) == 64 for oid in calls)
 
 
@@ -314,5 +325,5 @@ def test_async_driver_rejects_invalid_budget_configuration(
 
     with pytest.raises(ValueError, match="budget"):
         run_async(
-            b"", b"", fetch, 0,
+            "0" * 64, b"", b"", fetch, 0,
             unique=unique, byte_limit=byte_limit)

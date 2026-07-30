@@ -1,6 +1,6 @@
 """facts/auth/request.py — ephemeral proof of workspace access."""
 from core.fact import Fact, Need
-from .._commands import closer, offer_source
+from .._commands import offer_source
 from .._policy import FamilyPolicy
 from . import signature
 
@@ -77,10 +77,14 @@ def payload(node, workspace, verb, exp, ts):
     member = offer_source(node, workspace, "member", public)
     if member is None:
         raise ValueError("local identity is not a workspace member")
-    newmap = {item.fid: item, sig.fid: sig}
     deps = {item.fid: [sig.fid, member], sig.fid: []}
-    with node.lock:
-        return closer(node, workspace, newmap, deps)
+    return node.sender(workspace).close([sig, item], deps)
+
+
+PROOF_COMMANDS = {
+    purpose: payload
+    for purpose in PURPOSES
+}
 
 
 # QUERIES — none.

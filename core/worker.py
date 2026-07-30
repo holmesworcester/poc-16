@@ -52,7 +52,7 @@ class WorkerView:
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
             limit=merkle_map.MAX_RANGE_ROWS, include_dormant=False):
-        """One bounded generic-index page for a cold publisher/query."""
+        """One bounded generic-index page for a cold applier/query."""
         return indexes.posting_page(
             self._reader(indexes.FACT), kind, k0, k1,
             after=after, limit=limit, include_dormant=include_dormant)
@@ -98,7 +98,7 @@ class WorkerView:
 
     def authority_provider(self, name, a0, a1=None, requires=()):
         row = self._reader(indexes.AUTHORITY).get(
-            indexes.need_key(name, a0, a1, requires))
+            indexes.need_key(name, a0, a1))
         if row is None:
             return None
         if not isinstance(row, dict) or row.get("state") not in {
@@ -110,7 +110,16 @@ class WorkerView:
                 or not isinstance(row["fid"], str) \
                 or type(row["rank"]) is not int:
             raise ValueError("AuthoritySlot shape")
-        return row["fid"] if self.fact_active(row["fid"]) else None
+        if not self.fact_active(row["fid"]):
+            return None
+        offered = {
+            tuple(offer)
+            for offer in self.fact_record(row["fid"])["offers"]
+        }
+        return row["fid"] if all(
+            (required_name, required_a0, required_a1 or "") in offered
+            for required_name, required_a0, required_a1 in requires
+        ) else None
 
     def _committed_needs_match(self, stream):
         """Mirror the kernel's committed-authority omission check.
@@ -156,8 +165,8 @@ class WorkerView:
         purpose and the submitted request fact must name the same value.
         """
         try:
-            stream, blobs = decode_pile(pile_bytes, self.anchor)
-            if blobs or len(stream) > MAX_PROOF_FACTS:
+            stream = decode_pile(pile_bytes, self.anchor)
+            if len(stream) > MAX_PROOF_FACTS:
                 return None
             result = drain(stream, self.anchor)
             if not result.ok or not self._committed_needs_match(stream):

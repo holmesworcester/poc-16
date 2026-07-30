@@ -8,11 +8,11 @@ import pytest
 import facts
 import core.catalog as catalog_module
 import core.sync as sync_module
-from core import bao, cmds, shape
+from core import bao, shape
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.node import Node
-from core.walk import _fetch_blobs, _push
+from core.walk import _fetch_blobs
 from facts.content import chunk, file as file_family
 
 from .util import (
@@ -30,15 +30,25 @@ def close_node(node):
 
 
 def progress(node, workspace):
-    records = cmds.files(node, workspace)
+    records = facts.content.file.files(node, workspace)
     assert len(records) == 1
     return records[0]
+
+
+def push_all(node, workspace, peer):
+    """Exercise the production Reader -> Sender outbound path."""
+    candidates = node.reader(workspace).candidates()
+    closures = (
+        candidates.verify(fid).facts
+        for fid in candidates.candidate_ids()
+    )
+    return node.sender(workspace).deliver(peer, closures)
 
 
 def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     path = tmp_path / "node"
     node = Node(str(path))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     data = random.Random(16).randbytes(bao.WIDTH * 2 + 17)
     fid = send_bytes(node, workspace, "three-slices.bin", data)
 
@@ -54,14 +64,14 @@ def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     os.unlink(path / "ws" / f"{workspace}.idx.db")
     rebuilt = Node(str(path))
     output = tmp_path / "saved.bin"
-    assert cmds.save_file(rebuilt, workspace, fid, output)["bytes"] == len(data)
+    assert facts.content.file.save(rebuilt, workspace, fid, output)["bytes"] == len(data)
     assert output.read_bytes() == data
 
 
 def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     fid = send_bytes(node, workspace, "upgrade.bin", b"upgrade", ts=2)
     store = node.store(workspace)
     root = store.get("root")
@@ -88,7 +98,7 @@ def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
 
 def test_file_selector_compatibility_and_exact_suppression(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     first = send_bytes(node, workspace, "first.bin", b"first", ts=10)
     second = send_bytes(node, workspace, "second.bin", b"second", ts=20)
     root = node.fact_of(workspace, first).body["root"]
@@ -101,7 +111,7 @@ def test_file_selector_compatibility_and_exact_suppression(tmp_path):
     assert file_family.resolve(node, workspace, unique_prefix)["fid"] == first
     assert file_family.resolve(node, workspace, "") is None
 
-    cmds.remove(node, workspace, first, ts=30)
+    facts.content.delete.remove(node, workspace, first, ts=30)
     assert file_family.resolve(node, workspace, first) is None
 
 
@@ -109,7 +119,7 @@ def test_file_selector_compatibility_and_exact_suppression(tmp_path):
 def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
         tmp_path, monkeypatch, operation):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     wanted = random.Random(40).randbytes(bao.WIDTH + 17)
     unwanted = random.Random(41).randbytes(bao.WIDTH * 2 + 23)
     wanted_fid = send_bytes(
@@ -174,7 +184,7 @@ def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
 def test_file_read_pins_catalog_then_verifies_without_node_lock(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     payload = random.Random(42).randbytes(bao.WIDTH + 1)
     fid = send_bytes(node, workspace, "snapshot.bin", payload, ts=10)
     strict_verify = bao.verify
@@ -204,7 +214,7 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
 
     def remove():
         try:
-            cmds.remove(node, workspace, fid, ts=20)
+            facts.content.delete.remove(node, workspace, fid, ts=20)
             removed.set()
         except BaseException as error:
             errors.append(error)
@@ -223,13 +233,13 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
     assert not reader.is_alive() and not deleter.is_alive()
     assert errors == []
     assert result["value"] == ("snapshot.bin", payload)
-    assert cmds.files(node, workspace) == []
+    assert facts.content.file.files(node, workspace) == []
 
 
 def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     store = node.store(workspace)
     old_root = store.get("root")
     applier = node.applier(workspace)
@@ -244,7 +254,7 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
 
     pile = store.list("pile/")[0]
-    stream, _ = decode_pile(store.get(pile), workspace)
+    stream = decode_pile(store.get(pile), workspace)
     descriptor = next(fact for fact in stream if fact.t == file_family.TAG)
     chunks = [fact for fact in stream if fact.t == "chunk"]
     assert store.get("root") == old_root
@@ -263,7 +273,7 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
 def test_committed_blob_is_visible_without_an_arrival_cache(tmp_path):
     path = tmp_path / "node"
     node = Node(str(path))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     send_bytes(node, workspace, "restart.bin", b"restart")
     assert progress(node, workspace)["complete"]
     assert not (path / "app.db").exists()
@@ -274,26 +284,41 @@ def test_committed_blob_is_visible_without_an_arrival_cache(tmp_path):
 
 def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice")
+    workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "separate-proof-path.bin",
         random.Random(31).randbytes(bao.WIDTH + 1))
 
     events = []
 
+    def assert_delivery_is_outside_node_lock():
+        acquired = []
+
+        def probe():
+            held = source.lock.acquire(timeout=1)
+            acquired.append(held)
+            if held:
+                source.lock.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(2)
+        assert acquired == [True]
+
     class Capture:
         def put_obj(self, oid, raw):
+            assert_delivery_is_outside_node_lock()
             assert h(raw) == oid
             events.append(("object", oid, raw))
 
         def put_pile(self, raw):
+            assert_delivery_is_outside_node_lock()
             events.append(("pile", raw))
             self.raw = raw
 
     capture = Capture()
-    _push(source, workspace, capture, all_fids(source, workspace))
-    stream, embedded = decode_pile(capture.raw, workspace)
-    assert embedded == {}
+    push_all(source, workspace, capture)
+    stream = decode_pile(capture.raw, workspace)
     object_events = [event for event in events if event[0] == "object"]
     assert {
         oid for _, oid, _ in object_events
@@ -323,7 +348,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
 
 def test_blob_push_failure_precedes_the_fact_delivery(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice")
+    workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "one-way.bin",
         random.Random(32).randbytes(bao.WIDTH + 1))
@@ -338,13 +363,12 @@ def test_blob_push_failure_precedes_the_fact_delivery(tmp_path):
             pytest.fail("facts were delivered after an object upload failed")
 
     with pytest.raises(ConnectionError, match="lost object"):
-        _push(source, workspace, BrokenObjectDoor(), all_fids(
-            source, workspace))
+        push_all(source, workspace, BrokenObjectDoor())
 
 
 def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice")
+    workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "retry.bin",
         random.Random(17).randbytes(bao.WIDTH * 2 + 1))
@@ -391,7 +415,7 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
 
 def test_invalid_proof_never_counts_as_progress(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice")
+    workspace = facts.auth.workspace.create(source, "alice")
     fid = send_bytes(source, workspace, "proof.bin", b"good")
     descriptor = source.fact_of(workspace, fid)
     secret, public = source.identity(workspace)
@@ -407,26 +431,24 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
             item.fid: [
                 signed.fid, member_src(source, workspace, public), fid],
         },
-        blobs={h(invalid): invalid},
     )
-    pile, _ = decode_pile(
+    pile = decode_pile(
         closed_subset(source, workspace, [item.fid]), workspace)
 
     destination = Node(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
-    deliver(
-        destination, workspace,
-        encode_pile(pile, {h(invalid): invalid}))
+    destination.receive_object(workspace, h(invalid), invalid)
+    deliver(destination, workspace, encode_pile(pile))
     destination.turn(workspace)
     assert progress(destination, workspace)["have"] == 0
 
 
 def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     send_bytes(node, workspace, "gone.bin", b"gone")
     chunk_fid = node.by_type(workspace, chunk.TAG)[0].fid
-    cmds.remove(node, workspace, chunk_fid, ts=shape.FACT_TS_MAX)
+    facts.content.delete.remove(node, workspace, chunk_fid, ts=shape.FACT_TS_MAX)
     assert progress(node, workspace)["have"] == 0
 
     # The proof object remains present, but the query excludes its suppressed
@@ -442,7 +464,7 @@ def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
 def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     """SELF(file) and PARENT(file) resolve to one sid on every path."""
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     data = b"private-cascade-marker" * 40_000
     descriptor_fid = send_bytes(
         source, workspace, "cascade.bin", data, ts=10)
@@ -451,13 +473,13 @@ def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     }
     assert len(chunk_fids) > 1
 
-    cmds.remove(source, workspace, descriptor_fid, ts=20)
-    assert cmds.files(source, workspace) == []
+    facts.content.delete.remove(source, workspace, descriptor_fid, ts=20)
+    assert facts.content.file.files(source, workspace) == []
     assert chunk_fids.isdisjoint(
         fact.fid for fact in source.by_type(workspace, chunk.TAG))
 
     source.rebuild(workspace)
-    assert cmds.files(source, workspace) == []
+    assert facts.content.file.files(source, workspace) == []
 
     class NoBlobPeer:
         def obj(self, oid):

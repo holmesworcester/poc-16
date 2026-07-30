@@ -5,12 +5,9 @@ import urllib.error
 import urllib.request
 
 import facts as families
-from facts.auth import request as auth_request
 
 from . import peer_capability
-from .close import close, encode_pile
 from .crypto import h, unseal
-from .kernel import resolve_deps
 from .limits import (
     MAX_CONTROL_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -21,7 +18,6 @@ from .limits import (
     decode_json,
 )
 from .node import now_ms
-from .object_store import ensure_object
 
 
 class PushUnsupported(RuntimeError):
@@ -89,11 +85,12 @@ class Peer:
         n = self.node
         with n.lock:
             ts = now_ms()
-            facts = auth_request.payload(n, self.ws, "sync", ts + 120_000, ts)
+            facts = families.proof_payload(
+                n, self.ws, "sync", ts + 120_000, ts)
         body = json.dumps({
             "ws": self.ws,
             "pile": base64.b64encode(
-                encode_pile(facts, workspace=self.ws)).decode(),
+                n.sender(self.ws).pack(facts)).decode(),
         }).encode()
         if len(body) > MAX_MINT_REQUEST_BYTES:
             raise ValueError("mint request too large")
@@ -175,35 +172,6 @@ class Peer:
         self._http("POST", "/poke", data=b"", auth=False)
 
 
-def _push(node, ws, peer, push_fids):
-    """Close one dial's push set into a pile and PUT it — the mirror of a
-    pull. Available blob proofs travel as independently verified immutable
-    objects before the fact-only pile: if an upload fails, the peer cannot
-    publish a fact difference that only a one-way sender could satisfy.
-    Replicas that do not yet hold a proof still relay its fact, allowing a
-    receiver with another source to complete it. The responder drains the
-    pile on receipt, so there is no poke."""
-    with node.lock:
-        idx = node.idx(ws)
-        facts = close([node.fact_of(ws, fid) for fid in push_fids],
-                      lambda fid: resolve_deps(node.fact_of(ws, fid), idx) or [],
-                      lambda fid: node.fact_of(ws, fid))
-        blob_oids = sorted({
-            oid for fact in facts for oid in families.blob_refs(fact)
-        })
-        b = encode_pile(facts, workspace=ws)
-        st = node.store(ws)
-    for oid in blob_oids:
-        value = st.get("obj/" + oid)
-        if value is None:
-            continue
-        if h(value) != oid:
-            raise ValueError("local immutable object integrity")
-        peer.put_obj(oid, value)
-    peer.put_pile(b)
-    return tuple(fact.fid for fact in facts)
-
-
 def _fetch_blobs(node, ws, peer):
     """Fetch missing spilled objects.
 
@@ -214,7 +182,7 @@ def _fetch_blobs(node, ws, peer):
     st = node.store(ws)
     with node.lock:
         pending = []
-        for (fid,) in node.idx(ws).execute("SELECT fid FROM proofs"):
+        for fid in node.catalog(ws).eligible_ids():
             fact = node.fact_of(ws, fid)
             if node.suppressed(ws, fact):
                 continue
@@ -230,7 +198,7 @@ def _fetch_blobs(node, ws, peer):
                 continue
             blob = peer.obj(oid)
             if blob and h(blob) == oid:
-                ensure_object(st, oid, blob)
+                node.receive_object(ws, oid, blob)
                 fetched = True
             else:
                 whole = False

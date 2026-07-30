@@ -4,9 +4,11 @@ import os
 
 import pytest
 
-from core import cmds, mint
+import facts
+
+from core import catalog
 import core.sync as sync_module
-from core.close import close, encode_pile
+from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import device_invite as device_invite_fact
@@ -17,12 +19,13 @@ from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from core.kernel import drain, offer_src, resolve_deps
 from core.node import Node, now_ms
+from core.repository_reader import RepositoryReader
 
 from .util import add_member, all_fids, closed_subset, deliver, member_src
 from .util import inject_device_claim as _inject_device_claim
 def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
 
@@ -45,19 +48,19 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     with pytest.raises(ValueError, match="already enrolled"):
         grant(node, workspace, user, laptop, "duplicate")
 
-    members = {row["pk"]: row["role"] for row in cmds.members(node, workspace)}
+    members = {row["pk"]: row["role"] for row in facts.auth.user.members(node, workspace)}
     assert members[laptop] == "device"
     assert {row["pk"] for row in devices(node, workspace, user)} \
         == {user, laptop}
 
     node.bind_identity(workspace, laptop)
-    fid = cmds.post(node, workspace, "general", "authored by laptop")
+    fid = facts.content.message.post(node, workspace, "general", "authored by laptop")
     assert node.fact_of(workspace, fid).body["pk"] == laptop
 
 
 def test_direct_grant_retry_after_restart_reconstructs_the_same_fact(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
     laptop_secret, laptop = keypair()
@@ -79,7 +82,7 @@ def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
     # ``original_device`` by fid within 256 tries, which an unlucky random
     # founder key can defeat (the known full-run flake).
     node = Node(str(tmp_path / "node"), initial_secret=load_sk(f"{7:064x}"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder_secret, founder = node.identity(workspace)
     bind(node, workspace, "phone")
     original_device = offer_src(
@@ -127,7 +130,7 @@ def test_direct_grant_retry_survives_an_authority_winner_change(tmp_path):
 
 def test_device_authored_write_leaves_the_roster_unchanged(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
     founder = node.identity_id(workspace)
 
@@ -137,7 +140,7 @@ def test_device_authored_write_leaves_the_roster_unchanged(tmp_path):
     node.bind_identity(workspace, laptop)
 
     before = devices(node, workspace, founder)
-    cmds.post(node, workspace, "general", "ordinary device write", ts=10)
+    facts.content.message.post(node, workspace, "general", "ordinary device write", ts=10)
     assert devices(node, workspace, founder) == before
     assert not (tmp_path / "node" / "app.db").exists()
     assert {row["pk"] for row in devices(node, workspace, founder)} \
@@ -146,7 +149,7 @@ def test_device_authored_write_leaves_the_roster_unchanged(tmp_path):
 
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
 
@@ -161,13 +164,13 @@ def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
 
     assert {row["pk"] for row in devices(node, workspace, user)} \
         == {user, laptop, tablet}
-    assert {row["pk"] for row in cmds.members(node, workspace)} \
+    assert {row["pk"] for row in facts.auth.user.members(node, workspace)} \
         >= {user, laptop, tablet}
 
 
 def test_device_commands_reject_existing_members_and_bindings(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     with pytest.raises(ValueError, match="already in a device set"):
         bind(node, workspace, "renamed phone")
@@ -180,14 +183,14 @@ def test_device_commands_reject_existing_members_and_bindings(tmp_path):
 def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     founder_secret, founder = node.identity(workspace)
-    cmds.bind_device(node, workspace, "alice-phone")
+    facts.auth.device.bind(node, workspace, "alice-phone")
 
     bob_secret, bob, _ = add_member(node, workspace, "bob")
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    cmds.bind_device(node, workspace, "bob-phone")
+    facts.auth.device.bind(node, workspace, "bob-phone")
 
     sibling_secret, sibling = keypair()
     node.keychain.add_identity(sibling_secret)
@@ -200,12 +203,8 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
             workspace, public, user, sibling,
             f"{user[:8]}-sibling", 100 + ordinal)
         signed = signature(secret, public, item, 100 + ordinal)
-        device_source = node.idx(workspace).execute(
-            "SELECT o.src FROM fact_index o JOIN proofs p ON p.fid=o.src "
-            "WHERE o.kind='device_key' AND o.k0=? "
-            "ORDER BY p.rank, o.src LIMIT 1",
-            (public,),
-        ).fetchone()[0]
+        device_source = offer_src(
+            node.idx(workspace), "device_key", public)
         node.ingest_new(
             workspace, [signed, item],
             {
@@ -228,26 +227,21 @@ def test_conflicting_device_claim_uses_one_winner_for_reads_and_authority(
     with pytest.raises(ValueError, match="not a device-set member"):
         grant(node, workspace, bob, another, "must-not-use-losing-claim")
 
-    winner = node.idx(workspace).execute(
-        "SELECT o.src FROM fact_index o JOIN proofs p ON p.fid=o.src "
-        "WHERE o.kind='device_key' AND o.k0=? "
-        "ORDER BY p.rank, o.src LIMIT 1",
-        (sibling,),
-    ).fetchone()[0]
+    winner = offer_src(node.idx(workspace), "device_key", sibling)
     assert winner == grants[0].fid
 
 
 def test_conflicting_authority_converges_to_one_finite_subset(
         tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     founder_secret, founder = node.identity(workspace)
-    cmds.bind_device(node, workspace, "alice-phone")
+    facts.auth.device.bind(node, workspace, "alice-phone")
 
     bob_secret, bob, _ = add_member(node, workspace, "bob")
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    cmds.bind_device(node, workspace, "bob-phone")
+    facts.auth.device.bind(node, workspace, "bob-phone")
     common = closed_subset(node, workspace, all_fids(node, workspace))
 
     target_secret, target = keypair()
@@ -265,9 +259,7 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     stale_request = request_payload(
         node, workspace, "sync", ts + 120_000, ts)
     stale_bytes = encode_pile(stale_request)
-    assert mint.stateless(
-        stale_bytes, node.store(workspace).get("root"),
-        lambda oid: node.store(workspace).get("obj/" + oid), ts)
+    assert node.reader(workspace).mint(stale_bytes, ts)
     node.bind_identity(workspace, target)
     target_chain = closed_subset(
         node, workspace, [target_claim.fid, child_claim.fid])
@@ -303,6 +295,10 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     )
     assert drain(standalone, workspace).ok
     conflict_pile = encode_pile(standalone)
+    target_stream = decode_pile(target_chain, workspace)
+    assert drain(target_stream, workspace).ok
+    assert len(node.sender(workspace).pack_batches(
+        (standalone, target_stream))) == 2
 
     # The second peer sees the conflict first and the Bob chain second; the
     # first peer sees them in the opposite order.
@@ -317,9 +313,7 @@ def test_conflicting_authority_converges_to_one_finite_subset(
     accepted = node.ingest_new(
         workspace, [conflict_sig, conflict], conflict_deps)
     assert any(valid.fact.fid == conflict.fid for valid in accepted)
-    assert mint.stateless(
-        stale_bytes, node.store(workspace).get("root"),
-        lambda oid: node.store(workspace).get("obj/" + oid), ts) is None
+    assert node.reader(workspace).mint(stale_bytes, ts) is None
 
     for current in (node, peer):
         assert current.fact_of(workspace, conflict.fid) == conflict
@@ -336,7 +330,7 @@ def test_conflicting_authority_converges_to_one_finite_subset(
 
     # Canonical pruning cannot poison later turns.
     assert node.store(workspace).list("pile/") == []
-    posted = cmds.post(node, workspace, "general", "still authorized")
+    posted = facts.content.message.post(node, workspace, "general", "still authorized")
     assert node.fact_of(workspace, posted) is not None
 
 
@@ -344,14 +338,14 @@ def test_delete_rechecks_canonical_owner_after_device_claim_conflict(
         tmp_path):
     """A sender's losing ownership edge cannot keep its delete effective."""
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "alice", ts=1)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder = source.identity(workspace)
-    cmds.bind_device(source, workspace, "alice-phone")
+    facts.auth.device.bind(source, workspace, "alice-phone")
 
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
     source.keychain.add_identity(bob_secret)
     source.bind_identity(workspace, bob)
-    cmds.bind_device(source, workspace, "bob-phone")
+    facts.auth.device.bind(source, workspace, "bob-phone")
     common = closed_subset(source, workspace, all_fids(source, workspace))
 
     target_secret, target = keypair()
@@ -359,13 +353,13 @@ def test_delete_rechecks_canonical_owner_after_device_claim_conflict(
     bob_claim = _inject_device_claim(
         source, workspace, bob_secret, bob, bob, target, "bob-target", 100)
     source.bind_identity(workspace, target)
-    posted = cmds.post(
+    posted = facts.content.message.post(
         source, workspace, "general", "ownership must be local", ts=110)
     source.bind_identity(workspace, bob)
-    deletion = cmds.remove(source, workspace, posted, ts=120)
+    deletion = facts.content.delete.remove(source, workspace, posted, ts=120)
     bob_first = closed_subset(
         source, workspace, [bob_claim.fid, posted, deletion])
-    assert cmds.msgs(source, workspace) == []
+    assert facts.content.message.messages(source, workspace) == []
 
     # Alice's equally valid but shallower claim becomes the canonical
     # ownership provider for ``target``. Build it as an independent closed
@@ -406,18 +400,20 @@ def test_delete_rechecks_canonical_owner_after_device_claim_conflict(
         assert current.candidate_of(workspace, deletion) is not None
         assert current.fact_of(workspace, deletion) is None
         assert current.fact_of(workspace, posted) is not None
-        assert [row["fid"] for row in cmds.msgs(current, workspace)] == [posted]
+        assert [row["fid"] for row in facts.content.message.messages(current, workspace)] == [posted]
         assert current.idx(workspace).execute(
-            "SELECT 1 FROM actions WHERE fid=?", (deletion,)).fetchone() is None
+            "SELECT 1 FROM fact_index WHERE kind=? AND src=?",
+            (catalog.ACTION_INDEX, deletion),
+        ).fetchone() is None
         current.rebuild(workspace)
-        assert [row["fid"] for row in cmds.msgs(current, workspace)] == [posted]
+        assert [row["fid"] for row in facts.content.message.messages(current, workspace)] == [posted]
     assert source.store(workspace).get("root") \
         == peer.store(workspace).get("root")
 
 
 def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "root", ts=1)
+    workspace = facts.auth.workspace.create(source, "root", ts=1)
     root_secret, root = source.identity(workspace)
     bob_secret, bob = keypair()
     candidates = []
@@ -502,24 +498,28 @@ def test_diverged_equivalent_member_winners_can_mint_to_each_other(tmp_path):
 
     source_root = source.store(workspace).get("root")
     remote_root = remote.store(workspace).get("root")
-    assert mint.stateless(
-        encode_pile(source_request), remote_root,
-        lambda oid: remote.store(workspace).get("obj/" + oid), ts)
-    assert mint.stateless(
-        encode_pile(remote_request), source_root,
-        lambda oid: source.store(workspace).get("obj/" + oid), ts)
+    assert RepositoryReader(
+        workspace,
+        remote_root,
+        lambda oid: remote.store(workspace).get("obj/" + oid),
+    ).mint(encode_pile(source_request), ts)
+    assert RepositoryReader(
+        workspace,
+        source_root,
+        lambda oid: source.store(workspace).get("obj/" + oid),
+    ).mint(encode_pile(remote_request), ts)
 
 
 def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     founder_secret, founder = node.identity(workspace)
-    cmds.bind_device(node, workspace, "alice-phone")
+    facts.auth.device.bind(node, workspace, "alice-phone")
 
     bob_secret, bob, _ = add_member(node, workspace, "bob")
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    cmds.bind_device(node, workspace, "bob-phone")
+    facts.auth.device.bind(node, workspace, "bob-phone")
 
     target_secret, target = keypair()
     target_claim = _inject_device_claim(
@@ -551,11 +551,11 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
     deliver(node, workspace, conflict_pile, member="attacker00000000")
 
     node.bind_identity(workspace, founder)
-    posted = cmds.post(
+    posted = facts.content.message.post(
         node, workspace, "general", "honest same turn", ts=200)
 
     assert node.fact_of(workspace, posted) is not None
-    assert [message["text"] for message in cmds.msgs(node, workspace)] \
+    assert [message["text"] for message in facts.content.message.messages(node, workspace)] \
         == ["honest same turn"]
     assert node.fact_of(workspace, conflict.fid) == conflict
     assert node.fact_of(workspace, target_claim.fid) == target_claim
@@ -564,7 +564,7 @@ def test_conflict_does_not_discard_an_unrelated_pile(tmp_path):
 
 def test_rank_only_shadow_query_tracks_winner_and_stale_replay(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "root")
+    workspace = facts.auth.workspace.create(node, "root")
     root_secret, root = node.identity(workspace)
 
     q_secret, q, _ = add_member(node, workspace, "q")
@@ -581,7 +581,7 @@ def test_rank_only_shadow_query_tracks_winner_and_stale_replay(tmp_path):
             (deep_secret, deep, "deep-primary")):
         node.keychain.add_identity(secret)
         node.bind_identity(workspace, public)
-        cmds.bind_device(node, workspace, label)
+        facts.auth.device.bind(node, workspace, label)
 
     _, target = keypair()
     deep_item = short_item = None
@@ -678,7 +678,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     publish the same restored set.
     """
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "root", ts=1)
+    workspace = facts.auth.workspace.create(source, "root", ts=1)
     root_secret, root = source.identity(workspace)
 
     q_secret, q, _ = add_member(source, workspace, "q", ts=10)
@@ -696,7 +696,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
             (deep_secret, deep, "deep-primary")):
         source.keychain.add_identity(secret)
         source.bind_identity(workspace, public)
-        cmds.bind_device(source, workspace, label)
+        facts.auth.device.bind(source, workspace, label)
 
     target_secret, target = keypair()
     source.keychain.add_identity(target_secret)
@@ -717,9 +717,8 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     short_pile = closed_subset(source, workspace, [short_claim.fid])
     assert source.fact_of(workspace, child_claim.fid) is None
     assert source.candidate_of(workspace, child_claim.fid) == child_claim
-    assert source.idx(workspace).execute(
-        "SELECT 1 FROM staged WHERE fid=?",
-        (child_claim.fid,)).fetchone() is None
+    assert source.reader(workspace).candidates().fact_record(
+        child_claim.fid)["state"] == "dormant"
     assert source.store(workspace).list("quarantine/") == []
 
     invite_secret, invite_public = keypair()
@@ -746,7 +745,7 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert source.fact_of(workspace, child_claim.fid) == child_claim
 
     ordinary = [
-        cmds.post(source, workspace, "general", f"after-restore-{ordinal}")
+        facts.content.message.post(source, workspace, "general", f"after-restore-{ordinal}")
         for ordinal in range(2)
     ]
     ordinary_pile = closed_subset(source, workspace, ordinary)
@@ -804,7 +803,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
         tmp_path, monkeypatch):
     """A pull that reactivates a catalog fact must invalidate a 304 cache."""
     source = Node(str(tmp_path / "source"))
-    workspace = cmds.create(source, "root", ts=1)
+    workspace = facts.auth.workspace.create(source, "root", ts=1)
     root_secret, root = source.identity(workspace)
 
     q_secret, q, _ = add_member(source, workspace, "q", ts=10)
@@ -825,7 +824,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
             (deep_secret, deep, "deep-primary")):
         source.keychain.add_identity(secret)
         source.bind_identity(workspace, public)
-        cmds.bind_device(source, workspace, label)
+        facts.auth.device.bind(source, workspace, label)
 
     target_secret, target = keypair()
     source.keychain.add_identity(target_secret)

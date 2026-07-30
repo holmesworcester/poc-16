@@ -4,7 +4,9 @@ import threading
 
 import pytest
 
-from core import catalog, cmds, daemon, indexes
+import facts
+
+from core import catalog, daemon, indexes
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
@@ -57,7 +59,7 @@ def test_suppression_facts_not_suppressible(tmp_path):
     node, workspace, _, deletions = suppression_world(tmp_path / "node")
     first = node.fact_of(workspace, deletions[0])
     with pytest.raises(ValueError, match="never victims"):
-        cmds.remove(node, workspace, deletions[0], ts=200)
+        facts.content.delete.remove(node, workspace, deletions[0], ts=200)
     secret, public = node.identity(workspace)
     recursive = delete(workspace, public, first.key, OWNER, 200)
     sig = signature(secret, public, recursive, 200)
@@ -106,9 +108,9 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
     source, workspace, targets, deletions = suppression_world(
         tmp_path / "source")
     target = targets[1]
-    alone, _ = decode_pile(
+    alone = decode_pile(
         closed_subset(source, workspace, [target]), workspace)
-    with_deletion, _ = decode_pile(closed_subset(
+    with_deletion = decode_pile(closed_subset(
         source, workspace, [deletions[0]]), workspace)
 
     alone_result = drain(alone, workspace)
@@ -124,10 +126,10 @@ def test_suppression_stays_behind_the_root_commit(
         tmp_path, monkeypatch, restart):
     """Root and action projection advance atomically across a failed CAS."""
     node, workspace, _, _ = suppression_world(tmp_path / "node")
-    target_fid = cmds.post(
+    target_fid = facts.content.message.post(
         node, workspace, "unpublished", "target", ts=300)
     target = node.fact_of(workspace, target_fid)
-    deletion = delete(  # the fid cmds.remove(ts=301) authors below
+    deletion = delete(  # the fid facts.content.delete.remove(ts=301) authors below
         workspace, node.identity_id(workspace), target.key, OWNER, 301)
     store = node.store(workspace)
     old_root = store.get("root")
@@ -196,7 +198,7 @@ def test_suppression_stays_behind_the_root_commit(
 
     monkeypatch.setattr(store, "cas", fail_before_root_commit)
     with pytest.raises(ValueError, match="outside the canonical set"):
-        cmds.remove(node, workspace, target.fid, ts=301)
+        facts.content.delete.remove(node, workspace, target.fid, ts=301)
     reader.join(timeout=5)
 
     assert not reader.is_alive()

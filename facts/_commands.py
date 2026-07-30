@@ -26,17 +26,7 @@ def member_key(node, workspace, target):
     return named[0]
 
 
-def closer(node, workspace, newmap, deps):
-    from core.close import close
-    from core.kernel import resolve_deps
-
-    fact_of = lambda fid: newmap.get(fid) or node.fact_of(workspace, fid)
-    deps_of = lambda fid: deps[fid] if fid in deps else \
-        (resolve_deps(fact_of(fid), node.idx(workspace)) or [])
-    return close(list(newmap.values()), deps_of, fact_of)
-
-
-def publish(node, workspace, fact, signature, role="member", blobs=None):
+def publish(node, workspace, fact, signature, role="member"):
     """Close one signed fact with its local authority edge and ingest it."""
     authors = [
         public_key
@@ -52,7 +42,7 @@ def publish(node, workspace, fact, signature, role="member", blobs=None):
             f"publishing identity is not a workspace {role}")
     deps = {fact.fid: [r for _, r in fact.refs()] + [signature.fid]
             + [src], signature.fid: []}
-    node.ingest_new(workspace, [signature, fact], deps, blobs)
+    node.ingest_new(workspace, [signature, fact], deps)
     return fact.fid
 
 
@@ -70,10 +60,9 @@ def upload_builder(node, workspace):
 def upload_source(
         node, workspace, source, broker_url, provider_origin):
     """Run the one provider-neutral direct uploader with a fresh auth proof."""
-    from core.close import encode_pile
     from core.node import now_ms
     from deploy.upload_client_http import run_http
-    from facts.auth import request
+    import facts
 
     if source.workspace != workspace \
             or source.member != node.member_for(workspace):
@@ -81,7 +70,7 @@ def upload_source(
 
     def proof():
         now = now_ms()
-        return encode_pile(request.payload(
+        return node.sender(workspace).pack(facts.proof_payload(
             node, workspace, "upload", now + 120_000, now))
 
     result = run_http(source, broker_url, provider_origin, proof)

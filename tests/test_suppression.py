@@ -1,7 +1,7 @@
 """Death/suppression keys are extractable from clear envelopes alone."""
+import facts
 import pytest
 
-from core import cmds
 from core.close import decode_pile, encode_pile
 from core.fact import Fact, from_json
 from facts.auth.signature import signature
@@ -62,7 +62,7 @@ def test_suppression_marker_survives_the_wire_codec():
     deletion = Fact(
         "sample_delete", 3,
         [action(CONTENT_DELETE, SELF, target.key)], {}, WS)
-    decoded, _ = decode_pile(
+    decoded = decode_pile(
         encode_pile([deletion], workspace=WS), WS)
 
     assert decoded == [deletion]
@@ -80,7 +80,7 @@ def test_suppression_marker_survives_the_wire_codec():
 ])
 def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     secret, public = node.identity(workspace)
     member = offer_src(node.idx(workspace), "member", public)
     body = {**fact.body, "pk": public}

@@ -85,7 +85,9 @@ def test_root_document_links_resolve_locally():
 def test_retired_authority_implementations_cannot_return():
     for relative in (
             "core/admission.py",
+            "core/cmds.py",
             "core/legacy_v7.py",
+            "core/mint.py",
             "core/publication.py",
             "core/runtime.py",
             "core/removals.py",
@@ -101,6 +103,27 @@ def test_retired_authority_implementations_cannot_return():
         Path("core/repository_applier.py")]
     assert class_definitions("RepositoryReader") == [
         Path("core/repository_reader.py")]
+
+
+def test_core_dispatches_through_facts_without_importing_family_modules():
+    """Core may call the checked router, but family modules stay authoritative."""
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] != "core":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            for name in names:
+                if name == "facts.auth" or name.startswith("facts.auth.") \
+                        or name == "facts.content" \
+                        or name.startswith("facts.content."):
+                    offenders.append((path.as_posix(), name))
+    assert offenders == []
 
 
 def test_one_semantic_root_cas_and_one_root_compiler():
@@ -161,6 +184,40 @@ def test_pile_sender_is_the_only_production_encoder():
         "core/pile_sender.py",
         "core/staged_intent.py",
     }
+
+
+def test_ordinary_pile_surfaces_have_no_embedded_object_channel():
+    """Detached object ingress cannot grow back as optional pile plumbing."""
+    surfaces = (
+        (Path("core/close.py"), None, "encode_pile"),
+        (Path("core/close.py"), None, "decode_pile"),
+        (Path("core/pile_sender.py"), "PileSender", "pack"),
+        (Path("core/pile_sender.py"), "PileSender", "pile"),
+        (Path("core/pile_sender.py"), "PileSender", "send"),
+        (Path("core/node.py"), "Node", "ingest_new"),
+        (Path("facts/_commands.py"), None, "publish"),
+        (Path("core/repository_applier.py"), "RepositoryApplier", "propose"),
+    )
+    for path, owner, name in surfaces:
+        tree = parsed(path)
+        scope = tree.body
+        if owner is not None:
+            scope = next(
+                item.body for item in tree.body
+                if isinstance(item, ast.ClassDef) and item.name == owner)
+        definition = next(
+            item for item in scope
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == name)
+        parameters = {
+            argument.arg
+            for argument in (
+                *definition.args.posonlyargs,
+                *definition.args.args,
+                *definition.args.kwonlyargs,
+            )
+        }
+        assert "blobs" not in parameters, (path, owner, name)
 
 
 def test_pile_sender_owns_outbound_peer_delivery():

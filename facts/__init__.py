@@ -57,6 +57,33 @@ def compile_commands(modules):
 COMMANDS = compile_commands(MODULES)
 
 
+def compile_proof_commands(modules):
+    """Merge family-owned ephemeral proof constructors by exact purpose."""
+    commands = {}
+    for module in modules:
+        declared = getattr(module, "PROOF_COMMANDS", {})
+        if not isinstance(declared, dict):
+            raise ValueError(f"{module.__name__} PROOF_COMMANDS must be a dict")
+        for purpose, handler in declared.items():
+            if not isinstance(purpose, str) or not purpose \
+                    or purpose in commands or not callable(handler):
+                raise ValueError(f"bad proof command: {purpose!r}")
+            commands[purpose] = handler
+    return commands
+
+
+PROOF_COMMANDS = compile_proof_commands(MODULES)
+
+
+def proof_payload(node, workspace, purpose, exp, ts):
+    """Ask the registered fact family to author one ephemeral proof closure."""
+    try:
+        command = PROOF_COMMANDS[purpose]
+    except KeyError:
+        raise ValueError(f"unknown proof purpose: {purpose}") from None
+    return command(node, workspace, purpose, exp, ts)
+
+
 def workspace_for(node, prefix):
     """Resolve an exact workspace id or unique prefix at the host boundary."""
     hits = [ws for ws in node.workspaces() if prefix and ws.startswith(prefix)]

@@ -1,4 +1,4 @@
-"""Black-box and exact-tree contracts for the production mint path."""
+"""Black-box and exact-tree contracts for RepositoryReader minting."""
 import base64
 import inspect
 import json
@@ -7,12 +7,14 @@ import random
 import pytest
 from nacl.exceptions import CryptoError
 
-from core import cmds, daemon, mint, snapshot
+import facts
+
+from core import daemon, snapshot
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
 from core.node import Node, now_ms
-from core.worker import WorkerView
+from core.repository_reader import RepositoryReader
 from facts.auth import request
 from facts.auth.device import bind
 from facts.auth.signature import signature
@@ -29,10 +31,10 @@ from .util import (
 def world(tmp_path):
     node = Node(str(tmp_path / "node"))
     now = now_ms()
-    workspace = cmds.create(node, "alice", ts=now - 1)
-    facts = request.payload(
+    workspace = facts.auth.workspace.create(node, "alice", ts=now - 1)
+    proof_facts = request.payload(
         node, workspace, "sync", now + 60_000, now)
-    return node, workspace, now, facts, encode_pile(facts)
+    return node, workspace, now, proof_facts, encode_pile(proof_facts)
 
 
 def combine(*streams):
@@ -44,18 +46,22 @@ def combine(*streams):
     return out
 
 
-def authorize(node, workspace, pile, now, root=None, view=None):
+def authorize(node, workspace, pile, now, root=None, fetch=None):
     store = node.store(workspace)
-    root = root or store.get("root")
-    return mint.stateless(
-        pile, root, lambda oid: store.get("obj/" + oid), now, view)
+    root = store.get("root") if root is None else root
+    fetch = fetch or (lambda oid: store.get("obj/" + oid))
+    try:
+        return RepositoryReader(
+            workspace, root, fetch).mint(pile, now)
+    except (TypeError, ValueError):
+        return None
 
 
 def conflict_world(path, seed):
     """A random-depth device chain made stale by a shallower winner."""
     rng = random.Random(seed)
     node = Node(str(path))
-    workspace = cmds.create(node, "root", ts=1)
+    workspace = facts.auth.workspace.create(node, "root", ts=1)
     founder_secret, founder = node.identity(workspace)
     bind(node, workspace, "root-primary")
 
@@ -188,12 +194,14 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
 def test_missing_composite_trees_fail_closed(world):
     node, workspace, now, _, pile = world
     root = snapshot.encode_root(workspace)
-    assert mint.stateless(pile, root, lambda oid: None, now) is None
+    assert authorize(
+        node, workspace, pile, now,
+        root=root, fetch=lambda oid: None) is None
 
 
 def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice")
+    workspace = facts.auth.workspace.create(node, "alice")
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob")
     node.keychain.add_identity(bob_secret)
@@ -202,7 +210,7 @@ def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
     node.bind_identity(workspace, founder)
-    cmds.evict(node, workspace, bob)
+    facts.auth.removal.evict(node, workspace, bob)
     store = node.store(workspace)
     root = json.loads(store.get("root"))
     root["globals"] = [["removal", bob]]
@@ -212,32 +220,32 @@ def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     assert authorize(node, workspace, pile, now, root=forged) is None
     store._replace("root", forged)
     assert invoke_mint(node, workspace, pile)[1][0] == 403
-    node.rebuild(workspace)
-    assert "globals" not in json.loads(store.get("root"))
+    with pytest.raises(ValueError, match="root shape"):
+        node.rebuild(workspace)
+    assert store.get("root") == forged
     assert authorize(node, workspace, pile, now) is None
 
 
-def test_cached_worker_view_is_root_stamped(world):
+def test_repository_reader_remains_pinned_after_a_concurrent_commit(world):
     node, workspace, now, _, pile = world
     store = node.store(workspace)
     old_root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    view = WorkerView.from_root(old_root, fetch)
-    assert mint.stateless(
-        pile, old_root,
-        lambda _: pytest.fail("matching view fetched the store"),
-        now, view) == (node.pk, "sync")
+    reader = RepositoryReader(workspace, old_root, fetch)
+    assert reader.mint(pile, now) == (node.pk, "sync")
 
-    cmds.post(node, workspace, "general", "changes the root")
+    facts.content.message.post(node, workspace, "general", "changes the root")
     new_root, fetched = store.get("root"), []
 
     def tracked(oid):
         fetched.append(oid)
         return fetch(oid)
 
-    assert view.etag != h(store.get("root"))
-    assert mint.stateless(
-        pile, new_root, tracked, now, view) == (node.pk, "sync")
+    assert reader.etag != h(new_root)
+    assert reader.mint(pile, now) == (node.pk, "sync")
+    assert RepositoryReader(
+        workspace, new_root, tracked).mint(
+            pile, now) == (node.pk, "sync")
     assert fetched
 
 
@@ -249,33 +257,31 @@ def test_worker_matches_randomized_canonical_authority_conflicts(
     store = node.store(workspace)
     root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    old_view = WorkerView.from_root(old_root, fetch)
+    old_reader = RepositoryReader(workspace, old_root, fetch)
 
-    assert mint.stateless(
-        stale, old_root,
-        lambda _: pytest.fail("matching view fetched the store"),
-        now, old_view)
-    assert mint.stateless(stale, root, fetch, now, old_view) is None
+    assert old_reader.mint(stale, now)
+    assert authorize(node, workspace, stale, now, root=root) is None
     for pile, expected in ((stale, None), (fresh, (founder, "sync"))):
-        assert mint.stateless(pile, root, fetch, now) == expected
+        assert authorize(
+            node, workspace, pile, now, root=root, fetch=fetch) == expected
         assert invoke_mint(node, workspace, pile)[1][0] \
             == (200 if expected else 403)
 
 
 def test_gate_screens_the_whole_submitted_closure(tmp_path):
     node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    bob_message = cmds.post(
+    bob_message = facts.content.message.post(
         node, workspace, "general", "historical but now inactive", ts=20)
     bob_closure = decode_pile(
-        closed_subset(node, workspace, {bob_message}), workspace)[0]
+        closed_subset(node, workspace, {bob_message}), workspace)
 
     node.bind_identity(workspace, founder)
-    cmds.evict(node, workspace, bob)
+    facts.auth.removal.evict(node, workspace, bob)
     now = now_ms()
     good = request.payload(
         node, workspace, "sync", now + 60_000, now)
