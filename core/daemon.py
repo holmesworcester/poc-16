@@ -1,10 +1,11 @@
 """The daemon: a responder half (seven verbs, zero sync logic) plus an
 initiator half (cadence walks round-robin over the keyring, kicked on news).
 
-The gate opens a root-stamped WorkerView and performs exact authority and
+The gate opens one pinned RepositoryReader and performs exact authority and
 suppression reads; every other remote verb checks the resulting grant at the
-door. Invite blobs are the one ungated read; LIST on them is denied absolutely
-(there is no route).
+door. Root and object routes transport exact keys without making repository
+decisions. Invite blobs are the one ungated read; LIST on them is denied
+absolutely (there is no route).
 """
 import base64
 import json
@@ -15,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, mint as gate, peer_capability, shape, snapshot
+from . import cmds, peer_capability, shape
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
@@ -35,9 +36,7 @@ from .limits import (
     decode_json,
 )
 from .node import Node, now_ms
-from .object_store import ensure_object
-from .ingress import stage_pile
-from .runtime import AuthorityRejected
+from .pile_sender import AuthorityRejected
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
@@ -180,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._known(ws) or not self._member(ws):
             return self._send(401 if self._known(ws) else 404)
         if parts[0] == "root":
-            self.node.turn(ws)  # a peer drains before serving its root
+            # Exact-key transport: no repository policy is inferred here.
             b = self.node.store(ws).get("root") or b""
             if len(b) > MAX_ROOT_BYTES:
                 return self._send(503)
@@ -197,9 +196,6 @@ class Handler(BaseHTTPRequestHandler):
             if len(b) > MAX_OBJECT_BYTES or h(b) != parts[1]:
                 return self._send(503)
             return self._send(200, b, "application/octet-stream")
-        if parts[0] == "pile":
-            return self._json_limited(
-                200, self.node.store(ws).list("pile/"), MAX_CONTROL_BYTES)
         self._send(404)
 
     def do_PUT(self):
@@ -215,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404)
             try:
                 raw = self._body(MAX_OBJECT_BYTES)
-                ensure_object(self.node.store(ws), parts[1], raw)
+                self.node.receive_object(ws, parts[1], raw)
             except PayloadTooLarge:
                 return self._send(413)
             except ValueError:
@@ -233,8 +229,7 @@ class Handler(BaseHTTPRequestHandler):
             # The authenticated HTTP path names bytes, not their durable
             # generation. The receiving host mints that nonce internally so
             # a peer cannot recreate a retired object at the same store key.
-            stage_pile(self.node.store(ws), m, b)
-            self.node.turn(ws)  # drain on receipt — a pushed pile needs no poke
+            self.node.receive_pile(ws, m, b)
             return self._send(204)  # delivery receipt; acceptance is the judge
         self._send(403)
 
@@ -320,13 +315,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404)
         with self.node.lock:
             try:
-                root = self.node.store(ws).get("root")
-                if not root:
+                reader = self.node.reader(ws)
+                if reader is None:
                     return self._send(403)
-                anchor = snapshot.decode_root(root).anchor
             except Exception:
-                return self._send(403)
-            if anchor != ws:
                 return self._send(403)
             store = self.node.store(ws)
             fetch = BudgetedFetch(
@@ -334,8 +326,9 @@ class Handler(BaseHTTPRequestHandler):
                 max_fetches=MINT_MAX_FETCHES,
                 max_bytes=MINT_MAX_FETCH_BYTES,
             )
-            grant = gate.stateless(
-                pile, root, fetch, now_ms())
+            reader = type(reader)(
+                ws, reader.root_bytes, fetch)
+            grant = reader.mint(pile, now_ms())
         if grant is None:
             return self._send(403)
         public, verb = grant
@@ -344,8 +337,8 @@ class Handler(BaseHTTPRequestHandler):
         response = {
             "grant": base64.b64encode(
                 seal_to(public, token.encode())).decode(),
-            "root": base64.b64encode(root).decode(),
-            "etag": h(root)}
+            "root": base64.b64encode(reader.root_bytes).decode(),
+            "etag": reader.etag}
         if self.sync_profile is not None:
             response["cap"] = self.sync_profile
         return self._json(200, response)

@@ -1,30 +1,72 @@
-"""Small structural ratchets; runtime claims belong in behavioral tests."""
+"""Structural authority ratchets complement the behavioral role tests."""
 import ast
+import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_DOCS = {"AGENTS.md", "DESIGN.md", "README.md"}
+SOURCE_ROOTS = ("core", "facts", "adapters", "deploy")
+EXCLUDED_PARTS = {
+    "__pycache__",
+    ".pytest_cache",
+    ".wrangler",
+    "build",
+    "generated",
+    "node_modules",
+}
 
 
-def tracked(*patterns):
-    result = subprocess.run(
-        ["git", "ls-files", *patterns],
-        cwd=ROOT, check=True, capture_output=True, text=True)
-    out = set()
-    for line in result.stdout.splitlines():
-        path = Path(line)
-        if line.strip() and not path.parts[0].startswith(".") \
-                and (ROOT / path).exists():
-            out.add(path)
-    return out
+def source_paths():
+    """Discover the working filesystem, including untracked production code."""
+    paths = []
+    for root_name in SOURCE_ROOTS:
+        for path in (ROOT / root_name).rglob("*.py"):
+            relative = path.relative_to(ROOT)
+            if EXCLUDED_PARTS.intersection(relative.parts) \
+                    or path.name.startswith("test_") \
+                    or "tests" in relative.parts:
+                continue
+            paths.append(relative)
+    return tuple(sorted(paths))
+
+
+def parsed(path):
+    return ast.parse((ROOT / path).read_text(), filename=str(path))
+
+
+def class_definitions(name):
+    return [
+        path
+        for path in source_paths()
+        for item in ast.walk(parsed(path))
+        if isinstance(item, ast.ClassDef) and item.name == name
+    ]
+
+
+def calls_named(name):
+    return [
+        (path, call)
+        for path in source_paths()
+        for call in ast.walk(parsed(path))
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == name
+    ]
 
 
 def test_only_three_markdown_authorities_remain():
-    assert tracked("*.md", "**/*.md") == {
-        Path(name) for name in ROOT_DOCS}
+    found = {
+        path.relative_to(ROOT).as_posix()
+        for path in ROOT.rglob("*.md")
+        if not any(
+            part.startswith(".") or part in EXCLUDED_PARTS
+            for part in path.relative_to(ROOT).parts)
+    }
+    assert found == ROOT_DOCS
     assert not (ROOT / "docs").exists()
 
 
@@ -40,204 +82,283 @@ def test_root_document_links_resolve_locally():
                 f"{name} links missing {target}")
 
 
-def test_sources_do_not_point_at_retired_doc_ledgers():
-    retired = re.compile(
-        r"docs/|TODO\.md|REMOVALS\.md|SIMPLIFY\.md|CUTOVER\.md|"
-        r"KEY_HIERARCHY_ADR|PUNCTURABLE_ENCRYPTION_SOURCE")
-    offenders = []
-    for path in tracked("*.py", "**/*.py", "*.md"):
-        if path == Path("tests/test_repository_layout.py"):
+def test_retired_authority_implementations_cannot_return():
+    for relative in (
+            "core/admission.py",
+            "core/legacy_v7.py",
+            "core/publication.py",
+            "core/runtime.py",
+            "core/removals.py",
+            "deploy/cloudflare_upload/worker/publisher_stub.py"):
+        assert not (ROOT / relative).exists()
+    for name in (
+            "AdmissionMembrane",
+            "Publisher",
+            "WorkspaceRuntime"):
+        assert class_definitions(name) == []
+    assert class_definitions("PileSender") == [Path("core/pile_sender.py")]
+    assert class_definitions("RepositoryApplier") == [
+        Path("core/repository_applier.py")]
+    assert class_definitions("RepositoryReader") == [
+        Path("core/repository_reader.py")]
+
+
+def test_one_semantic_root_cas_and_one_root_compiler():
+    semantic = []
+    for path, call in calls_named("cas"):
+        if call.args and isinstance(call.args[0], ast.Constant) \
+                and call.args[0].value == "root":
+            semantic.append(path)
+    assert semantic == [Path("core/repository_applier.py")]
+
+    encode_root = []
+    for path in source_paths():
+        if path == Path("core/snapshot.py"):
             continue
-        text = (ROOT / path).read_text()
-        if retired.search(text):
-            offenders.append(str(path))
+        for call in ast.walk(parsed(path)):
+            if isinstance(call, ast.Call) \
+                    and isinstance(call.func, ast.Attribute) \
+                    and call.func.attr == "encode_root":
+                encode_root.append(path)
+    assert encode_root == [Path("core/repository_snapshot.py")]
+
+
+def test_applier_owns_object_establishment_generations_and_retirement():
+    for function, expected in (
+            ("ensure_object_async", {"core/repository_applier.py"}),
+            ("pile_source", {"core/repository_applier.py"}),
+            ("retire_exact_async", {"core/repository_applier.py"})):
+        callers = {
+            path.as_posix()
+            for path in source_paths()
+            if path != Path("core/object_store.py")
+            and path != Path("core/ingress.py")
+            for call in ast.walk(parsed(path))
+            if isinstance(call, ast.Call)
+            and (
+                isinstance(call.func, ast.Name)
+                and call.func.id == function
+                or isinstance(call.func, ast.Attribute)
+                and call.func.attr == function)
+        }
+        assert callers == expected
+
+
+def test_pile_sender_is_the_only_production_encoder():
+    callers = set()
+    for path in source_paths():
+        if path == Path("core/close.py"):
+            continue
+        for call in ast.walk(parsed(path)):
+            if isinstance(call, ast.Call) and (
+                    isinstance(call.func, ast.Name)
+                    and call.func.id == "encode_pile"
+                    or isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "encode_pile"):
+                callers.add(path.as_posix())
+    # staged_intent re-encodes solely to prove canonical upload bytes.
+    assert callers == {
+        "core/pile_sender.py",
+        "core/staged_intent.py",
+    }
+
+
+def test_pile_sender_owns_outbound_peer_delivery():
+    for method in ("put_obj", "put_pile"):
+        assert {
+            path.as_posix()
+            for path, _ in calls_named(method)
+        } == {"core/pile_sender.py"}
+
+
+def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
+    reader = parsed(Path("core/repository_reader.py"))
+    forbidden = {
+        "apply",
+        "cas",
+        "delete",
+        "drain",
+        "list",
+        "list_page",
+        "put",
+        "put_if_absent",
+        "stage",
+        "turn",
+    }
+    assert not [
+        call.func.attr
+        for call in ast.walk(reader)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in forbidden
+    ]
+
+    bypasses = []
+    for path in source_paths():
+        if path in {
+                Path("core/repository_reader.py"),
+                Path("core/candidate_archive.py")}:
+            continue
+        for call in ast.walk(parsed(path)):
+            if not isinstance(call, ast.Call):
+                continue
+            direct_candidate = (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "CandidateView")
+            direct_worker = (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "WorkerView"
+                and call.func.attr == "from_root")
+            if direct_candidate or direct_worker:
+                bypasses.append(path.as_posix())
+    assert bypasses == []
+
+
+def test_protocol_front_doors_route_semantic_reads_through_one_reader():
+    boundaries = (
+        (Path("core/daemon.py"), "Handler", "mint", {"reader", "mint"}),
+        (Path("deploy/gateway.py"), "Gateway", "_mint", {"mint_awaited"}),
+        (
+            Path("deploy/upload_broker.py"),
+            "UploadBroker",
+            "_authorize",
+            {"mint_awaited"},
+        ),
+    )
+    forbidden_effects = {
+        "apply",
+        "cas",
+        "delete",
+        "drain",
+        "list",
+        "list_page",
+        "put",
+        "put_if_absent",
+        "stage",
+        "turn",
+    }
+    bypasses = []
+    for path, class_name, method_name, required in boundaries:
+        tree = parsed(path)
+        owner = next(
+            item for item in tree.body
+            if isinstance(item, ast.ClassDef) and item.name == class_name)
+        method = next(
+            item for item in owner.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == method_name)
+        attributes = {
+            call.func.attr
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+        }
+        assert required <= attributes
+        assert attributes.isdisjoint(forbidden_effects)
+        if path == Path("core/daemon.py"):
+            assert "worker" not in attributes
+            assert any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "mint"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "reader"
+                for call in ast.walk(method)
+            )
+        else:
+            assert any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "mint_awaited"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "RepositoryReader"
+                for call in ast.walk(method)
+            )
+
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            direct_root_decode = (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "decode_root"
+                or isinstance(call.func, ast.Attribute)
+                and call.func.attr == "decode_root")
+            compatibility_mint = (
+                isinstance(call.func, ast.Name)
+                and call.func.id in {"stateless", "async_stateless"}
+                or isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"stateless", "async_stateless"})
+            if direct_root_decode or compatibility_mint:
+                bypasses.append(path.as_posix())
+    assert bypasses == []
+
+
+def test_applier_and_reader_import_closures_are_database_and_role_clean():
+    script = """
+import json
+import sys
+target = sys.argv[1]
+__import__(target)
+print(json.dumps(sorted(sys.modules)))
+"""
+    banned = {
+        "core.admission",
+        "core.catalog",
+        "core.client_projection",
+        "core.legacy_v7",
+        "core.node",
+        "core.pile_sender",
+        "core.publication",
+        "core.runtime",
+        "sqlite3",
+    }
+    closures = {}
+    for module in ("core.repository_applier", "core.repository_reader"):
+        result = subprocess.run(
+            [sys.executable, "-c", script, module],
+            cwd=ROOT, check=True, capture_output=True, text=True)
+        loaded = set(json.loads(result.stdout))
+        assert loaded.isdisjoint(banned)
+        closures[module] = loaded
+    assert "core.repository_reader" not in closures[
+        "core.repository_applier"]
+    assert "core.repository_applier" not in closures[
+        "core.repository_reader"]
+
+
+def test_full_node_composes_roles_without_a_second_receiving_loop():
+    node_tree = parsed(Path("core/node.py"))
+    node = next(
+        item for item in node_tree.body
+        if isinstance(item, ast.ClassDef) and item.name == "Node")
+    turn = next(
+        item for item in node.body
+        if isinstance(item, ast.FunctionDef) and item.name == "turn")
+    attributes = [
+        call.func.attr
+        for call in ast.walk(turn)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+    ]
+    assert attributes.count("turn") == 1
+    assert "list" not in attributes
+    assert "list_page" not in attributes
+
+
+def test_production_vocabulary_has_no_retired_positive_roles():
+    offenders = []
+    retired = re.compile(
+        r"\b(?:AdmissionMembrane|WorkspaceRuntime|Publisher)\b|"
+        r"\bpublisher(?:_stub| principal| role| package)?\b",
+        re.IGNORECASE,
+    )
+    for path in source_paths():
+        if retired.search((ROOT / path).read_text()):
+            offenders.append(path.as_posix())
     assert offenders == []
-
-
-def test_deleted_dual_paths_do_not_return():
-    assert not (ROOT / "core" / "removals.py").exists()
-    assert not (ROOT / "tests" / "test_removals.py").exists()
-    assert not (ROOT / "tests" / "test_key_hierarchy_adr.py").exists()
-    assert not (
-        ROOT / "tests" / "test_puncturable_encryption_source.py").exists()
-    for path in (
-            "facts/auth/legacy_genesis.py",
-            "facts/auth/legacy_invite.py",
-            "facts/auth/legacy_join.py",
-            "facts/auth/legacy_signature.py",
-            "facts/content/legacy_file.py",
-            "tests/test_auth_upgrade.py"):
-        assert not (ROOT / path).exists()
 
 
 def test_suppression_state_uses_the_explicit_module_name():
     assert (ROOT / "core" / "suppression_state.py").is_file()
-    assert (ROOT / "tests" / "test_suppression_state.py").is_file()
     assert not (ROOT / "core" / "actions.py").exists()
-    assert not (ROOT / "tests" / "test_actions.py").exists()
-
-
-def test_durable_fact_admission_has_one_kernel_mediated_entrance():
-    """Only the sealed receipt settlement may reach durable catalog writes."""
-    admission_tree = ast.parse(
-        (ROOT / "core" / "admission.py").read_text())
-    membrane = next(
-        item for item in admission_tree.body
-        if isinstance(item, ast.ClassDef)
-        and item.name == "AdmissionMembrane")
-    methods = {
-        item.name: item
-        for item in membrane.body if isinstance(item, ast.FunctionDef)
-    }
-    node_tree = ast.parse((ROOT / "core" / "node.py").read_text())
-    node = next(
-        item for item in node_tree.body
-        if isinstance(item, ast.ClassDef) and item.name == "Node")
-    node_methods = {
-        item.name: item
-        for item in node.body if isinstance(item, ast.FunctionDef)
-    }
-    assert "merge" not in node_methods
-    assert {
-        "admit", "admit_ingress", "_admit_judgment", "_settle_verified",
-    }.isdisjoint(node_methods)
-    assert {
-        "admit", "admit_ingress", "_judge", "_admit_judgment",
-        "_settle_verified",
-    } <= set(methods)
-
-    def calls_of(method):
-        return [
-            call for call in ast.walk(methods[method])
-            if isinstance(call, ast.Call)
-        ]
-
-    for entrance in ("admit", "admit_ingress"):
-        calls = calls_of(entrance)
-        assert sum(
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_judge"
-            for call in calls) == 1
-        assert sum(
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_admit_judgment"
-            for call in calls) == 1
-        assert not any(
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr in {"_settle_verified", "_admit_valid"}
-            for call in calls)
-
-    assert sum(
-        isinstance(call.func, ast.Name) and call.func.id == "drain"
-        for call in calls_of("_judge")
-    ) == 1
-    judgment_calls = calls_of("_admit_judgment")
-    assert sum(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "build"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "admission_proof"
-        for call in judgment_calls) == 1
-    assert sum(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "_settle_verified"
-        for call in judgment_calls) == 1
-    settlement_calls = [
-        call
-        for call in ast.walk(methods["_settle_verified"])
-        if isinstance(call, ast.Call)
-    ]
-    assert sum(
-        isinstance(call.func, ast.Attribute)
-        and call.func.attr == "_admit_valid"
-        for call in settlement_calls) == 1
-
-    private_calls = []
-    for path in tracked(
-            "core/*.py", "facts/**/*.py", "adapters/**/*.py",
-            "deploy/**/*.py", "bench/*.py"):
-        tree = ast.parse((ROOT / path).read_text())
-
-        class Calls(ast.NodeVisitor):
-            def __init__(self):
-                self.functions = []
-
-            def visit_ClassDef(self, item):
-                self.functions.append(item.name)
-                self.generic_visit(item)
-                self.functions.pop()
-
-            def visit_FunctionDef(self, item):
-                self.functions.append(item.name)
-                self.generic_visit(item)
-                self.functions.pop()
-
-            def visit_Call(self, item):
-                if isinstance(item.func, ast.Attribute) \
-                        and item.func.attr == "_admit_valid":
-                    private_calls.append(
-                        (str(path), tuple(self.functions)))
-                self.generic_visit(item)
-
-        Calls().visit(tree)
-    assert private_calls == [
-        (
-            "core/admission.py",
-            ("AdmissionMembrane", "_settle_verified"),
-        )]
-
-    settlement_entrances = []
-    for path in tracked(
-            "core/*.py", "facts/**/*.py", "adapters/**/*.py",
-            "deploy/**/*.py", "bench/*.py"):
-        tree = ast.parse((ROOT / path).read_text())
-        for call in ast.walk(tree):
-            if isinstance(call, ast.Call) \
-                    and isinstance(call.func, ast.Attribute) \
-                    and call.func.attr == "_settle_verified":
-                settlement_entrances.append(str(path))
-    assert sorted(settlement_entrances) == [
-        "core/admission.py",
-        "core/node.py",
-    ]
-
-    runtime_tree = ast.parse(
-        (ROOT / "core" / "runtime.py").read_text())
-    runtime = next(
-        item for item in runtime_tree.body
-        if isinstance(item, ast.ClassDef)
-        and item.name == "WorkspaceRuntime")
-    turn = next(
-        item for item in runtime.body
-        if isinstance(item, ast.FunctionDef) and item.name == "turn")
-    assert sum(
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "process"
-        for call in ast.walk(turn)
-    ) == 1
-
-    catalog_source = (ROOT / "core" / "catalog.py").read_text()
-    assert "class ScratchCatalog" in catalog_source
-    assert "def stage(" not in catalog_source
-    archive_tree = ast.parse(
-        (ROOT / "core" / "candidate_archive.py").read_text())
-    reconstruct = next(
-        item for item in archive_tree.body
-        if isinstance(item, ast.FunctionDef)
-        and item.name == "reconstruct")
-    assert any(
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "verify"
-        for call in ast.walk(reconstruct))
-    proof_tree = ast.parse(
-        (ROOT / "core" / "admission_proof.py").read_text())
-    verify = next(
-        item for item in proof_tree.body
-        if isinstance(item, ast.FunctionDef) and item.name == "verify")
-    assert sum(
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "drain"
-        for call in ast.walk(verify)) == 1

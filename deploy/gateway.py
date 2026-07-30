@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 import re
 
-from core import mint, peer_capability, snapshot
+from core import peer_capability
 from core.crypto import h, seal_to
 from core.grants import check_token, make_token
 from core.limits import (
@@ -19,6 +19,7 @@ from core.limits import (
     PayloadTooLarge,
     decode_json,
 )
+from core.repository_reader import RepositoryReader, RepositoryRootError
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
 INVITE_RE = re.compile(r"^[a-zA-Z0-9._~-]{1,256}$")
@@ -143,6 +144,7 @@ class Gateway:
         )
 
     async def _get(self, key, max_bytes):
+        """Fetch one exact transport key without interpreting repository state."""
         bounded = getattr(self.store, "get_bounded", None)
         if callable(bounded):
             return await bounded(key, max_bytes)
@@ -153,6 +155,13 @@ class Gateway:
 
     async def _root(self):
         return await self._get("root", self.max_root_bytes)
+
+    async def _reader(self):
+        """Open one root-only Reader for readiness or root presentation."""
+        root = await self._root()
+        return RepositoryReader(
+            self.workspace, root, lambda _oid: None,
+        ) if root else None
 
     @staticmethod
     def _decode_mint(body, workspace):
@@ -174,7 +183,7 @@ class Gateway:
             return Response(400)
         try:
             root = await self._root()
-            if not root or snapshot.decode_root(root).anchor != self.workspace:
+            if not root:
                 return Response(503)
         except Exception:
             return Response(503)
@@ -190,13 +199,17 @@ class Gateway:
                 return None
 
         try:
-            grant = await mint.async_stateless(
-                pile, root,
+            grant = await RepositoryReader.mint_awaited(
+                self.workspace,
+                root,
                 fetch,
+                pile,
                 trusted_now,
                 max_unique_fetches=self.max_mint_fetches,
                 max_fetch_bytes=self.max_mint_fetch_bytes,
             )
+        except RepositoryRootError:
+            return Response(503)
         except Exception:
             return Response(503 if fetch_error is not None else 403)
         if fetch_error is not None:
@@ -274,9 +287,7 @@ class Gateway:
             return self._json(200, {"ok": True})
         if path == "/readyz" and method == "GET":
             try:
-                root = await self._root()
-                if not root \
-                        or snapshot.decode_root(root).anchor != self.workspace:
+                if await self._reader() is None:
                     raise ValueError("root readiness")
             except Exception:
                 return self._json(503, {"ok": False})
@@ -310,14 +321,11 @@ class Gateway:
             return Response(401)
         if path == "/root" and method == "GET":
             try:
-                root = await self._root() or b""
-                if root:
-                    committed = snapshot.decode_root(root)
-                    if committed.anchor != self.workspace:
-                        raise ValueError("root anchor")
+                reader = await self._reader()
+                root = reader.root_bytes if reader is not None else b""
             except Exception:
                 return Response(503)
-            etag = h(root)
+            etag = reader.etag if reader is not None else h(root)
             if self._header(headers, "If-None-Match") == etag:
                 return Response(304)
             return Response(

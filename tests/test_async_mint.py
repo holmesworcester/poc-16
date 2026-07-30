@@ -7,6 +7,7 @@ import pytest
 from core import merkle_map, cmds, mint
 from core.close import decode_pile, encode_pile
 from core.node import Node, now_ms
+from core.repository_reader import RepositoryReader
 from facts.auth import request
 
 from .util import add_member, closed_subset
@@ -141,6 +142,33 @@ def test_async_driver_memoizes_repeated_tree_paths(snapshots):
     assert async_calls == list(dict.fromkeys(sync_calls))
     assert repeated.isdisjoint(
         oid for oid, count in Counter(async_calls).items() if count > 1)
+
+
+def test_async_driver_opens_exactly_one_pinned_reader(snapshots):
+    store = snapshots["node"].store(snapshots["workspace"])
+
+    class CountingReader(RepositoryReader):
+        constructions = 0
+
+        def __post_init__(self):
+            type(self).constructions += 1
+            super().__post_init__()
+
+    async def fetch(oid):
+        return store.get("obj/" + oid)
+
+    decision = asyncio.run(CountingReader.mint_awaited(
+        snapshots["workspace"],
+        snapshots["removed_root"],
+        fetch,
+        snapshots["founder_pile"],
+        snapshots["now"],
+        max_unique_fetches=UNIQUE_FETCH_BUDGET,
+        max_fetch_bytes=FETCH_BYTE_BUDGET,
+    ))
+
+    assert decision == (snapshots["founder"], "sync")
+    assert CountingReader.constructions == 1
 
 
 def test_missing_and_corrupt_pages_are_fetched_once_and_fail_closed(snapshots):

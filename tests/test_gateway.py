@@ -97,6 +97,38 @@ def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
     ).status == 403
 
 
+def test_gateway_rejects_a_misbound_or_malformed_repository_root(tmp_path):
+    node, workspace, _, pile, healthy = world(tmp_path)
+    _, _, token = mint(node, workspace, pile, healthy)
+    headers = {"Authorization": "Bearer " + token}
+    foreign = Node(str(tmp_path / "foreign"))
+    foreign_workspace = cmds.create(foreign, "mallory", ts=1)
+    foreign_root = foreign.store(foreign_workspace).get("root")
+    request_body = json.dumps({
+        "pile": base64.b64encode(pile).decode(),
+        "ws": workspace,
+    }).encode()
+
+    class RootOnly:
+        def __init__(self, root):
+            self.root = root
+
+        async def get_bounded(self, key, _limit):
+            return self.root if key == "root" else None
+
+    for bad_root in (foreign_root, b"{}"):
+        gateway = Gateway(
+            RootOnly(bad_root), workspace, b"s" * 32, lambda: 100)
+
+        assert call(gateway, "GET", "/readyz").status == 503
+        assert call(
+            gateway, "GET", "/root",
+            {"ws": workspace}, headers).status == 503
+        assert call(
+            gateway, "POST", "/mint", {"ws": workspace}, {},
+            request_body).status == 503
+
+
 def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
     node, workspace, _, pile, gateway = world(tmp_path)
     _, _, token = mint(node, workspace, pile, gateway)
@@ -218,22 +250,24 @@ def test_gateway_reports_provider_failures_as_observable_503(
         request_body).status == 503
 
     async def raising_after_fetch(
-            _pile, _root, fetch, _now, **_limits):
+            _workspace, _root, fetch, _pile, _now, **_limits):
         await fetch("0" * 64)
         raise ValueError("verifier stopped after provider failure")
 
     monkeypatch.setattr(
-        "deploy.gateway.mint.async_stateless", raising_after_fetch)
+        "deploy.gateway.RepositoryReader.mint_awaited",
+        raising_after_fetch)
     assert call(
         gateway, "POST", "/mint", {"ws": workspace}, {},
         request_body).status == 503
 
     async def invalid_without_fetch(
-            _pile, _root, _fetch, _now, **_limits):
+            _workspace, _root, _fetch, _pile, _now, **_limits):
         raise ValueError("invalid proof")
 
     monkeypatch.setattr(
-        "deploy.gateway.mint.async_stateless", invalid_without_fetch)
+        "deploy.gateway.RepositoryReader.mint_awaited",
+        invalid_without_fetch)
     assert call(
         gateway, "POST", "/mint", {"ws": workspace}, {},
         request_body).status == 403

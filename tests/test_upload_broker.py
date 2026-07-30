@@ -779,6 +779,19 @@ def test_broker_distinguishes_provider_failure_from_bad_proof(tmp_path):
     with pytest.raises(UploadUnavailable, match="root unavailable"):
         asyncio.run(broker.open(proof, vector.manifest, pile()))
 
+    foreign = Node(str(tmp_path / "foreign"))
+    foreign_workspace = cmds.create(foreign, "mallory", ts=1)
+    foreign_root = foreign.store(foreign_workspace).get("root")
+
+    class ForeignRoot:
+        async def get(self, key):
+            return foreign_root if key == "root" else None
+
+    misbound = UploadBroker(
+        ForeignRoot(), workspace, signer, clock, session_policy)
+    with pytest.raises(UploadUnavailable, match="root unavailable"):
+        asyncio.run(misbound.open(proof, vector.manifest, pile()))
+
     healthy = UploadBroker(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, signer, clock, session_policy)

@@ -12,7 +12,6 @@ import json
 import secrets
 from urllib.parse import urlsplit
 
-from core import mint, snapshot
 from core.limits import (
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_FETCHES,
@@ -24,6 +23,7 @@ from core.limits import (
     PayloadTooLarge,
 )
 from core.shape import valid_fid
+from core.repository_reader import RepositoryReader, RepositoryRootError
 from core.staged_intent import (
     SESSION_HEX_BYTES,
     staging_key,
@@ -311,8 +311,7 @@ class UploadBroker:
             raise InvalidUploadSession("upload authorization")
         try:
             root = await self._get("root", MAX_ROOT_BYTES)
-            if not root \
-                    or snapshot.decode_root(root).anchor != self.workspace:
+            if not root:
                 raise UploadUnavailable("workspace root unavailable")
         except UploadUnavailable:
             raise
@@ -330,12 +329,19 @@ class UploadBroker:
                 return None
 
         try:
-            grant = await mint.async_stateless(
-                proof, root, fetch, trusted_now,
+            grant = await RepositoryReader.mint_awaited(
+                self.workspace,
+                root,
+                fetch,
+                proof,
+                trusted_now,
                 max_unique_fetches=self.max_mint_fetches,
                 max_fetch_bytes=self.max_mint_fetch_bytes,
                 purpose=UPLOAD_PURPOSE,
             )
+        except RepositoryRootError as error:
+            raise UploadUnavailable(
+                "workspace root unavailable") from error
         except Exception as error:
             if fetch_error is not None:
                 raise UploadUnavailable(
