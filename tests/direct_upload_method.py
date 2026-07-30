@@ -4,8 +4,10 @@ This is explicitly a contract/problem-finding model, not proof of an upload
 broker, database-free publisher, provider, or F10: those runtimes do not exist
 yet. It composes the seeded history vocabulary from ``provider_conformance``
 with F10's ``Obligation`` vocabulary. Its abstract durable-root events check
-retirement ordering only. Future implementations must refine them through
-``ObligationTrace`` and an authenticated, read-back root witness.
+retirement ordering only. The bounded ``DurableHistoryCase`` corpus is
+separately refined by ``test_direct_upload_histories`` through the running
+Publisher, opaque-token shared bucket, ``ObligationTrace``, and an
+authenticated, read-back root witness.
 """
 import ast
 from contextlib import contextmanager
@@ -16,6 +18,7 @@ import random
 from urllib.parse import urlsplit
 
 from core.crypto import h
+from core.object_store import CREATED, Applied
 from core.shape import valid_fid
 from tests.ingress_obligations import Obligation
 from tests.provider_conformance import ConformanceRun, DEFAULT_SEED
@@ -27,6 +30,7 @@ MAX_BROKER_ATTACKS = 8
 MAX_NOTIFICATION_SCRIPTS = 16
 MAX_NOTIFICATION_STEPS = 12
 MAX_PROMOTION_CASES = 16
+MAX_DURABLE_HISTORY_CASES = 8
 # A deliberately tiny execution budget for this corpus, not the protocol's
 # object-size limit. Large-object compatibility is measured by x1p.17.10.
 MAX_CORPUS_UPLOAD_BYTES = 4 * 1024 * 1024
@@ -1912,6 +1916,142 @@ def exercise_promotion_corpus(implementation, provider, run):
                 run, case, events, expected)
         return PromotionReport(
             provider, run.seed, tuple(case.name for case in cases))
+
+
+@dataclass(frozen=True)
+class DurableHistoryCase:
+    """One bounded refinement of staging through the real publisher/F10 path."""
+
+    name: str
+    cas: str = "win"
+    pile_delete: str = "clean"
+    object_delete: str = "clean"
+
+
+@dataclass(frozen=True)
+class StageDischarge:
+    key: str
+    raw: bytes
+    delete_seq: int
+
+
+@dataclass(frozen=True)
+class StageCleanupReport:
+    discharges: tuple[StageDischarge, ...]
+    live: tuple[Obligation, ...]
+
+
+class StageCleanupViolation(AssertionError):
+    """First staging mutation that breaks exact-value retirement."""
+
+    def __init__(self, bucket, event, reason):
+        self.event = event
+        self.reason = reason
+        self.seed = bucket.seed
+        stop = len(bucket.history) if event is None else event.seq
+        self.prefix = tuple(bucket.history[:stop])
+        diagnostic = getattr(bucket, "diagnostic", None)
+        rendered = diagnostic() if callable(diagnostic) else (
+            f"bucket seed={bucket.seed:#x}")
+        at = "" if event is None else f" at event #{event.seq}"
+        super().__init__(
+            f"unsupported staging cleanup{at}: {reason}\n{rendered}")
+
+
+def durable_history_corpus(seed=DEFAULT_SEED):
+    """Replayable CAS/DELETE cases refined by the running publisher tests.
+
+    ``tests/test_direct_upload_histories.py`` executes these cases through
+    production ``Publisher``/``Node``, the shared opaque-token bucket, and
+    ``ObligationTrace``. They are not abstract commit events.
+    """
+    cases = [
+        DurableHistoryCase("cas-win"),
+        DurableHistoryCase("cas-unapplied-fresh-retry", cas="unapplied"),
+        DurableHistoryCase(
+            "cas-applied-response-lost-fresh-reconcile",
+            cas="applied-response-lost"),
+        DurableHistoryCase(
+            "competing-publishers-stale", cas="competing"),
+        DurableHistoryCase(
+            "pile-delete-unapplied",
+            pile_delete="unapplied"),
+        DurableHistoryCase(
+            "pile-delete-applied-response-lost",
+            pile_delete="applied-response-lost"),
+        DurableHistoryCase(
+            "object-delete-unapplied",
+            object_delete="unapplied"),
+        DurableHistoryCase(
+            "object-delete-applied-response-lost",
+            object_delete="applied-response-lost"),
+    ]
+    if len(cases) > MAX_DURABLE_HISTORY_CASES:
+        raise AssertionError("durable history corpus budget")
+    random.Random(seed ^ 0xCA5DE1E7E).shuffle(cases)
+    return tuple(cases)
+
+
+def check_stage_cleanup(bucket, *, prefix="stage/", require_drained=True):
+    """Replay exact staging lifetimes; DELETE of changed bytes is forbidden.
+
+    Publication authority is intentionally absent here. Pile retirement is
+    checked separately by ``ObligationTrace`` against authenticated root
+    bytes; this checker covers only the exact-value/idempotence obligation of
+    independently promoted staging objects.
+    """
+    bucket.assert_valid_history()
+    data = dict(bucket.initial)
+    obligations = {
+        key: Obligation(key, raw, 0)
+        for key, raw in data.items() if key.startswith(prefix)
+    }
+    discharges = []
+    for event in bucket.history:
+        if event.op == "put":
+            previous = data.get(event.key)
+            if event.key.startswith(prefix):
+                if previous is not None and previous != event.value:
+                    raise StageCleanupViolation(
+                        bucket, event,
+                        "acknowledged staging bytes were overwritten")
+                if previous is None:
+                    obligations[event.key] = Obligation(
+                        event.key, event.value, event.seq)
+            data[event.key] = event.value
+        elif event.op == "put_if_absent":
+            if event.result is CREATED:
+                data[event.key] = event.value
+                if event.key.startswith(prefix):
+                    obligations[event.key] = Obligation(
+                        event.key, event.value, event.seq)
+        elif event.op == "cas":
+            if isinstance(event.result, Applied):
+                data[event.key] = event.value
+        elif event.op == "delete":
+            if event.key.startswith(prefix) and event.result:
+                obligation = obligations.get(event.key)
+                if obligation is None:
+                    raise StageCleanupViolation(
+                        bucket, event,
+                        "DELETE has no live acknowledged staging value")
+                if data.get(event.key) != obligation.raw:
+                    raise StageCleanupViolation(
+                        bucket, event,
+                        "DELETE does not match the acknowledged staging bytes")
+                discharges.append(StageDischarge(
+                    event.key, obligation.raw, event.seq))
+                obligations.pop(event.key)
+            data.pop(event.key, None)
+
+    live = tuple(sorted(
+        obligations.values(),
+        key=lambda item: (item.created_seq, item.key)))
+    if require_drained and live:
+        raise StageCleanupViolation(
+            bucket, None,
+            "claimed cleanup left acknowledged staging values live")
+    return StageCleanupReport(tuple(discharges), live)
 
 
 @dataclass(frozen=True)

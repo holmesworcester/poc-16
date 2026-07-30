@@ -31,7 +31,7 @@ from .kernel import (
 )
 from .publication import INDEX_VERSION, Publisher, RootChanged
 from .runtime import WorkspaceRuntime
-from .object_store import ABSENT, ensure_object, verified_object
+from .object_store import ABSENT, ensure_object, retire_exact, verified_object
 from .store import FsStore
 
 SUPP_SCHEMA = (
@@ -196,26 +196,24 @@ class Node:
         self._retire_ingress_exact(ws, source, raw)
 
     def _retire_ingress_exact(self, ws, source, raw):
-        """Retire only the exact bytes observed, reconciling a lost reply."""
+        """Retire one hash-bound pile, reconciling a lost DELETE reply.
+
+        ``WorkspaceRuntime`` reaches this boundary only after a committed
+        publication witness; ``_quarantine_ingress`` reaches it only after
+        exact durable rejection evidence. The destructive-call inventory
+        ratchets those two authority paths.
+
+        Every accepted pile writer binds the final path segment to ``h(raw)``;
+        direct upload additionally makes creation conditional. That stable
+        same-address value is the precondition required by ``retire_exact``.
+        """
         if not isinstance(raw, bytes):
             raise TypeError("exact ingress bytes required")
-        st = self.store(ws)
-        current = st.get(source)
-        if current is None:
-            return  # another drainer already discharged the same obligation
-        if current != raw:
-            raise OSError("ingress source changed before retirement")
-        try:
-            st.delete(source)
-        except Exception as error:
-            try:
-                current = st.get(source)
-            except Exception:
-                raise error
-            if current is not None:
-                raise error
-        if st.get(source) is not None:
-            raise OSError("ingress retirement did not remove the source")
+        if not isinstance(source, str) \
+                or not source.startswith("pile/") \
+                or source.rsplit("/", 1)[-1] != h(raw):
+            raise ValueError("ingress source is not bound to exact bytes")
+        return retire_exact(self.store(ws), source, raw)
 
     def record_ingress_attempt_failure(self, ws, source, error):
         """Expose a retained retryable/program failure without deleting it."""

@@ -487,7 +487,7 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         )
         for site in deletes
     ] == [(
-        "core/node.py", "_retire_ingress_exact", 209, "st", "direct")]
+        "core/object_store.py", "retire_exact", 236, "store", "direct")]
     assert [
         (
             site.path, site.function, site.line,
