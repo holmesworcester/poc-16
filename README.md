@@ -174,8 +174,13 @@ to remain durably reachable. The current client keeps losing/inactive receipts
 only in its local catalog and may retire their original pile after publishing
 the eligible subset. The generic authenticated index bounds discovery for
 rooted/eligible candidates, but it does not manufacture missing dormant
-bytes. A serverless publisher is not complete until ingress retirement or a
-root-reachable candidate archive closes that retention boundary.
+bytes or prove that arbitrary bytes were ever admitted. The target gives each
+kernel-admitted candidate one current raw residence—eligible in a RangeTree
+leaf or dormant as a content-addressed blob—and points its authenticated
+FactTree record at a raw-free admission-proof DAG that the running kernel can
+replay. A serverless publisher is not complete until that archive exists and
+ingress retirement proves that every durable valid in the pile is represented,
+not only the currently eligible subset.
 
 There is no correctness reason to proxy immutable bytes through the publisher
 when the provider can enforce the complete request. The narrower boundary is

@@ -419,6 +419,52 @@ FactTree cannot substitute for this map without also gaining ordered raw-fact
 residency and pile/closure routing; object-store LIST cannot substitute
 because object names are content hashes and include unreachable history.
 
+### Dormant-candidate retention target
+
+The target law is stronger than “keep the bytes.” The committed root
+authenticates a monotone set of **kernel-admitted** durable candidates, and
+eligibility is a reversible derived subset of that set. Every candidate has
+exactly one raw residence in the current snapshot:
+
+- an eligible candidate occurs once in a RangeTree leaf;
+- a dormant candidate occurs once at `obj/H(encode(fact))`.
+
+Old immutable objects may remain as unreachable history. SQLite, provider
+events, and object-store LIST are never admission evidence or candidate
+authority.
+
+A dormant blob pointer proves only that some bytes exist. It does not prove
+that those bytes passed the family-neutral kernel. Durable admission must
+therefore consume the kernel's `Valid` receipt rather than a raw `Fact`.
+Scratch loading and tests may not share an unchecked route that can populate
+the durable candidate catalog.
+
+Each candidate record also names a content-addressed, raw-free admission-proof
+DAG node. A node binds the workspace and fid to the exact resolved dependency
+edges from one kernel judgment; every edge pins the corresponding parent proof
+oid from that same judgment. This path-shares old closure, prevents unrelated
+parent witnesses from being spliced into a proof, and avoids retaining another
+copy of a closed pile. A cold verifier follows the pinned proof DAG, obtains
+each fact from its one current residence, and reruns the actual kernel. An
+abstract proof mirror is not sufficient.
+
+FactTree will cover both eligible and dormant candidates. Its generic postings
+remain a mechanical projection of every candidate, while application reads
+filter for current eligibility. Dormant rows have an explicit dormant state
+and fid ordering; they never carry a sentinel or stale value that could be
+mistaken for a current proof rank. Full repair may page the authenticated
+`fact:` prefix, but ordinary store-only publication follows only the bounded
+type/key/ref/offer/scope/dependency postings affected by its intent.
+
+Publication writes a dormant blob before a CAS that deactivates an eligible
+candidate, and writes the new RangeTree leaf before a CAS that restores one.
+The single composite-root CAS atomically binds residence, admission proof,
+candidate postings, current eligibility, suppression, and authority. Ingress
+retirement is allowed only when that root represents every durable `Valid`
+receipt in the exact pile, whether eligible or dormant. Candidate deletion is
+out of scope until a separate proof can establish that a candidate can never
+regain standing.
+
 ## The three authenticated trees
 
 Wire RangeTree and the three Worker indexes share one persistent Merkle-treap
