@@ -69,3 +69,53 @@ def test_admin_target_prefers_exact_key_and_rejects_ambiguous_names(
         cmds.grant_admin(node, workspace, "duplicate")
     assert node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == before
+
+
+def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
+        tmp_path, monkeypatch):
+    ticks = iter(range(100, 200))
+    monkeypatch.setattr(
+        "core.node.now_ms", lambda: next(ticks))
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(
+        node, workspace, "bob", ts=10)
+    carol_secret, carol, _ = add_member(
+        node, workspace, "carol", ts=20)
+    _, dave, _ = add_member(
+        node, workspace, "dave", ts=30)
+    _, erin, _ = add_member(
+        node, workspace, "erin", ts=40)
+    node.keychain.add_identity(bob_secret)
+    node.keychain.add_identity(carol_secret)
+
+    cmds.grant_admin(node, workspace, bob)
+    node.bind_identity(workspace, bob)
+    carol_grant = cmds.grant_admin(
+        node, workspace, carol)
+
+    # Bob's admin authority was required when this immutable grant entered
+    # the DAG. Once admitted, its continuing authority follows Carol.
+    node.bind_identity(workspace, founder)
+    cmds.evict(node, workspace, bob)
+    assert node.fact_of(workspace, carol_grant) is not None
+
+    node.bind_identity(workspace, carol)
+    cmds.evict(node, workspace, dave)
+    assert suppression_state.active(
+        node.idx(workspace),
+        facts.principal_sid("member", dave),
+    )
+
+    # The converse is equally important: Carol's own removal ends the
+    # delegated authority even though Bob's historical grant remains.
+    node.bind_identity(workspace, founder)
+    cmds.evict(node, workspace, carol)
+    node.bind_identity(workspace, carol)
+    with pytest.raises(ValueError, match="outside the canonical set"):
+        cmds.evict(node, workspace, erin)
+    assert not suppression_state.active(
+        node.idx(workspace),
+        facts.principal_sid("member", erin),
+    )

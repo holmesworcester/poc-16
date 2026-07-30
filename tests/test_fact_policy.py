@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import facts
-from core import cmds
+from core import cmds, indexes
 from core.crypto import keypair
 from core.fact import Fact
 from core.node import Node
@@ -34,6 +34,18 @@ def test_one_registry_exhaustively_covers_the_router():
         for rule in family.POLICY.suppression or ()
     }
     assert kinds == {SELF, PARENT, ANCESTOR}
+    assert tuple(
+        rule.kind
+        for rule in facts.family_for("msg").POLICY.suppression
+    ) == (SELF,)
+    assert tuple(
+        rule.kind
+        for rule in facts.family_for("file_bao").POLICY.suppression
+    ) == (SELF, PARENT)
+    assert tuple(
+        rule.kind
+        for rule in facts.family_for("chunk").POLICY.suppression
+    ) == (SELF, PARENT, ANCESTOR)
     for tag in ("msg", "file_bao", "chunk"):
         direct = facts.family_for(tag).POLICY.direct_targets
         assert direct
@@ -58,6 +70,37 @@ def test_registry_rejects_duplicate_and_policyless_families():
         facts.compile_families((first, duplicate))
     with pytest.raises(ValueError, match="own its policy"):
         facts.compile_families((policyless,))
+
+
+@pytest.mark.parametrize(
+    ("policy", "error"),
+    (
+        (
+            _policy.FamilyPolicy(
+                direct_targets=(
+                    _policy.DirectTarget(
+                        _policy.CONTENT_DELETE,
+                        SELF,
+                        (_policy.OWNER,),
+                    ),
+                ),
+                owner_edge="member",
+            ),
+            "allow ADMIN",
+        ),
+        (
+            _policy.FamilyPolicy(
+                direct_targets=_policy.DELETE_SELF,
+            ),
+            "owner edge",
+        ),
+    ),
+)
+def test_registry_rejects_direct_delete_authority_gaps(policy, error):
+    family = SimpleNamespace(TAG="unsafe_delete_target", POLICY=policy)
+
+    with pytest.raises(ValueError, match=error):
+        facts.compile_families((family,))
 
 
 def test_new_principal_namespace_needs_no_core_change(monkeypatch):
@@ -173,3 +216,51 @@ def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
     admin_action = node.fact_of(
         workspace, cmds.remove(node, workspace, second, ts=43))
     assert admin_action.body["mode"] == _policy.ADMIN
+
+
+def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    posted = cmds.post(
+        node, workspace, "general", "Bob's message", ts=20)
+    descriptor = send_bytes(
+        node, workspace, "bob.bin", b"Bob's bytes", ts=21)
+    chunk = node.by_type(workspace, "chunk")[0].fid
+
+    direct = {
+        tag
+        for tag, family in facts.FAMILIES.items()
+        if any(
+            target.action == _policy.CONTENT_DELETE
+            for target in family.POLICY.direct_targets
+        )
+    }
+    targets = {
+        "msg": posted,
+        "file_bao": descriptor,
+        "chunk": chunk,
+    }
+    assert set(targets) == direct
+
+    node.bind_identity(workspace, founder)
+    # A descriptor suppresses its chunks, so exercise the direct chunk target
+    # first; every action still travels through the ordinary fact pipeline.
+    for ts, tag in enumerate(("chunk", "msg", "file_bao"), start=30):
+        target = targets[tag]
+        action_fid = cmds.remove(
+            node, workspace, target, ts=ts)
+        action = node.fact_of(workspace, action_fid)
+        assert action.body == {
+            "mode": _policy.ADMIN,
+            "pk": founder,
+        }
+        assert node.reader(workspace).worker().suppression(
+            indexes.fact_key(target)
+        ) == {
+            "state": "active",
+            "action": action_fid,
+        }

@@ -73,6 +73,29 @@ DELETE_SELF = (
     DirectTarget(CONTENT_DELETE, SELF, (OWNER, ADMIN)),
 )
 
+
+def validate_family_policy(policy):
+    """Reject registry declarations which violate global authority rules."""
+    if not isinstance(policy, FamilyPolicy):
+        raise ValueError("family policy type")
+    for target in policy.direct_targets:
+        if not isinstance(target, DirectTarget):
+            raise ValueError("direct target policy")
+        if target.action != CONTENT_DELETE:
+            continue
+        modes = set(target.modes)
+        if target.selector != SELF \
+                or not target.modes \
+                or len(modes) != len(target.modes) \
+                or not modes <= {OWNER, ADMIN}:
+            raise ValueError("direct deletion policy")
+        if ADMIN not in modes:
+            raise ValueError("direct deletion must allow ADMIN")
+        if OWNER in modes and not policy.owner_edge:
+            raise ValueError("OWNER deletion needs an owner edge")
+    return policy
+
+
 def _edge_map(edges):
     out = {}
     for edge in edges:

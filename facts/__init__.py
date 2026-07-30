@@ -7,7 +7,7 @@ import inspect
 
 from . import auth, content
 from core.suppression import deathkey, is_deletion, scoped_id, suppkeys
-from ._policy import validate_fact_policy
+from ._policy import validate_fact_policy, validate_family_policy
 
 MODULES = auth.MODULES + content.MODULES
 
@@ -20,6 +20,8 @@ def compile_families(modules):
         raise ValueError("duplicate fact tag")
     if any(not hasattr(module, "POLICY") for module in modules):
         raise ValueError("every fact family must own its policy")
+    for module in modules:
+        validate_family_policy(module.POLICY)
     if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
         raise ValueError("exactly one genesis family required")
     return families
