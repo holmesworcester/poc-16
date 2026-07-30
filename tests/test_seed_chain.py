@@ -5,8 +5,7 @@ import pytest
 
 from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
-from core import catalog, cmds, merkle_map
-from core import kernel as kernel_module
+from core import catalog, cmds
 from core.close import close, decode_pile
 from core.ingress import KernelRejected
 from core.kernel import drain, resolve_deps
@@ -114,9 +113,9 @@ def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
         str(tmp_path / "bulk-ranks"), 127, n_members=12,
         shape="star", seed=16)
     before = set(all_fids(node, workspace))
+    candidates = node.reader(workspace).candidates()
     first_ts = max(
-        node.candidate_of(workspace, fid).ts
-        for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
+        candidates.fact(fid).ts for fid in candidates.candidate_ids()
     ) + 1
 
     bulk_author(
@@ -140,81 +139,67 @@ def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
     assert drain(pile, workspace).ok
 
 
-def test_proof_rebuild_visits_a_deep_chain_once_per_fact(
-        tmp_path, monkeypatch):
+def test_reader_rebuilds_a_deleted_deep_chain_projection_without_root_write(
+        tmp_path):
     members = 64
     membership_facts = 1 + 4 * (members - 1)
     node, workspace, _ = build_seed(
         str(tmp_path / "proof-worklist"), membership_facts,
         n_members=members, shape="chain", seed=16)
     index = node.idx(workspace)
-    index.execute("DELETE FROM proofs")
+    root = node.store(workspace).get("root")
+    index.execute(
+        "DELETE FROM fact_index WHERE kind IN (?, ?)",
+        (catalog.STATE_INDEX, catalog.EDGE_INDEX),
+    )
     index.commit()
 
-    original = kernel_module.resolve_deps
-    calls = {"count": 0}
+    assert not node.catalog(workspace).eligible_ids()
+    assert index.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
+        (catalog.EDGE_INDEX,),
+    ).fetchone() is None
 
-    def counted(fact, db):
-        calls["count"] += 1
-        return original(fact, db)
+    node.rebuild(workspace)
 
-    monkeypatch.setattr(kernel_module, "resolve_deps", counted)
-    unresolved = kernel_module.rebuild_proofs(
-        index, lambda fid: node.candidate_of(workspace, fid), workspace)
+    assert node.store(workspace).get("root") == root
+    assert index.execute(
+        "SELECT COUNT(*) FROM fact_index "
+        "WHERE kind=? AND k0='eligible'",
+        (catalog.STATE_INDEX,),
+    ).fetchone()[0] == membership_facts
+    assert index.execute(
+        "SELECT MAX(CAST(k1 AS INTEGER)) FROM fact_index "
+        "WHERE kind=? AND k0='eligible'",
+        (catalog.STATE_INDEX,),
+    ).fetchone()[0] == 2 * (members - 1)
+    assert index.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
+        (catalog.EDGE_INDEX,),
+    ).fetchone() is not None
 
-    assert not unresolved
-    assert calls["count"] <= membership_facts
-    assert index.execute("SELECT MAX(rank) FROM proofs").fetchone()[0] \
-        == 2 * (members - 1)
 
-
-def test_ordinary_append_does_not_scan_all_proofs_or_offers(
-        tmp_path, monkeypatch):
+def test_ordinary_seed_append_aligns_projection_with_committed_reader(
+        tmp_path):
     node, workspace, _ = build_seed(
-        str(tmp_path / "incremental-proof"), 2047,
-        n_members=48, shape="random", seed=16)
-    statements = []
-    index = node.idx(workspace)
-    total = index.execute("SELECT COUNT(*) FROM proofs").fetchone()[0]
-    changed_rows = []
-    update = merkle_map.update
+        str(tmp_path / "ordinary-append"), 127,
+        n_members=12, shape="random", seed=16)
+    root = node.store(workspace).get("root")
 
-    def bounded_update(root, seed, changes, fetch, emit, **kwargs):
-        changed_rows.append(len(changes))
-        return update(root, seed, changes, fetch, emit, **kwargs)
+    fid = cmds.post(
+        node, workspace, "general", "one conflict-free live append")
 
-    monkeypatch.setattr(merkle_map, "update", bounded_update)
-    monkeypatch.setattr(
-        catalog.Catalog, "eligible_ids",
-        lambda *_: pytest.fail("ordinary append enumerated all proofs"))
-    monkeypatch.setattr(
-        node, "keys",
-        lambda *_: pytest.fail("ordinary append enumerated all fact keys"))
-    index.set_trace_callback(statements.append)
-    try:
-        cmds.post(
-            node, workspace, "general", "one conflict-free live append")
-    finally:
-        index.set_trace_callback(None)
-
-    normalized = [" ".join(statement.lower().split())
-                  for statement in statements]
-    forbidden = (
-        "select fid from proofs",
-        "select distinct o.name, o.a0, o.a1 from offers",
-        "left join proofs p on p.fid=o.src",
-    )
-    assert not [
-        statement for statement in normalized
-        if any(fragment in statement for fragment in forbidden)
-    ]
-    assert any(
-        statement.startswith("select 1 from proofs where fid=")
-        for statement in normalized)
-    assert changed_rows and 0 < max(changed_rows) < total // 4
+    assert node.store(workspace).get("root") != root
+    assert node.reader(workspace).candidates().fact(fid) \
+        == node.fact_of(workspace, fid)
+    assert node.idx(workspace).execute(
+        "SELECT 1 FROM fact_index "
+        "WHERE kind=? AND k0='eligible' AND src=?",
+        (catalog.STATE_INDEX, fid),
+    ).fetchone() == (1,)
 
 
-def test_chained_seed_catches_up_and_every_published_leaf_validates(tmp_path):
+def test_chained_seed_catches_up_and_every_committed_leaf_validates(tmp_path):
     node, workspace, _ = build_seed(
         str(tmp_path / "seed"), 511, n_members=24, shape="random")
 

@@ -4,11 +4,11 @@ import threading
 
 import pytest
 
-from core import cmds, daemon, indexes
+from core import catalog, cmds, daemon, indexes
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
-from core.worker import WorkerView
+from core.repository_reader import RepositoryReader
 from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 from facts.content.delete import delete
@@ -38,10 +38,8 @@ def test_e_identical_across_partitions_orders_batchings(
         for fid in all_fids(source, workspace)
         for _, target in source.fact_of(workspace, fid).refs()
     }
-    assert referenced <= {
-        fid for (fid,) in source.idx(workspace).execute(
-            "SELECT fid FROM proofs")
-    }
+    assert referenced <= set(
+        source.reader(workspace).candidates().candidate_ids())
     expected_root = source.store(workspace).get("root")
     expected_app = query_state(source)
     for seed in range(5):
@@ -71,30 +69,36 @@ def test_suppression_facts_not_suppressible(tmp_path):
             sig.fid: []})
 
     assert node.fact_of(workspace, recursive.fid) is None
-def test_old_index_rebuilds_reference_proofs(tmp_path, monkeypatch):
-    """A v7 restart repairs unranked ref targets before serving E."""
+
+
+def test_reader_rebuilds_missing_reference_projection_without_root_write(
+        tmp_path):
+    """The pinned root restores missing projection rows without a root CAS."""
     node, workspace, targets, deletions = suppression_world(tmp_path / "node")
     referenced = {targets[index] for index in (1, 4, 6)}
     expected = query_state(node)
+    root = node.store(workspace).get("root")
     index = node.idx(workspace)
     index.executemany(
-        "DELETE FROM proofs WHERE fid=?",
-        ((target,) for target in referenced))
-    index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-        ("obsolete-index-version",))
+        "DELETE FROM fact_index "
+        "WHERE kind IN (?, ?) AND src=?",
+        (
+            (catalog.STATE_INDEX, catalog.EDGE_INDEX, target)
+            for target in referenced
+        ),
+    )
     index.commit()
-    index.close()
 
-    upgraded = Node(node.dir)
+    assert referenced.isdisjoint(node.catalog(workspace).eligible_ids())
 
-    assert all(upgraded.fact_of(workspace, fid) is not None
+    node.rebuild(workspace)
+
+    assert node.store(workspace).get("root") == root
+    assert referenced <= node.catalog(workspace).eligible_ids()
+    assert all(node.catalog(workspace).edges(fid) for fid in referenced)
+    assert all(node.fact_of(workspace, fid) is not None
                for fid in deletions)
-    assert {
-        fid for (fid,) in upgraded.idx(workspace).execute(
-            "SELECT fid FROM proofs")
-    }.issuperset(referenced)
-    assert query_state(upgraded) == expected
+    assert query_state(node) == expected
 
 
 def test_verdicts_never_read_s(tmp_path, monkeypatch):
@@ -116,9 +120,9 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("restart", (False, True))
-def test_suppression_stays_behind_the_snapshot_commit(
+def test_suppression_stays_behind_the_root_commit(
         tmp_path, monkeypatch, restart):
-    """Ahead local action state is invisible until the composite root CAS."""
+    """Root and action projection advance atomically across a failed CAS."""
     node, workspace, _, _ = suppression_world(tmp_path / "node")
     target_fid = cmds.post(
         node, workspace, "unpublished", "target", ts=300)
@@ -131,25 +135,35 @@ def test_suppression_stays_behind_the_snapshot_commit(
     def visible():
         return target.fid in visible_fids(node, workspace)
 
-    def published_action(raw):
-        return WorkerView.from_root(
-            raw, lambda oid: store.get("obj/" + oid),
-        ).suppression(indexes.fact_key(target.fid))
+    def committed_action(raw):
+        return RepositoryReader(
+            workspace,
+            raw,
+            lambda oid: store.get("obj/" + oid),
+        ).worker().suppression(indexes.fact_key(target.fid))
 
-    assert published_action(old_root) == {"state": "clear"}
+    def projected_action():
+        return node.idx(workspace).execute(
+            "SELECT src FROM fact_index WHERE kind=? AND k0=?",
+            (catalog.ACTION_INDEX, indexes.fact_key(target.fid)),
+        ).fetchone()
+
+    assert committed_action(old_root) == {"state": "clear"}
+    assert projected_action() is None
     assert visible()
     now = daemon.now_ms()
     request = encode_pile(request_payload(
         node, workspace, "sync", now + 60_000, now))
     canonical_observed = []
-    original_mint = daemon.gate.stateless
+    old_view = node.reader(workspace).worker()
+    original_mint = type(old_view).mint
 
-    def observe_canonical(pile, root, fetch, trusted_now, view=None):
-        canonical_observed.append(root == old_root)
+    def observe_canonical(view, pile, trusted_now, *, purpose="sync"):
+        canonical_observed.append(view.etag == old_view.etag)
         return original_mint(
-            pile, root, fetch, trusted_now, view)
+            view, pile, trusted_now, purpose=purpose)
 
-    monkeypatch.setattr(daemon.gate, "stateless", observe_canonical)
+    monkeypatch.setattr(type(old_view), "mint", observe_canonical)
 
     release_reader = threading.Event()
     reader_waiting = threading.Event()
@@ -169,33 +183,29 @@ def test_suppression_stays_behind_the_snapshot_commit(
     candidate = []
     original_cas = store.cas
 
-    def fail_before_publish(key, etag, raw):
+    def fail_before_root_commit(key, etag, raw):
         candidate.append(raw)
         assert key == "root"
         assert store.get("root") == old_root
-        # The local suppression state is ahead, but readers still receive
-        # exactly the old composite root until the CAS.
-        assert deletion.fid in {
-            fid for (fid,) in node.idx(workspace).execute(
-                "SELECT fid FROM actions")}
+        # SQL is only a projection of the committed root, so it cannot expose
+        # the candidate action while the root CAS is still pending.
+        assert projected_action() is None
         release_reader.set()
         assert reader_waiting.wait(timeout=5)
-        raise RuntimeError("suppression snapshot CAS failed")
+        raise RuntimeError("suppression root CAS failed")
 
-    monkeypatch.setattr(store, "cas", fail_before_publish)
-    with pytest.raises(RuntimeError, match="snapshot CAS failed"):
+    monkeypatch.setattr(store, "cas", fail_before_root_commit)
+    with pytest.raises(ValueError, match="outside the canonical set"):
         cmds.remove(node, workspace, target.fid, ts=301)
     reader.join(timeout=5)
 
     assert not reader.is_alive()
     assert len(candidate) == 1
-    assert published_action(candidate[0]) == {
+    assert committed_action(candidate[0]) == {
         "state": "active", "action": deletion.fid}
     assert store.get("root") == old_root
     assert node.fact_of(workspace, deletion.fid) is None
-    assert deletion.fid not in {
-        fid for (fid,) in node.idx(workspace).execute(
-            "SELECT fid FROM actions")}
+    assert projected_action() is None
     assert observed == [(200, old_root)]
     assert canonical_observed == [True]
     assert visible()
@@ -204,9 +214,7 @@ def test_suppression_stays_behind_the_snapshot_commit(
     if restart:
         index = node.idx(workspace)
         index.executescript(
-            "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
-            "DELETE FROM admission_receipts; DELETE FROM proofs; "
-            "DELETE FROM supp; DELETE FROM meta;")
+            "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM meta;")
         index.commit()
         index.close()
         node = Node(node.dir)
@@ -230,7 +238,8 @@ def test_suppression_stays_behind_the_snapshot_commit(
     assert retried == candidate
     assert store.get("root") == candidate[0]
     assert node.fact_of(workspace, deletion.fid) == deletion
-    assert published_action(store.get("root")) == {
+    assert projected_action() == (deletion.fid,)
+    assert committed_action(store.get("root")) == {
         "state": "active", "action": deletion.fid}
     assert not visible()
     _, (code, body) = invoke_mint(node, workspace, request)
