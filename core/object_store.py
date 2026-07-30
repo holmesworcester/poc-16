@@ -278,3 +278,36 @@ async def ensure_object_async(store, oid, raw):
             raise ValueError("immutable object conflict")
         return EXISTS
     raise unknown
+
+
+async def retire_exact_async(store, key, raw):
+    """Awaited equivalent of :func:`retire_exact` for edge publishers.
+
+    This helper reconciles deletion mechanics only. The caller must first
+    prove through F10 that the exact durable work item may be retired.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("exact retirement bytes required")
+    current = await store.get(key)
+    if current is None:
+        return False
+    if current != raw:
+        raise OSError("retirement source changed")
+    try:
+        await store.delete(key)
+    except Exception as error:
+        try:
+            current = await store.get(key)
+        except Exception:
+            raise error
+        if current is None:
+            return True
+        if current != raw:
+            raise OSError("retirement source changed") from error
+        raise error
+    current = await store.get(key)
+    if current is None:
+        return True
+    if current != raw:
+        raise OSError("retirement source changed")
+    raise OSError("retirement did not remove the source")

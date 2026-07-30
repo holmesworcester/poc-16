@@ -17,6 +17,7 @@ from core.object_store import (
     STALE,
     StoreError,
     ensure_object_async,
+    retire_exact_async,
 )
 
 
@@ -214,6 +215,141 @@ def test_native_r2_guards_authoritative_mutations_and_prefixes():
         R2BindingStore(Bucket(), "../escape")
     with pytest.raises(ValueError, match="page budget"):
         R2BindingStore(Bucket(), max_list_pages=0)
+
+
+def test_native_r2_exact_retirement_handles_absence_success_and_change():
+    bucket = Bucket()
+    store = R2BindingStore(bucket, "tenant")
+    key, physical, raw = (
+        "ingress/v1/pile/member/fid",
+        "tenant/ingress/v1/pile/member/fid",
+        b"closed pile",
+    )
+
+    assert run(retire_exact_async(store, key, raw)) is False
+    bucket.data[physical] = raw
+    bucket.etags[physical] = bucket._token()
+    assert run(retire_exact_async(store, key, raw)) is True
+    assert physical not in bucket.data
+
+    bucket.data[physical] = b"replacement"
+    bucket.etags[physical] = bucket._token()
+    with pytest.raises(OSError, match="source changed"):
+        run(retire_exact_async(store, key, raw))
+    assert not any(
+        call == ("delete", physical) for call in bucket.calls[-2:])
+
+
+def test_native_r2_exact_retirement_reconciles_lost_delete_response():
+    class AppliedWithoutResponse(Bucket):
+        async def delete(self, key):
+            self.calls.append(("delete", key))
+            self.data.pop(key, None)
+            self.etags.pop(key, None)
+            raise ConnectionError("response lost after apply")
+
+    bucket = AppliedWithoutResponse()
+    store = R2BindingStore(bucket, "tenant")
+    key = "ingress/v1/pile/member/fid"
+    physical = "tenant/" + key
+    raw = b"durable intent"
+    bucket.data[physical] = raw
+    bucket.etags[physical] = bucket._token()
+
+    assert run(retire_exact_async(store, key, raw)) is True
+    assert physical not in bucket.data
+
+
+def test_native_r2_exact_retirement_keeps_retryable_or_changed_source():
+    class FailedOrChanged(Bucket):
+        def __init__(self, replacement=None):
+            super().__init__()
+            self.replacement = replacement
+
+        async def delete(self, key):
+            self.calls.append(("delete", key))
+            if self.replacement is not None:
+                self.data[key] = self.replacement
+                self.etags[key] = self._token()
+            raise ConnectionError("delete response unknown")
+
+    key = "ingress/v1/pile/member/fid"
+    physical = "tenant/" + key
+    raw = b"durable intent"
+
+    retained = FailedOrChanged()
+    retained.data[physical] = raw
+    retained.etags[physical] = retained._token()
+    with pytest.raises(OutcomeUnknown, match="outcome unknown"):
+        run(retire_exact_async(
+            R2BindingStore(retained, "tenant"), key, raw))
+    assert retained.data[physical] == raw
+
+    changed = FailedOrChanged(b"replacement")
+    changed.data[physical] = raw
+    changed.etags[physical] = changed._token()
+    with pytest.raises(OSError, match="source changed"):
+        run(retire_exact_async(
+            R2BindingStore(changed, "tenant"), key, raw))
+    assert changed.data[physical] == b"replacement"
+
+
+def test_native_r2_exact_retirement_refuses_noop_and_authoritative_keys():
+    class NoopDelete(Bucket):
+        async def delete(self, key):
+            self.calls.append(("delete", key))
+
+    key, raw = "ingress/v1/pile/member/fid", b"durable intent"
+    bucket = NoopDelete()
+    bucket.data[key] = raw
+    bucket.etags[key] = bucket._token()
+    store = R2BindingStore(bucket)
+
+    with pytest.raises(OSError, match="did not remove"):
+        run(retire_exact_async(store, key, raw))
+    for authoritative in ("root", "obj/" + h(raw)):
+        bucket.data[authoritative] = raw
+        bucket.etags[authoritative] = bucket._token()
+        with pytest.raises(ValueError, match="not deletable"):
+            run(retire_exact_async(store, authoritative, raw))
+
+
+def test_native_r2_exact_retirement_never_converts_read_failure_to_success():
+    class InitialReadFails(Bucket):
+        async def get(self, key):
+            self.calls.append(("get", key))
+            raise ConnectionError("read unavailable")
+
+    with pytest.raises(StoreError, match="read failed"):
+        run(retire_exact_async(
+            R2BindingStore(InitialReadFails()),
+            "ingress/v1/pile/member/fid",
+            b"intent",
+        ))
+
+    class ReconcileReadFails(Bucket):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        async def get(self, key):
+            self.reads += 1
+            if self.reads > 1:
+                raise ConnectionError("reconciliation read unavailable")
+            return await super().get(key)
+
+        async def delete(self, key):
+            self.calls.append(("delete", key))
+            raise ConnectionError("delete response unknown")
+
+    key, raw = "ingress/v1/pile/member/fid", b"intent"
+    bucket = ReconcileReadFails()
+    bucket.data[key] = raw
+    bucket.etags[key] = bucket._token()
+    with pytest.raises(OutcomeUnknown, match="outcome unknown"):
+        run(retire_exact_async(
+            R2BindingStore(bucket), key, raw))
+    assert bucket.data[key] == raw
 
 
 def test_native_r2_bounded_read_rejects_known_oversize_before_allocation():
