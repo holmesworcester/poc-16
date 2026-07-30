@@ -177,8 +177,10 @@ def test_ordinary_append_does_not_scan_all_proofs_or_offers(
     discovered = []
     changed_ranges = manifest.changed_ranges
 
-    def bounded_ranges(root, keys, fetch, expected_workspace):
-        ranges = changed_ranges(root, keys, fetch, expected_workspace)
+    def bounded_ranges(
+            root, keys, fetch, expected_workspace, **transitions):
+        ranges = changed_ranges(
+            root, keys, fetch, expected_workspace, **transitions)
         discovered.append(sum(len(current) for _, current in ranges))
         return ranges
 

@@ -517,19 +517,24 @@ rule. A leaf is a closed pile; a closure sibling lists transitive dependencies
 whose home is outside that exact leaf. **RangeTree** is a logical map from each
 opaque ordered range separator to its leaf and closure oids. It uses the same
 persistent Merkle-treap primitive as every other authenticated tree; it is not
-a second tree implementation. On an additions-only commit the publisher
-performs one bounded authenticated predecessor/successor search per new key,
-verifies the selected old leaf pile, unions its members with the new keys, and
-path-copies the replacement wire-map rows. It neither enumerates RangeTree nor
-consults a SQLite range directory, calls `Node.keys`, or runs an unconditional
-corpus-wide ordered fact-key query. Equal subtrees have equal object ids, so
+a second tree implementation. An ordinary commit passes the exact added,
+removed, and edge/closure-refreshed keys derived by settlement. Each key needs
+one bounded authenticated predecessor/successor search and one verified old
+leaf pile. Addition splits at a content-derived boundary; ordinary removal
+rewrites one home leaf; removing the fact that formed a boundary joins only
+that leaf and its immediate successor. Refresh keeps the same members and
+re-encodes their fact/closure bytes. Overlapping windows merge before one
+path-copy batch, while unrelated windows remain independent.
+
+This works for activation, deactivation, restoration, and canonical-authority
+rewiring. The ordinary publisher neither enumerates RangeTree nor consults a
+SQLite range directory, calls `Node.keys`, or runs an unconditional
+corpus-wide ordered fact-key query. Only repair and format cutover retain the
+full SQLite-backed reference build. Equal subtrees have equal object ids, so
 sync descends only remote paths whose oids are not present in the local
-RangeTree. Repair, format cutover, deactivation, and canonical-authority
-changes deliberately retain the full SQLite-backed RangeTree reference build.
-The three Worker indexes are separate: once Catalog has derived the exact
-activated, deactivated, rank/edge-changed, and transitively liveness-affected
-fid sets, their logical rows path-copy only those deltas. Incremental and full
-compilation still produce byte-identical roots.
+RangeTree. The three Worker indexes are separate: once settlement has derived
+the same exact transition sets, their logical rows path-copy those deltas.
+Incremental and full compilation produce byte-identical roots.
 
 RangeTree is an authenticated wire map for synchronization and store recovery,
 not a fourth authorization index. A read-only database-free Worker does not

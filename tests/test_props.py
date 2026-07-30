@@ -15,7 +15,15 @@ import sqlite3
 import pytest
 import facts
 
-from core import btreap, cmds, indexes, manifest, mint, suppression_state
+from core import (
+    btreap,
+    cmds,
+    indexes,
+    manifest,
+    mint,
+    shape,
+    suppression_state,
+)
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact
@@ -863,8 +871,9 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
     real = node_module.resolve_deps
     real_ranges = manifest.changed_ranges
 
-    def observed_ranges(root, changed, fetch, workspace):
-        ranges = real_ranges(root, changed, fetch, workspace)
+    def observed_ranges(root, changed, fetch, workspace, **transitions):
+        ranges = real_ranges(
+            root, changed, fetch, workspace, **transitions)
         discovered.append(sum(len(current) for _, current in ranges))
         return ranges
 
@@ -928,6 +937,40 @@ def test_one_fact_hot_commit_never_enters_the_full_key_path(world):
     finally:
         n.keys = keys
     assert n.fact_of(ws, detached.fid) == detached
+
+
+def test_hot_boundary_deactivation_never_enters_the_full_key_path(world):
+    """Removing a member path-copies the affected boundary windows."""
+    n, ws = world
+    member_secret, member_public, _ = add_member(
+        n, ws, "boundary-member", ts=3_190_000)
+    for ts in range(3_200_000, 3_210_000):
+        target = message(
+            ws, member_public, "general", "boundary victim", ts)
+        if shape.boundary(target.fid):
+            break
+    else:
+        raise AssertionError("deterministic boundary search failed")
+    target_fid = author_msg(
+        n,
+        ws,
+        member_secret,
+        member_public,
+        "boundary victim",
+        ts,
+    ).fid
+    cmds.post(n, ws, "general", "later neighbor", ts=ts + 1)
+
+    keys = n.keys
+    n.keys = lambda *args: pytest.fail(
+        "hot deactivation called Node.keys")
+    try:
+        cmds.evict(n, ws, member_public)
+    finally:
+        n.keys = keys
+
+    assert n.fact_of(ws, target_fid) is None
+    assert n.store(ws).get("root") == full_manifest(n, ws)
 
 
 def test_shadow_guard_keeps_identity(world):

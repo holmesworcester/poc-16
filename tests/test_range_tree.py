@@ -115,3 +115,167 @@ def test_new_key_discovery_reads_one_authenticated_path_not_the_map(
     assert len(entries) > 2
     with pytest.raises(ValueError, match="changed range key"):
         manifest.changed_ranges(root, (None,), objects.get, WORKSPACE)
+
+
+def test_randomized_add_remove_and_refresh_windows_match_full_build():
+    """Every ordinary eligibility delta has one history-independent result."""
+    corpus = _corpus()
+    active = {fact.fid: fact for fact in corpus[:96]}
+    inactive = {fact.fid: fact for fact in corpus[96:]}
+    dependencies = {fid: () for fid in active}
+    objects = {}
+    _, root = manifest.build(
+        (fact.key for fact in active.values()),
+        active.get,
+        lambda fid: dependencies.get(fid, ()),
+        _emitter(objects),
+    )
+    rng = random.Random(90210)
+
+    for _ in range(80):
+        additions = rng.sample(
+            list(inactive.values()),
+            min(len(inactive), rng.randint(0, 4)),
+        )
+        removable = list(active.values())
+        removals = rng.sample(
+            removable,
+            min(len(removable) - 1, rng.randint(0, 4)),
+        )
+        removal_ids = {fact.fid for fact in removals}
+        refreshable = [
+            fact for fact in active.values()
+            if fact.fid not in removal_ids
+        ]
+        rewired = rng.sample(
+            refreshable,
+            min(len(refreshable), rng.randint(0, 3)),
+        )
+        rewired = list({
+            fact.fid: fact
+            for fact in (
+                *rewired,
+                *(
+                    fact for fact in refreshable
+                    if set(dependencies.get(fact.fid, ())) & removal_ids
+                ),
+            )
+        }.values())
+        impacted = {fact.fid for fact in rewired}
+        while True:
+            expanded = impacted | {
+                fact.fid for fact in refreshable
+                if set(dependencies.get(fact.fid, ())) & impacted
+            }
+            if expanded == impacted:
+                break
+            impacted = expanded
+        refreshed = [
+            active[fid] for fid in sorted(impacted)]
+        if not additions and not removals and not refreshed:
+            continue
+
+        ranges = manifest.changed_ranges(
+            root,
+            (fact.key for fact in additions),
+            objects.get,
+            WORKSPACE,
+            removed=(fact.key for fact in removals),
+            refreshed=(fact.key for fact in refreshed),
+        )
+        for fact in removals:
+            active.pop(fact.fid)
+            inactive[fact.fid] = fact
+            dependencies.pop(fact.fid, None)
+        for fact in additions:
+            inactive.pop(fact.fid)
+            active[fact.fid] = fact
+            dependencies[fact.fid] = ()
+        available = sorted(active)
+        for fact in rewired:
+            choices = [
+                fid for fid in available if fid != fact.fid]
+            dependencies[fact.fid] = (
+                rng.choice(choices),
+            ) if choices else ()
+
+        root = manifest.update(
+            root,
+            ranges,
+            active.get,
+            lambda fid: dependencies.get(fid, ()),
+            objects.get,
+            _emitter(objects),
+        )
+        _, clean = manifest.build(
+            (fact.key for fact in active.values()),
+            active.get,
+            lambda fid: dependencies.get(fid, ()),
+            lambda raw: h(raw),
+        )
+        assert root == clean
+
+
+def test_boundary_removal_reads_only_two_neighboring_leaves(monkeypatch):
+    """Removing a cut joins its old leaf to one successor, never the map."""
+    corpus = _corpus()
+    active = {fact.fid: fact for fact in corpus}
+    objects = {}
+    entries, root = manifest.build(
+        (fact.key for fact in corpus),
+        active.get,
+        lambda fid: (),
+        _emitter(objects),
+    )
+    boundary_fact = next(
+        fact for fact in corpus
+        if shape.boundary(fact.fid)
+        and any(entry.sep > fact.key for entry in entries)
+    )
+    touched = []
+
+    def fetch(oid):
+        touched.append(oid)
+        return objects.get(oid)
+
+    monkeypatch.setattr(
+        btreap.Reader,
+        "items",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("range removal enumerated the tree")),
+    )
+    replacements = manifest.changed_ranges(
+        root,
+        (),
+        fetch,
+        WORKSPACE,
+        removed=(boundary_fact.key,),
+    )
+
+    assert len(replacements) == 1
+    assert len(replacements[0].old_seps) == 2
+    assert boundary_fact.key not in replacements[0].keys
+    depth = json.loads(objects[root])["depth"]
+    assert len(set(touched)) <= 2 * depth + 2
+
+
+def test_transition_shape_rejects_nonresident_and_overlapping_keys():
+    facts = _facts(4)
+    active = {fact.fid: fact for fact in facts}
+    objects = {}
+    _, root = manifest.build(
+        (fact.key for fact in facts),
+        active.get,
+        lambda fid: (),
+        _emitter(objects),
+    )
+    absent = Fact("sample", 999, [], {"absent": True}, WORKSPACE)
+
+    with pytest.raises(ValueError, match="not resident"):
+        manifest.changed_ranges(
+            root, (), objects.get, WORKSPACE,
+            removed=(absent.key,))
+    with pytest.raises(ValueError, match="overlapping"):
+        manifest.changed_ranges(
+            root, (facts[0].key,), objects.get, WORKSPACE,
+            removed=(facts[0].key,))

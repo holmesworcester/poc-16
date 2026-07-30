@@ -3,9 +3,9 @@
 One entry maps a leaf's first opaque canonical key to its pile oid and closure
 sibling oid. The RangeTree uses the same persistent authenticated treap as the
 Worker indexes: full build defines one history-independent root, while an
-additions-only commit locates affected leaves through bounded authenticated
-neighbor reads and path-copies only their tree paths. Equal RangeTree subtrees
-and equal leaf piles have equal oids, so one-sided sync still prunes by oid.
+ordinary commit locates only the affected leaf windows through authenticated
+neighbor reads and path-copies their tree paths. Equal RangeTree subtrees and
+equal leaf piles have equal oids, so one-sided sync still prunes by oid.
 """
 from bisect import bisect_right
 from typing import NamedTuple
@@ -32,6 +32,13 @@ class Entry(NamedTuple):
     sep: str
     leaf: str
     closure: str
+
+
+class RangeReplacement(NamedTuple):
+    """Old leaf separators replaced by one canonical local key window."""
+
+    old_seps: tuple[str, ...]
+    keys: tuple[str, ...]
 
 
 class Root(NamedTuple):
@@ -113,25 +120,38 @@ def build(keys, fact_of, deps_of, emit):
     return entries, encode(entries, emit)
 
 
-def changed_ranges(root, keys, fetch, workspace):
-    """Verified old leaves plus new keys for an additions-only update.
+def changed_ranges(
+        root, keys, fetch, workspace, *, removed=(), refreshed=()):
+    """Return the authenticated local windows affected by one eligibility delta.
 
-    A new key has no exact row yet, so locate its predecessor and successor in
-    the published RangeTree. The old home pile supplies the bounded existing
-    members. Content-derived cuts never disappear, so insertion can only split
-    that old leaf; no database key directory or full tree walk is involved.
+    ``keys`` are additions, ``removed`` are old resident keys, and
+    ``refreshed`` keep their residence but require new fact/closure bytes.
+    Removing a content-derived boundary joins only its leaf and immediate
+    successor; every other transition touches one home leaf. Independent
+    windows remain independent, so this never enumerates the RangeTree.
     """
     if not root:
         raise ValueError("missing RangeTree")
     supplied = tuple(keys)
-    if any(not is_key(item) for item in supplied):
+    old = tuple(removed)
+    refresh = tuple(refreshed)
+    if any(
+            not is_key(item)
+            for item in (*supplied, *old, *refresh)):
         raise ValueError("changed range key")
-    changed = tuple(sorted(set(supplied)))
-    if not changed:
+    additions = tuple(sorted(set(supplied)))
+    removals = tuple(sorted(set(old)))
+    refreshes = tuple(sorted(set(refresh)))
+    if set(additions) & set(removals) \
+            or set(additions) & set(refreshes) \
+            or set(removals) & set(refreshes):
+        raise ValueError("overlapping range change")
+    if not additions and not removals and not refreshes:
         return ()
     reader = btreap.Reader(root, RANGE_SEED, fetch)
     members = {}
-    groups = {}
+    parent = {}
+    assignments = []
 
     def member_keys(found):
         if found.sep not in members:
@@ -140,7 +160,57 @@ def changed_ranges(root, keys, fetch, workspace):
                     found, fetch, workspace))
         return members[found.sep]
 
-    for item in changed:
+    def add_node(sep):
+        parent.setdefault(sep, sep)
+        return sep
+
+    def find(sep):
+        root_sep = sep
+        while parent[root_sep] != root_sep:
+            root_sep = parent[root_sep]
+        while parent[sep] != sep:
+            next_sep = parent[sep]
+            parent[sep] = root_sep
+            sep = next_sep
+        return root_sep
+
+    def join(left, right):
+        left, right = find(add_node(left)), find(add_node(right))
+        if left != right:
+            parent[right] = left
+
+    def checked_home(item):
+        before_row, after_row = reader.neighbors(item)
+        before = _entry(*before_row) if before_row else None
+        after = _entry(*after_row) if after_row else None
+        before_keys = member_keys(before) if before is not None else ()
+        if before is None or item not in before_keys:
+            raise ValueError("changed range is not resident")
+        return before, after
+
+    def successor(found):
+        page = reader.range_page(
+            found.sep, "\uffff", after=found.sep, limit=1)
+        return _entry(*page.rows[0]) if page.rows else None
+
+    for item in removals:
+        home, after = checked_home(item)
+        node = add_node(home.sep)
+        assignments.append((node, (), (item,)))
+        if boundary(fid_of(item)):
+            if after is not None and after.sep == home.sep:
+                after = successor(home)
+            successor = after.sep if after is not None else None
+            if after is not None:
+                member_keys(after)
+            join(node, successor)
+
+    for item in refreshes:
+        home, _ = checked_home(item)
+        node = add_node(home.sep)
+        assignments.append((node, (), ()))
+
+    for item in additions:
         before_row, after_row = reader.neighbors(item)
         before = _entry(*before_row) if before_row else None
         after = _entry(*after_row) if after_row else None
@@ -160,13 +230,38 @@ def changed_ranges(root, keys, fetch, workspace):
                 if not boundary(fid_of(before_keys[-1])) else None
         if home is not None:
             member_keys(home)
-        groups.setdefault(home.sep if home else None, set()).add(item)
+        node = add_node(home.sep if home else None)
+        assignments.append((node, (item,), ()))
 
-    out = []
-    for old_sep, additions in groups.items():
-        old = members.get(old_sep, ())
-        out.append((old_sep, tuple(sorted((*old, *additions)))))
-    return tuple(sorted(out, key=lambda row: row[0] or "\uffff"))
+    groups = {}
+    for sep in parent:
+        group = groups.setdefault(
+            find(sep), {"old": set(), "keys": set()})
+        if sep is not None:
+            group["old"].add(sep)
+            group["keys"].update(members[sep])
+    for node, added, removed_keys in assignments:
+        group = groups[find(node)]
+        if not set(removed_keys) <= group["keys"] \
+                or set(added) & group["keys"]:
+            raise ValueError("inconsistent range change")
+        group["keys"].difference_update(removed_keys)
+        group["keys"].update(added)
+
+    replacements = [
+        RangeReplacement(
+            tuple(sorted(group["old"])),
+            tuple(sorted(group["keys"])),
+        )
+        for group in groups.values()
+    ]
+    return tuple(sorted(
+        replacements,
+        key=lambda change: (
+            change.old_seps[0] if change.old_seps
+            else change.keys[0] if change.keys else "\uffff",
+        ),
+    ))
 
 
 def update(root, ranges, fact_of, deps_of, fetch, emit):
@@ -174,13 +269,28 @@ def update(root, ranges, fact_of, deps_of, fetch, emit):
     if not root:
         raise ValueError("missing RangeTree")
     changes = {}
-    for old_sep, keys in ranges:
-        if old_sep is not None:
-            if not is_key(old_sep):
-                raise ValueError("manifest separator")
-            changes[old_sep] = None
-        for chunk in _chunks(tuple(keys), fid_of):
+    replacements = tuple(ranges)
+    if any(not isinstance(change, RangeReplacement)
+           for change in replacements):
+        raise ValueError("manifest replacement")
+    old_seps = [
+        sep for change in replacements for sep in change.old_seps]
+    if len(old_seps) != len(set(old_seps)) \
+            or any(not is_key(sep) for sep in old_seps):
+        raise ValueError("manifest separator")
+    for old_sep in old_seps:
+        changes[old_sep] = None
+    inserted = set()
+    for replacement in replacements:
+        keys = replacement.keys
+        if tuple(sorted(set(keys))) != keys \
+                or any(not is_key(item) for item in keys):
+            raise ValueError("manifest replacement keys")
+        for chunk in _chunks(keys, fid_of):
             entry = _range(chunk, fact_of, deps_of, emit)
+            if entry.sep in inserted:
+                raise ValueError("overlapping manifest replacement")
+            inserted.add(entry.sep)
             changes[entry.sep] = _value(entry)
     return btreap.update(
         root, RANGE_SEED, sorted(changes.items()), fetch,

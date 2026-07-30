@@ -137,7 +137,6 @@ class Publisher:
         changed = settlement.activated
         deactivated = set(settlement.deactivated)
         updated = settlement.updated
-        authority_changed = settlement.authority_changed
         changed_sids = settlement.changed_sids
         cache = {}
 
@@ -160,10 +159,6 @@ class Publisher:
                 objects[oid] = store.get("obj/" + oid)
             return objects[oid]
 
-        incremental = reuse and not forced_rebuild \
-            and not authority_changed and not deactivated \
-            and previous_root is not None
-
         previous = None
         if previous_root:
             try:
@@ -172,12 +167,23 @@ class Publisher:
                 pass
             if previous is not None and previous.anchor != ws:
                 raise ValueError("root anchor")
-        if incremental and previous and previous.manifest:
-            if changed:
-                changed_ranges = manifest.changed_ranges(
-                    previous.manifest,
-                    (node.fact_of(ws, fid).key for fid in changed),
-                    fetch, ws)
+        incremental = reuse and not forced_rebuild \
+            and previous is not None and bool(previous.manifest)
+        if incremental:
+            changed_ranges = manifest.changed_ranges(
+                previous.manifest,
+                (node.fact_of(ws, fid).key for fid in changed),
+                fetch,
+                ws,
+                removed=(
+                    node.candidate_of(ws, fid).key
+                    for fid in deactivated
+                ),
+                refreshed=(
+                    node.fact_of(ws, fid).key for fid in updated
+                ),
+            )
+            if changed_ranges:
                 manifest_oid = manifest.update(
                     previous.manifest, changed_ranges,
                     lambda fid: node.fact_of(ws, fid), deps_of, fetch, emit)
@@ -200,7 +206,7 @@ class Publisher:
             if tree_incremental else (),
             changed_sids=changed_sids if tree_incremental else ())
         action_etag = previous.action_etag \
-            if incremental and not changed_sids and previous \
+            if previous is not None and not changed_sids \
             else suppression_state.etag(idx)
         root = manifest.encode_root(
             ws, manifest_oid,
