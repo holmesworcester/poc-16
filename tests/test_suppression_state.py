@@ -5,10 +5,12 @@ import os
 import pytest
 
 import facts
-from core import cmds, suppression_state
+from core import catalog, cmds, suppression_state
+from core.candidate_archive import CandidateView
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
+from core.ingress import stage_pile
 from core.node import Node
 from core import sync as sync_module
 from facts.auth.removal import removal
@@ -29,7 +31,10 @@ from .util import (
 
 def _action_rows(node, workspace):
     return node.idx(workspace).execute(
-        "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
+        "SELECT a.sid, a.fid, r.proof "
+        "FROM actions a "
+        "JOIN admission_receipts r ON r.fid=a.fid "
+        "ORDER BY a.sid").fetchall()
 
 
 def _signed_pile(node, workspace, fact, signed, deps):
@@ -282,9 +287,9 @@ def test_action_sync_compares_witnesses_not_fact_id_order(tmp_path):
         == (first.fid,)
 
 
-def test_action_evidence_recanonicalizes_across_equivalent_providers(
-        tmp_path):
-    """Proof closure bytes follow the union, not the sender's winning edge."""
+def test_action_witness_remains_historical_across_current_provider_rewire(
+        tmp_path, monkeypatch):
+    """Current dependency settlement never rewrites historical admission."""
     base = Node(str(tmp_path / "base"))
     workspace = cmds.create(base, "alice", ts=1)
     founder_secret, founder = base.identity(workspace)
@@ -331,12 +336,41 @@ def test_action_evidence_recanonicalizes_across_equivalent_providers(
         _action_rows(peer, workspace)[0][2]
         for peer, _, _, _ in peers
     ]
-    assert evidence[0] == evidence[1]
+    assert evidence == [left_evidence, right_evidence]
     assert left[0].store(workspace).get("root") \
-        == right[0].store(workspace).get("root")
+        != right[0].store(workspace).get("root")
+
+    # Joining the lower complete witness is a FactTree-only transition. It
+    # must update the active-action sync hint without rebuilding current
+    # eligibility or refreshing RangeTree pile bytes.
+    lower = 0 if evidence[0] < evidence[1] else 1
+    source, target_peer = peers[lower][0], peers[1 - lower][0]
+    source_store = source.store(workspace)
+    selected = CandidateView(
+        source_store.get("root"),
+        lambda oid: source_store.get("obj/" + oid),
+    ).verify(left[3])
+    raw = encode_pile(selected.facts, workspace=workspace)
+    before = json.loads(target_peer.store(workspace).get("root"))
+    with monkeypatch.context() as context:
+        context.setattr(
+            catalog, "rebuild_proofs",
+            lambda *_args, **_kwargs: pytest.fail(
+                "witness-only join rebuilt current standing"))
+        deliver(target_peer, workspace, raw)
+        target_peer.turn(workspace)
+    after = json.loads(target_peer.store(workspace).get("root"))
+
+    assert before["manifest"] == after["manifest"]
+    assert before["action_etag"] != after["action_etag"]
+    assert _action_rows(target_peer, workspace)[0][2] == evidence[lower]
+    full = target_peer.store(workspace).get("root")
+    target_peer.commit(workspace, reuse=False)
+    assert target_peer.store(workspace).get("root") == full
+
     for peer, _, posted, _ in peers:
         peer.rebuild(workspace)
-        assert _action_rows(peer, workspace)[0][2] == evidence[0]
+        assert _action_rows(peer, workspace)[0][2] == evidence[lower]
         assert posted not in visible_fids(peer, workspace)
 
 
@@ -396,8 +430,7 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
             return tuple(self.obj(oid) for oid in oids)
 
         def put_pile(self, raw):
-            source.store(self.ws).put(
-                f"pile/peer/{h(raw)}", raw)
+            stage_pile(source.store(self.ws), "peer", raw)
             source.turn(self.ws)
 
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)

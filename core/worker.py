@@ -22,6 +22,8 @@ class WorkerView:
     @classmethod
     def from_root(cls, root_bytes, fetch):
         root = manifest.decode_root(root_bytes)
+        if root.layout_seed != indexes.layout_seed(root.anchor):
+            raise ValueError("composite layout seed")
         if not all(root.trees[name]["root"] for name in indexes.TREE_NAMES):
             raise ValueError("composite root is not Worker-readable")
         return cls(
@@ -41,11 +43,11 @@ class WorkerView:
 
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
-            limit=btreap.MAX_RANGE_ROWS):
+            limit=btreap.MAX_RANGE_ROWS, include_dormant=False):
         """One bounded generic-index page for a cold publisher/query."""
         return indexes.posting_page(
             self._reader(indexes.FACT), kind, k0, k1,
-            after=after, limit=limit)
+            after=after, limit=limit, include_dormant=include_dormant)
 
     def fact_location(self, fid):
         """Canonical reconciliation key locating this fact's home range."""
@@ -69,7 +71,8 @@ class WorkerView:
 
     def fact_active(self, fid):
         record = self.fact_record(fid)
-        return self.scopes_active(record["selectors"]) \
+        return record["state"] == "eligible" \
+            and self.scopes_active(record["selectors"]) \
             and self.scopes_active(record["liveness"])
 
     def principal_active(self, kind, public_key):

@@ -1,34 +1,42 @@
-"""Canonical RangeTree over closed home-leaf piles.
+"""Canonical RangeTree over home-leaf references.
 
-One entry maps a leaf's first opaque canonical key to its pile oid and closure
-sibling oid. The RangeTree uses the same persistent authenticated treap as the
-Worker indexes: full build defines one history-independent root, while an
-ordinary commit locates only the affected leaf windows through authenticated
-neighbor reads and path-copies their tree paths. Equal RangeTree subtrees and
-equal leaf piles have equal oids, so one-sided sync still prunes by oid.
+One entry maps a leaf's first opaque canonical key to a canonical ordered
+``(key, fact-object-oid)`` vector and a closure-sibling oid. Fact bodies have
+one residence at ``obj/H(encode(fact))``; RangeTree is only a derived transfer
+map. It uses the same persistent authenticated treap as the Worker indexes:
+full build defines one history-independent root, while an ordinary commit
+locates only the affected leaf windows through authenticated neighbor reads
+and path-copies their tree paths. Equal RangeTree subtrees and equal reference
+leaves have equal oids, so one-sided sync still prunes by oid.
 """
 from bisect import bisect_right
 from typing import NamedTuple
 
 from . import btreap
 from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
-from .close import decode_pile, encode_pile
 from .crypto import h
-from .fact import canon
-from .limits import MAX_ROOT_BYTES, decode_json
+from .fact import (
+    bound_to,
+    canon,
+    decode as decode_fact,
+    encode as encode_fact,
+)
+from .limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, decode_json
 from .shape import boundary, fid_of, is_key, key, stable_cut_positions, valid_fid
 from .object_store import verified_object
 
 # The one format identity. Written into the root; checked by decode_root.
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
-LAYOUT = "composite-btreap-v7-generic-candidate-index"
+PREVIOUS_LAYOUT = "composite-btreap-v7-generic-candidate-index"
+LAYOUT = "composite-btreap-v8-admission-proof-archive"
 TREE_NAMES = ("fact", "supp", "authority")
 RANGE_SEED = h(canon(["range-tree-v1"]))
+RANGE_LEAF_SCHEMA = "range-leaf-refs-v1"
 
 
 class Entry(NamedTuple):
-    """One home leaf: first key, pile oid, closure-sibling oid ("" if none)."""
+    """One home leaf: first key, ref-vector oid, closure oid ("" if none)."""
     sep: str
     leaf: str
     closure: str
@@ -79,14 +87,26 @@ def _entry(sep, value):
     return Entry(sep, *value)
 
 
+def checked_entry(row):
+    """Strictly decode one authenticated RangeTree ``(key, value)`` row."""
+    if not isinstance(row, (list, tuple)) or len(row) != 2:
+        raise ValueError("manifest entry")
+    return _entry(row[0], row[1])
+
+
 def _range(keys, fact_of, deps_of, emit):
-    members = []
+    members, references = [], []
     for wanted in keys:
         fact = fact_of(fid_of(wanted))
         if fact is None or key(fact) != wanted:
             raise ValueError("manifest member")
         members.append(fact)
-    leaf = _put(encode_pile(members), emit)
+        raw = encode_fact(fact)
+        references.append([wanted, h(raw)])
+    leaf = _put(canon({
+        "refs": references,
+        "schema": RANGE_LEAF_SCHEMA,
+    }), emit)
 
     def key_of(fid):
         fact = fact_of(fid)
@@ -99,15 +119,57 @@ def _range(keys, fact_of, deps_of, emit):
     return Entry(keys[0], leaf, closure)
 
 
-def range_members(entry, fetch, workspace):
-    """Verify and decode one RangeTree row's canonical home-leaf pile."""
-    held, blobs = decode_pile(
-        verified_object(entry.leaf, fetch), workspace)
-    keys = [key(fact) for fact in held]
-    if blobs or not keys or keys != sorted(set(keys)) \
-            or entry.sep != keys[0] \
-            or len(_chunks(keys, fid_of)) != 1:
+def range_references(entry, fetch):
+    """Verify one leaf and return its ordered ``(key, raw oid)`` rows."""
+    raw = verified_object(entry.leaf, fetch)
+    value = decode_json(raw, MAX_OBJECT_BYTES, "range leaf")
+    refs = value.get("refs") if isinstance(value, dict) else None
+    if not (
+            isinstance(value, dict)
+            and set(value) == {"refs", "schema"}
+            and value["schema"] == RANGE_LEAF_SCHEMA
+            and canon(value) == raw
+            and isinstance(refs, list)
+            and refs
+            and all(
+                isinstance(row, list) and len(row) == 2
+                and is_key(row[0]) and valid_fid(row[1])
+                for row in refs)
+            and refs == sorted(refs)
+            and len({row[0] for row in refs}) == len(refs)):
         raise ValueError("manifest range")
+    keys = [row[0] for row in refs]
+    if entry.sep != keys[0] or len(_chunks(keys, fid_of)) != 1:
+        raise ValueError("manifest range")
+    return tuple((address, oid) for address, oid in refs)
+
+
+def range_members(entry, fetch, workspace, *, wanted=None):
+    """Fetch, hash-check, and decode facts named by one reference leaf.
+
+    A fetcher may expose ``many(oids)``; remote reconciliation then obtains
+    fact objects in provider-sized batches while the same function remains
+    usable by a local point reader. ``wanted`` narrows a cold closure fetch
+    after the complete authenticated reference vector has been checked.
+    """
+    references = range_references(entry, fetch)
+    by_key = dict(references)
+    addresses = tuple(by_key) if wanted is None else tuple(sorted(set(wanted)))
+    if any(address not in by_key for address in addresses):
+        raise ValueError("manifest range member")
+    oids = tuple(by_key[address] for address in addresses)
+    many = getattr(fetch, "many", None)
+    raws = tuple(many(oids)) if callable(many) else tuple(
+        fetch(oid) for oid in oids)
+    if len(raws) != len(oids):
+        raise ValueError("manifest range fetch")
+    held = []
+    for address, oid, raw in zip(addresses, oids, raws):
+        fact = decode_fact(verified_object(oid, lambda _oid, raw=raw: raw))
+        if encode_fact(fact) != raw or key(fact) != address \
+                or not bound_to(fact, workspace):
+            raise ValueError("manifest range member")
+        held.append(fact)
     return held
 
 
@@ -156,8 +218,7 @@ def changed_ranges(
     def member_keys(found):
         if found.sep not in members:
             members[found.sep] = tuple(
-                key(fact) for fact in range_members(
-                    found, fetch, workspace))
+                address for address, _ in range_references(found, fetch))
         return members[found.sep]
 
     def add_node(sep):
@@ -389,14 +450,14 @@ def encode_root(
     })
 
 
-def decode_root(raw):
+def _decode_root(raw, stamp):
     """Decode and validate one published snapshot.
 
     Any malformed shape or foreign stamp is the wholesale-rebuild trigger;
     there is deliberately no compatibility path.
     """
     o = decode_json(raw, MAX_ROOT_BYTES, "root")
-    if not isinstance(o, dict) or o.get("stamp") != LAYOUT:
+    if not isinstance(o, dict) or o.get("stamp") != stamp:
         raise ValueError("root stamp")
     trees = o.get("trees")
     if not (set(o) == {
@@ -416,6 +477,15 @@ def decode_root(raw):
         {name: dict(trees[name]) for name in TREE_NAMES},
         o["action_etag"],
     )
+
+
+def decode_root(raw):
+    return _decode_root(raw, LAYOUT)
+
+
+def decode_previous_root(raw):
+    """Decode the one immediately preceding layout for proof cutover only."""
+    return _decode_root(raw, PREVIOUS_LAYOUT)
 
 
 def _trees_ok(trees):

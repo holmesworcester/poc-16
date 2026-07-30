@@ -9,6 +9,7 @@ from core import cmds
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
+from core.ingress import stage_pile
 from core.node import Node
 from core.object_store import Applied
 from facts.content import message as message_family
@@ -47,22 +48,29 @@ def _shared_nodes(
 
 def _observe_retirements(
         monkeypatch, trace, node, before_retire=None):
-    retire = node._retire_ingress_exact
+    published = node._retire_published_ingress
+    rejected = node._retire_rejected_ingress
 
-    def observed(workspace, key, raw):
+    def observe_published(workspace, key, raw, receipt):
         trace.observe_node_retirement(
             node, workspace, key, raw)
         if before_retire is not None:
             before_retire()
-        return retire(workspace, key, raw)
+        return published(workspace, key, raw, receipt)
 
-    monkeypatch.setattr(node, "_retire_ingress_exact", observed)
+    def observe_rejected(workspace, key, raw, receipt):
+        if before_retire is not None:
+            before_retire()
+        return rejected(workspace, key, raw, receipt)
+
+    monkeypatch.setattr(
+        node, "_retire_published_ingress", observe_published)
+    monkeypatch.setattr(
+        node, "_retire_rejected_ingress", observe_rejected)
 
 
 def _put_pile(store, raw, member="shared"):
-    key = f"pile/{member}/{h(raw)}"
-    store.put_if_absent(key, raw)
-    return key
+    return stage_pile(store, member, raw)
 
 
 def _forge_rejection(store, source, raw, error_type):
@@ -477,8 +485,10 @@ def test_failure_reports_first_unsupported_delete_and_replay_prefix():
 def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
     root = __file__.rsplit("/tests/", 1)[0]
     deletes = production_call_sites(root, "delete")
-    retirements = production_call_sites(
-        root, "_retire_ingress_exact")
+    published = production_call_sites(
+        root, "_retire_published_ingress")
+    rejected = production_call_sites(
+        root, "_retire_rejected_ingress")
 
     assert [
         (
@@ -499,13 +509,22 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
             site.path, site.function, site.line,
             site.receiver, site.use,
         )
-        for site in retirements
+            for site in published
+        ] == [
+        ("core/runtime.py", "turn", 73, "node", "direct"),
+        ("core/runtime.py", "turn", 110, "node", "direct"),
+    ]
+    assert [
+        (
+            site.path, site.function, site.line,
+            site.receiver, site.use,
+        )
+        for site in rejected
     ] == [
-            (
-                "core/node.py", "_quarantine_ingress", 204,
-                "self", "direct"),
-            ("core/runtime.py", "turn", 99, "node", "direct"),
-        ]
+                    (
+                    "core/node.py", "_quarantine_ingress", 260,
+                    "self", "direct"),
+    ]
 
 
 def test_delete_inventory_reports_alias_and_dynamic_capability(tmp_path):

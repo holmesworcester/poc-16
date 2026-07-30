@@ -318,6 +318,79 @@ def test_layout_stamp_forces_rebuild(tmp_path):
     assert republished == honest and all_fids(node, ws) == before
 
 
+def test_real_v7_pile_leaves_cut_over_to_v8_reference_residences(tmp_path):
+    """The one supported old layout is decoded with its actual leaf codec."""
+    node = Node(str(tmp_path / "node"))
+    ws = cmds.create(node, "alice", ts=1)
+    ts, cuts = 10, 0
+    while cuts < 1:
+        fid = cmds.post(
+            node, ws, "general", f"legacy-{ts}", ts=ts)
+        cuts += shape.boundary(fid)
+        ts += 1
+    cmds.post(node, ws, "general", "after legacy cut", ts=ts)
+    store = node.store(ws)
+    current = store.get("root")
+    body = json.loads(current)
+    facts_by_fid = {
+        fid: node.fact_of(ws, fid) for fid in all_fids(node, ws)}
+    keys = sorted(fact.key for fact in facts_by_fid.values())
+    cuts = shape.stable_cut_positions(
+        [shape.fid_of(address) for address in keys])
+    chunks = [
+        keys[start:stop]
+        for start, stop in zip([0] + cuts, cuts + [len(keys)])
+        if stop > start
+    ]
+
+    def emit(raw):
+        oid = h(raw)
+        store.put_if_absent("obj/" + oid, raw)
+        return oid
+
+    def deps(fid):
+        return resolve_deps(facts_by_fid[fid], node.idx(ws)) or ()
+
+    entries = []
+    for addresses in chunks:
+        members = [
+            facts_by_fid[shape.fid_of(address)]
+            for address in addresses
+        ]
+        leaf = emit(encode_pile(members, workspace=ws))
+        outside = manifest.closure_keys(
+            members, deps, lambda fid: facts_by_fid[fid].key)
+        closure = emit(canon({"keys": outside})) if outside else ""
+        entries.append(manifest.Entry(addresses[0], leaf, closure))
+    old_manifest = manifest.encode(entries, emit)
+    store._replace("root", canon({
+        **body,
+        "manifest": old_manifest,
+        "stamp": manifest.PREVIOUS_LAYOUT,
+    }))
+    siblings = [entry.closure for entry in entries if entry.closure]
+    assert siblings
+    sibling = siblings[0]
+    sibling_raw = store.get("obj/" + sibling)
+
+    store._delete("obj/" + sibling)
+    with pytest.raises(ValueError, match="object integrity"):
+        node.rebuild(ws)
+    store.put_if_absent("obj/" + sibling, sibling_raw)
+    store._replace("obj/" + sibling, b"corrupt")
+    with pytest.raises(ValueError, match="object integrity"):
+        node.rebuild(ws)
+    store._replace("obj/" + sibling, sibling_raw)
+
+    node.rebuild(ws)
+
+    assert store.get("root") == current
+    assert manifest.decode_root(store.get("root")).manifest == body["manifest"]
+    assert all(
+        node.fact_of(ws, fid) == fact
+        for fid, fact in facts_by_fid.items())
+
+
 # ---- oyd.3: sync rewrite ----------------------------------------------------
 
 
@@ -768,7 +841,8 @@ def test_production_deletion_family(tmp_path):
     assert removal == delete_family.delete(
         ws, node.identity_id(ws), victim.key, OWNER, 20)
     action = node.idx(ws).execute(
-        "SELECT fid, evidence FROM actions WHERE sid=?",
+        "SELECT a.fid, r.proof FROM actions a "
+        "JOIN admission_receipts r ON r.fid=a.fid WHERE a.sid=?",
         (f"fact:{victim_fid}",)).fetchone()
     assert action and action[0] == fid
     assert node.store(ws).has("obj/" + action[1])

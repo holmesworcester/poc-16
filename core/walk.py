@@ -145,7 +145,10 @@ class Peer:
             if error.code != 413:
                 raise
             if len(oids) == 1:
-                raise ValueError("single object exceeds page batch") from error
+                # Batch responses are capped below the valid single-object
+                # limit. Fall back to the hash-addressed GET instead of making
+                # a large-but-valid canonical fact impossible to reconcile.
+                return (self.obj(oids[0]),)
             middle = len(oids) // 2
             return self.objs(oids[:middle]) + self.objs(oids[middle:])
         values = decode_json(

@@ -1,5 +1,6 @@
 """Compile one eligible client snapshot and advance its root by one CAS."""
 import json
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from . import catalog, indexes, manifest, suppression_state
@@ -38,10 +39,41 @@ class PublicationPlan(NamedTuple):
     activated: tuple
     deactivated: tuple
     updated: tuple
+    witnesses: tuple
     authority_changed: bool
     changed_sids: tuple
+    admitted: tuple
     base_root: bytes | None
     base_token: VersionToken | Absent
+
+
+class PublicationResult(NamedTuple):
+    """Exact authorized-root outcome without ingress-retirement authority."""
+
+    workspace: str
+    root: bytes | None
+    admitted: tuple
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class PublicationReceipt:
+    """Node-minted authority to retire one exact published ingress value.
+
+    Value fields explain the durable publication event.  ``issuer`` binds the
+    receipt to the node that admitted it, while identity equality lets that
+    node reject caller-constructed copies even when every visible field was
+    copied from a genuine receipt.
+    """
+
+    workspace: str
+    root: bytes | None
+    admitted: tuple
+    outcome: str
+    source: str | None
+    payload: str | None
+    generation: str
+    issuer: object = field(repr=False, compare=False)
 
 
 class Publisher:
@@ -73,8 +105,17 @@ class Publisher:
         return base
 
     @staticmethod
-    def plan(change, base):
-        return PublicationPlan(*change, base.root, base.token)
+    def plan(change, base, admitted=()):
+        return PublicationPlan(
+            *change, tuple(sorted(set(admitted))), base.root, base.token)
+
+    def _result(self, root, admitted, outcome):
+        return PublicationResult(
+            self.workspace,
+            root,
+            tuple(sorted(set(admitted))),
+            outcome,
+        )
 
     def dirty(self, base):
         """Remember the publication base before catalog state moves ahead."""
@@ -118,6 +159,33 @@ class Publisher:
             raise
 
     def publish(self, settlement, *, reuse=True):
+        """Publish ordinary local/repair state without retirement authority."""
+        return self._publish(settlement, reuse=reuse)
+
+    def _publish_ingress(self, admission, *, reuse=True):
+        """Publish one already-bound admission and bind the exact result."""
+        from .ingress import check_source
+
+        if admission.workspace != self.workspace:
+            raise ValueError("publication ingress workspace")
+        binding = check_source(admission.source, admission.raw)
+        if admission.payload != h(admission.raw):
+            raise ValueError("publication ingress payload")
+        if admission.generation != binding.generation:
+            raise ValueError("publication ingress generation")
+        result = self._publish(admission.settlement, reuse=reuse)
+        return PublicationReceipt(
+            result.workspace,
+            result.root,
+            result.admitted,
+            result.outcome,
+            admission.source,
+            admission.payload,
+            admission.generation,
+            admission.issuer,
+        )
+
+    def _publish(self, settlement, *, reuse=True):
         node, ws = self.node, self.workspace
         store, idx = node.store(ws), node.idx(ws)
         forced_rebuild = idx.execute(
@@ -132,11 +200,19 @@ class Publisher:
                     raise RootChanged(
                         "root changed during rootless publication")
                 self.stamp(None, settlement.received)
-            return None
+            return self._result(
+                None, settlement.admitted, "rootless")
 
         changed = settlement.activated
         deactivated = set(settlement.deactivated)
-        updated = settlement.updated
+        transitioned = set(changed) | deactivated
+        # A dormant witness-only update changes FactTree but has no RangeTree
+        # residence to refresh.
+        updated = tuple(
+            fid for fid in settlement.updated
+            if fid not in transitioned
+            and node.fact_of(ws, fid) is not None
+        )
         changed_sids = settlement.changed_sids
         cache = {}
 
@@ -196,15 +272,34 @@ class Publisher:
                 deps_of, emit)
         tree_incremental = reuse and not forced_rebuild \
             and previous is not None and previous_root is not None
-        seed, trees = indexes.build(
-            ws, idx, lambda fid: node.candidate_of(ws, fid), emit,
+        candidate_changes = tuple(sorted(set(
+            settlement.received
+            + settlement.activated
+            + settlement.deactivated
+            + settlement.updated
+            + settlement.witnesses
+        )))
+        candidate_fids = candidate_changes if tree_incremental else \
+            node.catalog(ws).publication_ids(settlement.received)
+        built_indexes = indexes.build(
+            ws, idx, emit,
             previous=previous.trees if previous else {},
             fetch=fetch,
-            changed_fids=tuple((*changed, *updated))
-            if tree_incremental else None,
-            removed_fids=tuple(sorted(deactivated))
-            if tree_incremental else (),
-            changed_sids=changed_sids if tree_incremental else ())
+            changed_fids=candidate_changes if tree_incremental else None,
+            changed_sids=changed_sids if tree_incremental else (),
+            candidate_fids=candidate_fids)
+        seed, trees = built_indexes.seed, built_indexes.trees
+        must_compile = set(
+            settlement.received + settlement.witnesses)
+        represented = set(built_indexes.represented)
+        if tree_incremental:
+            # Exact duplicate/higher-witness Valids already reside in the
+            # pinned authorized base. New candidates and winning witness joins
+            # may never claim that induction step: this build must emit them.
+            represented.update(set(settlement.admitted) - must_compile)
+        if not set(settlement.admitted) <= represented \
+                or not must_compile <= set(built_indexes.represented):
+            raise ValueError("publication omitted admitted candidate")
         action_etag = previous.action_etag \
             if previous is not None and not changed_sids \
             else suppression_state.etag(idx)
@@ -219,8 +314,10 @@ class Publisher:
                     or current.value != settlement.base_root:
                 raise RootChanged("root changed during publication")
             self.stamp(root, settlement.received)
-            return root
+            return self._result(
+                root, settlement.admitted, "noop")
         unknown = None
+        outcome = None
         for _ in range(2):
             try:
                 result = store.cas(
@@ -229,11 +326,13 @@ class Publisher:
                 unknown = error
             else:
                 if isinstance(result, Applied):
+                    outcome = "applied"
                     break
                 if result is not STALE:
                     raise TypeError("conditional-replace result")
             current = store.read_versioned("root")
             if isinstance(current, Versioned) and current.value == root:
+                outcome = "confirmed"
                 break
             if current is ABSENT:
                 current_root, current_token = None, ABSENT
@@ -245,4 +344,5 @@ class Publisher:
         else:
             raise unknown or RootChanged("root changed during publication")
         self.stamp(root, settlement.received)
-        return root
+        return self._result(
+            root, settlement.admitted, outcome)

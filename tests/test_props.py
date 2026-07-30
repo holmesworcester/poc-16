@@ -173,8 +173,8 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
 
 def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
     """A root naming a leaf pile whose fact set deviates from the canonical
-    settle — a smuggled extra fact, or members shuffled across leaves — is
-    caught by resident()'s single rebuild equality ("store placement")."""
+    candidate archive — a smuggled extra fact, or members shuffled across
+    leaves — is rejected before it can seed the local catalog."""
     n, ws = world
     st = n.store(ws)
     before = all_fids(n, ws)
@@ -188,14 +188,24 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
         st._replace("obj/" + oid, raw)
         return oid
 
-    # A smuggled fact with no proof chain breaks store closure.
+    def forged_root(man):
+        return manifest.encode_root(
+            ws, man,
+            action_etag=body["action_etag"],
+            layout_seed=body["layout_seed"],
+            trees=body["trees"],
+        )
+
+    # Keep the honest candidate trees while smuggling an unrecorded fact into
+    # RangeTree. A verifier must compare both root-authenticated structures.
     hidden = Fact("sample", 0, [], {"hidden": True}, ws)
     members = decode_pile(fetch(entries[0].leaf), ws)[0]
     smuggled = entries[0]._replace(
+        sep=hidden.key,
         leaf=emit(encode_pile([hidden] + members, workspace=ws)))
     man = manifest.encode([smuggled] + list(entries[1:]), emit)
-    st._replace("root", manifest.encode_root(ws, man))
-    with pytest.raises(ValueError, match="invalid store facts"):
+    st._replace("root", forged_root(man))
+    with pytest.raises(ValueError, match="candidate residence partition"):
         n.rebuild(ws)
 
     # The same members shuffled across leaves break the rebuild equality.
@@ -208,9 +218,10 @@ def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
             leaf=emit(encode_pile(
                 [first[-1]] + second, workspace=ws))),
     ] + list(entries[2:])
-    st._replace("root", manifest.encode_root(
-        ws, manifest.encode(moved, emit)))
-    with pytest.raises(ValueError, match="store placement"):
+    st._replace("root", forged_root(manifest.encode(moved, emit)))
+    with pytest.raises(
+            ValueError,
+            match="manifest range|eligible RangeTree placement"):
         n.rebuild(ws)
 
     st._replace("root", honest)
@@ -230,7 +241,7 @@ def test_rebuild_rejects_a_non_durable_resident_family(
     assert all_fids(node, workspace) == before
 
 
-def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
+def test_rebuild_rejects_an_incomplete_empty_root_without_its_anchor(
         tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
@@ -242,7 +253,7 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
     store._replace(
         "root", manifest.encode_root(workspace, empty))
 
-    with pytest.raises(ValueError, match="store fact set"):
+    with pytest.raises(ValueError, match="candidate archive is incomplete"):
         node.rebuild(workspace)
 
     assert all_fids(node, workspace) == before
@@ -633,7 +644,7 @@ def full_manifest(n, ws):
         n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of,
         lambda raw: None)
     seed, trees = indexes.build(
-        ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
+        ws, idx, lambda raw: h(raw))
     return manifest.encode_root(
         ws, man,
         action_etag=suppression_state.etag(idx),
@@ -744,25 +755,22 @@ def test_resident_action_winner_delta_matches_full_fact_tree(tmp_path):
         "SELECT fid FROM actions WHERE sid=?", (sid,)
     ).fetchone() == (first,)
 
-    second_fact = node.fact_of(workspace, second)
-    evidence = node._action_evidence(workspace, second_fact)
     index.execute(
-        "UPDATE actions SET fid=?, evidence=? WHERE sid=?",
-        (second, evidence, sid),
+        "UPDATE actions SET fid=? WHERE sid=?",
+        (second, sid),
     )
     snapshot = manifest.decode_root(node.store(workspace).get("root"))
     fetch = lambda oid: node.store(workspace).get("obj/" + oid)
 
     incremental = indexes.build(
-        workspace, index, lambda fid: node.fact_of(workspace, fid),
-        lambda raw: h(raw),
+        workspace, index, lambda raw: h(raw),
         previous=snapshot.trees, fetch=fetch,
         changed_fids=(), changed_sids=(sid,))
     rebuilt = indexes.build(
-        workspace, index, lambda fid: node.fact_of(workspace, fid),
-        lambda raw: h(raw))
+        workspace, index, lambda raw: h(raw))
 
-    assert incremental == rebuilt
+    assert (incremental.seed, incremental.trees) == (
+        rebuilt.seed, rebuilt.trees)
 
 
 def test_incremental_equals_full(tmp_path):

@@ -133,7 +133,7 @@ def test_strict_config_rejects_malformed_or_credential_fields_before_clients(
 
 def test_longest_node_key_must_fit_before_provider_client_creation():
     fixed = len("/workspace/") + 64
-    longest = len("/pile/") + 16 + 1 + 64
+    longest = len("/pile/") + 16 + 1 + 32 + 1 + 64
     maximum_base = "x" * (1024 - fixed - longest)
     clients = []
 
@@ -141,7 +141,7 @@ def test_longest_node_key_must_fit_before_provider_client_creation():
         {**S3, "base_prefix": maximum_base},
         client_factory=lambda *args: clients.append(args) or object())
     store = factory("0" * 64)
-    longest_key = f"pile/{'0' * 16}/{'0' * 64}"
+    longest_key = f"pile/{'0' * 16}/{'0' * 32}/{'0' * 64}"
     assert len(store._physical(longest_key).encode("ascii")) == 1024
     assert len(clients) == 1
 

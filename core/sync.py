@@ -11,9 +11,11 @@ where a pile came from.
 import sqlite3
 
 from . import catalog, indexes, manifest, shape, suppression_state
+from .candidate_archive import CandidateView
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .kernel import drain, proof_rank, rebuild_proofs, resolve_deps
+from .ingress import stage_pile
 from .limits import MAX_OBJECT_BYTES, decode_json
 from .object_store import verified_object
 from .store import RemoteStore
@@ -77,12 +79,26 @@ def _holds(node, ws, extra, key):
 
 def _extract(node, ws, extra, entries, keys, fetch):
     """One batched wave over home leaves: fetch_plan groups ``keys``, each
-    pile is fetched once, and exactly the needed facts come out by key."""
+    reference leaf is fetched once, and exactly the needed fact objects come
+    out by key."""
     plan = manifest.fetch_plan(entries, keys)
-    raws = fetch.many(list(plan))
+    fetch.many(list(plan))
+    entries_by_leaf = {entry.leaf: entry for entry in entries}
+    references = {
+        leaf: dict(manifest.range_references(entries_by_leaf[leaf], fetch))
+        for leaf in plan
+    }
+    object_oids = [
+        references[leaf][address]
+        for leaf, wanted in plan.items()
+        for address in wanted
+        if address in references[leaf]
+    ]
+    fetch.many(object_oids)
     out = []
-    for (leaf, wanted), raw in zip(plan.items(), raws):
-        members, _ = decode_pile(_object(leaf, lambda oid: raw), ws)
+    for leaf, wanted in plan.items():
+        members = manifest.range_members(
+            entries_by_leaf[leaf], fetch, ws, wanted=wanted)
         held = {shape.key(f): f for f in members}
         out += [held[k] for k in wanted if k in held]
     return out
@@ -143,7 +159,9 @@ def sync(node, ws, url):
             remote_actions = {
                 sid: (fid, evidence)
                 for sid, fid, evidence in node.idx(ws).execute(
-                    "SELECT sid, fid, evidence FROM actions")
+                    "SELECT a.sid, a.fid, r.proof "
+                    "FROM actions a "
+                    "JOIN admission_receipts r ON r.fid=a.fid")
             }
     else:
         remote_actions = action_rows(remote_root, fetch_remote) \
@@ -176,12 +194,16 @@ def sync(node, ws, url):
         theirs, changed = manifest.compare(
             mine, their_man, fetch_remote)
         differing = set(changed)
-        raws = dict(zip(
-            (e.leaf for e in theirs if e in differing),
-            fetch_remote.many(
-                [e.leaf for e in theirs if e in differing])))
+        changed_entries = [e for e in theirs if e in differing]
+        fetch_remote.many([entry.leaf for entry in changed_entries])
+        references = {
+            entry: manifest.range_references(entry, fetch_remote)
+            for entry in changed_entries
+        }
+        fetch_remote.many([
+            oid for rows in references.values() for _, oid in rows])
         members_of = lambda e: manifest.range_members(
-            e, lambda oid: raws[oid], ws)
+            e, fetch_remote, ws)
         pulled_piles, push_keys = frontier(
             my_keys, theirs, differing, members_of)
 
@@ -203,13 +225,29 @@ def sync(node, ws, url):
         pull(node, ws, h(raw), raw)
         pulled = 1
         node.turn(ws)
+    # Keep an ordinary warm RangeTree delta on its established fetch budget.
+    # Candidate-witness reconciliation runs once the dial starts from an equal
+    # eligible manifest. If this turn changed RangeTree, the next dial joins
+    # the independent historical-witness component.
+    candidate_pulled, candidate_pushed, candidate_difference = (
+        reconcile_candidates(
+            node, ws, peer, remote_root, fetch_remote,
+            deliver=accepts_push)
+        if local_man == their_man
+        else (0, 0, False)
+    )
+    pulled = max(pulled, candidate_pulled)
+    pushed_facts += candidate_pushed
+    if candidate_pushed:
+        retag = None
     _, blobs_complete = _fetch_blobs(node, ws, peer)
     local_etag = _root_digest(node.store(ws))
     cache.update({
         "etag": retag, "root": remote_root,
         "local": local_etag,
     })
-    if not accepts_push and (push_fids or action_difference):
+    if not accepts_push and (
+            push_fids or action_difference or candidate_difference):
         # This edge is a reader, not a delivery receipt.  Preserve the dirty
         # marker so a later full-profile remint can deliver unchanged intent.
         cache["pending_push"] = True
@@ -220,6 +258,67 @@ def sync(node, ws, url):
     else:
         cache.pop("blobs", None)
     return pulled, pushed_facts + pushed_actions
+
+
+def _candidate_record(view, fid):
+    try:
+        return view.fact_record(fid)
+    except ValueError as error:
+        if str(error) == "missing FactRecord":
+            return None
+        raise
+
+
+def reconcile_candidates(
+        node, ws, peer, remote_root, fetch_remote, *, deliver=True):
+    """Join every candidate's selected complete historical witness.
+
+    RangeTree reconciles eligible fact bytes, but its logical map deliberately
+    omits admission history. FactTree's one-record-per-candidate range covers
+    both eligible and dormant state. For the same exact fact, the
+    lexicographically lower verified proof oid is the semilattice join.
+    Every witness closure then re-enters through the ordinary pile/kernel turn.
+    """
+    local_root = node.store(ws).get("root")
+    if not remote_root or not local_root:
+        return 0, 0, False
+    remote = CandidateView(remote_root, fetch_remote)
+    local_store = node.store(ws)
+    local = CandidateView(
+        local_root, lambda oid: local_store.get("obj/" + oid))
+    remote_fids = remote.candidate_ids()
+    local_fids = local.candidate_ids()
+    pull_fids, push_fids = [], []
+    for fid in remote_fids:
+        theirs = remote.fact_record(fid)
+        ours = _candidate_record(local, fid)
+        if ours is None or theirs["admission"] < ours["admission"]:
+            pull_fids.append(fid)
+    for fid in local_fids:
+        ours = local.fact_record(fid)
+        theirs = _candidate_record(remote, fid)
+        if theirs is None or ours["admission"] < theirs["admission"]:
+            push_fids.append(fid)
+
+    if deliver:
+        for fid in push_fids:
+            peer.put_pile(encode_pile(
+                local.verify(fid).facts, workspace=ws))
+
+    landed = 0
+    for fid in pull_fids:
+        try:
+            raw = encode_pile(
+                remote.verify(fid).facts, workspace=ws)
+        except (TypeError, ValueError):
+            # One poisoned selected witness does not block independent
+            # candidates from the same authenticated posting range.
+            continue
+        pull(node, ws, h(raw), raw)
+        landed += 1
+    if landed:
+        node.turn(ws)
+    return int(bool(landed)), len(push_fids) if deliver else 0, bool(push_fids)
 
 
 def frontier(my_keys, theirs, differing, members_of):
@@ -253,8 +352,7 @@ def pull(node, ws, oid, raw):
     """Put one verified path union into local ingress."""
     if raw is None or h(raw) != oid:
         raise ValueError("remote object integrity")
-    node.store(ws).put_if_absent(
-        f"pile/{node.member_for(ws)}/{oid}", raw)
+    stage_pile(node.store(ws), node.member_for(ws), raw)
 
 
 def push(node, ws, peer, fids):
@@ -277,9 +375,7 @@ def action_rows(root_bytes, fetch):
             if fact_tree.get(indexes.action_key(sid)) != slot:
                 continue
             record = view.fact_record(fid)
-            if not record["evidence"]:
-                continue
-            out[sid] = (fid, record["evidence"])
+            out[sid] = (fid, record["admission"])
         except (TypeError, ValueError):
             continue
     return out
@@ -293,23 +389,26 @@ def pull_actions(node, ws, remote_root, fetch, rows=None):
         local = {
             sid: (fid, evidence)
             for sid, fid, evidence in node.idx(ws).execute(
-                "SELECT sid, fid, evidence FROM actions")
+                "SELECT a.sid, a.fid, r.proof "
+                "FROM actions a "
+                "JOIN admission_receipts r ON r.fid=a.fid")
         }
     for sid, (fid, evidence_oid) in sorted(rows.items()):
         if local.get(sid) == (fid, evidence_oid):
             continue
         try:
-            fact, raw = suppression_state.validate_evidence(
-                ws, sid, fid, evidence_oid, fetch)
+            fact, stream = suppression_state.validate_evidence(
+                ws, sid, fid, evidence_oid, remote_root, fetch)
         except (TypeError, ValueError):
             continue
-        accepted.append((sid, fact, evidence_oid, raw))
+        accepted.append((sid, fact, evidence_oid, stream))
     if not accepted:
         return ()
 
     # Action evidence uses the same pile door and workspace turn as every
     # other arrival. Sync does not gain a private archive/commit bypass.
-    for _, _, _, raw in accepted:
+    for _, _, _, stream in accepted:
+        raw = encode_pile(stream, workspace=ws)
         pull(node, ws, h(raw), raw)
     node.turn(ws)
     return tuple(fact.fid for _, fact, _, _ in accepted)
@@ -319,19 +418,23 @@ def push_actions(node, ws, peer, remote_rows, *, deliver=True):
     """Find local witnesses missing from the peer and optionally deliver them."""
     with node.lock:
         rows = node.idx(ws).execute(
-            "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
-        evidence_oids = {
-            evidence
+            "SELECT a.sid, a.fid, r.proof "
+            "FROM actions a "
+            "JOIN admission_receipts r ON r.fid=a.fid "
+            "ORDER BY a.sid").fetchall()
+        witnesses = {
+            evidence: (sid, fid)
             for sid, fid, evidence in rows
             if remote_rows.get(sid) != (fid, evidence)
         }
-        payloads = [
-            node.store(ws).get("obj/" + evidence)
-            for evidence in sorted(evidence_oids)
-        ]
+        local_root = node.store(ws).get("root")
+        fetch = lambda oid: node.store(ws).get("obj/" + oid)
+        payloads = []
+        for evidence, (sid, fid) in sorted(witnesses.items()):
+            _, stream = suppression_state.validate_evidence(
+                ws, sid, fid, evidence, local_root, fetch)
+            payloads.append(encode_pile(stream, workspace=ws))
     for raw in payloads:
-        if raw is None:
-            raise ValueError("local action evidence")
         if deliver:
             peer.put_pile(raw)
     return len(payloads)

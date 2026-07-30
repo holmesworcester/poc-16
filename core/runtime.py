@@ -10,9 +10,8 @@ admission path, and the database-free Worker remains entirely separate.
 """
 import facts
 
-from .close import close, decode_pile, encode_pile
-from .crypto import h
-from .ingress import PermanentIngressRejection
+from .close import close, encode_pile
+from .ingress import PermanentIngressRejection, stage_pile
 from .kernel import resolve_deps
 from .object_store import ensure_object
 
@@ -48,6 +47,7 @@ class WorkspaceRuntime:
             # Absence here does not retire anything; it only proves that a
             # shared winner already discharged this node's local diagnostic.
             node.reconcile_ingress_attempt_failures(ws, piles)
+            node._reconcile_publication_receipts(ws, piles)
             if not piles:
                 if node.catalog(ws).staged_ids():
                     node.commit(ws)
@@ -57,7 +57,6 @@ class WorkspaceRuntime:
                 raw = None
                 try:
                     raw = store.get(source)
-                    stream, blobs = decode_pile(raw, ws)
                 except PermanentIngressRejection as error:
                     self._reject(source, raw, error)
                     continue
@@ -65,18 +64,30 @@ class WorkspaceRuntime:
                     node.record_ingress_attempt_failure(
                         ws, source, error)
                     continue
+                if raw is None:
+                    continue
+                pending = node._published_ingress_receipt(
+                    ws, source, raw)
+                if pending is not None:
+                    try:
+                        node._retire_published_ingress(
+                            ws, source, raw, pending)
+                    except Exception as error:
+                        node.record_ingress_attempt_failure(
+                            ws, source, error)
+                    else:
+                        node.clear_ingress_attempt_failure(ws, source)
+                    continue
                 try:
                     node._sync_index(ws)
-                    admission = node.admit(
-                        ws, stream,
-                        allowed_staged={
-                            fact.fid for fact in stream})
+                    admission = node.admit_ingress(
+                        ws, source, raw)
                     valids = tuple(
                         valid for valid in admission.valids
                         if node.fact_of(ws, valid.fact.fid) is not None)
-                    for oid, blob in blobs.items():
+                    for oid, blob in admission.blobs:
                         ensure_object(store, oid, blob)
-                    node.commit(ws, admission.settlement)
+                    publication = node.commit_ingress(admission)
                 except PermanentIngressRejection as error:
                     self._reject(source, raw, error)
                     continue
@@ -96,7 +107,8 @@ class WorkspaceRuntime:
                         ws, source, error)
                     continue
                 try:
-                    node._retire_ingress_exact(ws, source, raw)
+                    node._retire_published_ingress(
+                        ws, source, raw, publication)
                 except Exception as error:
                     node.record_ingress_attempt_failure(
                         ws, source, error)
@@ -122,8 +134,8 @@ class WorkspaceRuntime:
 
             raw = encode_pile(
                 close(news, deps_of, fact_of), blobs, workspace=ws)
-            source = f"pile/{node.member_for(ws)}/{h(raw)}"
-            node.store(ws).put_if_absent(source, raw)
+            source = stage_pile(
+                node.store(ws), node.member_for(ws), raw)
             fresh = self.turn()
             missing = [
                 fact.fid for fact in news

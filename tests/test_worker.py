@@ -143,7 +143,7 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     active = {"state": "active", "action": action_fid}
     assert new.suppression(sid) == active
     assert new._reader(indexes.FACT).get(indexes.action_key(sid)) == active
-    assert new.fact_record(action_fid)["evidence"]
+    assert new.fact_record(action_fid)["admission"]
 
     trees = manifest.decode_root(new_root).trees
     assert set(trees) == set(indexes.TREE_NAMES)

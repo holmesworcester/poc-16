@@ -169,6 +169,14 @@ def _decode(raw, oid, seed):
         raise ValueError("btreap page shape") from exc
 
 
+def root_metadata(root, seed, fetch):
+    """Return authenticated ``(count, depth)`` for one nonempty tree root."""
+    if not valid_fid(root):
+        raise ValueError("btreap root")
+    page = _decode(fetch(root), root, seed)
+    return page["count"], page["depth"]
+
+
 class Reader:
     """Hash-verifying exact reads; ``items`` is maintenance-only."""
 

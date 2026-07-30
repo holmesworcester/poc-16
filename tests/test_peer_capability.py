@@ -287,6 +287,5 @@ def test_push_grant_cannot_write_another_producer_segment(tmp_path):
             urllib.request.urlopen(request)
 
         assert denied.value.code == 403
-        assert remote.store(workspace).get(
-            f"pile/{other}/{h(raw)}") is None
+        assert remote.store(workspace).list(f"pile/{other}/") == []
         assert observed["puts"]

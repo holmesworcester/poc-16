@@ -10,6 +10,7 @@ from core import bao, cmds, indexes, manifest, mint
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.kernel import drain, offer_src, resolve_deps
+from core.ingress import pile_source, stage_pile
 from core.node import Node, resident
 from core.object_store import ABSENT, Applied, OutcomeUnknown
 from core.publication import PublicationPlan, Publisher, RootChanged
@@ -182,6 +183,51 @@ def test_publisher_reconciles_unknown_root_cas(
     assert calls == (1 if applied_before_loss else 2)
 
 
+def test_unknown_cas_followed_by_different_authorized_root_keeps_exact_pile(
+        tmp_path, monkeypatch):
+    """Ambiguity never turns a later winner into this pile's receipt."""
+    seed = Node(str(tmp_path / "seed"))
+    workspace = cmds.create(seed, "alice", ts=1)
+    raw_a, fact_a = _message_pile(seed, workspace, "ambiguous", 10)
+    raw_b, fact_b = _message_pile(seed, workspace, "later winner", 11)
+    bucket, (alice, bob) = _shared_clones(
+        seed, workspace, tmp_path, "alice", "bob")
+    source = stage_pile(alice.store(workspace), "shared", raw_a)
+    store = alice.store(workspace)
+    real_cas = store.cas
+    winner = []
+
+    def ambiguous(key, token, value):
+        applied = real_cas(key, token, value)
+        assert isinstance(applied, Applied)
+        bob._sync_index(workspace)
+        later = bob.admit(
+            workspace, decode_pile(raw_b, workspace)[0]).settlement
+        winner.append(bob.commit(workspace, later))
+        assert winner[-1] != value
+        raise OutcomeUnknown("response lost after a later root won")
+
+    monkeypatch.setattr(store, "cas", ambiguous)
+
+    # Readback observes Bob's different, valid root. Alice must not stamp its
+    # proposal, mint a publication receipt, or delete the exact source value.
+    assert alice.turn(workspace) == []
+    assert store.get("root") == winner[-1]
+    assert store.get(source) == raw_a
+    assert alice.ingress_attempt_error(workspace, source) is not None
+    assert alice.fact_of(workspace, fact_a.fid) == fact_a
+    assert alice.fact_of(workspace, fact_b.fid) == fact_b
+
+    # Once rebased, replay is an exact no-op publication and only that typed
+    # receipt can discharge the still-identical ingress object.
+    monkeypatch.setattr(store, "cas", real_cas)
+    alice.turn(workspace)
+    assert store.get("root") == winner[-1]
+    assert store.get(source) is None
+    assert alice.ingress_attempt_error(workspace, source) is None
+    assert bucket.assert_valid_history()
+
+
 def test_rootless_publication_does_not_stamp_across_bootstrap(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = "f" * 64
@@ -189,7 +235,7 @@ def test_rootless_publication_does_not_stamp_across_bootstrap(tmp_path):
     store = node.store(workspace)
     assert isinstance(store.cas("root", ABSENT, b"foreign"), Applied)
     plan = PublicationPlan(
-        (), (), (), (), False, (), None, ABSENT)
+        (), (), (), (), (), False, (), (), None, ABSENT)
 
     with pytest.raises(RootChanged, match="rootless"):
         Publisher(node, workspace).publish(plan)
@@ -272,7 +318,7 @@ def test_database_free_worker_mints_from_one_stale_but_complete_root(
     assert bucket.assert_valid_history()
 
 
-def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
+def test_cold_rebuild_reactivates_root_authenticated_dormant_candidates(
         tmp_path):
     seed = Node(str(tmp_path / "seed"))
     workspace = cmds.create(seed, "root", ts=1)
@@ -327,7 +373,11 @@ def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
     assert cmds.files(alice, workspace) == []
 
     bob._sync_index(workspace)
-    assert bob.candidate_of(workspace, child_claim.fid) is None
+    assert bob.candidate_of(workspace, child_claim.fid) == child_claim
+    assert bob.fact_of(workspace, child_claim.fid) is None
+    assert bob.candidate_of(workspace, descriptor) is not None
+    assert bob.fact_of(workspace, descriptor) is None
+    assert cmds.files(bob, workspace) == []
     invite_secret, invite_public = keypair()
     invitation = user_invite(workspace, root, invite_public, 500)
     invitation_sig = signature(root_secret, root, invitation, 500)
@@ -347,12 +397,15 @@ def test_rebuild_publishes_reactivated_local_receipts_instead_of_false_stamp(
     )
     bob_root = bob.store(workspace).get("root")
     bob_stream = _commit_facts(workspace, bucket.commits[-1])
-    assert child_claim.fid not in {fact.fid for fact in bob_stream}
+    bob_fids = {fact.fid for fact in bob_stream}
+    assert child_claim.fid in bob_fids
+    assert descriptor in bob_fids
+    assert bob.fact_of(workspace, child_claim.fid) == child_claim
 
     alice._sync_index(workspace)
     union_root = alice.store(workspace).get("root")
     union_stream = _commit_facts(workspace, bucket.commits[-1])
-    assert union_root != bob_root
+    assert union_root == bob_root
     assert child_claim.fid in {fact.fid for fact in union_stream}
     assert descriptor in {fact.fid for fact in union_stream}
     assert alice.fact_of(workspace, child_claim.fid) == child_claim
@@ -408,8 +461,8 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
     bucket, (alice, bob) = _shared_clones(
         seed, workspace, tmp_path, "alice", "bob")
     for raw in (first[2], second[2], message_raw):
-        alice.store(workspace).put(
-            "pile/shared/" + h(raw), raw)
+        source = pile_source("shared", raw, h(raw)[:32])
+        alice.store(workspace).put_if_absent(source, raw)
 
     paused = bucket.pause("alice", "cas", "root", when="before")
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -449,10 +502,8 @@ def test_concurrent_turns_preserve_every_tree_and_converge_to_serial_union(
     final_snapshot = manifest.decode_root(final_root)
     final_objects = dict(bucket.commits[-1].objects)
     serial = Node(str(tmp_path / "serial"))
-    serial.store(workspace).put(
-        "pile/serial/" + h(encode_pile(final)),
-        encode_pile(final),
-    )
+    stage_pile(
+        serial.store(workspace), "serial", encode_pile(final))
     serial.turn(workspace)
     assert serial.store(workspace).get("root") == final_root
     assert tuple(resident(

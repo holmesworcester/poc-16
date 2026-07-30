@@ -15,6 +15,7 @@ import pytest
 
 from core import cmds
 from core.crypto import h
+from core.ingress import pile_source
 from core.node import Node
 from core.object_store import (
     Applied,
@@ -98,8 +99,11 @@ class _History:
         assert capture.objects
         assert capture.operations[-1][0] == "pile"
         self.pile_raw = capture.pile
-        self.pile_key = (
-            f"pile/{self.member}/{h(self.pile_raw)}")
+        self.pile_key = pile_source(
+            self.member,
+            self.pile_raw,
+            f"{seed & ((1 << 128) - 1):032x}",
+        )
         session = f"{seed & ((1 << 64) - 1):016x}"
         self.stage_objects = {
             f"stage/{session}/obj/{oid}": (oid, raw)
@@ -129,16 +133,16 @@ class _History:
         shutil.copytree(self.path / "template", target)
         node = Node(str(target))
         node._stores[self.workspace] = self.bucket.handle(name)
-        retire = node._retire_ingress_exact
+        retire = node._retire_published_ingress
 
-        def observed(workspace, key, raw):
+        def observed(workspace, key, raw, receipt):
             self.trace.observe_node_retirement(
                 node, workspace, key, raw)
             if before_retire is not None:
                 before_retire()
-            return retire(workspace, key, raw)
+            return retire(workspace, key, raw, receipt)
 
-        node._retire_ingress_exact = observed
+        node._retire_published_ingress = observed
         self._actors[name] = node
         return node
 
@@ -532,8 +536,8 @@ def test_node_retirement_call_boundary_requires_hash_bound_pile(tmp_path):
         with pytest.raises(
                 ValueError,
                 match="ingress source is not bound to exact bytes"):
-            node._retire_ingress_exact(
-                history.workspace, wrong, history.pile_raw)
+            node._retire_published_ingress(
+                history.workspace, wrong, history.pile_raw, None)
         assert not [
             event for event in history.bucket.history
             if event.op == "delete" and event.key == wrong

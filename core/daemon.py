@@ -36,6 +36,7 @@ from .limits import (
 )
 from .node import Node, now_ms
 from .object_store import ensure_object
+from .ingress import stage_pile
 from .runtime import AuthorityRejected
 from .sync import sync
 
@@ -229,7 +230,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400)
             if h(b) != parts[2]:
                 return self._send(400)
-            self.node.store(ws).put(f"pile/{m}/{parts[2]}", b)
+            # The authenticated HTTP path names bytes, not their durable
+            # generation. The receiving host mints that nonce internally so
+            # a peer cannot recreate a retired object at the same store key.
+            stage_pile(self.node.store(ws), m, b)
             self.node.turn(ws)  # drain on receipt — a pushed pile needs no poke
             return self._send(204)  # delivery receipt; acceptance is the judge
         self._send(403)

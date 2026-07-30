@@ -126,7 +126,8 @@ Each workspace store exposes:
 ```text
 root                         one mutable, CAS-written composite root
 obj/<sha256>                 immutable pages, piles, facts, and blobs
-pile/<member>/<sha256>       idempotent ingress
+pile/<member>/<gen32>/<sha256>
+                             internal create-only publication work
 invite/<unguessable-id>      encrypted invite blob
 failed/pile/<sha256>         shared immutable rejected bytes
 failed/meta/<sha256>         shared immutable typed-rejection record
@@ -166,7 +167,10 @@ APIs provide the strong per-key reads and conditional writes this design
 uses. Cached custom domains and asynchronous replicas are not conforming
 authoritative adapters. LIST is strong but paginated, and several pages are
 not one transaction. Piles, invites, and rejection records remain
-non-authoritative operations with explicitly idempotent handling. Rejection
+non-authoritative operations with explicit create-only/idempotent handling.
+Every host/peer pile receives a fresh internally generated 128-bit generation;
+the authenticated HTTP peer names only member and body hash, and cannot choose
+or recreate that durable generation. Rejection
 evidence nevertheless participates in a destructive safety obligation: exact
 pile bytes and a content-addressed typed-reason record are read back before
 any worker may retire malformed ingress. The evidence is shared because host
@@ -190,13 +194,18 @@ No object or pile body transits the broker, Lambda, Worker, or publisher during
 upload; those components handle authority metadata or later publication. This
 is the one selected client protocol.
 Provider object-created events, an authenticated poke, and a scheduled fallback
-may all wake interchangeable database-free publishers. Wakeups are advisory;
-the durable pile is the work item. Publishers verify workspace, uploader,
-checksums, and closure; promote every present referenced attachment object;
-then update the authenticated trees and CAS root. A missing detached blob does
+may all wake interchangeable database-free publishers. Wakeups are advisory.
+The client-writable session marker is durable input, but it is never a
+canonical retirement target. Publishers verify workspace, uploader, checksums,
+and closure; promote every present referenced attachment object; then copy the
+verified pile bytes with create-only semantics to a fresh internal
+`pile/<member>/<generation>/<sha256>` key that no client capability can name.
+That internal generation updates the authenticated trees, CASes root, and
+retires only under its exact typed receipt. A missing detached blob does
 not block valid facts—the file remains incomplete exactly as it does after
-ordinary peer sync. Throttling, crashes, and CAS loss retain the pile. Clients
-can neither list/delete the namespace nor write root.
+ordinary peer sync. Throttling, crashes, and CAS loss retain the work item.
+Clients can neither list/delete the namespace nor write root or an internal
+pile generation.
 
 The split follows the authority actually required by each step:
 
@@ -218,13 +227,17 @@ core/store_publisher   async outbox/CAS/F10/retirement interpreter
 deploy/*               provider events, configuration, and store construction
 ```
 
-The client catalog and the database-free publisher use the same executable
-settlement and snapshot functions through different query adapters. SQLite may
-answer a client query; authenticated FactTree postings and candidate
-residences answer the cloud query. Neither adapter owns a second validity or
-settlement rule. `Node` is not packaged into Lambda or a Worker, and an
-in-memory SQLite reconstruction is not the edge implementation. Missing
-root, proof, fact-residence, or tree-page objects suspend the pure computation
+The client catalog and the database-free publisher use the same family
+registry, kernel rules, and canonical ordering. The cold/reference
+`settlement.project` operates directly over authenticated candidates; the
+client catalog preserves an affected-closure incremental path so an ordinary
+append is not O(all facts). Full cold reconstruction checks its answer against
+the committed projection. SQLite may answer a client query; authenticated
+FactTree postings and candidate residences answer the cloud query. Neither
+path owns a second family-validity or authorization policy. `Node` is not
+packaged into Lambda or a Worker, and an in-memory SQLite reconstruction is
+not the edge implementation. Missing root, proof, fact-residence, or tree-page
+objects suspend the pure computation
 through a bounded cache-miss driver, are awaited exactly once, and then rerun
 the same function. A missing attachment blob does not suspend fact
 settlement. Provider entrypoints contain no family policy, tree construction,
@@ -307,10 +320,15 @@ object that is present, one at a time, but it may settle and root the canonical
 facts when a detached Bao object is absent. The authenticated chunk facts then
 express the durable missing-object demand and file queries report incomplete,
 just as they do on an ordinary replica. Once F10 proves that every admitted
-fact from the pile is represented by the committed root, the pile may retire;
-an object that lands only afterward is unreachable staging garbage and cannot
-manufacture work without a marker. The client can retry that content through a
-new session or ordinary peer blob sync.
+fact from the copied pile is represented by the committed root, only that
+internal generation may retire. The client-writable staging marker is outside
+this destructive door. Capability expiry does not prove it safe to delete:
+providers may accept a request before expiry and complete it later. Staging
+retention/lifecycle is therefore a separate provider policy
+(`poc-16-x1p.17.15`), and the fail-safe current rule is to retain pile markers.
+A replay or late completion can at most trigger another fresh internal
+generation and an idempotent publication; it cannot recreate a retired
+generation or authorize root mutation.
 
 The logical protocol uses isolated ingress on both providers. “Direct” means
 the client sends immutable bytes to S3 or R2 itself; the authorization broker
@@ -517,9 +535,10 @@ Family queries intersect those generic addresses before loading canonical
 blobs, then apply suppression and assemble their view. For example, a file
 read selects only `chunk --file→ descriptor` rows and verifies those immutable
 Bao objects after releasing the catalog lock. The reference rows are local
-query routes, not dependency offers or additional authority. Deleting the
-workspace catalog can still lose node-local, currently ineligible receipts
-that were deliberately never published.
+query routes, not dependency offers or additional authority. Every
+proof-backed candidate is published, including currently ineligible ones, so
+deleting the workspace catalog loses only unpublished staged intent;
+committed candidate state rebuilds from the authenticated root.
 
 ### Fact versions and derived replay
 
@@ -542,7 +561,7 @@ deterministic and must not consult replica-local arrival order or wall-clock
 state.
 
 The root uses layout stamp
-`composite-btreap-v7-generic-candidate-index` and atomically binds:
+`composite-btreap-v8-admission-proof-archive` and atomically binds:
 
 ```text
 anchor          workspace genesis fid
@@ -555,9 +574,10 @@ stamp           exact format identity
 
 One compare-and-swap publishes the range manifest and all three authenticated
 trees. There is no second mutable removal root and therefore no two-root
-transaction. `action_etag` only avoids enumerating SuppTree when ordinary facts
-change but actions do not; Workers never trust it, and action evidence remains
-authoritative only through the authenticated trees.
+transaction. `action_etag` only avoids enumerating SuppTree when neither an
+effective action nor an active action's selected historical witness changes.
+Workers never trust it; the ACTIVE action fid and that fact's authenticated
+admission pointer form the evidence chain.
 
 Catalog settlement returns a publication plan pinned to the exact root bytes
 and opaque provider token returned by one read. Object and tree compilation
@@ -605,36 +625,31 @@ not a fourth authorization index. A read-only database-free Worker does not
 need it and never scans timestamp/fid keys: `WorkerView` exact-reads only
 FactTree, SuppTree, and AuthorityTree. The bounded RangeTree neighbor
 operation itself is store-only, and an edge responder may serve RangeTree
-objects by oid without interpreting them. That does not make the current
-publisher database-free: canonical eligibility, action state, and all four
-tree inputs are compiled from the client catalog. A future edge publisher
-must reconstruct an equivalent admitted-candidate and durable-intent view
-from authenticated objects before it can reuse this placement operation; it
-may not treat RangeTree alone as publication authority. FactTree now bounds
-discovery for current rooted/eligible candidates, but it does not authenticate
-every receipt retained only in a client's SQLite catalog. Today a losing or
-inactive receipt can outlive its retired ingress pile only on that client.
-Cold database-free publication therefore remains incomplete until dormant,
-restorable candidate bytes have a durable root-or-intent retention law.
-FactTree cannot substitute for this map without also gaining ordered raw-fact
-residency and pile/closure routing; object-store LIST cannot substitute
-because object names are content hashes and include unreachable history.
+objects by oid without interpreting them. The current client publisher still
+compiles from its catalog, but cold `candidate_archive.reconstruct` derives
+the complete admitted-candidate input from authenticated objects alone: it
+verifies all tree descriptors, the eligible RangeTree partition, every
+candidate's stable blob residence, generic postings, action witnesses, and
+every selected admission
+proof before rerunning current eligibility. An edge publisher may consume that
+verified archive but may not treat RangeTree alone as publication authority.
+Object-store LIST cannot substitute because object names are content hashes
+and include unreachable history.
 
-### Dormant-candidate retention target
+### Dormant-candidate retention
 
-The target law is stronger than “keep the bytes.” The committed root
+The retention law is stronger than “keep the bytes.” The committed root
 authenticates a monotone set of **kernel-admitted** durable candidates, and
 eligibility is a reversible derived subset of that set. Every candidate has
-exactly one raw residence in the current snapshot:
-
-- an eligible candidate occurs once in a RangeTree leaf;
-- a dormant candidate occurs once at `obj/H(encode(fact))`.
+one canonical exact-byte residence at `obj/H(encode(fact))`. An eligible
+candidate is additionally materialized in a derived RangeTree leaf for range
+reconciliation. That checked duplicate is not a second admission source.
 
 Old immutable objects may remain as unreachable history. SQLite, provider
 events, and object-store LIST are never admission evidence or candidate
 authority.
 
-A dormant blob pointer proves only that some bytes exist. It does not prove
+A candidate blob pointer proves only that some bytes exist. It does not prove
 that those bytes passed the family-neutral kernel. Durable admission must
 therefore consume the kernel's `Valid` receipt rather than a raw `Fact`.
 Scratch loading and tests may not share an unchecked route that can populate
@@ -646,25 +661,51 @@ edges from one kernel judgment; every edge pins the corresponding parent proof
 oid from that same judgment. This path-shares old closure, prevents unrelated
 parent witnesses from being spliced into a proof, and avoids retaining another
 copy of a closed pile. A cold verifier follows the pinned proof DAG, obtains
-each fact from its one current residence, and reruns the actual kernel. An
+each fact from its canonical blob residence, and reruns the actual kernel. An
 abstract proof mirror is not sufficient.
 
-FactTree will cover both eligible and dormant candidates. Its generic postings
-remain a mechanical projection of every candidate, while application reads
-filter for current eligibility. Dormant rows have an explicit dormant state
-and fid ordering; they never carry a sentinel or stale value that could be
-mistaken for a current proof rank. Full repair may page the authenticated
-`fact:` prefix, but ordinary store-only publication follows only the bounded
-type/key/ref/offer/scope/dependency postings affected by its intent.
+The replicated candidate value is `(exact fact bytes, selected historical
+witness)`. A candidate may be admitted through more than one complete valid
+closure; replicas join those observations by choosing the lexicographically
+smallest verified proof-root oid. Equal fact sets alone therefore need not
+have equal composite roots, while equal joined candidate/witness maps do. The
+witness records the edges under which admission actually succeeded.
+FactRecord's current dependency edges are a distinct settlement result and
+may later rewire without rewriting history.
 
-Publication writes a dormant blob before a CAS that deactivates an eligible
-candidate, and writes the new RangeTree leaf before a CAS that restores one.
+FactTree covers both eligible and dormant candidates. Its generic postings
+remain a mechanical projection of every candidate, while application reads
+read only the `index:` eligible namespace. Maintenance and reconciliation
+explicitly opt into `dormant-index:`; eligible rows always page before dormant
+rows, so dormant history cannot hide or delay a live result. Dormant rows have
+an explicit dormant state and fid ordering; they never carry a sentinel or
+stale value that could be mistaken for a current proof rank.
+
+Publication writes the stable blob before the first CAS that admits a
+candidate, and writes every new RangeTree leaf before a CAS that activates or
+restores one.
 The single composite-root CAS atomically binds residence, admission proof,
 candidate postings, current eligibility, suppression, and authority. Ingress
 retirement is allowed only when that root represents every durable `Valid`
 receipt in the exact pile, whether eligible or dormant. Candidate deletion is
 out of scope until a separate proof can establish that a candidate can never
 regain standing.
+
+Admission-proof traversal has explicit edge, node, depth, object-fetch, and
+combined proof/fact/cold-read byte budgets. One proof root is internally
+self-contained: each child pins the
+parent proof used by that same kernel judgment, rather than consulting the
+independently selected FactRecord proof for the parent. Multiple complete
+witnesses for every eligible or dormant candidate converge by lexicographic
+minimum proof oid. Once eligible RangeTree manifests match, the
+correctness-first implementation pages the authenticated `fact:` record range
+and sends each winning verified closure through ordinary pile ingress; it
+does not gain a private catalog-write door. This is linear maintenance I/O,
+not an ordinary Worker or publisher scan.
+`poc-16-x1p.17.8.1` separately tracks a Merkle witness-difference protocol
+that avoids this correctness-first full candidate scan.
+`poc-16-x1p.17.11.2.1` tracks bounded multiproof transfer for the scattered
+cold closure reads that remain after candidates have been identified.
 
 ## The three authenticated trees
 
@@ -678,10 +719,12 @@ the published depth and the hard depth cap; it never enumerates a tree.
 The schemas are:
 
 - **FactTree** — `fact:<fid>` maps to one bounded record containing the
-  reconciliation key, proof rank, resolved dependency edges, offers,
-  selectors, continuing liveness scopes, and optional action evidence.
-  Collision-free `index:...` rows are ordered by
-  `(kind, k0, k1, rank, fid)`. The immutable contribution mechanically mirrors
+  reconciliation key, selected admission-proof oid, explicit
+  eligible/dormant state, current raw residence, proof rank or null, resolved
+  dependency edges, offers, selectors, and continuing liveness scopes.
+  Collision-free eligible `index:...` and dormant
+  `dormant-index:...` rows are ordered by
+  `(kind, k0, k1, state, rank, fid)`. The immutable contribution mechanically mirrors
   client `fact_index`: type, reconciliation key, every explicit role/target
   reference, and every declared offer. Two family-neutral derived kinds add
   `suppression scope -> fid` and `resolved dependency target -> fid`, so a
@@ -689,11 +732,12 @@ The schemas are:
   without a corpus scan. There is one row per posting; no B-tree page contains
   an unbounded candidate list. A paged half-open range fetches at most two
   boundary paths, the returned rows, and one continuation lookahead, with a
-  hard 256-row page ceiling.
+  hard 256-row page ceiling. Every record points to its stable
+  `obj/H(encode(fact))` blob; eligible bytes also occur in derived RangeTree
+  leaves.
   `action:<sid>` mirrors a known direct/principal action slot so sync can
   corroborate a SuppTree witness through an independently addressed record.
-  Raw facts remain in manifest piles and are not emitted again as one object
-  per record.
+  The action fact's `admission` pointer is the sole action witness.
 - **SuppTree** — a suppression id maps directly to CLEAR or to ACTIVE with its
   effective action fid. CLEAR is a positive authenticated statement that this
   known, reserved id has no effective action in this snapshot; it is not the
@@ -722,7 +766,7 @@ through a rewired ancestor. FactRecord and `fact.scope` postings are updated
 for that entire affected closure, while unrelated rows remain shared by oid.
 
 Local SQLite retains `action_proposals` and their targets alongside the stable
-catalog. It derives `actions(sid, fid, evidence)` as the current effective
+catalog. It derives `actions(sid, fid)` as the current effective
 frontier and `supp(fid, sid)` as the selector reverse map. Only the proposals
 are retained input; the latter two tables are rebuildable indexes. None is a
 second published authority index, and the database-free Worker never reads
@@ -751,6 +795,13 @@ point. A loser retains its intent, rereads the winning root, derives the union,
 and retries. Objects written by a crash or losing attempt are harmless
 unreachable history; they are never overwritten or deleted.
 
+A typed index-compiler result lists candidate records that invocation actually
+constructed. Before CAS, the publisher requires every newly staged candidate
+and every winning witness-only join from the exact kernel judgment in that
+set. Exact duplicates or losing higher witnesses may instead inherit the
+pinned authorized base. This running compiler invariant replaces an
+unbounded post-CAS point scan.
+
 Tokens obey one law: within one `(store, key)`, the same token never denotes
 different bytes. The converse is unnecessary. An `X → Y → X` value-ABA may
 reuse X's token and is safe here because root bytes completely define the
@@ -762,8 +813,15 @@ algorithm.
 
 A lost mutation response is not a stale precondition. Publication rereads:
 candidate bytes mean the CAS succeeded; the exact unchanged base permits one
-safe retry; any other value means rebase while retaining staged intent. If
-reconciliation itself fails, no receipt or ingress key is retired.
+safe retry; any other value means rebase while retaining staged intent. Only
+Applied, byte-identical readback after an unknown outcome, or a
+token-and-byte-verified no-op returns a typed publication receipt bound to the
+workspace, exact source key, payload hash, root bytes, and complete durable
+Valid set. Because candidate retention is monotone, a later authorized root
+does not invalidate a receipt already minted by one of those outcomes. A
+canonical empty pile has an empty, vacuously covered durable set and retires
+under the same no-op receipt. If reconciliation itself fails, no receipt or
+ingress key is retired.
 
 A reader pins root bytes once. A later root is allowed to make that decision
 stale, but every manifest, tree page, fact record, suppression slot, authority
@@ -771,14 +829,15 @@ slot, and action witness used by the decision must remain explainable by the
 one pinned root. Re-reading `root` for individual components is incoherent,
 even when each component is independently valid.
 
-Published-state semantics do not depend on a private database, but the
-running writer implementation does: its SQLite catalog is both a derived
-eligibility index and the durable home of local staged intent. The checked-in
+Published candidate state no longer depends on a private database:
+`candidate_archive.reconstruct` cold-rebuilds it from one pinned root and its
+reachable immutable objects. The running client writer still uses SQLite as
+an accelerator and as the durable home of local staged intent. The checked-in
 Lambda and Cloudflare deployments are therefore readers, not publishers.
 Their authorization path has no database at all and needs only pinned root
 bytes, immutable object fetches, the submitted bounded closure, and trusted
-service time. Moving publication to an edge is a separate construction, not
-an alternate configuration of the current Worker.
+service time. Moving the turn coordinator and staged-intent consumption to an
+edge remains a separate construction, not an alternate client configuration.
 
 The safety laws are:
 
@@ -894,8 +953,8 @@ Replica admission must also converge when an old fact and an action arrive in
 opposite orders. Settlement therefore computes one deterministic fixed point:
 
 1. resolve and validate canonical local edges for every candidate;
-2. fold currently eligible action proposals in canonical `(fact key, fid,
-   evidence)` order;
+2. fold currently eligible action proposals in canonical `(fact key, fid)`
+   order;
 3. accept a proposal only if an earlier active target does not intersect its
    transitive, family-declared authorization scopes;
 4. let each accepted proposal activate all of its explicit target ids; and
@@ -904,7 +963,7 @@ opposite orders. Settlement therefore computes one deterministic fixed point:
 
 The earliest effective proposal wins a duplicate id. An action blocks an
 ordinary candidate whose canonical fact key is later; an earlier candidate
-remains admissible history. Retaining inactive receipts locally makes
+remains admissible history. Retaining dormant receipts in committed state makes
 fact-first, action-first, and later canonical-winner changes converge without
 a descendant lookup or sender-selected edge.
 
@@ -918,12 +977,10 @@ directly opening a new authorized sharing channel to that peer. There is no
 serialized admission frontier and no attempt to distinguish signing time from
 first delivery.
 
-Inactive receipts are likewise local durable intent, not a second replicated
-fact set. They are absent from the eligible manifest and need not be copied to
-every fresh replica. If a retaining node later finds one eligible, ordinary
-publication can share it then; if every holder disappears first, losing that
-inactive candidate is acceptable. Convergence applies to facts replicas have
-actually exchanged, not to hypothetical equality of their latent candidates.
+Dormant receipts are committed replicated candidate state, not local
+projection litter. They are absent from the eligible RangeTree manifest but
+remain in FactTree with stable blobs and selected historical witnesses.
+Reconciliation joins both eligible and dormant candidate/witness values.
 
 ## Worker authorization
 
@@ -959,12 +1016,15 @@ root is O(1) after blob completeness has been stamped for that HTTP content
 tag.
 
 When roots differ, sync reconciles admitted actions first. Each ACTIVE slot and
-its evidence closure are hash-checked and kernel-validated independently; one
+the action FactRecord's admission closure are hash-checked and
+kernel-validated independently; one
 missing or poisoned witness is skipped without blocking honest actions. The
 RangeTree is then compared by oid: shared pages are read from the authenticated
 local tree, while only novel remote paths and their changed piles are fetched.
 Local-only facts are pushed as one closed pile, remote ranges are assembled,
-and missing live blobs are fetched. A full-profile sender first delivers each
+and missing live blobs are fetched. Once eligible manifests agree, sync also
+pages candidate FactRecords and min-joins differing historical witnesses for
+eligible and dormant facts. A full-profile sender first delivers each
 locally available referenced blob as an idempotent, hash-verified immutable
 object, then delivers the fact-only pile. That order matters in a directed
 peer graph: an object-transfer failure cannot leave the receiver with a fact
@@ -980,14 +1040,15 @@ failures retain the exact live pile without a retry-count shortcut; they are
 visible as node-local attempt failures, and an authoritative restore isolates
 their staged candidates before the turn continues with another independent
 pile. Sync failures are likewise visible through `status`. Malformed roots,
-pages, facts, selectors, action evidence, or authority rows fail closed. A
+pages, facts, selectors, action witnesses, or authority rows fail closed. A
 root format mismatch may be republished from the current derived index only
 when its known snapshot fields equal the exact root bytes that index recorded;
 a different or unreadable snapshot is never clobbered. There is no ongoing
 dual decoder.
 
-Rebuild replays authenticated resident facts together with the stable local
-catalog and reconstructs eligibility, action state, and selector reverse maps.
+Rebuild cold-verifies the root-authenticated candidate archive, then
+reconstructs the stable local catalog, eligibility, action state, and selector
+reverse maps. Unpublished staged local intent remains separate.
 Queries need no replay phase or cursor: once the workspace index is stamped
 for the pinned root, they select and decode the same canonical catalog rows
 used by settlement. Blob-bearing queries verify currently resident object

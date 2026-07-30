@@ -5,10 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    btreap, close, cmds, daemon, fact, manifest, object_store, runtime, sync,
+    btreap, close, cmds, daemon, fact, manifest, node as node_module,
+    object_store, sync,
 )
 from core.crypto import h
 from core.fact import Fact, canon
+from core.ingress import stage_pile
 from core.limits import PayloadTooLarge
 from core.node import Node
 from core.object_store import OutcomeUnknown
@@ -70,11 +72,9 @@ def queued_messages(tmp_path):
     destination.add_workspace(workspace, "source", [])
     first_raw = closed_subset(source, workspace, [first])
     second_raw = closed_subset(source, workspace, [second])
-    first_key = f"pile/0000000000000000/{h(first_raw)}"
-    second_key = f"pile/ffffffffffffffff/{h(second_raw)}"
-    deliver(
+    first_key = deliver(
         destination, workspace, first_raw, member="0000000000000000")
-    deliver(
+    second_key = deliver(
         destination, workspace, second_raw, member="ffffffffffffffff")
     return (
         destination, workspace,
@@ -88,14 +88,14 @@ def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    decode = runtime.decode_pile
+    decode = node_module.decode_pile
 
     def program_failure(raw, expected_workspace):
         if raw == first_raw:
             raise ValueError("simulated decoder programming failure")
         return decode(raw, expected_workspace)
 
-    monkeypatch.setattr(runtime, "decode_pile", program_failure)
+    monkeypatch.setattr(node_module, "decode_pile", program_failure)
     node.turn(workspace)
 
     assert node.store(workspace).get(first_key) == first_raw
@@ -153,7 +153,7 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
     second_fid, _, second_key = second
     store = node.store(workspace)
     if boundary == "program":
-        original = node.commit
+        original = node.commit_ingress
         calls = 0
 
         def fail_first(*args, **kwargs):
@@ -163,7 +163,7 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
                 raise RuntimeError("simulated publication program failure")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(node, "commit", fail_first)
+        monkeypatch.setattr(node, "commit_ingress", fail_first)
     else:
         original = store.cas
         calls = 0
@@ -203,14 +203,14 @@ def test_retryable_failure_never_ages_into_destructive_quarantine(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    commit = node.commit
+    commit = node.commit_ingress
 
-    def fail_first_pile(*args, **kwargs):
-        if node.fact_of(workspace, first_fid) is not None:
+    def fail_first_pile(admission, *args, **kwargs):
+        if admission.source == first_key:
             raise OutcomeUnknown("persistent provider outage for this pile")
-        return commit(*args, **kwargs)
+        return commit(admission, *args, **kwargs)
 
-    monkeypatch.setattr(node, "commit", fail_first_pile)
+    monkeypatch.setattr(node, "commit_ingress", fail_first_pile)
 
     for _ in range(12):
         node.turn(workspace)
@@ -237,7 +237,7 @@ def test_failed_authoritative_restore_stops_before_the_next_pile(
     def fail_restore(_workspace):
         raise OutcomeUnknown("authoritative root unavailable")
 
-    monkeypatch.setattr(node, "commit", fail_commit)
+    monkeypatch.setattr(node, "commit_ingress", fail_commit)
     monkeypatch.setattr(node, "_restore_authoritative_state", fail_restore)
 
     with pytest.raises(
@@ -271,9 +271,9 @@ def test_rejection_retirement_requires_exact_durable_evidence(
     node = Node(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     bad = poisoned_timestamp_pile(workspace)
-    bad_key = f"pile/0000000000000000/{h(bad)}"
     good = closed_subset(source, workspace, [survivor])
-    deliver(node, workspace, bad, member="0000000000000000")
+    bad_key = deliver(
+        node, workspace, bad, member="0000000000000000")
     deliver(node, workspace, good, member="ffffffffffffffff")
     store = node.store(workspace)
 
@@ -325,7 +325,7 @@ def test_rejection_retirement_requires_exact_durable_evidence(
 
 
 def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
-        tmp_path):
+        tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "source", ts=1)
     survivor = cmds.post(source, workspace, "general", "survives", ts=2)
@@ -342,9 +342,18 @@ def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
         closed_subset(source, workspace, [survivor]),
         member="ffffffffffffffff")
 
+    listed = []
+    list_keys = node.store(workspace).list
+
+    def observe_list(prefix):
+        listed.append(prefix)
+        return list_keys(prefix)
+
+    monkeypatch.setattr(node.store(workspace), "list", observe_list)
     node.turn(workspace)
 
     assert node.fact_of(workspace, survivor) is not None
+    assert not any(prefix.startswith("failed/") for prefix in listed)
     failure = node.ingress_failures(workspace)[0]
     assert failure["error"] == "KernelRejected: ingress rejected"
     assert node.store(workspace).get(
@@ -361,15 +370,15 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     second.add_workspace(workspace, "shared", [])
     second.rebuild(workspace)
     bad = poisoned_timestamp_pile(workspace)
-    source = f"pile/0000000000000000/{h(bad)}"
-    first.store(workspace).put(source, bad)
+    source = stage_pile(
+        first.store(workspace), "0000000000000000", bad)
 
     listed = threading.Barrier(2)
     retiring = threading.Barrier(2)
     for node in (first, second):
         store = node.store(workspace)
         list_keys = store.list
-        retire = node._retire_ingress_exact
+        retire = node._retire_rejected_ingress
 
         def synchronized_list(prefix, list_keys=list_keys):
             keys = list_keys(prefix)
@@ -378,12 +387,12 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
             return keys
 
         def synchronized_retire(
-                ws, key, raw, retire=retire):
+                ws, key, raw, receipt, retire=retire):
             retiring.wait(timeout=5)
-            return retire(ws, key, raw)
+            return retire(ws, key, raw, receipt)
 
         monkeypatch.setattr(store, "list", synchronized_list)
-        monkeypatch.setattr(node, "_retire_ingress_exact",
+        monkeypatch.setattr(node, "_retire_rejected_ingress",
                             synchronized_retire)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -507,3 +516,38 @@ def test_daemon_body_rejects_claimed_oversize_without_reading():
 
     with pytest.raises(PayloadTooLarge):
         handler._body(8)
+
+
+def test_repeated_retirement_failures_reuse_one_publication_capability(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    raw = close.encode_pile((), workspace=workspace)
+    source = stage_pile(
+        node.store(workspace), node.member_for(workspace), raw)
+    store = node.store(workspace)
+    real_delete = store.delete
+    real_admit = node.admit_ingress
+    admits = {"count": 0}
+
+    def observed_admit(*args, **kwargs):
+        admits["count"] += 1
+        return real_admit(*args, **kwargs)
+
+    def failed_delete(_key):
+        raise OSError("injected retirement outage")
+
+    monkeypatch.setattr(node, "admit_ingress", observed_admit)
+    monkeypatch.setattr(store, "delete", failed_delete)
+
+    for _ in range(5):
+        node.turn(workspace)
+
+    assert store.get(source) == raw
+    assert admits["count"] == 1
+    assert len(node._publication_receipts) == 1
+
+    monkeypatch.setattr(store, "delete", real_delete)
+    node.turn(workspace)
+    assert store.get(source) is None
+    assert node._publication_receipts == {}

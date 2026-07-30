@@ -225,17 +225,23 @@ semantics; clients receive no LIST, DELETE, or `root` permission. S3 may also
 verify a signed SHA-256 checksum. R2 staging bytes are deliberately treated as
 untrusted until publication. An S3/R2 object-created event, authenticated poke,
 or scheduled scan wakes a database-free publisher. That publisher hashes every
-present object before canonical promotion, validates the pile, updates the
-authenticated trees, CASes `root`, and retires ingress only after the committed
-root proves publication. A lost event or poke affects latency, not durability.
+present object before canonical promotion and validates the pile. It then
+copies the exact verified pile to a fresh internal
+`pile/<member>/<generation>/<sha256>` key that client credentials cannot name.
+The internal generation updates the authenticated trees, CASes `root`, and
+retires only after the committed root proves publication. The original
+client-writable session marker is retained for a separate provider lifecycle
+policy; capability expiry alone is not a deletion proof because a request may
+start before expiry and complete afterward. A lost event or poke affects
+latency, not durability.
 
 Attachment bytes remain detached from fact validity. A missing Bao object
 does not block signed file/chunk facts from publication; the file is simply
 incomplete until a later direct upload or peer sync supplies it. This is the
 same rule used by ordinary replicas. F10 retirement therefore proves durable
-coverage of every admitted fact, not that every attachment byte exists. A
-staged object that arrives only after its marker has safely retired is an
-unreachable orphan and cannot create work by itself.
+coverage of every admitted fact, not that every attachment byte exists.
+Client-writable staging is not retired by this receipt; its retention and
+eventual cleanup are a separate provider lifecycle obligation.
 
 The AWS translator signs the exact `Content-Length`, `Content-Type`,
 `If-None-Match: *`, and `x-amz-checksum-sha256` headers of one S3 `PutObject`
@@ -258,24 +264,37 @@ test remains the direct-provider conformance gate for that header. That urllib
 probe is not browser evidence; browser `Content-Length` and CORS behavior
 remain a separate live obligation.
 
-That target also requires every valid candidate that may later regain standing
-to remain durably reachable. The current client keeps losing/inactive receipts
-only in its local catalog and may retire their original pile after publishing
-the eligible subset. The generic authenticated index bounds discovery for
-rooted/eligible candidates, but it does not manufacture missing dormant
-bytes or prove that arbitrary bytes were ever admitted. The target gives each
-kernel-admitted candidate one current raw residence—eligible in a RangeTree
-leaf or dormant as a content-addressed blob—and points its authenticated
-FactTree record at a raw-free admission-proof DAG that the running kernel can
-replay. A serverless publisher is not complete until that archive exists and
-ingress retirement proves that every durable valid in the pile is represented,
-not only the currently eligible subset.
+Every valid candidate that may later regain standing remains durably
+root-reachable. Every kernel-admitted candidate has a stable canonical blob at
+`obj/H(encode(fact))`; eligible facts are also materialized in derived
+RangeTree sync piles. Its authenticated FactTree record names the
+lexicographically smallest complete historical admission-proof DAG the
+replica has verified. Candidate state is exact bytes plus that selected
+witness; current eligibility and dependency edges are a separate derived
+projection. Sync min-joins witnesses for eligible and dormant candidates, and
+a cold reader verifies each selected proof by rerunning the actual kernel.
+
+Ingress retirement uses a typed compiler/publication result. Every durable
+`Valid` in the exact pile must be constructed into the proposal or inherited
+from its pinned authorized base; only Applied, byte-identical ambiguous-CAS
+readback, or a token-verified no-op can mint the exact source/hash-bound
+retirement receipt. No post-CAS fact scan grants deletion authority. Wiping
+SQLite and rebuilding from root-reachable objects preserves dormant
+candidates and later restoration; proof-less legacy rows are never inferred
+admitted.
+
+The archive removes the persistence blocker for a database-free publisher,
+but the checked-in Lambda and Cloudflare artifacts are not yet wired as
+publishers. They remain readers until their turn coordinator consumes this
+archive, stages direct-upload intent, emits the derived objects, and performs
+the same root-CAS/retirement protocol as the client runtime.
 
 There is no correctness reason to proxy immutable bytes through the publisher
 when the client can write an isolated ingress object directly. The narrower
 boundary is intentional: uploaders may create only the staging objects named
 by their grants, while publishers alone may list ingress, read workspace
-state, create canonical objects and derived index pages, retire proven piles,
+state, create canonical objects and derived index pages, retire proven internal
+piles,
 and CAS `root`. If a provider cannot enforce the exact staging key,
 create-only condition, byte bound, and expiry, the deployment must keep the
 host daemon or put a narrow streaming upload verifier in front of the object
@@ -395,6 +414,15 @@ and an event for the final pile only reduces wake latency. Object class comes
 before session deliberately: provider lifecycle can collect abandoned
 `objects/` without ever matching an F10-governed `piles/` marker, while a
 scheduled publisher can scan only the marker prefix.
+
+These staging paths never become canonical pile paths. After validation, the
+publisher performs a trusted create-only copy to an independently random
+internal generation. Replaying the same session marker—including a PUT that
+started before credential expiry but completed later—therefore produces, at
+worst, another fresh no-op publication attempt. It cannot recreate a retired
+internal key or make an old receipt destructive. Cleanup of client-writable
+staging is tracked separately; the current lifecycle input still excludes
+`piles/`.
 
 The provider-neutral broker core now implements `OPEN`, `ISSUE`, and
 `FINALIZE`. `OPEN` commits a finite, sorted `(digest, size)` vector under a

@@ -265,17 +265,27 @@ def test_peer_adaptively_splits_413_batches_without_losing_order_or_misses():
     assert list(map(len, calls)) == [5, 2, 3, 1, 2]
 
 
-def test_peer_reports_a_single_object_that_cannot_fit_a_batch():
+def test_peer_falls_back_to_single_get_when_one_object_cannot_fit_a_batch():
     peer = object.__new__(WalkPeer)
+    raw = b"x" * (walk.MAX_PAGE_BATCH_BYTES + 1)
+    oid = h(raw)
+    calls = []
 
-    def http(*_args, **_kwargs):
-        raise urllib.error.HTTPError(
-            "https://peer/page", 413, "too large", {}, io.BytesIO())
+    def http(method, path, *_args, **_kwargs):
+        calls.append((method, path, _kwargs.get("response_limit")))
+        if method == "POST":
+            raise urllib.error.HTTPError(
+                "https://peer/page", 413, "too large", {}, io.BytesIO())
+        assert (method, path) == ("GET", f"/page/{oid}")
+        return 200, raw, {}
 
     peer._http = http
 
-    with pytest.raises(ValueError, match="single object"):
-        peer.objs(("a" * 64,))
+    assert peer.objs((oid,)) == (raw,)
+    assert calls == [
+        ("POST", "/page", walk.MAX_PAGE_BATCH_BYTES),
+        ("GET", f"/page/{oid}", walk.MAX_OBJECT_BYTES),
+    ]
 
 
 def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):

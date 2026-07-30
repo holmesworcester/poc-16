@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 import facts
 from .fact import Fact, bound_to, decode
+from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
 from .shape import valid_fid
 
 class Valid(NamedTuple):
@@ -88,6 +89,7 @@ class MemoryContext:
         self.facts = {}
         self.proofs = {}
         self.edges = {}
+        self.closures = {}
 
     def has_fact(self, fid):
         return fid in self.facts
@@ -134,8 +136,16 @@ class MemoryContext:
             return None
         return 1 + max(self.proofs[fid] for fid in deps)
 
+    def closure(self, deps):
+        if any(fid not in self.closures for fid in deps):
+            return None
+        return frozenset().union(
+            *(self.closures[fid] for fid in deps))
+
     def admit(self, fact, rank, edges):
         self.facts[fact.fid], self.proofs[fact.fid] = fact, rank
+        closure = self.closure(tuple(edge.fid for edge in edges))
+        self.closures[fact.fid] = frozenset((fact.fid,)) | closure
         self.edges.update(
             ((fact.fid, edge.role), edge.fid) for edge in edges)
 
@@ -232,6 +242,37 @@ def proof_rank(db, deps):
     if any(fid not in ranks for fid in deps):
         return None
     return 1 + max(ranks[fid] for fid in deps)
+
+
+def proof_closure_size(db, deps, *, stop_after=None):
+    """Count the unique current proof ancestors of ``deps``.
+
+    The database-free context already retains exact closure sets.  SQLite
+    stores only direct edges, so derive the same set with a recursive UNION.
+    ``stop_after`` bounds work for callers that need only a protocol-limit
+    verdict; the returned value is then capped at ``stop_after + 1``.
+    """
+    deps = tuple(dict.fromkeys(deps))
+    if not deps:
+        return 0
+    if hasattr(db, "closure"):
+        closure = db.closure(deps)
+        if closure is None:
+            return None
+        size = len(closure)
+        return size if stop_after is None else min(size, stop_after + 1)
+    seeds = ", ".join("(?)" for _ in deps)
+    limit = "" if stop_after is None else " LIMIT ?"
+    args = deps if stop_after is None else deps + (stop_after + 1,)
+    rows = db.execute(
+        "WITH RECURSIVE closure(fid) AS ("
+        f"VALUES {seeds} "
+        "UNION "
+        "SELECT e.dst FROM edges e JOIN closure c ON e.src=c.fid"
+        ") SELECT fid FROM closure" + limit,
+        args,
+    ).fetchall()
+    return len(rows)
 
 
 def accepts(fact, edges, ctx, strict=False):
@@ -331,7 +372,14 @@ def extend_proofs(db, fids, fact_of, anchor=None, accept=None):
             edges = resolve_edges(fact, db)
             deps = None if edges is None else [edge.fid for edge in edges]
             rank = proof_rank(db, deps) if deps is not None else None
-            if rank is not None and accept(fact, edges):
+            closure_size = proof_closure_size(
+                db, deps, stop_after=MAX_CLOSURE_FACTS - 1
+            ) if rank is not None else None
+            if rank is not None \
+                    and closure_size is not None \
+                    and closure_size + 1 <= MAX_CLOSURE_FACTS \
+                    and len(edges) <= MAX_RESOLVED_EDGES \
+                    and accept(fact, edges):
                 ready.append((fid, rank, edges))
         if not ready:
             break
@@ -409,6 +457,8 @@ def _judge(stream, ctx):
             edges = resolve_edges(
                 fact, ctx, strict=True
             ) if handler is not None and refs_seen else None
+            if edges is not None and len(edges) > MAX_RESOLVED_EDGES:
+                return Judgment(False, tuple(valids))
             deps = None if edges is None else [edge.fid for edge in edges]
             good = edges is not None and accepts(
                 fact, edges, ctx, strict=True)
@@ -419,7 +469,9 @@ def _judge(stream, ctx):
             # rejection verdict.
             return Judgment(False, tuple(valids), error)
         rank = proof_rank(ctx, deps) if good else None
-        if rank is None:
+        closure = ctx.closure(deps) if rank is not None else None
+        if rank is None or closure is None \
+                or len(closure) + 1 > MAX_CLOSURE_FACTS:
             return Judgment(False, tuple(valids))
         ctx.admit(fact, rank, edges)
         valids.append(Valid(fact, tuple(deps), tuple(edges)))

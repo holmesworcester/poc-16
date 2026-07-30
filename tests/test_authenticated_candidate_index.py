@@ -63,9 +63,7 @@ def _canonical_root(node, workspace):
         lambda raw: h(raw),
     )
     seed, trees = indexes.build(
-        workspace, index,
-        lambda fid: node.candidate_of(workspace, fid),
-        lambda raw: h(raw),
+        workspace, index, lambda raw: h(raw),
     )
     return manifest.encode_root(
         workspace, range_root,

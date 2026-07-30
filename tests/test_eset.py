@@ -205,7 +205,8 @@ def test_suppression_stays_behind_the_manifest_commit(
         index = node.idx(workspace)
         index.executescript(
             "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
-            "DELETE FROM proofs; DELETE FROM supp; DELETE FROM meta;")
+            "DELETE FROM admission_receipts; DELETE FROM proofs; "
+            "DELETE FROM supp; DELETE FROM meta;")
         index.commit()
         index.close()
         node = Node(node.dir)
