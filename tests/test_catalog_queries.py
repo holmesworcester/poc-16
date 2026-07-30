@@ -1,291 +1,289 @@
-"""The single fact catalog and generic query-index contract."""
+"""The one disposable fact catalog and combined generic index."""
 import json
 import sqlite3
 
-from core import catalog, cmds, suppression_state
-from core.crypto import h
-from core.object_store import Applied
+import pytest
+
+from core import catalog, cmds, settlement
 from core.fact import Fact, canon, decode, encode
 from core.node import Node
 
 
-def test_catalog_stores_one_blob_and_indexes_type_refs_and_offers(tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    message_fid = cmds.post(
-        node, workspace, "general", "indexed by type", ts=2)
-    index = node.idx(workspace)
+OBSOLETE_TABLES = {
+    "action_proposals",
+    "action_targets",
+    "actions",
+    "admission_receipts",
+    "edges",
+    "log",
+    "offers",
+    "proofs",
+    "staged",
+    "supp",
+}
 
-    assert [
-        (name, kind)
-        for _, name, kind, *_ in index.execute("PRAGMA table_info(facts)")
-    ] == [("fid", "TEXT"), ("blob", "BLOB")]
 
-    for fid, raw in index.execute("SELECT fid, blob FROM facts"):
+def _tables(db):
+    return {
+        name for (name,) in db.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    }
+
+
+def _expected_projection(node, workspace):
+    """Derive exact local rows from one authenticated pinned archive."""
+    reader = node.reader(workspace)
+    archive = reader.archive()
+    facts_by_fid = {
+        fid: encode(fact)
+        for fid, fact in archive.facts.items()
+    }
+    rows = {
+        row
+        for fact in archive.facts.values()
+        for row in catalog.index_rows(fact)
+    }
+    for fid, record in archive.records.items():
+        if record["state"] != "eligible":
+            continue
+        rows.add((
+            catalog.STATE_INDEX,
+            "eligible",
+            str(record["rank"]),
+            fid,
+        ))
+        rows.update(
+            (
+                catalog.EDGE_INDEX,
+                f"{kind}:{role}",
+                parent,
+                fid,
+            )
+            for role, parent, kind in record["dependencies"]
+        )
+    projection = settlement.project(workspace, archive.facts)
+    rows.update(
+        (catalog.ACTION_INDEX, sid, "", fid)
+        for sid, fid in projection.actions.items()
+    )
+    return facts_by_fid, rows
+
+
+def _assert_exact_projection(node, workspace):
+    expected_facts, expected_rows = _expected_projection(
+        node, workspace)
+    db = node.idx(workspace)
+    actual_facts = dict(db.execute(
+        "SELECT fid, blob FROM facts"))
+    actual_rows = set(db.execute(
+        "SELECT kind, k0, k1, src FROM fact_index"))
+
+    assert actual_facts == expected_facts
+    assert actual_rows == expected_rows
+    assert _tables(db) == {"facts", "fact_index", "meta"}
+    assert set(
+        key for (key,) in db.execute("SELECT k FROM meta")
+    ) == {"index-version", "root", "root-bytes"}
+    for fid, raw in actual_facts.items():
         fact = decode(raw)
         assert fact.fid == fid
         assert encode(fact) == raw
-        rows = set(index.execute(
-            "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)))
-        assert rows == {
-            (catalog.TYPE_INDEX, fact.t, ""),
-            (catalog.KEY_INDEX, fact.key, ""),
-            *((catalog.REF_INDEX, role, target)
-              for role, target in fact.refs()),
-            *fact.offers(),
-        }
 
-    assert [fact.fid for fact in node.by_type(workspace, "msg")] \
-        == [message_fid]
+
+def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    kept = cmds.post(
+        node, workspace, "general", "kept", ts=2)
+    removed = cmds.post(
+        node, workspace, "general", "removed", ts=3)
+    action = cmds.remove(node, workspace, removed, ts=4)
+    db = node.idx(workspace)
+
+    assert [
+        (name, kind)
+        for _, name, kind, *_ in db.execute("PRAGMA table_info(facts)")
+    ] == [("fid", "TEXT"), ("blob", "BLOB")]
+    assert [
+        name for _, name, *_ in db.execute(
+            "PRAGMA table_info(fact_index)")
+    ] == ["kind", "k0", "k1", "src"]
+    _assert_exact_projection(node, workspace)
+
+    assert [fact.fid for fact in node.by_type(
+        workspace, "msg")] == [kept]
     assert node.select(
         workspace, "member", node.identity_id(workspace)
     )[0].fid == workspace
-    assert index.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE name IN ('offers','log','projected','message_rows')"
-    ).fetchone() is None
+    assert db.execute(
+        "SELECT src FROM fact_index "
+        "WHERE kind=? AND src=?",
+        (catalog.ACTION_INDEX, action),
+    ).fetchone() == (action,)
+    assert _tables(db).isdisjoint(OBSOLETE_TABLES)
     assert not (tmp_path / "node" / "app.db").exists()
 
 
-def test_public_queries_restart_directly_from_catalog(tmp_path):
+def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
     workspace = cmds.create(node, "alice", ts=1)
     keep = cmds.post(node, workspace, "general", "keep", ts=2)
     remove = cmds.post(node, workspace, "general", "remove", ts=3)
     cmds.remove(node, workspace, remove, ts=4)
-    index = node.idx(workspace)
-
-    assert [
-        name for _, name, *_ in index.execute(
-            "PRAGMA table_info(action_proposals)")
-    ] == ["fid", "k"]
-    assert [
-        name for _, name, *_ in index.execute("PRAGMA table_info(actions)")
-    ] == ["sid", "fid"]
-    assert index.execute(
-        "SELECT COUNT(*) FROM facts WHERE fid IN "
-        "(SELECT fid FROM action_proposals)"
-    ).fetchone() == index.execute(
-        "SELECT COUNT(*) FROM action_proposals"
-    ).fetchone()
-
+    root = node.reader(workspace).root_bytes
     expected = {
         "members": cmds.members(node, workspace),
         "messages": cmds.msgs(node, workspace),
     }
+    expected_facts, expected_rows = _expected_projection(
+        node, workspace)
     assert [row["fid"] for row in expected["messages"]] == [keep]
     node.idx(workspace).close()
 
     reopened = Node(str(directory))
+
+    assert reopened.reader(workspace).root_bytes == root
     assert cmds.members(reopened, workspace) == expected["members"]
     assert cmds.msgs(reopened, workspace) == expected["messages"]
+    assert dict(reopened.idx(workspace).execute(
+        "SELECT fid, blob FROM facts")) == expected_facts
+    assert set(reopened.idx(workspace).execute(
+        "SELECT kind, k0, k1, src FROM fact_index"
+    )) == expected_rows
     assert not (directory / "app.db").exists()
 
 
-def test_legacy_rows_migrate_to_canonical_blobs_and_generic_index():
-    workspace = "0" * 64
-    db = sqlite3.connect(":memory:")
-    db.executescript("""
-        CREATE TABLE facts(
-            fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
-        CREATE TABLE offers(
-            name TEXT, a0 TEXT, a1 TEXT, src TEXT,
-            PRIMARY KEY(name, a0, a1, src));
-    """)
-    committed = Fact(
-        "legacy", 1, [["offer", "legacy-key", "one"]], {"value": 1},
-        workspace)
-    pending = Fact("legacy", 2, [], {"value": 2}, workspace)
-    db.executemany(
-        "INSERT INTO facts VALUES(?,?,?,?,?)",
-        (
-            (fact.fid, fact.ts, fact.t, json.dumps(fact.to_json()), admitted)
-            for fact, admitted in ((committed, 1), (pending, 0))
-        ),
-    )
-    db.commit()
-    db.executescript(catalog.SCHEMA)
-
-    catalog.upgrade_schema(db, workspace)
-
-    assert {
-        name for _, name, *_ in db.execute("PRAGMA table_info(facts)")
-    } == {"fid", "blob"}
-    assert decode(db.execute(
-        "SELECT blob FROM facts WHERE fid=?", (committed.fid,)
-    ).fetchone()[0]) == committed
-    assert db.execute(
-        "SELECT fid FROM staged").fetchall() == [(pending.fid,)]
-    assert set(db.execute(
-        "SELECT kind, k0, k1, src FROM fact_index"
-    )) == {
-        (catalog.TYPE_INDEX, "legacy", "", committed.fid),
-        (catalog.TYPE_INDEX, "legacy", "", pending.fid),
-        (catalog.KEY_INDEX, committed.key, "", committed.fid),
-        (catalog.KEY_INDEX, pending.key, "", pending.fid),
-        ("legacy-key", "one", "", committed.fid),
-    }
-    assert db.execute(
-        "SELECT 1 FROM sqlite_master WHERE name='offers'"
-    ).fetchone() is None
-
-
-def test_legacy_action_tables_drop_copied_fact_json():
-    db = sqlite3.connect(":memory:")
-    db.executescript("""
-        CREATE TABLE action_proposals(
-            fid TEXT PRIMARY KEY, k TEXT NOT NULL, j TEXT NOT NULL);
-        CREATE TABLE actions(
-            sid TEXT PRIMARY KEY, fid TEXT NOT NULL,
-            j TEXT NOT NULL, evidence TEXT NOT NULL);
-        CREATE INDEX actions_by_fid ON actions(fid);
-        INSERT INTO action_proposals VALUES('action','key','copied body');
-        INSERT INTO actions VALUES('fact:target','action','copied body','proof');
-    """)
-
-    suppression_state.upgrade_schema(db)
-
-    assert [
-        name for _, name, *_ in db.execute(
-            "PRAGMA table_info(action_proposals)")
-    ] == ["fid", "k"]
-    assert [
-        name for _, name, *_ in db.execute("PRAGMA table_info(actions)")
-    ] == ["sid", "fid"]
-    assert db.execute("SELECT * FROM action_proposals").fetchall() == [
-        ("action", "key"),
-    ]
-    assert db.execute("SELECT * FROM actions").fetchall() == [
-        ("fact:target", "action"),
-    ]
-    assert db.execute(
-        "SELECT name FROM sqlite_master "
-        "WHERE type='index' AND name='actions_by_fid'"
-    ).fetchone() == ("actions_by_fid",)
-
-
-def test_rebuild_replaces_stale_and_missing_generic_index_rows(tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    message = cmds.post(node, workspace, "general", "kept", ts=2)
-    index = node.idx(workspace)
-    index.execute("DELETE FROM fact_index WHERE src=?", (message,))
-    index.execute(
-        "INSERT INTO fact_index VALUES(?,?,?,?)",
-        (catalog.TYPE_INDEX, "msg", "", workspace),
-    )
-    index.execute("DELETE FROM proofs WHERE fid=?", (message,))
-    index.commit()
-
-    node.rebuild(workspace)
-
-    for fid, raw in index.execute("SELECT fid, blob FROM facts"):
-        fact = decode(raw)
-        assert set(index.execute(
-            "SELECT kind, k0, k1 FROM fact_index WHERE src=?", (fid,)
-        )) == {
-            (catalog.TYPE_INDEX, fact.t, ""),
-            (catalog.KEY_INDEX, fact.key, ""),
-            *((catalog.REF_INDEX, role, target)
-              for role, target in fact.refs()),
-            *fact.offers(),
-        }
-    assert [row["fid"] for row in cmds.msgs(node, workspace)] == [message]
-
-
-def test_v23_blob_catalog_backfills_keys_before_foreign_root_republish(
+def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
     workspace = cmds.create(node, "alice", ts=1)
-    message = cmds.post(node, workspace, "general", "survives", ts=2)
-    store = node.store(workspace)
-    current = store.get("root")
-    foreign_value = json.loads(current)
-    foreign_value["stamp"] = "composite-btreap-v4"
-    foreign = canon(foreign_value)
-    assert isinstance(store.cas(
-        "root", store.read_versioned("root").token, foreign), Applied)
+    message_fid = cmds.post(
+        node, workspace, "general", "survives cut", ts=2)
+    root = node.reader(workspace).root_bytes
+    path = directory / "ws" / f"{workspace}.idx.db"
+    node.idx(workspace).close()
 
-    index = node.idx(workspace)
-    index.execute(
-        "DELETE FROM fact_index WHERE kind=?", (catalog.KEY_INDEX,))
-    index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('root',?)", (h(foreign),))
-    index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('root-bytes',?)", (foreign,))
-    index.execute(
+    db = sqlite3.connect(path)
+    db.executescript("""
+        DROP TABLE facts;
+        DROP TABLE fact_index;
+        CREATE TABLE facts(
+            fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
+        CREATE TABLE fact_index(
+            kind TEXT, k0 TEXT, k1 TEXT, src TEXT);
+        CREATE TABLE action_proposals(value TEXT);
+        CREATE TABLE action_targets(value TEXT);
+        CREATE TABLE actions(value TEXT);
+        CREATE TABLE admission_receipts(value TEXT);
+        CREATE TABLE edges(value TEXT);
+        CREATE TABLE log(value TEXT);
+        CREATE TABLE offers(value TEXT);
+        CREATE TABLE proofs(value TEXT);
+        CREATE TABLE staged(value TEXT);
+        CREATE TABLE supp(value TEXT);
+        CREATE INDEX fact_keys ON fact_index(k0,src);
+        CREATE INDEX fact_boundaries ON fact_index(k0,src);
+    """)
+    local_only = Fact(
+        "legacy",
+        3,
+        [],
+        {"value": "must be discarded"},
+        workspace,
+    )
+    db.execute(
+        "INSERT INTO facts VALUES(?,?,?,?,?)",
+        (
+            local_only.fid,
+            local_only.ts,
+            local_only.t,
+            json.dumps(local_only.to_json()),
+            1,
+        ),
+    )
+    db.execute(
         "INSERT OR REPLACE INTO meta VALUES('index-version',?)",
-        ("admission-catalog-v23",),
+        ("admission-catalog-v27",),
     )
-    index.commit()
-    index.close()
-
-    reopened = Node(str(directory))
-
-    assert reopened.store(workspace).get("root") != foreign
-    assert reopened.fact_of(workspace, message) is not None
-    assert [row["fid"] for row in cmds.msgs(reopened, workspace)] == [message]
-    assert reopened.idx(workspace).execute(
-        "SELECT COUNT(*) FROM fact_index WHERE kind=?",
-        (catalog.KEY_INDEX,),
-    ).fetchone() == reopened.idx(workspace).execute(
-        "SELECT COUNT(*) FROM facts"
-    ).fetchone()
-
-
-def test_old_boundary_directory_is_normalized_without_republishing(tmp_path):
-    directory = tmp_path / "node"
-    node = Node(str(directory))
-    workspace = cmds.create(node, "alice", ts=1)
-    cmds.post(node, workspace, "general", "kept", ts=2)
-    root = node.store(workspace).get("root")
-    index = node.idx(workspace)
-    fid = index.execute(
-        "SELECT src FROM fact_index WHERE kind=? LIMIT 1",
-        (catalog.KEY_INDEX,),
-    ).fetchone()[0]
-    index.execute(
-        "UPDATE fact_index SET k1='1' WHERE kind=? AND src=?",
-        (catalog.KEY_INDEX, fid),
-    )
-    index.execute(
-        "CREATE INDEX fact_boundaries ON fact_index(k0,src) "
-        "WHERE kind='fact.key' AND k1='1'"
-    )
-    index.execute(
-        "CREATE INDEX fact_keys ON fact_index(k0,src) "
-        "WHERE kind='fact.key'"
-    )
-    index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('index-version',?)",
-        ("admission-catalog-v24",),
-    )
-    index.commit()
-    index.close()
+    db.commit()
+    db.close()
 
     reopened = Node(str(directory))
     upgraded = reopened.idx(workspace)
 
-    assert upgraded.execute(
-        "SELECT 1 FROM fact_index WHERE kind=? AND k1!=''",
-        (catalog.KEY_INDEX,),
-    ).fetchone() is None
+    assert reopened.reader(workspace).root_bytes == root
+    assert reopened.fact_of(workspace, message_fid) is not None
+    assert reopened.candidate_of(
+        workspace, local_only.fid) is None
+    assert _tables(upgraded) == {"facts", "fact_index", "meta"}
+    assert _tables(upgraded).isdisjoint(OBSOLETE_TABLES)
     assert upgraded.execute(
         "SELECT 1 FROM sqlite_master "
-        "WHERE type='index' AND name IN ('fact_keys','fact_boundaries')"
+        "WHERE type='index' AND name IN "
+        "('fact_keys','fact_boundaries')"
     ).fetchone() is None
-    assert reopened.store(workspace).get("root") == root
+    _assert_exact_projection(reopened, workspace)
 
 
-def test_index_lookup_decodes_only_selected_fact_bodies(tmp_path, monkeypatch):
+def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
-    for timestamp in range(2, 22):
+    message_fid = cmds.post(
+        node, workspace, "general", "kept", ts=2)
+    root = node.reader(workspace).root_bytes
+    db = node.idx(workspace)
+    db.execute(
+        "DELETE FROM fact_index WHERE src=?", (message_fid,))
+    db.execute(
+        "DELETE FROM facts WHERE fid=?", (message_fid,))
+    db.execute(
+        "INSERT INTO fact_index VALUES(?,?,?,?)",
+        (catalog.TYPE_INDEX, "forged", "", workspace),
+    )
+    db.commit()
+
+    node.rebuild(workspace)
+
+    assert node.reader(workspace).root_bytes == root
+    _assert_exact_projection(node, workspace)
+    assert [row["fid"] for row in cmds.msgs(
+        node, workspace)] == [message_fid]
+
+
+def test_foreign_root_format_fails_closed_without_local_republish(
+        tmp_path):
+    directory = tmp_path / "node"
+    node = Node(str(directory))
+    workspace = cmds.create(node, "alice", ts=1)
+    cmds.post(node, workspace, "general", "kept", ts=2)
+    store = node.store(workspace)
+    value = json.loads(store.get("root"))
+    value["stamp"] = "obsolete-or-foreign-layout"
+    foreign = canon(value)
+    store._replace("root", foreign)
+    node.idx(workspace).close()
+
+    with pytest.raises(ValueError, match="root shape"):
+        Node(str(directory))
+
+    assert store.get("root") == foreign
+
+
+def test_index_lookup_decodes_only_selected_fact_bodies(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    for timestamp in range(2, 7):
         cmds.post(
-            node, workspace, "general", f"message-{timestamp}",
-            ts=timestamp)
+            node,
+            workspace,
+            "general",
+            f"message-{timestamp}",
+            ts=timestamp,
+        )
 
     decoded = []
     strict_decode = catalog.decode

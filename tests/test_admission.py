@@ -1,79 +1,156 @@
-"""The durable catalog has one running-kernel admission membrane."""
-import json
+"""Admission semantics remain authenticated; SQLite only projects them."""
+import sqlite3
 
 import pytest
 
 from core import catalog, cmds
-from core.fact import canon, encode
+from core.fact import encode
 from core.node import Node
 from facts.content.message import message
 
 
-def test_admission_retains_the_kernels_exact_semantic_edges(tmp_path):
-    node = Node(str(tmp_path / "node"))
-    workspace = cmds.create(node, "alice", ts=1)
-    fid = cmds.post(node, workspace, "general", "admitted", ts=2)
-
-    edges = node.catalog(workspace).admission_edges(fid)
-    assert edges == node.catalog(workspace).edges(fid)
-    assert [edge.role for edge in edges] == sorted(
-        edge.role for edge in edges)
-    assert len({edge.role for edge in edges}) == len(edges)
-    assert {edge.kind for edge in edges} == {"need"}
-
-    # Canonical JSON is not enough: a semantically malformed local witness
-    # fails closed when later proof-DAG work tries to consume it.
-    index = node.idx(workspace)
-    raw = index.execute(
-        "SELECT receipt FROM admission_receipts WHERE fid=?",
-        (fid,),
-    ).fetchone()[0]
-    damaged = json.loads(raw)
-    damaged["edges"][0][2] = "invented"
-    index.execute(
-        "UPDATE admission_receipts SET receipt=? WHERE fid=?",
-        (canon(damaged), fid),
+def _receipt_edges(reader, fid):
+    verified = reader.candidates().verify(fid)
+    receipt = next(
+        receipt
+        for receipt in verified.valids
+        if receipt.fact.fid == fid
     )
-    with pytest.raises(ValueError, match="admission receipt integrity"):
-        node.catalog(workspace).admission_edges(fid)
+    return tuple(sorted(
+        receipt.edges, key=lambda edge: edge.role))
 
 
-def test_v27_local_only_rows_remain_explicitly_proofless(tmp_path):
-    """The membrane does not pretend to solve the pending legacy-cut bead."""
+def test_combined_edge_rows_match_authenticated_admission_semantics(
+        tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
+    fid = cmds.post(
+        node, workspace, "general", "admitted", ts=2)
+    reader = node.reader(workspace)
+    expected = _receipt_edges(reader, fid)
+    projected = node.catalog(workspace).edges(fid)
+    record = reader.candidates().fact_record(fid)
+
+    assert projected == expected
+    assert [
+        [edge.role, edge.fid, edge.kind]
+        for edge in projected
+    ] == record["dependencies"]
+    assert [edge.role for edge in projected] == sorted(
+        edge.role for edge in projected)
+    assert len({edge.role for edge in projected}) == len(projected)
+    assert {edge.kind for edge in projected} == {"need"}
+    assert set(node.idx(workspace).execute(
+        "SELECT k0, k1 FROM fact_index "
+        "WHERE kind=? AND src=?",
+        (catalog.EDGE_INDEX, fid),
+    )) == {
+        (f"{edge.kind}:{edge.role}", edge.fid)
+        for edge in expected
+    }
+
+    # Local rows are explicitly unauthenticated accelerators. A malformed
+    # typed role fails closed locally, while the pinned repository proof
+    # remains intact and a root refresh restores the exact combined rows.
+    first = expected[0]
+    node.idx(workspace).execute(
+        "UPDATE fact_index SET k0=? "
+        "WHERE kind=? AND src=? AND k0=? AND k1=?",
+        (
+            f"invented:{first.role}",
+            catalog.EDGE_INDEX,
+            fid,
+            f"{first.kind}:{first.role}",
+            first.fid,
+        ),
+    )
+    node.idx(workspace).commit()
+    with pytest.raises(ValueError, match="fact projection edge"):
+        node.catalog(workspace).edges(fid)
+    assert _receipt_edges(reader, fid) == expected
+
+    node.rebuild(workspace)
+
+    assert node.catalog(workspace).edges(fid) == expected
+
+
+def test_legacy_local_authority_rows_are_discarded_not_blessed(
+        tmp_path):
+    directory = tmp_path / "node"
+    node = Node(str(directory))
+    workspace = cmds.create(node, "alice", ts=1)
+    root = node.reader(workspace).root_bytes
     forged = message(
-        workspace, node.identity_id(workspace),
-        "general", "legacy local-only row", 2)
-    index = node.idx(workspace)
-    index.execute(
+        workspace,
+        node.identity_id(workspace),
+        "general",
+        "legacy local-only row",
+        2,
+    )
+    db = node.idx(workspace)
+    db.execute(
         "INSERT INTO facts(fid, blob) VALUES(?,?)",
         (forged.fid, encode(forged)),
     )
-    index.execute("DELETE FROM admission_receipts")
-    index.execute(
+    db.executemany(
+        "INSERT INTO fact_index VALUES(?,?,?,?)",
+        catalog.index_rows(forged),
+    )
+    db.execute(
+        "INSERT INTO fact_index VALUES(?,?,?,?)",
+        (
+            catalog.STATE_INDEX,
+            "eligible",
+            "999",
+            forged.fid,
+        ),
+    )
+    db.executescript("""
+        CREATE TABLE admission_receipts(value TEXT);
+        CREATE TABLE proofs(value TEXT);
+        INSERT INTO admission_receipts VALUES('invented authority');
+        INSERT INTO proofs VALUES('invented rank');
+    """)
+    db.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('index-version', ?)",
         ("admission-catalog-v27-generic-candidate-index",),
     )
-    index.commit()
-    for connection in node._idx.values():
-        connection.close()
+    db.commit()
+    db.close()
 
-    reopened = Node(node.dir)
+    reopened = Node(str(directory))
+    upgraded = reopened.idx(workspace)
 
-    # The authenticated root is safely re-judged through the running kernel.
-    assert reopened.catalog(workspace).admission_edges(workspace) == ()
-    # The indistinguishable local-only legacy row is retained for the
-    # explicit .17.11.3 cutover decision, but never receives a witness.
-    assert reopened.candidate_of(workspace, forged.fid) == forged
+    assert reopened.reader(workspace).root_bytes == root
+    assert forged.fid not in reopened.reader(
+        workspace).archive().records
+    assert reopened.candidate_of(workspace, forged.fid) is None
     assert reopened.fact_of(workspace, forged.fid) is None
-    assert reopened.catalog(workspace).admission_edges(forged.fid) is None
+    assert {
+        name for (name,) in upgraded.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    } == {"facts", "fact_index", "meta"}
+    assert upgraded.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE name IN ('admission_receipts','proofs')"
+    ).fetchone() is None
 
 
-def test_raw_loader_is_memory_only(tmp_path):
-    import sqlite3
-
-    database = sqlite3.connect(tmp_path / "durable.db")
+def test_catalog_facade_is_read_only_over_a_disk_projection(tmp_path):
+    database = sqlite3.connect(tmp_path / "disposable.db")
     database.executescript(catalog.SCHEMA)
-    with pytest.raises(ValueError, match="in-memory"):
-        catalog.ScratchCatalog(database, "0" * 64)
+    facade = catalog.Catalog(database, "0" * 64)
+
+    assert facade.candidate("1" * 64) is None
+    assert not any(
+        name in catalog.Catalog.__dict__
+        for name in (
+            "admit",
+            "insert",
+            "publish",
+            "retire",
+            "settle",
+            "stage",
+        )
+    )
