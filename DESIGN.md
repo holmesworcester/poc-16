@@ -253,18 +253,17 @@ R2 PUT is not assumed safe or needed: Cloudflare accepts the exact PUT into
 isolated staging, and the publisher verifies it before canonical promotion.
 
 Provider credentials must preserve the same separation. AWS can give a
-presigner a PutObject-only resource policy. R2 can attenuate a child
-credential to exact object paths and actions, but its parent Object Read and
-Write token is bucket-scoped and also reads, lists, and deletes objects. A
-Cloudflare broker therefore must not hold such a parent token for the
-canonical workspace bucket. Unless a narrower parent primitive is
-live-proven, Cloudflare uses a separate ingress bucket: clients upload there
-directly, while only the publisher can validate/promote objects into the
-canonical bucket and CAS its root. The extra bucket is an authority boundary,
-not a second database. It protects canonical integrity, but does not by itself
-protect acknowledged staging from a compromised parent; that residual
-availability boundary must be either accepted explicitly with client retry
-until root publication or removed with a put-only verifier/parent.
+presigner a PutObject-only resource policy. R2
+[presigned URLs][r2-presigned] likewise bind one operation and object, but the
+long-lived parent Object Read and Write token is
+bucket-scoped and also reads, lists, and deletes objects. A Cloudflare broker
+therefore holds that parent only for a separate ingress bucket, never the
+canonical workspace bucket, and derives exact staging PUTs locally. Only the
+publisher can validate/promote those objects into the canonical bucket and CAS
+its root. The extra bucket is an authority boundary, not a second database. It
+protects canonical integrity, but does not protect pre-root staging from a
+compromised parent: an upload response is a retryable staging receipt, while
+observed root publication is the durable workspace acknowledgement.
 
 The generated Cloudflare isolated-ingress package refines that split into
 three provider identities:
@@ -277,9 +276,12 @@ publisher bindings       ingress read/retire + canonical promote/root CAS
 
 The broker Worker has no native R2 binding. Its only write-capable secret is
 the ingress parent; a distinct read-only S3 credential supplies canonical DAG
-reads. Local HS256 temporary-credential signing fixes each child JWT to the
-ingress bucket, one `objectPath`, `actions=[PutObject]`, issuer, audience,
-issued time, and expiry. The child is not a body-integrity proof. It targets
+reads. A segregated pure-stdlib SigV4 translator binds `PUT`, the path-style
+account endpoint, ingress bucket, one exact key, `Content-Length`,
+`Content-Type`, `If-None-Match: *`, credential scope
+`auto/s3/aws4_request`, and session-bounded expiry. It returns an ordinary
+`UploadCapability`, never a temporary credential. Its payload mode is
+explicitly `UNSIGNED-PAYLOAD`, so it is not a body-integrity proof. It targets
 only
 `ingress/v1/workspaces/<workspace>/objects/<session>/<digest>` or
 `.../piles/<session>/<member>/<digest>`, whose bytes remain untrusted until
@@ -321,8 +323,8 @@ before any PUT is issued:
    Merkle range proof against that fixed commitment. It derives exact object
    keys and advances only the committed prefix. Every signer request carries
    the session's fixed `not_after_ms`; provider capabilities must expire no
-   later. S3 lifetimes are rounded down to whole seconds and issuance fails
-   closed when less than one whole second remains.
+   later. Provider SigV4 lifetimes are rounded down to whole seconds and
+   issuance fails closed when less than one signed second remains.
 3. `FINALIZE` requires the complete committed prefix and derives the sole pile
    key fixed by `OPEN`; it accepts no replacement descriptor or path.
 
@@ -366,12 +368,17 @@ exact owner and role markers were observed before the first delete. Applying
 and live-verifying the lifecycle remains a separate privileged provisioning
 step because replacing a bucket's whole lifecycle document from a compute
 deploy could clobber unrelated rules. The current entries are non-public
-fail-closed stubs. These generated documents and credential-free JWT mutation
-tests establish the intended authority shape, not a live-provider or
-completed-publisher claim.
+fail-closed stubs. These generated documents, frozen SigV4 vectors, an
+independent verifier, and credential-free mutation tests establish the
+intended authority shape, not a live-provider or completed-publisher claim.
+Cloudflare documents `PutObject` `If-None-Match`, but its presign page does not
+explicitly guarantee signed `Content-Length`; the opt-in direct-provider seam
+remains required before claiming that boundary, and it is not browser
+evidence.
 
 [r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
+[r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
 
 The production profile also treats each provider's documented RFC 9110 strong
 ETag behavior as a refinement axiom: an ETag accepted as a root CAS token must

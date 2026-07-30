@@ -38,7 +38,7 @@ BROKER_SECRET_NAMES = (
 )
 
 COMPATIBILITY_DATE = "2026-07-29"
-DEFAULT_CHILD_TTL_SECONDS = 15 * 60
+DEFAULT_PRESIGN_TTL_SECONDS = 15 * 60
 DEFAULT_STAGE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 UPLOAD_PROTOCOL = "isolated-ingress-v1"
 UPLOAD_ORDER = "objects-first-pile-last"
@@ -72,7 +72,7 @@ class Deployment:
     canonical_bucket_profile: str = "dedicated-workspace"
     canonical_prefix: str | None = None
     ingress_prefix: str | None = None
-    child_ttl_seconds: int = DEFAULT_CHILD_TTL_SECONDS
+    presign_ttl_seconds: int = DEFAULT_PRESIGN_TTL_SECONDS
     stage_retention_seconds: int = DEFAULT_STAGE_RETENTION_SECONDS
 
     def __post_init__(self):
@@ -115,17 +115,17 @@ class Deployment:
                 "ingress prefix must use the selected logical protocol")
         object.__setattr__(self, "canonical_prefix", canonical)
         object.__setattr__(self, "ingress_prefix", ingress)
-        if not isinstance(self.child_ttl_seconds, int) \
-                or isinstance(self.child_ttl_seconds, bool) \
-                or not 30 <= self.child_ttl_seconds <= 60 * 60:
-            raise ValueError("child credential TTL")
+        if not isinstance(self.presign_ttl_seconds, int) \
+                or isinstance(self.presign_ttl_seconds, bool) \
+                or not 1 <= self.presign_ttl_seconds <= 60 * 60:
+            raise ValueError("presigned PUT TTL")
         if not isinstance(self.stage_retention_seconds, int) \
                 or isinstance(self.stage_retention_seconds, bool) \
                 or not 24 * 60 * 60 <= self.stage_retention_seconds \
                 <= 30 * 24 * 60 * 60:
             raise ValueError("stage retention")
-        if self.stage_retention_seconds <= self.child_ttl_seconds:
-            raise ValueError("stage retention must exceed child TTL")
+        if self.stage_retention_seconds <= self.presign_ttl_seconds:
+            raise ValueError("stage retention must exceed presigned PUT TTL")
 
     @property
     def endpoint(self):
@@ -166,11 +166,11 @@ class Deployment:
             ingress_prefix=environment.get(
                 "CF_UPLOAD_INGRESS_PREFIX",
                 f"ingress/v1/workspaces/{workspace}"),
-            child_ttl_seconds=_integer(
+            presign_ttl_seconds=_integer(
                 environment.get(
-                    "CF_UPLOAD_CHILD_TTL_SECONDS",
-                    DEFAULT_CHILD_TTL_SECONDS),
-                "child credential TTL",
+                    "CF_UPLOAD_PRESIGN_TTL_SECONDS",
+                    DEFAULT_PRESIGN_TTL_SECONDS),
+                "presigned PUT TTL",
             ),
             stage_retention_seconds=_integer(
                 environment.get(
@@ -278,7 +278,7 @@ def _worker_base(deployment, *, role, name, main):
 
 
 def broker_config(deployment):
-    """Generate a broker with credentials but no native R2 binding."""
+    """Generate a broker with segregated credentials and no R2 binding."""
     policies = access_policies(deployment)
     config = _worker_base(
         deployment,
@@ -293,7 +293,7 @@ def broker_config(deployment):
         "CANONICAL_PREFIX": deployment.canonical_prefix,
         "INGRESS_BUCKET": deployment.ingress_bucket,
         "INGRESS_PREFIX": deployment.ingress_prefix,
-        "CHILD_TTL_SECONDS": deployment.child_ttl_seconds,
+        "PRESIGN_TTL_SECONDS": deployment.presign_ttl_seconds,
         "CANONICAL_READ_POLICY_SHA256": _policy_digest(
             policies["broker_canonical_reader"]),
         "INGRESS_PARENT_POLICY_SHA256": _policy_digest(
@@ -359,9 +359,10 @@ def generated_boundary(deployment):
         "access_policies": access_policies(deployment),
         "ingress_lifecycle": ingress_lifecycle(deployment),
         "provider_claim": {
-            "kind": "credential-free-generated-boundary",
+            "kind": "isolated-ingress-presigned-put-v1",
             "live_verified": False,
             "canonical_raw_put_sha256_safe": False,
+            "payload_mode": "UNSIGNED-PAYLOAD",
             "upload_protocol": UPLOAD_PROTOCOL,
             "upload_order": UPLOAD_ORDER,
             "session_nonce": "32-lowercase-hex",

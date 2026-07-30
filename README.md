@@ -154,11 +154,11 @@ deployments below do not accept uploads and cannot publish a workspace by
 themselves.
 
 The end-to-end direct-to-object-store cloud path is not implemented yet. The
-kernel-authorized, provider-neutral broker core and an exact AWS SigV4
-translator now exist under `deploy/upload_broker.py` and
-`deploy/aws_upload_broker`, but they are deliberately absent from the
-read-only Lambda artifact. There is not yet a deployed broker endpoint,
-multi-batch client, or database-free publisher.
+kernel-authorized, provider-neutral broker core and exact AWS and R2 SigV4
+translators now exist under `deploy/upload_broker.py`,
+`deploy/aws_upload_broker`, and `deploy/cloudflare_upload`, but they are
+deliberately absent from the read-only serverless artifacts. There is not yet
+a deployed broker endpoint, multi-batch client, or database-free publisher.
 
 After proving workspace upload authority, a client will receive short-lived
 capabilities for exact broker-chosen upload keys, upload file objects first,
@@ -198,6 +198,19 @@ signed length and the configured S3 CORS policy must admit every
 client-controlled signed header. The deterministic botocore tests do not
 claim to prove that browser/provider boundary.
 
+The pure-stdlib R2 translator returns the same bearer `PUT` shape. It signs the
+path-style account endpoint, ingress bucket, exact class-first key,
+`Content-Length`, `Content-Type`, `If-None-Match: *`, credential scope
+`auto/s3/aws4_request`, and a lifetime rounded down beneath the session
+deadline. Its canonical payload is explicitly `UNSIGNED-PAYLOAD`: the URL is
+an exact staging capability, not proof of the declared SHA-256. Cloudflare's
+[presigned URL documentation][r2-presigned] recommends this single-operation,
+single-object shape and documents `Content-Type`; its presign page does not
+explicitly guarantee signed `Content-Length`, so the checked-in opt-in live
+test remains the direct-provider conformance gate for that header. That urllib
+probe is not browser evidence; browser `Content-Length` and CORS behavior
+remain a separate live obligation.
+
 That target also requires every valid candidate that may later regain standing
 to remain durably reachable. The current client keeps losing/inactive receipts
 only in its local catalog and may retire their original pile after publishing
@@ -231,16 +244,17 @@ and the publisher hashes the stored value before it conditionally creates a
 canonical `obj/<sha256>`. Raw presigned canonical R2 PUTs remain outside the
 selected protocol.
 
-Cloudflare also requires provider-level separation. A child R2 credential can
-be limited to `PutObject`, but the broker's current parent read/write token can
-read, list, and delete within its bucket. It must never target the canonical
-workspace bucket. A separate ingress bucket preserves canonical integrity,
-but parent compromise could still erase unpublished staging; whether that
-availability loss is accepted as a retryable pre-publication boundary or
-requires a put-only verifier/parent remains an explicit deployment decision.
+Cloudflare also requires provider-level separation. The broker's parent
+read/write token can read, list, and delete within its bucket even though each
+returned presigned URL authorizes only one exact `PUT`. The parent therefore
+targets only the separate ingress bucket and never the canonical workspace
+bucket. Parent compromise could still erase pre-publication staging. A
+successful staging `PUT` is only a retryable receipt; observation of the
+published root is the durable workspace acknowledgement.
 
 [r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
+[r2-presigned]: https://developers.cloudflare.com/r2/api/s3/presigned-urls/
 
 ### Prepared Cloudflare upload boundary
 
@@ -249,11 +263,11 @@ isolated-ingress choice, but it is not yet a working upload service. The
 broker config has no native R2 binding. It expects one S3-compatible
 credential created from an exact-bucket `Object Read only` policy for
 canonical DAG reads, plus one separate parent credential created from an exact
-ingress-bucket `Object Read & Write` policy. Only the latter can mint locally
-signed temporary credentials, and the mint helper fixes those children to
-one session-scoped staging object, `PutObject`, and a short expiry. The
-publisher config is the only role with native `INGRESS` and `CANONICAL`
-bindings.
+ingress-bucket `Object Read & Write` policy. The segregated stdlib signer uses
+only that ingress parent to derive one short-lived URL for one exact
+session-scoped `PutObject`; no temporary credential or S3 client is returned
+to the uploader. The publisher config is the only role with native `INGRESS`
+and `CANONICAL` bindings.
 
 Both providers use one logical staging grammar:
 
@@ -316,10 +330,9 @@ owner/role markers, removes broker then publisher, and never deletes or
 reconfigures either bucket. The real authorization endpoint, store-only
 publisher, queue/schedule wakes, lifecycle installation/conformance check,
 and live R2 proof remain tracked work. Cloudflare documents that action-level
-temporary credentials require local signing and that `PutObject` can be the
-sole child action in its [temporary-credential model][r2-temp-creds].
-
-[r2-temp-creds]: https://developers.cloudflare.com/r2/api/s3/temporary-credentials/
+presigned URLs are generated locally and grant one operation on one object;
+the optional direct-provider test checks the exact signed PUT, header
+substitution, key substitution, create-only replay, and privileged readback.
 
 ## Cloudflare read-only gateway
 

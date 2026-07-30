@@ -1,14 +1,10 @@
-"""Cloudflare R2 ingress-role policy, credential, and lifecycle tests."""
-import base64
-from dataclasses import replace
-import hashlib
-import hmac
+"""Cloudflare R2 ingress-role policy, signer, and lifecycle tests."""
 import json
 from pathlib import Path
 
 import pytest
 
-from core.staged_intent import staging_prefix
+from core.staged_intent import staging_key, staging_prefix
 from deploy.cloudflare_upload import manage
 from deploy.cloudflare_upload.boundary import (
     BROKER_SECRET_NAMES,
@@ -23,13 +19,6 @@ from deploy.cloudflare_upload.boundary import (
     generated_boundary,
     ingress_lifecycle,
     publisher_config,
-)
-from deploy.cloudflare_upload.credentials import (
-    ACTION,
-    inspect_put_credentials,
-    mint_put_credentials,
-    new_session_id,
-    staging_key,
 )
 
 
@@ -47,20 +36,6 @@ def deployment(**changes):
     }
     values.update(changes)
     return Deployment(**values)
-
-
-def upload_credentials(candidate=None):
-    candidate = deployment() if candidate is None else candidate
-    return mint_put_credentials(
-        candidate,
-        member="e" * 16,
-        session="f" * 32,
-        kind="obj",
-        digest="1" * 64,
-        parent_access_key_id="2" * 32,
-        parent_secret_access_key="3" * 64,
-        now=1_000,
-    )
 
 
 def _policy_allows(candidate, policy, bucket, action):
@@ -101,7 +76,7 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
         "CANONICAL_PREFIX": candidate.canonical_prefix,
         "INGRESS_BUCKET": candidate.ingress_bucket,
         "INGRESS_PREFIX": candidate.ingress_prefix,
-        "CHILD_TTL_SECONDS": candidate.child_ttl_seconds,
+        "PRESIGN_TTL_SECONDS": candidate.presign_ttl_seconds,
         "CANONICAL_READ_POLICY_SHA256":
             broker["vars"]["CANONICAL_READ_POLICY_SHA256"],
         "INGRESS_PARENT_POLICY_SHA256":
@@ -141,6 +116,13 @@ def test_checked_in_wrangler_input_is_an_inert_fail_closed_placeholder():
     assert (package / "pylock.toml").read_text().count(
         'name = "workers-runtime-sdk"') == 1
     assert (package / "uv.lock").is_file()
+
+
+def test_upload_package_has_no_credential_shaped_client_transport():
+    package = Path(__file__).parents[1] / "deploy" / "cloudflare_upload"
+
+    assert not (package / "credentials.py").exists()
+    assert (package / "signer.py").is_file()
 
 
 def test_ingress_parent_cannot_address_any_canonical_operation():
@@ -185,9 +167,9 @@ def test_ingress_parent_cannot_address_any_canonical_operation():
     {"ingress_prefix": "../escape"},
     {"ingress_prefix": "some/other/safe/prefix"},
     {"canonical_bucket_profile": "shared-prefixes"},
-    {"child_ttl_seconds": 3601},
+    {"presign_ttl_seconds": 3601},
     {"stage_retention_seconds": 23 * 60 * 60},
-    {"stage_retention_seconds": 900, "child_ttl_seconds": 900},
+    {"stage_retention_seconds": 900, "presign_ttl_seconds": 900},
 ))
 def test_deployment_rejects_ambiguous_or_collapsed_authority(changes):
     with pytest.raises(ValueError):
@@ -200,73 +182,6 @@ def test_r2_bucket_name_bounds_accept_exactly_three_through_sixty_three():
         canonical_bucket="a" * 63).canonical_bucket == "a" * 63
 
 
-def test_child_credential_is_one_exact_put_until_one_exact_expiry():
-    candidate = deployment()
-    credentials = upload_credentials(candidate)
-    authority = inspect_put_credentials(
-        candidate,
-        credentials,
-        parent_secret_access_key="3" * 64,
-        now=1_000,
-    )
-    expected_key = (
-        f"{candidate.ingress_prefix}/objects/"
-        f"{'f' * 32}/{'1' * 64}"
-    )
-
-    assert credentials.bucket == candidate.ingress_bucket
-    assert credentials.key == expected_key
-    assert credentials.expires_at == 1_900
-    assert authority.allows(
-        bucket=candidate.ingress_bucket,
-        key=expected_key,
-        action=ACTION,
-        now=1_899,
-    )
-    mutations = (
-        {
-            "bucket": candidate.canonical_bucket,
-            "key": expected_key,
-            "action": ACTION,
-            "now": 1_100,
-        },
-        {
-            "bucket": candidate.ingress_bucket,
-            "key": expected_key + "-other",
-            "action": ACTION,
-            "now": 1_100,
-        },
-        {
-            "bucket": candidate.ingress_bucket,
-            "key": expected_key,
-            "action": "DeleteObject",
-            "now": 1_100,
-        },
-        {
-            "bucket": candidate.ingress_bucket,
-            "key": expected_key,
-            "action": "ListObjectsV2",
-            "now": 1_100,
-        },
-        {
-            "bucket": candidate.ingress_bucket,
-            "key": expected_key,
-            "action": ACTION,
-            "now": 1_900,
-        },
-    )
-    assert all(not authority.allows(**mutation) for mutation in mutations)
-    with pytest.raises(ValueError, match="expiry"):
-        inspect_put_credentials(
-            candidate,
-            credentials,
-            parent_secret_access_key="3" * 64,
-            now=1_900,
-        )
-    assert "session_token" not in repr(credentials)
-    assert "secret_access_key" not in repr(credentials)
-
-
 def test_selected_logical_key_grammar_is_exact_for_objects_and_pile_marker():
     candidate = deployment()
     member = "e" * 16
@@ -275,113 +190,22 @@ def test_selected_logical_key_grammar_is_exact_for_objects_and_pile_marker():
     base = f"ingress/v1/workspaces/{candidate.workspace}"
 
     assert staging_key(
-        candidate,
-        member=member,
-        session=session,
-        kind="obj",
-        digest=digest,
+        candidate.workspace, member, session, "obj", digest,
     ) == f"{base}/objects/{session}/{digest}"
     assert staging_key(
-        candidate,
-        member=member,
-        session=session,
-        kind="pile",
-        digest=digest,
+        candidate.workspace, member, session, "pile", digest,
     ) == f"{base}/piles/{session}/{member}/{digest}"
-    sessions = {new_session_id() for _ in range(16)}
-    assert len(sessions) == 16
-    assert all(
-        len(value) == 32
-        and all(character in "0123456789abcdef" for character in value)
-        for value in sessions
-    )
-
-
-@pytest.mark.parametrize("changes", (
-    {"member": "E" * 16},
-    {"member": "e" * 15},
-    {"session": "F" * 32},
-    {"session": "f" * 31},
-    {"kind": "root"},
-    {"digest": "1" * 63},
-))
-def test_staging_key_rejects_every_free_form_path_fragment(changes):
-    arguments = {
-        "member": "e" * 16,
-        "session": "f" * 32,
-        "kind": "obj",
-        "digest": "1" * 64,
-    }
-    arguments.update(changes)
-    with pytest.raises(ValueError):
-        staging_key(deployment(), **arguments)
-
-
-def _mutate_claim(credentials, field, value):
-    framed = base64.b64decode(credentials.session_token).decode()
-    header, payload, signature = framed[4:].split(".")
-    claims = json.loads(base64.urlsafe_b64decode(
-        payload + "=" * (-len(payload) % 4)))
-    claims[field] = value
-    changed = base64.urlsafe_b64encode(json.dumps(
-        claims, sort_keys=True, separators=(",", ":")).encode()
-    ).rstrip(b"=").decode()
-    token = base64.b64encode(
-        f"jwt/{header}.{changed}.{signature}".encode()).decode()
-    return replace(credentials, session_token=token)
-
-
-@pytest.mark.parametrize("field,value", (
-    ("actions", ["DeleteObject"]),
-    ("bucket", "poc16-canonical"),
-    ("paths", {
-        "objectPaths": ["stage/v1/another-object"],
-        "prefixPaths": [],
-    }),
-    ("exp", 9_999),
-))
-def test_child_authority_claim_mutation_breaks_parent_signature(
-        field, value):
-    candidate = deployment()
-    mutated = _mutate_claim(upload_credentials(candidate), field, value)
-
-    with pytest.raises(ValueError, match="signature"):
-        inspect_put_credentials(
-            candidate,
-            mutated,
-            parent_secret_access_key="3" * 64,
-            now=1_000,
-        )
-
-
-def test_child_secret_derivation_matches_documented_r2_jwt_wire_format():
-    credentials = upload_credentials()
-    jwt = base64.b64decode(credentials.session_token).decode()[4:]
-
-    assert credentials.access_key_id == "2" * 32
-    assert credentials.secret_access_key == hashlib.sha256(
-        jwt.encode()).hexdigest()
-    unsigned, encoded_signature = jwt.rsplit(".", 1)
-    expected = hmac.new(
-        ("3" * 64).encode(), unsigned.encode(), hashlib.sha256).digest()
-    assert hmac.compare_digest(
-        base64.urlsafe_b64decode(
-            encoded_signature + "=" * (-len(encoded_signature) % 4)),
-        expected,
-    )
 
 
 def test_staging_capability_makes_no_false_canonical_body_binding_claim():
     candidate = deployment()
-    credentials = upload_credentials(candidate)
     claim = generated_boundary(candidate)["provider_claim"]
 
-    assert credentials.key.startswith(candidate.ingress_prefix + "/")
-    assert not credentials.key.startswith(candidate.canonical_prefix + "/")
     assert claim == {
-        "kind": "credential-free-generated-boundary",
+        "kind": "isolated-ingress-presigned-put-v1",
         "live_verified": False,
         "canonical_raw_put_sha256_safe": False,
+        "payload_mode": "UNSIGNED-PAYLOAD",
         "upload_protocol": "isolated-ingress-v1",
         "upload_order": "objects-first-pile-last",
         "session_nonce": "32-lowercase-hex",
