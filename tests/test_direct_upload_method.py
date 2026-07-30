@@ -1,31 +1,39 @@
 """The future direct-upload design fails closed under authority mutations."""
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
 
 from tests.direct_upload_method import (
-    AUTHORITY_DIMENSIONS,
+    BODY_SHA256_HEADER,
+    BROKER_MINT_DIMENSIONS,
     INTEGRATION_SEAMS,
     NOTIFICATION_FAULTS,
+    REQUIRED_PUT_HEADER_NAMES,
+    WIRE_PUT_DIMENSIONS,
+    BrokerImplementation,
     BrokerBoundaryViolation,
-    CapabilityViolation,
+    BrokerMintViolation,
     IngressRetirementViolation,
     NotificationImplementation,
     NotificationViolation,
     PromotionCase,
     PromotionImplementation,
     PromotionViolation,
-    UploadImplementation,
-    capability_mutations,
+    WirePut,
+    WirePutCapability,
+    WirePutImplementation,
+    WirePutViolation,
+    broker_mint_mutations,
     check_promotion_history,
-    exact_capability,
-    exact_request,
+    exact_broker_mint,
+    exact_wire_put,
     exercise_broker_parent_boundary,
-    exercise_capability_corpus,
+    exercise_broker_mint_corpus,
     exercise_ingress_retirement_boundary,
     exercise_notification_corpus,
     exercise_promotion_corpus,
+    exercise_wire_put_corpus,
     integration_inventory,
     isolated_broker_parent,
     notification_corpus,
@@ -34,77 +42,261 @@ from tests.direct_upload_method import (
     retirement_safe_broker_parent,
     single_bucket_broker_parent,
     unbuilt_direct_upload_symbols,
+    wire_put_mutations,
 )
 from tests.provider_conformance import ConformanceRun
+
+
+def _mint(provider, object_class, body, **kwargs):
+    profile, state, request = exact_broker_mint(
+        provider, object_class, body, **kwargs)
+    capability = BrokerImplementation().mint(
+        profile, state, request)
+    assert capability is not None
+    return profile, state, request, capability
 
 
 @pytest.mark.parametrize("provider", ("s3", "r2"))
 @pytest.mark.parametrize("object_class", ("obj", "pile"))
 @pytest.mark.parametrize("path", ("raw-presigned", "upload-verifier"))
-def test_exact_attenuation_survives_the_complete_seeded_corpus(
+def test_broker_then_wire_attenuation_survives_both_seeded_corpora(
         provider, object_class, path):
     body = f"{provider}:{object_class}:body".encode()
-    capability = exact_capability(provider, object_class, body)
-    request = exact_request(capability, body)
-    run = ConformanceRun(
-        f"direct-upload-{provider}-{path}", seed=0xD1EC7)
+    profile, state, mint_request, capability = _mint(
+        provider, object_class, body)
+    broker_run = ConformanceRun(
+        f"direct-upload-broker-{provider}", seed=0xD1EC7)
+    wire_run = ConformanceRun(
+        f"direct-upload-wire-{provider}-{path}", seed=0xD1EC7)
 
-    report = exercise_capability_corpus(
-        UploadImplementation(path=path),
-        capability, request, run)
+    broker_report = exercise_broker_mint_corpus(
+        BrokerImplementation(),
+        profile, state, mint_request, broker_run)
+    wire_report = exercise_wire_put_corpus(
+        WirePutImplementation(path=path),
+        capability, exact_wire_put(capability, body), wire_run)
 
-    assert report.provider == provider
-    assert set(report.mutations)
-    assert len(run.history) > len(report.mutations)
+    assert broker_report.provider == provider
+    assert wire_report.endpoint == profile.endpoint
+    assert set(broker_report.mutations)
+    assert set(wire_report.mutations)
+    assert len(broker_run.history) > len(broker_report.mutations)
+    assert len(wire_run.history) > len(wire_report.mutations)
 
 
-def test_mutation_inventory_covers_every_authority_dimension_and_is_replayable():
+def test_broker_mutations_cover_only_broker_authority_and_are_replayable():
     body = b"inventory"
-    capability = exact_capability("s3", "pile", body)
-    request = exact_request(capability, body)
+    _profile, state, request, _capability = _mint(
+        "s3", "pile", body)
 
-    first = capability_mutations(capability, request, seed=17)
-    replay = capability_mutations(capability, request, seed=17)
-    alternate = capability_mutations(capability, request, seed=18)
+    first = broker_mint_mutations(
+        state, request, seed=17)
+    replay = broker_mint_mutations(
+        state, request, seed=17)
+    alternate = broker_mint_mutations(
+        state, request, seed=18)
 
     covered = frozenset().union(*(
         mutation.dimensions for mutation in first))
-    assert covered == AUTHORITY_DIMENSIONS
+    assert covered == BROKER_MINT_DIMENSIONS
     assert first == replay
     assert [case.name for case in first] != [
         case.name for case in alternate]
 
 
-@pytest.mark.parametrize("dimension", sorted(AUTHORITY_DIMENSIONS))
-def test_every_ignored_authority_dimension_has_a_first_failing_replay(
-        dimension):
-    body = b"weak-policy"
-    capability = exact_capability("s3", "pile", body)
-    request = exact_request(capability, body)
-    implementation = UploadImplementation(
-        name=f"ignored-{dimension}",
-        ignored=frozenset({dimension}))
-    run = ConformanceRun(implementation.name, seed=0xBAD)
+def test_wire_mutations_cover_only_provider_visible_authority_and_replay():
+    body = b"wire-inventory"
+    _profile, _state, _mint_request, capability = _mint(
+        "r2", "obj", body)
+    request = exact_wire_put(capability, body)
 
-    with pytest.raises(CapabilityViolation) as caught:
-        exercise_capability_corpus(
-            implementation, capability, request, run)
+    first = wire_put_mutations(capability, request, seed=17)
+    replay = wire_put_mutations(capability, request, seed=17)
+    alternate = wire_put_mutations(capability, request, seed=18)
 
-    violation = caught.value
-    assert dimension in violation.mutation.dimensions
-    assert violation.seed == 0xBAD
-    assert violation.prefix
-    assert f"seed={violation.seed:#x}" in str(violation)
+    covered = frozenset().union(*(
+        mutation.dimensions for mutation in first))
+    assert covered == WIRE_PUT_DIMENSIONS
+    assert first == replay
+    assert [case.name for case in first] != [
+        case.name for case in alternate]
+
+
+def test_every_broker_mutation_has_a_planted_weak_policy():
+    profile, state, request, _capability = _mint(
+        "s3", "pile", b"weak-broker-policy")
+    mutations = broker_mint_mutations(
+        state, request, seed=0xBAD)
+
+    for mutation in mutations:
+        weak = BrokerImplementation(
+            name=f"ignored-{mutation.name}",
+            ignored=mutation.dimensions)
+        minted = weak.mint(
+            profile, mutation.state, mutation.request)
+        assert minted is not None, mutation.name
+
+    first = mutations[0]
+    run = ConformanceRun("weak-broker", seed=0xBAD)
+    with pytest.raises(BrokerMintViolation) as caught:
+        exercise_broker_mint_corpus(
+            BrokerImplementation(ignored=first.dimensions),
+            profile, state, request, run)
+
+    assert caught.value.seed == 0xBAD
+    assert caught.value.prefix
+    assert caught.value.mutation.dimensions <= first.dimensions
+
+
+def test_every_hostile_wire_mutation_has_a_planted_weak_policy():
+    body = b"weak-wire-policy"
+    _profile, _state, _mint_request, capability = _mint(
+        "s3", "pile", body)
+    request = exact_wire_put(capability, body)
+    mutations = [
+        mutation
+        for mutation in wire_put_mutations(
+            capability, request, seed=0xBAD)
+        if not mutation.expect_authorized
+    ]
+
+    for mutation in mutations:
+        weak = WirePutImplementation(
+            name=f"ignored-{mutation.name}",
+            ignored=mutation.dimensions)
+        result = weak.execute(
+            capability, mutation.request, {})
+        assert result.authorized, mutation.name
+
+    first = mutations[0]
+    run = ConformanceRun("weak-wire", seed=0xBAD)
+    with pytest.raises(WirePutViolation) as caught:
+        exercise_wire_put_corpus(
+            WirePutImplementation(ignored=first.dimensions),
+            capability, request, run)
+
+    assert caught.value.seed == 0xBAD
+    assert caught.value.prefix
+    assert caught.value.mutation.dimensions <= first.dimensions
+
+
+def test_wire_surface_contains_no_issuer_only_semantic_fields():
+    assert {field.name for field in fields(WirePut)} == {
+        "endpoint",
+        "operation",
+        "bucket",
+        "key",
+        "headers",
+        "credential_expires_at",
+        "now",
+        "body",
+    }
+    assert {field.name for field in fields(WirePutCapability)} == {
+        "endpoint",
+        "operation",
+        "bucket",
+        "key",
+        "signed_headers",
+        "expires_at",
+    }
+    invisible = {
+        "workspace", "member", "object_class", "digest", "evidence"}
+    assert not invisible & {
+        field.name for field in fields(WirePut)}
+    assert not invisible & {
+        field.name for field in fields(WirePutCapability)}
+
+
+@pytest.mark.parametrize("object_class", ("obj", "pile"))
+def test_broker_derives_key_and_signed_values_from_canonical_descriptor(
+        object_class):
+    workspace = "7" * 64
+    member = "8" * 16
+    body = b"broker-derived, never client-selected"
+    profile, _state, mint_request, capability = _mint(
+        "s3",
+        object_class,
+        body,
+        workspace=workspace,
+        member=member,
+    )
+    signed = dict(capability.signed_headers)
+
+    assert {field.name for field in fields(type(mint_request))} == {
+        "authorization", "descriptor_raw"}
+    assert profile.endpoint not in mint_request.descriptor_raw.decode()
+    assert profile.bucket not in mint_request.descriptor_raw.decode()
+    if object_class == "obj":
+        assert capability.key == (
+            f"workspaces/{workspace}/obj/{signed[BODY_SHA256_HEADER]}")
+    else:
+        assert capability.key == (
+            f"workspaces/{workspace}/pile/{member}/"
+            f"{signed[BODY_SHA256_HEADER]}")
+    assert signed["content-length"] == str(len(body))
+    assert signed["content-type"] == "application/octet-stream"
+    assert signed["if-none-match"] == "*"
+
+
+def test_object_issuer_is_erased_but_pile_issuer_is_key_bound():
+    body = b"same immutable upload"
+    object_one = _mint(
+        "s3", "obj", body, member="b" * 16)[3]
+    object_two = _mint(
+        "s3", "obj", body, member="c" * 16)[3]
+    pile_one = _mint(
+        "s3", "pile", body, member="b" * 16)[3]
+    pile_two = _mint(
+        "s3", "pile", body, member="c" * 16)[3]
+
+    assert object_one == object_two
+    assert pile_one != pile_two
+    assert f"/pile/{'b' * 16}/" in pile_one.key
+    assert f"/pile/{'c' * 16}/" in pile_two.key
+
+
+def test_issuer_and_descriptor_swap_cannot_mint_under_original_authority():
+    profile, state, request, _capability = _mint(
+        "r2", "pile", b"issuer-bound")
+    mutation = next(
+        mutation for mutation in broker_mint_mutations(
+            state, request, seed=1)
+        if mutation.name == "issuer-and-descriptor-swap")
+
+    assert BrokerImplementation().mint(
+        profile, mutation.state, mutation.request) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("workspace-path-injection", "member-path-injection"),
+)
+def test_authenticated_path_fragments_cannot_escape_the_derived_prefix(name):
+    profile, state, request, _capability = _mint(
+        "r2", "pile", b"path-shape")
+    mutation = next(
+        mutation for mutation in broker_mint_mutations(
+            state, request, seed=2)
+        if mutation.name == name)
+
+    assert BrokerImplementation().mint(
+        profile, mutation.state, mutation.request) is None
+    weak = BrokerImplementation(ignored=mutation.dimensions)
+    unsafe = weak.mint(
+        profile, mutation.state, mutation.request)
+    assert unsafe is not None
+    assert unsafe.key.count("/") > 4
 
 
 def test_prefix_key_grant_is_not_mistaken_for_exact_attenuation():
     body = b"prefix-grant"
-    capability = exact_capability("s3", "obj", body)
-    request = exact_request(capability, body)
+    _profile, _state, _mint_request, capability = _mint(
+        "s3", "obj", body)
+    request = exact_wire_put(capability, body)
 
-    with pytest.raises(CapabilityViolation) as caught:
-        exercise_capability_corpus(
-            UploadImplementation(
+    with pytest.raises(WirePutViolation) as caught:
+        exercise_wire_put_corpus(
+            WirePutImplementation(
                 name="prefix-grant", prefix_keys=True),
             capability, request,
             ConformanceRun("prefix-grant", seed=0xBAD))
@@ -114,13 +306,14 @@ def test_prefix_key_grant_is_not_mistaken_for_exact_attenuation():
 
 def test_overwrite_on_replay_is_caught_before_mutation_cases():
     body = b"immutable"
-    capability = exact_capability("s3", "obj", body)
-    request = exact_request(capability, body)
-    weak = UploadImplementation(
+    _profile, _state, _mint_request, capability = _mint(
+        "s3", "obj", body)
+    request = exact_wire_put(capability, body)
+    weak = WirePutImplementation(
         name="overwrite", overwrite_existing=True)
 
-    with pytest.raises(CapabilityViolation) as caught:
-        exercise_capability_corpus(
+    with pytest.raises(WirePutViolation) as caught:
+        exercise_wire_put_corpus(
             weak, capability, request,
             ConformanceRun("overwrite", seed=4))
 
@@ -131,36 +324,59 @@ def test_overwrite_on_replay_is_caught_before_mutation_cases():
 @pytest.mark.parametrize("binding", ("unsigned", "md5"))
 def test_non_collision_resistant_presigner_profiles_are_not_evidence(binding):
     body = b"provider-2xx-is-not-integrity"
-    capability = exact_capability("r2", "obj", body)
-    request = exact_request(capability, body)
+    _profile, _state, _mint_request, capability = _mint(
+        "r2", "obj", body)
+    request = exact_wire_put(capability, body)
 
     with pytest.raises(
-            CapabilityViolation,
+            WirePutViolation,
             match=rf"{binding} is not SHA-256 body binding"):
-        exercise_capability_corpus(
-            UploadImplementation(
+        exercise_wire_put_corpus(
+            WirePutImplementation(
                 name=f"raw-{binding}", body_binding=binding),
             capability, request,
             ConformanceRun(f"raw-{binding}", seed=9))
 
 
 def test_body_sha256_is_an_abstract_condition_not_provider_evidence():
-    capability = exact_capability("s3", "obj", b"symbolic-condition")
+    capability = _mint(
+        "s3", "obj", b"symbolic-condition")[3]
+    signed = dict(capability.signed_headers)
 
-    assert "abstract-body-sha256" in capability.signed_headers
-    assert "x-amz-checksum-sha256" not in capability.signed_headers
+    assert BODY_SHA256_HEADER in signed
+    assert "x-amz-checksum-sha256" not in signed
+    assert frozenset(signed) == REQUIRED_PUT_HEADER_NAMES
+
+
+def test_incomplete_signed_capability_is_not_exact_provider_authority():
+    body = b"incomplete presigner surface"
+    capability = _mint("s3", "obj", body)[3]
+    capability = replace(
+        capability,
+        signed_headers=tuple(
+            item for item in capability.signed_headers
+            if item[0] != "if-none-match"))
+    request = exact_wire_put(capability, body)
+
+    result = WirePutImplementation().execute(
+        capability, request, {})
+
+    assert not result.authorized
 
 
 def test_extra_signed_constraint_is_safe_but_missing_condition_is_not():
-    capability = exact_capability("s3", "obj", b"signed-conditions")
-    request = exact_request(capability, b"signed-conditions")
+    body = b"signed-conditions"
+    capability = _mint("s3", "obj", body)[3]
+    request = exact_wire_put(capability, body)
     mutations = {
         mutation.name: mutation
-        for mutation in capability_mutations(capability, request, seed=1)
+        for mutation in wire_put_mutations(capability, request, seed=1)
     }
 
-    assert mutations["extra-signed-constraint"].expect_authorized
-    assert not mutations["missing-signed-condition"].expect_authorized
+    assert mutations["extra-unsigned-header"].expect_authorized
+    assert mutations["header-name-case"].expect_authorized
+    assert not mutations["create-only-condition"].expect_authorized
+    assert not mutations["missing-signed-header"].expect_authorized
 
 
 @pytest.mark.parametrize(
@@ -173,10 +389,10 @@ def test_extra_signed_constraint_is_safe_but_missing_condition_is_not():
 def test_replay_classification_separates_provider_result_from_readback(
         path, replay_status):
     body = b"immutable replay"
-    capability = exact_capability("s3", "obj", body)
-    request = exact_request(capability, body)
+    capability = _mint("s3", "obj", body)[3]
+    request = exact_wire_put(capability, body)
     store = {}
-    implementation = UploadImplementation(path=path)
+    implementation = WirePutImplementation(path=path)
 
     assert implementation.execute(
         capability, request, store).status == "created"
@@ -188,37 +404,33 @@ def test_replay_classification_separates_provider_result_from_readback(
 
 
 def test_empty_body_binding_mutation_is_not_masked_by_size():
-    capability = exact_capability("s3", "obj", b"")
-    request = exact_request(capability, b"")
-    mutation = next(
-        mutation for mutation in capability_mutations(
-            capability, request, seed=1)
-        if mutation.name == "body-binding-algorithm")
+    capability = _mint("s3", "obj", b"")[3]
+    request = exact_wire_put(capability, b"")
 
-    with pytest.raises(CapabilityViolation) as caught:
-        exercise_capability_corpus(
-            UploadImplementation(
-                name="ignored-empty-body-binding",
-                ignored=frozenset({"body"})),
+    with pytest.raises(WirePutViolation) as caught:
+        exercise_wire_put_corpus(
+            WirePutImplementation(
+                name="unsigned-empty-body",
+                body_binding="unsigned"),
             capability,
             request,
-            ConformanceRun("ignored-empty-body-binding", seed=1),
+            ConformanceRun("unsigned-empty-body", seed=1),
         )
 
-    assert caught.value.mutation == mutation
+    assert caught.value.mutation.name == "implementation-profile"
 
 
 def test_exact_key_with_wrong_body_is_rejected_without_occupying_the_oid():
     body = b"legitimate immutable bytes"
-    capability = exact_capability("r2", "obj", body)
-    request = exact_request(capability, body)
+    capability = _mint("r2", "obj", body)[3]
+    request = exact_wire_put(capability, body)
     mutation = next(
-        mutation for mutation in capability_mutations(
+        mutation for mutation in wire_put_mutations(
             capability, request, seed=1)
-        if mutation.name == "key-body-mismatch")
+        if mutation.name == "same-length-body-substitution")
     store = {}
 
-    result = UploadImplementation().execute(
+    result = WirePutImplementation().execute(
         capability, mutation.request, store)
 
     assert not result.authorized

@@ -13,13 +13,16 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import random
+from urllib.parse import urlsplit
 
 from core.crypto import h
+from core.shape import valid_fid
 from tests.ingress_obligations import Obligation
 from tests.provider_conformance import ConformanceRun, DEFAULT_SEED
 
 
-MAX_CAPABILITY_CASES = 32
+MAX_BROKER_MINT_CASES = 24
+MAX_WIRE_PUT_CASES = 24
 MAX_BROKER_ATTACKS = 8
 MAX_NOTIFICATION_SCRIPTS = 16
 MAX_NOTIFICATION_STEPS = 12
@@ -29,7 +32,8 @@ MAX_PROMOTION_CASES = 16
 MAX_CORPUS_UPLOAD_BYTES = 4 * 1024 * 1024
 
 SHA256 = "sha256"
-REQUIRED_SIGNED_HEADERS = frozenset({
+BODY_SHA256_HEADER = "abstract-body-sha256"
+REQUIRED_PUT_HEADER_NAMES = frozenset({
     "content-length",
     "content-type",
     "host",
@@ -37,20 +41,30 @@ REQUIRED_SIGNED_HEADERS = frozenset({
     # A symbolic signed condition, not the name or semantics of a provider
     # header. Each adapter must refine this to a live-tested raw-upload or
     # streaming-verifier mechanism that actually binds all body bytes.
-    "abstract-body-sha256",
+    BODY_SHA256_HEADER,
 })
-AUTHORITY_DIMENSIONS = frozenset({
-    "provider",
-    "endpoint",
-    "operation",
-    "bucket",
-    "workspace",
-    "member",
+BROKER_MINT_DIMENSIONS = frozenset({
+    "auth-workspace",
+    "auth-member",
+    "auth-evidence",
+    "auth-descriptor",
+    "member-active",
+    "descriptor-commitment",
+    "descriptor-canonical",
+    "descriptor-workspace",
+    "descriptor-member",
+    "workspace-shape",
+    "member-shape",
     "object-class",
-    "key",
     "digest",
     "size",
     "content-type",
+})
+WIRE_PUT_DIMENSIONS = frozenset({
+    "endpoint",
+    "operation",
+    "bucket",
+    "key",
     "signed-headers",
     "expiry",
     "create-only",
@@ -100,50 +114,108 @@ def _key(workspace, member, object_class, digest):
     return prefix + object_class + "/" + digest
 
 
+def _valid_digest(value):
+    return isinstance(value, str) \
+        and len(value) == 64 \
+        and all(c in "0123456789abcdef" for c in value)
+
+
+def _valid_member(value):
+    return isinstance(value, str) \
+        and len(value) == 16 \
+        and all(c in "0123456789abcdef" for c in value)
+
+
 @dataclass(frozen=True)
-class UploadCapability:
+class ProviderUploadProfile:
     provider: str
     endpoint: str
-    operation: str
     bucket: str
+    ttl_seconds: int = 60
+    max_bytes: int = 5 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class UploadDescriptor:
     workspace: str
     member: str
     object_class: str
-    key: str
     digest: str
     size: int
     content_type: str
-    signed_headers: frozenset[str]
+
+
+@dataclass(frozen=True)
+class MintAuthorization:
+    workspace: str
+    member: str
+    descriptor_oid: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class BrokerState:
+    """Pinned broker-side authority, not caller-supplied PUT metadata."""
+
+    authorization: MintAuthorization
+    member_active: bool
+
+
+@dataclass(frozen=True)
+class BrokerMintRequest:
+    authorization: MintAuthorization
+    descriptor_raw: bytes
+
+
+@dataclass(frozen=True)
+class WirePutCapability:
+    """Claims recovered from a valid provider signature.
+
+    This deliberately contains only claims an S3/R2 service (or upload
+    verifier) can enforce. Workspace/member/class/digest semantics reach this
+    boundary only through the exact derived key or signed header values.
+    """
+
+    endpoint: str
+    operation: str
+    bucket: str
+    key: str
+    signed_headers: tuple[tuple[str, str], ...]
     expires_at: int
-    create_only: bool
-    checksum_algorithm: str = SHA256
 
 
 @dataclass(frozen=True)
-class UploadRequest:
-    provider: str
+class WirePut:
+    """The actual request surface visible to the provider.
+
+    The opaque signature bytes are represented by pairing this value with the
+    verified ``WirePutCapability`` claims. This model does not construct or
+    validate a real provider signature.
+    """
+
     endpoint: str
     operation: str
     bucket: str
-    workspace: str
-    member: str
-    object_class: str
     key: str
-    digest: str
-    size: int
-    content_type: str
-    signed_headers: frozenset[str]
+    headers: tuple[tuple[str, str], ...]
+    credential_expires_at: int
     now: int
-    create_only: bool
-    checksum_algorithm: str
     body: bytes
 
 
 @dataclass(frozen=True)
-class CapabilityMutation:
+class BrokerMintMutation:
     name: str
     dimensions: frozenset[str]
-    request: UploadRequest
+    state: BrokerState
+    request: BrokerMintRequest
+
+
+@dataclass(frozen=True)
+class WirePutMutation:
+    name: str
+    dimensions: frozenset[str]
+    request: WirePut
     expect_authorized: bool = False
 
 
@@ -155,27 +227,42 @@ class UploadResult:
 
 
 @dataclass(frozen=True)
-class CapabilityReport:
+class BrokerMintReport:
     provider: str
     seed: int
     mutations: tuple[str, ...]
 
 
-class CapabilityViolation(AssertionError):
+@dataclass(frozen=True)
+class WirePutReport:
+    endpoint: str
+    seed: int
+    mutations: tuple[str, ...]
+
+
+class BrokerMintViolation(AssertionError):
     def __init__(self, run, mutation, reason):
         self.seed = run.seed
         self.mutation = mutation
         self.reason = reason
         self.prefix = tuple(run.history)
         super().__init__(
-            f"first unsupported capability result: {mutation.name}: "
+            f"first unsupported broker mint result: {mutation.name}: "
             f"{reason}\n{_model_diagnostic(run)}")
 
 
-def exact_capability(
-        provider, object_class, body, *,
-        workspace="a" * 64, member="b" * 16, now=1_000):
-    """One fully attenuated grant; provider signing is intentionally abstract."""
+class WirePutViolation(AssertionError):
+    def __init__(self, run, mutation, reason):
+        self.seed = run.seed
+        self.mutation = mutation
+        self.reason = reason
+        self.prefix = tuple(run.history)
+        super().__init__(
+            f"first unsupported provider PUT result: {mutation.name}: "
+            f"{reason}\n{_model_diagnostic(run)}")
+
+
+def provider_upload_profile(provider):
     if provider == "s3":
         endpoint = "https://s3.us-west-2.amazonaws.com"
     elif provider == "r2":
@@ -183,162 +270,348 @@ def exact_capability(
             + ".r2.cloudflarestorage.com"
     else:
         raise ValueError("provider")
-    digest = h(body)
-    return UploadCapability(
-        provider,
-        endpoint,
-        "PUT",
-        "direct-upload-bucket",
+    return ProviderUploadProfile(
+        provider, endpoint, "direct-upload-bucket")
+
+
+def encode_upload_descriptor(descriptor):
+    return json.dumps(
+        {
+            "content_type": descriptor.content_type,
+            "digest": descriptor.digest,
+            "member": descriptor.member,
+            "object_class": descriptor.object_class,
+            "size": descriptor.size,
+            "workspace": descriptor.workspace,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _parse_upload_descriptor(raw):
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid upload descriptor encoding") from error
+    if not isinstance(value, dict) or set(value) != {
+            "content_type", "digest", "member", "object_class", "size",
+            "workspace"}:
+        raise ValueError("invalid upload descriptor shape")
+    if not all(
+            isinstance(value[name], str)
+            for name in (
+                "content_type", "digest", "member", "object_class",
+                "workspace")) \
+            or type(value["size"]) is not int:
+        raise ValueError("invalid upload descriptor fields")
+    return UploadDescriptor(
+        value["workspace"],
+        value["member"],
+        value["object_class"],
+        value["digest"],
+        value["size"],
+        value["content_type"],
+    )
+
+
+def decode_upload_descriptor(raw):
+    descriptor = _parse_upload_descriptor(raw)
+    if encode_upload_descriptor(descriptor) != raw:
+        raise ValueError("non-canonical upload descriptor")
+    return descriptor
+
+
+def _model_evidence(workspace, member, descriptor_oid):
+    """Opaque accepted evidence in this model, not a proof construction."""
+    return h(
+        b"accepted-workspace-upload-proof\0"
+        + workspace.encode() + b"\0"
+        + member.encode() + b"\0"
+        + descriptor_oid.encode())
+
+
+def _authorization(workspace, member, descriptor_raw):
+    descriptor_oid = h(descriptor_raw)
+    return MintAuthorization(
+        workspace,
+        member,
+        descriptor_oid,
+        _model_evidence(workspace, member, descriptor_oid),
+    )
+
+
+def exact_broker_mint(
+        provider, object_class, body, *,
+        workspace="a" * 64, member="b" * 16):
+    """Build one accepted broker input and its trusted provider profile.
+
+    ``BrokerState`` stands for the runtime's already-verified, pinned DAG
+    authorization. The model evidence is intentionally not claimed to be a
+    deployable authentication scheme.
+    """
+    descriptor = UploadDescriptor(
         workspace,
         member,
         object_class,
-        _key(workspace, member, object_class, digest),
-        digest,
+        h(body),
         len(body),
         "application/octet-stream",
-        REQUIRED_SIGNED_HEADERS,
-        now + 60,
-        True,
+    )
+    raw = encode_upload_descriptor(descriptor)
+    authorization = _authorization(workspace, member, raw)
+    return (
+        provider_upload_profile(provider),
+        BrokerState(authorization, True),
+        BrokerMintRequest(authorization, raw),
     )
 
 
-def exact_request(capability, body, *, now=1_000):
-    return UploadRequest(
-        capability.provider,
-        capability.endpoint,
-        capability.operation,
-        capability.bucket,
-        capability.workspace,
-        capability.member,
-        capability.object_class,
-        capability.key,
-        capability.digest,
-        capability.size,
-        capability.content_type,
-        capability.signed_headers,
-        now,
-        capability.create_only,
-        capability.checksum_algorithm,
-        body,
-    )
+def _signed_put_headers(profile, descriptor):
+    host = urlsplit(profile.endpoint).netloc
+    return tuple(sorted({
+        "content-length": str(descriptor.size),
+        "content-type": descriptor.content_type,
+        "host": host,
+        "if-none-match": "*",
+        BODY_SHA256_HEADER: descriptor.digest,
+    }.items()))
 
 
-def capability_mutations(capability, request, seed=DEFAULT_SEED):
-    """Return bounded, constraint-preserving authority mutations."""
-    wrong_body = (
-        bytes([request.body[0] ^ 1]) + request.body[1:]
-        if request.body else None
-    )
-    substitute_body = request.body + b"!"
-    other_digest = h(substitute_body)
+@dataclass(frozen=True)
+class BrokerImplementation:
+    """Candidate broker policy, not proof of a production verifier."""
+
+    name: str = "exact"
+    ignored: frozenset[str] = frozenset()
+
+    def mint(self, profile, state, request, *, now=1_000):
+        try:
+            descriptor = _parse_upload_descriptor(
+                request.descriptor_raw)
+        except ValueError:
+            return None
+        authorization = request.authorization
+        expected = state.authorization
+        dimensions = {
+            "auth-workspace": (
+                authorization.workspace == expected.workspace),
+            "auth-member": authorization.member == expected.member,
+            "auth-evidence": authorization.evidence == expected.evidence,
+            "auth-descriptor": (
+                authorization.descriptor_oid
+                == expected.descriptor_oid),
+            "member-active": state.member_active,
+            "descriptor-commitment": (
+                h(request.descriptor_raw)
+                == authorization.descriptor_oid),
+            "descriptor-canonical": (
+                encode_upload_descriptor(descriptor)
+                == request.descriptor_raw),
+            "descriptor-workspace": (
+                descriptor.workspace == authorization.workspace),
+            "descriptor-member": (
+                descriptor.member == authorization.member),
+            "workspace-shape": (
+                valid_fid(authorization.workspace)
+                and valid_fid(descriptor.workspace)),
+            "member-shape": (
+                _valid_member(authorization.member)
+                and _valid_member(descriptor.member)),
+            "object-class": descriptor.object_class in {"obj", "pile"},
+            "digest": _valid_digest(descriptor.digest),
+            "size": 0 <= descriptor.size <= profile.max_bytes,
+            "content-type": (
+                descriptor.content_type
+                == "application/octet-stream"),
+        }
+        if not all(
+                allowed or dimension in self.ignored
+                for dimension, allowed in dimensions.items()):
+            return None
+        return WirePutCapability(
+            profile.endpoint,
+            "PUT",
+            profile.bucket,
+            _key(
+                descriptor.workspace,
+                descriptor.member,
+                descriptor.object_class,
+                descriptor.digest,
+            ),
+            _signed_put_headers(profile, descriptor),
+            now + profile.ttl_seconds,
+        )
+
+
+def _accepted_descriptor_case(
+        descriptor, authority_workspace, authority_member, *,
+        active=True):
+    raw = encode_upload_descriptor(descriptor)
+    authorization = _authorization(
+        authority_workspace, authority_member, raw)
+    state = BrokerState(authorization, active)
+    return state, BrokerMintRequest(authorization, raw)
+
+
+def broker_mint_mutations(state, request, seed=DEFAULT_SEED):
+    """Mutate only inputs the broker authorization boundary observes."""
+    descriptor = decode_upload_descriptor(request.descriptor_raw)
     other_workspace = "d" * 64
     other_member = "e" * 16
-    alternate_class = "pile" \
-        if request.object_class == "obj" else "obj"
-    sibling = request.key.rsplit("/", 1)[0] + "/" + "f" * 64
+    alternate_digest = (
+        "f" * 64 if descriptor.digest != "f" * 64 else "e" * 64)
+
+    def accepted(
+            name, dimensions, candidate, *,
+            bind_descriptor_identity=False):
+        candidate_state, candidate_request = _accepted_descriptor_case(
+            candidate,
+            candidate.workspace
+            if bind_descriptor_identity
+            else request.authorization.workspace,
+            candidate.member
+            if bind_descriptor_identity
+            else request.authorization.member)
+        return BrokerMintMutation(
+            name, frozenset(dimensions),
+            candidate_state, candidate_request)
+
+    noncanonical = json.dumps(
+        json.loads(request.descriptor_raw), sort_keys=True).encode()
+    noncanonical_auth = _authorization(
+        descriptor.workspace, descriptor.member, noncanonical)
+    swapped_descriptor = replace(
+        descriptor,
+        workspace=other_workspace,
+        member=other_member)
+    swapped_raw = encode_upload_descriptor(swapped_descriptor)
+    swapped_authorization = _authorization(
+        other_workspace, other_member, swapped_raw)
     cases = [
-        CapabilityMutation(
-            "provider", frozenset({"provider"}),
-            replace(request, provider=(
-                "r2" if request.provider == "s3" else "s3"))),
-        CapabilityMutation(
-            "endpoint", frozenset({"endpoint"}),
-            replace(request, endpoint="https://cached.example.invalid")),
-        CapabilityMutation(
-            "operation", frozenset({"operation"}),
-            replace(request, operation="DELETE")),
-        CapabilityMutation(
-            "bucket", frozenset({"bucket"}),
-            replace(request, bucket="another-bucket")),
-        CapabilityMutation(
-            "workspace", frozenset({"workspace"}),
-            replace(request, workspace=other_workspace)),
-        CapabilityMutation(
-            "member", frozenset({"member"}),
-            replace(request, member=other_member)),
-        CapabilityMutation(
-            "object-class", frozenset({"object-class"}),
-            replace(request, object_class=alternate_class)),
-        CapabilityMutation(
-            "key", frozenset({"key"}),
-            replace(request, key=sibling)),
-        CapabilityMutation(
-            "root-key", frozenset({"key", "object-class"}),
-            replace(request, key=(
-                f"workspaces/{request.workspace}/root"),
-                object_class="root")),
-        CapabilityMutation(
-            "digest", frozenset({"digest"}),
-            replace(request, digest="0" * 64)),
-        CapabilityMutation(
-            "size", frozenset({"size"}),
-            replace(request, size=request.size + 1)),
-        CapabilityMutation(
-            "content-type", frozenset({"content-type"}),
-            replace(request, content_type="text/plain")),
-        CapabilityMutation(
-            "missing-signed-condition", frozenset({"signed-headers"}),
+        BrokerMintMutation(
+            "issuer-and-descriptor-swap",
+            frozenset({
+                "auth-workspace",
+                "auth-member",
+                "auth-evidence",
+                "auth-descriptor",
+            }),
+            state,
+            BrokerMintRequest(
+                swapped_authorization, swapped_raw)),
+        BrokerMintMutation(
+            "authorization-workspace-swap",
+            frozenset({"auth-workspace", "descriptor-workspace"}),
+            state,
             replace(
                 request,
-                signed_headers=request.signed_headers - {"if-none-match"})),
-        CapabilityMutation(
-            "extra-signed-constraint", frozenset({"signed-headers"}),
+                authorization=replace(
+                    request.authorization,
+                    workspace=other_workspace))),
+        BrokerMintMutation(
+            "authorization-member-swap",
+            frozenset({"auth-member", "descriptor-member"}),
+            state,
             replace(
                 request,
-                signed_headers=request.signed_headers | {"x-extra-auth"}),
-            expect_authorized=True),
-        CapabilityMutation(
-            "expired", frozenset({"expiry"}),
-            replace(request, now=capability.expires_at + 1)),
-        CapabilityMutation(
-            "condition", frozenset({"create-only"}),
-            replace(request, create_only=False)),
-        CapabilityMutation(
-            "body-binding-algorithm", frozenset({"body"}),
-            replace(request, checksum_algorithm="unsigned")),
-        CapabilityMutation(
-            "body-checksum-substitution",
-            frozenset({"body", "digest", "key", "size"}),
+                authorization=replace(
+                    request.authorization,
+                    member=other_member))),
+        BrokerMintMutation(
+            "authorization-evidence",
+            frozenset({"auth-evidence"}),
+            state,
             replace(
                 request,
-                body=substitute_body,
-                digest=other_digest,
-                size=len(substitute_body),
-                key=_key(
-                    request.workspace, request.member,
-                    request.object_class, other_digest))),
-        CapabilityMutation(
-            "workspace-key-swap",
-            frozenset({"workspace", "key"}),
+                authorization=replace(
+                    request.authorization,
+                    evidence="0" * 64))),
+        BrokerMintMutation(
+            "authorization-descriptor",
+            frozenset({"auth-descriptor", "descriptor-commitment"}),
+            state,
             replace(
                 request,
-                workspace=other_workspace,
-                key=_key(
-                    other_workspace, request.member,
-                    request.object_class, request.digest))),
-        CapabilityMutation(
-            "member-key-swap",
-            frozenset({"member", "key"}),
+                authorization=replace(
+                    request.authorization,
+                    descriptor_oid="0" * 64))),
+        BrokerMintMutation(
+            "inactive-member",
+            frozenset({"member-active"}),
+            replace(state, member_active=False),
+            request),
+        BrokerMintMutation(
+            "noncanonical-descriptor",
+            frozenset({"descriptor-canonical"}),
+            BrokerState(noncanonical_auth, True),
+            BrokerMintRequest(noncanonical_auth, noncanonical)),
+        accepted(
+            "foreign-workspace-descriptor",
+            {"descriptor-workspace"},
+            replace(descriptor, workspace=other_workspace)),
+        accepted(
+            "foreign-member-descriptor",
+            {"descriptor-member"},
+            replace(descriptor, member=other_member)),
+        accepted(
+            "workspace-path-injection",
+            {"workspace-shape"},
+            replace(descriptor, workspace="a" * 63 + "/"),
+            bind_descriptor_identity=True),
+        accepted(
+            "member-path-injection",
+            {"member-shape"},
+            replace(descriptor, member="b" * 15 + "/"),
+            bind_descriptor_identity=True),
+        accepted(
+            "root-object-class",
+            {"object-class"},
+            replace(descriptor, object_class="root")),
+        accepted(
+            "malformed-digest",
+            {"digest"},
+            replace(descriptor, digest="not-a-digest")),
+        accepted(
+            "negative-size",
+            {"size"},
+            replace(descriptor, size=-1)),
+        accepted(
+            "unapproved-content-type",
+            {"content-type"},
+            replace(descriptor, content_type="text/plain")),
+        BrokerMintMutation(
+            "descriptor-substitution",
+            frozenset({"descriptor-commitment"}),
+            state,
             replace(
                 request,
-                member=other_member,
-                key=_key(
-                    request.workspace, other_member,
-                    request.object_class, request.digest))),
+                descriptor_raw=encode_upload_descriptor(
+                    replace(descriptor, digest=alternate_digest)))),
+        BrokerMintMutation(
+            "descriptor-and-oid-without-new-proof",
+            frozenset({"auth-descriptor"}),
+            state,
+            replace(
+                request,
+                authorization=replace(
+                    request.authorization,
+                    descriptor_oid=h(encode_upload_descriptor(
+                        replace(
+                            descriptor,
+                            digest=alternate_digest)))),
+                descriptor_raw=encode_upload_descriptor(
+                    replace(descriptor, digest=alternate_digest)))),
     ]
-    if wrong_body is not None:
-        cases.append(CapabilityMutation(
-            "key-body-mismatch", frozenset({"body"}),
-            replace(request, body=wrong_body)))
-    if len(cases) > MAX_CAPABILITY_CASES:
-        raise AssertionError("capability corpus budget")
+    if len(cases) > MAX_BROKER_MINT_CASES:
+        raise AssertionError("broker mint corpus budget")
     random.Random(seed ^ 0xD1EC7).shuffle(cases)
     return tuple(cases)
 
 
 @dataclass(frozen=True)
-class UploadImplementation:
-    """Candidate semantics, not evidence of any provider's implementation."""
+class WirePutImplementation:
+    """Candidate wire semantics, not provider implementation evidence."""
 
     name: str = "exact"
     path: str = "raw-presigned"
@@ -353,8 +626,7 @@ class UploadImplementation:
         if not authorized:
             return UploadResult("rejected", False, False)
         address = (
-            request.provider, request.endpoint,
-            request.bucket, request.key)
+            request.endpoint, request.bucket, request.key)
         incumbent = store.get(address)
         if incumbent is not None:
             if incumbent == request.body:
@@ -378,32 +650,46 @@ class UploadImplementation:
             True)
 
     def _authorized(self, capability, request):
+        try:
+            actual_headers = _header_map(request.headers)
+            signed_headers = dict(capability.signed_headers)
+        except ValueError:
+            actual_headers = {
+                raw_name.lower(): value
+                for raw_name, value in request.headers
+            }
+            signed_headers = dict(capability.signed_headers)
+            headers_well_formed = False
+        else:
+            headers_well_formed = True
+        signed_names = frozenset(signed_headers)
+        signed_match = headers_well_formed and all(
+            actual_headers.get(name) == value
+            for name, value in signed_headers.items())
+        signed_match = signed_match \
+            and REQUIRED_PUT_HEADER_NAMES <= signed_names
+        expected_digest = signed_headers.get(BODY_SHA256_HEADER)
+        try:
+            expected_size = int(signed_headers.get(
+                "content-length", "invalid"))
+        except ValueError:
+            expected_size = -1
         dimensions = {
-            "provider": request.provider == capability.provider,
             "endpoint": request.endpoint == capability.endpoint,
             "operation": request.operation == capability.operation == "PUT",
             "bucket": request.bucket == capability.bucket,
-            "workspace": request.workspace == capability.workspace,
-            "member": request.member == capability.member,
-            "object-class": (
-                request.object_class == capability.object_class),
             "key": request.key == capability.key,
-            "digest": request.digest == capability.digest,
-            "size": (
-                request.size == capability.size
-                and len(request.body) == capability.size),
-            "content-type": (
-                request.content_type == capability.content_type),
-            "signed-headers": (
-                capability.signed_headers <= request.signed_headers
-                and REQUIRED_SIGNED_HEADERS <= request.signed_headers),
-            "expiry": request.now <= capability.expires_at,
+            "signed-headers": signed_match,
+            "expiry": (
+                request.credential_expires_at == capability.expires_at
+                and request.now <= capability.expires_at),
             "create-only": (
-                request.create_only is capability.create_only is True),
+                signed_headers.get("if-none-match") == "*"
+                and actual_headers.get("if-none-match") == "*"),
             "body": (
-                h(request.body) == capability.digest
-                and request.checksum_algorithm == SHA256
-                and capability.checksum_algorithm == SHA256),
+                self.body_binding == SHA256
+                and h(request.body) == expected_digest
+                and len(request.body) == expected_size),
         }
         if self.prefix_keys:
             dimensions["key"] = request.key.startswith(
@@ -413,40 +699,223 @@ class UploadImplementation:
             for dimension, allowed in dimensions.items())
 
 
-def _capability_failure(run, mutation, reason):
-    run.record(f"capability {mutation.name}", reason)
-    raise CapabilityViolation(run, mutation, reason)
+def _header_map(headers):
+    result = {}
+    for raw_name, value in headers:
+        name = raw_name.lower()
+        if name in result:
+            raise ValueError(f"duplicate header {name}")
+        result[name] = value
+    return result
 
 
-def exercise_capability_corpus(
+def exact_wire_put(capability, body, *, now=1_000):
+    return WirePut(
+        capability.endpoint,
+        capability.operation,
+        capability.bucket,
+        capability.key,
+        capability.signed_headers,
+        capability.expires_at,
+        now,
+        body,
+    )
+
+
+def _replace_header(request, name, value):
+    headers = [
+        (raw_name, raw_value)
+        for raw_name, raw_value in request.headers
+        if raw_name.lower() != name
+    ]
+    if value is not None:
+        headers.append((name, value))
+    return replace(request, headers=tuple(sorted(headers)))
+
+
+def wire_put_mutations(capability, request, seed=DEFAULT_SEED):
+    """Mutate only the signed request surface a provider can observe."""
+    wrong_body = (
+        bytes([request.body[0] ^ 1]) + request.body[1:]
+        if request.body else None
+    )
+    substitute_body = request.body + b"!"
+    sibling = request.key.rsplit("/", 1)[0] + "/" + "f" * 64
+    cases = [
+        WirePutMutation(
+            "endpoint",
+            frozenset({"endpoint"}),
+            replace(
+                request,
+                endpoint="https://cached.example.invalid")),
+        WirePutMutation(
+            "operation",
+            frozenset({"operation"}),
+            replace(request, operation="DELETE")),
+        WirePutMutation(
+            "bucket",
+            frozenset({"bucket"}),
+            replace(request, bucket="another-bucket")),
+        WirePutMutation(
+            "sibling-key",
+            frozenset({"key"}),
+            replace(request, key=sibling)),
+        WirePutMutation(
+            "root-key",
+            frozenset({"key"}),
+            replace(
+                request,
+                key=request.key.split("/obj/", 1)[0] + "/root"
+                if "/obj/" in request.key
+                else request.key.split("/pile/", 1)[0] + "/root")),
+        WirePutMutation(
+            "missing-signed-header",
+            frozenset({"signed-headers"}),
+            _replace_header(request, "content-type", None)),
+        WirePutMutation(
+            "content-length-header",
+            frozenset({"signed-headers"}),
+            _replace_header(
+                request, "content-length",
+                str(len(request.body) + 1))),
+        WirePutMutation(
+            "content-type-header",
+            frozenset({"signed-headers"}),
+            _replace_header(request, "content-type", "text/plain")),
+        WirePutMutation(
+            "host-header",
+            frozenset({"signed-headers"}),
+            _replace_header(request, "host", "other.invalid")),
+        WirePutMutation(
+            "body-digest-header",
+            frozenset({"signed-headers"}),
+            _replace_header(request, BODY_SHA256_HEADER, "0" * 64)),
+        WirePutMutation(
+            "create-only-condition",
+            frozenset({"signed-headers", "create-only"}),
+            _replace_header(request, "if-none-match", "present")),
+        WirePutMutation(
+            "duplicate-signed-header",
+            frozenset({"signed-headers"}),
+            replace(
+                request,
+                headers=request.headers
+                + (("Content-Type", "application/octet-stream"),))),
+        WirePutMutation(
+            "credential-expiry-claim",
+            frozenset({"expiry"}),
+            replace(
+                request,
+                credential_expires_at=capability.expires_at + 60)),
+        WirePutMutation(
+            "replay-after-expiry",
+            frozenset({"expiry"}),
+            replace(request, now=capability.expires_at + 1)),
+        WirePutMutation(
+            "extra-unsigned-header",
+            frozenset({"signed-headers"}),
+            replace(
+                request,
+                headers=request.headers + (("x-client-trace", "safe"),)),
+            expect_authorized=True),
+        WirePutMutation(
+            "header-name-case",
+            frozenset({"signed-headers"}),
+            replace(
+                request,
+                headers=tuple(
+                    (name.upper(), value)
+                    for name, value in request.headers)),
+            expect_authorized=True),
+    ]
+    if wrong_body is not None:
+        cases.append(WirePutMutation(
+            "same-length-body-substitution",
+            frozenset({"body"}),
+            replace(request, body=wrong_body)))
+    substituted = replace(request, body=substitute_body)
+    substituted = _replace_header(
+        substituted, "content-length", str(len(substitute_body)))
+    substituted = _replace_header(
+        substituted, BODY_SHA256_HEADER, h(substitute_body))
+    cases.append(WirePutMutation(
+        "body-and-header-substitution",
+        frozenset({"signed-headers", "body"}),
+        substituted))
+    if len(cases) > MAX_WIRE_PUT_CASES:
+        raise AssertionError("wire PUT corpus budget")
+    random.Random(seed ^ 0x517E).shuffle(cases)
+    return tuple(cases)
+
+
+def _broker_mint_failure(run, mutation, reason):
+    run.record(f"broker mint {mutation.name}", reason)
+    raise BrokerMintViolation(run, mutation, reason)
+
+
+def _wire_put_failure(run, mutation, reason):
+    run.record(f"provider PUT {mutation.name}", reason)
+    raise WirePutViolation(run, mutation, reason)
+
+
+def exercise_broker_mint_corpus(
+        implementation, profile, state, request, run):
+    """Check the broker decision before any provider capability exists."""
+    with _model_capture(run):
+        capability = implementation.mint(
+            profile, state, request)
+        if capability is None:
+            _broker_mint_failure(
+                run,
+                BrokerMintMutation(
+                    "exact", frozenset(), state, request),
+                "exact canonical request did not mint")
+        run.record("broker mint exact", capability.key)
+        mutations = broker_mint_mutations(
+            state, request, run.seed)
+        for mutation in mutations:
+            minted = implementation.mint(
+                profile, mutation.state, mutation.request)
+            if minted is not None:
+                _broker_mint_failure(
+                    run, mutation,
+                    f"unauthorized descriptor minted {minted.key}")
+            run.record(f"broker reject {mutation.name}", "rejected")
+        return BrokerMintReport(
+            profile.provider,
+            run.seed,
+            tuple(mutation.name for mutation in mutations))
+
+
+def exercise_wire_put_corpus(
         implementation, capability, request, run):
-    """Check exact attenuation and immutable state after every result."""
+    """Check exact attenuation using provider-visible claims only."""
     with _model_capture(run):
         if len(request.body) > MAX_CORPUS_UPLOAD_BYTES:
             raise ValueError(
                 "direct-upload corpus input exceeds its execution budget")
-        profile = CapabilityMutation(
+        profile = WirePutMutation(
             "implementation-profile",
             frozenset({"body"}),
             request)
         if implementation.body_binding != SHA256:
-            _capability_failure(
+            _wire_put_failure(
                 run, profile,
                 f"{implementation.body_binding} is not SHA-256 body binding")
         if implementation.path not in {
                 "raw-presigned", "upload-verifier"}:
-            _capability_failure(
+            _wire_put_failure(
                 run, profile,
                 f"unmodeled upload path {implementation.path}")
 
         address = (
-            request.provider, request.endpoint,
-            request.bucket, request.key)
+            request.endpoint, request.bucket, request.key)
         store = {}
         result = implementation.execute(capability, request, store)
         if not result.authorized or store != {address: request.body}:
-            _capability_failure(run, profile, "exact request did not create")
-        run.record("exact request", result.status)
+            _wire_put_failure(
+                run, profile, "exact PUT did not create")
+        run.record("provider PUT exact", result.status)
 
         before = dict(store)
         replay = implementation.execute(capability, request, store)
@@ -457,40 +926,41 @@ def exercise_capability_corpus(
         )
         if replay.status != expected_replay or replay.applied \
                 or store != before:
-            _capability_failure(run, profile, "equal replay was not idempotent")
-        run.record("equal replay", replay.status)
+            _wire_put_failure(
+                run, profile, "equal replay was not idempotent")
+        run.record("provider PUT equal replay", replay.status)
 
         store = {}
         unknown = implementation.execute(
             capability, request, store, lose_response=True)
         if unknown.status != "outcome-unknown" \
                 or store != {address: request.body}:
-            _capability_failure(
+            _wire_put_failure(
                 run, profile,
                 "applied-but-lost response lacks exact stored bytes")
-        run.record("applied response lost", unknown.status)
+        run.record("provider PUT response lost", unknown.status)
         retry = implementation.execute(capability, request, store)
         if retry.status != expected_replay or retry.applied \
                 or store != {address: request.body}:
-            _capability_failure(
+            _wire_put_failure(
                 run, profile,
                 "retry after a lost response was not an equal replay")
-        run.record("retry outcome-unknown", retry.status)
+        run.record("provider PUT retry outcome-unknown", retry.status)
 
         wrong = b"occupied by nonmatching bytes"
         store = {address: wrong}
         collision = implementation.execute(
             capability, request, store)
         if collision.applied or store != {address: wrong}:
-            _capability_failure(
-                run, CapabilityMutation(
+            _wire_put_failure(
+                run, WirePutMutation(
                     "colliding-existing-key",
                     frozenset({"create-only", "body"}),
                     request),
                 "immutable collision was overwritten")
-        run.record("colliding existing key", collision.status)
+        run.record("provider PUT colliding key", collision.status)
 
-        mutations = capability_mutations(
+        mutations = wire_put_mutations(
             capability, request, run.seed)
         for mutation in mutations:
             store = {}
@@ -498,7 +968,6 @@ def exercise_capability_corpus(
                 capability, mutation.request, store)
             if mutation.expect_authorized:
                 expected_address = (
-                    mutation.request.provider,
                     mutation.request.endpoint,
                     mutation.request.bucket,
                     mutation.request.key,
@@ -506,20 +975,21 @@ def exercise_capability_corpus(
                 if not result.authorized or not result.applied \
                         or store != {
                             expected_address: mutation.request.body}:
-                    _capability_failure(
+                    _wire_put_failure(
                         run, mutation,
-                        "safe attenuation tightening did not create "
+                        "safe wire variation did not create "
                         "the one exact value")
                 run.record(
-                    f"accept {mutation.name}", result.status)
+                    f"provider accept {mutation.name}", result.status)
                 continue
             if result.authorized or result.applied or store:
-                _capability_failure(
+                _wire_put_failure(
                     run, mutation,
-                    f"mutation accepted as {result.status}")
-            run.record(f"reject {mutation.name}", result.status)
-        return CapabilityReport(
-            capability.provider,
+                    f"wire mutation accepted as {result.status}")
+            run.record(
+                f"provider reject {mutation.name}", result.status)
+        return WirePutReport(
+            capability.endpoint,
             run.seed,
             tuple(mutation.name for mutation in mutations))
 
