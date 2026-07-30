@@ -378,6 +378,8 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     assert (staged / "deploy" / "aws_lambda" / "sdk_smoke.py").is_file()
     assert (
         staged / "deploy" / "aws_lambda" / "s3_bucket_policy.py").is_file()
+    assert not (staged / "deploy" / "upload_broker.py").exists()
+    assert not (staged / "deploy" / "aws_upload_broker").exists()
     assert not (staged / "tests").exists()
     assert not (staged / "native").exists()
     assert not (staged / "README.md").exists()

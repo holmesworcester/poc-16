@@ -137,8 +137,13 @@ class WorkerView:
                     return False
         return True
 
-    def mint(self, pile_bytes, trusted_now):
-        """Validate only the submitted bounded closure, then exact-read state."""
+    def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
+        """Validate one bounded closure for the caller's exact purpose.
+
+        ``purpose`` is supplied by the trusted endpoint, never decoded from a
+        bearer token or caller-owned JSON.  A family still has to accept that
+        purpose and the submitted request fact must name the same value.
+        """
         try:
             stream, blobs = decode_pile(pile_bytes, self.anchor)
             if blobs or len(stream) > MAX_PROOF_FACTS:
@@ -155,7 +160,8 @@ class WorkerView:
             request = ephemeral[0]
             family = facts.family_for(request.fact.t)
             authorize = getattr(family, "authorize", None)
-            return authorize(self, request, stream, trusted_now) \
+            return authorize(
+                self, request, stream, trusted_now, purpose=purpose) \
                 if authorize is not None else None
         except Exception:
             return None

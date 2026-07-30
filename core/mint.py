@@ -14,7 +14,9 @@ class _ObjectMiss(BaseException):
         self.oid = oid
 
 
-def stateless(pile_bytes, root_bytes, fetch, now, view=None):
+def stateless(
+        pile_bytes, root_bytes, fetch, now, view=None, *,
+        purpose="sync"):
     """Authorize a bounded request closure using exact authenticated reads.
 
     A caller may cache ``WorkerView`` only while its root ETag matches. Cold
@@ -22,16 +24,17 @@ def stateless(pile_bytes, root_bytes, fetch, now, view=None):
     tree or reconstructs SQLite.
     """
     if isinstance(view, WorkerView) and view.etag == h(root_bytes):
-        return view.mint(pile_bytes, now)
+        return view.mint(pile_bytes, now, purpose=purpose)
     try:
-        return WorkerView.from_root(root_bytes, fetch).mint(pile_bytes, now)
+        return WorkerView.from_root(root_bytes, fetch).mint(
+            pile_bytes, now, purpose=purpose)
     except Exception:
         return None
 
 
 async def async_stateless(
         pile_bytes, root_bytes, fetch, now, *,
-        max_unique_fetches, max_fetch_bytes):
+        max_unique_fetches, max_fetch_bytes, purpose="sync"):
     """Authorize against one pinned root using an awaited immutable reader.
 
     ``stateless`` and ``WorkerView`` remain the only verifier and policy path.
@@ -57,7 +60,8 @@ async def async_stateless(
     while True:
         try:
             return stateless(
-                pile_bytes, root_bytes, cached_fetch, now)
+                pile_bytes, root_bytes, cached_fetch, now,
+                purpose=purpose)
         except _ObjectMiss as miss:
             oid = miss.oid
 

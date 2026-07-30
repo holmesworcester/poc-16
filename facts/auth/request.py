@@ -6,7 +6,7 @@ from . import signature
 
 TAG = "req"
 POLICY = FamilyPolicy(authorization_guards=("member",))
-VERBS = frozenset({"sync"})
+PURPOSES = frozenset({"sync", "upload"})
 
 
 # SHAPE
@@ -41,7 +41,7 @@ def validate(f, ctx):
 DURABLE = False
 
 
-def authorize(view, valid, stream, trusted_now):
+def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
     """Authorize this ephemeral closure using only bounded Worker reads.
 
     ``view`` is the database-free CF capability: authenticated Fact,
@@ -50,7 +50,8 @@ def authorize(view, valid, stream, trusted_now):
     import facts
 
     body = valid.fact.body
-    if body["verb"] not in VERBS or body["exp"] < trusted_now:
+    if purpose not in PURPOSES or body["verb"] != purpose \
+            or body["exp"] < trusted_now:
         return None
     edges = {edge.role: edge.fid for edge in valid.edges}
     provider = {fact.fid: fact for fact in stream}.get(edges.get("member"))

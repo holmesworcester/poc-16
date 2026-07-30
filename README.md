@@ -153,7 +153,13 @@ indexes, and conditionally advances `root`. The Lambda and Cloudflare
 deployments below do not accept uploads and cannot publish a workspace by
 themselves.
 
-The intended cloud path is direct-to-object-store and is not implemented yet.
+The end-to-end direct-to-object-store cloud path is not implemented yet. The
+kernel-authorized, provider-neutral broker core and an exact AWS SigV4
+translator now exist under `deploy/upload_broker.py` and
+`deploy/aws_upload_broker`, but they are deliberately absent from the
+read-only Lambda artifact. There is not yet a deployed broker endpoint,
+multi-batch client, or database-free publisher.
+
 After proving workspace upload authority, a client will receive short-lived
 capabilities for exact broker-chosen upload keys, upload file objects first,
 and finally upload one exact closed-pile publication intent. A provider that
@@ -168,6 +174,14 @@ scan wakes a database-free publisher. That publisher validates the pile and
 objects, updates the authenticated trees, CASes `root`, and retires ingress
 only after the committed root proves publication. A lost event or poke affects
 latency, not durability.
+
+The AWS translator signs the exact `Content-Length`, `Content-Type`,
+`If-None-Match: *`, and `x-amz-checksum-sha256` headers of one S3 `PutObject`
+request. Browser JavaScript cannot set `Content-Length` itself, so browser
+support remains an opt-in live conformance check: the user agent must emit the
+signed length and the configured S3 CORS policy must admit every
+client-controlled signed header. The deterministic botocore tests do not
+claim to prove that browser/provider boundary.
 
 That target also requires every valid candidate that may later regain standing
 to remain durably reachable. The current client keeps losing/inactive receipts

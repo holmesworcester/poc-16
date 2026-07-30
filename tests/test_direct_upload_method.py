@@ -759,8 +759,12 @@ def test_weak_promotion_policies_emit_first_failing_trace(
     assert replayed.value.prefix == violation.prefix
 
 
-def test_current_integration_seams_are_explicit_and_runtime_is_still_unbuilt():
+def test_current_integration_seams_name_built_broker_and_unbuilt_roles():
     root = Path(__file__).parents[1]
 
     assert integration_inventory(root) == INTEGRATION_SEAMS
+    assert any(
+        seam.symbol == "UploadBroker"
+        and seam.path == "deploy/upload_broker.py"
+        for seam in INTEGRATION_SEAMS)
     assert unbuilt_direct_upload_symbols(root) == ()

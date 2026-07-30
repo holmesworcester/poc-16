@@ -2099,6 +2099,14 @@ INTEGRATION_SEAMS = (
         "handler",
         "segregated future AWS entrypoint"),
     IntegrationSeam(
+        "deploy/upload_broker.py",
+        "UploadBroker",
+        "production kernel-authorized exact staging capability broker"),
+    IntegrationSeam(
+        "deploy/aws_upload_broker/signer.py",
+        "S3UploadSigner",
+        "production exact SigV4 isolated-ingress translator"),
+    IntegrationSeam(
         "deploy/cloudflare_worker/runtime.py",
         "handle",
         "segregated future Cloudflare entrypoint"),
@@ -2139,9 +2147,9 @@ def integration_inventory(root):
 
 
 def unbuilt_direct_upload_symbols(root):
-    """Ratchet that this method does not masquerade as the future runtime."""
+    """Ratchet the publisher/uploader roles that remain design-only."""
     root = Path(root)
-    wanted = {"UploadBroker", "PilePublisher", "DirectUploader"}
+    wanted = {"PilePublisher", "DirectUploader"}
     found = []
     for directory in ("core", "adapters", "deploy"):
         for path in sorted((root / directory).rglob("*.py")):
