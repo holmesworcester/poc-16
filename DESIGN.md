@@ -358,6 +358,15 @@ adapter or deployed broker route, nor a database-free publisher, so these
 client commands do not make the current read-only Lambda/Worker deployments
 writable.
 
+`deploy/upload_keyring.py` gives AWS and Cloudflare one canonical bounded
+secret-document meaning. Rotation is distribute, activate, then retire: every
+cold instance first receives old plus new verification keys; new issuance
+switches only after propagation; the old key cannot be removed before its
+declared verification window ends. The cursor's fixed expiry means changing
+the default lifetime affects only newly opened sessions. Provider binding is
+also authenticated in every cursor, so copying the same secret bytes across
+AWS and R2 cannot resume a session on the other provider.
+
 The client persists four logically distinct values: the immutable complete
 source manifest, the most advanced authenticated cursor, `cursor_index`, and
 `delivered_index`. The cursor and its covered prefix are durable before any

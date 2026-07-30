@@ -20,6 +20,16 @@ from deploy.cloudflare_upload.boundary import (
     ingress_lifecycle,
     publisher_config,
 )
+from deploy.cloudflare_upload.signer import R2UploadSigner
+from deploy.upload_keyring import (
+    UploadKeyring,
+    decode_keyring,
+    encode_keyring,
+)
+from deploy.upload_session import (
+    SessionKey,
+    UploadSessionPolicy,
+)
 
 
 def deployment(**changes):
@@ -242,6 +252,22 @@ def test_lifecycle_collects_loose_objects_but_never_durable_pile_markers():
 
 
 def _deploy_environment():
+    key = SessionKey("key00001", b"k" * 32, 0, 10**12)
+    candidate = deployment()
+    provider = R2UploadSigner(
+        candidate,
+        "parent-id",
+        "parent-secret",
+        clock=lambda: 0,
+    ).provider_binding
+    keyring = encode_keyring(UploadKeyring(
+        provider,
+        UploadSessionPolicy(
+            "cloudflare-upload-production",
+            key.key_id,
+            (key,),
+        ),
+    )).decode("ascii")
     return {
         "CF_UPLOAD_ENABLE_STUB_DEPLOY": "1",
         "CF_UPLOAD_CREATE": "1",
@@ -250,6 +276,7 @@ def _deploy_environment():
         "CANONICAL_READ_SECRET_ACCESS_KEY": "reader-secret",
         "INGRESS_PARENT_ACCESS_KEY_ID": "parent-id",
         "INGRESS_PARENT_SECRET_ACCESS_KEY": "parent-secret",
+        "UPLOAD_SESSION_KEYRING": keyring,
     }
 
 
@@ -305,11 +332,15 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         "CANONICAL_READ_SECRET_ACCESS_KEY": "reader-secret",
         "INGRESS_PARENT_ACCESS_KEY_ID": "parent-id",
         "INGRESS_PARENT_SECRET_ACCESS_KEY": "parent-secret",
+        "UPLOAD_SESSION_KEYRING":
+            _deploy_environment()["UPLOAD_SESSION_KEYRING"],
     }]
     generated_bytes = b"".join(
         path.read_bytes() for path in generated.iterdir())
     assert b"reader-secret" not in generated_bytes
     assert b"parent-secret" not in generated_bytes
+    assert _deploy_environment()[
+        "UPLOAD_SESSION_KEYRING"].encode() not in generated_bytes
 
     before = {
         name: dict(objects) for name, objects in buckets.items()}
@@ -329,6 +360,49 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         candidate.broker_name, candidate.publisher_name,
     ]
     assert all("r2" not in call[3:] for call in calls)
+
+
+def test_deploy_rejects_noncanonical_keyring_before_provider_mutation(
+        tmp_path, monkeypatch):
+    candidate = deployment()
+    monkeypatch.setattr(manage, "GENERATED", tmp_path / "generated")
+    environment = _deploy_environment()
+    environment["UPLOAD_SESSION_KEYRING"] += "\n"
+    calls = []
+
+    with pytest.raises(ValueError, match="KEYRING is invalid"):
+        manage.deploy(
+            candidate,
+            environment,
+            runner=lambda command: calls.append(tuple(command)),
+            identity_reader=lambda *_: manage._ABSENT,
+        )
+
+    assert calls == []
+
+
+def test_deploy_rejects_keyring_bound_to_another_provider_before_mutation(
+        tmp_path, monkeypatch):
+    candidate = deployment()
+    monkeypatch.setattr(manage, "GENERATED", tmp_path / "generated")
+    environment = _deploy_environment()
+    loaded = decode_keyring(
+        environment["UPLOAD_SESSION_KEYRING"].encode())
+    environment["UPLOAD_SESSION_KEYRING"] = encode_keyring(UploadKeyring(
+        "aws-s3-v1:us-west-2:ingress:123456789012",
+        loaded.policy,
+    )).decode()
+    calls = []
+
+    with pytest.raises(ValueError, match="KEYRING is invalid"):
+        manage.deploy(
+            candidate,
+            environment,
+            runner=lambda command: calls.append(tuple(command)),
+            identity_reader=lambda *_: manage._ABSENT,
+        )
+
+    assert calls == []
 
 
 def test_build_dry_runs_both_exact_generated_worker_configs(

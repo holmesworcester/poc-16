@@ -17,6 +17,8 @@ from deploy.cloudflare_upload.boundary import (
     Deployment,
     generated_boundary,
 )
+from deploy.cloudflare_upload.signer import R2UploadSigner
+from deploy.upload_keyring import decode_keyring
 
 
 PACKAGE = Path(__file__).resolve().parent
@@ -191,27 +193,38 @@ def _preflight(
     return observed
 
 
-def _broker_secrets(environment):
+def _broker_secrets(deployment, environment):
     values = {}
     for name in BROKER_SECRET_NAMES:
         value = environment.get(name, "")
         if not isinstance(value, str) or not value:
             raise ValueError(f"{name} is required")
         values[name] = value
+    try:
+        signer = R2UploadSigner(
+            deployment,
+            values["INGRESS_PARENT_ACCESS_KEY_ID"],
+            values["INGRESS_PARENT_SECRET_ACCESS_KEY"],
+        )
+        decode_keyring(
+            values["UPLOAD_SESSION_KEYRING"].encode("ascii"),
+            signer.provider_binding,
+        )
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("UPLOAD_SESSION_KEYRING is invalid") from error
     return values
 
 
-def _deploy_one(role, path, environment, runner):
+def _deploy_one(role, path, runner, broker_secrets):
     command = [
         "uv", "run", "pywrangler", "deploy",
         "--config", str(path),
     ]
     if role == "broker":
-        values = _broker_secrets(environment)
         with tempfile.NamedTemporaryFile(
                 mode="w", prefix="poc16-upload-secrets-",
                 suffix=".json") as secrets:
-            json.dump(values, secrets)
+            json.dump(broker_secrets, secrets)
             secrets.flush()
             runner(command + ["--secrets-file", secrets.name])
         return
@@ -233,6 +246,10 @@ def deploy(
     runner = _run if runner is None else runner
     identity_reader = (
         _worker_identity if identity_reader is None else identity_reader)
+    # Resolve and validate every required secret before the publisher is the
+    # first provider mutation. A malformed broker key ring must not leave a
+    # half-installed role pair.
+    broker_secrets = _broker_secrets(deployment, environment)
     paths = render(deployment)
     boundary = generated_boundary(deployment)
     configs = {role: boundary[role] for role in ROLE_ORDER}
@@ -244,7 +261,8 @@ def deploy(
         identity_reader=identity_reader,
     )
     for role in ROLE_ORDER:
-        _deploy_one(role, paths[role], environment, runner)
+        _deploy_one(
+            role, paths[role], runner, broker_secrets)
         if identity_reader(
                 deployment, configs[role], environment) \
                 != _expected(configs[role]):

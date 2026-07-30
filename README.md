@@ -365,6 +365,9 @@ export CF_UPLOAD_INGRESS_BUCKET=poc16-untrusted-ingress
 export CF_UPLOAD_DEPLOYMENT_OWNER=my-stable-deployment-id
 export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_GROUP_ID
 export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_GROUP_ID
+# Canonical JSON produced by deploy.upload_keyring; keep the old key through
+# every issued cursor's expiry plus clock skew during rotation.
+export UPLOAD_SESSION_KEYRING='...'
 
 python3 -m deploy.cloudflare_upload.manage render
 python3 -m deploy.cloudflare_upload.manage test
