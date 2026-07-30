@@ -154,13 +154,20 @@ deployments below do not accept uploads and cannot publish a workspace by
 themselves.
 
 The end-to-end direct-to-object-store cloud path is not deployed yet. The
-kernel-authorized broker core, resumable multi-batch client, and exact AWS and
-R2 SigV4 translators now exist under `deploy/upload_broker.py`,
-`deploy/upload_client.py`, `deploy/upload_journal.py`,
-`deploy/aws_upload_broker`, and `deploy/cloudflare_upload`. The broker and
-publisher are still deliberately absent from the read-only serverless
-artifacts: there is not yet a deployed broker endpoint or database-free
-publisher, so the writable host path above remains the only complete
+kernel-authorized broker core, its strict transport-neutral HTTP endpoint,
+the resumable multi-batch client, and exact AWS and R2 SigV4 translators now
+exist under `deploy/upload_broker.py`, `deploy/upload_broker_http.py`,
+`deploy/upload_wire.py`, `deploy/upload_client.py`,
+`deploy/upload_journal.py`, `deploy/aws_upload_broker`, and
+`deploy/cloudflare_upload`. The endpoint serves only canonical, bounded
+`POST /upload/open`, `/upload/issue`, and `/upload/finalize` metadata
+documents and returns the broker's exact bearer PUT requests; provider object
+and pile bodies never cross it.
+
+That endpoint is not yet wired into either provider's event format or
+deployed. The broker and publisher remain deliberately absent from the
+read-only serverless artifacts, and the database-free publisher is not yet
+implemented, so the writable host path above remains the only complete
 production path today.
 
 Once such an endpoint is deployed, the existing generic command transport

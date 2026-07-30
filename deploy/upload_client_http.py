@@ -5,7 +5,6 @@ Provider bodies go straight to the capability URL through a streaming PUT.
 Neither adapter accepts bucket credentials, free-form object keys, LIST,
 DELETE, or root authority.
 """
-import base64
 import http.client
 import json
 import socket
@@ -14,11 +13,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
-from core.fact import canon
-from core.limits import (
-    MAX_MINT_REQUEST_BYTES,
-    PAGE_BATCH,
-)
+from core.limits import PAGE_BATCH, PayloadTooLarge
 from deploy.upload_broker import (
     MAX_FINALIZE_RESPONSE_BYTES,
     MAX_ISSUE_RESPONSE_BYTES,
@@ -40,40 +35,28 @@ from deploy.upload_client import (
     UploadSessionRejected,
 )
 from deploy.upload_session import (
-    MAX_RANGE_PROOF_BYTES,
     UploadLeaf,
     UploadManifest,
 )
+from deploy.upload_wire import (
+    FINALIZE_REQUEST_SCHEMA,
+    ISSUE_REQUEST_SCHEMA,
+    InvalidUploadWire,
+    MAX_FINALIZE_REQUEST_BYTES,
+    MAX_ISSUE_REQUEST_BYTES,
+    MAX_OPEN_REQUEST_BYTES,
+    OPEN_REQUEST_SCHEMA,
+    encode_finalize_request,
+    encode_issue_request,
+    encode_open_request,
+)
 
 
-OPEN_REQUEST_SCHEMA = "poc16-upload-open-request-v1"
-ISSUE_REQUEST_SCHEMA = "poc16-upload-issue-request-v1"
-FINALIZE_REQUEST_SCHEMA = "poc16-upload-finalize-request-v1"
-MAX_OPEN_REQUEST_BYTES = MAX_MINT_REQUEST_BYTES + 4_096
-MAX_ISSUE_REQUEST_BYTES = 128 * 1024
-MAX_FINALIZE_REQUEST_BYTES = 16 * 1024
 MAX_PROVIDER_ERROR_BYTES = 4_096
 
 
 def _system_now_ms():
     return time.time_ns() // 1_000_000
-
-
-def _b64(raw):
-    return base64.b64encode(raw).decode("ascii")
-
-
-def _bounded_canon(value, maximum, label):
-    raw = canon(value)
-    if len(raw) > maximum:
-        raise UploadProtocolError(f"{label} exceeds request limit")
-    return raw
-
-
-def _leaf_document(leaf):
-    if not isinstance(leaf, UploadLeaf):
-        raise TypeError("upload leaf")
-    return {"digest": leaf.digest, "size": leaf.size}
 
 
 def _capability(value):
@@ -135,9 +118,7 @@ class HttpBrokerTransport:
         self.timeout = timeout
         self.opener = urllib.request.urlopen if opener is None else opener
 
-    def _post(self, verb, document, request_limit, response_limit):
-        raw = _bounded_canon(
-            document, request_limit, f"{verb} request")
+    def _post(self, verb, raw, response_limit):
         request = urllib.request.Request(
             f"{self.base_url}/upload/{verb.lower()}",
             data=raw,
@@ -164,19 +145,13 @@ class HttpBrokerTransport:
     def open(self, proof, manifest, pile):
         if not isinstance(manifest, UploadManifest):
             raise TypeError("upload manifest")
+        try:
+            request = encode_open_request(proof, manifest, pile)
+        except (InvalidUploadWire, PayloadTooLarge) as error:
+            raise UploadProtocolError("invalid OPEN request") from error
         value = self._post(
             "OPEN",
-            {
-                "manifest": {
-                    "count": manifest.count,
-                    "root": manifest.root,
-                    "total_bytes": manifest.total_bytes,
-                },
-                "pile": _leaf_document(pile),
-                "proof": _b64(proof),
-                "schema": OPEN_REQUEST_SCHEMA,
-            },
-            MAX_OPEN_REQUEST_BYTES,
+            request,
             MAX_OPEN_RESPONSE_BYTES,
         )
         if set(value) != {
@@ -191,20 +166,14 @@ class HttpBrokerTransport:
 
     def issue(self, cursor, start_index, leaves, proof):
         leaves = tuple(leaves)
-        if len(leaves) > PAGE_BATCH \
-                or not isinstance(proof, bytes) \
-                or len(proof) > MAX_RANGE_PROOF_BYTES:
-            raise UploadProtocolError("ISSUE request bound")
+        try:
+            request = encode_issue_request(
+                cursor, start_index, leaves, proof)
+        except (InvalidUploadWire, PayloadTooLarge) as error:
+            raise UploadProtocolError("invalid ISSUE request") from error
         value = self._post(
             "ISSUE",
-            {
-                "cursor": cursor,
-                "leaves": [_leaf_document(leaf) for leaf in leaves],
-                "proof": _b64(proof),
-                "schema": ISSUE_REQUEST_SCHEMA,
-                "start_index": start_index,
-            },
-            MAX_ISSUE_REQUEST_BYTES,
+            request,
             MAX_ISSUE_RESPONSE_BYTES,
         )
         if set(value) != {
@@ -228,13 +197,14 @@ class HttpBrokerTransport:
             raise UploadProtocolError("invalid ISSUE response") from error
 
     def finalize(self, cursor):
+        try:
+            request = encode_finalize_request(cursor)
+        except (InvalidUploadWire, PayloadTooLarge) as error:
+            raise UploadProtocolError(
+                "invalid FINALIZE request") from error
         value = self._post(
             "FINALIZE",
-            {
-                "cursor": cursor,
-                "schema": FINALIZE_REQUEST_SCHEMA,
-            },
-            MAX_FINALIZE_REQUEST_BYTES,
+            request,
             MAX_FINALIZE_RESPONSE_BYTES,
         )
         if set(value) != {

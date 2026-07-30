@@ -328,6 +328,14 @@ before any PUT is issued:
 3. `FINALIZE` requires the complete committed prefix and derives the sole pile
    key fixed by `OPEN`; it accepts no replacement descriptor or path.
 
+`deploy/upload_wire.py` is the single canonical request codec on both sides
+of that protocol. `deploy/upload_broker_http.py` is its hostile,
+transport-neutral server membrane: it accepts only those three exact paths
+and bounded canonical JSON/base64 documents, calls the existing
+`UploadBroker`, and returns body-free errors. AWS Lambda and Cloudflare Worker
+event normalization remain deployment adapters around this membrane; neither
+provider body nor provider-specific request object enters the broker.
+
 The constant-size cursor binds protocol version, issuer/provider, key id,
 workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
 next index, issued bytes, last digest, issued time, and fixed expiry under an
@@ -340,9 +348,10 @@ provider session state. `deploy/upload_client.py` drives it through narrow
 broker/PUT transports, while `deploy/upload_journal.py` owns only the
 filesystem durability boundary. Fact-family commands author the same message,
 file, chunk, signature, and closed-pile bytes used by local publication;
-`core/cli.py` remains a generic passthrough. There is not yet a deployed broker
-route or database-free publisher, so these client commands do not make the
-current read-only Lambda/Worker deployments writable.
+`core/cli.py` remains a generic passthrough. There is not yet a provider event
+adapter or deployed broker route, nor a database-free publisher, so these
+client commands do not make the current read-only Lambda/Worker deployments
+writable.
 
 The client persists four logically distinct values: the immutable complete
 source manifest, the most advanced authenticated cursor, `cursor_index`, and

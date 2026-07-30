@@ -30,11 +30,12 @@ from deploy.upload_client_http import (
     HttpBrokerTransport,
     HttpPutTransport,
 )
-from deploy.upload_session import UploadLeaf, UploadVector
+from deploy.upload_session import TOKEN_BYTES, UploadLeaf, UploadVector
 
 
 SESSION = "a" * 32
-CURSOR = "opaque-cursor"
+CURSOR = "a" * TOKEN_BYTES
+ADVANCED = "b" * TOKEN_BYTES
 EXPIRY = 50_000
 LEAF = UploadLeaf(h(b"body"), 4)
 PILE = UploadLeaf(h(b"pile"), 4)
@@ -70,9 +71,9 @@ def test_broker_http_transport_round_trips_all_three_bounded_documents():
     replies = [
         open_document(OpenedUpload(SESSION, CURSOR, EXPIRY)),
         issue_document(IssuedUpload(
-            "advanced", 1, (GrantedUpload(LEAF, CAP),), EXPIRY)),
+            ADVANCED, 1, (GrantedUpload(LEAF, CAP),), EXPIRY)),
         finalize_document(FinalizedUpload(
-            "advanced", GrantedUpload(PILE, CAP), EXPIRY)),
+            ADVANCED, GrantedUpload(PILE, CAP), EXPIRY)),
     ]
 
     def open_url(request, timeout):
