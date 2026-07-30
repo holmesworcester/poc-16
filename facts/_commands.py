@@ -1,4 +1,5 @@
 """Shared mechanics for family commands; no fact policy lives here."""
+import os
 
 
 def offer_source(node, workspace, name, a0, a1=None, requires=()):
@@ -53,3 +54,39 @@ def publish(node, workspace, fact, signature, role="member", blobs=None):
             + [src], signature.fid: []}
     node.ingest_new(workspace, [signature, fact], deps, blobs)
     return fact.fid
+
+
+def upload_builder(node, workspace):
+    """Spool direct-upload bytes outside the workspace/object-store answer."""
+    from deploy.upload_journal import UploadSourceBuilder
+
+    return UploadSourceBuilder(
+        os.path.join(node.dir, "uploads"),
+        workspace,
+        node.member_for(workspace),
+    )
+
+
+def upload_source(
+        node, workspace, source, broker_url, provider_origin):
+    """Run the one provider-neutral direct uploader with a fresh auth proof."""
+    from core.close import encode_pile
+    from core.node import now_ms
+    from deploy.upload_client_http import run_http
+    from facts.auth import request
+
+    if source.workspace != workspace \
+            or source.member != node.member_for(workspace):
+        raise ValueError("upload source authority")
+
+    def proof():
+        now = now_ms()
+        return encode_pile(request.payload(
+            node, workspace, "upload", now + 120_000, now))
+
+    result = run_http(source, broker_url, provider_origin, proof)
+    return {
+        "objects": result.object_count,
+        "session": result.session,
+        "upload": result.source_id,
+    }

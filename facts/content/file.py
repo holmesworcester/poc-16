@@ -3,9 +3,11 @@ import os
 import tempfile
 
 from core import bao, catalog
+from core.close import encode_pile
 from core.crypto import h
 from core.object_store import ensure_object
 from core.fact import Fact, Need
+from core.shape import valid_fid
 from core.suppression import PARENT, selector_markers
 from .._policy import (
     DELETE_SELF,
@@ -14,7 +16,12 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from .._commands import offer_source
+from .._commands import (
+    closer,
+    offer_source,
+    upload_builder,
+    upload_source,
+)
 from ..auth import signature
 from . import chunk as chunkfam
 
@@ -94,8 +101,8 @@ DURABLE = True
 
 
 # COMMANDS
-def send(node, workspace, channel, path, name=None, ts=None):
-    """Prove every slice locally, spill it, then publish one closed pile."""
+def _prepare(node, workspace, channel, path, name, ts, put_object):
+    """Author the one file/chunk fact set; choose only where blobs land."""
     from core.node import now_ms
 
     timestamp = now_ms() if ts is None else ts
@@ -113,7 +120,6 @@ def send(node, workspace, channel, path, name=None, ts=None):
     member = offer_source(node, workspace, "member", public)
     if member is None:
         raise ValueError("publishing identity is not a workspace member")
-    store = node.store(workspace)
     with tempfile.TemporaryDirectory(prefix="tinyp2p-bao-") as scratch:
         outboard = os.path.join(scratch, "outboard")
         root = bao.prepare(source, outboard)
@@ -124,7 +130,7 @@ def send(node, workspace, channel, path, name=None, ts=None):
             if len(payload) != bao.span(index, size)[1]:
                 raise RuntimeError("Bao returned a short slice")
             cid = h(blob)
-            ensure_object(store, cid, blob)
+            put_object(cid, blob)
             cids.append(cid)
         if os.path.getsize(source) != size:
             raise ValueError("file changed while it was being proved")
@@ -144,8 +150,62 @@ def send(node, workspace, channel, path, name=None, ts=None):
         news += [item_signature, item]
         deps[item_signature.fid] = []
         deps[item.fid] = [item_signature.fid, member, descriptor.fid]
+    return descriptor, news, deps
+
+
+def send(node, workspace, channel, path, name=None, ts=None):
+    """Prove every slice locally, spill it, then publish one closed pile."""
+    store = node.store(workspace)
+    descriptor, news, deps = _prepare(
+        node, workspace, channel, path, name, ts,
+        lambda cid, blob: ensure_object(store, cid, blob),
+    )
     node.ingest_new(workspace, news, deps)
     return descriptor.fid
+
+
+def upload(
+        node, workspace, channel, path, broker_url, provider_origin,
+        name=None, ts=None):
+    """Author once, then send objects directly to exact provider PUTs."""
+    builder = upload_builder(node, workspace)
+
+    def spool(cid, blob):
+        if builder.add(blob) != cid:
+            raise RuntimeError("upload object digest")
+
+    try:
+        descriptor, news, deps = _prepare(
+            node, workspace, channel, path, name, ts,
+            spool,
+        )
+        with node.lock:
+            stream = closer(
+                node, workspace,
+                {fact.fid: fact for fact in news},
+                deps,
+            )
+        source = builder.finish(
+            encode_pile(stream, workspace=workspace))
+    except BaseException:
+        builder.discard()
+        raise
+    result = upload_source(
+        node, workspace, source, broker_url, provider_origin)
+    return {"fid": descriptor.fid, **result}
+
+
+def resume_upload(
+        node, workspace, upload_id, broker_url, provider_origin):
+    """Resume any retained direct-upload source by its content id."""
+    from deploy.upload_journal import UploadSource
+
+    if not valid_fid(upload_id):
+        raise ValueError("upload id")
+    source = UploadSource.load(
+        os.path.join(node.dir, "uploads", upload_id))
+    return upload_source(
+        node, workspace, source, broker_url, provider_origin)
 
 
 def save(node, workspace, selector, out_path):
@@ -297,5 +357,10 @@ def bytes_for(node, workspace, fid):
         _payloads(node, workspace, record, cids))
 
 
-CLI = {"content.file.send": send, "content.file.save": save,
-       "content.file.list": files}
+CLI = {
+    "content.file.list": files,
+    "content.file.resume_upload": resume_upload,
+    "content.file.save": save,
+    "content.file.send": send,
+    "content.file.upload": upload,
+}

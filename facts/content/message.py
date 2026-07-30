@@ -6,7 +6,14 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from .._commands import publish
+from core.close import encode_pile
+from .._commands import (
+    closer,
+    offer_source,
+    publish,
+    upload_builder,
+    upload_source,
+)
 from ..auth import signature
 
 TAG = "msg"
@@ -52,14 +59,42 @@ DURABLE = True
 
 
 # COMMANDS
-def post(node, workspace, channel, text, ts=None):
+def _author(node, workspace, channel, text, ts):
     from core.node import now_ms
 
-    ts = now_ms() if ts is None else ts
+    timestamp = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
-    item = message(workspace, public, channel, text, ts)
-    return publish(node, workspace, item,
-                   signature.signature(secret, public, item, ts))
+    item = message(workspace, public, channel, text, timestamp)
+    return item, signature.signature(secret, public, item, timestamp)
+
+
+def post(node, workspace, channel, text, ts=None):
+    item, signed = _author(node, workspace, channel, text, ts)
+    return publish(node, workspace, item, signed)
+
+
+def upload(
+        node, workspace, channel, text, broker_url, provider_origin,
+        ts=None):
+    """Author one message and send its closed pile directly to ingress."""
+    item, signed = _author(node, workspace, channel, text, ts)
+    public = item.body["pk"]
+    member = offer_source(node, workspace, "member", public)
+    if member is None:
+        raise ValueError("publishing identity is not a workspace member")
+    newmap = {item.fid: item, signed.fid: signed}
+    deps = {item.fid: [signed.fid, member], signed.fid: []}
+    with node.lock:
+        stream = closer(node, workspace, newmap, deps)
+    builder = upload_builder(node, workspace)
+    try:
+        source = builder.finish(
+            encode_pile(stream, workspace=workspace))
+    except BaseException:
+        builder.discard()
+        raise
+    return {"fid": item.fid, **upload_source(
+        node, workspace, source, broker_url, provider_origin)}
 
 
 # QUERIES
@@ -84,4 +119,8 @@ def messages(node, workspace, channel=None):
     ]
 
 
-CLI = {"content.message.post": post, "content.message.list": messages}
+CLI = {
+    "content.message.list": messages,
+    "content.message.post": post,
+    "content.message.upload": upload,
+}

@@ -334,10 +334,43 @@ next index, issued bytes, last digest, issued time, and fixed expiry under an
 HMAC-SHA-256 deployment key. Old keys remain available for at least the
 maximum session lifetime plus skew. Merkle leaves and internal nodes are
 domain-separated and include the leaf position; the wrapped root also commits
-count and total bytes. This provider-neutral state machine now runs in
+count and total bytes. This provider-neutral authority state machine runs in
 `deploy/upload_session.py` and `deploy/upload_broker.py`; it has no database or
-provider session state. There is not yet a deployed broker route, end-user
-uploader, or database-free publisher.
+provider session state. `deploy/upload_client.py` drives it through narrow
+broker/PUT transports, while `deploy/upload_journal.py` owns only the
+filesystem durability boundary. Fact-family commands author the same message,
+file, chunk, signature, and closed-pile bytes used by local publication;
+`core/cli.py` remains a generic passthrough. There is not yet a deployed broker
+route or database-free publisher, so these client commands do not make the
+current read-only Lambda/Worker deployments writable.
+
+The client persists four logically distinct values: the immutable complete
+source manifest, the most advanced authenticated cursor, `cursor_index`, and
+`delivered_index`. The cursor and its covered prefix are durable before any
+PUT in that range; each provider receipt advances `delivered_index` by exactly
+one. Thus a crash after `ISSUE` but before PUT resumes at
+`delivered_index` and asks the stateless broker to reissue already-covered
+authority. Replayed responses may not lower the retained cursor index. Only
+after all present object bodies are acknowledged does the client ask for the
+precommitted pile capability and PUT the pile last.
+
+Create-only staging has intentionally conservative recovery. A PUT-only
+capability cannot read an incumbent, so HTTP 409/412 never proves equality.
+The client starts a fresh broker session; timeout-before-apply can reuse the
+same exact capability, while timeout-after-apply safely leaves at most
+abandoned staging in the old session. Source bytes and progress survive
+process restart without SQLite or provider credentials. The complete vector
+contains only detached bytes the client can actually supply: valid pile facts
+may name additional missing Bao objects, which remain an incomplete-file
+condition for the publisher rather than an authorization or pile-delivery
+failure.
+
+The exact provider HTTPS origin is trusted client configuration, separate
+from the broker URL. A capability must match that scheme, host, and port as
+well as the broker-derived staging path before the client opens the body.
+Provider PUTs do not follow redirects. This keeps the broker on the metadata
+path even if it is compromised; path suffix validation alone would permit
+body exfiltration or HTTPS SSRF.
 
 An advancing rolling HMAC without the fixed Merkle vector is insufficient: an
 old cursor can be replay-forked into arbitrarily many different suffixes under

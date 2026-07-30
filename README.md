@@ -153,14 +153,44 @@ indexes, and conditionally advances `root`. The Lambda and Cloudflare
 deployments below do not accept uploads and cannot publish a workspace by
 themselves.
 
-The end-to-end direct-to-object-store cloud path is not implemented yet. The
-kernel-authorized, provider-neutral broker core and exact AWS and R2 SigV4
-translators now exist under `deploy/upload_broker.py`,
-`deploy/aws_upload_broker`, and `deploy/cloudflare_upload`, but they are
-deliberately absent from the read-only serverless artifacts. There is not yet
-a deployed broker endpoint, multi-batch client, or database-free publisher.
+The end-to-end direct-to-object-store cloud path is not deployed yet. The
+kernel-authorized broker core, resumable multi-batch client, and exact AWS and
+R2 SigV4 translators now exist under `deploy/upload_broker.py`,
+`deploy/upload_client.py`, `deploy/upload_journal.py`,
+`deploy/aws_upload_broker`, and `deploy/cloudflare_upload`. The broker and
+publisher are still deliberately absent from the read-only serverless
+artifacts: there is not yet a deployed broker endpoint or database-free
+publisher, so the writable host path above remains the only complete
+production path today.
 
-After proving workspace upload authority, a client will receive short-lived
+Once such an endpoint is deployed, the existing generic command transport
+exposes family-owned direct commands:
+
+```sh
+python3 -m core content.message.upload WORKSPACE general "hello" \
+  BROKER_URL PROVIDER_ORIGIN
+python3 -m core content.file.upload WORKSPACE general ./photo.jpg \
+  BROKER_URL PROVIDER_ORIGIN
+python3 -m core content.file.resume_upload WORKSPACE UPLOAD_ID \
+  BROKER_URL PROVIDER_ORIGIN
+```
+
+The local client process authors the ordinary fact closure and keeps an
+immutable source journal under its node directory; it does not admit those
+facts locally or need S3/R2 credentials. The source manifest is separate from
+the mutable session record. That record retains the most advanced
+authenticated cursor, the prefix covered by it, and the smaller prefix whose
+PUTs were acknowledged. A crash after `ISSUE` therefore reissues covered
+authority instead of skipping unuploaded bytes. A create precondition failure
+is never guessed to mean equal: because the PUT capability has no read
+authority, the client abandons that staging session and opens a fresh one.
+`PROVIDER_ORIGIN` is the independently configured exact HTTPS provider
+endpoint for this deployment and ingress bucket (the account endpoint for
+R2). The client rejects a capability for any other origin before opening
+source bytes, so even a compromised broker cannot redirect a PUT to itself or
+an internal HTTPS service.
+
+After proving workspace upload authority, the client receives short-lived
 capabilities for exact broker-chosen upload keys, upload file objects first,
 and finally upload one exact closed-pile publication intent. The selected
 common flow uses session-scoped isolated ingress on both S3 and R2, then lets

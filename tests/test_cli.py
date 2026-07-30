@@ -18,10 +18,13 @@ EXPECTED = {
     "auth.workspace.create",
     "content.delete.remove",
     "content.file.list",
+    "content.file.resume_upload",
     "content.file.save",
     "content.file.send",
+    "content.file.upload",
     "content.message.list",
     "content.message.post",
+    "content.message.upload",
 }
 
 
