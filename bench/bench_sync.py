@@ -4,7 +4,7 @@ Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
             "download + ingestion" number: fetch the manifest's leaf piles
-            and closure siblings, judge each unit through the kernel, merge
+            and closure siblings, judge each unit through the kernel, admit
             by id, then one commit. facts/s here is directly comparable to
             the 2000-5000 facts/s poc-7..13 have gotten.
 
@@ -13,10 +13,9 @@ Two questions, both answered against the *real* engine paths:
             the symmetric difference as one closed pile). Both converge; we
             measure the diff.
 
-The seed is bulk-built (facts inserted straight into the index, one manifest
-build at the end) so setup is O(n log n), not O(n^2) — building 500k facts by
-replaying 250k turns would be hopeless. The measured paths are the honest
-ones.
+The seed is kernel-admitted in bounded batches with one manifest build at the
+end, so setup is O(n log n), not O(n^2) — building 500k facts by replaying
+250k turns would be hopeless. The measured paths are the honest ones.
 
 Run:   python3 bench/bench_sync.py                 # 5k/10k/50k/100k facts
        python3 bench/bench_sync.py 500000          # add the 500k run
@@ -33,15 +32,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import catalog, cmds, manifest
+from core import cmds, manifest
 from core import node as node_module
 from core import sync as sync_module
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h
-from core.fact import decode
 from facts.auth.signature import signature
 from facts.content.message import message
-from core.kernel import extend_proofs, kernel, resolve_deps
+from core.kernel import kernel, offer_src, resolve_deps
 from core.node import Node, now_ms
 from core.publication import Publisher
 from core.shape import fid_of
@@ -61,12 +59,36 @@ perf = time.perf_counter
 
 # ---- bulk seed building ------------------------------------------------------
 
-def _insert(idx, workspace, fact):
-    catalog.Catalog(idx, workspace).stage(fact)
+def admit_batch(node, workspace, news, deps_new):
+    """Benchmark setup through the same running-kernel durable entrance.
+
+    This is the production local-authoring pattern at benchmark scale:
+    family-known edges close only ``news`` over existing standing, then the
+    database-free kernel judges that bounded closure from empty.
+    """
+    news = tuple(news)
+    newmap = {fact.fid: fact for fact in news}
+
+    def fact_of(fid):
+        return newmap.get(fid) or node.fact_of(workspace, fid)
+
+    def deps_of(fid):
+        return deps_new[fid] if fid in deps_new else (
+            resolve_deps(fact_of(fid), node.idx(workspace)) or ())
+
+    stream = close(news, deps_of, fact_of)
+    pending = node.idx(workspace).execute(
+        "SELECT 1 FROM meta WHERE k='publish-base'").fetchone() is not None
+    if not pending:
+        node._sync_index(workspace)
+    publisher = Publisher(node, workspace)
+    return node.admit(
+        workspace, stream,
+        base=publisher.base(pending=pending))
 
 
 def _commit_index(node, workspace):
-    """Benchmark-only direct-write boundary; runtime code never uses it."""
+    """Defer layout by changing only benchmark-local publication metadata."""
     idx = node.idx(workspace)
     root = node.store(workspace).get("root")
     idx.execute(
@@ -89,31 +111,22 @@ def build_members(node, ws, n_members, base_ts):
 
 
 def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
-    """Author n_msgs (msg + sig = 2 facts each) straight into the index,
-    random member, ts uniform over `window`. Rank the new signature providers
-    before returning because incremental benchmark callers resolve the batch's
-    closures without an intervening ``Node.commit()``."""
-    idx = node.idx(ws)
-    idx.execute("BEGIN")
-    try:
-        signatures, authored = [], []
-        for i in range(n_msgs):
-            sk, pk = rng.choice(members)
-            ts = first_ts + rng.randrange(window)
-            f = message(ws, pk, "general", f"{tag}m{i}", ts)
-            signed = signature(sk, pk, f, ts)
-            _insert(idx, ws, signed)
-            _insert(idx, ws, f)
-            signatures.append(signed.fid)
-            authored.extend((signed.fid, f.fid))
-        unresolved = extend_proofs(
-            idx, authored, lambda fid: node.candidate_of(ws, fid), ws)
-        if set(signatures).intersection(unresolved):
-            raise ValueError("bulk-authored signatures could not be ranked")
-        _commit_index(node, ws)
-    except Exception:
-        idx.rollback()
-        raise
+    """Kernel-admit ``n_msgs`` messages in one bounded unpublished batch."""
+    authored, deps = [], {}
+    index = node.idx(ws)
+    for i in range(n_msgs):
+        sk, pk = rng.choice(members)
+        ts = first_ts + rng.randrange(window)
+        fact = message(ws, pk, "general", f"{tag}m{i}", ts)
+        signed = signature(sk, pk, fact, ts)
+        member = offer_src(index, "member", pk)
+        if member is None:
+            raise ValueError("bulk author is not a member")
+        authored.extend((signed, fact))
+        deps[signed.fid] = ()
+        deps[fact.fid] = (signed.fid, member)
+    admit_batch(node, ws, authored, deps)
+    _commit_index(node, ws)
 
 
 def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
@@ -160,9 +173,10 @@ def seed_units(store, man, workspace):
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
-    """decode is the caller's (serial, like turn); kernel is parallel; merge
-    + catalog settlement serial. Returns streamed-record count. No commit — caller
-    lays out once at the end."""
+    """Decode is serial; kernel work is parallel; catalog admission is serial.
+
+    Returns streamed-record count. No commit: the caller lays out once.
+    """
     node._sync_index(ws)
     base = Publisher(node, ws).base()
     streamed = 0
@@ -170,10 +184,10 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
         buf = []
 
         def flush(bb):
-            for judgment in ex.map(lambda u: kernel(u, ws), bb):
+            judged = ex.map(lambda unit: (unit, kernel(unit, ws)), bb)
+            for unit, judgment in judged:
                 assert judgment.ok, "a published unit failed the kernel"
-                node.merge(
-                    ws, (valid.fact for valid in judgment.valids), base=base)
+                node.admit(ws, unit, base=base)
 
         for u in units:
             streamed += len(u)
@@ -209,12 +223,15 @@ def catchup(seed, ws, fresh_dir):
 # ---- the bidi benchmark ------------------------------------------------------
 
 def copy_facts(dst, ws, src, fids):
-    di, si = dst.idx(ws), src.idx(ws)
-    di.execute("BEGIN")
-    for fid in fids:
-        raw = si.execute(
-            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()[0]
-        _insert(di, ws, decode(raw))
+    selected = [src.fact_of(ws, fid) for fid in fids]
+    facts = close(
+        selected,
+        lambda fid: resolve_deps(
+            src.fact_of(ws, fid), src.idx(ws)) or (),
+        lambda fid: src.fact_of(ws, fid),
+    )
+    dst._sync_index(ws)
+    dst.admit(ws, facts)
     _commit_index(dst, ws)
 
 
@@ -305,10 +322,10 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
             "min": min(depths.values()),
             "max": max(depths.values()),
         }
-        # ``grow_tree`` is a benchmark-only direct catalog writer. Settle it
-        # before taking the shared membership snapshot; otherwise all but the
-        # anchor are still staged and a one-round reconciliation can expose
-        # previously invisible content only after its frontier was computed.
+        # ``grow_tree`` leaves one benchmark-sized admitted batch staged.
+        # Settle it before taking the shared membership snapshot; otherwise
+        # non-anchor facts are still staged and one-round reconciliation can
+        # expose previously invisible content after its frontier was computed.
         A.commit(ws)
     membership = all_fids(A, ws)
 

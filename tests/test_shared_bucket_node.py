@@ -109,13 +109,12 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
     bucket, (alice, bob) = _shared_clones(
         seed, workspace, tmp_path, "alice", "bob")
 
-    def candidates(raw):
-        judged = drain(decode_pile(raw, workspace)[0], workspace)
-        assert judged.ok
-        return tuple(valid.fact for valid in judged.valids)
+    def admit(node, raw):
+        return node.admit(
+            workspace, decode_pile(raw, workspace)[0]).settlement
 
-    alice_plan = alice.merge(workspace, candidates(raw_a))
-    bob_plan = bob.merge(workspace, candidates(raw_b))
+    alice_plan = admit(alice, raw_a)
+    bob_plan = admit(bob, raw_b)
     assert alice_plan.base_token == bob_plan.base_token
 
     alice_root = alice.commit(workspace, alice_plan)
@@ -124,7 +123,7 @@ def test_losing_publication_keeps_the_winner_and_retries_from_that_root(
     assert bob.store(workspace).get("root") == alice_root
 
     bob._restore_authoritative_state(workspace)
-    retry = bob.merge(workspace, candidates(raw_b))
+    retry = admit(bob, raw_b)
     final_root = bob.commit(workspace, retry)
     assert {fact.fid for fact in _commit_facts(
         workspace, bucket.commits[-1])} >= {
@@ -207,9 +206,8 @@ def test_post_cas_stamp_records_its_own_root_not_a_later_writers(tmp_path):
         seed, workspace, tmp_path, "alice", "bob")
 
     def plan(node, raw):
-        judged = drain(decode_pile(raw, workspace)[0], workspace)
-        return node.merge(
-            workspace, (valid.fact for valid in judged.valids))
+        return node.admit(
+            workspace, decode_pile(raw, workspace)[0]).settlement
 
     plan_a = plan(alice, raw_a)
     cas_won = bucket.pause("alice", "cas", "root", when="after")

@@ -1,4 +1,5 @@
 """Small structural ratchets; runtime claims belong in behavioral tests."""
+import ast
 from pathlib import Path
 import re
 import subprocess
@@ -74,3 +75,63 @@ def test_suppression_state_uses_the_explicit_module_name():
     assert (ROOT / "tests" / "test_suppression_state.py").is_file()
     assert not (ROOT / "core" / "actions.py").exists()
     assert not (ROOT / "tests" / "test_actions.py").exists()
+
+
+def test_durable_fact_admission_has_one_kernel_mediated_entrance():
+    """Raw facts may be loaded only into the named in-memory scratch type."""
+    node_tree = ast.parse((ROOT / "core" / "node.py").read_text())
+    node = next(
+        item for item in node_tree.body
+        if isinstance(item, ast.ClassDef) and item.name == "Node")
+    methods = {
+        item.name: item
+        for item in node.body if isinstance(item, ast.FunctionDef)
+    }
+    assert "merge" not in methods
+    assert "admit" in methods
+    calls = [
+        call
+        for call in ast.walk(methods["admit"])
+        if isinstance(call, ast.Call)
+    ]
+    assert any(
+        isinstance(call.func, ast.Name) and call.func.id == "drain"
+        for call in calls)
+    assert sum(
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "_admit_valid"
+        for call in calls) == 1
+
+    private_calls = []
+    for path in tracked(
+            "core/*.py", "facts/**/*.py", "adapters/**/*.py",
+            "deploy/**/*.py", "bench/*.py"):
+        tree = ast.parse((ROOT / path).read_text())
+
+        class Calls(ast.NodeVisitor):
+            def __init__(self):
+                self.functions = []
+
+            def visit_ClassDef(self, item):
+                self.functions.append(item.name)
+                self.generic_visit(item)
+                self.functions.pop()
+
+            def visit_FunctionDef(self, item):
+                self.functions.append(item.name)
+                self.generic_visit(item)
+                self.functions.pop()
+
+            def visit_Call(self, item):
+                if isinstance(item.func, ast.Attribute) \
+                        and item.func.attr == "_admit_valid":
+                    private_calls.append(
+                        (str(path), tuple(self.functions)))
+                self.generic_visit(item)
+
+        Calls().visit(tree)
+    assert private_calls == [("core/node.py", ("Node", "admit"))]
+
+    catalog_source = (ROOT / "core" / "catalog.py").read_text()
+    assert "class ScratchCatalog" in catalog_source
+    assert "def stage(" not in catalog_source

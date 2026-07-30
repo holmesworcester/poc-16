@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 import facts
 from .fact import Fact, bound_to, decode
+from .shape import valid_fid
 
 class Valid(NamedTuple):
     fact: Fact
@@ -26,6 +27,23 @@ class Judgment(NamedTuple):
     ok: bool
     valids: tuple
     failure: Exception | None = None
+
+
+def valid_resolved_edges(deps, edges):
+    """Whether a receipt has one canonical, exact dependency-edge tuple."""
+    if not isinstance(deps, (list, tuple)) \
+            or not isinstance(edges, (list, tuple)):
+        return False
+    if any(not isinstance(edge, ResolvedEdge) for edge in edges):
+        return False
+    roles = [edge.role for edge in edges]
+    if not all(isinstance(role, str) and role for role in roles):
+        return False
+    return roles == sorted(roles) \
+        and len(roles) == len(set(roles)) \
+        and all(valid_fid(edge.fid) for edge in edges) \
+        and all(edge.kind in ("need", "ref") for edge in edges) \
+        and tuple(deps) == tuple(edge.fid for edge in edges)
 
 
 class Context(NamedTuple):
@@ -181,9 +199,9 @@ def resolve_edges(f: Fact, db, strict=False):
         if strict:
             raise
         return None
-    roles = [edge.role for edge in edges]
-    if not all(isinstance(role, str) and role for role in roles) \
-            or len(roles) != len(set(roles)):
+    edges.sort(key=lambda edge: edge.role)
+    if not valid_resolved_edges(
+            tuple(edge.fid for edge in edges), edges):
         return None
     return tuple(edges)
 

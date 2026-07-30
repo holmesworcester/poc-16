@@ -15,6 +15,7 @@ import os
 import sqlite3
 import threading
 import time
+from typing import NamedTuple
 
 import facts
 
@@ -22,7 +23,7 @@ from . import catalog, indexes, manifest, suppression_state
 from .close import close, decode_pile, encode_pile
 from .crypto import h
 from .fact import Fact, canon
-from .ingress import PermanentIngressRejection
+from .ingress import KernelRejected, PermanentIngressRejection
 from .keychain import Keychain
 from .kernel import (
     drain,
@@ -42,6 +43,13 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA)
 
 
+class Admission(NamedTuple):
+    """One successful kernel judgment and its unpublished settlement."""
+
+    settlement: object
+    valids: tuple
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -53,9 +61,9 @@ def _edges(items, anchor=None):
     deps, db = {}, sqlite3.connect(":memory:")
     try:
         db.executescript(catalog.SCHEMA)
-        admitted = catalog.Catalog(db, anchor)
+        admitted = catalog.ScratchCatalog(db, anchor)
         for fact in items.values():
-            admitted.stage(fact)
+            admitted.load(fact)
         admitted.commit_stage(items)
         if rebuild_proofs(db, items.get, anchor):
             raise ValueError("store closure")
@@ -331,7 +339,11 @@ class Node:
         return self.catalog(ws).eligible(fid)
 
     def candidate_of(self, ws, fid) -> Fact:
-        """A kernel-valid durable receipt, whether currently eligible or not."""
+        """A retained candidate, whether currently eligible or not.
+
+        New rows have an exact local kernel receipt. Proof-less legacy rows
+        remain distinguishable until the explicit catalog-cut migration.
+        """
         return self.catalog(ws).candidate(fid)
 
     def catalog(self, ws):
@@ -430,9 +442,19 @@ class Node:
     def turn(self, ws):
         return self.workspace(ws).turn()
 
-    def merge(
-            self, ws, candidates, *, base=None, force=False,
+    def admit(
+            self, ws, stream, *, base=None, force=False,
             allowed_staged=None):
+        """Run the kernel, then durably settle only its exact Valid receipts.
+
+        This method is the catalog's sole durable fact entrance. Callers pass
+        a closed fact stream, never a caller-constructed receipt.
+        """
+        judgment = drain(tuple(stream), ws)
+        if not judgment.ok:
+            if judgment.failure is not None:
+                raise judgment.failure
+            raise KernelRejected("ingress rejected")
         publisher = Publisher(self, ws)
         base = publisher.base() if base is None else base
         idx, newfids = self.idx(ws), []
@@ -440,10 +462,11 @@ class Node:
         idx.execute("BEGIN")
         try:
             actions_dirty = False
-            for f in candidates:
+            for receipt in judgment.valids:
+                f = receipt.fact
                 if not facts.family_for(f.t).DURABLE:
                     continue  # judged, never persisted: litter drains away
-                if admitted.stage(f):
+                if admitted._admit_valid(receipt):
                     newfids.append(f.fid)
                 idx.executemany(
                     "INSERT OR IGNORE INTO supp VALUES(?,?)",
@@ -480,7 +503,8 @@ class Node:
                 self._invalidate_sync_cache(ws)
             publisher.dirty(base)
             idx.commit()
-            return publisher.plan(change, base)
+            return Admission(
+                publisher.plan(change, base), judgment.valids)
         except Exception:
             idx.rollback()
             raise
@@ -562,10 +586,10 @@ class Node:
                     raise ValueError("store fact set")
             idx.execute("BEGIN")
             try:
-                # Facts and their generic index rows are the stable admitted
-                # catalog. Re-derive the generic rows exactly from canonical
-                # blobs, then rebuild root-derived eligibility, edges,
-                # actions, and the selector reverse map around them.
+                # Facts and generic rows are the retained catalog (legacy
+                # proof-less rows remain distinguishable). Re-derive generic
+                # rows from canonical blobs, then rebuild root-derived
+                # eligibility, edges, actions, and selector reverse routes.
                 self.catalog(ws).reindex()
                 for table in ("proofs", "edges", "actions"):
                     idx.execute(f"DELETE FROM {table}")
@@ -589,9 +613,10 @@ class Node:
             except Exception:
                 idx.rollback()
                 raise
-            settlement = self.merge(
+            admission = self.admit(
                 ws, stream, base=base, force=True,
                 allowed_staged={fact.fid for fact in stream})
+            settlement = admission.settlement
             if root is not None:
                 try:
                     self._validate_root_actions(

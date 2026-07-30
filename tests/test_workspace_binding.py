@@ -12,7 +12,7 @@ from core import catalog, cmds, daemon
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
-from core.ingress import InvalidPile
+from core.ingress import InvalidPile, KernelRejected
 from core.node import Node
 from core.worker import WorkerView
 from facts.auth import request
@@ -78,27 +78,27 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_stage(
         decode_pile(hostile, second)
 
     family_calls = []
-    stage_calls = []
+    admission_calls = []
     real_family_for = facts.family_for
-    real_stage = catalog.Catalog.stage
+    real_admit = catalog.Catalog._admit_valid
 
     def observed_family(tag):
         family_calls.append(tag)
         return real_family_for(tag)
 
-    def observed_stage(self, fact):
-        stage_calls.append(fact.fid)
-        return real_stage(self, fact)
+    def observed_admit(self, receipt):
+        admission_calls.append(receipt.fact.fid)
+        return real_admit(self, receipt)
 
     monkeypatch.setattr(facts, "family_for", observed_family)
-    monkeypatch.setattr(catalog.Catalog, "stage", observed_stage)
+    monkeypatch.setattr(catalog.Catalog, "_admit_valid", observed_admit)
     source = f"pile/{node.member_for(second)}/{h(hostile)}"
     node.store(second).put(source, hostile)
 
     node.turn(second)
 
     assert family_calls == []
-    assert stage_calls == []
+    assert admission_calls == []
     assert node.candidate_of(second, foreign.fid) is None
     assert node.store(second).get(source) is None
     assert node.store(second).get("failed/pile/" + h(hostile)) == hostile
@@ -167,15 +167,16 @@ def test_database_free_mint_and_catalog_enforce_the_same_anchor(tmp_path):
 
     foreign = message(
         first, node.identity_id(first), "general", "not second", 101)
-    with pytest.raises(ValueError, match="fact workspace"):
-        node.catalog(second).stage(foreign)
+    with pytest.raises(KernelRejected, match="ingress rejected"):
+        node.admit(second, [foreign])
     assert node.candidate_of(second, foreign.fid) is None
 
     ws_less_ordinary = Fact("msg", 102, [], {}, None)
     db = sqlite3.connect(":memory:")
     db.executescript(catalog.SCHEMA)
     with pytest.raises(ValueError, match="fact workspace"):
-        catalog.Catalog(db, ws_less_ordinary.fid).stage(ws_less_ordinary)
+        catalog.ScratchCatalog(
+            db, ws_less_ordinary.fid).load(ws_less_ordinary)
 
 
 @pytest.mark.parametrize("case", ("foreign-inner-pile", "incomplete-proof"))

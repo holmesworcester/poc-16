@@ -495,11 +495,11 @@ def test_production_delete_inventory_and_both_proof_callers_are_ratchets():
         )
         for site in retirements
     ] == [
-        (
-            "core/node.py", "_quarantine_ingress", 196,
-            "self", "direct"),
-        ("core/runtime.py", "turn", 97, "node", "direct"),
-    ]
+            (
+                "core/node.py", "_quarantine_ingress", 204,
+                "self", "direct"),
+            ("core/runtime.py", "turn", 99, "node", "direct"),
+        ]
 
 
 def test_delete_inventory_reports_alias_and_dynamic_capability(tmp_path):

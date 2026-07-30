@@ -285,9 +285,9 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
     stream, _ = decode_pile(pile, workspace)
     judgment = drain(stream, workspace)
     assert judgment.ok
-    node.merge(workspace, (valid.fact for valid in judgment.valids))
+    node.admit(workspace, stream)
 
-    # Model process death at the exact merge/manifest boundary: no exception
+    # Model process death at the exact admission/manifest boundary: no exception
     # handler gets to restore the derived index before its connections close.
     assert h(node.store(workspace).get("root")) == old_root
     assert node.idx(workspace).execute(
@@ -354,8 +354,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     ))
     deliver(node, workspace, raw)
     judgment = drain(decode_pile(raw, workspace)[0], workspace)
-    settlement = node.merge(
-        workspace, (valid.fact for valid in judgment.valids))
+    admission = node.admit(workspace, decode_pile(raw, workspace)[0])
     old_root = node.store(workspace).get("root")
 
     def die_after_cas(*args, **kwargs):
@@ -364,7 +363,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     original_stamp = Publisher.stamp
     monkeypatch.setattr(Publisher, "stamp", die_after_cas)
     with pytest.raises(RuntimeError, match="post-CAS death"):
-        node.commit(workspace, settlement)
+        node.commit(workspace, admission.settlement)
     assert node.store(workspace).get("root") != old_root
     assert node.idx(workspace).execute(
         "SELECT 1 FROM staged WHERE fid=?",

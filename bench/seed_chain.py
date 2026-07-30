@@ -3,8 +3,8 @@
 The four shapes keep the authority facts identical and vary only who invites
 each user: ``star`` is the old founder-only low bar, ``wide`` models a small
 set of prolific inviters, ``random`` is a uniform random recursive tree, and
-``chain`` is the adversarial spine. Membership and content are bulk-inserted;
-the finished fact set receives one layout commit.
+``chain`` is the adversarial spine. Membership and content are kernel-admitted
+in bounded batches; the finished fact set receives one layout commit.
 """
 import collections
 import hashlib
@@ -20,7 +20,7 @@ from bench.bench_sync import (
     MEMBERS,
     YEARS,
     _commit_index,
-    _insert,
+    admit_batch,
     bulk_author,
 )
 from core import cmds
@@ -30,6 +30,7 @@ from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
+from core.kernel import offer_src
 from core.node import Node
 
 SHAPES = ("star", "wide", "random", "chain")
@@ -93,38 +94,38 @@ def grow_tree(node, workspace, n_members, base_ts, rng, *,
     parents = {node.pk: None}
     depths = {node.pk: 0}
     users = {node.pk: workspace}
-    idx = node.idx(workspace)
-    idx.execute("BEGIN")
-    try:
-        for ordinal in range(1, n_members):
-            parent_at = _parent_index(
-                shape, ordinal, rng, min(wide_inviters, ordinal))
-            inviter_sk, inviter_pk = identities[parent_at]
-            invite_ts = base_ts + 2 * ordinal - 1
-            user_ts = invite_ts + 1
+    authored, deps = [], {}
+    for ordinal in range(1, n_members):
+        parent_at = _parent_index(
+            shape, ordinal, rng, min(wide_inviters, ordinal))
+        inviter_sk, inviter_pk = identities[parent_at]
+        invite_ts = base_ts + 2 * ordinal - 1
+        user_ts = invite_ts + 1
 
-            invite_sk, invite_pk = keys.next() if keys else keypair()
-            invitation = user_invite(
-                workspace, inviter_pk, invite_pk, invite_ts)
-            invitation_sig = signature(
-                inviter_sk, inviter_pk, invitation, invite_ts)
-            member_sk, member_pk = keys.next() if keys else keypair()
-            joined = user(
-                invitation, invite_sk, member_pk, f"u{ordinal - 1}", user_ts)
-            joined_sig = signature(member_sk, member_pk, joined, user_ts)
+        invite_sk, invite_pk = keys.next() if keys else keypair()
+        invitation = user_invite(
+            workspace, inviter_pk, invite_pk, invite_ts)
+        invitation_sig = signature(
+            inviter_sk, inviter_pk, invitation, invite_ts)
+        member_sk, member_pk = keys.next() if keys else keypair()
+        joined = user(
+            invitation, invite_sk, member_pk, f"u{ordinal - 1}", user_ts)
+        joined_sig = signature(member_sk, member_pk, joined, user_ts)
 
-            for fact in (invitation_sig, invitation, joined_sig, joined):
-                _insert(idx, workspace, fact)
-            node.keychain.add_identity(member_sk, persist=False)
-            identities.append((member_sk, member_pk))
-            parents[member_pk] = inviter_pk
-            depths[member_pk] = depths[inviter_pk] + 1
-            users[member_pk] = joined.fid
-        _commit_index(node, workspace)
-        node.keychain.save()
-    except Exception:
-        idx.rollback()
-        raise
+        authored.extend((invitation_sig, invitation, joined_sig, joined))
+        deps[invitation_sig.fid] = ()
+        deps[invitation.fid] = (
+            invitation_sig.fid, users[inviter_pk])
+        deps[joined_sig.fid] = ()
+        deps[joined.fid] = (invitation.fid, joined_sig.fid)
+        node.keychain.add_identity(member_sk, persist=False)
+        identities.append((member_sk, member_pk))
+        parents[member_pk] = inviter_pk
+        depths[member_pk] = depths[inviter_pk] + 1
+        users[member_pk] = joined.fid
+    admit_batch(node, workspace, authored, deps)
+    _commit_index(node, workspace)
+    node.keychain.save()
     return identities, parents, depths, users
 
 
@@ -136,44 +137,53 @@ def grow_devices(
     all_devices = []
     devices_by_user = {}
     device_to_user = {}
-    idx = node.idx(workspace)
-    idx.execute("BEGIN")
-    try:
-        ts = base_ts
-        for user_number, (user_secret, user_public) in enumerate(identities):
-            primary = device(
-                workspace, user_public, f"u{user_number}-d0", ts)
-            primary_sig = signature(
-                user_secret, user_public, primary, ts)
-            _insert(idx, workspace, primary_sig)
-            _insert(idx, workspace, primary)
-            device_set = [(user_secret, user_public)]
-            devices_by_user[user_public] = [user_public]
-            device_to_user[user_public] = user_public
-            ts += 1
+    authored, deps, ts = [], {}, base_ts
+    index = node.idx(workspace)
+    for user_number, (user_secret, user_public) in enumerate(identities):
+        primary = device(
+            workspace, user_public, f"u{user_number}-d0", ts)
+        primary_sig = signature(
+            user_secret, user_public, primary, ts)
+        authored.extend((primary_sig, primary))
+        member_source = offer_src(index, "member", user_public)
+        if member_source is None:
+            raise ValueError("device seed user is not a member")
+        deps[primary_sig.fid] = ()
+        deps[primary.fid] = (primary_sig.fid, member_source)
+        device_set = [(user_secret, user_public)]
+        member_sources = {user_public: member_source}
+        device_sources = {user_public: primary.fid}
+        devices_by_user[user_public] = [user_public]
+        device_to_user[user_public] = user_public
+        ts += 1
 
-            for device_number in range(1, devices_per_user):
-                inviter_secret, inviter_public = device_set[-1]
-                sibling_secret, sibling_public = \
-                    keys.next() if keys else keypair()
-                grant = device_invite(
-                    workspace, inviter_public, user_public, sibling_public,
-                    f"u{user_number}-d{device_number}", ts)
-                grant_sig = signature(
-                    inviter_secret, inviter_public, grant, ts)
-                _insert(idx, workspace, grant_sig)
-                _insert(idx, workspace, grant)
-                node.keychain.add_identity(sibling_secret, persist=False)
-                device_set.append((sibling_secret, sibling_public))
-                devices_by_user[user_public].append(sibling_public)
-                device_to_user[sibling_public] = user_public
-                ts += 1
-            all_devices.extend(device_set)
-        _commit_index(node, workspace)
-        node.keychain.save()
-    except Exception:
-        idx.rollback()
-        raise
+        for device_number in range(1, devices_per_user):
+            inviter_secret, inviter_public = device_set[-1]
+            sibling_secret, sibling_public = \
+                keys.next() if keys else keypair()
+            grant = device_invite(
+                workspace, inviter_public, user_public, sibling_public,
+                f"u{user_number}-d{device_number}", ts)
+            grant_sig = signature(
+                inviter_secret, inviter_public, grant, ts)
+            authored.extend((grant_sig, grant))
+            deps[grant_sig.fid] = ()
+            deps[grant.fid] = (
+                grant_sig.fid,
+                member_sources[inviter_public],
+                device_sources[inviter_public],
+            )
+            node.keychain.add_identity(sibling_secret, persist=False)
+            device_set.append((sibling_secret, sibling_public))
+            member_sources[sibling_public] = grant.fid
+            device_sources[sibling_public] = grant.fid
+            devices_by_user[user_public].append(sibling_public)
+            device_to_user[sibling_public] = user_public
+            ts += 1
+        all_devices.extend(device_set)
+    admit_batch(node, workspace, authored, deps)
+    _commit_index(node, workspace)
+    node.keychain.save()
     return all_devices, devices_by_user, device_to_user
 
 

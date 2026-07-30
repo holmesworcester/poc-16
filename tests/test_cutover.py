@@ -13,6 +13,7 @@ from core import btreap, cmds
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
 from core.fact import canon
+from core.ingress import KernelRejected
 from core.kernel import drain, resolve_deps
 from core.node import Node
 from facts._policy import OWNER
@@ -636,20 +637,28 @@ def test_pull_feeds_ordinary_admission(tmp_path, monkeypatch):
     assert all_fids(twin, ws) == all_fids(destination, ws)
     assert twin.store(ws).get("root") == destination.store(ws).get("root")
 
-    # Direct merge/commit is not a judge bypass: canonical settlement
-    # revalidates local edges and retains these bytes only as inactive catalog
-    # receipts. The source root therefore cannot expose a poisoned pull range.
-    secret, public = source.identity(ws)
+    # The durable catalog has no raw-Fact entrance. Even a direct in-process
+    # admission call runs the same kernel and changes neither retained
+    # candidates nor generic postings when the closed unit is forged.
+    _, public = source.identity(ws)
     forged = message(ws, public, "general", "forged", ts + 10)
     unsigned = signature(keypair()[0], public, forged, ts + 10)  # wrong sk
     source_root = source.store(ws).get("root")
+    candidate_count = source.idx(ws).execute(
+        "SELECT COUNT(*) FROM facts").fetchone()
+    posting_count = source.idx(ws).execute(
+        "SELECT COUNT(*) FROM fact_index").fetchone()
     with source.lock:
-        settlement = source.merge(ws, [unsigned, forged])
-        source.commit(ws, settlement)
+        with pytest.raises(KernelRejected, match="ingress rejected"):
+            source.admit(ws, [unsigned, forged])
     before = all_fids(destination, ws)
-    assert source.candidate_of(ws, unsigned.fid) == unsigned
-    assert source.candidate_of(ws, forged.fid) == forged
+    assert source.candidate_of(ws, unsigned.fid) is None
+    assert source.candidate_of(ws, forged.fid) is None
     assert source.fact_of(ws, forged.fid) is None
+    assert source.idx(ws).execute(
+        "SELECT COUNT(*) FROM facts").fetchone() == candidate_count
+    assert source.idx(ws).execute(
+        "SELECT COUNT(*) FROM fact_index").fetchone() == posting_count
     assert source.store(ws).get("root") == source_root
     assert sync_module.sync(destination, ws, "local://source") == (0, 0)
 

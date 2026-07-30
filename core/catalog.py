@@ -7,31 +7,39 @@ finite canonical DAG: a fact is publishable exactly when it has a proof row.
 Winner changes replace proofs/edges; they never serialize, delete, or reinsert
 a receipt.
 
-Receipts enter with a row in ``staged``. Publication removes that marker only
+Kernel receipts enter with a row in ``staged`` and their exact resolved edge
+tuple in ``admission_receipts``. Publication removes only the staging marker
 after the composite-root CAS. Recovery retains uncommitted stages while
 rebuilding derived standing from the current root, so a lost CAS never depends
 on another process leaving the original ingress pile in place.
+
+Raw facts have no durable catalog door. ``ScratchCatalog`` is the deliberately
+separate loader for the two in-memory graph workspaces used while ordering a
+closed store view or assembling a sync closure.
 """
+import json
 from typing import NamedTuple
 
 import facts
 
-from .fact import bound_to, decode, encode, from_json
+from .fact import bound_to, canon, decode, encode, from_json
 from . import suppression_state
 from .close import close
 from .kernel import (
     Context,
     ResolvedEdge,
+    Valid,
     accepts,
     extend_proofs,
     rebuild_proofs,
+    valid_resolved_edges,
 )
 
 TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"
 INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX, REF_INDEX))
-INDEX_VERSION = "admission-catalog-v27-generic-candidate-index"
+INDEX_VERSION = "admission-catalog-v28-kernel-receipts"
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -40,6 +48,8 @@ CREATE TABLE IF NOT EXISTS facts(
 SCHEMA = FACTS_SCHEMA + """
 CREATE TABLE IF NOT EXISTS staged(
     fid TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS admission_receipts(
+    fid TEXT PRIMARY KEY, receipt BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS fact_index(
     kind TEXT, k0 TEXT, k1 TEXT, src TEXT,
     PRIMARY KEY(kind, k0, k1, src));
@@ -71,6 +81,46 @@ def _bound_receipt(fact, anchor):
     """Catalog defense in depth for the registry's sole ws-less exception."""
     return bound_to(fact, anchor) \
         and (fact.ws is not None or facts.is_genesis(fact.t))
+
+
+def _receipt_bytes(receipt):
+    """Canonical local commitment to one running-kernel edge judgment."""
+    if not isinstance(receipt, Valid):
+        raise TypeError("durable admission requires a kernel Valid receipt")
+    edges = tuple(receipt.edges)
+    deps = tuple(receipt.deps)
+    if not valid_resolved_edges(deps, edges):
+        raise ValueError("invalid kernel receipt edges")
+    return canon({
+        "deps": list(deps),
+        "edges": [
+            [edge.role, edge.fid, edge.kind]
+            for edge in edges
+        ],
+    })
+
+
+def _store_fact(db, anchor, fact):
+    """Common byte/index write below sealed durable and memory-only doors."""
+    if not _bound_receipt(fact, anchor):
+        raise ValueError("fact workspace")
+    raw = encode(fact)
+    row = db.execute(
+        "SELECT blob FROM facts WHERE fid=?", (fact.fid,)).fetchone()
+    fresh = row is None
+    if row is not None and row[0] != raw:
+        raise ValueError("fact catalog conflict")
+    db.execute("INSERT OR IGNORE INTO facts VALUES(?,?)", (fact.fid, raw))
+    if fresh:
+        db.execute("INSERT INTO staged VALUES(?)", (fact.fid,))
+    db.executemany(
+        "INSERT OR IGNORE INTO fact_index VALUES(?,?,?,?)",
+        index_rows(fact),
+    )
+    return db.execute(
+        "SELECT 1 FROM staged WHERE fid=?",
+        (fact.fid,),
+    ).fetchone() is not None
 
 
 def _reindex(db, anchor):
@@ -253,28 +303,53 @@ class Catalog:
                 (fid,))
         )
 
-    def stage(self, fact):
-        """Store one durable receipt; return whether it still awaits publish."""
-        if not _bound_receipt(fact, self.anchor):
-            raise ValueError("fact workspace")
-        raw = encode(fact)
+    def _admit_valid(self, receipt):
+        """Store one receipt minted by the caller's running kernel judgment.
+
+        This is private because ``Valid`` is an ordinary Python value, not a
+        process capability. ``Node.admit`` is the sole durable caller and runs
+        the kernel itself immediately before entering this method.
+        """
+        receipt_bytes = _receipt_bytes(receipt)
+        pending = _store_fact(self.db, self.anchor, receipt.fact)
+        existing = self.db.execute(
+            "SELECT 1 FROM admission_receipts WHERE fid=?",
+            (receipt.fact.fid,),
+        ).fetchone()
+        if existing is None:
+            self.db.execute(
+                "INSERT INTO admission_receipts VALUES(?,?)",
+                (receipt.fact.fid, receipt_bytes),
+            )
+        else:
+            self.admission_edges(receipt.fact.fid)
+        return pending
+
+    def admission_edges(self, fid):
+        """The first exact edge tuple under which ``fid`` passed the kernel."""
         row = self.db.execute(
-            "SELECT blob FROM facts WHERE fid=?", (fact.fid,)).fetchone()
-        fresh = row is None
-        if row is not None and row[0] != raw:
-            raise ValueError("fact catalog conflict")
-        self.db.execute("INSERT OR IGNORE INTO facts VALUES(?,?)",
-                        (fact.fid, raw))
-        if fresh:
-            self.db.execute("INSERT INTO staged VALUES(?)", (fact.fid,))
-        self.db.executemany(
-            "INSERT OR IGNORE INTO fact_index VALUES(?,?,?,?)",
-            index_rows(fact),
-        )
-        return self.db.execute(
-            "SELECT 1 FROM staged WHERE fid=?",
-            (fact.fid,),
-        ).fetchone() is not None
+            "SELECT receipt FROM admission_receipts WHERE fid=?",
+            (fid,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0])
+            if not isinstance(value, dict) or set(value) != {"deps", "edges"}:
+                raise ValueError("admission receipt shape")
+            deps = tuple(value["deps"])
+            edges = tuple(ResolvedEdge(*edge) for edge in value["edges"])
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("admission receipt integrity") from error
+        if not valid_resolved_edges(deps, edges) or canon({
+                "deps": list(deps),
+                "edges": [
+                    [edge.role, edge.fid, edge.kind]
+                    for edge in edges
+                ],
+        }) != row[0]:
+            raise ValueError("admission receipt integrity")
+        return edges
 
     def reindex(self):
         """Rebuild the exact generic index from every retained fact blob."""
@@ -466,3 +541,21 @@ class Catalog:
                 deactivated or updated or (activated - received_set)),
             tuple(sorted(changed_sids)),
         )
+
+
+class ScratchCatalog(Catalog):
+    """Raw-fact loader confined to a SQLite in-memory proof workspace."""
+
+    def __init__(self, db, anchor):
+        filenames = [
+            filename
+            for _, name, filename in db.execute("PRAGMA database_list")
+            if name == "main"
+        ]
+        if filenames != [""]:
+            raise ValueError("scratch catalog requires an in-memory database")
+        super().__init__(db, anchor)
+
+    def load(self, fact):
+        """Load unjudged bytes for ephemeral graph resolution only."""
+        return _store_fact(self.db, self.anchor, fact)

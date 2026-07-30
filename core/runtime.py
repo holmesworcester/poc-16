@@ -12,8 +12,8 @@ import facts
 
 from .close import close, decode_pile, encode_pile
 from .crypto import h
-from .ingress import KernelRejected, PermanentIngressRejection
-from .kernel import drain, resolve_deps
+from .ingress import PermanentIngressRejection
+from .kernel import resolve_deps
 from .object_store import ensure_object
 
 
@@ -27,6 +27,17 @@ class WorkspaceRuntime:
     def __init__(self, node, workspace):
         self.node = node
         self.workspace = workspace
+
+    def _reject(self, source, raw, error):
+        """Quarantine one exact, permanently invalid ingress object."""
+        node, ws = self.node, self.workspace
+        try:
+            node._quarantine_ingress(ws, source, raw, error)
+        except Exception as quarantine_error:
+            node.record_ingress_attempt_failure(
+                ws, source, quarantine_error)
+        else:
+            node.clear_ingress_attempt_failure(ws, source)
 
     def turn(self):
         node, ws = self.node, self.workspace
@@ -47,20 +58,8 @@ class WorkspaceRuntime:
                 try:
                     raw = store.get(source)
                     stream, blobs = decode_pile(raw, ws)
-                    judgment = drain(stream, ws)
-                    if not judgment.ok:
-                        if judgment.failure is not None:
-                            raise judgment.failure
-                        raise KernelRejected("ingress rejected")
                 except PermanentIngressRejection as error:
-                    try:
-                        node._quarantine_ingress(
-                            ws, source, raw, error)
-                    except Exception as quarantine_error:
-                        node.record_ingress_attempt_failure(
-                            ws, source, quarantine_error)
-                    else:
-                        node.clear_ingress_attempt_failure(ws, source)
+                    self._reject(source, raw, error)
                     continue
                 except Exception as error:
                     node.record_ingress_attempt_failure(
@@ -68,16 +67,19 @@ class WorkspaceRuntime:
                     continue
                 try:
                     node._sync_index(ws)
-                    settlement = node.merge(
-                        ws, (valid.fact for valid in judgment.valids),
+                    admission = node.admit(
+                        ws, stream,
                         allowed_staged={
-                            valid.fact.fid for valid in judgment.valids})
+                            fact.fid for fact in stream})
                     valids = tuple(
-                        valid for valid in judgment.valids
+                        valid for valid in admission.valids
                         if node.fact_of(ws, valid.fact.fid) is not None)
                     for oid, blob in blobs.items():
                         ensure_object(store, oid, blob)
-                    node.commit(ws, settlement)
+                    node.commit(ws, admission.settlement)
+                except PermanentIngressRejection as error:
+                    self._reject(source, raw, error)
+                    continue
                 except Exception as error:
                     try:
                         node._restore_authoritative_state(ws)

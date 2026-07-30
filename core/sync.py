@@ -42,7 +42,7 @@ def _resolver(node, ws, extra):
     mem = sqlite3.connect(":memory:")
     with node.lock:
         node.idx(ws).backup(mem)
-    scratch = catalog.Catalog(mem, ws)
+    scratch = catalog.ScratchCatalog(mem, ws)
 
     def fact_of(fid):
         return extra.get(fid) or node.fact_of(ws, fid)
@@ -51,7 +51,7 @@ def _resolver(node, ws, extra):
         facts = tuple(facts)
         extra.update({f.fid: f for f in facts})
         for fact in facts:
-            scratch.stage(fact)
+            scratch.load(fact)
         # A newly arrived lower-rank provider can change the canonical winner
         # for facts already present in the scratch copy.  Incrementally ranking
         # only ``facts`` leaves those old rows stale and wedges the next closure
