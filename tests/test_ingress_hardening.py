@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    btreap, close, cmds, daemon, fact, manifest, node as node_module,
-    object_store, sync,
+    close, cmds, daemon, fact, manifest, merkle_map, node as node_module,
+    object_store, runtime, sync,
 )
 from core.crypto import h
 from core.fact import Fact, canon
@@ -463,11 +463,11 @@ def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
             decoder(nested)
 
 
-def test_btreap_parser_recursion_is_also_a_value_error():
+def test_merkle_map_parser_recursion_is_also_a_value_error():
     nested = b"[" * 2_000 + b"0" + b"]" * 2_000
 
-    with pytest.raises(ValueError, match="btreap page shape"):
-        btreap._decode(nested, h(nested), h(b"seed"))
+    with pytest.raises(ValueError, match="merkle map page shape"):
+        merkle_map._decode(nested, h(nested), h(b"seed"))
 
 
 def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):

@@ -322,7 +322,7 @@ def test_pruned_subtree_is_still_validated_against_inherited_bounds():
     hostile_root = h(raw)
     objects[hostile_root] = raw
 
-    with pytest.raises(ValueError, match="merkle map child route"):
+    with pytest.raises(ValueError, match="merkle map page shape"):
         merkle_map.Reader(
             hostile_root, SEED, objects.get).items(known)
 
@@ -376,6 +376,8 @@ def test_depth_and_value_budgets_reject_before_publication():
         merkle_map.build(
             (("k" * (merkle_map.MAX_KEY_BYTES + 1), 1),),
             SEED, emitted.append)
+    with pytest.raises(ValueError, match="null value"):
+        merkle_map.build((("key", None),), SEED, emitted.append)
     assert emitted == []
 
 
@@ -420,15 +422,17 @@ def test_hostile_prefix_chain_has_deterministic_hard_depth_and_leaf_bounds():
 
 
 def test_maximum_byte_fanout_is_finite_and_canonical():
-    source = [("p", {"byte": "terminal"})] + [
-        ("p" + chr(byte), {"byte": byte})
-        for byte in range(128)
+    stem = "p" * (merkle_map.MAX_KEY_BYTES - 1)
+    wide = "x" * (merkle_map.MAX_VALUE_BYTES - 64)
+    source = [
+        (stem + chr(byte), {"byte": byte, "wide": wide})
+        for byte in range(64, 96)
     ]
     objects = {}
     built = merkle_map.build(source, SEED, emitter(objects))
     root = json.loads(objects[built.root])
     assert root["kind"] == "branch"
-    assert len(root["children"]) == merkle_map.MAX_FANOUT == 129
+    assert len(root["children"]) == merkle_map.MAX_FANOUT == 32
     assert len(objects[built.root]) <= merkle_map.MAX_PAGE_BYTES
     assert dict(
         merkle_map.Reader(
@@ -436,6 +440,27 @@ def test_maximum_byte_fanout_is_finite_and_canonical():
             max_page_depth=built.page_depth,
         ).items()
     ) == dict(source)
+
+    reader = merkle_map.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+    assert reader.range_page(
+        stem + "_", stem + "_\uffff", limit=1
+    ) == merkle_map.RangePage(
+        ((stem + "_", {"byte": 95, "wide": wide}),), None)
+    assert reader.pages_read <= (
+        2 * built.page_depth + 2 * (1 + 1))
+    assert reader.range_page(
+        stem + "]", stem + "^", limit=1
+    ) == merkle_map.RangePage(
+        ((stem + "]", {"byte": 93, "wide": wide}),), None)
+    assert reader.pages_read <= (
+        2 * built.page_depth + 2 * (1 + 1))
+    assert reader.range_page(
+        stem + "_!", stem + "_~", limit=1
+    ) == merkle_map.RangePage((), None)
+    assert reader.pages_read <= (
+        2 * built.page_depth + 2 * (1 + 1))
 
 
 def test_seeded_insert_delete_restore_matches_bulk_under_hostile_prefixes():
@@ -517,8 +542,7 @@ def test_resumable_oid_pruned_diff_is_bounded_and_classifies_rows():
 
     cursor, returned, differing = None, [], []
     while True:
-        page = remote.diff_page(
-            known, local=local, after=cursor, limit=5)
+        page = remote.diff_page(local, after=cursor, limit=5)
         returned.extend(page.rows)
         differing.extend(page.differing)
         assert remote.pages_read <= (
@@ -531,9 +555,155 @@ def test_resumable_oid_pruned_diff_is_bounded_and_classifies_rows():
     assert dict(differing) == dict(changes)
     assert len(returned) <= (
         len(changes) * merkle_map.LEAF_MAX_ROWS)
+    same = merkle_map.Reader(
+        remote_built.root, SEED, objects.get,
+        max_page_depth=remote_built.page_depth)
     assert remote.diff_page(
-        set(objects), local=local, limit=5
+        same, limit=5
     ) == merkle_map.DiffPage((), (), None)
+
+
+def test_stale_physically_held_page_is_not_a_current_reachability_witness():
+    objects = {}
+    original = merkle_map.build(rows(90), SEED, emitter(objects))
+    changed = ("key:00044", {"n": 44, "text": "new current value"})
+    current = merkle_map.update(
+        original.root, SEED, (changed,), objects.get, emitter(objects))
+    # The immutable store still physically contains every object from both
+    # roots.  Diff authority nevertheless comes only from ``current.root``.
+    historical = merkle_map.Reader(
+        original.root, SEED, objects.get,
+        max_page_depth=original.page_depth)
+    local = merkle_map.Reader(
+        current.root, SEED, objects.get,
+        max_page_depth=current.page_depth)
+    page = historical.diff_page(local, limit=merkle_map.MAX_RANGE_ROWS)
+    assert (changed[0], rows(90)[44][1]) in page.differing
+
+
+def test_missing_label_cannot_hide_a_child_from_nonmembership():
+    wide = "v" * (merkle_map.MAX_VALUE_BYTES - 128)
+    source = [
+        (f"{prefix}:{number:02d}", {"wide": wide, "n": number})
+        for prefix in ("a", "c", "e")
+        for number in range(11)
+    ]
+    objects = {}
+    built = merkle_map.build(source, SEED, emitter(objects))
+    page = json.loads(objects[built.root])
+    assert page["kind"] == "branch"
+    victim = next(
+        child for child in page["children"]
+        if merkle_map._decode_bound(child[5]).startswith("c:"))
+    victim[0] += 1
+    raw = merkle_map.canon(page)
+    bad_root = h(raw)
+    objects[bad_root] = raw
+    with pytest.raises(ValueError, match="merkle map page shape"):
+        merkle_map.Reader(
+            bad_root, SEED, objects.get,
+            max_page_depth=built.page_depth).get("c:05")
+
+
+def test_child_bound_shorter_than_parent_prefix_fails_as_page_shape():
+    source = [
+        (f"shared-prefix-{suffix}:{number:02d}", {"n": number})
+        for suffix in ("a", "b")
+        for number in range(20)
+    ]
+    objects = {}
+    built = merkle_map.build(source, SEED, emitter(objects))
+    page = json.loads(objects[built.root])
+    assert page["kind"] == "branch"
+    assert len(page["prefix"]) > len(merkle_map._tokens("x"))
+    page["children"][0][5] = merkle_map._bound_text("x")
+    raw = merkle_map.canon(page)
+    hostile_root = h(raw)
+    objects[hostile_root] = raw
+
+    with pytest.raises(ValueError, match="merkle map page shape"):
+        merkle_map.Reader(
+            hostile_root, SEED, objects.get,
+            max_page_depth=built.page_depth).get(source[0][0])
+
+
+def test_diff_does_not_prune_same_oid_with_forged_child_descriptor():
+    objects = {}
+    built = merkle_map.build(rows(80), SEED, emitter(objects))
+    page = json.loads(objects[built.root])
+    assert page["kind"] == "branch"
+    page["children"][0][2] += 1
+    page["count"] += 1
+    raw = merkle_map.canon(page)
+    hostile_root = h(raw)
+    objects[hostile_root] = raw
+
+    hostile = merkle_map.Reader(
+        hostile_root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+    current = merkle_map.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+    with pytest.raises(ValueError, match="merkle map child metadata"):
+        hostile.diff_page(current, limit=merkle_map.MAX_RANGE_ROWS)
+
+
+def test_seeded_neighbor_differential_preserves_ancestor_fallbacks():
+    alphabet = "abcxyz013~"
+    for seed in range(40):
+        rng = random.Random(seed)
+        keys = set()
+        while len(keys) < 90:
+            keys.add("".join(
+                rng.choice(alphabet)
+                for _ in range(rng.randint(2, 9))))
+        source = tuple(
+            (key, {"key": key}) for key in sorted(keys))
+        objects = {}
+        built = merkle_map.build(source, SEED, emitter(objects))
+        reader = merkle_map.Reader(
+            built.root, SEED, objects.get,
+            max_page_depth=built.page_depth)
+        ordered = [row[0] for row in source]
+        queries = [
+            "".join(
+                rng.choice(alphabet)
+                for _ in range(rng.randint(2, 9)))
+            for _ in range(40)
+        ]
+        if seed == 34:
+            queries.append("cb31z~b")
+        for query in queries:
+            at = __import__("bisect").bisect_left(ordered, query)
+            exact = at < len(ordered) and ordered[at] == query
+            before = source[at] if exact else source[at - 1] if at else None
+            after = source[at] if at < len(source) else None
+            assert reader.neighbors(query) == (before, after)
+            assert reader.pages_read <= 3 * built.page_depth
+
+
+def test_disjoint_max_fanout_diff_pages_resume_near_late_labels():
+    wide = "y" * (merkle_map.MAX_VALUE_BYTES - 64)
+    source = [
+        ("p" + chr(byte), {"byte": byte, "wide": wide})
+        for byte in range(64, 96)
+    ]
+    objects = {}
+    built = merkle_map.build(source, SEED, emitter(objects))
+    reader = merkle_map.Reader(
+        built.root, SEED, objects.get,
+        max_page_depth=built.page_depth)
+    empty = merkle_map.Reader("", SEED, objects.get)
+    cursor, found = "p[", []
+    for _ in range(4):
+        page = reader.diff_page(empty, after=cursor, limit=1)
+        found.extend(page.rows)
+        assert reader.pages_read <= (
+            2 * built.page_depth + 2 * (1 + 1))
+        if page.cursor is None:
+            break
+        cursor = page.cursor
+    assert [row[0] for row in found] == ["p\\", "p]", "p^", "p_"]
 
 
 def test_leaf_byte_limit_splits_before_row_limit_and_collapses_on_delete():

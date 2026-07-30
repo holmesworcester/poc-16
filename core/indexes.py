@@ -3,7 +3,7 @@
 The range manifest is shaped for reconciliation, not point authorization. A
 Worker should not download it, enumerate facts, or reconstruct SQLite merely
 to decide whether one principal or fact is live. This module projects the
-same admitted snapshot into three maps over the history-independent B-treap:
+same admitted snapshot into three maps over the history-independent Merkle map:
 
 ``FactTree``
     ``fact:<fid>`` maps to the bounded data needed for an exact Worker or
@@ -53,7 +53,7 @@ from typing import NamedTuple
 
 import facts
 
-from . import btreap
+from . import merkle_map
 from .catalog import Catalog, INTERNAL_INDEXES, index_rows
 from .crypto import h
 from .fact import canon, encode
@@ -107,7 +107,7 @@ class IndexBuild:
 
 
 def layout_seed(anchor):
-    """Pin all three canonical treaps to this workspace, not local history."""
+    """Pin all three canonical maps to this workspace, not local history."""
     return h(canon(["composite-layout-seed-v1", anchor]))
 
 
@@ -202,7 +202,7 @@ def decode_posting_key(key):
 
 def posting_page(
         reader, kind, k0=None, k1=None, *, after=None,
-        limit=btreap.MAX_RANGE_ROWS, include_dormant=False):
+        limit=merkle_map.MAX_RANGE_ROWS, include_dormant=False):
     """Read one authenticated posting range without enumerating FactTree."""
     def read(state, cursor, count):
         prefix = posting_prefix(kind, k0, k1, state=state)
@@ -577,7 +577,7 @@ def build(
             raise ValueError("unpublished candidate index delta")
         fact_changes, supp_changes, addresses = {}, {}, set()
         represented = set()
-        fact_reader = btreap.Reader(previous[FACT]["root"], seed, fetch)
+        fact_reader = merkle_map.Reader(previous[FACT]["root"], seed, fetch)
         for fid in sorted(changed_set):
             fact = admitted.admitted(fid)
             if fact is None:
@@ -664,7 +664,7 @@ def build(
         }
         built = {}
         for name in TREE_NAMES:
-            result = btreap.update(
+            result = merkle_map.update(
                 previous[name]["root"], seed, change_sets[name], fetch, emit)
             built[name] = {
                 "root": result.root,
@@ -729,7 +729,7 @@ def build(
             (FACT, fact_rows),
             (SUPP, supp_rows),
             (AUTHORITY, authority_rows)):
-        result = btreap.build(tuple(rows.items()), seed, emit)
+        result = merkle_map.build(tuple(rows.items()), seed, emit)
         built[name] = {
             "root": result.root,
             "count": result.count,

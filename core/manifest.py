@@ -3,7 +3,7 @@
 One entry maps a leaf's first opaque canonical key to a canonical ordered
 ``(key, fact-object-oid)`` vector and a closure-sibling oid. Fact bodies have
 one residence at ``obj/H(encode(fact))``; RangeTree is only a derived transfer
-map. It uses the same persistent authenticated treap as the Worker indexes:
+map. It uses the same persistent bounded Merkle map as the Worker indexes:
 full build defines one history-independent root, while an ordinary commit
 locates only the affected leaf windows through authenticated neighbor reads
 and path-copies their tree paths. Equal RangeTree subtrees and equal reference
@@ -12,8 +12,8 @@ leaves have equal oids, so one-sided sync still prunes by oid.
 from bisect import bisect_right
 from typing import NamedTuple
 
-from . import btreap
-from .btreap import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
+from . import merkle_map
+from .merkle_map import MAX_PAGE_DEPTH as MAX_TREE_DEPTH
 from .crypto import h
 from .fact import (
     bound_to,
@@ -29,7 +29,7 @@ from .object_store import verified_object
 # A mismatch is a ValueError => the store rebuilds wholesale (no read-compat
 # path exists. Replaces the pre-cutover tree configuration.
 PREVIOUS_LAYOUT = "composite-btreap-v7-generic-candidate-index"
-LAYOUT = "composite-btreap-v8-admission-proof-archive"
+LAYOUT = "composite-merkle-map-v8-admission-proof-archive"
 TREE_NAMES = ("fact", "supp", "authority")
 RANGE_SEED = h(canon(["range-tree-v1"]))
 RANGE_LEAF_SCHEMA = "range-leaf-refs-v1"
@@ -210,7 +210,7 @@ def changed_ranges(
         raise ValueError("overlapping range change")
     if not additions and not removals and not refreshes:
         return ()
-    reader = btreap.Reader(root, RANGE_SEED, fetch)
+    reader = merkle_map.Reader(root, RANGE_SEED, fetch)
     members = {}
     parent = {}
     assignments = []
@@ -353,7 +353,7 @@ def update(root, ranges, fact_of, deps_of, fetch, emit):
                 raise ValueError("overlapping manifest replacement")
             inserted.add(entry.sep)
             changes[entry.sep] = _value(entry)
-    return btreap.update(
+    return merkle_map.update(
         root, RANGE_SEED, sorted(changes.items()), fetch,
         lambda raw: _put(raw, emit)).root
 
@@ -367,15 +367,48 @@ def locate(entries, key):
 def compare(mine, theirs, fetch):
     """Remote RangeTree rows and the exact mappings not held locally.
 
-    Shared authenticated pages are decoded from the local object map, so the
-    complete logical remote map is available without fetching those pages.
+    The two current authenticated roots are diffed in bounded resumable pages;
+    stale immutable pages outside the local root are never pruning evidence.
+    This compatibility wrapper consumes the pages because the current sync
+    turn still expects the complete entry vector.
     """
     held = {entry.sep: entry for entry in mine}
-    known = {}
-    encode(mine, lambda raw: known.setdefault(h(raw), raw))
-    rows = btreap.Reader(
-        theirs, RANGE_SEED, fetch).items(known)
-    entries = sorted(_entry(*row) for row in rows)
+    local_objects = {}
+    local_root = encode(
+        mine,
+        lambda raw: local_objects.setdefault(h(raw), raw),
+    )
+    local = merkle_map.Reader(local_root, RANGE_SEED, local_objects.get)
+    remote_objects = {}
+
+    def remote_fetch(oid):
+        if oid not in remote_objects:
+            remote_objects[oid] = fetch(oid)
+        return remote_objects[oid]
+
+    remote = merkle_map.Reader(theirs, RANGE_SEED, remote_fetch)
+
+    def differing(reader, other):
+        cursor, out = None, []
+        while True:
+            page = reader.diff_page(other, after=cursor)
+            out.extend(page.differing)
+            if page.cursor is None:
+                return tuple(out)
+            cursor = page.cursor
+
+    remote_rows = differing(remote, local)
+    local_rows = differing(local, remote)
+    remote_changes = dict(remote_rows)
+    rows = {
+        sep: _value(entry)
+        for sep, entry in held.items()
+    }
+    rows.update(remote_changes)
+    for sep, _ in local_rows:
+        if sep not in remote_changes:
+            rows.pop(sep, None)
+    entries = sorted(_entry(*row) for row in rows.items())
     return entries, [
         entry for entry in entries if held.get(entry.sep) != entry]
 
@@ -408,7 +441,7 @@ def encode(entries, emit):
     """Bulk-build the canonical authenticated RangeTree."""
     checked = [_entry(entry.sep, _value(entry)) for entry in entries]
     rows = tuple((entry.sep, _value(entry)) for entry in checked)
-    return btreap.build(
+    return merkle_map.build(
         rows, RANGE_SEED, lambda raw: _put(raw, emit)).root
 
 
@@ -418,7 +451,7 @@ def decode(raw, fetch):
     rooted = lambda oid: raw if oid == root else fetch(oid)
     return [
         _entry(*row) for row in
-        btreap.Reader(root, RANGE_SEED, rooted).items()
+        merkle_map.Reader(root, RANGE_SEED, rooted).items()
     ]
 
 

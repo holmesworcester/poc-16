@@ -16,7 +16,7 @@ import pytest
 import facts
 
 from core import (
-    btreap,
+    merkle_map,
     cmds,
     indexes,
     manifest,
@@ -625,7 +625,7 @@ def test_efficient_updates(world):
     range_root = manifest.decode_root(st.get("root")).manifest
     range_depth = json.loads(st.get("obj/" + range_root))["depth"]
     depth = max(tree_depth, range_depth)
-    assert depth <= btreap.MAX_PAGE_DEPTH
+    assert depth <= merkle_map.MAX_PAGE_DEPTH
     assert len(objs) <= 6 + 10 * depth, \
         f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
@@ -658,7 +658,7 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
     statements, updates = [], []
     index = node.idx(workspace)
     index.set_trace_callback(statements.append)
-    update = btreap.update
+    update = merkle_map.update
 
     def observed(root, seed, rows, fetch, emit):
         rows = tuple(rows)
@@ -666,7 +666,7 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
             updates.append(rows)
         return update(root, seed, rows, fetch, emit)
 
-    monkeypatch.setattr(btreap, "update", observed)
+    monkeypatch.setattr(merkle_map, "update", observed)
     try:
         added = cmds.post(
             node, workspace, "general", "bounded action consult", ts=1_000)
@@ -705,7 +705,7 @@ def test_action_publication_path_copies_only_its_changed_sid(
     target = cmds.post(
         node, workspace, "general", "one more target", ts=40)
     updates = []
-    update = btreap.update
+    update = merkle_map.update
 
     def observed(root, seed, rows, fetch, emit):
         rows = tuple(rows)
@@ -713,7 +713,7 @@ def test_action_publication_path_copies_only_its_changed_sid(
             updates.append(rows)
         return update(root, seed, rows, fetch, emit)
 
-    monkeypatch.setattr(btreap, "update", observed)
+    monkeypatch.setattr(merkle_map, "update", observed)
     action = cmds.remove(node, workspace, target, ts=200)
 
     by_tree = dict(zip(indexes.TREE_NAMES, updates))

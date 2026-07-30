@@ -103,6 +103,13 @@ RangeTree, or rebuild SQLite. AuthorityTree remains the exact winner cache for
 ordinary authorization, where reading every conflicting candidate would be
 wasteful.
 
+All four authenticated maps use one canonical bounded radix codec. Leaves
+have hard row and encoded-byte ceilings; larger subtrees split by key bytes,
+not by an author-grindable priority. Exact, neighbor, range-page, and
+root-to-root diff reads verify hashes, authenticated child bounds, and finite
+fetch budgets. Full and incremental construction of the same rows produce the
+same root.
+
 The single `ctl/command` endpoint is a trusted node-local control plane.
 Remote peers use the authenticated `root`, `page`, `pile`, `poke`, and `mint`
 protocol routes.
