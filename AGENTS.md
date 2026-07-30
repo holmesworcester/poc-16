@@ -23,7 +23,7 @@ type, every explicit reference, and every offer.
 Read and change the write path in authority order:
 
 ```text
-runtime turn → kernel/family → catalog settlement → publisher root CAS
+runtime turn → admission membrane → kernel/family → catalog → publisher CAS
 ```
 
 Client queries select through the generic catalog index and let the family
@@ -33,13 +33,16 @@ assemble its view. The read-only CF path is separate:
 root + immutable objects → WorkerView → family authorize hook
 ```
 
-It must remain database-free. `Node` composes local resources and exposes the
-workspace-bound runtime; do not add another admission route in daemon or sync.
+It must remain database-free. `Node` only composes local resources and exposes
+the workspace-bound runtime/membrane; `AdmissionMembrane.process` is the one
+exact-pile-to-publication entrance. Do not add another admission route in
+daemon or sync.
 Preserve read isomorphism: if both client and CF paths ask the same published
 state question, both must use the authenticated-tree answer. SQLite is for
 client-only durable intent, query assembly, and full repair—not a parallel
-answer or range directory. New fact placement uses bounded RangeTree neighbor
-reads over immutable objects.
+answer or range directory. FactOrder is a direct bounded map from eligible
+fact keys to stable fact objects; candidate/proof sync is the sole replicated
+join.
 
 Every behavior change needs a realistic test. Prefer real daemon/socket
 coverage at product boundaries and direct hostile-input tests at codec and

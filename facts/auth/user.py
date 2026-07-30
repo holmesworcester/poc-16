@@ -4,7 +4,7 @@ import json
 import urllib.request
 
 from core.close import decode_pile, encode_pile
-from core.crypto import box_decrypt, h, kdf, load_sk, sign, verify
+from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
 from core import suppression_state
 from core.suppression import scoped_id
@@ -64,6 +64,7 @@ DURABLE = True
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
     from core.kernel import drain
+    from core.ingress import stage_pile
     from core.node import now_ms
     from core.sync import sync
 
@@ -96,7 +97,7 @@ def accept(node, link, name):
         bootstrap + [sig, member],
         workspace=workspace,
     )  # bootstrap is already closed/topo
-    node.store(workspace).put(f"pile/{node.member_for(workspace)}/{h(pile)}", pile)
+    stage_pile(node.store(workspace), node.member_for(workspace), pile)
     node.turn(workspace)
     sync(node, workspace, url)
     return workspace

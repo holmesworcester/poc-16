@@ -8,6 +8,7 @@ import tempfile
 from core import cmds, daemon
 from core.close import close, encode_pile
 from core.crypto import h, keypair
+from core.ingress import stage_pile
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
@@ -188,7 +189,7 @@ def closed_subset(n, ws, fids):
 
 
 def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
-    dst.store(ws).put(f"pile/{member}/{h(pile_bytes)}", pile_bytes)
+    return stage_pile(dst.store(ws), member, pile_bytes)
 
 
 def all_fids(n, ws):

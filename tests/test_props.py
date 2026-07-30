@@ -1,9 +1,9 @@
 """The load-bearing properties.
 
-P-history-independence: same set, same bytes — any pile grouping, any
-arrival order, any number of turns converges to an identical root.
-P-paths-are-piles: every published root-to-leaf path union (a topo-sorted
-closed set) passes the kernel from an empty scratchpad.
+P-history-independence: the same candidate/proof join — any proof arrival
+order and any number of turns — converges to an identical root.
+P-paths-are-piles: every selected historical proof is a closed, topo-sorted
+set that passes the kernel from an empty scratchpad.
 P-rebuild: wipe the derived index, replay the store's own units, get the
 identical root back.
 P-efficient-updates: one new fact rewrites O(1) objects, not O(n).
@@ -19,14 +19,14 @@ from core import (
     merkle_map,
     cmds,
     indexes,
-    manifest,
     mint,
-    shape,
-    suppression_state,
+    snapshot,
 )
+from core.candidate_archive import CandidateView
 from core.close import close, decode_pile, encode_pile
 from core.crypto import h, keypair, load_sk
-from core.fact import Fact
+from core.fact import Fact, encode as encode_fact
+from core.shape import fid_of
 from facts.auth.request import payload as request_payload
 from facts.auth.request import request
 from facts.auth.signature import signature
@@ -34,7 +34,6 @@ from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import drain, resolve_deps
-from core import node as node_module
 from core.node import Node, now_ms
 from core.publication import Publisher
 
@@ -81,61 +80,54 @@ def world(tmp_path, monkeypatch):
 
 
 def units_of(store):
-    """Per-leaf published unit, from the store alone: the home-leaf pile's
-    members plus its closure sibling's facts (each resolved at its own home
-    leaf), serialized deps-first by the ordinary close()."""
+    """Each selected historical admission proof from the store alone."""
     fetch = lambda oid: store.get("obj/" + oid)
-    snapshot = manifest.decode_root(store.get("root"))
-    man, ws = snapshot.manifest, snapshot.anchor
-    entries = manifest.decode(fetch(man), fetch)
-    piles = {
-        entry.sep: decode_pile(fetch(entry.leaf), ws)[0]
-        for entry in entries}
+    view = CandidateView(store.get("root"), fetch)
+    for fid in view.candidate_ids():
+        yield fid, view.verify(fid).facts
 
-    def at(key):
-        home = manifest.locate(entries, key)
-        return next(f for f in piles[home.sep] if f.key == key)
 
-    for entry in entries:
-        members = piles[entry.sep]
-        outside = json.loads(fetch(entry.closure))["keys"] \
-            if entry.closure else []
-        items = {f.fid: f for f in members}
-        items.update((f.fid, f) for f in map(at, outside))
-        deps = node_module._edges(
-            items, ws)  # unit-local canonical providers
-        yield entry, close(members, deps.__getitem__, items.__getitem__)
+def candidate_pile(node, workspace, fid):
+    """Exact selected historical witness for one candidate."""
+    store = node.store(workspace)
+    view = CandidateView(
+        store.get("root"), lambda oid: store.get("obj/" + oid))
+    return encode_pile(view.verify(fid).facts, workspace=workspace)
 
 
 def test_paths_are_piles(world):
-    """Every published leaf unit — pile plus closure sibling — judges
-    alone, from nothing."""
+    """Every selected historical proof judges alone, from nothing."""
     n, ws = world
     count = 0
-    for entry, stream in units_of(n.store(ws)):
+    for fid, stream in units_of(n.store(ws)):
         result = drain(stream, ws)
-        assert result.ok, f"unit failed the kernel: {entry}"
+        assert result.ok, f"proof failed the kernel: {fid}"
         count += 1
-    assert count >= 2  # genuinely sharded, independent of content-id churn
+    assert count >= 2
 
 
 def test_history_independence(tmp_path, world):
-    """Random pile groupings, random order, random turn batching — one root."""
+    """Random proof order and turn batching preserve the candidate join."""
     n, ws = world
     fids = all_fids(n, ws)
+    selected = [
+        (fid, encode_pile(stream, workspace=ws))
+        for fid, stream in units_of(n.store(ws))
+    ]
     for seed in range(3):
         rng = random.Random(seed)
         b = Node(str(tmp_path / f"b{seed}"))
-        shuffled = fids[:]
+        shuffled = selected[:]
         rng.shuffle(shuffled)
         i = 0
         while i < len(shuffled):
             take = rng.randint(1, 9)
-            for k in range(rng.randint(1, 3)):  # several piles per turn
-                chunk = shuffled[i:i + take]
-                i += take
-                if chunk:
-                    deliver(b, ws, closed_subset(n, ws, chunk), member=f"m{k}aaaaaaaaaaaaaa")
+            chunk = shuffled[i:i + take]
+            i += take
+            for ordinal, (_, raw) in enumerate(chunk):
+                deliver(
+                    b, ws, raw,
+                    member=f"m{seed:03d}{i:05d}{ordinal:07d}")
             b.turn(ws)
         assert b.store(ws).get("root") == n.store(ws).get("root")
         assert all_fids(b, ws) == fids
@@ -148,7 +140,7 @@ def test_rebuild(world):
         "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
         "DELETE FROM meta;")
     n.rebuild(ws)
-    n.commit(ws)
+    n.admission(ws).publish()
     assert h(n.store(ws).get("root")) == before
 
 
@@ -158,11 +150,13 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     before = all_fids(n, ws)
     root_bytes = st.get("root")
     fetch = lambda oid: st.get("obj/" + oid)
-    man = manifest.decode_root(root_bytes).manifest
-    entries = manifest.decode(fetch(man), fetch)
-    st._replace(
-        "obj/" + entries[0].leaf,
-        encode_pile([], workspace=ws))
+    committed = snapshot.decode_root(root_bytes)
+    _, fact_oid = snapshot.fact_order_rows(
+        committed.maps[snapshot.FACT_ORDER],
+        committed.layout_seed,
+        fetch,
+    )[0]
+    st._replace("obj/" + fact_oid, b"corrupt")
 
     with pytest.raises(ValueError, match="object integrity"):
         n.rebuild(ws)
@@ -171,46 +165,48 @@ def test_rebuild_rejects_a_corrupted_leaf(world):
     assert all_fids(n, ws) == before
 
 
-def test_rebuild_rejects_a_pile_that_hides_or_misplaces_facts(world):
-    """A root naming a leaf pile whose fact set deviates from the canonical
-    settle — a smuggled extra fact, or members shuffled across leaves — is
-    caught by resident()'s single rebuild equality ("store placement")."""
+def test_rebuild_rejects_fact_order_that_hides_or_misplaces_facts(world):
+    """FactOrder cannot smuggle bytes or remap an eligible key."""
     n, ws = world
     st = n.store(ws)
     before = all_fids(n, ws)
     honest = st.get("root")
     fetch = lambda oid: st.get("obj/" + oid)
-    body = json.loads(honest)
-    entries = manifest.decode(fetch(body["manifest"]), fetch)
+    committed = snapshot.decode_root(honest)
+    rows = list(snapshot.fact_order_rows(
+        committed.maps[snapshot.FACT_ORDER],
+        committed.layout_seed,
+        fetch,
+    ))
 
     def emit(raw):
         oid = h(raw)
         st._replace("obj/" + oid, raw)
         return oid
 
-    # A smuggled fact with no proof chain breaks store closure.
+    def forged_root(order_rows):
+        order = snapshot.build_fact_order(
+            order_rows, committed.layout_seed, emit)
+        return snapshot.encode_root(
+            ws,
+            {
+                **committed.maps,
+                snapshot.FACT_ORDER: order,
+            },
+            seed=committed.layout_seed,
+        )
+
     hidden = Fact("sample", 0, [], {"hidden": True}, ws)
-    members = decode_pile(fetch(entries[0].leaf), ws)[0]
-    smuggled = entries[0]._replace(
-        leaf=emit(encode_pile([hidden] + members, workspace=ws)))
-    man = manifest.encode([smuggled] + list(entries[1:]), emit)
-    st._replace("root", manifest.encode_root(ws, man))
-    with pytest.raises(ValueError, match="invalid store facts"):
+    hidden_oid = emit(encode_fact(hidden))
+    st._replace("root", forged_root(rows + [(hidden.key, hidden_oid)]))
+    with pytest.raises(ValueError, match="missing FactRecord"):
         n.rebuild(ws)
 
-    # The same members shuffled across leaves break the rebuild equality.
-    first = decode_pile(fetch(entries[0].leaf), ws)[0]
-    second = decode_pile(fetch(entries[1].leaf), ws)[0]
-    moved = [
-        entries[0]._replace(
-            leaf=emit(encode_pile(first[:-1], workspace=ws))),
-        entries[1]._replace(
-            leaf=emit(encode_pile(
-                [first[-1]] + second, workspace=ws))),
-    ] + list(entries[2:])
-    st._replace("root", manifest.encode_root(
-        ws, manifest.encode(moved, emit)))
-    with pytest.raises(ValueError, match="store placement"):
+    assert len(rows) >= 2
+    moved = list(rows)
+    moved[0] = (moved[0][0], moved[1][1])
+    st._replace("root", forged_root(moved))
+    with pytest.raises(ValueError, match="FactOrder projection"):
         n.rebuild(ws)
 
     st._replace("root", honest)
@@ -230,19 +226,15 @@ def test_rebuild_rejects_a_non_durable_resident_family(
     assert all_fids(node, workspace) == before
 
 
-def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
+def test_rebuild_rejects_an_incomplete_empty_root_without_its_anchor(
         tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     before = all_fids(node, workspace)
     store = node.store(workspace)
-    _, empty = manifest.build(
-        [], lambda fid: None, lambda fid: (),
-        lambda raw: store._replace("obj/" + h(raw), raw))
-    store._replace(
-        "root", manifest.encode_root(workspace, empty))
+    store._replace("root", snapshot.encode_root(workspace))
 
-    with pytest.raises(ValueError, match="store fact set"):
+    with pytest.raises(ValueError, match="candidate archive is incomplete"):
         node.rebuild(workspace)
 
     assert all_fids(node, workspace) == before
@@ -251,13 +243,13 @@ def test_rebuild_rejects_a_canonical_empty_root_without_its_anchor(
 def test_commit_never_publishes_a_root_without_its_anchor(tmp_path):
     """The publisher never mints a root every reader must reject: rebuild and
     WorkerView both demand the anchor, so an index that lacks it is not
-    publishable — it stays ahead of the manifest instead."""
+    publishable — it stays ahead of the snapshot instead."""
     node = Node(str(tmp_path / "node"))
     workspace = cmds.create(node, "alice", ts=1)
     root = node.store(workspace).get("root")
     node.idx(workspace).executescript("DELETE FROM facts;")
 
-    assert node.commit(workspace) is None
+    assert node.admission(workspace).publish() is None
     assert node.store(workspace).get("root") == root
     assert node.idx(workspace).execute(
         "SELECT 1 FROM meta WHERE k='root'").fetchone() is None
@@ -293,7 +285,7 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
     stream, _ = decode_pile(pile, workspace)
     judgment = drain(stream, workspace)
     assert judgment.ok
-    node.admit(workspace, stream)
+    node.admission(workspace).admit(stream)
 
     # Model process death at the exact admission/manifest boundary: no exception
     # handler gets to restore the derived index before its connections close.
@@ -333,7 +325,7 @@ def test_pre_manifest_crash_retains_intent_behind_authoritative_root(
     assert reopened.idx(workspace).execute(
         "SELECT 1 FROM sqlite_master WHERE name='log'").fetchone() is None
     assert reopened.store(workspace).get("root") \
-        == full_manifest(reopened, workspace)
+        == full_snapshot(reopened, workspace)
 
 
 def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
@@ -362,7 +354,8 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     ))
     deliver(node, workspace, raw)
     judgment = drain(decode_pile(raw, workspace)[0], workspace)
-    admission = node.admit(workspace, decode_pile(raw, workspace)[0])
+    admission = node.admission(workspace).admit(
+        decode_pile(raw, workspace)[0])
     old_root = node.store(workspace).get("root")
 
     def die_after_cas(*args, **kwargs):
@@ -371,7 +364,7 @@ def test_post_cas_crash_recovers_staged_catalog_receipts(tmp_path, monkeypatch):
     original_stamp = Publisher.stamp
     monkeypatch.setattr(Publisher, "stamp", die_after_cas)
     with pytest.raises(RuntimeError, match="post-CAS death"):
-        node.commit(workspace, admission.settlement)
+        node.admission(workspace).publish(admission.settlement)
     assert node.store(workspace).get("root") != old_root
     assert node.idx(workspace).execute(
         "SELECT 1 FROM staged WHERE fid=?",
@@ -548,7 +541,7 @@ def test_bulk_index_crash_retains_but_hides_unpublished_facts(
 
     monkeypatch.setattr(node.store(workspace), "cas", fail_before_manifest)
     with pytest.raises(RuntimeError, match="bulk pre-manifest failure"):
-        node.commit(workspace)
+        node.admission(workspace).publish()
 
     for index in node._idx.values():
         index.close()
@@ -581,7 +574,10 @@ def test_straggler_minifold(tmp_path, world):
     nodes still agree byte-for-byte."""
     n, ws = world
     b = Node(str(tmp_path / "b"))
-    deliver(b, ws, closed_subset(n, ws, all_fids(n, ws)))
+    for ordinal, (_, stream) in enumerate(units_of(n.store(ws))):
+        deliver(
+            b, ws, encode_pile(stream, workspace=ws),
+            member=f"a{ordinal:015d}")
     b.turn(ws)
     assert b.store(ws).get("root") == n.store(ws).get("root")
 
@@ -591,7 +587,7 @@ def test_straggler_minifold(tmp_path, world):
     ) + 5
     f = author_msg(n, ws, n.sk, n.pk, "late straggler", ts=old)
     assert f.fid in all_fids(n, ws)
-    deliver(b, ws, closed_subset(n, ws, [f.fid]))
+    deliver(b, ws, candidate_pile(n, ws, f.fid))
     b.turn(ws)
     assert b.store(ws).get("root") == n.store(ws).get("root")
 
@@ -606,54 +602,50 @@ def test_efficient_updates(world):
     cmds.post(n, ws, "general", "one more")
     objs = [k for k in puts if k.startswith("obj/")]
     total = len(st.list("obj/"))
-    # A post adds a message and signature. Each can rewrite a search/rotation
-    # path in each of three persistent trees, plus bounded manifest/raw pages.
-    tree_depth = max(
+    # A post adds a message and signature. Each rewrites bounded paths in the
+    # four authenticated maps and emits its stable fact object.
+    depth = max(
         row["depth"] for row in
-        json.loads(st.get("root"))["trees"].values())
-    range_root = manifest.decode_root(st.get("root")).manifest
-    range_depth = json.loads(st.get("obj/" + range_root))["depth"]
-    depth = max(tree_depth, range_depth)
+        json.loads(st.get("root"))["maps"].values())
     assert depth <= merkle_map.MAX_PAGE_DEPTH
     assert len(objs) <= 6 + 10 * depth, \
         f"a single post rewrote {len(objs)} objects"
     assert total > 20  # against a store big enough to make the bound mean something
 
 
-def full_manifest(n, ws):
+def full_snapshot(n, ws):
     """The root a from-scratch full recompute would write (no memo)."""
-    idx, cache = n.idx(ws), {}
-
-    def deps_of(fid):
-        if fid not in cache:
-            cache[fid] = resolve_deps(n.fact_of(ws, fid), idx) or []
-        return cache[fid]
-
-    _, man = manifest.build(
-        n.keys(ws), lambda fid: n.fact_of(ws, fid), deps_of,
-        lambda raw: None)
+    idx = n.idx(ws)
     seed, trees = indexes.build(
-        ws, idx, lambda fid: n.fact_of(ws, fid), lambda raw: h(raw))
-    return manifest.encode_root(
-        ws, man,
-        action_etag=suppression_state.etag(idx),
-        layout_seed=seed, trees=trees)
+        ws, idx, lambda raw: h(raw))
+    order = snapshot.build_fact_order(
+        (
+            (fact.key, h(encode_fact(fact)))
+            for fact in (
+                n.fact_of(ws, fid_of(address))
+                for address in n.keys(ws)
+            )
+            if fact is not None
+        ),
+        seed,
+        lambda raw: h(raw),
+    )
+    return snapshot.encode_root(
+        ws, {snapshot.FACT_ORDER: order, **trees}, seed=seed)
 
 
 def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
     """Existing actions are not rescanned or republished for an unrelated fact."""
     node, workspace, _, _ = test_util.suppression_world(tmp_path / "node")
-    before = manifest.decode_root(node.store(workspace).get("root"))
     statements, updates = [], []
     index = node.idx(workspace)
     index.set_trace_callback(statements.append)
     update = merkle_map.update
 
-    def observed(root, seed, rows, fetch, emit):
+    def observed(root, seed, rows, fetch, emit, **kwargs):
         rows = tuple(rows)
-        if seed != manifest.RANGE_SEED:
-            updates.append(rows)
-        return update(root, seed, rows, fetch, emit)
+        updates.append(rows)
+        return update(root, seed, rows, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", observed)
     try:
@@ -673,7 +665,8 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
         " where sid=" in statement or " where fid=" in statement
         for statement in action_reads
     ), action_reads
-    by_tree = dict(zip(indexes.TREE_NAMES, updates))
+    by_tree = dict(zip(
+        (*indexes.TREE_NAMES, snapshot.FACT_ORDER), updates))
     sid = indexes.fact_key(added)
     assert {
         key for key, _ in by_tree[indexes.FACT]
@@ -682,9 +675,7 @@ def test_ordinary_append_reads_only_exact_action_slots(tmp_path, monkeypatch):
     assert dict(by_tree[indexes.SUPP]) == {
         sid: {"state": "clear"},
     }
-    after = manifest.decode_root(node.store(workspace).get("root"))
-    assert after.action_etag == before.action_etag
-    assert node.store(workspace).get("root") == full_manifest(
+    assert node.store(workspace).get("root") == full_snapshot(
         node, workspace)
 
 
@@ -696,16 +687,16 @@ def test_action_publication_path_copies_only_its_changed_sid(
     updates = []
     update = merkle_map.update
 
-    def observed(root, seed, rows, fetch, emit):
+    def observed(root, seed, rows, fetch, emit, **kwargs):
         rows = tuple(rows)
-        if seed != manifest.RANGE_SEED:
-            updates.append(rows)
-        return update(root, seed, rows, fetch, emit)
+        updates.append(rows)
+        return update(root, seed, rows, fetch, emit, **kwargs)
 
     monkeypatch.setattr(merkle_map, "update", observed)
     action = cmds.remove(node, workspace, target, ts=200)
 
-    by_tree = dict(zip(indexes.TREE_NAMES, updates))
+    by_tree = dict(zip(
+        (*indexes.TREE_NAMES, snapshot.FACT_ORDER), updates))
     sid = indexes.fact_key(target)
     active = {"state": "active", "action": action}
     assert {
@@ -713,7 +704,7 @@ def test_action_publication_path_copies_only_its_changed_sid(
         if key.startswith("action:")
     } == {indexes.action_key(sid): active}
     assert dict(by_tree[indexes.SUPP]) == {sid: active}
-    assert node.store(workspace).get("root") == full_manifest(
+    assert node.store(workspace).get("root") == full_snapshot(
         node, workspace)
 
 
@@ -744,25 +735,25 @@ def test_resident_action_winner_delta_matches_full_fact_tree(tmp_path):
         "SELECT fid FROM actions WHERE sid=?", (sid,)
     ).fetchone() == (first,)
 
-    second_fact = node.fact_of(workspace, second)
-    evidence = node._action_evidence(workspace, second_fact)
     index.execute(
-        "UPDATE actions SET fid=?, evidence=? WHERE sid=?",
-        (second, evidence, sid),
+        "UPDATE actions SET fid=? WHERE sid=?",
+        (second, sid),
     )
-    snapshot = manifest.decode_root(node.store(workspace).get("root"))
+    committed = snapshot.decode_root(node.store(workspace).get("root"))
     fetch = lambda oid: node.store(workspace).get("obj/" + oid)
 
     incremental = indexes.build(
-        workspace, index, lambda fid: node.fact_of(workspace, fid),
-        lambda raw: h(raw),
-        previous=snapshot.trees, fetch=fetch,
+        workspace, index, lambda raw: h(raw),
+        previous={
+            name: committed.maps[name]
+            for name in indexes.TREE_NAMES
+        }, fetch=fetch,
         changed_fids=(), changed_sids=(sid,))
     rebuilt = indexes.build(
-        workspace, index, lambda fid: node.fact_of(workspace, fid),
-        lambda raw: h(raw))
+        workspace, index, lambda raw: h(raw))
 
-    assert incremental == rebuilt
+    assert (incremental.seed, incremental.trees) == (
+        rebuilt.seed, rebuilt.trees)
 
 
 def test_incremental_equals_full(tmp_path):
@@ -770,20 +761,20 @@ def test_incremental_equals_full(tmp_path):
     step — across promotions, a straggler, a new member, and an eviction."""
     n = Node(str(tmp_path / "a"))
     ws = cmds.create(n, "alice")
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
     t0 = now_ms()
     bsk, bpk, _ = add_member(n, ws, "bob", t0 + 1)
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
     for i in range(60):  # enough to promote several ranges out of the tail
         who = (n.sk, n.pk) if i % 2 else (bsk, bpk)
         author_msg(n, ws, *who, f"m{i}", t0 + 10 + i)
-        assert n.store(ws).get("root") == full_manifest(n, ws)
+        assert n.store(ws).get("root") == full_snapshot(n, ws)
     send_bytes(n, ws, "f.bin", b"x" * 20_000)
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
     author_msg(n, ws, n.sk, n.pk, "straggler", t0 + 5)  # lands deep in history
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
     cmds.evict(n, ws, "bob")
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
 
 
 def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
@@ -859,28 +850,23 @@ def test_rejoining_an_existing_key_cannot_shadow_its_invite_into_a_cycle(
         assert drain(stream, ws).ok
 
 
-def test_hot_commit_uses_range_tree_without_corpus_scan(
+def test_hot_commit_path_copies_four_maps_without_corpus_scan(
         world, monkeypatch):
-    """The authenticated RangeTree selects one old leaf and path-copies it."""
+    """An ordinary append updates exact map rows and never calls Node.keys."""
     n, ws = world
     total = n.idx(ws).execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    resolved, puts, statements, discovered = [], [], [], []
+    puts, statements, updates = [], [], []
     keys = n.keys
     store = n.store(ws)
     real_put = store.put_if_absent
-    real = node_module.resolve_deps
-    real_ranges = manifest.changed_ranges
+    real_update = merkle_map.update
 
-    def observed_ranges(root, changed, fetch, workspace, **transitions):
-        ranges = real_ranges(
-            root, changed, fetch, workspace, **transitions)
-        discovered.append(sum(len(current) for _, current in ranges))
-        return ranges
+    def observed_update(root, seed, rows, fetch, emit, **kwargs):
+        rows = tuple(rows)
+        updates.append(rows)
+        return real_update(root, seed, rows, fetch, emit, **kwargs)
 
-    monkeypatch.setattr(
-        node_module, "resolve_deps",
-        lambda fact, db: (resolved.append(fact.fid), real(fact, db))[1])
-    monkeypatch.setattr(manifest, "changed_ranges", observed_ranges)
+    monkeypatch.setattr(merkle_map, "update", observed_update)
     monkeypatch.setattr(
         store, "put_if_absent",
         lambda k, b: (puts.append(k), real_put(k, b))[1])
@@ -900,27 +886,27 @@ def test_hot_commit_uses_range_tree_without_corpus_scan(
         and "order by" in statement.lower()
     ]
     assert not ordered
-    assert discovered and 0 < max(discovered) < total
+    assert len(updates) == 4
+    by_map = dict(zip(
+        (*indexes.TREE_NAMES, snapshot.FACT_ORDER), updates))
+    assert by_map[snapshot.FACT_ORDER]
+    assert all(
+        value is not None and h(n.store(ws).get("obj/" + value)) == value
+        for _, value in by_map[snapshot.FACT_ORDER])
     assert n.idx(ws).execute(
         "SELECT 1 FROM sqlite_master "
         "WHERE type='index' AND name IN ('fact_keys','fact_boundaries')"
     ).fetchone() is None
     objects = [k for k in puts if k.startswith("obj/")]
-    tree_depth = max(
+    depth = max(
         row["depth"] for row in
-        json.loads(store.get("root"))["trees"].values())
-    range_root = manifest.decode_root(store.get("root")).manifest
-    range_depth = json.loads(store.get("obj/" + range_root))["depth"]
-    depth = max(tree_depth, range_depth)
+        json.loads(store.get("root"))["maps"].values())
     assert len(objects) <= 6 + 10 * depth, \
-        f"bounded range + authenticated paths, got {objects}"
+        f"bounded authenticated paths, got {objects}"
     authenticated_rows = sum(
         row["count"]
-        for row in json.loads(store.get("root"))["trees"].values())
+        for row in json.loads(store.get("root"))["maps"].values())
     assert len(objects) < authenticated_rows
-    assert len(set(resolved)) < total, \
-        f"resolved {len(set(resolved))} of {total} closures — the memo " \
-        "isn't localizing the changed range"
 
 
 def test_one_fact_hot_commit_never_enters_the_full_key_path(world):
@@ -939,18 +925,12 @@ def test_one_fact_hot_commit_never_enters_the_full_key_path(world):
     assert n.fact_of(ws, detached.fid) == detached
 
 
-def test_hot_boundary_deactivation_never_enters_the_full_key_path(world):
-    """Removing a member path-copies the affected boundary windows."""
+def test_hot_deactivation_never_enters_the_full_key_path(world):
+    """Removing a member deletes exact FactOrder rows without a full scan."""
     n, ws = world
     member_secret, member_public, _ = add_member(
         n, ws, "boundary-member", ts=3_190_000)
-    for ts in range(3_200_000, 3_210_000):
-        target = message(
-            ws, member_public, "general", "boundary victim", ts)
-        if shape.boundary(target.fid):
-            break
-    else:
-        raise AssertionError("deterministic boundary search failed")
+    ts = 3_200_000
     target_fid = author_msg(
         n,
         ws,
@@ -970,7 +950,7 @@ def test_hot_boundary_deactivation_never_enters_the_full_key_path(world):
         n.keys = keys
 
     assert n.fact_of(ws, target_fid) is None
-    assert n.store(ws).get("root") == full_manifest(n, ws)
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
 
 
 def test_shadow_guard_keeps_identity(world):
@@ -985,14 +965,13 @@ def test_shadow_guard_keeps_identity(world):
     n.turn(ws)  # commit's shadow guard drops the memo -> full recompute
     assert s2.fid in all_fids(n, ws)  # the duplicate sig validated and merged
     assert n.catalog(ws).shadows([s2.fid]) is True
-    assert n.store(ws).get("root") == full_manifest(n, ws)  # still byte-identical
+    assert n.store(ws).get("root") == full_snapshot(n, ws)
 
 
 def test_action_state_has_no_duplicate_root_metadata(world):
     n, ws = world
     root = json.loads(n.store(ws).get("root"))
-    assert set(root) == {
-        "action_etag", "anchor", "layout_seed", "manifest", "stamp", "trees"}
+    assert set(root) == {"anchor", "layout_seed", "maps", "stamp"}
     assert "globals" not in root and "actions" not in root
 
 

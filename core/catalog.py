@@ -39,7 +39,7 @@ TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"
 INTERNAL_INDEXES = frozenset((TYPE_INDEX, KEY_INDEX, REF_INDEX))
-INDEX_VERSION = "admission-catalog-v28-kernel-receipts"
+INDEX_VERSION = "admission-catalog-v30-proof-archive"
 FACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY, blob BLOB NOT NULL);
@@ -49,7 +49,7 @@ SCHEMA = FACTS_SCHEMA + """
 CREATE TABLE IF NOT EXISTS staged(
     fid TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS admission_receipts(
-    fid TEXT PRIMARY KEY, receipt BLOB NOT NULL);
+    fid TEXT PRIMARY KEY, receipt BLOB NOT NULL, proof TEXT);
 CREATE TABLE IF NOT EXISTS fact_index(
     kind TEXT, k0 TEXT, k1 TEXT, src TEXT,
     PRIMARY KEY(kind, k0, k1, src));
@@ -146,6 +146,12 @@ def upgrade_schema(db, anchor):
     if not columns:
         return
     if "blob" in columns:
+        receipt_columns = {
+            row[1]
+            for row in db.execute("PRAGMA table_info(admission_receipts)")
+        }
+        if receipt_columns and "proof" not in receipt_columns:
+            db.execute("ALTER TABLE admission_receipts ADD COLUMN proof TEXT")
         # Derived rows must reach the running version before _sync_index can
         # republish and stamp it. This also removes early-v24 boundary markers
         # and closes a crash window where publication could look current while
@@ -210,8 +216,15 @@ class Eligibility(NamedTuple):
     activated: tuple
     deactivated: tuple
     updated: tuple
-    authority_changed: bool
+    witnesses: tuple
     changed_sids: tuple
+
+
+class AdmissionChange(NamedTuple):
+    """Local storage and selected-witness changes from one kernel receipt."""
+
+    staged: bool
+    witness_changed: bool
 
 
 class Catalog:
@@ -223,6 +236,43 @@ class Catalog:
         row = self.db.execute(
             "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
         return decode(row[0]) if row else None
+
+    def admitted(self, fid):
+        """One candidate with a kernel proof object, excluding legacy rows."""
+        row = self.db.execute(
+            "SELECT f.blob FROM facts f "
+            "JOIN admission_receipts a ON a.fid=f.fid "
+            "WHERE f.fid=? AND a.proof IS NOT NULL",
+            (fid,),
+        ).fetchone()
+        return decode(row[0]) if row else None
+
+    def admitted_ids(self):
+        return tuple(
+            fid for (fid,) in self.db.execute(
+                "SELECT fid FROM admission_receipts "
+                "WHERE proof IS NOT NULL ORDER BY fid")
+        )
+
+    def publication_ids(self, received=()):
+        """Proof-backed candidates represented by one proposed root.
+
+        A kernel receipt is retained locally before the root CAS and therefore
+        remains ``staged`` across a failed publication.  Full tree rebuilds
+        must not treat every such tentative row as already authenticated.
+        Existing non-staged candidates plus the exact settlement's received
+        rows are the only candidates this publication may bind.
+        """
+        received = set(received)
+        return tuple(
+            fid
+            for fid, staged in self.db.execute(
+                "SELECT a.fid, s.fid IS NOT NULL "
+                "FROM admission_receipts a "
+                "LEFT JOIN staged s ON s.fid=a.fid "
+                "WHERE a.proof IS NOT NULL ORDER BY a.fid")
+            if not staged or fid in received
+        )
 
     def eligible(self, fid):
         row = self.db.execute(
@@ -291,7 +341,9 @@ class Catalog:
     def staged_ids(self):
         return tuple(
             fid for (fid,) in self.db.execute(
-                "SELECT fid FROM staged ORDER BY fid")
+                "SELECT s.fid FROM staged s "
+                "JOIN admission_receipts a ON a.fid=s.fid "
+                "WHERE a.proof IS NOT NULL ORDER BY s.fid")
         )
 
     def edges(self, fid):
@@ -303,7 +355,7 @@ class Catalog:
                 (fid,))
         )
 
-    def _admit_valid(self, receipt):
+    def _admit_valid(self, receipt, proof_oid):
         """Store one receipt minted by the caller's running kernel judgment.
 
         This is private because ``Valid`` is an ordinary Python value, not a
@@ -311,22 +363,49 @@ class Catalog:
         the kernel itself immediately before entering this method.
         """
         receipt_bytes = _receipt_bytes(receipt)
+        from .shape import valid_fid
+        if not valid_fid(proof_oid):
+            raise ValueError("admission proof oid")
         pending = _store_fact(self.db, self.anchor, receipt.fact)
         existing = self.db.execute(
-            "SELECT 1 FROM admission_receipts WHERE fid=?",
+            "SELECT receipt, proof FROM admission_receipts WHERE fid=?",
             (receipt.fact.fid,),
         ).fetchone()
         if existing is None:
             self.db.execute(
-                "INSERT INTO admission_receipts VALUES(?,?)",
-                (receipt.fact.fid, receipt_bytes),
+                "INSERT INTO admission_receipts VALUES(?,?,?)",
+                (receipt.fact.fid, receipt_bytes, proof_oid),
             )
+            selected = True
+        elif existing[1] is None:
+            self.db.execute(
+                "UPDATE admission_receipts SET receipt=?, proof=? "
+                "WHERE fid=?",
+                (receipt_bytes, proof_oid, receipt.fact.fid),
+            )
+            selected = True
         else:
+            # Detect local corruption even when this new complete witness
+            # loses the deterministic min-join.
             self.admission_edges(receipt.fact.fid)
-        return pending
+            old_proof = self.admission_proof(receipt.fact.fid)
+            if proof_oid < old_proof:
+                self.db.execute(
+                    "UPDATE admission_receipts SET receipt=?, proof=? "
+                    "WHERE fid=?",
+                    (receipt_bytes, proof_oid, receipt.fact.fid),
+                )
+                selected = True
+            elif proof_oid == old_proof:
+                if existing[0] != receipt_bytes:
+                    raise ValueError("admission receipt integrity")
+                selected = False
+            else:
+                selected = False
+        return AdmissionChange(pending, selected)
 
     def admission_edges(self, fid):
-        """The first exact edge tuple under which ``fid`` passed the kernel."""
+        """Exact edges from this candidate's selected complete witness."""
         row = self.db.execute(
             "SELECT receipt FROM admission_receipts WHERE fid=?",
             (fid,),
@@ -350,6 +429,19 @@ class Catalog:
         }) != row[0]:
             raise ValueError("admission receipt integrity")
         return edges
+
+    def admission_proof(self, fid):
+        from .shape import valid_fid
+
+        row = self.db.execute(
+            "SELECT proof FROM admission_receipts WHERE fid=?",
+            (fid,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        if not valid_fid(row[0]):
+            raise ValueError("admission receipt integrity")
+        return row[0]
 
     def reindex(self):
         """Rebuild the exact generic index from every retained fact blob."""
@@ -378,12 +470,14 @@ class Catalog:
     def _authorization_scopes(self, fact, edges=None):
         edges = edges or self.edges(fact.fid)
         direct = {edge.role: edge.fid for edge in edges}
+
         def edges_of(fid):
             if fid == fact.fid:
                 return direct
             return {edge.role: edge.fid for edge in self.edges(fid)}
+
         return facts.authorization_scopes(
-            fact, edges, edges_of, self.candidate)
+            fact, edges, edges_of, self.admitted)
 
     def _accept(self, fact, edges):
         """Canonical family validity plus deterministic action-time guards."""
@@ -393,7 +487,7 @@ class Catalog:
         try:
             return not any(
                 suppression_state.blocks(
-                    self.db, sid, fact.key, self.candidate)
+                    self.db, sid, fact.key, self.admitted)
                 for sid in self._authorization_scopes(fact, edges)
             )
         except (KeyError, TypeError, ValueError):
@@ -415,27 +509,33 @@ class Catalog:
     def settle(
             self, received, *, force=False, actions_dirty=False,
             allowed_staged=None):
-        """Settle once and return the exact eligibility delta."""
+        """Incrementally settle the affected proof/action closure.
+
+        The database-free projector is the cold/reference implementation.
+        Ordinary client turns preserve locality here: exact generic indexes
+        extend the proof DAG, while winner/action changes take the established
+        canonical rebuild path.
+        """
         received = tuple(dict.fromkeys(received))
         received_set = set(received)
         shadows = self.shadows(received) if received else False
         rebuild = force or shadows or not received
-        rebuild_fids = None
+        rebuild_fids = self.admitted_ids()
         if allowed_staged is not None:
             allowed_staged = set(allowed_staged)
-            # A failed pile leaves its receipts staged for an exact retry.
-            # Another pile must not accidentally publish them when its own
-            # change triggers a full canonical rebuild.
             disallowed_staged = any(
                 fid not in allowed_staged
                 for (fid,) in self.db.execute("SELECT fid FROM staged"))
             rebuild = rebuild or disallowed_staged
             rebuild_fids = tuple(
                 fid for fid, staged in self.db.execute(
-                    "SELECT f.fid, s.fid IS NOT NULL "
-                    "FROM facts f LEFT JOIN staged s ON s.fid=f.fid")
+                    "SELECT a.fid, s.fid IS NOT NULL "
+                    "FROM admission_receipts a "
+                    "LEFT JOIN staged s ON s.fid=a.fid "
+                    "WHERE a.proof IS NOT NULL")
                 if not staged or fid in allowed_staged
             )
+
         def standing():
             by_fid = {
                 fid: [rank, []]
@@ -460,14 +560,14 @@ class Catalog:
 
         def rebuild_all():
             return rebuild_proofs(
-                self.db, self.candidate, self.anchor, self._accept,
+                self.db, self.admitted, self.anchor, self._accept,
                 rebuild_fids)
 
         if rebuild:
             rebuild_all()
         else:
             unresolved = extend_proofs(
-                self.db, received, self.candidate,
+                self.db, received, self.admitted,
                 self.anchor, self._accept)
             if unresolved:
                 standing_before = {
@@ -485,7 +585,7 @@ class Catalog:
                     self._proof_order(received),
                     (),
                     (),
-                    False,
+                    (),
                     (),
                 )
 
@@ -493,7 +593,7 @@ class Catalog:
             seen = set()
             while True:
                 state = tuple(self.db.execute(
-                    "SELECT sid, fid, evidence FROM actions ORDER BY sid"))
+                    "SELECT sid, fid FROM actions ORDER BY sid"))
                 if state in seen:
                     raise ValueError("action settlement cycle")
                 seen.add(state)
@@ -537,8 +637,7 @@ class Catalog:
             self._proof_order(activated),
             tuple(sorted(deactivated)),
             tuple(sorted(updated)),
-            shadows or bool(
-                deactivated or updated or (activated - received_set)),
+            (),
             tuple(sorted(changed_sids)),
         )
 

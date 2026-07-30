@@ -1,14 +1,10 @@
-"""Pure key-discipline parameters: format and stable boundary."""
+"""Pure fact-address discipline; authenticated maps own their own geometry."""
 import pytest
 
 from core import shape
 from core.fact import Fact
 
 WORKSPACE = "0" * 64
-
-
-def fid(prefix):
-    return f"{prefix:08x}" + "0" * 56
 
 
 def test_fact_key_round_trips_through_fact_shape():
@@ -67,29 +63,8 @@ def test_fact_constructor_rejects_noncanonical_timestamp(timestamp):
         Fact("sample", timestamp, [], {}, WORKSPACE)
 
 
-def test_hash_derived_boundary(monkeypatch):
-    monkeypatch.setattr(shape, "CUT", 8)
-
-    assert shape.boundary(fid(16))
-    assert not shape.boundary(fid(17))
-
-
-def test_stable_cuts_are_monotone(monkeypatch):
-    """Adding keys never removes a boundary — the settle's licence to
-    rebuild only the touched leaf and RangeTree path."""
-    monkeypatch.setattr(shape, "CUT", 2)
-    fids = [fid(number) for number in range(1, 11)]
-
-    assert shape.stable_cut_positions(fids) == [2, 4, 6, 8, 10]
-    for stop in range(len(fids)):
-        prefix = shape.stable_cut_positions(fids[:stop])
-        assert prefix == [
-            cut for cut in shape.stable_cut_positions(fids) if cut <= stop]
-
-
-def test_sql_boundary_suffix_is_exactly_the_shape_rule():
-    """Catalog's partial SQLite index is the CUT=64 boundary predicate."""
-    for suffix in range(256):
-        content_id = f"123456{suffix:02x}" + "0" * 56
-        assert shape.boundary(content_id) \
-            == (suffix in {0x00, 0x40, 0x80, 0xC0})
+def test_fact_shape_has_no_current_storage_partition_policy():
+    """The retired content-hash cut survives only in the v7 decoder."""
+    assert not hasattr(shape, "CUT")
+    assert not hasattr(shape, "boundary")
+    assert not hasattr(shape, "stable_cut_positions")

@@ -10,11 +10,9 @@ admission path, and the database-free Worker remains entirely separate.
 """
 import facts
 
-from .close import close, decode_pile, encode_pile
-from .crypto import h
-from .ingress import PermanentIngressRejection
+from .close import close, encode_pile
+from .ingress import PermanentIngressRejection, stage_pile
 from .kernel import resolve_deps
-from .object_store import ensure_object
 
 
 class AuthorityRejected(ValueError):
@@ -32,7 +30,7 @@ class WorkspaceRuntime:
         """Quarantine one exact, permanently invalid ingress object."""
         node, ws = self.node, self.workspace
         try:
-            node._quarantine_ingress(ws, source, raw, error)
+            node.admission(ws).reject(source, raw, error)
         except Exception as quarantine_error:
             node.record_ingress_attempt_failure(
                 ws, source, quarantine_error)
@@ -43,21 +41,22 @@ class WorkspaceRuntime:
         node, ws = self.node, self.workspace
         with node.lock:
             store = node.store(ws)
+            membrane = node.admission(ws)
             piles = store.list("pile/")
             # LIST is part of the conforming authoritative-store contract.
             # Absence here does not retire anything; it only proves that a
             # shared winner already discharged this node's local diagnostic.
             node.reconcile_ingress_attempt_failures(ws, piles)
+            membrane.reconcile(piles)
             if not piles:
                 if node.catalog(ws).staged_ids():
-                    node.commit(ws)
+                    membrane.publish()
                 return []
             fresh_all = []
             for source in piles:
                 raw = None
                 try:
                     raw = store.get(source)
-                    stream, blobs = decode_pile(raw, ws)
                 except PermanentIngressRejection as error:
                     self._reject(source, raw, error)
                     continue
@@ -65,24 +64,26 @@ class WorkspaceRuntime:
                     node.record_ingress_attempt_failure(
                         ws, source, error)
                     continue
+                if raw is None:
+                    continue
+                pending = membrane.pending(source, raw)
+                if pending is not None:
+                    try:
+                        membrane.retire(source, raw, pending)
+                    except Exception as error:
+                        node.record_ingress_attempt_failure(
+                            ws, source, error)
+                    else:
+                        node.clear_ingress_attempt_failure(ws, source)
+                    continue
                 try:
-                    node._sync_index(ws)
-                    admission = node.admit(
-                        ws, stream,
-                        allowed_staged={
-                            fact.fid for fact in stream})
-                    valids = tuple(
-                        valid for valid in admission.valids
-                        if node.fact_of(ws, valid.fact.fid) is not None)
-                    for oid, blob in blobs.items():
-                        ensure_object(store, oid, blob)
-                    node.commit(ws, admission.settlement)
+                    processed = membrane.process(source, raw)
                 except PermanentIngressRejection as error:
                     self._reject(source, raw, error)
                     continue
                 except Exception as error:
                     try:
-                        node._restore_authoritative_state(ws)
+                        membrane.restore()
                     except Exception as restore_error:
                         node.record_ingress_attempt_failure(
                             ws, source,
@@ -95,14 +96,18 @@ class WorkspaceRuntime:
                     node.record_ingress_attempt_failure(
                         ws, source, error)
                     continue
+                if processed.receipt is None:
+                    node.clear_ingress_attempt_failure(ws, source)
+                    continue
                 try:
-                    node._retire_ingress_exact(ws, source, raw)
+                    membrane.retire(
+                        source, raw, processed.receipt)
                 except Exception as error:
                     node.record_ingress_attempt_failure(
                         ws, source, error)
                     continue
                 node.clear_ingress_attempt_failure(ws, source)
-                fresh_all.extend(valids)
+                fresh_all.extend(processed.valids)
             return fresh_all
 
     def ingest(self, news, deps_new, blobs=None):
@@ -122,8 +127,8 @@ class WorkspaceRuntime:
 
             raw = encode_pile(
                 close(news, deps_of, fact_of), blobs, workspace=ws)
-            source = f"pile/{node.member_for(ws)}/{h(raw)}"
-            node.store(ws).put_if_absent(source, raw)
+            source = stage_pile(
+                node.store(ws), node.member_for(ws), raw)
             fresh = self.turn()
             missing = [
                 fact.fid for fact in news

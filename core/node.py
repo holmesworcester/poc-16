@@ -15,24 +15,22 @@ import os
 import sqlite3
 import threading
 import time
-from typing import NamedTuple
 
 import facts
 
-from . import catalog, indexes, manifest, suppression_state
-from .close import close, decode_pile, encode_pile
-from .crypto import h
-from .fact import Fact, canon
-from .ingress import KernelRejected, PermanentIngressRejection
-from .keychain import Keychain
-from .kernel import (
-    drain,
-    resolve_deps,
-    rebuild_proofs,
+from . import (
+    admission as admission_layer,
+    catalog,
+    legacy_v7,
+    snapshot,
+    suppression_state,
 )
+from .crypto import h
+from .fact import Fact
+from .keychain import Keychain
 from .publication import INDEX_VERSION, Publisher, RootChanged
 from .runtime import WorkspaceRuntime
-from .object_store import ABSENT, ensure_object, retire_exact, verified_object
+from .object_store import ABSENT
 from .store import FsStore
 
 SUPP_SCHEMA = (
@@ -43,65 +41,8 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """ + suppression_state.SCHEMA + "\n".join(SUPP_SCHEMA)
 
 
-class Admission(NamedTuple):
-    """One successful kernel judgment and its unpublished settlement."""
-
-    settlement: object
-    valids: tuple
-
-
 def now_ms():
     return int(time.time() * 1000)
-
-
-def _edges(items, anchor=None):
-    """Closure edges resolved against the whole resident set: the canonical
-    providers any reader of the store derives, with no index of its own
-    (was tree._canonical_graph)."""
-    deps, db = {}, sqlite3.connect(":memory:")
-    try:
-        db.executescript(catalog.SCHEMA)
-        admitted = catalog.ScratchCatalog(db, anchor)
-        for fact in items.values():
-            admitted.load(fact)
-        admitted.commit_stage(items)
-        if rebuild_proofs(db, items.get, anchor):
-            raise ValueError("store closure")
-        for fid, f in items.items():
-            resolved = resolve_deps(f, db)
-            if resolved is None or any(d not in items for d in resolved):
-                raise ValueError("store closure")
-            deps[fid] = resolved
-    finally:
-        db.close()
-    return deps
-
-
-def resident(man, fetch, anchor):
-    """Every committed fact, deps-first, from the manifest alone.
-
-    Leaf piles decode with the ONE pile codec (close.decode_pile); the member
-    set is then proved by rebuilding the manifest from the keys we read and
-    comparing its root oid — placement, chunking, pile and sibling bytes in a
-    single equality (replaces tree.validate_view).
-    """
-    items = {}
-    entries = manifest.decode(verified_object(man, fetch), fetch) if man else ()
-    for entry in entries:
-        members, _ = decode_pile(
-            verified_object(entry.leaf, fetch), anchor)
-        items.update({f.fid: f for f in members})
-    if any(
-            (family := facts.family_for(fact.t)) is None
-            or not family.DURABLE
-            for fact in items.values()):
-        raise ValueError("store contains an ephemeral fact")
-    deps = _edges(items, anchor)
-    if manifest.build(
-            sorted(f.key for f in items.values()), items.__getitem__,
-            deps.__getitem__, lambda raw: None)[1] != man:
-        raise ValueError("store placement")
-    return close(items.values(), deps.__getitem__, items.__getitem__)
 
 
 class Node:
@@ -121,7 +62,7 @@ class Node:
             os.remove(os.path.join(dir, "app.db"))
         except FileNotFoundError:
             pass
-        self._stores, self._idx = {}, {}
+        self._stores, self._idx, self._admissions = {}, {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._sync_errors = {}
         self._ingress_attempt_errors = {}
@@ -154,6 +95,13 @@ class Node:
         """Bind the socket-free coordinator for one workspace turn."""
         return WorkspaceRuntime(self, workspace)
 
+    def admission(self, workspace):
+        """Bind the workspace's sole durable-fact admission membrane."""
+        if workspace not in self._admissions:
+            self._admissions[workspace] = \
+                admission_layer.AdmissionMembrane(self, workspace)
+        return self._admissions[workspace]
+
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
         with self.lock:
@@ -174,54 +122,6 @@ class Node:
         for key in [
                 key for key in self.sync_cache if key[0] == workspace]:
             self.sync_cache.pop(key).clear()
-
-    def _quarantine_ingress(self, ws, source, raw, error):
-        """Retire one permanently failing ingress unit without losing bytes.
-
-        Rejection evidence is deliberately shared by every worker on the
-        workspace prefix. Exact payload and typed metadata bytes become
-        immutable before the live workset obligation is retired.
-        """
-        if not isinstance(error, PermanentIngressRejection):
-            raise TypeError("typed permanent ingress rejection required")
-        if not isinstance(raw, bytes):
-            raise TypeError("exact ingress bytes required")
-        st = self.store(ws)
-        failure_id = h(raw)
-        payload_key = "failed/pile/" + failure_id
-        st.put_if_absent(payload_key, raw)
-        if st.get(payload_key) != raw:
-            raise OSError("rejection payload was not preserved exactly")
-        record = canon({
-            "error": f"{type(error).__name__}: {error}",
-            "id": failure_id,
-            "source": source,
-        })
-        meta_key = "failed/meta/" + h(record)
-        st.put_if_absent(meta_key, record)
-        if st.get(meta_key) != record:
-            raise OSError("rejection metadata was not preserved exactly")
-        self._retire_ingress_exact(ws, source, raw)
-
-    def _retire_ingress_exact(self, ws, source, raw):
-        """Retire one hash-bound pile, reconciling a lost DELETE reply.
-
-        ``WorkspaceRuntime`` reaches this boundary only after a committed
-        publication witness; ``_quarantine_ingress`` reaches it only after
-        exact durable rejection evidence. The destructive-call inventory
-        ratchets those two authority paths.
-
-        Every accepted pile writer binds the final path segment to ``h(raw)``;
-        direct upload additionally makes creation conditional. That stable
-        same-address value is the precondition required by ``retire_exact``.
-        """
-        if not isinstance(raw, bytes):
-            raise TypeError("exact ingress bytes required")
-        if not isinstance(source, str) \
-                or not source.startswith("pile/") \
-                or source.rsplit("/", 1)[-1] != h(raw):
-            raise ValueError("ingress source is not bound to exact bytes")
-        return retire_exact(self.store(ws), source, raw)
 
     def record_ingress_attempt_failure(self, ws, source, error):
         """Expose a retained retryable/program failure without deleting it."""
@@ -330,11 +230,6 @@ class Node:
                 continue
         raise RootChanged("root kept changing during index synchronization")
 
-    def _restore_authoritative_state(self, ws):
-        """Discard a failed turn's local state before releasing its lock."""
-        self.idx(ws).rollback()
-        self._sync_index(ws)
-
     def fact_of(self, ws, fid) -> Fact:
         return self.catalog(ws).eligible(fid)
 
@@ -381,160 +276,10 @@ class Node:
                 "WHERE i.kind='fact.key' ORDER BY i.k0")
         ]
 
-    def _action_evidence(self, ws, fact):
-        """Persist the action's current canonical proof closure."""
-        idx = self.idx(ws)
-        fact_of = lambda fid: self.fact_of(ws, fid)
-        raw = encode_pile(
-            close(
-                [fact],
-                lambda fid: resolve_deps(fact_of(fid), idx),
-                fact_of,
-            ),
-            workspace=ws,
-        )
-        oid = h(raw)
-        ensure_object(self.store(ws), oid, raw)
-        return oid
-
-    def _refresh_action_evidence(self, ws, sids=None):
-        """Canonicalize proof bytes after eligibility and edges settle."""
-        idx, changed = self.idx(ws), set()
-        fids = {
-            fid for (fid,) in idx.execute(
-                "SELECT DISTINCT fid FROM actions ORDER BY fid")
-        } if sids is None else {
-            row[0]
-            for sid in sorted(set(sids))
-            if (row := idx.execute(
-                "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone())
-        }
-        for fid in sorted(fids):
-            fact = self.fact_of(ws, fid)
-            if fact is None:
-                raise ValueError("active action lacks standing")
-            changed.update(suppression_state.bind_evidence(
-                idx, fid, self._action_evidence(ws, fact)))
-        return changed
-
-    def _validate_root_actions(self, ws, root_bytes, fetch):
-        """Validate action evidence entirely through authenticated slots."""
-        from .worker import WorkerView
-
-        view = WorkerView.from_root(root_bytes, fetch)
-        fact_tree = view._reader(indexes.FACT)
-        supp = view.trees[indexes.SUPP]
-        for sid, slot in view._reader(indexes.SUPP).items(
-                max_pages=max(1, 2 * supp["count"] - 1)):
-            if not isinstance(slot, dict) or slot.get("state") != "active":
-                continue
-            fid = slot.get("action")
-            if fact_tree.get(indexes.action_key(sid)) != slot:
-                raise ValueError("action slot mismatch")
-            record = view.fact_record(fid)
-            evidence_oid = record["evidence"]
-            if not evidence_oid:
-                raise ValueError("action evidence missing")
-            action, _ = suppression_state.validate_evidence(
-                ws, sid, fid, evidence_oid, fetch)
-            if action.fid != fid:
-                raise ValueError("action evidence fact")
     # ---- the turn ------------------------------------------------------------
 
     def turn(self, ws):
         return self.workspace(ws).turn()
-
-    def admit(
-            self, ws, stream, *, base=None, force=False,
-            allowed_staged=None):
-        """Run the kernel, then durably settle only its exact Valid receipts.
-
-        This method is the catalog's sole durable fact entrance. Callers pass
-        a closed fact stream, never a caller-constructed receipt.
-        """
-        judgment = drain(tuple(stream), ws)
-        if not judgment.ok:
-            if judgment.failure is not None:
-                raise judgment.failure
-            raise KernelRejected("ingress rejected")
-        publisher = Publisher(self, ws)
-        base = publisher.base() if base is None else base
-        idx, newfids = self.idx(ws), []
-        admitted = self.catalog(ws)
-        idx.execute("BEGIN")
-        try:
-            actions_dirty = False
-            for receipt in judgment.valids:
-                f = receipt.fact
-                if not facts.family_for(f.t).DURABLE:
-                    continue  # judged, never persisted: litter drains away
-                if admitted._admit_valid(receipt):
-                    newfids.append(f.fid)
-                idx.executemany(
-                    "INSERT OR IGNORE INTO supp VALUES(?,?)",
-                    ((f.fid, sid)
-                     for sid in sorted(
-                         facts.fact_scopes(f))))
-                if facts.action_sids(f):
-                    actions_dirty = True
-                    suppression_state.archive(idx, f)
-            force = force or (
-                not newfids and not admitted.has_eligible()
-                and idx.execute(
-                    "SELECT 1 FROM facts LIMIT 1").fetchone() is not None)
-            change = admitted.settle(
-                newfids, force=force, actions_dirty=actions_dirty,
-                allowed_staged=allowed_staged) \
-                if newfids or force or actions_dirty \
-                else catalog.Eligibility((), (), (), (), False, ())
-            changed_sids = set(change.changed_sids)
-            if change.authority_changed:
-                changed_sids.update(self._refresh_action_evidence(ws))
-            elif changed_sids:
-                changed_sids.update(
-                    self._refresh_action_evidence(ws, changed_sids))
-            change = change._replace(
-                changed_sids=tuple(sorted(changed_sids)))
-            if force:
-                staged = self.catalog(ws).staged_ids()
-                change = change._replace(
-                    received=staged if allowed_staged is None else tuple(
-                        fid for fid in staged if fid in allowed_staged))
-            restored = set(change.activated) - set(newfids)
-            if restored:
-                self._invalidate_sync_cache(ws)
-            publisher.dirty(base)
-            idx.commit()
-            return Admission(
-                publisher.plan(change, base), judgment.valids)
-        except Exception:
-            idx.rollback()
-            raise
-
-    def commit(self, ws, settlement=None, *, reuse=True, _base=None):
-        idx = self.idx(ws)
-        publisher = Publisher(self, ws)
-        if settlement is None:
-            base = publisher.base(pending=True) if _base is None else _base
-            try:
-                staged = self.catalog(ws).staged_ids()
-                publisher.dirty(base)
-                admitted = self.catalog(ws)
-                change = admitted.settle(
-                    staged, force=True, actions_dirty=True)
-                changed_sids = set(change.changed_sids)
-                changed_sids.update(self._refresh_action_evidence(ws))
-                change = change._replace(
-                    received=tuple(staged),
-                    authority_changed=True,
-                    changed_sids=tuple(sorted(changed_sids)),
-                )
-                idx.commit()
-                settlement = publisher.plan(change, base)
-            except Exception:
-                idx.rollback()
-                raise
-        return publisher.publish(settlement, reuse=reuse)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -548,44 +293,50 @@ class Node:
             st, idx = self.store(ws), self.idx(ws)
             publisher = Publisher(self, ws)
             base = publisher.root_base()
-            raw, root, stream = base.root, None, []
-            if raw:
+            raw, root = base.root, None
+            archive, legacy_stream = None, ()
+            fetch = lambda oid: st.get("obj/" + oid)
+            if raw is not None:
                 try:
-                    root = manifest.decode_root(raw)
+                    root = snapshot.decode_root(raw)
                 except ValueError:
-                    # A foreign envelope may be republished from this index
-                    # only when all known snapshot bindings equal the exact
-                    # root it stamped. Damaged or different bytes fail closed.
-                    if not publisher.same_snapshot_envelope(raw):
-                        raise ValueError(
-                            "unreadable root does not match indexed snapshot")
-                    self.commit(ws, reuse=False, _base=base)
-                    base = publisher.root_base()
-                    raw = base.root
-                    root = manifest.decode_root(raw)
+                    try:
+                        previous = legacy_v7.decode_root(raw)
+                    except ValueError:
+                        # Tests and operator repair may rewrite only a format
+                        # stamp. Republish such an exact known envelope from a
+                        # current catalog; never interpret unknown bytes.
+                        if not publisher.same_snapshot_envelope(raw):
+                            raise ValueError(
+                                "unreadable root does not match indexed "
+                                "snapshot")
+                        self.admission(ws).publish(
+                            reuse=False, _base=base)
+                        base = publisher.root_base()
+                        raw = base.root
+                        root = snapshot.decode_root(raw)
+                    else:
+                        if previous.anchor != ws \
+                                or previous.layout_seed \
+                                != snapshot.layout_seed(ws):
+                            raise ValueError("root anchor")
+                        # The one explicit v7→v8 cut: only raw facts already
+                        # authenticated by the old RangeTree are rejudged.
+                        # Proof-less local-only rows are not inferred admitted.
+                        legacy_stream = tuple(
+                            legacy_v7.recover(previous, fetch))
             if root is not None:
                 if root.anchor != ws:
                     raise ValueError("root anchor")
-                fetch = lambda oid: st.get("obj/" + oid)
                 try:
-                    stream = list(resident(root.manifest, fetch, ws))
+                    from .candidate_archive import reconstruct
+
+                    archive = reconstruct(raw, fetch)
                 except ValueError as exc:
                     if not republish:
                         raise ValueError(
-                            f"invalid store facts: {exc}") from exc
-                    # A semantic index upgrade can re-pick canonical
-                    # providers for the same fact set; the old placement is
-                    # then a layout this code has no reader for. Republish
-                    # from the index under the current rule (same answer as
-                    # the foreign-stamp branch above) and read back what we
-                    # just wrote.
-                    self.commit(ws, reuse=False)
-                    base = publisher.root_base()
-                    raw = base.root
-                    root = manifest.decode_root(raw)
-                    stream = list(resident(root.manifest, fetch, ws))
-                if ws not in {fact.fid for fact in stream}:
-                    raise ValueError("store fact set")
+                            f"invalid candidate archive: {exc}") from exc
+                    raise
             idx.execute("BEGIN")
             try:
                 # Facts and generic rows are the retained catalog (legacy
@@ -601,8 +352,10 @@ class Node:
                 idx.execute("DROP TABLE IF EXISTS supp")
                 for statement in SUPP_SCHEMA:
                     idx.execute(statement)
-                for (fid,) in idx.execute("SELECT fid FROM facts"):
-                    fact = self.candidate_of(ws, fid)
+                for fid in self.catalog(ws).admitted_ids():
+                    fact = self.catalog(ws).admitted(fid)
+                    if fact is None:
+                        continue
                     idx.executemany(
                         "INSERT OR IGNORE INTO supp VALUES(?,?)",
                         ((fid, sid)
@@ -615,24 +368,29 @@ class Node:
             except Exception:
                 idx.rollback()
                 raise
-            admission = self.admit(
-                ws, stream, base=base, force=True,
-                allowed_staged={fact.fid for fact in stream})
+            if archive is not None:
+                admission = self.admission(ws)._settle_verified(
+                    archive.receipt_proofs,
+                    tuple(
+                        receipt
+                        for receipt, _ in archive.receipt_proofs),
+                    base,
+                    force=True,
+                    allowed_staged=set(archive.records),
+                )
+            else:
+                admission = self.admission(ws).admit(
+                    legacy_stream, base=base, force=True,
+                    allowed_staged={
+                        fact.fid for fact in legacy_stream})
             settlement = admission.settlement
-            if root is not None:
-                try:
-                    self._validate_root_actions(
-                        ws, raw, lambda oid: st.get("obj/" + oid))
-                except ValueError:
-                    if not republish:
-                        raise
             # A semantic index upgrade can select different canonical
             # providers for the same fact ids. A retained local receipt can
             # also regain standing under an external (or absent) root. Compile
             # the exact derived answer: Publisher skips CAS only when those
             # bytes equal the base, otherwise it publishes the local union.
             try:
-                publisher.publish(settlement, reuse=False)
+                self.admission(ws).publish(settlement, reuse=False)
             except Exception:
                 idx.rollback()
                 raise

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import facts
 
-from . import merkle_map, indexes, manifest
+from . import indexes, merkle_map, snapshot
 from .close import decode_pile
 from .crypto import h
 from .kernel import drain
@@ -21,17 +21,27 @@ class WorkerView:
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        root = manifest.decode_root(root_bytes)
-        if not all(root.trees[name]["root"] for name in indexes.TREE_NAMES):
+        root = snapshot.decode_root(root_bytes)
+        if root.layout_seed != indexes.layout_seed(root.anchor):
+            raise ValueError("composite layout seed")
+        if not all(root.maps[name]["root"] for name in indexes.TREE_NAMES):
             raise ValueError("composite root is not Worker-readable")
         return cls(
-            h(root_bytes), root.anchor, root.layout_seed, root.trees, fetch)
+            h(root_bytes), root.anchor, root.layout_seed,
+            {
+                name: root.maps[name]
+                for name in indexes.TREE_NAMES
+            },
+            fetch,
+        )
 
     def _reader(self, name):
         descriptor = self.trees[name]
         return merkle_map.Reader(
             descriptor["root"], self.seed, self.fetch,
-            max_page_depth=descriptor["depth"])
+            max_page_depth=descriptor["depth"],
+            expected_count=descriptor["count"],
+            expected_depth=descriptor["depth"])
 
     def fact_record(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
@@ -41,11 +51,11 @@ class WorkerView:
 
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
-            limit=merkle_map.MAX_RANGE_ROWS):
+            limit=merkle_map.MAX_RANGE_ROWS, include_dormant=False):
         """One bounded generic-index page for a cold publisher/query."""
         return indexes.posting_page(
             self._reader(indexes.FACT), kind, k0, k1,
-            after=after, limit=limit)
+            after=after, limit=limit, include_dormant=include_dormant)
 
     def fact_location(self, fid):
         """Canonical reconciliation key locating this fact's home range."""
@@ -69,7 +79,8 @@ class WorkerView:
 
     def fact_active(self, fid):
         record = self.fact_record(fid)
-        return self.scopes_active(record["selectors"]) \
+        return record["state"] == "eligible" \
+            and self.scopes_active(record["selectors"]) \
             and self.scopes_active(record["liveness"])
 
     def principal_active(self, kind, public_key):

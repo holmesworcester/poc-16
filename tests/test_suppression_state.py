@@ -5,10 +5,12 @@ import os
 import pytest
 
 import facts
-from core import cmds, suppression_state
+from core import catalog, cmds, suppression_state
+from core.candidate_archive import CandidateView
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
+from core.ingress import stage_pile
 from core.node import Node
 from core import sync as sync_module
 from facts.auth.removal import removal
@@ -29,7 +31,10 @@ from .util import (
 
 def _action_rows(node, workspace):
     return node.idx(workspace).execute(
-        "SELECT sid, fid, evidence FROM actions ORDER BY sid").fetchall()
+        "SELECT a.sid, a.fid, r.proof "
+        "FROM actions a "
+        "JOIN admission_receipts r ON r.fid=a.fid "
+        "ORDER BY a.sid").fetchall()
 
 
 def _signed_pile(node, workspace, fact, signed, deps):
@@ -62,7 +67,9 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
 
     root = json.loads(node.store(workspace).get("root"))
     assert set(root) == {
-        "action_etag", "anchor", "layout_seed", "manifest", "stamp", "trees"}
+        "anchor", "layout_seed", "maps", "stamp"}
+    assert set(root["maps"]) == {
+        "authority", "fact", "fact_order", "supp"}
     assert "removals" not in root
     assert _action_rows(node, workspace)[0][:2] == (
         f"fact:{target}", action_fid)
@@ -244,7 +251,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     assert roots[0] == roots[1]
 
 
-def test_action_sync_compares_witnesses_not_fact_id_order(tmp_path):
+def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice", ts=1)
     founder_secret, founder = source.identity(workspace)
@@ -270,21 +277,20 @@ def test_action_sync_compares_witnesses_not_fact_id_order(tmp_path):
     store = source.store(workspace)
     root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    pulled = sync_module.pull_actions(
-        destination, workspace, root, fetch,
-        sync_module.action_rows(root, fetch),
+    pulled, pushed, pending = sync_module.reconcile_candidates(
+        destination, workspace, None, root, fetch, deliver=False,
     )
 
-    assert first.fid in pulled
+    assert (pulled, pushed, pending) == (1, 0, True)
     sid = facts.principal_sid("member", bob)
     assert destination.idx(workspace).execute(
         "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
         == (first.fid,)
 
 
-def test_action_evidence_recanonicalizes_across_equivalent_providers(
-        tmp_path):
-    """Proof closure bytes follow the union, not the sender's winning edge."""
+def test_action_witness_remains_historical_across_current_provider_rewire(
+        tmp_path, monkeypatch):
+    """Current dependency settlement never rewrites historical admission."""
     base = Node(str(tmp_path / "base"))
     workspace = cmds.create(base, "alice", ts=1)
     founder_secret, founder = base.identity(workspace)
@@ -331,12 +337,42 @@ def test_action_evidence_recanonicalizes_across_equivalent_providers(
         _action_rows(peer, workspace)[0][2]
         for peer, _, _, _ in peers
     ]
-    assert evidence[0] == evidence[1]
+    assert evidence == [left_evidence, right_evidence]
     assert left[0].store(workspace).get("root") \
-        == right[0].store(workspace).get("root")
+        != right[0].store(workspace).get("root")
+
+    # Joining the lower complete witness is a FactTree-only transition. The
+    # direct eligible order and the two semantic projections do not change.
+    lower = 0 if evidence[0] < evidence[1] else 1
+    source, target_peer = peers[lower][0], peers[1 - lower][0]
+    source_store = source.store(workspace)
+    selected = CandidateView(
+        source_store.get("root"),
+        lambda oid: source_store.get("obj/" + oid),
+    ).verify(left[3])
+    raw = encode_pile(selected.facts, workspace=workspace)
+    before = json.loads(target_peer.store(workspace).get("root"))
+    with monkeypatch.context() as context:
+        context.setattr(
+            catalog, "rebuild_proofs",
+            lambda *_args, **_kwargs: pytest.fail(
+                "witness-only join rebuilt current standing"))
+        deliver(target_peer, workspace, raw)
+        target_peer.turn(workspace)
+    after = json.loads(target_peer.store(workspace).get("root"))
+
+    assert before["maps"]["fact_order"] == after["maps"]["fact_order"]
+    assert before["maps"]["fact"] != after["maps"]["fact"]
+    assert before["maps"]["supp"] == after["maps"]["supp"]
+    assert before["maps"]["authority"] == after["maps"]["authority"]
+    assert _action_rows(target_peer, workspace)[0][2] == evidence[lower]
+    full = target_peer.store(workspace).get("root")
+    target_peer.admission(workspace).publish(reuse=False)
+    assert target_peer.store(workspace).get("root") == full
+
     for peer, _, posted, _ in peers:
         peer.rebuild(workspace)
-        assert _action_rows(peer, workspace)[0][2] == evidence[0]
+        assert _action_rows(peer, workspace)[0][2] == evidence[lower]
         assert posted not in visible_fids(peer, workspace)
 
 
@@ -365,7 +401,7 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
         node.idx(workspace), facts.principal_sid("member", carol))
 
 
-def test_action_leg_converges_before_the_ordinary_fact_diff(
+def test_candidate_proof_sync_carries_actions_and_their_projection(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice", ts=1)
@@ -379,6 +415,8 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
     action_fid = cmds.remove(source, workspace, target, ts=20)
 
     class LocalPeer:
+        accepts_push = True
+
         def __init__(self, node, ws, url):
             self.node, self.ws = node, ws
             self.cache = node.sync_cache.setdefault((ws, url), {})
@@ -396,9 +434,11 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
             return tuple(self.obj(oid) for oid in oids)
 
         def put_pile(self, raw):
-            source.store(self.ws).put(
-                f"pile/peer/{h(raw)}", raw)
+            stage_pile(source.store(self.ws), "peer", raw)
             source.turn(self.ws)
+
+        def put_obj(self, oid, raw):
+            source.store(self.ws).put_if_absent("obj/" + oid, raw)
 
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     sync_module.sync(destination, workspace, "local")
@@ -408,8 +448,8 @@ def test_action_leg_converges_before_the_ordinary_fact_diff(
     assert target not in visible_fids(destination, workspace)
 
 
-def test_one_poisoned_action_witness_does_not_block_an_honest_action(
-        tmp_path):
+def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
+        tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "alice", ts=1)
     poisoned_target = cmds.post(
@@ -434,18 +474,43 @@ def test_one_poisoned_action_witness_does_not_block_an_honest_action(
     poisoned_evidence = rows[poisoned_sid][1]
     store = source.store(workspace)
 
-    def fetch(oid):
-        return b"not the claimed object" if oid == poisoned_evidence \
-            else store.get("obj/" + oid)
+    class PoisonedPeer:
+        accepts_push = False
+        poisoned = True
 
-    accepted = sync_module.pull_actions(
-        destination, workspace, store.get("root"), fetch, rows)
+        def __init__(self, node, ws, url):
+            self.ws = ws
+            self.cache = node.sync_cache.setdefault((ws, url), {})
 
-    assert rows[honest_sid][0] in accepted
-    assert rows[poisoned_sid][0] not in accepted
+        def root(self, etag=None):
+            raw = store.get("root")
+            current = h(raw)
+            return None if etag == current else (raw, current)
+
+        def obj(self, oid):
+            return b"not the claimed object" \
+                if self.poisoned and oid == poisoned_evidence \
+                else store.get("obj/" + oid)
+
+        def objs(self, oids):
+            return tuple(self.obj(oid) for oid in oids)
+
+    monkeypatch.setattr(sync_module, "Peer", PoisonedPeer)
+    url = "local://poisoned"
+    with pytest.raises(ValueError, match="unresolved candidate difference"):
+        sync_module.sync(destination, workspace, url)
+
     assert suppression_state.active(
         destination.idx(workspace), honest_sid)
     assert not suppression_state.active(
         destination.idx(workspace), poisoned_sid)
     assert honest_target not in visible_fids(destination, workspace)
     assert poisoned_target in visible_fids(destination, workspace)
+    cache = destination.sync_cache[(workspace, url)]
+    assert {"etag", "local", "root"}.isdisjoint(cache)
+
+    PoisonedPeer.poisoned = False
+    assert sync_module.sync(destination, workspace, url) == (1, 0)
+    assert suppression_state.active(
+        destination.idx(workspace), poisoned_sid)
+    assert destination.store(workspace).get("root") == store.get("root")

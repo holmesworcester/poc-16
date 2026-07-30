@@ -1,14 +1,17 @@
 """The provider-neutral door from untrusted staging to publication."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 
 import pytest
 
 from core import bao, cmds
+from core import ingress as ingress_module
 from core import staged_intent as staged_intent_module
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
 from core.ingress import InvalidStagedIntent, PermanentIngressRejection
+from core.ingress import check_source
 from core.node import Node
 from core.staged_intent import (
     InvalidStagedObject,
@@ -16,6 +19,7 @@ from core.staged_intent import (
     confirm_staged_object,
     decode_staged_pile,
     parse_staging_key,
+    promote_staged_pile,
     staging_key,
     staging_prefix,
 )
@@ -78,6 +82,56 @@ def test_real_multi_chunk_pile_derives_exact_same_session_object_set(
         blob = node.store(workspace).get("obj/" + digest)
         assert blob is not None and h(blob) == digest
         assert confirm_staged_object(first, object_key, blob) == blob
+
+
+def test_verified_session_promotes_to_fresh_internal_generation(
+        staged_file, monkeypatch):
+    node, workspace, raw, key = staged_file
+    intent = decode_staged_pile(workspace, key, raw)
+    generation = "e" * 32
+    monkeypatch.setattr(
+        ingress_module.secrets, "token_hex", lambda size: generation)
+
+    source = promote_staged_pile(node.store(workspace), intent)
+
+    assert source == f"pile/{MEMBER}/{generation}/{h(raw)}"
+    assert source != intent.key
+    assert check_source(source, raw).generation == generation
+    assert node.store(workspace).get(source) == raw
+
+
+def test_staging_replay_and_concurrent_promotions_cannot_recreate_generation(
+        staged_file):
+    node, workspace, raw, key = staged_file
+    intent = decode_staged_pile(workspace, key, raw)
+    store = node.store(workspace)
+
+    first = promote_staged_pile(store, intent)
+    old_receipt = node.admission(workspace).commit_ingress(
+        node.admission(workspace).admit_ingress(first, raw))
+    # Another worker wins retirement while this process still holds its
+    # genuine historical receipt.
+    store.delete(first)
+
+    # Even a replay of the exact client-writable session object crosses the
+    # trusted copy door into a new internal key. Two concurrent notification
+    # handlers likewise cannot collide or recreate ``first``.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        promoted = tuple(pool.map(
+            lambda _: promote_staged_pile(store, intent), range(2)))
+    assert len(set(promoted)) == 2
+    assert first not in promoted
+    assert all(store.get(source) == raw for source in promoted)
+
+    for source in promoted:
+        with pytest.raises(
+                ValueError, match="published ingress capability"):
+            node.admission(workspace).retire(
+                source, raw, old_receipt)
+        assert store.get(source) == raw
+
+    node.turn(workspace)
+    assert all(store.get(source) is None for source in promoted)
 
 
 def test_object_confirmation_separates_retryable_delay_from_poison(

@@ -2,19 +2,17 @@
 
 The authenticated state is keyed by suppression id: SuppTree answers whether
 one id is CLEAR or ACTIVE and FactTree's matching action slot names the
-immutable evidence record. Local SQLite retains proposal ids and targets,
+immutable action record, whose admission pointer is the witness. Local SQLite
+retains proposal ids and targets,
 derives the current action frontier, and supports the reverse index used
 to enumerate already-resident victims. It is never consulted by a Worker and
 is not a second authority index.
 
 ``core.suppression`` defines the pure clear-envelope selector and exact-target
-vocabulary. This module is the stateful half: it folds validated proposals,
-binds each effective action to its current canonical proof closure, and
-answers admission and suppression queries against the derived index.
+vocabulary. This module is the stateful half: it folds validated proposals
+and answers admission and suppression queries against the derived index.
+An action's selected historical witness lives once in its FactRecord.
 """
-from .crypto import h
-from .fact import canon
-
 ACTION_PROPOSALS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS action_proposals(
     fid TEXT PRIMARY KEY,
@@ -23,8 +21,7 @@ CREATE TABLE IF NOT EXISTS action_proposals(
 ACTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS actions(
     sid TEXT PRIMARY KEY,
-    fid TEXT NOT NULL,
-    evidence TEXT NOT NULL);
+    fid TEXT NOT NULL);
 """
 SCHEMA = ACTION_PROPOSALS_SCHEMA + """
 CREATE TABLE IF NOT EXISTS action_targets(
@@ -44,7 +41,8 @@ def upgrade_schema(idx):
     action_columns = {
         row[1] for row in idx.execute("PRAGMA table_info(actions)")
     }
-    if "j" not in proposal_columns and "j" not in action_columns:
+    rebuild_actions = action_columns != {"sid", "fid"}
+    if "j" not in proposal_columns and not rebuild_actions:
         return
     idx.execute("BEGIN")
     try:
@@ -57,12 +55,12 @@ def upgrade_schema(idx):
                 "INSERT INTO action_proposals(fid,k) "
                 "SELECT fid,k FROM action_proposals_legacy")
             idx.execute("DROP TABLE action_proposals_legacy")
-        if "j" in action_columns:
+        if rebuild_actions:
             idx.execute("ALTER TABLE actions RENAME TO actions_legacy")
             idx.execute(ACTIONS_SCHEMA)
             idx.execute(
-                "INSERT INTO actions(sid,fid,evidence) "
-                "SELECT sid,fid,evidence FROM actions_legacy")
+                "INSERT INTO actions(sid,fid) "
+                "SELECT sid,fid FROM actions_legacy")
             idx.execute("DROP TABLE actions_legacy")
             idx.execute(
                 "CREATE INDEX IF NOT EXISTS actions_by_fid ON actions(fid)")
@@ -105,15 +103,12 @@ def discard(idx, fids):
 
 def snapshot(idx):
     """Return the exact effective sid bindings at this settlement point."""
-    return {
-        sid: (fid, evidence)
-        for sid, fid, evidence in idx.execute(
-            "SELECT sid, fid, evidence FROM actions ORDER BY sid")
-    }
+    return dict(idx.execute(
+        "SELECT sid, fid FROM actions ORDER BY sid"))
 
 
 def changed(before, after):
-    """Return ids whose effective action or evidence binding changed."""
+    """Return ids whose effective action binding changed."""
     return {
         sid for sid in before.keys() | after.keys()
         if before.get(sid) != after.get(sid)
@@ -152,62 +147,17 @@ def settle(idx, fact_of, guards_of):
         if active.intersection(guards):
             continue
         for sid in sorted(targets - active):
-            previous = before.get(sid)
-            evidence = previous[1] \
-                if previous is not None and previous[0] == fid else ""
             idx.execute(
-                "INSERT INTO actions VALUES(?,?,?)",
-                (sid, fid, evidence),
+                "INSERT INTO actions VALUES(?,?)",
+                (sid, fid),
             )
         active.update(targets)
     return changed(before, snapshot(idx))
 
 
-def bind_evidence(idx, fid, evidence_oid):
-    """Bind one canonical current proof closure to every slot for ``fid``."""
-    rows = idx.execute(
-        "SELECT sid, evidence FROM actions WHERE fid=? ORDER BY sid",
-        (fid,)).fetchall()
-    if not rows or not isinstance(evidence_oid, str) or not evidence_oid:
-        raise ValueError("action evidence binding")
-    changed = {sid for sid, evidence in rows if evidence != evidence_oid}
-    idx.execute(
-        "UPDATE actions SET evidence=? WHERE fid=?",
-        (evidence_oid, fid),
-    )
-    return changed
-
-
 def active(idx, sid):
     return idx.execute(
         "SELECT 1 FROM actions WHERE sid=?", (sid,)).fetchone() is not None
-
-
-def etag(idx):
-    """Non-authoritative sync hint for the exact active action set."""
-    rows = list(idx.execute(
-        "SELECT sid, fid, evidence FROM actions ORDER BY sid"))
-    return h(canon(["active-actions-v1", rows]))
-
-
-def validate_evidence(workspace, sid, fid, evidence_oid, fetch):
-    """Verify one immutable action witness through the ordinary kernel."""
-    import facts
-    from .close import decode_pile
-    from .kernel import drain
-
-    raw = fetch(evidence_oid) if evidence_oid else None
-    if raw is None or h(raw) != evidence_oid:
-        raise ValueError("action evidence object")
-    stream, blobs = decode_pile(raw, workspace)
-    result = drain(stream, workspace)
-    matches = [
-        valid for valid in result.valids
-        if valid.fact.fid == fid and sid in facts.action_sids(valid.fact)
-    ]
-    if blobs or not result.ok or len(matches) != 1:
-        raise ValueError("action evidence")
-    return matches[0].fact, raw
 
 
 def blocks(idx, sid, candidate_key, fact_of):

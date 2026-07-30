@@ -12,7 +12,7 @@ from core import catalog, cmds, daemon
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
-from core.ingress import InvalidPile, KernelRejected
+from core.ingress import InvalidPile, KernelRejected, stage_pile
 from core.node import Node
 from core.worker import WorkerView
 from facts.auth import request
@@ -86,14 +86,14 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_stage(
         family_calls.append(tag)
         return real_family_for(tag)
 
-    def observed_admit(self, receipt):
+    def observed_admit(self, receipt, proof_oid):
         admission_calls.append(receipt.fact.fid)
-        return real_admit(self, receipt)
+        return real_admit(self, receipt, proof_oid)
 
     monkeypatch.setattr(facts, "family_for", observed_family)
     monkeypatch.setattr(catalog.Catalog, "_admit_valid", observed_admit)
-    source = f"pile/{node.member_for(second)}/{h(hostile)}"
-    node.store(second).put(source, hostile)
+    source = stage_pile(
+        node.store(second), node.member_for(second), hostile)
 
     node.turn(second)
 
@@ -168,7 +168,7 @@ def test_database_free_mint_and_catalog_enforce_the_same_anchor(tmp_path):
     foreign = message(
         first, node.identity_id(first), "general", "not second", 101)
     with pytest.raises(KernelRejected, match="ingress rejected"):
-        node.admit(second, [foreign])
+        node.admission(second).admit([foreign])
     assert node.candidate_of(second, foreign.fid) is None
 
     ws_less_ordinary = Fact("msg", 102, [], {}, None)

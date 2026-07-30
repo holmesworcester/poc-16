@@ -78,29 +78,79 @@ def test_suppression_state_uses_the_explicit_module_name():
 
 
 def test_durable_fact_admission_has_one_kernel_mediated_entrance():
-    """Raw facts may be loaded only into the named in-memory scratch type."""
+    """Only the sealed receipt settlement may reach durable catalog writes."""
+    admission_tree = ast.parse(
+        (ROOT / "core" / "admission.py").read_text())
+    membrane = next(
+        item for item in admission_tree.body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "AdmissionMembrane")
+    methods = {
+        item.name: item
+        for item in membrane.body if isinstance(item, ast.FunctionDef)
+    }
     node_tree = ast.parse((ROOT / "core" / "node.py").read_text())
     node = next(
         item for item in node_tree.body
         if isinstance(item, ast.ClassDef) and item.name == "Node")
-    methods = {
+    node_methods = {
         item.name: item
         for item in node.body if isinstance(item, ast.FunctionDef)
     }
-    assert "merge" not in methods
-    assert "admit" in methods
-    calls = [
+    assert "merge" not in node_methods
+    assert {
+        "admit", "admit_ingress", "_admit_judgment", "_settle_verified",
+    }.isdisjoint(node_methods)
+    assert {
+        "admit", "admit_ingress", "_judge", "_admit_judgment",
+        "_settle_verified",
+    } <= set(methods)
+
+    def calls_of(method):
+        return [
+            call for call in ast.walk(methods[method])
+            if isinstance(call, ast.Call)
+        ]
+
+    for entrance in ("admit", "admit_ingress"):
+        calls = calls_of(entrance)
+        assert sum(
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_judge"
+            for call in calls) == 1
+        assert sum(
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_admit_judgment"
+            for call in calls) == 1
+        assert not any(
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"_settle_verified", "_admit_valid"}
+            for call in calls)
+
+    assert sum(
+        isinstance(call.func, ast.Name) and call.func.id == "drain"
+        for call in calls_of("_judge")
+    ) == 1
+    judgment_calls = calls_of("_admit_judgment")
+    assert sum(
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "build"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "admission_proof"
+        for call in judgment_calls) == 1
+    assert sum(
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "_settle_verified"
+        for call in judgment_calls) == 1
+    settlement_calls = [
         call
-        for call in ast.walk(methods["admit"])
+        for call in ast.walk(methods["_settle_verified"])
         if isinstance(call, ast.Call)
     ]
-    assert any(
-        isinstance(call.func, ast.Name) and call.func.id == "drain"
-        for call in calls)
     assert sum(
         isinstance(call.func, ast.Attribute)
         and call.func.attr == "_admit_valid"
-        for call in calls) == 1
+        for call in settlement_calls) == 1
 
     private_calls = []
     for path in tracked(
@@ -130,8 +180,64 @@ def test_durable_fact_admission_has_one_kernel_mediated_entrance():
                 self.generic_visit(item)
 
         Calls().visit(tree)
-    assert private_calls == [("core/node.py", ("Node", "admit"))]
+    assert private_calls == [
+        (
+            "core/admission.py",
+            ("AdmissionMembrane", "_settle_verified"),
+        )]
+
+    settlement_entrances = []
+    for path in tracked(
+            "core/*.py", "facts/**/*.py", "adapters/**/*.py",
+            "deploy/**/*.py", "bench/*.py"):
+        tree = ast.parse((ROOT / path).read_text())
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) \
+                    and isinstance(call.func, ast.Attribute) \
+                    and call.func.attr == "_settle_verified":
+                settlement_entrances.append(str(path))
+    assert sorted(settlement_entrances) == [
+        "core/admission.py",
+        "core/node.py",
+    ]
+
+    runtime_tree = ast.parse(
+        (ROOT / "core" / "runtime.py").read_text())
+    runtime = next(
+        item for item in runtime_tree.body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "WorkspaceRuntime")
+    turn = next(
+        item for item in runtime.body
+        if isinstance(item, ast.FunctionDef) and item.name == "turn")
+    assert sum(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "process"
+        for call in ast.walk(turn)
+    ) == 1
 
     catalog_source = (ROOT / "core" / "catalog.py").read_text()
     assert "class ScratchCatalog" in catalog_source
     assert "def stage(" not in catalog_source
+    archive_tree = ast.parse(
+        (ROOT / "core" / "candidate_archive.py").read_text())
+    reconstruct = next(
+        item for item in archive_tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "reconstruct")
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "verify"
+        for call in ast.walk(reconstruct))
+    proof_tree = ast.parse(
+        (ROOT / "core" / "admission_proof.py").read_text())
+    verify = next(
+        item for item in proof_tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "verify")
+    assert sum(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "drain"
+        for call in ast.walk(verify)) == 1

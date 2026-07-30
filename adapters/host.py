@@ -13,7 +13,8 @@ import re
 SCHEMA = "poc16-host-store-v1"
 MAX_CONFIG_BYTES = 64 * 1024
 _WORKSPACE_RE = re.compile(r"^[0-9a-f]{64}$")
-_LONGEST_NODE_KEY = f"pile/{'0' * 16}/{'0' * 64}"
+_LONGEST_NODE_KEY = (
+    f"pile/{'0' * 16}/{'0' * 32}/{'0' * 64}")
 _CREDENTIAL_WORDS = (
     "access_key", "credential", "password", "secret", "session", "token")
 _COMMON = frozenset({

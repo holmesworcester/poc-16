@@ -1,8 +1,9 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
-Layout: root (the CAS'd workspace/index manifest), obj/<hash> (manifest
-shards, leaf piles, closure siblings, blobs — immutable),
-pile/<member>/<hash> (ingress), invite/<id> (public reads), and
+Layout: root (the CAS'd composite snapshot), obj/<hash> (bounded map pages,
+admission proofs, fact/file blobs — immutable),
+pile/<member>/<generation>/<hash> (internal ingress),
+invite/<id> (public reads), and
 failed/{pile,meta}/<hash> (shared immutable rejected-ingress evidence).
 
 The public mutation contract rejects unconditional root/object replacement

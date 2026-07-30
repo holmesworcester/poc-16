@@ -1,5 +1,7 @@
 """Direct-key device grants and equal-peer runtime behavior."""
 
+import os
+
 import pytest
 
 from core import cmds, mint
@@ -758,12 +760,17 @@ def test_late_rank_change_restores_pruned_authority_in_every_arrival_order(
     assert first.fact_of(workspace, child_claim.fid) is None
     assert first.candidate_of(workspace, child_claim.fid) == child_claim
 
-    # Eligibility and edges are derived around the stable admitted catalog.
-    first.idx(workspace).executescript(
-        "DELETE FROM proofs; DELETE FROM edges; DELETE FROM meta;")
-    first.idx(workspace).commit()
+    # The authenticated candidate archive, not SQLite, retains the temporarily
+    # inactive child. Wipe the entire local catalog before restoration.
+    dormant_root = first.store(workspace).get("root")
+    index_path = tmp_path / "first" / "ws" / f"{workspace}.idx.db"
+    first.idx(workspace).close()
+    first._idx.pop(workspace)
+    os.unlink(index_path)
     first.rebuild(workspace)
+    assert first.store(workspace).get("root") == dormant_root
     assert first.fact_of(workspace, child_claim.fid) is None
+    assert first.candidate_of(workspace, child_claim.fid) == child_claim
     deliver(first, workspace, rejoin_pile, member="first2aaaaaaaaaa")
     first.turn(workspace)
     deliver(first, workspace, ordinary_pile, member="first3aaaaaaaaaa")
@@ -880,6 +887,8 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
     assert all_fids(local, workspace) == all_fids(remote, workspace)
 
     class LocalPeer:
+        accepts_push = False
+
         def __init__(self, node, ws, url):
             self.node, self.ws, self.url = node, ws, url
             self.cache = node.sync_cache.setdefault((ws, url), {})
@@ -894,6 +903,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
             return remote.store(self.ws).get("obj/" + object_hash)
 
         def put_pile(self, body):
+            assert self.accepts_push
             deliver(remote, self.ws, body)
             remote.turn(self.ws)
 
@@ -911,6 +921,7 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
     assert local.fact_of(workspace, child_claim.fid) == child_claim
     assert (workspace, url) not in local.sync_cache
 
+    LocalPeer.accepts_push = True
     _, pushed = sync_module.sync(local, workspace, url)
     assert pushed
     assert remote.fact_of(workspace, child_claim.fid) == child_claim

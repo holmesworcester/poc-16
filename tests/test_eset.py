@@ -4,10 +4,11 @@ import threading
 
 import pytest
 
-from core import cmds, daemon, sync
+from core import cmds, daemon, indexes
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
 from core.node import Node
+from core.worker import WorkerView
 from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 from facts.content.delete import delete
@@ -115,7 +116,7 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("restart", (False, True))
-def test_suppression_stays_behind_the_manifest_commit(
+def test_suppression_stays_behind_the_snapshot_commit(
         tmp_path, monkeypatch, restart):
     """Ahead local action state is invisible until the composite root CAS."""
     node, workspace, _, _ = suppression_world(tmp_path / "node")
@@ -130,14 +131,12 @@ def test_suppression_stays_behind_the_manifest_commit(
     def visible():
         return target.fid in visible_fids(node, workspace)
 
-    def published_fids(raw):
-        return {
-            fid for fid, _ in sync.action_rows(
-                raw, lambda oid: store.get("obj/" + oid)).values()
-        }
+    def published_action(raw):
+        return WorkerView.from_root(
+            raw, lambda oid: store.get("obj/" + oid),
+        ).suppression(indexes.fact_key(target.fid))
 
-    assert published_fids(old_root)  # the world's deletions already settled
-    assert deletion.fid not in published_fids(old_root)
+    assert published_action(old_root) == {"state": "clear"}
     assert visible()
     now = daemon.now_ms()
     request = encode_pile(request_payload(
@@ -181,16 +180,17 @@ def test_suppression_stays_behind_the_manifest_commit(
                 "SELECT fid FROM actions")}
         release_reader.set()
         assert reader_waiting.wait(timeout=5)
-        raise RuntimeError("suppression manifest CAS failed")
+        raise RuntimeError("suppression snapshot CAS failed")
 
     monkeypatch.setattr(store, "cas", fail_before_publish)
-    with pytest.raises(RuntimeError, match="manifest CAS failed"):
+    with pytest.raises(RuntimeError, match="snapshot CAS failed"):
         cmds.remove(node, workspace, target.fid, ts=301)
     reader.join(timeout=5)
 
     assert not reader.is_alive()
     assert len(candidate) == 1
-    assert deletion.fid in published_fids(candidate[0])
+    assert published_action(candidate[0]) == {
+        "state": "active", "action": deletion.fid}
     assert store.get("root") == old_root
     assert node.fact_of(workspace, deletion.fid) is None
     assert deletion.fid not in {
@@ -205,7 +205,8 @@ def test_suppression_stays_behind_the_manifest_commit(
         index = node.idx(workspace)
         index.executescript(
             "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM staged; "
-            "DELETE FROM proofs; DELETE FROM supp; DELETE FROM meta;")
+            "DELETE FROM admission_receipts; DELETE FROM proofs; "
+            "DELETE FROM supp; DELETE FROM meta;")
         index.commit()
         index.close()
         node = Node(node.dir)
@@ -229,7 +230,8 @@ def test_suppression_stays_behind_the_manifest_commit(
     assert retried == candidate
     assert store.get("root") == candidate[0]
     assert node.fact_of(workspace, deletion.fid) == deletion
-    assert deletion.fid in published_fids(store.get("root"))
+    assert published_action(store.get("root")) == {
+        "state": "active", "action": deletion.fid}
     assert not visible()
     _, (code, body) = invoke_mint(node, workspace, request)
     assert (code, base64.b64decode(body["root"])) == (200, candidate[0])

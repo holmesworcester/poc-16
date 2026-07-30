@@ -62,7 +62,7 @@ def test_public_queries_restart_directly_from_catalog(tmp_path):
     ] == ["fid", "k"]
     assert [
         name for _, name, *_ in index.execute("PRAGMA table_info(actions)")
-    ] == ["sid", "fid", "evidence"]
+    ] == ["sid", "fid"]
     assert index.execute(
         "SELECT COUNT(*) FROM facts WHERE fid IN "
         "(SELECT fid FROM action_proposals)"
@@ -152,12 +152,12 @@ def test_legacy_action_tables_drop_copied_fact_json():
     ] == ["fid", "k"]
     assert [
         name for _, name, *_ in db.execute("PRAGMA table_info(actions)")
-    ] == ["sid", "fid", "evidence"]
+    ] == ["sid", "fid"]
     assert db.execute("SELECT * FROM action_proposals").fetchall() == [
         ("action", "key"),
     ]
     assert db.execute("SELECT * FROM actions").fetchall() == [
-        ("fact:target", "action", "proof"),
+        ("fact:target", "action"),
     ]
     assert db.execute(
         "SELECT name FROM sqlite_master "

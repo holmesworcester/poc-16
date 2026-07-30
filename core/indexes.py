@@ -1,24 +1,25 @@
-"""Exact authenticated read views over the committed fact set.
+"""Exact authenticated read views over the committed candidate join.
 
-The range manifest is shaped for reconciliation, not point authorization. A
-Worker should not download it, enumerate facts, or reconstruct SQLite merely
-to decide whether one principal or fact is live. This module projects the
-same admitted snapshot into three maps over the history-independent Merkle map:
+A Worker reads these maps directly and never reconstructs SQLite merely to
+decide whether one principal or fact is live. This module projects the same
+admitted candidate/proof state into three bounded Merkle maps:
 
 ``FactTree``
     ``fact:<fid>`` maps to the bounded data needed for an exact Worker or
-    publisher read: reconciliation key, proof rank, resolved dependencies,
-    offers, suppression selectors, continuing liveness ids, and optional
-    action evidence. ``index:...`` rows are the authenticated counterpart of
-    the client catalog's generic index. One row per
-    ``(kind, k0, k1, rank, fid)`` supports bounded type, key, explicit-ref,
-    offer-candidate, suppression-scope, and reverse-dependency ranges without
-    copying a fact body or hiding an unbounded posting list in one value.
-    Raw facts remain in manifest piles.
+    publisher read: reconciliation key, selected admission proof, explicit
+    eligibility state, canonical fact oid, resolved dependencies, offers,
+    suppression selectors, and continuing liveness ids. Every raw fact lives
+    at its content address; the separate direct FactOrder projection carries
+    only eligible key-to-object references. ``index:...`` rows are the
+    authenticated counterpart of the client catalog's generic index. One row per
+    ``(kind, k0, k1, state, rank, fid)`` supports bounded type, key,
+    explicit-ref, offer-candidate, suppression-scope, and reverse-dependency
+    ranges without hiding an unbounded posting list in one value. Ordinary
+    application ranges select only the eligible prefix.
     ``action:<sid>`` maps to the same CLEAR/ACTIVE value as SuppTree for known
-    direct and principal targets. That second binding is deliberate: sync may
-    enumerate active SuppTree entries, but accepts one only when FactTree
-    independently binds the same sid-to-action witness.
+    direct and principal targets. That second binding lets a bounded
+    authorization read corroborate an active action without trusting an
+    on-request claim.
 
 ``SuppTree``
     A typed suppression id maps to ``{"state": "clear"}`` or
@@ -27,7 +28,8 @@ same admitted snapshot into three maps over the history-independent Merkle map:
     action. It is not a missing row: a missing required slot makes Worker
     authorization fail closed. ACTIVE names the effective action in this
     snapshot; a later root may return to CLEAR if canonical settlement makes
-    that proposal ineligible. Its evidence can be reached through FactTree.
+    that proposal ineligible. Its historical admission witness is reached
+    through the action's FactRecord.
 
 ``AuthorityTree``
     A canonical base NeedKey maps to the kernel's selected provider and proof
@@ -45,14 +47,15 @@ produce the same roots for the same logical maps.
 """
 import base64
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import facts
 
 from . import merkle_map
-from .catalog import INTERNAL_INDEXES, index_rows
+from .catalog import Catalog, INTERNAL_INDEXES, index_rows
 from .crypto import h
-from .fact import canon
+from .fact import canon, encode
 from .shape import fid_of, is_key, valid_fid
 
 FACT = "fact"
@@ -65,6 +68,7 @@ MAX_PROOF_RANK = (1 << 63) - 1
 SCOPE_INDEX = "fact.scope"
 DEPENDENCY_INDEX = "fact.dependency"
 POSTING = "index:"
+DORMANT_POSTING = "dormant-index:"
 POSTING_VALUE = "candidate"
 
 
@@ -74,8 +78,9 @@ class IndexPosting(NamedTuple):
     kind: str
     k0: str
     k1: str
-    rank: int
+    rank: int | None
     fid: str
+    state: str = "eligible"
 
 
 class PostingPage(NamedTuple):
@@ -84,6 +89,20 @@ class PostingPage(NamedTuple):
     rows: tuple[IndexPosting, ...]
     cursor: str | None
     pages_read: int
+
+
+@dataclass(frozen=True)
+class IndexBuild:
+    """Canonical descriptors plus candidate records this invocation emitted."""
+
+    seed: str
+    trees: dict
+    represented: frozenset
+
+    def __iter__(self):
+        """Preserve the established ``seed, trees = build(...)`` surface."""
+        yield self.seed
+        yield self.trees
 
 
 def layout_seed(anchor):
@@ -123,26 +142,34 @@ def _decode_component(value):
         raise ValueError("fact index component") from error
 
 
-def posting_prefix(kind, k0=None, k1=None):
+def posting_prefix(kind, k0=None, k1=None, *, state="eligible"):
     """Collision-free ordered prefix for one generic index address."""
-    if not isinstance(kind, str) or not kind or k1 is not None and k0 is None:
+    if state not in {"eligible", "dormant"} \
+            or not isinstance(kind, str) or not kind \
+            or k1 is not None and k0 is None:
         raise ValueError("fact index address")
     parts = [_component(kind)]
     if k0 is not None:
         parts.append(_component(k0))
     if k1 is not None:
         parts.append(_component(k1))
-    return POSTING + ":".join(parts) + ":"
+    namespace = POSTING if state == "eligible" else DORMANT_POSTING
+    return namespace + ":".join(parts) + ":"
 
 
-def posting_key(kind, k0, k1, rank, fid):
-    """FactTree key ordered by address, proof rank, then source fid."""
-    if type(rank) is not int or not 0 <= rank <= MAX_PROOF_RANK \
-            or not valid_fid(fid):
+def posting_key(kind, k0, k1, rank, fid, state="eligible"):
+    """FactTree key ordered by address, standing/rank, then source fid."""
+    if (
+            state not in {"eligible", "dormant"}
+            or not valid_fid(fid)
+            or state == "eligible" and (
+                type(rank) is not int or not 0 <= rank <= MAX_PROOF_RANK)
+            or state == "dormant" and rank is not None):
         raise ValueError("fact index posting")
+    order = f"{rank:020d}" if rank is not None else "-"
     return (
-        posting_prefix(kind, k0, k1)
-        + f"{rank:020d}:{fid}"
+        posting_prefix(kind, k0, k1, state=state)
+        + f"{order}:{fid}"
     )
 
 
@@ -150,39 +177,87 @@ def decode_posting_key(key):
     """Strictly decode and re-encode one authenticated posting key."""
     try:
         namespace, kind, k0, k1, rank, fid = key.split(":")
+        state = {
+            POSTING[:-1]: "eligible",
+            DORMANT_POSTING[:-1]: "dormant",
+        }[namespace]
         row = IndexPosting(
             _decode_component(kind),
             _decode_component(k0),
             _decode_component(k1),
-            int(rank),
+            int(rank) if state == "eligible" else None,
             fid,
+            state,
         )
-        if namespace != POSTING[:-1] or len(rank) != 20 \
-                or posting_key(*row) != key:
+        if (
+                state == "eligible" and len(rank) != 20
+                or state == "dormant" and rank != "-"
+                or posting_key(*row) != key):
             raise ValueError("fact index posting")
         return row
-    except (AttributeError, TypeError, ValueError) as error:
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ValueError("fact index posting") from error
 
 
 def posting_page(
         reader, kind, k0=None, k1=None, *, after=None,
-        limit=merkle_map.MAX_RANGE_ROWS):
+        limit=merkle_map.MAX_RANGE_ROWS, include_dormant=False):
     """Read one authenticated posting range without enumerating FactTree."""
-    prefix = posting_prefix(kind, k0, k1)
-    page = reader.range_page(
-        prefix, prefix + "\uffff", after=after, limit=limit)
+    def read(state, cursor, count):
+        prefix = posting_prefix(kind, k0, k1, state=state)
+        return reader.range_page(
+            prefix, prefix + "\uffff", after=cursor, limit=count)
+
+    state, cursor = "eligible", after
+    if include_dormant and after is not None:
+        try:
+            marker, cursor = after.split("|", 1)
+            state = {"e": "eligible", "d": "dormant"}[marker]
+            cursor = cursor or None
+        except (AttributeError, KeyError, ValueError) as error:
+            raise ValueError("fact index cursor") from error
+    page = read(state, cursor, limit)
+    pages_read = reader.pages_read
+    pages = [(state, page)]
+    if include_dormant and state == "eligible" and page.cursor is None:
+        remaining = limit - len(page.rows)
+        if remaining:
+            dormant = read("dormant", None, remaining)
+            pages_read += reader.pages_read
+            pages.append(("dormant", dormant))
     rows = []
-    for key, value in page.rows:
-        row = decode_posting_key(key)
-        if value != {"state": POSTING_VALUE, "fid": row.fid}:
-            raise ValueError("fact index posting value")
-        if row.kind != kind \
-                or k0 is not None and row.k0 != k0 \
-                or k1 is not None and row.k1 != k1:
-            raise ValueError("fact index posting range")
-        rows.append(row)
-    return PostingPage(tuple(rows), page.cursor, reader.pages_read)
+    for expected_state, current in pages:
+        for key, value in current.rows:
+            row = decode_posting_key(key)
+            if value != {
+                    "state": POSTING_VALUE,
+                    "fid": row.fid,
+                    "eligibility": row.state,
+            }:
+                raise ValueError("fact index posting value")
+            if row.state != expected_state \
+                    or row.kind != kind \
+                    or k0 is not None and row.k0 != k0 \
+                    or k1 is not None and row.k1 != k1:
+                raise ValueError("fact index posting range")
+            rows.append(row)
+    last_state, last_page = pages[-1]
+    if not include_dormant:
+        next_cursor = last_page.cursor
+    elif last_page.cursor is not None:
+        next_cursor = (
+            "e" if last_state == "eligible" else "d"
+        ) + "|" + last_page.cursor
+    elif last_state == "eligible" and len(rows) == limit:
+        next_cursor = "d|"
+    else:
+        next_cursor = None
+    return PostingPage(tuple(rows), next_cursor, pages_read)
+
+
+def is_posting_key(key):
+    return isinstance(key, str) and key.startswith(
+        (POSTING, DORMANT_POSTING))
 
 
 principal_sid = facts.principal_sid
@@ -191,16 +266,21 @@ principal_sid = facts.principal_sid
 def checked_fact_record(record, fid=None):
     """Return one strict FactRecord or fail before trusting its routes."""
     fields = {
-        "dependencies", "evidence", "key", "liveness", "offers", "rank",
-        "selectors",
+        "admission", "dependencies", "fact_oid", "key", "liveness",
+        "offers", "rank", "selectors", "state",
     }
-    if not isinstance(record, dict) or set(record) != fields \
-            or not is_key(record["key"]) \
-            or fid is not None and fid_of(record["key"]) != fid \
-            or type(record["rank"]) is not int \
-            or not 0 <= record["rank"] <= MAX_PROOF_RANK \
-            or not isinstance(record["evidence"], str) \
-            or record["evidence"] and not valid_fid(record["evidence"]):
+    if (
+            not isinstance(record, dict)
+            or set(record) != fields
+            or not is_key(record["key"])
+            or fid is not None and fid_of(record["key"]) != fid
+            or record["state"] not in {"eligible", "dormant"}
+            or record["state"] == "eligible" and (
+                type(record["rank"]) is not int
+                or not 0 <= record["rank"] <= MAX_PROOF_RANK)
+            or record["state"] == "dormant" and record["rank"] is not None
+            or not valid_fid(record["admission"])
+            or not valid_fid(record["fact_oid"])):
         raise ValueError("FactRecord shape")
     selectors, liveness = record["selectors"], record["liveness"]
     if not isinstance(selectors, list) or selectors != sorted(set(selectors)) \
@@ -251,11 +331,16 @@ def _record_index_rows(fact, record):
     return tuple(sorted(rows))
 
 
-def _posting_changes(fact, record, value):
+def record_postings(fact, record):
+    """Mechanical authenticated posting keys for one checked candidate."""
     return {
-        posting_key(kind, k0, k1, record["rank"], fact.fid): value
+        posting_key(kind, k0, k1, record["rank"], fact.fid, record["state"])
         for kind, k0, k1, _ in _record_index_rows(fact, record)
     }
+
+
+def _posting_changes(fact, record, value):
+    return {key: value for key in record_postings(fact, record)}
 
 
 def need_key(name, a0, a1=None, requires=()):
@@ -267,20 +352,24 @@ def need_key(name, a0, a1=None, requires=()):
 
 
 def build(
-        anchor, idx, fact_of, emit, *, previous=None, fetch=None,
-        changed_fids=None, removed_fids=(), changed_sids=()):
+        anchor, idx, emit, *, previous=None, fetch=None,
+        changed_fids=None, removed_fids=(), changed_sids=(),
+        candidate_fids=None):
     """Build or path-update Fact/Supp/Authority for one logical commit.
 
-    ``changed_fids`` names added or rank/dependency-changed standing,
-    ``removed_fids`` names lost standing, and ``changed_sids`` is the exact
-    effective-action/evidence delta. Format upgrades pass ``None`` and take
-    the canonical bulk path. ``previous`` is only a path-copy optimization:
-    it cannot affect the logical rows or resulting roots. ``fact_of`` must
-    return retained canonical candidates, including a just-removed fact.
+    ``candidate_fids`` is the exact root-authorized candidate population;
+    omitted callers use the whole proof-backed catalog. ``changed_fids``
+    names added candidates, selected-witness changes, and
+    eligibility/rank/dependency transitions. ``removed_fids`` is reserved for
+    a future proven candidate-GC protocol and must remain empty.
+    ``changed_sids`` is the exact effective-action/evidence delta. Format
+    upgrades pass ``None`` and take the canonical bulk path. ``previous`` is
+    only a path-copy optimization: it cannot affect logical rows or roots.
 
-    The caller supplies one derived-index snapshot and publishes the returned
-    descriptors together with the range manifest. This function emits
-    immutable objects but never advances the mutable root itself.
+    The caller publishes the returned descriptors in the same composite root
+    as FactOrder. Candidate deletion is not a standing transition and is
+    deliberately unsupported. This function emits immutable objects but never
+    advances the mutable root itself.
     """
     seed = layout_seed(anchor)
     previous = previous or {}
@@ -288,7 +377,18 @@ def build(
     incremental = changed_fids is not None and all(
         previous.get(name, {}).get("root") for name in TREE_NAMES)
 
-    action_by_sid, action_evidence = {}, {}
+    admitted = Catalog(idx, anchor)
+    fact_of = admitted.admitted
+    if candidate_fids is None:
+        candidate_fids = (
+            tuple(sorted(set(changed_fids or ())))
+            if incremental else admitted.admitted_ids()
+        )
+    else:
+        candidate_fids = tuple(sorted(set(candidate_fids)))
+    if any(fact_of(fid) is None for fid in candidate_fids):
+        raise ValueError("missing retained fact candidate")
+    action_by_sid = {}
 
     def checked_action(sid, fid):
         fact = fact_of(fid)
@@ -297,32 +397,22 @@ def build(
         return fact
 
     if not incremental:
-        for sid, fid, evidence in idx.execute(
-                "SELECT sid, fid, evidence FROM actions ORDER BY sid"):
+        for sid, fid in idx.execute(
+                "SELECT sid, fid FROM actions ORDER BY sid"):
             checked_action(sid, fid)
-            action_by_sid[sid] = (fid, evidence)
-            action_evidence[fid] = min(
-                evidence, action_evidence.get(fid, evidence))
+            action_by_sid[sid] = fid
 
     active_cache = {}
 
     def active_binding(sid):
         if sid not in active_cache:
             row = idx.execute(
-                "SELECT fid, evidence FROM actions WHERE sid=?",
+                "SELECT fid FROM actions WHERE sid=?",
                 (sid,)).fetchone()
             if row is not None:
                 checked_action(sid, row[0])
-            active_cache[sid] = row
+            active_cache[sid] = row[0] if row is not None else None
         return active_cache[sid]
-
-    def evidence_for(fid):
-        if not incremental:
-            return action_evidence.get(fid, "")
-        row = idx.execute(
-            "SELECT evidence FROM actions WHERE fid=? "
-            "ORDER BY evidence LIMIT 1", (fid,)).fetchone()
-        return row[0] if row else ""
 
     def fact_record(fact):
         selectors = sorted(facts.fact_scopes(fact))
@@ -330,14 +420,18 @@ def build(
             raise ValueError("fact selector budget")
         proof = idx.execute(
             "SELECT rank FROM proofs WHERE fid=?", (fact.fid,)).fetchone()
-        if proof is None:
-            raise ValueError("FactRecord standing")
+        state = "eligible" if proof is not None else "dormant"
+        exact_edges = admitted.edges(fact.fid) if proof is not None \
+            else admitted.admission_edges(fact.fid)
+        # Admission is historical replicated state: the lexicographically
+        # smallest complete witness actually observed for these exact bytes.
+        # Current dependencies are a separate canonical settlement result.
+        admission_oid = admitted.admission_proof(fact.fid)
+        if exact_edges is None or admission_oid is None:
+            raise ValueError("FactRecord admission")
         dependencies = [
-            [role, target, kind]
-            for role, target, kind in idx.execute(
-                "SELECT role, dst, kind FROM edges "
-                "WHERE src=? ORDER BY role",
-                (fact.fid,))
+            [edge.role, edge.fid, edge.kind]
+            for edge in exact_edges
         ]
         if len(dependencies) > MAX_DEPENDENCIES:
             raise ValueError("fact dependency budget")
@@ -348,23 +442,35 @@ def build(
                     role: target
                     for role, target, _ in dependencies
                 }
-            return dict(idx.execute(
-                "SELECT role, dst FROM edges WHERE src=? ORDER BY role",
-                (fid,)).fetchall())
+            standing = idx.execute(
+                "SELECT 1 FROM proofs WHERE fid=?", (fid,)).fetchone()
+            edges = admitted.edges(fid) if standing is not None \
+                else admitted.admission_edges(fid)
+            return {
+                edge.role: edge.fid
+                for edge in (edges or ())
+            }
 
         # Selectors answer whether this fact is suppressed. Liveness ids
         # answer whether authority it depends on remains usable. Keeping both
         # in the record makes Worker reads explicit and bounded.
         liveness = set(facts.authority_scopes(
             fact, edges_of, fact_of)) - set(selectors)
+        raw = encode(fact)
+        raw_oid = h(raw)
+        emitted = emit(raw)
+        if emitted is not None and emitted != raw_oid:
+            raise ValueError("candidate residence identity")
         return checked_fact_record({
+            "admission": admission_oid,
             "dependencies": dependencies,
-            "evidence": evidence_for(fact.fid),
+            "fact_oid": raw_oid,
             "key": fact.key,
             "liveness": sorted(liveness),
             "offers": [list(row) for row in fact.offers()],
-            "rank": proof[0],
+            "rank": proof[0] if proof is not None else None,
             "selectors": selectors,
+            "state": state,
         }, fact.fid)
 
     def active_slot(sid):
@@ -372,15 +478,16 @@ def build(
         # an absent tree row. ACTIVE carries the deterministic archive winner.
         row = active_binding(sid) if incremental \
             else action_by_sid.get(sid)
-        return {"state": "active", "action": row[0]} \
+        return {"state": "active", "action": row} \
             if row is not None else {"state": "clear"}
 
     def reservations(fact):
         """Precreate every slot whose absence must not mean permission.
 
         Explicit selectors reserve SuppTree ids. Directly deletable facts and
-        principal providers also reserve FactTree corroboration slots so
-        action sync can cross-check an enumerated ACTIVE entry.
+        principal providers also reserve FactTree corroboration slots so a
+        bounded Worker read can authenticate both the target and its current
+        CLEAR/ACTIVE suppression state under the same root.
         """
         fact_slots, supp_slots = {}, {}
         selectors = facts.fact_scopes(fact)
@@ -429,7 +536,7 @@ def build(
     def reserved_slot(sid, reserved):
         row = active_binding(sid)
         if row is not None:
-            return {"state": "active", "action": row[0]}
+            return {"state": "active", "action": row}
         return {"state": "clear"} if reserved else None
 
     def authority_value(address):
@@ -464,10 +571,19 @@ def build(
         removed_set = set(removed_fids)
         if changed_set.intersection(removed_set):
             raise ValueError("overlapping fact index delta")
+        if removed_set:
+            raise ValueError("candidate deletion is unsupported")
+        if not changed_set <= set(candidate_fids):
+            raise ValueError("unpublished candidate index delta")
         fact_changes, supp_changes, addresses = {}, {}, set()
-        fact_reader = merkle_map.Reader(previous[FACT]["root"], seed, fetch)
-        for fid in sorted(changed_set | removed_set):
-            fact = fact_of(fid)
+        represented = set()
+        fact_reader = merkle_map.Reader(
+            previous[FACT]["root"], seed, fetch,
+            max_page_depth=previous[FACT]["depth"],
+            expected_count=previous[FACT]["count"],
+            expected_depth=previous[FACT]["depth"])
+        for fid in sorted(changed_set):
+            fact = admitted.admitted(fid)
             if fact is None:
                 raise ValueError("missing retained fact candidate")
             old_record = fact_reader.get(fact_key(fid))
@@ -475,24 +591,29 @@ def build(
                 checked_fact_record(old_record, fid)
                 fact_changes.update(
                     _posting_changes(fact, old_record, None))
-            elif fid in removed_set:
-                raise ValueError("missing removed FactRecord")
 
             for name, a0, a1 in fact.offers():
                 addresses.add((name, a0, a1))
                 addresses.add((name, a0, None))
 
-            if fid in changed_set:
-                current = fact_record(fact)
-                value = {"state": POSTING_VALUE, "fid": fid}
-                fact_changes.update(_posting_changes(fact, current, value))
-                fact_changes[fact_key(fid)] = current
+            current = fact_record(fact)
+            value = {
+                "state": POSTING_VALUE,
+                "fid": fid,
+                "eligibility": current["state"],
+            }
+            fact_changes.update(_posting_changes(fact, current, value))
+            fact_changes[fact_key(fid)] = current
+            represented.add(fid)
+            if current["state"] == "eligible":
                 fact_slots, supp_slots = reservations(fact)
                 fact_changes.update(fact_slots)
                 supp_changes.update(supp_slots)
                 continue
 
-            fact_changes[fact_key(fid)] = None
+            # Loss of standing changes the posting prefix but never deletes
+            # the admitted candidate or its canonical fact object. Only
+            # current authority reservations are withdrawn below.
             principal = facts.principal_sids(fact)
             for sid in facts.fact_scopes(fact):
                 supp_changes[sid] = reserved_slot(
@@ -530,11 +651,8 @@ def build(
                 and previous_slot.get("state") == "active" else None
             if old_fid is not None and old_fid != current_fid:
                 old = fact_of(old_fid)
-                standing = idx.execute(
-                    "SELECT 1 FROM proofs WHERE fid=?",
-                    (old_fid,)).fetchone() is not None
                 fact_changes[fact_key(old_fid)] = \
-                    fact_record(old) if old is not None and standing else None
+                    fact_record(old) if old is not None else None
 
         authority_changes = {
             need_key(*address): authority_value(address)
@@ -551,42 +669,48 @@ def build(
         built = {}
         for name in TREE_NAMES:
             result = merkle_map.update(
-                previous[name]["root"], seed, change_sets[name], fetch, emit)
+                previous[name]["root"], seed, change_sets[name], fetch, emit,
+                expected_count=previous[name]["count"],
+                expected_depth=previous[name]["depth"])
             built[name] = {
                 "root": result.root,
                 "count": result.count,
                 "depth": result.page_depth,
             }
-        return seed, built
+        return IndexBuild(seed, built, frozenset(represented))
 
     # Full rebuild is the reference definition of all three logical maps.
-    # Historical action evidence remains explicit; no replica-local arrival
-    # order or observation leaks into the result.
+    # The action fact's historical admission pointer is the sole evidence;
+    # no replica-local arrival order or duplicate pointer leaks into the map.
     fact_rows, supp_rows = {}, {}
-    current = [
-        fact_of(fid)
-        for (fid,) in idx.execute("SELECT fid FROM proofs ORDER BY fid")
-    ]
+    current = [admitted.admitted(fid) for fid in candidate_fids]
+    represented = set()
     for fact in current:
         if fact is None:
-            raise ValueError("missing standing fact candidate")
+            raise ValueError("missing admitted fact candidate")
         record = fact_record(fact)
         fact_rows[fact_key(fact.fid)] = record
+        represented.add(fact.fid)
         fact_rows.update(_posting_changes(
             fact, record,
-            {"state": POSTING_VALUE, "fid": fact.fid},
+            {
+                "state": POSTING_VALUE,
+                "fid": fact.fid,
+                "eligibility": record["state"],
+            },
         ))
-        fact_slots, supp_slots = reservations(fact)
-        for key, value in fact_slots.items():
-            fact_rows.setdefault(key, value)
-        for key, value in supp_slots.items():
-            supp_rows.setdefault(key, value)
+        if record["state"] == "eligible":
+            fact_slots, supp_slots = reservations(fact)
+            for key, value in fact_slots.items():
+                fact_rows.setdefault(key, value)
+            for key, value in supp_slots.items():
+                supp_rows.setdefault(key, value)
     for _, sid in idx.execute(
             "SELECT s.fid, s.k FROM supp s "
             "JOIN proofs p ON p.fid=s.fid ORDER BY s.fid, s.k"):
         supp_rows.setdefault(sid, active_slot(sid))
 
-    for sid, (fid, _) in action_by_sid.items():
+    for sid, fid in action_by_sid.items():
         active = {"state": "active", "action": fid}
         supp_rows[sid] = active
         fact_rows[action_key(sid)] = active
@@ -617,4 +741,4 @@ def build(
             "count": result.count,
             "depth": result.page_depth,
         }
-    return seed, built
+    return IndexBuild(seed, built, frozenset(represented))

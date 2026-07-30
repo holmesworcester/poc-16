@@ -6,8 +6,8 @@ Safety law
 An acknowledged shared pile ``(key, exact_bytes)`` remains an obligation
 until a DELETE of that exact value cites one of two durable witnesses:
 
-* a committed, authenticated root whose resident closure contains every
-  durable fact in those bytes that the runtime classified as publishable; or
+* a committed, authenticated root whose candidate archive contains every
+  durable ``Valid`` minted for those bytes, eligible or dormant; or
 * exact, read-back rejection payload and typed permanent-rejection metadata.
 
 CAS attempts, retry counts, local catalogs, and local diagnostics are not
@@ -21,14 +21,12 @@ from pathlib import Path
 
 import facts
 
-from core import indexes, manifest
+from core.candidate_archive import reconstruct
 from core.close import decode_pile
 from core.crypto import h
 from core.ingress import KernelRejected, PermanentIngressRejection
 from core.kernel import drain
-from core.node import resident
 from core.object_store import CREATED, Applied
-from core.worker import WorkerView
 
 
 @dataclass(frozen=True)
@@ -38,7 +36,7 @@ class PublicationObservation:
     seq: int
     key: str
     raw: bytes
-    publishable_fids: frozenset[str]
+    candidate_fids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -119,22 +117,19 @@ class ObligationTrace:
             return None
         if not judgment.ok:
             return None
-        durable = {
-            fact.fid for fact in stream
-            if facts.family_for(fact.t).DURABLE
-        }
-        publishable = frozenset(
-            fid for fid in durable if node.fact_of(workspace, fid) is not None)
+        candidates = frozenset(
+            receipt.fact.fid for receipt in judgment.valids
+            if facts.family_for(receipt.fact.t).DURABLE)
         observation = PublicationObservation(
-            len(self.bucket.history), key, raw, publishable)
+            len(self.bucket.history), key, raw, candidates)
         self.observations.append(observation)
         return observation
 
-    def observe_publication(self, key, raw, publishable_fids):
+    def observe_publication(self, key, raw, candidate_fids):
         """Add an explicit observation for small checker mutation tests."""
         observation = PublicationObservation(
             len(self.bucket.history), key, raw,
-            frozenset(publishable_fids))
+            frozenset(candidate_fids))
         self.observations.append(observation)
         return observation
 
@@ -224,20 +219,20 @@ class ObligationTrace:
             if current is None:
                 continue
             try:
-                resident_fids = self._validated_snapshot(current)
+                candidate_fids = self._validated_snapshot(current)
             except Exception as error:
                 reasons.append(
                     f"current root at event #{current.seq} is not "
                     f"authenticated: {type(error).__name__}: {error}")
                 continue
-            if observation.publishable_fids <= resident_fids:
+            if observation.candidate_fids <= candidate_fids:
                 return ("publication", current.seq), ""
             reasons.append(
                 "current committed root does not contain every "
-                "runtime-classified publishable fact")
+                "kernel-valid durable candidate")
         return None, reasons[-1] if reasons else (
             "current committed root does not contain every "
-            "runtime-classified publishable fact")
+            "kernel-valid durable candidate")
 
     def _rejection_witness(
             self, obligation, delete_seq, data, verified):
@@ -300,30 +295,15 @@ class ObligationTrace:
         try:
             objects = dict(snapshot.objects)
             fetch = objects.get
-            root = manifest.decode_root(snapshot.root)
-            if root.anchor != self.workspace:
+            archive = reconstruct(snapshot.root, fetch)
+            if archive.workspace != self.workspace:
                 raise ValueError("foreign workspace anchor")
-            stream = tuple(resident(
-                root.manifest, fetch, self.workspace))
-            resident_fids = frozenset(fact.fid for fact in stream)
-            view = WorkerView.from_root(snapshot.root, fetch)
-            for name in indexes.TREE_NAMES:
-                descriptor = root.trees[name]
-                page = json.loads(fetch(descriptor["root"]))
-                if (page.get("count"), page.get("depth")) != (
-                        descriptor["count"], descriptor["depth"]):
-                    raise ValueError(f"{name} root descriptor mismatch")
-                rows = view._reader(name).items(
-                    max_pages=descriptor["count"])
-                if len(rows) != descriptor["count"]:
-                    raise ValueError(f"{name} count mismatch")
-            for fid in resident_fids:
-                view.fact_record(fid)
+            candidate_fids = frozenset(archive.records)
         except Exception as error:
             self._snapshot_errors[cache_key] = error
             raise
-        self._snapshot_fids[cache_key] = resident_fids
-        return resident_fids
+        self._snapshot_fids[cache_key] = candidate_fids
+        return candidate_fids
 
     def _fail(self, event, reason):
         diagnostic = getattr(self.bucket, "diagnostic", None)

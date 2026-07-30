@@ -5,16 +5,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from core import (
-    merkle_map, close, cmds, daemon, fact, manifest, object_store, runtime, sync,
+    admission as admission_module, admission_proof, close, cmds, daemon,
+    fact, merkle_map,
+    object_store, runtime, snapshot, sync,
 )
 from core.crypto import h
 from core.fact import Fact, canon
+from core.ingress import stage_pile
 from core.limits import PayloadTooLarge
 from core.node import Node
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from facts.content import message as message_family
-from tests.util import closed_subset, deliver
+from tests.util import all_fids, closed_subset, deliver
 
 
 def poisoned_timestamp_pile(workspace):
@@ -70,11 +73,9 @@ def queued_messages(tmp_path):
     destination.add_workspace(workspace, "source", [])
     first_raw = closed_subset(source, workspace, [first])
     second_raw = closed_subset(source, workspace, [second])
-    first_key = f"pile/0000000000000000/{h(first_raw)}"
-    second_key = f"pile/ffffffffffffffff/{h(second_raw)}"
-    deliver(
+    first_key = deliver(
         destination, workspace, first_raw, member="0000000000000000")
-    deliver(
+    second_key = deliver(
         destination, workspace, second_raw, member="ffffffffffffffff")
     return (
         destination, workspace,
@@ -88,14 +89,14 @@ def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    decode = runtime.decode_pile
+    decode = admission_module.decode_pile
 
     def program_failure(raw, expected_workspace):
         if raw == first_raw:
             raise ValueError("simulated decoder programming failure")
         return decode(raw, expected_workspace)
 
-    monkeypatch.setattr(runtime, "decode_pile", program_failure)
+    monkeypatch.setattr(admission_module, "decode_pile", program_failure)
     node.turn(workspace)
 
     assert node.store(workspace).get(first_key) == first_raw
@@ -153,7 +154,8 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
     second_fid, _, second_key = second
     store = node.store(workspace)
     if boundary == "program":
-        original = node.commit
+        membrane = node.admission(workspace)
+        original = membrane.commit_ingress
         calls = 0
 
         def fail_first(*args, **kwargs):
@@ -163,7 +165,7 @@ def test_failed_publication_is_isolated_from_the_next_pile_and_retries(
                 raise RuntimeError("simulated publication program failure")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(node, "commit", fail_first)
+        monkeypatch.setattr(membrane, "commit_ingress", fail_first)
     else:
         original = store.cas
         calls = 0
@@ -203,14 +205,15 @@ def test_retryable_failure_never_ages_into_destructive_quarantine(
     node, workspace, first, second = queued_messages(tmp_path)
     first_fid, first_raw, first_key = first
     second_fid, _, second_key = second
-    commit = node.commit
+    membrane = node.admission(workspace)
+    commit = membrane.commit_ingress
 
-    def fail_first_pile(*args, **kwargs):
-        if node.fact_of(workspace, first_fid) is not None:
+    def fail_first_pile(admission, *args, **kwargs):
+        if admission.source == first_key:
             raise OutcomeUnknown("persistent provider outage for this pile")
-        return commit(*args, **kwargs)
+        return commit(admission, *args, **kwargs)
 
-    monkeypatch.setattr(node, "commit", fail_first_pile)
+    monkeypatch.setattr(membrane, "commit_ingress", fail_first_pile)
 
     for _ in range(12):
         node.turn(workspace)
@@ -234,11 +237,12 @@ def test_failed_authoritative_restore_stops_before_the_next_pile(
     def fail_commit(*_args, **_kwargs):
         raise RuntimeError("simulated publication failure")
 
-    def fail_restore(_workspace):
+    def fail_restore():
         raise OutcomeUnknown("authoritative root unavailable")
 
-    monkeypatch.setattr(node, "commit", fail_commit)
-    monkeypatch.setattr(node, "_restore_authoritative_state", fail_restore)
+    membrane = node.admission(workspace)
+    monkeypatch.setattr(membrane, "commit_ingress", fail_commit)
+    monkeypatch.setattr(membrane, "restore", fail_restore)
 
     with pytest.raises(
             OutcomeUnknown, match="authoritative root unavailable"):
@@ -271,9 +275,9 @@ def test_rejection_retirement_requires_exact_durable_evidence(
     node = Node(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     bad = poisoned_timestamp_pile(workspace)
-    bad_key = f"pile/0000000000000000/{h(bad)}"
     good = closed_subset(source, workspace, [survivor])
-    deliver(node, workspace, bad, member="0000000000000000")
+    bad_key = deliver(
+        node, workspace, bad, member="0000000000000000")
     deliver(node, workspace, good, member="ffffffffffffffff")
     store = node.store(workspace)
 
@@ -325,7 +329,7 @@ def test_rejection_retirement_requires_exact_durable_evidence(
 
 
 def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
-        tmp_path):
+        tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = cmds.create(source, "source", ts=1)
     survivor = cmds.post(source, workspace, "general", "survives", ts=2)
@@ -342,9 +346,18 @@ def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
         closed_subset(source, workspace, [survivor]),
         member="ffffffffffffffff")
 
+    listed = []
+    list_keys = node.store(workspace).list
+
+    def observe_list(prefix):
+        listed.append(prefix)
+        return list_keys(prefix)
+
+    monkeypatch.setattr(node.store(workspace), "list", observe_list)
     node.turn(workspace)
 
     assert node.fact_of(workspace, survivor) is not None
+    assert not any(prefix.startswith("failed/") for prefix in listed)
     failure = node.ingress_failures(workspace)[0]
     assert failure["error"] == "KernelRejected: ingress rejected"
     assert node.store(workspace).get(
@@ -361,15 +374,16 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     second.add_workspace(workspace, "shared", [])
     second.rebuild(workspace)
     bad = poisoned_timestamp_pile(workspace)
-    source = f"pile/0000000000000000/{h(bad)}"
-    first.store(workspace).put(source, bad)
+    source = stage_pile(
+        first.store(workspace), "0000000000000000", bad)
 
     listed = threading.Barrier(2)
     retiring = threading.Barrier(2)
     for node in (first, second):
         store = node.store(workspace)
+        membrane = node.admission(workspace)
         list_keys = store.list
-        retire = node._retire_ingress_exact
+        retire = membrane._retire_rejected
 
         def synchronized_list(prefix, list_keys=list_keys):
             keys = list_keys(prefix)
@@ -377,13 +391,12 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
                 listed.wait(timeout=5)
             return keys
 
-        def synchronized_retire(
-                ws, key, raw, retire=retire):
+        def synchronized_retire(key, raw, receipt, retire=retire):
             retiring.wait(timeout=5)
-            return retire(ws, key, raw)
+            return retire(key, raw, receipt)
 
         monkeypatch.setattr(store, "list", synchronized_list)
-        monkeypatch.setattr(node, "_retire_ingress_exact",
+        monkeypatch.setattr(membrane, "_retire_rejected",
                             synchronized_retire)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -435,13 +448,13 @@ def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
     root["removals"] = {"oid": "", "fp": ""}
 
     with pytest.raises(ValueError, match="root shape"):
-        manifest.decode_root(canon(root))
+        snapshot.decode_root(canon(root))
 
 
 @pytest.mark.parametrize("decoder", [
     close.decode_pile,
-    manifest.decode_root,
-    sync._sibling_keys,
+    snapshot.decode_root,
+    admission_proof.decode,
     fact.decode,
 ])
 def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
@@ -461,7 +474,7 @@ def test_merkle_map_parser_recursion_is_also_a_value_error():
         merkle_map._decode(nested, h(nested), h(b"seed"))
 
 
-def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
+def test_pile_root_and_proof_codecs_reject_size_before_parsing(monkeypatch):
     workspace = "0" * 64
     cases = (
         (
@@ -469,8 +482,13 @@ def test_pile_root_and_sibling_codecs_reject_size_before_parsing(monkeypatch):
             lambda raw: close.decode_pile(raw, workspace),
             canon({"ws": workspace, "facts": []}),
         ),
-        (manifest, "MAX_ROOT_BYTES", manifest.decode_root, b'{"stamp":"x"}'),
-        (sync, "MAX_OBJECT_BYTES", sync._sibling_keys, b'{"keys":[]}'),
+        (snapshot, "MAX_ROOT_BYTES", snapshot.decode_root, b'{"stamp":"x"}'),
+        (
+            admission_proof,
+            "MAX_OBJECT_BYTES",
+            admission_proof.decode,
+            b'{"schema":"admission-proof-v1"}',
+        ),
     )
     for module, limit, decoder, raw in cases:
         monkeypatch.setattr(module, limit, len(raw) - 1)
@@ -507,3 +525,85 @@ def test_daemon_body_rejects_claimed_oversize_without_reading():
 
     with pytest.raises(PayloadTooLarge):
         handler._body(8)
+
+
+def test_repeated_retirement_failures_reuse_one_publication_capability(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = cmds.create(node, "alice", ts=1)
+    raw = close.encode_pile((), workspace=workspace)
+    source = stage_pile(
+        node.store(workspace), node.member_for(workspace), raw)
+    store = node.store(workspace)
+    real_delete = store.delete
+    membrane = node.admission(workspace)
+    real_admit = membrane.admit_ingress
+    admits = {"count": 0}
+
+    def observed_admit(*args, **kwargs):
+        admits["count"] += 1
+        return real_admit(*args, **kwargs)
+
+    def failed_delete(_key):
+        raise OSError("injected retirement outage")
+
+    monkeypatch.setattr(membrane, "admit_ingress", observed_admit)
+    monkeypatch.setattr(store, "delete", failed_delete)
+
+    for _ in range(5):
+        node.turn(workspace)
+
+    assert store.get(source) == raw
+    assert admits["count"] == 1
+    assert len(membrane._receipts) == 1
+
+    monkeypatch.setattr(store, "delete", real_delete)
+    node.turn(workspace)
+    assert store.get(source) is None
+    assert membrane._receipts == {}
+
+
+def test_distinct_failed_admissions_do_not_accumulate_bound_pile_bytes(
+        tmp_path, monkeypatch):
+    source = Node(str(tmp_path / "source"))
+    workspace = cmds.create(source, "alice", ts=1)
+    bootstrap = closed_subset(
+        source, workspace, all_fids(source, workspace))
+    fids = [
+        cmds.post(
+            source, workspace, "general", f"failed-{ordinal}",
+            ts=10 + ordinal)
+        for ordinal in range(8)
+    ]
+    raws = [
+        closed_subset(source, workspace, [fid])
+        for fid in fids
+    ]
+    assert len(set(raws)) == 8
+
+    node = Node(str(tmp_path / "node"))
+    node.add_workspace(workspace, "alice", peers=[])
+    deliver(node, workspace, bootstrap)
+    node.turn(workspace)
+    store = node.store(workspace)
+    queued = {
+        deliver(
+            node, workspace, raw,
+            member=f"{ordinal:016x}",
+        ): raw
+        for ordinal, raw in enumerate(raws)
+    }
+    assert len(queued) == 8
+    membrane = node.admission(workspace)
+
+    def fail_publish(_admission, **_options):
+        raise OSError("injected publication outage")
+
+    monkeypatch.setattr(membrane, "commit_ingress", fail_publish)
+    node.turn(workspace)
+
+    assert set(store.list("pile/")) == set(queued)
+    assert all(store.get(key) == raw for key, raw in queued.items())
+    assert membrane._bounds == {}
+    assert membrane._receipts == {}
+    assert len(node.ingress_attempt_failures(workspace)) == len(queued)

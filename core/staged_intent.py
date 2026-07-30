@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import facts
 from .close import decode_pile, encode_pile
 from .crypto import h
-from .ingress import InvalidStagedIntent
+from .ingress import InvalidStagedIntent, stage_pile
 from .limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
 from .shape import valid_fid
 
@@ -144,6 +144,21 @@ class InvalidStagedObject(ValueError):
     """One staged attachment cannot promote; it does not reject the pile."""
 
 
+def promote_staged_pile(store, intent):
+    """Copy one verified session intent to a fresh internal work generation.
+
+    Upload credentials can address only ``intent.key`` in the isolated
+    staging namespace.  The trusted publisher creates this distinct canonical
+    key with an independent random generation and never returns it to the
+    uploader.  Therefore replaying a still-valid or in-flight staging PUT
+    cannot recreate a canonical generation after its receipt retires it.
+    Staging-object lifecycle cleanup is deliberately a separate operation.
+    """
+    if not isinstance(intent, StagedPileIntent):
+        raise TypeError("staged pile intent")
+    return stage_pile(store, intent.member, intent.raw)
+
+
 def decode_staged_pile(configured_workspace, key, raw):
     """Bind one exact pile marker to canonical facts and required objects."""
     if not valid_fid(configured_workspace):
@@ -236,6 +251,7 @@ __all__ = (
     "StagedObjectsPending",
     "StagedPileIntent",
     "StagingAddress",
+    "promote_staged_pile",
     "confirm_staged_object",
     "decode_staged_pile",
     "parse_staging_key",

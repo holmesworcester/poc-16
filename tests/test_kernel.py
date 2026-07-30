@@ -1,10 +1,14 @@
 """Adversarial kernel tests: the judge rejects what it must, whole units."""
+import sqlite3
 
 import pytest
 
+import facts
+from core import catalog
 from core.close import close
 from core.crypto import keypair, sign
-from core.fact import Fact
+from core.fact import Fact, Need, encode
+from core import settlement
 from facts.auth.admin import admin
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
@@ -16,10 +20,13 @@ from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
 from facts.content.message import message
 from core.kernel import (
+    ResolvedEdge,
     drain,
+    rebuild_proofs,
     validate,
 )
 from core.node import now_ms
+from facts._policy import FamilyPolicy
 
 
 @pytest.fixture
@@ -339,3 +346,113 @@ def test_single_judge_loop():
         and node.func.id == "_judge"
         for node in ast.walk(defs["kernel"])
     )
+
+
+@pytest.mark.parametrize(
+    ("chain_length", "consumer_is_eligible"),
+    ((254, True), (255, False)),
+)
+def test_provider_rewire_obeys_same_256_fact_closure_bound_hot_and_cold(
+        monkeypatch, chain_length, consumer_is_eligible):
+    """A longer canonical winner cannot create a hot-only proof.
+
+    The consumer is first admitted through a rank-zero provider.  Removing
+    that winner rewires its one named need to a provider whose own proof is
+    still legal.  At 254 ancestors the resulting consumer closure is exactly
+    256 facts; at 255 it would be 257 and must become dormant in both engines.
+    """
+    tag = "test_closure_rewire"
+    anchor = "a" * 64
+
+    class RewireFamily:
+        TAG = tag
+        POLICY = FamilyPolicy()
+        DURABLE = True
+
+        @staticmethod
+        def needs(fact):
+            return (Need("provider", "test.provider", "target"),) \
+                if fact.body.get("consumer") else ()
+
+        @staticmethod
+        def validate(fact, _ctx):
+            return fact.t == tag
+
+    real_family_for = facts.family_for
+    monkeypatch.setattr(
+        facts,
+        "family_for",
+        lambda candidate: RewireFamily
+        if candidate == tag else real_family_for(candidate),
+    )
+
+    chain = []
+    parent = None
+    for ordinal in range(chain_length):
+        atoms = [] if parent is None else [["ref", "parent", parent]]
+        fact = Fact(tag, ordinal + 1, atoms, {"chain": ordinal}, anchor)
+        chain.append(fact)
+        parent = fact.fid
+    short = Fact(
+        tag, chain_length + 1,
+        [["offer", "test.provider", "target"]],
+        {"provider": "short"},
+        anchor,
+    )
+    long = Fact(
+        tag, chain_length + 2,
+        [
+            ["ref", "parent", parent],
+            ["offer", "test.provider", "target"],
+        ],
+        {"provider": "long"},
+        anchor,
+    )
+    consumer = Fact(
+        tag, chain_length + 3, [], {"consumer": True}, anchor)
+    all_candidates = {
+        fact.fid: fact
+        for fact in (*chain, short, long, consumer)
+    }
+
+    db = sqlite3.connect(":memory:")
+    db.executescript(catalog.SCHEMA)
+    for fact in all_candidates.values():
+        db.execute(
+            "INSERT INTO facts VALUES(?,?)", (fact.fid, encode(fact)))
+        db.executemany(
+            "INSERT INTO fact_index VALUES(?,?,?,?)",
+            catalog.index_rows(fact),
+        )
+
+    def hot_standing():
+        ranks = dict(db.execute(
+            "SELECT fid, rank FROM proofs ORDER BY fid"))
+        edges = {}
+        for source, role, target, kind in db.execute(
+                "SELECT src, role, dst, kind FROM edges ORDER BY src, role"):
+            edges.setdefault(source, []).append(
+                ResolvedEdge(role, target, kind))
+        return {
+            fid: (rank, tuple(edges.get(fid, ())))
+            for fid, rank in ranks.items()
+        }
+
+    assert not rebuild_proofs(
+        db, all_candidates.get, anchor, fids=all_candidates)
+    assert hot_standing() == settlement.project(
+        anchor, all_candidates).standing
+    assert consumer.fid in hot_standing()
+
+    rewired = dict(all_candidates)
+    rewired.pop(short.fid)
+    db.execute("DELETE FROM fact_index WHERE src=?", (short.fid,))
+    db.execute("DELETE FROM facts WHERE fid=?", (short.fid,))
+    unresolved = rebuild_proofs(
+        db, rewired.get, anchor, fids=rewired)
+    projected = settlement.project(anchor, rewired)
+
+    assert hot_standing() == projected.standing
+    assert (consumer.fid in hot_standing()) is consumer_is_eligible
+    assert (consumer.fid in unresolved) is not consumer_is_eligible
+    assert long.fid in hot_standing()

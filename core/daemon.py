@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 import facts
 
-from . import cmds, manifest, mint as gate, peer_capability, shape
+from . import cmds, mint as gate, peer_capability, shape, snapshot
 from .crypto import h, seal_to
 from .fetch_budget import BudgetedFetch
 from .grants import check_token as _check_token
@@ -36,6 +36,7 @@ from .limits import (
 )
 from .node import Node, now_ms
 from .object_store import ensure_object
+from .ingress import stage_pile
 from .runtime import AuthorityRejected
 from .sync import sync
 
@@ -229,7 +230,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400)
             if h(b) != parts[2]:
                 return self._send(400)
-            self.node.store(ws).put(f"pile/{m}/{parts[2]}", b)
+            # The authenticated HTTP path names bytes, not their durable
+            # generation. The receiving host mints that nonce internally so
+            # a peer cannot recreate a retired object at the same store key.
+            stage_pile(self.node.store(ws), m, b)
             self.node.turn(ws)  # drain on receipt — a pushed pile needs no poke
             return self._send(204)  # delivery receipt; acceptance is the judge
         self._send(403)
@@ -319,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
                 root = self.node.store(ws).get("root")
                 if not root:
                     return self._send(403)
-                anchor = manifest.decode_root(root).anchor
+                anchor = snapshot.decode_root(root).anchor
             except Exception:
                 return self._send(403)
             if anchor != ws:

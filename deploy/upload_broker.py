@@ -12,7 +12,7 @@ import json
 import secrets
 from urllib.parse import urlsplit
 
-from core import manifest, mint
+from core import mint, snapshot
 from core.limits import (
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_FETCHES,
@@ -312,7 +312,7 @@ class UploadBroker:
         try:
             root = await self._get("root", MAX_ROOT_BYTES)
             if not root \
-                    or manifest.decode_root(root).anchor != self.workspace:
+                    or snapshot.decode_root(root).anchor != self.workspace:
                 raise UploadUnavailable("workspace root unavailable")
         except UploadUnavailable:
             raise

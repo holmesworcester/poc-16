@@ -1,9 +1,9 @@
-"""close(): the canonical-topo serializer, and the ingress unit codec.
+"""close(): the canonical-topo serializer, and the wire ingress unit codec.
 
-Ingress, request, and invite piles use the same ordered fact-list codec
-(+ attached blobs) — and so does a settled home leaf: one pile codec serves
-the wire and residence alike, so a fact's bytes live once and a resident leaf
-decodes with the reader the ingress already has.
+Ingress, request, invite, and sync-push piles use the same ordered fact-list
+codec (+ attached blobs). Published fact bodies instead have one canonical
+content-addressed residence; FactOrder stores only key-to-object references
+and deliberately does not introduce a second body or pile codec.
 close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.

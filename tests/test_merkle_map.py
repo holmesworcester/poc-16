@@ -59,6 +59,64 @@ def test_exact_reads_are_bounded_and_missing_is_authenticated():
     assert reader.pages_read <= built.page_depth
 
 
+@pytest.mark.parametrize("field", ("count", "depth"))
+@pytest.mark.parametrize("surface", ("get", "known-items", "same-root-diff"))
+def test_reader_rejects_forged_outer_metadata_on_every_root_decode(
+        field, surface):
+    objects = {}
+    built = merkle_map.build(rows(40), SEED, emitter(objects))
+    expected = {
+        "count": built.count,
+        "depth": built.page_depth,
+    }
+    expected[field] += 1
+    fetched = []
+
+    def fetch(oid):
+        fetched.append(oid)
+        return objects.get(oid)
+
+    def reader():
+        return merkle_map.Reader(
+            built.root, SEED, fetch,
+            max_page_depth=expected["depth"],
+            expected_count=expected["count"],
+            expected_depth=expected["depth"])
+
+    hostile = reader()
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        if surface == "get":
+            hostile.get(rows(40)[0][0])
+        elif surface == "known-items":
+            hostile.items(
+                {built.root: objects[built.root]},
+                max_pages=max(1, 2 * built.count - 1))
+        else:
+            hostile.diff_page(reader())
+    if surface == "same-root-diff":
+        # Equal roots need one authenticated decode, not two store reads.
+        assert fetched == [built.root]
+
+
+@pytest.mark.parametrize("field", ("count", "depth"))
+def test_incremental_update_rejects_forged_outer_metadata_before_emit(field):
+    objects = {}
+    built = merkle_map.build(rows(40), SEED, emitter(objects))
+    expected = {
+        "count": built.count,
+        "depth": built.page_depth,
+    }
+    expected[field] += 1
+    emitted = []
+
+    with pytest.raises(ValueError, match="merkle map root metadata"):
+        merkle_map.update(
+            built.root, SEED, (), objects.get, emitted.append,
+            expected_count=expected["count"],
+            expected_depth=expected["depth"])
+    assert emitted == []
+
+
 def test_neighbor_reads_are_bounded_and_match_ordered_map():
     objects = {}
     built = merkle_map.build(rows(), SEED, emitter(objects))
