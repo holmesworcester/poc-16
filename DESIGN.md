@@ -264,6 +264,45 @@ arrives last, commits the workspace, member, session, and declared object
 digests, and is the only durable ready marker; loose staged objects and event
 notifications are not publication work by themselves.
 
+The logical protocol uses isolated ingress on both providers. “Direct” means
+the client sends immutable bytes to S3 or R2 itself; the authorization broker
+does not proxy the body, and the later publisher only validates and promotes
+the stored value. AWS-native canonical PUT remains a possible measured
+optimization, not a second client protocol.
+
+Large sessions stay database-free by fixing their complete authority set
+before any PUT is issued:
+
+1. `OPEN` validates one workspace-bound `upload` proof and commits a bounded,
+   strictly digest-sorted, unique vector of `(sha256, size)` leaves, its count
+   and total bytes, and one pile digest and size. The broker chooses the
+   session nonce and fixed expiry and returns an authenticated cursor at index
+   zero.
+2. `ISSUE` accepts a contiguous range of at most `PAGE_BATCH` leaves plus a
+   Merkle range proof against that fixed commitment. It derives exact object
+   keys and advances only the committed prefix.
+3. `FINALIZE` requires the complete committed prefix and derives the sole pile
+   key fixed by `OPEN`; it accepts no replacement descriptor or path.
+
+The constant-size cursor binds protocol version, issuer/provider, key id,
+workspace, member, session, fixed manifest root/count/bytes, pile digest/size,
+next index, issued bytes, last digest, and fixed expiry under an
+HMAC-SHA-256 deployment key. Old keys remain available for at least the
+maximum session lifetime plus skew. Merkle leaves and internal nodes are
+domain-separated and include the leaf position; the wrapped root also commits
+count and total bytes.
+
+An advancing rolling HMAC without the fixed Merkle vector is insufficient: an
+old cursor can be replay-forked into arbitrarily many different suffixes under
+one session. With the fixed vector, all forks are confined to the same finite
+keys and valid batch partitions converge to the same cursor. Exact batch and
+finalization replay deliberately reissue the same authority so a lost response
+is recoverable. Rejecting such replay while remaining stateless is impossible;
+provider state is introduced only if the product later requires exactly-once
+quota charging or recovery after a client loses its cursor. Authorization
+order does not prove network completion. A publisher that sees the pile first
+retains it until every referenced object is present and valid.
+
 R2 long-lived bucket-item credentials cannot be restricted to a workspace
 prefix. `Object Read only` also includes LIST. Consequently the generated
 read policy is tenant-safe only when the canonical bucket is dedicated to the

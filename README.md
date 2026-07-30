@@ -162,18 +162,24 @@ multi-batch client, or database-free publisher.
 
 After proving workspace upload authority, a client will receive short-lived
 capabilities for exact broker-chosen upload keys, upload file objects first,
-and finally upload one exact closed-pile publication intent. A provider that
-can prove the complete request may target canonical `obj/<sha256>` and
-`pile/<member>/<sha256>` keys directly. An isolated-ingress deployment uses
-session-scoped staging keys and lets the publisher promote only verified
-SHA-256 objects. In either case a conforming request binds a
-collision-resistant body digest, an exact length or hard byte ceiling, expiry,
-and create-only semantics; clients receive no LIST, DELETE, or `root`
-permission. An S3/R2 object-created event, authenticated poke, or scheduled
-scan wakes a database-free publisher. That publisher validates the pile and
-objects, updates the authenticated trees, CASes `root`, and retires ingress
-only after the committed root proves publication. A lost event or poke affects
-latency, not durability.
+and finally upload one exact closed-pile publication intent. The selected
+common flow uses session-scoped isolated ingress on both S3 and R2, then lets
+the publisher promote only verified SHA-256 objects. AWS could enforce a
+canonical content-addressed PUT directly, but using that provider-specific
+shortcut would give clients two recovery protocols and put abandoned,
+unvalidated uploads in the canonical namespace; it remains an optimization to
+justify with measurements rather than the default design.
+
+This is still direct-to-object-store upload: the file and pile bytes travel
+from the client to the ingress bucket, not through the broker, Lambda, or
+Worker. The broker handles only a bounded authorization proof and returns
+bearer PUT requests. Each request binds a collision-resistant body digest, an
+exact length or hard byte ceiling, expiry, and create-only semantics; clients
+receive no LIST, DELETE, or `root` permission. An S3/R2 object-created event,
+authenticated poke, or scheduled scan wakes a database-free publisher. That
+publisher validates the pile and objects, updates the authenticated trees,
+CASes `root`, and retires ingress only after the committed root proves
+publication. A lost event or poke affects latency, not durability.
 
 The AWS translator signs the exact `Content-Length`, `Content-Type`,
 `If-None-Match: *`, and `x-amz-checksum-sha256` headers of one S3 `PutObject`
@@ -251,6 +257,18 @@ from validated descriptor authority; the client does not supply a free-form
 key. Objects are uploaded first. The closed pile/intention is uploaded last
 and is the sole durable ready marker. Loose objects do not cause publication,
 and an event for the final pile only reduces wake latency.
+
+One broker call is currently bounded to `PAGE_BATCH` descriptors and creates a
+fresh session, so it is not yet the multi-thousand-object client protocol. The
+target opens a session by committing a finite, sorted `(digest, size)` vector
+under a domain-separated Merkle root. A constant-size authenticated cursor
+then proves and issues contiguous batches of at most `PAGE_BATCH`; finalization
+is possible only after the whole committed vector and can issue only the one
+pile digest fixed when the session opened. Replayed or forked cursors may
+reissue already committed exact keys, but cannot enlarge or replace the finite
+authority set. This keeps the broker database-free. A client that loses its
+opaque cursor starts a new session, and lifecycle collection removes the
+abandoned ingress.
 
 This is a provider boundary, not a Python convention: compromising the
 write-capable ingress parent still cannot address the canonical bucket. It is
