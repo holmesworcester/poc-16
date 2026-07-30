@@ -14,6 +14,7 @@ from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
 from core.ingress import InvalidPile
+from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
 from core.node import Node
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
@@ -222,8 +223,14 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
     })).decode()
 
     class Response:
-        def read(self):
+        headers = {}
+
+        def read(self, maximum):
+            assert maximum == MAX_OBJECT_BYTES + 1
             return b"encrypted"
+
+        def close(self):
+            pass
 
     monkeypatch.setattr(
         user_family.urllib.request, "urlopen",
@@ -237,6 +244,86 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
 
     assert node.workspaces() == []
     assert json.dumps(node.keyring, sort_keys=True) == before
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_invite_redemption_bounds_and_closes_untrusted_http_body(
+        tmp_path, monkeypatch, declared):
+    node = Node(str(tmp_path / "joiner"))
+    workspace = "0" * 64
+    link = base64.urlsafe_b64encode(canon({
+        "u": "https://invite.invalid",
+        "ws": workspace,
+        "s": "01" * 32,
+    })).decode()
+
+    class Response:
+        headers = {
+            "Content-Length": "9",
+        } if declared else {}
+
+        def __init__(self):
+            self.reads = []
+            self.closed = False
+
+        def read(self, maximum):
+            self.reads.append(maximum)
+            return b"x" * maximum
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr(user_family, "MAX_OBJECT_BYTES", 8)
+    monkeypatch.setattr(
+        user_family.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: response)
+
+    with pytest.raises(PayloadTooLarge, match="invite response"):
+        user_family.accept(node, link, "new member")
+
+    assert response.reads == ([] if declared else [9])
+    assert response.closed is True
+
+
+def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "joiner"))
+    workspace = "0" * 64
+    link = base64.urlsafe_b64encode(canon({
+        "u": "https://invite.invalid",
+        "ws": workspace,
+        "s": "01" * 32,
+    })).decode()
+
+    class Response:
+        headers = {"Content-Length": "8"}
+
+        def __init__(self):
+            self.closed = False
+
+        @staticmethod
+        def read(maximum):
+            assert maximum == 9
+            return b"x" * 8
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr(user_family, "MAX_OBJECT_BYTES", 8)
+    monkeypatch.setattr(
+        user_family.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: response)
+
+    def decrypt(_key, encrypted):
+        assert encrypted == b"x" * 8
+        return b"{}"
+
+    monkeypatch.setattr(user_family, "box_decrypt", decrypt)
+    with pytest.raises(ValueError, match="invite workspace"):
+        user_family.accept(node, link, "new member")
+    assert response.closed is True
 
 
 def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):

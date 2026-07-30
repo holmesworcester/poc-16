@@ -412,13 +412,13 @@ def test_candidate_proof_sync_carries_actions_and_their_projection(
             self.node, self.ws = node, ws
             self.cache = node.sync_cache.setdefault((ws, url), {})
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             return (
                 source.store(self.ws).get("root"),
                 h(source.store(self.ws).get("root")),
             )
 
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             return source.store(self.ws).get("obj/" + oid)
 
         def objs(self, oids):
@@ -472,12 +472,12 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
             self.ws = ws
             self.cache = node.sync_cache.setdefault((ws, url), {})
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             raw = store.get("root")
             current = h(raw)
             return None if etag == current else (raw, current)
 
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             return b"not the claimed object" \
                 if self.poisoned and oid == poisoned_evidence \
                 else store.get("obj/" + oid)

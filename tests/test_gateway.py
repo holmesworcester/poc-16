@@ -34,6 +34,24 @@ def call(gateway, method, path, query=None, headers=None, body=b""):
         gateway.handle(method, path, query, headers, body))
 
 
+def test_gateway_has_no_whole_object_read_fallback():
+    class WholeOnly:
+        gets = 0
+
+        async def get(self, _key):
+            self.gets += 1
+            raise AssertionError("whole-object fallback was used")
+
+    store = WholeOnly()
+    gateway = Gateway(
+        store, "0" * 64, b"s" * 32, lambda: 0)
+
+    response = call(gateway, "GET", "/readyz")
+
+    assert response.status == 503
+    assert store.gets == 0
+
+
 def mint(node, workspace, pile, gateway):
     response = call(
         gateway,

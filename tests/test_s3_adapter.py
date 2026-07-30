@@ -653,6 +653,44 @@ def test_list_objects_v2_reads_every_page_with_bounded_exact_requests():
     ]
 
 
+def test_list_page_caps_a_larger_caller_budget_to_the_store_page_size():
+    client = ScriptedClient(list_objects_v2=[{
+        "Contents": [],
+        "IsTruncated": False,
+    }])
+    store = S3Store(config(list_page_size=2), client=client)
+
+    page = store.list_page("pile/", None, 256)
+
+    assert page.keys == ()
+    assert page.cursor is None
+    assert client.calls == [("list_objects_v2", {
+        "Bucket": "test-bucket",
+        "Prefix": "tenant/workspace/pile/",
+        "MaxKeys": 2,
+        "ExpectedBucketOwner": "123456789012",
+    })]
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_list_page_rejects_provider_response_over_effective_limit(
+        duplicate):
+    keys = [
+        "tenant/workspace/pile/member/a",
+        "tenant/workspace/pile/member/b",
+        "tenant/workspace/pile/member/c",
+    ]
+    if duplicate:
+        keys = [keys[0]] * 3
+    store = S3Store(config(), client=ScriptedClient(list_objects_v2=[{
+        "Contents": [{"Key": key} for key in keys],
+        "IsTruncated": False,
+    }]))
+
+    with pytest.raises(StoreError, match="requested page limit"):
+        store.list_page("pile/", None, 2)
+
+
 @pytest.mark.parametrize("second_page", [False, True])
 def test_list_rejects_nonadvancing_or_over_bound_pagination(second_page):
     pages = [{

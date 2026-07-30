@@ -1,13 +1,16 @@
 """The process CLI and daemon are transports for family-owned commands."""
+import io
 import json
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 
 import facts
 from core import cli, daemon
+from core.limits import PayloadTooLarge
 from core.node import Node
-from core.runtime import AuthorityRejected
+from core.pile_sender import AuthorityRejected
 
 
 EXPECTED = {
@@ -37,6 +40,20 @@ def test_checked_registry_is_exactly_the_union_of_family_declarations():
     assert facts.COMMANDS == declared
     assert set(facts.COMMANDS) == EXPECTED
     assert all(path.count(".") >= 2 for path in facts.COMMANDS)
+
+
+def test_ephemeral_proof_constructors_are_family_owned_and_purpose_keyed():
+    declared = {
+        purpose: command
+        for module in facts.MODULES
+        for purpose, command in getattr(module, "PROOF_COMMANDS", {}).items()
+    }
+    assert facts.PROOF_COMMANDS == declared
+    assert set(facts.PROOF_COMMANDS) == {"sync", "upload"}
+    assert all(
+        command.__module__.startswith("facts.")
+        for command in facts.PROOF_COMMANDS.values()
+    )
 
 
 def test_registry_rejects_duplicates_bad_paths_and_noncallables():
@@ -168,6 +185,100 @@ def test_process_cli_forwards_path_and_tokens_without_application_parsing(
     )]
     assert json.loads(capsys.readouterr().out) == {
         "received": ["name=value", "two words"]}
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_control_success_response_is_bounded_before_json(
+        monkeypatch, declared):
+    class Response:
+        headers = {"Content-Length": "9"} if declared else {}
+
+        def __init__(self):
+            self.reads = []
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def read(self, maximum):
+            self.reads.append(maximum)
+            return b"x" * maximum
+
+    response = Response()
+    monkeypatch.setattr(cli, "MAX_CONTROL_BYTES", 8)
+    monkeypatch.setattr(
+        cli.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: response)
+
+    with pytest.raises(PayloadTooLarge, match="control response"):
+        cli.ctl("https://node.invalid", "test.command.run", [])
+
+    assert response.reads == ([] if declared else [9])
+    assert response.closed is True
+
+
+def test_exact_bound_control_response_reaches_json(monkeypatch):
+    raw = b"{}" + b" " * 6
+
+    class Response:
+        headers = {"Content-Length": str(len(raw))}
+
+        def __init__(self):
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        @staticmethod
+        def read(maximum):
+            assert maximum == 9
+            return raw
+
+    response = Response()
+    monkeypatch.setattr(cli, "MAX_CONTROL_BYTES", 8)
+    monkeypatch.setattr(
+        cli.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: response)
+
+    assert cli.ctl(
+        "https://node.invalid", "test.command.run", []) == {}
+    assert response.closed is True
+
+
+def test_control_error_response_is_bounded_and_closed(
+        monkeypatch, capsys):
+    class Body(io.BytesIO):
+        def __init__(self, raw):
+            super().__init__(raw)
+            self.reads = []
+
+        def read(self, maximum=-1):
+            self.reads.append(maximum)
+            return super().read(maximum)
+
+    body = Body(b"x" * 9)
+    error = urllib.error.HTTPError(
+        "https://node.invalid/ctl/command",
+        500,
+        "hostile endpoint",
+        {},
+        body,
+    )
+    monkeypatch.setattr(cli, "MAX_CONTROL_BYTES", 8)
+    monkeypatch.setattr(
+        cli, "ctl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    assert cli.main(["test.command.run"]) == 1
+    assert body.reads == [9]
+    assert body.closed is True
+    assert "hostile endpoint" in capsys.readouterr().err
 
 
 def test_command_discovery_is_sorted_and_needs_no_daemon(capsys):

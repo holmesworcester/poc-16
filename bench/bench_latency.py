@@ -25,6 +25,7 @@ import facts
 from core import snapshot
 from core import sync as sync_module
 from core.crypto import h
+from core.limits import MAX_OBJECT_BYTES
 from core.object_store import CREATED
 
 
@@ -43,18 +44,20 @@ class SameStorePeer:
         self.store = node.store(workspace)
         self.cache = node.sync_cache.setdefault((workspace, url), {})
 
-    def root(self, etag=None):
-        raw = self.store.get("root")
+    def root(self, etag=None, *, response_limit):
+        raw = self.store.get_bounded("root", response_limit)
         current = h(raw) if raw is not None else None
         if etag == current:
             return None
-        return self.store.get("root"), current
+        return raw, current
 
-    def obj(self, oid):
-        return self.store.get("obj/" + oid)
+    def obj(self, oid, *, response_limit):
+        return self.store.get_bounded("obj/" + oid, response_limit)
 
     def objs(self, oids):
-        return tuple(self.obj(oid) for oid in oids)
+        return tuple(
+            self.obj(oid, response_limit=MAX_OBJECT_BYTES)
+            for oid in oids)
 
     def put_pile(self, raw):
         raise AssertionError("same-root benchmark unexpectedly pushed")

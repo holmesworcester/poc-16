@@ -152,6 +152,63 @@ def test_native_r2_list_uses_truncation_and_opaque_cursors():
     ] == [None, "2", "4"]
 
 
+def test_native_r2_list_stops_at_one_over_the_provider_page_bound():
+    class Counted:
+        def __init__(self, values):
+            self.values = values
+            self.pulls = 0
+
+        def __iter__(self):
+            for value in self.values:
+                self.pulls += 1
+                yield value
+
+    objects = Counted([
+        R2Object("tenant/pile/member/a", b"", "a"),
+        R2Object("tenant/pile/member/a", b"", "a"),
+        R2Object("tenant/pile/member/a", b"", "a"),
+        R2Object("tenant/pile/member/never-read", b"", "b"),
+    ])
+
+    class Overlong(Bucket):
+        async def list(self, prefix, limit, cursor=None):
+            return Page(objects, False)
+
+    with pytest.raises(StoreError, match="requested page limit"):
+        run(R2BindingStore(Overlong(), "tenant").list_page(
+            "pile/", None, 2))
+    assert objects.pulls == 3
+
+
+@pytest.mark.parametrize("key, message", [
+    ("tenant/other/key", "out-of-prefix"),
+    ("tenant/pile/../key", "invalid logical key"),
+    ("tenant/pile/" + "x" * 1025, "invalid logical key"),
+    (object(), "non-string"),
+])
+def test_native_r2_list_rejects_malformed_provider_keys(key, message):
+    class Malformed(Bucket):
+        async def list(self, prefix, limit, cursor=None):
+            return Page([R2Object(key, b"", "etag")], False)
+
+    with pytest.raises(StoreError, match=message):
+        run(R2BindingStore(Malformed(), "tenant").list_page(
+            "pile/", None, 2))
+
+
+@pytest.mark.parametrize("next_cursor", [None, 7, object(), "same"])
+def test_native_r2_list_rejects_missing_malformed_or_repeated_cursor(
+        next_cursor):
+    class BadCursor(Bucket):
+        async def list(self, prefix, limit, cursor=None):
+            return Page([], True, next_cursor)
+
+    cursor = "same" if next_cursor == "same" else None
+    with pytest.raises(StoreError, match="cursor"):
+        run(R2BindingStore(BadCursor()).list_page(
+            "pile/", cursor, 2))
+
+
 def test_native_r2_list_rejects_unbounded_unique_cursors():
     class Endless(Bucket):
         async def list(self, prefix, limit, cursor=None):

@@ -892,13 +892,13 @@ def test_restoration_forces_a_followup_walk_for_the_restored_fact(
             self.node, self.ws, self.url = node, ws, url
             self.cache = node.sync_cache.setdefault((ws, url), {})
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             current = remote.store(self.ws).get("root")
             current_etag = h(remote.store(self.ws).get("root"))
             return None if etag == current_etag else (
                 current, current_etag)
 
-        def obj(self, object_hash):
+        def obj(self, object_hash, **_options):
             return remote.store(self.ws).get("obj/" + object_hash)
 
         def put_pile(self, body):

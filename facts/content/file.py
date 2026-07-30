@@ -239,10 +239,10 @@ def _state(store, descriptor, chunks):
                 or child["pk"] != body["pk"] \
                 or child["chan"] != body["chan"]:
             continue
-        raw = store.get("obj/" + child["cid"])
         try:
-            if raw is None or len(raw) > bao.MAX_PROOF_BYTES \
-                    or h(raw) != child["cid"]:
+            raw = store.get_bounded(
+                "obj/" + child["cid"], bao.MAX_PROOF_BYTES)
+            if raw is None or h(raw) != child["cid"]:
                 continue
             bao.verify(raw, body["root"], child["i"], body["size"])
         except Exception:
@@ -324,7 +324,8 @@ def _payloads(node, workspace, record, cids):
     store = node.store(workspace)
     return (
         bao.verify(
-            store.get("obj/" + cids[index]),
+            store.get_bounded(
+                "obj/" + cids[index], bao.MAX_PROOF_BYTES),
             record["root"], index, record["size"])
         for index in range(record["total"])
     )

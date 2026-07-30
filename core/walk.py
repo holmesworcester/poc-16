@@ -8,6 +8,7 @@ import facts as families
 
 from . import peer_capability
 from .crypto import h, unseal
+from .http_body import read_bounded
 from .limits import (
     MAX_CONTROL_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -54,17 +55,8 @@ class Peer:
             req.add_header("If-None-Match", etag)
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
-                claimed = r.headers.get("Content-Length")
-                if claimed is not None:
-                    try:
-                        length = int(claimed)
-                    except (TypeError, ValueError) as error:
-                        raise ValueError("peer content length") from error
-                    if length < 0 or length > response_limit:
-                        raise ValueError("peer response too large")
-                body = r.read(response_limit + 1)
-                if len(body) > response_limit:
-                    raise ValueError("peer response too large")
+                body = read_bounded(
+                    r, response_limit, "peer response")
                 return r.status, body, dict(r.headers)
         except urllib.error.HTTPError as e:
             if e.code == 304:
@@ -105,9 +97,12 @@ class Peer:
             "sync_profile": peer_capability.negotiate(token, o),
         })
 
-    def root(self, etag=None):
+    def root(self, etag=None, *, response_limit):
+        if type(response_limit) is not int \
+                or not 0 < response_limit <= MAX_ROOT_BYTES:
+            raise ValueError("peer root response limit")
         status, b, hdr = self._http(
-            "GET", "/root", etag=etag, response_limit=MAX_ROOT_BYTES)
+            "GET", "/root", etag=etag, response_limit=response_limit)
         response_etag = next(
             (value for name, value in hdr.items()
              if name.lower() == "etag"),
@@ -115,9 +110,12 @@ class Peer:
         )
         return None if status == 304 else (b, response_etag)
 
-    def obj(self, oh):
+    def obj(self, oh, *, response_limit):
+        if type(response_limit) is not int \
+                or not 0 < response_limit <= MAX_OBJECT_BYTES:
+            raise ValueError("peer object response limit")
         _, b, _ = self._http(
-            "GET", f"/page/{oh}", response_limit=MAX_OBJECT_BYTES)
+            "GET", f"/page/{oh}", response_limit=response_limit)
         return b
 
     def put_obj(self, oid, value):
@@ -145,7 +143,8 @@ class Peer:
                 # Batch responses are capped below the valid single-object
                 # limit. Fall back to the hash-addressed GET instead of making
                 # a large-but-valid canonical fact impossible to reconcile.
-                return (self.obj(oids[0]),)
+                return (self.obj(
+                    oids[0], response_limit=MAX_OBJECT_BYTES),)
             middle = len(oids) // 2
             return self.objs(oids[:middle]) + self.objs(oids[middle:])
         values = decode_json(
@@ -196,7 +195,7 @@ def _fetch_blobs(node, ws, peer):
         for oid in refs:
             if st.has("obj/" + oid):
                 continue
-            blob = peer.obj(oid)
+            blob = peer.obj(oid, response_limit=MAX_OBJECT_BYTES)
             if blob and h(blob) == oid:
                 node.receive_object(ws, oid, blob)
                 fetched = True

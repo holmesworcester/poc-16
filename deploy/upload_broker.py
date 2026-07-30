@@ -269,7 +269,7 @@ class UploadBroker:
         provider = getattr(signer, "provider_binding", None)
         if not valid_fid(workspace):
             raise ValueError("workspace")
-        if not callable(getattr(store, "get", None)) \
+        if not callable(getattr(store, "get_bounded", None)) \
                 or not callable(getattr(signer, "sign", None)) \
                 or not valid_provider_binding(provider) \
                 or not callable(now) or not callable(nonce) \
@@ -297,9 +297,7 @@ class UploadBroker:
         return trusted_now
 
     async def _get(self, key, maximum):
-        bounded = getattr(self.store, "get_bounded", None)
-        value = await bounded(key, maximum) \
-            if callable(bounded) else await self.store.get(key)
+        value = await self.store.get_bounded(key, maximum)
         if value is not None and (
                 not isinstance(value, bytes) or len(value) > maximum):
             raise PayloadTooLarge("upload broker read")

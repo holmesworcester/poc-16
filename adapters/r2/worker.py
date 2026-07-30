@@ -10,6 +10,7 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    ListPage,
     Versioned,
     VersionToken,
     authoritative_key,
@@ -56,7 +57,10 @@ class R2BindingStore:
 
     def _key(self, key):
         key = validate_key(key)
-        return f"{self.prefix}/{key}" if self.prefix else key
+        physical = f"{self.prefix}/{key}" if self.prefix else key
+        if len(physical.encode("ascii")) > 1024:
+            raise ValueError("R2 object key exceeds 1024 bytes")
+        return physical
 
     def _list_prefix(self, prefix):
         if not isinstance(prefix, str):
@@ -70,13 +74,44 @@ class R2BindingStore:
             physical += logical
         if trailing:
             physical += "/"
+        if len(physical.encode("ascii")) > 1024:
+            raise ValueError("R2 list prefix exceeds 1024 bytes")
         return physical
 
     def _logical(self, physical):
         base = f"{self.prefix}/" if self.prefix else ""
+        try:
+            oversized = len(physical.encode("ascii")) > 1024
+        except UnicodeEncodeError as error:
+            raise StoreError("R2 returned an invalid logical key") from error
+        if oversized:
+            raise StoreError("R2 returned an invalid logical key")
         if not physical.startswith(base):
             raise StoreError("R2 returned a key outside the configured prefix")
-        return physical[len(base):]
+        logical = physical[len(base):]
+        try:
+            return validate_key(logical)
+        except (TypeError, ValueError) as error:
+            raise StoreError("R2 returned an invalid logical key") from error
+
+    @staticmethod
+    def _page_objects(values, limit):
+        """Consume at most one object beyond the native LIST page budget."""
+        try:
+            iterator = iter(values)
+        except TypeError as error:
+            raise StoreError("R2 LIST objects are not iterable") from error
+        objects = []
+        try:
+            for _ in range(limit + 1):
+                objects.append(next(iterator))
+        except StopIteration:
+            pass
+        except Exception as error:
+            raise StoreError("R2 LIST object iteration failed") from error
+        if len(objects) > limit:
+            raise StoreError("R2 LIST exceeded the requested page limit")
+        return tuple(objects)
 
     @staticmethod
     async def _bytes(obj):
@@ -193,29 +228,55 @@ class R2BindingStore:
             key, value, onlyIf=condition)
         return STALE if result is None else Applied(self._token(result))
 
-    async def list(self, prefix):
-        physical, cursor, out = self._list_prefix(prefix), None, []
-        for _ in range(self.max_list_pages):
-            try:
-                options = {"prefix": physical, "limit": 1000}
-                if cursor is not None:
-                    options["cursor"] = cursor
-                page = await self.bucket.list(**options)
-                objects = tuple(page.objects)
-                truncated = page.truncated
-                next_cursor = page.cursor
-            except Exception as error:
+    async def list_page(self, prefix, cursor=None, limit=1000):
+        """Issue exactly one bounded native R2 LIST request."""
+        if type(limit) is not int or not 0 < limit <= 1000:
+            raise ValueError("R2 list page limit")
+        if cursor is not None and (
+                not isinstance(cursor, str) or not cursor):
+            raise ValueError("R2 list cursor")
+        physical = self._list_prefix(prefix)
+        try:
+            options = {"prefix": physical, "limit": limit}
+            if cursor is not None:
+                options["cursor"] = cursor
+            page = await self.bucket.list(**options)
+            objects = self._page_objects(page.objects, limit)
+            truncated = page.truncated
+            next_cursor = page.cursor
+        except StoreError:
+            raise
+        except Exception as error:
+            raise StoreError(
+                f"R2 list failed for {prefix}") from error
+        keys = set()
+        for obj in objects:
+            key = getattr(obj, "key", None)
+            if not isinstance(key, str):
+                raise StoreError("R2 LIST returned a non-string key")
+            if not key.startswith(physical):
                 raise StoreError(
-                    f"R2 list failed for {prefix}") from error
-            out.extend(self._logical(str(obj.key)) for obj in objects)
-            if not truncated:
+                    "R2 LIST returned an out-of-prefix key")
+            keys.add(self._logical(key))
+        keys = tuple(sorted(keys))
+        if not isinstance(truncated, bool):
+            raise StoreError("R2 LIST returned invalid truncation")
+        if not truncated:
+            return ListPage(keys, None)
+        if not isinstance(next_cursor, str) \
+                or not next_cursor or next_cursor == cursor:
+            raise StoreError("R2 LIST returned a repeated cursor")
+        return ListPage(keys, next_cursor)
+
+    async def list(self, prefix):
+        """Compatibility/admin helper; receiving code uses ``list_page``."""
+        cursor, out = None, set()
+        for _ in range(self.max_list_pages):
+            page = await self.list_page(prefix, cursor, 1000)
+            out.update(page.keys)
+            if page.cursor is None:
                 return sorted(out)
-            if next_cursor is None:
-                raise StoreError("R2 LIST returned no cursor")
-            next_cursor = str(next_cursor)
-            if not next_cursor or next_cursor == cursor:
-                raise StoreError("R2 LIST returned a repeated cursor")
-            cursor = next_cursor
+            cursor = page.cursor
         raise StoreError("R2 LIST exceeded page budget")
 
     async def delete(self, key):

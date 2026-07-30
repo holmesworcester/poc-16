@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 import re
 
-from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.limits import PayloadTooLarge
 from core.object_store import validate_key
 from deploy.cloudflare_upload.signer import R2SigV4
 
@@ -81,15 +81,7 @@ async def _bounded_response(response, maximum):
         raise PayloadTooLarge("R2 canonical object")
     stream = getattr(response, "body", None)
     if stream is None or not hasattr(stream, "getReader"):
-        array_buffer = getattr(response, "arrayBuffer", None)
-        if not callable(array_buffer):
-            raise RuntimeError("R2 canonical response body")
-        raw = _chunk_bytes(await array_buffer())
-        if len(raw) > maximum:
-            raise PayloadTooLarge("R2 canonical object")
-        if declared is not None and len(raw) != declared:
-            raise RuntimeError("R2 canonical response length")
-        return raw
+        raise RuntimeError("R2 canonical response body stream")
     reader = stream.getReader()
     chunks, total = [], 0
     try:
@@ -137,9 +129,6 @@ class R2CanonicalReader:
         if len(physical.encode("ascii")) > 1024:
             raise ValueError("R2 canonical key")
         return physical
-
-    async def get(self, key):
-        return await self.get_bounded(key, MAX_OBJECT_BYTES)
 
     async def get_bounded(self, key, maximum):
         signed = self._signer.sign(

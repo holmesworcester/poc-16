@@ -144,9 +144,6 @@ class ReadOnlyStore:
     def __init__(self, bucket, prefix):
         self._store = R2BindingStore(bucket, prefix)
 
-    async def get(self, key):
-        return await self._store.get(key)
-
     async def get_bounded(self, key, max_bytes):
         return await self._store.get_bounded(key, max_bytes)
 
@@ -235,9 +232,13 @@ def _chunk_bytes(value):
 async def _bounded_body(request, limit):
     """Consume a Workers ReadableStream without buffering past ``limit``."""
     stream = getattr(request, "body", None)
-    if stream is None or not hasattr(stream, "getReader"):
-        raw = await request.bytes()
-        return raw if len(raw) <= limit else None
+    if stream is None:
+        declared = _content_length(dict(request.headers.items()))
+        if declared not in {None, 0}:
+            raise ValueError("request body stream")
+        return b""
+    if not hasattr(stream, "getReader"):
+        raise ValueError("request body stream")
     reader = stream.getReader()
     chunks, total = [], 0
     try:

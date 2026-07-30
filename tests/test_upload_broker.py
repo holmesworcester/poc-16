@@ -5,9 +5,9 @@ from dataclasses import fields, replace
 import json
 import random
 
+import facts
 import pytest
 
-import facts
 from core.close import encode_pile
 from core.crypto import h
 from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES, PAGE_BATCH
@@ -770,8 +770,21 @@ def test_broker_distinguishes_provider_failure_from_bad_proof(tmp_path):
     ) = world(tmp_path)
     vector = UploadVector(())
 
-    class Failing:
+    class WholeOnly:
+        gets = 0
+
         async def get(self, _key):
+            self.gets += 1
+            raise AssertionError("whole-object fallback was used")
+
+    whole_only = WholeOnly()
+    with pytest.raises(ValueError, match="upload broker dependency"):
+        UploadBroker(
+            whole_only, workspace, signer, clock, session_policy)
+    assert whole_only.gets == 0
+
+    class Failing:
+        async def get_bounded(self, _key, _maximum):
             raise OSError("injected provider outage")
 
     broker = UploadBroker(
@@ -784,7 +797,7 @@ def test_broker_distinguishes_provider_failure_from_bad_proof(tmp_path):
     foreign_root = foreign.store(foreign_workspace).get("root")
 
     class ForeignRoot:
-        async def get(self, key):
+        async def get_bounded(self, key, _maximum):
             return foreign_root if key == "root" else None
 
     misbound = UploadBroker(

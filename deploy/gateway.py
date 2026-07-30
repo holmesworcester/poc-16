@@ -38,17 +38,8 @@ class AsyncFromSyncReader:
     def __init__(self, reader):
         self.reader = reader
 
-    async def get(self, key):
-        return self.reader.get(key)
-
     async def get_bounded(self, key, max_bytes):
-        bounded = getattr(self.reader, "get_bounded", None)
-        if callable(bounded):
-            return bounded(key, max_bytes)
-        value = self.reader.get(key)
-        if value is not None and len(value) > max_bytes:
-            raise PayloadTooLarge("object read exceeds byte limit")
-        return value
+        return self.reader.get_bounded(key, max_bytes)
 
     async def has(self, key):
         return self.reader.has(key)
@@ -145,10 +136,7 @@ class Gateway:
 
     async def _get(self, key, max_bytes):
         """Fetch one exact transport key without interpreting repository state."""
-        bounded = getattr(self.store, "get_bounded", None)
-        if callable(bounded):
-            return await bounded(key, max_bytes)
-        value = await self.store.get(key)
+        value = await self.store.get_bounded(key, max_bytes)
         if value is not None and len(value) > max_bytes:
             raise PayloadTooLarge("object read exceeds byte limit")
         return value

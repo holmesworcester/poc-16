@@ -1,6 +1,7 @@
 """The two actor compositions share one database-free receiving engine."""
 import asyncio
 import base64
+import inspect
 import json
 import sqlite3
 
@@ -8,10 +9,12 @@ import facts
 import pytest
 
 from core.candidate_archive import reconstruct
-from core.crypto import h
-from core.fact import canon
+from core.close import decode_pile, encode_pile
+from core.crypto import h, keypair
+from core.fact import Fact, canon
+from core.ingress import KernelRejected
 from core.node import Node
-from core.limits import MAX_PILE_BYTES, PayloadTooLarge
+from core.limits import MAX_PILE_BYTES, MAX_ROOT_BYTES, PayloadTooLarge
 from core.repository_applier import RepositoryApplier, SyncStoreAdapter
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
@@ -63,6 +66,50 @@ def test_applier_adapter_has_no_unbounded_read_or_list_fallback():
         run(adapter.list_page("pile/", None, 1))
 
 
+def test_strict_async_store_needs_no_whole_get_or_list_surface(tmp_path):
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
+    pile = closed_subset(source, workspace, all_fids(source, workspace))
+
+    class StrictAsyncStore:
+        def __init__(self, root):
+            self.inner = FsStore(root)
+
+        async def get_bounded(self, key, maximum):
+            return self.inner.get_bounded(key, maximum)
+
+        async def read_versioned(self, key):
+            return self.inner.read_versioned(key)
+
+        async def put(self, key, value):
+            return self.inner.put(key, value)
+
+        async def put_if_absent(self, key, value):
+            return self.inner.put_if_absent(key, value)
+
+        async def cas(self, key, token, value):
+            return self.inner.cas(key, token, value)
+
+        async def list_page(self, prefix, cursor, limit):
+            return self.inner.list_page(prefix, cursor, limit)
+
+        async def delete(self, key):
+            return self.inner.delete(key)
+
+    store = StrictAsyncStore(str(tmp_path / "hosted"))
+    assert not hasattr(store, "get")
+    assert not hasattr(store, "list")
+    applier = RepositoryApplier(workspace, store)
+
+    key = run(applier.stage("feed7feed7feed7f", pile))
+    result = run(applier.apply(key))
+
+    assert result.status == "applied"
+    assert result.retired is True
+    assert store.inner.get_bounded(key, MAX_PILE_BYTES) is None
+    assert store.inner.get_bounded("root", MAX_ROOT_BYTES) == \
+        source.reader(workspace).root_bytes
+
+
 def test_apply_fetches_internal_pile_through_bounded_contract(
         tmp_path):
     source, workspace, _, _ = suppression_world(tmp_path / "source")
@@ -93,6 +140,34 @@ def test_apply_fetches_internal_pile_through_bounded_contract(
 
     assert result.status == "applied"
     assert (key, MAX_PILE_BYTES) in store.bounded_reads
+
+
+def test_apply_has_no_unstaged_raw_commit_door(tmp_path):
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
+    pile = closed_subset(source, workspace, all_fids(source, workspace))
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    unstaged = (
+        "pile/feed7feed7feed7f/"
+        "0123456789abcdef0123456789abcdef/"
+        + h(pile)
+    )
+
+    assert "raw" not in inspect.signature(applier.apply).parameters
+    with pytest.raises(TypeError):
+        run(applier.apply(unstaged, pile))
+
+    missing = run(applier.apply(unstaged))
+    assert missing.status == "missing"
+    proposal = run(applier.propose(pile))
+    with pytest.raises(ValueError, match="present exact generation"):
+        run(applier.commit(unstaged, pile, proposal))
+    with pytest.raises(ValueError, match="present exact generation"):
+        run(applier.reject(
+            unstaged, pile, KernelRejected("forged unstaged rejection")))
+    assert store.get_bounded("root", MAX_ROOT_BYTES) is None
+    assert store.list("obj/") == []
+    assert store.list("failed/") == []
 
 
 def test_cold_applier_reproduces_full_p2p_root_without_sql(

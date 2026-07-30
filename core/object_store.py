@@ -132,15 +132,7 @@ class OutcomeUnknown(StoreError):
     """A mutation may have committed, but its response was not received."""
 
 
-class ObjectReader(Protocol):
-    """The immutable read surface shared with remote HTTP peers."""
-
-    def get(self, key: str) -> bytes | None: ...
-
-    def has(self, key: str) -> bool: ...
-
-
-class ObjectStore(ObjectReader, Protocol):
+class ObjectStore(Protocol):
     """The S3/R2-shaped operations used by a RepositoryApplier."""
 
     def get_bounded(
@@ -164,15 +156,7 @@ class ObjectStore(ObjectReader, Protocol):
     def delete(self, key: str): ...
 
 
-class AsyncObjectReader(Protocol):
-    """Awaited immutable reads used by edge bindings."""
-
-    async def get(self, key: str) -> bytes | None: ...
-
-    async def has(self, key: str) -> bool: ...
-
-
-class AsyncObjectStore(AsyncObjectReader, Protocol):
+class AsyncObjectStore(Protocol):
     """Awaited equivalent of the writable ObjectStore contract."""
 
     async def get_bounded(
@@ -240,44 +224,6 @@ def ensure_object(store, oid, raw):
     raise unknown
 
 
-def retire_exact(store, key, raw):
-    """Delete one replace-proof work item and reconcile an unknown response.
-
-    This helper does not authorize deletion. The caller must already hold the
-    durable publication/rejection/promotion witness for ``raw`` and establish
-    that accepted same-address writes cannot change its value (normally
-    create-only plus key/body binding). That invariant makes the initial exact
-    read stable until DELETE linearizes. A lost DELETE response is success
-    only after a strong read observes absence; a surviving or changed value
-    is never silently discharged.
-    """
-    if not isinstance(raw, bytes):
-        raise TypeError("exact retirement bytes required")
-    current = store.get(key)
-    if current is None:
-        return False
-    if current != raw:
-        raise OSError("retirement source changed")
-    try:
-        store.delete(key)
-    except Exception as error:
-        try:
-            current = store.get(key)
-        except Exception:
-            raise error
-        if current is None:
-            return True
-        if current != raw:
-            raise OSError("retirement source changed") from error
-        raise error
-    current = store.get(key)
-    if current is None:
-        return True
-    if current != raw:
-        raise OSError("retirement source changed")
-    raise OSError("retirement did not remove the source")
-
-
 async def ensure_object_async(store, oid, raw):
     """Awaited equivalent of :func:`ensure_object` for edge bindings."""
     if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
@@ -308,10 +254,10 @@ async def ensure_object_async(store, oid, raw):
 
 
 async def retire_exact_async(store, key, raw):
-    """Awaited equivalent of :func:`retire_exact` for hosted appliers.
+    """Retire one exact hosted work item and reconcile an unknown response.
 
-    This helper reconciles deletion mechanics only. The caller must first
-    prove through F10 that the exact durable work item may be retired.
+    This helper reconciles bounded deletion mechanics only. The caller must
+    first prove through F10 that the exact durable work item may be retired.
     """
     if not isinstance(raw, bytes):
         raise TypeError("exact retirement bytes required")

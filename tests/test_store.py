@@ -23,7 +23,11 @@ from core.object_store import (
     VersionToken,
     ensure_object,
 )
-from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PayloadTooLarge,
+)
 from core.store import FsStore, RemoteStore
 from core.walk import Peer as WalkPeer
 
@@ -211,19 +215,31 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
 
 def test_remote_store_adapts_peer_gets_without_exposing_list():
     root, page = b"root", b"page"
+    calls = []
 
     class Peer:
-        def root(self):
+        def root(self, *, response_limit):
+            calls.append(("root", response_limit))
             return root, h(root)
 
-        def obj(self, oid):
+        def obj(self, oid, *, response_limit):
+            calls.append((oid, response_limit))
             return page if oid == h(page) else None
 
     store = RemoteStore(Peer())
 
     assert store.get("root") == root
     assert store.get("obj/" + h(page)) == page
+    assert store.get_bounded("root", len(root)) == root
+    assert store.get_bounded("obj/" + h(page), len(page)) == page
     assert store.has("obj/" + h(page))
+    assert calls == [
+        ("root", MAX_ROOT_BYTES),
+        (h(page), MAX_OBJECT_BYTES),
+        ("root", len(root)),
+        (h(page), len(page)),
+        (h(page), MAX_OBJECT_BYTES),
+    ]
     assert not hasattr(store, "read_versioned")
     with pytest.raises(TypeError, match="LIST"):
         store.list_page("obj/", None, 1)
@@ -344,12 +360,42 @@ def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
             "GET", "/public", auth=False, response_limit=8)
 
 
+@pytest.mark.parametrize("key", ("root", "obj/" + "a" * 64))
+def test_remote_bounded_read_drives_the_peer_stream_limit(
+        monkeypatch, key):
+    class Response:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read(count):
+            assert count == 9
+            return b"x" * count
+
+    monkeypatch.setattr(
+        walk.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: Response())
+    peer = object.__new__(WalkPeer)
+    peer.url, peer.ws = "https://peer", "workspace"
+    peer.cache = {"token": "already-minted"}
+
+    with pytest.raises(ValueError, match="response too large"):
+        RemoteStore(peer).get_bounded(key, 8)
+
+
 def test_peer_reads_snapshot_etag_case_insensitively():
     peer = object.__new__(WalkPeer)
     peer._http = lambda *_args, **_kwargs: (
         200, b"root", {"etag": "opaque"})
 
-    assert peer.root() == (b"root", "opaque")
+    assert peer.root(
+        response_limit=MAX_ROOT_BYTES) == (b"root", "opaque")
 
 
 def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
@@ -358,8 +404,11 @@ def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
     objects = {first_oid: first, third_oid: third}
 
     class Store:
-        def get(self, key):
-            return objects.get(key[4:])
+        def get_bounded(self, key, maximum):
+            value = objects.get(key[4:])
+            if value is not None and len(value) > maximum:
+                raise PayloadTooLarge("fake object")
+            return value
 
     class Node:
         def store(self, ws):
@@ -400,9 +449,12 @@ def test_page_batch_route_stops_before_256_valid_objects_exceed_bytes(
         def __init__(self):
             self.reads = 0
 
-        def get(self, key):
+        def get_bounded(self, key, maximum):
             self.reads += 1
-            return objects.get(key[4:])
+            value = objects.get(key[4:])
+            if value is not None and len(value) > maximum:
+                raise PayloadTooLarge("fake object")
+            return value
 
     store = Store()
 

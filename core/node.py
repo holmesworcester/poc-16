@@ -18,6 +18,7 @@ from . import (
 )
 from .fact import Fact
 from .keychain import Keychain
+from .limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PAGE_BATCH
 from .pile_sender import PileSender
 from .repository_applier import RepositoryApplier
 from .repository_reader import RepositoryReader
@@ -118,13 +119,14 @@ class Node:
     def reader(self, workspace):
         """Pin the same DB-free read capability used by hosted recipients."""
         store = self.store(workspace)
-        root = store.get("root")
+        root = store.get_bounded("root", MAX_ROOT_BYTES)
         if root is None:
             return None
         return RepositoryReader(
             workspace,
             root,
-            lambda oid: store.get("obj/" + oid),
+            lambda oid: store.get_bounded(
+                "obj/" + oid, MAX_OBJECT_BYTES),
         )
 
     def add_workspace(self, workspace, name, peers, identity=None):
@@ -180,10 +182,25 @@ class Node:
 
     def ingress_failures(self, ws):
         """Shared immutable rejection evidence, projected as status rows."""
+        store = self.store(ws)
+        names, cursor, seen = [], None, set()
+        for _ in range(PAGE_BATCH):
+            page = store.list_page(
+                "failed/meta/", cursor, PAGE_BATCH - len(names))
+            names.extend(
+                name for name in page.keys if name not in names)
+            if page.cursor is None or len(names) >= PAGE_BATCH:
+                break
+            if page.cursor in seen:
+                raise ValueError("failure record cursor did not advance")
+            seen.add(page.cursor)
+            cursor = page.cursor
+
         out = []
-        for name in self.store(ws).list("failed/meta"):
+        for name in names:
             try:
-                value = json.loads(self.store(ws).get(name))
+                value = json.loads(store.get_bounded(
+                    name, MAX_OBJECT_BYTES))
                 if isinstance(value, dict):
                     out.append(value)
             except (TypeError, ValueError):
@@ -302,7 +319,7 @@ class Node:
         """Apply each discovered exact pile independently through one engine."""
         with self.lock:
             store = self.store(ws)
-            before = store.get("root")
+            before = store.get_bounded("root", MAX_ROOT_BYTES)
             fresh = []
             for item in _run_applier(self.applier(ws).turn()):
                 if item.error is not None:
@@ -317,7 +334,7 @@ class Node:
                     continue
                 self.clear_ingress_attempt_failure(ws, item.source)
                 fresh.extend(result.valids)
-            if store.get("root") != before:
+            if store.get_bounded("root", MAX_ROOT_BYTES) != before:
                 self._invalidate_sync_cache(ws)
             self._sync_index(ws)
             return fresh

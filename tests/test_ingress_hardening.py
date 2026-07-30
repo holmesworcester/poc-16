@@ -375,6 +375,47 @@ def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
         "failed/pile/" + h(rejected)) == rejected
 
 
+def test_failure_status_follows_short_native_pages_without_whole_list(
+        tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "node", ts=1)
+    inner = node.store(workspace)
+    expected = []
+    for ordinal in range(3):
+        record = {
+            "error": f"InvalidPile: poison {ordinal}",
+            "id": f"failure-{ordinal}",
+            "source": f"pile/member/{ordinal}",
+            "ts": ordinal,
+        }
+        raw = canon(record)
+        inner.put_if_absent("failed/meta/" + h(raw), raw)
+        expected.append(record)
+
+    class ShortPages:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def list(self, _prefix):
+            raise AssertionError("failure status used whole LIST")
+
+        def list_page(self, prefix, cursor, limit):
+            self.calls.append((prefix, cursor, limit))
+            return inner.list_page(prefix, cursor, 1)
+
+    short = ShortPages()
+    node._stores[workspace] = short
+
+    assert node.ingress_failures(workspace) == expected
+    assert len(short.calls) == len(expected)
+    assert {prefix for prefix, _, _ in short.calls} == {
+        "failed/meta/"}
+    assert [limit for _, _, limit in short.calls] == [256, 255, 254]
+
+
 def test_two_workers_share_immutable_rejection_evidence_without_clobber(
         tmp_path, monkeypatch):
     shared = tmp_path / "shared"

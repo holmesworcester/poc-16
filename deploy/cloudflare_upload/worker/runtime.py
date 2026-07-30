@@ -166,9 +166,13 @@ def _chunk_bytes(value):
 
 async def _bounded_body(request, limit):
     stream = getattr(request, "body", None)
-    if stream is None or not hasattr(stream, "getReader"):
-        raw = _chunk_bytes(await request.bytes())
-        return raw if len(raw) <= limit else None
+    if stream is None:
+        declared = _content_length(_headers(request))
+        if declared not in {None, 0}:
+            raise ValueError("upload request body stream")
+        return b""
+    if not hasattr(stream, "getReader"):
+        raise ValueError("upload request body stream")
     reader = stream.getReader()
     chunks, total = [], 0
     try:

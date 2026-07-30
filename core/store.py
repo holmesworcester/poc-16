@@ -221,11 +221,18 @@ class RemoteStore:
         self.peer = peer
 
     def get(self, key):
+        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        return self.get_bounded(key, limit)
+
+    def get_bounded(self, key, max_bytes):
+        if type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+            raise ValueError("remote read byte limit")
         if key == "root":
-            got = self.peer.root()
+            got = self.peer.root(response_limit=max_bytes)
             return got[0] if got is not None else None
         if key.startswith("obj/"):
-            return self.peer.obj(key[4:])
+            return self.peer.obj(key[4:], response_limit=max_bytes)
         return None
 
     def get_many(self, keys):

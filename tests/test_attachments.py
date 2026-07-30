@@ -236,6 +236,47 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
     assert facts.content.file.files(node, workspace) == []
 
 
+def test_file_payload_and_state_reads_use_the_bao_proof_bound(tmp_path):
+    node = Node(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    payload = b"bounded Bao proof"
+    fid = send_bytes(
+        node, workspace, "bounded.bin", payload, ts=10)
+    proof_keys = {
+        "obj/" + fact.body["cid"]
+        for fact in node.by_type(workspace, chunk.TAG)
+        if dict(fact.refs()).get("file") == fid
+    }
+    inner = node.store(workspace)
+
+    class ProofBoundStore:
+        def __init__(self):
+            self.proof_reads = []
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def get(self, key):
+            if key in proof_keys:
+                raise AssertionError("file proof used whole-object get")
+            return inner.get(key)
+
+        def get_bounded(self, key, maximum):
+            if key in proof_keys:
+                self.proof_reads.append((key, maximum))
+            return inner.get_bounded(key, maximum)
+
+    bounded = ProofBoundStore()
+    node._stores[workspace] = bounded
+
+    assert file_family.bytes_for(
+        node, workspace, fid) == ("bounded.bin", payload)
+    assert bounded.proof_reads == [
+        (next(iter(proof_keys)), bao.MAX_PROOF_BYTES),
+        (next(iter(proof_keys)), bao.MAX_PROOF_BYTES),
+    ]
+
+
 def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
@@ -336,7 +377,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     assert progress(destination, workspace)["complete"]
 
     class SourceObjects:
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             return source.store(workspace).get("obj/" + oid)
 
     landed, complete = _fetch_blobs(
@@ -397,10 +438,10 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
         def __init__(self, node, ws, peer_url):
             self.cache = node.sync_cache[(ws, peer_url)]
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             return None
 
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             if oid == delayed and oid not in attempts:
                 attempts.add(oid)
                 return b"wrong object"
@@ -482,7 +523,7 @@ def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     assert facts.content.file.files(source, workspace) == []
 
     class NoBlobPeer:
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             raise AssertionError(f"suppressed blob was demanded: {oid}")
 
     for fid in chunk_fids:

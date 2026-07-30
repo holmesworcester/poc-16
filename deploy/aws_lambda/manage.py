@@ -394,6 +394,7 @@ def _smoke_endpoint(url, state, workspace):
     """Exercise the deployed database-free gate using a client identity."""
     from core import snapshot
     from core.crypto import h
+    from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
     from core.node import Node, now_ms
     from core.walk import Peer
 
@@ -407,7 +408,7 @@ def _smoke_endpoint(url, state, workspace):
     peer.mint()
     if peer.accepts_push:
         raise RuntimeError("serverless peer advertised write acceptance")
-    got = peer.root()
+    got = peer.root(response_limit=MAX_ROOT_BYTES)
     if got is None or not got[0]:
         raise RuntimeError("serverless peer returned no root")
     root, etag = got
@@ -419,7 +420,8 @@ def _smoke_endpoint(url, state, workspace):
          if descriptor["root"]),
         "",
     )
-    raw = peer.obj(oid) if oid else None
+    raw = peer.obj(
+        oid, response_limit=MAX_OBJECT_BYTES) if oid else None
     if raw is None or h(raw) != oid:
         raise RuntimeError("serverless immutable-object read failed")
 

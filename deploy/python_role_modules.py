@@ -11,6 +11,7 @@ REPOSITORY_READER_CORE_MODULES = (
     "fact.py",
     "fact_index.py",
     "grants.py",
+    "http_body.py",
     "indexes.py",
     "ingress.py",
     "kernel.py",

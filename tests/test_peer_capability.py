@@ -18,6 +18,7 @@ from core import close as close_module
 from core import sync as sync_module
 from core.close import decode_pile
 from core.crypto import h
+from core.limits import MAX_ROOT_BYTES
 from core.node import Node, now_ms
 from core.sync import sync
 from core.walk import Peer, PushUnsupported
@@ -247,19 +248,19 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
     with serving(
             remote, peer_capability.FULL) as (url, observed, edge):
         peer = Peer(local, workspace, url)
-        peer.root()
+        peer.root(response_limit=MAX_ROOT_BYTES)
         assert peer.accepts_push
         assert observed["mints"] == 1
 
         edge.sync_profile = peer_capability.READ_ONLY
         edge.secret = b"rotated-peer-capability-secret"
-        peer.root()
+        peer.root(response_limit=MAX_ROOT_BYTES)
         assert not peer.accepts_push
         assert observed["mints"] == 2
 
         peer.cache.clear()
         cold = Peer(local, workspace, url)
-        cold.root()
+        cold.root(response_limit=MAX_ROOT_BYTES)
         assert not cold.accepts_push
         assert observed["mints"] == 3
         with pytest.raises(PushUnsupported, match="pull-only"):

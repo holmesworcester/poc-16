@@ -62,7 +62,7 @@ class Request:
         self.method = method
         self.url = url
         self.headers = headers or {}
-        self.body = stream
+        self.body = Stream([body]) if stream is None and body else stream
         self._body = body
         self.bytes_calls = 0
 
@@ -350,6 +350,22 @@ def test_runtime_streams_request_body_only_to_its_hard_limit(
         headers={"Content-Length": "6"})
     assert run(runtime.handle(declared, environment)).status == 413
     assert declared.bytes_calls == 0
+
+
+def test_runtime_never_falls_back_to_whole_request_bytes():
+    empty = Request("GET", "https://worker.example/healthz")
+    assert run(runtime._bounded_body(empty, 8)) == b""
+    assert empty.bytes_calls == 0
+
+    malformed = Request(
+        "POST",
+        "https://worker.example/mint",
+        b"x",
+        stream=object(),
+    )
+    with pytest.raises(ValueError, match="body stream"):
+        run(runtime._bounded_body(malformed, 8))
+    assert malformed.bytes_calls == 0
 
 
 def test_runtime_bounds_query_bytes_and_field_count_before_gateway_io(

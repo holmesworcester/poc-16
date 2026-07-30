@@ -618,12 +618,12 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
             self.cache = node.sync_cache.setdefault((ws, url), {})
             self.ws = ws
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             root = remote.store(self.ws).get("root")
             etag = h(root)
             return None if self.cache.get("etag") == etag else (root, etag)
 
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             return remote.store(self.ws).get("obj/" + oid)
 
         def objs(self, oids):
@@ -664,12 +664,12 @@ def test_registered_rootless_workspace_pulls_the_remote_candidate_archive(
             self.ws = ws
             self.cache = node.sync_cache.setdefault((ws, url), {})
 
-        def root(self, etag=None):
+        def root(self, etag=None, **_options):
             raw = remote.store(self.ws).get("root")
             current = h(raw)
             return None if etag == current else (raw, current)
 
-        def obj(self, oid):
+        def obj(self, oid, **_options):
             return remote.store(self.ws).get("obj/" + oid)
 
         def objs(self, oids):

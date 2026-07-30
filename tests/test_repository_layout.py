@@ -272,6 +272,219 @@ def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
     assert bypasses == []
 
 
+def test_untrusted_read_boundaries_have_no_whole_get_fallback():
+    boundaries = (
+        (Path("deploy/gateway.py"), "AsyncFromSyncReader", "get_bounded"),
+        (Path("deploy/gateway.py"), "Gateway", "_get"),
+        (Path("deploy/upload_broker.py"), "UploadBroker", "_get"),
+        (
+            Path("core/repository_applier.py"),
+            "RepositoryApplier",
+            "_get_bounded",
+        ),
+    )
+    for path, class_name, method_name in boundaries:
+        owner = next(
+            item for item in parsed(path).body
+            if isinstance(item, ast.ClassDef) and item.name == class_name)
+        method = next(
+            item for item in owner.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == method_name)
+        attributes = {
+            call.func.attr
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+        }
+        assert "get_bounded" in attributes
+        assert "get" not in attributes
+
+    for path, class_name in (
+            (Path("deploy/gateway.py"), "AsyncFromSyncReader"),
+            (Path("deploy/cloudflare_worker/runtime.py"), "ReadOnlyStore"),
+            (
+                Path("deploy/cloudflare_upload/reader.py"),
+                "R2CanonicalReader",
+            )):
+        owner = next(
+            item for item in parsed(path).body
+            if isinstance(item, ast.ClassDef) and item.name == class_name)
+        assert not [
+            item for item in owner.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == "get"
+        ]
+
+
+def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
+    remote_store = next(
+        item for item in parsed(Path("core/store.py")).body
+        if isinstance(item, ast.ClassDef) and item.name == "RemoteStore")
+    remote_bounded = next(
+        item for item in remote_store.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "get_bounded")
+    assert {
+        call.func.attr
+        for call in ast.walk(remote_bounded)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+    } >= {"obj", "root"}
+
+    sync_tree = parsed(Path("core/sync.py"))
+    remote_fetch = next(
+        item for item in ast.walk(sync_tree)
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "fetch_remote")
+    file_tree = parsed(Path("facts/content/file.py"))
+    file_reads = [
+        item for item in file_tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name in {"_state", "_payloads"}
+    ]
+    node = next(
+        item for item in parsed(Path("core/node.py")).body
+        if isinstance(item, ast.ClassDef) and item.name == "Node")
+    failures = next(
+        item for item in node.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "ingress_failures")
+
+    for method in (remote_fetch, *file_reads):
+        attributes = {
+            call.func.attr
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+        }
+        assert "get_bounded" in attributes
+        assert "get" not in attributes
+    failure_attributes = {
+        call.func.attr
+        for call in ast.walk(failures)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+    }
+    assert "list_page" in failure_attributes
+    assert "list" not in failure_attributes
+
+
+def test_http_and_worker_boundaries_never_whole_materialize_bodies():
+    functions = (
+        (Path("facts/auth/user.py"), "accept", "read_bounded", "read"),
+        (Path("core/cli.py"), "ctl", "read_bounded", "read"),
+        (Path("core/cli.py"), "main", "read_bounded", "read"),
+        (
+            Path("deploy/cloudflare_worker/runtime.py"),
+            "_bounded_body",
+            "getReader",
+            "bytes",
+        ),
+        (
+            Path("deploy/cloudflare_upload/worker/runtime.py"),
+            "_bounded_body",
+            "getReader",
+            "bytes",
+        ),
+        (
+            Path("deploy/cloudflare_upload/reader.py"),
+            "_bounded_response",
+            "getReader",
+            "arrayBuffer",
+        ),
+    )
+    for path, name, required, forbidden in functions:
+        function = next(
+            item for item in parsed(path).body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == name)
+        attributes = {
+            call.func.attr
+            for call in ast.walk(function)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+        }
+        names = {
+            call.func.id
+            for call in ast.walk(function)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+        }
+        assert required in attributes | names
+        assert forbidden not in attributes
+
+
+def test_provider_list_adapters_validate_native_page_shape_before_use():
+    s3 = (ROOT / "adapters/s3/store.py").read_text()
+    r2 = (ROOT / "adapters/r2/worker.py").read_text()
+
+    assert 'len(contents) > args["MaxKeys"]' in s3
+    assert "_page_objects(page.objects, limit)" in r2
+    assert "for _ in range(limit + 1)" in r2
+    assert "validate_key(logical)" in r2
+    assert "not isinstance(key, str)" in r2
+
+
+def test_repository_apply_and_mutations_require_exact_stored_source():
+    owner = next(
+        item for item in parsed(Path("core/repository_applier.py")).body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "RepositoryApplier")
+    methods = {
+        item.name: item
+        for item in owner.body
+        if isinstance(item, ast.AsyncFunctionDef)
+        and item.name in {"apply", "commit", "reject"}
+    }
+    apply = methods["apply"]
+    assert [arg.arg for arg in apply.args.args] == ["self", "source"]
+    assert apply.args.vararg is None
+    assert apply.args.kwarg is None
+    assert [arg.arg for arg in apply.args.kwonlyargs] == ["retire"]
+
+    for name, mutations in (
+            ("commit", {"_establish_outbox", "cas"}),
+            ("reject", {"_put_evidence", "retire_exact_async"})):
+        method = methods[name]
+        exact_reads = [
+            call for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_get_bounded"
+            and len(call.args) == 3
+            and isinstance(call.args[1], ast.Name)
+            and call.args[1].id == "source"
+            and isinstance(call.args[2], ast.Name)
+            and call.args[2].id == "MAX_PILE_BYTES"
+        ]
+        guards = [
+            compare for compare in ast.walk(method)
+            if isinstance(compare, ast.Compare)
+            and isinstance(compare.left, ast.Name)
+            and compare.left.id == "incumbent"
+            and len(compare.ops) == 1
+            and isinstance(compare.ops[0], ast.NotEq)
+            and len(compare.comparators) == 1
+            and isinstance(compare.comparators[0], ast.Name)
+            and compare.comparators[0].id == "raw"
+        ]
+        mutation_calls = [
+            call for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr in mutations
+                or isinstance(call.func, ast.Name)
+                and call.func.id in mutations
+            )
+        ]
+        assert len(exact_reads) == len(guards) == 1
+        assert mutation_calls
+        assert exact_reads[0].lineno < guards[0].lineno \
+            < min(call.lineno for call in mutation_calls)
+
+
 def test_protocol_front_doors_route_semantic_reads_through_one_reader():
     boundaries = (
         (Path("core/daemon.py"), "Handler", "mint", {"reader", "mint"}),

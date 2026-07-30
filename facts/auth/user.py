@@ -6,6 +6,8 @@ import urllib.request
 from core.close import decode_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
+from core.http_body import read_bounded
+from core.limits import MAX_OBJECT_BYTES
 from core.suppression import scoped_id
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from . import signature, user_invite
@@ -51,7 +53,7 @@ def validate(f, ctx):
                        ["offer", "member", f.body["pk"]]],
                       dict(f.body), f.ws)
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 
@@ -69,8 +71,13 @@ def accept(node, link, name):
     link_data = json.loads(base64.urlsafe_b64decode(link))
     url, workspace = link_data["u"], link_data["ws"]
     seed = bytes.fromhex(link_data["s"])
-    encrypted = urllib.request.urlopen(
-        f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15).read()
+    response = urllib.request.urlopen(
+        f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15)
+    try:
+        encrypted = read_bounded(
+            response, MAX_OBJECT_BYTES, "invite response")
+    finally:
+        response.close()
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
     if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
             or blob.get("ws") != workspace:

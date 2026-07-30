@@ -26,6 +26,7 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    ListPage,
     Versioned,
     VersionToken,
     KEY_RE,
@@ -572,9 +573,15 @@ class S3Store:
             response, "conditional root PutObject", mutation=True)
         return Applied(VersionToken(etag))
 
-    def list(self, prefix):
+    def _list_args(self, prefix, limit):
         if not isinstance(prefix, str):
             raise TypeError("list prefix")
+        if type(limit) is not int or not 0 < limit <= 1000:
+            raise ValueError("S3 list page limit")
+        # ``limit`` is the caller's upper bound.  A deployment may impose a
+        # smaller provider request size without making that store unusable by
+        # the provider-neutral Applier.
+        limit = min(limit, self.config.list_page_size)
         logical_prefix = prefix[:-1] if prefix.endswith("/") else prefix
         if prefix and not logical_prefix:
             raise ValueError("bad list prefix")
@@ -586,48 +593,71 @@ class S3Store:
             logical_prefix + "/" if logical_prefix else "")
         if len(physical_prefix.encode("ascii")) > 1024:
             raise ValueError("S3 list prefix exceeds 1024 bytes")
-        base_args = {
+        return {
             "Bucket": self.config.bucket,
             "Prefix": physical_prefix,
-            "MaxKeys": self.config.list_page_size,
+            "MaxKeys": limit,
             **self._owner_args(),
-        }
+        }, namespace, physical_prefix
+
+    def list_page(self, prefix, cursor=None, limit=None):
+        """Issue exactly one bounded ListObjectsV2 request."""
+        limit = self.config.list_page_size if limit is None else limit
+        args, namespace, physical_prefix = self._list_args(prefix, limit)
+        if cursor is not None:
+            if not isinstance(cursor, str) or not cursor:
+                raise ValueError("S3 list cursor")
+            args["ContinuationToken"] = cursor
+        try:
+            response = self._read_client.list_objects_v2(**args)
+        except Exception as error:
+            _raise_read_error("ListObjectsV2", error)
+        if not isinstance(response, dict):
+            raise StoreError("S3 ListObjectsV2 response is not a mapping")
+        contents = response.get("Contents", ())
+        if contents is None:
+            contents = ()
+        if not isinstance(contents, (list, tuple)):
+            raise StoreError("S3 ListObjectsV2 Contents is not a sequence")
+        if len(contents) > args["MaxKeys"]:
+            raise StoreError(
+                "S3 ListObjectsV2 exceeded the requested page limit")
+        out = set()
+        for item in contents:
+            physical = item.get("Key") if isinstance(item, dict) else None
+            if not isinstance(physical, str) \
+                    or not physical.startswith(physical_prefix):
+                raise StoreError(
+                    "S3 ListObjectsV2 returned an out-of-prefix key")
+            logical = physical[len(namespace):]
+            validate_key(logical)
+            out.add(logical)
+        truncated = response.get("IsTruncated", False)
+        if not isinstance(truncated, bool):
+            raise StoreError(
+                "S3 ListObjectsV2 IsTruncated is not boolean")
+        continuation = response.get("NextContinuationToken") \
+            if truncated else None
+        if truncated and (
+                not isinstance(continuation, str) or not continuation
+                or continuation == cursor):
+            raise StoreError(
+                "S3 ListObjectsV2 pagination token did not advance")
+        return ListPage(tuple(sorted(out)), continuation)
+
+    def list(self, prefix):
+        """Compatibility/admin helper; receiving code uses ``list_page``."""
         out = set()
         continuation = None
         seen_tokens = set()
         for _ in range(self.config.max_list_pages):
-            args = dict(base_args)
-            if continuation is not None:
-                args["ContinuationToken"] = continuation
-            try:
-                response = self._read_client.list_objects_v2(**args)
-            except Exception as error:
-                _raise_read_error("ListObjectsV2", error)
-            if not isinstance(response, dict):
-                raise StoreError("S3 ListObjectsV2 response is not a mapping")
-            contents = response.get("Contents", ())
-            if contents is None:
-                contents = ()
-            if not isinstance(contents, (list, tuple)):
-                raise StoreError("S3 ListObjectsV2 Contents is not a sequence")
-            for item in contents:
-                physical = item.get("Key") if isinstance(item, dict) else None
-                if not isinstance(physical, str) \
-                        or not physical.startswith(physical_prefix):
-                    raise StoreError(
-                        "S3 ListObjectsV2 returned an out-of-prefix key")
-                logical = physical[len(namespace):]
-                validate_key(logical)
-                out.add(logical)
-            truncated = response.get("IsTruncated", False)
-            if not isinstance(truncated, bool):
-                raise StoreError(
-                    "S3 ListObjectsV2 IsTruncated is not boolean")
-            if not truncated:
+            page = self.list_page(
+                prefix, continuation, self.config.list_page_size)
+            out.update(page.keys)
+            if page.cursor is None:
                 return sorted(out)
-            continuation = response.get("NextContinuationToken")
-            if not isinstance(continuation, str) or not continuation \
-                    or continuation in seen_tokens:
+            continuation = page.cursor
+            if continuation in seen_tokens:
                 raise StoreError(
                     "S3 ListObjectsV2 pagination token did not advance")
             seen_tokens.add(continuation)

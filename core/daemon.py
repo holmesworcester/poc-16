@@ -170,18 +170,23 @@ class Handler(BaseHTTPRequestHandler):
         parts, q = self._q()
         ws = q.get("ws", "")
         if parts[0] == "invite" and len(parts) == 2:  # the one ungated read
-            b = self.node.store(ws).get("invite/" + parts[1]) if self._known(ws) else None
+            try:
+                b = self.node.store(ws).get_bounded(
+                    "invite/" + parts[1], MAX_OBJECT_BYTES
+                ) if self._known(ws) else None
+            except PayloadTooLarge:
+                return self._send(503)
             if b is None:
                 return self._send(404)
-            if len(b) > MAX_OBJECT_BYTES:
-                return self._send(503)
             return self._send(200, b, "application/octet-stream")
         if not self._known(ws) or not self._member(ws):
             return self._send(401 if self._known(ws) else 404)
         if parts[0] == "root":
             # Exact-key transport: no repository policy is inferred here.
-            b = self.node.store(ws).get("root") or b""
-            if len(b) > MAX_ROOT_BYTES:
+            try:
+                b = self.node.store(ws).get_bounded(
+                    "root", MAX_ROOT_BYTES) or b""
+            except PayloadTooLarge:
                 return self._send(503)
             etag = h(b)
             if self.headers.get("If-None-Match") == etag:
@@ -190,10 +195,14 @@ class Handler(BaseHTTPRequestHandler):
         if parts[0] == "page" and len(parts) == 2:  # store objects and blobs alike
             if not shape.valid_fid(parts[1]):
                 return self._send(404)
-            b = self.node.store(ws).get("obj/" + parts[1])
+            try:
+                b = self.node.store(ws).get_bounded(
+                    "obj/" + parts[1], MAX_OBJECT_BYTES)
+            except PayloadTooLarge:
+                return self._send(503)
             if b is None:
                 return self._send(404)
-            if len(b) > MAX_OBJECT_BYTES or h(b) != parts[1]:
+            if h(b) != parts[1]:
                 return self._send(503)
             return self._send(200, b, "application/octet-stream")
         self._send(404)
@@ -266,9 +275,13 @@ class Handler(BaseHTTPRequestHandler):
             store = self.node.store(ws)
             values, encoded_size = [], 2
             for index, oid in enumerate(oids):
-                raw = store.get("obj/" + oid)
+                try:
+                    raw = store.get_bounded(
+                        "obj/" + oid, MAX_OBJECT_BYTES)
+                except PayloadTooLarge:
+                    return self._send(503)
                 if raw is not None and (
-                        len(raw) > MAX_OBJECT_BYTES or h(raw) != oid):
+                        h(raw) != oid):
                     return self._send(503)
                 item_size = 4 if raw is None \
                     else 2 + 4 * ((len(raw) + 2) // 3)
@@ -322,7 +335,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403)
             store = self.node.store(ws)
             fetch = BudgetedFetch(
-                lambda oid: store.get("obj/" + oid),
+                lambda oid: store.get_bounded(
+                    "obj/" + oid, MAX_OBJECT_BYTES),
                 max_fetches=MINT_MAX_FETCHES,
                 max_bytes=MINT_MAX_FETCH_BYTES,
             )

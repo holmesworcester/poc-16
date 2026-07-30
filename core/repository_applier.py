@@ -78,14 +78,8 @@ class SyncStoreAdapter:
     def __init__(self, store):
         self.store = store
 
-    async def get(self, key):
-        return self.store.get(key)
-
     async def get_bounded(self, key, max_bytes):
         return self.store.get_bounded(key, max_bytes)
-
-    async def has(self, key):
-        return self.store.has(key)
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
@@ -108,7 +102,7 @@ class SyncStoreAdapter:
 
 def async_store(store):
     """Return one awaited store without introducing provider branches."""
-    method = getattr(type(store), "get", None)
+    method = getattr(type(store), "get_bounded", None)
     return store if inspect.iscoroutinefunction(method) \
         else SyncStoreAdapter(store)
 
@@ -531,8 +525,7 @@ class RepositoryApplier:
             result = ApplyResult("admitted", None)
         else:
             source = await self._claimed_staged_source(intent)
-            result = await self.apply(
-                source, intent.raw, retire=False)
+            result = await self.apply(source, retire=False)
             if result.status == "rejected":
                 await self._record_staged_receipt(
                     "rejected", key, raw)
@@ -787,6 +780,11 @@ class RepositoryApplier:
     async def commit(self, source, raw, proposal):
         """Interpret one pure proposal and mint F10 authority on exact success."""
         binding = check_source(source, raw)
+        incumbent = await self._get_bounded(
+            self.store, source, MAX_PILE_BYTES)
+        if incumbent != raw:
+            raise ValueError(
+                "repository source is not a present exact generation")
         if not isinstance(proposal, ApplyProposal):
             raise TypeError("repository apply proposal")
         if proposal.workspace != self.workspace \
@@ -893,6 +891,11 @@ class RepositoryApplier:
         if not isinstance(error, PermanentIngressRejection):
             raise TypeError("typed permanent ingress rejection required")
         binding = check_source(source, raw)
+        incumbent = await self._get_bounded(
+            self.store, source, MAX_PILE_BYTES)
+        if incumbent != raw:
+            raise ValueError(
+                "repository source is not a present exact generation")
         payload = h(raw)
         await self._put_evidence("failed/pile/" + payload, raw)
         record = canon({
@@ -930,13 +933,12 @@ class RepositoryApplier:
             raise ValueError("durable rejection witness")
         return await retire_exact_async(self.store, source, raw)
 
-    async def apply(self, source, raw=None, *, retire=True):
-        """Run one exact internal generation through the complete transition."""
+    async def apply(self, source, *, retire=True):
+        """Run one present exact internal generation through the transition."""
+        raw = await self._get_bounded(
+            self.store, source, MAX_PILE_BYTES)
         if raw is None:
-            raw = await self._get_bounded(
-                self.store, source, MAX_PILE_BYTES)
-            if raw is None:
-                return ApplyResult("missing", None)
+            return ApplyResult("missing", None)
         check_source(source, raw)
         key = (source, h(raw))
         receipt = self._receipts.get(key)

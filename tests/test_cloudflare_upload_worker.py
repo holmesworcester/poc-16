@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import urllib.error
 from urllib.parse import unquote, urlsplit
 
+import facts
 import pytest
 
-import facts
 from core.close import encode_pile
 from core.crypto import h
 from core.limits import PayloadTooLarge
@@ -54,7 +54,7 @@ def deployment(workspace):
         ingress_bucket="poc16-untrusted-ingress",
         owner="production-west",
         broker_name="poc16-upload-broker",
-        publisher_name="poc16-upload-publisher",
+        applier_name="poc16-repository-applier",
         read_permission_group_id="c" * 32,
         write_permission_group_id="d" * 32,
         presign_ttl_seconds=60,
@@ -113,7 +113,8 @@ class Request:
         self.url = url
         self.headers = Headers(headers)
         self._body = body
-        self.body = Stream([body]) if stream else None
+        self.body = Stream([body]) if stream is True \
+            else None if stream is False else stream
         self.bytes_calls = 0
 
     async def bytes(self):
@@ -123,14 +124,16 @@ class Request:
 
 class FetchResponse:
     def __init__(
-            self, status, body=b"", *, declared=True, stream=False):
+            self, status, body=b"", *, declared=True, stream=True):
         self.status = status
         self._body = body
         self.headers = Headers(
             {"content-length": str(len(body))} if declared else {})
         self.body = Stream([body]) if stream else None
+        self.array_calls = 0
 
     async def arrayBuffer(self):
+        self.array_calls += 1
         return self._body
 
 
@@ -528,6 +531,49 @@ def test_canonical_reader_bounds_declared_and_streamed_responses():
     assert streamed_response.body.reader.reads == 2
     assert streamed_response.body.reader.cancelled
     assert streamed_response.body.reader.released is True
+
+
+def test_worker_request_and_canonical_fetch_never_whole_materialize():
+    empty = Request(
+        "POST", "https://broker.example/upload/open",
+        stream=False)
+    assert run(runtime._bounded_body(empty, 8)) == b""
+    assert empty.bytes_calls == 0
+
+    missing_stream = Request(
+        "POST", "https://broker.example/upload/open",
+        b"x", {"content-length": "1"}, stream=False)
+    with pytest.raises(ValueError, match="body stream"):
+        run(runtime._bounded_body(missing_stream, 8))
+    assert missing_stream.bytes_calls == 0
+
+    malformed_stream = Request(
+        "POST", "https://broker.example/upload/open",
+        b"x", stream=object())
+    with pytest.raises(ValueError, match="body stream"):
+        run(runtime._bounded_body(malformed_stream, 8))
+    assert malformed_stream.bytes_calls == 0
+
+    config = R2ReadConfig(
+        "https://" + "a" * 32 + ".r2.cloudflarestorage.com",
+        "poc16-canonical",
+        "workspaces/" + "b" * 64,
+    )
+    response = FetchResponse(200, b"root", stream=False)
+
+    async def fetch(_request):
+        return response
+
+    reader = R2CanonicalReader(
+        config,
+        READ_ACCESS,
+        READ_SECRET,
+        fetch,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(RuntimeError, match="body stream"):
+        run(reader.get_bounded("root", 8))
+    assert response.array_calls == 0
 
 
 def test_internal_fetch_request_repr_redacts_presigned_authority():

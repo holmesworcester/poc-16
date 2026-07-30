@@ -1,9 +1,11 @@
 """AWS events are hints into the one provider-neutral repository applier."""
 import asyncio
 from pathlib import Path
+import re
 import sqlite3
 
 import facts
+import pytest
 
 from adapters.s3 import S3Config, S3Store
 from core import bao
@@ -19,7 +21,7 @@ from deploy.aws_repository_applier import manage
 from facts.content import chunk
 
 from .util import closed_subset, send_bytes
-from .provider_fakes import FakeS3Bucket
+from .provider_fakes import FakeS3Bucket, ProviderError
 
 
 SESSION = "a" * 32
@@ -199,6 +201,78 @@ def test_sam_role_can_retire_only_internal_piles():
     assert "CanonicalPrefix}/root" not in delete_section
 
 
+def test_sam_role_limits_canonical_missing_key_probes():
+    raw = (
+        Path(__file__).parents[1]
+        / "deploy/aws_repository_applier/template.yaml"
+    ).read_text()
+    probe = raw.split(
+        "- Sid: DistinguishMissingCanonicalKeys", 1)[1].split(
+        "- Sid: DiscoverStagedPileMarkers", 1)[0]
+
+    assert "Action: s3:ListBucket" in probe
+    assert "CanonicalBucketName" in probe
+    assert "ExpectedBucketOwner" in probe
+    assert "CanonicalPrefix}/root" in probe
+    assert "CanonicalPrefix}/obj/*" in probe
+    assert "CanonicalPrefix}/applier/*" in probe
+    assert "CanonicalPrefix}/staged/*" in probe
+    assert "s3:max-keys: 1" in probe
+    for forbidden in (
+            "CanonicalPrefix}/pile",
+            "CanonicalPrefix}/failed",
+            "IngressBucketName",
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject"):
+        assert forbidden not in probe
+
+
+def test_sam_role_grants_only_required_operational_cursor_authority():
+    raw = (
+        Path(__file__).parents[1]
+        / "deploy/aws_repository_applier/template.yaml"
+    ).read_text()
+    read = raw.split(
+        "- Sid: ReadCanonicalRepository", 1)[1].split(
+        "- Sid: ReadIsolatedIngress", 1)[0]
+    write = raw.split(
+        "- Sid: ConditionallyWriteCanonicalRepository", 1)[1].split(
+        "- Sid: RetireOnlyInternalPileGenerations", 1)[0]
+    delete = raw.split(
+        "- Sid: RetireOnlyInternalPileGenerations", 1)[1].split(
+        "- !If", 1)[0]
+
+    assert "Action:\n                  - s3:GetObject" in read
+    assert "CanonicalPrefix}/applier/*" in read
+    assert "Action: s3:PutObject" in write
+    assert "CanonicalPrefix}/applier/*" in write
+    assert "CanonicalPrefix}/applier/*" not in delete
+
+
+def test_sam_role_limits_ingress_missing_probe_to_detached_objects():
+    raw = (
+        Path(__file__).parents[1]
+        / "deploy/aws_repository_applier/template.yaml"
+    ).read_text()
+    probe = raw.split(
+        "- Sid: DistinguishMissingIngressObjects", 1)[1].split(
+        "- Sid: ReadCanonicalRepository", 1)[0]
+
+    assert "Action: s3:ListBucket" in probe
+    assert "IngressBucketName" in probe
+    assert "ExpectedBucketOwner" in probe
+    assert "ingress/v1/workspaces/${WorkspaceId}/objects/*" in probe
+    assert "s3:max-keys: 1" in probe
+    for forbidden in (
+            "CanonicalBucketName",
+            "/piles/*",
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject"):
+        assert forbidden not in probe
+
+
 def test_real_s3_adapters_keep_ingress_and_canonical_prefixes_disjoint(
         tmp_path):
     source = Node(str(tmp_path / "source"))
@@ -245,3 +319,212 @@ def test_real_s3_adapters_keep_ingress_and_canonical_prefixes_disjoint(
     assert not any(
         key.startswith(f"workspaces/{workspace}/")
         for key in ingress_bucket.data)
+
+
+def test_403_missing_root_probe_bootstraps_repository_genesis(tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    raw = closed_subset(
+        source, workspace,
+        [fact.fid for fact in source.by_type(workspace, "workspace")],
+    )
+    bucket = FakeS3Bucket()
+    bucket.deny_missing_get = True
+    prefix = f"workspaces/{workspace}"
+    canonical = S3Store(
+        S3Config(
+            "canonical-bucket",
+            prefix,
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            probe_access_denied_missing=True,
+        ),
+        client=bucket.client("applier"),
+    )
+
+    applier = RepositoryApplier(workspace, canonical)
+    internal = asyncio.run(applier.stage(MEMBER, raw))
+    result = asyncio.run(applier.apply(internal))
+
+    assert result.status == "applied"
+    assert bucket.data[prefix + "/root"] == result.root
+    assert (
+        "applier", "list", prefix + "/root", ()
+    ) in bucket.history
+
+
+def test_403_missing_archive_page_uses_exact_probe_not_access_denied(
+        tmp_path):
+    source = Node(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    raw = closed_subset(
+        source, workspace,
+        [fact.fid for fact in source.by_type(workspace, "workspace")],
+    )
+    bucket = FakeS3Bucket()
+    bucket.deny_missing_get = True
+    prefix = f"workspaces/{workspace}"
+    canonical = S3Store(
+        S3Config(
+            "canonical-bucket",
+            prefix,
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            probe_access_denied_missing=True,
+        ),
+        client=bucket.client("applier"),
+    )
+    applier = RepositoryApplier(workspace, canonical)
+    internal = asyncio.run(applier.stage(MEMBER, raw))
+    assert asyncio.run(applier.apply(internal)).status == "applied"
+    missing = next(
+        key for key in sorted(bucket.data)
+        if key.startswith(prefix + "/obj/"))
+    bucket.data.pop(missing)
+    bucket.tokens.pop(missing)
+    bucket.history.clear()
+
+    with pytest.raises(ValueError, match="integrity"):
+        asyncio.run(
+            RepositoryApplier(workspace, canonical).propose(raw))
+
+    probes = [
+        key for _, operation, key, result in bucket.history
+        if operation == "list" and result == ()
+    ]
+    assert probes == [missing]
+
+
+def test_403_missing_operational_cursors_do_not_wedge_cold_discovery(
+        tmp_path):
+    workspace = "c" * 64
+    bucket = FakeS3Bucket()
+    bucket.deny_missing_get = True
+    prefix = f"workspaces/{workspace}"
+    canonical = S3Store(
+        S3Config(
+            "canonical-bucket",
+            prefix,
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            probe_access_denied_missing=True,
+        ),
+        client=bucket.client("applier"),
+    )
+    applier = RepositoryApplier(workspace, canonical)
+
+    assert asyncio.run(applier.turn()) == ()
+    assert asyncio.run(applier.drain_staged(
+        FsStore(str(tmp_path / "empty-ingress")))) == ()
+
+    cursor_keys = {
+        prefix + "/applier/cursor/internal",
+        prefix + "/applier/cursor/staged",
+    }
+    assert cursor_keys <= set(bucket.data)
+    probes = {
+        key for _, operation, key, result in bucket.history
+        if operation == "list" and result == () and key in cursor_keys
+    }
+    assert probes == cursor_keys
+    assert {
+        key for _, operation, key, _ in bucket.history
+        if operation == "put" and key in cursor_keys
+    } == cursor_keys
+
+
+def test_403_missing_ingress_object_is_bounded_unavailable_work(
+        tmp_path):
+    _, workspace, staged, marker, refs = _stage_file(tmp_path)
+    bucket = FakeS3Bucket()
+    raw = staged.get(marker)
+    ingress = S3Store(
+        S3Config(
+            "isolated-ingress",
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            probe_access_denied_missing=True,
+        ),
+        client=bucket.client("applier"),
+    )
+    ingress.put_if_absent(marker, raw)
+    bucket.deny_missing_get = True
+    canonical = FsStore(str(tmp_path / "canonical-missing-object"))
+
+    outcomes = asyncio.run(
+        RepositoryApplier(workspace, canonical).drain_staged(ingress))
+
+    result = outcomes[0][1]
+    expected = {
+        staging_key(workspace, MEMBER, SESSION, "obj", oid)
+        for oid in refs
+    }
+    assert result.result.status == "applied"
+    assert set(result.unavailable) == expected
+    probes = {
+        key for _, operation, key, values in bucket.history
+        if operation == "list" and values == ()
+        and key.startswith(
+            f"ingress/v1/workspaces/{workspace}/objects/")
+    }
+    assert probes == expected
+
+
+def test_cold_staged_apply_obeys_probe_prefixes_from_sam_policy(
+        tmp_path):
+    _, workspace, ingress, marker, _ = _stage_file(tmp_path)
+    raw_template = (
+        Path(__file__).parents[1]
+        / "deploy/aws_repository_applier/template.yaml"
+    ).read_text()
+    probe = raw_template.split(
+        "- Sid: DistinguishMissingCanonicalKeys", 1)[1].split(
+        "- Sid: DiscoverStagedPileMarkers", 1)[0]
+    suffixes = re.findall(
+        r'\$\{CanonicalPrefix\}(/[^"]+)"', probe)
+    prefix = f"workspaces/{workspace}"
+
+    bucket = FakeS3Bucket()
+    bucket.deny_missing_get = True
+    inner = bucket.client("applier")
+
+    def allowed(physical):
+        return physical.startswith(prefix + "/pile/") or any(
+            re.fullmatch(
+                re.escape(prefix + suffix).replace(r"\*", ".*"),
+                physical,
+            )
+            for suffix in suffixes)
+
+    class PolicyClient:
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def list_objects_v2(self, **request):
+            physical = request["Prefix"]
+            if request.get("MaxKeys") != 1 or not allowed(physical):
+                raise ProviderError(403, "AccessDenied")
+            return inner.list_objects_v2(**request)
+
+    canonical = S3Store(
+        S3Config(
+            "canonical-bucket",
+            prefix,
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            probe_access_denied_missing=True,
+        ),
+        client=PolicyClient(),
+    )
+
+    result = asyncio.run(
+        RepositoryApplier(workspace, canonical).apply_staged(
+            ingress, marker))
+
+    assert result.result.status == "applied"
+    probes = [
+        key for _, operation, key, values in bucket.history
+        if operation == "list" and values == ()
+    ]
+    assert any(key.startswith(prefix + "/staged/") for key in probes)
+    assert all(allowed(key) for key in probes)

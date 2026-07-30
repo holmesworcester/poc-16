@@ -8,6 +8,9 @@ import sys
 import urllib.error
 import urllib.request
 
+from .http_body import read_bounded
+from .limits import MAX_CONTROL_BYTES
+
 DEFAULT_NODE = "http://127.0.0.1:7100"
 USAGE = (
     "usage: core [--node URL] <scope.family.verb> [args...]\n"
@@ -39,7 +42,8 @@ def ctl(node_url, path, argv):
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read())
+        return json.loads(read_bounded(
+            response, MAX_CONTROL_BYTES, "control response"))
 
 
 def _serve(argv):
@@ -98,9 +102,18 @@ def main(argv=None):
         out = ctl(node_url, path, tokens)
     except urllib.error.HTTPError as error:
         try:
-            detail = json.loads(error.read()).get("error", error.reason)
-        except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
+            raw = read_bounded(
+                error, MAX_CONTROL_BYTES, "control error response")
+            detail = json.loads(raw).get("error", error.reason)
+        except (
+                AttributeError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+                ValueError,
+        ):
             detail = error.reason
+        finally:
+            error.close()
         print(f"core: {error.code}: {detail}", file=sys.stderr)
         return 1
     if isinstance(out, str):

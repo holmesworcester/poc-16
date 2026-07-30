@@ -14,10 +14,9 @@ from dataclasses import dataclass
 
 import facts
 
-from .candidate_archive import CandidateView
-from .close import encode_pile
 from .crypto import h
-from .ingress import stage_pile
+from .limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
+from .repository_reader import RepositoryReader
 from .store import RemoteStore
 from .walk import Peer, _fetch_blobs
 
@@ -32,7 +31,7 @@ _UNREAD = object()
 
 
 def _root_digest(store):
-    raw = store.get("root")
+    raw = store.get_bounded("root", MAX_ROOT_BYTES)
     return h(raw) if raw is not None else None
 
 
@@ -65,29 +64,29 @@ def _delta(local, remote):
     return CandidateDelta(tuple(pull), tuple(push))
 
 
-def _push_candidate(view, fid, peer, store):
-    """Deliver one verified historical witness and any held detached blobs."""
-    verified = view.verify(fid)
-    blob_oids = sorted({
-        oid
-        for fact in verified.facts
-        for oid in facts.blob_refs(fact)
-    })
-    for oid in blob_oids:
-        raw = store.get("obj/" + oid)
-        if raw is None:
-            continue
-        if h(raw) != oid:
-            raise ValueError("local immutable object integrity")
-        peer.put_obj(oid, raw)
-    peer.put_pile(encode_pile(verified.facts, workspace=view.root.anchor))
+def _push_candidates(view, fids, peer, sender):
+    """Deliver verified deltas as bounded ordinary piles.
+
+    Bad witnesses remain independent: every valid closure is still delivered.
+    Detached objects precede every pile that can name them, and the receiver
+    invokes its one RepositoryApplier settlement path per bounded batch.
+    """
+    closures, failures = [], []
+    for fid in fids:
+        try:
+            closures.append(view.verify(fid).facts)
+        except (TypeError, ValueError) as error:
+            failures.append(error)
+    sender.deliver(peer, closures)
+    return failures
 
 
 def pull(node, workspace, oid, raw):
     """Stage one verified proof closure through ordinary pile ingress."""
     if raw is None or h(raw) != oid:
         raise ValueError("remote object integrity")
-    stage_pile(node.store(workspace), node.member_for(workspace), raw)
+    node.stage_received_pile(
+        workspace, node.member_for(workspace), raw)
 
 
 def reconcile_candidates(
@@ -102,33 +101,37 @@ def reconcile_candidates(
     """
     store = node.store(workspace)
     if local_root is _UNREAD:
-        local_root = store.get("root")
-    remote = CandidateView(remote_root, fetch_remote) if remote_root else None
-    local = CandidateView(
-        local_root, lambda oid: store.get("obj/" + oid),
-    ) if local_root else None
+        local_root = store.get_bounded("root", MAX_ROOT_BYTES)
+    remote = RepositoryReader(
+        workspace, remote_root, fetch_remote,
+    ).candidates() if remote_root else None
+    local = RepositoryReader(
+        workspace,
+        local_root,
+        lambda oid: store.get_bounded(
+            "obj/" + oid, MAX_OBJECT_BYTES),
+    ).candidates() if local_root else None
     delta = _delta(local, remote)
     failures = []
 
     if deliver and local is not None:
-        for fid in delta.push:
-            try:
-                _push_candidate(local, fid, peer, store)
-            except (TypeError, ValueError) as error:
-                failures.append(error)
+        try:
+            failures.extend(_push_candidates(
+                local, delta.push, peer, node.sender(workspace)))
+        except (TypeError, ValueError) as error:
+            failures.append(error)
 
     landed = 0
     if remote is not None:
+        closures = []
         for fid in delta.pull:
             try:
-                raw = encode_pile(
-                    remote.verify(fid).facts,
-                    workspace=workspace,
-                )
-                pull(node, workspace, h(raw), raw)
+                closures.append(remote.verify(fid).facts)
                 landed += 1
             except (TypeError, ValueError) as error:
                 failures.append(error)
+        for raw in node.sender(workspace).pack_batches(closures):
+            pull(node, workspace, h(raw), raw)
     if landed:
         node.turn(workspace)
     if failures:
@@ -146,7 +149,8 @@ def sync(node, workspace, url):
     peer = Peer(node, workspace, url)
     remote_store = RemoteStore(peer)
     cache = peer.cache
-    got = peer.root(cache.get("etag"))
+    got = peer.root(
+        cache.get("etag"), response_limit=MAX_ROOT_BYTES)
     accepts_push = peer.accepts_push
     if got is None:
         local_etag = _root_digest(node.store(workspace))
@@ -165,10 +169,12 @@ def sync(node, workspace, url):
 
     def fetch_remote(oid):
         if oid not in objects:
-            objects[oid] = remote_store.get("obj/" + oid)
+            objects[oid] = remote_store.get_bounded(
+                "obj/" + oid, MAX_OBJECT_BYTES)
         return objects[oid]
 
-    local_root = node.store(workspace).get("root")
+    local_root = node.store(workspace).get_bounded(
+        "root", MAX_ROOT_BYTES)
     pulled, pushed, pending_push = reconcile_candidates(
         node,
         workspace,
