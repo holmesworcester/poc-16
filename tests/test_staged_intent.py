@@ -4,12 +4,14 @@ import json
 import pytest
 
 from core import bao, cmds
+from core import staged_intent as staged_intent_module
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
 from core.ingress import InvalidStagedIntent, PermanentIngressRejection
 from core.node import Node
 from core.staged_intent import (
+    InvalidStagedObject,
     StagedObjectsPending,
     confirm_staged_object,
     decode_staged_pile,
@@ -91,13 +93,16 @@ def test_object_confirmation_separates_retryable_delay_from_poison(
     foreign = staging_key(
         workspace, MEMBER, "f" * 32, "obj", intent.blob_refs[0])
     for observed in (surplus, foreign):
-        with pytest.raises(InvalidStagedIntent, match="surplus"):
+        with pytest.raises(InvalidStagedObject, match="surplus"):
             confirm_staged_object(intent, observed, b"")
-    with pytest.raises(InvalidStagedIntent, match="integrity"):
+    with pytest.raises(InvalidStagedObject, match="object key"):
+        confirm_staged_object(intent, "not/a/staging/key", b"")
+    with pytest.raises(InvalidStagedObject, match="integrity"):
         confirm_staged_object(
             intent, intent.object_keys[0], b"not the named bytes")
 
     assert issubclass(InvalidStagedIntent, PermanentIngressRejection)
+    assert not issubclass(InvalidStagedObject, PermanentIngressRejection)
     assert not issubclass(StagedObjectsPending, PermanentIngressRejection)
 
 
@@ -229,3 +234,12 @@ def test_pile_without_object_references_is_a_valid_ready_marker(
 
     assert intent.blob_refs == ()
     assert intent.object_keys == ()
+
+
+def test_staged_object_reference_count_is_bounded_without_large_fixture(
+        staged_file, monkeypatch):
+    _, workspace, raw, key = staged_file
+    monkeypatch.setattr(staged_intent_module, "MAX_STAGED_OBJECTS", 1)
+
+    with pytest.raises(InvalidStagedIntent, match="reference count"):
+        decode_staged_pile(workspace, key, raw)

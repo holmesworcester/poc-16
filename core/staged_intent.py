@@ -25,6 +25,7 @@ from .shape import valid_fid
 STAGING_PREFIX = "ingress/v1"
 SESSION_HEX_BYTES = 32
 MEMBER_HEX_BYTES = 16
+MAX_STAGED_OBJECTS = 65_536
 
 
 def _lower_hex(value, length):
@@ -139,6 +140,10 @@ class StagedObjectsPending(RuntimeError):
     """At least one exact required object is not visible yet; retry later."""
 
 
+class InvalidStagedObject(ValueError):
+    """One staged attachment cannot promote; it does not reject the pile."""
+
+
 def decode_staged_pile(configured_workspace, key, raw):
     """Bind one exact pile marker to canonical facts and required objects."""
     if not valid_fid(configured_workspace):
@@ -174,6 +179,9 @@ def decode_staged_pile(configured_workspace, key, raw):
                 if not valid_fid(digest):
                     raise InvalidStagedIntent("invalid object reference")
                 refs.add(digest)
+                if len(refs) > MAX_STAGED_OBJECTS:
+                    raise InvalidStagedIntent(
+                        "staged object reference count")
     except InvalidStagedIntent:
         raise
     except Exception as error:
@@ -200,26 +208,31 @@ def confirm_staged_object(intent, key, raw):
     """
     if not isinstance(intent, StagedPileIntent):
         raise TypeError("staged pile intent")
-    address = parse_staging_key(key)
+    try:
+        address = parse_staging_key(key)
+    except InvalidStagedIntent as error:
+        raise InvalidStagedObject("staged object key") from error
     position = bisect_left(intent.blob_refs, address.digest)
     if address.object_class != "obj" \
             or address.workspace != intent.workspace \
             or address.session != intent.session \
             or position == len(intent.blob_refs) \
             or intent.blob_refs[position] != address.digest:
-        raise InvalidStagedIntent("foreign or surplus staged object")
+        raise InvalidStagedObject("foreign or surplus staged object")
     if raw is None:
         raise StagedObjectsPending("staged objects incomplete")
     if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
             or h(raw) != address.digest:
-        raise InvalidStagedIntent("staged object integrity")
+        raise InvalidStagedObject("staged object integrity")
     return raw
 
 
 __all__ = (
     "MEMBER_HEX_BYTES",
+    "MAX_STAGED_OBJECTS",
     "SESSION_HEX_BYTES",
     "STAGING_PREFIX",
+    "InvalidStagedObject",
     "StagedObjectsPending",
     "StagedPileIntent",
     "StagingAddress",
