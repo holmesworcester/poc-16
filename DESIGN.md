@@ -241,6 +241,48 @@ protect acknowledged staging from a compromised parent; that residual
 availability boundary must be either accepted explicitly with client retry
 until root publication or removed with a put-only verifier/parent.
 
+The generated Cloudflare isolated-ingress package refines that split into
+three provider identities:
+
+```text
+broker canonical reader  exact canonical bucket, Object Read only, no writes
+broker ingress parent    exact ingress bucket, bucket-item read/write/list
+publisher bindings       ingress read/retire + canonical promote/root CAS
+```
+
+The broker Worker has no native R2 binding. Its only write-capable secret is
+the ingress parent; a distinct read-only S3 credential supplies canonical DAG
+reads. Local HS256 temporary-credential signing fixes each child JWT to the
+ingress bucket, one `objectPath`, `actions=[PutObject]`, issuer, audience,
+issued time, and expiry. The child is not a body-integrity proof. It targets
+only
+`ingress/v1/workspaces/<workspace>/sessions/<session>/obj/<digest>` or
+`.../pile/<member>/<digest>`, whose bytes remain untrusted until the publisher
+hashes and validates them. The broker mints and pins the session; it is not a
+caller-selected path fragment. Objects arrive first. The closed pile/intention
+arrives last, commits the workspace, member, session, and declared object
+digests, and is the only durable ready marker; loose staged objects and event
+notifications are not publication work by themselves.
+
+R2 long-lived bucket-item credentials cannot be restricted to a workspace
+prefix. `Object Read only` also includes LIST. Consequently the generated
+read policy is tenant-safe only when the canonical bucket is dedicated to the
+one configured workspace. A string `CANONICAL_PREFIX` narrows application
+lookups but is not provider enforcement. A shared canonical bucket requires a
+different provider-enforced read path before a broker compromise can be
+claimed workspace-confined.
+
+The package also emits one lifecycle input scoped only to that workspace's
+staging prefix. Compute deploy/remove never owns either bucket or applies or
+removes bucket configuration: it deploys publisher before broker, stops broker
+before publisher, and deletes only Workers whose exact owner and role markers
+were observed before the first delete. Applying and live-verifying the
+lifecycle remains a separate privileged provisioning step because replacing a
+bucket's whole lifecycle document from a compute deploy could clobber
+unrelated rules. The current entries are non-public fail-closed stubs. These
+generated documents and credential-free JWT mutation tests establish the
+intended authority shape, not a live-provider or completed-publisher claim.
+
 [r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 

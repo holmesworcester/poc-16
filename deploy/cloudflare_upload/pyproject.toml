@@ -1,0 +1,16 @@
+[project]
+name = "poc16-cloudflare-upload-boundary"
+version = "0.1.0"
+description = "Fail-closed Cloudflare R2 ingress role boundary"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.5",
+    "workers-py==1.16.0",
+    "workers-runtime-sdk==1.6.3",
+]
+
+[tool.pywrangler]
+allow-build = false

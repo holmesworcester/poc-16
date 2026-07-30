@@ -212,6 +212,70 @@ requires a put-only verifier/parent remains an explicit deployment decision.
 [r2-s3-api]: https://developers.cloudflare.com/r2/api/s3/api/
 [r2-worker-api]: https://developers.cloudflare.com/r2/api/workers/workers-api-reference/
 
+### Prepared Cloudflare upload boundary
+
+`deploy/cloudflare_upload/` now renders the provider boundary for the
+isolated-ingress choice, but it is not yet a working upload service. The
+broker config has no native R2 binding. It expects one S3-compatible
+credential created from an exact-bucket `Object Read only` policy for
+canonical DAG reads, plus one separate parent credential created from an exact
+ingress-bucket `Object Read & Write` policy. Only the latter can mint locally
+signed temporary credentials, and the mint helper fixes those children to
+one session-scoped staging object, `PutObject`, and a short expiry. The
+publisher config is the only role with native `INGRESS` and `CANONICAL`
+bindings.
+
+Both providers use one logical staging grammar:
+
+```text
+ingress/v1/workspaces/<ws64>/sessions/<nonce32>/obj/<sha256>
+ingress/v1/workspaces/<ws64>/sessions/<nonce32>/pile/<member16>/<sha256>
+```
+
+The broker chooses the lowercase-hex session nonce and derives every path
+from validated descriptor authority; the client does not supply a free-form
+key. Objects are uploaded first. The closed pile/intention is uploaded last
+and is the sole durable ready marker. Loose objects do not cause publication,
+and an event for the final pile only reduces wake latency.
+
+This is a provider boundary, not a Python convention: compromising the
+write-capable ingress parent still cannot address the canonical bucket. It is
+also deliberately honest about two limits. Cloudflare's bucket-item write
+parent can overwrite or delete acknowledged staging, and its bucket-item
+read policy includes LIST over the selected bucket. Therefore a deployment
+must use a canonical bucket dedicated to that workspace until a
+provider-enforced workspace-prefix read path exists; setting
+`CANONICAL_PREFIX` alone is not tenant isolation.
+
+Render the two Worker configs, the two exact R2 token-policy inputs, and the
+ingress-only seven-day lifecycle input with:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=32_LOWERCASE_HEX_CHARACTERS
+export CF_UPLOAD_WORKSPACE=64_LOWERCASE_HEX_CHARACTERS
+export CF_UPLOAD_CANONICAL_BUCKET=poc16-one-workspace-canonical
+export CF_UPLOAD_CANONICAL_BUCKET_PROFILE=dedicated-workspace
+export CF_UPLOAD_INGRESS_BUCKET=poc16-untrusted-ingress
+export CF_UPLOAD_DEPLOYMENT_OWNER=my-stable-deployment-id
+export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_GROUP_ID
+export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_GROUP_ID
+
+python3 -m deploy.cloudflare_upload.manage render
+python3 -m deploy.cloudflare_upload.manage test
+```
+
+The checked-in broker and publisher entries return 503 and have no public
+route. An explicit `CF_UPLOAD_ENABLE_STUB_DEPLOY=1` can deploy that fail-closed
+binding skeleton for infrastructure testing; `remove` preflights both exact
+owner/role markers, removes broker then publisher, and never deletes or
+reconfigures either bucket. The real authorization endpoint, store-only
+publisher, queue/schedule wakes, lifecycle installation/conformance check,
+and live R2 proof remain tracked work. Cloudflare documents that action-level
+temporary credentials require local signing and that `PutObject` can be the
+sole child action in its [temporary-credential model][r2-temp-creds].
+
+[r2-temp-creds]: https://developers.cloudflare.com/r2/api/s3/temporary-credentials/
+
 ## Cloudflare read-only gateway
 
 The Cloudflare Python Worker is isolated under `deploy/cloudflare_worker`. It

@@ -20,3 +20,9 @@ deploy/cloudflare_worker/.wrangler/
 deploy/cloudflare_worker/build/
 deploy/cloudflare_worker/python_modules/
 deploy/cloudflare_worker/wrangler.generated.json
+deploy/cloudflare_upload/.env*
+deploy/cloudflare_upload/.venv/
+deploy/cloudflare_upload/.venv-workers/
+deploy/cloudflare_upload/.wrangler/
+deploy/cloudflare_upload/generated/
+deploy/cloudflare_upload/python_modules/
