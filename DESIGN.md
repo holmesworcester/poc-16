@@ -196,6 +196,28 @@ publisher  verifies/promotes ingress, derives pages, CASes root, proves retireme
 reader     reads only the pinned root and its authenticated closure
 ```
 
+The target implementation keeps that authority flow visible in the module
+graph:
+
+```text
+core/staged_intent     untrusted ingress key + bytes -> typed workspace intent
+core/settlement        pure admitted-candidate fixed point
+core/snapshot          pure authenticated-tree proposal + immutable outbox
+core/store_publisher   async outbox/CAS/F10/retirement interpreter
+deploy/*               provider events, configuration, and store construction
+```
+
+The client catalog and the database-free publisher use the same executable
+settlement and snapshot functions through different query adapters. SQLite may
+answer a client query; authenticated FactTree postings and candidate
+residences answer the cloud query. Neither adapter owns a second validity or
+settlement rule. `Node` is not packaged into Lambda or a Worker, and an
+in-memory SQLite reconstruction is not the edge implementation. Missing
+immutable objects suspend the pure computation through a bounded cache-miss
+driver, are awaited exactly once, and then rerun the same function. Provider
+entrypoints contain no family policy, tree construction, staging grammar, or
+retirement decision.
+
 Proxying the client upload through the publisher adds bandwidth and failure
 surface but no serialization point: the client writes its exact granted
 object-store key directly. A staging deployment may require the publisher to
