@@ -53,9 +53,13 @@ def _author_eviction(node, workspace, target, ts):
     item = removal(workspace, public, target, ts)
     signed = signature(secret, public, item, ts)
     admin = offer_src(node.idx(workspace), "admin", public)
+    target_member = offer_src(node.idx(workspace), "member", target)
     node.ingest_new(
         workspace, [signed, item],
-        {signed.fid: (), item.fid: (signed.fid, admin)})
+        {
+            signed.fid: (),
+            item.fid: (signed.fid, admin, target_member),
+        })
     return item
 
 
@@ -93,7 +97,8 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     assert target not in visible_fids(rebuilt, workspace)
 
 
-def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
+def test_historical_fact_survives_but_removed_member_cannot_author_now(
+        tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
@@ -110,12 +115,23 @@ def test_evicted_member_cannot_launder_a_valid_signed_fact(tmp_path):
 
     node.turn(workspace)
     assert node.candidate_of(workspace, item.fid) == item
-    assert node.fact_of(workspace, item.fid) is None
+    assert node.fact_of(workspace, item.fid) == item
+    assert [row["fid"] for row in facts.content.message.messages(
+        node, workspace)] == [item.fid]
     assert node.store(workspace).list("pile/") == []
     assert node.ingress_failures(workspace) == []
 
+    root = node.store(workspace).get("root")
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    with pytest.raises(ValueError, match="not a workspace member"):
+        facts.content.message.post(
+            node, workspace, "general", "cannot share now", ts=ts + 1)
+    assert node.store(workspace).get("root") == root
 
-def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
+
+def test_historical_admin_action_survives_but_removed_admin_cannot_author(
+        tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
@@ -128,14 +144,26 @@ def test_delegated_admin_liveness_follows_grantee_not_grantor(tmp_path):
     signed = signature(bob_secret, bob, item, ts)
     pile = _signed_pile(
         node, workspace, item, signed,
-        {signed.fid: (), item.fid: (signed.fid, admin_fid)})
+        {
+            signed.fid: (),
+            item.fid: (
+                signed.fid,
+                admin_fid,
+                member_src(node, workspace, carol),
+            ),
+        })
     deliver(node, workspace, pile)
 
     node.turn(workspace)
     assert node.candidate_of(workspace, item.fid) == item
-    assert node.fact_of(workspace, item.fid) is None
-    assert not suppression_state.active(
+    assert node.fact_of(workspace, item.fid) == item
+    assert suppression_state.active(
         node.idx(workspace), facts.principal_sid("member", carol))
+
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    with pytest.raises(ValueError, match="not a workspace admin"):
+        facts.auth.removal.evict(node, workspace, carol)
 
 
 def test_terminal_member_action_covers_a_future_provider(tmp_path):
@@ -159,8 +187,9 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
         facts.principal_sid("member", bob))
 
 
-def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
-    """An earlier action deactivates a later fact even when it arrives last."""
+def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
+        tmp_path):
+    """A prior-sorting removal cannot rewrite historical fact admission."""
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
@@ -180,15 +209,20 @@ def test_guard_screening_converges_in_both_delivery_orders(tmp_path):
         peer.add_workspace(workspace, "alice", peers=[])
         deliver(peer, workspace, base)
         peer.turn(workspace)
-        for pile in order:
+        for ordinal, pile in enumerate(order):
             deliver(peer, workspace, pile)
             peer.turn(workspace)
+            if name == "fact-first" and ordinal == 0:
+                assert peer.fact_of(workspace, posted.fid) == posted
         peers.append(peer)
 
     assert all(
         peer.candidate_of(workspace, posted.fid) == posted
-        and peer.fact_of(workspace, posted.fid) is None
-        and facts.content.message.messages(peer, workspace) == []
+        and peer.fact_of(workspace, posted.fid) == posted
+        and [row["fid"] for row in facts.content.message.messages(
+            peer, workspace)] == [posted.fid]
+        and suppression_state.active(
+            peer.idx(workspace), facts.principal_sid("member", bob))
         for peer in peers
     )
     assert peers[0].store(workspace).get("root") \
@@ -215,7 +249,14 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     later_sig = signature(secret, public, later, later.ts)
     source.ingest_new(
         workspace, [later_sig, later],
-        {later_sig.fid: (), later.fid: (later_sig.fid, workspace)})
+        {
+            later_sig.fid: (),
+            later.fid: (
+                later_sig.fid,
+                workspace,
+                member_src(source, workspace, bob),
+            ),
+        })
     later_pile = closed_subset(source, workspace, [later.fid])
 
     posted = message(
@@ -246,7 +287,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
             "SELECT fid FROM actions WHERE sid=?", (sid,)).fetchone() \
             == (first.fid,)
         assert peer.candidate_of(workspace, posted.fid) == posted
-        assert peer.fact_of(workspace, posted.fid) is None
+        assert peer.fact_of(workspace, posted.fid) == posted
         roots.append(peer.store(workspace).get("root"))
     assert roots[0] == roots[1]
 
@@ -386,7 +427,7 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
     facts.auth.removal.evict(node, workspace, bob)
 
     node.bind_identity(workspace, child)
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not a workspace admin"):
         facts.auth.removal.evict(node, workspace, carol)
     assert not suppression_state.active(
         node.idx(workspace), facts.principal_sid("member", carol))

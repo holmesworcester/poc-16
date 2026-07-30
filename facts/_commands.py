@@ -3,11 +3,11 @@ import os
 
 
 def offer_source(node, workspace, name, a0, a1=None, requires=()):
-    from core.kernel import offer_src
-
+    """Return the current live provider from one pinned repository root."""
     with node.lock:
-        return offer_src(
-            node.idx(workspace), name, a0, a1, requires)
+        reader = node.reader(workspace)
+        return None if reader is None else reader.worker().authority_provider(
+            name, a0, a1, requires)
 
 
 def member_key(node, workspace, target):

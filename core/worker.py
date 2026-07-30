@@ -96,7 +96,13 @@ class WorkerView:
         return self._reader(indexes.AUTHORITY).get(
             indexes.need_key(name, a0, a1)) is not None
 
-    def authority_provider(self, name, a0, a1=None, requires=()):
+    def authority_witness(self, name, a0, a1=None, requires=()):
+        """Return the canonical admitted provider without current liveness.
+
+        This is the immutable relationship answer used to check a submitted
+        historical closure.  Call ``authority_provider`` when the caller needs
+        authority that is usable at this pinned root.
+        """
         row = self._reader(indexes.AUTHORITY).get(
             indexes.need_key(name, a0, a1))
         if row is None:
@@ -110,8 +116,6 @@ class WorkerView:
                 or not isinstance(row["fid"], str) \
                 or type(row["rank"]) is not int:
             raise ValueError("AuthoritySlot shape")
-        if not self.fact_active(row["fid"]):
-            return None
         offered = {
             tuple(offer)
             for offer in self.fact_record(row["fid"])["offers"]
@@ -120,6 +124,11 @@ class WorkerView:
             (required_name, required_a0, required_a1 or "") in offered
             for required_name, required_a0, required_a1 in requires
         ) else None
+
+    def authority_provider(self, name, a0, a1=None, requires=()):
+        """Return the canonical provider only when it is usable now."""
+        fid = self.authority_witness(name, a0, a1, requires)
+        return fid if fid is not None and self.fact_active(fid) else None
 
     def _committed_needs_match(self, stream):
         """Mirror the kernel's committed-authority omission check.
@@ -141,19 +150,9 @@ class WorkerView:
                 row = authority.get(address)
                 if row is None:
                     continue
-                provider = self.authority_provider(
-                    need.name, need.a0, need.a1)
+                provider = self.authority_witness(
+                    need.name, need.a0, need.a1, need.requires)
                 if provider is None:
-                    return False
-                offered = {
-                    tuple(offer) for offer in self.fact_record(provider)["offers"]
-                    if isinstance(offer, list) and len(offer) == 3
-                }
-                if any(
-                        (required_name, required_a0, required_a1 or "")
-                        not in offered
-                        for required_name, required_a0, required_a1
-                        in need.requires):
                     return False
         return True
 

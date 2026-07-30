@@ -179,11 +179,8 @@ def test_pile_sender_is_the_only_production_encoder():
                     or isinstance(call.func, ast.Attribute)
                     and call.func.attr == "encode_pile"):
                 callers.add(path.as_posix())
-    # staged_intent re-encodes solely to prove canonical upload bytes.
-    assert callers == {
-        "core/pile_sender.py",
-        "core/staged_intent.py",
-    }
+    # decode_pile owns canonical-wire validation, so no receiver re-encodes.
+    assert callers == {"core/pile_sender.py"}
 
 
 def test_ordinary_pile_surfaces_have_no_embedded_object_channel():

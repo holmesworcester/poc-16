@@ -3,7 +3,7 @@
 Handlers own shape-specific validation.  This module owns the cross-family
 rules that must not be inferred from arbitrary refs or fields: named
 dependency roles, suppression inheritance, direct action targets, ownership,
-one-time authorization guards, and continuing authority liveness.
+and continuing authority liveness.
 """
 from dataclasses import dataclass
 
@@ -63,7 +63,6 @@ class FamilyPolicy:
     suppression: tuple[SelectorRule, ...] | None = NEVER
     direct_targets: tuple[DirectTarget, ...] = ()
     owner_edge: str | None = None
-    authorization_guards: tuple[str, ...] = ()
     authority_liveness_guards: tuple[str, ...] = ()
     principal_offers: tuple[SidOffer, ...] = ()
     action_offers: tuple[SidOffer, ...] = ()
@@ -93,6 +92,14 @@ def validate_family_policy(policy):
             raise ValueError("direct deletion must allow ADMIN")
         if OWNER in modes and not policy.owner_edge:
             raise ValueError("OWNER deletion needs an owner edge")
+        self_rules = sum(
+            rule == Self()
+            for rule in policy.suppression or ()
+        )
+        if self_rules != 1:
+            raise ValueError(
+                "direct SELF target needs exactly one Self() "
+                "suppression selector")
     return policy
 
 

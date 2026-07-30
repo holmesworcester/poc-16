@@ -56,9 +56,24 @@ def test_one_registry_exhaustively_covers_the_router():
             for row in direct
         )
 
-    admin = facts.family_for("admin").POLICY
-    assert admin.authorization_guards == ("grantor_admin",)
-    assert admin.authority_liveness_guards == ("grantee_member",)
+    admin_policy = facts.family_for("admin").POLICY
+    assert not hasattr(admin_policy, "authorization_guards")
+    assert admin_policy.authority_liveness_guards == ("grantee_member",)
+
+    workspace = "0" * 64
+    assert {
+        need.role for need in facts.auth.admin.needs(
+            facts.auth.admin.admin(workspace, "grantor", "grantee", 1))
+    } == {"author", "grantor_admin", "grantee_member"}
+    assert {
+        need.role for need in facts.auth.removal.needs(
+            facts.auth.removal.removal(workspace, "admin", "target", 1))
+    } == {"author", "admin", "target_member"}
+    assert {
+        need.role for need in facts.content.message.needs(
+            facts.content.message.message(
+                workspace, "member", "general", "proof", 1))
+    } == {"author", "member"}
 
 
 def test_registry_rejects_duplicate_and_policyless_families():
@@ -77,6 +92,7 @@ def test_registry_rejects_duplicate_and_policyless_families():
     (
         (
             _policy.FamilyPolicy(
+                suppression=(_policy.Self(),),
                 direct_targets=(
                     _policy.DirectTarget(
                         _policy.CONTENT_DELETE,
@@ -90,6 +106,7 @@ def test_registry_rejects_duplicate_and_policyless_families():
         ),
         (
             _policy.FamilyPolicy(
+                suppression=(_policy.Self(),),
                 direct_targets=_policy.DELETE_SELF,
             ),
             "owner edge",
@@ -101,6 +118,48 @@ def test_registry_rejects_direct_delete_authority_gaps(policy, error):
 
     with pytest.raises(ValueError, match=error):
         facts.compile_families((family,))
+
+
+@pytest.mark.parametrize(
+    "suppression",
+    (
+        _policy.NEVER,
+        (_policy.Parent("member"),),
+        (_policy.SelectorRule(SELF, ("malformed",)),),
+        (_policy.Self(), _policy.Self()),
+    ),
+)
+def test_registry_rejects_direct_delete_without_one_self_selector(
+        suppression):
+    family = SimpleNamespace(
+        TAG="undeclared_delete_target",
+        POLICY=_policy.FamilyPolicy(
+            suppression=suppression,
+            direct_targets=_policy.DELETE_SELF,
+            owner_edge="member",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exactly one Self"):
+        facts.compile_families((family,))
+
+
+def test_registry_allows_one_self_selector_with_inherited_selectors():
+    family = SimpleNamespace(
+        TAG="declared_delete_target",
+        POLICY=_policy.FamilyPolicy(
+            suppression=(
+                _policy.Self(),
+                _policy.Parent("member"),
+                _policy.Ancestor("member", "workspace"),
+            ),
+            direct_targets=_policy.DELETE_SELF,
+            owner_edge="member",
+        ),
+    )
+
+    compiled = facts.compile_families((facts.auth.workspace, family))
+    assert compiled[family.TAG] is family
 
 
 def test_new_principal_namespace_needs_no_core_change(monkeypatch):

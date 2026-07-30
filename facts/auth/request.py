@@ -5,7 +5,7 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "req"
-POLICY = FamilyPolicy(authorization_guards=("member",))
+POLICY = FamilyPolicy()
 PURPOSES = frozenset({"sync", "upload"})
 
 
@@ -33,7 +33,7 @@ def validate(f, ctx):
             and isinstance(body["exp"], int) \
             and f == request(
                 f.ws, body["pk"], body["verb"], body["exp"], f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

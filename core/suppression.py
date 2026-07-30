@@ -1,6 +1,10 @@
 """Clear-envelope explicit selectors and exact action targets."""
 
 from . import shape
+from .limits import (
+    MAX_ATOM_NAME_BYTES,
+    valid_bounded_text,
+)
 
 ATOM = "supp"
 TARGET = "target"
@@ -25,13 +29,24 @@ def self_selector():
 
 
 def parent_selector(role, fid):
-    if not isinstance(role, str) or not role or not shape.valid_fid(fid):
+    if not valid_bounded_text(
+            role, MAX_ATOM_NAME_BYTES) or not shape.valid_fid(fid):
         raise ValueError("parent selector")
     return [ATOM, PARENT, role, fid]
 
 
+def _valid_ancestor_path(path):
+    if not valid_bounded_text(path, MAX_ATOM_NAME_BYTES):
+        return False
+    roles = path.split("/")
+    return len(roles) >= 2 and all(
+        valid_bounded_text(role, MAX_ATOM_NAME_BYTES)
+        for role in roles
+    )
+
+
 def ancestor_selector(path, fid):
-    if not isinstance(path, str) or "/" not in path \
+    if not _valid_ancestor_path(path) \
             or not shape.valid_fid(fid):
         raise ValueError("ancestor selector")
     return [ATOM, ANCESTOR, path, fid]
@@ -39,7 +54,8 @@ def ancestor_selector(path, fid):
 
 def action(name, selector, target_key):
     """Bind an action to an exact target address and selector token."""
-    if not isinstance(name, str) or not name or selector != SELF \
+    if not valid_bounded_text(
+            name, MAX_ATOM_NAME_BYTES) or selector != SELF \
             or not shape.is_key(target_key):
         raise ValueError("suppression action")
     return [ACTION, name, selector, target_key]
@@ -49,12 +65,12 @@ def valid_selector_marker(entry):
     return entry == [ATOM, SELF] or (
         isinstance(entry, list) and len(entry) == 4
         and entry[0] == ATOM and entry[1] == PARENT
-        and isinstance(entry[2], str) and entry[2]
+        and valid_bounded_text(entry[2], MAX_ATOM_NAME_BYTES)
         and shape.valid_fid(entry[3])
     ) or (
         isinstance(entry, list) and len(entry) == 4
         and entry[0] == ATOM and entry[1] == ANCESTOR
-        and isinstance(entry[2], str) and "/" in entry[2]
+        and _valid_ancestor_path(entry[2])
         and shape.valid_fid(entry[3])
     )
 
@@ -70,7 +86,8 @@ def selector_markers(fact):
 
 def valid_action_marker(entry):
     return isinstance(entry, list) and len(entry) == 4 \
-        and entry[0] == ACTION and isinstance(entry[1], str) and entry[1] \
+        and entry[0] == ACTION \
+        and valid_bounded_text(entry[1], MAX_ATOM_NAME_BYTES) \
         and entry[2] == SELF and shape.is_key(entry[3])
 
 

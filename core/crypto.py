@@ -1,6 +1,7 @@
 """Crypto: hashing, Ed25519 signatures, invite secretbox, grant sealed box."""
 import hashlib
 from nacl import bindings, public, secret, signing
+from nacl.exceptions import BadSignatureError
 
 
 def h(b: bytes) -> str:
@@ -24,7 +25,7 @@ def verify(pk_hex: str, msg: str, sig_hex: str) -> bool:
     try:
         signing.VerifyKey(bytes.fromhex(pk_hex)).verify(msg.encode(), bytes.fromhex(sig_hex))
         return True
-    except Exception:
+    except (BadSignatureError, TypeError, UnicodeError, ValueError):
         return False
 
 

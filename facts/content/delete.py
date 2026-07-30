@@ -21,9 +21,7 @@ from .._commands import offer_source, publish
 from ..auth import signature
 
 TAG = "delete"
-POLICY = _policy.FamilyPolicy(
-    authorization_guards=("actor_authority",),
-)
+POLICY = _policy.FamilyPolicy()
 
 
 # SHAPE
@@ -93,7 +91,7 @@ def validate(f, ctx):
 
         return is_deletion(f) and f == delete(
             f.ws, pk, target_key, mode, f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

@@ -88,6 +88,49 @@ def test_real_multi_chunk_pile_derives_exact_same_session_object_set(
         assert confirm_staged_object(first, object_key, blob) == blob
 
 
+@pytest.mark.parametrize("failure_type", (RuntimeError, AssertionError))
+def test_blob_reference_program_failure_is_retryable_at_staging_door(
+        staged_file, monkeypatch, tmp_path, failure_type):
+    _, workspace, raw, key = staged_file
+    ingress = FsStore(str(tmp_path / "ingress"))
+    canonical = FsStore(str(tmp_path / "canonical"))
+    ingress.put_if_absent(key, raw)
+    original = chunk.blob_refs
+
+    def program_failure(_fact):
+        raise failure_type("blob reference program failure")
+
+    monkeypatch.setattr(chunk, "blob_refs", program_failure)
+    with pytest.raises(
+            failure_type, match="blob reference program failure"):
+        asyncio.run(
+            RepositoryApplier(workspace, canonical).apply_staged(
+                ingress, key))
+
+    assert ingress.get(key) == raw
+    assert canonical.list("staged/rejected/") == []
+    assert canonical.list("pile/") == []
+    assert canonical.get("root") is None
+
+    monkeypatch.setattr(chunk, "blob_refs", original)
+    applied = asyncio.run(
+        RepositoryApplier(workspace, canonical).apply_staged(
+            ingress, key))
+    assert applied.result.status == "applied"
+    assert canonical.get("root") == applied.result.root
+    assert canonical.list("staged/rejected/") == []
+
+
+@pytest.mark.parametrize("malformed", (None, [], ("not-a-fid",)))
+def test_malformed_blob_reference_results_are_explicit_staging_rejections(
+        staged_file, monkeypatch, malformed):
+    _, workspace, raw, key = staged_file
+    monkeypatch.setattr(chunk, "blob_refs", lambda _fact: malformed)
+
+    with pytest.raises(InvalidStagedIntent, match="object reference"):
+        decode_staged_pile(workspace, key, raw)
+
+
 def _put_staged_file(ingress, node, workspace, raw, key):
     ingress.put_if_absent(key, raw)
     intent = decode_staged_pile(workspace, key, raw)
@@ -463,7 +506,7 @@ def test_marker_rejects_noncanonical_extra_and_forged_forms(
     candidates = (
         (
             pretty,
-            "non-canonical staged pile",
+            "invalid staged pile",
         ),
         (
             embedded,

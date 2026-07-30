@@ -40,7 +40,7 @@ def validate(f, ctx):
             None)
         return f == shaped and f.fid == ctx.anchor \
             and verify(pk, _presig(f.ts, atoms), signature)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

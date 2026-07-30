@@ -26,6 +26,12 @@ MAX_PAGE_BATCH_BYTES = 4 * MIB
 MAX_CLOSURE_FACTS = 256
 MAX_RESOLVED_EDGES = 64
 
+# Clear-envelope names become authenticated index vocabulary; values may
+# become authenticated map keys. Bound both before family dispatch so malformed
+# atoms cannot escape as retryable program failures or unbounded index rows.
+MAX_ATOM_NAME_BYTES = 128
+MAX_ATOM_VALUE_BYTES = 384
+
 
 class PayloadTooLarge(ValueError):
     """A bounded protocol value exceeded its declared byte budget."""
@@ -35,6 +41,30 @@ class InvalidEncoding(ValueError):
     """Bytes violate an immutable protocol shape or integrity rule."""
 
 
+def valid_bounded_text(value, maximum, *, allow_empty=False):
+    """Whether one protocol string has canonical bounded UTF-8 bytes."""
+    if not isinstance(value, str):
+        return False
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeError:
+        return False
+    return size <= maximum and (allow_empty or size > 0)
+
+
+def _unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise InvalidEncoding("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite(_value):
+    raise InvalidEncoding("non-finite JSON number")
+
+
 def decode_json(raw, limit, label):
     """Decode bounded JSON and expose every parser failure as ``ValueError``."""
     if not isinstance(raw, bytes):
@@ -42,6 +72,10 @@ def decode_json(raw, limit, label):
     if len(raw) > limit:
         raise PayloadTooLarge(f"{label} too large")
     try:
-        return json.loads(raw)
+        return json.loads(
+            raw,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_nonfinite,
+        )
     except (TypeError, ValueError, RecursionError, UnicodeError) as error:
         raise InvalidEncoding(f"{label} encoding") from error

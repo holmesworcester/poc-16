@@ -12,7 +12,6 @@ from . import signature
 TAG = "device"
 POLICY = FamilyPolicy(
     suppression=(Self(),),
-    authorization_guards=("member",),
     authority_liveness_guards=("member",),
     principal_offers=(SidOffer("device_key", "device"),),
 )
@@ -44,7 +43,7 @@ def validate(f, ctx):
         return set(body) == {"pk", "label"} \
             and all(isinstance(body[key], str) for key in body) \
             and f == device(f.ws, body["pk"], body["label"], f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

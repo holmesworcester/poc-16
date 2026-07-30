@@ -5,6 +5,8 @@ import pathlib
 import facts
 
 from core import fact as core_fact
+from core.fact import Fact
+from core.kernel import MemoryContext
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FACTS = ROOT / "facts"
@@ -48,6 +50,14 @@ def test_every_family_has_the_new_contract_in_order():
         validation_names = {node.id for node in ast.walk(functions["validate"])
                             if isinstance(node, ast.Name)}
         assert "globals_" not in validation_names, path
+        for handler in (
+                node for node in ast.walk(functions["validate"])
+                if isinstance(node, ast.ExceptHandler)):
+            caught = {
+                node.id for node in ast.walk(handler.type)
+                if isinstance(node, ast.Name)
+            } if handler.type is not None else {"BaseException"}
+            assert caught.isdisjoint({"Exception", "BaseException"}), path
         for returned in (node for node in ast.walk(functions["validate"])
                          if isinstance(node, ast.Return)):
             assert not isinstance(returned.value, (ast.Tuple, ast.Dict, ast.Set)), path
@@ -84,6 +94,21 @@ def test_router_covers_each_family_once():
         for module in facts.MODULES
         for command in getattr(module, "CLI", {}).values()
     )
+
+
+def test_every_family_validator_is_total_for_a_malformed_body():
+    workspace = "0" * 64
+    for module in facts.MODULES:
+        malformed = Fact(
+            module.TAG,
+            1,
+            [],
+            {},
+            None if getattr(module, "GENESIS", False) else workspace,
+        )
+        anchor = malformed.fid \
+            if getattr(module, "GENESIS", False) else workspace
+        assert module.validate(malformed, MemoryContext(anchor)) is False
 
 
 def test_core_fact_module_has_no_family_authors():

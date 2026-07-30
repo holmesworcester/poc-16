@@ -8,6 +8,7 @@ import sqlite3
 import facts
 import pytest
 
+from core import crypto
 from core.candidate_archive import reconstruct
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
@@ -322,6 +323,163 @@ def test_permanent_rejection_preserves_exact_evidence_before_delete(
     assert store.get(
         "failed/meta/" + h(result.rejection.record)
     ) == result.rejection.record
+
+
+def test_removal_of_a_never_member_is_rejected_before_root_mutation(
+        tmp_path):
+    author = Node(str(tmp_path / "author"))
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    secret, public = author.identity(workspace)
+    _, never_member = keypair()
+    item = facts.auth.removal.removal(
+        workspace, public, never_member, 10)
+    signed = facts.auth.signature.signature(
+        secret, public, item, item.ts)
+    base = decode_pile(
+        closed_subset(author, workspace, all_fids(author, workspace)),
+        workspace,
+    )
+    raw = encode_pile(
+        (*base, signed, item), workspace=workspace)
+
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("feed7feed7feed7f", raw))
+    result = run(applier.apply(source))
+
+    assert result.status == "rejected"
+    assert result.retired is True
+    assert store.get("root") is None
+    assert store.get(source) is None
+    assert store.get("failed/pile/" + h(raw)) == raw
+
+
+def test_family_program_failure_retains_source_without_rejection_evidence(
+        tmp_path, monkeypatch):
+    author = Node(str(tmp_path / "author"))
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    facts.content.message.post(
+        author, workspace, "general", "valid before failure", ts=10)
+    raw = closed_subset(
+        author, workspace, all_fids(author, workspace))
+
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("feed7feed7feed7f", raw))
+
+    def broken_constructor(*_args, **_kwargs):
+        raise RuntimeError("message family program failure")
+
+    monkeypatch.setattr(
+        facts.content.message, "message", broken_constructor)
+    with pytest.raises(
+            RuntimeError, match="message family program failure"):
+        run(applier.apply(source))
+
+    assert store.get(source) == raw
+    assert store.get("root") is None
+    assert store.list("failed/") == []
+    assert applier._receipts == {}
+
+
+def test_crypto_program_failure_retains_source_without_rejection_evidence(
+        tmp_path, monkeypatch):
+    author = Node(str(tmp_path / "author"))
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    raw = closed_subset(
+        author, workspace, all_fids(author, workspace))
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("feed7feed7feed7f", raw))
+
+    def program_failure(*_args, **_kwargs):
+        raise RuntimeError("crypto program failure")
+
+    monkeypatch.setattr(crypto.signing, "VerifyKey", program_failure)
+    with pytest.raises(RuntimeError, match="crypto program failure"):
+        run(applier.apply(source))
+
+    assert store.get(source) == raw
+    assert store.get("root") is None
+    assert store.list("failed/") == []
+    assert applier._receipts == {}
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ("whitespace", "key-order", "duplicate-key", "non-finite", "bad-ref"),
+)
+def test_noncanonical_pile_retires_exact_source_then_healthy_work_applies(
+        tmp_path, attack):
+    author = Node(str(tmp_path / "author"))
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    good = closed_subset(
+        author, workspace, all_fids(author, workspace))
+    encoded_workspace = workspace.encode()
+    if attack == "whitespace":
+        bad = b'{ "facts": [], "ws": \"' + encoded_workspace + b'\" }'
+    elif attack == "key-order":
+        bad = b'{\"ws\":\"' + encoded_workspace + b'\",\"facts\":[]}'
+    elif attack == "duplicate-key":
+        bad = b'{\"facts\":[],\"ws\":\"' + encoded_workspace \
+            + b'\",\"ws\":\"' + encoded_workspace + b'\"}'
+    elif attack == "non-finite":
+        bad = b'{\"facts\":[],\"ws\":NaN}'
+    else:
+        poison = Fact(
+            "msg",
+            2,
+            [["ref", "member", []]],
+            {"pk": author.pk, "chan": "general", "text": "poison"},
+            workspace,
+        )
+        bad = encode_pile((poison,), workspace=workspace)
+
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    bad_source = run(applier.stage("bad", bad))
+    rejected = run(applier.apply(bad_source))
+
+    assert rejected.status == "rejected"
+    assert rejected.retired is True
+    assert store.get(bad_source) is None
+    assert store.get("root") is None
+    assert store.get("failed/pile/" + h(bad)) == bad
+
+    good_source = run(applier.stage("good", good))
+    applied = run(applier.apply(good_source))
+    assert applied.status == "applied"
+    assert applied.retired is True
+    assert store.get("root") == author.reader(workspace).root_bytes
+
+
+def test_settlement_program_failure_is_retryable_not_dormancy(
+        tmp_path, monkeypatch):
+    node = Node(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    facts.content.message.post(
+        node, workspace, "general", "retained candidate", ts=10)
+    proof = facts.auth.request.payload(
+        node, workspace, "sync", 200, 100)
+    raw = encode_pile(proof, workspace=workspace)
+    store = node.store(workspace)
+    root = store.get("root")
+    applier = node.applier(workspace)
+    source = run(applier.stage("feed7feed7feed7f", raw))
+
+    def broken_constructor(*_args, **_kwargs):
+        raise AssertionError("settlement family program failure")
+
+    monkeypatch.setattr(
+        facts.content.message, "message", broken_constructor)
+    with pytest.raises(
+            AssertionError, match="settlement family program failure"):
+        run(applier.apply(source))
+
+    assert store.get(source) == raw
+    assert store.get("root") == root
+    assert store.list("failed/") == []
+    assert applier._receipts == {}
 
 
 def test_malformed_pile_is_rejected_before_root_or_archive_reads(

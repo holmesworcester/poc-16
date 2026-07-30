@@ -21,7 +21,6 @@ POLICY = FamilyPolicy(
     suppression=(Self(),),
     direct_targets=DELETE_SELF,
     owner_edge="member",
-    authorization_guards=("member",),
 )
 
 
@@ -50,7 +49,7 @@ def validate(f, ctx):
             and all(isinstance(body[key], str) for key in body) \
             and f == message(
                 f.ws, body["pk"], body["chan"], body["text"], f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

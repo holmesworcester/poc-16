@@ -15,9 +15,9 @@ from bisect import bisect_left
 from dataclasses import dataclass
 
 import facts
-from .close import decode_pile, encode_pile
+from .close import decode_pile
 from .crypto import h
-from .ingress import InvalidStagedIntent
+from .ingress import InvalidPile, InvalidStagedIntent
 from .limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
 from .shape import valid_fid
 
@@ -159,30 +159,32 @@ def decode_staged_pile(configured_workspace, key, raw):
         raise InvalidStagedIntent("staged pile digest")
     try:
         stream = decode_pile(raw, configured_workspace)
-        if encode_pile(
-                stream, workspace=configured_workspace) != raw:
-            raise InvalidStagedIntent("non-canonical staged pile")
-        refs = set()
-        for fact in stream:
-            family = facts.family_for(fact.t)
-            if family is None:
-                raise InvalidStagedIntent("unknown fact family")
-            if fact.ws is None and (
-                    fact.fid != configured_workspace
-                    or not facts.is_genesis(fact.t)):
-                raise InvalidStagedIntent(
-                    "only workspace genesis may omit workspace")
-            for digest in facts.blob_refs(fact):
-                if not valid_fid(digest):
-                    raise InvalidStagedIntent("invalid object reference")
-                refs.add(digest)
-                if len(refs) > MAX_STAGED_OBJECTS:
-                    raise InvalidStagedIntent(
-                        "staged object reference count")
-    except InvalidStagedIntent:
-        raise
-    except Exception as error:
+    except InvalidPile as error:
         raise InvalidStagedIntent("invalid staged pile") from error
+    refs = set()
+    for fact in stream:
+        family = facts.family_for(fact.t)
+        if family is None:
+            raise InvalidStagedIntent("unknown fact family")
+        if fact.ws is None and (
+                fact.fid != configured_workspace
+                or not facts.is_genesis(fact.t)):
+            raise InvalidStagedIntent(
+                "only workspace genesis may omit workspace")
+        try:
+            digests = facts.blob_refs(fact)
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise InvalidStagedIntent(
+                "invalid object references") from error
+        if not isinstance(digests, tuple):
+            raise InvalidStagedIntent("invalid object references")
+        for digest in digests:
+            if not valid_fid(digest):
+                raise InvalidStagedIntent("invalid object reference")
+            refs.add(digest)
+            if len(refs) > MAX_STAGED_OBJECTS:
+                raise InvalidStagedIntent(
+                    "staged object reference count")
     return StagedPileIntent(
         configured_workspace,
         address.session,

@@ -176,23 +176,6 @@ def authority_scopes(fact, edges_of, fact_of):
     return frozenset(out)
 
 
-def authorization_scopes(fact, edges, edges_of, fact_of):
-    """Exact live scopes required to admit this irreversible effect."""
-    family = family_for(fact.t)
-    if family is None:
-        raise ValueError("authorization family")
-    by_role = {edge.role: edge.fid for edge in edges}
-    out = set()
-    for role in family.POLICY.authorization_guards:
-        provider = fact_of(by_role.get(role))
-        if provider is None:
-            raise ValueError("authorization guard edge")
-        out.update(authority_scopes(provider, edges_of, fact_of))
-    if len(out) > MAX_AUTHORITY_SCOPES:
-        raise ValueError("authorization scope budget")
-    return frozenset(out)
-
-
 def action_sids(fact):
     """Every typed id activated by this validated action family."""
     family = family_for(fact.t)
@@ -210,4 +193,4 @@ def principal_sid(namespace, public_key):
 def blob_refs(fact):
     """Return immutable object hashes named by a fact, if that family has any."""
     hook = getattr(FAMILIES[fact.t], "blob_refs", None)
-    return tuple(hook(fact)) if hook is not None else ()
+    return hook(fact) if hook is not None else ()

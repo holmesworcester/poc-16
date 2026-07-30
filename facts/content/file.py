@@ -24,7 +24,6 @@ POLICY = FamilyPolicy(
     suppression=(Self(), Parent("member")),
     direct_targets=DELETE_SELF,
     owner_edge="member",
-    authorization_guards=("member",),
 )
 WIDTH = bao.WIDTH
 MAX_FILE_BYTES = bao.MAX_FILE_BYTES
@@ -86,7 +85,7 @@ def validate(f, ctx):
         return len(parents) == 1 and f == file(
             f.ws, body["pk"], body["chan"], body["name"], body["size"],
             body["root"], body["n"], f.ts, parents[0])
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

@@ -343,12 +343,13 @@ def _posting_changes(fact, record, value):
     return {key: value for key in record_postings(fact, record)}
 
 
-def need_key(name, a0, a1=None, requires=()):
-    """Canonical authority address; full keys may bind required co-offers."""
-    return canon([
-        "need", name, a0, a1,
-        sorted([list(row) for row in requires]),
-    ]).decode()
+def need_key(name, a0, a1=None):
+    """Canonical base authority address.
+
+    Required co-offers never alter this key. Readers check them on the
+    selected provider's authenticated FactRecord.
+    """
+    return canon(["need", name, a0, a1]).decode()
 
 
 def build(

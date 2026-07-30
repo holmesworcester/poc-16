@@ -89,6 +89,8 @@ def decode_pile(b: bytes, workspace):
             raise InvalidEncoding("pile workspace")
         if not all(bound_to(fact, pile_workspace) for fact in facts):
             raise InvalidEncoding("mixed workspace pile")
+        if encode_pile(facts, workspace=pile_workspace) != b:
+            raise InvalidEncoding("pile is not canonical")
         return facts
     except PayloadTooLarge as error:
         raise InvalidPile(str(error)) from error

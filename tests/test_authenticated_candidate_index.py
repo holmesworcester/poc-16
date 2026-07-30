@@ -1,7 +1,9 @@
 """Differential tests for the authenticated generic candidate routes."""
+import json
 import random
 
 import facts
+import pytest
 
 from core import catalog, indexes, merkle_map, snapshot
 from core.crypto import h, keypair
@@ -288,6 +290,17 @@ def test_authority_winner_cache_still_saves_conflict_range_fetches(tmp_path):
     assert candidate_page.pages_read \
         <= 2 * view.trees[indexes.FACT]["depth"] + len(candidates) + 1
     assert candidate_page.pages_read > authority.pages_read
+
+
+def test_authority_keys_are_base_only_and_never_encode_cooffers():
+    key = indexes.need_key("device_key", "device")
+    assert json.loads(key) == ["need", "device_key", "device", None]
+    with pytest.raises(TypeError):
+        indexes.need_key(
+            "device_key",
+            "device",
+            requires=(("device", "owner", "device"),),
+        )
 
 
 def test_transitive_liveness_postings_follow_same_rank_provider_rewire(

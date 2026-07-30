@@ -7,14 +7,18 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import facts
 
-from core import status
 from core import (
     admission_proof, close, daemon, fact, merkle_map, object_store,
-    repository_applier as repository_applier_module, snapshot,
+    repository_applier as repository_applier_module, snapshot, status,
 )
 from core.crypto import h
 from core.fact import Fact, canon
-from core.limits import PayloadTooLarge
+from core.ingress import InvalidPile
+from core.limits import (
+    MAX_ATOM_NAME_BYTES,
+    MAX_ATOM_VALUE_BYTES,
+    PayloadTooLarge,
+)
 from core.node import Node
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
@@ -38,6 +42,66 @@ def poisoned_timestamp_pile(workspace):
         "ws": workspace,
         "facts": [{"b": body, "e": envelope}],
     })
+
+
+def test_pile_codec_requires_one_canonical_json_spelling():
+    workspace = "0" * 64
+    canonical = close.encode_pile((), workspace=workspace)
+    assert close.decode_pile(canonical, workspace) == []
+
+    aliases = (
+        b'{ "facts": [], "ws": "' + workspace.encode() + b'" }',
+        b'{"ws":"' + workspace.encode() + b'","facts":[]}',
+        b'{"facts":[],"ws":"' + workspace.encode()
+        + b'","ws":"' + workspace.encode() + b'"}',
+        b'{"facts":[],"ws":NaN}',
+        b'{"facts":[],"ws":Infinity}',
+    )
+    for raw in aliases:
+        with pytest.raises(InvalidPile):
+            close.decode_pile(raw, workspace)
+
+
+def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
+    workspace = "0" * 64
+    fid = "f" * 64
+    valid = Fact(
+        "unknown",
+        1,
+        [
+            ["ref", "r" * MAX_ATOM_NAME_BYTES, fid],
+            [
+                "offer",
+                "n" * MAX_ATOM_NAME_BYTES,
+                "v" * MAX_ATOM_VALUE_BYTES,
+                "w" * MAX_ATOM_VALUE_BYTES,
+            ],
+        ],
+        {},
+        workspace,
+    )
+    raw = close.encode_pile((valid,), workspace=workspace)
+    assert close.decode_pile(raw, workspace) == [valid]
+
+    malformed = (
+        ["ref", "", fid],
+        ["ref", "r" * (MAX_ATOM_NAME_BYTES + 1), fid],
+        ["ref", "role", []],
+        ["ref", "role", "not-a-fid"],
+        ["offer", "", "value"],
+        ["offer", "name", ""],
+        ["offer", "name", "value", ""],
+        ["offer", "n" * (MAX_ATOM_NAME_BYTES + 1), "value"],
+        ["offer", "name", "v" * (MAX_ATOM_VALUE_BYTES + 1)],
+        ["offer", "name", []],
+    )
+    for atom in malformed:
+        poison = Fact("unknown", 1, [atom], {}, workspace)
+        with pytest.raises(InvalidPile):
+            close.decode_pile(
+                close.encode_pile((poison,), workspace=workspace),
+                workspace,
+            )
 
 
 def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
@@ -593,16 +657,25 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
     store = node.store(workspace)
     real_delete = store.delete
     applier = node.applier(workspace)
+    real_propose = applier.propose
+    proposals = 0
+
+    async def counted_propose(value):
+        nonlocal proposals
+        proposals += 1
+        return await real_propose(value)
 
     def failed_delete(_key):
         raise OSError("injected retirement outage")
 
     monkeypatch.setattr(store, "delete", failed_delete)
+    monkeypatch.setattr(applier, "propose", counted_propose)
 
     for _ in range(5):
         node.turn(workspace)
 
     assert store.get(source) == raw
+    assert proposals == 1
     assert len(applier._receipts) == 1
     assert store.list("failed/") == []
     assert node.ingress_attempt_failures(workspace)[0]["error"] == \

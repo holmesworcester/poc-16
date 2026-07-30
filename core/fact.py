@@ -9,12 +9,24 @@ import json
 from dataclasses import dataclass, field
 
 from .crypto import h
-from .limits import InvalidEncoding, MAX_OBJECT_BYTES, decode_json
+from .limits import (
+    InvalidEncoding,
+    MAX_ATOM_NAME_BYTES,
+    MAX_ATOM_VALUE_BYTES,
+    MAX_OBJECT_BYTES,
+    decode_json,
+    valid_bounded_text,
+)
 from .shape import key, valid_fid, valid_timestamp
 
 
 def canon(o) -> bytes:
-    return json.dumps(o, sort_keys=True, separators=(",", ":")).encode()
+    return json.dumps(
+        o,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
 
 @dataclass(frozen=True)
@@ -81,10 +93,19 @@ def _atoms_ok(atoms) -> bool:
         if not (isinstance(a, list) and a):
             return False
         if a[0] == "ref":
-            if len(a) != 3:
+            if len(a) != 3 \
+                    or not valid_bounded_text(
+                        a[1], MAX_ATOM_NAME_BYTES) \
+                    or not valid_fid(a[2]):
                 return False
         elif a[0] == "offer":
-            if len(a) not in (3, 4):
+            if len(a) not in (3, 4) \
+                    or not valid_bounded_text(
+                        a[1], MAX_ATOM_NAME_BYTES) \
+                    or not valid_bounded_text(
+                        a[2], MAX_ATOM_VALUE_BYTES) \
+                    or len(a) == 4 and not valid_bounded_text(
+                        a[3], MAX_ATOM_VALUE_BYTES):
                 return False
         elif a[0] == "supp":
             from .suppression import valid_selector_marker

@@ -15,7 +15,7 @@ from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "user_invite"
-POLICY = FamilyPolicy(authorization_guards=("member",))
+POLICY = FamilyPolicy()
 
 
 # SHAPE
@@ -41,7 +41,7 @@ def validate(f, ctx):
         name, invite_pk, empty = f.offers()[0]
         return name == "invitee" and empty == "" \
             and f == user_invite(f.ws, f.body["pk"], invite_pk, f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

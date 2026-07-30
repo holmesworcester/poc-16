@@ -203,7 +203,7 @@ def test_repository_applier_rejects_forged_base_map_metadata(
     assert tuple(store.list("obj/")) == objects
 
 
-def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
+def test_post_removal_candidates_remain_eligible_paginated_and_cold_rebuilt(
         tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -211,7 +211,7 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     provider = member_src(node, workspace, bob)
     eviction = facts.auth.removal.evict(node, workspace, bob)
     first_ts = node.candidate_of(workspace, eviction).ts + 1
-    raw, dormant = _removed_member_messages(
+    raw, accepted = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 11, first_ts)
     applier = node.applier(workspace)
     source = run(applier.stage("hostile00000000", raw))
@@ -229,8 +229,8 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     assert result.retired is True
     assert store.get(source) is None
     cold = _reader(workspace, store)
-    for fact in dormant:
-        assert cold.candidates().fact_record(fact.fid)["state"] == "dormant"
+    for fact in accepted:
+        assert cold.candidates().fact_record(fact.fid)["state"] == "eligible"
         assert cold.candidates().fact(fact.fid) == fact
 
     before_noop = store.get("root")
@@ -242,46 +242,41 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
     live_fid = facts.content.message.post(
         node, workspace, "general", "one eligible", ts=first_ts + 100)
     view = _root_view(node, workspace)
-    for fact in dormant:
+    for fact in accepted:
         record = view.fact_record(fact.fid)
-        assert record["state"] == "dormant"
+        assert record["state"] == "eligible"
         assert record["fact_oid"] == h(encode(fact))
         assert view.fact(fact.fid) == fact
         view.verify(fact.fid)
 
     worker = node.reader(workspace).worker()
-    ordinary = worker.postings(
-        catalog.TYPE_INDEX, "msg", "", limit=1)
-    assert [(row.state, row.fid) for row in ordinary.rows] == [
-        ("eligible", live_fid)]
-    assert ordinary.cursor is None
-
-    rows, cursor = [], None
-    while True:
-        page = worker.postings(
-            catalog.TYPE_INDEX, "msg", "",
-            after=cursor, limit=3, include_dormant=True)
-        rows.extend(page.rows)
-        cursor = page.cursor
-        if cursor is None:
-            break
-    assert rows[0].state == "eligible"
-    assert {row.fid for row in rows if row.state == "dormant"} == {
-        fact.fid for fact in dormant}
-    assert len(rows) == len(dormant) + 1
+    expected_fids = {fact.fid for fact in accepted} | {live_fid}
+    for include_dormant in (False, True):
+        rows, cursor = [], None
+        while True:
+            page = worker.postings(
+                catalog.TYPE_INDEX, "msg", "",
+                after=cursor, limit=3,
+                include_dormant=include_dormant)
+            rows.extend(page.rows)
+            cursor = page.cursor
+            if cursor is None:
+                break
+        assert {row.fid for row in rows} == expected_fids
+        assert {row.state for row in rows} == {"eligible"}
 
     expected_root = store.get("root")
     expected = _reader(workspace, store, expected_root).archive()
-    assert set(expected.records) >= {fact.fid for fact in dormant}
+    assert set(expected.records) >= {fact.fid for fact in accepted}
 
-    # A fresh recipient reader reconstructs dormant bodies and eligibility
-    # using only the pinned root and immutable object fetches.
+    # A fresh recipient reader reconstructs historically admitted bodies and
+    # eligibility using only the pinned root and immutable object fetches.
     rebuilt = _reader(workspace, store, expected_root)
     assert rebuilt.root_bytes == expected_root
-    for fact in dormant:
+    for fact in accepted:
         assert rebuilt.candidates().fact(fact.fid) == fact
         assert rebuilt.candidates().fact_record(fact.fid)[
-            "state"] == "dormant"
+            "state"] == "eligible"
 
 
 @pytest.mark.parametrize(
@@ -290,7 +285,6 @@ def test_dormant_candidates_are_retained_paginated_and_cold_rebuilt(
         ("extra-supp-clear", "SuppTree projection"),
         ("forged-authority", "AuthorityTree projection"),
         ("eligible-to-dormant", "FactOrder projection"),
-        ("dormant-to-eligible", "FactOrder projection"),
         ("rank-relabel", "eligible FactRecord judgment"),
         ("dependency-relabel", "eligible FactRecord judgment"),
         ("arbitrary-action-slot", "FactTree projection"),
@@ -310,11 +304,11 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
     provider = member_src(node, workspace, bob)
     eviction = facts.auth.removal.evict(node, workspace, bob)
     first_ts = node.candidate_of(workspace, eviction).ts + 1
-    raw, dormant_messages = _removed_member_messages(
+    raw, historical_messages = _removed_member_messages(
         node, workspace, bob_secret, bob, provider, 1, first_ts)
     _, admitted = _stage_apply(node.applier(workspace), raw)
     assert admitted.status == "applied"
-    dormant = dormant_messages[0].fid
+    historical = historical_messages[0].fid
 
     def mutate(rows):
         fact_rows = rows[indexes.FACT]
@@ -323,13 +317,10 @@ def test_cold_reconstruction_rejects_authenticated_projection_lies(
         elif attack == "forged-authority":
             address = next(iter(rows[indexes.AUTHORITY]))
             rows[indexes.AUTHORITY][address] = {
-                "state": "provider", "fid": dormant, "rank": 0}
+                "state": "provider", "fid": historical, "rank": 0}
         elif attack == "eligible-to-dormant":
             record = fact_rows[indexes.fact_key(live)]
             record["state"], record["rank"] = "dormant", None
-        elif attack == "dormant-to-eligible":
-            record = fact_rows[indexes.fact_key(dormant)]
-            record["state"], record["rank"] = "eligible", 0
         elif attack == "rank-relabel":
             fact_rows[indexes.fact_key(live)]["rank"] += 1
         elif attack == "dependency-relabel":
@@ -560,14 +551,15 @@ def test_admission_proof_traversal_enforces_every_budget_and_graph_guard(
             lambda _fid: None, lambda _oid: None)
 
 
-@pytest.mark.parametrize("dormant", (False, True))
-def test_candidate_proof_min_join_converges_without_a_range_difference(
-        tmp_path, monkeypatch, dormant):
+@pytest.mark.parametrize("prior_removal", (False, True))
+def test_candidate_proof_min_join_converges_with_or_without_prior_removal(
+        tmp_path, monkeypatch, prior_removal):
     seed = Node(str(tmp_path / "seed"))
     workspace = facts.auth.workspace.create(seed, "alice", ts=1)
     bob_secret, bob, _ = add_member(seed, workspace, "bob", ts=10)
     provider = member_src(seed, workspace, bob)
-    eviction = facts.auth.removal.evict(seed, workspace, bob) if dormant else None
+    eviction = facts.auth.removal.evict(
+        seed, workspace, bob) if prior_removal else None
     base = closed_subset(seed, workspace, all_fids(seed, workspace))
 
     item = message(
@@ -595,7 +587,7 @@ def test_candidate_proof_min_join_converges_without_a_range_difference(
         for pile in (base, initial, alternate):
             deliver(current, workspace, pile)
             current.turn(workspace)
-        assert (current.fact_of(workspace, item.fid) is None) is dormant
+        assert current.fact_of(workspace, item.fid) == item
         assert current.candidate_of(workspace, item.fid) == item
         nodes.append(current)
     local, remote = nodes

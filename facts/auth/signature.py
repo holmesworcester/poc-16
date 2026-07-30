@@ -28,7 +28,7 @@ def validate(f, ctx):
                       {"sig": f.body["sig"]}, f.ws)
         return name == "author" and f == shaped \
             and verify(pk, target, f.body["sig"])
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

@@ -12,7 +12,6 @@ from . import signature
 TAG = "device_invite"
 POLICY = FamilyPolicy(
     suppression=(Self(),),
-    authorization_guards=("member", "device"),
     authority_liveness_guards=("member", "device"),
     principal_offers=(
         SidOffer("member", "member"),
@@ -59,7 +58,7 @@ def validate(f, ctx):
             and f == device_invite(
                 f.ws, body["pk"], body["user"], body["device"],
                 body["label"], f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

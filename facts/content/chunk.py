@@ -21,7 +21,6 @@ POLICY = FamilyPolicy(
     ),
     direct_targets=DELETE_SELF,
     owner_edge="member",
-    authorization_guards=("member",),
 )
 
 
@@ -92,7 +91,7 @@ def validate(f, ctx):
             f.ws, body["pk"], body["chan"], body["root"],
             body["i"], body["n"], body["cid"], f.ts,
             parents[0], ancestors[0])
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 
@@ -101,7 +100,7 @@ DURABLE = True
 
 
 def blob_refs(f):
-    return (f.body["cid"],)
+    return (f.body.get("cid"),)
 
 
 # COMMANDS

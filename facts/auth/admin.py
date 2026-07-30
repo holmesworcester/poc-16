@@ -11,8 +11,7 @@ from . import signature
 
 TAG = "admin"
 POLICY = FamilyPolicy(
-    authorization_guards=("grantor_admin",),
-    # Grantor authority is checked when the grant is admitted. The resulting
+    # The grantor_admin Need is checked when the grant is admitted. The resulting
     # admin authority remains live only while the grantee remains a member.
     authority_liveness_guards=("grantee_member",),
 )
@@ -46,7 +45,7 @@ def validate(f, ctx):
         return set(body) == {"pk", "target"} \
             and all(isinstance(body[key], str) for key in body) \
             and f == admin(f.ws, body["pk"], body["target"], f.ts)
-    except Exception:
+    except (KeyError, IndexError, TypeError, ValueError):
         return False
 
 

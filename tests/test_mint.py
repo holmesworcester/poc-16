@@ -268,7 +268,8 @@ def test_worker_matches_randomized_canonical_authority_conflicts(
             == (200 if expected else 403)
 
 
-def test_gate_screens_the_whole_submitted_closure(tmp_path):
+def test_gate_checks_current_uploader_not_historical_closure_authors(
+        tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
@@ -279,14 +280,19 @@ def test_gate_screens_the_whole_submitted_closure(tmp_path):
         node, workspace, "general", "historical but now inactive", ts=20)
     bob_closure = decode_pile(
         closed_subset(node, workspace, {bob_message}), workspace)
+    now = now_ms()
+    bob_request = request.payload(
+        node, workspace, "sync", now + 60_000, now)
 
     node.bind_identity(workspace, founder)
     facts.auth.removal.evict(node, workspace, bob)
-    now = now_ms()
     good = request.payload(
         node, workspace, "sync", now + 60_000, now)
     assert authorize(
         node, workspace, encode_pile(good), now) == (node.pk, "sync")
     assert authorize(
+        node, workspace, encode_pile(bob_request), now) is None
+    assert authorize(
         node, workspace,
-        encode_pile(combine(bob_closure, good)), now) is None
+        encode_pile(combine(bob_closure, good)), now) \
+        == (founder, "sync")
