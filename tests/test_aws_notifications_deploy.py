@@ -596,14 +596,19 @@ def test_enable_with_missing_launch_evidence_stops_before_build(
     assert effects == ["lifecycle"]
 
 
-def test_enabled_update_rejects_untested_software_before_build(monkeypatch):
-    candidate = args(create=False, update=True)
+@pytest.mark.parametrize(("enable", "target_enabled"), (
+    (None, True),
+    (False, False),
+))
+def test_enabled_update_rejects_untested_software_before_build(
+        monkeypatch, enable, target_enabled):
+    candidate = args(create=False, update=True, enable=enable)
     incumbent = manage._outputs(stack(
         candidate, enabled=True, software_digest="e" * 64))
     effects = []
     monkeypatch.setattr(
         manage, "_stack_for_deploy",
-        lambda _args: ("stack", True, False, incumbent))
+        lambda _args: ("stack", target_enabled, False, incumbent))
     monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
     monkeypatch.setattr(
         manage, "_verify_state_lifecycle",
@@ -613,9 +618,39 @@ def test_enabled_update_rejects_untested_software_before_build(monkeypatch):
     monkeypatch.setattr(
         manage, "build", lambda *_args, **_kwargs: effects.append("build"))
 
-    with pytest.raises(RuntimeError, match="disable.*changing software"):
+    with pytest.raises(
+            RuntimeError, match="disable.*incumbent software.*changing"):
         manage.deploy(candidate)
     assert effects == ["lifecycle"]
+
+
+def test_already_disabled_update_can_stage_new_software(monkeypatch):
+    candidate = args(create=False, update=True)
+    incumbent = manage._outputs(stack(
+        candidate, enabled=False, software_digest="e" * 64))
+    final = stack(
+        candidate, enabled=False, software_digest=SOFTWARE_DIGEST)
+    effects = []
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", False, False, incumbent))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
+    monkeypatch.setattr(
+        manage, "_verify_state_lifecycle", lambda _args: None)
+    monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(
+        manage, "build", lambda _args, **_kwargs: effects.append("build"))
+    monkeypatch.setattr(manage, "_owned_stack", lambda _args: final)
+    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
+    monkeypatch.setattr(
+        manage, "_run", lambda command, **_kwargs: effects.append(command))
+
+    outputs = manage.deploy(candidate)
+
+    assert outputs["SoftwareDigest"] == SOFTWARE_DIGEST
+    assert effects[0] == "build"
+    assert effects[1][:2] == ["sam", "deploy"]
 
 
 def test_build_refuses_prepared_input_change(monkeypatch):

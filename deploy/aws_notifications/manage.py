@@ -553,10 +553,12 @@ def deploy(args):
         _check_binding(incumbent, binding)
     _verify_state_lifecycle(args)
     software_digest = _prepare_software()
-    if incumbent is not None and enabled \
-            and incumbent.get("SoftwareDigest") != software_digest:
+    if incumbent is not None \
+            and incumbent.get("SoftwareDigest") != software_digest \
+            and (incumbent.get("Enabled") != "false" or enabled):
         raise RuntimeError(
-            "disable notification production before changing software")
+            "disable notification production with incumbent software before "
+            "changing software")
     if args.enable is True:
         _check_launch_gate(args, target, binding, software_digest)
         _check_initialized(args, incumbent)

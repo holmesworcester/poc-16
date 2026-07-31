@@ -738,9 +738,11 @@ encode it only after the corresponding device test passes:
 
 Repeat `deploy` with `--update --enable`, the same immutable arguments, and
 `--ios-launch-record IOS.json --android-launch-record ANDROID.json`. An enabled
-deployment rejects a changed software digest. Upgrade by explicitly disabling,
-deploying the new code while disabled, repeating both launch tests against that
-digest, and then enabling it.
+deployment rejects a changed software digest. Upgrade in three distinct steps:
+disable using the incumbent code, deploy the new code after the stack is already
+disabled, then repeat both launch tests against that digest and enable it. The
+tool rejects a one-step disable-plus-code-change because CloudFormation need not
+disable triggers before replacing function code.
 
 The source queue retains wakes for four days and the DLQ for fourteen. A
 carrier wake is not the durable record; non-expiring notification state is.
