@@ -8,7 +8,12 @@ from .delivery import (
     seal_target,
     trigger_for,
 )
-from .worker import NotificationWorker, WorkerResult, carrier_disposition
+from .worker import (
+    NotificationWorker,
+    WorkerResult,
+    carrier_disposition,
+    handle_carrier_delivery,
+)
 
 __all__ = (
     "NotificationIntent",
@@ -18,6 +23,7 @@ __all__ = (
     "carrier_disposition",
     "derive",
     "derive_awaited",
+    "handle_carrier_delivery",
     "seal_target",
     "trigger_for",
 )

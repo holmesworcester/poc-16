@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from enum import Enum
 from inspect import isawaitable
 
+from core.limits import MAX_ROOT_BYTES, PayloadTooLarge
 from core.shape import FACT_TS_MAX, valid_fid
 
 from .carrier import ACK as CARRIER_ACK
 from .carrier import RETRY as CARRIER_RETRY
+from .carrier import CarrierDelivery
 from .delivery import (
     DeliveryResult,
     InvalidPublicationHint,
@@ -23,6 +25,7 @@ from .delivery import (
     derive_awaited,
     request_for,
 )
+from .hints import decode_hint, materialize_hint
 
 
 class NotificationAction(Enum):
@@ -34,6 +37,10 @@ class NotificationAction(Enum):
 ACK = NotificationAction.ACK
 RETRY = NotificationAction.RETRY
 TERMINAL = NotificationAction.TERMINAL
+
+
+async def _resolve(value):
+    return await value if isawaitable(value) else value
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,17 +94,13 @@ class NotificationWorker:
         self.now_ms = now_ms
         self.push_node = public
 
-    @staticmethod
-    async def _resolve(value):
-        return await value if isawaitable(value) else value
-
     async def process(self, hint):
         """Return an ack decision; never acknowledge a retryable failure."""
         if not isinstance(hint, PublicationHint):
             return WorkerResult(TERMINAL, reason="invalid-hint")
         try:
-            root = await self._resolve(self.current_root(hint.workspace))
-            now = await self._resolve(self.now_ms())
+            root = await _resolve(self.current_root(hint.workspace))
+            now = await _resolve(self.now_ms())
             if type(now) is not int or not 0 <= now <= FACT_TS_MAX:
                 raise ValueError("notification clock")
             intents = await derive_awaited(
@@ -116,7 +119,7 @@ class NotificationWorker:
         for intent in intents:
             try:
                 request = request_for(intent, self.secret, now)
-                accepted = await self._resolve(self.provider.send(request))
+                accepted = await _resolve(self.provider.send(request))
                 if not isinstance(accepted, PushAccepted):
                     raise OSError("push provider returned no acceptance")
             except PushUnregistered:
@@ -139,6 +142,41 @@ class NotificationWorker:
         )
 
 
+async def handle_carrier_delivery(
+        delivery, workspace, notification_state, worker):
+    """Resolve one canonical carrier body through the shared worker path.
+
+    The trusted deployment supplies ``workspace`` and a read-only
+    notification-state capability.  Carrier metadata is never authority.
+    """
+    read = getattr(notification_state, "get_bounded", None)
+    if not isinstance(delivery, CarrierDelivery) \
+            or not valid_fid(workspace) \
+            or not callable(read) \
+            or not isinstance(worker, NotificationWorker):
+        raise TypeError("notification carrier handler")
+    try:
+        reference = decode_hint(delivery.body)
+    except (TypeError, ValueError):
+        return CARRIER_ACK
+    if reference.workspace != workspace:
+        return CARRIER_ACK
+    try:
+        raw = await _resolve(read(
+            "obj/" + reference.root_oid, MAX_ROOT_BYTES))
+    except PayloadTooLarge:
+        return CARRIER_ACK
+    except Exception:
+        return CARRIER_RETRY
+    if raw is None or not isinstance(raw, bytes):
+        return CARRIER_RETRY
+    try:
+        hint = materialize_hint(reference, raw)
+    except (TypeError, ValueError):
+        return CARRIER_ACK
+    return carrier_disposition(await worker.process(hint))
+
+
 __all__ = (
     "ACK",
     "NotificationAction",
@@ -147,4 +185,5 @@ __all__ = (
     "TERMINAL",
     "WorkerResult",
     "carrier_disposition",
+    "handle_carrier_delivery",
 )

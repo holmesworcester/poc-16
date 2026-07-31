@@ -302,6 +302,7 @@ def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
     "name,expected",
     [
         ("UnregisteredError", PushUnregistered),
+        ("InvalidArgumentError", PushRetryable),
         ("NotFoundError", PushRetryable),
         ("QuotaExceededError", PushRetryable),
         ("SenderIdMismatchError", PushRetryable),
@@ -319,3 +320,15 @@ def test_firebase_adapter_classifies_errors_without_leaking_details(
     with pytest.raises(expected) as caught:
         adapter.send(_request())
     assert "secret provider detail" not in str(caught.value)
+
+
+def test_firebase_adapter_retries_generic_send_value_error():
+    module = FakeMessaging()
+    module.error = ValueError("bad provider payload with secret detail")
+    adapter = FirebaseAdminFcm(
+        {("poc16.mobile", "production"): object()},
+        messaging_module=module)
+
+    with pytest.raises(PushRetryable) as caught:
+        adapter.send(_request())
+    assert "secret detail" not in str(caught.value)

@@ -5,7 +5,6 @@ import importlib
 
 from notifications.delivery import (
     PushAccepted,
-    PushInvalidEndpoint,
     PushPermanent,
     PushRequest,
     PushRetryable,
@@ -23,11 +22,9 @@ _RETRYABLE = frozenset({
     "UnavailableError",
     "UnknownError",
 })
-_INVALID_ENDPOINT = frozenset({
-    "InvalidArgumentError",
-})
 _RETRYABLE_CONFIGURATION = frozenset({
     "FailedPreconditionError",
+    "InvalidArgumentError",
     "NotFoundError",
     "PermissionDeniedError",
     "SenderIdMismatchError",
@@ -102,9 +99,6 @@ class FirebaseAdminFcm:
                     or isinstance(
                     error, (OSError, TimeoutError)):
                 raise PushRetryable(f"FCM send failed: {name}") from error
-            if name in _INVALID_ENDPOINT or isinstance(error, ValueError):
-                raise PushInvalidEndpoint(
-                    f"FCM target was rejected: {name}") from error
             if isinstance(error, PushPermanent):
                 raise
             raise PushRetryable(f"FCM send failed: {name}") from error
