@@ -14,9 +14,10 @@ from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
 from core.ingress import InvalidStagedIntent, PermanentIngressRejection
+from core.limits import PayloadTooLarge
 from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
-from core.object_store import STALE
+from core.object_store import OutcomeUnknown, STALE
 from core.staged_intent import (
     InvalidStagedObject,
     StagedObjectsPending,
@@ -138,6 +139,45 @@ def _put_staged_file(ingress, node, workspace, raw, key):
         ingress.put_if_absent(
             object_key, node.store(workspace).get("obj/" + digest))
     return intent
+
+
+class _FaultStore:
+    """Lose selected write responses or crash before selected creates."""
+
+    def __init__(
+            self, store, *, lose_create=(), lose_put=(), crash_create=()):
+        self.store = store
+        self.lose_create = set(lose_create)
+        self.lose_put = set(lose_put)
+        self.crash_create = tuple(crash_create)
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    @staticmethod
+    def _matched(key, selectors):
+        return next(
+            (selector for selector in selectors
+             if key.startswith(selector)),
+            None,
+        )
+
+    def put_if_absent(self, key, value):
+        if self._matched(key, self.crash_create):
+            raise RuntimeError("simulated crash before create")
+        result = self.store.put_if_absent(key, value)
+        lost = self._matched(key, self.lose_create)
+        if lost is not None:
+            self.lose_create.remove(lost)
+            raise OutcomeUnknown("simulated lost create response")
+        return result
+
+    def put(self, key, value):
+        self.store.put(key, value)
+        lost = self._matched(key, self.lose_put)
+        if lost is not None:
+            self.lose_put.remove(lost)
+            raise OutcomeUnknown("simulated lost write response")
 
 
 def test_verified_session_enters_the_applier_through_a_fresh_generation(
@@ -395,6 +435,117 @@ def test_stale_marker_replay_reuses_one_claimed_internal_generation(
     assert replay.source == first.source
     assert underlying.list("pile/") == sources == [first.source]
     assert len(underlying.list("staged/claim/")) == 1
+
+
+def test_cross_kind_operational_bytes_never_gain_staged_authority(
+        staged_file, tmp_path):
+    _, workspace, raw, key = staged_file
+    intent = decode_staged_pile(workspace, key, raw)
+    store = FsStore(str(tmp_path / "canonical"))
+    applier = RepositoryApplier(workspace, store)
+    marker = applier._marker_receipt("admitted", key, raw)
+    promoted = applier._object_receipt(
+        "promoted", intent, intent.blob_refs[0])
+    page = applier._page_receipt(intent, 0, 1)
+
+    for expected, foreign in (
+            (marker, promoted), (promoted, page), (page, marker)):
+        store.put(expected.key, foreign.raw)
+        restarted = RepositoryApplier(workspace, store)
+        with pytest.raises((ValueError, PayloadTooLarge)):
+            asyncio.run(restarted._has_evidence(expected))
+        assert store.get(expected.key) == foreign.raw
+
+    discovery = canon({
+        "cursor": "foreign-page",
+        "kind": "staged",
+        "workspace": workspace,
+    })
+    store.put(applier._staged_object_cursor_key(intent), discovery)
+    with pytest.raises(ValueError, match="staged object cursor"):
+        asyncio.run(
+            RepositoryApplier(
+                workspace, store,
+            )._load_staged_object_cursor(intent, 1)
+        )
+
+    claim_key = applier._staged_claim_key(intent.key, intent.raw)
+    store.put(claim_key, promoted.raw)
+    with pytest.raises(ValueError, match="staged claim shape"):
+        asyncio.run(
+            RepositoryApplier(
+                workspace, store,
+            )._claimed_staged_source(intent)
+        )
+    assert store.list("pile/") == []
+
+
+def test_operational_writes_reconcile_lost_responses_and_restart(
+        staged_file, tmp_path):
+    _, workspace, raw, key = staged_file
+    store = FsStore(str(tmp_path / "canonical"))
+    evidence = RepositoryApplier(
+        workspace, store)._marker_receipt("admitted", key, raw)
+    faulty = _FaultStore(
+        store,
+        lose_create=(evidence.key,),
+        lose_put=("applier/cursor/staged",),
+    )
+
+    asyncio.run(
+        RepositoryApplier(workspace, faulty)._put_evidence(evidence)
+    )
+    asyncio.run(
+        RepositoryApplier(
+            workspace, faulty,
+        )._save_discovery_cursor("staged", "next-page")
+    )
+    restarted = RepositoryApplier(workspace, store)
+    assert asyncio.run(restarted._has_evidence(evidence)) is True
+    assert asyncio.run(
+        restarted._load_discovery_cursor("staged")
+    ) == "next-page"
+
+    collision = restarted._marker_receipt("done", key, raw)
+    foreign = b"x" + collision.raw[1:]
+    store.put(collision.key, foreign)
+    with pytest.raises(
+            ValueError, match="operational evidence conflict"):
+        asyncio.run(restarted._put_evidence(collision))
+    assert store.get(collision.key) == foreign
+
+
+def test_claim_survives_lost_response_and_crash_before_internal_copy(
+        staged_file, tmp_path):
+    _, workspace, raw, key = staged_file
+    intent = decode_staged_pile(workspace, key, raw)
+    store = FsStore(str(tmp_path / "canonical"))
+
+    faulty = _FaultStore(
+        store,
+        lose_create=("staged/claim/",),
+        crash_create=("pile/",),
+    )
+    with pytest.raises(RuntimeError, match="crash before create"):
+        asyncio.run(
+            RepositoryApplier(
+                workspace, faulty,
+            )._claimed_staged_source(intent)
+        )
+
+    claim_key = RepositoryApplier(
+        workspace, store)._staged_claim_key(intent.key, intent.raw)
+    claimed_source = json.loads(store.get(claim_key))["source"]
+    assert store.get(claimed_source) is None
+
+    recovered = asyncio.run(
+        RepositoryApplier(
+            workspace, store,
+        )._claimed_staged_source(intent)
+    )
+    assert recovered == claimed_source
+    assert store.get(recovered) == raw
+    assert store.list("staged/claim/") == [claim_key]
 
 
 def test_invalid_marker_gets_one_deterministic_staged_rejection(

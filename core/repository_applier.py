@@ -11,7 +11,6 @@ Cloudflare's native R2 binding implements the same awaited methods directly.
 """
 from dataclasses import dataclass, field
 import inspect
-import json
 import secrets
 
 import facts
@@ -61,6 +60,23 @@ from .limits import (
 
 _MAX_DISCOVERY_CURSOR_BYTES = 16 * 1024
 _STAGED_OBJECT_BATCH = PAGE_BATCH
+
+
+@dataclass(frozen=True, slots=True)
+class _Evidence:
+    """One exact operational value bound to one provider-neutral key."""
+
+    key: str
+    raw: bytes
+
+
+def _decode_evidence(raw, label, fields):
+    """Decode one bounded canonical record with an explicit exact schema."""
+    value = decode_json(raw, _MAX_DISCOVERY_CURSOR_BYTES, label)
+    if not isinstance(value, dict) or set(value) != set(fields) \
+            or canon(value) != raw:
+        raise ValueError(label)
+    return value
 
 
 class _ObjectMiss(Exception):
@@ -226,15 +242,12 @@ class RepositoryApplier:
             self.store, key, _MAX_DISCOVERY_CURSOR_BYTES)
         if raw is None:
             return None
-        value = decode_json(
-            raw, _MAX_DISCOVERY_CURSOR_BYTES,
-            "repository discovery cursor")
-        if not isinstance(value, dict) or set(value) != {
-                "cursor", "kind", "workspace"} \
-                or value["kind"] != kind \
+        value = _decode_evidence(
+            raw, "repository discovery cursor",
+            {"cursor", "kind", "workspace"})
+        if value["kind"] != kind \
                 or value["workspace"] != self.workspace \
-                or not isinstance(value["cursor"], str) \
-                or canon(value) != raw:
+                or not isinstance(value["cursor"], str):
             raise ValueError("repository discovery cursor")
         return value["cursor"] or None
 
@@ -249,13 +262,7 @@ class RepositoryApplier:
             "kind": kind,
             "workspace": self.workspace,
         })
-        key = self._cursor_key(kind)
-        try:
-            await self.store.put(key, raw)
-        except OutcomeUnknown:
-            if await self._get_bounded(
-                    self.store, key, max(1, len(raw))) != raw:
-                raise
+        await self._put_hint(_Evidence(self._cursor_key(kind), raw))
 
     async def _discovery_page(self, store, kind, prefix, limit):
         if type(limit) is not int or not 0 < limit <= PAGE_BATCH:
@@ -266,30 +273,16 @@ class RepositoryApplier:
             raise TypeError("repository discovery page")
         return page
 
-    def _staged_receipt(self, kind, key, raw):
+    def _marker_receipt(self, kind, key, raw):
         record = canon({
             "key": key,
             "kind": f"staged-{kind}-v1",
             "payload": h(raw),
             "workspace": self.workspace,
         })
-        return f"staged/{kind}/{h(record)}", record
+        return _Evidence(f"staged/{kind}/{h(record)}", record)
 
-    async def _has_staged_receipt(self, kind, key, raw):
-        receipt_key, receipt = self._staged_receipt(kind, key, raw)
-        incumbent = await self._get_bounded(
-            self.store, receipt_key, max(1, len(receipt)))
-        if incumbent is None:
-            return False
-        if incumbent != receipt:
-            raise ValueError("staged receipt conflict")
-        return True
-
-    async def _record_staged_receipt(self, kind, key, raw):
-        receipt_key, receipt = self._staged_receipt(kind, key, raw)
-        await self._put_evidence(receipt_key, receipt)
-
-    def _staged_object_receipt(self, kind, intent, oid):
+    def _object_receipt(self, kind, intent, oid):
         record = canon({
             "kind": f"staged-object-{kind}-v1",
             "marker": intent.key,
@@ -297,25 +290,10 @@ class RepositoryApplier:
             "payload": h(intent.raw),
             "workspace": self.workspace,
         })
-        return f"staged/object-{kind}/{h(record)}", record
+        return _Evidence(
+            f"staged/object-{kind}/{h(record)}", record)
 
-    async def _has_staged_object_receipt(self, kind, intent, oid):
-        receipt_key, receipt = self._staged_object_receipt(
-            kind, intent, oid)
-        incumbent = await self._get_bounded(
-            self.store, receipt_key, max(1, len(receipt)))
-        if incumbent is None:
-            return False
-        if incumbent != receipt:
-            raise ValueError("staged object receipt conflict")
-        return True
-
-    async def _record_staged_object_receipt(self, kind, intent, oid):
-        receipt_key, receipt = self._staged_object_receipt(
-            kind, intent, oid)
-        await self._put_evidence(receipt_key, receipt)
-
-    def _staged_object_page_receipt(self, intent, page, pages):
+    def _page_receipt(self, intent, page, pages):
         record = canon({
             "kind": "staged-object-page-v1",
             "marker": intent.key,
@@ -324,25 +302,7 @@ class RepositoryApplier:
             "payload": h(intent.raw),
             "workspace": self.workspace,
         })
-        return f"staged/object-page/{h(record)}", record
-
-    async def _staged_object_page_done(
-            self, intent, page, pages):
-        receipt_key, receipt = self._staged_object_page_receipt(
-            intent, page, pages)
-        incumbent = await self._get_bounded(
-            self.store, receipt_key, max(1, len(receipt)))
-        if incumbent is None:
-            return False
-        if incumbent != receipt:
-            raise ValueError("staged object page receipt conflict")
-        return True
-
-    async def _record_staged_object_page(
-            self, intent, page, pages):
-        receipt_key, receipt = self._staged_object_page_receipt(
-            intent, page, pages)
-        await self._put_evidence(receipt_key, receipt)
+        return _Evidence(f"staged/object-page/{h(record)}", record)
 
     def _staged_object_cursor_key(self, intent):
         binding = canon({
@@ -361,20 +321,16 @@ class RepositoryApplier:
             self.store, key, _MAX_DISCOVERY_CURSOR_BYTES)
         if raw is None:
             return 0
-        value = decode_json(
-            raw, _MAX_DISCOVERY_CURSOR_BYTES,
-            "staged object cursor")
-        if not isinstance(value, dict) or set(value) != {
-                "kind", "marker", "page", "pages", "payload",
-                "workspace"} \
-                or value["kind"] != "staged-object-cursor-v1" \
+        value = _decode_evidence(
+            raw, "staged object cursor",
+            {"kind", "marker", "page", "pages", "payload", "workspace"})
+        if value["kind"] != "staged-object-cursor-v1" \
                 or value["marker"] != intent.key \
                 or value["pages"] != pages \
                 or value["payload"] != h(intent.raw) \
                 or value["workspace"] != self.workspace \
                 or type(value["page"]) is not int \
-                or not 0 <= value["page"] < pages \
-                or canon(value) != raw:
+                or not 0 <= value["page"] < pages:
             raise ValueError("staged object cursor")
         return value["page"]
 
@@ -391,21 +347,16 @@ class RepositoryApplier:
             "payload": h(intent.raw),
             "workspace": self.workspace,
         })
-        key = self._staged_object_cursor_key(intent)
-        try:
-            await self.store.put(key, raw)
-        except OutcomeUnknown:
-            if await self._get_bounded(
-                    self.store, key, max(1, len(raw))) != raw:
-                raise
+        await self._put_hint(_Evidence(
+            self._staged_object_cursor_key(intent), raw))
 
     async def _next_staged_object_page(
             self, intent, start, pages):
         """Find one unfinished page; every scan is bounded by 256 receipts."""
         for offset in range(pages):
             page = (start + offset) % pages
-            if not await self._staged_object_page_done(
-                    intent, page, pages):
+            if not await self._has_evidence(
+                    self._page_receipt(intent, page, pages)):
                 return page
         return None
 
@@ -419,36 +370,34 @@ class RepositoryApplier:
 
     async def _claimed_staged_source(self, intent):
         """Create or recover the marker's one durable internal generation."""
-        claim_key = self._staged_claim_key(intent.key, intent.raw)
         proposed_source = pile_source(
             intent.member, intent.raw, secrets.token_hex(16))
-        proposed = canon({
-            "key": intent.key,
-            "payload": h(intent.raw),
-            "source": proposed_source,
-            "workspace": self.workspace,
-        })
+        claim = _Evidence(
+            self._staged_claim_key(intent.key, intent.raw),
+            canon({
+                "key": intent.key,
+                "payload": h(intent.raw),
+                "source": proposed_source,
+                "workspace": self.workspace,
+            }),
+        )
         try:
             created = await self.store.put_if_absent(
-                claim_key, proposed)
+                claim.key, claim.raw)
         except OutcomeUnknown:
             created = None
         incumbent = await self._get_bounded(
-            self.store, claim_key, _MAX_DISCOVERY_CURSOR_BYTES)
-        if created is CREATED and incumbent != proposed:
+            self.store, claim.key, _MAX_DISCOVERY_CURSOR_BYTES)
+        if created is CREATED and incumbent != claim.raw:
             raise OSError("staged claim disappeared")
         if incumbent is None:
             raise OSError("staged claim was not preserved")
-        try:
-            value = json.loads(incumbent)
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ValueError("staged claim shape") from error
-        if not isinstance(value, dict) or set(value) != {
-                "key", "payload", "source", "workspace"} \
-                or value["key"] != intent.key \
+        value = _decode_evidence(
+            incumbent, "staged claim shape",
+            {"key", "payload", "source", "workspace"})
+        if value["key"] != intent.key \
                 or value["payload"] != h(intent.raw) \
-                or value["workspace"] != self.workspace \
-                or canon(value) != incumbent:
+                or value["workspace"] != self.workspace:
             raise ValueError("staged claim binding")
         source = value["source"]
         binding = check_source(source, intent.raw)
@@ -498,13 +447,19 @@ class RepositoryApplier:
         raw = await self._get_bounded(ingress, key, MAX_PILE_BYTES)
         if raw is None:
             return None
-        if await self._has_staged_receipt("rejected", key, raw):
+        receipts = {
+            state: self._marker_receipt(state, key, raw)
+            for state in ("admitted", "done", "rejected")
+        }
+        if await self._has_evidence(
+                receipts["rejected"]):
             return StagedApplyResult(
                 key,
                 None,
                 ApplyResult("rejected-staging", None),
             )
-        if await self._has_staged_receipt("done", key, raw):
+        if await self._has_evidence(
+                receipts["done"]):
             return StagedApplyResult(
                 key,
                 None,
@@ -513,14 +468,13 @@ class RepositoryApplier:
         try:
             intent = decode_staged_pile(self.workspace, key, raw)
         except PermanentIngressRejection:
-            await self._record_staged_receipt("rejected", key, raw)
+            await self._put_evidence(receipts["rejected"])
             return StagedApplyResult(
                 key,
                 None,
                 ApplyResult("rejected-staging", None),
             )
-        admitted = await self._has_staged_receipt(
-            "admitted", key, raw)
+        admitted = await self._has_evidence(receipts["admitted"])
         source = None
         if admitted:
             result = ApplyResult("admitted", None)
@@ -528,8 +482,7 @@ class RepositoryApplier:
             source = await self._claimed_staged_source(intent)
             result = await self.apply(source, retire=False)
             if result.status == "rejected":
-                await self._record_staged_receipt(
-                    "rejected", key, raw)
+                await self._put_evidence(receipts["rejected"])
                 retired = await self.retire_rejection(
                     source, intent.raw, result.rejection)
                 return StagedApplyResult(
@@ -544,8 +497,7 @@ class RepositoryApplier:
                 )
             if result.status not in {"applied", "confirmed", "noop"}:
                 return StagedApplyResult(key, source, result)
-            await self._record_staged_receipt(
-                "admitted", key, raw)
+            await self._put_evidence(receipts["admitted"])
             receipt = self._receipts[(source, h(intent.raw))]
             retired = await self.retire(
                 source, intent.raw, receipt)
@@ -562,7 +514,7 @@ class RepositoryApplier:
             len(intent.blob_refs) + _STAGED_OBJECT_BATCH - 1
         ) // _STAGED_OBJECT_BATCH
         if pages == 0:
-            await self._record_staged_receipt("done", key, raw)
+            await self._put_evidence(receipts["done"])
             return StagedApplyResult(
                 key, source, result, (), (), ())
 
@@ -570,7 +522,7 @@ class RepositoryApplier:
         page = await self._next_staged_object_page(
             intent, cursor, pages)
         if page is None:
-            await self._record_staged_receipt("done", key, raw)
+            await self._put_evidence(receipts["done"])
             return StagedApplyResult(
                 key, source, result, (), (), ())
 
@@ -587,17 +539,18 @@ class RepositoryApplier:
                 "obj",
                 oid,
             )
-            if await self._has_staged_object_receipt(
-                    "promoted", intent, oid) \
-                    or await self._has_staged_object_receipt(
-                        "poisoned", intent, oid):
+            promoted_receipt = self._object_receipt(
+                "promoted", intent, oid)
+            poisoned_receipt = self._object_receipt(
+                "poisoned", intent, oid)
+            if await self._has_evidence(promoted_receipt) \
+                    or await self._has_evidence(poisoned_receipt):
                 continue
             try:
                 value = await self._get_bounded(
                     ingress, object_key, MAX_OBJECT_BYTES)
             except PayloadTooLarge:
-                await self._record_staged_object_receipt(
-                    "poisoned", intent, oid)
+                await self._put_evidence(poisoned_receipt)
                 poisoned.append(object_key)
                 continue
             except (OSError, StoreError):
@@ -609,8 +562,7 @@ class RepositoryApplier:
             try:
                 confirm_staged_object(intent, object_key, value)
             except InvalidStagedObject:
-                await self._record_staged_object_receipt(
-                    "poisoned", intent, oid)
+                await self._put_evidence(poisoned_receipt)
                 poisoned.append(object_key)
                 continue
             try:
@@ -618,17 +570,16 @@ class RepositoryApplier:
             except (OSError, StoreError):
                 unavailable.append(object_key)
                 continue
-            await self._record_staged_object_receipt(
-                "promoted", intent, oid)
+            await self._put_evidence(promoted_receipt)
             promoted.append(oid)
 
         if not unavailable:
-            await self._record_staged_object_page(
-                intent, page, pages)
+            await self._put_evidence(
+                self._page_receipt(intent, page, pages))
         following = await self._next_staged_object_page(
             intent, (page + 1) % pages, pages)
         if following is None:
-            await self._record_staged_receipt("done", key, raw)
+            await self._put_evidence(receipts["done"])
         else:
             # This cursor is a fairness hint, never completion authority.
             # Concurrent regressions only duplicate bounded work because
@@ -845,23 +796,40 @@ class RepositoryApplier:
         self._receipts.pop(key, None)
         return retired
 
-    async def _put_evidence(self, key, raw):
+    async def _read_evidence(self, evidence):
+        return await self._get_bounded(
+            self.store, evidence.key, max(1, len(evidence.raw)))
+
+    async def _has_evidence(self, evidence):
+        incumbent = await self._read_evidence(evidence)
+        if incumbent is not None and incumbent != evidence.raw:
+            raise ValueError("operational evidence conflict")
+        return incumbent is not None
+
+    async def _put_hint(self, evidence):
+        try:
+            await self.store.put(evidence.key, evidence.raw)
+        except OutcomeUnknown:
+            if await self._read_evidence(evidence) != evidence.raw:
+                raise
+
+    async def _put_evidence(self, evidence):
         unknown = None
         for _ in range(2):
             try:
-                result = await self.store.put_if_absent(key, raw)
+                result = await self.store.put_if_absent(
+                    evidence.key, evidence.raw)
             except OutcomeUnknown as error:
                 unknown = error
             else:
                 if result not in {CREATED, EXISTS}:
                     raise TypeError("evidence create result")
-            incumbent = await self._get_bounded(
-                self.store, key, max(1, len(raw)))
-            if incumbent == raw:
+            incumbent = await self._read_evidence(evidence)
+            if incumbent == evidence.raw:
                 return
             if incumbent is not None:
-                raise ValueError("rejection evidence conflict")
-        raise unknown or OSError("rejection evidence was not preserved")
+                raise ValueError("operational evidence conflict")
+        raise unknown or OSError("operational evidence was not preserved")
 
     async def reject(self, source, raw, error, *, retire=True):
         """Persist exact typed permanent-rejection evidence, then retire."""
@@ -874,13 +842,15 @@ class RepositoryApplier:
             raise ValueError(
                 "repository source is not a present exact generation")
         payload = h(raw)
-        await self._put_evidence("failed/pile/" + payload, raw)
+        await self._put_evidence(
+            _Evidence("failed/pile/" + payload, raw))
         record = canon({
             "error": f"{type(error).__name__}: {error}",
             "id": payload,
             "source": source,
         })
-        await self._put_evidence("failed/meta/" + h(record), record)
+        await self._put_evidence(
+            _Evidence("failed/meta/" + h(record), record))
         receipt = RejectionReceipt(
             source, payload, record, binding.generation)
         retired = await retire_exact_async(
