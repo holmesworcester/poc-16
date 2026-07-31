@@ -2,9 +2,9 @@
 from workers import WorkerEntrypoint
 
 if __package__:
-    from .reader import get_bounded, read_versioned
+    from .reader import get_bounded, read_versioned, release_state
 else:
-    from reader import get_bounded, read_versioned
+    from reader import get_bounded, read_versioned, release_state
 
 
 class Default(WorkerEntrypoint):
@@ -13,3 +13,6 @@ class Default(WorkerEntrypoint):
 
     async def read_versioned(self, key, maximum):
         return await read_versioned(self.env, key, maximum)
+
+    async def release(self):
+        return release_state(self.env)

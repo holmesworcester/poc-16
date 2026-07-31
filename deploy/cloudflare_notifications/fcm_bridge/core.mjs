@@ -9,6 +9,7 @@ const FID = /^[0-9a-f]{64}$/;
 const APPLICATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const ENVIRONMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PROJECT = /^[a-z][a-z0-9-]{4,62}$/;
+const ROLE = "notification-fcm-boundary";
 
 function retry() {
   return {status: "retry"};
@@ -156,8 +157,11 @@ class FcmBridge {
   }
 
   settings() {
-    if (this.env.POC16_DEPLOYMENT_ROLE !== "notification-fcm-boundary"
+    if (this.env.POC16_DEPLOYMENT_ROLE !== ROLE
         || !FID.test(this.env.POC16_DEPLOYMENT_IDENTITY)
+        || !FID.test(this.env.POC16_SOFTWARE_DIGEST)
+        || !FID.test(this.env.POC16_RELEASE_ID)
+        || this.env.NOTIFICATIONS_ENABLED !== "1"
         || typeof this.env.FCM_APPLICATION !== "string"
         || !APPLICATION.test(this.env.FCM_APPLICATION)
         || typeof this.env.FCM_ENVIRONMENT !== "string"
@@ -256,8 +260,37 @@ class FcmBridge {
   }
 }
 
+function releaseFor(env) {
+  if (env.POC16_DEPLOYMENT_ROLE !== ROLE
+      || !FID.test(env.POC16_DEPLOYMENT_IDENTITY)
+      || !FID.test(env.POC16_SOFTWARE_DIGEST)
+      || !FID.test(env.POC16_RELEASE_ID)
+      || !["0", "1"].includes(env.NOTIFICATIONS_ENABLED)) {
+    throw new Error("FCM release bindings");
+  }
+  return {
+    enabled: env.NOTIFICATIONS_ENABLED === "1",
+    format: "poc16-cloudflare-notification-runtime-v1",
+    identity: env.POC16_DEPLOYMENT_IDENTITY,
+    release_id: env.POC16_RELEASE_ID,
+    role: ROLE,
+    software_digest: env.POC16_SOFTWARE_DIGEST,
+  };
+}
+
+function acceptsConsumerRelease(env, callerRelease) {
+  const expected = {...releaseFor(env), role: "notification-consumer"};
+  const keys = Object.keys(expected);
+  return callerRelease !== null && typeof callerRelease === "object"
+    && !Array.isArray(callerRelease)
+    && Object.keys(callerRelease).length === keys.length
+    && keys.every(key => callerRelease[key] === expected[key]);
+}
+
 export {
+  acceptsConsumerRelease,
   FcmBridge,
+  releaseFor,
   FORMAT,
   MAX_RESPONSE_BYTES,
   boundedJson,

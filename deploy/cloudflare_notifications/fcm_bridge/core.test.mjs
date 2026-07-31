@@ -3,6 +3,7 @@ import {test} from "node:test";
 import {webcrypto} from "node:crypto";
 
 import {
+  acceptsConsumerRelease,
   FcmBridge,
   MAX_RESPONSE_BYTES,
   boundedJson,
@@ -30,6 +31,9 @@ async function fixture() {
       POC16_DEPLOYMENT_ROLE: "notification-fcm-boundary",
       POC16_DEPLOYMENT_OWNER: "unit-test-owner",
       POC16_DEPLOYMENT_IDENTITY: "c".repeat(64),
+      POC16_SOFTWARE_DIGEST: "d".repeat(64),
+      POC16_RELEASE_ID: "e".repeat(64),
+      NOTIFICATIONS_ENABLED: "1",
       FCM_APPLICATION: "poc16.mobile",
       FCM_ENVIRONMENT: "production",
       FCM_PROJECT_ID: "firebase-project",
@@ -56,6 +60,25 @@ function document() {
     ttl_seconds: 60,
   };
 }
+
+test("FCM acceptance is atomically bound to the caller release", async () => {
+  const {env} = await fixture();
+  const caller = {
+    enabled: true,
+    format: "poc16-cloudflare-notification-runtime-v1",
+    identity: env.POC16_DEPLOYMENT_IDENTITY,
+    release_id: env.POC16_RELEASE_ID,
+    role: "notification-consumer",
+    software_digest: env.POC16_SOFTWARE_DIGEST,
+  };
+
+  assert.equal(acceptsConsumerRelease(env, caller), true);
+  assert.equal(acceptsConsumerRelease(
+    env, {...caller, release_id: "f".repeat(64)}), false);
+  assert.equal(acceptsConsumerRelease(
+    env, {...caller, role: "notification-scanner"}), false);
+  assert.equal(acceptsConsumerRelease(env, {...caller, extra: true}), false);
+});
 
 function jsonResponse(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {

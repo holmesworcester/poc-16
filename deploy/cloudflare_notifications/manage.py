@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -47,13 +48,19 @@ SCANNER_CONFIG = PACKAGE / "wrangler.scanner.generated.json"
 CONSUMER_CONFIG = PACKAGE / "wrangler.consumer.generated.json"
 READER_CONFIG = PACKAGE / "wrangler.reader.generated.json"
 FCM_CONFIG = PACKAGE / "wrangler.fcm.generated.json"
+HARNESS_CONFIG = PACKAGE / "wrangler.launch-harness.generated.json"
+HARNESS_SOURCE = PACKAGE / "launch_harness" / "worker.mjs"
 BUILD = PACKAGE / "build"
 VENDORED = PACKAGE / "python_modules"
 RELEASE = BUILD / "release"
+RELEASE_MANIFEST_FORMAT = "poc16-cloudflare-notification-release-v1"
+RELEASE_MANIFEST_ENV = "CF_NOTIFICATION_RELEASE_MANIFEST"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
 SOFTWARE_BINDING = "POC16_SOFTWARE_DIGEST"
+RELEASE_BINDING = "POC16_RELEASE_ID"
+ROLE_BINDING = "POC16_DEPLOYMENT_ROLE"
 ACCOUNT_BINDING = "POC16_CLOUDFLARE_ACCOUNT_ID"
 WRANGLER = "wrangler@4.118.0"
 # The free plan fixes retention at 24 hours. Correctness does not depend on
@@ -73,13 +80,31 @@ BOOTSTRAP_MODES = {
 }
 
 FID = re.compile(r"^[0-9a-f]{64}$")
+VERSION_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
 SAFE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 APPLICATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 ENVIRONMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,62}$")
+WORKERS_SUBDOMAIN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _ABSENT = object()
+
+ROLE_KEYS = ("reader", "scanner", "consumer", "fcm")
+ROLE_NAMES = {
+    "reader": "notification-canonical-reader",
+    "scanner": "notification-scanner",
+    "consumer": "notification-consumer",
+    "fcm": "notification-fcm-boundary",
+}
+CONFIG_PATHS = {
+    "reader": READER_CONFIG,
+    "scanner": SCANNER_CONFIG,
+    "consumer": CONSUMER_CONFIG,
+    "fcm": FCM_CONFIG,
+}
 
 CORE_MODULES = tuple(dict.fromkeys(
     (*REPOSITORY_READER_CORE_MODULES, "fetch_budget.py")))
@@ -104,8 +129,7 @@ def stage():
         root.mkdir(parents=True)
         _copy(PACKAGE / entry, root / "entry.py")
         _copy(PACKAGE / f"{role}.py", root / f"{role}.py")
-        if role != "reader":
-            _copy(PACKAGE / "settings.py", root / "settings.py")
+        _copy(PACKAGE / "settings.py", root / "settings.py")
         for name in CORE_MODULES:
             _copy(REPOSITORY / "core" / name, root / "core" / name)
         if role != "reader":
@@ -149,6 +173,7 @@ def stage():
     for source in (
             PACKAGE / "fcm_bridge" / "core.mjs",
             PACKAGE / "fcm_bridge" / "worker.js",
+            HARNESS_SOURCE,
             PACKAGE / "manage.py",
             PACKAGE / "pylock.toml",
             PACKAGE / "pyproject.toml",
@@ -210,9 +235,106 @@ def _prefix(value, label):
         raise ValueError(f"{label} is not a safe store prefix") from error
 
 
-def _mobile_launch_binding(configs):
-    reader, scanner, consumer, fcm = configs
+def _worker_versions(value):
+    if not isinstance(value, dict) or set(value) != set(ROLE_KEYS):
+        raise ValueError("exact Cloudflare Worker versions")
+    result = {}
+    for role in ROLE_KEYS:
+        version = value.get(role)
+        if not isinstance(version, str) or not VERSION_ID.fullmatch(version):
+            raise ValueError(f"invalid {role} Worker version")
+        result[role] = version
+    if len(set(result.values())) != len(result):
+        raise ValueError("Cloudflare Worker versions must differ")
+    return result
+
+
+def _manifest_path(environment=os.environ):
+    raw = _text(environment, RELEASE_MANIFEST_ENV)
+    path = Path(raw).expanduser().resolve()
+    if path == Path("/") or path.is_dir():
+        raise ValueError("release manifest must name a file")
+    return path
+
+
+def _release_manifest(document):
+    if not isinstance(document, dict) or set(document) != {
+            "deployment_identity", "format", "release_id",
+            "software_digest", "worker_versions"} \
+            or document.get("format") != RELEASE_MANIFEST_FORMAT \
+            or not FID.fullmatch(document.get("deployment_identity", "")) \
+            or not FID.fullmatch(document.get("release_id", "")) \
+            or not FID.fullmatch(document.get("software_digest", "")):
+        raise ValueError("Cloudflare notification release manifest")
     return {
+        **document,
+        "worker_versions": _worker_versions(document["worker_versions"]),
+    }
+
+
+def _load_release(environment=os.environ):
+    path = _manifest_path(environment)
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise RuntimeError("cannot read Cloudflare release manifest") from error
+    if not 0 < len(raw) <= 4096 or raw.endswith(b"\n"):
+        raise RuntimeError("non-canonical Cloudflare release manifest")
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("malformed Cloudflare release manifest") from error
+    document = _release_manifest(document)
+    canonical = json.dumps(
+        document, ensure_ascii=True, separators=(",", ":"),
+        sort_keys=True).encode("ascii")
+    if raw != canonical:
+        raise RuntimeError("non-canonical Cloudflare release manifest")
+    return document
+
+
+def _write_release(document, environment=os.environ):
+    document = _release_manifest(document)
+    path = _manifest_path(environment)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise RuntimeError("release manifest already exists")
+    raw = json.dumps(
+        document, ensure_ascii=True, separators=(",", ":"),
+        sort_keys=True).encode("ascii")
+    temporary = path.with_name(path.name + ".pending")
+    try:
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError("release manifest staging file already exists") \
+            from error
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(raw)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            # Same-directory hard-link publication is create-if-absent.  An
+            # os.replace here would silently clobber a concurrent operator's
+            # complete manifest after the precheck above.
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise RuntimeError("release manifest already exists") from error
+        temporary.unlink()
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _mobile_launch_binding(configs, worker_versions=None):
+    reader, scanner, consumer, fcm = configs
+    binding = {
         "canonical_bucket": reader["r2_buckets"][0]["bucket_name"],
         "canonical_prefix": reader["vars"]["CANONICAL_PREFIX"],
         "cloudflare_account_id": scanner["vars"][ACCOUNT_BINDING],
@@ -227,14 +349,19 @@ def _mobile_launch_binding(configs):
             "NOTIFICATION_STATE_PREFIX"],
         "provider": "cloudflare",
         "push_node_id": consumer["vars"]["PUSH_NODE"],
+        "release_id": scanner["vars"][RELEASE_BINDING],
         "software_digest": scanner["vars"][SOFTWARE_BINDING],
         "workspace": scanner["vars"]["WORKSPACE"],
     }
+    if worker_versions is not None:
+        binding["worker_versions"] = _worker_versions(worker_versions)
+    return binding
 
 
 def generated_configs(
         environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE,
-        software_digest=None):
+        software_digest=None, release_id=None, worker_versions=None,
+        launch_gate=True):
     """Resolve one workspace and keep live effects disabled by default."""
     if bootstrap_mode not in BOOTSTRAP_MODES:
         raise ValueError("notification bootstrap mode")
@@ -242,6 +369,9 @@ def generated_configs(
         if software_digest is None else software_digest
     if not FID.fullmatch(software_digest or ""):
         raise ValueError("software digest must be 64 lowercase hex")
+    release_id = "0" * 64 if release_id is None else release_id
+    if not FID.fullmatch(release_id or ""):
+        raise ValueError("release id must be 64 lowercase hex")
     workspace = _text(environment, "CF_WORKSPACE")
     account = _text(environment, "CLOUDFLARE_ACCOUNT_ID")
     owner = _text(environment, "CF_DEPLOYMENT_OWNER")
@@ -310,14 +440,13 @@ def generated_configs(
         "canonical_bucket": canonical,
         "canonical_prefix": canonical_prefix,
         "cloudflare_account_id": account,
+        "completion_domain": "poc16-notification-delivery-v1",
         "consumer": consumer_name,
         "fcm_application": application,
         "fcm_environment": firebase_environment,
         "fcm_project": firebase_project,
         "fcm_worker": fcm_name,
         "format": "poc16-cloudflare-notification-deployment-v1",
-        "notification_dlq": dlq,
-        "notification_queue": queue,
         "push_node": push_node,
         "reader": reader_name,
         "scanner": scanner_name,
@@ -335,6 +464,7 @@ def generated_configs(
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        RELEASE_BINDING: release_id,
         ACCOUNT_BINDING: account,
     }
 
@@ -348,6 +478,7 @@ def generated_configs(
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        RELEASE_BINDING: release_id,
         ACCOUNT_BINDING: account,
     })
     reader["r2_buckets"][0].update({
@@ -364,9 +495,10 @@ def generated_configs(
         "bucket_name": state, "preview_bucket_name": state})
     scanner["services"][0]["service"] = reader_name
     scanner["queues"]["producers"][0]["queue"] = queue
-    scanner["triggers"]["crons"] = (
-        [environment.get("CF_NOTIFICATION_CRON", "* * * * *")]
-        if enabled == "1" or bootstrap_mode != BOOTSTRAP_NONE else [])
+    # Cron and Queue consumption are version-agnostic provider controls.  They
+    # are attached only after exact-version promotion and never baked into a
+    # candidate upload.
+    scanner["triggers"]["crons"] = []
 
     consumer = json.loads(CONSUMER_TEMPLATE.read_text())
     consumer["name"] = consumer_name
@@ -375,21 +507,17 @@ def generated_configs(
     consumer["services"][0]["service"] = reader_name
     consumer["services"][1]["service"] = scanner_name
     consumer["services"][2]["service"] = fcm_name
-    consumer["queues"]["consumers"] = ([{
-        "queue": queue,
-        "max_batch_size": MAX_BATCH_SIZE,
-        "max_batch_timeout": 5,
-        "max_retries": MAX_RETRIES,
-        "dead_letter_queue": dlq,
-        "max_concurrency": MAX_CONCURRENCY,
-        "retry_delay": RETRY_DELAY_SECONDS,
-    }] if enabled == "1" else [])
+    consumer["queues"]["consumers"] = []
     fcm = json.loads(FCM_TEMPLATE.read_text())
     fcm["name"] = fcm_name
+    fcm["main"] = (RELEASE / "deploy" / "cloudflare_notifications"
+                   / "fcm_bridge" / "worker.js").relative_to(
+                       PACKAGE).as_posix()
     fcm["vars"].update({
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        RELEASE_BINDING: release_id,
         ACCOUNT_BINDING: account,
         "NOTIFICATIONS_ENABLED": enabled,
         "NOTIFICATION_TEST_MODE": test_mode,
@@ -401,11 +529,13 @@ def generated_configs(
         config["build"]["command"] = (
             f"python manage.py stage-locked {software_digest}")
     configs = reader, scanner, consumer, fcm
-    if enabled == "1" and test_mode == "0":
+    if enabled == "1" and test_mode == "0" and launch_gate:
+        if worker_versions is None:
+            raise RuntimeError("exact Cloudflare Worker versions are required")
         require_mobile_launches({
             "ios": environment.get("CF_IOS_LAUNCH_RECORD"),
             "android": environment.get("CF_ANDROID_LAUNCH_RECORD"),
-        }, _mobile_launch_binding(configs))
+        }, _mobile_launch_binding(configs, worker_versions))
     return configs
 
 
@@ -416,11 +546,47 @@ def _write_configs(configs):
         path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
+def _harness_config(configs, environment=os.environ):
+    _reader, _scanner, _consumer, fcm = configs
+    name = _safe_name(
+        environment, "CF_NOTIFICATION_LAUNCH_HARNESS",
+        "poc16-notify-launch-" + configs[1]["vars"]["WORKSPACE"][:12])
+    if name in {config["name"] for config in configs}:
+        raise ValueError("launch harness name must differ from release Workers")
+    return {
+        "$schema": "node_modules/wrangler/config-schema.json",
+        "name": name,
+        "main": HARNESS_SOURCE.relative_to(PACKAGE).as_posix(),
+        "compatibility_date": "2026-07-31",
+        "workers_dev": True,
+        "preview_urls": False,
+        "routes": [],
+        "services": [{"binding": "FCM_BOUNDARY", "service": fcm["name"]}],
+        "vars": {
+            ACCOUNT_BINDING: fcm["vars"][ACCOUNT_BINDING],
+            IDENTITY_BINDING: fcm["vars"][IDENTITY_BINDING],
+            OWNER_BINDING: fcm["vars"][OWNER_BINDING],
+            RELEASE_BINDING: fcm["vars"][RELEASE_BINDING],
+            ROLE_BINDING: "notification-launch-harness",
+            SOFTWARE_BINDING: fcm["vars"][SOFTWARE_BINDING],
+            "NOTIFICATIONS_ENABLED": "1",
+        },
+    }
+
+
+def _write_harness(config):
+    HARNESS_CONFIG.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
 def _run(command, *, capture=False, timeout=CONTROL_TIMEOUT_SECONDS,
-         input_text=None):
+         input_text=None, extra_environment=None):
     try:
+        environment = dict(os.environ)
+        if extra_environment:
+            environment.update(extra_environment)
         return subprocess.run(
-            command, cwd=PACKAGE, env=os.environ, check=True,
+            command, cwd=PACKAGE, env=environment, check=True,
             capture_output=capture, text=True, input=input_text,
             timeout=timeout)
     except FileNotFoundError as error:
@@ -428,16 +594,197 @@ def _run(command, *, capture=False, timeout=CONTROL_TIMEOUT_SECONDS,
             f"required executable is unavailable: {command[0]}") from error
 
 
-def _pywrangler(*arguments, capture=False, input_text=None):
+def _pywrangler(
+        *arguments, capture=False, input_text=None, extra_environment=None):
     return _run(
         ["uv", "run", "pywrangler", *arguments],
-        capture=capture, input_text=input_text)
+        capture=capture, input_text=input_text,
+        extra_environment=extra_environment)
 
 
-def _wrangler(*arguments, capture=False, input_text=None):
+def _wrangler(
+        *arguments, capture=False, input_text=None, extra_environment=None):
     return _run(
         ["npx", "--yes", WRANGLER, *arguments],
-        capture=capture, input_text=input_text)
+        capture=capture, input_text=input_text,
+        extra_environment=extra_environment)
+
+
+def _json_output(result, label):
+    raw = getattr(result, "stdout", "")
+    if not isinstance(raw, str) or not 0 < len(raw) <= API_RESPONSE_BYTES:
+        raise RuntimeError(f"malformed Cloudflare {label} response")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"malformed Cloudflare {label} response") from error
+
+
+def _wrangler_event(role, config_path, arguments, secrets_document=None):
+    """Run one upload and return Wrangler's machine-readable exact result."""
+    runner = _wrangler if role == "fcm" else _pywrangler
+    with tempfile.TemporaryDirectory(
+            prefix="poc16-cf-notify-version-") as directory:
+        output = Path(directory) / "wrangler.ndjson"
+        command = [*arguments, "--config", str(config_path)]
+        if secrets_document is not None:
+            if not isinstance(secrets_document, dict) or not secrets_document:
+                raise ValueError("version secrets")
+            secrets_path = Path(directory) / "secrets.json"
+            secrets_path.write_text(json.dumps(
+                secrets_document, ensure_ascii=True, separators=(",", ":"),
+                sort_keys=True))
+            command.extend(("--secrets-file", str(secrets_path)))
+        runner(*command, extra_environment={
+            "WRANGLER_OUTPUT_FILE_PATH": str(output),
+        })
+        try:
+            raw = output.read_bytes()
+        except OSError as error:
+            raise RuntimeError("Wrangler omitted operation evidence") from error
+    if not 0 < len(raw) <= 64 * 1024:
+        raise RuntimeError("malformed Wrangler operation evidence")
+    events = []
+    try:
+        for line in raw.splitlines():
+            value = json.loads(line)
+            if isinstance(value, dict) and value.get("type") != \
+                    "wrangler-session":
+                events.append(value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("malformed Wrangler operation evidence") from error
+    if len(events) != 1:
+        raise RuntimeError("ambiguous Wrangler operation evidence")
+    return events[0]
+
+
+def _upload_version(role, config, *, release_id, secrets_document=None):
+    if role not in ROLE_KEYS or not FID.fullmatch(release_id or ""):
+        raise ValueError("Worker release upload")
+    arguments = [
+        "versions", "upload", "--strict", "--tag", release_id[:32],
+        "--message", f"poc16 notification release {release_id}",
+    ]
+    event = _wrangler_event(
+        role, CONFIG_PATHS[role], arguments, secrets_document)
+    if event.get("type") != "version-upload" \
+            or event.get("version") != 1 \
+            or event.get("worker_name") != config["name"] \
+            or not VERSION_ID.fullmatch(event.get("version_id", "")):
+        raise RuntimeError("malformed Wrangler version-upload evidence")
+    return event["version_id"]
+
+
+def _active_version(config, environment=os.environ):
+    """Return the sole live version, or ABSENT when none is deployed."""
+    try:
+        document = _api(
+            "GET", "/workers/scripts/" + quote(config["name"], safe="")
+            + "/deployments", environment=environment)
+    except RuntimeError as error:
+        cause = error.__cause__
+        if isinstance(cause, HTTPError) and cause.code == 404:
+            return _ABSENT
+        raise
+    deployments = document.get("deployments") \
+        if isinstance(document, dict) else None
+    if not isinstance(deployments, list) or len(deployments) > 100 \
+            or any(not isinstance(row, dict) for row in deployments):
+        raise RuntimeError("malformed Cloudflare deployments")
+    # Uploading a first version creates the Worker but not a deployment.  That
+    # is still active absence and must remain stable through candidate upload.
+    if not deployments:
+        return _ABSENT
+    versions = deployments[0].get("versions")
+    if not isinstance(versions, list) or len(versions) != 1:
+        raise RuntimeError("notification Worker has a split deployment")
+    row = versions[0]
+    version = row.get("version_id") if isinstance(row, dict) else None
+    percentage = row.get("percentage") if isinstance(row, dict) else None
+    if not VERSION_ID.fullmatch(version or "") \
+            or percentage not in {100, 100.0}:
+        raise RuntimeError("malformed Cloudflare deployment status")
+    return version
+
+
+def _config_role(config):
+    role_name = config.get("vars", {}).get(ROLE_BINDING)
+    matches = [role for role, name in ROLE_NAMES.items()
+               if name == role_name]
+    if len(matches) != 1:
+        raise ValueError("notification Worker role")
+    return matches[0]
+
+
+def _version_bindings_at(runner, config_path, version_id):
+    result = runner(
+        "versions", "view", version_id, "--json", "--config",
+        str(config_path), capture=True)
+    document = _json_output(result, "Worker version")
+    if not isinstance(document, dict) or document.get("id") != version_id:
+        raise RuntimeError("Cloudflare returned the wrong Worker version")
+    resources = document.get("resources")
+    bindings = resources.get("bindings") if isinstance(resources, dict) \
+        else None
+    if not isinstance(bindings, list):
+        raise RuntimeError("malformed Cloudflare Worker version")
+    return bindings
+
+
+def _version_bindings(role, config, version_id):
+    runner = _wrangler if role == "fcm" else _pywrangler
+    return _version_bindings_at(runner, CONFIG_PATHS[role], version_id)
+
+
+def _binding_values(bindings, names):
+    values = []
+    for name in names:
+        matches = [item for item in bindings
+                   if isinstance(item, dict) and item.get("name") == name]
+        if len(matches) != 1 or matches[0].get("type") != "plain_text" \
+                or not isinstance(matches[0].get("text"), str):
+            return None
+        values.append(matches[0]["text"])
+    return tuple(values)
+
+
+def _version_markers(role, config, version_id):
+    return _binding_values(_version_bindings(role, config, version_id), (
+        OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
+        "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    ))
+
+
+def _expected_markers(config):
+    variables = config["vars"]
+    return (
+        variables[OWNER_BINDING], variables[IDENTITY_BINDING],
+        variables[SOFTWARE_BINDING], variables[RELEASE_BINDING],
+        variables["NOTIFICATIONS_ENABLED"], variables[ROLE_BINDING],
+    )
+
+
+def _require_candidate(role, config, version_id, secrets=()):
+    bindings = _version_bindings(role, config, version_id)
+    if _binding_values(bindings, (
+            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
+            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    )) != _expected_markers(config):
+        raise RuntimeError("Cloudflare candidate version markers differ")
+    for name in secrets:
+        matches = [item for item in bindings
+                   if isinstance(item, dict) and item.get("name") == name]
+        if len(matches) != 1 or matches[0].get("type") != "secret_text":
+            raise RuntimeError(
+                f"candidate Worker is missing required secret {name}")
+
+
+def _promote(role, config, version_id):
+    runner = _wrangler if role == "fcm" else _pywrangler
+    runner(
+        "versions", "deploy", "--version-id", version_id, "-y",
+        "--message", "poc16 exact notification release",
+        "--config", str(CONFIG_PATHS[role]))
 
 
 def sync():
@@ -459,6 +806,10 @@ def build():
         "CF_NOTIFICATIONS_ENABLED": "0",
     }, software_digest=software_digest)
     _write_configs(configs)
+    harness = _harness_config(configs, {
+        "CF_NOTIFICATION_LAUNCH_HARNESS": "poc16-notify-launch-build",
+    })
+    _write_harness(harness)
     for config in (READER_CONFIG, SCANNER_CONFIG, CONSUMER_CONFIG):
         with tempfile.TemporaryDirectory(
                 prefix="poc16-cf-notify-") as output:
@@ -482,19 +833,177 @@ def build():
                 path.suffix in {".js", ".mjs"}
                 for path in Path(output).rglob("*")):
             raise RuntimeError("FCM dry-run omitted bridge code")
+    with tempfile.TemporaryDirectory(
+            prefix="poc16-cf-notify-harness-") as output:
+        _wrangler(
+            "deploy", "--dry-run", "--outdir", output,
+            "--config", str(HARNESS_CONFIG))
+        if not any(
+                path.suffix in {".js", ".mjs"}
+                for path in Path(output).rglob("*")):
+            raise RuntimeError("launch harness dry-run omitted code")
 
 
 def print_launch_binding():
-    """Print the exact tested-deployment subject for the device harness."""
+    """Print the exact immutable provider release tested by mobile devices."""
     software_digest = _prepare_software()
-    environment = dict(os.environ)
-    environment["CF_NOTIFICATIONS_ENABLED"] = "0"
-    environment["CF_NOTIFICATION_TEST_MODE"] = "0"
+    manifest = _load_release()
     configs = generated_configs(
-        environment, software_digest=software_digest)
+        software_digest=software_digest,
+        release_id=manifest["release_id"],
+        worker_versions=manifest["worker_versions"], launch_gate=False)
+    identity, release_id, observed_software = _release_identity(configs)
+    if identity != manifest["deployment_identity"] \
+            or release_id != manifest["release_id"] \
+            or observed_software != manifest["software_digest"]:
+        raise RuntimeError("release manifest does not match local deployment")
     print(json.dumps(
-        _mobile_launch_binding(configs), sort_keys=True,
+        _mobile_launch_binding(configs, manifest["worker_versions"]),
+        sort_keys=True,
         separators=(",", ":")))
+
+
+def prepare_launch():
+    """Upload, but do not activate, one exact production candidate set."""
+    software_digest = _prepare_software()
+    release_id = secrets.token_hex(32)
+    configs = generated_configs(
+        software_digest=software_digest, release_id=release_id,
+        launch_gate=False)
+    if configs[0]["vars"]["NOTIFICATIONS_ENABLED"] != "1" \
+            or configs[0]["vars"]["NOTIFICATION_TEST_MODE"] != "0":
+        raise ValueError("prepare-launch requires production enablement")
+    _write_configs(configs)
+    credentials = _release_secrets(configs)
+    _stage_locked(software_digest)
+    create = os.environ.get("CF_CREATE") == "1"
+    for config in configs:
+        _require_deployable(config, create=create)
+    _require_effects_detached(configs)
+    _require_retained_notification_objects(configs[0], configs[1])
+    versions = _upload_release(configs, release_id, credentials)
+    identity, release_id, software_digest = _release_identity(configs)
+    document = {
+        "deployment_identity": identity,
+        "format": RELEASE_MANIFEST_FORMAT,
+        "release_id": release_id,
+        "software_digest": software_digest,
+        "worker_versions": versions,
+    }
+    _write_release(document)
+    print(json.dumps(
+        _mobile_launch_binding(configs, versions), sort_keys=True,
+        separators=(",", ":")))
+
+
+def stage_launch_fcm():
+    """Activate only the exact FCM candidate for a private test harness."""
+    software_digest = _prepare_software()
+    manifest = _load_release()
+    configs = generated_configs(
+        software_digest=software_digest,
+        release_id=manifest["release_id"],
+        worker_versions=manifest["worker_versions"], launch_gate=False)
+    identity, release_id, observed_software = _release_identity(configs)
+    if (identity, release_id, observed_software) != (
+            manifest["deployment_identity"], manifest["release_id"],
+            manifest["software_digest"]):
+        raise RuntimeError("release manifest does not match local deployment")
+    _write_configs(configs)
+    _release_secrets(configs)
+    _stage_locked(software_digest)
+    _require_effects_detached(configs)
+    for role, config in zip(ROLE_KEYS, configs):
+        _require_candidate(
+            role, config, manifest["worker_versions"][role],
+            (("FIREBASE_SERVICE_ACCOUNT_JSON",) if role == "fcm" else
+             (("PUSH_NODE_SECRET",) if role == "consumer" else ())))
+    # FCM may be invoked only through a temporary private service-bound
+    # harness.  Scanner and Queue effects remain detached throughout.
+    _promote("fcm", configs[3], manifest["worker_versions"]["fcm"])
+    if _active_version(configs[3]) != manifest["worker_versions"]["fcm"]:
+        raise RuntimeError("Cloudflare promoted the wrong FCM version")
+    _require_effects_detached(configs)
+
+
+def _manifest_configs(*, launch_gate=False):
+    software_digest = _prepare_software()
+    manifest = _load_release()
+    configs = generated_configs(
+        software_digest=software_digest,
+        release_id=manifest["release_id"],
+        worker_versions=manifest["worker_versions"],
+        launch_gate=launch_gate)
+    if _release_identity(configs) != (
+            manifest["deployment_identity"], manifest["release_id"],
+            manifest["software_digest"]):
+        raise RuntimeError("release manifest does not match local deployment")
+    return manifest, configs
+
+
+def deploy_launch_harness():
+    """Create one temporary authenticated route to the staged FCM RPC."""
+    manifest, configs = _manifest_configs()
+    harness = _harness_config(configs)
+    _write_configs(configs)
+    _write_harness(harness)
+    _stage_locked(manifest["software_digest"])
+    _require_effects_detached(configs)
+    if _active_version(configs[3]) != manifest["worker_versions"]["fcm"]:
+        raise RuntimeError("exact staged FCM version is not active")
+    _require_candidate(
+        "fcm", configs[3], manifest["worker_versions"]["fcm"],
+        ("FIREBASE_SERVICE_ACCOUNT_JSON",))
+    if _worker_markers(harness) is not _ABSENT:
+        raise RuntimeError("temporary launch harness already exists")
+    secret = _text(os.environ, "CF_NOTIFICATION_HARNESS_SECRET")
+    if not FID.fullmatch(secret):
+        raise ValueError(
+            "CF_NOTIFICATION_HARNESS_SECRET must be 32-byte hex")
+    event = _wrangler_event("fcm", HARNESS_CONFIG, (
+        "versions", "upload", "--strict", "--tag",
+        manifest["release_id"][:32], "--message",
+        "temporary poc16 mobile launch harness",
+    ), {"LAUNCH_HARNESS_SECRET": secret})
+    version = event.get("version_id") if isinstance(event, dict) else None
+    if event.get("type") != "version-upload" or event.get("version") != 1 \
+            or event.get("worker_name") != harness["name"] \
+            or not VERSION_ID.fullmatch(version or ""):
+        raise RuntimeError("malformed launch harness upload evidence")
+    bindings = _version_bindings_at(_wrangler, HARNESS_CONFIG, version)
+    if _binding_values(bindings, (
+            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
+            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    )) != _expected_markers(harness) or len([
+        row for row in bindings if isinstance(row, dict)
+        and row.get("name") == "LAUNCH_HARNESS_SECRET"
+        and row.get("type") == "secret_text"
+    ]) != 1:
+        raise RuntimeError("launch harness candidate bindings differ")
+    _wrangler(
+        "versions", "deploy", "--version-id", version, "-y",
+        "--config", str(HARNESS_CONFIG))
+    _require_owned(harness)
+    subdomain = _text(os.environ, "CF_WORKERS_SUBDOMAIN")
+    if not WORKERS_SUBDOMAIN.fullmatch(subdomain):
+        raise ValueError("CF_WORKERS_SUBDOMAIN")
+    print(f"https://{harness['name']}.{subdomain}.workers.dev/v1/send")
+
+
+def remove_launch_harness():
+    """Delete only the exact temporary harness; never touch release state."""
+    _manifest, configs = _manifest_configs()
+    harness = _harness_config(configs)
+    _write_harness(harness)
+    _require_owned(harness)
+    _wrangler(
+        "delete", harness["name"], "--force", "--config",
+        str(HARNESS_CONFIG))
+
+
+def _require_harness_absent(configs):
+    if _worker_markers(_harness_config(configs)) is not _ABSENT:
+        raise RuntimeError("remove the temporary launch harness before enablement")
 
 
 def _control_environment(environment=os.environ):
@@ -584,43 +1093,25 @@ def _require_retained_notification_objects(
 
 
 def _worker_bindings(config, environment=os.environ):
-    account, _token = _control_environment(environment)
-    try:
-        result = _api(
-            "GET",
-            "/workers/scripts/" + quote(config["name"], safe="")
-            + "/settings",
-            environment=environment)
-    except RuntimeError as error:
-        cause = error.__cause__
-        if isinstance(cause, HTTPError) and cause.code == 404:
-            return _ABSENT
-        raise
-    if not isinstance(result, dict) or not isinstance(
-            result.get("bindings"), list):
-        raise RuntimeError("malformed Cloudflare Worker settings")
-    return result["bindings"]
+    version = _active_version(config, environment)
+    if version is _ABSENT:
+        return _ABSENT
+    role_name = config.get("vars", {}).get(ROLE_BINDING)
+    if role_name == "notification-launch-harness":
+        return _version_bindings_at(
+            _wrangler, HARNESS_CONFIG, version)
+    role = _config_role(config)
+    return _version_bindings(role, config, version)
 
 
 def _worker_markers(config, environment=os.environ):
     bindings = _worker_bindings(config, environment)
     if bindings is _ABSENT:
         return _ABSENT
-    values = []
-    for name in (
-            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
-            "NOTIFICATIONS_ENABLED"):
-        matches = [
-            item for item in bindings
-            if isinstance(item, dict) and item.get("name") == name]
-        if name in {SOFTWARE_BINDING, "NOTIFICATIONS_ENABLED"} \
-                and not matches:
-            values.append(None)
-            continue
-        if len(matches) != 1 or matches[0].get("type") != "plain_text":
-            return None
-        values.append(matches[0].get("text"))
-    return tuple(values)
+    return _binding_values(bindings, (
+        OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
+        "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    ))
 
 
 def _worker_owner(config, environment=os.environ):
@@ -643,30 +1134,27 @@ def _require_deployable(config, *, create):
         if not create:
             raise RuntimeError(
                 "Worker is absent; set CF_CREATE=1 for explicit creation")
-    elif observed is None or observed[:2] != immutable:
+    elif observed is None or observed[:2] != immutable \
+            or observed[5] != config["vars"][ROLE_BINDING]:
         raise RuntimeError(
             "refusing to overwrite a Worker with different ownership or "
-            "immutable notification bindings")
-    elif production and observed[2] != config["vars"][SOFTWARE_BINDING]:
+            "immutable notification bindings or role")
+    elif production and observed[4] != "0" \
+            and observed != _expected_markers(config):
         raise RuntimeError(
-            "disable notifications before changing software; production "
-            "may enable only the exact tested digest")
+            "disable notifications before preparing production software, "
+            "or resume the exact staged candidate")
     elif config["vars"]["NOTIFICATION_TEST_MODE"] == "0" \
-            and observed[2] != config["vars"][SOFTWARE_BINDING] \
-            and (observed[3] != "0"
-                 or config["vars"]["NOTIFICATIONS_ENABLED"] != "0"):
+            and (observed[2], observed[3]) != (
+                config["vars"][SOFTWARE_BINDING],
+                config["vars"][RELEASE_BINDING]) \
+            and observed[4] != "0":
         raise RuntimeError(
-            "disable the incumbent software before changing its digest")
+            "disable the incumbent release before replacing it")
 
 
 def _require_owned(config):
-    expected = (
-        config["vars"][OWNER_BINDING],
-        config["vars"][IDENTITY_BINDING],
-        config["vars"][SOFTWARE_BINDING],
-        config["vars"]["NOTIFICATIONS_ENABLED"],
-    )
-    if _worker_markers(config) != expected:
+    if _worker_markers(config) != _expected_markers(config):
         raise RuntimeError(
             "refusing to mutate an absent, unowned, or rebound Worker")
 
@@ -677,7 +1165,8 @@ def _require_immutable_owned(config):
         config["vars"][OWNER_BINDING],
         config["vars"][IDENTITY_BINDING],
     )
-    if observed in {_ABSENT, None} or observed[:2] != expected:
+    if observed in {_ABSENT, None} or observed[:2] != expected \
+            or observed[5] != config["vars"][ROLE_BINDING]:
         raise RuntimeError(
             "refusing to mutate an absent, unowned, or rebound Worker")
 
@@ -726,6 +1215,206 @@ def _firebase_secret(expected_project, environment=os.environ):
     return raw
 
 
+def _release_secrets(configs, environment=os.environ):
+    push_secret = _text(environment, "CF_PUSH_NODE_SECRET")
+    if not FID.fullmatch(push_secret):
+        raise ValueError("CF_PUSH_NODE_SECRET must be a 32-byte hex seed")
+    try:
+        actual_push_node = load_sk(push_secret).verify_key.encode().hex()
+    except (TypeError, ValueError) as error:
+        raise ValueError("CF_PUSH_NODE_SECRET is invalid") from error
+    if actual_push_node != configs[2]["vars"]["PUSH_NODE"]:
+        raise ValueError(
+            "CF_PUSH_NODE_SECRET does not match CF_PUSH_NODE_PUBLIC")
+    firebase_secret = _firebase_secret(
+        configs[3]["vars"]["FCM_PROJECT_ID"], environment)
+    return {
+        "consumer": {"PUSH_NODE_SECRET": push_secret},
+        "fcm": {"FIREBASE_SERVICE_ACCOUNT_JSON": firebase_secret},
+    }
+
+
+def _release_identity(configs):
+    identities = {
+        config["vars"][IDENTITY_BINDING] for config in configs}
+    releases = {config["vars"][RELEASE_BINDING] for config in configs}
+    software = {config["vars"][SOFTWARE_BINDING] for config in configs}
+    if len(identities) != 1 or len(releases) != 1 or len(software) != 1:
+        raise RuntimeError("notification release configs disagree")
+    return identities.pop(), releases.pop(), software.pop()
+
+
+def _upload_release(configs, release_id, secrets_by_role):
+    versions = {}
+    configs_by_role = dict(zip(ROLE_KEYS, configs))
+    # A first upload must establish every service-binding target before the
+    # role that references it: FCM, reader, scanner, then consumer.
+    for role in ("fcm", "reader", "scanner", "consumer"):
+        config = configs_by_role[role]
+        version = _upload_version(
+            role, config, release_id=release_id,
+            secrets_document=secrets_by_role.get(role))
+        versions[role] = version
+        _require_candidate(
+            role, config, version,
+            tuple((secrets_by_role.get(role) or {}).keys()))
+    return versions
+
+
+def _snapshot(configs):
+    return {
+        role: _active_version(config)
+        for role, config in zip(ROLE_KEYS, configs)
+    }
+
+
+def _require_snapshot(configs, expected):
+    for role, config in zip(ROLE_KEYS, configs):
+        if _active_version(config) != expected[role]:
+            raise RuntimeError("concurrent notification deployment")
+
+
+def _promote_release(configs, versions, initial):
+    enabled = configs[0]["vars"]["NOTIFICATIONS_ENABLED"] == "1"
+    order = ("fcm", "reader", "consumer", "scanner") if enabled else (
+        "fcm", "scanner", "consumer", "reader")
+    expected = dict(initial)
+    configs_by_role = dict(zip(ROLE_KEYS, configs))
+    for role in order:
+        _require_snapshot(configs, expected)
+        config = configs_by_role[role]
+        if expected[role] != versions[role]:
+            _promote(role, config, versions[role])
+            if _active_version(config) != versions[role]:
+                raise RuntimeError(
+                    "Cloudflare promoted the wrong Worker version")
+        expected[role] = versions[role]
+    _require_snapshot(configs, versions)
+
+
+def _queue_consumers(scanner):
+    queue = scanner["queues"]["producers"][0]["queue"]
+    result = _wrangler(
+        "queues", "consumer", "worker", "list", queue, "--json",
+        capture=True)
+    document = _json_output(result, "Queue consumers")
+    if not isinstance(document, list) or len(document) > 1 \
+            or any(not isinstance(row, dict) for row in document):
+        raise RuntimeError("malformed Cloudflare Queue consumers")
+    return document
+
+
+def _cron_schedules(scanner, environment=os.environ):
+    result = _api(
+        "GET", "/workers/scripts/" + quote(scanner["name"], safe="")
+        + "/schedules", environment=environment)
+    if not isinstance(result, list) or len(result) > 16:
+        raise RuntimeError("malformed Cloudflare Cron schedules")
+    schedules = []
+    for row in result:
+        if not isinstance(row, dict) or not isinstance(row.get("cron"), str):
+            raise RuntimeError("malformed Cloudflare Cron schedule")
+        schedules.append(row["cron"])
+    return schedules
+
+
+def _require_effects_detached(configs, *, scanner_absent=False):
+    _reader, scanner, consumer, _fcm = configs
+    rows = _queue_consumers(scanner)
+    if rows:
+        raise RuntimeError("notification Queue consumer must be detached")
+    # Cron triggers cannot exist without their Worker.  Querying schedules for
+    # a first-create scanner is not merely redundant: Cloudflare returns 404.
+    if not scanner_absent and _cron_schedules(scanner):
+        raise RuntimeError("notification Cron must be detached")
+
+
+def _require_effects_attached(configs, environment=os.environ):
+    _reader, scanner, consumer, _fcm = configs
+    queue = scanner["queues"]["producers"][0]["queue"]
+    dlq = _safe_name(environment, "CF_NOTIFICATION_DLQ", queue + "-dlq")
+    rows = _queue_consumers(scanner)
+    row = rows[0] if len(rows) == 1 else None
+    settings = row.get("settings") if isinstance(row, dict) else None
+    script = (row.get("script") or row.get("service")) \
+        if isinstance(row, dict) else None
+    expected_settings = {
+        "batch_size": MAX_BATCH_SIZE,
+        "max_retries": MAX_RETRIES,
+        "max_wait_time_ms": 5000,
+        "max_concurrency": MAX_CONCURRENCY,
+        "retry_delay": RETRY_DELAY_SECONDS,
+    }
+    if row is None or row.get("type") != "worker" \
+            or script != consumer["name"] \
+            or row.get("dead_letter_queue") != dlq \
+            or not isinstance(settings, dict) \
+            or any(settings.get(name) != value
+                   for name, value in expected_settings.items()):
+        raise RuntimeError("notification Queue consumer differs")
+    cron = environment.get("CF_NOTIFICATION_CRON", "* * * * *")
+    if _cron_schedules(scanner, environment) != [cron]:
+        raise RuntimeError("notification Cron differs")
+
+
+def _detach_effects(configs, *, scanner_absent=False):
+    _reader, scanner, consumer, _fcm = configs
+    # Stop discovery first, then delivery.  Repeated calls are safe and do not
+    # touch queued bodies or cursor state.
+    if not scanner_absent:
+        _wrangler(
+            "triggers", "deploy", "--config", str(SCANNER_CONFIG))
+    rows = _queue_consumers(scanner)
+    if rows:
+        row = rows[0]
+        script = row.get("script") or row.get("service")
+        if row.get("type") != "worker" or script != consumer["name"]:
+            raise RuntimeError("notification Queue has another consumer")
+        queue = scanner["queues"]["producers"][0]["queue"]
+        _wrangler(
+            "queues", "consumer", "worker", "remove", queue,
+            consumer["name"])
+    _require_effects_detached(configs, scanner_absent=scanner_absent)
+
+
+def _attach_effects(configs, environment=os.environ):
+    _reader, scanner, consumer, _fcm = configs
+    _require_effects_detached(configs)
+    queue = scanner["queues"]["producers"][0]["queue"]
+    dlq = _safe_name(environment, "CF_NOTIFICATION_DLQ", queue + "-dlq")
+    _wrangler(
+        "queues", "consumer", "worker", "add", queue, consumer["name"],
+        "--batch-size", str(MAX_BATCH_SIZE),
+        "--batch-timeout", "5",
+        "--message-retries", str(MAX_RETRIES),
+        "--dead-letter-queue", dlq,
+        "--max-concurrency", str(MAX_CONCURRENCY),
+        "--retry-delay-secs", str(RETRY_DELAY_SECONDS))
+    cron = environment.get("CF_NOTIFICATION_CRON", "* * * * *")
+    if not isinstance(cron, str) or not 0 < len(cron) <= 128:
+        raise ValueError("CF_NOTIFICATION_CRON")
+    _wrangler(
+        "triggers", "deploy", "--triggers", cron,
+        "--config", str(SCANNER_CONFIG))
+    _require_effects_attached(configs, environment)
+
+
+def _activate_effects(configs, versions):
+    """Attach traffic only while the exact complete release remains active."""
+    _require_snapshot(configs, versions)
+    try:
+        _attach_effects(configs)
+        _require_snapshot(configs, versions)
+    except Exception:
+        try:
+            _detach_effects(configs)
+        except Exception as detach_error:
+            raise RuntimeError(
+                "notification activation failed and effects could not be "
+                "detached") from detach_error
+        raise
+
+
 def provision():
     """Explicitly create both finite-retention queues; never adopt names."""
     if os.environ.get("CF_CREATE") != "1":
@@ -743,59 +1432,108 @@ def provision():
 
 
 def deploy():
-    """Deploy private boundaries before the default-inert queue roles."""
+    """Promote exact versions; attach effects only after a complete release."""
     software_digest = _prepare_software()
-    configs = generated_configs(software_digest=software_digest)
+    production = os.environ.get("CF_NOTIFICATIONS_ENABLED", "0") == "1" \
+        and os.environ.get("CF_NOTIFICATION_TEST_MODE", "0") == "0"
+    manifest_name = os.environ.get(RELEASE_MANIFEST_ENV)
+    disabled_manifest = not production and isinstance(manifest_name, str) \
+        and manifest_name and Path(manifest_name).expanduser().is_file()
+    manifest = _load_release() if production or disabled_manifest else None
+    release_id = manifest["release_id"] if manifest else secrets.token_hex(32)
+    versions = manifest["worker_versions"] if production else None
+    configs = generated_configs(
+        software_digest=software_digest, release_id=release_id,
+        worker_versions=versions)
+    identity, release_id, observed_software = _release_identity(configs)
+    if manifest and (identity, release_id, observed_software) != (
+            manifest["deployment_identity"], manifest["release_id"],
+            manifest["software_digest"]):
+        raise RuntimeError("release manifest does not match local deployment")
     _write_configs(configs)
+    credentials = _release_secrets(configs)
+    _stage_locked(software_digest)
     create = os.environ.get("CF_CREATE") == "1"
     for config in configs:
         _require_deployable(config, create=create)
     _require_retained_notification_objects(configs[0], configs[1])
-    secret = _text(os.environ, "CF_PUSH_NODE_SECRET")
-    if not FID.fullmatch(secret):
-        raise ValueError("CF_PUSH_NODE_SECRET must be a 32-byte hex seed")
-    try:
-        actual_push_node = load_sk(secret).verify_key.encode().hex()
-    except (TypeError, ValueError) as error:
-        raise ValueError("CF_PUSH_NODE_SECRET is invalid") from error
-    if actual_push_node != configs[2]["vars"]["PUSH_NODE"]:
-        raise ValueError(
-            "CF_PUSH_NODE_SECRET does not match CF_PUSH_NODE_PUBLIC")
-    firebase_secret = _firebase_secret(
-        configs[3]["vars"]["FCM_PROJECT_ID"])
-    _stage_locked(software_digest)
-    _wrangler("deploy", "--config", str(FCM_CONFIG))
-    _require_owned(configs[3])
-    _wrangler(
-        "secret", "put", "FIREBASE_SERVICE_ACCOUNT_JSON",
-        "--config", str(FCM_CONFIG), input_text=firebase_secret + "\n")
-    _require_owned(configs[3])
-    _pywrangler("deploy", "--strict", "--config", str(READER_CONFIG))
-    _require_owned(configs[0])
-    with tempfile.NamedTemporaryFile(
-            mode="w", prefix="poc16-cf-notify-", suffix=".json") as file:
-        json.dump({"PUSH_NODE_SECRET": secret}, file)
-        file.flush()
-        _pywrangler(
-            "deploy", "--strict", "--config", str(CONSUMER_CONFIG),
-            "--secrets-file", file.name)
-    _require_owned(configs[2])
-    _pywrangler("deploy", "--strict", "--config", str(SCANNER_CONFIG))
-    _require_owned(configs[1])
+    initial = _snapshot(configs)
+    if production:
+        _require_effects_detached(configs)
+        _require_harness_absent(configs)
+        for role, config in zip(ROLE_KEYS, configs):
+            _require_candidate(
+                role, config, versions[role],
+                tuple((credentials.get(role) or {}).keys()))
+        if initial["fcm"] != versions["fcm"]:
+            raise RuntimeError(
+                "stage and physically test the exact FCM version first")
+    else:
+        _detach_effects(
+            configs, scanner_absent=initial["scanner"] is _ABSENT)
+        versions = _upload_release(configs, release_id, credentials)
+    _promote_release(configs, versions, initial)
+    if production or configs[0]["vars"]["NOTIFICATION_TEST_MODE"] == "1" \
+            and configs[0]["vars"]["NOTIFICATIONS_ENABLED"] == "1":
+        _activate_effects(configs, versions)
+    else:
+        _require_effects_detached(configs)
+
+
+def disable():
+    """Stop new notification traffic without building or changing code."""
+    configs = generated_configs()
+    _write_configs(configs)
+    # Establish ownership of the complete release before the first provider
+    # mutation.  This command deliberately needs no push credential, Firebase
+    # secret, release manifest, R2 lifecycle read, upload, or promotion.
+    for config in configs:
+        _require_immutable_owned(config)
+    _detach_effects(configs)
 
 
 def _deploy_scanner_mode(mode):
-    """Deploy one explicit initialization mode on an existing scanner."""
+    """Promote one exact scanner mode without rebuilding another release."""
     if mode not in BOOTSTRAP_MODES:
         raise ValueError("notification bootstrap mode")
     software_digest = _prepare_software()
+    ordinary = generated_configs(software_digest=software_digest)
+    observed = [_worker_markers(config) for config in ordinary]
+    if any(value in {_ABSENT, None} for value in observed):
+        raise RuntimeError("notification release is not fully deployed")
+    releases = {value[3] for value in observed}
+    software = {value[2] for value in observed}
+    enabled_states = {value[4] for value in observed}
+    if len(releases) != 1 or software != {software_digest} \
+            or enabled_states != {"0"}:
+        raise RuntimeError(
+            "bootstrap requires one complete disabled current release")
+    release_id = releases.pop()
     configs = generated_configs(
-        bootstrap_mode=mode, software_digest=software_digest)
+        bootstrap_mode=mode, software_digest=software_digest,
+        release_id=release_id)
     _write_configs(configs)
-    _require_owned(configs[1])
+    if mode == BOOTSTRAP_NONE:
+        _wrangler(
+            "triggers", "deploy", "--config", str(SCANNER_CONFIG))
+    else:
+        _require_effects_detached(configs)
     _require_retained_notification_objects(configs[0], configs[1])
-    _pywrangler("deploy", "--strict", "--config", str(SCANNER_CONFIG))
-    _require_owned(configs[1])
+    version = _upload_version(
+        "scanner", configs[1], release_id=release_id)
+    _require_candidate("scanner", configs[1], version)
+    _promote("scanner", configs[1], version)
+    if _active_version(configs[1]) != version:
+        raise RuntimeError("Cloudflare promoted the wrong scanner version")
+    if mode == BOOTSTRAP_NONE:
+        _require_effects_detached(configs)
+    else:
+        cron = os.environ.get("CF_NOTIFICATION_CRON", "* * * * *")
+        if not isinstance(cron, str) or not 0 < len(cron) <= 128:
+            raise ValueError("CF_NOTIFICATION_CRON")
+        _wrangler(
+            "triggers", "deploy", "--triggers", cron,
+            "--config", str(SCANNER_CONFIG))
 
 
 def bootstrap_current():
@@ -813,14 +1551,55 @@ def seal_bootstrap():
     _deploy_scanner_mode(BOOTSTRAP_NONE)
 
 
-def verify():
+def _nonproduction_release_configs():
+    """Reconstruct one disabled/test release from active version markers."""
     software_digest = _prepare_software()
-    configs = generated_configs(software_digest=software_digest)
-    for config in configs:
+    probe = generated_configs(
+        software_digest=software_digest, launch_gate=False)
+    observed = [_worker_markers(config) for config in probe]
+    if any(value in {_ABSENT, None} for value in observed):
+        raise RuntimeError("notification release is not fully deployed")
+    for config, markers in zip(probe, observed):
+        if markers[:2] != (
+                config["vars"][OWNER_BINDING],
+                config["vars"][IDENTITY_BINDING]) \
+                or markers[5] != config["vars"][ROLE_BINDING]:
+            raise RuntimeError("active notification release is not owned")
+    releases = {value[3] for value in observed}
+    software = {value[2] for value in observed}
+    enabled = {value[4] for value in observed}
+    expected_enabled = probe[0]["vars"]["NOTIFICATIONS_ENABLED"]
+    if len(releases) != 1 or software != {software_digest} \
+            or enabled != {expected_enabled}:
+        raise RuntimeError(
+            "active notification release differs from local configuration")
+    configs = generated_configs(
+        software_digest=software_digest, release_id=releases.pop(),
+        launch_gate=False)
+    return _snapshot(configs), configs
+
+
+def verify():
+    production = os.environ.get("CF_NOTIFICATIONS_ENABLED", "0") == "1" \
+        and os.environ.get("CF_NOTIFICATION_TEST_MODE", "0") == "0"
+    if production:
+        manifest, configs = _manifest_configs(launch_gate=True)
+        versions = manifest["worker_versions"]
+    else:
+        versions, configs = _nonproduction_release_configs()
+    for role, config in zip(ROLE_KEYS, configs):
+        if _active_version(config) != versions[role]:
+            raise RuntimeError("active Worker version differs from release")
         _require_owned(config)
+    _require_harness_absent(configs)
     _require_bootstrap_sealed(configs[1])
     _require_secret(configs[3], "FIREBASE_SERVICE_ACCOUNT_JSON")
+    _require_secret(configs[2], "PUSH_NODE_SECRET")
     _require_retained_notification_objects(configs[0], configs[1])
+    if configs[0]["vars"]["NOTIFICATIONS_ENABLED"] == "1":
+        _require_effects_attached(configs)
+    else:
+        _require_effects_detached(configs)
     queue = configs[1]["queues"]["producers"][0]["queue"]
     dlq = _safe_name(os.environ, "CF_NOTIFICATION_DLQ", queue + "-dlq")
     for name in (queue, dlq):
@@ -904,9 +1683,14 @@ Commands:
   sync       materialize locked Python Worker dependencies
   stage      internal exact-source build hook
   build      dry-run all four default-disabled Worker bundles
-  launch-binding     print the exact real-device launch subject
+  prepare-launch     upload one inert exact production candidate release
+  stage-launch-fcm   promote only its FCM boundary for private device tests
+  deploy-launch-harness  create a temporary authenticated FCM test route
+  remove-launch-harness  delete that exact temporary test route
+  launch-binding     print the exact four-version real-device test subject
   provision  explicitly create primary and DLQ with one-day retention
-  deploy     deploy owned FCM/read boundaries, consumer, then scanner
+  deploy     promote exact versions, then attach Queue/Cron effects
+  disable    stop Queue/Cron traffic without uploading another version
   bootstrap-current   initialize at the current root on the next schedule
   bootstrap-backfill  initialize from the empty FactTree on the next schedule
   seal-bootstrap      disable initialization after observing its completion
@@ -925,9 +1709,14 @@ def main(argv):
         "sync": sync,
         "stage": stage,
         "build": build,
+        "prepare-launch": prepare_launch,
+        "stage-launch-fcm": stage_launch_fcm,
+        "deploy-launch-harness": deploy_launch_harness,
+        "remove-launch-harness": remove_launch_harness,
         "launch-binding": print_launch_binding,
         "provision": provision,
         "deploy": deploy,
+        "disable": disable,
         "bootstrap-current": bootstrap_current,
         "bootstrap-backfill": bootstrap_backfill,
         "seal-bootstrap": seal_bootstrap,

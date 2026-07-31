@@ -6,6 +6,11 @@ from core.limits import MAX_ROOT_BYTES
 from core.object_store import ABSENT, Versioned, validate_store_prefix
 from core.shape import valid_fid
 
+if __package__:
+    from .settings import release
+else:
+    from settings import release
+
 
 def _text(env, name):
     value = getattr(env, name)
@@ -62,4 +67,8 @@ async def read_versioned(env, key, maximum=MAX_ROOT_BYTES):
     }
 
 
-__all__ = ("Settings", "get_bounded", "read_versioned")
+def release_state(env):
+    return release(env, "notification-canonical-reader")
+
+
+__all__ = ("Settings", "get_bounded", "read_versioned", "release_state")

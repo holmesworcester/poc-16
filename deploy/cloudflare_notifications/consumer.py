@@ -13,9 +13,9 @@ from notifications.carrier import ACK, delivery_disposition
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 
 if __package__:
-    from .settings import enabled, text
+    from .settings import enabled, release, require_peer, text
 else:
-    from settings import enabled, text
+    from settings import enabled, release, require_peer, text
 
 
 MAX_BATCH_SIZE = 10
@@ -55,12 +55,15 @@ class Settings:
         if len({id(canonical), id(state), id(fcm)}) != 3:
             raise ValueError("notification services must be segregated")
         if not callable(getattr(canonical, "get_bounded", None)) \
-                or not callable(getattr(canonical, "read_versioned", None)):
+                or not callable(getattr(canonical, "read_versioned", None)) \
+                or not callable(getattr(canonical, "release", None)):
             raise ValueError("CANONICAL_READER binding")
         if not all(callable(getattr(state, name, None))
-                   for name in ("get_bounded", "pending", "complete")):
+                   for name in ("get_bounded", "pending", "complete",
+                                "release")):
             raise ValueError("NOTIFICATION_STATE_SERVICE binding")
-        if not callable(getattr(fcm, "send", None)):
+        if not callable(getattr(fcm, "send", None)) \
+                or not callable(getattr(fcm, "release", None)):
             raise ValueError("FCM_BOUNDARY binding")
         return cls(
             enabled(env), workspace, canonical, state, fcm, secret,
@@ -90,9 +93,22 @@ async def consume(env, batch):
             _retry(message)
         return
 
+    local = release(env, "notification-consumer")
+    try:
+        await require_peer(
+            settings.canonical_reader, "notification-canonical-reader", local)
+        await require_peer(
+            settings.state, "notification-scanner", local)
+        await require_peer(
+            settings.fcm, "notification-fcm-boundary", local)
+    except Exception:
+        for message in messages:
+            _retry(message)
+        return
+
     canonical = ReadServiceStore(settings.canonical_reader)
     state = NotificationStateService(settings.state, settings.identity)
-    provider = FcmServiceBinding(settings.fcm)
+    provider = FcmServiceBinding(settings.fcm, local)
 
     async def current_root(workspace):
         if workspace != settings.workspace:

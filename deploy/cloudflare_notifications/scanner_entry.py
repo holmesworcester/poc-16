@@ -2,9 +2,9 @@
 from workers import WorkerEntrypoint
 
 if __package__:
-    from .scanner import complete, get_state_bounded, pending, scan
+    from .scanner import complete, get_state_bounded, pending, release_state, scan
 else:
-    from scanner import complete, get_state_bounded, pending, scan
+    from scanner import complete, get_state_bounded, pending, release_state, scan
 
 
 class Default(WorkerEntrypoint):
@@ -23,3 +23,6 @@ class Default(WorkerEntrypoint):
 
     async def complete(self, body_oid):
         return await complete(self.env, body_oid)
+
+    async def release(self):
+        return release_state(self.env)

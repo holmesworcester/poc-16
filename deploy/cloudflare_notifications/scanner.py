@@ -13,9 +13,9 @@ from notifications.discovery import (
 )
 
 if __package__:
-    from .settings import enabled, prefix, text
+    from .settings import enabled, prefix, release, require_peer, text
 else:
-    from settings import enabled, prefix, text
+    from settings import enabled, prefix, release, require_peer, text
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +45,8 @@ class Settings:
         if canonical is state:
             raise ValueError("canonical reader and notification state differ")
         if not callable(getattr(canonical, "get_bounded", None)) \
-                or not callable(getattr(canonical, "read_versioned", None)):
+                or not callable(getattr(canonical, "read_versioned", None)) \
+                or not callable(getattr(canonical, "release", None)):
             raise ValueError("CANONICAL_READER binding")
         queue = getattr(env, "NOTIFICATION_QUEUE")
         if not callable(getattr(queue, "send", None)):
@@ -69,6 +70,9 @@ def _state(settings):
 async def scan(env):
     """Run exactly one bounded shared cursor turn."""
     settings = Settings.from_env(env)
+    local = release(env, "notification-scanner")
+    await require_peer(
+        settings.canonical_reader, "notification-canonical-reader", local)
     discovery = NotificationDiscovery(
         ReadServiceStore(settings.canonical_reader),
         R2BindingStore(settings.state, settings.state_prefix),
@@ -103,6 +107,11 @@ async def complete(env, body_oid):
     return await _state(Settings.from_env(env)).complete(body_oid)
 
 
+def release_state(env):
+    return release(env, "notification-scanner")
+
+
 __all__ = (
-    "Settings", "complete", "get_state_bounded", "pending", "scan",
+    "Settings", "complete", "get_state_bounded", "pending", "release_state",
+    "scan",
 )

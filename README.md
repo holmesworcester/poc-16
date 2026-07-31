@@ -346,22 +346,36 @@ Provisioning uses the free-plan-compatible one-day Queue retention. Paid
 retention can provide more operational headroom, but is not a correctness
 requirement because every fair scan recreates the pending wake from R2.
 
-All four Workers carry one SHA-256 deployment identity over the Cloudflare
-account, workspace, buckets and prefixes, Queue/DLQ, Worker names, push-node
-public key, and exact Firebase application/environment/project. They also carry
-the exact staged software digest and enablement state. The deploy tool checks
-these markers and the human owner before any update. Changing an identity
-binding is a drain/migration, not an in-place update; the owner marker alone
-cannot authorize it. The FactTree cursor uses that same identity as its owner,
-so a second deployment pointed at the same R2 prefix cannot advance work into
-a different Queue.
+All four Workers carry one SHA-256 semantic delivery identity over the
+Cloudflare account, workspace and canonical repository, notification-state
+namespace, Worker roles, push-node public key, exact Firebase
+application/environment/project, and completion domain. Queue, DLQ, schedule,
+and wake identity are deliberately excluded: they are replaceable carriers,
+not authority to declare delivery complete. The Workers also carry the exact
+staged software digest, one shared high-entropy release ID, their exact role,
+and enablement state. The scanner checks the reader's complete release marker
+before discovery. The consumer checks the reader, scanner, and FCM markers
+before each batch, then passes its expected marker into the same FCM RPC that
+may issue the irreversible provider request. The FCM boundary rejects release
+skew inside that call. A partial or competing four-Worker rollout can therefore
+delay work but cannot send through a mismatched release. The deploy tool checks
+these markers and the human owner before any update.
+
+Changing a semantic identity binding is a drain/migration, not an in-place
+update; the owner marker alone cannot authorize it. The FactTree cursor uses
+that same identity as its owner. Equivalent scanners may therefore race or
+fail over through replacement Queues while sharing the durable pending cursor,
+but a different repository, state namespace, push node, Firebase route, or
+completion domain cannot advance it.
 
 The Firebase service-account key is deliberately not part of that immutable
-identity or the mobile launch record. Rotating to another credential for the
-same bound Firebase project is an availability-only cutover: authentication or
-configuration failure returns `RETRY` and leaves the durable pending cursor
-unchanged. A different project is an identity change and cannot be substituted
-in place.
+identity or the mobile launch record. Rotating it still creates a new immutable
+Worker version and shared release ID and repeats the exact-version mobile test.
+The tool never uses `wrangler secret put`, because that command creates and
+immediately deploys an untested version; secrets enter only during an inert
+`versions upload --secrets-file`. Authentication or configuration failure
+returns `RETRY` and leaves the durable pending cursor unchanged. A different
+project is an identity change and cannot be substituted in place.
 
 The preference commands are available now:
 
@@ -428,6 +442,12 @@ python3 -m deploy.cloudflare_notifications.manage seal-bootstrap
 python3 -m deploy.cloudflare_notifications.manage verify
 ```
 
+This first deployment is disabled. On a genuinely empty account, `deploy`
+checks the Queue only; it does not query or mutate Cron triggers until the
+scanner Worker exists. Candidate versions are uploaded in dependency order
+(FCM boundary, reader, scanner, consumer), then promoted as one disabled
+release. No ordinary `wrangler deploy` or `wrangler secret put` is used.
+
 `deploy` always installs the scanner in sealed mode; scanning an absent cursor
 then fails instead of guessing whether to skip or replay history.
 `bootstrap-current` temporarily schedules initialization even while delivery
@@ -439,28 +459,66 @@ bootstrap mode. The control tool cannot read the private R2 binding, so the
 successful scheduled invocation—not merely local config generation—is the
 bootstrap evidence. A later missing cursor remains a loud runtime fault and
 requires another explicit recovery decision.
+Disabled `verify` reconstructs the release from the four exact active Worker
+versions and does not require a production manifest or mobile launch records;
+it requires Queue and Cron effects to remain detached. Production `verify`
+instead requires the protected manifest, exact launch records, and attached
+effects.
 
 Production enablement additionally requires `CF_IOS_LAUNCH_RECORD` and
-`CF_ANDROID_LAUNCH_RECORD`. Run `launch-binding` against the disabled staged
-deployment and give its exact JSON output to the physical-device harness; that
-harness writes each record with `deploy.notification_launch.launch_record()`
-only after the corresponding real device launches:
+`CF_ANDROID_LAUNCH_RECORD`. A production candidate is an immutable release
+manifest containing one shared release ID, one source digest, and the exact
+Cloudflare version ID for each of the four Workers. Use a new protected
+manifest path for each candidate; `prepare-launch` refuses to overwrite one.
+
+`stage-launch-fcm` promotes only that exact FCM version while Queue and Cron
+effects remain detached and the other three Workers remain on the disabled
+incumbent. `deploy-launch-harness` then creates a temporary Workers.dev route
+whose only capability is a service binding to that FCM version. The route
+requires a 32-byte bearer secret and a canonical, at-most-16-KiB
+`Content-Length`; it has no R2 or Queue binding. Give the output of
+`launch-binding` to the physical-device harness. It writes each record with
+`deploy.notification_launch.launch_record()` only after that exact candidate
+causes the corresponding real device to launch:
 
 ```sh
+export CF_NOTIFICATIONS_ENABLED=1
+export CF_NOTIFICATION_RELEASE_MANIFEST=/protected/cf-notify-release.json
+python3 -m deploy.cloudflare_notifications.manage prepare-launch
+python3 -m deploy.cloudflare_notifications.manage stage-launch-fcm
+export CF_NOTIFICATION_HARNESS_SECRET="$(openssl rand -hex 32)"
+export CF_WORKERS_SUBDOMAIN=your-workers-subdomain
+python3 -m deploy.cloudflare_notifications.manage deploy-launch-harness
 python3 -m deploy.cloudflare_notifications.manage launch-binding
 export CF_IOS_LAUNCH_RECORD=/protected/ios.json
 export CF_ANDROID_LAUNCH_RECORD=/protected/android.json
-export CF_NOTIFICATIONS_ENABLED=1
+python3 -m deploy.cloudflare_notifications.manage remove-launch-harness
 python3 -m deploy.cloudflare_notifications.manage deploy
+python3 -m deploy.cloudflare_notifications.manage verify
 ```
 
 Both records bind the Cloudflare account, deployment identity, workspace,
 R2/Queue locations, push-node ID, Firebase app/environment/project, and exact
-staged software digest. The old `CF_MOBILE_LAUNCH_GATE=1` flag has no effect.
-Upgrades use three distinct deploys: disable with the incumbent digest, deploy
-new code only after all four incumbent Workers report disabled, then repeat
-both real-device tests for the new digest and enable. The tool rejects a
-one-step disable-plus-code-change because provider rollout order is not atomic.
+source digest, shared release ID, and four Worker version IDs. Production
+`deploy` validates those records before provider access, revalidates every
+candidate and active version around each promotion, promotes those same IDs,
+and only then attaches the Queue consumer and Cron schedule. A partial or
+concurrent four-Worker rollout fails closed. The old
+`CF_MOBILE_LAUNCH_GATE=1` flag has no effect.
+
+For an emergency traffic stop, `manage disable` performs only ownership checks
+and detaches Cron followed by the Queue consumer; it does not need Firebase or
+push secrets, inspect R2 lifecycle, build, upload, or promote code. An FCM call
+already in progress may still finish. A durable code-level disable uses the
+incumbent source and manifest with `CF_NOTIFICATIONS_ENABLED=0` and `deploy`;
+that promotes the FCM boundary first. For an upgrade, establish that disabled
+incumbent, select a fresh manifest path for the new source, then repeat
+`prepare-launch` through physical testing and production `deploy`.
+
+Cloudflare's version model and machine-readable upload evidence are documented
+under [Workers Versions and Deployments](https://developers.cloudflare.com/workers/versions-and-deployments/),
+[Wrangler commands](https://developers.cloudflare.com/workers/wrangler/commands/workers/),
+and [Wrangler system environment variables](https://developers.cloudflare.com/workers/wrangler/system-environment-variables/).
 
 ## Facts, suppression, and deletion
 

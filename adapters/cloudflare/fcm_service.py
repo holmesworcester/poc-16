@@ -22,12 +22,19 @@ FORMAT = "poc16-fcm-service-v1"
 class FcmServiceBinding:
     """Translate one typed push request into the private bridge contract."""
 
-    __slots__ = ("service",)
+    __slots__ = ("release", "service")
 
-    def __init__(self, service):
+    def __init__(self, service, release):
         if not callable(getattr(service, "send", None)):
             raise TypeError("FCM service binding")
+        if not isinstance(release, dict) or set(release) != {
+                "enabled", "format", "identity", "release_id", "role",
+                "software_digest"} \
+                or release.get("role") != "notification-consumer" \
+                or release.get("enabled") is not True:
+            raise TypeError("FCM caller release")
         self.service = service
+        self.release = dict(release)
 
     async def send(self, request):
         if not isinstance(request, PushRequest):
@@ -47,7 +54,9 @@ class FcmServiceBinding:
             "ttl_seconds": request.ttl_seconds,
         }
         try:
-            response = await self.service.send(document)
+            # The boundary compares this marker with its own release inside
+            # the same RPC that can perform the irreversible FCM request.
+            response = await self.service.send(document, self.release)
         except Exception as error:
             raise PushRetryable("FCM service unavailable") from error
         if not isinstance(response, dict) \
