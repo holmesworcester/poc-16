@@ -8,6 +8,7 @@ const MAX_TTL_SECONDS = 28 * 24 * 60 * 60;
 const FID = /^[0-9a-f]{64}$/;
 const APPLICATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const ENVIRONMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const PROJECT = /^[a-z][a-z0-9-]{4,62}$/;
 
 function retry() {
   return {status: "retry"};
@@ -156,14 +157,20 @@ class FcmBridge {
 
   settings() {
     if (this.env.POC16_DEPLOYMENT_ROLE !== "notification-fcm-boundary"
+        || !FID.test(this.env.POC16_DEPLOYMENT_IDENTITY)
         || typeof this.env.FCM_APPLICATION !== "string"
         || !APPLICATION.test(this.env.FCM_APPLICATION)
         || typeof this.env.FCM_ENVIRONMENT !== "string"
-        || !ENVIRONMENT.test(this.env.FCM_ENVIRONMENT)) {
+        || !ENVIRONMENT.test(this.env.FCM_ENVIRONMENT)
+        || typeof this.env.FCM_PROJECT_ID !== "string"
+        || !PROJECT.test(this.env.FCM_PROJECT_ID)) {
       throw new Error("FCM boundary bindings");
     }
     if (this.account === null) {
       this.account = parseServiceAccount(this.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      if (this.account.projectId !== this.env.FCM_PROJECT_ID) {
+        throw new Error("Firebase project binding");
+      }
     }
     return this.account;
   }

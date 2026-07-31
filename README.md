@@ -325,6 +325,15 @@ configurations and reject an enabled deletion rule overlapping either the
 notification-state prefix or its canonical workspace prefix. The tool never
 changes lifecycle configuration or deletes either bucket or Queue.
 
+All four Workers carry one SHA-256 deployment identity over the workspace,
+buckets and prefixes, Queue/DLQ, Worker names, push-node public key, and exact
+Firebase application/environment/project. The deploy tool checks both this
+identity and the human owner marker before any update. Changing one of those
+bindings is a drain/migration, not an in-place update; the owner marker alone
+cannot authorize it. The FactTree cursor uses that same identity as its owner,
+so a second deployment pointed at the same R2 prefix cannot advance work into
+a different Queue.
+
 The preference commands are available now:
 
 ```sh
@@ -354,8 +363,11 @@ python3 -m pytest -q tests/test_notification*.py tests/test_*notifications*.py
 For Cloudflare, set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
 `CF_WORKSPACE`, `CF_DEPLOYMENT_OWNER`, `CF_CANONICAL_BUCKET`,
 `CF_NOTIFICATION_STATE_BUCKET`, `CF_FIREBASE_APPLICATION`,
-`CF_FIREBASE_ENVIRONMENT`, the selected push-node seed, and
-`FIREBASE_SERVICE_ACCOUNT_JSON`. The control token needs Worker and Queue
+`CF_FIREBASE_ENVIRONMENT`, `CF_FIREBASE_PROJECT_ID`,
+`CF_PUSH_NODE_PUBLIC`, the matching `CF_PUSH_NODE_SECRET`, and
+`FIREBASE_SERVICE_ACCOUNT_JSON`. Test-mode enablement additionally names the
+same exact project in `CF_FIREBASE_TEST_PROJECT_ID`; the service-account JSON
+must carry that bound project ID. The control token needs Worker and Queue
 permissions plus Workers R2 Storage Write, which Cloudflare currently requires
 even to read bucket lifecycle rules. First creation is explicit:
 

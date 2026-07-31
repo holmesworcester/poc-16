@@ -16,7 +16,7 @@ from adapters.cloudflare.queue import (
     delivery_from_message,
 )
 from adapters.r2.reader import R2ReadBindingStore
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.limits import PayloadTooLarge
 from facts.auth import push_endpoint
 from facts.auth.device import bind
@@ -245,6 +245,7 @@ class CanonicalReadService:
     def __init__(self, workspace, bucket):
         self.env = SimpleNamespace(
             POC16_DEPLOYMENT_ROLE="notification-canonical-reader",
+            POC16_DEPLOYMENT_IDENTITY="e" * 64,
             WORKSPACE=workspace,
             CANONICAL_PREFIX=f"workspaces/{workspace}",
             CANONICAL=bucket,
@@ -265,9 +266,12 @@ class StateReadService:
         return await scanner.get_state_bounded(self.env, key, maximum)
 
 
-def _scanner_env(workspace, canonical_reader, state, queue, *, enabled="1"):
+def _scanner_env(
+        workspace, canonical_reader, state, queue, *, enabled="1",
+        identity="e" * 64):
     return SimpleNamespace(
         POC16_DEPLOYMENT_ROLE="notification-scanner",
+        POC16_DEPLOYMENT_IDENTITY=identity,
         NOTIFICATIONS_ENABLED=enabled,
         WORKSPACE=workspace,
         NOTIFICATION_STATE_PREFIX=f"notifications/v1/{workspace}",
@@ -281,9 +285,11 @@ def _consumer_env(
         workspace, canonical_reader, state_reader, secret, fcm, *, enabled="1"):
     return SimpleNamespace(
         POC16_DEPLOYMENT_ROLE="notification-consumer",
+        POC16_DEPLOYMENT_IDENTITY="e" * 64,
         NOTIFICATIONS_ENABLED=enabled,
         WORKSPACE=workspace,
         PUSH_NODE_SECRET=secret.encode().hex(),
+        PUSH_NODE=secret.verify_key.encode().hex(),
         CANONICAL_READER=canonical_reader,
         NOTIFICATION_STATE_READER=state_reader,
         FCM_BOUNDARY=fcm,
@@ -413,6 +419,26 @@ def test_concurrent_cloudflare_scanners_duplicate_but_cursor_cas_wins(
     assert queue.bodies[0] == queue.bodies[1]
 
 
+def test_different_deployments_cannot_steal_one_shared_cursor(tmp_path):
+    node, workspace, _secret = _world(tmp_path)
+    canonical, state = R2Bucket(), R2Bucket()
+    queue_a, queue_b = Queue(), Queue()
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    reader_service = CanonicalReadService(workspace, canonical)
+    first = _scanner_env(
+        workspace, reader_service, state, queue_a, identity="a" * 64)
+    foreign = _scanner_env(
+        workspace, reader_service, state, queue_b, identity="b" * 64)
+
+    run(_scan_idle(first))
+
+    with pytest.raises(ValueError, match="cursor owner"):
+        run(scanner.scan(foreign))
+    assert any(key.endswith("/root") for key in state.data)
+    assert queue_b.bodies == []
+
+
 def test_consumer_acknowledges_poison_and_retries_only_retryable_work(
         tmp_path):
     (_node, workspace, secret, _event, canonical, state, queue,
@@ -454,6 +480,21 @@ def test_consumer_bounds_hostile_batches_before_any_delivery(tmp_path):
     assert fcm.documents == []
 
 
+def test_consumer_rejects_a_push_secret_rebound_under_old_config():
+    secret, _public = keypair()
+    canonical = SimpleNamespace(
+        get_bounded=lambda *args: None,
+        read_versioned=lambda *args: None,
+    )
+    state = SimpleNamespace(get_bounded=lambda *args: None)
+    env = _consumer_env(
+        "a" * 64, canonical, state, secret, FcmService())
+    env.PUSH_NODE = "f" * 64
+
+    with pytest.raises(ValueError, match="does not match PUSH_NODE"):
+        consumer.Settings.from_env(env)
+
+
 def _manage_environment(**extra):
     return {
         "CF_WORKSPACE": "a" * 64,
@@ -462,6 +503,8 @@ def _manage_environment(**extra):
         "CF_NOTIFICATION_STATE_BUCKET": "notification-state",
         "CF_FIREBASE_APPLICATION": "poc16.mobile",
         "CF_FIREBASE_ENVIRONMENT": "production",
+        "CF_FIREBASE_PROJECT_ID": "firebase-project",
+        "CF_PUSH_NODE_PUBLIC": load_sk("b" * 64).verify_key.encode().hex(),
         **extra,
     }
 
@@ -506,6 +549,7 @@ def test_nonproduction_test_enablement_does_not_claim_mobile_launch_gate():
     _reader, scanner_config, consumer_config, _fcm = \
         manage.generated_configs(_manage_environment(
             CF_FIREBASE_ENVIRONMENT="staging",
+            CF_FIREBASE_TEST_PROJECT_ID="firebase-project",
             CF_NOTIFICATIONS_ENABLED="1",
             CF_NOTIFICATION_TEST_MODE="1"))
 
@@ -519,6 +563,26 @@ def test_test_mode_cannot_enable_a_production_firebase_environment():
         manage.generated_configs(_manage_environment(
             CF_NOTIFICATIONS_ENABLED="1",
             CF_NOTIFICATION_TEST_MODE="1"))
+
+
+def test_test_mode_binds_the_exact_service_account_project():
+    with pytest.raises(ValueError, match="exact allowed Firebase test"):
+        manage.generated_configs(_manage_environment(
+            CF_FIREBASE_ENVIRONMENT="staging",
+            CF_FIREBASE_TEST_PROJECT_ID="different-project",
+            CF_NOTIFICATIONS_ENABLED="1",
+            CF_NOTIFICATION_TEST_MODE="1"))
+
+
+def test_firebase_secret_must_match_the_bound_project():
+    secret = json.dumps({
+        "project_id": "firebase-other",
+        "client_email": "worker@example.test",
+        "private_key": "private-key",
+    })
+    with pytest.raises(ValueError, match="bound project"):
+        manage._firebase_secret(
+            "firebase-project", {"FIREBASE_SERVICE_ACCOUNT_JSON": secret})
 
 
 @pytest.mark.parametrize("bucket,prefix", [
@@ -595,11 +659,20 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
     assert "r2_buckets" not in consumer_config
     assert "r2_buckets" not in fcm_config
     assert "services" not in fcm_config
+    identity = scanner_config["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+    assert len(identity) == 64
+    assert {
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+        for config in (
+            reader_config, scanner_config, consumer_config, fcm_config)
+    } == {identity}
     assert fcm_config["vars"] == {
+        "POC16_DEPLOYMENT_IDENTITY": identity,
         "POC16_DEPLOYMENT_OWNER": "production-owner",
         "POC16_DEPLOYMENT_ROLE": "notification-fcm-boundary",
         "FCM_APPLICATION": "poc16.mobile",
         "FCM_ENVIRONMENT": "production",
+        "FCM_PROJECT_ID": "firebase-project",
     }
     assert consumer_config["services"] == [
         {
@@ -614,6 +687,38 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
     ]
     assert "repository_applier.py" not in manage.CORE_MODULES
     assert "full_peer" not in scanner.__file__
+
+
+@pytest.mark.parametrize("change", [
+    {"CF_WORKSPACE": "f" * 64},
+    {"CF_CANONICAL_BUCKET": "canonical-other"},
+    {"CF_NOTIFICATION_STATE_BUCKET": "notification-state-other"},
+    {"CF_NOTIFICATION_QUEUE": "notification-other"},
+    {"CF_NOTIFICATION_DLQ": "notification-other-dlq"},
+    {"CF_PUSH_NODE_PUBLIC": "f" * 64},
+    {"CF_FIREBASE_PROJECT_ID": "firebase-other"},
+    {"CF_FIREBASE_APPLICATION": "another.app"},
+])
+def test_immutable_binding_changes_rotate_deployment_identity(change):
+    old = manage.generated_configs(_manage_environment())[1]
+    new = manage.generated_configs(_manage_environment(**change))[1]
+    assert old["vars"]["POC16_DEPLOYMENT_IDENTITY"] \
+        != new["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+
+
+def test_same_owner_cannot_rebind_an_existing_worker(monkeypatch):
+    old = manage.generated_configs(_manage_environment())[1]
+    changed = manage.generated_configs(_manage_environment(
+        CF_NOTIFICATION_QUEUE="notification-other"))[1]
+    monkeypatch.setattr(
+        manage, "_worker_markers",
+        lambda config: (
+            old["vars"]["POC16_DEPLOYMENT_OWNER"],
+            old["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        ))
+
+    with pytest.raises(RuntimeError, match="immutable notification"):
+        manage._require_deployable(changed, create=True)
 
 
 def test_redrive_accepts_primary_copy_before_acknowledging_dlq(

@@ -22,14 +22,16 @@ class Settings:
     state: object
     queue: object
     state_prefix: str
+    identity: str
 
     @classmethod
     def from_env(cls, env):
         if text(env, "POC16_DEPLOYMENT_ROLE") != "notification-scanner":
             raise ValueError("notification scanner role binding")
         workspace = text(env, "WORKSPACE")
-        if not valid_fid(workspace):
-            raise ValueError("WORKSPACE binding")
+        identity = text(env, "POC16_DEPLOYMENT_IDENTITY")
+        if not valid_fid(workspace) or not valid_fid(identity):
+            raise ValueError("notification scanner identity bindings")
         canonical = getattr(env, "CANONICAL_READER")
         state = getattr(env, "NOTIFICATION_STATE")
         if canonical is state:
@@ -43,6 +45,7 @@ class Settings:
         return cls(
             enabled(env), workspace, canonical, state, queue,
             prefix(env, "NOTIFICATION_STATE_PREFIX"),
+            identity,
         )
 
 
@@ -56,6 +59,7 @@ async def scan(env):
         R2BindingStore(settings.state, settings.state_prefix),
         settings.workspace,
         CloudflareQueueCarrier(settings.queue),
+        owner=settings.identity,
     )
     return (await discovery.run_once()).status
 

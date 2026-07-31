@@ -5,6 +5,7 @@ Queue and R2 data are intentionally never deleted by this tool.  Worker
 removal first disables the producer and checks the deployment-owner marker;
 the retained cursor, primary queue, and DLQ make rollback recoverable.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ if str(REPOSITORY) not in sys.path:
 from adapters.cloudflare.queue import (  # noqa: E402
     MAX_CLOUDFLARE_QUEUE_BODY_BYTES,
 )
+from core.crypto import load_sk  # noqa: E402
 from core.object_store import validate_store_prefix  # noqa: E402
 from deploy.cloudflare_python import patch_pynacl  # noqa: E402
 from deploy.python_role_modules import (  # noqa: E402
@@ -45,6 +47,7 @@ BUILD = PACKAGE / "build"
 VENDORED = PACKAGE / "python_modules"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
+IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
 WRANGLER = "wrangler@4.118.0"
 RETENTION_SECONDS = 14 * 24 * 60 * 60
 MAX_BATCH_SIZE = 10
@@ -60,6 +63,7 @@ SAFE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 APPLICATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 ENVIRONMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PROJECT = re.compile(r"^[a-z][a-z0-9-]{4,62}$")
 _ABSENT = object()
 
 CORE_MODULES = tuple(dict.fromkeys(
@@ -179,21 +183,29 @@ def generated_configs(environment=os.environ):
         raise ValueError("notification Worker names must differ")
     application = _text(environment, "CF_FIREBASE_APPLICATION")
     firebase_environment = _text(environment, "CF_FIREBASE_ENVIRONMENT")
+    firebase_project = _text(environment, "CF_FIREBASE_PROJECT_ID")
+    push_node = _text(environment, "CF_PUSH_NODE_PUBLIC")
     if not APPLICATION.fullmatch(application):
         raise ValueError("CF_FIREBASE_APPLICATION is invalid")
     if not ENVIRONMENT.fullmatch(firebase_environment):
         raise ValueError("CF_FIREBASE_ENVIRONMENT is invalid")
+    if not PROJECT.fullmatch(firebase_project):
+        raise ValueError("CF_FIREBASE_PROJECT_ID is invalid")
+    if not FID.fullmatch(push_node):
+        raise ValueError("CF_PUSH_NODE_PUBLIC must be 64 lowercase hex")
     enabled = environment.get("CF_NOTIFICATIONS_ENABLED", "0")
     test_mode = environment.get("CF_NOTIFICATION_TEST_MODE", "0")
     if enabled not in {"0", "1"} or test_mode not in {"0", "1"}:
         raise ValueError("notification enablement bindings must be 0 or 1")
     if enabled == "1" and environment.get("CF_MOBILE_LAUNCH_GATE") != "1":
         if test_mode != "1" or firebase_environment.lower() in {
-                "prod", "production"}:
+                "prod", "production"} \
+                or environment.get("CF_FIREBASE_TEST_PROJECT_ID") \
+                != firebase_project:
             raise ValueError(
                 "production enablement requires the live iOS and Android "
-                "gate; test mode requires a non-production Firebase "
-                "environment")
+                "gate; test mode requires a non-production environment "
+                "and the exact allowed Firebase test project")
 
     canonical_prefix = _prefix(environment.get(
         "CF_CANONICAL_PREFIX", f"workspaces/{workspace}"),
@@ -201,10 +213,32 @@ def generated_configs(environment=os.environ):
     state_prefix = _prefix(environment.get(
         "CF_NOTIFICATION_STATE_PREFIX", f"notifications/v1/{workspace}"),
         "CF_NOTIFICATION_STATE_PREFIX")
+    identity_document = {
+        "canonical_bucket": canonical,
+        "canonical_prefix": canonical_prefix,
+        "consumer": consumer_name,
+        "fcm_application": application,
+        "fcm_environment": firebase_environment,
+        "fcm_project": firebase_project,
+        "fcm_worker": fcm_name,
+        "format": "poc16-cloudflare-notification-deployment-v1",
+        "notification_dlq": dlq,
+        "notification_queue": queue,
+        "push_node": push_node,
+        "reader": reader_name,
+        "scanner": scanner_name,
+        "state_bucket": state,
+        "state_prefix": state_prefix,
+        "workspace": workspace,
+    }
+    identity = hashlib.sha256(json.dumps(
+        identity_document, ensure_ascii=True, separators=(",", ":"),
+        sort_keys=True).encode("ascii")).hexdigest()
     common = {
         "WORKSPACE": workspace,
         "NOTIFICATIONS_ENABLED": enabled,
         "NOTIFICATION_TEST_MODE": test_mode,
+        IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
     }
 
@@ -213,6 +247,7 @@ def generated_configs(environment=os.environ):
     reader["vars"].update({
         "WORKSPACE": workspace,
         "CANONICAL_PREFIX": canonical_prefix,
+        IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
     })
     reader["r2_buckets"][0].update({
@@ -235,6 +270,7 @@ def generated_configs(environment=os.environ):
     consumer = json.loads(CONSUMER_TEMPLATE.read_text())
     consumer["name"] = consumer_name
     consumer["vars"].update(common)
+    consumer["vars"]["PUSH_NODE"] = push_node
     consumer["services"][0]["service"] = reader_name
     consumer["services"][1]["service"] = scanner_name
     consumer["services"][2]["service"] = fcm_name
@@ -250,9 +286,11 @@ def generated_configs(environment=os.environ):
     fcm = json.loads(FCM_TEMPLATE.read_text())
     fcm["name"] = fcm_name
     fcm["vars"].update({
+        IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         "FCM_APPLICATION": application,
         "FCM_ENVIRONMENT": firebase_environment,
+        "FCM_PROJECT_ID": firebase_project,
     })
     return reader, scanner, consumer, fcm
 
@@ -301,6 +339,8 @@ def build():
         "CF_NOTIFICATION_STATE_BUCKET": "notification-state-build",
         "CF_FIREBASE_APPLICATION": "poc16.mobile",
         "CF_FIREBASE_ENVIRONMENT": "production",
+        "CF_FIREBASE_PROJECT_ID": "firebase-build",
+        "CF_PUSH_NODE_PUBLIC": "c" * 64,
         "CF_NOTIFICATIONS_ENABLED": "0",
     })
     _write_configs(configs)
@@ -434,32 +474,50 @@ def _worker_bindings(config, environment=os.environ):
     return result["bindings"]
 
 
-def _worker_owner(config, environment=os.environ):
+def _worker_markers(config, environment=os.environ):
     bindings = _worker_bindings(config, environment)
     if bindings is _ABSENT:
         return _ABSENT
-    matches = [
-        item for item in bindings
-        if isinstance(item, dict) and item.get("name") == OWNER_BINDING]
-    if len(matches) != 1 or matches[0].get("type") != "plain_text":
-        return None
-    return matches[0].get("text")
+    values = []
+    for name in (OWNER_BINDING, IDENTITY_BINDING):
+        matches = [
+            item for item in bindings
+            if isinstance(item, dict) and item.get("name") == name]
+        if len(matches) != 1 or matches[0].get("type") != "plain_text":
+            return None
+        values.append(matches[0].get("text"))
+    return tuple(values)
+
+
+def _worker_owner(config, environment=os.environ):
+    markers = _worker_markers(config, environment)
+    return markers if markers in {_ABSENT, None} else markers[0]
 
 
 def _require_deployable(config, *, create):
-    observed = _worker_owner(config)
-    expected = config["vars"][OWNER_BINDING]
+    observed = _worker_markers(config)
+    expected = (
+        config["vars"][OWNER_BINDING],
+        config["vars"][IDENTITY_BINDING],
+    )
     if observed is _ABSENT:
         if not create:
             raise RuntimeError(
                 "Worker is absent; set CF_CREATE=1 for explicit creation")
     elif observed != expected:
-        raise RuntimeError("refusing to overwrite an unowned Worker")
+        raise RuntimeError(
+            "refusing to overwrite a Worker with different ownership or "
+            "immutable notification bindings")
 
 
 def _require_owned(config):
-    if _worker_owner(config) != config["vars"][OWNER_BINDING]:
-        raise RuntimeError("refusing to mutate an absent or unowned Worker")
+    expected = (
+        config["vars"][OWNER_BINDING],
+        config["vars"][IDENTITY_BINDING],
+    )
+    if _worker_markers(config) != expected:
+        raise RuntimeError(
+            "refusing to mutate an absent, unowned, or rebound Worker")
 
 
 def _require_secret(config, name):
@@ -471,7 +529,9 @@ def _require_secret(config, name):
         raise RuntimeError(f"Worker is missing required secret {name}")
 
 
-def _firebase_secret(environment=os.environ):
+def _firebase_secret(expected_project, environment=os.environ):
+    if not PROJECT.fullmatch(expected_project or ""):
+        raise ValueError("expected Firebase project is invalid")
     raw = _text(environment, "FIREBASE_SERVICE_ACCOUNT_JSON")
     if len(raw) > 64 * 1024:
         raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is too large")
@@ -484,6 +544,9 @@ def _firebase_secret(environment=os.environ):
             isinstance(value.get(name), str) and value[name]
             for name in ("project_id", "client_email", "private_key")):
         raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is incomplete")
+    if value["project_id"] != expected_project:
+        raise ValueError(
+            "Firebase service account does not match the bound project")
     return raw
 
 
@@ -515,7 +578,15 @@ def deploy():
     secret = _text(os.environ, "CF_PUSH_NODE_SECRET")
     if not FID.fullmatch(secret):
         raise ValueError("CF_PUSH_NODE_SECRET must be a 32-byte hex seed")
-    firebase_secret = _firebase_secret()
+    try:
+        actual_push_node = load_sk(secret).verify_key.encode().hex()
+    except (TypeError, ValueError) as error:
+        raise ValueError("CF_PUSH_NODE_SECRET is invalid") from error
+    if actual_push_node != configs[2]["vars"]["PUSH_NODE"]:
+        raise ValueError(
+            "CF_PUSH_NODE_SECRET does not match CF_PUSH_NODE_PUBLIC")
+    firebase_secret = _firebase_secret(
+        configs[3]["vars"]["FCM_PROJECT_ID"])
     _wrangler("deploy", "--config", str(FCM_CONFIG))
     _require_owned(configs[3])
     _wrangler(

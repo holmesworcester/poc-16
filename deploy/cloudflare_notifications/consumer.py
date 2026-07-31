@@ -29,20 +29,27 @@ class Settings:
     state_reader: object
     fcm: object
     push_secret: object
+    identity: str
+    push_node: str
 
     @classmethod
     def from_env(cls, env):
         if text(env, "POC16_DEPLOYMENT_ROLE") != "notification-consumer":
             raise ValueError("notification consumer role binding")
         workspace = text(env, "WORKSPACE")
-        if not valid_fid(workspace):
-            raise ValueError("WORKSPACE binding")
+        identity = text(env, "POC16_DEPLOYMENT_IDENTITY")
+        push_node = text(env, "PUSH_NODE")
+        if not valid_fid(workspace) or not valid_fid(identity) \
+                or not valid_fid(push_node):
+            raise ValueError("notification consumer identity bindings")
         canonical = getattr(env, "CANONICAL_READER")
         state = getattr(env, "NOTIFICATION_STATE_READER")
         try:
             secret = load_sk(text(env, "PUSH_NODE_SECRET"))
         except (TypeError, ValueError) as error:
             raise ValueError("PUSH_NODE_SECRET binding") from error
+        if secret.verify_key.encode().hex() != push_node:
+            raise ValueError("PUSH_NODE_SECRET does not match PUSH_NODE")
         fcm = getattr(env, "FCM_BOUNDARY")
         if len({id(canonical), id(state), id(fcm)}) != 3:
             raise ValueError("notification services must be segregated")
@@ -55,6 +62,7 @@ class Settings:
             raise ValueError("FCM_BOUNDARY binding")
         return cls(
             enabled(env), workspace, canonical, state, fcm, secret,
+            identity, push_node,
         )
 
 

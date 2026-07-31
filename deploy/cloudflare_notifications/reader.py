@@ -21,6 +21,7 @@ class Settings:
     workspace: str
     bucket: object
     prefix: str
+    identity: str
 
     @classmethod
     def from_env(cls, env):
@@ -28,14 +29,15 @@ class Settings:
                 != "notification-canonical-reader":
             raise ValueError("notification reader role binding")
         workspace = _text(env, "WORKSPACE")
-        if not valid_fid(workspace):
-            raise ValueError("WORKSPACE binding")
+        identity = _text(env, "POC16_DEPLOYMENT_IDENTITY")
+        if not valid_fid(workspace) or not valid_fid(identity):
+            raise ValueError("notification reader identity bindings")
         prefix = _text(env, "CANONICAL_PREFIX").strip("/")
         try:
             validate_store_prefix(prefix)
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("CANONICAL_PREFIX binding") from error
-        return cls(workspace, getattr(env, "CANONICAL"), prefix)
+        return cls(workspace, getattr(env, "CANONICAL"), prefix, identity)
 
 
 def store(env):

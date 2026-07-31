@@ -29,8 +29,10 @@ async function fixture() {
     env: {
       POC16_DEPLOYMENT_ROLE: "notification-fcm-boundary",
       POC16_DEPLOYMENT_OWNER: "unit-test-owner",
+      POC16_DEPLOYMENT_IDENTITY: "c".repeat(64),
       FCM_APPLICATION: "poc16.mobile",
       FCM_ENVIRONMENT: "production",
+      FCM_PROJECT_ID: "firebase-project",
       FIREBASE_SERVICE_ACCOUNT_JSON: JSON.stringify({
         project_id: "firebase-project",
         client_email: "worker@firebase-project.iam.gserviceaccount.com",
@@ -151,6 +153,12 @@ test("configuration and document failures are retryable without provider calls",
 
   assert.deepEqual(await bridge.send(wrongApplication), {status: "retry"});
   assert.equal(calls, 0);
+  env.FCM_PROJECT_ID = "another-project";
+  assert.deepEqual(await new FcmBridge(env, {
+    crypto: webcrypto, fetch: async () => { calls += 1; },
+  }).send(document()), {status: "retry"});
+  assert.equal(calls, 0);
+  env.FCM_PROJECT_ID = "firebase-project";
   env.FIREBASE_SERVICE_ACCOUNT_JSON = "not json";
   assert.deepEqual(await new FcmBridge(env, {
     crypto: webcrypto, fetch: async () => { calls += 1; },
