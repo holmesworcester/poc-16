@@ -366,11 +366,8 @@ async def direct_smoke(event, *, state=None, worker=None, workspace=None):
 
 
 def delivery_handler(event, _context):
-    """Handle SQS normally or an independently enabled direct launch test."""
+    """Handle SQS normally or one private operator direct launch test."""
     if isinstance(event, dict) and event.get("schema") == DIRECT_SMOKE_SCHEMA:
-        if os.environ.get("TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED") \
-                != "true":
-            raise RuntimeError("notification direct smoke is disabled")
         return asyncio.run(direct_smoke(event))
     return asyncio.run(deliver_batch(event))
 

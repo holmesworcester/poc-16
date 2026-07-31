@@ -42,6 +42,9 @@ KMS_KEY_ARN_PATTERN = (
     r"^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:"
     r"[0-9]{12}:key/[A-Za-z0-9-]+$")
 ALARM_ACTION_ARN_PATTERN = r"^arn:[a-z0-9-]+:[a-z0-9-]+:[^:]*:[^:]*:.+$"
+LAMBDA_VERSION_ARN_PATTERN = (
+    r"^arn:(?:aws|aws-us-gov|aws-cn):lambda:[a-z0-9-]+:[0-9]{12}:"
+    r"function:[A-Za-z0-9_-]+:[1-9][0-9]*$")
 
 DEPLOYMENT_ID_RE = re.compile(DEPLOYMENT_ID_PATTERN)
 OWNER_RE = re.compile(OWNER_PATTERN)
@@ -49,6 +52,7 @@ SECRET_ARN_RE = re.compile(SECRET_ARN_PATTERN)
 SECRET_VERSION_RE = re.compile(SECRET_VERSION_PATTERN)
 KMS_KEY_ARN_RE = re.compile(KMS_KEY_ARN_PATTERN)
 ALARM_ACTION_ARN_RE = re.compile(ALARM_ACTION_ARN_PATTERN)
+LAMBDA_VERSION_ARN_RE = re.compile(LAMBDA_VERSION_ARN_PATTERN)
 
 
 __all__ = tuple(
