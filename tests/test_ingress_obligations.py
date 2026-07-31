@@ -1,6 +1,7 @@
 """F10 retirement is exact, witnessed, generation-bound, and replay-safe."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 import threading
 
@@ -20,7 +21,9 @@ from core.repository_applier import (
 )
 from core.store import FsStore
 
+from .ingress_obligations import ObligationTrace, ObligationViolation
 from .provider_fakes import provider_store
+from .shared_bucket import ScriptedBucket
 from .util import closed_subset
 
 
@@ -73,6 +76,45 @@ def test_applied_and_already_represented_generations_retire_exactly(
     assert store.get(second_source) is None
     assert store.get("root") == root
     assert fid in replay.admitted
+
+
+def test_publication_root_without_exact_spend_cannot_authorize_delete(
+        tmp_path):
+    workspace, raw, _ = _message_pile(
+        tmp_path / "source-without-spend", "unspent publication", 10)
+    bucket = ScriptedBucket(seed=0xF10C)
+    store = bucket.handle("worker")
+    applier = RepositoryApplier(workspace, store)
+    source = run(applier.stage("member", raw))
+    result = run(applier.commit(
+        source, raw, run(applier.propose(raw))))
+    trace = ObligationTrace(bucket, workspace)
+    trace.observe_publication(source, raw, applier._receipts[source])
+
+    store.delete(source)
+
+    assert result.status == "applied"
+    with pytest.raises(
+            ObligationViolation,
+            match="definite fresh publication spend"):
+        trace.check()
+
+
+def test_publication_observation_derives_every_durable_fact_from_pile(
+        tmp_path):
+    workspace, raw, _ = _message_pile(
+        tmp_path / "source-omitted-admission", "omitted admission", 10)
+    bucket = ScriptedBucket(seed=0xF10D)
+    applier = RepositoryApplier(workspace, bucket.handle("worker"))
+    source = run(applier.stage("member", raw))
+    run(applier.commit(source, raw, run(applier.propose(raw))))
+    receipt = applier._receipts[source]
+    assert receipt.admitted
+
+    with pytest.raises(
+            AssertionError, match="invalid publication observation"):
+        ObligationTrace(bucket, workspace).observe_publication(
+            source, raw, replace(receipt, admitted=()))
 
 
 def test_stale_apply_receipt_cannot_delete_a_recreated_generation(tmp_path):

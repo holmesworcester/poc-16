@@ -14,9 +14,11 @@ from .convergence_fuzzer import (
     build_corpus,
     build_plan,
     execute,
+    exercise_spent_aba,
     f1_backend,
     provider_backend,
 )
+from .ingress_obligations import ObligationViolation
 
 
 pytestmark = pytest.mark.unit
@@ -39,7 +41,7 @@ def test_fixed_schedules_converge_through_f1_full_peer_s3_and_r2(
         label for _, label, _ in plan.stages}
     backends = [
         f1_backend(corpus, seed),
-        *(provider_backend(kind, corpus, tmp_path / kind)
+        *(provider_backend(kind, corpus, tmp_path / kind, seed)
           for kind in ("full-peer", "s3", "r2")),
     ]
     monkeypatch.setattr(sqlite3, "connect", _database_forbidden)
@@ -51,6 +53,20 @@ def test_fixed_schedules_converge_through_f1_full_peer_s3_and_r2(
         asyncio.run(execute(
             corpus, plan, backend,
             tmp_path / f"ingress-{backend.name}"))
+    checked = [
+        backend for backend in backends
+        if backend.name in {"f1", "s3", "r2"}
+    ]
+    summaries = [
+        tuple(sorted(
+            (item.key, item.witness)
+            for item in backend.oracle.report.discharges
+        ))
+        for backend in checked
+    ]
+    assert summaries[1:] == summaries[:1] * 2
+    for backend in checked:
+        asyncio.run(exercise_spent_aba(corpus, plan, backend))
     used = {
         int(actor.split("-")[1])
         for actor in (
@@ -58,6 +74,29 @@ def test_fixed_schedules_converge_through_f1_full_peer_s3_and_r2(
             + [item[0] for item in plan.remaining + plan.retries])
     }
     assert used == set(range(workers))
+
+
+@pytest.mark.parametrize("kind", ("s3", "r2"))
+def test_provider_trace_reports_first_unsupported_aba_delete(
+        kind, tmp_path):
+    corpus = build_corpus(tmp_path / f"author-{kind}")
+    plan = build_plan(2, 0xF10BAD)
+    backend = provider_backend(
+        kind, corpus, tmp_path / kind, plan.seed)
+    asyncio.run(execute(
+        corpus, plan, backend, tmp_path / f"ingress-{kind}"))
+    source = asyncio.run(exercise_spent_aba(corpus, plan, backend))
+
+    applier = backend.applier("unsupported-delete")
+    asyncio.run(applier.store.delete(source))
+
+    with pytest.raises(ObligationViolation) as caught:
+        backend.oracle.trace.check()
+    assert caught.value.event.key == source
+    assert len(caught.value.prefix) == caught.value.event.seq
+    assert f"provider={kind}" in str(caught.value)
+    assert f"seed={plan.seed:#x}" in str(caught.value)
+    assert f"unsupported DELETE {source}" in str(caught.value)
 
 
 def test_actual_reachable_object_destruction_shrinks_and_replays(

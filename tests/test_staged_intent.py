@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -21,7 +22,7 @@ from core.ingress import (
 from core.limits import PayloadTooLarge
 from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
-from core.object_store import OutcomeUnknown, STALE
+from core.object_store import CREATED, OutcomeUnknown, STALE
 from core.staged_intent import (
     InvalidStagedObject,
     StagedObjectsPending,
@@ -33,6 +34,12 @@ from core.staged_intent import (
 )
 from core.store import FsStore
 from facts.content import chunk
+from tests.direct_upload_method import (
+    BODY_SHA256_HEADER,
+    WirePutCapability,
+    WirePutImplementation,
+    exact_wire_put,
+)
 from tests.util import closed_subset, send_bytes
 
 
@@ -215,6 +222,74 @@ def test_verified_session_enters_the_applier_through_a_reserved_generation(
     assert ingress.get(key) == raw
     assert set(applied.promoted) == set(intent.blob_refs)
     assert applied.unavailable == ()
+
+
+def test_preexpiry_put_completes_after_expiry_without_f10_marker_delete(
+        staged_file, tmp_path):
+    _, workspace, raw, key = staged_file
+    ingress = FsStore(str(tmp_path / "delayed-ingress"))
+    expires_at = 1_000
+    capability = WirePutCapability(
+        "https://ingress.example",
+        "PUT",
+        "ingress-bucket",
+        key,
+        tuple(sorted({
+            BODY_SHA256_HEADER: h(raw),
+            "content-length": str(len(raw)),
+            "content-type": "application/octet-stream",
+            "host": "ingress.example",
+            "if-none-match": "*",
+        }.items())),
+        expires_at,
+    )
+    request = exact_wire_put(capability, raw, now=expires_at)
+    writing, release = threading.Event(), threading.Event()
+    clock = [expires_at]
+    address = (
+        request.endpoint, request.bucket, request.key)
+
+    class DelayedIngress:
+        completed_at = None
+
+        def get(self, candidate):
+            assert candidate == address
+            return ingress.get(key)
+
+        def __setitem__(self, candidate, value):
+            assert candidate == address and value == raw
+            writing.set()
+            if not release.wait(5):
+                raise TimeoutError("delayed provider PUT was not released")
+            self.completed_at = clock[0]
+            assert ingress.put_if_absent(key, value) is CREATED
+
+    delayed = DelayedIngress()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            WirePutImplementation().execute,
+            capability,
+            request,
+            delayed,
+        )
+        assert writing.wait(5)
+        assert not pending.done()
+        clock[0] = expires_at + 1
+        release.set()
+        uploaded = pending.result(5)
+
+    canonical = FsStore(str(tmp_path / "delayed-canonical"))
+    applied = asyncio.run(
+        RepositoryApplier(workspace, canonical).apply_staged(
+            ingress, key))
+
+    assert uploaded.authorized and uploaded.applied
+    assert request.now <= expires_at < delayed.completed_at
+    assert applied.result.status == "applied"
+    assert applied.result.retired is True
+    assert canonical.get(applied.source) is None
+    assert canonical.list("pile/") == []
+    assert ingress.get(key) == raw
 
 
 def test_direct_and_staged_origins_are_stable_but_distinct(

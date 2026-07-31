@@ -45,7 +45,11 @@ class PublicationObservation:
     seq: int
     key: str
     raw: bytes
-    validated_fids: frozenset[str]
+    generation: str
+    outcome: str
+    base_root: bytes | None
+    root: bytes
+    admitted: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -118,35 +122,39 @@ class ObligationTrace:
         self._snapshot_fids = {}
         self._snapshot_errors = {}
 
-    def observe_node_retirement(self, node, workspace, key, raw):
-        """Record the production runtime's post-commit classification.
-
-        Permanent decoder/kernel rejection deliberately records no
-        publication witness; that path must stand on its durable rejection
-        evidence instead.
-        """
-        if workspace != self.workspace:
-            raise AssertionError("workspace mismatch")
+    def observe_publication(self, key, raw, receipt):
+        """Record the running Applier's exact post-commit F10 capability."""
+        binding = check_source(key, raw)
+        admitted = receipt.admitted
         try:
-            stream = decode_pile(raw, workspace)
-            judgment = drain(stream, workspace)
-        except PermanentIngressRejection:
-            return None
+            judgment = drain(decode_pile(raw, self.workspace), self.workspace)
+        except Exception as error:
+            raise AssertionError(
+                "publication input no longer passes the immutable door"
+            ) from error
         if not judgment.ok:
-            return None
-        validated_fids = frozenset(
-            receipt.fact.fid for receipt in judgment.valids
-            if facts.family_for(receipt.fact.t).DURABLE)
-        observation = PublicationObservation(
-            len(self.bucket.history), key, raw, validated_fids)
-        self.observations.append(observation)
-        return observation
-
-    def observe_publication(self, key, raw, validated_fids):
-        """Add an explicit observation for small checker mutation tests."""
+            raise AssertionError(
+                "publication input no longer passes the immutable door")
+        derived = tuple(sorted({
+            valid.fact.fid for valid in judgment.valids
+            if facts.family_for(valid.fact.t).DURABLE
+        }))
+        if receipt.workspace != self.workspace \
+                or receipt.source != key \
+                or receipt.payload != h(raw) \
+                or receipt.generation != binding.generation \
+                or receipt.outcome not in {"applied", "confirmed", "noop"} \
+                or receipt.base_root is not None \
+                and not isinstance(receipt.base_root, bytes) \
+                or not isinstance(receipt.root, bytes) \
+                or not isinstance(admitted, tuple) \
+                or any(not isinstance(fid, str) for fid in admitted) \
+                or admitted != derived:
+            raise AssertionError("invalid publication observation")
         observation = PublicationObservation(
             len(self.bucket.history), key, raw,
-            frozenset(validated_fids))
+            receipt.generation, receipt.outcome,
+            receipt.base_root, receipt.root, admitted)
         self.observations.append(observation)
         return observation
 
@@ -190,7 +198,9 @@ class ObligationTrace:
                         self._fail(
                             event, "no live acknowledged pile obligation")
                     publication, publication_reason = \
-                        self._publication_witness(obligation, event.seq)
+                        self._publication_witness(
+                            obligation, event, data, verified,
+                            definite_creates)
                     rejection, rejection_reason = self._rejection_witness(
                         obligation, event, data, verified, definite_creates)
                     witness = publication or rejection
@@ -222,7 +232,9 @@ class ObligationTrace:
                     event.key, event.value, event.seq)
         data[event.key] = event.value
 
-    def _publication_witness(self, obligation, delete_seq):
+    def _publication_witness(
+            self, obligation, deletion, data, verified, definite_creates):
+        delete_seq = deletion.seq
         candidates = [
             observation for observation in self.observations
             if observation.key == obligation.key
@@ -235,30 +247,74 @@ class ObligationTrace:
                 "for the exact bytes")
         reasons = []
         for observation in candidates:
-            current = max(
+            snapshot = max(
                 (
                     snapshot for snapshot in self._snapshots()
                     if snapshot.seq <= observation.seq
+                    and snapshot.root == observation.root
                 ),
                 key=lambda snapshot: snapshot.seq,
                 default=None)
-            if current is None:
+            if snapshot is None:
+                reasons.append(
+                    "receipt root has no committed authenticated snapshot")
                 continue
             try:
-                validated_fids = self._validated_snapshot(current)
+                validated_fids = self._validated_snapshot(snapshot)
             except Exception as error:
                 reasons.append(
-                    f"current root at event #{current.seq} is not "
+                    f"receipt root at event #{snapshot.seq} is not "
                     f"authenticated: {type(error).__name__}: {error}")
                 continue
-            if observation.validated_fids <= validated_fids:
-                return ("publication", current.seq), ""
-            reasons.append(
-                "current committed root does not contain every "
-                "kernel-valid durable fact")
+            if not set(observation.admitted) <= validated_fids:
+                reasons.append(
+                    "committed receipt root does not contain every "
+                    "kernel-valid durable fact")
+                continue
+            proof = h(canon([
+                self.workspace,
+                obligation.key,
+                h(obligation.raw),
+                observation.generation,
+                observation.outcome,
+                "" if observation.base_root is None
+                else h(observation.base_root),
+                h(observation.root),
+                h(canon(list(observation.admitted))),
+            ]))
+            spend_raw = canon({
+                "kind": "internal-generation-spend-v1",
+                "outcome": observation.outcome,
+                "proof": proof,
+            })
+            spend_key = "applier/spent/" + observation.generation
+            created = [
+                seq for seq, value, actor
+                in definite_creates.get(spend_key, ())
+                if value == spend_raw
+                and actor == deletion.actor
+                and max(
+                    obligation.created_seq,
+                    observation.seq,
+                ) < seq < delete_seq
+            ]
+            if not created:
+                reasons.append("no definite fresh publication spend")
+                continue
+            spend = verified.get(spend_key)
+            if spend is None \
+                    or not max(created) < spend[0] < delete_seq \
+                    or spend[1] != spend_raw \
+                    or data.get(spend_key) != spend_raw:
+                reasons.append(
+                    "no exact durable publication spend read-back")
+                continue
+            return (
+                "publication",
+                max(snapshot.seq, observation.seq, max(created), spend[0]),
+            ), ""
         return None, reasons[-1] if reasons else (
-            "current committed root does not contain every "
-            "kernel-valid durable fact")
+            "receipt root does not contain every kernel-valid durable fact")
 
     def _rejection_witness(
             self, obligation, deletion, data, verified, definite_creates):

@@ -38,6 +38,24 @@ class BrokenBody:
         self.closed = True
 
 
+def _schedule_put_fault(rules, key, when):
+    if when not in {"before", "after"}:
+        raise ValueError("provider put fault")
+    rules.append([key, when, 0])
+
+
+def _raise_put_fault(rules, key, when):
+    for rule in rules:
+        if rule[:2] != [key, when]:
+            continue
+        rule[2] += 1
+        if rule[2] == 1:
+            raise ConnectionError(
+                "scripted provider transport failure before apply"
+                if when == "before"
+                else "scripted provider response loss after apply")
+
+
 class FakeS3Bucket:
     """Strong per-key fake with value-ABA tokens and cursor pagination."""
 
@@ -53,6 +71,7 @@ class FakeS3Bucket:
         self.deny_missing_get = False
         self.body_factory = None
         self.insert_after_page = None
+        self.put_faults = []
 
     def client(self, actor):
         return FakeS3Client(self, actor)
@@ -67,6 +86,12 @@ class FakeS3Bucket:
 
     def _record(self, actor, operation, key, result):
         self.history.append((actor, operation, key, result))
+
+    def fail_put(self, key, *, when):
+        _schedule_put_fault(self.put_faults, key, when)
+
+    def _put_fault(self, key, when):
+        _raise_put_fault(self.put_faults, key, when)
 
 
 class FakeS3Client:
@@ -102,6 +127,7 @@ class FakeS3Client:
     def put_object(self, **request):
         key, value = request["Key"], bytes(request["Body"])
         with self.bucket.lock:
+            self.bucket._put_fault(key, "before")
             if request.get("IfNoneMatch") == "*" \
                     and key in self.bucket.data:
                 raise ProviderError(412, "PreconditionFailed")
@@ -113,6 +139,7 @@ class FakeS3Client:
             self.bucket.data[key] = value
             self.bucket.tokens[key] = token
             self.bucket._record(self.actor, "put", key, token)
+            self.bucket._put_fault(key, "after")
             if self.bucket.drop_after_apply:
                 self.bucket.drop_after_apply -= 1
                 raise ConnectionError("scripted response loss after apply")
@@ -200,6 +227,7 @@ class FakeR2Bucket:
         self.page_size = page_size
         self.history = []
         self.conditional_barrier = None
+        self.put_faults = []
 
     def _etag(self, value):
         token = self.value_tokens.get(value)
@@ -208,6 +236,12 @@ class FakeR2Bucket:
             token = f"opaque-r2-value-{self.generation}"
             self.value_tokens[value] = token
         return token
+
+    def fail_put(self, key, *, when):
+        _schedule_put_fault(self.put_faults, key, when)
+
+    def _put_fault(self, key, when):
+        _raise_put_fault(self.put_faults, key, when)
 
     async def get(self, key):
         self.history.append(("get", key))
@@ -223,6 +257,7 @@ class FakeR2Bucket:
 
     async def put(self, key, value, **options):
         self.history.append(("put", key, options))
+        self._put_fault(key, "before")
         condition = options.get("onlyIf")
         if isinstance(condition, dict) and "etagMatches" in condition \
                 and self.conditional_barrier is not None:
@@ -237,7 +272,9 @@ class FakeR2Bucket:
         value = bytes(value)
         self.data[key] = value
         self.tokens[key] = self._etag(value)
-        return R2Object(key, b"", self.tokens[key])
+        result = R2Object(key, b"", self.tokens[key])
+        self._put_fault(key, "after")
+        return result
 
     async def list(self, prefix, limit, cursor=None):
         self.history.append(("list", prefix, limit, cursor))

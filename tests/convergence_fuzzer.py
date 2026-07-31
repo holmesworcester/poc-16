@@ -36,6 +36,7 @@ from full_peer.node import FullPeer
 from .adversarial_bucket import AdversarialBucket, Fault, Nonconforming
 from .ingress_obligations import ObligationTrace
 from .provider_fakes import FakeR2Bucket, FakeS3Bucket
+from .provider_obligations import ProviderHistory
 from .shared_bucket import InjectedCrash
 from .util import add_member, suppression_world
 
@@ -199,8 +200,7 @@ class _TracedApplier(RepositoryApplier):
         self._trace = trace
 
     async def retire(self, source, raw, receipt):
-        self._trace.observe_publication(
-            source, raw, receipt.admitted)
+        self._trace.observe_publication(source, raw, receipt)
         return await super().retire(source, raw, receipt)
 
 
@@ -211,6 +211,7 @@ class F1Oracle:
         self.corpus, self.bucket, self.trace = corpus, bucket, trace
         self._checked = 0
         self._previous = frozenset()
+        self.report = None
 
     def _acknowledged_before(self, key, raw, seq):
         return any(
@@ -225,6 +226,7 @@ class F1Oracle:
     def check(self, final=False):
         self.bucket.assert_valid_history()
         report = self.trace.check()
+        self.report = report
         applied = [
             event for event in self.bucket.history
             if event.op == "cas" and isinstance(event.result, Applied)
@@ -268,6 +270,48 @@ class F1Oracle:
         self.bucket.assert_valid_history()
 
 
+class ProviderF10Oracle:
+    """Apply the same checker to normalized native-adapter operations."""
+
+    def __init__(self, provider, bucket, history, trace):
+        self.provider = provider
+        self.bucket = bucket
+        self.history = history
+        self.trace = trace
+        self.report = None
+
+    def check(self, final=False):
+        self.history.assert_valid_history()
+        self.report = self.trace.check()
+        if not final:
+            return
+        assert not self.report.live, self.history.diagnostic()
+        prefix = (
+            '"opaque-value-' if self.provider == "s3"
+            else "opaque-r2-value-")
+        assert self.history.token_values
+        assert all(
+            token.startswith(prefix) and token != h(raw)
+            for token, raw in self.history.token_values.items()
+        ), self.history.diagnostic()
+        assert all(
+            rule[2] >= 1 for rule in self.bucket.put_faults
+        ), self.history.diagnostic()
+        native = self.bucket.history
+        if self.provider == "s3":
+            assert any(
+                operation == "delete"
+                and "/pile/" in key
+                for _, operation, key, _ in native
+            ), self.history.diagnostic()
+        else:
+            assert any(
+                operation == "delete"
+                and "/pile/" in key
+                for operation, key, *_ in native
+            ), self.history.diagnostic()
+
+
 @dataclass(slots=True)
 class Backend:
     name: str
@@ -304,8 +348,8 @@ def f1_backend(
     return Backend("f1", applier, inject, oracle)
 
 
-def provider_backend(kind, corpus, directory):
-    """Build a no-fault provider/full-peer refinement of the same schedule."""
+def provider_backend(kind, corpus, directory, seed=0):
+    """Build a provider/full-peer refinement of the same logical schedule."""
     if kind == "full-peer":
         peer = FullPeer(
             str(directory / "peer"), initial_secret="22" * 32)
@@ -318,25 +362,57 @@ def provider_backend(kind, corpus, directory):
 
     elif kind == "s3":
         bucket = FakeS3Bucket(page_size=2)
-        store = S3Store(
-            S3Config(
-                "f2-convergence",
-                "tenant",
-                read_total_max_attempts=1,
-                list_page_size=2,
-            ),
-            client=bucket.client("applier"),
-        )
-        applier = lambda _actor: RepositoryApplier(
-            corpus.workspace, store)
+        history = ProviderHistory("s3", seed, bucket.history)
+        trace = ObligationTrace(history, corpus.workspace)
+
+        def applier(actor):
+            store = S3Store(
+                S3Config(
+                    "f2-convergence",
+                    "tenant",
+                    read_total_max_attempts=1,
+                    list_page_size=2,
+                ),
+                client=bucket.client(actor),
+            )
+            return _TracedApplier(
+                corpus.workspace,
+                history.sync_store(store, actor),
+                trace,
+            )
     elif kind == "r2":
-        store = R2BindingStore(
-            FakeR2Bucket(page_size=2), "tenant")
-        applier = lambda _actor: RepositoryApplier(
-            corpus.workspace, store)
+        bucket = FakeR2Bucket(page_size=2)
+        history = ProviderHistory("r2", seed, bucket.history)
+        trace = ObligationTrace(history, corpus.workspace)
+
+        def applier(actor):
+            store = R2BindingStore(bucket, "tenant")
+            return _TracedApplier(
+                corpus.workspace,
+                history.async_store(store, actor),
+                trace,
+            )
     else:
         raise AssertionError(kind)
-    return Backend(kind, applier, lambda _actor, _fault: False)
+    if kind == "full-peer":
+        return Backend(kind, applier, lambda _actor, _fault: False)
+
+    def inject(actor, fault):
+        if fault == "crash-after":
+            history.crash_after(actor, "cas", "root")
+        else:
+            bucket.fail_put(
+                "tenant/root",
+                when={
+                    "unknown-before": "before",
+                    "unknown-after": "after",
+                }[fault],
+            )
+        return True
+
+    return Backend(
+        kind, applier, inject,
+        ProviderF10Oracle(kind, bucket, history, trace))
 
 
 def _put_staged(corpus, ingress, seed):
@@ -482,6 +558,7 @@ async def execute(
             assert outcome.result.status in {
                 "applied", "confirmed", "noop", "admitted"}
             assert set(outcome.promoted) == set(corpus.staged_objects)
+            assert ingress.get(marker) == corpus.staged_raw
 
         await take(f"staged(attachment) actor={actor}", staged)
         for actor, label in plan.remaining:
@@ -504,7 +581,8 @@ async def execute(
             applier = backend.applier("final-" + label)
             assert await applier.store.get_bounded(
                 source, max(1, len(corpus.work[label]))) is None
-        if backend.oracle is None:
+        assert ingress.get(marker) == corpus.staged_raw
+        if backend.name != "f1":
             await _verify_provider(corpus, backend)
 
     try:
@@ -512,3 +590,24 @@ async def execute(
     except _Stop:
         return tuple(trace)
     return tuple(trace)
+
+
+async def exercise_spent_aba(corpus, plan, backend):
+    """Recreate one spent source and prove restart cannot delete it again."""
+    member = next(
+        member for _, label, member in plan.stages
+        if label == "post-b")
+    raw = corpus.work["post-b"]
+    first = backend.applier("aba-create")
+    source = await first.stage(member, raw)
+    assert await first.store.get_bounded(source, len(raw)) is None
+    assert await first.store.put_if_absent(source, raw) is CREATED
+
+    replay = await backend.applier("aba-restart").apply(source)
+
+    assert replay.status in {"applied", "confirmed", "noop"}
+    assert replay.retired is False
+    assert await first.store.get_bounded(source, len(raw)) == raw
+    report = backend.oracle.trace.check()
+    assert [(item.key, item.raw) for item in report.live] == [(source, raw)]
+    return source
