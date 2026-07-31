@@ -1,4 +1,4 @@
-"""Bounded post-publication discovery over authenticated FactOrder diffs.
+"""Bounded post-publication discovery over authenticated FactTree diffs.
 
 The repository remains unaware of notifications.  A separate operational
 store retains old root bytes as immutable objects and uses its own ``root``
@@ -10,11 +10,10 @@ import facts
 
 from core import indexes, merkle_map, snapshot
 from core.crypto import h
-from core.fact import bound_to, canon, decode
+from core.fact import canon
+from core.fact_index import TYPE_INDEX
 from core.limits import (
-    MIB,
     MAX_MERKLE_PAGE_BYTES,
-    MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PayloadTooLarge,
     decode_json,
@@ -30,56 +29,14 @@ from core.object_store import (
 )
 from core.repository_reader import RepositoryReader
 from core.repository_applier import async_store
-from core.shape import is_key, valid_fid
+from core.shape import valid_fid
 
 from .carrier import Carrier, CarrierAccepted
-from .delivery import trigger_for
 from .hints import NotificationHint, encode_hint, hint_id
 
 
 CURSOR_FORMAT = "notification-cursor-v1"
 MAX_CURSOR_BYTES = 4 * 1024
-MAX_DIFF_CACHE_OBJECTS = 4_096
-MAX_DIFF_CACHE_BYTES = 32 * MIB
-
-
-class _ObjectMiss(BaseException):
-    __slots__ = ("oid",)
-
-    def __init__(self, oid):
-        super().__init__(oid)
-        self.oid = oid
-
-
-class _AwaitedPages:
-    """Bound synchronous Merkle replay while fetching each page once."""
-
-    def __init__(self, store):
-        self.store = store
-        self.cache = {}
-        self.bytes = 0
-
-    def get(self, oid):
-        if oid not in self.cache:
-            raise _ObjectMiss(oid)
-        return self.cache[oid]
-
-    async def fill(self, oid):
-        if oid in self.cache:
-            return
-        if len(self.cache) >= MAX_DIFF_CACHE_OBJECTS:
-            raise ValueError("notification diff object budget")
-        raw = await self.store.get_bounded(
-            "obj/" + oid, MAX_MERKLE_PAGE_BYTES)
-        if raw is not None and (
-                not isinstance(raw, bytes)
-                or len(raw) > MAX_MERKLE_PAGE_BYTES):
-            raise PayloadTooLarge("notification diff object")
-        size = 0 if raw is None else len(raw)
-        if self.bytes + size > MAX_DIFF_CACHE_BYTES:
-            raise ValueError("notification diff byte budget")
-        self.cache[oid] = raw
-        self.bytes += size
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +50,14 @@ class Cursor:
         if not valid_fid(self.workspace) \
                 or self.base is not None and not valid_fid(self.base) \
                 or self.target is not None and not valid_fid(self.target) \
-                or self.after is not None and not is_key(self.after) \
                 or self.after is not None and self.target is None \
                 or self.target is not None and self.target == self.base:
             raise ValueError("notification cursor")
+        try:
+            if self.after is not None:
+                merkle_map.checked_query_key(self.after)
+        except ValueError as error:
+            raise ValueError("notification cursor") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +98,7 @@ def decode_cursor(raw):
 
 
 class NotificationDiscovery:
-    """Publish at most one bounded FactOrder-diff page per invocation.
+    """Publish at most one bounded FactTree-diff page per invocation.
 
     An absent cursor deliberately starts at the empty map: first activation
     backfills every historical trigger. Later deployments must preserve the
@@ -224,32 +185,13 @@ class NotificationDiscovery:
 
     @staticmethod
     def _map_reader(root, fetch):
-        descriptor = root.maps[snapshot.FACT_ORDER]
+        descriptor = root.maps[indexes.FACT]
         return merkle_map.Reader(
             descriptor["root"], root.layout_seed, fetch,
             max_page_depth=descriptor["depth"],
             expected_count=descriptor["count"],
             expected_depth=descriptor["depth"],
         )
-
-    @staticmethod
-    def _diff_page(target_root, base_descriptor, cursor, fetch, page_rows):
-        target_descriptor = target_root.maps[snapshot.FACT_ORDER]
-        if target_descriptor["count"] < base_descriptor["count"]:
-            raise ValueError("notification FactOrder is not monotone")
-        remote = NotificationDiscovery._map_reader(target_root, fetch)
-        local = merkle_map.Reader(
-            base_descriptor["root"], target_root.layout_seed, fetch,
-            max_page_depth=base_descriptor["depth"],
-            expected_count=base_descriptor["count"],
-            expected_depth=base_descriptor["depth"],
-        )
-        page = remote.diff_page(
-            local, after=cursor.after, limit=page_rows)
-        for key, _oid in page.differing:
-            if local.get(key) is not None:
-                raise ValueError("notification FactOrder row changed")
-        return page
 
     async def _page(self, cursor):
         target_raw = await self._root(
@@ -264,33 +206,40 @@ class NotificationDiscovery:
                 self.cursor_store, cursor.base)
             base_root = RepositoryReader(
                 self.workspace, base_raw, lambda _oid: None).root
-            base_descriptor = base_root.maps[snapshot.FACT_ORDER]
+            base_descriptor = base_root.maps[indexes.FACT]
 
-        pages = _AwaitedPages(self.repository_store)
-        while True:
-            try:
-                page = self._diff_page(
-                    target_root, base_descriptor, cursor,
-                    pages.get, self.page_rows)
-                break
-            except _ObjectMiss as miss:
-                await pages.fill(miss.oid)
+        target_descriptor = target_root.maps[indexes.FACT]
+        if target_descriptor["count"] < base_descriptor["count"]:
+            raise ValueError("notification FactTree is not monotone")
+
+        async def fetch(oid):
+            return await self._get(
+                self.repository_store, "obj/" + oid,
+                MAX_MERKLE_PAGE_BYTES)
+
+        remote = self._map_reader(target_root, fetch)
+        local = merkle_map.Reader(
+            base_descriptor["root"], target_root.layout_seed, fetch,
+            max_page_depth=base_descriptor["depth"],
+            expected_count=base_descriptor["count"],
+            expected_depth=base_descriptor["depth"],
+        )
+        page = await remote.diff_page_awaited(
+            local, after=cursor.after, limit=self.page_rows)
 
         discovered = []
-        for key, oid in page.differing:
-            oid = indexes.checked_fact_oid(oid)
-            raw = await self._get(
-                self.repository_store, "obj/" + oid,
-                MAX_REPOSITORY_OBJECT_BYTES)
-            if not isinstance(raw, bytes) or h(raw) != oid:
-                raise ValueError("notification fact object")
-            fact = decode(raw)
-            family = facts.family_for(fact.t)
-            if fact.key != key or not bound_to(fact, self.workspace) \
-                    or family is None or not family.DURABLE:
-                raise ValueError("notification FactOrder fact")
-            if trigger_for(fact) is not None:
-                discovered.append(fact.fid)
+        for key, value in page.differing:
+            if not indexes.is_posting_key(key):
+                continue
+            row = indexes.decode_posting_key(key)
+            if value != {"state": indexes.POSTING_VALUE, "fid": row.fid}:
+                raise ValueError("notification FactTree posting")
+            family = facts.family_for(row.k0) \
+                if row.kind == TYPE_INDEX and row.k1 == "" else None
+            if family is not None \
+                    and getattr(family, "notification_trigger", None) \
+                    is not None:
+                discovered.append(row.fid)
         return page.cursor, tuple(sorted(discovered))
 
     async def run_once(self):

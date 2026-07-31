@@ -7,11 +7,13 @@ import pytest
 import facts
 from core import merkle_map
 from core.crypto import h
+from core.fact import encode
 from core.limits import MAX_PILE_FACTS, PayloadTooLarge
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from facts.auth.device import bind
-from facts.content import delete, message
+from facts import _bao
+from facts.content import delete, file_slice, message
 from full_peer.node import FullPeer
 from notifications.carrier import CarrierAccepted
 from notifications.discovery import (
@@ -28,6 +30,7 @@ from notifications.hints import (
     hint_id,
     materialize_hint,
 )
+from tests.util import send_bytes
 
 
 @dataclass
@@ -234,6 +237,29 @@ def test_discovery_reports_residence_without_current_authority(
     assert event in {
         fid for raw in carrier.payloads for fid in decode_hint(raw).facts
     }
+
+
+def test_large_bao_fact_is_classified_without_fetching_its_blob(tmp_path):
+    node, workspace = _world(tmp_path)
+    cursor = FsStore(str(tmp_path / "cursor"))
+    asyncio.run(_drain(_discovery(
+        node, workspace, cursor, MemoryCarrier([]))))
+
+    send_bytes(
+        node, workspace, "large.bin", b"x" * (_bao.WIDTH + 1), ts=10)
+    slice_fact = max(
+        node.by_type(workspace, file_slice.TAG),
+        key=lambda fact: len(encode(fact)))
+    slice_raw = encode(slice_fact)
+    assert len(slice_raw) > _bao.WIDTH
+
+    repository = AwaitedStore(node.store(workspace))
+    carrier = MemoryCarrier([])
+    asyncio.run(_drain(NotificationDiscovery(
+        repository, cursor, workspace, carrier)))
+
+    assert carrier.payloads == []
+    assert ("get", "obj/" + h(slice_raw)) not in repository.calls
 
 
 def test_target_stays_pinned_while_page_continuation_exists(tmp_path):

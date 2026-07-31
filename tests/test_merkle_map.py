@@ -1,4 +1,5 @@
 """Golden and hostile vectors for the one authenticated tree codec."""
+import asyncio
 import json
 import random
 
@@ -746,6 +747,67 @@ def test_resumable_oid_pruned_diff_is_bounded_and_classifies_rows():
     assert remote.diff_page(
         same, limit=5
     ) == merkle_map.DiffPage((), (), None)
+
+
+def test_awaited_diff_is_sync_identical_and_enforces_aggregate_page_budget():
+    source = [(f"k:{number:04d}", {"n": number}) for number in range(180)]
+    objects = {}
+    local_built = merkle_map.build(source, SEED, emitter(objects))
+    changes = (
+        ("k:0007", {"n": 700}),
+        ("k:0091", {"n": 9100}),
+        ("k:0179", {"n": 17900}),
+    )
+    remote_built = merkle_map.update(
+        local_built.root, SEED, changes, objects.get, emitter(objects))
+
+    def sync_readers():
+        return (
+            merkle_map.Reader(
+                remote_built.root, SEED, objects.get,
+                max_page_depth=remote_built.page_depth),
+            merkle_map.Reader(
+                local_built.root, SEED, objects.get,
+                max_page_depth=local_built.page_depth),
+        )
+
+    remote, local = sync_readers()
+    expected = remote.diff_page(local, limit=5)
+
+    def awaited_readers(calls):
+        async def fetch(oid):
+            calls.append(oid)
+            await asyncio.sleep(0)
+            return objects.get(oid)
+
+        return (
+            merkle_map.Reader(
+                remote_built.root, SEED, fetch,
+                max_page_depth=remote_built.page_depth),
+            merkle_map.Reader(
+                local_built.root, SEED, fetch,
+                max_page_depth=local_built.page_depth),
+        )
+
+    calls = []
+    remote, local = awaited_readers(calls)
+    actual = asyncio.run(remote.diff_page_awaited(local, limit=5))
+    assert actual == expected
+    exact = remote.pages_read + local.pages_read
+    assert exact == len(calls) > 0
+
+    calls = []
+    remote, local = awaited_readers(calls)
+    assert asyncio.run(remote.diff_page_awaited(
+        local, limit=5, max_pages=exact)) == expected
+    assert len(calls) == exact
+
+    calls = []
+    remote, local = awaited_readers(calls)
+    with pytest.raises(ValueError, match="diff page budget"):
+        asyncio.run(remote.diff_page_awaited(
+            local, limit=5, max_pages=exact - 1))
+    assert len(calls) == exact - 1
 
 
 def test_stale_physically_held_page_is_not_a_current_reachability_witness():

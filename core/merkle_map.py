@@ -64,6 +64,12 @@ class _Read:
 
 
 @dataclass(frozen=True, slots=True)
+class _DiffRead:
+    fetch: object
+    oid: str
+
+
+@dataclass(frozen=True, slots=True)
 class _Write:
     raw: bytes
 
@@ -123,6 +129,12 @@ def _query_key(key):
     if len(raw) > MAX_KEY_BYTES + 4:
         raise ValueError("merkle map lookup key")
     return raw
+
+
+def checked_query_key(key):
+    """Validate and return one exact range/diff continuation key."""
+    _query_key(key)
+    return key
 
 
 def _row_item(key, value):
@@ -868,7 +880,9 @@ class Reader:
         rows = tuple(found[:limit])
         return RangePage(rows, rows[-1][0] if more else None)
 
-    def diff_page(self, local, *, after=None, limit=MAX_RANGE_ROWS):
+    def diff_page(
+            self, local, *, after=None, limit=MAX_RANGE_ROWS,
+            max_pages=None):
         """Return one resumable oid-pruned page of a remote map.
 
         Pruning compares subtrees reachable from the two supplied *current
@@ -878,104 +892,17 @@ class Reader:
         returned alongside the exact ``differing`` rows.  Run the operation in
         both directions to discover deletions.
         """
-        if not isinstance(local, Reader) or local.seed != self.seed \
-                or after is not None and (
-                    not isinstance(after, str) or not after):
-            raise ValueError("merkle map diff")
-        if after is not None:
-            _query_key(after)
-        if type(limit) is not int or not 1 <= limit <= MAX_RANGE_ROWS:
-            raise ValueError("merkle map diff")
-        self.pages_read = 0
-        self._page_budget = (
-            2 * self.max_page_depth + 2 * (limit + 1))
-        local_pages = 0
+        return _drive_diff(_diff_program(
+            self, local, after=after, limit=limit,
+            max_pages=max_pages))
 
-        def local_page(ref):
-            nonlocal local_pages
-            oid, expected, route = ref
-            local_pages += 1
-            page, summary = local._decode_page(local.fetch(oid), oid)
-            if expected is not None and _descriptor(summary) != expected:
-                raise ValueError("merkle map child metadata")
-            if route is not None:
-                prefix, label = route
-                if any(
-                        not _matches_route(edge, prefix, label)
-                        for edge in (summary.first, summary.last)):
-                    raise ValueError("merkle map child route")
-            return page, summary
-
-        remote_root = (self.root, None, None) if self.root else None
-        local_root = (local.root, None, None) if local.root else None
-        if remote_root is not None and remote_root == local_root and (
-                self.expected_root is not None
-                or local.expected_root is not None):
-            _, summary = self._page(self.root)
-            local._check_root(summary)
-        stack = [(remote_root, local_root)] if remote_root else []
-        rows = []
-        while stack and len(rows) <= limit:
-            remote_ref, local_ref = stack.pop()
-            oid, expected, route = remote_ref
-            # Equal content hashes authenticate equality only when the two
-            # current parents also authenticate the same descriptor and route.
-            # A hostile parent may reuse a genuine child oid beside forged
-            # bounds/counts; that child must be opened and rejected.
-            if local_ref is not None and remote_ref == local_ref:
-                continue
-            page, summary = self._page(oid, expected, route)
-            if after is not None and summary.last <= after:
-                continue
-            if page["kind"] == "leaf":
-                for key, value in page["rows"]:
-                    if after is None or key > after:
-                        rows.append((key, value))
-                        if len(rows) > limit:
-                            break
-                continue
-
-            local_children = {}
-            if local_ref is not None:
-                local_node, _ = local_page(local_ref)
-                if local_node["kind"] == "branch" \
-                        and local_node["prefix"] == page["prefix"]:
-                    local_children = {
-                        row[0]: (
-                            row[1],
-                            _descriptor(_summary_row(row)),
-                            (_decode_prefix(local_node["prefix"]), row[0]),
-                        )
-                        for row in local_node["children"]
-                    }
-            prefix = _decode_prefix(page["prefix"])
-            for row in reversed(page["children"]):
-                child = _summary_row(row)
-                if after is not None and child.last <= after:
-                    continue
-                stack.append((
-                    (
-                        child.oid, _descriptor(child),
-                        (prefix, row[0]),
-                    ),
-                    local_children.get(row[0]),
-                ))
-
-        more = len(rows) > limit
-        selected = tuple(rows[:limit])
-        differing = []
-        lookup_pages = 0
-        for row in selected:
-            incumbent = local.get(row[0])
-            lookup_pages += local.pages_read
-            if incumbent != row[1]:
-                differing.append(row)
-        local.pages_read = local_pages + lookup_pages
-        return DiffPage(
-            selected,
-            tuple(differing),
-            selected[-1][0] if more else None,
-        )
+    async def diff_page_awaited(
+            self, local, *, after=None, limit=MAX_RANGE_ROWS,
+            max_pages=None):
+        """Await the same bounded diff one authenticated page at a time."""
+        return await diff_page_awaited(
+            self, local, after=after, limit=limit,
+            max_pages=max_pages)
 
     def items(self, known=None, *, max_pages=None):
         """Decode the complete map for repair only.
@@ -1040,6 +967,172 @@ class Reader:
         if any(a[0] >= b[0] for a, b in zip(out, out[1:])):
             raise ValueError("merkle map global order")
         return tuple(out)
+
+
+def _diff_program(
+        remote, local, *, after=None, limit=MAX_RANGE_ROWS,
+        max_pages=None):
+    """Yield one remote/local page at a time for the shared diff traversal."""
+    if not isinstance(remote, Reader) or not isinstance(local, Reader) \
+            or local.seed != remote.seed \
+            or after is not None and (
+                not isinstance(after, str) or not after):
+        raise ValueError("merkle map diff")
+    if after is not None:
+        _query_key(after)
+    if type(limit) is not int or not 1 <= limit <= MAX_RANGE_ROWS:
+        raise ValueError("merkle map diff")
+    remote_walk = 2 * remote.max_page_depth + 2 * (limit + 1)
+    local_walk = 2 * local.max_page_depth + 2 * (limit + 1)
+    maximum = remote_walk + local_walk + limit * local.max_page_depth
+    budget = maximum if max_pages is None else max_pages
+    if type(budget) is not int or not 0 <= budget <= maximum:
+        raise ValueError("merkle map diff page budget")
+
+    remote.pages_read = local.pages_read = 0
+    total = 0
+
+    def load(reader, ref):
+        nonlocal total
+        oid, expected, route = ref
+        if total >= budget:
+            raise ValueError("merkle map diff page budget")
+        total += 1
+        reader.pages_read += 1
+        page, summary = reader._decode_page(
+            (yield _DiffRead(reader.fetch, oid)), oid)
+        if expected is not None and _descriptor(summary) != expected:
+            raise ValueError("merkle map child metadata")
+        if route is not None:
+            prefix, label = route
+            if any(
+                    not _matches_route(edge, prefix, label)
+                    for edge in (summary.first, summary.last)):
+                raise ValueError("merkle map child route")
+        return page, summary
+
+    def local_many(keys):
+        nonlocal total
+        program = _get_many_program(
+            local.root,
+            local.seed,
+            keys,
+            max_page_depth=local.max_page_depth,
+            expected_count=None if local.expected_root is None
+            else local.expected_root[0],
+            expected_depth=None if local.expected_root is None
+            else local.expected_root[1],
+        )
+        try:
+            operation = next(program)
+            while True:
+                if not isinstance(operation, _Read):
+                    raise TypeError("merkle map lookup operation")
+                if total >= budget:
+                    raise ValueError("merkle map diff page budget")
+                total += 1
+                local.pages_read += 1
+                operation = program.send((yield _DiffRead(
+                    local.fetch, operation.oid)))
+        except StopIteration as done:
+            answers, _pages = done.value
+            return answers
+        finally:
+            program.close()
+
+    remote_root = (remote.root, None, None) if remote.root else None
+    local_root = (local.root, None, None) if local.root else None
+    if remote_root is not None and remote_root == local_root and (
+            remote.expected_root is not None
+            or local.expected_root is not None):
+        _, summary = yield from load(remote, remote_root)
+        local._check_root(summary)
+    stack = [(remote_root, local_root)] if remote_root else []
+    rows = []
+    while stack and len(rows) <= limit:
+        remote_ref, local_ref = stack.pop()
+        if local_ref is not None and remote_ref == local_ref:
+            continue
+        page, summary = yield from load(remote, remote_ref)
+        if after is not None and summary.last <= after:
+            continue
+        if page["kind"] == "leaf":
+            for key, value in page["rows"]:
+                if after is None or key > after:
+                    rows.append((key, value))
+                    if len(rows) > limit:
+                        break
+            continue
+
+        local_children = {}
+        if local_ref is not None:
+            local_node, _ = yield from load(local, local_ref)
+            if local_node["kind"] == "branch" \
+                    and local_node["prefix"] == page["prefix"]:
+                prefix = _decode_prefix(local_node["prefix"])
+                local_children = {
+                    row[0]: (
+                        row[1], _descriptor(_summary_row(row)),
+                        (prefix, row[0]),
+                    )
+                    for row in local_node["children"]
+                }
+        prefix = _decode_prefix(page["prefix"])
+        for row in reversed(page["children"]):
+            child = _summary_row(row)
+            if after is not None and child.last <= after:
+                continue
+            stack.append((
+                (
+                    child.oid, _descriptor(child),
+                    (prefix, row[0]),
+                ),
+                local_children.get(row[0]),
+            ))
+
+    more = len(rows) > limit
+    selected = tuple(rows[:limit])
+    incumbents = yield from local_many(tuple(row[0] for row in selected))
+    differing = [
+        row for row in selected if incumbents[row[0]] != row[1]
+    ]
+    return DiffPage(
+        selected,
+        tuple(differing),
+        selected[-1][0] if more else None,
+    )
+
+
+def _drive_diff(program):
+    try:
+        operation = next(program)
+        while True:
+            if not isinstance(operation, _DiffRead):
+                raise TypeError("merkle map diff operation")
+            operation = program.send(operation.fetch(operation.oid))
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
+
+
+async def diff_page_awaited(
+        remote, local, *, after=None, limit=MAX_RANGE_ROWS,
+        max_pages=None):
+    """Await the exact sync diff program without retaining fetched pages."""
+    program = _diff_program(
+        remote, local, after=after, limit=limit, max_pages=max_pages)
+    try:
+        operation = next(program)
+        while True:
+            if not isinstance(operation, _DiffRead):
+                raise TypeError("merkle map diff operation")
+            operation = program.send(
+                await operation.fetch(operation.oid))
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
 
 
 def _update_program(
