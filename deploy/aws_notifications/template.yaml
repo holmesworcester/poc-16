@@ -7,10 +7,6 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["false", "true"]
-  DirectSmokeEnabled:
-    Type: String
-    Default: "false"
-    AllowedValues: ["false", "true"]
   DeploymentId:
     Type: String
     MinLength: 3
@@ -261,6 +257,8 @@ Resources:
       CodeUri: stage/
       Handler: deploy.aws_notifications.app.scanner_handler
       Runtime: python3.13
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: FunctionUpdate
       Architectures: [x86_64]
       Role: !GetAtt NotificationScannerRole.Arn
       MemorySize: 1024
@@ -281,6 +279,7 @@ Resources:
           TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
           TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
           TINYP2P_NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
+          TINYP2P_NOTIFICATION_SOFTWARE_DIGEST: !Ref SoftwareDigest
 
   NotificationDeliveryFunction:
     Type: AWS::Serverless::Function
@@ -289,6 +288,8 @@ Resources:
       CodeUri: stage/
       Handler: deploy.aws_notifications.app.delivery_handler
       Runtime: python3.13
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: FunctionUpdate
       Architectures: [x86_64]
       Role: !GetAtt NotificationDeliveryRole.Arn
       MemorySize: 1024
@@ -307,7 +308,23 @@ Resources:
           TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
           TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
           TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
-          TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED: !Ref DirectSmokeEnabled
+          TINYP2P_NOTIFICATION_SOFTWARE_DIGEST: !Ref SoftwareDigest
+
+  NotificationScannerVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      Description: !Ref SoftwareDigest
+      FunctionName: !Ref NotificationScannerFunction
+      RuntimePolicy:
+        UpdateRuntimeOn: FunctionUpdate
+
+  NotificationDeliveryVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      Description: !Ref SoftwareDigest
+      FunctionName: !Ref NotificationDeliveryFunction
+      RuntimePolicy:
+        UpdateRuntimeOn: FunctionUpdate
 
   NotificationDeliveryMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -315,7 +332,7 @@ Resources:
       BatchSize: 10
       Enabled: !If [NotificationsEnabled, true, false]
       EventSourceArn: !GetAtt NotificationQueue.Arn
-      FunctionName: !Ref NotificationDeliveryFunction
+      FunctionName: !Ref NotificationDeliveryVersion
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
@@ -325,14 +342,14 @@ Resources:
       ScheduleExpression: !Ref ScheduleExpression
       State: !If [NotificationsEnabled, ENABLED, DISABLED]
       Targets:
-        - Arn: !GetAtt NotificationScannerFunction.Arn
+        - Arn: !Ref NotificationScannerVersion
           Id: notification-scanner
 
   NotificationScanPermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
-      FunctionName: !Ref NotificationScannerFunction
+      FunctionName: !Ref NotificationScannerVersion
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NotificationScanSchedule.Arn
 
@@ -400,8 +417,6 @@ Outputs:
     Value: !Ref SoftwareDigest
   Enabled:
     Value: !Ref Enabled
-  DirectSmokeEnabled:
-    Value: !Ref DirectSmokeEnabled
   WorkspaceId:
     Value: !Ref WorkspaceId
   CanonicalBucketName:
@@ -438,7 +453,7 @@ Outputs:
     Value: !Ref NotificationDeadLetterQueue
   NotificationDeadLetterQueueArn:
     Value: !GetAtt NotificationDeadLetterQueue.Arn
-  NotificationScannerFunctionArn:
-    Value: !GetAtt NotificationScannerFunction.Arn
-  NotificationDeliveryFunctionArn:
-    Value: !GetAtt NotificationDeliveryFunction.Arn
+  NotificationScannerVersionArn:
+    Value: !Ref NotificationScannerVersion
+  NotificationDeliveryVersionArn:
+    Value: !Ref NotificationDeliveryVersion

@@ -713,36 +713,64 @@ python3 -m deploy.aws_notifications.manage bootstrap --current \
   --deployment-id DEPLOYMENT --region REGION
 ```
 
-Direct smoke is an independent, normally disabled path. Enable its switch with
-a disabled `deploy --update --enable-smoke`, using the same immutable arguments
-as create, then invoke it with one canonical hint. It bypasses SQS and does not
-complete notification cursor state. A pass proves current authority and at
-least one FCM acceptance; it does not prove that iOS or Android launched:
+Direct smoke is an explicit operator path and is permitted only while
+production is disabled. The Lambda has no public route; AWS IAM is invocation
+authority, and the command requires an explicit acknowledgement that it will
+contact live FCM. It bypasses SQS and does not complete notification cursor
+state. A pass proves current authority and at least one FCM acceptance; it does
+not prove that iOS or Android launched:
 
 ```sh
 python3 -m deploy.aws_notifications.manage direct-smoke \
   --stack-name poc16-notifications --deployment-id DEPLOYMENT \
-  --hint-file notification-hint.json --region REGION
+  --hint-file notification-hint.json --confirm-live-fcm --region REGION
 ```
 
 Production remains fail-closed until a real-device harness has observed both
 an iOS and an Android launch and written one canonical record per platform.
-Records have the exact shape below. `binding` must equal the owned stack's
-immutable bucket/workspace/secret/push values and its full StackId and
-`SoftwareDigest` outputs; use `deploy.notification_launch.launch_record()` to
-encode it only after the corresponding device test passes:
+Obtain the binding directly from the owned, disabled stack; this command
+refuses an enabled deployment and validates both numeric Version ARNs against
+the stack's partition, region, and account:
+
+```sh
+python3 -m deploy.aws_notifications.manage launch-binding \
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT \
+  --region REGION > launch-binding.json
+```
+
+Records have the exact shape below. The harness must use that binding unchanged
+and call `deploy.notification_launch.launch_record()` only after the
+corresponding device test passes:
 
 ```json
-{"binding":{"canonical_bucket":"CANONICAL_BUCKET","canonical_prefix":"workspaces/WS64","deployment_id":"DEPLOYMENT","expected_bucket_owner":"ACCOUNT_ID","notification_secret_arn":"SECRET_ARN","notification_secret_version_id":"SECRET_VERSION_ID","notification_state_bucket":"NOTIFICATION_STATE_BUCKET","notification_state_prefix":"workspaces/WS64/notifications","provider":"aws","push_node_id":"PUSH_NODE_ID","software_digest":"SOFTWARE_DIGEST","stack_id":"FULL_STACK_ARN","workspace":"WS64"},"platform":"ios","result":"passed","schema":"poc16-mobile-notification-launch-v1"}
+{"binding":{"canonical_bucket":"CANONICAL_BUCKET","canonical_prefix":"workspaces/WS64","delivery_version_arn":"DELIVERY_VERSION_ARN","deployment_id":"DEPLOYMENT","expected_bucket_owner":"ACCOUNT_ID","notification_secret_arn":"SECRET_ARN","notification_secret_version_id":"SECRET_VERSION_ID","notification_state_bucket":"NOTIFICATION_STATE_BUCKET","notification_state_prefix":"workspaces/WS64/notifications","provider":"aws","push_node_id":"PUSH_NODE_ID","scanner_version_arn":"SCANNER_VERSION_ARN","software_digest":"SOFTWARE_DIGEST","stack_id":"FULL_STACK_ARN","workspace":"WS64"},"platform":"ios","result":"passed","schema":"poc16-mobile-notification-launch-v1"}
 ```
 
 Repeat `deploy` with `--update --enable`, the same immutable arguments, and
 `--ios-launch-record IOS.json --android-launch-record ANDROID.json`. An enabled
-deployment rejects a changed software digest. Upgrade in three distinct steps:
-disable using the incumbent code, deploy the new code after the stack is already
-disabled, then repeat both launch tests against that digest and enable it. The
-tool rejects a one-step disable-plus-code-change because CloudFormation need not
-disable triggers before replacing function code.
+deployment rejects a changed software digest. Enable is a traffic-only
+operation: it does not stage or build source and does not run SAM. The tool
+creates a previous-template CloudFormation change set, requires its resolved
+traffic parameter to match the requested state and every other parameter to
+reuse its existing value, requires its only resource changes to be the
+EventBridge schedule and SQS event-source switch, rechecks the exact disabled
+stack, and only then executes it. A concurrent stack update makes that preflight
+fail closed. Afterward it verifies the same StackId, binding,
+software digest, queues, and scanner/delivery version ARNs.
+
+Upgrade in three distinct steps: disable using the incumbent code, deploy the
+new code after the stack is already disabled, then repeat both launch tests
+against that digest and enable it. A release update builds and packages first,
+then creates but does not immediately execute its CloudFormation change set.
+It requires the resolved `Enabled` parameter to remain false, requires a new
+software digest to update both functions and publish both Version resources,
+and rechecks the exact disabled predecessor before execution. Thus a concurrent
+operator cannot turn a stale disabled preflight into a combined live code
+replacement and disable. SQS, EventBridge, bootstrap, and direct smoke all
+invoke immutable numeric version ARNs; no unqualified function ARN is an
+output. Both the functions and their published versions use `FunctionUpdate`
+runtime management, so a tested version's managed runtime cannot drift before
+activation.
 
 The source queue retains wakes for four days and the DLQ for fourteen. A
 carrier wake is not the durable record; non-expiring notification state is.
@@ -754,10 +782,17 @@ python3 -m deploy.aws_notifications.manage redrive \
   --max-per-second 10 --region REGION
 ```
 
-Removal never trusts approximate SQS depth. First update with both `--disable`
-and `--disable-smoke`, allow or redrive work as appropriate, then explicitly
-accept carrier destruction. This preserves both external buckets and the
-secret but can discard any wakes still in SQS:
+Removal never trusts approximate SQS depth. First use the traffic-only
+`deploy --update --disable` operation, allow or redrive work as appropriate,
+then explicitly accept carrier destruction. Emergency disable needs only the
+stack name, deployment ID, and optional AWS region/profile; it does not stage,
+build, or compare a local source checkout. Removal preserves both external
+buckets and the secret but can discard any wakes still in SQS:
+
+```sh
+python3 -m deploy.aws_notifications.manage deploy --update --disable \
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT --region REGION
+```
 
 ```sh
 python3 -m deploy.aws_notifications.manage remove \

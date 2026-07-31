@@ -796,11 +796,12 @@ def test_direct_smoke_distinguishes_no_recipient_retry_and_terminal(
     assert terminal["accepted_count"] == terminal["retry_count"] == 0
 
 
-def test_direct_smoke_handler_is_separately_disabled(monkeypatch):
-    monkeypatch.delenv(
-        "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED", raising=False)
-    with pytest.raises(RuntimeError, match="direct smoke is disabled"):
-        app.delivery_handler({
-            "body": base64.b64encode(b"hint").decode("ascii"),
-            "schema": DIRECT_SMOKE_SCHEMA,
-        }, None)
+def test_direct_smoke_handler_is_a_private_operator_mode(monkeypatch):
+    async def smoke(event):
+        return {"schema": event["schema"]}
+
+    monkeypatch.setattr(app, "direct_smoke", smoke)
+    assert app.delivery_handler({
+        "body": base64.b64encode(b"hint").decode("ascii"),
+        "schema": DIRECT_SMOKE_SCHEMA,
+    }, None) == {"schema": DIRECT_SMOKE_SCHEMA}

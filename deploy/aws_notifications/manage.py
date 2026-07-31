@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 
 from adapters.aws import queue_binding
 from adapters.s3 import S3Config
@@ -29,6 +30,7 @@ from .config import (
     DIRECT_SMOKE_SCHEMA,
     DLQ_RETENTION_SECONDS,
     KMS_KEY_ARN_RE,
+    LAMBDA_VERSION_ARN_RE,
     MAX_RECEIVE_COUNT,
     OWNER_RE,
     QUEUE_RETENTION_SECONDS,
@@ -44,6 +46,40 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 STAGE = HERE / "stage"
 BUILD = HERE / ".aws-sam"
+PACKAGED = BUILD / "packaged.yaml"
+LOG_RETENTION_DAYS = 14
+OPERABLE_STACK_STATUSES = frozenset({
+    "CREATE_COMPLETE",
+    "UPDATE_COMPLETE",
+    "UPDATE_ROLLBACK_COMPLETE",
+})
+TEMPLATE_PARAMETERS = (
+    "Enabled",
+    "DeploymentId",
+    "SoftwareDigest",
+    "WorkspaceId",
+    "CanonicalBucketName",
+    "CanonicalPrefix",
+    "NotificationStateBucketName",
+    "NotificationStatePrefix",
+    "ExpectedBucketOwner",
+    "NotificationSecretArn",
+    "NotificationSecretVersionId",
+    "PushNodeId",
+    "RepositoryKmsKeyArn",
+    "NotificationStateKmsKeyArn",
+    "NotificationSecretKmsKeyArn",
+    "ScheduleExpression",
+    "ScannerReservedConcurrency",
+    "DeliveryReservedConcurrency",
+    "MaxReceiveCount",
+    "LogRetentionDays",
+    "AlarmActionArn",
+)
+TRAFFIC_RESOURCES = {
+    "NotificationDeliveryMapping": "AWS::Lambda::EventSourceMapping",
+    "NotificationScanSchedule": "AWS::Events::Rule",
+}
 SOURCE_PACKAGES = ("facts", "notifications")
 SOURCE_TREES = ("adapters/aws", "adapters/gcp", "adapters/s3")
 NOTIFICATION_CORE_MODULES = (
@@ -445,8 +481,7 @@ def _owned_stack(args, stack=None):
             or outputs.get("DeploymentMarker") != DEPLOYMENT_MARKER \
             or outputs.get("DeploymentId") != args.deployment_id:
         raise RuntimeError("refusing to operate on an unowned stack")
-    status = stack.get("StackStatus")
-    if not isinstance(status, str) or status.startswith("DELETE_"):
+    if stack.get("StackStatus") not in OPERABLE_STACK_STATUSES:
         raise RuntimeError("notification stack is not operable")
     return stack
 
@@ -471,98 +506,429 @@ def _stack_for_deploy(args):
         return (
             args.stack_name,
             bool(args.enable),
-            bool(args.direct_smoke),
             None,
         )
     if incumbent is None:
         raise RuntimeError("update requires an existing owned stack")
     owned = _owned_stack(args, incumbent)
     outputs = _outputs(owned)
-    switches = []
-    for output, selected in (
-            ("Enabled", args.enable),
-            ("DirectSmokeEnabled", args.direct_smoke)):
-        incumbent = outputs.get(output)
-        if incumbent not in {"true", "false"}:
-            raise RuntimeError("notification stack has no traffic state")
-        switches.append(
-            incumbent == "true" if selected is None else selected)
-    return owned["StackId"], *switches, outputs
+    incumbent = outputs.get("Enabled")
+    if incumbent not in {"true", "false"}:
+        raise RuntimeError("notification stack has no traffic state")
+    enabled = incumbent == "true" if args.enable is None else args.enable
+    return owned["StackId"], enabled, outputs
 
 
-def _parameters(args, enabled, direct_smoke, push_node, software_digest):
-    if type(enabled) is not bool or type(direct_smoke) is not bool \
-            or not valid_fid(push_node) or not valid_fid(software_digest):
+def _parameter_values(args, enabled, push_node, software_digest):
+    if type(enabled) is not bool or not valid_fid(push_node) \
+            or not valid_fid(software_digest):
         raise TypeError("notification deployment state")
-    return (
-        f"Enabled={'true' if enabled else 'false'}",
-        f"DirectSmokeEnabled={'true' if direct_smoke else 'false'}",
-        f"DeploymentId={args.deployment_id}",
-        f"SoftwareDigest={software_digest}",
-        f"WorkspaceId={args.workspace}",
-        f"CanonicalBucketName={args.canonical_bucket}",
-        f"CanonicalPrefix={args.canonical_prefix}",
-        f"NotificationStateBucketName={args.state_bucket}",
-        f"NotificationStatePrefix={args.state_prefix}",
-        f"ExpectedBucketOwner={args.expected_owner}",
-        f"NotificationSecretArn={args.notification_secret_arn}",
-        f"NotificationSecretVersionId={args.notification_secret_version_id}",
-        f"PushNodeId={push_node}",
-        f"RepositoryKmsKeyArn={args.repository_kms_key_arn or ''}",
-        f"NotificationStateKmsKeyArn={args.state_kms_key_arn or ''}",
-        f"NotificationSecretKmsKeyArn={args.secret_kms_key_arn or ''}",
-        f"ScheduleExpression={args.schedule}",
-        f"ScannerReservedConcurrency={args.scanner_concurrency}",
-        f"DeliveryReservedConcurrency={args.delivery_concurrency}",
-        f"MaxReceiveCount={args.max_receive_count}",
-        f"AlarmActionArn={args.alarm_action_arn or ''}",
-    )
-
-
-def _check_launch_gate(args, stack_id, binding, software_digest):
-    """Require exact, deployment-bound evidence from both mobile platforms."""
-    expected = {
-        "canonical_bucket": binding["CanonicalBucketName"],
-        "canonical_prefix": binding["CanonicalPrefix"],
-        "deployment_id": args.deployment_id,
-        "expected_bucket_owner": binding["ExpectedBucketOwner"],
-        "notification_secret_arn": binding["NotificationSecretArn"],
-        "notification_secret_version_id": (
-            binding["NotificationSecretVersionId"]),
-        "notification_state_bucket": binding["NotificationStateBucketName"],
-        "notification_state_prefix": binding["NotificationStatePrefix"],
-        "provider": "aws",
-        "push_node_id": binding["PushNodeId"],
-        "software_digest": software_digest,
-        "stack_id": stack_id,
-        "workspace": binding["WorkspaceId"],
+    values = {
+        "Enabled": "true" if enabled else "false",
+        "DeploymentId": args.deployment_id,
+        "SoftwareDigest": software_digest,
+        "WorkspaceId": args.workspace,
+        "CanonicalBucketName": args.canonical_bucket,
+        "CanonicalPrefix": args.canonical_prefix,
+        "NotificationStateBucketName": args.state_bucket,
+        "NotificationStatePrefix": args.state_prefix,
+        "ExpectedBucketOwner": args.expected_owner,
+        "NotificationSecretArn": args.notification_secret_arn,
+        "NotificationSecretVersionId": args.notification_secret_version_id,
+        "PushNodeId": push_node,
+        "RepositoryKmsKeyArn": args.repository_kms_key_arn or "",
+        "NotificationStateKmsKeyArn": args.state_kms_key_arn or "",
+        "NotificationSecretKmsKeyArn": args.secret_kms_key_arn or "",
+        "ScheduleExpression": args.schedule,
+        "ScannerReservedConcurrency": str(args.scanner_concurrency),
+        "DeliveryReservedConcurrency": str(args.delivery_concurrency),
+        "MaxReceiveCount": str(args.max_receive_count),
+        "LogRetentionDays": str(LOG_RETENTION_DAYS),
+        "AlarmActionArn": args.alarm_action_arn or "",
     }
+    if tuple(values) != TEMPLATE_PARAMETERS:
+        raise AssertionError("notification template parameter drift")
+    return values
+
+
+def _parameters(args, enabled, push_node, software_digest):
+    return tuple(
+        f"{name}={value}" for name, value in _parameter_values(
+            args, enabled, push_node, software_digest).items())
+
+
+def _version_arns(outputs, stack_id=None):
+    if not isinstance(outputs, dict):
+        raise RuntimeError("notification deployment has no immutable versions")
+    values = {
+        "delivery_version_arn": outputs.get("NotificationDeliveryVersionArn"),
+        "scanner_version_arn": outputs.get("NotificationScannerVersionArn"),
+    }
+    if any(LAMBDA_VERSION_ARN_RE.fullmatch(value or "") is None
+           for value in values.values()):
+        raise RuntimeError("notification deployment has no immutable versions")
+    if stack_id is not None:
+        parts = stack_id.split(":", 5) if isinstance(stack_id, str) else ()
+        boundaries = [
+            value.split(":", 6) for value in values.values()
+        ]
+        if len(parts) != 6 or any(
+                len(value) != 7 or value[1] != parts[1]
+                or value[3:5] != parts[3:5]
+                for value in boundaries):
+            raise RuntimeError(
+                "notification immutable versions cross stack boundary")
+    return values
+
+
+def _launch_binding(stack_id, outputs):
+    result = {
+        "canonical_bucket": outputs.get("CanonicalBucketName"),
+        "canonical_prefix": outputs.get("CanonicalPrefix"),
+        "deployment_id": outputs.get("DeploymentId"),
+        **_version_arns(outputs, stack_id),
+        "expected_bucket_owner": outputs.get("ExpectedBucketOwner"),
+        "notification_secret_arn": outputs.get("NotificationSecretArn"),
+        "notification_secret_version_id": outputs.get(
+            "NotificationSecretVersionId"),
+        "notification_state_bucket": outputs.get(
+            "NotificationStateBucketName"),
+        "notification_state_prefix": outputs.get("NotificationStatePrefix"),
+        "provider": "aws",
+        "push_node_id": outputs.get("PushNodeId"),
+        "software_digest": outputs.get("SoftwareDigest"),
+        "stack_id": stack_id,
+        "workspace": outputs.get("WorkspaceId"),
+    }
+    if not all(isinstance(value, str) and value for value in result.values()) \
+            or not all(valid_fid(result[name]) for name in (
+                "push_node_id", "software_digest", "workspace")):
+        raise RuntimeError("notification launch binding is incomplete")
+    return result
+
+
+def _check_launch_gate(args, stack_id, outputs):
+    """Require exact, deployment-bound evidence from both mobile platforms."""
     require_mobile_launches({
         "ios": getattr(args, "ios_launch_record", None),
         "android": getattr(args, "android_launch_record", None),
-    }, expected)
+    }, _launch_binding(stack_id, outputs))
+
+
+def _traffic_parameters(enabled):
+    if type(enabled) is not bool:
+        raise TypeError("notification traffic state")
+    return (
+        f"ParameterKey=Enabled,ParameterValue={'true' if enabled else 'false'}",
+        *(f"ParameterKey={name},UsePreviousValue=true"
+          for name in TEMPLATE_PARAMETERS if name != "Enabled"),
+    )
+
+
+def _change_set_document(result, label):
+    try:
+        value = json.loads(result.stdout)
+    except (AttributeError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"malformed notification {label}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"malformed notification {label}")
+    return value
+
+
+def _discard_change_set(args, change_set):
+    try:
+        _run([
+            "aws", "cloudformation", "delete-change-set",
+            "--change-set-name", change_set,
+            *_provider_flags(args),
+        ])
+    except subprocess.CalledProcessError:
+        pass
+
+
+def _start_change_set(args, stack_id, kind, options):
+    name = f"poc16-notification-{kind}-" + uuid.uuid4().hex
+    created = _change_set_document(_run([
+        "aws", "cloudformation", "create-change-set",
+        "--stack-name", stack_id,
+        "--change-set-name", name,
+        "--change-set-type", "UPDATE",
+        *options,
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True), f"{kind} creation response")
+    change_set = created.get("Id")
+    if not isinstance(change_set, str) or not change_set \
+            or created.get("StackId") != stack_id:
+        raise RuntimeError(f"malformed {kind} creation response")
+    return change_set
+
+
+def _ready_change_set(args, stack_id, change_set, kind):
+    _run([
+        "aws", "cloudformation", "wait",
+        "change-set-create-complete",
+        "--change-set-name", change_set,
+        *_provider_flags(args),
+    ])
+    document = _change_set_document(_run([
+        "aws", "cloudformation", "describe-change-set",
+        "--change-set-name", change_set,
+        "--no-paginate",
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True), f"{kind} change set")
+    if document.get("ChangeSetId") != change_set \
+            or document.get("StackId") != stack_id \
+            or document.get("Status") != "CREATE_COMPLETE" \
+            or document.get("ExecutionStatus") != "AVAILABLE" \
+            or document.get("NextToken") is not None:
+        raise RuntimeError(f"{kind} change set is not executable")
+    return document
+
+
+def _create_traffic_change_set(args, stack_id, enabled):
+    """Create and prove one traffic-only, previous-template stack update."""
+    action = "enable" if enabled else "disable"
+    change_set = _start_change_set(args, stack_id, action, [
+        "--use-previous-template",
+        "--capabilities", "CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND",
+        "--parameters", *_traffic_parameters(enabled),
+    ])
+    try:
+        document = _ready_change_set(
+            args, stack_id, change_set, "traffic")
+        parameters = {}
+        for row in document.get("Parameters", ()):
+            if not isinstance(row, dict) \
+                    or not isinstance(row.get("ParameterKey"), str) \
+                    or row["ParameterKey"] in parameters:
+                raise RuntimeError("traffic change set parameters")
+            parameters[row["ParameterKey"]] = row
+        if set(parameters) != set(TEMPLATE_PARAMETERS) \
+                or parameters["Enabled"].get("ParameterValue") \
+                != ("true" if enabled else "false") \
+                or any(parameters[name].get("UsePreviousValue") is not True
+                       for name in TEMPLATE_PARAMETERS if name != "Enabled"):
+            raise RuntimeError("traffic change set parameters")
+        changes = {}
+        for row in document.get("Changes", ()):
+            change = row.get("ResourceChange") \
+                if isinstance(row, dict) and row.get("Type") == "Resource" \
+                else None
+            logical = change.get("LogicalResourceId") \
+                if isinstance(change, dict) else None
+            if not isinstance(logical, str) or logical in changes:
+                raise RuntimeError("traffic change set resource scope")
+            changes[logical] = change
+        if set(changes) != set(TRAFFIC_RESOURCES) or any(
+                change.get("Action") != "Modify"
+                or change.get("ResourceType") != TRAFFIC_RESOURCES[name]
+                or change.get("Replacement") != "False"
+                or set(change.get("Scope", ())) != {"Properties"}
+                for name, change in changes.items()):
+            raise RuntimeError("traffic change set resource scope")
+    except Exception:
+        _discard_change_set(args, change_set)
+        raise
+    return change_set
+
+
+def _release_parameters(args, push_node, software_digest):
+    return tuple(
+        f"ParameterKey={name},ParameterValue={value}"
+        for name, value in _parameter_values(
+            args, False, push_node, software_digest).items())
+
+
+def _package_release(args):
+    _run([
+        "sam", "package",
+        "--template-file", str(BUILD / "template.yaml"),
+        "--output-template-file", str(PACKAGED),
+        "--resolve-s3",
+        *_provider_flags(args),
+    ])
+
+
+def _create_release_change_set(
+        args, stack_id, push_node, software_digest, previous_digest):
+    """Package a release, then create but do not execute its exact update."""
+    _package_release(args)
+    expected = _parameter_values(args, False, push_node, software_digest)
+    change_set = _start_change_set(args, stack_id, "release", [
+        "--template-body", "file://" + str(PACKAGED),
+        "--capabilities", "CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND",
+        "--parameters", *_release_parameters(
+            args, push_node, software_digest),
+    ])
+    try:
+        document = _ready_change_set(
+            args, stack_id, change_set, "release")
+        parameters = {}
+        for row in document.get("Parameters", ()):
+            if not isinstance(row, dict) \
+                    or not isinstance(row.get("ParameterKey"), str) \
+                    or not isinstance(row.get("ParameterValue"), str) \
+                    or row["ParameterKey"] in parameters:
+                raise RuntimeError("release change set parameters")
+            parameters[row["ParameterKey"]] = row["ParameterValue"]
+        if parameters != expected or parameters.get("Enabled") != "false":
+            raise RuntimeError("release change set parameters")
+        changes = document.get("Changes")
+        if not isinstance(changes, list) or not changes:
+            raise RuntimeError("release change set has no resource changes")
+        logical = set()
+        for row in changes:
+            change = row.get("ResourceChange") \
+                if isinstance(row, dict) and row.get("Type") == "Resource" \
+                else None
+            name = change.get("LogicalResourceId") \
+                if isinstance(change, dict) else None
+            if not isinstance(name, str) or not name or name in logical:
+                raise RuntimeError("release change set resource scope")
+            logical.add(name)
+        if software_digest != previous_digest and not {
+                "NotificationScannerFunction",
+                "NotificationDeliveryFunction",
+                "NotificationScannerVersion",
+                "NotificationDeliveryVersion",
+        }.issubset(logical):
+            raise RuntimeError("release did not publish exact Lambda versions")
+    except Exception:
+        _discard_change_set(args, change_set)
+        raise
+    return change_set
+
+
+def _execute_change_set(args, stack_id, change_set):
+    _run([
+        "aws", "cloudformation", "execute-change-set",
+        "--change-set-name", change_set,
+        "--client-request-token", uuid.uuid4().hex,
+        *_provider_flags(args),
+    ])
+    _run([
+        "aws", "cloudformation", "wait", "stack-update-complete",
+        "--stack-name", stack_id,
+        *_provider_flags(args),
+    ])
+
+
+def _set_production(
+        args, stack_id, enabled, incumbent, binding=None, push_node=None):
+    """Toggle only the two traffic resources for exact deployed versions."""
+    initial = "false" if enabled else "true"
+    if incumbent.get("Enabled") != initial:
+        raise RuntimeError(
+            f"explicit {'enable' if enabled else 'disable'} requires an "
+            f"{'disabled' if enabled else 'enabled'} deployment")
+    software_digest = incumbent.get("SoftwareDigest")
+    if not valid_fid(software_digest):
+        raise RuntimeError("notification deployment has no software digest")
+    versions = _version_arns(incumbent, stack_id)
+    if enabled:
+        _check_launch_gate(args, stack_id, incumbent)
+        _check_initialized(args, incumbent, stack_id)
+    change_set = _create_traffic_change_set(args, stack_id, enabled)
+    current_stack = _owned_stack(args)
+    current = _outputs(current_stack)
+    try:
+        if current_stack.get("StackId") != stack_id \
+                or current.get("Enabled") != initial \
+                or current.get("SoftwareDigest") != software_digest \
+                or _version_arns(current, stack_id) != versions \
+                or {name: value for name, value in current.items()
+                    if name != "Enabled"} != {
+                    name: value for name, value in incumbent.items()
+                    if name != "Enabled"}:
+            raise RuntimeError("notification traffic preflight became stale")
+        if enabled:
+            _check_binding(current, binding)
+            _checked_queues(args, current)
+    except Exception:
+        _discard_change_set(args, change_set)
+        raise
+    _execute_change_set(args, stack_id, change_set)
+    final_stack = _owned_stack(args)
+    outputs = _outputs(final_stack)
+    if final_stack.get("StackId") != stack_id \
+            or outputs.get("Enabled") != ("true" if enabled else "false") \
+            or outputs.get("SoftwareDigest") != software_digest \
+            or _version_arns(outputs, stack_id) != versions \
+            or {name: value for name, value in outputs.items()
+                if name != "Enabled"} != {
+                name: value for name, value in incumbent.items()
+                if name != "Enabled"}:
+        raise RuntimeError("notification traffic postcondition failed")
+    if enabled:
+        _check_binding(outputs, binding)
+        _checked_queues(args, outputs)
+    return outputs
+
+
+def _deploy_release(
+        args, stack_id, incumbent, binding, push_node, software_digest):
+    """Execute a built release only against the same disabled predecessor."""
+    previous_digest = incumbent.get("SoftwareDigest")
+    if not valid_fid(previous_digest):
+        raise RuntimeError("notification deployment has no software digest")
+    previous_versions = _version_arns(incumbent, stack_id)
+    change_set = _create_release_change_set(
+        args, stack_id, push_node, software_digest, previous_digest)
+    current_stack = _owned_stack(args)
+    current = _outputs(current_stack)
+    try:
+        if current_stack.get("StackId") != stack_id \
+                or current.get("Enabled") != "false" \
+                or current != incumbent \
+                or _version_arns(current, stack_id) != previous_versions:
+            raise RuntimeError("notification release preflight became stale")
+        _check_binding(current, binding)
+        _checked_queues(args, current)
+    except Exception:
+        _discard_change_set(args, change_set)
+        raise
+    _execute_change_set(args, stack_id, change_set)
+    final_stack = _owned_stack(args)
+    outputs = _outputs(final_stack)
+    versions = _version_arns(outputs, stack_id)
+    if final_stack.get("StackId") != stack_id \
+            or outputs.get("Enabled") != "false" \
+            or outputs.get("SoftwareDigest") != software_digest \
+            or (software_digest != previous_digest
+                and versions == previous_versions):
+        raise RuntimeError("notification release postcondition failed")
+    _check_binding(outputs, binding)
+    _checked_queues(args, outputs)
+    return outputs
 
 
 def deploy(args):
     """Create disabled; updates preserve state without an explicit switch."""
+    if args.update and args.enable is False:
+        if DEPLOYMENT_ID_RE.fullmatch(args.deployment_id or "") is None:
+            raise ValueError("deployment ID")
+        target, enabled, incumbent = _stack_for_deploy(args)
+        return _set_production(args, target, enabled, incumbent)
     args = _validated(args)
-    target, enabled, direct_smoke_enabled, incumbent = _stack_for_deploy(args)
+    target, enabled, incumbent = _stack_for_deploy(args)
     push_node = _secret_binding(args)
     binding = _binding(args, push_node)
     if incumbent is not None:
         _check_binding(incumbent, binding)
     _verify_state_lifecycle(args)
-    software_digest = _prepare_software()
-    if incumbent is not None \
-            and incumbent.get("SoftwareDigest") != software_digest \
-            and (incumbent.get("Enabled") != "false" or enabled):
-        raise RuntimeError(
-            "disable notification production with incumbent software before "
-            "changing software")
     if args.enable is True:
-        _check_launch_gate(args, target, binding, software_digest)
-        _check_initialized(args, incumbent)
+        return _set_production(
+            args, target, enabled, incumbent, binding, push_node)
+    if incumbent is not None and incumbent.get("Enabled") != "false":
+        raise RuntimeError(
+            "disable notification production before updating deployment")
+    software_digest = _prepare_software()
     build(args, expected_digest=software_digest)
+    if incumbent is not None:
+        return _deploy_release(
+            args, target, incumbent, binding, push_node, software_digest)
     _run([
         "sam", "deploy",
         "--template-file", str(BUILD / "template.yaml"),
@@ -571,17 +937,17 @@ def deploy(args):
         "--resolve-s3",
         "--no-fail-on-empty-changeset",
         "--parameter-overrides", *_parameters(
-            args, enabled, direct_smoke_enabled, push_node, software_digest),
+            args, enabled, push_node, software_digest),
         "--tags",
         f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}",
         f"{DEPLOYMENT_ID_TAG}={args.deployment_id}",
         *_provider_flags(args),
     ])
-    outputs = _outputs(_owned_stack(args))
+    deployed_stack = _owned_stack(args)
+    outputs = _outputs(deployed_stack)
     _check_binding(outputs, binding)
+    _version_arns(outputs, deployed_stack["StackId"])
     if outputs.get("Enabled") != ("true" if enabled else "false") \
-            or outputs.get("DirectSmokeEnabled") \
-            != ("true" if direct_smoke_enabled else "false") \
             or outputs.get("SoftwareDigest") != software_digest:
         raise RuntimeError("deployed notification outputs are incomplete")
     _checked_queues(args, outputs)
@@ -599,10 +965,8 @@ def remove(args):
         raise RuntimeError(
             "refusing to delete the notification carrier; explicitly pass "
             "--destroy-carrier after disabling the deployment")
-    if outputs.get("Enabled") != "false" \
-            or outputs.get("DirectSmokeEnabled") != "false":
-        raise RuntimeError(
-            "disable production and direct-smoke invocation before removal")
+    if outputs.get("Enabled") != "false":
+        raise RuntimeError("disable production before removal")
     flags = _provider_flags(args)
     _run([
         "aws", "cloudformation", "delete-stack",
@@ -669,13 +1033,14 @@ def _invoke(args, function, payload):
     return response
 
 
-def _check_initialized(args, outputs):
+def _check_initialized(args, outputs, stack_id=None):
     if not isinstance(outputs, dict):
         raise RuntimeError("bootstrap notification state before enabling")
     try:
+        versions = _version_arns(outputs, stack_id)
         response = _invoke(
             args,
-            outputs["NotificationScannerFunctionArn"],
+            versions["scanner_version_arn"],
             {
                 "schema": SCAN_WAKE_SCHEMA,
                 "workspace": outputs["WorkspaceId"],
@@ -694,12 +1059,14 @@ def _check_initialized(args, outputs):
 
 def bootstrap(args):
     """Initialize absent notification state while production is disabled."""
-    outputs = _outputs(_owned_stack(args))
+    stack = _owned_stack(args)
+    outputs = _outputs(stack)
     if outputs.get("Enabled") != "false":
         raise RuntimeError("disable notification production before bootstrap")
+    versions = _version_arns(outputs, stack["StackId"])
     response = _invoke(
         args,
-        outputs["NotificationScannerFunctionArn"],
+        versions["scanner_version_arn"],
         {
             "mode": args.bootstrap_mode,
             "schema": BOOTSTRAP_SCHEMA,
@@ -714,18 +1081,31 @@ def bootstrap(args):
     return response
 
 
+def launch_binding(args):
+    """Return the exact disabled deployment binding for device harnesses."""
+    stack = _owned_stack(args)
+    outputs = _outputs(stack)
+    if outputs.get("Enabled") != "false":
+        raise RuntimeError("disable notification production before launch test")
+    return _launch_binding(stack["StackId"], outputs)
+
+
 def direct_smoke(args):
     """Directly prove current authority plus at least one FCM acceptance."""
-    outputs = _outputs(_owned_stack(args))
-    if outputs.get("DirectSmokeEnabled") != "true":
-        raise RuntimeError("notification direct smoke is disabled")
+    if not args.confirm_live_fcm:
+        raise RuntimeError("explicitly confirm live FCM invocation")
+    stack = _owned_stack(args)
+    outputs = _outputs(stack)
+    if outputs.get("Enabled") != "false":
+        raise RuntimeError("disable notification production before smoke")
+    versions = _version_arns(outputs, stack["StackId"])
     raw = Path(args.hint_file).read_bytes()
     hint = decode_hint(raw)
     if hint.workspace != outputs.get("WorkspaceId"):
         raise ValueError("direct-smoke hint workspace")
     response = _invoke(
         args,
-        outputs["NotificationDeliveryFunctionArn"],
+        versions["delivery_version_arn"],
         {
             "body": base64.b64encode(raw).decode("ascii"),
             "schema": DIRECT_SMOKE_SCHEMA,
@@ -761,15 +1141,14 @@ def parser():
     test.add_argument("pytest_args", nargs="*")
     deploy_command = commands.add_parser("deploy")
     _identity_arguments(deploy_command)
-    deploy_command.add_argument("--workspace", required=True)
-    deploy_command.add_argument("--canonical-bucket", required=True)
-    deploy_command.add_argument("--canonical-prefix", required=True)
-    deploy_command.add_argument("--state-bucket", required=True)
-    deploy_command.add_argument("--state-prefix", required=True)
-    deploy_command.add_argument("--expected-owner", required=True)
-    deploy_command.add_argument("--notification-secret-arn", required=True)
-    deploy_command.add_argument(
-        "--notification-secret-version-id", required=True)
+    deploy_command.add_argument("--workspace")
+    deploy_command.add_argument("--canonical-bucket")
+    deploy_command.add_argument("--canonical-prefix")
+    deploy_command.add_argument("--state-bucket")
+    deploy_command.add_argument("--state-prefix")
+    deploy_command.add_argument("--expected-owner")
+    deploy_command.add_argument("--notification-secret-arn")
+    deploy_command.add_argument("--notification-secret-version-id")
     deploy_command.add_argument("--repository-kms-key-arn")
     deploy_command.add_argument("--state-kms-key-arn")
     deploy_command.add_argument("--secret-kms-key-arn")
@@ -787,14 +1166,6 @@ def parser():
     traffic.add_argument(
         "--disable", dest="enable", action="store_const", const=False)
     deploy_command.set_defaults(enable=None)
-    smoke = deploy_command.add_mutually_exclusive_group()
-    smoke.add_argument(
-        "--enable-smoke", dest="direct_smoke",
-        action="store_const", const=True)
-    smoke.add_argument(
-        "--disable-smoke", dest="direct_smoke",
-        action="store_const", const=False)
-    deploy_command.set_defaults(direct_smoke=None)
     mode = deploy_command.add_mutually_exclusive_group(required=True)
     mode.add_argument("--create", action="store_true")
     mode.add_argument("--update", action="store_true")
@@ -814,9 +1185,12 @@ def parser():
     bootstrap_mode.add_argument(
         "--backfill", dest="bootstrap_mode", action="store_const",
         const="backfill")
+    launch_command = commands.add_parser("launch-binding")
+    _identity_arguments(launch_command)
     smoke_command = commands.add_parser("direct-smoke")
     _identity_arguments(smoke_command)
     smoke_command.add_argument("--hint-file", required=True)
+    smoke_command.add_argument("--confirm-live-fcm", action="store_true")
     return result
 
 
@@ -840,6 +1214,8 @@ def main(argv=None):
         print(redrive(args))
     elif args.command == "bootstrap":
         print(json.dumps(bootstrap(args), sort_keys=True))
+    elif args.command == "launch-binding":
+        print(json.dumps(launch_binding(args), sort_keys=True))
     else:
         print(json.dumps(direct_smoke(args), sort_keys=True))
     return 0
