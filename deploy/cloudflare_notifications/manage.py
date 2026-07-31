@@ -49,7 +49,9 @@ VENDORED = PACKAGE / "python_modules"
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
 WRANGLER = "wrangler@4.118.0"
-RETENTION_SECONDS = 14 * 24 * 60 * 60
+# The free plan fixes retention at 24 hours. Correctness does not depend on
+# Queue retention because the scanner republishes the durable pending body.
+RETENTION_SECONDS = 24 * 60 * 60
 MAX_BATCH_SIZE = 10
 MAX_RETRIES = 25
 MAX_CONCURRENCY = 4
@@ -671,8 +673,9 @@ def verify():
         result = _wrangler("queues", "info", name, capture=True)
         print(result.stdout, end="")
     print(
-        "ALERT REQUIRED: page on DLQ backlog_count > 0 and on primary "
-        "oldest_message_timestamp_ms approaching the finite retention window")
+        "ALERT REQUIRED: page on DLQ backlog_count > 0 and stale primary "
+        "work; the R2 pending cursor preserves correctness while schedules "
+        "recreate expired wakes")
     print(
         "R2 VERIFIED: no enabled deletion lifecycle overlaps canonical "
         "history or the permanent notification cursor/root prefix; this "
@@ -747,7 +750,7 @@ Commands:
   sync       materialize locked Python Worker dependencies
   stage      internal exact-source build hook
   build      dry-run all four default-disabled Worker bundles
-  provision  explicitly create primary and DLQ with 14-day retention
+  provision  explicitly create primary and DLQ with one-day retention
   deploy     deploy owned FCM/read boundaries, consumer, then scanner
   bootstrap-current   initialize at the current root on the next schedule
   bootstrap-backfill  initialize from the empty FactTree on the next schedule

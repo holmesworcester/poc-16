@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from time import time_ns
 
 from adapters.cloudflare.fcm_service import FcmServiceBinding
+from adapters.cloudflare.notification_state import NotificationStateService
 from adapters.cloudflare.queue import delivery_from_message
 from adapters.cloudflare.read_service import ReadServiceStore
 from core.crypto import load_sk
@@ -26,7 +27,7 @@ class Settings:
     enabled: bool
     workspace: str
     canonical_reader: object
-    state_reader: object
+    state: object
     fcm: object
     push_secret: object
     identity: str
@@ -43,7 +44,7 @@ class Settings:
                 or not valid_fid(push_node):
             raise ValueError("notification consumer identity bindings")
         canonical = getattr(env, "CANONICAL_READER")
-        state = getattr(env, "NOTIFICATION_STATE_READER")
+        state = getattr(env, "NOTIFICATION_STATE_SERVICE")
         try:
             secret = load_sk(text(env, "PUSH_NODE_SECRET"))
         except (TypeError, ValueError) as error:
@@ -56,8 +57,9 @@ class Settings:
         if not callable(getattr(canonical, "get_bounded", None)) \
                 or not callable(getattr(canonical, "read_versioned", None)):
             raise ValueError("CANONICAL_READER binding")
-        if not callable(getattr(state, "get_bounded", None)):
-            raise ValueError("NOTIFICATION_STATE_READER binding")
+        if not all(callable(getattr(state, name, None))
+                   for name in ("get_bounded", "pending", "complete")):
+            raise ValueError("NOTIFICATION_STATE_SERVICE binding")
         if not callable(getattr(fcm, "send", None)):
             raise ValueError("FCM_BOUNDARY binding")
         return cls(
@@ -89,7 +91,7 @@ async def consume(env, batch):
         return
 
     canonical = ReadServiceStore(settings.canonical_reader)
-    state = ReadServiceStore(settings.state_reader, versioned=False)
+    state = NotificationStateService(settings.state, settings.identity)
     provider = FcmServiceBinding(settings.fcm)
 
     async def current_root(workspace):

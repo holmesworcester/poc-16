@@ -320,13 +320,15 @@ be silently discarded.
 The Cloudflare artifact under `deploy/cloudflare_notifications` divides that
 composition into four private Workers: a mutation-free canonical R2 reader, a
 FactTree scanner with notification-state R2 plus Queue-producer authority, a
-Queue consumer with only read services and the selected push-node secret, and
-a small FCM HTTP v1 bridge which alone holds the Firebase service account. The
-consumer has no R2 or Firebase credential; the FCM bridge has no repository
-binding or public route. It targets Firebase installation IDs through `fid`.
-Generic `INVALID_ARGUMENT`, project/auth failures, quotas, timeouts, and
-malformed provider responses retry; only an exact typed FCM `UNREGISTERED`
-detail makes that FID terminal.
+Queue consumer with canonical reads, the scanner's narrow
+`get_bounded/pending/complete` service, and the selected push-node secret, and a
+small FCM HTTP v1 bridge which alone holds the Firebase service account. The
+consumer has no R2 binding, raw cursor CAS, or Firebase credential. Only the
+scanner service can advance the exact current pending OID. The FCM bridge has
+no repository binding or public route and targets Firebase installation IDs
+through `fid`. Generic `INVALID_ARGUMENT`, project/auth failures, quotas,
+timeouts, and malformed provider responses retry; only an exact typed FCM
+`UNREGISTERED` detail makes that FID terminal.
 
 The shared raw notification data ceiling is 1 KiB. Exact/one-over tests include
 Base64 expansion, the stable delivery ID, and JSON keys, keeping every locally
@@ -337,6 +339,9 @@ facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
 configurations and reject an enabled deletion rule overlapping either the
 notification-state prefix or its canonical workspace prefix. The tool never
 changes lifecycle configuration or deletes either bucket or Queue.
+Provisioning uses the free-plan-compatible one-day Queue retention. Paid
+retention can provide more operational headroom, but is not a correctness
+requirement because every fair scan recreates the pending wake from R2.
 
 All four Workers carry one SHA-256 deployment identity over the workspace,
 buckets and prefixes, Queue/DLQ, Worker names, push-node public key, and exact
@@ -389,8 +394,23 @@ export CF_CREATE=1
 python3 -m deploy.cloudflare_notifications.manage provision
 python3 -m deploy.cloudflare_notifications.manage build
 python3 -m deploy.cloudflare_notifications.manage deploy
+python3 -m deploy.cloudflare_notifications.manage bootstrap-current
+# Wait for one successful scheduled scanner invocation, then seal the mode.
+python3 -m deploy.cloudflare_notifications.manage seal-bootstrap
 python3 -m deploy.cloudflare_notifications.manage verify
 ```
+
+`deploy` always installs the scanner in sealed mode; scanning an absent cursor
+then fails instead of guessing whether to skip or replay history.
+`bootstrap-current` temporarily schedules initialization even while delivery
+is disabled and skips existing triggers. Use `bootstrap-backfill` instead only
+when replaying existing triggers is deliberate. Both operations are idempotent
+for the chosen mode. After the Cloudflare scheduled invocation succeeds,
+`seal-bootstrap` restores `none`; `verify` rejects a Worker still carrying a
+bootstrap mode. The control tool cannot read the private R2 binding, so the
+successful scheduled invocation—not merely local config generation—is the
+bootstrap evidence. A later missing cursor remains a loud runtime fault and
+requires another explicit recovery decision.
 
 ## Facts, suppression, and deletion
 

@@ -10,6 +10,7 @@ import pytest
 
 import facts
 from adapters.cloudflare.fcm_service import FcmServiceBinding
+from adapters.cloudflare.notification_state import NotificationStateService
 from adapters.cloudflare.queue import (
     CloudflareQueueCarrier,
     MAX_CLOUDFLARE_QUEUE_BODY_BYTES,
@@ -36,6 +37,11 @@ from notifications.delivery import (
     seal_target,
 )
 from notifications.hints import decode_hint
+from notifications.discovery import (
+    CursorNotInitialized,
+    PENDING_CURRENT,
+    PENDING_NONCURRENT,
+)
 from deploy.cloudflare_notifications import consumer, manage, reader, scanner
 
 
@@ -149,6 +155,59 @@ class FcmService:
         return outcome
 
 
+class FailCompleteOnce:
+    def __init__(self, service, *, after=False):
+        self.service, self.after, self.failed = service, after, False
+
+    async def get_bounded(self, key, maximum):
+        return await self.service.get_bounded(key, maximum)
+
+    async def pending(self, body_oid):
+        return await self.service.pending(body_oid)
+
+    async def complete(self, body_oid):
+        if not self.failed:
+            self.failed = True
+            if self.after:
+                await self.service.complete(body_oid)
+            raise TimeoutError("lost notification-state completion response")
+        return await self.service.complete(body_oid)
+
+
+class BarrierStateService:
+    def __init__(self, service, parties=2):
+        self.service = service
+        self.barrier = asyncio.Barrier(parties)
+
+    async def get_bounded(self, key, maximum):
+        return await self.service.get_bounded(key, maximum)
+
+    async def pending(self, body_oid):
+        status = await self.service.pending(body_oid)
+        await self.barrier.wait()
+        return status
+
+    async def complete(self, body_oid):
+        return await self.service.complete(body_oid)
+
+
+class PausingComplete:
+    def __init__(self, service):
+        self.service = service
+        self.entered, self.resume = asyncio.Event(), asyncio.Event()
+
+    async def get_bounded(self, key, maximum):
+        return await self.service.get_bounded(key, maximum)
+
+    async def pending(self, body_oid):
+        return await self.service.pending(body_oid)
+
+    async def complete(self, body_oid):
+        self.entered.set()
+        await self.resume.wait()
+        return await self.service.complete(body_oid)
+
+
 def _request():
     return PushRequest(
         "poc16.mobile", "production", "android", "installation-fid",
@@ -198,6 +257,24 @@ def test_fcm_service_binding_is_awaited_and_uses_fid_not_token():
     assert document["fid"] == "installation-fid"
     assert "token" not in document
     assert document["format"] == "poc16-fcm-service-v1"
+
+
+def test_notification_state_service_rejects_untyped_rpc_results():
+    class Malformed:
+        async def get_bounded(self, _key, _maximum):
+            return None
+
+        async def pending(self, _body_oid):
+            return "probably-current"
+
+        async def complete(self, _body_oid):
+            return "done"
+
+    state = NotificationStateService(Malformed(), "a" * 64)
+    with pytest.raises(ValueError, match="pending response"):
+        run(state.pending("b" * 64))
+    with pytest.raises(ValueError, match="completion response"):
+        run(state.complete("b" * 64))
 
 
 @pytest.mark.parametrize("response,error", [
@@ -258,21 +335,28 @@ class CanonicalReadService:
         return await reader.read_versioned(self.env, key, maximum)
 
 
-class StateReadService:
+class StateService:
     def __init__(self, scanner_env):
         self.env = scanner_env
 
     async def get_bounded(self, key, maximum):
         return await scanner.get_state_bounded(self.env, key, maximum)
 
+    async def pending(self, body_oid):
+        return await scanner.pending(self.env, body_oid)
+
+    async def complete(self, body_oid):
+        return await scanner.complete(self.env, body_oid)
+
 
 def _scanner_env(
         workspace, canonical_reader, state, queue, *, enabled="1",
-        identity="e" * 64):
+        identity="e" * 64, bootstrap="none"):
     return SimpleNamespace(
         POC16_DEPLOYMENT_ROLE="notification-scanner",
         POC16_DEPLOYMENT_IDENTITY=identity,
         NOTIFICATIONS_ENABLED=enabled,
+        NOTIFICATION_BOOTSTRAP_MODE=bootstrap,
         WORKSPACE=workspace,
         NOTIFICATION_STATE_PREFIX=f"notifications/v1/{workspace}",
         CANONICAL_READER=canonical_reader,
@@ -282,16 +366,17 @@ def _scanner_env(
 
 
 def _consumer_env(
-        workspace, canonical_reader, state_reader, secret, fcm, *, enabled="1"):
+        workspace, canonical_reader, state_service, secret, fcm, *,
+        enabled="1", identity="e" * 64):
     return SimpleNamespace(
         POC16_DEPLOYMENT_ROLE="notification-consumer",
-        POC16_DEPLOYMENT_IDENTITY="e" * 64,
+        POC16_DEPLOYMENT_IDENTITY=identity,
         NOTIFICATIONS_ENABLED=enabled,
         WORKSPACE=workspace,
         PUSH_NODE_SECRET=secret.encode().hex(),
         PUSH_NODE=secret.verify_key.encode().hex(),
         CANONICAL_READER=canonical_reader,
-        NOTIFICATION_STATE_READER=state_reader,
+        NOTIFICATION_STATE_SERVICE=state_service,
         FCM_BOUNDARY=fcm,
     )
 
@@ -306,6 +391,14 @@ async def _scan_idle(env, maximum=100):
     raise AssertionError("Cloudflare scanner did not become idle")
 
 
+async def _bootstrap(env, mode):
+    env.NOTIFICATION_BOOTSTRAP_MODE = mode
+    try:
+        return await scanner.scan(env)
+    finally:
+        env.NOTIFICATION_BOOTSTRAP_MODE = "none"
+
+
 def _published_world(tmp_path):
     node, workspace, secret = _world(tmp_path)
     event = message.post(node, workspace, "general", "hello", ts=4)
@@ -314,25 +407,25 @@ def _published_world(tmp_path):
         node, workspace, canonical, f"workspaces/{workspace}")
     canonical_reader = CanonicalReadService(workspace, canonical)
     scan_env = _scanner_env(workspace, canonical_reader, state, queue)
-    statuses = run(_scan_idle(scan_env))
-    assert "published" in statuses
+    assert run(_bootstrap(scan_env, "backfill")) == "bootstrapped-backfill"
+    assert run(scanner.scan(scan_env)) == "published"
     assert len(queue.bodies) == 1
     assert decode_hint(queue.bodies[0].encode()).facts == (event,)
     return (
         node, workspace, secret, event, canonical, state, queue,
-        canonical_reader, StateReadService(scan_env))
+        canonical_reader, StateService(scan_env))
 
 
 def test_actual_r2_scanner_and_queue_consumer_share_one_awaited_path(
         tmp_path):
     (_node, workspace, secret, _event, canonical, state, queue,
-     canonical_reader, state_reader) = _published_world(tmp_path)
+     canonical_reader, state_service) = _published_world(tmp_path)
     fcm = FcmService()
     item = QueueMessage(queue.bodies[0])
 
     run(consumer.consume(
         _consumer_env(
-            workspace, canonical_reader, state_reader, secret, fcm),
+            workspace, canonical_reader, state_service, secret, fcm),
         SimpleNamespace(messages=[item])))
 
     assert item.action == "ack"
@@ -340,6 +433,116 @@ def test_actual_r2_scanner_and_queue_consumer_share_one_awaited_path(
     assert fcm.documents[0]["fid"] == "firebase-installation-id"
     assert any(call[0] == "get" for call in canonical.calls)
     assert any(call[0] == "get" for call in state.calls)
+    assert run(state_service.pending(h(queue.bodies[0].encode()))) \
+        == PENDING_NONCURRENT
+
+
+def test_expired_queue_wake_is_recreated_from_r2_pending(tmp_path):
+    (_node, _workspace, _secret, _event, _canonical, _state, queue,
+     _canonical_reader, state_service) = _published_world(tmp_path)
+    exact, = queue.bodies
+    queue.bodies.clear()  # model Queue expiry or a completely dropped wake
+
+    assert run(scanner.scan(state_service.env)) == "republished"
+
+    assert queue.bodies == [exact]
+
+
+def test_crash_after_fcm_acceptance_retries_before_cursor_progress(
+        tmp_path):
+    (_node, workspace, secret, _event, _canonical, _state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    body, fcm = queue.bodies[0], FcmService()
+    first = QueueMessage(body, "crash-before-complete")
+
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader,
+            FailCompleteOnce(state_service), secret, fcm),
+        SimpleNamespace(messages=[first])))
+
+    assert first.action == "retry"
+    assert len(fcm.documents) == 1
+    assert run(state_service.pending(h(body.encode()))) == PENDING_CURRENT
+
+    second = QueueMessage(body, "retry-after-crash", 2)
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[second])))
+
+    assert second.action == "ack"
+    assert len(fcm.documents) == 2
+    assert run(state_service.pending(h(body.encode()))) \
+        == PENDING_NONCURRENT
+
+
+def test_lost_completion_response_reconciles_without_another_fcm_send(
+        tmp_path):
+    (_node, workspace, secret, _event, _canonical, _state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    body, fcm = queue.bodies[0], FcmService()
+    first = QueueMessage(body, "lost-completion-response")
+
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader,
+            FailCompleteOnce(state_service, after=True), secret, fcm),
+        SimpleNamespace(messages=[first])))
+    assert first.action == "retry"
+    assert len(fcm.documents) == 1
+
+    second = QueueMessage(body, "completion-redelivery", 2)
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[second])))
+
+    assert second.action == "ack"
+    assert len(fcm.documents) == 1
+
+
+def test_concurrent_queue_workers_may_duplicate_but_complete_once(tmp_path):
+    (_node, workspace, secret, _event, _canonical, _state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    body, fcm = queue.bodies[0], FcmService()
+    barrier = BarrierStateService(state_service)
+    items = (
+        QueueMessage(body, "concurrent-a"),
+        QueueMessage(body, "concurrent-b"),
+    )
+
+    async def race():
+        await asyncio.gather(*(
+            consumer.consume(
+                _consumer_env(
+                    workspace, canonical_reader, barrier, secret, fcm),
+                SimpleNamespace(messages=[item]))
+            for item in items))
+
+    run(race())
+
+    assert [item.action for item in items] == ["ack", "ack"]
+    assert len(fcm.documents) == 2
+    assert run(state_service.pending(h(body.encode()))) \
+        == PENDING_NONCURRENT
+
+
+def test_invalid_endpoint_is_terminal_cursor_progress(tmp_path):
+    (_node, workspace, secret, _event, _canonical, _state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    fcm = FcmService([{"status": "invalid-endpoint"}])
+    item = QueueMessage(queue.bodies[0], "invalid-endpoint")
+
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[item])))
+
+    assert item.action == "ack"
+    assert len(fcm.documents) == 1
+    assert run(state_service.pending(h(queue.bodies[0].encode()))) \
+        == PENDING_NONCURRENT
 
 
 @pytest.mark.parametrize("mutate", [
@@ -351,7 +554,7 @@ def test_actual_r2_scanner_and_queue_consumer_share_one_awaited_path(
 def test_delayed_cloudflare_work_uses_current_mute_or_suppression(
         tmp_path, mutate):
     (node, workspace, secret, event, canonical, state, queue,
-     canonical_reader, state_reader) = _published_world(tmp_path)
+     canonical_reader, state_service) = _published_world(tmp_path)
     mutate(node, workspace, event)
     _copy_repository(
         node, workspace, canonical, f"workspaces/{workspace}")
@@ -359,7 +562,7 @@ def test_delayed_cloudflare_work_uses_current_mute_or_suppression(
 
     run(consumer.consume(
         _consumer_env(
-            workspace, canonical_reader, state_reader, secret, fcm),
+            workspace, canonical_reader, state_service, secret, fcm),
         SimpleNamespace(messages=[item])))
 
     assert item.action == "ack"
@@ -373,6 +576,7 @@ def test_dropped_schedule_wake_only_delays_the_next_facttree_diff(tmp_path):
         node, workspace, canonical, f"workspaces/{workspace}")
     env = _scanner_env(
         workspace, CanonicalReadService(workspace, canonical), state, queue)
+    assert run(_bootstrap(env, "current")) == "bootstrapped-current"
     run(_scan_idle(env))
     queue.bodies.clear()
 
@@ -382,12 +586,122 @@ def test_dropped_schedule_wake_only_delays_the_next_facttree_diff(tmp_path):
     # No queue effect occurs while both the optional wake and one schedule
     # are absent.  The next ordinary schedule resumes from durable state.
     assert queue.bodies == []
-    run(_scan_idle(env))
+    assert run(scanner.scan(env)) == "published"
 
     assert decode_hint(queue.bodies[0].encode()).facts == (event,)
 
 
-def test_concurrent_cloudflare_scanners_duplicate_but_cursor_cas_wins(
+def test_sealed_scanner_requires_explicit_bootstrap_and_detects_state_loss(
+        tmp_path):
+    node, workspace, _secret = _world(tmp_path)
+    old = message.post(node, workspace, "general", "old", ts=4)
+    canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    env = _scanner_env(
+        workspace, CanonicalReadService(workspace, canonical), state, queue)
+
+    with pytest.raises(CursorNotInitialized):
+        run(scanner.scan(env))
+    assert run(_bootstrap(env, "current")) == "bootstrapped-current"
+    assert run(scanner.scan(env)) == "idle"
+    assert queue.bodies == []
+
+    new = message.post(node, workspace, "general", "new", ts=5)
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    assert run(scanner.scan(env)) == "published"
+    assert decode_hint(queue.bodies[0].encode()).facts == (new,)
+    assert old not in decode_hint(queue.bodies[0].encode()).facts
+
+    state.data.pop(f"notifications/v1/{workspace}/root")
+    state.etags.pop(f"notifications/v1/{workspace}/root")
+    with pytest.raises(CursorNotInitialized):
+        run(scanner.scan(env))
+
+
+def test_disabled_scanner_runs_only_explicit_bootstrap(tmp_path):
+    node, workspace, _secret = _world(tmp_path)
+    canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    env = _scanner_env(
+        workspace, CanonicalReadService(workspace, canonical), state, queue,
+        enabled="0")
+
+    assert run(scanner.scan(env)) == "disabled"
+    assert run(_bootstrap(env, "current")) == "bootstrapped-current"
+    assert run(scanner.scan(env)) == "disabled"
+    assert queue.bodies == []
+
+
+def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
+    (node, workspace, secret, _event, canonical, state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    initial = queue.bodies[0]
+    assert run(state_service.complete(h(initial.encode()))) \
+        == PENDING_NONCURRENT
+    preference.set_global(node, workspace, preference.NONE, ts=5)
+    _copy_repository(
+        node, workspace, canonical, f"workspaces/{workspace}")
+    root_key = f"notifications/v1/{workspace}/root"
+    state.data.pop(root_key)
+    state.etags.pop(root_key)
+    queue.bodies.clear()
+    assert run(_bootstrap(state_service.env, "backfill")) \
+        == "bootstrapped-backfill"
+    assert run(scanner.scan(state_service.env)) == "published"
+    old_body, = queue.bodies
+    paused, fcm = PausingComplete(state_service), FcmService()
+    old_item = QueueMessage(old_body, "old-muted")
+
+    async def scenario():
+        old_task = asyncio.create_task(consumer.consume(
+            _consumer_env(
+                workspace, canonical_reader, paused, secret, fcm),
+            SimpleNamespace(messages=[old_item])))
+        await paused.entered.wait()
+        assert fcm.documents == []
+
+        state.data.pop(root_key)
+        state.etags.pop(root_key)
+        queue.bodies.clear()
+        assert await _bootstrap(state_service.env, "backfill") \
+            == "bootstrapped-backfill"
+        assert await scanner.scan(state_service.env) == "published"
+        new_body, = queue.bodies
+        old_hint, new_hint = map(
+            lambda body: decode_hint(body.encode()),
+            (old_body, new_body))
+        assert old_hint.root_oid == new_hint.root_oid
+        assert old_hint.facts == new_hint.facts
+        assert old_hint.generation != new_hint.generation
+        assert h(old_body.encode()) != h(new_body.encode())
+
+        await asyncio.to_thread(
+            preference.set_global,
+            node, workspace, preference.ALL, ts=6)
+        await asyncio.to_thread(
+            _copy_repository,
+            node, workspace, canonical, f"workspaces/{workspace}")
+        paused.resume.set()
+        await old_task
+        assert old_item.action == "ack"
+        assert await state_service.pending(h(new_body.encode())) \
+            == PENDING_CURRENT
+
+        new_item = QueueMessage(new_body, "new-unmuted")
+        await consumer.consume(
+            _consumer_env(
+                workspace, canonical_reader, state_service, secret, fcm),
+            SimpleNamespace(messages=[new_item]))
+        assert new_item.action == "ack"
+
+    run(scenario())
+    assert len(fcm.documents) == 1
+
+
+def test_concurrent_cloudflare_scanners_republish_one_pending_body(
         tmp_path):
     node, workspace, _secret = _world(tmp_path)
     canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
@@ -395,13 +709,14 @@ def test_concurrent_cloudflare_scanners_duplicate_but_cursor_cas_wins(
         node, workspace, canonical, f"workspaces/{workspace}")
     env = _scanner_env(
         workspace, CanonicalReadService(workspace, canonical), state, queue)
+    run(_bootstrap(env, "current"))
     run(_scan_idle(env))
     queue.bodies.clear()
     message.post(node, workspace, "general", "race", ts=10)
     _copy_repository(
         node, workspace, canonical, f"workspaces/{workspace}")
-    # Pin the target but refuse carrier acceptance.  Both racing invocations
-    # now start from the same durable target/cursor token.
+    # Persist pending state but lose Queue acceptance. Both later invocations
+    # can only republish that one exact durable body.
     queue.fail = True
     with pytest.raises(PublishOutcomeUnknown):
         run(scanner.scan(env))
@@ -414,7 +729,7 @@ def test_concurrent_cloudflare_scanners_duplicate_but_cursor_cas_wins(
 
     statuses = run(race())
 
-    assert sorted(statuses) == ["published", "raced"]
+    assert statuses == ["republished", "republished"]
     assert len(queue.bodies) == 2
     assert queue.bodies[0] == queue.bodies[1]
 
@@ -431,6 +746,7 @@ def test_different_deployments_cannot_steal_one_shared_cursor(tmp_path):
     foreign = _scanner_env(
         workspace, reader_service, state, queue_b, identity="b" * 64)
 
+    run(_bootstrap(first, "current"))
     run(_scan_idle(first))
 
     with pytest.raises(ValueError, match="cursor owner"):
@@ -442,7 +758,7 @@ def test_different_deployments_cannot_steal_one_shared_cursor(tmp_path):
 def test_consumer_acknowledges_poison_and_retries_only_retryable_work(
         tmp_path):
     (_node, workspace, secret, _event, canonical, state, queue,
-     canonical_reader, state_reader) = _published_world(tmp_path)
+     canonical_reader, state_service) = _published_world(tmp_path)
     service = FcmService([
         {"status": "retry"},
         {"status": "accepted", "message_id": "accepted"},
@@ -453,7 +769,7 @@ def test_consumer_acknowledges_poison_and_retries_only_retryable_work(
 
     run(consumer.consume(
         _consumer_env(
-            workspace, canonical_reader, state_reader, secret, service),
+            workspace, canonical_reader, state_service, secret, service),
         SimpleNamespace(messages=[poison, retry, accepted])))
 
     assert poison.action == "ack"
@@ -464,7 +780,7 @@ def test_consumer_acknowledges_poison_and_retries_only_retryable_work(
 
 def test_consumer_bounds_hostile_batches_before_any_delivery(tmp_path):
     (_node, workspace, secret, _event, canonical, state, queue,
-     canonical_reader, state_reader) = _published_world(tmp_path)
+     canonical_reader, state_service) = _published_world(tmp_path)
     messages = [
         QueueMessage(queue.bodies[0], f"m-{number}")
         for number in range(consumer.MAX_BATCH_SIZE + 1)
@@ -473,7 +789,7 @@ def test_consumer_bounds_hostile_batches_before_any_delivery(tmp_path):
 
     run(consumer.consume(
         _consumer_env(
-            workspace, canonical_reader, state_reader, secret, fcm),
+            workspace, canonical_reader, state_service, secret, fcm),
         SimpleNamespace(messages=messages)))
 
     assert {item.action for item in messages} == {"retry"}
@@ -486,7 +802,11 @@ def test_consumer_rejects_a_push_secret_rebound_under_old_config():
         get_bounded=lambda *args: None,
         read_versioned=lambda *args: None,
     )
-    state = SimpleNamespace(get_bounded=lambda *args: None)
+    state = SimpleNamespace(
+        get_bounded=lambda *args: None,
+        pending=lambda *args: None,
+        complete=lambda *args: None,
+    )
     env = _consumer_env(
         "a" * 64, canonical, state, secret, FcmService())
     env.PUSH_NODE = "f" * 64
@@ -561,6 +881,22 @@ def test_launch_gate_enables_exact_bounded_queue_configuration():
         "max_concurrency": 4,
         "retry_delay": 30,
     }
+
+
+def test_provision_uses_free_plan_queue_retention(monkeypatch):
+    configs = manage.generated_configs(_manage_environment())
+    calls = []
+    monkeypatch.setenv("CF_CREATE", "1")
+    monkeypatch.setattr(manage, "generated_configs", lambda: configs)
+    monkeypatch.setattr(
+        manage, "_wrangler",
+        lambda *arguments, **options: calls.append(arguments))
+
+    manage.provision()
+
+    assert len(calls) == 2
+    assert all(call[-2:] == (
+        "--message-retention-period-secs", "86400") for call in calls)
 
 
 def test_enable_is_rejected_without_real_mobile_launch_gate():
@@ -704,7 +1040,7 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
             "service": "poc16-notify-read-aaaaaaaaaaaa",
         },
         {
-            "binding": "NOTIFICATION_STATE_READER",
+            "binding": "NOTIFICATION_STATE_SERVICE",
             "service": "poc16-notify-scan-aaaaaaaaaaaa",
         },
         {"binding": "FCM_BOUNDARY", "service": "poc16-fcm-boundary"},

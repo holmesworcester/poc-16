@@ -10,7 +10,7 @@
   "routes": [],
   "services": [
     {"binding": "CANONICAL_READER", "service": "replace-canonical-reader"},
-    {"binding": "NOTIFICATION_STATE_READER", "service": "replace-notification-scanner"},
+    {"binding": "NOTIFICATION_STATE_SERVICE", "service": "replace-notification-scanner"},
     {"binding": "FCM_BOUNDARY", "service": "replace-fcm-boundary"}
   ],
   "queues": {"consumers": []},
