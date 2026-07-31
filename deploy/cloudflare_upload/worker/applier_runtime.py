@@ -2,7 +2,7 @@
 
 The runtime owns only binding/configuration translation and scheduling.  Both
 R2 buckets are exposed through the provider-neutral object-store contract;
-all validation, immutable promotion, settlement, root CAS, reconciliation,
+all validation, immutable promotion, root CAS, reconciliation,
 and F10 retirement remain in ``core.repository_applier``.
 """
 from dataclasses import dataclass

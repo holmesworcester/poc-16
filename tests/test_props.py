@@ -6,7 +6,7 @@ RepositoryReader pins that published root and has no mutation authority.
 
 The properties below exercise those production roles directly:
 
-* selected historical paths remain independently valid piles;
+* every validated residence can be reassembled as an independently valid pile;
 * arrival order, turn batching, suppression, and stragglers converge;
 * root/object integrity failures never advance or retire work;
 * pre-CAS, ambiguous-CAS, and post-CAS crashes have exact replay behavior;
@@ -78,16 +78,16 @@ def stage_apply(applier, raw, member=MEMBER, **options):
 
 
 def units_of(node, workspace):
-    """Each selected historical admission proof through RepositoryReader."""
-    candidates = node.reader(workspace).candidates()
-    for fid in candidates.candidate_ids():
-        yield fid, candidates.verify(fid).facts
+    """A fresh valid closure for each stored fact through RepositoryReader."""
+    validated = node.reader(workspace).validated()
+    for fid in validated.fact_ids():
+        yield fid, validated.closure((fid,))
 
 
-def candidate_pile(node, workspace, fid):
-    """Pack one reader-selected historical witness through PileSender."""
-    proof = node.reader(workspace).candidates().verify(fid)
-    return node.sender(workspace).pack(proof.facts)
+def fact_pile(node, workspace, fid):
+    """Pack one reader-assembled current closure through PileSender."""
+    unit = node.reader(workspace).validated().closure((fid,))
+    return node.sender(workspace).pack(unit)
 
 
 def message_pile(node, workspace, text, ts):
@@ -158,23 +158,23 @@ def world(tmp_path, monkeypatch):
 
 
 def test_paths_are_piles_through_repository_reader(world):
-    """Every selected historical proof judges alone, from an empty kernel."""
+    """Every freshly assembled closure judges alone from an empty kernel."""
     node, workspace = world
     count = 0
     for fid, stream in units_of(node, workspace):
         result = drain(stream, workspace)
-        assert result.ok, f"proof failed the kernel: {fid}"
+        assert result.ok, f"closure failed the kernel: {fid}"
         count += 1
     assert count >= 2
 
 
 def test_history_independence_across_order_and_turn_batching(
         tmp_path, world):
-    """Random exact-pile order and batching preserve the candidate join."""
+    """Random exact-pile order and batching preserve the validated-fact join."""
     source, workspace = world
     expected_root = source.reader(workspace).root_bytes
     expected_fids = set(
-        source.reader(workspace).candidates().candidate_ids())
+        source.reader(workspace).validated().fact_ids())
     selected = [
         source.sender(workspace).pack(stream)
         for _, stream in units_of(source, workspace)
@@ -193,17 +193,17 @@ def test_history_independence_across_order_and_turn_batching(
                 run(applier.stage(f"peer{seed}", raw))
             position += take
             report = run(applier.turn())
-            # Opaque generation ids may put a non-anchor proof ahead of the
-            # workspace proof. That is retryable retained work, not rejection.
+            # Opaque generation ids may put a non-anchor closure ahead of the
+            # workspace closure. That is retryable work, not rejection.
             for item in report:
                 if item.error is None:
                     continue
                 assert isinstance(item.error, RepositoryAnchorPending)
                 assert str(item.error) == \
-                    "repository anchor candidate is not available yet"
+                    "repository anchor fact is not available yet"
                 assert store.get(item.source) is not None
 
-        # The anchor has now arrived. Discharge any proof that was attempted
+        # The anchor has now arrived. Discharge any closure that was attempted
         # before it, independent of its generation key's LIST position.
         for _ in range(len(selected) + 1):
             if not store.list("pile/"):
@@ -211,11 +211,11 @@ def test_history_independence_across_order_and_turn_batching(
             report = run(applier.turn())
             assert all(item.error is None for item in report)
         else:
-            pytest.fail("retained historical piles did not drain")
+            pytest.fail("retained validated-fact piles did not drain")
 
         reader = reader_for(store, workspace)
         assert reader.root_bytes == expected_root
-        assert set(reader.candidates().candidate_ids()) == expected_fids
+        assert set(reader.validated().fact_ids()) == expected_fids
         assert store.list("pile/") == []
 
 
@@ -241,7 +241,7 @@ def test_sender_authors_but_only_applier_advances_root(tmp_path):
     assert result.status == "applied"
     assert result.retired is True
     assert node.store(workspace).get(source) is None
-    assert node.reader(workspace).candidates().fact(item.fid) == item
+    assert node.reader(workspace).validated().fact(item.fid) == item
 
 
 def test_cold_applier_and_reader_are_database_free(
@@ -274,12 +274,12 @@ def test_repository_reader_remains_pinned_during_later_apply(tmp_path):
 
     _, result = stage_apply(node.applier(workspace), raw)
     assert result.status == "applied"
-    with pytest.raises(ValueError, match="missing FactRecord"):
-        pinned.candidates().fact_record(item.fid)
+    with pytest.raises(ValueError, match="missing validated fact"):
+        pinned.validated().fact(item.fid)
 
     current = node.reader(workspace)
     assert current.etag != pinned.etag
-    assert current.candidates().fact(item.fid) == item
+    assert current.validated().fact(item.fid) == item
     assert not any(
         name in RepositoryReader.__dict__
         for name in ("apply", "cas", "delete", "list", "put", "turn")
@@ -309,13 +309,12 @@ def test_projection_rebuild_rejects_a_corrupted_reachable_object(world):
     node, workspace = world
     store = node.store(workspace)
     root = store.get("root")
-    candidates = node.reader(workspace).candidates()
-    fid = candidates.candidate_ids()[0]
-    record = candidates.fact_record(fid)
-    store._replace("obj/" + record["fact_oid"], b"corrupt")
+    validated = node.reader(workspace).validated()
+    fid = validated.fact_ids()[0]
+    store._replace("obj/" + validated.fact_oid(fid), b"corrupt")
 
     with pytest.raises(ValueError, match="object integrity"):
-        node.reader(workspace).candidates().fact(fid)
+        node.reader(workspace).validated().fact(fid)
     with pytest.raises(ValueError, match="object integrity"):
         node.rebuild(workspace)
     assert store.get("root") == root
@@ -334,8 +333,8 @@ def test_reader_rejects_forged_root_metadata_without_building_a_root(world):
         forged,
         lambda oid: store.get("obj/" + oid),
     )
-    with pytest.raises(ValueError, match="merkle map root metadata"):
-        reader.archive()
+    with pytest.raises(ValueError, match="noncanonical repository projection"):
+        reader.all_facts()
     assert store.get("root") == honest
 
 
@@ -346,10 +345,9 @@ def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
         node, workspace, "blocked by corrupt base", ts=10)
     store = node.store(workspace)
     root = store.get("root")
-    view = node.reader(workspace).candidates()
-    anchor_record = view.fact_record(workspace)
+    view = node.reader(workspace).validated()
     store._replace(
-        "obj/" + anchor_record["fact_oid"], b"corrupt")
+        "obj/" + view.fact_oid(workspace), b"corrupt")
     source = run(node.applier(workspace).stage(MEMBER, raw))
 
     with pytest.raises(ValueError, match="object integrity"):
@@ -357,7 +355,7 @@ def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
 
     assert store.get("root") == root
     assert store.get(source) == raw
-    assert item.fid not in view.candidate_ids()
+    assert item.fid not in view.fact_ids()
 
 
 def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
@@ -373,7 +371,7 @@ def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
 
     with pytest.raises(
             RepositoryAnchorPending,
-            match="repository anchor candidate"):
+            match="repository anchor fact"):
         run(applier.apply(source))
 
     assert store.get("root") is None
@@ -381,13 +379,13 @@ def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
     assert store.list("obj/") == []
 
     _, anchored = stage_apply(
-        applier, candidate_pile(author, workspace, workspace))
+        applier, fact_pile(author, workspace, workspace))
     retried = run(applier.apply(source))
 
     assert anchored.status == "applied"
     assert retried.status == "applied"
     assert store.get(source) is None
-    assert reader_for(store, workspace).candidates().fact(
+    assert reader_for(store, workspace).validated().fact(
         detached.fid) == detached
 
 
@@ -419,7 +417,7 @@ def test_pre_cas_crash_retains_work_and_cold_retry_applies(
     assert result.status == "applied"
     assert result.retired is True
     assert store.get(source) is None
-    assert reader_for(store, workspace).candidates().fact(item.fid) == item
+    assert reader_for(store, workspace).validated().fact(item.fid) == item
 
 
 def test_ambiguous_cas_is_confirmed_before_exact_retirement(
@@ -443,7 +441,7 @@ def test_ambiguous_cas_is_confirmed_before_exact_retirement(
     assert result.status == "confirmed"
     assert result.retired is True
     assert store.get(source) is None
-    assert reader_for(store, workspace).candidates().fact(item.fid) == item
+    assert reader_for(store, workspace).validated().fact(item.fid) == item
 
 
 def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
@@ -460,7 +458,7 @@ def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
     assert applied.status == "applied"
     assert applied.retired is False
     assert store.get(source) == raw
-    assert node.reader(workspace).candidates().fact(item.fid) == item
+    assert node.reader(workspace).validated().fact(item.fid) == item
 
     close_indexes(node)
     reopened = Node(str(directory))
@@ -496,14 +494,14 @@ def test_failed_turn_keeps_old_root_and_retries_same_generation(
     assert store.get("root") == old_reader.root_bytes
     assert store.get(source) == raw
     assert node.ingress_attempt_failures(workspace)[0]["source"] == source
-    with pytest.raises(ValueError, match="missing FactRecord"):
-        old_reader.candidates().fact_record(item.fid)
+    with pytest.raises(ValueError, match="missing validated fact"):
+        old_reader.validated().fact(item.fid)
 
     monkeypatch.setattr(store, "cas", original_cas)
     node.turn(workspace)
     assert store.get(source) is None
     assert node.ingress_attempt_failures(workspace) == []
-    assert node.reader(workspace).candidates().fact(item.fid) == item
+    assert node.reader(workspace).validated().fact(item.fid) == item
 
 
 def test_concurrent_appliers_rebase_without_retiring_the_cas_loser(
@@ -552,8 +550,8 @@ def test_concurrent_appliers_rebase_without_retiring_the_cas_loser(
 
     reader = reader_for(store, workspace)
     assert reader.root_bytes == expected
-    assert reader.candidates().fact(first.fid) == first
-    assert reader.candidates().fact(second.fid) == second
+    assert reader.validated().fact(first.fid) == first
+    assert reader.validated().fact(second.fid) == second
     assert store.list("pile/") == []
 
 
@@ -573,7 +571,7 @@ def test_suppression_is_authenticated_and_reader_pinned(tmp_path):
 
     assert pinned.worker().fact_active(survivor)
     assert not node.reader(workspace).worker().fact_active(survivor)
-    assert node.reader(workspace).candidates().fact(survivor).fid == survivor
+    assert node.reader(workspace).validated().fact(survivor).fid == survivor
 
 
 def test_suppression_converges_in_both_pile_orders(tmp_path):
@@ -583,9 +581,9 @@ def test_suppression_converges_in_both_pile_orders(tmp_path):
         source, workspace, all_fids(source, workspace))
     target = facts.content.message.post(
         source, workspace, "general", "suppressed", ts=10)
-    target_raw = candidate_pile(source, workspace, target)
+    target_raw = fact_pile(source, workspace, target)
     action = facts.content.delete.remove(source, workspace, target, ts=20)
-    action_raw = candidate_pile(source, workspace, action)
+    action_raw = fact_pile(source, workspace, action)
     expected = source.reader(workspace).root_bytes
 
     roots = []
@@ -614,10 +612,10 @@ def test_straggler_replay_converges_byte_for_byte(tmp_path, world):
     assert reader_for(store, workspace).root_bytes \
         == source.reader(workspace).root_bytes
 
-    candidates = source.reader(workspace).candidates()
+    validated = source.reader(workspace).validated()
     old = min(
-        candidates.fact(fid).ts
-        for fid in candidates.candidate_ids()
+        validated.fact(fid).ts
+        for fid in validated.fact_ids()
     ) + 5
     fact = author_msg(
         source,
@@ -629,7 +627,7 @@ def test_straggler_replay_converges_byte_for_byte(tmp_path, world):
     )
     stage_apply(
         applier,
-        candidate_pile(source, workspace, fact.fid),
+        fact_pile(source, workspace, fact.fid),
     )
 
     assert reader_for(store, workspace).root_bytes \
@@ -652,18 +650,13 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     )
 
     invite_fid = carol.refs()[0][1]
-    invitation = node.reader(workspace).candidates().fact(invite_fid)
-    dependencies = {
-        parent
-        for _, parent, _ in
-        node.reader(workspace).candidates().fact_record(
-            invite_fid)["dependencies"]
-    }
-    assert bob_fact.fid in dependencies
+    invitation = node.reader(workspace).validated().fact(invite_fid)
+    closure = node.reader(workspace).validated().closure((invite_fid,))
+    assert bob_fact.fid in {fact.fid for fact in closure}
     assert bob_fact.ts < invitation.ts < carol.ts
 
     stream = decode_pile(
-        candidate_pile(node, workspace, carol.fid),
+        fact_pile(node, workspace, carol.fid),
         workspace,
     )
     assert drain(stream, workspace).ok
@@ -727,10 +720,8 @@ def test_rejoining_key_cannot_shadow_its_invite_into_a_cycle(tmp_path):
         },
     )
 
-    record = node.reader(workspace).candidates().fact_record(
-        invitation.fid)
-    assert original.fid in {
-        parent for _, parent, _ in record["dependencies"]}
+    closure = node.reader(workspace).validated().closure((invitation.fid,))
+    assert original.fid in {fact.fid for fact in closure}
     for _, stream in units_of(node, workspace):
         assert drain(stream, workspace).ok
 
@@ -750,11 +741,11 @@ def test_detached_signature_applies_without_a_full_projection_scan(world):
     _, result = stage_apply(node.applier(workspace), raw)
 
     assert result.status == "applied"
-    assert node.reader(workspace).candidates().fact(
+    assert node.reader(workspace).validated().fact(
         detached.fid) == detached
 
 
-def test_duplicate_witness_join_is_history_independent(tmp_path, world):
+def test_duplicate_fact_join_is_history_independent(tmp_path, world):
     node, workspace = world
     target = author_msg(
         node, workspace, node.sk, node.pk,
@@ -788,11 +779,11 @@ def test_duplicate_witness_join_is_history_independent(tmp_path, world):
         if not store.list("pile/"):
             break
     else:
-        raise AssertionError("retained pre-anchor candidates did not converge")
+        raise AssertionError("retained pre-anchor closures did not converge")
 
     reader = reader_for(store, workspace)
     assert reader.root_bytes == expected
-    assert reader.candidates().fact(duplicate.fid) == duplicate
+    assert reader.validated().fact(duplicate.fid) == duplicate
 
 
 def test_root_contains_only_reader_maps_and_anchor(world):
@@ -856,10 +847,10 @@ def test_poison_cannot_wedge_honest_work_in_the_same_turn(world):
     assert by_source[honest_source].error is None
     assert by_source[honest_source].result.status == "applied"
     assert node.store(workspace).list("pile/") == []
-    assert node.reader(workspace).candidates().fact(item.fid) == item
+    assert node.reader(workspace).validated().fact(item.fid) == item
 
 
-def test_ephemeral_request_never_enters_repository_candidates(world):
+def test_ephemeral_request_never_enters_validated_repository(world):
     node, workspace = world
     ts = now_ms()
     ephemeral = request(
@@ -868,7 +859,7 @@ def test_ephemeral_request_never_enters_repository_candidates(world):
     member = offer_src(
         node.idx(workspace), "member", node.pk)
     chain = decode_pile(
-        candidate_pile(node, workspace, member),
+        fact_pile(node, workspace, member),
         workspace,
     )
     raw = node.sender(workspace).pack(
@@ -877,9 +868,9 @@ def test_ephemeral_request_never_enters_repository_candidates(world):
 
     # The detached signature is durable and may advance the root; the request
     # it authenticates is deliberately ephemeral and must never become a
-    # repository candidate.
+    # validated repository.
     assert result.status == "applied"
     assert result.retired is True
-    candidates = node.reader(workspace).candidates()
-    assert candidates.fact(signed.fid) == signed
-    assert ephemeral.fid not in candidates.candidate_ids()
+    validated = node.reader(workspace).validated()
+    assert validated.fact(signed.fid) == signed
+    assert ephemeral.fid not in validated.fact_ids()

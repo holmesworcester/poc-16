@@ -37,7 +37,6 @@ class Need:
     name: str
     a0: str
     a1: str | None = None
-    requires: tuple = ()
 
 
 @dataclass(frozen=True)

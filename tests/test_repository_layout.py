@@ -47,6 +47,18 @@ def class_definitions(name):
     ]
 
 
+def annotated_fields(path, class_name):
+    owner = next(
+        item for item in parsed(path).body
+        if isinstance(item, ast.ClassDef) and item.name == class_name)
+    return tuple(
+        item.target.id
+        for item in owner.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+    )
+
+
 def calls_named(name):
     return [
         (path, call)
@@ -85,10 +97,13 @@ def test_root_document_links_resolve_locally():
 def test_retired_authority_implementations_cannot_return():
     for relative in (
             "core/admission.py",
+            "core/admission_proof.py",
+            "core/candidate_archive.py",
             "core/cmds.py",
             "core/legacy_v7.py",
             "core/mint.py",
             "core/publication.py",
+            "core/settlement.py",
             "core/runtime.py",
             "core/removals.py",
             "deploy/cloudflare_upload/worker/publisher_stub.py"):
@@ -103,6 +118,28 @@ def test_retired_authority_implementations_cannot_return():
         Path("core/repository_applier.py")]
     assert class_definitions("RepositoryReader") == [
         Path("core/repository_reader.py")]
+
+
+def test_validated_residence_has_no_persisted_admission_judgment():
+    """A closed pile is the certificate; repository residence stores no path."""
+    for name in (
+            "AdmissionProof",
+            "Candidate",
+            "CandidateView",
+            "FactRecord",
+            "Settlement",
+    ):
+        assert class_definitions(name) == []
+
+    assert annotated_fields(Path("core/fact.py"), "Need") == (
+        "role", "name", "a0", "a1")
+    assert annotated_fields(Path("core/kernel.py"), "ResolvedEdge") == (
+        "role", "fid")
+    assert annotated_fields(Path("core/kernel.py"), "Valid") == (
+        "fact", "edges")
+    assert annotated_fields(
+        Path("core/validated_set.py"), "ValidatedSet") == (
+            "workspace", "root", "facts")
 
 
 def test_core_dispatches_through_facts_without_importing_family_modules():
@@ -251,20 +288,20 @@ def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
     for path in source_paths():
         if path in {
                 Path("core/repository_reader.py"),
-                Path("core/candidate_archive.py")}:
+                Path("core/validated_set.py")}:
             continue
         for call in ast.walk(parsed(path)):
             if not isinstance(call, ast.Call):
                 continue
-            direct_candidate = (
+            direct_validated = (
                 isinstance(call.func, ast.Name)
-                and call.func.id == "CandidateView")
+                and call.func.id == "ValidatedView")
             direct_worker = (
                 isinstance(call.func, ast.Attribute)
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == "WorkerView"
                 and call.func.attr == "from_root")
-            if direct_candidate or direct_worker:
+            if direct_validated or direct_worker:
                 bypasses.append(path.as_posix())
     assert bypasses == []
 

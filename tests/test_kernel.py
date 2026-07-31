@@ -6,7 +6,6 @@ import facts
 from core.close import close
 from core.crypto import keypair, sign
 from core.fact import Fact, Need
-from core import settlement
 from facts.auth.admin import admin
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
@@ -268,7 +267,7 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
         assert result.ok
         by_fid = {fact.fid: fact for fact in stream}
         deps = {
-            valid.fact.fid: valid.deps
+            valid.fact.fid: tuple(edge.fid for edge in valid.edges)
             for valid in result.valids
         }
         closed = close(
@@ -344,20 +343,9 @@ def test_single_judge_loop():
     )
 
 
-@pytest.mark.parametrize(
-    ("chain_length", "consumer_is_eligible"),
-    ((254, True), (255, False)),
-)
-def test_provider_rewire_obeys_256_fact_bound_in_canonical_projection(
-        monkeypatch, chain_length, consumer_is_eligible):
-    """A longer canonical winner cannot create an oversized proof.
-
-    The canonical projection first selects a rank-zero provider.  Projecting a
-    candidate set without that provider rewires the named need to a provider
-    whose own proof is still legal.  At 254 ancestors the resulting consumer
-    closure is exactly 256 facts; at 255 it would be 257 and must be dormant.
-    """
-    tag = "test_closure_rewire"
+def test_later_provider_does_not_readjudicate_an_accepted_fact(monkeypatch):
+    """Provider choice belongs to each closed-pile judgment, not storage."""
+    tag = "test_interchangeable_provider"
     anchor = "a" * 64
 
     class RewireFamily:
@@ -382,44 +370,26 @@ def test_provider_rewire_obeys_256_fact_bound_in_canonical_projection(
         if candidate == tag else real_family_for(candidate),
     )
 
-    chain = []
-    parent = None
-    for ordinal in range(chain_length):
-        atoms = [] if parent is None else [["ref", "parent", parent]]
-        fact = Fact(tag, ordinal + 1, atoms, {"chain": ordinal}, anchor)
-        chain.append(fact)
-        parent = fact.fid
-    short = Fact(
-        tag, chain_length + 1,
+    first = Fact(
+        tag, 1,
         [["offer", "test.provider", "target"]],
-        {"provider": "short"},
+        {"provider": "first"},
         anchor,
     )
-    long = Fact(
-        tag, chain_length + 2,
-        [
-            ["ref", "parent", parent],
-            ["offer", "test.provider", "target"],
-        ],
-        {"provider": "long"},
+    second = Fact(
+        tag, 2,
+        [["offer", "test.provider", "target"]],
+        {"provider": "second"},
         anchor,
     )
     consumer = Fact(
-        tag, chain_length + 3, [], {"consumer": True}, anchor)
-    all_candidates = {
-        fact.fid: fact
-        for fact in (*chain, short, long, consumer)
-    }
+        tag, 3, [], {"consumer": True}, anchor)
 
-    initial = settlement.project(anchor, all_candidates)
-    assert consumer.fid in initial.standing
-    assert long.fid in initial.standing
+    accepted = drain([first, consumer], anchor)
+    later = drain([second], anchor)
 
-    rewired = dict(all_candidates)
-    rewired.pop(short.fid)
-    projected = settlement.project(anchor, rewired)
-
-    assert (consumer.fid in projected.standing) is consumer_is_eligible
-    assert long.fid in projected.standing
-    assert set(rewired) - set(projected.standing) == (
-        set() if consumer_is_eligible else {consumer.fid})
+    assert accepted.ok
+    assert accepted.valids[-1].fact == consumer
+    assert later.ok
+    # There is intentionally no whole-set projection call here: both durable
+    # receipts join storage and neither can revoke the other.

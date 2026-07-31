@@ -33,11 +33,7 @@ def _action_rows(node, workspace):
         "WHERE kind=? ORDER BY k0",
         (catalog.ACTION_INDEX,),
     ).fetchall()
-    candidates = node.reader(workspace).candidates()
-    return [
-        (sid, fid, candidates.fact_record(fid)["admission"])
-        for sid, fid in actions
-    ]
+    return list(actions)
 
 
 def _signed_pile(node, workspace, fact, signed, deps):
@@ -117,7 +113,7 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
     deliver(node, workspace, pile)
 
     node.turn(workspace)
-    assert node.candidate_of(workspace, item.fid) == item
+    assert node.fact_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) == item
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [item.fid]
@@ -139,6 +135,7 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     _, carol, _ = add_member(node, workspace, "carol", ts=20)
+    _, dave, _ = add_member(node, workspace, "dave", ts=21)
     admin_fid = facts.auth.admin.grant(node, workspace, bob)
     eviction = facts.auth.removal.evict(node, workspace, bob)
 
@@ -158,7 +155,7 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
     deliver(node, workspace, pile)
 
     node.turn(workspace)
-    assert node.candidate_of(workspace, item.fid) == item
+    assert node.fact_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) == item
     assert suppression_state.active(
         node.idx(workspace), facts.principal_sid("member", carol))
@@ -166,7 +163,7 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
     with pytest.raises(ValueError, match="not a workspace admin"):
-        facts.auth.removal.evict(node, workspace, carol)
+        facts.auth.removal.evict(node, workspace, dave)
 
 
 def test_terminal_member_action_covers_a_future_provider(tmp_path):
@@ -220,7 +217,7 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
         peers.append(peer)
 
     assert all(
-        peer.candidate_of(workspace, posted.fid) == posted
+        peer.fact_of(workspace, posted.fid) == posted
         and peer.fact_of(workspace, posted.fid) == posted
         and [row["fid"] for row in facts.content.message.messages(
             peer, workspace)] == [posted.fid]
@@ -291,13 +288,13 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
             (catalog.ACTION_INDEX, sid),
         ).fetchone() \
             == (first.fid,)
-        assert peer.candidate_of(workspace, posted.fid) == posted
+        assert peer.fact_of(workspace, posted.fid) == posted
         assert peer.fact_of(workspace, posted.fid) == posted
         roots.append(peer.store(workspace).get("root"))
     assert roots[0] == roots[1]
 
 
-def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
+def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder = source.identity(workspace)
@@ -323,7 +320,7 @@ def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
     store = source.store(workspace)
     root = store.get("root")
     fetch = lambda oid: store.get("obj/" + oid)
-    pulled, pushed, pending = sync_module.reconcile_candidates(
+    pulled, pushed, pending = sync_module.reconcile_facts(
         destination, workspace, None, root, fetch, deliver=False,
     )
 
@@ -334,151 +331,6 @@ def test_candidate_sync_compares_witnesses_not_fact_id_order(tmp_path):
         (catalog.ACTION_INDEX, sid),
     ).fetchone() \
         == (first.fid,)
-
-
-def test_action_witness_remains_historical_across_current_provider_rewire(
-        tmp_path):
-    """Current dependency settlement never rewrites historical admission."""
-    base = Node(str(tmp_path / "base"))
-    workspace = facts.auth.workspace.create(base, "alice", ts=1)
-    founder_secret, founder = base.identity(workspace)
-    facts.auth.device.bind(base, workspace, "alice-primary")
-    common = closed_subset(base, workspace, all_fids(base, workspace))
-
-    target_secret, target = keypair()
-    peers = []
-    for name, label, claim_ts in (
-            ("left", "left-claim", 100),
-            ("right", "right-claim", 101)):
-        peer = Node(str(tmp_path / name))
-        peer.keychain.add_identity(founder_secret)
-        peer.keychain.add_identity(target_secret)
-        peer.add_workspace(
-            workspace, "alice", peers=[], identity=founder)
-        deliver(peer, workspace, common)
-        peer.turn(workspace)
-        claim = inject_device_claim(
-            peer, workspace, founder_secret, founder, founder,
-            target, label, claim_ts)
-
-        peer.bind_identity(workspace, target)
-        posted = facts.content.message.post(
-            peer, workspace, "general", "same immutable message", ts=200)
-        peer.bind_identity(workspace, founder)
-        deletion = facts.content.delete.remove(peer, workspace, posted, ts=210)
-        peers.append((peer, claim, posted, deletion))
-
-    left, right = peers
-    assert left[2:] == right[2:]
-    left_evidence = _action_rows(left[0], workspace)[0][2]
-    right_evidence = _action_rows(right[0], workspace)[0][2]
-    assert left_evidence != right_evidence
-
-    left_claim = closed_subset(left[0], workspace, [left[1].fid])
-    right_claim = closed_subset(right[0], workspace, [right[1].fid])
-    deliver(left[0], workspace, right_claim)
-    left[0].turn(workspace)
-    deliver(right[0], workspace, left_claim)
-    right[0].turn(workspace)
-
-    evidence = [
-        _action_rows(peer, workspace)[0][2]
-        for peer, _, _, _ in peers
-    ]
-    assert evidence == [left_evidence, right_evidence]
-    assert left[0].store(workspace).get("root") \
-        != right[0].store(workspace).get("root")
-
-    # Joining the lower complete witness is a FactTree-only transition. The
-    # direct eligible order and the two semantic projections do not change.
-    lower = 0 if evidence[0] < evidence[1] else 1
-    source, target_peer = peers[lower][0], peers[1 - lower][0]
-    selected = source.reader(workspace).candidates().verify(left[3])
-    raw = encode_pile(selected.facts, workspace=workspace)
-    before = json.loads(target_peer.store(workspace).get("root"))
-    deliver(target_peer, workspace, raw)
-    target_peer.turn(workspace)
-    after = json.loads(target_peer.store(workspace).get("root"))
-
-    assert before["maps"]["fact_order"] == after["maps"]["fact_order"]
-    assert before["maps"]["fact"] != after["maps"]["fact"]
-    assert before["maps"]["supp"] == after["maps"]["supp"]
-    assert before["maps"]["authority"] == after["maps"]["authority"]
-    assert _action_rows(target_peer, workspace)[0][2] == evidence[lower]
-    full = target_peer.store(workspace).get("root")
-    target_peer.rebuild(workspace)
-    assert target_peer.store(workspace).get("root") == full
-
-    for peer, _, posted, _ in peers:
-        peer.rebuild(workspace)
-        assert _action_rows(peer, workspace)[0][2] == evidence[lower]
-        assert posted not in visible_fids(peer, workspace)
-
-
-def test_sender_never_coalesces_closures_that_rewire_a_historical_witness(
-        tmp_path):
-    """Batching cannot replace a selected proof with a newly valid proof."""
-    base = Node(str(tmp_path / "base"))
-    workspace = facts.auth.workspace.create(base, "alice", ts=1)
-    founder_secret, founder = base.identity(workspace)
-    facts.auth.device.bind(base, workspace, "alice-primary")
-    common = closed_subset(base, workspace, all_fids(base, workspace))
-
-    target_secret, target = keypair()
-    peers = []
-    for name, label, claim_ts in (
-            ("left", "left-claim", 100),
-            ("right", "right-claim", 101)):
-        peer = Node(str(tmp_path / name))
-        peer.keychain.add_identity(founder_secret)
-        peer.keychain.add_identity(target_secret)
-        peer.add_workspace(
-            workspace, "alice", peers=[], identity=founder)
-        deliver(peer, workspace, common)
-        peer.turn(workspace)
-        claim = inject_device_claim(
-            peer, workspace, founder_secret, founder, founder,
-            target, label, claim_ts)
-        peer.bind_identity(workspace, target)
-        posted = facts.content.message.post(
-            peer, workspace, "general", "same immutable message", ts=200)
-        peer.bind_identity(workspace, founder)
-        deletion = facts.content.delete.remove(peer, workspace, posted, ts=210)
-        peers.append((peer, claim, posted, deletion))
-
-    left, right = peers
-    assert left[2:] == right[2:]
-    higher, lower = (
-        (left, right) if left[1].fid > right[1].fid else (right, left)
-    )
-    lower_claim = lower[1]
-    deliver(
-        higher[0], workspace,
-        closed_subset(lower[0], workspace, [lower_claim.fid]))
-    higher[0].turn(workspace)
-
-    source = higher[0]
-    candidates = source.reader(workspace).candidates()
-    expected = candidates.fact_record(higher[3])["admission"]
-    batches = source.sender(workspace).pack_batches((
-        candidates.verify(lower_claim.fid).facts,
-        candidates.verify(higher[3]).facts,
-    ))
-
-    # The union is kernel-valid, but it would resolve the deletion through the
-    # lower claim and manufacture a proof the source never selected.
-    assert len(batches) == 2
-    destination = Node(str(tmp_path / "destination"))
-    destination.add_workspace(workspace, "alice", peers=[])
-    for raw in batches:
-        destination.receive_pile(workspace, "peer", raw)
-    destination.turn(workspace)
-
-    actual = destination.reader(workspace).candidates() \
-        .fact_record(higher[3])["admission"]
-    assert actual == expected
-    assert destination.store(workspace).get("root") \
-        == source.store(workspace).get("root")
 
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):
@@ -506,7 +358,7 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
         node.idx(workspace), facts.principal_sid("member", carol))
 
 
-def test_candidate_proof_sync_carries_actions_and_their_projection(
+def test_fact_sync_carries_actions_and_their_projection(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
@@ -552,7 +404,7 @@ def test_candidate_proof_sync_carries_actions_and_their_projection(
     assert target not in visible_fids(destination, workspace)
 
 
-def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
+def test_one_poisoned_fact_lands_honest_state_without_caching(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
@@ -569,13 +421,11 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
 
     facts.content.delete.remove(source, workspace, poisoned_target, ts=20)
     facts.content.delete.remove(source, workspace, honest_target, ts=21)
-    rows = {
-        sid: (fid, evidence)
-        for sid, fid, evidence in _action_rows(source, workspace)
-    }
+    rows = dict(_action_rows(source, workspace))
     poisoned_sid = f"fact:{poisoned_target}"
     honest_sid = f"fact:{honest_target}"
-    poisoned_evidence = rows[poisoned_sid][1]
+    poisoned_oid = source.reader(workspace).validated().fact_oid(
+        rows[poisoned_sid])
     store = source.store(workspace)
 
     class PoisonedPeer:
@@ -593,7 +443,7 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
 
         def obj(self, oid, **_options):
             return b"not the claimed object" \
-                if self.poisoned and oid == poisoned_evidence \
+                if self.poisoned and oid == poisoned_oid \
                 else store.get("obj/" + oid)
 
         def objs(self, oids):
@@ -601,7 +451,8 @@ def test_one_poisoned_candidate_witness_lands_honest_state_without_caching(
 
     monkeypatch.setattr(sync_module, "Peer", PoisonedPeer)
     url = "local://poisoned"
-    with pytest.raises(ValueError, match="unresolved candidate difference"):
+    with pytest.raises(
+            ValueError, match="unresolved validated-fact difference"):
         sync_module.sync(destination, workspace, url)
 
     assert suppression_state.active(

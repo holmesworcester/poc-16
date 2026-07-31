@@ -19,9 +19,7 @@ BUILD = HERE / ".aws-sam"
 MARKER = "poc16-aws-repository-applier-v1"
 CORE_MODULES = (
     "__init__.py",
-    "admission_proof.py",
     "bao.py",
-    "candidate_archive.py",
     "close.py",
     "crypto.py",
     "fact.py",
@@ -34,11 +32,11 @@ CORE_MODULES = (
     "object_store.py",
     "repository_applier.py",
     "repository_snapshot.py",
-    "settlement.py",
     "shape.py",
     "snapshot.py",
     "staged_intent.py",
     "suppression.py",
+    "validated_set.py",
 )
 DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 OWNER = re.compile(r"^[0-9]{12}$")

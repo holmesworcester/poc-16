@@ -65,9 +65,7 @@ BROKER_PROVIDER_MODULES = (
 )
 APPLIER_CORE_MODULES = (
     "__init__.py",
-    "admission_proof.py",
     "bao.py",
-    "candidate_archive.py",
     "close.py",
     "crypto.py",
     "fact.py",
@@ -80,11 +78,11 @@ APPLIER_CORE_MODULES = (
     "object_store.py",
     "repository_applier.py",
     "repository_snapshot.py",
-    "settlement.py",
     "shape.py",
     "snapshot.py",
     "staged_intent.py",
     "suppression.py",
+    "validated_set.py",
 )
 
 
@@ -294,7 +292,7 @@ def _verify_broker_bundle(directory):
     required = {
         "entry.py",
         "runtime.py",
-        "core/candidate_archive.py",
+        "core/validated_set.py",
         "core/repository_reader.py",
         "core/staged_intent.py",
         "facts/auth/request.py",

@@ -1,6 +1,6 @@
 """facts/auth/request.py — ephemeral proof of workspace access."""
 from core.fact import Fact, Need
-from .._commands import offer_source
+from .._commands import member_source
 from .._policy import FamilyPolicy
 from . import signature
 
@@ -10,17 +10,20 @@ PURPOSES = frozenset({"sync", "upload"})
 
 
 # SHAPE
-def request(workspace, pk, verb, exp, ts):
+def request(workspace, pk, verb, exp, ts, owner=None):
+    owner = pk if owner is None else owner
     return Fact(
-        TAG, ts, [], {"pk": pk, "verb": verb, "exp": exp}, workspace)
+        TAG, ts, [],
+        {"pk": pk, "owner": owner, "verb": verb, "exp": exp}, workspace)
 
 
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
+    owner = f.body.get("owner", "")
     return (
         Need("author", "author", f.fid, pk),
-        Need("member", "member", pk),
+        Need("member", "member", pk, owner),
     )
 
 
@@ -28,11 +31,14 @@ def needs(f):
 def validate(f, ctx):
     try:
         body = f.body
-        return set(body) == {"pk", "verb", "exp"} \
-            and isinstance(body["pk"], str) and isinstance(body["verb"], str) \
+        return set(body) == {"pk", "owner", "verb", "exp"} \
+            and isinstance(body["pk"], str) \
+            and isinstance(body["owner"], str) \
+            and isinstance(body["verb"], str) \
             and isinstance(body["exp"], int) \
             and f == request(
-                f.ws, body["pk"], body["verb"], body["exp"], f.ts)
+                f.ws, body["pk"], body["verb"], body["exp"], f.ts,
+                body["owner"])
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -55,15 +61,17 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
         return None
     edges = {edge.role: edge.fid for edge in valid.edges}
     provider = {fact.fid: fact for fact in stream}.get(edges.get("member"))
-    if provider is None or ("member", body["pk"], "") not in provider.offers():
+    if provider is None or (
+            "member", body["pk"], body["owner"]) not in provider.offers():
         return None
-    sid = facts.principal_sid("member", body["pk"])
-    if not view.authority_known("member", body["pk"]):
+    sid = facts.principal_sid("member", body["owner"])
+    if not view.authority_known("member", body["pk"], body["owner"]):
         # A never-seen address may bootstrap from its self-contained closure.
         # A terminal pre-tombstone must fail closed.
         if view.suppression_known(sid):
             return None
-    elif view.authority_provider("member", body["pk"]) is None \
+    elif view.authority_provider(
+            "member", body["pk"], body["owner"]) is None \
             or view.suppression(sid)["state"] != "clear":
         return None
     return body["pk"], body["verb"]
@@ -72,11 +80,11 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
 # COMMANDS — build the already-topological request + auth closure for a mint.
 def payload(node, workspace, verb, exp, ts):
     secret, public = node.identity(workspace)
-    item = request(workspace, public, verb, exp, ts)
-    sig = signature.signature(secret, public, item, ts)
-    member = offer_source(node, workspace, "member", public)
+    member, owner = member_source(node, workspace, public)
     if member is None:
         raise ValueError("local identity is not a workspace member")
+    item = request(workspace, public, verb, exp, ts, owner)
+    sig = signature.signature(secret, public, item, ts)
     deps = {item.fid: [sig.fid, member], sig.fid: []}
     return node.sender(workspace).close([sig, item], deps)
 

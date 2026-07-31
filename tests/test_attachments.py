@@ -37,10 +37,10 @@ def progress(node, workspace):
 
 def push_all(node, workspace, peer):
     """Exercise the production Reader -> Sender outbound path."""
-    candidates = node.reader(workspace).candidates()
+    candidates = node.reader(workspace).validated()
     closures = (
-        candidates.verify(fid).facts
-        for fid in candidates.candidate_ids()
+        candidates.closure((fid,))
+        for fid in candidates.fact_ids()
     )
     return node.sender(workspace).deliver(peer, closures)
 
@@ -291,7 +291,7 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
 
     monkeypatch.setattr(applier, "commit", fail_commit)
 
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not admitted"):
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
 
     pile = store.list("pile/")[0]
@@ -463,8 +463,7 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     invalid = b"not a Bao proof"
     item, signed = chunk.author(
         workspace, secret, public, "general", descriptor.body["root"], 0, 1,
-        h(invalid), descriptor.ts + 1, descriptor.fid,
-        member_src(source, workspace, public))
+        h(invalid), descriptor.ts + 1, descriptor.fid)
     source.ingest_new(
         workspace, [signed, item],
         {

@@ -36,7 +36,6 @@ from .limits import (
     decode_json,
 )
 from .node import Node, now_ms
-from .pile_sender import AuthorityRejected
 from .sync import sync
 
 GRANT_TTL = int(os.environ.get("TINYP2P_GRANT_TTL", 60_000))
@@ -386,8 +385,6 @@ class Handler(BaseHTTPRequestHandler):
                 result = facts.invoke_command(self.node, path, argv)
                 self.syncer.kick()
             return self._json(200, result)
-        except AuthorityRejected as e:
-            return self._json(403, {"error": f"{type(e).__name__}: {e}"})
         except facts.WorkspaceNotFound as e:
             return self._json(404, {"error": f"{type(e).__name__}: {e}"})
         except (KeyError, TypeError, ValueError) as e:

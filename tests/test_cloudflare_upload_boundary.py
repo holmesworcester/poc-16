@@ -471,7 +471,7 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
         for relative in (
                 "entry.py",
                 "runtime.py",
-                "core/candidate_archive.py",
+                    "core/validated_set.py",
                 "core/repository_reader.py",
                 "core/staged_intent.py",
                 "facts/auth/request.py",
@@ -523,7 +523,7 @@ def test_stage_broker_is_db_free_and_uses_shared_reader_sources(
     for relative in (
             "entry.py",
             "runtime.py",
-            "core/candidate_archive.py",
+            "core/validated_set.py",
             "core/repository_reader.py",
             "core/staged_intent.py",
             "facts/auth/request.py",

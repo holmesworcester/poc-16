@@ -7,10 +7,6 @@ from .kernel import drain, resolve_deps
 from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
 
 
-class AuthorityRejected(ValueError):
-    """A valid authored fact lacks current canonical standing."""
-
-
 class PileSender:
     """Close local intent and deliver it to a recipient's shared Applier."""
 
@@ -40,53 +36,37 @@ class PileSender:
         return encode_pile(closed, workspace=self.workspace)
 
     def pack_batches(self, closed_units):
-        """Coalesce witness-compatible units within the pile byte boundary.
-
-        A proof closure binds every fact to exact named dependency edges.
-        Adding another independently verified closure can change canonical
-        offer selection even when the resulting stream remains valid. Such a
-        union would manufacture a different historical witness, so it must be
-        sent separately. Compatible closures can still share their common
-        prefix and avoid one receiver settlement per changed fact.
-        """
-        def edge_map(unit, *, strict=True):
+        """Coalesce closed units while preserving whole-pile validity."""
+        def valid_unit(unit, *, strict=True):
             judgment = drain(unit, self.workspace)
             if not judgment.ok or len(judgment.valids) != len(unit):
                 if strict:
                     raise ValueError("outbound unit is not an exact closure")
-                return None
-            return {
-                valid.fact.fid: tuple(valid.edges)
-                for valid in judgment.valids
-            }
+                return False
+            return True
 
         def checked_unit(unit):
-            edges = edge_map(unit)
-            # Fail before any delivery if one indivisible proof is too large.
+            valid_unit(unit)
+            # Fail before delivery if one indivisible closure is too large.
             self.pack(unit)
-            return unit, edges
+            return unit
 
-        batches, current, current_edges = [], [], {}
+        batches, current, current_fids = [], [], set()
         for raw_unit in closed_units:
             unit = tuple(raw_unit)
             if not unit:
                 continue
-            unit, isolated_edges = checked_unit(unit)
+            unit = checked_unit(unit)
             if not current:
                 current = list(unit)
-                current_edges = isolated_edges
+                current_fids = {fact.fid for fact in unit}
                 continue
 
-            shared = current_edges.keys() & isolated_edges.keys()
-            compatible = all(
-                current_edges[fid] == isolated_edges[fid]
-                for fid in shared
-            )
             additions = [
                 fact for fact in unit
-                if fact.fid not in current_edges
+                if fact.fid not in current_fids
             ]
-            if compatible and not additions:
+            if not additions:
                 continue
             trial = (*current, *additions)
             try:
@@ -94,28 +74,17 @@ class PileSender:
             except PayloadTooLarge:
                 batches.append(self.pack(current))
                 current = list(unit)
-                current_edges = isolated_edges
+                current_fids = {fact.fid for fact in unit}
                 continue
 
-            if compatible:
-                combined_edges = edge_map(trial, strict=False)
-                expected_edges = {
-                    **current_edges,
-                    **{
-                        fact.fid: isolated_edges[fact.fid]
-                        for fact in additions
-                    },
-                }
-                compatible = combined_edges is not None \
-                    and combined_edges == expected_edges
-            if not compatible:
+            if not valid_unit(trial, strict=False):
                 batches.append(self.pack(current))
                 current = list(unit)
-                current_edges = isolated_edges
+                current_fids = {fact.fid for fact in unit}
                 continue
 
             current.extend(additions)
-            current_edges = combined_edges
+            current_fids.update(fact.fid for fact in additions)
         if current:
             batches.append(self.pack(current))
         return tuple(batches)
@@ -165,11 +134,6 @@ class PileSender:
         ]
         if missing:
             sample = ", ".join(sorted(missing)[:3])
-            error = (
-                f"authored facts are outside the canonical set: {sample}")
-            if any(
-                    node.candidate_of(workspace, fid) is not None
-                    for fid in missing):
-                raise AuthorityRejected(error)
-            raise ValueError(error)
+            raise ValueError(
+                f"authored facts were not admitted: {sample}")
         return fresh

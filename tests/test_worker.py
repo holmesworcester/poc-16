@@ -96,7 +96,7 @@ def test_worker_mint_rejects_forged_outer_map_metadata(
     view = WorkerView.from_root(forged, fetch)
     with pytest.raises(ValueError, match="merkle map root metadata"):
         if name == indexes.FACT:
-            view.fact_record(workspace)
+            view.fact(workspace)
         elif name == indexes.SUPP:
             view.principal_active(
                 "member", node.identity_id(workspace))
@@ -186,7 +186,7 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
     active = {"state": "active", "action": action_fid}
     assert new.suppression(sid) == active
     assert new._reader(indexes.FACT).get(indexes.action_key(sid)) == active
-    assert new.fact_record(action_fid)["admission"]
+    assert new.fact(action_fid).fid == action_fid
 
     maps = snapshot.decode_root(new_root).maps
     assert set(maps) == set(snapshot.MAP_NAMES)

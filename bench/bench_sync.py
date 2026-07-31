@@ -3,13 +3,13 @@
 Two questions, both answered against the *real* engine paths:
 
   catchup   A fresh node ingests a whole workspace from empty. This is the
-            "download + ingestion" number: fetch every selected historical
-            proof and judge bounded piles through the shared
+            "download + ingestion" number: fetch every validated fact,
+            assemble fresh bounded closures, and judge them through the shared
             RepositoryApplier. facts/s is measured at that real boundary.
 
   bidi      Two peers with shared membership and disjoint message sets do
-            one candidate/proof join in both directions. Both converge; we
-            measure the exact selected proof closures transferred.
+            one validated-fact join in both directions. Both converge; we
+            measure the exact fresh closures transferred.
 
 The seed and measured catchup both use the production PileSender →
 RepositoryApplier transition. There is no benchmark-only SQL admission or
@@ -70,7 +70,9 @@ def build_members(node, ws, n_members, base_ts):
     return members
 
 
-def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
+def bulk_author(
+        node, ws, members, n_msgs, first_ts, window, rng, tag="",
+        owners=None):
     """Author ``n_msgs`` messages in production-sized exact piles."""
     authored, deps = [], {}
     index = node.idx(ws)
@@ -83,10 +85,12 @@ def bulk_author(node, ws, members, n_msgs, first_ts, window, rng, tag=""):
 
     for i in range(n_msgs):
         sk, pk = rng.choice(members)
+        owner = pk if owners is None else owners[pk]
         ts = first_ts + rng.randrange(window)
-        fact = message(ws, pk, "general", f"{tag}m{i}", ts)
+        fact = message(
+            ws, pk, "general", f"{tag}m{i}", ts, owner)
         signed = signature(sk, pk, fact, ts)
-        member = offer_src(index, "member", pk)
+        member = offer_src(index, "member", pk, owner)
         if member is None:
             raise ValueError("bulk author is not a member")
         authored.extend((signed, fact))
@@ -121,7 +125,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
 # ---- unit streaming ----------------------------------------------------------
 
 def snapshot_objs(store):
-    """``(root bytes, unique cold object reads)`` for the candidate archive."""
+    """``(root bytes, unique cold object reads)`` for validated facts."""
     root = store.get("root")
     oids = []
 
@@ -130,23 +134,23 @@ def snapshot_objs(store):
         return store.get("obj/" + oid)
 
     # This helper intentionally receives only a store. Construct the public
-    # Reader and use its subordinate CandidateView rather than bypassing it.
+    # reader and touch each authenticated canonical fact residence.
     workspace = snapshot.decode_root(root).anchor
-    view = RepositoryReader(workspace, root, fetch).candidates()
-    for fid in view.candidate_ids():
-        view.verify(fid)
+    view = RepositoryReader(workspace, root, fetch).validated()
+    for fid in view.fact_ids():
+        view.fact(fid)
     return root, tuple(dict.fromkeys(oids))
 
 
 def seed_units(store, root, workspace):
-    """The production sync units: selected historical proof closures."""
+    """The production sync units: fresh validated-fact closures."""
     view = RepositoryReader(
         workspace, root,
-        lambda oid: store.get("obj/" + oid)).candidates()
+        lambda oid: store.get("obj/" + oid)).validated()
     if view.root.anchor != workspace:
         raise ValueError("benchmark snapshot workspace")
-    for fid in view.candidate_ids():
-        yield view.verify(fid).facts
+    for fid in view.fact_ids():
+        yield view.closure((fid,))
 
 
 def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
@@ -210,7 +214,7 @@ def copy_facts(dst, ws, src, fids):
 
 
 def reconcile(A, B, ws):
-    """One candidate/proof join in both directions, as the sync core does."""
+    """One validated-fact join in both directions, as the sync core does."""
     astore, bstore = A.store(ws), B.store(ws)
     remote_objects = {}
 
@@ -220,13 +224,13 @@ def reconcile(A, B, ws):
         return remote_objects[oid]
 
     t0 = perf()
-    mine = A.reader(ws).candidates()
+    mine = A.reader(ws).validated()
     theirs = RepositoryReader(
-        ws, bstore.get("root"), fetch_remote).candidates()
+        ws, bstore.get("root"), fetch_remote).validated()
     delta = sync_module._delta(mine, theirs)
     pull_fids, push_fids = set(delta.pull), set(delta.push)
-    pulled = [theirs.verify(fid).facts for fid in delta.pull]
-    pushed = [mine.verify(fid).facts for fid in delta.push]
+    pulled = [theirs.closure((fid,)) for fid in delta.pull]
+    pushed = [mine.closure((fid,)) for fid in delta.push]
     pull_bytes = sum(
         len(raw) for raw in remote_objects.values() if raw is not None)
     push_streamed = sum(len(unit) for unit in pushed)
@@ -275,7 +279,7 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
 
     per_side = max(1, (total_facts - len(membership)) // 4)  # msgs per side
     first = max(
-        A.candidate_of(ws, fid).ts
+        A.fact_of(ws, fid).ts
         for (fid,) in A.idx(ws).execute("SELECT fid FROM facts")
     ) + 1
     bulk_author(A, ws, members, per_side, first, window, random.Random(1), "A")
@@ -297,7 +301,7 @@ def mb(b):
 def run_catchup(scales):
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          "workers, one four-map candidate snapshot\n")
+          "workers, one four-map validated snapshot\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"
@@ -354,12 +358,12 @@ def run_bidi(scales):
 
 
 def check_leaves(seed, ws):
-    """Every selected historical candidate proof still judges alone."""
-    view = seed.reader(ws).candidates()
-    fids = view.candidate_ids()
+    """Every validated residence can be assembled into a fresh closure."""
+    view = seed.reader(ws).validated()
+    fids = view.fact_ids()
     for fid in fids:
-        assert kernel(view.verify(fid).facts, ws).ok, \
-            "a selected historical proof failed the kernel"
+        assert kernel(view.closure((fid,)), ws).ok, \
+            "a validated fact failed fresh closure assembly"
     return len(fids)
 
 
@@ -401,7 +405,7 @@ def measure_write_cost(node_dir, scale, posts=200):
     shutil.rmtree(node_dir, ignore_errors=True)
     seed, ws, _ = build_seed(node_dir, scale)
     timestamps = [
-        seed.candidate_of(ws, fid).ts
+        seed.fact_of(ws, fid).ts
         for (fid,) in seed.idx(ws).execute("SELECT fid FROM facts")
     ]
     lo, hi = min(timestamps), max(timestamps)

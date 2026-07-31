@@ -8,7 +8,7 @@ import facts
 import pytest
 
 from adapters.s3 import S3Config, S3Store
-from core import bao
+from core import bao, indexes, snapshot
 from core.close import decode_pile
 from core.crypto import h
 from core.node import Node
@@ -353,7 +353,7 @@ def test_403_missing_root_probe_bootstraps_repository_genesis(tmp_path):
     ) in bucket.history
 
 
-def test_403_missing_archive_page_uses_exact_probe_not_access_denied(
+def test_403_missing_validated_map_page_uses_exact_probe_not_access_denied(
         tmp_path):
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
@@ -377,9 +377,8 @@ def test_403_missing_archive_page_uses_exact_probe_not_access_denied(
     applier = RepositoryApplier(workspace, canonical)
     internal = asyncio.run(applier.stage(MEMBER, raw))
     assert asyncio.run(applier.apply(internal)).status == "applied"
-    missing = next(
-        key for key in sorted(bucket.data)
-        if key.startswith(prefix + "/obj/"))
+    root = snapshot.decode_root(bucket.data[prefix + "/root"])
+    missing = prefix + "/obj/" + root.maps[indexes.FACT]["root"]
     bucket.data.pop(missing)
     bucket.tokens.pop(missing)
     bucket.history.clear()

@@ -31,6 +31,23 @@ FAMILIES = compile_families(MODULES)
 MAX_AUTHORITY_SCOPES = 64
 
 
+def _principal_namespaces(modules):
+    """Map authority offer names to their one declared suppression namespace."""
+    out = {}
+    for module in modules:
+        for declaration in module.POLICY.principal_offers:
+            incumbent = out.setdefault(
+                declaration.name, declaration.namespace)
+            if incumbent != declaration.namespace:
+                raise ValueError(
+                    f"principal offer namespace conflict: "
+                    f"{declaration.name!r}")
+    return out
+
+
+PRINCIPAL_NAMESPACES = _principal_namespaces(MODULES)
+
+
 class WorkspaceNotFound(LookupError):
     """A command named no unique local workspace."""
 
@@ -143,37 +160,63 @@ def principal_sids(fact):
         _offer_sids(fact, family.POLICY.principal_offers))
 
 
-def authority_scopes(fact, edges_of, fact_of):
-    """Transitively expand the declared continuing liveness of authority.
+def authority_scopes(fact):
+    """Return continuing-liveness ids declared by this fact's own policy.
 
-    Only family-declared ``authority_liveness_guards`` are followed.  This is
-    not a walk over every dependency: it is a bounded expansion of explicit
-    policy edges, so a delegated admin carried by a child device inherits that
-    device provider's user/device liveness without making unrelated proof
-    support revocable.
+    Liveness must be recoverable from immutable fact bytes.  A guard names one
+    of the family's declared Needs; the Need address contributes the typed
+    principal id directly.  No selected provider, admission edge, or
+    historical validation path is persisted or replayed.
     """
-    out, seen, pending = set(), set(), [fact]
-    while pending:
-        provider = pending.pop()
-        if provider.fid in seen:
-            continue
-        seen.add(provider.fid)
-        if len(seen) > MAX_AUTHORITY_SCOPES:
-            raise ValueError("authority liveness budget")
-        out.update(fact_scopes(provider))
-        out.update(principal_sids(provider))
-        family = family_for(provider.t)
-        if family is None:
-            raise ValueError("authority liveness family")
-        edges = edges_of(provider.fid)
-        for role in family.POLICY.authority_liveness_guards:
-            guarded = fact_of(edges.get(role))
-            if guarded is None:
-                raise ValueError("authority liveness edge")
-            pending.append(guarded)
+    family = family_for(fact.t)
+    if family is None:
+        raise ValueError("authority liveness family")
+    declared = tuple(family.needs(fact))
+    needs = {need.role: need for need in declared}
+    if len(needs) != len(declared):
+        raise ValueError("duplicate authority need role")
+    out = set()
+    for role in family.POLICY.authority_liveness_guards:
+        need = needs.get(role)
+        namespace = None if need is None else \
+            PRINCIPAL_NAMESPACES.get(need.name)
+        if namespace is None:
+            raise ValueError("authority liveness declaration")
+        # Principal-bearing offers use a1 for the durable identity and a0 for
+        # the concrete signing key. Direct users have the same value in both
+        # positions; devices thereby inherit their owner's liveness.
+        out.add(principal_sid(namespace, need.a1 or need.a0))
     if len(out) > MAX_AUTHORITY_SCOPES:
         raise ValueError("authority liveness scope budget")
     return frozenset(out)
+
+
+def current_scopes(fact):
+    """All explicit, principal, and policy-declared current liveness ids."""
+    return fact_scopes(fact) | principal_sids(fact) | authority_scopes(fact)
+
+
+def explicit_provider(fact, role):
+    """Return a provider fid explicitly named by a suppression path.
+
+    Parent and ancestor selectors are semantic envelope atoms.  When their
+    final path role matches a Need role, that exact provider matters and the
+    kernel must check it instead of choosing another offer at the same
+    address.  Families without such an atom deliberately accept any valid
+    provider of the address.
+    """
+    from core.suppression import selector_markers
+
+    matches = {
+        marker[3]
+        for marker in selector_markers(fact)
+        if len(marker) == 4
+        and marker[1] in {"parent", "ancestor"}
+        and marker[2].split("/")[-1] == role
+    }
+    if len(matches) > 1:
+        raise ValueError(f"ambiguous explicit provider for {role!r}")
+    return next(iter(matches), None)
 
 
 def action_sids(fact):

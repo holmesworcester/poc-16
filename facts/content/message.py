@@ -7,7 +7,7 @@ from .._policy import (
     author_selectors,
 )
 from .._commands import (
-    offer_source,
+    member_source,
     publish,
     upload_builder,
     upload_source,
@@ -18,24 +18,26 @@ TAG = "msg"
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     direct_targets=DELETE_SELF,
-    owner_edge="member",
+    owner_field="owner",
 )
 
 
 # SHAPE
-def message(workspace, pk, channel, text, ts):
+def message(workspace, pk, channel, text, ts, owner=None):
+    owner = pk if owner is None else owner
     return Fact(
         TAG, ts, author_selectors(POLICY, {}),
-        {"pk": pk, "chan": channel, "text": text}, workspace,
+        {"pk": pk, "owner": owner, "chan": channel, "text": text}, workspace,
     )
 
 
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
+    owner = f.body.get("owner", "")
     return (
         Need("author", "author", f.fid, pk),
-        Need("member", "member", pk),
+        Need("member", "member", pk, owner),
     )
 
 
@@ -43,10 +45,11 @@ def needs(f):
 def validate(f, ctx):
     try:
         body = f.body
-        return set(body) == {"pk", "chan", "text"} \
+        return set(body) == {"pk", "owner", "chan", "text"} \
             and all(isinstance(body[key], str) for key in body) \
             and f == message(
-                f.ws, body["pk"], body["chan"], body["text"], f.ts)
+                f.ws, body["pk"], body["chan"], body["text"], f.ts,
+                body["owner"])
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -61,7 +64,11 @@ def _author(node, workspace, channel, text, ts):
 
     timestamp = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
-    item = message(workspace, public, channel, text, timestamp)
+    _, owner = member_source(node, workspace, public)
+    if owner is None:
+        raise ValueError("publishing identity is not a workspace member")
+    item = message(
+        workspace, public, channel, text, timestamp, owner)
     return item, signature.signature(secret, public, item, timestamp)
 
 
@@ -76,7 +83,8 @@ def upload(
     """Author one message and send its closed pile directly to ingress."""
     item, signed = _author(node, workspace, channel, text, ts)
     public = item.body["pk"]
-    member = offer_source(node, workspace, "member", public)
+    member, _ = member_source(
+        node, workspace, public, item.body["owner"])
     if member is None:
         raise ValueError("publishing identity is not a workspace member")
     deps = {item.fid: [signed.fid, member], signed.fid: []}

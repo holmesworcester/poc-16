@@ -181,7 +181,7 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
     assert json.loads(result.rejection.record)["error"] \
         == "InvalidPile: pile workspace"
     assert store.get("root") == root
-    assert node.candidate_of(second, foreign.fid) is None
+    assert node.fact_of(second, foreign.fid) is None
 
     ws_less_ordinary = Fact("msg", 102, [], {}, None)
     index = node.idx(second)
@@ -191,10 +191,10 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
     )
     index.commit()
     with pytest.raises(ValueError, match="fact projection integrity"):
-        node.catalog(second).candidate(ws_less_ordinary.fid)
+        node.catalog(second).fact(ws_less_ordinary.fid)
 
     node.rebuild(second)
-    assert node.candidate_of(second, ws_less_ordinary.fid) is None
+    assert node.fact_of(second, ws_less_ordinary.fid) is None
     assert store.get("root") == root
 
 
@@ -339,7 +339,7 @@ def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
     )
 
     with pytest.raises(ValueError, match="fact projection integrity"):
-        node.catalog(workspace).candidate(foreign.fid)
+        node.catalog(workspace).fact(foreign.fid)
 
     index.execute(
         "DELETE FROM meta WHERE k='root'",
@@ -349,7 +349,7 @@ def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
     node._idx.clear()
 
     reopened = Node(node.dir)
-    assert reopened.candidate_of(workspace, foreign.fid) is None
+    assert reopened.fact_of(workspace, foreign.fid) is None
     assert reopened.store(workspace).get("root") == root
 
 

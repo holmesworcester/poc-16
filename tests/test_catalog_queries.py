@@ -6,9 +6,10 @@ import pytest
 
 import facts
 
-from core import catalog, settlement
+from core import catalog
 from core.fact import Fact, canon, decode, encode
 from core.node import Node
+from core.repository_snapshot import action_bindings
 
 
 OBSOLETE_TABLES = {
@@ -34,40 +35,21 @@ def _tables(db):
 
 
 def _expected_projection(node, workspace):
-    """Derive exact local rows from one authenticated pinned archive."""
+    """Derive exact local rows from one authenticated validated set."""
     reader = node.reader(workspace)
-    archive = reader.archive()
+    validated = reader.all_facts()
     facts_by_fid = {
         fid: encode(fact)
-        for fid, fact in archive.facts.items()
+        for fid, fact in validated.facts.items()
     }
     rows = {
         row
-        for fact in archive.facts.values()
+        for fact in validated.facts.values()
         for row in catalog.index_rows(fact)
     }
-    for fid, record in archive.records.items():
-        if record["state"] != "eligible":
-            continue
-        rows.add((
-            catalog.STATE_INDEX,
-            "eligible",
-            str(record["rank"]),
-            fid,
-        ))
-        rows.update(
-            (
-                catalog.EDGE_INDEX,
-                f"{kind}:{role}",
-                parent,
-                fid,
-            )
-            for role, parent, kind in record["dependencies"]
-        )
-    projection = settlement.project(workspace, archive.facts)
     rows.update(
         (catalog.ACTION_INDEX, sid, "", fid)
-        for sid, fid in projection.actions.items()
+        for sid, fid in action_bindings(validated.facts).items()
     )
     return facts_by_fid, rows
 
@@ -218,7 +200,7 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
 
     assert reopened.reader(workspace).root_bytes == root
     assert reopened.fact_of(workspace, message_fid) is not None
-    assert reopened.candidate_of(
+    assert reopened.fact_of(
         workspace, local_only.fid) is None
     assert _tables(upgraded) == {"facts", "fact_index", "meta"}
     assert _tables(upgraded).isdisjoint(OBSOLETE_TABLES)
@@ -299,5 +281,5 @@ def test_index_lookup_decodes_only_selected_fact_bodies(
     selected = node.catalog(workspace).indexed(
         "member", node.identity_id(workspace))
 
-    assert [fact.fid for _, fact in selected] == [workspace]
+    assert [fact.fid for fact in selected] == [workspace]
     assert decoded == [workspace]

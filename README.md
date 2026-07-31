@@ -31,7 +31,7 @@ not a third repository actor or state machine.
 
 1. `core/fact.py`, then `facts/`: wire facts and family-owned policy.
 2. `core/kernel.py`: the bounded, database-free closed-pile judgment.
-3. `core/repository_snapshot.py`: the pure candidate-set-to-root compiler.
+3. `core/repository_snapshot.py`: the pure validated-fact-set compiler.
 4. `core/repository_applier.py`: storage effects and the sole root CAS.
 5. `core/repository_reader.py`, `core/worker.py`: pinned authenticated reads.
 6. `core/pile_sender.py`: client authorship and closure.
@@ -113,10 +113,29 @@ Each fact family declares its own:
 - ownership and direct-action policy;
 - continuing authority liveness.
 
+A pile must contain enough facts to validate as a closed unit. Stored state
+does not retain that incidental validation path:
+
+```text
+wire:    one closed pile of facts and dependencies
+stored:  fid -> canonical fact bytes, plus mechanical indexes
+```
+
+Validation is monotone: once a fact validates against a validated set, adding
+more validated facts cannot invalidate it. If one exact provider is
+semantically significant, the fact names the complete offer address or an
+explicit provider ID in its immutable bytes. Otherwise providers at the same
+complete address are interchangeable. For membership the complete address is
+`member(device_key, durable_owner)`, so later device affiliations cannot
+rewrite ownership.
+
 A suppressible family serializes the exact IDs that may suppress each fact.
 Selectors can name SELF, a parent, a grandparent/ancestor path, or several
 such IDs. A family with no suppression policy serializes no suppression key
-and its facts cannot be suppressed.
+and its facts cannot be directly suppressed. That is a visibility rule:
+separately, a family may declare current principal/authority scopes whose
+suppression makes the fact unusable as an authority provider without removing
+the fact from validated storage.
 
 `SuppTree` maps a known suppression ID to one of:
 
@@ -134,12 +153,12 @@ delete facts owned by the same durable member principal, including facts
 written by any of that member's devices. These are ordinary family checks,
 not special cases in `Node`.
 
-Removal does not retroactively make every later fact invalid. Once removal
-has propagated, peers stop granting that principal new sharing authority.
-Facts accepted by a peer that had not yet learned the removal remain
-legitimate workspace facts. Named needs and their exact admission edges prove
-the historical judgment; commands and remote minting separately consult the
-pinned root's current authority-liveness rows.
+Removal does not retroactively revoke validated storage. Once removal has
+propagated, peers stop granting that principal new sharing authority. Facts
+accepted by a peer that had not yet learned the removal remain legitimate
+workspace facts. The closed pile was the validation certificate; no selected
+dependency path is retained afterward. Commands and remote minting consult
+the pinned root's current suppression and authority maps.
 
 ## Client persistence
 
@@ -151,12 +170,12 @@ fact_index(kind, k0, k1, src)    every lookup and derived projection row
 meta(k, v)                        pinned-root/cache version only
 ```
 
-The combined index includes type, canonical fact key, every ref, every family
-offer, structural standing/rank, resolved edges, and active suppression
-actions. Structural standing records historical canonical admission;
-suppression and authority-liveness decide current use. Family queries assemble
-views from those rows. There are no family-specific application tables and no
-SQL receiving authority.
+The combined index includes type, canonical fact key, every explicit ref,
+every family offer, every declared suppression/current-liveness scope, and
+current action bindings. It contains no validation verdict, proof, rank,
+selected dependency edge, eligibility label, or dormant state. Family queries
+assemble views from those rows. There are no family-specific application
+tables and no SQL receiving authority.
 
 The database can be deleted and rebuilt from a pinned `RepositoryReader`
 without changing `root`. When fact-form versioning is introduced, rebuild
@@ -351,8 +370,8 @@ that this checkout has deployed them.
 
 The honest `PileSender -> RepositoryApplier -> RepositoryReader` benchmark
 path is wired. It exposed that the snapshot compiler still reconstructs the
-full candidate archive for each commit. That is a correctness-preserving but
-expensive baseline. Incremental compilation must be byte-identical to a full
+full validated fact set for each commit. That is a correctness-preserving but
+expensive baseline. Incremental insertion must be byte-identical to a full
 compile before it replaces the baseline.
 
 No 50k/200k fact-rate or file-throughput number is asserted here until the

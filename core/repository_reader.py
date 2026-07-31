@@ -2,9 +2,9 @@
 from dataclasses import dataclass
 
 from . import snapshot
-from .candidate_archive import CandidateView
 from .crypto import h
 from .object_store import verified_object
+from .validated_set import ValidatedView, reconstruct
 from .worker import WorkerView
 
 
@@ -58,14 +58,12 @@ class RepositoryReader:
         """Return the bounded authorization/query view at this exact root."""
         return WorkerView.from_root(self.root_bytes, self.fetch)
 
-    def candidates(self):
-        """Return authenticated candidate point/range reads at this root."""
-        return CandidateView(self.root_bytes, self.fetch)
+    def validated(self):
+        """Return authenticated validated-fact point/range reads."""
+        return ValidatedView(self.root_bytes, self.fetch)
 
-    def archive(self):
-        """Verify the complete root-reachable candidate archive."""
-        from .candidate_archive import reconstruct
-
+    def all_facts(self):
+        """Verify and return the complete root-reachable validated set."""
         return reconstruct(self.root_bytes, self.fetch)
 
     def object(self, oid):

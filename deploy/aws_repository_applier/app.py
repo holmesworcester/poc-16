@@ -4,7 +4,7 @@ S3 notifications and scheduled invocations are discovery hints only.  Every
 exact marker is fetched from isolated ingress and translated by the same
 ``RepositoryApplier.apply_staged`` method used by filesystem and Cloudflare
 compositions.  This module owns AWS configuration and event normalization;
-it contains no repository policy, settlement, tree, or CAS algorithm.
+it contains no repository policy, tree, or CAS algorithm.
 """
 import asyncio
 from dataclasses import dataclass

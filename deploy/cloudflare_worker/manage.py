@@ -198,7 +198,7 @@ def _verify_bundle(directory):
         "entry.py",
         "runtime.py",
         "crypto_compat.py",
-        "core/candidate_archive.py",
+        "core/validated_set.py",
         "core/repository_reader.py",
         "core/worker.py",
         "facts/auth/request.py",

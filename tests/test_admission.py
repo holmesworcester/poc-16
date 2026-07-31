@@ -1,7 +1,6 @@
-"""Admission semantics remain authenticated; SQLite only projects them."""
-import sqlite3
+"""Successful whole-pile judgment is the repository's only admission."""
 
-import pytest
+import sqlite3
 
 import facts
 
@@ -11,73 +10,25 @@ from core.node import Node
 from facts.content.message import message
 
 
-def _receipt_edges(reader, fid):
-    verified = reader.candidates().verify(fid)
-    receipt = next(
-        receipt
-        for receipt in verified.valids
-        if receipt.fact.fid == fid
-    )
-    return tuple(sorted(
-        receipt.edges, key=lambda edge: edge.role))
-
-
-def test_combined_edge_rows_match_authenticated_admission_semantics(
-        tmp_path):
+def test_sql_projection_contains_no_admission_verdict_or_edges(tmp_path):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     fid = facts.content.message.post(
-        node, workspace, "general", "admitted", ts=2)
-    reader = node.reader(workspace)
-    expected = _receipt_edges(reader, fid)
-    projected = node.catalog(workspace).edges(fid)
-    record = reader.candidates().fact_record(fid)
-
-    assert projected == expected
-    assert [
-        [edge.role, edge.fid, edge.kind]
-        for edge in projected
-    ] == record["dependencies"]
-    assert [edge.role for edge in projected] == sorted(
-        edge.role for edge in projected)
-    assert len({edge.role for edge in projected}) == len(projected)
-    assert {edge.kind for edge in projected} == {"need"}
-    assert set(node.idx(workspace).execute(
-        "SELECT k0, k1 FROM fact_index "
-        "WHERE kind=? AND src=?",
-        (catalog.EDGE_INDEX, fid),
-    )) == {
-        (f"{edge.kind}:{edge.role}", edge.fid)
-        for edge in expected
+        node, workspace, "general", "admitted once", ts=2)
+    kinds = {
+        kind for (kind,) in node.idx(workspace).execute(
+            "SELECT DISTINCT kind FROM fact_index WHERE src=?", (fid,))
     }
 
-    # Local rows are explicitly unauthenticated accelerators. A malformed
-    # typed role fails closed locally, while the pinned repository proof
-    # remains intact and a root refresh restores the exact combined rows.
-    first = expected[0]
-    node.idx(workspace).execute(
-        "UPDATE fact_index SET k0=? "
-        "WHERE kind=? AND src=? AND k0=? AND k1=?",
-        (
-            f"invented:{first.role}",
-            catalog.EDGE_INDEX,
-            fid,
-            f"{first.kind}:{first.role}",
-            first.fid,
-        ),
-    )
-    node.idx(workspace).commit()
-    with pytest.raises(ValueError, match="fact projection edge"):
-        node.catalog(workspace).edges(fid)
-    assert _receipt_edges(reader, fid) == expected
-
-    node.rebuild(workspace)
-
-    assert node.catalog(workspace).edges(fid) == expected
+    assert node.catalog(workspace).fact(fid).fid == fid
+    assert kinds == {"fact.key", "fact.scope", "fact.type"}
+    assert not any(
+        marker in kind
+        for kind in kinds
+        for marker in ("admission", "edge", "eligible", "proof", "rank"))
 
 
-def test_legacy_local_authority_rows_are_discarded_not_blessed(
-        tmp_path):
+def test_legacy_local_authority_rows_are_discarded_not_blessed(tmp_path):
     directory = tmp_path / "node"
     node = Node(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -98,15 +49,6 @@ def test_legacy_local_authority_rows_are_discarded_not_blessed(
         "INSERT INTO fact_index VALUES(?,?,?,?)",
         catalog.index_rows(forged),
     )
-    db.execute(
-        "INSERT INTO fact_index VALUES(?,?,?,?)",
-        (
-            catalog.STATE_INDEX,
-            "eligible",
-            "999",
-            forged.fid,
-        ),
-    )
     db.executescript("""
         CREATE TABLE admission_receipts(value TEXT);
         CREATE TABLE proofs(value TEXT);
@@ -115,7 +57,7 @@ def test_legacy_local_authority_rows_are_discarded_not_blessed(
     """)
     db.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('index-version', ?)",
-        ("admission-catalog-v27-generic-candidate-index",),
+        ("obsolete-admission-projection",),
     )
     db.commit()
     db.close()
@@ -125,8 +67,7 @@ def test_legacy_local_authority_rows_are_discarded_not_blessed(
 
     assert reopened.reader(workspace).root_bytes == root
     assert forged.fid not in reopened.reader(
-        workspace).archive().records
-    assert reopened.candidate_of(workspace, forged.fid) is None
+        workspace).all_facts().facts
     assert reopened.fact_of(workspace, forged.fid) is None
     assert {
         name for (name,) in upgraded.execute(
@@ -144,7 +85,7 @@ def test_catalog_facade_is_read_only_over_a_disk_projection(tmp_path):
     database.executescript(catalog.SCHEMA)
     facade = catalog.Catalog(database, "0" * 64)
 
-    assert facade.candidate("1" * 64) is None
+    assert facade.fact("1" * 64) is None
     assert not any(
         name in catalog.Catalog.__dict__
         for name in (

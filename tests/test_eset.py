@@ -41,7 +41,7 @@ def test_e_identical_across_partitions_orders_batchings(
         for _, target in source.fact_of(workspace, fid).refs()
     }
     assert referenced <= set(
-        source.reader(workspace).candidates().candidate_ids())
+        source.reader(workspace).validated().fact_ids())
     expected_root = source.store(workspace).get("root")
     expected_app = query_state(source)
     for seed in range(5):
@@ -64,7 +64,7 @@ def test_suppression_facts_not_suppressible(tmp_path):
     recursive = delete(workspace, public, first.key, OWNER, 200)
     sig = signature(secret, public, recursive, 200)
 
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="were not admitted"):
         node.ingest_new(workspace, [sig, recursive], {
             recursive.fid: [
                 first.fid, sig.fid, member_src(node, workspace, public)],
@@ -82,22 +82,21 @@ def test_reader_rebuilds_missing_reference_projection_without_root_write(
     root = node.store(workspace).get("root")
     index = node.idx(workspace)
     index.executemany(
-        "DELETE FROM fact_index "
-        "WHERE kind IN (?, ?) AND src=?",
-        (
-            (catalog.STATE_INDEX, catalog.EDGE_INDEX, target)
-            for target in referenced
-        ),
+        "DELETE FROM fact_index WHERE src=?",
+        ((target,) for target in referenced),
+    )
+    index.executemany(
+        "DELETE FROM facts WHERE fid=?",
+        ((target,) for target in referenced),
     )
     index.commit()
 
-    assert referenced.isdisjoint(node.catalog(workspace).eligible_ids())
+    assert referenced.isdisjoint(node.catalog(workspace).fact_ids())
 
     node.rebuild(workspace)
 
     assert node.store(workspace).get("root") == root
-    assert referenced <= node.catalog(workspace).eligible_ids()
-    assert all(node.catalog(workspace).edges(fid) for fid in referenced)
+    assert referenced <= node.catalog(workspace).fact_ids()
     assert all(node.fact_of(workspace, fid) is not None
                for fid in deletions)
     assert query_state(node) == expected
@@ -197,7 +196,7 @@ def test_suppression_stays_behind_the_root_commit(
         raise RuntimeError("suppression root CAS failed")
 
     monkeypatch.setattr(store, "cas", fail_before_root_commit)
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not admitted"):
         facts.content.delete.remove(node, workspace, target.fid, ts=301)
     reader.join(timeout=5)
 

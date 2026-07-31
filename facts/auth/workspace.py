@@ -16,7 +16,7 @@ def _presig(ts, atoms):
 
 
 def workspace(sk, pk, name, ts):
-    atoms = [["offer", "member", pk], ["offer", "admin", pk]]
+    atoms = [["offer", "member", pk, pk], ["offer", "admin", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "sig": sign(sk, _presig(ts, atoms))},
                 None)
@@ -34,7 +34,7 @@ def validate(f, ctx):
         if set(body) != {"name", "pk", "sig"}:
             return False
         pk, name, signature = body["pk"], body["name"], body["sig"]
-        atoms = [["offer", "member", pk], ["offer", "admin", pk]]
+        atoms = [["offer", "member", pk, pk], ["offer", "admin", pk]]
         shaped = Fact(
             TAG, f.ts, atoms, {"name": name, "pk": pk, "sig": signature},
             None)

@@ -104,7 +104,7 @@ def visible_fids(node, workspace):
     with node.lock:
         return {
             fid
-            for fid in node.catalog(workspace).eligible_ids()
+            for fid in node.catalog(workspace).fact_ids()
             if not node.suppressed(workspace, node.fact_of(workspace, fid))
         }
 
@@ -169,10 +169,10 @@ def inject_device_claim(
             signed.fid: [],
             item.fid: [
                 signed.fid,
-                member_src(node, workspace, public),
                 offer_src(
-                    node.idx(workspace), "device_key", public,
-                    requires=(("device", user, public),)),
+                    node.idx(workspace), "member", public, user),
+                offer_src(
+                    node.idx(workspace), "device_key", public, user),
             ],
         },
     )
@@ -197,7 +197,7 @@ def all_fids(n, ws):
     with n.lock:
         facts = [
             n.fact_of(ws, fid)
-            for fid in n.catalog(ws).eligible_ids()
+            for fid in n.catalog(ws).fact_ids()
         ]
     return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
 

@@ -10,7 +10,6 @@ import facts
 from core import cli, daemon
 from core.limits import PayloadTooLarge
 from core.node import Node
-from core.pile_sender import AuthorityRejected
 
 
 EXPECTED = {
@@ -141,14 +140,14 @@ def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
     assert handler.syncer.kicks == 1
 
     def denied(node):
-        raise AuthorityRejected("no")
+        raise ValueError("no")
 
     def broken(node):
         raise RuntimeError("boom")
 
     monkeypatch.setitem(facts.COMMANDS, "test.command.denied", denied)
     monkeypatch.setitem(facts.COMMANDS, "test.command.broken", broken)
-    assert _request(handler, "test.command.denied", [])[0] == 403
+    assert _request(handler, "test.command.denied", [])[0] == 400
     assert _request(handler, "test.command.broken", [])[0] == 500
     assert handler.syncer.kicks == 1
 

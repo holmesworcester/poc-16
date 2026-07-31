@@ -22,7 +22,7 @@ POLICY = FamilyPolicy(
 # SHAPE
 def user(invite_fact, invite_sk, pk, name, ts):
     atoms = author_selectors(POLICY, {}) + [
-        ["ref", "invite", invite_fact.fid], ["offer", "member", pk]]
+        ["ref", "invite", invite_fact.fid], ["offer", "member", pk, pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "countersig": sign(invite_sk, pk)},
                 workspace_of(invite_fact))
@@ -38,7 +38,7 @@ def validate(f, ctx):
     try:
         if set(f.body) != {"name", "pk", "countersig"} or len(f.refs()) != 1:
             return False
-        if f.offers() != [("member", f.body["pk"], "")]:
+        if f.offers() != [("member", f.body["pk"], f.body["pk"])]:
             return False
         ref_role, ref_fid = f.refs()[0]
         if ref_role != "invite":
@@ -50,7 +50,7 @@ def validate(f, ctx):
         shaped = Fact(TAG, f.ts,
                       author_selectors(POLICY, {}) + [
                        ["ref", "invite", ref_fid],
-                       ["offer", "member", f.body["pk"]]],
+                       ["offer", "member", f.body["pk"], f.body["pk"]]],
                       dict(f.body), f.ws)
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
     except (KeyError, IndexError, TypeError, ValueError):
@@ -115,22 +115,31 @@ def members(node, workspace):
     with node.lock:
         candidates = {}
         role_order = {"admin": 0, "member": 1, "device": 2}
-        for rank, fact in node.select_ranked(workspace, "member"):
+        # The roster is historical presentation: keep removed identities
+        # visible and report their current liveness in ``evicted`` below.
+        for fact in node.select(
+                workspace, "member", include_suppressed=True):
             body = fact.body
             if fact.t == "workspace":
-                row = body.get("pk"), body.get("name"), "admin"
+                row = (
+                    body.get("pk"), body.get("name"), "admin",
+                    body.get("pk"))
             elif fact.t == TAG:
-                row = body.get("pk"), body.get("name"), "member"
+                row = (
+                    body.get("pk"), body.get("name"), "member",
+                    body.get("pk"))
             elif fact.t == "device_invite":
-                row = body.get("device"), body.get("label"), "device"
+                row = (
+                    body.get("device"), body.get("label"), "device",
+                    body.get("user"))
             else:
                 continue
-            public, name, role = row
-            choice = (role_order[role], rank, fact.fid)
-            if public and name and (
+            public, name, role, owner = row
+            choice = (role_order[role], fact.fid)
+            if public and name and owner and (
                     public not in candidates
                     or choice < candidates[public][0]):
-                candidates[public] = (choice, name, role)
+                candidates[public] = (choice, name, role, owner)
 
         admins = {
             public
@@ -144,9 +153,9 @@ def members(node, workspace):
                 "name": name,
                 "role": "admin" if public in admins else role,
                 "evicted": suppression_state.active(
-                    node.idx(workspace), scoped_id("member", public)),
+                    node.idx(workspace), scoped_id("member", owner)),
             }
-            for public, (_, name, role) in candidates.items()
+            for public, (_, name, role, owner) in candidates.items()
         ]
     return sorted(rows, key=lambda row: (row["name"], row["pk"]))
 

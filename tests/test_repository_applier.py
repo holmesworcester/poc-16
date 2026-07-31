@@ -9,7 +9,7 @@ import facts
 import pytest
 
 from core import crypto
-from core.candidate_archive import reconstruct
+from core.validated_set import reconstruct
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon
@@ -190,9 +190,9 @@ def test_cold_applier_reproduces_full_p2p_root_without_sql(
     assert result.retired is True
     assert store.get(key) is None
     assert store.get("root") == expected
-    archive = reconstruct(
+    validated = reconstruct(
         expected, lambda oid: store.get("obj/" + oid))
-    assert set(result.admitted) <= set(archive.records)
+    assert set(result.admitted) <= set(validated.facts)
 
 
 def test_crash_after_cas_replays_as_token_checked_noop_and_retires(
@@ -252,7 +252,7 @@ def test_concurrent_cold_appliers_rebase_retained_loser(
     assert store.get("root") == expected
 
     # The winners simulated crash left its exact obligation live.  A cold
-    # replay proves the already-committed candidate through the new root.
+    # Replay observes the already-committed fact through the new root.
     discharged = run(RepositoryApplier(
         workspace, store).apply(first_key))
     assert discharged.status == "noop"
@@ -453,36 +453,40 @@ def test_noncanonical_pile_retires_exact_source_then_healthy_work_applies(
     assert store.get("root") == author.reader(workspace).root_bytes
 
 
-def test_settlement_program_failure_is_retryable_not_dormancy(
+def test_apply_does_not_readjudicate_previously_validated_facts(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(
-        node, workspace, "general", "retained candidate", ts=10)
-    proof = facts.auth.request.payload(
+        node, workspace, "general", "retained fact", ts=10)
+    request = facts.auth.request.payload(
         node, workspace, "sync", 200, 100)
-    raw = encode_pile(proof, workspace=workspace)
+    raw = encode_pile(request, workspace=workspace)
     store = node.store(workspace)
     root = store.get("root")
     applier = node.applier(workspace)
     source = run(applier.stage("feed7feed7feed7f", raw))
 
     def broken_constructor(*_args, **_kwargs):
-        raise AssertionError("settlement family program failure")
+        raise AssertionError("previous fact was re-adjudicated")
 
     monkeypatch.setattr(
         facts.content.message, "message", broken_constructor)
-    with pytest.raises(
-            AssertionError, match="settlement family program failure"):
-        run(applier.apply(source))
+    result = run(applier.apply(source))
 
-    assert store.get(source) == raw
-    assert store.get("root") == root
+    assert result.status == "applied"
+    assert result.retired is True
+    assert store.get(source) is None
+    assert store.get("root") != root
+    assert any(
+        fact.body.get("text") == "retained fact"
+        for fact in node.reader(workspace).all_facts().facts.values()
+    )
     assert store.list("failed/") == []
     assert applier._receipts == {}
 
 
-def test_malformed_pile_is_rejected_before_root_or_archive_reads(
+def test_malformed_pile_is_rejected_before_root_or_validated_set_reads(
         tmp_path, monkeypatch):
     source = Node(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
@@ -495,7 +499,7 @@ def test_malformed_pile_is_rejected_before_root_or_archive_reads(
         store,
         "read_versioned",
         lambda _key: pytest.fail(
-            "malformed pile forced repository root/archive reads"),
+            "malformed pile forced repository root/validated-set reads"),
     )
 
     result = run(applier.apply(key))
@@ -545,8 +549,8 @@ def test_repository_reader_is_pinned_and_has_no_store_authority(tmp_path):
         return store.get("obj/" + oid)
 
     reader = RepositoryReader(workspace, root, fetch)
-    archive = reader.candidates()
-    assert archive.fact(workspace).fid == workspace
+    validated = reader.validated()
+    assert validated.fact(workspace).fid == workspace
     assert reader.worker().fact_active(workspace)
     assert reader.root_bytes == root
     assert reads

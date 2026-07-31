@@ -50,10 +50,10 @@ def test_sender_batches_verified_closures_at_the_wire_limit(
         source, workspace, "general", "first batch", ts=10)
     second = facts.content.message.post(
         source, workspace, "general", "second batch", ts=11)
-    view = source.reader(workspace).candidates()
+    view = source.reader(workspace).validated()
     units = (
-        view.verify(first).facts,
-        view.verify(second).facts,
+        view.closure((first,)),
+        view.closure((second,)),
     )
     sender = source.sender(workspace)
     single_limit = max(len(sender.pack(unit)) for unit in units)
@@ -129,8 +129,8 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         assert pushed > 0
         assert remote.fact_of(workspace, local_fid) \
             == local.fact_of(workspace, local_fid)
-        # The signature and message are two candidates but one verified,
-        # closed outbound batch and therefore one receiver settlement.
+        # The signature and message are two facts but one verified,
+        # closed outbound batch and therefore one receiver transition.
         assert len(observed["puts"]) == 1
         assert all(path.startswith("/pile/") for path in observed["puts"])
 
@@ -187,7 +187,7 @@ def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
         tmp_path, monkeypatch):
     """The cache blesses the compared root, never a later local commit."""
     remote, workspace, local = replicas(tmp_path)
-    real_reconcile = sync_module.reconcile_candidates
+    real_reconcile = sync_module.reconcile_facts
     raced = {}
 
     def reconcile_then_commit(*args, **kwargs):
@@ -203,7 +203,7 @@ def test_next_304_retries_a_local_commit_that_raced_the_pinned_snapshot(
         return answer
 
     monkeypatch.setattr(
-        sync_module, "reconcile_candidates", reconcile_then_commit)
+        sync_module, "reconcile_facts", reconcile_then_commit)
     with serving(
             remote, peer_capability.FULL) as (url, observed, _):
         assert sync(local, workspace, url) == (0, 0)

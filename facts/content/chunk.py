@@ -1,9 +1,8 @@
 """facts/content/chunk.py — the signed name of one self-proving Bao slice."""
 from core import bao
 from core.fact import Fact, Need
-from core.suppression import ANCESTOR, PARENT, selector_markers
+from core.suppression import PARENT, selector_markers
 from .._policy import (
-    Ancestor,
     DELETE_SELF,
     FamilyPolicy,
     Parent,
@@ -17,24 +16,24 @@ POLICY = FamilyPolicy(
     suppression=(
         Self(),
         Parent("file"),
-        Ancestor("file", "member"),
     ),
     direct_targets=DELETE_SELF,
-    owner_edge="member",
+    owner_field="owner",
 )
 
 
 # SHAPE
 def chunk(
         workspace, pk, channel, root, index, count, cid, ts,
-        file_fid, member_fid):
+        file_fid, owner=None):
+    owner = pk if owner is None else owner
     return Fact(
         TAG, ts,
         author_selectors(
             POLICY,
-            {"file": file_fid, "file/member": member_fid},
+            {"file": file_fid},
         ) + [["ref", "file", file_fid]],
-        {"pk": pk, "chan": channel, "root": root,
+        {"pk": pk, "owner": owner, "chan": channel, "root": root,
          "i": index, "n": count, "cid": cid},
         workspace,
     )
@@ -45,9 +44,10 @@ def needs(f):
     """Author and membership; the descriptor is the explicit ``file`` ref."""
     body = f.body
     pk = body.get("pk", "")
+    owner = body.get("owner", "")
     return (
         Need("author", "author", f.fid, pk),
-        Need("member", "member", pk),
+        Need("member", "member", pk, owner),
     )
 
 
@@ -55,10 +55,11 @@ def needs(f):
 def validate(f, ctx):
     try:
         body = f.body
-        if set(body) != {"pk", "chan", "root", "i", "n", "cid"}:
+        if set(body) != {
+                "pk", "owner", "chan", "root", "i", "n", "cid"}:
             return False
         if not all(isinstance(body[key], str)
-                   for key in ("pk", "chan", "root", "cid")):
+                   for key in ("pk", "owner", "chan", "root", "cid")):
             return False
         if not isinstance(body["i"], int) or not isinstance(body["n"], int):
             return False
@@ -83,14 +84,10 @@ def validate(f, ctx):
             marker[3] for marker in selector_markers(f)
             if marker[1] == PARENT and marker[2] == "file"
         ]
-        ancestors = [
-            marker[3] for marker in selector_markers(f)
-            if marker[1] == ANCESTOR and marker[2] == "file/member"
-        ]
-        return len(parents) == len(ancestors) == 1 and f == chunk(
+        return len(parents) == 1 and f == chunk(
             f.ws, body["pk"], body["chan"], body["root"],
             body["i"], body["n"], body["cid"], f.ts,
-            parents[0], ancestors[0])
+            parents[0], body["owner"])
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -106,10 +103,10 @@ def blob_refs(f):
 # COMMANDS
 def author(
         workspace, secret, public, channel, root, index, count, cid, ts,
-        file_fid, member_fid):
+        file_fid, owner=None):
     item = chunk(
         workspace, public, channel, root, index, count, cid, ts,
-        file_fid, member_fid)
+        file_fid, owner)
     return item, signature.signature(secret, public, item, ts)
 
 

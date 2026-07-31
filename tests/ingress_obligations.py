@@ -6,8 +6,8 @@ Safety law
 An acknowledged shared pile ``(key, exact_bytes)`` remains an obligation
 until a DELETE of that exact value cites one of two durable witnesses:
 
-* a committed, authenticated root whose candidate archive contains every
-  durable ``Valid`` minted for those bytes, eligible or dormant; or
+* a committed, authenticated root whose validated set contains every
+  durable ``Valid`` minted for those bytes; or
 * exact, read-back rejection payload and typed permanent-rejection metadata.
 
 CAS attempts, retry counts, local catalogs, and local diagnostics are not
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import facts
 
-from core.candidate_archive import reconstruct
+from core.validated_set import reconstruct
 from core.close import decode_pile
 from core.crypto import h
 from core.ingress import KernelRejected, PermanentIngressRejection
@@ -31,12 +31,12 @@ from core.object_store import CREATED, Applied
 
 @dataclass(frozen=True)
 class PublicationObservation:
-    """Runtime classification made after settlement and before retirement."""
+    """Runtime classification made after validation and before retirement."""
 
     seq: int
     key: str
     raw: bytes
-    candidate_fids: frozenset[str]
+    validated_fids: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -117,19 +117,19 @@ class ObligationTrace:
             return None
         if not judgment.ok:
             return None
-        candidates = frozenset(
+        validated_fids = frozenset(
             receipt.fact.fid for receipt in judgment.valids
             if facts.family_for(receipt.fact.t).DURABLE)
         observation = PublicationObservation(
-            len(self.bucket.history), key, raw, candidates)
+            len(self.bucket.history), key, raw, validated_fids)
         self.observations.append(observation)
         return observation
 
-    def observe_publication(self, key, raw, candidate_fids):
+    def observe_publication(self, key, raw, validated_fids):
         """Add an explicit observation for small checker mutation tests."""
         observation = PublicationObservation(
             len(self.bucket.history), key, raw,
-            frozenset(candidate_fids))
+            frozenset(validated_fids))
         self.observations.append(observation)
         return observation
 
@@ -219,20 +219,20 @@ class ObligationTrace:
             if current is None:
                 continue
             try:
-                candidate_fids = self._validated_snapshot(current)
+                validated_fids = self._validated_snapshot(current)
             except Exception as error:
                 reasons.append(
                     f"current root at event #{current.seq} is not "
                     f"authenticated: {type(error).__name__}: {error}")
                 continue
-            if observation.candidate_fids <= candidate_fids:
+            if observation.validated_fids <= validated_fids:
                 return ("publication", current.seq), ""
             reasons.append(
                 "current committed root does not contain every "
-                "kernel-valid durable candidate")
+                "kernel-valid durable fact")
         return None, reasons[-1] if reasons else (
             "current committed root does not contain every "
-            "kernel-valid durable candidate")
+            "kernel-valid durable fact")
 
     def _rejection_witness(
             self, obligation, delete_seq, data, verified):
@@ -295,15 +295,15 @@ class ObligationTrace:
         try:
             objects = dict(snapshot.objects)
             fetch = objects.get
-            archive = reconstruct(snapshot.root, fetch)
-            if archive.workspace != self.workspace:
+            validated = reconstruct(snapshot.root, fetch)
+            if validated.workspace != self.workspace:
                 raise ValueError("foreign workspace anchor")
-            candidate_fids = frozenset(archive.records)
+            validated_fids = frozenset(validated.facts)
         except Exception as error:
             self._snapshot_errors[cache_key] = error
             raise
-        self._snapshot_fids[cache_key] = candidate_fids
-        return candidate_fids
+        self._snapshot_fids[cache_key] = validated_fids
+        return validated_fids
 
     def _fail(self, event, reason):
         diagnostic = getattr(self.bucket, "diagnostic", None)

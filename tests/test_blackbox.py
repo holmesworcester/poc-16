@@ -218,9 +218,10 @@ def test_alice_bob_carol(tmp_path):
         wait_until(
             lambda: any(
                 "HTTP Error 403" in failure["error"]
+                or "not a workspace member" in failure["error"]
                 for failure in command("carol", "core.status")[
                     "workspaces"][ws]["sync_failures"]),
-            10, "carol's remote mint is refused")
+            10, "carol's sync authorization is refused")
         # ctl is a trusted node-local surface, not the remote auth boundary:
         # a replica that received its own eviction rejects here too; one that
         # missed it may keep writing an isolated store, but cannot deliver it.
@@ -229,7 +230,7 @@ def test_alice_bob_carol(tmp_path):
                 "carol", "content.message.post",
                 ws, "general", "ghost")
         except urllib.error.HTTPError as local_rejection:
-            assert local_rejection.code == 403
+            assert local_rejection.code in {400, 403}
         time.sleep(4)  # several cadences prove it cannot cross the door
         assert "ghost" not in texts("alice", ws)
         assert "ghost" not in texts("bob", ws)

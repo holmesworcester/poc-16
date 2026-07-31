@@ -2,7 +2,7 @@
 
 SQLite is a disposable local query/authorship projection.  It is rebuilt from
 the committed authenticated repository and is never an input to receiving,
-settlement, immutable-object creation, root CAS, or retirement.
+immutable-object creation, root CAS, or retirement.
 """
 import asyncio
 import json
@@ -268,18 +268,14 @@ class Node:
         )
 
     def fact_of(self, ws, fid) -> Fact:
-        return self.catalog(ws).eligible(fid)
-
-    def candidate_of(self, ws, fid) -> Fact:
-        """A retained candidate, whether currently eligible or dormant."""
-        return self.catalog(ws).candidate(fid)
+        return self.catalog(ws).fact(fid)
 
     def catalog(self, ws):
         return catalog.Catalog(self.idx(ws), ws)
 
-    def select_ranked(
+    def select(
             self, ws, kind, k0=None, k1=None, *,
-            include_suppressed=False):
+            include_suppressed=False, **_options):
         """Select current facts through the one generic type/offer index."""
         with self.lock:
             self._sync_index(ws)
@@ -287,28 +283,19 @@ class Node:
             if include_suppressed:
                 return rows
             return tuple(
-                (rank, fact) for rank, fact in rows
+                fact for fact in rows
                 if not self.suppressed(ws, fact)
             )
-
-    def select(self, ws, kind, k0=None, k1=None, **options):
-        return tuple(
-            fact for _, fact in self.select_ranked(
-                ws, kind, k0, k1, **options)
-        )
 
     def by_type(self, ws, tag, **options):
         return self.select(ws, catalog.TYPE_INDEX, tag, **options)
 
     def keys(self, ws):
-        """Canonical eligible keys for client-only query assembly."""
+        """Canonical validated keys for client-only query assembly."""
         return [
             fact_key for (fact_key,) in self.idx(ws).execute(
                 "SELECT i.k0 FROM fact_index i "
-                "JOIN fact_index s ON s.src=i.src "
-                "AND s.kind=? AND s.k0='eligible' "
                 "WHERE i.kind='fact.key' ORDER BY i.k0",
-                (catalog.STATE_INDEX,),
             )
         ]
 

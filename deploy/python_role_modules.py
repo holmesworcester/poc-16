@@ -3,9 +3,7 @@
 
 REPOSITORY_READER_CORE_MODULES = (
     "__init__.py",
-    "admission_proof.py",
     "bao.py",
-    "candidate_archive.py",
     "close.py",
     "crypto.py",
     "fact.py",
@@ -21,10 +19,10 @@ REPOSITORY_READER_CORE_MODULES = (
     "peer_capability.py",
     "repository_reader.py",
     "repository_snapshot.py",
-    "settlement.py",
     "shape.py",
     "snapshot.py",
     "suppression.py",
+    "validated_set.py",
     "worker.py",
 )
 

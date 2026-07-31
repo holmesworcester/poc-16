@@ -1,10 +1,10 @@
 """The sole exact-pile to repository-root state transition.
 
 ``RepositoryApplier`` is database-free and provider-neutral.  It consumes one
-internal, generation-bound pile; joins its running-kernel receipts with the
-candidate archive pinned by one root read; invokes the pure repository
-compiler; establishes every immutable object; advances the one mutable root by
-CAS; and only then grants exact retirement authority.
+internal, generation-bound closed pile, validates that unit atomically, unions
+every durable result with the validated facts pinned by one root read, invokes
+the pure repository compiler, establishes every immutable object, advances
+the one mutable root by CAS, and only then grants exact retirement authority.
 
 Synchronous filesystem/S3 stores are adapted to this asynchronous surface.
 Cloudflare's native R2 binding implements the same awaited methods directly.
@@ -16,7 +16,6 @@ import secrets
 
 import facts
 
-from . import admission_proof, candidate_archive
 from .close import decode_pile
 from .crypto import h
 from .ingress import (
@@ -40,7 +39,8 @@ from .object_store import (
     ensure_object_async,
     retire_exact_async,
 )
-from .repository_snapshot import Candidate, compile_snapshot
+from .repository_snapshot import compile_snapshot
+from .validated_set import reconstruct
 from .shape import valid_fid
 from .staged_intent import (
     InvalidStagedObject,
@@ -69,7 +69,7 @@ class _ObjectMiss(Exception):
 
 
 class RepositoryAnchorPending(RuntimeError):
-    """A valid durable candidate arrived before the workspace genesis."""
+    """A valid closed pile arrived before the workspace genesis."""
 
 
 class SyncStoreAdapter:
@@ -658,7 +658,7 @@ class RepositoryApplier:
         await self._save_discovery_cursor("staged", page.cursor)
         return tuple(outcomes)
 
-    async def _load_archive(self, root_bytes):
+    async def _load_validated(self, root_bytes):
         if root_bytes is None:
             return None
         objects = {}
@@ -670,33 +670,14 @@ class RepositoryApplier:
 
         while True:
             try:
-                archive = candidate_archive.reconstruct(root_bytes, fetch)
+                validated = reconstruct(root_bytes, fetch)
             except _ObjectMiss as miss:
                 objects[miss.oid] = await self._get_bounded(
                     self.store, "obj/" + miss.oid, MAX_OBJECT_BYTES)
                 continue
-            if archive.workspace != self.workspace:
+            if validated.workspace != self.workspace:
                 raise ValueError("repository root workspace")
-            return archive
-
-    @staticmethod
-    def _archive_candidates(archive):
-        if archive is None:
-            return {}
-        receipts = {
-            receipt.fact.fid: (receipt, proof)
-            for receipt, proof in archive.receipt_proofs
-        }
-        if set(receipts) != set(archive.records):
-            raise ValueError("repository archive witnesses")
-        return {
-            fid: Candidate(
-                archive.facts[fid],
-                proof,
-                tuple(receipt.edges),
-            )
-            for fid, (receipt, proof) in receipts.items()
-        }
+            return validated
 
     async def propose(self, raw):
         """Derive one proposal without mutating canonical repository state."""
@@ -717,7 +698,7 @@ class RepositoryApplier:
             base_root, base_token = versioned.value, versioned.token
         else:
             raise TypeError("versioned root read")
-        archive = await self._load_archive(base_root)
+        validated = await self._load_validated(base_root)
 
         pending = {}
 
@@ -728,34 +709,30 @@ class RepositoryApplier:
                 raise ValueError("repository object hash collision")
             return oid
 
-        proofs = admission_proof.build(
-            self.workspace, judgment.valids, emit)
-        candidates = self._archive_candidates(archive)
-        durable = []
+        facts_by_fid = {} if validated is None else dict(validated.facts)
+        durable, durable_receipts = [], []
         for receipt in judgment.valids:
             family = facts.family_for(receipt.fact.t)
             if family is None or not family.DURABLE:
                 continue
             fid = receipt.fact.fid
             durable.append(fid)
-            proposed = Candidate(
-                receipt.fact, proofs[fid], tuple(receipt.edges))
-            incumbent = candidates.get(fid)
+            durable_receipts.append(receipt)
+            incumbent = facts_by_fid.get(fid)
             if incumbent is not None \
-                    and encode(incumbent.fact) != encode(receipt.fact):
-                raise ValueError("repository candidate conflict")
-            if incumbent is None or proposed.admission < incumbent.admission:
-                candidates[fid] = proposed
+                    and encode(incumbent) != encode(receipt.fact):
+                raise ValueError("repository fact conflict")
+            facts_by_fid[fid] = receipt.fact
 
-        if candidates and self.workspace not in candidates:
+        if facts_by_fid and self.workspace not in facts_by_fid:
             raise RepositoryAnchorPending(
-                "repository anchor candidate is not available yet")
-        compiled = compile_snapshot(self.workspace, candidates)
+                "repository anchor fact is not available yet")
+        compiled = compile_snapshot(self.workspace, facts_by_fid)
         for oid, value in compiled.outbox:
             emit(value)
         admitted = tuple(sorted(set(durable)))
         if compiled.root is not None \
-                and not set(admitted) <= set(compiled.records):
+                and not set(admitted) <= set(compiled.objects):
             raise ValueError("repository proposal omitted admission")
         return ApplyProposal(
             self.workspace,
@@ -765,11 +742,7 @@ class RepositoryApplier:
             compiled.root,
             tuple(sorted(pending.items())),
             admitted,
-            tuple(
-                receipt for receipt in judgment.valids
-                if (record := compiled.records.get(receipt.fact.fid))
-                is not None and record["state"] == "eligible"
-            ),
+            tuple(durable_receipts),
             self._issuer,
         )
 

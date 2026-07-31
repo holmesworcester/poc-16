@@ -8,7 +8,7 @@ import pytest
 import facts
 
 from core import (
-    admission_proof, close, daemon, fact, merkle_map, object_store,
+    close, daemon, fact, merkle_map, object_store,
     repository_applier as repository_applier_module, snapshot, status,
 )
 from core.crypto import h
@@ -256,7 +256,7 @@ def test_failed_root_commit_is_isolated_from_the_next_pile_and_retries(
 
     assert store.get(first_key) == first_raw
     assert store.get(second_key) is None
-    assert node.candidate_of(workspace, first_fid) is None
+    assert node.fact_of(workspace, first_fid) is None
     assert node.fact_of(workspace, first_fid) is None
     assert node.fact_of(workspace, second_fid) is not None
     assert store.list("failed/") == []
@@ -570,7 +570,6 @@ def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
 @pytest.mark.parametrize("decoder", [
     close.decode_pile,
     snapshot.decode_root,
-    admission_proof.decode,
     fact.decode,
 ])
 def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
@@ -590,7 +589,7 @@ def test_merkle_map_parser_recursion_is_also_a_value_error():
         merkle_map._decode(nested, h(nested), h(b"seed"))
 
 
-def test_pile_root_and_proof_codecs_reject_size_before_parsing(monkeypatch):
+def test_pile_and_root_codecs_reject_size_before_parsing(monkeypatch):
     workspace = "0" * 64
     cases = (
         (
@@ -599,12 +598,6 @@ def test_pile_root_and_proof_codecs_reject_size_before_parsing(monkeypatch):
             canon({"ws": workspace, "facts": []}),
         ),
         (snapshot, "MAX_ROOT_BYTES", snapshot.decode_root, b'{"stamp":"x"}'),
-        (
-            admission_proof,
-            "MAX_OBJECT_BYTES",
-            admission_proof.decode,
-            b'{"schema":"admission-proof-v1"}',
-        ),
     )
     for module, limit, decoder, raw in cases:
         monkeypatch.setattr(module, limit, len(raw) - 1)

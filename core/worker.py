@@ -6,7 +6,9 @@ import facts
 from . import indexes, merkle_map, snapshot
 from .close import decode_pile
 from .crypto import h
+from .fact import decode
 from .kernel import drain
+from .object_store import verified_object
 
 MAX_PROOF_FACTS = 64
 
@@ -43,23 +45,29 @@ class WorkerView:
             expected_count=descriptor["count"],
             expected_depth=descriptor["depth"])
 
-    def fact_record(self, fid):
+    def fact_oid(self, fid):
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
         if row is None:
-            raise ValueError("missing FactRecord")
-        return indexes.checked_fact_record(row, fid)
+            raise ValueError("missing validated fact")
+        return indexes.checked_fact_oid(row)
+
+    def fact(self, fid):
+        fact = decode(verified_object(self.fact_oid(fid), self.fetch))
+        if fact.fid != fid:
+            raise ValueError("validated fact identity")
+        return fact
 
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
-            limit=merkle_map.MAX_RANGE_ROWS, include_dormant=False):
+            limit=merkle_map.MAX_RANGE_ROWS):
         """One bounded generic-index page for a cold applier/query."""
         return indexes.posting_page(
             self._reader(indexes.FACT), kind, k0, k1,
-            after=after, limit=limit, include_dormant=include_dormant)
+            after=after, limit=limit)
 
     def fact_location(self, fid):
         """Canonical reconciliation key locating this fact's home range."""
-        return self.fact_record(fid)["key"]
+        return self.fact(fid).key
 
     def suppression(self, sid):
         row = self._reader(indexes.SUPP).get(sid)
@@ -78,10 +86,8 @@ class WorkerView:
         return all(self.suppression(sid)["state"] == "clear" for sid in scopes)
 
     def fact_active(self, fid):
-        record = self.fact_record(fid)
-        return record["state"] == "eligible" \
-            and self.scopes_active(record["selectors"]) \
-            and self.scopes_active(record["liveness"])
+        fact = self.fact(fid)
+        return self.scopes_active(facts.current_scopes(fact))
 
     def principal_active(self, kind, public_key):
         return self.suppression(
@@ -96,13 +102,8 @@ class WorkerView:
         return self._reader(indexes.AUTHORITY).get(
             indexes.need_key(name, a0, a1)) is not None
 
-    def authority_witness(self, name, a0, a1=None, requires=()):
-        """Return the canonical admitted provider without current liveness.
-
-        This is the immutable relationship answer used to check a submitted
-        historical closure.  Call ``authority_provider`` when the caller needs
-        authority that is usable at this pinned root.
-        """
+    def authority_provider(self, name, a0, a1=None):
+        """Return the current provider for one complete authority address."""
         row = self._reader(indexes.AUTHORITY).get(
             indexes.need_key(name, a0, a1))
         if row is None:
@@ -112,49 +113,11 @@ class WorkerView:
             raise ValueError("missing AuthoritySlot")
         if row["state"] == "none":
             return None
-        if set(row) != {"state", "fid", "rank"} \
-                or not isinstance(row["fid"], str) \
-                or type(row["rank"]) is not int:
+        if set(row) != {"state", "fid"} \
+                or not isinstance(row["fid"], str):
             raise ValueError("AuthoritySlot shape")
-        offered = {
-            tuple(offer)
-            for offer in self.fact_record(row["fid"])["offers"]
-        }
-        return row["fid"] if all(
-            (required_name, required_a0, required_a1 or "") in offered
-            for required_name, required_a0, required_a1 in requires
-        ) else None
-
-    def authority_provider(self, name, a0, a1=None, requires=()):
-        """Return the canonical provider only when it is usable now."""
-        fid = self.authority_witness(name, a0, a1, requires)
+        fid = row["fid"]
         return fid if fid is not None and self.fact_active(fid) else None
-
-    def _committed_needs_match(self, stream):
-        """Mirror the kernel's committed-authority omission check.
-
-        A submitted equivalent provider is allowed: peers with different
-        current winners must still be able to authenticate the sync that
-        converges them.  But once a base offer address is committed, its
-        canonical provider must be live and must carry every family-declared
-        co-offer.  This is the bounded-tree form of
-        kernel._matches_committed_authority; an absent base address alone is
-        the legitimate bootstrap case.
-        """
-        authority = self._reader(indexes.AUTHORITY)
-        for fact in stream:
-            handler = facts.family_for(fact.t)
-            for need in handler.needs(fact):
-                address = indexes.need_key(
-                    need.name, need.a0, need.a1)
-                row = authority.get(address)
-                if row is None:
-                    continue
-                provider = self.authority_witness(
-                    need.name, need.a0, need.a1, need.requires)
-                if provider is None:
-                    return False
-        return True
 
     def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
         """Validate one bounded closure for the caller's exact purpose.
@@ -168,7 +131,7 @@ class WorkerView:
             if len(stream) > MAX_PROOF_FACTS:
                 return None
             result = drain(stream, self.anchor)
-            if not result.ok or not self._committed_needs_match(stream):
+            if not result.ok:
                 return None
             ephemeral = [
                 valid for valid in result.valids

@@ -1,6 +1,5 @@
 """Read-only local host status for the daemon control plane."""
 from .crypto import h
-from .fact_index import STATE_INDEX
 from .limits import MAX_ROOT_BYTES
 
 
@@ -15,12 +14,8 @@ def describe(node):
             out["workspaces"][workspace] = {
                 "root": h(root) if root is not None else None,
                 "facts": database.execute(
-                    "SELECT COUNT(*) FROM fact_index "
-                    "WHERE kind=? AND k0='eligible'",
-                    (STATE_INDEX,),
+                    "SELECT COUNT(*) FROM facts",
                 ).fetchone()[0],
-                "admitted": database.execute(
-                    "SELECT COUNT(*) FROM facts").fetchone()[0],
                 "peers": entry["peers"],
                 "name": entry["name"],
                 "identity": entry["identity"],

@@ -1,15 +1,15 @@
-"""Composite snapshot and the direct eligible-fact order map.
+"""Composite snapshot and the direct validated-fact order map.
 
 One mutable ``root`` value atomically names four immutable bounded Merkle
 maps:
 
 ``fact_order``
-    Eligible ``fact.key -> fact object oid`` rows.  This is an ordering and
-    transfer projection only; admission authority lives in Fact records and
-    their historical proof DAGs.
+    Validated ``fact.key -> fact object oid`` rows.  This is an ordering and
+    transfer projection only; successful closed-pile admission is the durable
+    certificate and no historical validation path is stored.
 
 ``fact``, ``supp``, ``authority``
-    The exact candidate, suppression, and selected-authority indexes described
+    The exact validated-fact, suppression, and selected-authority indexes described
     by :mod:`core.indexes`.
 
 Every map uses the same history-independent codec and descriptor shape.  There
@@ -24,7 +24,7 @@ from .fact import canon
 from .limits import MAX_ROOT_BYTES, decode_json
 from .shape import is_key, valid_fid
 
-LAYOUT = "composite-merkle-map-v8-admission-proof-archive"
+LAYOUT = "composite-merkle-map-v9-validated-facts"
 FACT_ORDER = "fact_order"
 TREE_NAMES = ("fact", "supp", "authority")
 MAP_NAMES = (FACT_ORDER, *TREE_NAMES)
@@ -125,7 +125,7 @@ def build_fact_order(rows, seed, emit):
 
 
 def update_fact_order(descriptor_value, changes, seed, fetch, emit):
-    """Path-copy an exact eligible activation/deactivation batch."""
+    """Path-copy an exact validated-fact insertion batch."""
     if not _descriptor_ok(descriptor_value):
         raise ValueError("FactOrder descriptor")
     checked = []

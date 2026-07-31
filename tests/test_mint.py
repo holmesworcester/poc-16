@@ -58,7 +58,7 @@ def authorize(node, workspace, pile, now, root=None, fetch=None):
 
 
 def conflict_world(path, seed):
-    """A random-depth device chain made stale by a shallower winner."""
+    """A random-depth device chain plus a different explicit affiliation."""
     rng = random.Random(seed)
     node = Node(str(path))
     workspace = facts.auth.workspace.create(node, "root", ts=1)
@@ -99,7 +99,7 @@ def conflict_world(path, seed):
     inject_device_claim(
         node, workspace, founder_secret, founder, founder, target,
         f"conflict-{rng.randrange(1_000)}", base + 4)
-    assert node.fact_of(workspace, child_claim.fid) is None
+    assert node.fact_of(workspace, child_claim.fid) == child_claim
     fresh = encode_pile(request.payload(
         node, workspace, "sync", now + 600_000, now))
     return node, workspace, now, founder, stale_root, stale, fresh
@@ -250,7 +250,7 @@ def test_repository_reader_remains_pinned_after_a_concurrent_commit(world):
 
 
 @pytest.mark.parametrize("seed", range(5))
-def test_worker_matches_randomized_canonical_authority_conflicts(
+def test_worker_keeps_explicit_authority_stable_across_later_providers(
         tmp_path, seed):
     node, workspace, now, founder, old_root, stale, fresh = \
         conflict_world(tmp_path / f"conflict-{seed}", seed)
@@ -260,12 +260,19 @@ def test_worker_matches_randomized_canonical_authority_conflicts(
     old_reader = RepositoryReader(workspace, old_root, fetch)
 
     assert old_reader.mint(stale, now)
-    assert authorize(node, workspace, stale, now, root=root) is None
-    for pile, expected in ((stale, None), (fresh, (founder, "sync"))):
+    for pile, expected in (
+            (stale, True),
+            (fresh, (founder, "sync"))):
+        result = authorize(
+            node, workspace, pile, now, root=root, fetch=fetch)
+        if expected is True:
+            assert result is not None
+        else:
+            assert result == expected
         assert authorize(
-            node, workspace, pile, now, root=root, fetch=fetch) == expected
+            node, workspace, pile, now, root=root, fetch=fetch) == result
         assert invoke_mint(node, workspace, pile)[1][0] \
-            == (200 if expected else 403)
+            == 200
 
 
 def test_gate_checks_current_uploader_not_historical_closure_authors(

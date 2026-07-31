@@ -62,7 +62,7 @@ class SidOffer:
 class FamilyPolicy:
     suppression: tuple[SelectorRule, ...] | None = NEVER
     direct_targets: tuple[DirectTarget, ...] = ()
-    owner_edge: str | None = None
+    owner_field: str | None = None
     authority_liveness_guards: tuple[str, ...] = ()
     principal_offers: tuple[SidOffer, ...] = ()
     action_offers: tuple[SidOffer, ...] = ()
@@ -90,8 +90,8 @@ def validate_family_policy(policy):
             raise ValueError("direct deletion policy")
         if ADMIN not in modes:
             raise ValueError("direct deletion must allow ADMIN")
-        if OWNER in modes and not policy.owner_edge:
-            raise ValueError("OWNER deletion needs an owner edge")
+        if OWNER in modes and not policy.owner_field:
+            raise ValueError("OWNER deletion needs an owner field")
         self_rules = sum(
             rule == Self()
             for rule in policy.suppression or ()
@@ -169,24 +169,14 @@ def allows_direct_target(policy, action, selector, mode):
 
 
 def member_principal(db_or_ctx, provider_fid, actor_key):
-    """Derive the durable owner principal of one exact member provider.
-
-    Direct membership owns itself.  A device_invite also offers
-    ``device(owner, device_key)``; that authenticated offer makes every
-    device in the set share the owner's principal without trusting a field
-    supplied by a delete proposal.
-    """
+    """Read the durable principal from one exact ``member(key, owner)`` offer."""
     offers_from = db_or_ctx.offers_from if hasattr(db_or_ctx, "offers_from") \
         else lambda source, name: db_or_ctx.execute(
             "SELECT k0, k1 FROM fact_index WHERE src=? AND kind=? "
             "ORDER BY k0, k1", (source, name)).fetchall()
-    members = offers_from(provider_fid, "member")
-    if (actor_key, "") not in members:
-        return None
     owners = {
-        owner for owner, device in offers_from(provider_fid, "device")
-        if device == actor_key
+        owner
+        for key, owner in offers_from(provider_fid, "member")
+        if key == actor_key and owner
     }
-    if len(owners) > 1:
-        return None
-    return next(iter(owners), actor_key)
+    return next(iter(owners)) if len(owners) == 1 else None

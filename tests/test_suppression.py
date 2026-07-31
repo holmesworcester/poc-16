@@ -32,16 +32,12 @@ class EnvelopeOnly:
 
 
 def test_type_owned_selectors_are_envelope_visible_and_exact():
-    member = "cd" * 32
     msg = message(WS, "pk", "general", "hello", 1)
     attachment = file(
-        WS, "pk", "general", "a.txt", 3, "ab" * 32, 1, 2, member)
+        WS, "pk", "general", "a.txt", 3, "ab" * 32, 1, 2)
 
     assert suppkeys(msg) == {"fact:" + msg.fid}
-    assert suppkeys(attachment) == {
-        "fact:" + attachment.fid,
-        "fact:" + member,
-    }
+    assert suppkeys(attachment) == {"fact:" + attachment.fid}
     assert deathkey(msg) is None
     assert not is_deletion(msg)
     assert msg.atoms == [self_selector()]
@@ -88,7 +84,7 @@ def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
         fact.t, node.fact_of(workspace, member).ts + 1, [], body, workspace)
     proof = signature(secret, public, markerless, markerless.ts)
 
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not admitted"):
         node.ingest_new(
             workspace, [proof, markerless],
             {proof.fid: [], markerless.fid: [proof.fid, member]},

@@ -27,8 +27,8 @@ def device_invite(workspace, pk, user, device_pk, label, ts):
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [
-         ["offer", "member", device_pk],
-         ["offer", "device_key", device_pk],
+         ["offer", "member", device_pk, user],
+         ["offer", "device_key", device_pk, user],
          ["offer", "device", user, device_pk]],
         {"pk": pk, "user": user, "device": device_pk, "label": label},
         workspace)
@@ -41,11 +41,8 @@ def needs(f):
     user = body.get("user", "")
     return (
         Need("author", "author", f.fid, signer),
-        Need("member", "member", signer),
-        Need(
-            "device", "device_key", signer, None,
-            (("device", user, signer),),
-        ),
+        Need("member", "member", signer, user),
+        Need("device", "device_key", signer, user),
     )
 
 
@@ -73,13 +70,12 @@ def grant(node, workspace, user, device_pk, label):
         secret, public = node.identity(workspace)
         member = offer_source(node, workspace, "member", public)
         device_source = offer_source(
-            node, workspace, "device_key", public,
-            requires=(("device", user, public),))
+            node, workspace, "device_key", public, user)
         if member is None or device_source is None:
             raise ValueError("local identity is not a device-set member")
         # Timestamps order facts but do not establish causality. Reuse the
         # immutable workspace anchor's timestamp so this logical grant has
-        # stable bytes even if an authority proof winner later changes;
+        # stable bytes even if the current mechanical provider later changes;
         # refs/needs and close() carry the actual relation.
         ts = node.fact_of(workspace, workspace).ts
         item = device_invite(

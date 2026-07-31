@@ -68,7 +68,7 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
     node, workspace, built = build_seed(
         directory, scale, n_members=members)
     high_ts = max(
-        node.candidate_of(workspace, fid).ts
+        node.fact_of(workspace, fid).ts
         for (fid,) in node.idx(workspace).execute("SELECT fid FROM facts")
     )
 

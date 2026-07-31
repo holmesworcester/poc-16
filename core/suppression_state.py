@@ -19,7 +19,7 @@ def active(db, sid):
 def suppresses(db, fact):
     import facts
 
-    return any(active(db, sid) for sid in facts.fact_scopes(fact))
+    return any(active(db, sid) for sid in facts.current_scopes(fact))
 
 
 __all__ = ("active", "suppresses")

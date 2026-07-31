@@ -123,7 +123,7 @@ def test_stage_is_an_explicit_importable_broker_only_allowlist(tmp_path):
     staged = manage.stage(tmp_path / "stage")
 
     for relative in (
-            "core/candidate_archive.py",
+            "core/validated_set.py",
             "core/repository_reader.py",
             "facts/auth/request.py",
             "adapters/s3/store.py",

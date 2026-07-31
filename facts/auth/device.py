@@ -22,7 +22,7 @@ def device(workspace, pk, label, ts):
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [
-         ["offer", "device_key", pk],
+         ["offer", "device_key", pk, pk],
          ["offer", "device", pk, pk]],
         {"pk": pk, "label": label}, workspace)
 
@@ -32,7 +32,7 @@ def needs(f):
     pk = f.body.get("pk", "")
     return (
         Need("author", "author", f.fid, pk),
-        Need("member", "member", pk),
+        Need("member", "member", pk, pk),
     )
 
 
@@ -70,7 +70,7 @@ def bind(node, workspace, label):
 def devices(node, workspace, user=None):
     with node.lock:
         chosen = {}
-        for rank, fact in node.select_ranked(workspace, "device"):
+        for fact in node.select(workspace, "device"):
             body = fact.body
             if fact.t == TAG:
                 row = body.get("pk"), body.get("pk"), body.get("label")
@@ -80,14 +80,15 @@ def devices(node, workspace, user=None):
             else:
                 continue
             user_pk, device_pk, label = row
-            choice = (rank, fact.fid)
-            if device_pk and label and (
-                    device_pk not in chosen
-                    or choice < chosen[device_pk][0]):
-                chosen[device_pk] = (choice, user_pk, label)
+            association = (user_pk, device_pk)
+            choice = fact.fid
+            if all(association) and label and (
+                    association not in chosen
+                    or choice < chosen[association][0]):
+                chosen[association] = (choice, label)
         rows = [
             (user_pk, device_pk, label)
-            for device_pk, (_, user_pk, label) in chosen.items()
+            for (user_pk, device_pk), (_, label) in chosen.items()
             if user is None or user_pk == user
         ]
     return [

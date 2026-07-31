@@ -1,14 +1,14 @@
-"""Peer reconciliation as one join over admitted candidates.
+"""Peer reconciliation as one join over validated fact identities.
 
 The replicated value is:
 
-``candidate fid -> (exact fact bytes, minimum verified proof root)``
+``fid -> canonical fact bytes``
 
-FactOrder, eligibility, resolved edges, suppression, and authority are pure
-projections of that join.  Sync therefore has no separate action channel,
-range-leaf protocol, closure sibling, or projection authority.  Every selected
-historical proof re-enters through the ordinary closed-pile ingress door.
-Detached file bytes remain a separate best-effort completion pass.
+FactOrder, suppression, and authority are mechanical projections of that
+monotone set.  A sender assembles a fresh closure for each missing fact; no
+stored validation path crosses the wire. Every closure re-enters through the
+ordinary exact-pile door. Detached file bytes remain a separate best-effort
+completion pass.
 """
 from dataclasses import dataclass
 
@@ -22,7 +22,7 @@ from .walk import Peer, _fetch_blobs
 
 
 @dataclass(frozen=True)
-class CandidateDelta:
+class FactDelta:
     pull: tuple
     push: tuple
 
@@ -35,46 +35,30 @@ def _root_digest(store):
     return h(raw) if raw is not None else None
 
 
-def _candidate_record(view, fid):
-    if view is None:
-        return None
-    try:
-        return view.fact_record(fid)
-    except ValueError as error:
-        if str(error) == "missing FactRecord":
-            return None
-        raise
-
-
 def _delta(local, remote):
-    """Compute the min-proof semilattice delta for two pinned roots."""
-    remote_fids = remote.candidate_ids() if remote is not None else ()
-    local_fids = local.candidate_ids() if local is not None else ()
-    pull, push = [], []
-    for fid in remote_fids:
-        theirs = remote.fact_record(fid)
-        ours = _candidate_record(local, fid)
-        if ours is None or theirs["admission"] < ours["admission"]:
-            pull.append(fid)
-    for fid in local_fids:
-        ours = local.fact_record(fid)
-        theirs = _candidate_record(remote, fid)
-        if theirs is None or ours["admission"] < theirs["admission"]:
-            push.append(fid)
-    return CandidateDelta(tuple(pull), tuple(push))
+    """Compute the grow-only validated-fid delta for two pinned roots."""
+    remote_fids = set(remote.fact_ids()) if remote is not None else set()
+    local_fids = set(local.fact_ids()) if local is not None else set()
+    for fid in remote_fids & local_fids:
+        if remote.fact_oid(fid) != local.fact_oid(fid):
+            raise ValueError("validated fact identity conflict")
+    return FactDelta(
+        tuple(sorted(remote_fids - local_fids)),
+        tuple(sorted(local_fids - remote_fids)),
+    )
 
 
-def _push_candidates(view, fids, peer, sender):
-    """Deliver verified deltas as bounded ordinary piles.
+def _push_facts(view, fids, peer, sender):
+    """Deliver freshly closed validated-fact deltas as ordinary piles.
 
-    Bad witnesses remain independent: every valid closure is still delivered.
+    Bad closures remain independent: every valid closure is still delivered.
     Detached objects precede every pile that can name them, and the receiver
-    invokes its one RepositoryApplier settlement path per bounded batch.
+    invokes its one RepositoryApplier path per bounded batch.
     """
     closures, failures = [], []
     for fid in fids:
         try:
-            closures.append(view.verify(fid).facts)
+            closures.append(view.closure((fid,)))
         except (TypeError, ValueError) as error:
             failures.append(error)
     sender.deliver(peer, closures)
@@ -82,21 +66,21 @@ def _push_candidates(view, fids, peer, sender):
 
 
 def pull(node, workspace, oid, raw):
-    """Stage one verified proof closure through ordinary pile ingress."""
+    """Stage one freshly verified closure through ordinary pile ingress."""
     if raw is None or h(raw) != oid:
         raise ValueError("remote object integrity")
     node.stage_received_pile(
         workspace, node.member_for(workspace), raw)
 
 
-def reconcile_candidates(
+def reconcile_facts(
         node, workspace, peer, remote_root, fetch_remote, *,
         deliver=True, local_root=_UNREAD):
-    """Join candidate/proof state, landing independent valid proofs first.
+    """Join validated facts, landing independent valid closures first.
 
-    A poisoned selected proof cannot become a cached false convergence.  Valid
-    independent candidates are staged and settled, then the first unresolved
-    difference is raised so the remote root remains eligible for retry or
+    A poisoned closure cannot become a cached false convergence.  Valid
+    independent facts are staged and applied, then the first unresolved
+    difference is raised so the remote root remains available for retry or
     operator diagnosis.
     """
     store = node.store(workspace)
@@ -104,19 +88,19 @@ def reconcile_candidates(
         local_root = store.get_bounded("root", MAX_ROOT_BYTES)
     remote = RepositoryReader(
         workspace, remote_root, fetch_remote,
-    ).candidates() if remote_root else None
+    ).validated() if remote_root else None
     local = RepositoryReader(
         workspace,
         local_root,
         lambda oid: store.get_bounded(
             "obj/" + oid, MAX_OBJECT_BYTES),
-    ).candidates() if local_root else None
+    ).validated() if local_root else None
     delta = _delta(local, remote)
     failures = []
 
     if deliver and local is not None:
         try:
-            failures.extend(_push_candidates(
+            failures.extend(_push_facts(
                 local, delta.push, peer, node.sender(workspace)))
         except (TypeError, ValueError) as error:
             failures.append(error)
@@ -126,7 +110,7 @@ def reconcile_candidates(
         closures = []
         for fid in delta.pull:
             try:
-                closures.append(remote.verify(fid).facts)
+                closures.append(remote.closure((fid,)))
                 landed += 1
             except (TypeError, ValueError) as error:
                 failures.append(error)
@@ -136,7 +120,7 @@ def reconcile_candidates(
         node.turn(workspace)
     if failures:
         raise ValueError(
-            "unresolved candidate difference") from failures[0]
+            "unresolved validated-fact difference") from failures[0]
     return (
         int(bool(landed)),
         len(delta.push) if deliver else 0,
@@ -145,7 +129,7 @@ def reconcile_candidates(
 
 
 def sync(node, workspace, url):
-    """Converge one peer dial; return ``(pulled turn, pushed candidates)``."""
+    """Converge one peer dial; return ``(pulled turn, pushed facts)``."""
     peer = Peer(node, workspace, url)
     remote_store = RemoteStore(peer)
     cache = peer.cache
@@ -175,7 +159,7 @@ def sync(node, workspace, url):
 
     local_root = node.store(workspace).get_bounded(
         "root", MAX_ROOT_BYTES)
-    pulled, pushed, pending_push = reconcile_candidates(
+    pulled, pushed, pending_push = reconcile_facts(
         node,
         workspace,
         peer,
@@ -209,4 +193,4 @@ def sync(node, workspace, url):
     return pulled, pushed
 
 
-__all__ = ["CandidateDelta", "pull", "reconcile_candidates", "sync"]
+__all__ = ["FactDelta", "pull", "reconcile_facts", "sync"]

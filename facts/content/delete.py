@@ -7,7 +7,6 @@ share ownership), while ADMIN requires an admin offer for the signing key.
 """
 
 from core.fact import Fact, Need
-from core.fact_index import EDGE_INDEX
 from core.shape import fid_of, key_parts
 from core.suppression import (
     SELF,
@@ -26,25 +25,29 @@ POLICY = _policy.FamilyPolicy()
 
 
 # SHAPE
-def delete(workspace, pk, target_key, mode, ts):
+def delete(workspace, pk, target_key, mode, ts, owner=None):
     """Exact target address + selector token + hard target dependency."""
     target = fid_of(target_key)
+    owner = pk if owner is None else owner
     return Fact(
         TAG, ts,
         [
             action(_policy.CONTENT_DELETE, SELF, target_key),
             ["ref", TARGET, target],
         ],
-        {"pk": pk, "mode": mode}, workspace)
+        {"pk": pk, "owner": owner, "mode": mode}, workspace)
 
 
 # NEEDS — OWNER and ADMIN are distinct conjunctive authority modes.
 def needs(f):
     pk = f.body.get("pk", "")
     authority = "member" if f.body.get("mode") == _policy.OWNER else "admin"
+    owner = f.body.get("owner", "")
     return (
         Need("author", "author", f.fid, pk),
-        Need("actor_authority", authority, pk),
+        Need(
+            "actor_authority", authority, pk,
+            owner if authority == "member" else None),
     )
 
 
@@ -52,17 +55,18 @@ def needs(f):
 def validate(f, ctx):
     try:
         import facts  # function-local: the router imports this package
-        if set(f.body) != {"pk", "mode"}:
+        if set(f.body) != {"pk", "owner", "mode"}:
             return False
-        pk, mode = f.body["pk"], f.body["mode"]
-        if not isinstance(pk, str) or mode not in {
+        pk, owner, mode = f.body["pk"], f.body["owner"], f.body["mode"]
+        if not isinstance(pk, str) or not isinstance(owner, str) \
+                or mode not in {
                 _policy.OWNER, _policy.ADMIN}:
             return False
         ((name, target),) = f.refs()
-        row = ctx.fact_meta(target)
-        if row is None:
+        target_fact = ctx.fact_of(target)
+        if target_fact is None:
             return False
-        target_ts, target_tag = row
+        target_ts, target_tag = target_fact.ts, target_fact.t
         victim = facts.family_for(target_tag)
         target_key = action_target_key(f)
         if name != TARGET or victim is None or not victim.DURABLE \
@@ -75,23 +79,12 @@ def validate(f, ctx):
             return False
 
         target_policy = victim.POLICY
-        if mode == _policy.OWNER:
-            target_provider = ctx.edge_source(target, target_policy.owner_edge)
-            actor_provider = ctx.provider("member", pk)
-            if target_provider is None or actor_provider is None:
-                return False
-            target_members = ctx.offers_from(target_provider, "member")
-            if not target_members:
-                return False
-            target_principal = _policy.member_principal(
-                ctx, target_provider, target_members[0][0])
-            actor_principal = _policy.member_principal(
-                ctx, actor_provider, pk)
-            if target_principal is None or target_principal != actor_principal:
-                return False
+        if target_policy.owner_field is None \
+                or target_fact.body.get(target_policy.owner_field) != owner:
+            return False
 
         return is_deletion(f) and f == delete(
-            f.ws, pk, target_key, mode, f.ts)
+            f.ws, pk, target_key, mode, f.ts, owner)
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -105,6 +98,7 @@ def remove(node, workspace, target, ts=None):
     """Choose OWNER when principals match, otherwise require ADMIN."""
     import facts
     from core.node import now_ms
+    from .._commands import member_source
 
     with node.lock:
         victim = node.fact_of(workspace, target)
@@ -122,35 +116,15 @@ def remove(node, workspace, target, ts=None):
     ts = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     with node.lock:
-        actor_member = offer_source(node, workspace, "member", public)
-        target_provider = node.idx(workspace).execute(
-            "SELECT k1 FROM fact_index "
-            "WHERE kind=? AND src=? AND k0=?",
-            (
-                EDGE_INDEX,
-                victim.fid,
-                "need:" + policy.owner_edge,
-            )).fetchone()
-        actor_principal = _policy.member_principal(
-            node.idx(workspace), actor_member, public) if actor_member else None
-        target_member = node.fact_of(
-            workspace, target_provider[0]) if target_provider else None
-        target_actor = None
-        if target_member is not None:
-            row = node.idx(workspace).execute(
-                "SELECT k0 FROM fact_index "
-                "WHERE src=? AND kind='member' "
-                "ORDER BY k0 LIMIT 1", (target_provider[0],)).fetchone()
-            target_actor = row[0] if row else None
-        target_principal = _policy.member_principal(
-            node.idx(workspace), target_provider[0], target_actor
-        ) if target_provider and target_actor else None
-        mode = _policy.OWNER if actor_principal is not None \
-            and actor_principal == target_principal else _policy.ADMIN
+        target_principal = victim.body.get(policy.owner_field, "")
+        actor_member, _ = member_source(
+            node, workspace, public, target_principal)
+        mode = _policy.OWNER if actor_member is not None else _policy.ADMIN
         if mode == _policy.ADMIN and offer_source(
                 node, workspace, "admin", public) is None:
             raise ValueError("only the owner or an admin may delete this fact")
-    item = delete(workspace, public, victim.key, mode, ts)
+    item = delete(
+        workspace, public, victim.key, mode, ts, target_principal)
     return publish(node, workspace, item,
                    signature.signature(secret, public, item, ts),
                    role="member" if mode == _policy.OWNER else "admin")

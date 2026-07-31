@@ -9,7 +9,6 @@ import facts
 
 from core import catalog
 from core.close import close, decode_pile
-from core.ingress import KernelRejected
 from core.kernel import drain, resolve_deps
 from core.limits import MAX_CLOSURE_FACTS
 
@@ -110,14 +109,14 @@ def test_topology_and_content_use_independent_rng_streams(tmp_path):
     assert messages(star, star_ws) == messages(random_tree, random_ws)
 
 
-def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
+def test_bulk_author_closes_signatures_before_messages(tmp_path):
     node, workspace, _ = build_seed(
-        str(tmp_path / "bulk-ranks"), 127, n_members=12,
+        str(tmp_path / "bulk-closure"), 127, n_members=12,
         shape="star", seed=16)
     before = set(all_fids(node, workspace))
-    candidates = node.reader(workspace).candidates()
+    candidates = node.reader(workspace).validated()
     first_ts = max(
-        candidates.fact(fid).ts for fid in candidates.candidate_ids()
+        candidates.fact(fid).ts for fid in candidates.fact_ids()
     ) + 1
 
     bulk_author(
@@ -141,44 +140,34 @@ def test_bulk_author_ranks_signatures_before_incremental_closure(tmp_path):
     assert drain(pile, workspace).ok
 
 
-def test_reader_rebuilds_a_deleted_deep_chain_projection_without_root_write(
+def test_reader_rebuilds_a_deleted_projection_without_root_write(
         tmp_path):
     members = 64
     membership_facts = 1 + 4 * (members - 1)
     node, workspace, _ = build_seed(
-        str(tmp_path / "proof-worklist"), membership_facts,
+        str(tmp_path / "projection-worklist"), membership_facts,
         n_members=members, shape="chain", seed=16)
     index = node.idx(workspace)
     root = node.store(workspace).get("root")
-    index.execute(
-        "DELETE FROM fact_index WHERE kind IN (?, ?)",
-        (catalog.STATE_INDEX, catalog.EDGE_INDEX),
-    )
+    index.execute("DELETE FROM fact_index")
+    index.execute("DELETE FROM facts")
     index.commit()
 
-    assert not node.catalog(workspace).eligible_ids()
-    assert index.execute(
-        "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
-        (catalog.EDGE_INDEX,),
-    ).fetchone() is None
+    assert not node.catalog(workspace).fact_ids()
 
     node.rebuild(workspace)
 
     assert node.store(workspace).get("root") == root
     assert index.execute(
-        "SELECT COUNT(*) FROM fact_index "
-        "WHERE kind=? AND k0='eligible'",
-        (catalog.STATE_INDEX,),
+        "SELECT COUNT(*) FROM facts",
     ).fetchone()[0] == membership_facts
-    assert index.execute(
-        "SELECT MAX(CAST(k1 AS INTEGER)) FROM fact_index "
-        "WHERE kind=? AND k0='eligible'",
-        (catalog.STATE_INDEX,),
-    ).fetchone()[0] == 2 * (members - 1)
-    assert index.execute(
-        "SELECT 1 FROM fact_index WHERE kind=? LIMIT 1",
-        (catalog.EDGE_INDEX,),
-    ).fetchone() is not None
+    assert node.catalog(workspace).fact_ids() == set(
+        node.reader(workspace).validated().fact_ids())
+    assert not {
+        kind for (kind,) in index.execute(
+            "SELECT DISTINCT kind FROM fact_index")
+        if any(word in kind for word in ("edge", "eligible", "proof", "rank"))
+    }
 
 
 def test_ordinary_seed_append_aligns_projection_with_committed_reader(
@@ -192,12 +181,11 @@ def test_ordinary_seed_append_aligns_projection_with_committed_reader(
         node, workspace, "general", "one conflict-free live append")
 
     assert node.store(workspace).get("root") != root
-    assert node.reader(workspace).candidates().fact(fid) \
+    assert node.reader(workspace).validated().fact(fid) \
         == node.fact_of(workspace, fid)
     assert node.idx(workspace).execute(
-        "SELECT 1 FROM fact_index "
-        "WHERE kind=? AND k0='eligible' AND src=?",
-        (catalog.STATE_INDEX, fid),
+        "SELECT 1 FROM facts WHERE fid=?",
+        (fid,),
     ).fetchone() == (1,)
 
 
@@ -223,11 +211,11 @@ def test_chained_bidirectional_reconciliation_converges(tmp_path):
     assert result["push_streamed"] > result["push_useful"]
 
 
-def test_chain_seed_rejects_a_proof_beyond_the_protocol_closure_bound(
+def test_chain_seed_rejects_a_pile_beyond_the_protocol_closure_bound(
         tmp_path):
     members = 2 + (MAX_CLOSURE_FACTS - 1) // 4
     membership_facts = 1 + 4 * (members - 1)
-    with pytest.raises(KernelRejected, match="ingress rejected"):
+    with pytest.raises(ValueError, match="not admitted"):
         build_seed(
             str(tmp_path / "too-deep"), membership_facts,
             n_members=members, shape="chain", seed=16)

@@ -5,9 +5,10 @@ engine.  Deleting or poisoning this database cannot change repository state;
 ``refresh`` replaces it solely from a pinned root and root-reachable objects.
 """
 
-from . import catalog, settlement
+from . import catalog
 from .crypto import h
 from .fact import encode
+from .repository_snapshot import action_bindings
 
 
 def refresh(db, reader, *, workspace=None):
@@ -15,21 +16,18 @@ def refresh(db, reader, *, workspace=None):
     if reader is None:
         if workspace is None:
             raise ValueError("empty projection workspace")
-        archive, root_bytes = None, None
+        validated, root_bytes = None, None
     else:
         workspace = reader.workspace
-        archive = reader.archive()
+        validated = reader.all_facts()
         root_bytes = reader.root_bytes
-    projected = settlement.project(
-        workspace, archive.facts) if archive is not None else \
-        settlement.Projection({}, {})
     db.execute("BEGIN")
     try:
         for table in ("fact_index", "facts"):
             db.execute(f"DELETE FROM {table}")
-        if archive is not None:
-            for fid in sorted(archive.facts):
-                fact = archive.facts[fid]
+        if validated is not None:
+            for fid in sorted(validated.facts):
+                fact = validated.facts[fid]
                 db.execute(
                     "INSERT INTO facts VALUES(?,?)",
                     (fid, encode(fact)),
@@ -38,28 +36,12 @@ def refresh(db, reader, *, workspace=None):
                     "INSERT INTO fact_index VALUES(?,?,?,?)",
                     catalog.index_rows(fact),
                 )
-            for fid, (rank, edges) in sorted(projected.standing.items()):
-                db.execute(
-                    "INSERT INTO fact_index VALUES(?,?,?,?)",
-                    (catalog.STATE_INDEX, "eligible", str(rank), fid),
-                )
-                db.executemany(
-                    "INSERT INTO fact_index VALUES(?,?,?,?)",
-                    (
-                        (
-                            catalog.EDGE_INDEX,
-                            f"{edge.kind}:{edge.role}",
-                            edge.fid,
-                            fid,
-                        )
-                        for edge in edges
-                    ),
-                )
             db.executemany(
                 "INSERT INTO fact_index VALUES(?,?,?,?)",
                 (
                     (catalog.ACTION_INDEX, sid, "", fid)
-                    for sid, fid in sorted(projected.actions.items())
+                    for sid, fid in sorted(
+                        action_bindings(validated.facts).items())
                 ),
             )
         db.execute(

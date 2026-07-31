@@ -9,7 +9,6 @@ from core.crypto import keypair
 from core.fact import Fact
 from core.node import Node
 from core.suppression import (
-    ANCESTOR,
     PARENT,
     SELF,
     parent_selector,
@@ -33,7 +32,7 @@ def test_one_registry_exhaustively_covers_the_router():
         for family in facts.FAMILIES.values()
         for rule in family.POLICY.suppression or ()
     }
-    assert kinds == {SELF, PARENT, ANCESTOR}
+    assert kinds == {SELF, PARENT}
     assert tuple(
         rule.kind
         for rule in facts.family_for("msg").POLICY.suppression
@@ -41,11 +40,11 @@ def test_one_registry_exhaustively_covers_the_router():
     assert tuple(
         rule.kind
         for rule in facts.family_for("file_bao").POLICY.suppression
-    ) == (SELF, PARENT)
+    ) == (SELF,)
     assert tuple(
         rule.kind
         for rule in facts.family_for("chunk").POLICY.suppression
-    ) == (SELF, PARENT, ANCESTOR)
+    ) == (SELF, PARENT)
     for tag in ("msg", "file_bao", "chunk"):
         direct = facts.family_for(tag).POLICY.direct_targets
         assert direct
@@ -100,7 +99,7 @@ def test_registry_rejects_duplicate_and_policyless_families():
                         (_policy.OWNER,),
                     ),
                 ),
-                owner_edge="member",
+                owner_field="owner",
             ),
             "allow ADMIN",
         ),
@@ -109,7 +108,7 @@ def test_registry_rejects_duplicate_and_policyless_families():
                 suppression=(_policy.Self(),),
                 direct_targets=_policy.DELETE_SELF,
             ),
-            "owner edge",
+            "owner field",
         ),
     ),
 )
@@ -136,7 +135,7 @@ def test_registry_rejects_direct_delete_without_one_self_selector(
         POLICY=_policy.FamilyPolicy(
             suppression=suppression,
             direct_targets=_policy.DELETE_SELF,
-            owner_edge="member",
+            owner_field="owner",
         ),
     )
 
@@ -154,7 +153,7 @@ def test_registry_allows_one_self_selector_with_inherited_selectors():
                 _policy.Ancestor("member", "workspace"),
             ),
             direct_targets=_policy.DELETE_SELF,
-            owner_edge="member",
+            owner_field="owner",
         ),
     )
 
@@ -193,7 +192,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
     signed = signature(secret, public, malformed, malformed.ts)
     monkeypatch.setattr(message_family, "validate", lambda fact, ctx: True)
 
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not admitted"):
         node.ingest_new(
             workspace, [signed, malformed], {
                 signed.fid: [],
@@ -203,7 +202,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
     assert node.fact_of(workspace, malformed.fid) is None
 
 
-def test_runtime_policy_rejects_a_forged_nonancestor(
+def test_runtime_policy_rejects_a_forged_nonparent(
         tmp_path, monkeypatch):
     node = Node(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -212,7 +211,7 @@ def test_runtime_policy_rejects_a_forged_nonancestor(
     original = node.by_type(workspace, "chunk")[0]
     atoms = [
         marker[:] if not (
-            marker[0] == "supp" and marker[1] == ANCESTOR
+            marker[0] == "supp" and marker[1] == PARENT
         ) else [*marker[:3], "f" * 64]
         for marker in original.atoms
     ]
@@ -221,7 +220,7 @@ def test_runtime_policy_rejects_a_forged_nonancestor(
     signed = signature(secret, public, forged, forged.ts)
     monkeypatch.setattr(chunk_family, "validate", lambda fact, ctx: True)
 
-    with pytest.raises(ValueError, match="outside the canonical set"):
+    with pytest.raises(ValueError, match="not admitted"):
         node.ingest_new(
             workspace, [signed, forged], {
                 signed.fid: [],
@@ -315,6 +314,7 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
         action = node.fact_of(workspace, action_fid)
         assert action.body == {
             "mode": _policy.ADMIN,
+            "owner": bob,
             "pk": founder,
         }
         assert node.reader(workspace).worker().suppression(

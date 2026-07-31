@@ -8,21 +8,18 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
-from .fact_index import EDGE_INDEX, STATE_INDEX
 from .fact import Fact, bound_to
 from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
 from .shape import valid_fid
 
 class Valid(NamedTuple):
     fact: Fact
-    deps: tuple  # refs + canonical providers for family-declared needs
-    edges: tuple = ()  # same dependencies with stable family-declared roles
+    edges: tuple  # ephemeral named dependencies for this closed pile
 
 
 class ResolvedEdge(NamedTuple):
     role: str
     fid: str
-    kind: str
 
 
 class Judgment(NamedTuple):
@@ -31,30 +28,13 @@ class Judgment(NamedTuple):
     failure: Exception | None = None
 
 
-def valid_resolved_edges(deps, edges):
-    """Whether a receipt has one canonical, exact dependency-edge tuple."""
-    if not isinstance(deps, (list, tuple)) \
-            or not isinstance(edges, (list, tuple)):
-        return False
-    if any(not isinstance(edge, ResolvedEdge) for edge in edges):
-        return False
-    roles = [edge.role for edge in edges]
-    if not all(isinstance(role, str) and role for role in roles):
-        return False
-    return roles == sorted(roles) \
-        and len(roles) == len(set(roles)) \
-        and all(valid_fid(edge.fid) for edge in edges) \
-        and all(edge.kind in ("need", "ref") for edge in edges) \
-        and tuple(deps) == tuple(edge.fid for edge in edges)
-
-
 class MemoryContext:
     """Bounded database-free relationship state for CF authorization."""
 
     def __init__(self, anchor):
         self.anchor = anchor
         self.facts = {}
-        self.proofs = {}
+        self.depths = {}
         self.edges = {}
         self.closures = {}
 
@@ -64,6 +44,9 @@ class MemoryContext:
     def fact_meta(self, fid):
         fact = self.facts.get(fid)
         return (fact.ts, fact.t) if fact is not None else None
+
+    def fact_of(self, fid):
+        return self.facts.get(fid)
 
     def offers_from(self, source, name):
         fact = self.facts.get(source)
@@ -75,33 +58,35 @@ class MemoryContext:
     def edge_source(self, source, role):
         return self.edges.get((source, role))
 
-    def provider(self, name, a0, a1=None, requires=()):
-        return self.resolve_offer(name, a0, a1, requires)
+    def provider(self, name, a0, a1=None, source=None):
+        return self.resolve_offer(name, a0, a1, source)
 
-    def resolve_offer(self, name, a0, a1=None, requires=()):
+    def resolve_offer(self, name, a0, a1=None, source=None):
+        if source is not None:
+            fact = self.facts.get(source)
+            if fact is None or source not in self.depths:
+                return None
+            offered = set(fact.offers())
+            address = (name, a0, a1 or "")
+            return source if address in offered else None
         candidates = []
         for fid, fact in self.facts.items():
-            if fid not in self.proofs or not any(
+            if fid not in self.depths or not any(
                     offer == name and value0 == a0
                     and (a1 is None or value1 == a1)
                     for offer, value0, value1 in fact.offers()):
                 continue
-            candidates.append((self.proofs[fid], fid))
+            candidates.append(fid)
         if not candidates:
             return None
-        source = min(candidates)[1]
-        offered = set(self.facts[source].offers())
-        return source if all(
-            (required_name, required_a0, required_a1 or "") in offered
-            for required_name, required_a0, required_a1 in requires
-        ) else None
+        return min(candidates)
 
-    def rank(self, deps):
+    def depth(self, deps):
         if not deps:
             return 0
-        if any(fid not in self.proofs for fid in deps):
+        if any(fid not in self.depths for fid in deps):
             return None
-        return 1 + max(self.proofs[fid] for fid in deps)
+        return 1 + max(self.depths[fid] for fid in deps)
 
     def closure(self, deps):
         if any(fid not in self.closures for fid in deps):
@@ -109,54 +94,38 @@ class MemoryContext:
         return frozenset().union(
             *(self.closures[fid] for fid in deps))
 
-    def admit(self, fact, rank, edges):
-        self.facts[fact.fid], self.proofs[fact.fid] = fact, rank
+    def admit(self, fact, depth, edges):
+        self.facts[fact.fid], self.depths[fact.fid] = fact, depth
         closure = self.closure(tuple(edge.fid for edge in edges))
         self.closures[fact.fid] = frozenset((fact.fid,)) | closure
         self.edges.update(
             ((fact.fid, edge.role), edge.fid) for edge in edges)
 
 
-def offer_src(db, name, a0, a1=None, requires=()):
-    """Canonical finite-proof provider for an offer address, or ``None``.
+def offer_src(db, name, a0, a1=None, source=None):
+    """Deterministic provider for an offer address, or an exact named source.
 
-    Providers are ordered by their shortest authority proof and then source
-    id.  Proof rank is well-founded: every dependency has a lower rank than
-    its dependent, so a later lower-fid offer cannot rewire the final graph
-    into a cycle.
-
-    ``requires`` is a family-declared tuple of co-offers that must come from
-    the selected source.  Selection happens *before* those checks.  This lets
-    a family declare one globally canonical claim (for example, ownership of
-    a key) while also checking the claim's associated value without allowing
-    a losing claimant to become authoritative.
+    A fact that semantically depends on one provider names it in an explicit
+    envelope selector and ``resolve_edges`` passes that fid as ``source``.
+    Otherwise providers of the same address are validation-interchangeable;
+    choosing the lowest fid is only deterministic closure assembly, never a
+    persisted admission verdict.
     """
     if hasattr(db, "resolve_offer"):
-        return db.resolve_offer(name, a0, a1, requires)
-    query = (
-        "SELECT o.src FROM fact_index o "
-        "JOIN fact_index p ON p.src=o.src "
-        "AND p.kind=? AND p.k0='eligible' "
-        "WHERE o.kind=? AND o.k0=?"
-    )
-    args = [STATE_INDEX, name, a0]
+        return db.resolve_offer(name, a0, a1, source)
+    query = "SELECT src FROM fact_index WHERE kind=? AND k0=?"
+    args = [name, a0]
     if a1 is not None:
-        query, args = query + " AND o.k1=?", args + [a1]
+        query, args = query + " AND k1=?", args + [a1]
+    if source is not None:
+        query, args = query + " AND src=?", args + [source]
     row = db.execute(
-        query + " ORDER BY CAST(p.k1 AS INTEGER), o.src LIMIT 1",
+        query + " ORDER BY src LIMIT 1",
         args,
     ).fetchone()
     if row is None:
         return None
-    source = row[0]
-    for required_name, required_a0, required_a1 in requires:
-        if db.execute(
-                "SELECT 1 FROM fact_index "
-                "WHERE src=? AND kind=? AND k0=? AND k1=?",
-                (source, required_name, required_a0,
-                 required_a1 or "")).fetchone() is None:
-            return None
-    return source
+    return row[0]
 
 
 def resolve_edges(f: Fact, db, strict=False):
@@ -165,23 +134,26 @@ def resolve_edges(f: Fact, db, strict=False):
     if handler is None:
         return None
     edges = [
-        ResolvedEdge(role, fid, "ref")
+        ResolvedEdge(role, fid)
         for role, fid in f.refs()
     ]
     try:
         for need in handler.needs(f):
+            source = facts.explicit_provider(f, need.role)
             source = offer_src(
-                db, need.name, need.a0, need.a1, need.requires)
+                db, need.name, need.a0, need.a1, source=source)
             if source is None:
                 return None
-            edges.append(ResolvedEdge(need.role, source, "need"))
+            edges.append(ResolvedEdge(need.role, source))
     except Exception:
         if strict:
             raise
         return None
     edges.sort(key=lambda edge: edge.role)
-    if not valid_resolved_edges(
-            tuple(edge.fid for edge in edges), edges):
+    roles = [edge.role for edge in edges]
+    if not all(isinstance(role, str) and role for role in roles) \
+            or roles != sorted(roles) or len(roles) != len(set(roles)) \
+            or not all(valid_fid(edge.fid) for edge in edges):
         return None
     return tuple(edges)
 
@@ -189,63 +161,11 @@ def resolve_edges(f: Fact, db, strict=False):
 def resolve_deps(f: Fact, db):
     """Resolve refs and family needs to deterministic provider ids.
 
-    ``None`` means an unmet need or unknown family.  The same resolver is used
-    during judgment and by proof-based sync, so closure
-    edges are a pure function of the accepted set.
+    ``None`` means an unmet need or unknown family. The same resolver is used
+    for local closed-pile construction and database-free judgment.
     """
     edges = resolve_edges(f, db)
     return None if edges is None else [edge.fid for edge in edges]
-
-
-def proof_rank(db, deps):
-    """Return one plus the maximum dependency rank (or zero at a root)."""
-    if hasattr(db, "rank"):
-        return db.rank(deps)
-    if not deps:
-        return 0
-    rows = db.execute(
-        f"SELECT src, CAST(k1 AS INTEGER) FROM fact_index "
-        f"WHERE kind=? AND k0='eligible' AND src IN "
-        f"({','.join('?' for _ in deps)})",
-        (STATE_INDEX, *deps),
-    ).fetchall()
-    ranks = {fid: rank for fid, rank in rows}
-    if any(fid not in ranks for fid in deps):
-        return None
-    return 1 + max(ranks[fid] for fid in deps)
-
-
-def proof_closure_size(db, deps, *, stop_after=None):
-    """Count the unique current proof ancestors of ``deps``.
-
-    The database-free context already retains exact closure sets.  SQLite
-    stores only direct edges, so derive the same set with a recursive UNION.
-    ``stop_after`` bounds work for callers that need only a protocol-limit
-    verdict; the returned value is then capped at ``stop_after + 1``.
-    """
-    deps = tuple(dict.fromkeys(deps))
-    if not deps:
-        return 0
-    if hasattr(db, "closure"):
-        closure = db.closure(deps)
-        if closure is None:
-            return None
-        size = len(closure)
-        return size if stop_after is None else min(size, stop_after + 1)
-    seeds = ", ".join("(?)" for _ in deps)
-    limit = "" if stop_after is None else " LIMIT ?"
-    args = deps if stop_after is None else deps + (stop_after + 1,)
-    rows = db.execute(
-        "WITH RECURSIVE closure(fid) AS ("
-        f"VALUES {seeds} "
-        "UNION "
-        "SELECT e.k1 FROM fact_index e JOIN closure c ON e.src=c.fid "
-        "WHERE e.kind=?"
-        ") SELECT fid FROM closure" + limit,
-        (*deps, EDGE_INDEX) if stop_after is None
-        else (*deps, EDGE_INDEX, stop_after + 1),
-    ).fetchall()
-    return len(rows)
 
 
 def accepts(fact, edges, ctx, strict=False):
@@ -291,13 +211,13 @@ def _judge(stream, ctx):
             # failure retains its pile instead of manufacturing a permanent
             # rejection verdict.
             return Judgment(False, tuple(valids), error)
-        rank = proof_rank(ctx, deps) if good else None
-        closure = ctx.closure(deps) if rank is not None else None
-        if rank is None or closure is None \
+        depth = ctx.depth(deps) if good else None
+        closure = ctx.closure(deps) if depth is not None else None
+        if depth is None or closure is None \
                 or len(closure) + 1 > MAX_CLOSURE_FACTS:
             return Judgment(False, tuple(valids))
-        ctx.admit(fact, rank, edges)
-        valids.append(Valid(fact, tuple(deps), tuple(edges)))
+        ctx.admit(fact, depth, edges)
+        valids.append(Valid(fact, tuple(edges)))
     return Judgment(True, tuple(valids))
 
 

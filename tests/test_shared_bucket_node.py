@@ -94,29 +94,16 @@ def _signed_pile(node, workspace, item):
 
 
 def _resident(reader):
-    """Eligible facts in dependency order, after full root verification."""
-    archive = reader.archive()
-    eligible = {
-        fid: archive.facts[fid]
-        for fid, record in archive.records.items()
-        if record["state"] == "eligible"
-    }
-    return tuple(close(
-        eligible.values(),
-        lambda fid: tuple(
-            parent
-            for _, parent, _ in archive.records[fid]["dependencies"]
-        ),
-        eligible.__getitem__,
-    ))
+    """Validated facts in one freshly assembled closure."""
+    view = reader.validated()
+    return view.closure(view.fact_ids())
 
 
 def _commit_facts(workspace, commit):
     objects = dict(commit.objects)
     reader = RepositoryReader(
         workspace, commit.root, objects.get)
-    # archive() traverses and rederives every authenticated map, record,
-    # residence, suppression slot, authority row, and admission proof.
+    # all_facts() traverses residences and rederives every authenticated map.
     return _resident(reader)
 
 
@@ -161,8 +148,8 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
     assert recovered.retired is True
     assert store_a.get(source_a) is None
     reader = _reader(workspace, store_a)
-    assert reader.candidates().fact(first.fid) == first
-    assert reader.candidates().fact(second.fid) == second
+    assert reader.validated().fact(first.fid) == first
+    assert reader.validated().fact(second.fid) == second
     assert bucket.assert_valid_history()
 
 
@@ -185,7 +172,7 @@ def test_opaque_token_is_not_root_content_identity(tmp_path):
     assert after.token.value.startswith("opaque:")
     assert after.token.value != h(after.value)
     assert after.token != before.token
-    assert _reader(workspace, store).candidates().fact(item.fid) == item
+    assert _reader(workspace, store).validated().fact(item.fid) == item
     assert bucket.assert_valid_history()
 
 
@@ -228,7 +215,7 @@ def test_applier_reconciles_unknown_root_cas(
 
     assert store.get(source) is None
     assert calls == (1 if applied_before_loss else 2)
-    assert _reader(workspace, store).candidates().fact(item.fid) == item
+    assert _reader(workspace, store).validated().fact(item.fid) == item
 
 
 def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
@@ -272,8 +259,8 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
     assert replay.retired is True
     assert alice_store.get(source_a) is None
     reader = _reader(workspace, alice_store)
-    assert reader.candidates().fact(first.fid) == first
-    assert reader.candidates().fact(second.fid) == second
+    assert reader.validated().fact(first.fid) == first
+    assert reader.validated().fact(second.fid) == second
     assert bucket.assert_valid_history()
 
 
@@ -323,7 +310,7 @@ def test_database_free_reader_stays_pinned_during_later_eviction(
     assert bucket.assert_valid_history()
 
 
-def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
+def test_later_authority_changes_never_remove_validated_facts(
         tmp_path):
     author = Node(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "root", ts=1)
@@ -365,15 +352,14 @@ def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
         ts=201,
     )
     before = author.reader(workspace)
-    before_candidates = before.candidates()
+    before_facts = before.validated()
     chunk_fids = {
         fid
-        for fid in before_candidates.candidate_ids()
-        if before_candidates.fact(fid).t == "chunk"
+        for fid in before_facts.fact_ids()
+        if before_facts.fact(fid).t == "chunk"
     }
     assert len(chunk_fids) == 2
-    assert before_candidates.fact_record(
-        descriptor)["state"] == "eligible"
+    assert before_facts.fact(descriptor).fid == descriptor
 
     _, child = keypair()
     child_claim = inject_device_claim(
@@ -396,13 +382,12 @@ def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
         "from-short",
         400,
     )
-    dormant_root = author.store(workspace).get("root")
-    dormant = _reader(
-        workspace, bucket.handle("cold-reader"), dormant_root)
-    dormant_candidates = dormant.candidates()
+    changed_root = author.store(workspace).get("root")
+    changed = _reader(
+        workspace, bucket.handle("cold-reader"), changed_root)
+    changed_facts = changed.validated()
     for fid in (child_claim.fid, descriptor, *chunk_fids):
-        assert dormant_candidates.fact_record(fid)["state"] == "dormant"
-        assert dormant_candidates.fact(fid).fid == fid
+        assert changed_facts.fact(fid).fid == fid
 
     invite_secret, invite_public = keypair()
     invitation = user_invite(
@@ -435,12 +420,11 @@ def test_cold_applier_reactivates_root_authenticated_dormant_candidates(
 
     active = _reader(
         workspace, bucket.handle("reactivated"))
-    active_candidates = active.candidates()
+    active_facts = active.validated()
     for fid in (child_claim.fid, descriptor, *chunk_fids):
-        assert active_candidates.fact_record(fid)["state"] == "eligible"
-        assert active_candidates.fact(fid).fid == fid
+        assert active_facts.fact(fid).fid == fid
     for fid in chunk_fids:
-        chunk = active_candidates.fact(fid)
+        chunk = active_facts.fact(fid)
         assert active.object(chunk.body["cid"])
     assert bucket.assert_valid_history()
 
@@ -451,7 +435,7 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     target_fid = facts.content.message.post(
         author, workspace, "general", "target", ts=10)
-    target = author.reader(workspace).candidates().fact(target_fid)
+    target = author.reader(workspace).validated().fact(target_fid)
     public = author.identity_id(workspace)
     proposals = [
         _signed_pile(

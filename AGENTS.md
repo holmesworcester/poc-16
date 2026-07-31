@@ -1,7 +1,7 @@
 # POC-16 engineer guide
 
-Read `README.md` for operation and `DESIGN.md` for the protocol and trust
-model. Those files and this guide are the repository’s only Markdown
+Read `README.md` for operation and `DESIGN.md` for protocol and trust
+boundaries. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
 Start a work session with:
@@ -12,107 +12,122 @@ bd ready
 git status --short
 ```
 
-## Roles and actors
+## Capabilities
 
-The repository has exactly three capabilities:
+There are three capabilities and two actors:
 
-- `PileSender` may use SQLite. It closes local intent, encodes one ordinary
-  pile, and delivers it. It has no root-CAS or retirement authority.
-- `RepositoryApplier` is database-free. It is the sole exact-pile receiving
-  engine, immutable-object establisher, root compiler/CAS owner, rejection
-  recorder, and F10 internal-generation retiree.
-- `RepositoryReader` is database-free, pinned to one root, and side-effect
-  free. `WorkerView` and `CandidateView` are subordinate implementations
-  constructed through it.
+- `PileSender` may use SQLite. It closes local intent, encodes ordinary piles,
+  and delivers them. It cannot publish a root or retire ingress.
+- `RepositoryApplier` is database-free. It validates one closed pile, unions
+  every durable fact into the validated set, establishes immutable objects,
+  compiles and compare-and-swaps `root`, records rejection evidence, and
+  retires only its exact internal generation.
+- `RepositoryReader` is database-free and side-effect free. It answers from
+  one pinned root through `WorkerView` and `ValidatedView`.
 
-Those capabilities compose into two actor types:
+A full peer combines all three capabilities. A hosted recipient combines
+Applier and Reader; its metadata broker is a Reader plus a provider signer,
+not another actor or validation door. Never add a second pile-to-root path,
+provider-specific compiler, SQL publication path, or authority membrane.
 
-- A full P2P node combines Sender + Applier + Reader. SQLite accelerates local
-  authorship and presentation only.
-- A hosted recipient combines Applier + Reader. Its metadata broker is a
-  Reader plus a provider signer; it grants confined direct-upload
-  capabilities but does not apply facts. Provider stacks may isolate that
-  front door from the Applier process; the split is a least-privilege
-  compartment boundary inside the hosted actor, not a third actor type.
+## The central theorem
 
-Do not add a fourth publication role, a pre-Applier authority membrane, an
-ambient per-workspace state machine, SQL settlement, a provider-specific
-receiver, or any second pile-to-root path.
+The wire and stored values are deliberately different:
+
+```text
+wire:    one bounded, topologically ordered closed pile
+stored:  fid -> canonical fact-object oid
+```
+
+The pile is the validation certificate. If any member fails, the whole pile
+fails and no valid prefix is published. After a successful root CAS, every
+durable fact is an equal resident; ephemeral facts are discarded. Do not store
+the selected dependency edges, proof DAGs, ranks, winners, eligibility labels,
+dormant candidates, or a second settlement state.
+
+Validated storage is monotone:
+
+```text
+if f validates against S, f remains valid in every validated superset S'
+```
+
+If one provider is semantically significant, the fact must name that provider
+or its complete offer address in immutable bytes. Otherwise providers at the
+same complete address are interchangeable. Current suppression and authority
+maps may change visibility or authorization, never fact residence.
 
 ## Authority flow
 
-Read and change the system in this order:
+Read and change the receiving path in this order:
 
 ```text
-facts family command
-  → PileSender closes and encodes
-  → internal generation or isolated direct-upload marker
-  → RepositoryApplier validates with kernel/family policy
-  → repository_snapshot compiles authenticated maps
-  → immutable objects are established
-  → RepositoryApplier performs the sole root CAS
-  → exact internal generation is retired under its ApplyReceipt
-  → RepositoryReader answers from one pinned root
-  → client_projection optionally rebuilds disposable SQLite
+closed pile
+  -> RepositoryApplier
+  -> kernel plus family policy
+  -> monotone validated-fact union
+  -> repository_snapshot's pure four-map compiler
+  -> immutable object establishment
+  -> the sole root CAS
+  -> exact internal-generation retirement
+  -> RepositoryReader
 ```
 
-Direct-upload clients write detached objects first and the exact pile marker
-last into an isolated ingress namespace. Notifications are hints. The Applier
-fetches the marker itself, copies it behind an Applier-minted internal
-generation, uses the same transition as P2P receipt, commits facts before
-detached-object completion, and never deletes client-writable ingress.
+`FactTree` binds `fact:<fid>` directly to the canonical fact object's oid and
+also contains mechanical postings. `FactOrder`, `SuppTree`, and
+`AuthorityTree` are deterministic projections. SQLite mirrors canonical fact
+bytes plus generic index rows for local authorship and presentation only; it
+must be deletable and rebuildable from a pinned Reader.
 
-The object-store model is an immutable content-addressed map plus one
-linearizable, opaque-token CAS register named `root`. Exact untrusted reads
-use mandatory `get_bounded`; discovery uses mandatory bounded `list_page` and
-cursors only as liveness hints. Whole-GET and whole-LIST compatibility
-fallbacks are forbidden. LIST never authorizes a fact, mutation, or deletion.
+Direct-upload clients write detached immutable objects first and one exact
+closed pile marker last into isolated ingress. Notifications and LIST results
+are liveness hints only. The Applier copies an exact marker behind its own
+internal generation and invokes the same transition used by a full peer.
 
-## Fact families and indexes
+## Fact families
 
-Use one module per fact family under `facts/auth/` or `facts/content/`.
-Families own construction, needs, validation, commands, query assembly, blob
-references, suppression selectors/actions, authority scopes, and `POLICY`.
-`facts/__init__.py` is the checked command, ephemeral-proof, and behavior
-dispatch inventory. Keep `core/` family-neutral; it must not import concrete
-`facts.auth` or `facts.content` modules.
+Use one module per family under `facts/auth/` or `facts/content/`. Families own
+construction, exact shape checks, named Needs, immutable refs/offers,
+suppression selectors/actions, authority scopes, ownership, commands, query
+assembly, and detached blob references. `facts/__init__.py` is the checked
+registry. Keep core family-neutral; it may dispatch through `facts`, but it
+must not import concrete family modules or switch on their tags.
 
-Durable facts exist once as canonical encoded blobs. The mechanical generic
-index covers type, reconciliation key, every explicit reference, and every
-offer. SQLite contains one fact table and that one combined index; structural
-standing/rank, exact resolved edges, and active suppression actions are typed
-rows in the same index. Current liveness is distinct from structural standing.
-Deleting SQLite must not alter repository answers.
+Needs use complete offer addresses. A fact may also name an exact provider in
+its envelope when identity matters. Do not infer durable ownership from a
+current winning provider. Suppression selectors are explicit: SELF, named
+parent or ancestor paths, several selectors, or none. A family with none
+cannot be directly suppressed, although its declared current authority scopes
+may still make it unusable as a provider.
 
-If a client and a hosted Reader ask the same published-state question, both
-must derive the answer from authenticated maps. SQLite may serve client-only
-query assembly, never auth, suppression, admission, or root construction.
+## Object-store and concurrency rules
+
+The storage contract is immutable content-addressed objects plus one
+linearizable opaque-token CAS register named `root`. Exact untrusted reads use
+bounded APIs. Discovery uses bounded pagination. Never rely on ETags being
+content hashes, unconditional replacement, whole-GET/whole-LIST fallbacks, or
+LIST for safety.
+
+Stale workers may duplicate bounded immutable work or delay convergence. They
+must not overwrite different bytes at an object key, clobber a newer root,
+retire another generation, skip required detached-object completion, mint
+from unobserved state, or corrupt a Merkle tree.
 
 ## Change rules
 
-- Inbound facts and objects enter through `RepositoryApplier`.
-- Outbound peer objects/piles are encoded and delivered through `PileSender`.
-- A sync batch may share facts only when the combined kernel judgment
-  preserves every selected witness's exact named edges. Valid-but-rewired or
-  jointly invalid closures remain separate ordinary piles.
-- Production code constructs `WorkerView`/`CandidateView` through
-  `RepositoryReader`.
+- Inbound piles enter through `RepositoryApplier`.
+- Outbound piles enter through `PileSender`.
+- Sync compares `fid -> object_oid`, assembles fresh closures from immutable
+  refs and Needs, and receives them through the ordinary Applier.
 - Provider adapters translate storage, events, budgets, and deployment
-  configuration. They do not contain protocol policy or a compiler.
-- A proposal, receipt, cursor, notification, ETag, or SQL row is not authority
-  beyond the exact binding documented by its type.
-- Preserve concurrent safety: stale workers may delay convergence but cannot
-  clobber a root, corrupt a tree, delete another generation, or mint from
-  unobserved state.
-
-Every behavior change needs a realistic test. Prefer real daemon/socket,
-provider-fake, cold-restart, crash-point, and hostile-input coverage over
-placeholder assertions. Keep structural authority ratchets in
-`tests/test_repository_layout.py`.
+  configuration only.
+- A receipt, cursor, notification, ETag, SQL row, or local lock carries no
+  authority beyond its exact documented binding.
+- Every behavior change needs a realistic test. Prefer actual daemon/socket,
+  provider-fake, restart, crash-point, concurrent, and hostile-input coverage.
+- Keep structural authority ratchets in `tests/test_repository_layout.py`.
 
 When working in a worktree, edit only that worktree and commit completed work
-on its branch before handoff or review. Preserve unrelated changes and never
-use destructive checkout/reset commands against a shared workspace.
+on its branch before handoff or review. Preserve unrelated changes.
 
 Useful gates:
 

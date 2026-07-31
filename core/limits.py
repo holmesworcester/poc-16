@@ -20,9 +20,8 @@ MAX_MINT_FETCH_BYTES = 4 * MIB
 MAX_PAGE_REQUEST_BYTES = 64 * 1024
 MAX_PAGE_BATCH_BYTES = 4 * MIB
 
-# One immutable kernel/archive closure. These are protocol limits, not merely
-# implementation budgets: the kernel must never mint a durable Valid that the
-# raw-free admission witness cannot represent.
+# One immutable closed pile. These are protocol limits, not merely
+# implementation budgets: every receiving engine enforces the same boundary.
 MAX_CLOSURE_FACTS = 256
 MAX_RESOLVED_EDGES = 64
 

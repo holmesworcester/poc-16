@@ -181,7 +181,7 @@ def _fetch_blobs(node, ws, peer):
     st = node.store(ws)
     with node.lock:
         pending = []
-        for fid in node.catalog(ws).eligible_ids():
+        for fid in node.catalog(ws).fact_ids():
             fact = node.fact_of(ws, fid)
             if node.suppressed(ws, fact):
                 continue
