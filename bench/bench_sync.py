@@ -36,7 +36,7 @@ from core.close import close
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import kernel, resolve_deps
-from core.limits import MAX_CLOSURE_FACTS
+from core.limits import MAX_CLOSURE_FACTS, MAX_PILE_FACTS
 from full_peer.node import FullPeer, now_ms
 from core.repository_reader import RepositoryReader
 
@@ -158,6 +158,7 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
     _ = workers  # retained for benchmark-call compatibility
     streamed = 0
     buf = []
+    buffered_fids = set()
 
     def flush(bb):
         ordered = {}
@@ -169,10 +170,17 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 
     for unit in units:
         streamed += len(unit)
+        unit_fids = {fact.fid for fact in unit}
+        if buf and len(buffered_fids | unit_fids) > MAX_PILE_FACTS:
+            flush(buf)
+            buf = []
+            buffered_fids.clear()
         buf.append(unit)
+        buffered_fids.update(unit_fids)
         if len(buf) >= batch:
             flush(buf)
             buf = []
+            buffered_fids.clear()
     if buf:
         flush(buf)
     return streamed

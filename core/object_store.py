@@ -212,11 +212,15 @@ class AsyncObjectStore(Protocol):
     async def delete(self, key: str): ...
 
 
-def verified_object(oid, fetch):
+def verified_object(
+        oid, fetch, *, max_bytes=MAX_REPOSITORY_OBJECT_BYTES):
     """Fetch one content-addressed object and verify its name."""
+    if type(max_bytes) is not int \
+            or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+        raise ValueError("object byte limit")
     raw = fetch(oid) if oid else None
     if not isinstance(raw, bytes) \
-            or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
+            or len(raw) > max_bytes \
             or h(raw) != oid:
         raise ValueError("object integrity")
     return raw

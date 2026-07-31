@@ -214,7 +214,8 @@ def test_chain_seed_rejects_a_pile_beyond_the_protocol_closure_bound(
         tmp_path):
     members = 2 + (MAX_CLOSURE_FACTS - 1) // 4
     membership_facts = 1 + 4 * (members - 1)
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(
+            ValueError, match="not admitted|pile has too many facts"):
         build_seed(
             str(tmp_path / "too-deep"), membership_facts,
             n_members=members, shape="chain", seed=16)

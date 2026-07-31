@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from . import snapshot
 from .crypto import h
 from .object_store import verified_object
+from .limits import MAX_OBJECT_BYTES
 from .validated_set import ValidatedView, reconstruct
 from .worker import WorkerView
 
@@ -68,7 +69,8 @@ class RepositoryReader:
 
     def object(self, oid):
         """Read one hash-verified immutable object through the pinned reader."""
-        return verified_object(oid, self.fetch)
+        return verified_object(
+            oid, self.fetch, max_bytes=MAX_OBJECT_BYTES)
 
     def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
         """Run the family authorization hook against this exact root."""

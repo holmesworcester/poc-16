@@ -532,11 +532,10 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     } == runtime._BUDGETS
     assert runtime.MAX_REQUEST_BYTES <= limits.MAX_MINT_REQUEST_BYTES
     assert runtime.MAX_ROOT_BYTES <= limits.MAX_ROOT_BYTES
-    assert runtime.MAX_OBJECT_BYTES <= min(
-        limits.MAX_OBJECT_BYTES,
-        limits.MAX_REPOSITORY_OBJECT_BYTES,
-        limits.MAX_PAGE_BATCH_BYTES,
-    )
+    # The single-object route also carries detached Bao proofs and invites.
+    # Authenticated repository reads apply their narrower page/fact bound at
+    # the gate call site rather than shrinking this shared transport ceiling.
+    assert runtime.MAX_OBJECT_BYTES <= limits.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES <= limits.MAX_PAGE_BATCH_BYTES
     assert runtime.MAX_MINT_FETCHES <= limits.MAX_MINT_FETCHES

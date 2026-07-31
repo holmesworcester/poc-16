@@ -116,9 +116,12 @@ def serving(node, profile, tamper_cap=None):
         thread.join(5)
 
 
-def test_full_peer_serves_one_object_larger_than_the_batch_limit(tmp_path):
+def test_full_peer_falls_back_when_one_object_exceeds_encoded_batch(
+        tmp_path):
     remote, workspace, local = replicas(tmp_path)
-    raw = b"x" * (MAX_PAGE_BATCH_BYTES + 1)
+    # Base64 plus the JSON envelope crosses the batch response limit while
+    # the raw detached object remains inside its 4 MiB single-object limit.
+    raw = b"x" * (3 * MAX_PAGE_BATCH_BYTES // 4 + 1)
     oid = h(raw)
     remote.receive_object(workspace, oid, raw)
 
