@@ -292,6 +292,70 @@ def test_applier_owns_object_establishment_generations_and_retirement():
         assert callers == expected
 
 
+def test_inbound_canonical_objects_have_one_semantic_write_door():
+    callers = {
+        path.as_posix()
+        for path in source_paths()
+        for call in ast.walk(parsed(path))
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "admit_object"
+    }
+    assert callers == {
+        "core/http.py",
+        "core/repository_applier.py",
+        "full_peer/node.py",
+    }
+
+    # Provider adapters expose mutation mechanics and deployment code may
+    # conditionally create isolated ingress. Neither is another canonical
+    # obj/* writer. Track simple local aliases as well as inline key building
+    # so the ratchet does not ban legitimate non-canonical creates.
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] not in {"full_peer", "adapters", "deploy"}:
+            continue
+        for function in (
+                item for item in ast.walk(parsed(path))
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            names = set()
+
+            def canonical(expression):
+                return any(
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and (node.value == "obj" or node.value.startswith("obj/"))
+                    or isinstance(node, ast.Name) and node.id in names
+                    for node in ast.walk(expression)
+                )
+
+            for assignment in (
+                    item for item in ast.walk(function)
+                    if isinstance(item, (ast.Assign, ast.AnnAssign))):
+                value = assignment.value
+                if value is None or not canonical(value):
+                    continue
+                targets = assignment.targets \
+                    if isinstance(assignment, ast.Assign) \
+                    else (assignment.target,)
+                names.update(
+                    node.id
+                    for target in targets
+                    for node in ast.walk(target)
+                    if isinstance(node, ast.Name)
+                )
+            offenders.extend(
+                (path, call.lineno)
+                for call in ast.walk(function)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr in {"put", "put_if_absent", "_replace"}
+                and call.args
+                and canonical(call.args[0])
+            )
+    assert not offenders
+
+
 def test_only_cursor_savers_may_use_overwriteable_operational_hints():
     applier = next(
         item for item in parsed(Path("core/repository_applier.py")).body
