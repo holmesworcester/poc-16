@@ -7,7 +7,7 @@ import pytest
 import facts
 from core import fact_index
 from core.close import close, encode_pile
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.kernel import offer_src, resolve_deps
 from full_peer.node import FullPeer
 from full_peer import sync as sync_module
@@ -60,6 +60,23 @@ def _author_eviction(node, workspace, target, ts):
             item.fid: (signed.fid, admin, target_member),
         })
     return item
+
+
+def _ordered_action_world(path):
+    """Fixed identities whose ts=41 action fid sorts below the ts=20 fid."""
+    founder_secret = load_sk(f"{1:064x}")
+    member_secret = load_sk(f"{2:064x}")
+    member = member_secret.verify_key.encode().hex()
+    node = FullPeer(str(path), initial_secret=founder_secret)
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    add_member(
+        node,
+        workspace,
+        "bob",
+        ts=10,
+        member_identity=(member_secret, member),
+    )
+    return node, workspace, member_secret, member
 
 
 def test_composite_root_has_no_legacy_removal_object(tmp_path):
@@ -230,20 +247,16 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
 
 
 def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
+    source, workspace, bob_secret, bob = _ordered_action_world(
+        tmp_path / "source")
     base = closed_subset(source, workspace, all_fids(source, workspace))
 
     first = _author_eviction(source, workspace, bob, 20)
     first_pile = closed_subset(source, workspace, [first.fid])
-    later = next(
-        removal(workspace, source.identity_id(workspace), bob, ts)
-        for ts in range(41, 500)
-        if removal(
-            workspace, source.identity_id(workspace), bob, ts
-        ).fid < first.fid
-    )
+    later = removal(
+        workspace, source.identity_id(workspace), bob, 41)
+    assert later.key > first.key
+    assert later.fid < first.fid  # deliberately opposes key order
     secret, public = source.identity(workspace)
     later_sig = signature(secret, public, later, later.ts)
     source.ingest_new(
@@ -294,10 +307,9 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
 
 
 def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    source, workspace, _, bob = _ordered_action_world(
+        tmp_path / "source")
     founder_secret, founder = source.identity(workspace)
-    _, bob, _ = add_member(source, workspace, "bob", ts=10)
     common = closed_subset(source, workspace, all_fids(source, workspace))
     first = _author_eviction(source, workspace, bob, 20)
 
@@ -307,13 +319,8 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
         workspace, "alice", peers=[], identity=founder)
     deliver(destination, workspace, common)
     destination.turn(workspace)
-    later_ts = next(
-        ts for ts in range(41, 500)
-        if removal(
-            workspace, destination.identity_id(workspace), bob, ts
-        ).fid < first.fid
-    )
-    later = _author_eviction(destination, workspace, bob, later_ts)
+    later = _author_eviction(destination, workspace, bob, 41)
+    assert later.key > first.key
     assert later.fid < first.fid  # the obsolete tuple-order shortcut
 
     store = source.store(workspace)
