@@ -12,6 +12,7 @@ from core.crypto import keypair
 from core.fact import Fact
 from core.http import HttpGate
 from core.kernel import drain
+from core.limits import MAX_REPOSITORY_OBJECT_BYTES
 from deploy.cloudflare_worker import runtime as cloudflare
 from facts.auth._display import MAX_DISPLAY_BYTES
 from facts.auth.device import device
@@ -216,7 +217,7 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
         assert sum(size for _, size, _ in object_reads) \
             <= cloudflare.MAX_MINT_FETCH_BYTES
         assert all(
-            maximum == cloudflare.MAX_OBJECT_BYTES
+            maximum == MAX_REPOSITORY_OBJECT_BYTES
             for _, _, maximum in object_reads
         )
 
