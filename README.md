@@ -37,7 +37,10 @@ processes or stacks without creating another repository state machine.
 7. `full_peer/pile_sender.py`: stateful-client authorship and closure.
 8. `full_peer/node.py`: `FullPeer`, the composition root, not a policy owner.
 9. `full_peer/sql_store.py`: the sole SQL boundary.
-10. `deploy/` and `adapters/`: provider adaptation and packaging only.
+10. `full_peer/daemon.py`, `full_peer/iroh_process.py`, `full_peer/iroh/`:
+    process composition, child lifecycle, then the connection-only Iroh byte
+    wrapper.
+11. `deploy/` and `adapters/`: provider adaptation and packaging only.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -81,6 +84,61 @@ python3 -m full_peer content.message.list WORKSPACE_PREFIX
 ```
 
 Use `--node URL` to target a non-default local daemon.
+
+At startup the daemon reads `TINYP2P_GRANT_TTL`,
+`TINYP2P_MINT_MAX_FETCHES`, and `TINYP2P_MINT_MAX_FETCH_BYTES` once into one
+validated immutable `HttpGateOptions` value. The stdlib adapter passes those
+limits to the same `HttpGate` for every request; the full peer does not
+implement grant or mint policy.
+
+### Iroh connection mode
+
+Iroh is only an encrypted connection and reachability layer. The Rust code
+does not parse HTTP, grants, workspaces, object keys, or facts and never opens
+the bucket. It forwards one byte stream to the loopback
+`core/http_stdlib.py` listener. That listener still invokes the one
+`HttpGate`, whose bearer grant checks and normal GET/PUT/mint operations reach
+the same object-store and `RepositoryApplier` interfaces as plain HTTP.
+Endpoint IDs, tickets, ALPN, and connection success confer no repository
+authority.
+
+Build the small wrapper:
+
+```sh
+cargo build --release --locked \
+  --manifest-path full_peer/iroh/Cargo.toml
+```
+
+Run one supervised full peer:
+
+```sh
+python3 -m full_peer daemon ./state --port 0 --iroh \
+  --iroh-binary ./full_peer/iroh/target/release/poc16-iroh
+```
+
+The command starts the peer-data gate on loopback, starts local control on a
+different loopback listener, starts and monitors Iroh, persists the endpoint
+key at `./state/iroh/endpoint.key`, and prints `IROH ... peer=TICKET`. If the
+Iroh child or data listener dies, the whole service fails shut. SIGINT and
+SIGTERM stop and reap every child. Add `--iroh-loopback` only for a
+single-machine test; normal mode enables Iroh's production reachability
+preset.
+
+The standalone commands remain useful for diagnosis. This creates a local
+HTTP seam whose bytes traverse Iroh to the accepting peer:
+
+```sh
+./full_peer/iroh/target/release/poc16-iroh forward --peer TICKET
+```
+
+The remaining outbound integration is explicit in bead `poc-16-32h`.
+Workspace peer configuration currently stores HTTP URLs; `FullPeer` does not
+yet persist a peer ticket and recreate a local forwarder for its sync
+scheduler. Therefore the supervised accepting path and manual forwarder are
+working, but ordinary invites do not yet establish Iroh-only scheduled sync.
+Do not advertise the accepting peer's loopback data URL as a remote peer;
+`--url` is rejected in Iroh mode so it cannot accidentally advertise a plain
+HTTP endpoint.
 
 ## Repository flow
 

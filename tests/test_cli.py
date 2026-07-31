@@ -1,5 +1,6 @@
 """The process CLI and daemon are transports for family-owned commands."""
 import asyncio
+from dataclasses import FrozenInstanceError
 import io
 import json
 from types import SimpleNamespace
@@ -30,6 +31,28 @@ EXPECTED = {
     "content.message.post",
     "content.message.upload",
 }
+
+
+def test_http_gate_host_options_are_immutable_and_fail_closed():
+    options = cli._gate_options({
+        "TINYP2P_GRANT_TTL": "1234",
+        "TINYP2P_MINT_MAX_FETCHES": "7",
+        "TINYP2P_MINT_MAX_FETCH_BYTES": "8192",
+    })
+    assert (
+        options.grant_ttl_ms,
+        options.max_mint_fetches,
+        options.max_mint_fetch_bytes,
+    ) == (1234, 7, 8192)
+    with pytest.raises(FrozenInstanceError):
+        options.grant_ttl_ms = 1
+
+    for invalid in (
+            {"TINYP2P_GRANT_TTL": "0"},
+            {"TINYP2P_MINT_MAX_FETCHES": "-1"},
+            {"TINYP2P_MINT_MAX_FETCH_BYTES": "not-an-integer"}):
+        with pytest.raises(RuntimeError, match="invalid"):
+            cli._gate_options(invalid)
 
 
 def test_checked_registry_is_exactly_the_union_of_family_declarations():

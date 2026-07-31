@@ -236,9 +236,12 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     monkeypatch.setattr(host, "load_store_factory", lambda path: factory)
     def serve(
             directory, port, host_name, cadence, url, *,
-            control_port, store_factory):
+            control_port, store_factory, gate_options,
+            iroh_binary, iroh_key_file,
+            iroh_loopback):
         seen["arguments"] = (
-            directory, port, host_name, cadence, url, control_port)
+            directory, port, host_name, cadence, url, control_port,
+            gate_options, iroh_binary, iroh_key_file, iroh_loopback)
         seen["peer"] = FullPeer(
             directory, initial_secret=secret,
             store_factory=store_factory)
@@ -253,6 +256,8 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     assert selected.store(workspace).get("root") \
         == bootstrap.store(workspace).get("root")
     assert seen["arguments"][1:3] == (0, "127.0.0.1")
+    assert seen["arguments"][6].grant_ttl_ms == 60_000
+    assert seen["arguments"][7:] == (None, None, False)
 
 
 def test_daemon_help_documents_reproducible_s3_r2_config(capsys):
@@ -270,6 +275,7 @@ def test_filesystem_daemon_path_imports_no_cloud_adapter_or_sdk():
     script = r"""
 import builtins
 import tempfile
+import threading
 
 real_import = builtins.__import__
 def guarded(name, *args, **kwargs):
@@ -279,9 +285,41 @@ def guarded(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
 
-from full_peer.node import FullPeer
-node = FullPeer(tempfile.mkdtemp())
-node.store("0" * 64)
+from full_peer import cli, daemon
+
+class Server:
+    made = []
+
+    def __init__(self, address, handler):
+        self.server_address = (address[0], 19000 + len(self.made))
+        self.handler = handler
+        self.daemon_threads = False
+        self.stopped = threading.Event()
+        self.closed = False
+        self.made.append(self)
+
+    def serve_forever(self):
+        if self is self.made[0]:
+            self.stopped.wait(5)
+
+    def shutdown(self):
+        self.stopped.set()
+
+    def server_close(self):
+        self.closed = True
+
+daemon.ThreadingHTTPServer = Server
+try:
+    cli.main([
+        "daemon", tempfile.mkdtemp(), "--port", "0", "--control-port", "0",
+    ])
+except RuntimeError as error:
+    assert "control listener stopped unexpectedly" in str(error)
+else:
+    raise AssertionError("fake control lifecycle did not stop daemon")
+
+assert len(Server.made) == 2
+assert all(server.stopped.is_set() and server.closed for server in Server.made)
 """
     result = subprocess.run(
         [sys.executable, "-c", script], cwd=ROOT,

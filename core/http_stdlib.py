@@ -5,13 +5,41 @@ HTTP request bytes, selects one workspace, and delegates every authorization
 and repository operation to the database-free gate.
 """
 import asyncio
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 import time
 from urllib.parse import parse_qs, urlparse
 
 from . import peer_capability
 from .http import HttpGate, Response
-from .limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
+from .limits import (
+    MAX_MINT_FETCHES,
+    MAX_MINT_FETCH_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    PayloadTooLarge,
+)
+
+
+@dataclass(frozen=True)
+class HttpGateOptions:
+    """Validated host knobs passed unchanged into every request gate."""
+
+    grant_ttl_ms: int = 60_000
+    max_mint_fetches: int = MAX_MINT_FETCHES
+    max_mint_fetch_bytes: int = MAX_MINT_FETCH_BYTES
+
+    def __post_init__(self):
+        if type(self.grant_ttl_ms) is not int or self.grant_ttl_ms < 1:
+            raise ValueError("grant TTL")
+        for label, value, ceiling in (
+                ("mint fetch count", self.max_mint_fetches, MAX_MINT_FETCHES),
+                (
+                    "mint fetch bytes",
+                    self.max_mint_fetch_bytes,
+                    MAX_MINT_FETCH_BYTES,
+                )):
+            if type(value) is not int or not 0 <= value <= ceiling:
+                raise ValueError(label)
 
 
 def now_ms():
@@ -49,6 +77,7 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
 
     peer = secret = None
     sync_profile = peer_capability.FULL
+    gate_options = HttpGateOptions()
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_args):
@@ -114,6 +143,9 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             now_ms,
             _SyncReceiver(self.peer, workspace),
             sync_profile=self.sync_profile,
+            grant_ttl_ms=self.gate_options.grant_ttl_ms,
+            max_mint_fetches=self.gate_options.max_mint_fetches,
+            max_mint_fetch_bytes=self.gate_options.max_mint_fetch_bytes,
         )
         try:
             response = asyncio.run(gate.handle(
@@ -132,8 +164,14 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
         return self._dispatch("PUT")
 
 
-def handler_for(peer, secret, sync_profile=peer_capability.FULL):
+def handler_for(
+        peer, secret, sync_profile=peer_capability.FULL, *,
+        gate_options=None):
     """Bind one ordinary HTTP server without mutable global authority."""
+    gate_options = HttpGateOptions() \
+        if gate_options is None else gate_options
+    if not isinstance(gate_options, HttpGateOptions):
+        raise TypeError("HTTP gate options")
     return type(
         "BoundPeerHandler",
         (StdlibPeerHandler,),
@@ -141,8 +179,9 @@ def handler_for(peer, secret, sync_profile=peer_capability.FULL):
             "peer": peer,
             "secret": secret,
             "sync_profile": sync_profile,
+            "gate_options": gate_options,
         },
     )
 
 
-__all__ = ("StdlibPeerHandler", "handler_for")
+__all__ = ("HttpGateOptions", "StdlibPeerHandler", "handler_for")

@@ -55,6 +55,43 @@ schedule turns and translate results, but it is not a fact-policy, compiler,
 suppression, or CAS authority. `full_peer/sql_store.py` is the sole SQL
 module, and deleting its database changes no repository answer.
 
+### 1.1 Iroh is connection authority only
+
+The optional full-peer path is deliberately a wrapper around the existing
+HTTP byte seam:
+
+```text
+ordinary HTTP GET/PUT/mint bytes
+    -> loopback forwarder
+    -> one Iroh bidirectional stream
+    -> supervised Iroh acceptor
+    -> loopback core/http_stdlib listener
+    -> the one HttpGate
+    -> RepositoryReader or RepositoryApplier
+    -> the configured object store
+```
+
+Only `full_peer` owns Iroh endpoint keys, tickets, child processes, and
+connection lifecycle. The Rust crate under `full_peer/iroh/` copies bytes; it
+has no HTTP parser, route table, grant codec, workspace model, repository
+operation, object-store client, or CAS. Iroh transport identity encrypts and
+reaches a peer but grants no fact, bucket, or workspace authority. Every
+request must independently pass the normal `HttpGate` grant decision.
+Full-peer host configuration becomes one validated immutable gate-options
+value at startup (grant lifetime and bounded mint fetch count/bytes);
+`core.http_stdlib` passes it into `HttpGate` without interpreting it.
+
+The peer-data listener behind an Iroh acceptor is unconditionally loopback.
+Local control is a second, unconditionally loopback listener and is never an
+Iroh upstream. A stopped Iroh child or peer-data listener stops the service;
+normal process shutdown reaps the child. The endpoint key is stable across
+restart, but that stable identity is still not an authorization principal.
+
+The accepting lifecycle is supervised today. Durable outbound mapping from a
+workspace peer to an Iroh ticket and scheduler-owned forwarder remains future
+work (`poc-16-32h`); until it lands, the standalone forwarder is diagnostic
+and ordinary invite/sync configuration must not be described as Iroh-only.
+
 ## 2. Facts and closed piles
 
 A fact has a canonical clear envelope and a canonical body:

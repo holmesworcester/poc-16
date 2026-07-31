@@ -44,7 +44,10 @@ Read implementation authority in this order:
 4. `core/http.py` for peer routes and authorization.
 5. `full_peer/` for the stateful local composition; `sql_store.py` is its sole
    SQL boundary.
-6. `adapters/` and `deploy/` for provider adaptation and packaging.
+6. `full_peer/daemon.py`, `full_peer/iroh_process.py`, and `full_peer/iroh/`
+   for process composition, child lifecycle, and the connection-only Iroh
+   byte wrapper.
+7. `adapters/` and `deploy/` for provider adaptation and packaging.
 
 ## The central theorem
 
@@ -137,6 +140,9 @@ from unobserved state, or corrupt a Merkle tree.
   refs and Needs, and receives them through the ordinary Applier.
 - Provider adapters translate storage, events, budgets, and deployment
   configuration only.
+- Iroh transports opaque HTTP bytes only. Endpoint identity, tickets, ALPN,
+  and connection success never grant repository authority; local control
+  never traverses Iroh.
 - A receipt, cursor, notification, ETag, SQL row, or local lock carries no
   authority beyond its exact documented binding.
 - Every behavior change needs a realistic test. Prefer actual daemon/socket,

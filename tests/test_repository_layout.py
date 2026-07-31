@@ -796,6 +796,64 @@ def test_local_control_is_unconditionally_loopback_and_not_peer_data():
     assert "control_host" not in parameters
 
 
+def test_iroh_is_a_full_peer_owned_connection_wrapper_only():
+    crate = ROOT / "full_peer" / "iroh"
+    assert {
+        path.relative_to(crate).as_posix()
+        for path in crate.rglob("*")
+        if path.is_file()
+    } == {
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/lib.rs",
+        "src/main.rs",
+    }
+
+    manifest = (crate / "Cargo.toml").read_text()
+    for authority_or_protocol_dependency in (
+            "axum",
+            "aws-sdk-s3",
+            "http",
+            "hyper",
+            "object_store",
+            "reqwest",
+            "serde_json"):
+        assert not re.search(
+            rf"(?m)^{re.escape(authority_or_protocol_dependency)}\s*=",
+            manifest,
+        )
+    rust = "\n".join(
+        (crate / relative).read_text()
+        for relative in ("src/lib.rs", "src/main.rs")
+    )
+    for duplicate_route_or_credential in (
+            '"/mint"',
+            '"/page',
+            '"/pile',
+            '"/root"',
+            '"Authorization"',
+            '"Bearer "'):
+        assert duplicate_route_or_credential not in rust
+
+    daemon = (ROOT / "full_peer" / "daemon.py").read_text()
+    process = (ROOT / "full_peer" / "iroh_process.py").read_text()
+    assert "class IrohProcess" in process
+    assert '"serve"' in process
+    assert '"--upstream"' in process
+    assert "peer_handler_for(" in daemon
+    assert "gate_options=self.gate_options" in daemon
+    assert "_control_server(" in daemon
+    assert not any(
+        path.suffix == ".rs"
+        for path in (ROOT / "core").rglob("*")
+    )
+    assert all(
+        "endpoint_id" not in (ROOT / path).read_text()
+        for path in source_paths()
+        if path.parts[0] == "core"
+    )
+
+
 def test_full_peer_projection_has_no_repository_authority_residue():
     source = (ROOT / "full_peer" / "sql_store.py").read_text()
     for retired in (

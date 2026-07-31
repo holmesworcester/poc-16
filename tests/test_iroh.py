@@ -1,54 +1,85 @@
-"""Real Iroh loopback around the one core HTTP grant gate."""
+"""Real Iroh transport around the one ordinary full-peer HTTP grant gate."""
+import asyncio
 import base64
 import http.client
 import json
 import os
 from pathlib import Path
-import select
+import queue
+import re
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+from urllib.parse import urlparse
 
 import pytest
 
 import facts
 from core.close import encode_pile
 from core.crypto import h, unseal
-from core.limits import MAX_OBJECT_BYTES
-from core.node import Node, now_ms
+from core.limits import MAX_MINT_FETCHES, MAX_MINT_FETCH_BYTES
+from core.repository_reader import RepositoryReader
 from facts.auth import request
+from full_peer.daemon import FullPeerService
+from full_peer.node import FullPeer, now_ms
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "full_peer" / "iroh" / "Cargo.toml"
 
 
-def free_port():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
-def wait_port(port, timeout=15):
+def wait_until(predicate, timeout=15, message="condition"):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=.2):
+            if predicate():
                 return
         except OSError:
-            time.sleep(.05)
-    raise AssertionError(f"port {port} did not open")
+            pass
+        time.sleep(.05)
+    raise AssertionError(f"timed out waiting for {message}")
+
+
+def port_open(port):
+    with socket.create_connection(("127.0.0.1", port), timeout=.2):
+        return True
 
 
 def stop(process):
     if process.poll() is None:
         process.terminate()
     try:
-        process.wait(10)
+        return process.wait(10)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(5)
+        return process.wait(5)
+
+
+def next_line(process, timeout=30):
+    result = queue.Queue(maxsize=1)
+
+    def read():
+        result.put(process.stdout.readline())
+
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        line = result.get(timeout=timeout).strip()
+    except queue.Empty:
+        stop(process)
+        raise AssertionError("process did not report readiness") from None
+    if not line:
+        error = process.stderr.read() if process.poll() is not None else ""
+        stop(process)
+        raise AssertionError(f"process exited before readiness: {error}")
+    return line
+
+
+def parse_fields(line, marker):
+    assert line.startswith(marker + " "), line
+    return dict(field.split("=", 1) for field in line.split()[1:])
 
 
 def ready_process(command):
@@ -59,17 +90,137 @@ def ready_process(command):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
     )
-    readable, _, _ = select.select([process.stdout], [], [], 30)
-    if not readable:
+    return process, parse_fields(next_line(process), "READY")
+
+
+def start_full_peer(state, binary, environment=None):
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "full_peer",
+            "daemon",
+            str(state),
+            "--port", "0",
+            "--control-port", "0",
+            "--cadence", "3600",
+            "--iroh",
+            "--iroh-binary", str(binary),
+            "--iroh-loopback",
+        ],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **(environment or {})},
+    )
+    service = next_line(process)
+    match = re.fullmatch(
+        r"full peer [^:]+: data (http://[^;]+); "
+        r"control (http://[^ ]+) \(.*\)",
+        service,
+    )
+    if match is None:
         stop(process)
-        raise AssertionError("Iroh process did not report readiness")
-    line = process.stdout.readline().strip()
-    if not line.startswith("READY "):
-        error = process.stderr.read() if process.poll() is not None else ""
+        raise AssertionError(f"bad full-peer readiness: {service!r}")
+    iroh = parse_fields(next_line(process), "IROH")
+    return process, {
+        "data": match.group(1),
+        "control": match.group(2),
+        **iroh,
+    }
+
+
+def start_plain_full_peer(state, environment):
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "full_peer",
+            "daemon",
+            str(state),
+            "--port", "0",
+            "--control-port", "0",
+            "--cadence", "3600",
+        ],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={**os.environ, **environment},
+    )
+    service = next_line(process)
+    match = re.fullmatch(
+        r"full peer [^:]+: data (http://[^;]+); "
+        r"control (http://[^ ]+) \(.*\)",
+        service,
+    )
+    if match is None:
         stop(process)
-        raise AssertionError(f"bad Iroh readiness: {line!r} {error!r}")
-    return process, dict(field.split("=", 1) for field in line.split()[1:])
+        raise AssertionError(f"bad full-peer readiness: {service!r}")
+    return process, {
+        "data": match.group(1),
+        "control": match.group(2),
+    }
+
+
+def address(url):
+    parsed = urlparse(url)
+    return parsed.hostname, parsed.port
+
+
+def call(target, method, path, *, body=b"", token=None, headers=None):
+    request_headers = {"Connection": "close", **(headers or {})}
+    if token is not None:
+        request_headers["Authorization"] = "Bearer " + token
+    connection = http.client.HTTPConnection(*target, timeout=15)
+    connection.request(method, path, body=body, headers=request_headers)
+    response = connection.getresponse()
+    result = response.status, response.read(), {
+        name.lower(): value for name, value in response.getheaders()
+        if name.lower() in {"content-type", "etag"}
+    }
+    connection.close()
+    return result
+
+
+def repository_bytes(node_dir, workspace):
+    root = Path(node_dir) / "ws" / workspace
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.name != ".root.lock"
+        and not path.name.endswith((".idx.db", ".idx.db-shm", ".idx.db-wal"))
+    }
+
+
+def mint(target, workspace, pile, identity_secret):
+    status, body, _ = call(
+        target,
+        "POST",
+        f"/mint?ws={workspace}",
+        body=json.dumps({
+            "ws": workspace,
+            "pile": base64.b64encode(pile).decode(),
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert status == 200
+    value = json.loads(body)
+    return (
+        unseal(
+            identity_secret,
+            base64.b64decode(value["grant"]),
+        ).decode(),
+        value["cap"],
+    )
 
 
 @pytest.fixture(scope="module")
@@ -93,269 +244,304 @@ def iroh_binary(tmp_path_factory):
     return target / "debug" / "poc16-iroh"
 
 
-def start_gate(node_dir, port, *, read_only=False):
-    command = [
-        sys.executable,
-        "-m",
-        "core",
-        "daemon",
-        str(node_dir),
-        "--port",
-        str(port),
-        "--cadence",
-        "3600",
-        "--peer-data-only",
-    ]
-    if read_only:
-        command.append("--read-only")
-    process = subprocess.Popen(
-        command,
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "TINYP2P_GRANT_TTL": "3000"},
-    )
-    wait_port(port)
-    return process
-
-
-def call(address, method, path, *, body=b"", token=None, headers=None):
-    host, port = address
-    request_headers = {"Connection": "close", **(headers or {})}
-    if token is not None:
-        request_headers["Authorization"] = "Bearer " + token
-    connection = http.client.HTTPConnection(host, port, timeout=15)
-    connection.request(
-        method,
-        path,
-        body=body,
-        headers=request_headers,
-    )
-    response = connection.getresponse()
-    result = response.status, response.read(), {
-        name.lower(): value for name, value in response.getheaders()
-        if name.lower() in {"content-type", "etag"}
-    }
-    connection.close()
-    return result
-
-
-def raw_call(address, raw):
-    with socket.create_connection(address, timeout=15) as stream:
-        stream.settimeout(15)
-        stream.sendall(raw)
-        reader = stream.makefile("rb")
-        status_line = reader.readline(4096)
-        assert status_line.startswith(b"HTTP/1.1 ")
-        status = int(status_line.split()[1])
-        headers = {}
-        while True:
-            line = reader.readline(16 * 1024)
-            if line == b"\r\n":
-                break
-            name, value = line.decode("ascii").split(":", 1)
-            headers[name.lower()] = value.strip()
-        size = int(headers.get("content-length", "0"))
-        return status, reader.read(size), {
-            name: value for name, value in headers.items()
-            if name in {"content-type", "etag"}
-        }
-
-
-def repository_bytes(node_dir, workspace):
-    root = Path(node_dir) / "ws" / workspace
-    return {
-        path.relative_to(root).as_posix(): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.name != ".root.lock"
-        and not path.name.endswith(".idx.db")
-    }
-
-
-def mint(address, workspace, pile, identity_secret):
-    response = call(
-        address,
-        "POST",
-        f"/mint?ws={workspace}",
-        body=json.dumps({
-            "ws": workspace,
-            "pile": base64.b64encode(pile).decode(),
-        }).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    assert response[0] == 200
-    value = json.loads(response[1])
-    return unseal(
-        identity_secret,
-        base64.b64decode(value["grant"]),
-    ).decode(), value["cap"]
-
-
-def test_core_http_is_unchanged_across_real_iroh_identities(
+def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         tmp_path, iroh_binary):
-    node_dir = tmp_path / "peer"
-    node = Node(str(node_dir))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    member = node.member_for(workspace)
-    identity_secret = node.identity(workspace)[0]
+    state = tmp_path / "peer"
+    bootstrap = FullPeer(str(state))
+    workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
+    identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
     pile = encode_pile(request.payload(
-        node, workspace, "sync", issued + 120_000, issued))
-    node.store(workspace).put("invite/not-remote", b"local bootstrap")
-    node.idx(workspace).close()
+        bootstrap, workspace, "sync", issued + 300_000, issued))
+    bootstrap.sql(workspace).db.close()
 
-    gate_port = free_port()
-    gate_address = ("127.0.0.1", gate_port)
-    gate = start_gate(node_dir, gate_port)
-    processes = [gate]
+    daemon, ready = start_full_peer(
+        state,
+        iroh_binary,
+        {"TINYP2P_GRANT_TTL": "1000"},
+    )
+    children = [daemon]
+    first_endpoint = ready["endpoint_id"]
+    first_child_pid = int(ready["pid"])
     try:
-        accepting, accepting_ready = ready_process([
-            str(iroh_binary),
-            "serve",
-            "--upstream",
-            f"127.0.0.1:{gate_port}",
-            "--loopback",
-            "--session-seconds",
-            "30",
-        ])
-        processes.append(accepting)
         forwarders = []
         for _ in range(2):
-            process, ready = ready_process([
+            forwarder, forwarded = ready_process([
                 str(iroh_binary),
                 "forward",
-                "--peer",
-                accepting_ready["peer"],
+                "--peer", ready["peer"],
                 "--loopback",
-                "--session-seconds",
-                "30",
             ])
-            processes.append(process)
+            children.append(forwarder)
             forwarders.append((
-                ready["endpoint_id"],
-                ("127.0.0.1", int(ready["listen"].rsplit(":", 1)[1])),
+                forwarded["endpoint_id"],
+                address("http://" + forwarded["listen"]),
             ))
         assert len({
-            accepting_ready["endpoint_id"],
+            first_endpoint,
             *(identity for identity, _ in forwarders),
         }) == 3
-        paths = [gate_address, *(address for _, address in forwarders)]
 
-        def parity(method, path, **kwargs):
-            results = [call(address, method, path, **kwargs) for address in paths]
-            assert results[1:] == results[:1] * (len(results) - 1)
-            return results[0]
+        direct = address(ready["data"])
+        through_iroh = [target for _, target in forwarders]
+        assert call(direct, "GET", "/healthz")[0] == 200
+        assert all(
+            call(target, "GET", "/healthz")[0] == 200
+            for target in through_iroh
+        )
 
-        raw = b"ordinary object bytes over unchanged core HTTP"
-        oid = h(raw)
         token, capability = mint(
-            gate_address, workspace, pile, identity_secret)
+            through_iroh[0], workspace, pile, identity_secret)
         assert capability == "sync-v1/full"
-        assert parity(
-            "PUT", f"/page/{oid}?ws={workspace}",
-            body=raw, token=token,
+        raw = b"ordinary object bytes through Iroh"
+        oid = h(raw)
+        assert call(
+            through_iroh[0],
+            "PUT",
+            f"/page/{oid}?ws={workspace}",
+            body=raw,
+            token=token,
         )[0] == 204
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        assert parity(
-            "GET", f"/page/{oid}?ws={workspace}", token=token,
+
+        token, _ = mint(
+            through_iroh[1], workspace, pile, identity_secret)
+        assert call(
+            through_iroh[1],
+            "GET",
+            f"/page/{oid}?ws={workspace}",
+            token=token,
         )[:2] == (200, raw)
 
-        baseline = repository_bytes(node_dir, workspace)
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        assert parity(
-            "GET", f"/root?ws={workspace}",
-        )[0] == 401
-        tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
-        assert parity(
-            "GET", f"/root?ws={workspace}", token=tampered,
-        )[0] == 401
-        assert parity(
-            "GET", "/root?ws=" + "0" * 64, token=token,
-        )[0] == 404
-
-        wrong_oid = "f" * 64
-        assert h(b"does not match") != wrong_oid
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        assert parity(
-            "PUT", f"/page/{wrong_oid}?ws={workspace}",
-            body=b"does not match", token=token,
-        )[0] == 400
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        assert parity(
-            "PUT",
-            f"/pile/not-{member}/{h(b'pile')}?ws={workspace}",
-            body=b"pile",
+        baseline = repository_bytes(state, workspace)
+        time.sleep(1.2)
+        assert call(
+            through_iroh[1],
+            "GET",
+            f"/page/{oid}?ws={workspace}",
             token=token,
-        )[0] == 403
-
-        ctl = json.dumps({
-            "path": "content.message.post",
-            "argv": [workspace, "general", "must-not-land"],
-        }).encode()
-        for method, path, body in (
-                ("POST", "/ctl/command", ctl),
-                ("GET", f"/invite/not-remote?ws={workspace}", b""),
-                ("POST", f"/poke?ws={workspace}", b""),
-                ("GET", f"/unknown?ws={workspace}", b"")):
-            route_token, _ = mint(
-                gate_address, workspace, pile, identity_secret)
-            assert parity(
-                method, path, body=body, token=route_token,
-            )[0] == 404
-
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        oversized = (
-            f"PUT /page/{h(b'never lands')}?ws={workspace} HTTP/1.1\r\n"
-            f"Host: localhost\r\n"
-            f"Authorization: Bearer {token}\r\n"
-            f"Content-Length: {MAX_OBJECT_BYTES + 1}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode()
-        oversize_results = [
-            raw_call(address, oversized) for address in paths
-        ]
-        assert oversize_results[1:] == \
-            oversize_results[:1] * (len(oversize_results) - 1)
-        assert oversize_results[0][0] == 413
-
-        token, _ = mint(gate_address, workspace, pile, identity_secret)
-        malformed = (
-            f"PUT /page/{h(b'malformed never lands')}?ws={workspace} HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            f"Authorization: Bearer {token}\r\n"
-            "Content-Length: nope\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode()
-        malformed_results = [
-            raw_call(address, malformed) for address in paths
-        ]
-        assert malformed_results[1:] == \
-            malformed_results[:1] * (len(malformed_results) - 1)
-        assert malformed_results[0][0] == 400
-        assert repository_bytes(node_dir, workspace) == baseline
-
-        expired, _ = mint(gate_address, workspace, pile, identity_secret)
-        time.sleep(3.1)
-        assert parity(
-            "GET", f"/root?ws={workspace}", token=expired,
         )[0] == 401
-        assert repository_bytes(node_dir, workspace) == baseline
-
-        stop(gate)
-        gate = start_gate(node_dir, gate_port, read_only=True)
-        processes[0] = gate
-        read_only, capability = mint(
-            gate_address, workspace, pile, identity_secret)
-        assert capability == "sync-v1/read"
-        assert parity(
+        assert repository_bytes(state, workspace) == baseline
+        assert call(
+            through_iroh[0],
+            "GET",
+            f"/root?ws={workspace}",
+        )[0] == 401
+        token, _ = mint(
+            through_iroh[0], workspace, pile, identity_secret)
+        assert call(
+            through_iroh[0],
             "PUT",
-            f"/page/{h(b'read only denial')}?ws={workspace}",
-            body=b"read only denial",
-            token=read_only,
-        )[0] == 401
-        assert repository_bytes(node_dir, workspace) == baseline
+            f"/page/{'f' * 64}?ws={workspace}",
+            body=b"wrong digest",
+            token=token,
+        )[0] == 400
+        control_request = b'{"path":"peer.status","argv":[]}'
+        peer_control = call(
+            direct,
+            "POST",
+            f"/ctl/command?ws={workspace}",
+            body=control_request,
+        )
+        tunneled_control = call(
+            through_iroh[0],
+            "POST",
+            f"/ctl/command?ws={workspace}",
+            body=control_request,
+        )
+        assert peer_control[0] == 405
+        assert tunneled_control == peer_control
+        assert repository_bytes(state, workspace) == baseline
+
+        status, body, _ = call(
+            address(ready["control"]),
+            "POST",
+            f"/ctl/command?ws={workspace}",
+            body=control_request,
+        )
+        assert status == 200
+        assert workspace in json.loads(body)["workspaces"]
+
+        for forwarder in children[1:]:
+            stop(forwarder)
+        children[:] = [daemon]
+        assert stop(daemon) == 0
+        children.clear()
+        wait_until(
+            lambda: _pid_absent(first_child_pid),
+            message="supervised Iroh child cleanup",
+        )
+
+        daemon, ready = start_full_peer(
+            state,
+            iroh_binary,
+            {"TINYP2P_GRANT_TTL": "1000"},
+        )
+        children.append(daemon)
+        assert ready["endpoint_id"] == first_endpoint
+        second_child_pid = int(ready["pid"])
+        os.kill(second_child_pid, signal.SIGTERM)
+        assert daemon.wait(15) != 0
+        children.clear()
+        wait_until(
+            lambda: _pid_absent(second_child_pid),
+            message="failed Iroh child reaping",
+        )
+        for url in (ready["data"], ready["control"]):
+            wait_until(
+                lambda url=url: not _address_open(address(url)),
+                message=f"{url} fail-shut",
+            )
     finally:
-        for process in reversed(processes):
+        for process in reversed(children):
             stop(process)
+
+
+def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
+    state = tmp_path / "peer"
+    bootstrap = FullPeer(str(state))
+    workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
+    issued = now_ms()
+    pile = encode_pile(request.payload(
+        bootstrap, workspace, "sync", issued + 300_000, issued))
+    store = bootstrap.store(workspace)
+    root = store.get("root")
+
+    async def measure():
+        fetched = {}
+
+        async def fetch(oid):
+            raw = store.get("obj/" + oid)
+            fetched.setdefault(oid, raw)
+            return raw
+
+        decision = await RepositoryReader.mint_awaited(
+            workspace,
+            root,
+            fetch,
+            pile,
+            issued,
+            max_unique_fetches=MAX_MINT_FETCHES,
+            max_fetch_bytes=MAX_MINT_FETCH_BYTES,
+        )
+        assert decision is not None
+        return len(fetched), sum(len(raw) for raw in fetched.values())
+
+    fetches, fetched_bytes = asyncio.run(measure())
+    assert fetches > 0
+    assert fetched_bytes > 0
+    bootstrap.sql(workspace).db.close()
+    body = json.dumps({
+        "ws": workspace,
+        "pile": base64.b64encode(pile).decode(),
+    }).encode()
+
+    configurations = (
+        {
+            "TINYP2P_MINT_MAX_FETCHES": str(fetches - 1),
+            "TINYP2P_MINT_MAX_FETCH_BYTES": str(MAX_MINT_FETCH_BYTES),
+        },
+        {
+            "TINYP2P_MINT_MAX_FETCHES": str(MAX_MINT_FETCHES),
+            "TINYP2P_MINT_MAX_FETCH_BYTES": str(fetched_bytes - 1),
+        },
+    )
+    for environment in configurations:
+        daemon, ready = start_plain_full_peer(state, environment)
+        try:
+            assert call(
+                address(ready["data"]),
+                "POST",
+                f"/mint?ws={workspace}",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )[0] == 403
+            assert store.get("root") == root
+        finally:
+            assert stop(daemon) == 0
+
+
+def _pid_absent(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _address_open(target):
+    try:
+        with socket.create_connection(target, timeout=.2):
+            return True
+    except OSError:
+        return False
+
+
+def test_peer_data_listener_death_fails_the_whole_service(tmp_path):
+    service = FullPeerService(
+        str(tmp_path / "peer"),
+        0,
+        cadence=3600,
+        control_port=0,
+    )
+    errors = []
+
+    def run():
+        try:
+            service.run()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    wait_until(
+        lambda: port_open(service.peer_server.server_address[1]),
+        message="peer-data listener",
+    )
+    service.peer_server.shutdown()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "peer-data listener" in str(errors[0])
+    assert not _address_open(service.control_server.server_address)
+
+
+def test_iroh_mode_refuses_an_externally_bound_plain_http_seam(tmp_path):
+    with pytest.raises(
+            ValueError, match="Iroh peer-data listener must use a loopback IP"):
+        FullPeerService(
+            str(tmp_path),
+            0,
+            host="0.0.0.0",
+            control_port=0,
+            iroh_binary="poc16-iroh",
+        )
+    with pytest.raises(
+            ValueError, match="cannot advertise a plain HTTP peer URL"):
+        FullPeerService(
+            str(tmp_path / "url"),
+            0,
+            url="https://peer.example",
+            control_port=0,
+            iroh_binary="poc16-iroh",
+        )
+
+
+def test_iroh_startup_failure_closes_both_bound_listeners(tmp_path):
+    service = FullPeerService(
+        str(tmp_path),
+        0,
+        cadence=3600,
+        control_port=0,
+        iroh_binary=tmp_path / "missing-poc16-iroh",
+    )
+    addresses = (
+        service.peer_server.server_address,
+        service.control_server.server_address,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        service.start()
+
+    assert all(not _address_open(target) for target in addresses)

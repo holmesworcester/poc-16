@@ -4,17 +4,24 @@ Application verbs live with fact families; this process only renders replies.
 """
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 from core.http_body import read_bounded
-from core.limits import MAX_CONTROL_BYTES
+from core.http_stdlib import HttpGateOptions
+from core.limits import (
+    MAX_CONTROL_BYTES,
+    MAX_MINT_FETCHES,
+    MAX_MINT_FETCH_BYTES,
+)
 
 DEFAULT_NODE = "http://127.0.0.1:7101"
 USAGE = (
     "usage: full_peer [--node URL] <scope.family.verb> [args...]\n"
-    "       full_peer daemon <dir> [--port PORT] [--control-port PORT]\n"
+    "       full_peer daemon <dir> [--port PORT] [--control-port PORT] "
+    "[--iroh]\n"
     "       full_peer --commands"
 )
 STORE_HELP = """\
@@ -46,6 +53,29 @@ def ctl(node_url, path, argv):
             response, MAX_CONTROL_BYTES, "control response"))
 
 
+def _gate_options(environ=None):
+    """Read process configuration once into one immutable validated value."""
+    environ = os.environ if environ is None else environ
+
+    def integer(name, default):
+        try:
+            return int(environ.get(name, default))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"invalid {name}") from error
+
+    try:
+        return HttpGateOptions(
+            grant_ttl_ms=integer("TINYP2P_GRANT_TTL", 60_000),
+            max_mint_fetches=integer(
+                "TINYP2P_MINT_MAX_FETCHES", MAX_MINT_FETCHES),
+            max_mint_fetch_bytes=integer(
+                "TINYP2P_MINT_MAX_FETCH_BYTES", MAX_MINT_FETCH_BYTES),
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "invalid full-peer HTTP gate configuration") from error
+
+
 def _serve(argv):
     parser = argparse.ArgumentParser(
         prog="full_peer daemon",
@@ -60,9 +90,25 @@ def _serve(argv):
     parser.add_argument("--cadence", type=float, default=1.0)
     parser.add_argument("--url")
     parser.add_argument(
+        "--iroh", action="store_true",
+        help="wrap the loopback peer-data listener in supervised Iroh")
+    parser.add_argument(
+        "--iroh-binary",
+        default=os.environ.get("POC16_IROH_BINARY", "poc16-iroh"),
+        help="poc16-iroh executable (default: POC16_IROH_BINARY or PATH)")
+    parser.add_argument(
+        "--iroh-key-file",
+        help="stable endpoint key (default: DIR/iroh/endpoint.key)")
+    parser.add_argument(
+        "--iroh-loopback", action="store_true",
+        help="disable relay/discovery for a local test or demo")
+    parser.add_argument(
         "--store-config", metavar="PATH",
         help="strict S3/R2 host-store JSON (default: local filesystem)")
     args = parser.parse_args(argv)
+    if not args.iroh and (
+            args.iroh_key_file is not None or args.iroh_loopback):
+        parser.error("--iroh-key-file/--iroh-loopback require --iroh")
     store_factory = None
     if args.store_config is not None:
         from adapters.host import load_store_factory
@@ -70,7 +116,13 @@ def _serve(argv):
     from .daemon import serve
     return serve(
         args.dir, args.port, args.host, args.cadence, args.url,
-        control_port=args.control_port, store_factory=store_factory)
+        control_port=args.control_port,
+        store_factory=store_factory,
+        gate_options=_gate_options(),
+        iroh_binary=args.iroh_binary if args.iroh else None,
+        iroh_key_file=args.iroh_key_file,
+        iroh_loopback=args.iroh_loopback,
+    )
 
 
 def _commands():

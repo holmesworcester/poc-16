@@ -8,16 +8,20 @@ scheduling and an unconditionally loopback control listener.
 import ipaddress
 import json
 import os
+import signal
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 import facts
 
 from core.limits import MAX_CONTROL_BYTES, PayloadTooLarge, decode_json
+from core.http_stdlib import HttpGateOptions
 from core.http_stdlib import handler_for as peer_handler_for
 
 from . import status
+from .iroh_process import IrohProcess, STOP_SECONDS
 from .node import FullPeer, now_ms
 from .sync import sync
 
@@ -33,15 +37,22 @@ class Syncer(threading.Thread):
 
     def __init__(self, node, cadence):
         super().__init__(daemon=True)
-        self.node, self.cadence, self.wake = node, cadence, threading.Event()
+        self.node, self.cadence = node, cadence
+        self.wake, self.stopping = threading.Event(), threading.Event()
 
     def kick(self):
         self.wake.set()
 
+    def stop(self):
+        self.stopping.set()
+        self.wake.set()
+
     def run(self):
-        while True:
+        while not self.stopping.is_set():
             self.wake.wait(self.cadence)
             self.wake.clear()
+            if self.stopping.is_set():
+                return
             for workspace in self.node.workspaces():
                 for url in self.node.keyring["workspaces"][workspace]["peers"]:
                     try:
@@ -53,6 +64,24 @@ class Syncer(threading.Thread):
                             traceback.print_exc()
                     else:
                         self.node.record_sync_success(workspace, url)
+
+
+def _loopback(host, label):
+    try:
+        allowed = ipaddress.ip_address(host).is_loopback
+    except ValueError as error:
+        raise ValueError(f"{label} must use a loopback IP") from error
+    if not allowed:
+        raise ValueError(f"{label} must use a loopback IP")
+
+
+def _http_address(host, port):
+    return f"http://[{host}]:{port}" if ":" in host \
+        else f"http://{host}:{port}"
+
+
+def _socket_address(host, port):
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 class ControlHandler(BaseHTTPRequestHandler):
@@ -176,49 +205,234 @@ def control_handler_for(node, syncer):
 
 
 def _control_server(node, syncer, host, port):
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError as error:
-        raise ValueError("control listener must use a loopback IP") from error
-    if not loopback:
-        raise ValueError("control listener must use a loopback IP")
-    return ThreadingHTTPServer(
+    _loopback(host, "control listener")
+    server = ThreadingHTTPServer(
         (host, port), control_handler_for(node, syncer))
+    server.daemon_threads = True
+    return server
+
+
+class FullPeerService:
+    """Supervise the data gate, local control, scheduler, and Iroh wrapper."""
+
+    def __init__(
+            self, directory, port, host="127.0.0.1", cadence=1.0,
+            url=None, *, control_port=7101, store_factory=None,
+            gate_options=None, iroh_binary=None, iroh_key_file=None,
+            iroh_loopback=False):
+        if port == control_port and port != 0:
+            raise ValueError("peer and control ports must differ")
+        if iroh_binary is not None:
+            _loopback(host, "Iroh peer-data listener")
+            if url is not None:
+                raise ValueError(
+                    "Iroh mode cannot advertise a plain HTTP peer URL")
+
+        self.directory = directory
+        self.node = FullPeer(directory, store_factory=store_factory)
+        self.syncer = Syncer(self.node, cadence)
+        self.secret = os.urandom(32)
+        self.gate_options = HttpGateOptions() \
+            if gate_options is None else gate_options
+        self.peer_server = ThreadingHTTPServer(
+            (host, port), peer_handler_for(
+                self.node,
+                self.secret,
+                gate_options=self.gate_options,
+            ))
+        self.peer_server.daemon_threads = True
+        try:
+            self.control_server = _control_server(
+                self.node, self.syncer, "127.0.0.1", control_port)
+        except BaseException:
+            self.peer_server.server_close()
+            raise
+
+        data_host, actual_port = self.peer_server.server_address[:2]
+        self.data_address = _http_address(data_host, actual_port)
+        self.control_address = _http_address(
+            "127.0.0.1", self.control_server.server_address[1])
+        self.node.url = url or self.data_address
+        self.iroh_binary = iroh_binary
+        self.iroh_key_file = Path(
+            iroh_key_file
+            or Path(directory) / "iroh" / "endpoint.key")
+        self.iroh_loopback = iroh_loopback
+        self.iroh = None
+        self.peer_thread = self.monitor_thread = None
+        self._control_thread = None
+        self._control_active = threading.Event()
+        self._closing = threading.Event()
+        self._started = False
+        self._failure = None
+        self._failure_lock = threading.Lock()
+
+    @property
+    def failure(self):
+        with self._failure_lock:
+            return self._failure
+
+    def _fail(self, message):
+        if self._closing.is_set():
+            return
+        with self._failure_lock:
+            if self._failure is not None:
+                return
+            self._failure = message
+        # The control loop is the main wait point. Its shutdown unblocks run();
+        # stop peer data immediately when the supervised transport disappears.
+        if threading.current_thread() is not self.peer_thread:
+            self.peer_server.shutdown()
+        if self._control_active.is_set():
+            self.control_server.shutdown()
+
+    def _serve_peer_data(self):
+        try:
+            self.peer_server.serve_forever()
+        except BaseException as error:
+            self._fail(
+                f"peer-data listener failed: {type(error).__name__}: {error}")
+        else:
+            self._fail("peer-data listener stopped unexpectedly")
+
+    def _monitor(self):
+        while not self._closing.wait(.05):
+            if self.peer_thread is not None \
+                    and not self.peer_thread.is_alive():
+                self._fail("peer-data listener died")
+                return
+            if self.iroh is not None:
+                code = self.iroh.process.poll()
+                if code is not None:
+                    self._fail(f"Iroh child exited unexpectedly ({code})")
+                    return
+
+    def start(self):
+        if self._started:
+            raise RuntimeError("full peer service already started")
+        try:
+            self.syncer.start()
+            self.peer_thread = threading.Thread(
+                target=self._serve_peer_data,
+                name="full-peer-data",
+                daemon=True,
+            )
+            self.peer_thread.start()
+            self._started = True
+            if self.iroh_binary is not None:
+                host, port = self.peer_server.server_address[:2]
+                self.iroh = IrohProcess.start(
+                    self.iroh_binary,
+                    _socket_address(host, port),
+                    self.iroh_key_file,
+                    loopback=self.iroh_loopback,
+                )
+            self.monitor_thread = threading.Thread(
+                target=self._monitor,
+                name="full-peer-supervisor",
+                daemon=True,
+            )
+            self.monitor_thread.start()
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def report(self):
+        print(
+            f"full peer {self.node.member}: data {self.data_address}; "
+            f"control {self.control_address} ({self.directory})",
+            flush=True,
+        )
+        if self.iroh is not None:
+            print(
+                f"IROH endpoint_id={self.iroh.ready.endpoint_id} "
+                f"peer={self.iroh.ready.peer} pid={self.iroh.process.pid}",
+                flush=True,
+            )
+
+    def run(self):
+        self.start()
+        if self.failure is not None:
+            self.close()
+            raise RuntimeError(self.failure)
+        self.report()
+        self._control_thread = threading.current_thread()
+        self._control_active.set()
+        try:
+            if self.failure is not None:
+                raise RuntimeError(self.failure)
+            self.control_server.serve_forever()
+            if not self._closing.is_set() and self.failure is None:
+                self._fail("control listener stopped unexpectedly")
+        finally:
+            self._control_active.clear()
+            self.close()
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+
+    def close(self):
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        self.syncer.stop()
+        if self._started:
+            self.peer_server.shutdown()
+        if self._control_active.is_set() \
+                and threading.current_thread() is not self._control_thread:
+            self.control_server.shutdown()
+        self.peer_server.server_close()
+        self.control_server.server_close()
+        if self.iroh is not None:
+            self.iroh.stop()
+        if self.peer_thread is not None:
+            self.peer_thread.join(STOP_SECONDS)
+        if self.monitor_thread is not None:
+            self.monitor_thread.join(STOP_SECONDS)
+        if self.syncer.is_alive():
+            self.syncer.join(STOP_SECONDS)
+
+
+def _run_service(service):
+    """Give SIGTERM the same bounded cleanup path as Ctrl-C."""
+    handlers = {}
+    main_thread = threading.current_thread() is threading.main_thread()
+
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    if main_thread:
+        for name in ("SIGINT", "SIGTERM"):
+            number = getattr(signal, name, None)
+            if number is not None:
+                handlers[number] = signal.getsignal(number)
+                signal.signal(number, interrupt)
+    try:
+        service.run()
+    except KeyboardInterrupt:
+        service.close()
+    finally:
+        if main_thread:
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
 
 
 def serve(
         directory, port, host="127.0.0.1", cadence=1.0, url=None, *,
-        control_port=7101, store_factory=None):
-    """Run peer data on the requested interface and control on loopback."""
-    if port == control_port:
-        raise ValueError("peer and control ports must differ")
-    node = FullPeer(directory, store_factory=store_factory)
-    syncer = Syncer(node, cadence)
-    secret = os.urandom(32)
-    peer_server = ThreadingHTTPServer(
-        (host, port), peer_handler_for(node, secret))
-    try:
-        control_server = _control_server(
-            node, syncer, "127.0.0.1", control_port)
-    except BaseException:
-        peer_server.server_close()
-        raise
-    actual_port = peer_server.server_address[1]
-    node.url = url or f"http://{host}:{actual_port}"
-    syncer.start()
-    peer_thread = threading.Thread(
-        target=peer_server.serve_forever, daemon=True)
-    peer_thread.start()
-    print(
-        f"full peer {node.member}: data {node.url}; "
-        f"control http://127.0.0.1:{control_server.server_address[1]} "
-        f"({directory})",
-        flush=True,
+        control_port=7101, store_factory=None, gate_options=None,
+        iroh_binary=None, iroh_key_file=None, iroh_loopback=False):
+    """Run one full peer; optionally expose peer data only through Iroh."""
+    service = FullPeerService(
+        directory,
+        port,
+        host,
+        cadence,
+        url,
+        control_port=control_port,
+        store_factory=store_factory,
+        gate_options=gate_options,
+        iroh_binary=iroh_binary,
+        iroh_key_file=iroh_key_file,
+        iroh_loopback=iroh_loopback,
     )
-    try:
-        control_server.serve_forever()
-    finally:
-        peer_server.shutdown()
-        peer_server.server_close()
-        control_server.server_close()
-        peer_thread.join()
+    return _run_service(service)
