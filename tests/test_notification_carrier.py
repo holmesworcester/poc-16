@@ -1,4 +1,5 @@
 """Provider-neutral carrier vocabulary and deterministic fault schedule."""
+import asyncio
 from enum import Enum
 import json
 
@@ -29,13 +30,17 @@ def _body(event="e", delivery="d"):
     })
 
 
+def _publish(carrier, body):
+    return asyncio.run(carrier.publish(body))
+
+
 def test_publish_requires_typed_durable_acceptance_and_preserves_bytes():
     carrier, body = FaultCarrier(), _body()
     carrier.lose_next_publish_response = True
 
     with pytest.raises(PublishOutcomeUnknown, match="response loss"):
-        carrier.publish(body)
-    accepted = carrier.publish(body)
+        _publish(carrier, body)
+    accepted = _publish(carrier, body)
 
     assert isinstance(accepted, CarrierAccepted)
     assert accepted.message_id == "message-0002"
@@ -46,7 +51,7 @@ def test_publish_requires_typed_durable_acceptance_and_preserves_bytes():
 def test_retry_redelivers_stable_body_message_and_embedded_ids():
     carrier, seen = FaultCarrier(), []
     body = _body("a", "b")
-    accepted = carrier.publish(body)
+    accepted = _publish(carrier, body)
 
     def handler(delivery):
         seen.append(delivery)
@@ -68,10 +73,10 @@ def test_retry_redelivers_stable_body_message_and_embedded_ids():
 def test_reordered_delayed_poison_and_partial_batch_map_independently():
     carrier = FaultCarrier()
     accepted = [
-        carrier.publish(_body("a", "a")),
-        carrier.publish(b"not a canonical hint"),
-        carrier.publish(_body("r", "r")),
-        carrier.publish(_body("d", "d")),
+        _publish(carrier, _body("a", "a")),
+        _publish(carrier, b"not a canonical hint"),
+        _publish(carrier, _body("r", "r")),
+        _publish(carrier, _body("d", "d")),
     ]
     observed = []
 
@@ -106,7 +111,7 @@ def test_reordered_delayed_poison_and_partial_batch_map_independently():
 @pytest.mark.parametrize("fault", ["ack_loss", "crash_after"])
 def test_ack_loss_or_crash_after_completion_can_duplicate(fault):
     carrier, completed = FaultCarrier(), []
-    accepted = carrier.publish(_body())
+    accepted = _publish(carrier, _body())
 
     def handler(delivery):
         completed.append((delivery.message_id, delivery.body))

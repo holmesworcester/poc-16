@@ -44,7 +44,7 @@ def _checked_id(value, label):
 
 @dataclass(frozen=True, slots=True)
 class CarrierAccepted:
-    """Typed evidence that a provider durably accepted one publish call."""
+    """Evidence that the exact call's body is durable for later delivery."""
 
     message_id: str
 
@@ -55,7 +55,9 @@ class CarrierAccepted:
 class Carrier(Protocol):
     """Publish one opaque body without imposing receive mechanics."""
 
-    def publish(self, body: bytes) -> CarrierAccepted: ...
+    async def publish(self, body: bytes) -> CarrierAccepted:
+        """Return acceptance only for this call's exact ``body`` bytes."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

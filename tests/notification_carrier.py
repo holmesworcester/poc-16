@@ -27,7 +27,7 @@ class FaultCarrier:
         self.history = []
         self.lose_next_publish_response = False
 
-    def publish(self, body):
+    async def publish(self, body):
         body = checked_body(body)
         message_id = f"message-{len(self.records) + 1:04d}"
         self.records.append(_Record(message_id, body))
