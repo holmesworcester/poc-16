@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: POC-16 post-publication notification scanner and FCM worker
+
+Parameters:
+  Enabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+  DeploymentId:
+    Type: String
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{2,63}$"
+  WorkspaceId:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{64}$"
+  CanonicalBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  CanonicalPrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 760
+    AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
+  NotificationStateBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+  NotificationStatePrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 760
+    AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
+  NotificationStateMinimumRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 28
+  ExpectedBucketOwner:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+  NotificationSecretArn:
+    Type: String
+    AllowedPattern: '^arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  RepositoryKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$'
+  NotificationStateKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$'
+  NotificationSecretKmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$'
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+  ScannerReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+  DeliveryReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 100
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  AlarmActionArn:
+    Type: String
+    Default: ""
+
+Conditions:
+  NotificationsEnabled: !Equals [!Ref Enabled, "true"]
+  HasRepositoryKmsKey: !Not [!Equals [!Ref RepositoryKmsKeyArn, ""]]
+  HasStateKmsKey: !Not [!Equals [!Ref NotificationStateKmsKeyArn, ""]]
+  HasSecretKmsKey: !Not [!Equals [!Ref NotificationSecretKmsKeyArn, ""]]
+  HasAlarmAction: !Not [!Equals [!Ref AlarmActionArn, ""]]
+
+Resources:
+  NotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: NotificationsEnabled
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Condition: NotificationsEnabled
+    Properties:
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 360
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  NotificationScannerRole:
+    Type: AWS::IAM::Role
+    Condition: NotificationsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScanPublishedNotificationFacts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadCanonicalRepository
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
+              - Sid: OwnNotificationCursor
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/root"
+                  - !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"
+              - Sid: PublishNotificationHints
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt NotificationQueue.Arn
+              - !If
+                - HasRepositoryKmsKey
+                - Sid: DecryptCanonicalRepository
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref RepositoryKmsKeyArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasStateKmsKey
+                - Sid: UseNotificationStateKey
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
+                  Resource: !Ref NotificationStateKmsKeyArn
+                - !Ref AWS::NoValue
+              - Sid: WriteScannerLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-notification-scanner:*"
+
+  NotificationDeliveryRole:
+    Type: AWS::IAM::Role
+    Condition: NotificationsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeliverCurrentAuthorizedNotifications
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadCanonicalRepository
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
+              - Sid: ReadHistoricalNotificationRoot
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"
+              - Sid: ReadExactNotificationSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref NotificationSecretArn
+              - Sid: ConsumeNotificationHints
+                Effect: Allow
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ReceiveMessage
+                Resource: !GetAtt NotificationQueue.Arn
+              - !If
+                - HasRepositoryKmsKey
+                - Sid: DecryptCanonicalRepository
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref RepositoryKmsKeyArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasStateKmsKey
+                - Sid: DecryptNotificationState
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref NotificationStateKmsKeyArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasSecretKmsKey
+                - Sid: DecryptNotificationSecret
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref NotificationSecretKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:CallerAccount: !Ref AWS::AccountId
+                      kms:ViaService: !Sub
+                        "secretsmanager.${AWS::Region}.${AWS::URLSuffix}"
+                      "kms:EncryptionContext:SecretARN":
+                        !Ref NotificationSecretArn
+                - !Ref AWS::NoValue
+              - Sid: WriteDeliveryLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-notification-delivery:*"
+
+  NotificationScannerFunction:
+    Type: AWS::Serverless::Function
+    Condition: NotificationsEnabled
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-notification-scanner"
+      CodeUri: stage/
+      Handler: deploy.aws_notifications.app.scanner_handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Role: !GetAtt NotificationScannerRole.Arn
+      MemorySize: 1024
+      Timeout: 60
+      ReservedConcurrentExecutions: !Ref ScannerReservedConcurrency
+      Environment:
+        Variables:
+          TINYP2P_NOTIFICATION_AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
+          TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
+          TINYP2P_NOTIFICATION_CANONICAL_PREFIX: !Ref CanonicalPrefix
+          TINYP2P_NOTIFICATION_STATE_BUCKET: !Ref NotificationStateBucketName
+          TINYP2P_NOTIFICATION_STATE_PREFIX: !Ref NotificationStatePrefix
+          TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
+          TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
+          TINYP2P_NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
+
+  NotificationDeliveryFunction:
+    Type: AWS::Serverless::Function
+    Condition: NotificationsEnabled
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-notification-delivery"
+      CodeUri: stage/
+      Handler: deploy.aws_notifications.app.delivery_handler
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Role: !GetAtt NotificationDeliveryRole.Arn
+      MemorySize: 1024
+      Timeout: 60
+      ReservedConcurrentExecutions: !Ref DeliveryReservedConcurrency
+      Environment:
+        Variables:
+          TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
+          TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
+          TINYP2P_NOTIFICATION_CANONICAL_PREFIX: !Ref CanonicalPrefix
+          TINYP2P_NOTIFICATION_STATE_BUCKET: !Ref NotificationStateBucketName
+          TINYP2P_NOTIFICATION_STATE_PREFIX: !Ref NotificationStatePrefix
+          TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
+          TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
+          TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
+
+  NotificationDeliveryMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: NotificationsEnabled
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt NotificationQueue.Arn
+      FunctionName: !Ref NotificationDeliveryFunction
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  NotificationScanSchedule:
+    Type: AWS::Events::Rule
+    Condition: NotificationsEnabled
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationScannerFunction.Arn
+          Id: notification-scanner
+
+  NotificationScanPermission:
+    Type: AWS::Lambda::Permission
+    Condition: NotificationsEnabled
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NotificationScannerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotificationScanSchedule.Arn
+
+  NotificationScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: NotificationsEnabled
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notification-scanner"
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotificationDeliveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: NotificationsEnabled
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notification-delivery"
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotificationQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: NotificationsEnabled
+    Properties:
+      AlarmDescription: Notification work is not reaching FCM promptly
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotificationQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmAction
+        - [!Ref AlarmActionArn]
+        - !Ref AWS::NoValue
+
+  NotificationDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: NotificationsEnabled
+    Properties:
+      AlarmDescription: Notification work reached the finite-retention DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotificationDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmAction
+        - [!Ref AlarmActionArn]
+        - !Ref AWS::NoValue
+
+Outputs:
+  DeploymentMarker:
+    Value: poc16-aws-notifications-v1
+  DeploymentId:
+    Value: !Ref DeploymentId
+  Enabled:
+    Value: !Ref Enabled
+  WorkspaceId:
+    Value: !Ref WorkspaceId
+  NotificationStateMinimumRetentionDays:
+    Value: !Ref NotificationStateMinimumRetentionDays
+  NotificationQueueUrl:
+    Condition: NotificationsEnabled
+    Value: !Ref NotificationQueue
+  NotificationQueueArn:
+    Condition: NotificationsEnabled
+    Value: !GetAtt NotificationQueue.Arn
+  NotificationDeadLetterQueueUrl:
+    Condition: NotificationsEnabled
+    Value: !Ref NotificationDeadLetterQueue
+  NotificationDeadLetterQueueArn:
+    Condition: NotificationsEnabled
+    Value: !GetAtt NotificationDeadLetterQueue.Arn
+  NotificationScannerFunctionArn:
+    Condition: NotificationsEnabled
+    Value: !GetAtt NotificationScannerFunction.Arn
+  NotificationDeliveryFunctionArn:
+    Condition: NotificationsEnabled
+    Value: !GetAtt NotificationDeliveryFunction.Arn
