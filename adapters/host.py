@@ -9,12 +9,12 @@ import json
 import os
 import re
 
+from core.object_store import validate_store_prefix
+
 
 SCHEMA = "poc16-host-store-v1"
 MAX_CONFIG_BYTES = 64 * 1024
 _WORKSPACE_RE = re.compile(r"^[0-9a-f]{64}$")
-_LONGEST_NODE_KEY = (
-    f"pile/{'0' * 16}/{'0' * 32}/{'0' * 64}")
 _CREDENTIAL_WORDS = (
     "access_key", "credential", "password", "secret", "session", "token")
 _COMMON = frozenset({
@@ -131,6 +131,12 @@ def factory_from_mapping(document, *, client_factory=None):
     probe_prefix = workspace_prefix(base, "0" * 64)
     excluded = {"backend", "base_prefix", "schema"}
     options = _provider_arguments(document, excluded)
+    try:
+        validate_store_prefix(probe_prefix)
+    except ValueError as error:
+        raise ValueError(
+            "configured workspace object prefix exceeds 1024 bytes") \
+            from error
 
     if backend == "s3":
         from adapters.s3 import S3Config, S3Store
@@ -145,9 +151,6 @@ def factory_from_mapping(document, *, client_factory=None):
         R2S3Config(prefix=probe_prefix, **options)
         config_type, store_type = R2S3Config, R2S3Store
 
-    if len(
-            f"{probe_prefix}/{_LONGEST_NODE_KEY}".encode("ascii")) > 1024:
-        raise ValueError("configured workspace object prefix exceeds 1024 bytes")
     if client_factory is None:
         _require_sdk()
 

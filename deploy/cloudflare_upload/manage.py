@@ -50,6 +50,7 @@ REMOVE_ORDER = tuple(reversed(ROLE_ORDER))
 BROKER_CORE_MODULES = UPLOAD_BROKER_CORE_MODULES
 BROKER_DEPLOY_MODULES = (
     "__init__.py",
+    "repository_apply_wire.py",
     "upload_broker.py",
     "upload_broker_http.py",
     "upload_keyring.py",
@@ -78,7 +79,6 @@ APPLIER_CORE_MODULES = (
     "repository_snapshot.py",
     "shape.py",
     "snapshot.py",
-    "staged_intent.py",
     "suppression.py",
     "validated_set.py",
 )
@@ -200,7 +200,6 @@ def render(deployment):
         paths[role] = path
     for name, value in (
             ("access-policies", boundary["access_policies"]),
-            ("ingress-lock", boundary["ingress_lock"]),
             ("boundary-claim", boundary["provider_claim"])):
         path = GENERATED / f"{name}.json"
         _write_json(path, value)
@@ -264,7 +263,7 @@ def _verify_applier_bundle(directory):
         "deploy/repository_apply_wire.py",
         "core/repository_applier.py",
         "core/repository_snapshot.py",
-        "core/staged_intent.py",
+        "core/ingress.py",
         "adapters/r2/worker.py",
         "facts/auth/workspace.py",
     }
@@ -299,7 +298,7 @@ def _verify_broker_bundle(directory):
         "runtime.py",
         "core/validated_set.py",
         "core/repository_reader.py",
-        "core/staged_intent.py",
+        "core/ingress.py",
         "facts/auth/request.py",
         "deploy/upload_broker.py",
         "deploy/upload_broker_http.py",
@@ -441,14 +440,6 @@ def _control_token(environment):
     return value
 
 
-def _lock_url(deployment):
-    return (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        f"{quote(deployment.account_id, safe='')}/r2/buckets/"
-        f"{quote(deployment.ingress_bucket, safe='')}/lock"
-    )
-
-
 def _control_request(
         endpoint, environment, *, method="GET", document=None,
         headers=None, absent_404=False):
@@ -490,76 +481,6 @@ def _control_request(
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("malformed Cloudflare control response") from error
     return envelope["result"]
-
-
-def _lock_headers(deployment):
-    headers = {}
-    if deployment.jurisdiction != "default":
-        headers["cf-r2-jurisdiction"] = deployment.jurisdiction
-    return headers
-
-
-def _read_ingress_lock(deployment, environment):
-    """Read the documented lock document, normalizing omitted rules."""
-    result = _control_request(
-        _lock_url(deployment),
-        environment,
-        headers=_lock_headers(deployment),
-    )
-    if not isinstance(result, dict):
-        raise RuntimeError("malformed Cloudflare ingress bucket lock")
-    rules = result.get("rules", [])
-    if not isinstance(rules, list):
-        raise RuntimeError("malformed Cloudflare ingress bucket lock")
-    return {"rules": rules}
-
-
-def _write_ingress_lock(deployment, environment, document):
-    """Replace the lock document; the provider's response is opaque."""
-    _control_request(
-        _lock_url(deployment),
-        environment,
-        method="PUT",
-        document=document,
-        headers=_lock_headers(deployment),
-    )
-
-
-def ensure_ingress_lock(
-        deployment, environment, *, reader=None, writer=None):
-    """Install the lock under one exclusive bucket-configuration owner.
-
-    Cloudflare's whole-document lock PUT has no compare precondition.  The
-    ``exclusive-dedicated`` profile therefore declares this deployment the
-    sole configuration writer; Cloudflare does not enforce bucket-scoped REST
-    configuration tokens.  A pre-existing foreign document is refused,
-    concurrent same-owner installers write identical bytes, and a lost PUT
-    response is reconciled by the following exact GET.  This read check does
-    not pretend to defeat a racing account administrator.
-    """
-    desired = generated_boundary(deployment)["ingress_lock"]
-    reader = reader or (
-        lambda: _read_ingress_lock(deployment, environment))
-    writer = writer or (
-        lambda value: _write_ingress_lock(
-            deployment, environment, value))
-    observed = reader()
-    if observed == desired:
-        return False
-    if observed != {"rules": []}:
-        raise RuntimeError(
-            "refusing to replace foreign ingress bucket lock rules")
-    write_error = None
-    try:
-        writer(desired)
-    except (OSError, RuntimeError) as error:
-        write_error = error
-    if reader() != desired:
-        if write_error is not None:
-            raise write_error
-        raise RuntimeError(
-            "Cloudflare ingress bucket lock was not preserved")
-    return True
 
 
 def _worker_identity(
@@ -664,7 +585,7 @@ def _deploy_one(role, path, runner, broker_secrets):
 
 def deploy(
         deployment, environment=os.environ, *,
-        runner=None, identity_reader=None, lock_configurer=None):
+        runner=None, identity_reader=None):
     """Deploy Applier then broker after checking both exact identities."""
     runner = _run if runner is None else runner
     identity_reader = (
@@ -682,8 +603,6 @@ def deploy(
         create=environment.get("CF_UPLOAD_CREATE") == "1",
         identity_reader=identity_reader,
     )
-    (ensure_ingress_lock if lock_configurer is None else lock_configurer)(
-        deployment, environment)
     runner([
         "uv", "run", "pywrangler", "sync", "--allow-build",
     ])

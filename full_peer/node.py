@@ -12,7 +12,9 @@ import threading
 import time
 
 from core import fact_index
+from core.crypto import h
 from core.fact import Fact
+from core.ingress import ingress_key, parse_ingress_key
 from core.limits import (
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
@@ -20,7 +22,7 @@ from core.limits import (
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
-from full_peer.upload_journal import UploadSource, UploadSourceBuilder
+from full_peer.upload_journal import UploadSource
 
 from . import bao_native, sql_store
 from .keychain import (
@@ -82,7 +84,7 @@ class FullPeer:
 
     @property
     def member(self):
-        return self.pk[:16]
+        return self.pk
 
     def identity(self, workspace=None):
         return self.keychain.default() if workspace is None \
@@ -92,7 +94,7 @@ class FullPeer:
         return self.identity(workspace)[1]
 
     def member_for(self, workspace):
-        return self.identity_id(workspace)[:16]
+        return self.identity_id(workspace)
 
     def workspaces(self):
         return list(self.keyring["workspaces"])
@@ -188,11 +190,12 @@ class FullPeer:
     def attachment_io(self):
         return bao_native
 
-    def start_upload(self, workspace):
-        return UploadSourceBuilder(
+    def create_upload(self, workspace, pile):
+        return UploadSource.create(
             os.path.join(self.dir, "uploads"),
             workspace,
             self.member_for(workspace),
+            pile,
         )
 
     def load_upload(self, upload_id):
@@ -462,23 +465,29 @@ class FullPeer:
             store = self.store(ws)
             before = store.get_bounded("root", MAX_ROOT_BYTES)
             try:
-                result = _run_applier(self.applier(ws).apply(source))
+                result = _run_applier(self.applier(ws).apply_exact(
+                    store, source, parse_ingress_key(source).digest))
             except Exception as error:
                 self.record_ingress_attempt_failure(ws, source, error)
                 return []
-            if result.status == "retryable":
-                self.record_ingress_attempt_failure(
-                    ws, source, RuntimeError("repository apply retryable"))
-                return []
-            if result.status == "rejected":
-                self.record_ingress_attempt_failure(
-                    ws, source, ValueError("repository rejected exact pile"))
-                return []
-            self.clear_ingress_attempt_failure(ws, source)
-            if store.get_bounded("root", MAX_ROOT_BYTES) != before:
-                self._evict_sync_cache(ws)
-            self._sync_sql(ws)
-            return list(result.admitted)
+            return self._finish_turn(ws, source, before, result)
+
+    def _finish_turn(self, ws, source, before, result):
+        """Reflect one core result into disposable full-peer state."""
+        store = self.store(ws)
+        if result.status == "retryable":
+            self.record_ingress_attempt_failure(
+                ws, source, RuntimeError("repository apply retryable"))
+            return []
+        if result.status == "rejected":
+            self.record_ingress_attempt_failure(
+                ws, source, ValueError("repository rejected exact pile"))
+            return []
+        self.clear_ingress_attempt_failure(ws, source)
+        if store.get_bounded("root", MAX_ROOT_BYTES) != before:
+            self._evict_sync_cache(ws)
+        self._sync_sql(ws)
+        return list(result.admitted)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -486,15 +495,19 @@ class FullPeer:
         return self.sender(ws).send(news, deps_new)
 
     def receive_pile(self, ws, member, raw):
-        """Stage one stable internal generation and invoke RepositoryApplier."""
+        """Persist one received body, then invoke the shared exact Applier."""
         with self.lock:
-            source = self.stage_received_pile(ws, member, raw)
-            return self.turn(ws, source)
-
-    def stage_received_pile(self, ws, member, raw):
-        """Create an internal generation without duplicating apply semantics."""
-        with self.lock:
-            return _run_applier(self.applier(ws).stage(member, raw))
+            payload = h(raw)
+            source = ingress_key(ws, payload[:32], member, payload)
+            store = self.store(ws)
+            before = store.get_bounded("root", MAX_ROOT_BYTES)
+            try:
+                result = _run_applier(
+                    self.applier(ws).receive_pile(member, raw))
+            except Exception as error:
+                self.record_ingress_attempt_failure(ws, source, error)
+                return []
+            return self._finish_turn(ws, source, before, result)
 
     # ---- rebuild: the store's own units through the same kernel --------------
 

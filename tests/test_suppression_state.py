@@ -132,7 +132,7 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
     assert node.fact_of(workspace, item.fid) == item
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [item.fid]
-    assert node.store(workspace).list("pile/")
+    assert node.store(workspace).list("ingress/")
     assert node.ingress_failures(workspace) == []
 
     root = node.store(workspace).get("root")
@@ -388,7 +388,7 @@ def test_fact_sync_carries_actions_and_their_projection(
             return tuple(self.obj(oid) for oid in oids)
 
         def put_pile(self, raw):
-            source.receive_pile(self.ws, "peer", raw)
+            source.receive_pile(self.ws, "a" * 64, raw)
 
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     sync_module.sync(destination, workspace, "local")

@@ -180,6 +180,16 @@ class SqlStore:
             f"WHERE {where}", args,
         ).fetchone()[0]
 
+    def postings(
+            self, kind, k0=None, k1=None, *, source_type=None):
+        """Return only generic index values and fact IDs, never fact blobs."""
+        where, args = _index_filter(kind, k0, k1, source_type)
+        return tuple(self.db.execute(
+            "SELECT i.k1, i.src FROM fact_index i "
+            f"WHERE {where} ORDER BY i.k1, i.src",
+            args,
+        ))
+
     def active(self, sid):
         return self.db.execute(
             "SELECT 1 FROM fact_index "

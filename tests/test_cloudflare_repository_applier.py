@@ -11,8 +11,9 @@ import pytest
 from core.close import encode_pile
 from core.crypto import h, load_sk
 from core.limits import MAX_HOSTED_SUBREQUESTS
+from core.object_store import MAX_STORE_PREFIX_BYTES
 from core.repository_reader import RepositoryReader
-from core.staged_intent import staging_key
+from core.ingress import ingress_key
 from deploy.cloudflare_upload.worker import applier_runtime
 from deploy.cloudflare_upload.worker.applier_runtime import apply
 from facts.auth.signature import signature
@@ -40,6 +41,20 @@ def _put(bucket, key, raw):
     bucket.etags[key] = bucket._token()
 
 
+def test_runtime_rejects_canonical_prefix_one_byte_over_provider_budget():
+    workspace = "a" * 64
+    canonical, ingress = Bucket(), Bucket()
+    exact = _env(workspace, canonical, ingress)
+    exact.CANONICAL_PREFIX = "a" * MAX_STORE_PREFIX_BYTES
+    assert applier_runtime.Settings.from_env(exact).canonical_prefix \
+        == exact.CANONICAL_PREFIX
+
+    oversized = _env(workspace, canonical, ingress)
+    oversized.CANONICAL_PREFIX = "a" * (MAX_STORE_PREFIX_BYTES + 1)
+    with pytest.raises(ValueError, match="CANONICAL_PREFIX"):
+        applier_runtime.Settings.from_env(oversized)
+
+
 def test_exact_r2_rpc_applies_and_replays_without_sql_list_or_delete(
         tmp_path, monkeypatch):
     source = FullPeer(str(tmp_path / "source"))
@@ -47,8 +62,8 @@ def test_exact_r2_rpc_applies_and_replays_without_sql_list_or_delete(
     facts.content.message.post(
         source, workspace, "general", "through R2", ts=10)
     raw = closed_subset(source, workspace, all_fids(source, workspace))
-    key = staging_key(
-        workspace, "b" * 16, "c" * 32, "pile", h(raw))
+    key = ingress_key(
+        workspace, "c" * 32, "b" * 64, h(raw))
     canonical, ingress = Bucket(), Bucket()
     _put(ingress, key, raw)
     env = _env(workspace, canonical, ingress)
@@ -77,24 +92,23 @@ def test_exact_r2_rpc_applies_and_replays_without_sql_list_or_delete(
     assert canonical.data[f"workspaces/{workspace}/root"] == root
 
 
-@pytest.mark.parametrize("fault", ("foreign", "object", "digest"))
+@pytest.mark.parametrize("fault", ("foreign", "nonpile", "digest"))
 def test_rpc_rejects_unbound_address_before_r2_read(fault):
     workspace = "a" * 64
     raw = b"pile"
-    key = staging_key(
-        workspace, "b" * 16, "c" * 32, "pile", h(raw))
+    key = ingress_key(
+        workspace, "c" * 32, "b" * 64, h(raw))
     digest = h(raw)
     if fault == "foreign":
-        key = staging_key(
-            "d" * 64, "b" * 16, "c" * 32, "pile", digest)
-    elif fault == "object":
-        key = staging_key(
-            workspace, "b" * 16, "c" * 32, "obj", digest)
+        key = ingress_key(
+            "d" * 64, "c" * 32, "b" * 64, digest)
+    elif fault == "nonpile":
+        key = key.replace("/piles/", "/objects/")
     else:
         digest = "e" * 64
     canonical, ingress = Bucket(), Bucket()
 
-    with pytest.raises(ValueError, match="source binding"):
+    with pytest.raises(ValueError, match="exact ingress|ingress key"):
         asyncio.run(apply(
             _env(workspace, canonical, ingress), key, digest))
     assert canonical.calls == []
@@ -118,8 +132,8 @@ def test_same_isolate_overlap_is_not_hidden_by_singleflight(monkeypatch):
 
     workspace = "a" * 64
     raw = b"pile"
-    key = staging_key(
-        workspace, "b" * 16, "c" * 32, "pile", h(raw))
+    key = ingress_key(
+        workspace, "c" * 32, "b" * 64, h(raw))
     env = _env(workspace, Bucket(), Bucket())
     monkeypatch.setattr(applier_runtime, "RepositoryApplier", Delayed)
 
@@ -166,8 +180,8 @@ def test_realistic_nonempty_turn_stays_below_configured_calls():
             secret, public, item, timestamp), item))
     raw = encode_pile(stream, workspace=root.fid)
     canonical, ingress = Bucket(), Bucket()
-    key = staging_key(
-        root.fid, "b" * 16, "c" * 32, "pile", h(raw))
+    key = ingress_key(
+        root.fid, "c" * 32, "b" * 64, h(raw))
     _put(ingress, key, raw)
 
     result = asyncio.run(apply(

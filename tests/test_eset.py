@@ -211,9 +211,9 @@ def test_suppression_stays_behind_the_root_commit(
     assert observed == [(200, old_root)]
     assert canonical_observed and all(canonical_observed)
     assert visible()
-    assert store.list("pile/")
+    assert store.list("ingress/")
     failed_source = next(
-        source for source in store.list("pile/")
+        source for source in store.list("ingress/")
         if store.get(source) is not None
         and deletion.fid in {
             fact.fid for fact in decode_pile(store.get(source), workspace)

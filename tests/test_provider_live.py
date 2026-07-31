@@ -15,12 +15,6 @@ Commands:
       python3 -m pytest -q -m live_r2 \
         tests/test_provider_live.py::test_live_r2_presigned_staging_put
 
-    POC16_LIVE_R2_RETAINED_INGRESS=1 POC16_R2_WORKSPACE=... \
-      CF_UPLOAD_DEPLOYMENT_OWNER=... CLOUDFLARE_API_TOKEN=... \
-      plus the R2 values above \
-      python3 -m pytest -q -m live_r2 \
-        tests/test_provider_live.py::test_live_r2_lock_defeats_parent_mutation
-
 These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
 """
@@ -38,12 +32,10 @@ import pytest
 from adapters.r2 import R2S3Config, R2S3Store
 from adapters.s3 import S3Config, S3Store
 from core.object_store import Applied, OutcomeUnknown
-from core.staged_intent import parse_staging_key, staging_key
+from core.ingress import ingress_key, parse_ingress_key
 from deploy.cloudflare_upload.boundary import Deployment
-from deploy.cloudflare_upload.boundary import ingress_lock
-from deploy.cloudflare_upload import manage as cloudflare_manage
 from deploy.cloudflare_upload.signer import R2UploadSigner
-from deploy.upload_broker import AuthorizedPut
+from deploy.upload_broker import AuthorizedPilePut
 from tests.provider_conformance import (
     ConformanceRun,
     exercise_sync_store,
@@ -313,7 +305,7 @@ def test_live_r2_presigned_staging_put():
     access = os.environ["POC16_R2_ACCESS_KEY_ID"]
     secret = os.environ["POC16_R2_SECRET_ACCESS_KEY"]
     workspace = secrets.token_hex(32)
-    member = secrets.token_hex(8)
+    member = secrets.token_hex(32)
     session = secrets.token_hex(16)
     body = b"poc16 live direct R2 staging upload"
     digest = hashlib.sha256(body).hexdigest()
@@ -331,12 +323,13 @@ def test_live_r2_presigned_staging_put():
         applier_name="poc16-live-repository-applier",
         read_permission_group_id="c" * 32,
         write_permission_group_id="d" * 32,
+        broker_domain="uploads.example.com",
         presign_ttl_seconds=30,
     )
-    key = staging_key(
-        workspace, member, session, "obj", digest)
-    other_key = staging_key(
-        workspace, member, session, "obj", other_digest)
+    key = ingress_key(
+        workspace, session, member, digest)
+    other_key = ingress_key(
+        workspace, session, member, other_digest)
     observer = R2S3Store(
         R2S3Config(account_id=account, bucket=bucket),
         access_key_id=access,
@@ -344,15 +337,12 @@ def test_live_r2_presigned_staging_put():
     )
     _require_endpoint(observer, "r2")
     capability = R2UploadSigner(
-        candidate, access, secret).sign(AuthorizedPut(
+        candidate, access, secret).sign(AuthorizedPilePut(
             workspace,
             member,
             session,
-            "obj",
             digest,
             len(body),
-            "application/octet-stream",
-            key,
             time.time_ns() // 1_000_000 + 30_000,
         ))
     parsed = urlsplit(capability.url)
@@ -383,98 +373,8 @@ def test_live_r2_presigned_staging_put():
         assert observer.get(other_key) is None
     finally:
         for staged in cleanup:
-            address = parse_staging_key(staged)
+            address = parse_ingress_key(staged)
             if address.workspace != workspace:
                 raise ValueError("refusing unsafe live R2 cleanup")
             observer._mutation_client.delete_object(
                 Bucket=bucket, Key=staged)
-
-
-@pytest.mark.live
-@pytest.mark.live_r2
-def test_live_r2_lock_defeats_parent_mutation():
-    """Leave one tiny locked probe behind after attacking it with the parent."""
-    required = (
-        "POC16_R2_ACCOUNT_ID",
-        "POC16_R2_BUCKET",
-        "POC16_R2_ACCESS_KEY_ID",
-        "POC16_R2_SECRET_ACCESS_KEY",
-        "POC16_R2_WORKSPACE",
-        "CF_UPLOAD_DEPLOYMENT_OWNER",
-        "CLOUDFLARE_API_TOKEN",
-    )
-    _required_opt_in("POC16_LIVE_R2_RETAINED_INGRESS", required)
-    try:
-        import boto3  # noqa: F401
-        from botocore.exceptions import ClientError
-    except ImportError:
-        pytest.skip("boto3 is required for the privileged R2 observer")
-
-    account = os.environ["POC16_R2_ACCOUNT_ID"]
-    bucket = os.environ["POC16_R2_BUCKET"]
-    workspace = os.environ["POC16_R2_WORKSPACE"]
-    access = os.environ["POC16_R2_ACCESS_KEY_ID"]
-    secret = os.environ["POC16_R2_SECRET_ACCESS_KEY"]
-    canonical = "poc16-live-unused-canonical"
-    if bucket == canonical:
-        canonical += "-other"
-    candidate = Deployment(
-        account_id=account,
-        workspace=workspace,
-        canonical_bucket=canonical,
-        ingress_bucket=bucket,
-        owner=os.environ["CF_UPLOAD_DEPLOYMENT_OWNER"],
-        broker_name="poc16-live-upload-broker",
-        applier_name="poc16-live-repository-applier",
-        read_permission_group_id="c" * 32,
-        write_permission_group_id="d" * 32,
-        jurisdiction=os.environ.get("POC16_R2_JURISDICTION", "default"),
-        presign_ttl_seconds=30,
-    )
-    observed = cloudflare_manage._read_ingress_lock(
-        candidate, os.environ)
-    assert observed == ingress_lock(candidate), (
-        "refusing a destructive parent probe without the exact "
-        "indefinite ingress lock")
-
-    member, session = secrets.token_hex(8), secrets.token_hex(16)
-    body = b"poc16 live retained R2 ingress"
-    digest = hashlib.sha256(body).hexdigest()
-    key = staging_key(
-        workspace, member, session, "obj", digest)
-    observer = R2S3Store(
-        R2S3Config(account_id=account, bucket=bucket),
-        access_key_id=access,
-        secret_access_key=secret,
-    )
-    _require_endpoint(observer, "r2")
-    capability = R2UploadSigner(
-        candidate, access, secret).sign(AuthorizedPut(
-            workspace,
-            member,
-            session,
-            "obj",
-            digest,
-            len(body),
-            "application/octet-stream",
-            key,
-            time.time_ns() // 1_000_000 + 30_000,
-        ))
-    print(
-        f"live R2 indefinite-retention probe (not collectible): {key}",
-        flush=True,
-    )
-
-    assert _live_put(capability, body) in {200, 201}
-    assert observer.get(key) == body
-    for operation in (
-            lambda: observer._mutation_client.put_object(
-                Bucket=bucket, Key=key, Body=b"replacement"),
-            lambda: observer._mutation_client.delete_object(
-                Bucket=bucket, Key=key)):
-        with pytest.raises(ClientError) as denied:
-            operation()
-        response = getattr(denied.value, "response", {})
-        assert response.get(
-            "ResponseMetadata", {}).get("HTTPStatusCode") == 403
-        assert observer.get(key) == body

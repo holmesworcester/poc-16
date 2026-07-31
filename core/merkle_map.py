@@ -25,7 +25,7 @@ FORMAT = "merkle-map-v1"
 
 # Logical authenticated keys are provider-neutral ASCII.  Current callers
 # derive them from fixed fact keys, typed suppression ids, canonical JSON, or
-# base64url components.  The catalog-side pre-admission ratchet for every
+# base64url components. The family-side pre-admission ratchet for every
 # future family remains tracked by poc-16-x1p.17.12; this boundary ensures the
 # map itself never emits an unbounded page.
 MAX_KEY_BYTES = 384

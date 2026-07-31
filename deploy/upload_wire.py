@@ -1,90 +1,56 @@
-"""Canonical request codec for the direct-upload HTTP protocol.
+"""Canonical metadata wire for one exact-pile direct upload.
 
-This module is the one agreement between upload clients and broker endpoints.
-It carries only bounded metadata: authorization proofs, Merkle descriptors,
-and authenticated cursors. Provider bodies and credentials never cross it.
+Pile bytes travel straight from the client to S3/R2.  This wire carries only
+the current authorization proof, exact digest/size, fixed lease, and final
+application result.
 """
 import base64
 from dataclasses import dataclass, field
-from itertools import islice
 
 from core.fact import canon
-from core.limits import (
-    MAX_MINT_REQUEST_BYTES,
-    PAGE_BATCH,
-    PayloadTooLarge,
-    decode_json,
-)
-from deploy.upload_session import (
-    MAX_RANGE_PROOF_BYTES,
-    MAX_SESSION_OBJECTS,
-    UploadLeaf,
-    UploadManifest,
-    valid_cursor,
-    valid_leaf,
-    valid_manifest,
-)
+from core.limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge, decode_json
+from deploy.upload_session import UploadLeaf, valid_cursor, valid_leaf
 
 
-OPEN_REQUEST_SCHEMA = "poc16-upload-open-request-v1"
-ISSUE_REQUEST_SCHEMA = "poc16-upload-issue-request-v1"
-FINALIZE_REQUEST_SCHEMA = "poc16-upload-finalize-request-v1"
+OPEN_REQUEST_SCHEMA = "poc16-upload-open-request-v2"
+FINALIZE_REQUEST_SCHEMA = "poc16-upload-finalize-request-v2"
+OPEN_RESPONSE_SCHEMA = "poc16-upload-open-v3"
+FINALIZE_RESPONSE_SCHEMA = "poc16-upload-finalize-v2"
 UPLOAD_CONTENT_TYPE = "application/octet-stream"
 
-MAX_OPEN_RESPONSE_BYTES = 2_048
-MAX_ISSUE_RESPONSE_BYTES = 512 * 1024
-MAX_FINALIZE_RESPONSE_BYTES = 4_096
-
-# Base64 expands the largest accepted mint proof by 4/3. Keep the HTTP
-# envelope from silently imposing a smaller authorization-proof limit than
-# UploadBroker itself.
-MAX_OPEN_REQUEST_BYTES = (
-    4 * ((MAX_MINT_REQUEST_BYTES + 2) // 3) + 4_096
-)
-MAX_ISSUE_REQUEST_BYTES = 128 * 1024
-MAX_FINALIZE_REQUEST_BYTES = 16 * 1024
+MAX_OPEN_REQUEST_BYTES = 4 * ((MAX_MINT_REQUEST_BYTES + 2) // 3) + 1_024
+MAX_OPEN_RESPONSE_BYTES = 8 * 1_024
+MAX_FINALIZE_REQUEST_BYTES = 4 * 1_024
+MAX_FINALIZE_RESPONSE_BYTES = 1_024
+FINAL_STATUSES = frozenset(("applied", "noop", "rejected", "retryable"))
 
 
 class InvalidUploadWire(ValueError):
     """A request is not the one canonical upload protocol document."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UploadCapability:
-    """One exact provider request issued by the broker to the client."""
-
-    method: str
     url: str = field(repr=False)
     headers: tuple[tuple[str, str], ...] = field(repr=False)
     expires_at_ms: int
 
 
-@dataclass(frozen=True)
-class GrantedUpload:
-    leaf: UploadLeaf
-    capability: UploadCapability
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OpenedUpload:
     session: str
     cursor: str
+    capability: UploadCapability
     expires_at_ms: int
 
 
-@dataclass(frozen=True)
-class IssuedUpload:
-    cursor: str
-    next_index: int
-    objects: tuple[GrantedUpload, ...]
-    expires_at_ms: int
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FinalizedUpload:
-    cursor: str
-    pile: GrantedUpload
-    expires_at_ms: int
+    status: str
+
+    def __post_init__(self):
+        if self.status not in FINAL_STATUSES:
+            raise ValueError("upload final status")
 
 
 def _invalid(label, error=None):
@@ -125,8 +91,7 @@ def _leaf_document(leaf):
 
 
 def _decode_leaf(value):
-    if not isinstance(value, dict) \
-            or set(value) != {"digest", "size"}:
+    if not isinstance(value, dict) or set(value) != {"digest", "size"}:
         _invalid("upload leaf")
     try:
         leaf = UploadLeaf(value["digest"], value["size"])
@@ -137,51 +102,61 @@ def _decode_leaf(value):
     return leaf
 
 
-def _manifest_document(value):
-    if not valid_manifest(value):
-        _invalid("upload manifest")
+def capability_document(value):
+    """Encode the shared capability value without provider semantics."""
+    if not isinstance(value, UploadCapability) \
+            or not isinstance(value.url, str) \
+            or not isinstance(value.headers, tuple) \
+            or any(
+                not isinstance(pair, tuple) or len(pair) != 2
+                or not all(isinstance(item, str) for item in pair)
+                for pair in value.headers
+            ) \
+            or len({name for name, _ in value.headers}) \
+            != len(value.headers) \
+            or type(value.expires_at_ms) is not int:
+        _invalid("upload capability")
     return {
-        "count": value.count,
-        "root": value.root,
-        "total_bytes": value.total_bytes,
+        "expires_at_ms": value.expires_at_ms,
+        "headers": dict(value.headers),
+        "url": value.url,
     }
 
 
-def _decode_manifest(value):
-    if not isinstance(value, dict) \
-            or set(value) != {"count", "root", "total_bytes"}:
-        _invalid("upload manifest")
+def decode_capability_document(value):
+    """Decode the one canonical JSON shape used on wire and in journals."""
     try:
-        manifest = UploadManifest(
-            value["root"], value["count"], value["total_bytes"])
+        if not isinstance(value, dict) or set(value) != {
+                "expires_at_ms", "headers", "url"} \
+                or not isinstance(value["headers"], dict) \
+                or not all(
+                    isinstance(name, str) and isinstance(header, str)
+                    for name, header in value["headers"].items()
+                ):
+            raise ValueError
+        result = UploadCapability(
+            value["url"],
+            tuple(sorted(value["headers"].items())),
+            value["expires_at_ms"],
+        )
+        # Re-encoding rejects bool timestamps and other ambiguous values.
+        capability_document(result)
+        return result
     except (KeyError, TypeError, ValueError) as error:
-        _invalid("upload manifest", error)
-    if not valid_manifest(manifest):
-        _invalid("upload manifest")
-    return manifest
-
-
-def _cursor(value):
-    if not valid_cursor(value):
-        _invalid("upload cursor")
-    return value
+        _invalid("upload capability", error)
 
 
 def _request(raw, maximum, fields, schema, label):
     try:
         value = decode_json(raw, maximum, label)
+        if canon(value) != raw or not isinstance(value, dict) \
+                or set(value) != fields or value.get("schema") != schema:
+            raise ValueError
+        return value
     except PayloadTooLarge:
         raise
-    except ValueError as error:
-        _invalid(label, error)
-    try:
-        canonical = canon(value)
     except (RecursionError, TypeError, UnicodeError, ValueError) as error:
         _invalid(label, error)
-    if canonical != raw or not isinstance(value, dict) \
-            or set(value) != fields or value.get("schema") != schema:
-        _invalid(label)
-    return value
 
 
 def _encoded(value, maximum, label):
@@ -194,101 +169,37 @@ def _encoded(value, maximum, label):
     return raw
 
 
-def encode_open_request(proof, manifest, pile):
-    return _encoded(
-        {
-            "manifest": _manifest_document(manifest),
-            "pile": _leaf_document(pile),
-            "proof": _encode_b64(
-                proof, MAX_MINT_REQUEST_BYTES, "upload proof"),
-            "schema": OPEN_REQUEST_SCHEMA,
-        },
-        MAX_OPEN_REQUEST_BYTES,
-        "upload OPEN request",
-    )
+def encode_open_request(proof, pile):
+    return _encoded({
+        "pile": _leaf_document(pile),
+        "proof": _encode_b64(
+            proof, MAX_MINT_REQUEST_BYTES, "upload proof"),
+        "schema": OPEN_REQUEST_SCHEMA,
+    }, MAX_OPEN_REQUEST_BYTES, "upload OPEN request")
 
 
 def decode_open_request(raw):
     value = _request(
         raw,
         MAX_OPEN_REQUEST_BYTES,
-        {"manifest", "pile", "proof", "schema"},
+        {"pile", "proof", "schema"},
         OPEN_REQUEST_SCHEMA,
         "upload OPEN request",
     )
     return (
         _decode_b64(
             value["proof"], MAX_MINT_REQUEST_BYTES, "upload proof"),
-        _decode_manifest(value["manifest"]),
         _decode_leaf(value["pile"]),
     )
 
 
-def _bounded_leaves(values):
-    try:
-        leaves = tuple(islice(iter(values), PAGE_BATCH + 1))
-    except (TypeError, ValueError) as error:
-        _invalid("upload ISSUE leaves", error)
-    if not leaves or len(leaves) > PAGE_BATCH:
-        _invalid("upload ISSUE leaves")
-    return leaves
-
-
-def encode_issue_request(cursor, start_index, leaves, proof):
-    leaves = _bounded_leaves(leaves)
-    if type(start_index) is not int \
-            or not 0 <= start_index < MAX_SESSION_OBJECTS:
-        _invalid("upload ISSUE start index")
-    return _encoded(
-        {
-            "cursor": _cursor(cursor),
-            "leaves": [_leaf_document(leaf) for leaf in leaves],
-            "proof": _encode_b64(
-                proof, MAX_RANGE_PROOF_BYTES, "upload range proof"),
-            "schema": ISSUE_REQUEST_SCHEMA,
-            "start_index": start_index,
-        },
-        MAX_ISSUE_REQUEST_BYTES,
-        "upload ISSUE request",
-    )
-
-
-def decode_issue_request(raw):
-    value = _request(
-        raw,
-        MAX_ISSUE_REQUEST_BYTES,
-        {"cursor", "leaves", "proof", "schema", "start_index"},
-        ISSUE_REQUEST_SCHEMA,
-        "upload ISSUE request",
-    )
-    start_index = value["start_index"]
-    if type(start_index) is not int \
-            or not 0 <= start_index < MAX_SESSION_OBJECTS \
-            or not isinstance(value["leaves"], list):
-        _invalid("upload ISSUE request")
-    leaves = _bounded_leaves(
-        _decode_leaf(item) for item in value["leaves"])
-    return (
-        _cursor(value["cursor"]),
-        start_index,
-        leaves,
-        _decode_b64(
-            value["proof"],
-            MAX_RANGE_PROOF_BYTES,
-            "upload range proof",
-        ),
-    )
-
-
 def encode_finalize_request(cursor):
-    return _encoded(
-        {
-            "cursor": _cursor(cursor),
-            "schema": FINALIZE_REQUEST_SCHEMA,
-        },
-        MAX_FINALIZE_REQUEST_BYTES,
-        "upload FINALIZE request",
-    )
+    if not valid_cursor(cursor):
+        _invalid("upload cursor")
+    return _encoded({
+        "cursor": cursor,
+        "schema": FINALIZE_REQUEST_SCHEMA,
+    }, MAX_FINALIZE_REQUEST_BYTES, "upload FINALIZE request")
 
 
 def decode_finalize_request(raw):
@@ -299,30 +210,104 @@ def decode_finalize_request(raw):
         FINALIZE_REQUEST_SCHEMA,
         "upload FINALIZE request",
     )
-    return _cursor(value["cursor"])
+    cursor = value["cursor"]
+    if not valid_cursor(cursor):
+        _invalid("upload cursor")
+    return cursor
+
+
+def open_document(result):
+    if not isinstance(result, OpenedUpload) \
+            or not isinstance(result.session, str) \
+            or not valid_cursor(result.cursor) \
+            or type(result.expires_at_ms) is not int:
+        _invalid("OPEN response")
+    return {
+        "cursor": result.cursor,
+        "expires_at_ms": result.expires_at_ms,
+        "put": capability_document(result.capability),
+        "schema": OPEN_RESPONSE_SCHEMA,
+        "session": result.session,
+    }
+
+
+def encode_open_response(result):
+    return _encoded(
+        open_document(result), MAX_OPEN_RESPONSE_BYTES, "OPEN response")
+
+
+def decode_open_response(raw):
+    value = _request(
+        raw,
+        MAX_OPEN_RESPONSE_BYTES,
+        {"cursor", "expires_at_ms", "put", "schema", "session"},
+        OPEN_RESPONSE_SCHEMA,
+        "OPEN response",
+    )
+    try:
+        result = OpenedUpload(
+            value["session"], value["cursor"],
+            decode_capability_document(value["put"]),
+            value["expires_at_ms"])
+        open_document(result)
+        return result
+    except (KeyError, TypeError, ValueError) as error:
+        _invalid("OPEN response", error)
+
+
+def finalize_document(result):
+    if not isinstance(result, FinalizedUpload):
+        _invalid("FINALIZE response")
+    return {"schema": FINALIZE_RESPONSE_SCHEMA, "status": result.status}
+
+
+def encode_finalize_response(result):
+    return _encoded(
+        finalize_document(result),
+        MAX_FINALIZE_RESPONSE_BYTES,
+        "FINALIZE response",
+    )
+
+
+def decode_finalize_response(raw):
+    value = _request(
+        raw,
+        MAX_FINALIZE_RESPONSE_BYTES,
+        {"schema", "status"},
+        FINALIZE_RESPONSE_SCHEMA,
+        "FINALIZE response",
+    )
+    try:
+        return FinalizedUpload(value["status"])
+    except (KeyError, TypeError, ValueError) as error:
+        _invalid("FINALIZE response", error)
 
 
 __all__ = (
     "FINALIZE_REQUEST_SCHEMA",
+    "FINALIZE_RESPONSE_SCHEMA",
+    "FINAL_STATUSES",
     "FinalizedUpload",
-    "GrantedUpload",
-    "ISSUE_REQUEST_SCHEMA",
     "InvalidUploadWire",
     "MAX_FINALIZE_REQUEST_BYTES",
     "MAX_FINALIZE_RESPONSE_BYTES",
-    "MAX_ISSUE_REQUEST_BYTES",
-    "MAX_ISSUE_RESPONSE_BYTES",
     "MAX_OPEN_REQUEST_BYTES",
     "MAX_OPEN_RESPONSE_BYTES",
     "OPEN_REQUEST_SCHEMA",
+    "OPEN_RESPONSE_SCHEMA",
     "OpenedUpload",
-    "IssuedUpload",
     "UPLOAD_CONTENT_TYPE",
     "UploadCapability",
+    "capability_document",
+    "decode_capability_document",
+    "decode_finalize_response",
     "decode_finalize_request",
-    "decode_issue_request",
+    "decode_open_response",
     "decode_open_request",
+    "encode_finalize_response",
     "encode_finalize_request",
-    "encode_issue_request",
+    "encode_open_response",
     "encode_open_request",
+    "finalize_document",
+    "open_document",
 )

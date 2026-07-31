@@ -43,7 +43,7 @@ def validate(f, ctx):
         return False
 
 
-# MODE — requests are judged but never enter the durable client catalog.
+# MODE — requests are judged but never enter durable validated storage.
 DURABLE = False
 
 

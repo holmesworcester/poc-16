@@ -1,6 +1,8 @@
 """Validated constants shared by the isolated Lambda deployment tools."""
 import re
 
+from core.object_store import MAX_STORE_PREFIX_BYTES
+
 
 DEPLOYMENT_MARKER = "poc16-aws-lambda-gateway-v1"
 DEPLOYMENT_TAG = "poc16:deployment"
@@ -17,7 +19,7 @@ MAX_QUERY_FIELDS = 8
 MAX_LOG_METHOD_CHARS = 16
 MAX_LOG_PATH_CHARS = 256
 MAX_LOG_RECORD_BYTES = 1280
-MAX_STORE_PREFIX_LENGTH = 760
+MAX_STORE_PREFIX_LENGTH = MAX_STORE_PREFIX_BYTES
 
 WORKSPACE_PATTERN = r"^[0-9a-f]{64}$"
 DEPLOYMENT_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{2,63}$"

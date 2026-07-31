@@ -4,6 +4,8 @@ import os
 import random
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -121,9 +123,12 @@ def test_independent_slice_piles_make_partial_progress(tmp_path, monkeypatch):
         deliver(destination, workspace, raw)
     assert progress(destination, workspace)["have"] == 1
     assert not progress(destination, workspace)["complete"]
-    assert files.bytes_for(
-        destination, workspace, progress(destination, workspace)["fid"]
-    )[1] is None
+    with pytest.raises(ValueError, match="file incomplete"):
+        files.save(
+            destination, workspace,
+            progress(destination, workspace)["fid"],
+            tmp_path / "incomplete.bin",
+        )
 
     deliver(destination, workspace, raw_piles[2])
     assert progress(destination, workspace)["complete"]
@@ -220,17 +225,75 @@ assert validate(decode_pile(raw, {workspace!r}), {workspace!r})
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_pure_verifier_matches_rust_authoring_binding(tmp_path):
-    source = tmp_path / "cross.bin"
-    data = random.Random(4).randbytes(_bao.WIDTH + 33)
+def test_authoring_generates_once_and_leaves_verification_to_admission(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+
+    class GenerateOnly:
+        prepare = staticmethod(bao_native.prepare)
+        proof = staticmethod(bao_native.proof)
+
+        @staticmethod
+        def verify(*_args):
+            pytest.fail("authoring redundantly verified its generated proof")
+
+    monkeypatch.setattr(node, "attachment_io", lambda: GenerateOnly)
+    fid = send_bytes(node, workspace, "once.bin", b"once", ts=2)
+
+    assert progress(node, workspace)["fid"] == fid
+    assert progress(node, workspace)["complete"]
+
+
+@pytest.mark.parametrize("size", (
+    0,
+    1,
+    1023,
+    1024,
+    1025,
+    _bao.WIDTH - 1,
+    _bao.WIDTH,
+    _bao.WIDTH + 1,
+    2 * _bao.WIDTH - 1,
+    2 * _bao.WIDTH,
+    2 * _bao.WIDTH + 1,
+))
+def test_pure_verifier_matches_rust_at_tree_and_slice_boundaries(
+        tmp_path, size):
+    source = tmp_path / f"cross-{size}.bin"
+    data = random.Random(size).randbytes(size)
     source.write_bytes(data)
-    outboard = tmp_path / "cross.obao"
+    outboard = tmp_path / f"cross-{size}.obao"
     root = bao_native.prepare(str(source), str(outboard))
+    if size == 0:
+        assert root == _bao.EMPTY_ROOT
     for index in range(_bao.geometry(len(data))):
         proof = bao_native.proof(
             str(source), str(outboard), index, len(data))
         assert _bao.verify(proof, root, index, len(data)) \
             == bao_native.verify(proof, root, index, len(data))
+
+
+def test_empty_descriptor_has_the_unique_bao_root(tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    fid = send_bytes(node, workspace, "empty.bin", b"", ts=2)
+    descriptor = node.fact_of(workspace, fid)
+
+    assert descriptor.body["root"] == _bao.EMPTY_ROOT
+    assert _bao.geometry(descriptor.body["size"]) == 0
+    assert files.validate(descriptor, None)
+    bad = files.file(
+        workspace,
+        descriptor.body["pk"],
+        descriptor.body["chan"],
+        descriptor.body["name"],
+        0,
+        "0" * 64,
+        descriptor.ts,
+        descriptor.body["owner"],
+    )
+    assert not files.validate(bad, None)
 
 
 def test_file_list_counts_generic_ref_index_without_decoding_slice_bodies(
@@ -252,23 +315,87 @@ def test_file_list_counts_generic_ref_index_without_decoding_slice_bodies(
     assert slices.TAG not in decoded
 
 
-def test_selected_reads_touch_only_the_selected_descriptor_slices(
+def test_selected_save_fetches_only_that_descriptor_and_one_slice_at_a_time(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    wanted = send_bytes(node, workspace, "wanted.bin", b"wanted", ts=2)
+    wanted_bytes = b"w" * (_bao.WIDTH + 13)
+    wanted = send_bytes(
+        node, workspace, "wanted.bin", wanted_bytes, ts=2)
     unwanted = send_bytes(node, workspace, "unwanted.bin", b"unwanted", ts=3)
-    verified = []
-    strict = _bao.verify
+    wanted_slices = {
+        fact.fid for fact in slice_facts(node, workspace, wanted)
+    }
+    unwanted_slices = {
+        fact.fid for fact in slice_facts(node, workspace, unwanted)
+    }
+    fetched = []
+    projection = node.sql(workspace)
+    strict_fact = projection.fact
+    strict_payload = slices.payload
 
-    def observed(proof, root, index, size, width=_bao.WIDTH):
-        verified.append(root)
-        return strict(proof, root, index, size, width)
+    def observed_fact(fid):
+        if fid in wanted_slices | unwanted_slices:
+            fetched.append(fid)
+        return strict_fact(fid)
 
-    monkeypatch.setattr(_bao, "verify", observed)
-    assert files.bytes_for(node, workspace, wanted) == ("wanted.bin", b"wanted")
-    assert verified == [node.fact_of(workspace, wanted).body["root"]]
-    assert node.fact_of(workspace, unwanted).body["root"] not in verified
+    consumed = 0
+
+    def observed_payload(fact, descriptor):
+        nonlocal consumed
+        # The next proof fact is fetched only after this one is consumed.
+        assert len(fetched) == consumed + 1
+        consumed += 1
+        return strict_payload(fact, descriptor)
+
+    monkeypatch.setattr(projection, "fact", observed_fact)
+    monkeypatch.setattr(slices, "payload", observed_payload)
+    monkeypatch.setattr(
+        _bao, "verify",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an admitted Bao proof was verified twice"),
+    )
+    output = tmp_path / "wanted.out"
+    assert files.save(node, workspace, wanted, output)["bytes"] \
+        == len(wanted_bytes)
+    assert output.read_bytes() == wanted_bytes
+    assert set(fetched) == wanted_slices
+    assert set(fetched).isdisjoint(unwanted_slices)
+
+
+def test_save_releases_peer_lock_and_keeps_its_resident_slice_snapshot(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    data = b"s" * (_bao.WIDTH + 7)
+    descriptor = send_bytes(
+        node, workspace, "concurrent.bin", data, ts=2)
+    output = tmp_path / "concurrent.out"
+    first_started = threading.Event()
+    root_advanced = threading.Event()
+    strict_payload = slices.payload
+
+    def paused_payload(fact, parent):
+        if slices.index_of(fact) == 0:
+            first_started.set()
+            assert root_advanced.wait(5)
+        return strict_payload(fact, parent)
+
+    monkeypatch.setattr(slices, "payload", paused_payload)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            files.save, node, workspace, descriptor, output)
+        assert first_started.wait(5)
+        try:
+            facts.content.delete.remove(
+                node, workspace, descriptor, ts=3)
+        finally:
+            root_advanced.set()
+        result = pending.result(10)
+
+    assert result["bytes"] == len(data)
+    assert output.read_bytes() == data
+    assert files.files(node, workspace) == []
 
 
 def test_descriptor_deletion_cascades_to_slices(tmp_path):

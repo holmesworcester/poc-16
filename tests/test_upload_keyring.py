@@ -17,11 +17,11 @@ from deploy.upload_keyring import (
 )
 from deploy.upload_session import (
     InvalidUploadSession,
+    MAX_SESSION_BYTES,
     SessionKey,
     SessionState,
     SessionTokenCodec,
     UploadLeaf,
-    UploadManifest,
     UploadSessionPolicy,
 )
 
@@ -53,7 +53,7 @@ def policy(*, keys=(OLD,), active="oldkey01", ttl=TTL):
         ttl_ms=ttl,
         max_ttl_ms=4 * TTL,
         clock_skew_ms=SKEW,
-        max_bytes=32 * 1024 * 1024,
+        max_bytes=MAX_SESSION_BYTES,
     )
 
 
@@ -64,13 +64,9 @@ def keyring(*, provider=PROVIDER, **policy_options):
 def state(key_id="oldkey01", *, expires_at=NOW + TTL):
     return SessionState(
         "a" * 64,
-        "b" * 16,
+        "b" * 64,
         "c" * 32,
-        UploadManifest("d" * 64, 2, 11),
         UploadLeaf("e" * 64, 7),
-        0,
-        0,
-        None,
         NOW,
         expires_at,
         key_id,
@@ -94,6 +90,7 @@ def test_keyring_round_trip_is_canonical_bounded_and_redacted():
 
     assert encode_keyring(loaded) == raw
     assert loaded.provider_binding == PROVIDER
+    assert loaded.policy.max_bytes == MAX_SESSION_BYTES
     assert tuple(key.key_id for key in loaded.policy.keys) == (
         "newkey02", "oldkey01")
     assert len(raw) < MAX_KEYRING_BYTES

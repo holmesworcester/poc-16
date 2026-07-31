@@ -19,6 +19,7 @@ from core.limits import (
 )
 from core.shape import valid_fid
 from core.http import HttpGate, Response
+from core.object_store import validate_store_prefix
 
 if __package__:
     from .crypto_compat import seal_to, unseal
@@ -117,8 +118,10 @@ class Settings:
         if not valid_fid(workspace):
             raise ValueError("WORKSPACE binding")
         prefix = _text(env, "STORE_PREFIX").strip("/")
-        if not prefix:
-            raise ValueError("STORE_PREFIX binding")
+        try:
+            validate_store_prefix(prefix)
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError("STORE_PREFIX binding") from error
         try:
             secret = base64.b64decode(
                 _text(env, "GRANT_SECRET"), validate=True)

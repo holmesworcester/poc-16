@@ -116,15 +116,11 @@ def _left_len(size):
     return _CHUNK * (1 << (chunks.bit_length() - 1))
 
 
-def verify(proof, root, start, count, size):
-    """Verify one canonical Bao range proof and return exactly its payload.
-
-    ``start`` and ``count`` must describe a positive in-file range. The
-    encoded length, root, consumed proof length, and output length are all
-    checked here so alternate/trailing encodings cannot name the same slice.
-    """
-    if not isinstance(proof, bytes) or not isinstance(root, bytes) \
-            or len(root) != 32 \
+def _decode(proof, start, count, size, root):
+    """Parse once; ``root=None`` trusts the earlier admission certificate."""
+    if not isinstance(proof, bytes) \
+            or root is not None and (
+                not isinstance(root, bytes) or len(root) != 32) \
             or type(start) is not int or type(count) is not int \
             or type(size) is not int \
             or not 0 <= start < size or not 0 < count <= size - start:
@@ -141,23 +137,38 @@ def verify(proof, root, start, count, size):
             return
         if subtree_len <= _CHUNK:
             raw = _read_exact(source, subtree_len)
-            _verify(
-                expected,
-                _chunk_cv(raw, subtree_start // _CHUNK, root_node),
-            )
+            if expected is not None:
+                _verify(
+                    expected,
+                    _chunk_cv(raw, subtree_start // _CHUNK, root_node),
+                )
             lo = max(0, start - subtree_start)
             hi = min(subtree_len, end - subtree_start)
             output.write(raw[lo:hi])
             return
         parent = _read_exact(source, 64)
-        _verify(expected, _parent_cv(parent, root_node))
+        if expected is not None:
+            _verify(expected, _parent_cv(parent, root_node))
         left = _left_len(subtree_len)
-        descend(subtree_start, left, parent[:32], False)
         descend(
-            subtree_start + left, subtree_len - left, parent[32:], False)
+            subtree_start, left,
+            None if expected is None else parent[:32], False)
+        descend(
+            subtree_start + left, subtree_len - left,
+            None if expected is None else parent[32:], False)
 
     descend(0, size, root, True)
     payload = output.getvalue()
     if source.tell() != len(proof) or len(payload) != count:
         raise ValueError("non-canonical or short Bao slice")
     return payload
+
+
+def verify(proof, root, start, count, size):
+    """Authenticate one canonical range proof and return its exact payload."""
+    return _decode(proof, start, count, size, root)
+
+
+def extract(proof, start, count, size):
+    """Extract a canonical proof already authenticated during admission."""
+    return _decode(proof, start, count, size, None)

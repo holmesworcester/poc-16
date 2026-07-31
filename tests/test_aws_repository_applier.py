@@ -11,7 +11,7 @@ from core.crypto import h
 from core.object_store import ensure_object_async
 from core.repository_applier import RepositoryApplier, async_store
 from core.repository_reader import RepositoryReader
-from core.staged_intent import staging_key
+from core.ingress import ingress_key
 from core.store import FsStore
 from deploy.aws_repository_applier import app, manage
 from deploy.aws_repository_applier.app import apply_request
@@ -29,7 +29,7 @@ from .util import all_fids, closed_subset
 
 
 SESSION = "a" * 32
-MEMBER = "b" * 16
+MEMBER = "b" * 64
 BUCKET = "isolated-ingress"
 
 
@@ -40,7 +40,7 @@ def _stage(tmp_path):
         source, workspace, "general", "provider applier", ts=10)
     raw = closed_subset(source, workspace, all_fids(source, workspace))
     ingress = FsStore(str(tmp_path / "ingress"))
-    key = staging_key(workspace, MEMBER, SESSION, "pile", h(raw))
+    key = ingress_key(workspace, SESSION, MEMBER, h(raw))
     ingress.put_if_absent(key, raw)
     return source, workspace, ingress, key, raw
 
@@ -177,7 +177,7 @@ def _s3_store(bucket, name, prefix=""):
             prefix,
             expected_bucket_owner="123456789012",
             read_total_max_attempts=1,
-            access_denied_is_absent=True,
+            conditional_write_403_is_absent=True,
         ),
         client=bucket.client("applier"),
     )
@@ -251,7 +251,7 @@ def test_existing_but_unreadable_root_cannot_be_overwritten(tmp_path):
             "canonical-bucket", prefix,
             expected_bucket_owner="123456789012",
             read_total_max_attempts=1,
-            access_denied_is_absent=True,
+            conditional_write_403_is_absent=True,
         ),
         client=DenyRootRead(),
     )
@@ -290,7 +290,7 @@ def test_existing_but_unreadable_immutable_never_confirms_equality():
             "canonical-bucket", f"workspaces/{workspace}",
             expected_bucket_owner="123456789012",
             read_total_max_attempts=1,
-            access_denied_is_absent=True,
+            conditional_write_403_is_absent=True,
         ),
         client=DenyReads(),
     )
@@ -311,27 +311,20 @@ def test_lambda_handler_returns_retryable_exact_result(monkeypatch):
         "schema": APPLY_RESULT_SCHEMA, "status": "retryable"}
 
 
-@pytest.mark.parametrize(("internal", "public"), (
-    ("applied", "applied"),
-    ("confirmed", "applied"),
-    ("admitted", "applied"),
-    ("noop", "noop"),
-    ("rootless", "noop"),
-    ("rejected", "rejected"),
-    ("retryable", "retryable"),
-))
+@pytest.mark.parametrize(
+    "status", ("applied", "noop", "rejected", "retryable"))
 def test_private_apply_result_has_one_small_provider_shape(
-        internal, public, monkeypatch):
+        status, monkeypatch):
     async def outcome(_event):
-        return type("Result", (), {"status": internal})()
+        return type("Result", (), {"status": status})()
 
     monkeypatch.setattr(app, "apply_request", outcome)
     document = app.handler({}, None)
     assert document == {
         "schema": "poc16-repository-apply-result-v1",
-        "status": public,
+        "status": status,
     }
-    assert decode_apply_result(document) == public
+    assert decode_apply_result(document) == status
     assert set(document) == {"schema", "status"}
     assert APPLY_REQUEST_SCHEMA == "poc16-repository-apply-v1"
 
@@ -350,9 +343,11 @@ def test_private_apply_result_decoder_rejects_every_noncanonical_shape(value):
 
 def test_private_apply_request_has_an_explicit_provider_key_bound():
     workspace, digest = "a" * 64, "b" * 64
-    assert encode_apply_request(
-        workspace, "k" * MAX_APPLY_KEY_BYTES, digest)["key"] \
-        == "k" * MAX_APPLY_KEY_BYTES
-    for key in ("k" * (MAX_APPLY_KEY_BYTES + 1), "snowman-☃"):
+    key = ingress_key(workspace, "c" * 32, "d" * 64, digest)
+    assert encode_apply_request(workspace, key, digest)["key"] == key
+    for key in (
+            "k" * (MAX_APPLY_KEY_BYTES + 1), "snowman-☃",
+            ingress_key("e" * 64, "c" * 32, "d" * 64, digest),
+            ingress_key(workspace, "c" * 32, "d" * 64, "f" * 64)):
         with pytest.raises(ValueError, match="apply request"):
             encode_apply_request(workspace, key, digest)

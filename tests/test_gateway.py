@@ -19,6 +19,7 @@ from core.limits import (
 )
 from full_peer.node import FullPeer
 from core.http import AsyncFromSyncReader, HttpGate
+from core.object_store import MAX_INVITE_ID_BYTES
 from facts.auth import request
 
 
@@ -84,7 +85,7 @@ def test_gateway_mints_then_serves_one_pinned_snapshot(tmp_path):
     assert body["etag"] == h(node.store(workspace).get("root"))
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
-        trusted_now=now) == node.identity_id(workspace)[:16]
+        trusted_now=now) == node.identity_id(workspace)
 
     headers = {"Authorization": "Bearer " + token}
     root = call(
@@ -389,6 +390,35 @@ def test_public_invites_use_the_hosted_reader_ceiling(size, status):
     assert response.status == status
     assert response.body == (raw if status == 200 else b"")
     assert reads == [("invite/valid", MAX_INVITE_BYTES)]
+
+
+@pytest.mark.parametrize(
+    ("identifier_bytes", "status", "read_count"),
+    (
+        (MAX_INVITE_ID_BYTES, 200, 1),
+        (MAX_INVITE_ID_BYTES + 1, 404, 0),
+    ),
+)
+def test_public_invite_identifier_has_one_shared_key_budget(
+        identifier_bytes, status, read_count):
+    reads = []
+
+    class InviteStore:
+        async def get_bounded(self, key, _limit):
+            reads.append(key)
+            return b"invite"
+
+    gateway = HttpGate(
+        InviteStore(), "0" * 64, b"s" * 32, lambda: 100)
+    response = call(
+        gateway,
+        "GET",
+        "/invite/" + "i" * identifier_bytes,
+        {"ws": "0" * 64},
+    )
+
+    assert response.status == status
+    assert len(reads) == read_count
 
 
 def test_gateway_translates_preallocation_read_limit_to_413(tmp_path):

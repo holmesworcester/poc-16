@@ -1,4 +1,4 @@
-"""The one disposable fact catalog and combined generic index."""
+"""The one disposable SQL projection and combined generic index."""
 import json
 import sqlite3
 
@@ -76,7 +76,7 @@ def _assert_exact_projection(node, workspace):
         assert encode(fact) == raw
 
 
-def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
+def test_sql_store_has_one_blob_table_and_one_exact_combined_index(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     kept = facts.content.message.post(
@@ -192,7 +192,7 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
     )
     db.execute(
         "INSERT OR REPLACE INTO meta VALUES('obsolete',?)",
-        ("admission-catalog-v27",),
+        ("legacy-projection-v27",),
     )
     db.commit()
     db.close()

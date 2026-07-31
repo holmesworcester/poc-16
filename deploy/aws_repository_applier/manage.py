@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 from adapters.s3 import S3Config
+from core.object_store import validate_store_prefix
 from core.shape import valid_fid
 
 
@@ -33,7 +34,6 @@ CORE_MODULES = (
     "repository_snapshot.py",
     "shape.py",
     "snapshot.py",
-    "staged_intent.py",
     "suppression.py",
     "validated_set.py",
 )
@@ -148,6 +148,7 @@ def _validated(args):
         raise ValueError("workspace")
     if not PREFIX.fullmatch(args.canonical_prefix or ""):
         raise ValueError("canonical prefix")
+    validate_store_prefix(args.canonical_prefix)
     if not OWNER.fullmatch(args.expected_owner or ""):
         raise ValueError("expected bucket owner")
     S3Config(

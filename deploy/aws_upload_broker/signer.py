@@ -5,9 +5,8 @@ from datetime import datetime, timezone
 import re
 from urllib.parse import parse_qs, urlsplit
 
-from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
-from core.staged_intent import staging_key
-from deploy.upload_broker import AuthorizedPut
+from core.limits import MAX_PILE_BYTES
+from deploy.upload_broker import AuthorizedPilePut
 from deploy.upload_wire import UPLOAD_CONTENT_TYPE, UploadCapability
 
 
@@ -98,7 +97,7 @@ def _checksum(digest):
 def _headers(put, config):
     values = {
         "content-length": str(put.size),
-        "content-type": put.content_type,
+        "content-type": UPLOAD_CONTENT_TYPE,
         "if-none-match": "*",
         "x-amz-checksum-sha256": _checksum(put.digest),
     }
@@ -114,7 +113,7 @@ def _params(put, config, headers):
         "Bucket": config.bucket,
         "ChecksumSHA256": values["x-amz-checksum-sha256"],
         "ContentLength": put.size,
-        "ContentType": put.content_type,
+        "ContentType": UPLOAD_CONTENT_TYPE,
         "IfNoneMatch": "*",
         "Key": put.key,
     }
@@ -197,8 +196,7 @@ def _inspect_url(url, put, config, client, headers, ttl_seconds):
         raise RuntimeError("S3 presigner timestamp") from error
     expires_at_ms = (
         int(issued.timestamp()) + ttl_seconds) * 1000
-    return UploadCapability(
-        "PUT", url, headers, expires_at_ms)
+    return UploadCapability(url, headers, expires_at_ms)
 
 
 def _presign(client, put, config, headers, ttl_seconds):
@@ -230,22 +228,12 @@ class S3UploadSigner:
         _endpoint_host(self.client)
 
     def sign(self, put):
-        if not isinstance(put, AuthorizedPut) \
-                or put.key != staging_key(
-                    put.workspace,
-                    put.member,
-                    put.session,
-                    put.object_class,
-                    put.digest,
-                ) \
-                or put.content_type != UPLOAD_CONTENT_TYPE \
+        if not isinstance(put, AuthorizedPilePut) \
                 or type(put.size) is not int or put.size < 0 \
                 or type(put.not_after_ms) is not int \
                 or put.not_after_ms < 0:
             raise ValueError("authorized S3 upload")
-        maximum = MAX_OBJECT_BYTES \
-            if put.object_class == "obj" else MAX_PILE_BYTES
-        if put.size > maximum:
+        if put.size > MAX_PILE_BYTES:
             raise ValueError("authorized S3 upload size")
         headers = _headers(put, self.config)
         capability = _presign(

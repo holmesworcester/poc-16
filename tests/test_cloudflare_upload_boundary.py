@@ -4,12 +4,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from core.staged_intent import staging_key, staging_prefix
+from core.ingress import ingress_key
+from core.object_store import MAX_STORE_PREFIX_BYTES
 from deploy.cloudflare_upload import manage
 from deploy.cloudflare_upload.boundary import (
     BROKER_SECRET_NAMES,
@@ -22,7 +21,6 @@ from deploy.cloudflare_upload.boundary import (
     broker_config,
     bucket_resource,
     generated_boundary,
-    ingress_lock,
     applier_config,
 )
 from deploy.cloudflare_upload.signer import R2UploadSigner
@@ -49,6 +47,7 @@ def deployment(**changes):
         "applier_name": "poc16-repository-applier",
         "read_permission_group_id": "c" * 32,
         "write_permission_group_id": "d" * 32,
+        "broker_domain": "uploads.example.com",
     }
     values.update(changes)
     return Deployment(**values)
@@ -83,8 +82,7 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     assert broker["vars"] == {
         "WORKSPACE": candidate.workspace,
         "CANONICAL_BUCKET_PROFILE": "dedicated-workspace",
-        "UPLOAD_PROTOCOL": "isolated-ingress-v1",
-        "UPLOAD_ORDER": "objects-first-pile-last",
+        "UPLOAD_PROTOCOL": "exact-pile-v2",
         OWNER_BINDING: candidate.owner,
         ROLE_BINDING: "broker",
         "R2_ENDPOINT": candidate.endpoint,
@@ -115,7 +113,15 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
         },
     ]
     assert applier["vars"][ROLE_BINDING] == "applier"
-    assert broker["routes"] == applier["routes"] == []
+    assert broker["routes"] == [{
+        "pattern": candidate.broker_domain,
+        "custom_domain": True,
+    }]
+    assert broker["services"] == [{
+        "binding": "APPLIER",
+        "service": candidate.applier_name,
+    }]
+    assert applier["routes"] == []
     assert broker["workers_dev"] is applier["workers_dev"] is False
     assert broker["main"] == "build/broker/entry.py"
     assert broker["base_dir"] == "build/broker"
@@ -208,18 +214,23 @@ def test_r2_bucket_name_bounds_accept_exactly_three_through_sixty_three():
         canonical_bucket="a" * 63).canonical_bucket == "a" * 63
 
 
-def test_selected_logical_key_grammar_is_exact_for_objects_and_pile_marker():
+def test_canonical_prefix_accepts_exact_provider_budget_and_rejects_one_over():
+    assert deployment(
+        canonical_prefix="a" * MAX_STORE_PREFIX_BYTES,
+    ).canonical_prefix == "a" * MAX_STORE_PREFIX_BYTES
+    with pytest.raises(ValueError, match="canonical prefix"):
+        deployment(canonical_prefix="a" * (MAX_STORE_PREFIX_BYTES + 1))
+
+
+def test_selected_logical_key_grammar_has_only_one_exact_pile():
     candidate = deployment()
-    member = "e" * 16
+    member = "e" * 64
     session = "f" * 32
     digest = "1" * 64
     base = f"ingress/v1/workspaces/{candidate.workspace}"
 
-    assert staging_key(
-        candidate.workspace, member, session, "obj", digest,
-    ) == f"{base}/objects/{session}/{digest}"
-    assert staging_key(
-        candidate.workspace, member, session, "pile", digest,
+    assert ingress_key(
+        candidate.workspace, session, member, digest,
     ) == f"{base}/piles/{session}/{member}/{digest}"
 
 
@@ -230,41 +241,16 @@ def test_staging_capability_makes_no_false_canonical_body_binding_claim():
     assert claim == {
         "kind": "isolated-ingress-presigned-put-v1",
         "live_verified": False,
-        "acknowledged_ingress_retention":
-            "r2-bucket-lock-indefinite-v1",
-        "lock_control_profile": "exclusive-dedicated",
         "canonical_raw_put_sha256_safe": False,
         "payload_mode": "UNSIGNED-PAYLOAD",
-        "upload_protocol": "isolated-ingress-v1",
-        "upload_order": "objects-first-pile-last",
+        "upload_protocol": "exact-pile-v2",
         "session_nonce": "32-lowercase-hex",
-        "object_key": (
-            "ingress/v1/workspaces/<ws64>/objects/"
-            "<nonce32>/<sha256>"
-        ),
-        "ready_marker_key": (
+        "pile_key": (
             "ingress/v1/workspaces/<ws64>/piles/"
-            "<nonce32>/<member16>/<sha256>"
+            "<nonce32>/<member64>/<sha256>"
         ),
-        "ready_marker_is_sole_durable_intent": True,
+        "finalize_invokes_private_applier": True,
     }
-
-
-def test_bucket_lock_retains_every_acknowledged_ingress_key_indefinitely():
-    # Contract: https://developers.cloudflare.com/r2/buckets/bucket-locks/
-    # Prefix locks cover existing/future objects and outrank lifecycle rules.
-    candidate = deployment()
-    lock = ingress_lock(candidate)
-    rule = lock["rules"][0]
-
-    assert rule["enabled"] is True
-    assert rule["prefix"] == candidate.ingress_prefix + "/"
-    assert rule["condition"] == {"type": "Indefinite"}
-    assert candidate.canonical_bucket not in json.dumps(lock)
-    assert staging_prefix(
-        candidate.workspace, "obj").startswith(rule["prefix"])
-    assert staging_prefix(
-        candidate.workspace, "pile").startswith(rule["prefix"])
 
 
 def _deploy_environment():
@@ -347,8 +333,6 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         _deploy_environment(),
         runner=runner,
         identity_reader=identity_reader,
-        lock_configurer=lambda deployment, _environment:
-            calls.append(("lock", deployment.ingress_bucket)),
     )
     assert list(workers.values()) == [
         (candidate.owner, "applier"),
@@ -357,9 +341,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     assert [
         call[3] if call[0] == "uv" else call[0]
         for call in calls
-    ] == [
-        "lock", "sync", "deploy", "deploy",
-    ]
+    ] == ["sync", "deploy", "deploy"]
     assert all(
         "--strict" in call
         for call in calls
@@ -367,8 +349,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     )
     assert json.loads(paths["broker"].read_text())["r2_buckets"] == []
     assert not obsolete.exists()
-    assert json.loads(paths["ingress-lock"].read_text()) == (
-        ingress_lock(candidate))
+    assert "ingress-lock" not in paths
     assert secret_documents == [{
         "CANONICAL_READ_ACCESS_KEY_ID": "reader-id",
         "CANONICAL_READ_SECRET_ACCESS_KEY": "reader-secret",
@@ -401,9 +382,7 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     assert [
         call[3] if call[0] == "uv" else call[0]
         for call in calls
-    ] == [
-        "lock", "sync", "deploy", "deploy", "delete", "delete",
-    ]
+    ] == ["sync", "deploy", "deploy", "delete", "delete"]
     assert [call[4] for call in calls[-2:]] == [
         candidate.broker_name, candidate.applier_name,
     ]
@@ -479,9 +458,9 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
                     "entry.py",
                     "applier_runtime.py",
                     "deploy/repository_apply_wire.py",
+                    "core/ingress.py",
                     "core/repository_applier.py",
                     "core/repository_snapshot.py",
-                    "core/staged_intent.py",
                     "adapters/r2/worker.py",
                     "facts/auth/workspace.py"):
                 path = target / relative
@@ -491,9 +470,9 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
         for relative in (
                 "entry.py",
                 "runtime.py",
-                    "core/validated_set.py",
+                "core/validated_set.py",
                 "core/repository_reader.py",
-                "core/staged_intent.py",
+                "core/ingress.py",
                 "facts/auth/request.py",
                 "deploy/upload_broker.py",
                 "deploy/upload_broker_http.py",
@@ -545,7 +524,7 @@ def test_stage_broker_is_db_free_and_uses_shared_reader_sources(
             "runtime.py",
             "core/validated_set.py",
             "core/repository_reader.py",
-            "core/staged_intent.py",
+            "core/ingress.py",
             "facts/auth/request.py",
             "deploy/upload_broker.py",
             "deploy/upload_broker_http.py",
@@ -593,9 +572,9 @@ def test_stage_applier_contains_shared_engine_and_no_host_or_sql_authority(
             "entry.py",
             "applier_runtime.py",
             "deploy/repository_apply_wire.py",
+            "core/ingress.py",
             "core/repository_applier.py",
             "core/repository_snapshot.py",
-            "core/staged_intent.py",
             "adapters/r2/worker.py",
             "facts/auth/workspace.py"):
         assert (staged / relative).is_file()
@@ -717,149 +696,6 @@ def test_control_plane_identity_requires_one_exact_owner_and_role(
         candidate, config, environment) is None
 
 
-def test_lock_control_request_is_exact_bounded_and_jurisdiction_scoped(
-        monkeypatch):
-    candidate = deployment(jurisdiction="eu")
-    desired = ingress_lock(candidate)
-    seen = []
-    results = iter(({}, None))
-
-    def open_lock(request, timeout):
-        seen.append((request, timeout))
-        return _APIResponse({
-            "success": True,
-            "result": next(results),
-        })
-
-    monkeypatch.setattr(manage, "urlopen", open_lock)
-    observed = manage._read_ingress_lock(
-        candidate,
-        {"CLOUDFLARE_API_TOKEN": "control-secret"},
-    )
-    replaced = manage._write_ingress_lock(
-        candidate,
-        {"CLOUDFLARE_API_TOKEN": "control-secret"},
-        desired,
-    )
-
-    # The GET schema makes rules optional; the PUT result is opaque.
-    assert observed == {"rules": []}
-    assert replaced is None
-    request, timeout = seen[0]
-    assert request.full_url.endswith(
-        f"/r2/buckets/{candidate.ingress_bucket}/lock")
-    assert request.get_header(
-        "Authorization") == "Bearer control-secret"
-    assert request.get_header("Cf-r2-jurisdiction") == "eu"
-    assert timeout == manage.SETTINGS_TIMEOUT_SECONDS
-    request, timeout = seen[1]
-    assert request.method == "PUT"
-    assert json.loads(request.data) == desired
-    assert request.get_header("Content-type") == "application/json"
-    assert timeout == manage.SETTINGS_TIMEOUT_SECONDS
-
-
-def test_lock_reader_rejects_malformed_provider_document(monkeypatch):
-    candidate = deployment()
-    monkeypatch.setattr(
-        manage,
-        "urlopen",
-        lambda _request, timeout: _APIResponse({
-            "success": True,
-            "result": {"rules": None},
-        }),
-    )
-
-    with pytest.raises(RuntimeError, match="malformed.*bucket lock"):
-        manage._read_ingress_lock(
-            candidate,
-            {"CLOUDFLARE_API_TOKEN": "control-secret"},
-        )
-
-
-def test_lock_install_reconciles_crash_and_refuses_foreign_rules():
-    candidate = deployment()
-    desired = ingress_lock(candidate)
-    state = {"rules": []}
-    writes = []
-
-    def reader():
-        return json.loads(json.dumps(state))
-
-    def before_apply(_value):
-        raise ConnectionError("crash before provider apply")
-
-    with pytest.raises(ConnectionError, match="before provider apply"):
-        manage.ensure_ingress_lock(
-            candidate,
-            {},
-            reader=reader,
-            writer=before_apply,
-        )
-    assert state == {"rules": []}
-
-    def lost_response(value):
-        writes.append(value)
-        state.clear()
-        state.update(value)
-        raise ConnectionError("response lost after provider apply")
-
-    assert manage.ensure_ingress_lock(
-        candidate, {}, reader=reader, writer=lost_response)
-    assert state == desired
-    assert writes == [desired]
-    assert not manage.ensure_ingress_lock(
-        candidate, {}, reader=reader,
-        writer=lambda _value: pytest.fail("idempotent retry wrote"))
-
-    state["rules"].append({
-        "id": "foreign",
-        "enabled": True,
-        "prefix": "other/",
-        "condition": {"type": "Indefinite"},
-    })
-    with pytest.raises(RuntimeError, match="foreign"):
-        manage.ensure_ingress_lock(
-            candidate, {}, reader=reader,
-            writer=lambda _value: pytest.fail("foreign rules overwritten"))
-
-
-def test_concurrent_lock_installers_only_write_the_same_exact_value():
-    candidate = deployment()
-    desired = ingress_lock(candidate)
-    state = {"rules": []}
-    mutex = threading.Lock()
-    first_reads = threading.Barrier(2)
-    local = threading.local()
-    writes = []
-
-    def reader():
-        with mutex:
-            observed = json.loads(json.dumps(state))
-        count = getattr(local, "reads", 0)
-        local.reads = count + 1
-        if count == 0:
-            first_reads.wait(5)
-        return observed
-
-    def writer(value):
-        with mutex:
-            writes.append(value)
-            state.clear()
-            state.update(value)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = tuple(pool.map(
-            lambda _ordinal: manage.ensure_ingress_lock(
-                candidate, {}, reader=reader, writer=writer),
-            range(2),
-        ))
-
-    assert outcomes == (True, True)
-    assert state == desired
-    assert writes == [desired, desired]
-
-
 def test_environment_requires_explicit_dedicated_canonical_profile():
     values = {
         "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
@@ -867,6 +703,7 @@ def test_environment_requires_explicit_dedicated_canonical_profile():
         "CF_UPLOAD_CANONICAL_BUCKET": "poc16-canonical",
         "CF_UPLOAD_INGRESS_BUCKET": "poc16-ingress",
         "CF_UPLOAD_DEPLOYMENT_OWNER": "production-west",
+        "CF_UPLOAD_BROKER_DOMAIN": "uploads.example.com",
         "CF_UPLOAD_ISSUER": "cloudflare-upload-production",
         "CF_R2_BUCKET_ITEM_READ_PERMISSION_ID": "c" * 32,
         "CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID": "d" * 32,
@@ -875,9 +712,9 @@ def test_environment_requires_explicit_dedicated_canonical_profile():
         Deployment.from_environment(values)
 
     values["CF_UPLOAD_CANONICAL_BUCKET_PROFILE"] = "dedicated-workspace"
-    with pytest.raises(ValueError, match="exclusive deployment"):
+    with pytest.raises(ValueError, match="dedicated-workspace"):
         Deployment.from_environment(values)
 
-    values["CF_UPLOAD_INGRESS_BUCKET_PROFILE"] = "exclusive-dedicated"
+    values["CF_UPLOAD_INGRESS_BUCKET_PROFILE"] = "dedicated-workspace"
     assert Deployment.from_environment(
         values).canonical_bucket_profile == "dedicated-workspace"

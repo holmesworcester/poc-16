@@ -92,18 +92,32 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     node.keychain.add_identity(sibling_secret)
     facts.auth.device_invite.grant(
         node, workspace, node.pk, sibling, "laptop")
-
     timestamp = now_ms()
+    _, push_node = keypair()
+    facts.auth.push_endpoint.register(
+        node,
+        workspace,
+        "1" * 64,
+        push_node,
+        "android",
+        "poc16.mobile",
+        "production",
+        facts.auth.push_endpoint.encode_sealed_target(b"x" * 49),
+        ts=timestamp,
+    )
+    facts.content.notification_preference.set_global(
+        node, workspace, "all", ts=timestamp + 1)
+
     message = facts.content.message.post(
-        node, workspace, "general", "context contract", ts=timestamp)
+        node, workspace, "general", "context contract", ts=timestamp + 2)
     send_bytes(
         node, workspace, "context.bin", b"context",
-        ts=timestamp + 1)
+        ts=timestamp + 3)
     facts.content.delete.remove(
-        node, workspace, message, ts=timestamp + 2)
+        node, workspace, message, ts=timestamp + 4)
     facts.auth.removal.evict(node, workspace, member)
     ephemeral = facts.auth.request.payload(
-        node, workspace, "sync", timestamp + 10_000, timestamp + 4)
+        node, workspace, "sync", timestamp + 10_000, timestamp + 6)
 
     durable = decode_pile(
         closed_subset(node, workspace, all_fids(node, workspace)),
@@ -125,13 +139,15 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     }
     assert routes == {
         "admin": (0, 1, 1, 0, 7),
-        "chunk": (1, 0, 2, 0, 9),
+        "file_slice": (1, 1, 1, 0, 8),
         "delete": (1, 0, 0, 1, 6),
         "device": (0, 2, 3, 0, 12),
         "device_invite": (0, 3, 5, 0, 17),
         "evict": (0, 1, 0, 1, 6),
-        "file_bao": (0, 2, 1, 0, 8),
+        "file_bao": (0, 1, 1, 0, 7),
         "msg": (0, 0, 1, 0, 6),
+        "notification_preference": (0, 2, 1, 0, 8),
+        "push_endpoint": (0, 1, 3, 0, 11),
         "req": (0, 0, 0, 0, 4),
         "signature": (0, 1, 0, 0, 5),
         "user": (1, 1, 2, 0, 10),

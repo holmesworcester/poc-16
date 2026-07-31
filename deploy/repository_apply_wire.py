@@ -1,21 +1,14 @@
 """Canonical private broker-to-RepositoryApplier documents."""
 from core.shape import valid_fid
+from core.ingress import MAX_INGRESS_KEY_BYTES, parse_ingress_key
 
 
 APPLY_REQUEST_SCHEMA = "poc16-repository-apply-v1"
 APPLY_RESULT_SCHEMA = "poc16-repository-apply-result-v1"
-MAX_APPLY_KEY_BYTES = 1024
+MAX_APPLY_KEY_BYTES = MAX_INGRESS_KEY_BYTES
+MAX_APPLY_RESULT_BYTES = 256
 _PUBLIC_STATUSES = frozenset({
     "applied", "noop", "rejected", "retryable"})
-_RESULT_STATUSES = {
-    "admitted": "applied",
-    "applied": "applied",
-    "confirmed": "applied",
-    "noop": "noop",
-    "rootless": "noop",
-    "rejected": "rejected",
-    "retryable": "retryable",
-}
 
 
 def encode_apply_request(workspace, key, digest):
@@ -27,6 +20,12 @@ def encode_apply_request(workspace, key, digest):
     if not valid_fid(workspace) or not isinstance(key, str) or not key \
             or not key_bytes or len(key_bytes) > MAX_APPLY_KEY_BYTES \
             or not valid_fid(digest):
+        raise ValueError("repository apply request")
+    try:
+        address = parse_ingress_key(key)
+    except ValueError as error:
+        raise ValueError("repository apply request") from error
+    if address.workspace != workspace or address.digest != digest:
         raise ValueError("repository apply request")
     return {
         "schema": APPLY_REQUEST_SCHEMA,
@@ -48,9 +47,9 @@ def decode_apply_request(value):
 
 
 def encode_apply_result(result):
-    """Hide internal outcomes behind the four-result provider contract."""
-    status = _RESULT_STATUSES.get(getattr(result, "status", None))
-    if status is None:
+    """Encode the same four outcomes used by core and every provider."""
+    status = getattr(result, "status", None)
+    if status not in _PUBLIC_STATUSES:
         raise ValueError("repository apply result")
     return {"schema": APPLY_RESULT_SCHEMA, "status": status}
 
@@ -69,6 +68,7 @@ __all__ = (
     "APPLY_REQUEST_SCHEMA",
     "APPLY_RESULT_SCHEMA",
     "MAX_APPLY_KEY_BYTES",
+    "MAX_APPLY_RESULT_BYTES",
     "decode_apply_request",
     "decode_apply_result",
     "encode_apply_request",

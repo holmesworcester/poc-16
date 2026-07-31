@@ -13,6 +13,7 @@ import re
 from . import peer_capability
 from .crypto import h, seal_to
 from .grants import check_token, make_token
+from .ingress import PermanentIngressRejection
 from .limits import (
     MAX_INVITE_BYTES,
     MAX_MINT_FETCHES,
@@ -29,9 +30,11 @@ from .limits import (
     decode_json,
 )
 from .repository_reader import RepositoryReader, RepositoryRootError
+from .object_store import MAX_INVITE_ID_BYTES
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
-INVITE_RE = re.compile(r"^[a-zA-Z0-9._~-]{1,256}$")
+INVITE_RE = re.compile(
+    rf"^[a-z0-9._-]{{1,{MAX_INVITE_ID_BYTES}}}$")
 
 
 @dataclass(frozen=True)
@@ -219,7 +222,7 @@ class HttpGate:
             return Response(403)
         public, verb = grant
         token = make_token(
-            self.secret, public[:16], self.workspace, verb,
+            self.secret, public, self.workspace, verb,
             capability=self.sync_profile,
             issued_at=trusted_now, ttl_ms=self.grant_ttl_ms)
         response = {
@@ -356,10 +359,17 @@ class HttpGate:
                     or h(body) != parts[2]:
                 return Response(400)
             try:
-                await self.receiver.receive_pile(member, body)
-            except Exception:
+                result = await self.receiver.receive_pile(member, body)
+            except PermanentIngressRejection:
                 return Response(400)
-            return Response(204)
+            except Exception:
+                return Response(503)
+            status = getattr(result, "status", None)
+            if status in {"applied", "noop"}:
+                return Response(204)
+            if status == "rejected":
+                return Response(400)
+            return Response(503)
         if self.receiver is None and self._read_only_path(path):
             return Response(405)
         if not self._member(headers, trusted_now):

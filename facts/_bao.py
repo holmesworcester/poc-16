@@ -1,6 +1,6 @@
 """Pure Bao geometry and hosted slice verification."""
 
-from ._bao_verify import verify as _verify
+from ._bao_verify import extract as _extract, verify as _verify
 
 WIDTH = 256 * 1024
 MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
@@ -15,6 +15,7 @@ MAX_PROOF_BYTES = (
     WIDTH // BAO_CHUNK_BYTES + 2 * _DEPTH
 ) * 64 + 8
 MAX_PROOF_BASE64_BYTES = ((MAX_PROOF_BYTES + 2) // 3) * 4
+EMPTY_ROOT = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 
 
 def geometry(size, width=WIDTH):
@@ -40,3 +41,9 @@ def verify(proof, root_hex, index, size, width=WIDTH):
         raise ValueError("Bao root") from error
     start, count = span(index, size, width)
     return _verify(proof, root, start, count, size)
+
+
+def extract(proof, index, size, width=WIDTH):
+    """Return bytes from a canonical proof already certified at admission."""
+    start, count = span(index, size, width)
+    return _extract(proof, start, count, size)

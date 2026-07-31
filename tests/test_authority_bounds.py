@@ -122,7 +122,7 @@ def test_repository_applier_rejects_a_signed_oversized_founder_name(
     rejected.add_workspace(hostile.fid, "hostile", peers=[])
     rejected.receive_pile(
         hostile.fid,
-        "feed7feed7feed7f",
+        "feed" * 16,
         encode_pile((hostile,), workspace=hostile.fid),
     )
     assert rejected.store(hostile.fid).get("root") is None
@@ -131,7 +131,7 @@ def test_repository_applier_rejects_a_signed_oversized_founder_name(
     accepted.add_workspace(root.fid, "healthy", peers=[])
     accepted.receive_pile(
         root.fid,
-        "feed7feed7feed7f",
+        "feed" * 16,
         encode_pile((root,), workspace=root.fid),
     )
     assert accepted.reader(root.fid) is not None

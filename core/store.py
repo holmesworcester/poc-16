@@ -2,7 +2,7 @@
 
 Layout: root (the CAS'd composite snapshot), obj/<hash> (bounded map pages
 and fact/file blobs — immutable),
-pile/<member>/<reservation>/<hash> (internal ingress),
+ingress/v1/workspaces/<ws>/piles/<session>/<uploader>/<hash> (exact ingress),
 and invite/<id> (public reads).
 
 The public mutation contract rejects unconditional root/object replacement

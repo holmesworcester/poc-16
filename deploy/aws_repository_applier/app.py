@@ -10,7 +10,6 @@ import os
 from adapters.s3 import S3Config, S3Store
 from core.repository_applier import RepositoryApplier
 from core.shape import valid_fid
-from core.staged_intent import parse_staging_key
 from deploy.repository_apply_wire import (
     decode_apply_request,
     encode_apply_result,
@@ -58,7 +57,7 @@ def _repository_stores():
             "probe_access_denied_missing": False,
             # The applier has only conditional writes. A hidden existing key
             # therefore fails its create/CAS instead of being overwritten.
-            "access_denied_is_absent": True,
+            "conditional_write_403_is_absent": True,
         }
         _stores = (
             S3Store(S3Config(
@@ -80,11 +79,6 @@ def _exact_request(request, workspace):
     requested_workspace, key, digest = decode_apply_request(request)
     if requested_workspace != workspace:
         raise ValueError("AWS applier request binding")
-    address = parse_staging_key(key)
-    if address.workspace != workspace \
-            or address.object_class != "pile" \
-            or address.digest != digest:
-        raise ValueError("AWS applier source binding")
     return key, digest
 
 

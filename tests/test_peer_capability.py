@@ -19,8 +19,9 @@ from full_peer import sync as sync_module
 from core.close import decode_pile
 from core.crypto import h
 from core.grants import check_token, make_token
+from core.ingress import ingress_key
 from core.limits import MAX_PAGE_BATCH_BYTES, MAX_ROOT_BYTES
-from core.repository_applier import ApplyResult
+from core.object_store import STALE
 from full_peer import node as node_module
 from full_peer.node import FullPeer, now_ms
 from full_peer.sync import sync
@@ -73,7 +74,7 @@ def test_sender_batches_verified_closures_at_the_wire_limit(
     destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", [])
     for raw in batches:
-        destination.receive_pile(workspace, "peer", raw)
+        destination.receive_pile(workspace, "a" * 64, raw)
     assert destination.store(workspace).get("root") \
         == source.store(workspace).get("root")
 
@@ -139,24 +140,22 @@ def test_http_receive_retains_retryable_exact_source_for_reupload(
         local, workspace, "general", "retry me", ts=10)
     raw = local.sender(workspace).pack(
         local.reader(workspace).validated().closure((fid,)))
-    applier = remote.applier(workspace)
-    commit = applier.commit
-    before_sources = set(remote.store(workspace).list("pile/"))
+    store = remote.store(workspace)
+    commit = store.cas
+    before_sources = set(store.list("ingress/"))
     calls = 0
 
-    async def fail_once(*args, **kwargs):
+    def fail_once(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            proposal = args[-1]
-            return ApplyResult(
-                "retryable", proposal.base_root, proposal.admitted)
-        return await commit(*args, **kwargs)
+            return STALE
+        return commit(*args, **kwargs)
 
     def wrong_full_peer_path(*_args, **_kwargs):
         raise AssertionError("HTTP bypassed RepositoryApplier")
 
-    monkeypatch.setattr(applier, "commit", fail_once)
+    monkeypatch.setattr(store, "cas", fail_once)
     monkeypatch.setattr(remote, "receive_pile", wrong_full_peer_path)
     monkeypatch.setattr(remote, "turn", wrong_full_peer_path)
 
@@ -172,9 +171,11 @@ def test_http_receive_retains_retryable_exact_source_for_reupload(
             headers={"Authorization": "Bearer " + token},
         )
 
-        assert urllib.request.urlopen(request).status == 204
+        with pytest.raises(urllib.error.HTTPError) as delayed:
+            urllib.request.urlopen(request)
+        assert delayed.value.code == 503
         assert len(
-            set(remote.store(workspace).list("pile/")) - before_sources
+            set(store.list("ingress/")) - before_sources
         ) == 1
         assert remote.fact_of(workspace, fid) is None
 
@@ -186,9 +187,100 @@ def test_http_receive_retains_retryable_exact_source_for_reupload(
         assert urllib.request.urlopen(retry).status == 204
 
     assert len(
-        set(remote.store(workspace).list("pile/")) - before_sources
+        set(store.list("ingress/")) - before_sources
     ) == 1
     assert remote.fact_of(workspace, fid) is not None
+
+
+def test_http_rejects_invalid_pile_but_retries_storage_failure(
+        tmp_path, monkeypatch):
+    remote, workspace, local = replicas(tmp_path)
+    member = local.member_for(workspace)
+    invalid = b"{}"
+
+    with serving(
+            remote, peer_capability.FULL) as (url, _observed, edge):
+        token = make_token(
+            edge.secret, member, workspace,
+            capability=peer_capability.FULL)
+
+        def put(raw):
+            request = urllib.request.Request(
+                f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+                data=raw,
+                method="PUT",
+                headers={"Authorization": "Bearer " + token},
+            )
+            with pytest.raises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(request)
+            return denied.value.code
+
+        assert put(invalid) == 400
+        digest = h(invalid)
+        source = ingress_key(
+            workspace, digest[:32], member, digest)
+        assert remote.store(workspace).get(source) == invalid
+
+        with monkeypatch.context() as bounded:
+            bounded.setattr(close_module, "MAX_PILE_JSON_VALUES", 4)
+            amplified = (
+                b'{"facts":[],"junk":[0,1,2,3],"ws":"'
+                + workspace.encode() + b'"}'
+            )
+            assert put(amplified) == 400
+            amplified_digest = h(amplified)
+            amplified_source = ingress_key(
+                workspace, amplified_digest[:32], member,
+                amplified_digest)
+            assert remote.store(workspace).get(amplified_source) is None
+
+        monkeypatch.setattr(
+            remote.store(workspace),
+            "put_if_absent",
+            lambda *_args: (_ for _ in ()).throw(
+                OSError("object store unavailable")),
+        )
+        assert put(b'{"facts":[],"ws":"' + workspace.encode() + b'"}') \
+            == 503
+
+
+def test_http_returns_retryable_until_the_workspace_anchor_arrives(tmp_path):
+    author = FullPeer(str(tmp_path / "author"))
+    workspace = facts.auth.workspace.create(author, "alice", ts=1)
+    recipient = FullPeer(
+        str(tmp_path / "recipient"),
+        initial_secret=author.identity(workspace)[0],
+    )
+    recipient.add_workspace(workspace, "recipient", [])
+    secret, member = author.identity(workspace)
+    target = facts.content.message.message(
+        workspace, member, "general", "later", 10)
+    signed = facts.auth.signature.signature(secret, member, target, 10)
+    pending = author.sender(workspace).pack((signed,))
+    anchor = closed_subset(author, workspace, (workspace,))
+
+    with serving(
+            recipient, peer_capability.FULL) as (url, _observed, edge):
+        token = make_token(
+            edge.secret, member, workspace,
+            capability=peer_capability.FULL)
+
+        def put(raw):
+            request = urllib.request.Request(
+                f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+                data=raw,
+                method="PUT",
+                headers={"Authorization": "Bearer " + token},
+            )
+            try:
+                return urllib.request.urlopen(request).status
+            except urllib.error.HTTPError as denied:
+                return denied.code
+
+        assert put(pending) == 503
+        assert put(anchor) == 204
+        assert put(pending) == 204
+    assert recipient.fact_of(workspace, signed.fid) == signed
 
 
 def test_full_peer_constructs_one_applier_during_cold_concurrent_lookup(
@@ -250,16 +342,16 @@ def test_concurrent_http_receives_converge_through_one_applier(
             local.reader(workspace).validated().closure((fid,)))
         for fid in fids
     ]
-    applier = remote.applier(workspace)
-    commit = applier.commit
-    before_sources = set(remote.store(workspace).list("pile/"))
+    store = remote.store(workspace)
+    commit = store.cas
+    before_sources = set(store.list("ingress/"))
     committing = threading.Barrier(2)
     receiver_ids = []
     applier_for = remote.applier
 
-    async def race_commits(*args, **kwargs):
+    def race_commits(*args, **kwargs):
         committing.wait(timeout=5)
-        return await commit(*args, **kwargs)
+        return commit(*args, **kwargs)
 
     def observed_applier(ws):
         receiver = applier_for(ws)
@@ -269,7 +361,7 @@ def test_concurrent_http_receives_converge_through_one_applier(
     def wrong_full_peer_path(*_args, **_kwargs):
         raise AssertionError("HTTP bypassed RepositoryApplier")
 
-    monkeypatch.setattr(applier, "commit", race_commits)
+    monkeypatch.setattr(store, "cas", race_commits)
     monkeypatch.setattr(remote, "applier", observed_applier)
     monkeypatch.setattr(remote, "receive_pile", wrong_full_peer_path)
     monkeypatch.setattr(remote, "turn", wrong_full_peer_path)
@@ -290,6 +382,8 @@ def test_concurrent_http_receives_converge_through_one_applier(
                     headers={"Authorization": "Bearer " + token},
                 )
                 statuses.append(urllib.request.urlopen(request).status)
+            except urllib.error.HTTPError as error:
+                statuses.append(error.code)
             except Exception as error:
                 errors.append(error)
 
@@ -304,18 +398,18 @@ def test_concurrent_http_receives_converge_through_one_applier(
             assert not worker.is_alive()
 
         assert errors == []
-        assert statuses == [204, 204]
+        assert sorted(statuses) == [204, 503]
         assert len(receiver_ids) == 2
         assert len(set(receiver_ids)) == 1
         assert len(
-            set(remote.store(workspace).list("pile/")) - before_sources
+            set(store.list("ingress/")) - before_sources
         ) == 2
         assert sum(
             remote.fact_of(workspace, fid) is not None
             for fid in fids
         ) == 1
 
-        monkeypatch.setattr(applier, "commit", commit)
+        monkeypatch.setattr(store, "cas", commit)
         for raw in raws:
             retry = urllib.request.Request(
                 f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
@@ -325,7 +419,7 @@ def test_concurrent_http_receives_converge_through_one_applier(
             assert urllib.request.urlopen(retry).status == 204
 
     assert len(
-        set(remote.store(workspace).list("pile/")) - before_sources
+        set(store.list("ingress/")) - before_sources
     ) == 2
     assert all(
         remote.fact_of(workspace, fid) is not None
@@ -354,13 +448,13 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         assert all(path.startswith("/pile/") for path in observed["puts"])
 
         staged = []
-        real_stage = local.stage_received_pile
+        real_receive = local.receive_pile
 
-        def record_stage(ws, member, raw):
+        def record_receive(ws, member, raw):
             staged.append(raw)
-            return real_stage(ws, member, raw)
+            return real_receive(ws, member, raw)
 
-        local.stage_received_pile = record_stage
+        local.receive_pile = record_receive
         remote_fid = facts.content.message.post(
             remote, workspace, "general", "from remote", ts=20)
         assert sync(local, workspace, url) == (1, 0)
@@ -579,8 +673,9 @@ def test_push_grant_cannot_write_another_producer_segment(tmp_path):
 
     with serving(
             remote, peer_capability.FULL) as (url, observed, edge):
+        before = remote.store(workspace).list("ingress/")
         member = local.member_for(workspace)
-        other = "0" * 16 if member != "0" * 16 else "f" * 16
+        other = "0" * 64 if member != "0" * 64 else "f" * 64
         token = make_token(
             edge.secret, member, workspace,
             capability=peer_capability.FULL)
@@ -593,5 +688,5 @@ def test_push_grant_cannot_write_another_producer_segment(tmp_path):
             urllib.request.urlopen(request)
 
         assert denied.value.code == 403
-        assert remote.store(workspace).list(f"pile/{other}/") == []
+        assert remote.store(workspace).list("ingress/") == before
         assert observed["puts"]

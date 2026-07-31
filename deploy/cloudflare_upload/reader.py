@@ -3,7 +3,11 @@ from dataclasses import dataclass, field
 import re
 
 from core.limits import PayloadTooLarge
-from core.object_store import validate_key
+from core.object_store import (
+    MAX_PROVIDER_KEY_BYTES,
+    validate_key,
+    validate_store_prefix,
+)
 from deploy.cloudflare_upload.signer import R2SigV4
 
 
@@ -11,8 +15,6 @@ _BUCKET = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 _ENDPOINT = re.compile(
     r"^https://[0-9a-f]{32}(?:\.(?:eu|fedramp))?"
     r"\.r2\.cloudflarestorage\.com$")
-_PREFIX = re.compile(r"^[a-z0-9:._-]+(?:/[a-z0-9:._-]+)*$")
-
 GET_TTL_SECONDS = 30
 MAX_RESPONSE_CHUNKS = 65_536
 
@@ -25,13 +27,14 @@ class R2ReadConfig:
     ttl_seconds: int = GET_TTL_SECONDS
 
     def __post_init__(self):
+        try:
+            validate_store_prefix(self.prefix)
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError("R2 canonical read config") from error
         if not isinstance(self.endpoint, str) \
                 or _ENDPOINT.fullmatch(self.endpoint) is None \
                 or not isinstance(self.bucket, str) \
                 or _BUCKET.fullmatch(self.bucket) is None \
-                or not isinstance(self.prefix, str) \
-                or _PREFIX.fullmatch(self.prefix) is None \
-                or len(self.prefix.encode("ascii")) > 768 \
                 or type(self.ttl_seconds) is not int \
                 or not 1 <= self.ttl_seconds <= 60:
             raise ValueError("R2 canonical read config")
@@ -126,7 +129,7 @@ class R2CanonicalReader:
     def _physical(self, key):
         key = validate_key(key)
         physical = f"{self.config.prefix}/{key}"
-        if len(physical.encode("ascii")) > 1024:
+        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("R2 canonical key")
         return physical
 

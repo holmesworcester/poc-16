@@ -28,6 +28,7 @@ from tests.adversarial_bucket import (
 )
 from tests.provider_conformance import ConformanceRun, exercise_sync_store
 from tests.provider_fakes import FakeR2Bucket
+from tests.util import apply_planted
 
 pytestmark = pytest.mark.unit
 
@@ -557,18 +558,18 @@ raise AssertionError("applier did not reach root CAS")
     assert reopened.store(workspace).get("root") != old_root
     assert [entry["text"] for entry in facts.content.message.messages(
         reopened, workspace)] == ["process crash"]
-    retained = reopened.store(workspace).list("pile/")
+    retained = reopened.store(workspace).list("ingress/")
     assert len(retained) >= 2
     committed_root = reopened.store(workspace).get("root")
 
     results = [
-        asyncio.run(reopened.applier(workspace).apply(source))
+        asyncio.run(apply_planted(reopened.applier(workspace), source))
         for source in retained
     ]
 
     assert {result.status for result in results} == {"noop"}
     assert reopened.store(workspace).get("root") == committed_root
-    assert reopened.store(workspace).list("pile/") == retained
+    assert reopened.store(workspace).list("ingress/") == retained
 
 
 def test_real_process_probe_terminates_a_hung_child():

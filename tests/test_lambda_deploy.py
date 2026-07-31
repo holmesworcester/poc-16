@@ -41,6 +41,11 @@ from deploy.aws_lambda.config import (
 )
 from deploy.aws_lambda.s3_bucket_policy import policy
 from core.http import AsyncFromSyncReader, HttpGate, Response
+from core.object_store import (
+    MAX_INVITE_ID_BYTES,
+    MAX_LOGICAL_KEY_BYTES,
+    MAX_PROVIDER_KEY_BYTES,
+)
 from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request
 
@@ -133,7 +138,7 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
     assert body["cap"] == "sync-v1/read"
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
-        trusted_now=now) == node.identity_id(workspace)[:16]
+        trusted_now=now) == node.identity_id(workspace)
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
         trusted_now=now, require_push=True) is None
@@ -479,7 +484,9 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
         with pytest.raises(ValueError):
             S3Config(bucket=bucket, prefix="tenant")
 
-    for prefix in ("tenant", "tenant/workspace", "a" * 760):
+    for prefix in (
+            "tenant", "tenant/workspace",
+            "a" * MAX_STORE_PREFIX_LENGTH):
         assert len(prefix) <= MAX_STORE_PREFIX_LENGTH
         assert prefix_re.fullmatch(prefix)
         S3Config(bucket="test-bucket", prefix=prefix)
@@ -490,9 +497,12 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
         with pytest.raises(ValueError):
             S3Config(bucket="test-bucket", prefix=prefix)
 
-    # The longest public key is invite/<256 bytes>; this is exactly S3's
-    # 1,024-byte physical-key ceiling at the accepted prefix maximum.
-    assert MAX_STORE_PREFIX_LENGTH + 1 + len("invite/") + 256 == 1024
+    # The longest public key is invite/<256 bytes>; this is exactly the
+    # provider's physical-key ceiling at the accepted prefix maximum.
+    assert MAX_LOGICAL_KEY_BYTES \
+        == len("invite/") + MAX_INVITE_ID_BYTES
+    assert MAX_STORE_PREFIX_LENGTH + 1 + MAX_LOGICAL_KEY_BYTES \
+        == MAX_PROVIDER_KEY_BYTES
 
 
 def test_list_permission_is_limited_to_gateway_read_namespaces():

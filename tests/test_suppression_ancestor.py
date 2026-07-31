@@ -143,7 +143,7 @@ def test_immutable_ref_ancestor_survives_a_lower_equivalent_provider(
 
     compiled = compile_snapshot(
         workspace, {fact.fid: fact for fact in grown})
-    objects = dict(compiled.outbox)
+    objects = dict(compiled.objects)
     view = ValidatedView(compiled.root, objects.get)
     closure = view.closure((leaf.fid,))
 
@@ -211,7 +211,7 @@ def test_parent_selector_pins_an_exact_need_during_reconstruction(
 
     compiled = compile_snapshot(
         genesis.fid, {fact.fid: fact for fact in grown})
-    view = ValidatedView(compiled.root, dict(compiled.outbox).get)
+    view = ValidatedView(compiled.root, dict(compiled.objects).get)
     closure = view.closure((leaf.fid,))
 
     assert tuple(fact.fid for fact in closure) == (

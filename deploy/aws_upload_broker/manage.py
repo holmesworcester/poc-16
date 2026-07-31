@@ -35,6 +35,7 @@ from deploy.aws_upload_broker.config import (  # noqa: E402
     ISSUER_RE,
     KEYRING_VERSION_RE,
     KMS_KEY_ARN_RE,
+    LAMBDA_ARN_RE,
     MAX_STORE_PREFIX_LENGTH,
     PREFIX_RE,
     SECRET_ARN_RE,
@@ -70,6 +71,7 @@ FILES = (
     "deploy/upload_keyring.py",
     "deploy/upload_session.py",
     "deploy/upload_wire.py",
+    "deploy/repository_apply_wire.py",
     "deploy/aws_upload_broker/__init__.py",
     "deploy/aws_upload_broker/app.py",
     "deploy/aws_upload_broker/config.py",
@@ -195,6 +197,12 @@ def _validate_deploy_args(args):
     )
     if args.canonical_bucket == args.ingress_bucket:
         raise ValueError("canonical and ingress buckets must differ")
+    applier = getattr(args, "applier_function_arn", None)
+    if not isinstance(applier, str) or LAMBDA_ARN_RE.fullmatch(applier) is None:
+        raise ValueError("repository Applier function ARN")
+    arn = applier.split(":", 7)
+    if arn[3] != args.region or arn[4] != owner:
+        raise ValueError("repository Applier function scope")
     if not isinstance(args.issuer, str) \
             or not ISSUER_RE.fullmatch(args.issuer):
         raise ValueError("upload issuer")
@@ -446,35 +454,6 @@ def _stack_for_deploy(args):
     return _validate_owned_stack(args, stack)["StackId"]
 
 
-def _assert_no_ingress_lifecycle(args):
-    """Refuse a bucket whose independent lifecycle can erase upload work."""
-    try:
-        document = _json_command([
-            "aws",
-            "s3api",
-            "get-bucket-lifecycle-configuration",
-            "--bucket",
-            args.ingress_bucket,
-            "--expected-bucket-owner",
-            args.expected_owner,
-            "--output",
-            "json",
-            *_provider_flags(args),
-        ])
-    except subprocess.CalledProcessError as error:
-        detail = error.stderr if isinstance(error.stderr, str) else ""
-        if "NoSuchLifecycleConfiguration" in detail:
-            return
-        raise RuntimeError(
-            "AWS ingress lifecycle lookup failed") from error
-    rules = document.get("Rules")
-    if not isinstance(rules, list):
-        raise RuntimeError("AWS ingress lifecycle response is malformed")
-    if rules:
-        raise RuntimeError(
-            "AWS ingress bucket lifecycle can erase acknowledged work")
-
-
 def _deploy_stack(args, target=None):
     _validate_deploy_args(args)
     target = _stack_for_deploy(args) if target is None else target
@@ -484,6 +463,7 @@ def _deploy_stack(args, target=None):
         f"CanonicalBucketName={args.canonical_bucket}",
         f"CanonicalPrefix={args.prefix}",
         f"IngressBucketName={args.ingress_bucket}",
+        f"RepositoryApplierFunctionArn={args.applier_function_arn}",
         f"UploadIssuer={args.issuer}",
         f"UploadKeyringSecretArn={args.keyring_secret_arn}",
         f"UploadKeyringVersionId={args.keyring_version_id}",
@@ -563,7 +543,6 @@ def _readiness(url):
 def deploy(args):
     _validate_deploy_args(args)
     target = _stack_for_deploy(args)
-    _assert_no_ingress_lifecycle(args)
     build(args)
     _deploy_stack(args, target)
     _readiness(_stack_url(args))
@@ -604,6 +583,7 @@ def _deployment_arguments(command):
     command.add_argument("--canonical-bucket", required=True)
     command.add_argument("--prefix", required=True)
     command.add_argument("--ingress-bucket", required=True)
+    command.add_argument("--applier-function-arn", required=True)
     command.add_argument("--issuer", required=True)
     command.add_argument("--keyring-secret-arn", required=True)
     command.add_argument("--keyring-version-id", required=True)

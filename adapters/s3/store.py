@@ -31,9 +31,11 @@ from core.object_store import (
     Versioned,
     VersionToken,
     KEY_RE,
+    MAX_PROVIDER_KEY_BYTES,
     authoritative_key,
     validate_create,
     validate_key,
+    validate_store_prefix,
 )
 
 
@@ -83,6 +85,7 @@ def _validate_prefix(prefix):
     if not KEY_RE.fullmatch(prefix) \
             or any(part in {"", ".", ".."} for part in prefix.split("/")):
         raise ValueError("S3 prefix")
+    validate_store_prefix(prefix)
 
 
 def _value_bytes(value):
@@ -205,7 +208,7 @@ class S3Config:
     max_list_pages: int = 10_000
     max_body_read_calls: int = 4096
     probe_access_denied_missing: bool = False
-    access_denied_is_absent: bool = False
+    conditional_write_403_is_absent: bool = False
 
     def __post_init__(self):
         if not isinstance(self.bucket, str) \
@@ -259,12 +262,12 @@ class S3Config:
         for value, name in (
                 (self.probe_access_denied_missing,
                  "probe_access_denied_missing"),
-                (self.access_denied_is_absent,
-                 "access_denied_is_absent")):
+                (self.conditional_write_403_is_absent,
+                 "conditional_write_403_is_absent")):
             if not isinstance(value, bool):
                 raise ValueError(name)
         if self.probe_access_denied_missing \
-                and self.access_denied_is_absent:
+                and self.conditional_write_403_is_absent:
             raise ValueError("choose one AccessDenied missing-key policy")
 
 
@@ -346,7 +349,7 @@ class S3Store:
         key = validate_key(key)
         physical = (
             f"{self.config.prefix}/{key}" if self.config.prefix else key)
-        if len(physical.encode("ascii")) > 1024:
+        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("S3 object key exceeds 1024 bytes")
         return physical
 
@@ -468,10 +471,11 @@ class S3Store:
             if _is_missing_key(error):
                 return None
             # S3 reports a missing key as 403 when the principal intentionally
-            # lacks ListBucket.  This mode is safe only for callers whose
-            # writes are conditional: an existing unreadable value then
-            # produces EXISTS/STALE rather than an overwrite.
-            if self.config.access_denied_is_absent \
+            # lacks ListBucket. This deliberately narrow mode is safe only in
+            # a conditional-write composition: an existing unreadable value
+            # then produces EXISTS/STALE rather than an overwrite. Read-only
+            # callers must leave it disabled and fail closed.
+            if self.config.conditional_write_403_is_absent \
                     and _is_access_denied(error):
                 return None
             if self.config.probe_access_denied_missing \
@@ -605,7 +609,7 @@ class S3Store:
             self.config.prefix + "/" if self.config.prefix else "")
         physical_prefix = namespace + (
             logical_prefix + "/" if logical_prefix else "")
-        if len(physical_prefix.encode("ascii")) > 1024:
+        if len(physical_prefix.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("S3 list prefix exceeds 1024 bytes")
         return {
             "Bucket": self.config.bucket,

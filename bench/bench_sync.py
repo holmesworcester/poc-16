@@ -49,6 +49,7 @@ YEARS = 3
 MEMBERS = 100
 WORKERS = 8
 BATCH = 256
+BENCHMARK_UPLOADER = "b" * 64
 
 perf = time.perf_counter
 
@@ -166,7 +167,7 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
             for fact in unit:
                 ordered.setdefault(fact.fid, fact)
         raw = node.sender(ws).pack(tuple(ordered.values()))
-        node.receive_pile(ws, "benchmark", raw)
+        node.receive_pile(ws, BENCHMARK_UPLOADER, raw)
 
     for unit in units:
         streamed += len(unit)
@@ -218,7 +219,8 @@ def copy_facts(dst, ws, src, fids):
     )
     if ws not in dst.workspaces():
         dst.add_workspace(ws, "benchmark-copy", peers=[])
-    dst.receive_pile(ws, "benchmark", dst.sender(ws).pack(facts))
+    dst.receive_pile(
+        ws, BENCHMARK_UPLOADER, dst.sender(ws).pack(facts))
 
 
 def reconcile(A, B, ws):

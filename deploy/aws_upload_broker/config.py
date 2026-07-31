@@ -1,21 +1,23 @@
 """Validated constants for the isolated AWS upload-broker deployment."""
 import re
 
+from core.object_store import MAX_STORE_PREFIX_BYTES
+
 
 DEPLOYMENT_MARKER = "poc16-aws-upload-broker-v1"
 DEPLOYMENT_TAG = "poc16:deployment"
 DEPLOYMENT_ID_TAG = "poc16:deployment-id"
 
-FUNCTION_TIMEOUT_SECONDS = 15
+FUNCTION_TIMEOUT_SECONDS = 90
 SDK_CONNECT_TIMEOUT_SECONDS = 2
-SDK_READ_TIMEOUT_SECONDS = 5
+SDK_READ_TIMEOUT_SECONDS = 70
 SDK_TOTAL_ATTEMPTS = 1
-SDK_CLEANUP_MARGIN_SECONDS = 3
+SDK_CLEANUP_MARGIN_SECONDS = 10
 
 MAX_LOG_RECORD_BYTES = 1_280
 MAX_LOG_METHOD_CHARS = 16
 MAX_LOG_PATH_CHARS = 128
-MAX_STORE_PREFIX_LENGTH = 760
+MAX_STORE_PREFIX_LENGTH = MAX_STORE_PREFIX_BYTES
 
 WORKSPACE_PATTERN = r"^[0-9a-f]{64}$"
 DEPLOYMENT_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{2,63}$"
@@ -35,6 +37,9 @@ KMS_KEY_ARN_PATTERN = (
     r"[0-9]{12}:key/[A-Za-z0-9-]+$")
 ALARM_ACTION_ARN_PATTERN = (
     r"^arn:[a-z0-9-]+:[a-z0-9-]+:[^:]*:[^:]*:.+$")
+LAMBDA_ARN_PATTERN = (
+    r"^arn:(?:aws|aws-us-gov|aws-cn):lambda:[a-z0-9-]+:[0-9]{12}:"
+    r"function:[A-Za-z0-9_-]{1,64}(?::(?:[A-Za-z0-9_-]+|[0-9]+))?$")
 
 WORKSPACE_RE = re.compile(WORKSPACE_PATTERN)
 DEPLOYMENT_ID_RE = re.compile(DEPLOYMENT_ID_PATTERN)
@@ -45,6 +50,7 @@ SECRET_ARN_RE = re.compile(SECRET_ARN_PATTERN)
 KEYRING_VERSION_RE = re.compile(r"^[A-Za-z0-9-]{32,64}$")
 KMS_KEY_ARN_RE = re.compile(KMS_KEY_ARN_PATTERN)
 ALARM_ACTION_ARN_RE = re.compile(ALARM_ACTION_ARN_PATTERN)
+LAMBDA_ARN_RE = re.compile(LAMBDA_ARN_PATTERN)
 
 
 def validate_sdk_budget(

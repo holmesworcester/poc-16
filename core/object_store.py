@@ -11,9 +11,9 @@ The root-authoritative snapshot uses only two namespaces:
     comparison capability for the exact bytes returned by the same read; it is
     not a content digest or a globally unique generation.
 
-The same local store may retain exact ``pile/`` sources. Direct-upload
-``ingress/v1/`` sources live in a separate provider compartment. Neither
-namespace is a repository answer or part of ``RepositoryReader``.
+The same local store may retain exact ``ingress/v1/`` sources. Hosted uploads
+put that namespace in a separate provider compartment. It is retry input,
+never a repository answer or part of ``RepositoryReader``.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes
@@ -25,6 +25,7 @@ import re
 from typing import Protocol
 
 from .crypto import h
+from .ingress import MAX_INGRESS_KEY_BYTES
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -32,6 +33,21 @@ from .limits import (
 )
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
+
+# S3 and R2 both cap one complete object key at 1,024 bytes. A configured
+# prefix must leave room for every logical namespace the shared store may
+# address, not merely the ingress key that happened to be longest before
+# public invitations were included in this inventory.
+MAX_PROVIDER_KEY_BYTES = 1024
+MAX_INVITE_ID_BYTES = 256
+MAX_LOGICAL_KEY_BYTES = max(
+    len("root"),
+    len("obj/") + 64,
+    len("invite/") + MAX_INVITE_ID_BYTES,
+    MAX_INGRESS_KEY_BYTES,
+)
+MAX_STORE_PREFIX_BYTES = (
+    MAX_PROVIDER_KEY_BYTES - 1 - MAX_LOGICAL_KEY_BYTES)
 
 
 def validate_key(key):
@@ -44,6 +60,18 @@ def validate_key(key):
             or key.startswith("root/"):
         raise ValueError(f"reserved key {key!r}")
     return key
+
+
+def validate_store_prefix(prefix):
+    """Validate a prefix that leaves room for every logical store key."""
+    if not isinstance(prefix, str) or not KEY_RE.fullmatch(prefix) \
+            or any(
+                not part or part in {".", ".."}
+                for part in prefix.split("/")):
+        raise ValueError("store key prefix")
+    if len(prefix.encode("ascii")) > MAX_STORE_PREFIX_BYTES:
+        raise ValueError("store prefix exceeds provider object-key budget")
+    return prefix
 
 
 def authoritative_key(key):
@@ -155,14 +183,12 @@ class OutcomeUnknown(StoreError):
 
 
 class ObjectStore(Protocol):
-    """The S3/R2-shaped operations used by a RepositoryApplier."""
+    """The complete bounded mutation surface used by RepositoryApplier."""
 
     def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
 
     def read_versioned(self, key: str) -> Versioned | Absent: ...
-
-    def put(self, key: str, value: bytes): ...
 
     def put_if_absent(
             self, key: str, value: bytes) -> CreateResult: ...
@@ -171,22 +197,13 @@ class ObjectStore(Protocol):
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
 
-    def list_page(
-            self, prefix: str, cursor: str | None,
-            limit: int) -> ListPage: ...
-
-    def delete(self, key: str): ...
-
-
 class AsyncObjectStore(Protocol):
-    """Awaited equivalent of the writable ObjectStore contract."""
+    """Awaited equivalent of the exact RepositoryApplier contract."""
 
     async def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
 
     async def read_versioned(self, key: str) -> Versioned | Absent: ...
-
-    async def put(self, key: str, value: bytes): ...
 
     async def put_if_absent(
             self, key: str, value: bytes) -> CreateResult: ...
@@ -194,13 +211,6 @@ class AsyncObjectStore(Protocol):
     async def cas(
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
-
-    async def list_page(
-            self, prefix: str, cursor: str | None,
-            limit: int) -> ListPage: ...
-
-    async def delete(self, key: str): ...
-
 
 def verified_object(
         oid, fetch, *, max_bytes=MAX_REPOSITORY_OBJECT_BYTES):

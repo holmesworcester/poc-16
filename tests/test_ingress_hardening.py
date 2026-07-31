@@ -33,7 +33,12 @@ from facts.content import message as message_family
 from full_peer import status
 from full_peer.node import FullPeer
 
-from .util import all_fids, closed_subset
+from .util import (
+    all_fids,
+    apply_planted,
+    closed_subset,
+    plant_for,
+)
 
 
 def run(awaitable):
@@ -77,8 +82,8 @@ def test_fact_count_is_bounded_before_store_or_kernel_work(
             raise AssertionError("oversized pile mutated store")
 
     applier = RepositoryApplier(workspace, NeverMutated())
-    with pytest.raises(PayloadTooLarge, match="too many facts"):
-        run(applier.stage("member", over))
+    with pytest.raises(InvalidPile, match="too many facts"):
+        run(applier.receive_pile("a" * 64, over))
 
 
 def test_json_value_budget_precedes_staging_and_healthy_pile_recovers(
@@ -92,11 +97,11 @@ def test_json_value_budget_precedes_staging_and_healthy_pile_recovers(
         close, "MAX_PILE_JSON_VALUES", close._scan_json_values(exact))
     store = FsStore(str(tmp_path / "store"))
     applier = RepositoryApplier(root.fid, store)
-    with pytest.raises(PayloadTooLarge, match="too many JSON values"):
-        run(applier.stage("member", over))
+    with pytest.raises(InvalidPile, match="too many JSON values"):
+        run(applier.receive_pile("a" * 64, over))
     monkeypatch.setattr(
         close, "MAX_PILE_JSON_VALUES", limits.MAX_PILE_JSON_VALUES)
-    result = run(applier.receive_pile("member", healthy))
+    result = run(applier.receive_pile("a" * 64, healthy))
     assert result.status == "applied"
     assert store.get("root") is not None
 
@@ -146,11 +151,11 @@ def test_rejected_exact_pile_does_not_block_independent_pile(tmp_path):
     healthy = closed_subset(source, workspace, all_fids(source, workspace))
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
-    bad = run(applier.stage("bad", b"{}"))
-    good = run(applier.stage("good", healthy))
+    bad = run(plant_for(applier, "b" * 64, b"{}"))
+    good = run(plant_for(applier, "c" * 64, healthy))
 
-    assert run(applier.apply(bad)).status == "rejected"
-    assert run(applier.apply(good)).status == "applied"
+    assert run(apply_planted(applier, bad)).status == "rejected"
+    assert run(apply_planted(applier, good)).status == "applied"
     assert store.get(bad) == b"{}"
     assert store.get(good) == healthy
     assert store.get("root") == source.store(workspace).get("root")
@@ -168,8 +173,8 @@ def test_program_failure_retains_source_and_independent_work_progresses(
     second_raw = closed_subset(source, workspace, (second,))
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
-    first_key = run(applier.stage("first", first_raw))
-    second_key = run(applier.stage("second", second_raw))
+    first_key = run(plant_for(applier, "d" * 64, first_raw))
+    second_key = run(plant_for(applier, "e" * 64, second_raw))
     original = message_family.message
     monkeypatch.setattr(
         message_family,
@@ -178,9 +183,9 @@ def test_program_failure_retains_source_and_independent_work_progresses(
             RuntimeError("family program failure")),
     )
     with pytest.raises(RuntimeError, match="family program failure"):
-        run(applier.apply(first_key))
+        run(apply_planted(applier, first_key))
     monkeypatch.setattr(message_family, "message", original)
-    assert run(applier.apply(second_key)).status == "applied"
+    assert run(apply_planted(applier, second_key)).status == "applied"
     assert store.get(first_key) == first_raw
 
 
@@ -191,7 +196,7 @@ def test_failed_root_commit_retains_exact_source_for_named_retry(
     raw = closed_subset(source, workspace, all_fids(source, workspace))
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
-    key = run(applier.stage("member", raw))
+    key = run(plant_for(applier, "a" * 64, raw))
     original = store.cas
     monkeypatch.setattr(
         store,
@@ -200,12 +205,12 @@ def test_failed_root_commit_retains_exact_source_for_named_retry(
             RuntimeError("root CAS failed")),
     )
     with pytest.raises(RuntimeError, match="root CAS failed"):
-        run(applier.apply(key))
+        run(apply_planted(applier, key))
     assert store.get(key) == raw
     assert store.get("root") is None
     monkeypatch.setattr(store, "cas", original)
-    assert run(RepositoryApplier(workspace, store).apply(key)).status \
-        == "applied"
+    assert run(apply_planted(
+        RepositoryApplier(workspace, store), key)).status == "applied"
 
 
 def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
@@ -278,7 +283,7 @@ def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):
     raw = close.encode_pile((genesis, signed, exact), workspace=workspace)
     destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "destination", [])
-    destination.receive_pile(workspace, "0123456789abcdef", raw)
+    destination.receive_pile(workspace, "0123456789abcdef" * 4, raw)
     assert destination.fact_of(workspace, exact.fid) == exact
 
     secret_token = b"g" * 32

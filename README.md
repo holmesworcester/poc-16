@@ -8,8 +8,8 @@ disposable full-client query and authorship accelerator.
 The implementation is deliberately strict about authority and direction:
 
 - `RepositoryApplier` is the only fact-pile-to-root capability. It is
-  database-free and owns immutable establishment and the root CAS for one
-  caller-named, retained source pile.
+  database-free and owns closed-pile validation, immutable establishment, and
+  the root CAS. It never deletes ingress.
 - `RepositoryReader` is a pinned, database-free, side-effect-free read
   capability.
 - `HttpGate` is the one peer route and authorization capability over those
@@ -45,6 +45,10 @@ processes or stacks without creating another repository state machine.
     wrapper.
 12. `deploy/` and `adapters/`: shared upload wire/session values, provider
     adaptation, and packaging—never full-peer-local client state.
+13. `facts/auth/push_endpoint.py` and
+    `facts/content/notification_preference.py`, then `notifications/`:
+    authenticated notification state followed by stateless post-publication
+    derivation and provider delivery.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -199,21 +203,92 @@ An authored unit follows one path:
 ```text
 facts command
     -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
-    -> caller conditionally creates one exact, digest-addressed source
+    -> RepositoryApplier reads one exact create-only source key
     -> kernel judges the exact closed pile
     -> pure compiler path-copies FactTree, SuppTree, and FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
+    -> applied, noop, rejected, or retryable result
     -> RepositoryReader pins the resulting root
 ```
 
-The exact immutable source is the retry record. Byte-identical delivery by the
-same member names the same local source; direct upload supplies its exact
-ingress key and digest. Root-CAS losers reapply that one source against the
-newer root. A lost CAS response is reconciled by reading `root`; replay after a
-confirmed commit is a no-op. The Applier never discovers work with LIST and
-never deletes a source, so concurrent workers can duplicate bounded immutable
-work without a queue, cursor, receipt, or destructive cleanup protocol.
+The exact key and digest identify one delivery attempt; they do not grant
+admission. Root-CAS losers retry from the newer root, and a lost CAS response
+is reconciled by reading the root. Repeating an already-applied pile returns
+an idempotent result. The source remains immutable staging for provider
+retention, so concurrent workers have no destructive ingress action to race.
+One bad pile cannot wedge a later exact request.
+
+## Mobile notifications
+
+The repository contains notification facts, pure derivation, and a Firebase
+adapter prototype. It does not yet contain a root-commit emitter, hint carrier,
+or deployed notification Worker. The intended flow is:
+
+```text
+mobile installation -> sealed push_endpoint fact
+user setting         -> notification_preference fact
+new message          -> family-owned notification trigger
+future commit emitter -> hint naming the exact root and newly resident triggers
+future worker         -> authenticated preference/endpoint join -> FCM
+```
+
+An endpoint belongs to one workspace user and mobile installation. It carries
+the selected push-node key and provider mapping, with the FCM target sealed to
+that push node. The plaintext target never enters repository state. Rotation
+publishes the replacement and an ordinary exact deletion of the prior endpoint
+in one pile. Member and device removal make the endpoint unusable through the
+same liveness rules as other facts.
+
+Preferences are shared user state: `none`, `mentions`, or `all` globally, with
+an optional per-channel override or `inherit`. An enrolled device replaces all
+observed values using ordinary exact deletion. Concurrent active values meet
+restrictively, so a concurrent mute wins. With no global preference the default
+is `none`.
+
+The database-free derivation prototype currently pins the exact root named by
+a supplied hint and follows authenticated tree postings rather than scanning
+all facts:
+
+1. route key to candidate user preferences;
+2. user and cell key to current preference values;
+3. user key to all current endpoint facts.
+
+It opens that root through `RepositoryReader`, validates the postings, and
+checks suppression/liveness through the reader's `WorkerView`. Message facts
+carry canonical mention IDs; display text is never parsed. Each
+`(event, endpoint)` result has a stable delivery ID which the Firebase adapter
+uses as both the Android and Apple collapse key.
+
+A future SNS, Pub/Sub, or other carrier would hold no authority. Its hint must
+name only trigger facts newly resident in the successful root transition.
+Delivery must authenticate each event in that historical hint root, then use a
+separately pinned current root for endpoints, preferences, suppression, and
+liveness. The current one-root prototype does not implement that split and is
+not deployable. Duplicate hints must derive the same delivery IDs. There is
+currently no emitter, carrier, deployment, notification outbox, queue evidence,
+repository callback, or second publication path. Future delivery must remain
+post-commit and tolerate duplicate provider submission.
+
+The preference commands are available now:
+
+```sh
+python3 -m full_peer content.notification.set_global WORKSPACE all
+python3 -m full_peer content.notification.set_channel WORKSPACE general none
+python3 -m full_peer content.notification.list WORKSPACE
+python3 -m full_peer auth.push_endpoint.list WORKSPACE
+```
+
+Endpoint registration is intended to be called by mobile integration after it
+obtains notification permission and an FCM installation ID, seals that ID with
+`notifications.seal_target`, and has durable retry state for publishing the
+newest endpoint. Do not pass an unsealed target to the fact command.
+
+Run the deterministic fact, derivation, and Firebase-adapter coverage with:
+
+```sh
+python3 -m pytest -q tests/test_notifications.py
+```
 
 ## Facts, suppression, and deletion
 
@@ -272,8 +347,9 @@ not special cases in `FullPeer`.
 Removal does not retroactively revoke validated storage. Once removal has
 propagated, peers stop granting that principal new sharing authority. Facts
 accepted by a peer that had not yet learned the removal remain legitimate
-workspace facts. The closed pile was the validation certificate; no selected
-dependency path is retained afterward. A remote proof names its exact provider;
+workspace facts. The pile supplies the one-time validation closure.
+Authenticated residence after root CAS is the durable admission certificate;
+no selected dependency path is retained afterward. A remote proof names its exact provider;
 the hosted Reader authenticates that FactTree residence and its current
 SuppTree scopes. Stateful commands assemble interchangeable candidates from
 their disposable SQL projection.
@@ -303,77 +379,60 @@ serialized form, not preserve an obsolete original encoding.
 
 ## Direct object-store upload
 
-Peers do not proxy file bytes through Lambda or a Worker. A broker reads a
-pinned repository root to authorize an upload and returns exact, short-lived,
-create-only PUT capabilities. Each source uploads one exact fact-only closed
-pile marker to isolated ingress. A file upload sends the signed descriptor
-first and then one independently admissible inline Bao slice pile per range;
-there is no detached attachment-object phase.
+Peers do not proxy pile bytes through Lambda or a Worker. The entire hosted
+upload protocol is:
 
-The stateful client owns this side of the protocol:
-`full_peer/upload_journal.py` durably spools immutable source bytes and one
-atomic progress record, `full_peer/upload_client.py` advances only persisted
-OPEN/ISSUE/FINALIZE authority, and `full_peer/upload_client_http.py` performs
-bounded broker POSTs and exact streaming PUTs. Provider brokers and deployment
-adapters remain under `deploy/`; only `upload_session.py` and `upload_wire.py`
-are shared by both sides.
+```text
+OPEN(proof, pile digest, pile size)
+    -> exact fixed-expiry create-only PUT plus cursor
+client PUTs the pile directly to S3/R2
+FINALIZE(cursor)
+    -> broker privately invokes Applier(exact key, digest)
+    -> applied | noop | rejected | retryable
+```
 
-`content.file.uploads` pages the retained local sources and reports `active`,
-`expired`, `abandoned`, or `completed`. These are delivery states, never
-publication verdicts. One cross-process writer owns a source for an entire
-resume; atomic journal updates cannot move its authenticated cursor or
-delivered prefix backward. `content.file.abandon_upload` durably stops retries,
-but collection waits until every locally observed capability expiry.
-`content.file.collect_upload` then removes only that exact abandoned source, or
-an exact source whose pile-last delivery step was durably journaled. It never
-reads or mutates repository state. A legacy v1 journal can still resume, but
-abandoned collection fails closed because v1 did not retain replaced-session
-expiry history.
+There is no `ISSUE`, detached-object vector, upload group, Queue/SQS message,
+bucket notification, cron, or LIST drain. A file descriptor and each Bao
+slice are ordinary facts; the slice contains its payload and range proof and
+can be sent in its own closed pile. Large uploads are therefore just repeated
+instances of the same small protocol.
 
-The pile is the durable work item. After its exact create-only PUT succeeds,
-`FINALIZE` names that pile's key and digest to the provider's private Applier.
-The request itself is the wake-up and work identity; no notification, LIST,
-queue, cron, or database is needed to discover it. A retry sends the same
-bounded request again.
+The stateful client retains one exact pile and, while useful, its current
+lease. `full_peer/upload_journal.py` owns that local crash state,
+`full_peer/upload_client.py` owns `OPEN -> PUT -> FINALIZE`, and
+`full_peer/upload_client_http.py` owns the HTTP effects. If a response is lost,
+the client repeats `FINALIZE`; if a lease expires, it opens a new exact session.
+Local active, abandoned, and completed states never grant repository
+authority, and abandoning local state is safe because an outstanding request
+can write only one isolated immutable staging key.
 
-`RepositoryApplier` then:
+Family commands collect an `applied` or `noop` source immediately. File upload
+runs descriptor and slice piles strictly in order, collecting each success
+before creating the next source; `rejected`, retryable, and exceptional turns
+stop the loop and retain the current source for inspection or retry. Thus even
+a maximum-size file consumes at most one live journal slot. This is not yet a
+durable whole-file workflow cursor: a crash between successful piles may
+require rerunning the file command.
 
-1. bounded-fetches and digest-checks the exact pile;
-2. checks the exact key/session/member/digest binding and that every ordinary
-   fact names the configured workspace (the workspace-genesis fact is the
-   sole ws-less exception);
-3. validates the complete closed pile through the ordinary kernel;
-4. establishes immutable fact and Merkle objects;
-5. performs the one root CAS and returns `applied`, `noop`, `rejected`, or
-   `retryable`.
+`OPEN` reads one pinned repository root and checks current upload authority.
+The cursor fixes workspace, uploader, provider, session, pile digest, size,
+issue time, and expiry. `FINALIZE` changes none of those and does not reread
+liveness. Removal before a new `OPEN` denies it; removal afterward leaves only
+that already-confined pile usable until its fixed expiry.
 
-The Applier never deletes the client pile. Until an exact abandoned-session
-collection rule is proved, provider policy retains the complete client-writable
-namespace: the AWS broker role is conditional PUT-only and deployment admits
-only a no-lifecycle bucket, while Cloudflare uses an indefinite R2 bucket lock
-over the ingress prefix. Immutable source bytes plus root CAS let concurrent
-Workers duplicate bounded work without losing a pile or corrupting the tree.
+The broker has read-only canonical access, an exact ingress PUT signer, and a
+narrow provider-private invocation of the Applier. It never receives pile
+bytes and cannot mutate canonical storage directly. The Applier bounded-reads
+the exact key, checks its workspace/session/member/digest binding, decodes the
+whole closed pile, invokes the ordinary kernel, and owns the only root CAS.
+The member path component identifies the authenticated uploader, not every
+fact author in a legitimate relayed closure.
 
-The marker's member component names the broker-authenticated upload session,
-not the author of every fact in a relayed closure. Per-fact signatures and
-family needs remain the authority proof.
-
-The broker is a `RepositoryReader` plus a provider signer. It has read-only
-canonical credentials and exposes only exact create-only ingress PUT grants;
-it has no repository mutation route. The Applier alone can mutate the
-canonical bucket.
-
-Upload authorization has one explicit staleness bound. `OPEN` reads one
-pinned repository root and checks the uploader's current authority. A
-successful `OPEN` exchanges that observation for one bearer lease whose fixed
-expiry is the key-ring session TTL after the broker's trusted time. `ISSUE`
-and `FINALIZE` verify the authenticated cursor, monotonic prefix, quotas, and
-that same deadline; they do not reread liveness and cannot extend the lease.
-Thus removal before a new `OPEN` denies it, while removal after `OPEN` leaves
-only the already-confined session usable until expiry. Every exact provider
-PUT expires no later than the session. Neither the cursor nor a successful PUT
-is repository admission: the Applier still validates the pile and owns the
-only root CAS.
+`RepositoryApplier` never deletes ingress. A configured S3/R2 lifecycle may
+eventually collect old staging because the client reports success only after
+`applied` or `noop`; if an unpublished staging key expires, the sender simply
+opens and uploads a new exact session. Retention is storage hygiene, not a
+server-side work queue or a correctness precondition.
 
 ## Object-store contract
 
@@ -386,15 +445,13 @@ adapters:
 - one linearizable conditional replace of `root`;
 - an opaque version token returned with the exact root bytes.
 
-`RepositoryApplier` requires only exact reads and conditional writes. It does
-not require LIST or DELETE. Other provider administration may expose bounded
-pagination, but it is outside pile application and cannot authorize a root
-mutation.
+`get_bounded` is mandatory and cannot be a compatibility wrapper around an
+unbounded whole-object GET. The receive algorithm does not require LIST.
 
 The opaque provider version token is not the root content hash. Readers use
 the content hash as snapshot identity; Appliers use the opaque token only as
 the compare capability for CAS. Correctness never depends on ETag being
-MD5-like, on LIST ordering beyond the adapter contract, or on a database.
+MD5-like, bucket enumeration, or a database.
 
 The filesystem adapter is a stronger local implementation of the same
 contract. S3 uses conditional requests through `adapters/s3`; the Cloudflare
@@ -404,62 +461,26 @@ runtime uses the native R2 binding through `adapters/r2/worker.py`.
 
 AWS uses two externally owned buckets:
 
-- canonical: `root` and immutable `obj/` (a full peer also stages exact local
-  `pile/` sources in this store);
-- ingress: client-created, immutable closed piles.
+- canonical: the CAS register `root` and immutable authenticated `obj/`;
+- ingress: create-only exact closed piles under
+  `ingress/v1/workspaces/<ws64>/piles/<session32>/<uploader64>/<digest64>`.
 
 The upload broker and repository Applier are separate Lambda stacks so their
-IAM authorities do not overlap.
+mutation authorities remain segregated. The Applier has no public URL. The
+broker can
+read canonical authorization objects, sign one exact ingress PUT, and invoke
+that private Applier; only the Applier can read ingress and CAS `root`.
 
 Prerequisites:
 
 - Python 3.13, AWS CLI, SAM CLI, and credentials for the target account;
 - two distinct buckets;
 - a Secrets Manager upload-session key ring;
-- deployment credentials allowed to read the ingress bucket lifecycle;
 - bucket policies that allow clients only their broker-issued create-only
   PUTs and allow the Applier role the exact canonical/ingress operations in
   its template.
 
-Create the broker key ring:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage keyring-create \
-  --name poc16/upload-keyring \
-  --deployment-id DEPLOYMENT \
-  --issuer ISSUER \
-  --ingress-bucket INGRESS_BUCKET \
-  --region REGION \
-  --expected-owner ACCOUNT_ID
-```
-
-That command prints the secret ARN and version ID. Deploy the broker with
-those values:
-
-```sh
-python3 -m deploy.aws_upload_broker.manage deploy --create \
-  --stack poc16-upload-broker \
-  --deployment-id DEPLOYMENT \
-  --workspace WS64 \
-  --canonical-bucket CANONICAL_BUCKET \
-  --prefix workspaces/WS64 \
-  --ingress-bucket INGRESS_BUCKET \
-  --issuer ISSUER \
-  --keyring-secret-arn SECRET_ARN \
-  --keyring-version-id VERSION_ID \
-  --expected-owner ACCOUNT_ID \
-  --region REGION
-```
-
-Deployment refuses an ingress bucket with any lifecycle rules:
-[S3 bucket policies do not stop lifecycle actions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html),
-so a rule could otherwise hide or expire acknowledged work. Stack removal
-never adds one and leaves the bucket intact. The bucket is externally owned;
-later lifecycle or bucket-policy mutation by its storage administrator is
-outside broker-parent compromise, so that configuration authority must remain
-deploy-only and absent from both Lambda roles.
-
-Deploy the database-free Applier:
+Deploy the database-free Applier first:
 
 ```sh
 python3 -m deploy.aws_repository_applier.manage deploy \
@@ -473,26 +494,56 @@ python3 -m deploy.aws_repository_applier.manage deploy \
   --region REGION
 ```
 
-The Applier has no Function URL, bucket event, queue, or schedule. The broker's
-private `FINALIZE` path invokes it with exactly
-`{schema, workspace, key, digest}` after the client PUT; only the four-state
-result crosses back. Stack removal deletes compute and logs only; it does not
-delete either bucket or the external secret.
+Read its private `FunctionArn` stack output, then create the broker key ring:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage keyring-create \
+  --name poc16/upload-keyring \
+  --deployment-id DEPLOYMENT \
+  --issuer ISSUER \
+  --ingress-bucket INGRESS_BUCKET \
+  --region REGION \
+  --expected-owner ACCOUNT_ID
+```
+
+The command prints the secret ARN and version ID. Deploy the public broker
+with those values and the Applier ARN:
+
+```sh
+python3 -m deploy.aws_upload_broker.manage deploy --create \
+  --stack poc16-upload-broker \
+  --deployment-id DEPLOYMENT \
+  --workspace WS64 \
+  --canonical-bucket CANONICAL_BUCKET \
+  --prefix workspaces/WS64 \
+  --ingress-bucket INGRESS_BUCKET \
+  --applier-function-arn APPLIER_FUNCTION_ARN \
+  --issuer ISSUER \
+  --keyring-secret-arn SECRET_ARN \
+  --keyring-version-id VERSION_ID \
+  --expected-owner ACCOUNT_ID \
+  --region REGION
+```
+
+The client performs `OPEN`, PUTs the returned exact URL directly to S3, and
+calls `FINALIZE`; the broker synchronously invokes the Applier. Neither stack
+uses LIST, S3 notifications, SQS, or a schedule. A time-based ingress
+lifecycle is safe because ingress is non-authoritative retry input; choose a
+retention window long enough for the client retry policy. The deploy tools do
+not create or mutate either bucket or its lifecycle. Stack removal deletes
+compute and logs only, never either bucket or the external secret. Remove the
+broker before the Applier when retiring both roles.
 
 ## Cloudflare deployment
 
 Cloudflare likewise uses distinct canonical and ingress R2 buckets. The
 broker has no native R2 binding: it receives a read-only canonical S3 token
-and an ingress S3 signing token, while its code surface mints only exact
-create-only PUTs. R2 gives that parent credential broad object mutation
-verbs, so deployment first installs and reads back an indefinite provider
-bucket lock over the complete ingress prefix. The lock prevents overwrite,
-DELETE, and lifecycle expiry after an acknowledged PUT even if the parent
-credential is compromised, following the provider's
-[bucket-lock contract](https://developers.cloudflare.com/r2/buckets/bucket-locks/).
-The Applier has native bindings to both buckets and a private service binding
-from the broker. It has no public route or cron trigger: broker `FINALIZE`
-invokes exactly one named pile after its create-only PUT.
+and an ingress S3 signing token, while its code mints only exact create-only
+PUTs. The separate ingress bucket is non-authoritative: misuse of its broader
+parent credential can deny service, but cannot publish facts. The private,
+route-less Applier Worker has native bindings to both buckets and alone owns
+validation and the canonical root CAS. The public broker reaches it through a
+Worker service binding. There is no bucket lock, queue, cron, or LIST drain.
 
 Set the non-secret deployment inputs:
 
@@ -503,24 +554,20 @@ export CF_UPLOAD_CANONICAL_BUCKET=CANONICAL_BUCKET
 export CF_UPLOAD_INGRESS_BUCKET=INGRESS_BUCKET
 export CF_UPLOAD_DEPLOYMENT_OWNER=OWNER
 export CF_UPLOAD_CANONICAL_BUCKET_PROFILE=dedicated-workspace
-export CF_UPLOAD_INGRESS_BUCKET_PROFILE=exclusive-dedicated
+export CF_UPLOAD_INGRESS_BUCKET_PROFILE=dedicated-workspace
 export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_PERMISSION_ID32
 export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_PERMISSION_ID32
 export CF_UPLOAD_ISSUER=ISSUER
+export CF_UPLOAD_BROKER_DOMAIN=uploads.example.com
 ```
 
 Set a deploy-only `CLOUDFLARE_API_TOKEN` with account-scoped Workers Scripts
-Edit and Workers R2 Storage Edit, the two canonical/ingress S3 credential
-pairs, and `UPLOAD_SESSION_KEYRING`. Cloudflare's REST configuration authority
-is [account-scoped](https://developers.cloudflare.com/r2/api/tokens/); its
-bucket-scoped object tokens cannot call this API. The
-`exclusive-dedicated` profile is therefore an operator invariant: this
-deployment is the sole lock-configuration writer for its dedicated ingress
-bucket, and the control token is never a Worker secret. Lock update replaces
-one whole document and exposes no CAS precondition. Concurrent instances of
-this same deployment write the same document; deployment refuses a foreign
-document already present, but does not claim to defeat a racing account
-administrator or compromised control token. For first creation set:
+Edit. `render` emits the two bucket-scoped access-policy documents; provision
+their S3-compatible credentials and set
+`CANONICAL_READ_ACCESS_KEY_ID`, `CANONICAL_READ_SECRET_ACCESS_KEY`,
+`INGRESS_PARENT_ACCESS_KEY_ID`, `INGRESS_PARENT_SECRET_ACCESS_KEY`, and
+`UPLOAD_SESSION_KEYRING`. The control token is used only by deployment and is
+never a Worker secret. For first creation set:
 
 ```sh
 export CF_UPLOAD_CREATE=1
@@ -535,8 +582,9 @@ python3 -m deploy.cloudflare_upload.manage test
 python3 -m deploy.cloudflare_upload.manage deploy
 ```
 
-Deployment installs the ingress lock before the Applier and broker. Removal
-reverses the compute order and preserves both R2 buckets and the lock:
+Deployment installs and verifies the private Applier before exposing the
+broker. Removal deletes the broker first and then the Applier, preserving both
+R2 buckets and their independently managed lifecycle configuration:
 
 ```sh
 python3 -m deploy.cloudflare_upload.manage remove
@@ -549,35 +597,12 @@ that this checkout has deployed them.
 
 ## Current performance status
 
-The honest `PileSender -> RepositoryApplier -> RepositoryReader` path uses the
-incremental compiler. It path-copies only affected authenticated routes and is
-continuously checked against the byte-identical full compiler oracle.
-Superseded intermediate Merkle pages are released during the batch, kernel
-closure sets are compact bitsets, and a just-staged pile reuses its already
-verified body instead of fetching a second live copy.
+The honest `PileSender -> RepositoryApplier -> RepositoryReader` benchmark
+path uses incremental snapshot extension. Each exact pile updates affected
+Fact, Order, and Suppression routes and establishes immutable pages
+immediately; it does not rebuild a client database or replay the full fact
+corpus on every commit.
 
-The shared hard cuts are a 4 MiB canonical fact, 256 facts per closed pile,
-5 MiB per pile, 48 KiB authenticated pages, and a 512-page path. The executable
-conservative accounting peaks at 113,008,656
-bytes, leaving 14,991,344 bytes below Cloudflare's 128,000,000-byte isolate
-limit. It is an implementation ratchet, not a formal heap proof or a live
-workerd/Pyodide measurement.
-
-The smaller incremental algorithm establishes one immutable changed path at a
-time and CASes only the final composite root. A real R2-adapter test covers a
-249-fact genesis and a second nonempty 249-fact append in fewer than 25,000
-provider calls; the conservative maximum-shape ceiling is 8,137,488 against
-the configured 10,000,000. File authoring emits a small signed descriptor pile
-and one independently closed inline Bao-slice pile per range, so file size no
-longer has to fit one pile and no detached object protocol is involved.
-
-Each hosted invocation applies exactly one caller-named pile. Concurrent
-isolates may race on the root CAS; losers return `retryable` and the caller
-reinvokes that same retained source. Live provider conformance still follows.
-See
-[DESIGN.md](DESIGN.md#51-hosted-turn-envelope).
-
-No 50k/200k fact-rate or file-throughput number is asserted here. Those larger
-throughput runs remain a separate benchmark bead requiring facts/s at both
-sizes and MiB/s for file transfer; they are not part of the hosted-turn memory
-accounting work.
+No 50k/200k fact-rate or file-throughput number is asserted here until the
+benchmark is rerun. The corresponding bead requires facts/s at both sizes and
+MiB/s for file transfer.

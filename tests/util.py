@@ -11,6 +11,9 @@ import facts
 from core import http, peer_capability
 from core.close import close, encode_pile
 from core.crypto import h, keypair
+from core.ingress import ingress_key, parse_ingress_key
+from core.object_store import CREATED, EXISTS
+from core.repository_applier import async_store
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
@@ -36,6 +39,31 @@ def invoke_mint_value(node, workspace, value):
     ))
     body = json.loads(response.body) if response.body else None
     return gate, (response.status, body)
+
+
+async def plant_exact(store, workspace, member, raw, session=None):
+    """Test-fixture upload: create one exact source without applying it."""
+    digest = h(raw)
+    key = ingress_key(
+        workspace, digest[:32] if session is None else session,
+        member, digest)
+    store = async_store(store)
+    result = await store.put_if_absent(key, raw)
+    assert result in {CREATED, EXISTS}
+    assert await store.get_bounded(key, max(1, len(raw))) == raw
+    return key
+
+
+async def plant_for(applier, member, raw, session=None):
+    return await plant_exact(
+        applier.store, applier.workspace, member, raw, session)
+
+
+async def apply_planted(applier, source, source_store=None):
+    """Invoke only the public exact-source boundary in tests."""
+    source_store = applier.store if source_store is None else source_store
+    return await applier.apply_exact(
+        source_store, source, parse_ingress_key(source).digest)
 
 
 def invoke_mint(node, workspace, pile):
@@ -83,7 +111,8 @@ def replay_random(source, workspace, destination, seed):
                 pending.append(deliver(
                     destination, workspace,
                     closed_subset(source, workspace, chunk),
-                    member=f"seed{seed}batch{batch}pile{pile}"))
+                    member=h(
+                        f"seed{seed}batch{batch}pile{pile}".encode())))
         for exact_source in pending:
             destination.turn(workspace, exact_source)
         batch += 1
@@ -91,7 +120,7 @@ def replay_random(source, workspace, destination, seed):
 
 
 def query_state(node, workspace=None):
-    """Canonical public query state over the single fact catalog."""
+    """Canonical public query state over the disposable SQL projection."""
     if workspace is None:
         known = node.workspaces() or list(node._sql)
         if len(known) != 1:
@@ -204,10 +233,11 @@ def closed_subset(n, ws, fids):
     return encode_pile(facts, workspace=ws)
 
 
-def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
+def deliver(dst, ws, pile_bytes, member="feed" * 16):
     """Deliver and apply one exact pile; there is no discovery turn."""
-    source = dst.stage_received_pile(ws, member, pile_bytes)
-    dst.turn(ws, source)
+    digest = h(pile_bytes)
+    source = ingress_key(ws, digest[:32], member, digest)
+    dst.receive_pile(ws, member, pile_bytes)
     return source
 
 

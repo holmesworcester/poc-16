@@ -2,9 +2,8 @@
 
 The broker receives no native R2 binding.  Its canonical reads use a separate
 Object Read-only credential, and its write-capable S3 parent is confined to a
-distinct ingress bucket.  An indefinite provider lock makes that parent's
-broad mutation verbs harmless to acknowledged ingress.  The
-RepositoryApplier alone receives native bindings to both buckets.
+distinct, non-authoritative ingress bucket. The RepositoryApplier alone
+receives native bindings to both buckets.
 """
 from dataclasses import dataclass
 import hashlib
@@ -13,6 +12,7 @@ import re
 from urllib.parse import urlsplit
 
 from core.limits import MAX_HOSTED_CPU_MS, MAX_HOSTED_SUBREQUESTS
+from core.object_store import validate_store_prefix
 
 
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
@@ -24,6 +24,9 @@ OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 WORKER = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 WORKSPACE = re.compile(r"^[0-9a-f]{64}$")
+DOMAIN = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}$")
 JURISDICTIONS = frozenset({"default", "eu", "fedramp"})
 
 READ_GROUP = "Workers R2 Storage Bucket Item Read"
@@ -41,20 +44,17 @@ BROKER_SECRET_NAMES = (
 
 COMPATIBILITY_DATE = "2026-07-29"
 DEFAULT_PRESIGN_TTL_SECONDS = 15 * 60
-UPLOAD_PROTOCOL = "isolated-ingress-v1"
-UPLOAD_ORDER = "objects-first-pile-last"
+UPLOAD_PROTOCOL = "exact-pile-v2"
 
 
 def _safe_prefix(value, label):
     if not isinstance(value, str):
         raise ValueError(label)
     value = value.strip("/")
-    parts = value.split("/")
-    if not value or len(value.encode()) > 768 \
-            or any(not part or part in {".", ".."} for part in parts):
-        raise ValueError(label)
-    if any(not re.fullmatch(r"[A-Za-z0-9:._-]+", part) for part in parts):
-        raise ValueError(label)
+    try:
+        validate_store_prefix(value)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValueError(label) from error
     return value
 
 
@@ -69,10 +69,11 @@ class Deployment:
     applier_name: str
     read_permission_group_id: str
     write_permission_group_id: str
+    broker_domain: str
     upload_issuer: str = "cloudflare-upload-production"
     jurisdiction: str = "default"
     canonical_bucket_profile: str = "dedicated-workspace"
-    ingress_bucket_profile: str = "exclusive-dedicated"
+    ingress_bucket_profile: str = "dedicated-workspace"
     canonical_prefix: str | None = None
     ingress_prefix: str | None = None
     presign_ttl_seconds: int = DEFAULT_PRESIGN_TTL_SECONDS
@@ -88,6 +89,7 @@ class Deployment:
             (WORKER, self.applier_name, "applier Worker name"),
             (HEX_ID, self.read_permission_group_id, "read permission id"),
             (HEX_ID, self.write_permission_group_id, "write permission id"),
+            (DOMAIN, self.broker_domain, "broker custom domain"),
         )
         for pattern, value, label in fields:
             if not isinstance(value, str) or not pattern.fullmatch(value):
@@ -104,9 +106,9 @@ class Deployment:
         if self.canonical_bucket_profile != "dedicated-workspace":
             raise ValueError(
                 "canonical bucket must use the dedicated-workspace profile")
-        if self.ingress_bucket_profile != "exclusive-dedicated":
+        if self.ingress_bucket_profile != "dedicated-workspace":
             raise ValueError(
-                "ingress bucket lock must use exclusive deployment authority")
+                "ingress bucket must use the dedicated-workspace profile")
         canonical = _safe_prefix(
             self.canonical_prefix
             or f"workspaces/{self.workspace}",
@@ -157,6 +159,8 @@ class Deployment:
                 "CF_R2_BUCKET_ITEM_READ_PERMISSION_ID", ""),
             write_permission_group_id=environment.get(
                 "CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID", ""),
+            broker_domain=environment.get(
+                "CF_UPLOAD_BROKER_DOMAIN", ""),
             upload_issuer=environment.get("CF_UPLOAD_ISSUER", ""),
             jurisdiction=environment.get(
                 "CF_R2_JURISDICTION", "default"),
@@ -219,7 +223,7 @@ def access_policies(deployment):
 
     Cloudflare's bucket-item write permission is intentionally represented as
     broad within ingress.  Canonical isolation comes from the distinct bucket;
-    ``ingress_lock`` independently prevents acknowledged-value mutation.
+    ingress objects are retry inputs, never repository authority.
     """
     return {
         "broker_canonical_reader": _access_policy(
@@ -261,7 +265,6 @@ def _worker_base(deployment, *, role, name, main):
             "CANONICAL_BUCKET_PROFILE":
                 deployment.canonical_bucket_profile,
             "UPLOAD_PROTOCOL": UPLOAD_PROTOCOL,
-            "UPLOAD_ORDER": UPLOAD_ORDER,
             OWNER_BINDING: deployment.owner,
             ROLE_BINDING: role,
         },
@@ -285,6 +288,14 @@ def broker_config(deployment):
         main="build/broker/entry.py",
     )
     config["base_dir"] = "build/broker"
+    config["routes"] = [{
+        "pattern": deployment.broker_domain,
+        "custom_domain": True,
+    }]
+    config["services"] = [{
+        "binding": "APPLIER",
+        "service": deployment.applier_name,
+    }]
     config["r2_buckets"] = []
     config["vars"].update({
         "R2_ENDPOINT": deployment.endpoint,
@@ -335,47 +346,23 @@ def applier_config(deployment):
     return config
 
 
-def ingress_lock(deployment):
-    """Retain the complete client-writable namespace until proved cleanup."""
-    suffix = hashlib.sha256(
-        f"{deployment.owner}:{deployment.ingress_prefix}".encode()
-    ).hexdigest()[:16]
-    return {
-        "rules": [{
-            "id": f"poc16-retained-ingress-{suffix}",
-            "enabled": True,
-            "prefix": deployment.ingress_prefix + "/",
-            "condition": {"type": "Indefinite"},
-        }],
-    }
-
-
 def generated_boundary(deployment):
     return {
         "broker": broker_config(deployment),
         "applier": applier_config(deployment),
         "access_policies": access_policies(deployment),
-        "ingress_lock": ingress_lock(deployment),
         "provider_claim": {
             "kind": "isolated-ingress-presigned-put-v1",
             "live_verified": False,
-            "acknowledged_ingress_retention":
-                "r2-bucket-lock-indefinite-v1",
-            "lock_control_profile": "exclusive-dedicated",
             "canonical_raw_put_sha256_safe": False,
             "payload_mode": "UNSIGNED-PAYLOAD",
             "upload_protocol": UPLOAD_PROTOCOL,
-            "upload_order": UPLOAD_ORDER,
             "session_nonce": "32-lowercase-hex",
-            "object_key": (
-                "ingress/v1/workspaces/<ws64>/objects/"
-                "<nonce32>/<sha256>"
-            ),
-            "ready_marker_key": (
+            "pile_key": (
                 "ingress/v1/workspaces/<ws64>/piles/"
-                "<nonce32>/<member16>/<sha256>"
+                "<nonce32>/<member64>/<sha256>"
             ),
-            "ready_marker_is_sole_durable_intent": True,
+            "finalize_invokes_private_applier": True,
         },
     }
 

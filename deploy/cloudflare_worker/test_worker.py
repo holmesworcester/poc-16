@@ -14,6 +14,7 @@ import pytest
 import facts
 
 from core import limits
+from core.object_store import MAX_STORE_PREFIX_BYTES
 from core.close import encode_pile
 from core.crypto import (
     h,
@@ -523,6 +524,30 @@ def test_generated_config_is_single_workspace_least_privilege():
     assert "GRANT_SECRET" not in config["vars"]
 
 
+def test_manage_and_runtime_share_exact_store_prefix_budget(
+        tmp_path, monkeypatch):
+    environment = {
+        "CF_WORKSPACE": "a" * 64,
+        "CF_R2_BUCKET": "production",
+        "CF_DEPLOYMENT_OWNER": "production-primary",
+        "CF_ROUTE": "gateway.example.com/*",
+        "CF_STORE_PREFIX": "a" * MAX_STORE_PREFIX_BYTES,
+    }
+    assert manage.generated_config(environment)["vars"]["STORE_PREFIX"] \
+        == environment["CF_STORE_PREFIX"]
+    environment["CF_STORE_PREFIX"] += "a"
+    with pytest.raises(ValueError, match="CF_STORE_PREFIX"):
+        manage.generated_config(environment)
+
+    _, _, _, _, runtime_env = worker_world(tmp_path, monkeypatch)
+    runtime_env.STORE_PREFIX = "a" * MAX_STORE_PREFIX_BYTES
+    assert runtime.Settings.from_env(runtime_env).prefix \
+        == runtime_env.STORE_PREFIX
+    runtime_env.STORE_PREFIX += "a"
+    with pytest.raises(ValueError, match="STORE_PREFIX"):
+        runtime.Settings.from_env(runtime_env)
+
+
 def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     config = json.loads(manage.TEMPLATE.read_text())
 
@@ -532,9 +557,9 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     } == runtime._BUDGETS
     assert runtime.MAX_REQUEST_BYTES <= limits.MAX_MINT_REQUEST_BYTES
     assert runtime.MAX_ROOT_BYTES <= limits.MAX_ROOT_BYTES
-    # The single-object route also carries detached Bao proofs and invites.
-    # Authenticated repository reads apply their narrower page/fact bound at
-    # the gate call site rather than shrinking this shared transport ceiling.
+    # Bao slice payloads are inline ordinary facts. Authenticated repository
+    # reads apply their narrower page/fact bound at the gate call site rather
+    # than shrinking this shared object-response ceiling.
     assert runtime.MAX_OBJECT_BYTES <= limits.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES <= limits.MAX_PAGE_BATCH_BYTES

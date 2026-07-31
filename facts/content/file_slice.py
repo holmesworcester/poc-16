@@ -14,6 +14,7 @@ from .._policy import FamilyPolicy, Parent, author_selectors
 
 
 TAG = "file_slice"
+SLICE_INDEX = "file.slice"
 POLICY = FamilyPolicy(suppression=(Parent("file"),))
 
 
@@ -26,7 +27,10 @@ def file_slice(workspace, file_fid, index, proof, ts):
         TAG,
         ts,
         author_selectors(POLICY, {"file": file_fid})
-        + [["ref", "file", file_fid]],
+        + [
+            ["offer", SLICE_INDEX, file_fid, str(index)],
+            ["ref", "file", file_fid],
+        ],
         {
             "i": index,
             "proof": base64.b64encode(proof).decode("ascii"),
@@ -65,17 +69,15 @@ def index_of(fact):
 
 
 def payload(fact, descriptor):
-    """Return this fact's bytes after checking the descriptor's Bao root."""
+    """Extract bytes whose fact was already certified during admission."""
     index = index_of(fact)
     if descriptor.t != "file_bao" \
             or fact.ws != descriptor.ws \
             or fact.refs() != [("file", descriptor.fid)] \
             or fact.ts != descriptor.ts \
-            or not 0 <= index < descriptor.body["n"]:
+            or not 0 <= index < bao.geometry(descriptor.body["size"]):
         raise ValueError("file slice descriptor")
-    return bao.verify(
-        proof_bytes(fact), descriptor.body["root"], index,
-        descriptor.body["size"])
+    return bao.extract(proof_bytes(fact), index, descriptor.body["size"])
 
 
 # VALIDATE
@@ -92,7 +94,8 @@ def validate(fact, ctx):
         if descriptor is None or descriptor.t != "file_bao" \
                 or descriptor.ws != fact.ws \
                 or fact.ts != descriptor.ts \
-                or not 0 <= index < descriptor.body["n"]:
+                or not 0 <= index < bao.geometry(
+                    descriptor.body["size"]):
             return False
         if len(bao.verify(
                 proof, descriptor.body["root"], index,

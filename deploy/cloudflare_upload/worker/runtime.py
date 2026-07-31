@@ -23,8 +23,7 @@ from deploy.upload_broker_http import (
 from deploy.upload_keyring import decode_keyring
 
 
-UPLOAD_PROTOCOL = "isolated-ingress-v1"
-UPLOAD_ORDER = "objects-first-pile-last"
+UPLOAD_PROTOCOL = "exact-pile-v2"
 MAX_REQUEST_CHUNKS = 65_536
 
 
@@ -59,6 +58,7 @@ class Settings:
     ingress_access_key_id: str
     ingress_secret_access_key: str = field(repr=False)
     session_policy: object = field(repr=False)
+    applier: object = field(repr=False)
 
     @classmethod
     def from_env(cls, env, *, clock):
@@ -66,8 +66,7 @@ class Settings:
                 or _text(
                     env, "CANONICAL_BUCKET_PROFILE",
                 ) != "dedicated-workspace" \
-                or _text(env, "UPLOAD_PROTOCOL") != UPLOAD_PROTOCOL \
-                or _text(env, "UPLOAD_ORDER") != UPLOAD_ORDER:
+                or _text(env, "UPLOAD_PROTOCOL") != UPLOAD_PROTOCOL:
             raise ValueError("upload broker role binding")
         workspace = _text(env, "WORKSPACE")
         if not valid_fid(workspace):
@@ -109,6 +108,9 @@ class Settings:
             raise ValueError("UPLOAD_SESSION_KEYRING binding") from error
         if keyring.policy.issuer != _text(env, "UPLOAD_ISSUER"):
             raise ValueError("UPLOAD_ISSUER binding")
+        applier = getattr(env, "APPLIER")
+        if not callable(getattr(applier, "apply", None)):
+            raise ValueError("APPLIER service binding")
         return cls(
             workspace,
             read_config,
@@ -118,6 +120,7 @@ class Settings:
             ingress_access,
             ingress_secret,
             keyring.policy,
+            applier,
         )
 
 
@@ -225,12 +228,18 @@ def broker(settings, fetch, clock, nonce):
         fetch,
         clock=clock,
     )
+    async def apply_exact(key, digest):
+        value = await settings.applier.apply(key, digest)
+        convert = getattr(value, "to_py", None)
+        return convert() if callable(convert) else value
+
     return UploadBrokerEndpoint(UploadBroker(
         reader,
         settings.workspace,
         signer,
         clock,
         settings.session_policy,
+        apply_exact=apply_exact,
         nonce=nonce,
     ))
 

@@ -26,10 +26,17 @@ from facts.content import file_slice
 from facts.content.message import message
 
 from .shared_bucket import ScriptedBucket
-from .util import add_member, inject_device_claim, member_src, send_bytes
+from .util import (
+    add_member,
+    apply_planted,
+    inject_device_claim,
+    member_src,
+    plant_for,
+    send_bytes,
+)
 
 
-MEMBER = "feed7feed7feed7f"
+MEMBER = "f" * 64
 
 
 def run(awaitable):
@@ -56,8 +63,10 @@ def _reader(workspace, store, root=None):
 
 
 def _stage_apply(applier, raw, member=MEMBER, **options):
-    source = run(applier.stage(member, raw))
-    return source, run(applier.apply(source, **options))
+    if options:
+        raise ValueError("apply_exact has no alternate commit options")
+    source = run(plant_for(applier, member, raw))
+    return source, run(apply_planted(applier, source))
 
 
 def _message_pile(node, workspace, text, ts):
@@ -122,29 +131,30 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
     store_b = bucket.handle("bob")
     worker_a = RepositoryApplier(workspace, store_a)
     worker_b = RepositoryApplier(workspace, store_b)
-    source_a = run(worker_a.stage("alice", first_raw))
-    source_b = run(worker_b.stage("bob", second_raw))
-
-    proposal_a = run(worker_a.propose(source_a, h(first_raw), first_raw))
-    proposal_b = run(worker_b.propose(source_b, h(second_raw), second_raw))
-    assert proposal_a.base_token == proposal_b.base_token
-    assert proposal_a.base_token.value.startswith("opaque:")
-
-    won = run(worker_a.commit(source_a, h(first_raw), proposal_a))
-    lost = run(worker_b.commit(source_b, h(second_raw), proposal_b))
+    source_a = run(plant_for(worker_a, "a" * 64, first_raw))
+    source_b = run(plant_for(worker_b, "b" * 64, second_raw))
+    paused = bucket.pause("alice", "cas", "root", when="before")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        losing = pool.submit(run, apply_planted(worker_a, source_a))
+        paused.wait()
+        try:
+            won = run(apply_planted(worker_b, source_b))
+        finally:
+            paused.release.set()
+        lost = losing.result(timeout=10)
     assert won.status == "applied"
     assert lost.status == "retryable"
     assert store_a.get(source_a) == first_raw
     assert store_b.get(source_b) == second_raw
 
-    retried = run(RepositoryApplier(
-        workspace, store_b).apply(source_b))
+    retried = run(apply_planted(
+        RepositoryApplier(workspace, store_a), source_a))
     assert retried.status == "applied"
-    assert store_b.get(source_b) == second_raw
+    assert store_a.get(source_a) == first_raw
     assert store_a.get(source_a) == first_raw
 
-    recovered = run(RepositoryApplier(
-        workspace, store_a).apply(source_a))
+    recovered = run(apply_planted(
+        RepositoryApplier(workspace, store_b), source_b))
     assert recovered.status == "noop"
     assert store_a.get(source_a) == first_raw
     reader = _reader(workspace, store_a)
@@ -185,7 +195,7 @@ def test_applier_reconciles_unknown_root_cas(
         node, workspace, "survives ambiguity", 10)
     store = node.store(workspace)
     applier = node.applier(workspace)
-    source = run(applier.stage(MEMBER, raw))
+    source = run(plant_for(applier, MEMBER, raw))
     real_cas, calls = store.cas, 0
 
     def ambiguous(key, token, value):
@@ -200,13 +210,13 @@ def test_applier_reconciles_unknown_root_cas(
 
     monkeypatch.setattr(store, "cas", ambiguous)
     if applied_before_loss:
-        result = run(applier.apply(source))
-        assert result.status == "confirmed"
+        result = run(apply_planted(applier, source))
+        assert result.status == "applied"
     else:
-        assert run(applier.apply(source)).status == "retryable"
+        assert run(apply_planted(applier, source)).status == "retryable"
         assert store.get(source) == raw
-        result = run(RepositoryApplier(
-            workspace, store).apply(source))
+        result = run(apply_planted(
+            RepositoryApplier(workspace, store), source))
         assert result.status == "applied"
 
     assert store.get(source) == raw
@@ -227,16 +237,16 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
     bob_store = bucket.handle("bob")
     alice = RepositoryApplier(workspace, alice_store)
     bob = RepositoryApplier(workspace, bob_store)
-    source_a = run(alice.stage("alice", first_raw))
-    source_b = run(bob.stage("bob", second_raw))
+    source_a = run(plant_for(alice, "a" * 64, first_raw))
+    source_b = run(plant_for(bob, "b" * 64, second_raw))
 
     lost_response = bucket.pause(
         "alice", "cas", "root", when="after")
     with ThreadPoolExecutor(max_workers=1) as pool:
-        applying = pool.submit(run, alice.apply(source_a))
+        applying = pool.submit(run, apply_planted(alice, source_a))
         lost_response.wait()
-        later = run(RepositoryApplier(
-            workspace, bob_store).apply(source_b))
+        later = run(apply_planted(
+            RepositoryApplier(workspace, bob_store), source_b))
         assert later.status == "applied"
         lost_response.error = OutcomeUnknown(
             "response lost after a later root won")
@@ -248,8 +258,8 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
     assert alice_store.get(source_a) == first_raw
     assert bob_store.get(source_b) == second_raw
 
-    replay = run(RepositoryApplier(
-        workspace, alice_store).apply(source_a))
+    replay = run(apply_planted(
+        RepositoryApplier(workspace, alice_store), source_a))
     assert replay.status == "noop"
     assert alice_store.get(source_a) == first_raw
     reader = _reader(workspace, alice_store)
@@ -455,7 +465,7 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     _, first = _stage_apply(
         RepositoryApplier(workspace, high_store),
         high[0],
-        member="high",
+        member="a" * 64,
     )
     assert first.status == "applied"
     sid = indexes.fact_key(target_fid)
@@ -470,30 +480,20 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     low_applier = RepositoryApplier(workspace, low_store)
     addition_applier = RepositoryApplier(
         workspace, addition_store)
-    low_source = run(low_applier.stage("low", low[0]))
-    addition_source = run(addition_applier.stage(
-        "addition", addition_raw))
-    low_proposal = run(low_applier.propose(
-        low_source, h(low[0]), low[0]))
-    addition_proposal = run(
-        addition_applier.propose(
-            addition_source, h(addition_raw), addition_raw))
-    assert low_proposal.base_token == addition_proposal.base_token
+    low_source = run(plant_for(low_applier, "c" * 64, low[0]))
+    addition_source = run(plant_for(
+        addition_applier, "d" * 64, addition_raw))
 
     paused = bucket.pause("low", "cas", "root", when="before")
     with ThreadPoolExecutor(max_workers=1) as pool:
         losing = pool.submit(
             run,
-            low_applier.commit(
-                low_source, h(low[0]), low_proposal),
+            apply_planted(low_applier, low_source),
         )
         paused.wait()
         try:
-            added = run(addition_applier.commit(
-                addition_source,
-                h(addition_raw),
-                addition_proposal,
-            ))
+            added = run(apply_planted(
+                addition_applier, addition_source))
             assert added.status == "applied"
         finally:
             paused.release.set()
@@ -502,11 +502,11 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     assert low_store.get(low_source) == low[0]
     assert addition_store.get(addition_source) == addition_raw
 
-    low_retry = run(RepositoryApplier(
-        workspace, low_store).apply(low_source))
+    low_retry = run(apply_planted(
+        RepositoryApplier(workspace, low_store), low_source))
     assert low_retry.status == "applied"
-    addition_replay = run(RepositoryApplier(
-        workspace, addition_store).apply(addition_source))
+    addition_replay = run(apply_planted(
+        RepositoryApplier(workspace, addition_store), addition_source))
     assert addition_replay.status == "noop"
 
     final_reader = _reader(workspace, low_store)
@@ -540,7 +540,7 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     _, serial = _stage_apply(
         RepositoryApplier(workspace, serial_store),
         serial_raw,
-        member="serial",
+        member="f" * 64,
     )
     assert serial.status == "applied"
     assert serial_store.get("root") == final_reader.root_bytes

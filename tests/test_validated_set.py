@@ -12,7 +12,13 @@ from core.repository_applier import RepositoryApplier
 from core.store import FsStore
 from core.validated_set import reconstruct
 
-from .util import all_fids, closed_subset, suppression_world
+from .util import (
+    all_fids,
+    apply_planted,
+    closed_subset,
+    plant_for,
+    suppression_world,
+)
 
 
 def run(awaitable):
@@ -20,8 +26,8 @@ def run(awaitable):
 
 
 def apply(applier, member, raw):
-    source = run(applier.stage(member, raw))
-    return run(applier.apply(source))
+    source = run(plant_for(applier, member, raw))
+    return run(apply_planted(applier, source))
 
 
 def test_unclosed_pile_is_rejected_atomically(tmp_path):
@@ -32,7 +38,7 @@ def test_unclosed_pile_is_rejected_atomically(tmp_path):
     raw = encode_pile((message,), workspace=workspace)
     store = FsStore(str(tmp_path / "recipient"))
 
-    result = apply(RepositoryApplier(workspace, store), "member", raw)
+    result = apply(RepositoryApplier(workspace, store), "a" * 64, raw)
 
     assert result.status == "rejected"
     assert store.get("root") is None
@@ -45,7 +51,7 @@ def test_valid_prefix_of_invalid_pile_publishes_nothing(tmp_path):
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
     genesis = closed_subset(author, workspace, (workspace,))
-    assert apply(applier, "member", genesis).status == "applied"
+    assert apply(applier, "a" * 64, genesis).status == "applied"
     before_root = store.get("root")
     before = reconstruct(
         before_root, lambda oid: store.get("obj/" + oid))
@@ -57,7 +63,7 @@ def test_valid_prefix_of_invalid_pile_publishes_nothing(tmp_path):
         secret, public, message, message.ts)
     mixed = encode_pile((signed, message), workspace=workspace)
 
-    result = apply(applier, "member", mixed)
+    result = apply(applier, "a" * 64, mixed)
 
     assert result.status == "rejected"
     assert store.get("root") == before_root
@@ -79,7 +85,7 @@ def test_successful_closed_pile_publishes_every_durable_fact(tmp_path):
     }
     store = FsStore(str(tmp_path / "recipient"))
 
-    result = apply(RepositoryApplier(workspace, store), "member", raw)
+    result = apply(RepositoryApplier(workspace, store), "a" * 64, raw)
     validated = reconstruct(
         result.root, lambda oid: store.get("obj/" + oid))
 
@@ -126,7 +132,7 @@ def test_fact_delta_has_no_proof_root_dimension(tmp_path):
     # Recompile the earlier validated set to obtain a real pinned peer root.
     from core.repository_snapshot import compile_snapshot
     compiled = compile_snapshot(workspace, base.facts)
-    objects = dict(compiled.outbox)
+    objects = dict(compiled.objects)
     earlier = type(current)(
         compiled.root,
         lambda oid: objects.get(oid) or store.get("obj/" + oid),

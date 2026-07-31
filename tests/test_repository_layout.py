@@ -9,7 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_DOCS = {"AGENTS.md", "DESIGN.md", "README.md"}
-SOURCE_ROOTS = ("core", "full_peer", "facts", "adapters", "deploy")
+SOURCE_ROOTS = (
+    "core", "full_peer", "facts", "notifications", "adapters", "deploy")
 EXCLUDED_PARTS = {
     "__pycache__",
     ".pytest_cache",
@@ -138,8 +139,7 @@ def test_retired_authority_implementations_cannot_return():
         Path("full_peer/upload_client.py")]
     assert class_definitions("UploadSource") == [
         Path("full_peer/upload_journal.py")]
-    assert class_definitions("UploadSourceBuilder") == [
-        Path("full_peer/upload_journal.py")]
+    assert class_definitions("UploadSourceBuilder") == []
     assert class_definitions("Node") == []
     assert class_definitions("RepositoryApplier") == [
         Path("core/repository_applier.py")]
@@ -190,6 +190,41 @@ def test_core_dispatches_through_facts_without_importing_family_modules():
     assert offenders == []
 
 
+def test_repository_core_cannot_own_notification_delivery():
+    """Push is a replayable consequence of a root, never a commit effect."""
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] != "core":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            offenders.extend(
+                (path.as_posix(), name)
+                for name in names
+                if name == "notifications" or name.startswith("notifications."))
+    assert offenders == []
+    assert not (ROOT / "core/delivery_queue.py").exists()
+    applier = (ROOT / "core/repository_applier.py").read_text()
+    assert "publication_effect" not in applier
+    assert "notification" not in applier
+    for name in (
+            "consumer.py",
+            "dispatcher.py",
+            "job.py",
+            "matcher.py",
+            "model.py",
+            "outbox.py",
+            "provider.py",
+            "queue_evidence.py",
+            "target.py"):
+        assert not (ROOT / "notifications" / name).exists()
+
+
 def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
     """Family policy/commands name behavior, never one host implementation."""
     offenders = []
@@ -218,10 +253,10 @@ def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
         "abandon_upload",
         "attachment_io",
         "collect_upload",
+        "create_upload",
         "load_upload",
         "now_ms",
         "run_upload",
-        "start_upload",
         "sync_peer",
         "upload_status",
     } <= {
@@ -278,8 +313,6 @@ def test_full_peer_owns_upload_client_state_not_provider_runtime():
     assert deploy_to_client == []
     for name in (
             "FinalizedUpload",
-            "GrantedUpload",
-            "IssuedUpload",
             "OpenedUpload",
             "UploadCapability"):
         assert class_definitions(name) == [Path("deploy/upload_wire.py")]
@@ -358,8 +391,7 @@ def test_applier_owns_object_establishment_and_exact_source_identity():
     assert "ensure_object" not in object_store_functions
 
     for function, expected in (
-            ("ensure_object_async", {"core/repository_applier.py"}),
-            ("pile_source", {"core/repository_applier.py"})):
+            ("ensure_object_async", {"core/repository_applier.py"}),):
         callers = {
             path.as_posix()
             for path in source_paths()
@@ -494,7 +526,10 @@ def test_ordinary_pile_surfaces_have_no_embedded_object_channel():
         (Path("full_peer/pile_sender.py"), "PileSender", "send"),
         (Path("full_peer/node.py"), "FullPeer", "ingest_new"),
         (Path("facts/_commands.py"), None, "publish"),
-        (Path("core/repository_applier.py"), "RepositoryApplier", "propose"),
+        (Path("core/repository_applier.py"), "RepositoryApplier",
+         "receive_pile"),
+        (Path("core/repository_applier.py"), "RepositoryApplier",
+         "apply_exact"),
     )
     for path, owner, name in surfaces:
         tree = parsed(path)
@@ -796,19 +831,17 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
         item.name: item
         for item in owner.body
         if isinstance(item, ast.AsyncFunctionDef)
-        and item.name in {"apply", "apply_exact", "propose", "commit"}
     }
-    apply = methods["apply"]
-    assert [arg.arg for arg in apply.args.args] == ["self", "source"]
-    assert apply.args.vararg is None
-    assert apply.args.kwarg is None
-    assert apply.args.kwonlyargs == []
+    public = {
+        name for name in methods
+        if not name.startswith("_")
+    }
+    assert public == {"apply_exact", "receive_pile"}
+    assert [arg.arg for arg in methods["receive_pile"].args.args] == [
+        "self", "member", "raw"]
     assert [arg.arg for arg in methods["apply_exact"].args.args] == [
         "self", "source_store", "source", "payload"]
-    assert [arg.arg for arg in methods["propose"].args.args] == [
-        "self", "source", "payload", "raw"]
-    assert [arg.arg for arg in methods["commit"].args.args] == [
-        "self", "source", "payload", "proposal"]
+    assert {"apply", "propose", "commit", "stage"}.isdisjoint(methods)
 
     calls = [
         call.func.attr
@@ -851,9 +884,9 @@ def test_internal_source_identity_has_one_retained_runtime_path():
                 and call.func.attr == name)
         ]
 
-    assert len(calls("stage", "pile_source")) == 1
-    assert len(calls("apply", "check_source")) == 1
-    assert len(calls("apply", "apply_exact")) == 1
+    assert len(calls("_stage", "ingress_key")) == 1
+    assert len(calls("apply_exact", "parse_ingress_key")) == 1
+    assert len(calls("receive_pile", "apply_exact")) == 1
     assert not any(
         calls(method, name)
         for method in methods
@@ -1063,7 +1096,7 @@ def test_full_node_composes_roles_without_a_second_receiving_loop():
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
     ]
-    assert attributes.count("apply") == 1
+    assert attributes.count("apply_exact") == 1
     assert "turn" not in attributes
     assert "list" not in attributes
     assert "list_page" not in attributes

@@ -18,25 +18,21 @@ POLICY = FamilyPolicy(
     direct_targets=DELETE_SELF,
     owner_field="owner",
 )
-WIDTH = bao.WIDTH
 MAX_FILE_BYTES = bao.MAX_FILE_BYTES
 MAX_NAME = 255
 ENCODING = "bao-inline-v1"
 
 
 # SHAPE
-def file(
-        workspace, pk, channel, name, size, root, count, ts, owner=None):
+def file(workspace, pk, channel, name, size, root, ts, owner=None):
     owner = pk if owner is None else owner
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [
             ["offer", "file", root, pk],
-            ["offer", "slices", root, str(count)],
         ],
         {"pk": pk, "owner": owner, "chan": channel, "name": name,
-         "size": size, "root": root, "width": WIDTH, "n": count,
-         "enc": ENCODING},
+         "size": size, "root": root},
         workspace,
     )
 
@@ -55,26 +51,22 @@ def needs(fact):
 def validate(fact, _ctx):
     try:
         body = fact.body
-        if set(body) != {
-                "pk", "owner", "chan", "name", "size", "root", "width",
-                "n", "enc"}:
+        if set(body) != {"pk", "owner", "chan", "name", "size", "root"}:
             return False
         if not all(isinstance(body[key], str) for key in (
-                "pk", "owner", "chan", "name", "root", "enc")) \
-                or not all(type(body[key]) is int for key in (
-                    "size", "n", "width")):
+                "pk", "owner", "chan", "name", "root")) \
+                or type(body["size"]) is not int:
             return False
-        if body["enc"] != ENCODING or body["width"] != WIDTH \
-                or not 0 <= body["size"] <= MAX_FILE_BYTES \
+        if not 0 <= body["size"] <= MAX_FILE_BYTES \
+                or body["size"] == 0 and body["root"] != bao.EMPTY_ROOT \
                 or not body["name"] \
                 or len(body["name"].encode()) > MAX_NAME \
                 or len(body["root"]) != 64 \
-                or any(c not in "0123456789abcdef" for c in body["root"]) \
-                or body["n"] != bao.geometry(body["size"]):
+                or any(c not in "0123456789abcdef" for c in body["root"]):
             return False
         return fact == file(
             fact.ws, body["pk"], body["chan"], body["name"], body["size"],
-            body["root"], body["n"], fact.ts, body["owner"])
+            body["root"], fact.ts, body["owner"])
     except (KeyError, TypeError, UnicodeError, ValueError):
         return False
 
@@ -119,9 +111,8 @@ def _author(node, workspace, channel, path, name, ts, emit):
     with tempfile.TemporaryDirectory(prefix="tinyp2p-bao-") as scratch:
         outboard = os.path.join(scratch, "outboard")
         root = native.prepare(source, outboard)
-        count = bao.geometry(size)
         descriptor = file(
-            workspace, public, channel, label, size, root, count, timestamp,
+            workspace, public, channel, label, size, root, timestamp,
             owner)
         signed = signature.signature(secret, public, descriptor, timestamp)
         descriptor_closed = sender.close(
@@ -130,11 +121,8 @@ def _author(node, workspace, channel, path, name, ts, emit):
         )
         emit(sender.pack(descriptor_closed), descriptor.fid)
 
-        for index in range(count):
+        for index in range(bao.geometry(size)):
             proof = native.proof(source, outboard, index, size)
-            if len(bao.verify(
-                    proof, root, index, size)) != bao.span(index, size)[1]:
-                raise RuntimeError("Bao returned a short slice")
             item = slices.file_slice(
                 workspace, descriptor.fid, index, proof, timestamp)
             emit(sender.pack((*descriptor_closed, item)), item.fid)
@@ -158,33 +146,22 @@ def send(node, workspace, channel, path, name=None, ts=None):
 def upload(
         node, workspace, channel, path, broker_url, provider_origin,
         name=None, ts=None):
-    """Direct-upload each ordinary fact-only pile in descriptor-first order."""
-    results = []
+    """Upload and collect each pile before authoring the next Bao slice."""
+    count = 0
 
     def deliver(raw, _expected):
-        builder = node.start_upload(workspace)
-        try:
-            source = builder.finish(raw)
-        except BaseException:
-            builder.discard()
-            raise
-        results.append(direct_upload(
-            node, workspace, source, broker_url, provider_origin))
+        nonlocal count
+        source = node.create_upload(workspace, raw)
+        result = direct_upload(
+            node, workspace, source, broker_url, provider_origin)
+        count += 1
+        if result["status"] == "rejected":
+            raise ValueError(
+                f"upload rejected; retained source {source.source_id}")
 
     descriptor = _author(
         node, workspace, channel, path, name, ts, deliver)
-    answer = {
-        "fid": descriptor.fid,
-        "piles": len(results),
-        "sessions": [result["session"] for result in results],
-        "uploads": [result["upload"] for result in results],
-    }
-    if len(results) == 1:
-        answer.update({
-            "session": results[0]["session"],
-            "upload": results[0]["upload"],
-        })
-    return answer
+    return {"fid": descriptor.fid, "piles": count}
 
 
 def resume_upload(
@@ -216,14 +193,14 @@ def collect_upload(node, workspace, upload_id):
 
 # QUERIES
 def _record(descriptor, have):
-    body, total = descriptor.body, descriptor.body["n"]
+    body = descriptor.body
+    total = bao.geometry(body["size"])
     return {
         "fid": descriptor.fid,
         "chan": body["chan"],
         "name": body["name"],
         "size": body["size"],
         "root": body["root"],
-        "blob": None,
         "encoding": ENCODING,
         "total": total,
         "have": have,
@@ -271,12 +248,21 @@ def _states(node, workspace, selector=None):
                     source_type=slices.TAG)
                 by_index = None
             else:
-                candidates = select(
-                    REF_INDEX, "file", descriptor.fid,
-                    source_type=slices.TAG)
                 by_index = {}
-                for item in candidates:
-                    by_index.setdefault(slices.index_of(item), item)
+                for position, fid in admitted.postings(
+                        slices.SLICE_INDEX, descriptor.fid,
+                        source_type=slices.TAG):
+                    try:
+                        index = int(position)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("corrupt file slice projection") \
+                            from error
+                    if str(index) != position \
+                            or not 0 <= index < bao.geometry(
+                                descriptor.body["size"]) \
+                            or index in by_index:
+                        raise ValueError("corrupt file slice projection")
+                    by_index[index] = fid
                 have = len(by_index)
             out.append((_record(descriptor, have), descriptor, by_index))
     return sorted(out, key=lambda item: (
@@ -293,29 +279,17 @@ def _resolve_state(node, workspace, selector):
     return states[0] if states else (None, None, None)
 
 
-def _payloads(record, descriptor, by_index):
-    return (
-        slices.payload(by_index[index], descriptor)
-        for index in range(record["total"])
-    )
-
-
-def resolve(node, workspace, selector):
-    return _resolve_state(node, workspace, selector)[0]
-
-
-def bytes_for(node, workspace, fid):
-    record, descriptor, by_index = _resolve_state(node, workspace, fid)
-    if record is None:
-        return None
-    if not record["complete"]:
-        return record["name"], None
-    return record["name"], b"".join(
-        _payloads(record, descriptor, by_index))
+def _payloads(node, workspace, record, descriptor, by_index):
+    for index in range(record["total"]):
+        with node.lock:
+            item = node.sql(workspace).fact(by_index[index])
+        if item is None:
+            raise ValueError("file slice disappeared from validated storage")
+        yield slices.payload(item, descriptor)
 
 
 def save(node, workspace, selector, out_path):
-    """Verify one slice at a time, then atomically replace the target path."""
+    """Stream admitted slices, then atomically replace the target path."""
     record, descriptor, by_index = _resolve_state(
         node, workspace, selector)
     if record is None:
@@ -329,7 +303,8 @@ def save(node, workspace, selector, out_path):
     try:
         written = 0
         with os.fdopen(handle, "wb") as output:
-            for payload in _payloads(record, descriptor, by_index):
+            for payload in _payloads(
+                    node, workspace, record, descriptor, by_index):
                 output.write(payload)
                 written += len(payload)
             output.flush()

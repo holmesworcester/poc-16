@@ -16,11 +16,13 @@ from core.object_store import (
     STALE,
     StoreError,
     ListPage,
+    MAX_PROVIDER_KEY_BYTES,
     Versioned,
     VersionToken,
     authoritative_key,
     validate_create,
     validate_key,
+    validate_store_prefix,
 )
 
 
@@ -56,7 +58,7 @@ class R2BindingStore:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         if self.prefix:
-            validate_key(self.prefix)
+            validate_store_prefix(self.prefix)
         if type(max_list_pages) is not int or max_list_pages < 1:
             raise ValueError("R2 list page budget")
         self.max_list_pages = max_list_pages
@@ -64,7 +66,7 @@ class R2BindingStore:
     def _key(self, key):
         key = validate_key(key)
         physical = f"{self.prefix}/{key}" if self.prefix else key
-        if len(physical.encode("ascii")) > 1024:
+        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("R2 object key exceeds 1024 bytes")
         return physical
 
@@ -80,14 +82,15 @@ class R2BindingStore:
             physical += logical
         if trailing:
             physical += "/"
-        if len(physical.encode("ascii")) > 1024:
+        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("R2 list prefix exceeds 1024 bytes")
         return physical
 
     def _logical(self, physical):
         base = f"{self.prefix}/" if self.prefix else ""
         try:
-            oversized = len(physical.encode("ascii")) > 1024
+            oversized = len(physical.encode("ascii")) > \
+                MAX_PROVIDER_KEY_BYTES
         except UnicodeEncodeError as error:
             raise StoreError("R2 returned an invalid logical key") from error
         if oversized:

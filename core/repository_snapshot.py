@@ -21,7 +21,7 @@ class CompiledSnapshot:
     """Canonical root proposal and every immutable object it emits."""
 
     root: bytes | None
-    outbox: tuple
+    objects: tuple
     fact_oids: dict
 
 
@@ -401,7 +401,7 @@ async def extend_snapshot_awaited(
 
 
 def compile_snapshot(anchor, facts_by_fid):
-    """Build one history-independent root and immutable object outbox."""
+    """Build one history-independent root and its immutable objects."""
     if not facts_by_fid:
         return CompiledSnapshot(None, (), {})
     if anchor not in facts_by_fid:

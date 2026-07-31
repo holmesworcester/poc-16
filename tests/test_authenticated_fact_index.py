@@ -65,7 +65,7 @@ def test_compile_is_history_independent_over_same_validated_set(tmp_path):
         workspace, dict(reversed(tuple(validated.items()))))
 
     assert forward.root == reverse.root
-    assert forward.outbox == reverse.outbox
+    assert forward.objects == reverse.objects
 
 
 def test_current_scopes_are_one_mechanical_definition(tmp_path):

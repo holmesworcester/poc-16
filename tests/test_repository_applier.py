@@ -7,8 +7,8 @@ import facts
 import pytest
 
 from core import crypto
-from core.close import encode_pile
-from core.crypto import h, keypair
+from core.crypto import h
+from core.ingress import InvalidPile, ingress_key
 from core.limits import (
     MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -22,14 +22,14 @@ from core.store import FsStore
 from core.validated_set import reconstruct
 from full_peer.node import FullPeer
 
-from .util import all_fids, closed_subset, suppression_world
+from .util import all_fids, closed_subset, plant_exact, suppression_world
 
 
 def run(awaitable):
     return asyncio.run(awaitable)
 
 
-def test_stage_rejects_bad_type_and_one_over_before_mutation(tmp_path):
+def test_receive_rejects_bad_type_and_one_over_before_mutation(tmp_path):
     class MutationSpy(FsStore):
         def __init__(self, root):
             super().__init__(root)
@@ -42,9 +42,10 @@ def test_stage_rejects_bad_type_and_one_over_before_mutation(tmp_path):
     store = MutationSpy(str(tmp_path / "hosted"))
     applier = RepositoryApplier("0" * 64, store)
     with pytest.raises(TypeError, match="exact ingress bytes"):
-        run(applier.stage("member", "not bytes"))
-    with pytest.raises(PayloadTooLarge, match="pile too large"):
-        run(applier.stage("member", b"x" * (MAX_PILE_BYTES + 1)))
+        run(applier.receive_pile("a" * 64, "not bytes"))
+    with pytest.raises(InvalidPile, match="pile too large"):
+        run(applier.receive_pile(
+            "a" * 64, b"x" * (MAX_PILE_BYTES + 1)))
     assert store.mutations == []
 
 
@@ -88,8 +89,8 @@ def test_exact_async_store_applies_without_sql_list_or_delete(
         lambda *_args, **_kwargs: pytest.fail("applier opened SQLite"),
     )
     applier = RepositoryApplier(workspace, store)
-    key = run(applier.stage("feed7feed7feed7f", raw))
-    result = run(applier.apply(key))
+    key = run(plant_exact(store, workspace, "f" * 64, raw))
+    result = run(applier.apply_exact(store, key, h(raw)))
     assert result.status == "applied"
     assert store.inner.get_bounded(key, MAX_PILE_BYTES) == raw
     assert store.inner.get_bounded("root", MAX_ROOT_BYTES) == \
@@ -101,15 +102,15 @@ def test_apply_exact_needs_caller_key_and_digest(tmp_path):
     raw = closed_subset(source, workspace, all_fids(source, workspace))
     ingress = FsStore(str(tmp_path / "ingress"))
     canonical = FsStore(str(tmp_path / "canonical"))
-    key = "provider/exact/pile"
+    key = ingress_key(workspace, "b" * 32, "c" * 64, h(raw))
     ingress.put_if_absent(key, raw)
     applier = RepositoryApplier(workspace, canonical)
 
     assert list(inspect.signature(applier.apply_exact).parameters) == [
         "source_store", "source", "payload",
     ]
-    rejected = run(applier.apply_exact(ingress, key, "0" * 64))
-    assert rejected.status == "rejected"
+    with pytest.raises(ValueError, match="exact ingress address"):
+        run(applier.apply_exact(ingress, key, "0" * 64))
     assert canonical.get("root") is None
     assert canonical.list("obj/") == []
     assert ingress.get(key) == raw
@@ -126,26 +127,30 @@ def test_missing_and_oversize_exact_sources_are_typed_without_mutation(
     ingress = FsStore(str(tmp_path / "ingress"))
     applier = RepositoryApplier(workspace, canonical)
 
-    missing = run(applier.apply_exact(ingress, "missing", "b" * 64))
+    missing_key = ingress_key(
+        workspace, "c" * 32, "d" * 64, "b" * 64)
+    missing = run(applier.apply_exact(ingress, missing_key, "b" * 64))
     assert missing.status == "retryable"
 
     raw = b"x" * (MAX_PILE_BYTES + 1)
-    ingress.put_if_absent("oversize", raw)
-    oversize = run(applier.apply_exact(ingress, "oversize", h(raw)))
+    oversize_key = ingress_key(
+        workspace, "e" * 32, "f" * 64, h(raw))
+    ingress.put_if_absent(oversize_key, raw)
+    oversize = run(applier.apply_exact(ingress, oversize_key, h(raw)))
     assert oversize.status == "rejected"
     assert canonical.list("") == []
-    assert ingress.get("oversize") == raw
+    assert ingress.get(oversize_key) == raw
 
 
 def test_whole_pile_rejection_precedes_repository_reads(tmp_path):
     workspace = "a" * 64
     store = FsStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
-    key = run(applier.stage("member", b"{}"))
+    key = run(plant_exact(store, workspace, "a" * 64, b"{}"))
     store.read_versioned = lambda _key: pytest.fail(
         "invalid pile read repository state")
 
-    result = run(applier.apply(key))
+    result = run(applier.apply_exact(store, key, h(b"{}")))
     assert result.status == "rejected"
     assert store.get(key) == b"{}"
     assert store.list("obj/") == []
@@ -157,9 +162,9 @@ def test_cold_applier_reproduces_full_peer_root(tmp_path):
     expected = source.store(workspace).get("root")
     store = FsStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
-    key = run(applier.stage("feed7feed7feed7f", raw))
+    key = run(plant_exact(store, workspace, "f" * 64, raw))
 
-    result = run(applier.apply(key))
+    result = run(applier.apply_exact(store, key, h(raw)))
 
     assert result.status == "applied"
     assert store.get(key) == raw
@@ -183,14 +188,14 @@ def test_repository_page_reads_remain_bounded(tmp_path):
     initial = closed_subset(source, workspace, all_fids(source, workspace))
     store = RecordingStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
-    assert run(applier.receive_pile("0123456789abcdef", initial)).status \
+    assert run(applier.receive_pile("0" * 64, initial)).status \
         == "applied"
 
     fid = facts.content.message.post(
         source, workspace, "general", "next", ts=100)
     update = closed_subset(source, workspace, (fid,))
     store.object_reads.clear()
-    assert run(applier.receive_pile("fedcba9876543210", update)).status \
+    assert run(applier.receive_pile("f" * 64, update)).status \
         == "applied"
     assert store.object_reads
     assert all(
@@ -215,18 +220,20 @@ def test_lost_cas_response_replays_from_retained_source(tmp_path):
 
     store = LoseFirstCasReply(str(tmp_path / "hosted"))
     first = RepositoryApplier(workspace, store)
-    key = run(first.stage("feed7feed7feed7f", raw))
-    confirmed = run(first.apply(key))
-    assert confirmed.status == "confirmed"
+    key = run(plant_exact(store, workspace, "f" * 64, raw))
+    confirmed = run(first.apply_exact(store, key, h(raw)))
+    assert confirmed.status == "applied"
     assert store.get(key) == raw
 
-    replay = run(RepositoryApplier(workspace, store).apply(key))
+    replay = run(RepositoryApplier(workspace, store).apply_exact(
+        store, key, h(raw)))
     assert replay.status == "noop"
     assert replay.root == confirmed.root
     assert store.get(key) == raw
 
 
-def test_concurrent_exact_sources_rebase_after_one_root_cas(tmp_path):
+def test_concurrent_cold_apply_exact_reconciles_lost_winner_and_rebases_loser(
+        tmp_path):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     base = closed_subset(source, workspace, all_fids(source, workspace))
@@ -238,42 +245,109 @@ def test_concurrent_exact_sources_rebase_after_one_root_cas(tmp_path):
     second_raw = closed_subset(source, workspace, (second_fid,))
     expected = source.store(workspace).get("root")
 
-    store = FsStore(str(tmp_path / "shared"))
-    left = RepositoryApplier(workspace, store)
-    right = RepositoryApplier(workspace, store)
-    assert run(left.receive_pile("base", base)).status == "applied"
-    left_key = run(left.stage("left", first_raw))
-    right_key = run(right.stage("right", second_raw))
-    left_proposal = run(left.propose(left_key, h(first_raw), first_raw))
-    right_proposal = run(right.propose(right_key, h(second_raw), second_raw))
+    class Interleaved:
+        def __init__(self, path):
+            self.inner = FsStore(path)
+            self.race = False
+            self.reads = 0
+            self.barrier = asyncio.Barrier(2)
+            self.lost_reply = False
 
-    assert run(left.commit(
-        left_key, h(first_raw), left_proposal)).status == "applied"
-    assert run(right.commit(
-        right_key, h(second_raw), right_proposal)).status == "retryable"
-    assert store.get(left_key) == first_raw
-    assert store.get(right_key) == second_raw
-    assert run(RepositoryApplier(
-        workspace, store).apply(right_key)).status == "applied"
-    assert store.get("root") == expected
+        async def get_bounded(self, key, maximum):
+            await asyncio.sleep(0)
+            return self.inner.get_bounded(key, maximum)
+
+        async def read_versioned(self, key):
+            result = self.inner.read_versioned(key)
+            if self.race and key == "root" and self.reads < 2:
+                self.reads += 1
+                await self.barrier.wait()
+            return result
+
+        async def put_if_absent(self, key, value):
+            await asyncio.sleep(0)
+            return self.inner.put_if_absent(key, value)
+
+        async def cas(self, key, token, value):
+            result = self.inner.cas(key, token, value)
+            if isinstance(result, Applied) and not self.lost_reply:
+                self.lost_reply = True
+                raise OutcomeUnknown("winner committed; response was lost")
+            return result
+
+    async def scenario():
+        store = Interleaved(str(tmp_path / "shared"))
+        bootstrap = RepositoryApplier(workspace, store)
+        assert (await bootstrap.receive_pile(
+            "a" * 64, base)).status == "applied"
+        left_key = await plant_exact(
+            store, workspace, "b" * 64, first_raw)
+        right_key = await plant_exact(
+            store, workspace, "c" * 64, second_raw)
+        store.race = True
+        workers = (
+            RepositoryApplier(workspace, store),
+            RepositoryApplier(workspace, store),
+        )
+        collision = await asyncio.gather(
+            workers[0].apply_exact(
+                store, left_key, h(first_raw)),
+            workers[1].apply_exact(
+                store, right_key, h(second_raw)),
+        )
+        assert sorted(result.status for result in collision) == [
+            "applied", "retryable"]
+        loser = next(
+            (key, raw) for key, raw, result in (
+                (left_key, first_raw, collision[0]),
+                (right_key, second_raw, collision[1]),
+            ) if result.status == "retryable"
+        )
+        retried = await RepositoryApplier(
+            workspace, store).apply_exact(store, loser[0], h(loser[1]))
+        assert retried.status == "applied"
+        return store, left_key, right_key
+
+    store, left_key, right_key = run(scenario())
+    assert store.inner.get(left_key) == first_raw
+    assert store.inner.get(right_key) == second_raw
+    assert store.inner.get("root") == expected
+    reader = RepositoryReader(
+        workspace,
+        store.inner.get("root"),
+        lambda oid: store.inner.get("obj/" + oid),
+    )
+    validated = reader.validated()
+    assert {first_fid, second_fid} <= set(validated.fact_ids())
+    # Reading every fact also authenticates all three map roots and postings.
+    assert validated.fact(first_fid).body["text"] == "first"
+    assert validated.fact(second_fid).body["text"] == "second"
 
 
-def test_proposal_is_bound_to_source_digest_and_applier(tmp_path):
-    secret, public = keypair()
-    root = facts.auth.workspace.workspace(secret, public, "root", 1)
-    raw = encode_pile((root,), workspace=root.fid)
-    store = FsStore(str(tmp_path / "hosted"))
-    applier = RepositoryApplier(root.fid, store)
-    key = run(applier.stage("member", raw))
-    proposal = run(applier.propose(key, h(raw), raw))
+def test_bad_exact_addresses_fail_before_any_source_read(tmp_path):
+    class SourceSpy:
+        reads = 0
 
-    with pytest.raises(ValueError, match="proposal binding"):
-        run(applier.commit("another", h(raw), proposal))
-    with pytest.raises(ValueError, match="proposal binding"):
-        run(RepositoryApplier(root.fid, store).commit(
-            key, h(raw), proposal))
-    assert store.get("root") is None
-    assert store.get(key) == raw
+        async def get_bounded(self, _key, _maximum):
+            self.reads += 1
+            raise AssertionError("bad address reached source storage")
+
+    workspace = "a" * 64
+    source = SourceSpy()
+    applier = RepositoryApplier(
+        workspace, FsStore(str(tmp_path / "canonical")))
+    digest = "d" * 64
+    bad = (
+        ("not/an/ingress/key", digest),
+        (ingress_key(
+            "b" * 64, "c" * 32, "e" * 64, digest), digest),
+        (ingress_key(
+            workspace, "c" * 32, "e" * 64, digest), "f" * 64),
+    )
+    for key, claimed in bad:
+        with pytest.raises(ValueError, match="exact ingress address"):
+            run(applier.apply_exact(source, key, claimed))
+    assert source.reads == 0
 
 
 def test_program_failure_retains_source_and_does_not_mutate_root(
@@ -282,14 +356,14 @@ def test_program_failure_retains_source_and_does_not_mutate_root(
     raw = closed_subset(source, workspace, all_fids(source, workspace))
     store = FsStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
-    key = run(applier.stage("member", raw))
+    key = run(plant_exact(store, workspace, "a" * 64, raw))
 
     def failure(*_args, **_kwargs):
         raise RuntimeError("crypto program failure")
 
     monkeypatch.setattr(crypto.signing, "VerifyKey", failure)
     with pytest.raises(RuntimeError, match="crypto program failure"):
-        run(applier.apply(key))
+        run(applier.apply_exact(store, key, h(raw)))
     assert store.get(key) == raw
     assert store.get("root") is None
 

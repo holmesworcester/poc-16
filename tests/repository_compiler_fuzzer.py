@@ -197,8 +197,8 @@ def build_plan(corpus, seed):
     return Plan(seed, tuple(steps))
 
 
-def _retain(objects, outbox):
-    for oid, raw in outbox:
+def _retain(objects, emitted):
+    for oid, raw in emitted:
         assert h(raw) == oid
         incumbent = objects.setdefault(oid, raw)
         assert incumbent == raw
@@ -227,7 +227,7 @@ def run_plan(corpus, plan, incremental=extend_snapshot):
     resident = {corpus.workspace: corpus.anchor}
     current = compile_snapshot(corpus.workspace, resident)
     objects, roots, suppression, prefix = {}, {}, {}, []
-    _retain(objects, current.outbox)
+    _retain(objects, current.objects)
 
     for step in plan.steps:
         prefix.append(step)
@@ -246,18 +246,18 @@ def run_plan(corpus, plan, incremental=extend_snapshot):
             assert candidate.fact_oids == {
                 fid: expected_oids[fid] for fid in incoming}
 
-            full_outbox = dict(full.outbox)
-            assert len(full_outbox) == len(full.outbox)
-            candidate_outbox = dict(candidate.outbox)
-            assert len(candidate_outbox) == len(candidate.outbox)
+            full_objects = dict(full.objects)
+            assert len(full_objects) == len(full.objects)
+            candidate_objects = dict(candidate.objects)
+            assert len(candidate_objects) == len(candidate.objects)
             # Incremental publication may establish unreachable intermediate
             # path roots. They are harmless immutable garbage; only the final
             # root must match the history-independent full compiler.
             assert all(h(raw) == oid
-                       for oid, raw in candidate_outbox.items())
-            _retain(objects, candidate.outbox)
+                       for oid, raw in candidate_objects.items())
+            _retain(objects, candidate.objects)
             assert all(
-                objects.get(oid) == raw for oid, raw in full.outbox)
+                objects.get(oid) == raw for oid, raw in full.objects)
 
             decoded, actual_rows = _root_rows(candidate.root, objects)
             assert set(decoded.maps) == set(snapshot.MAP_NAMES)
@@ -276,7 +276,7 @@ def run_plan(corpus, plan, incremental=extend_snapshot):
 
             if not set(incoming) - set(resident):
                 assert candidate.root == previous_root
-                assert candidate.outbox == ()
+                assert candidate.objects == ()
             resident, current = expected_facts, candidate
             roots[step.name] = candidate.root
             suppression[step.name] = dict(expected_rows[indexes.SUPP])

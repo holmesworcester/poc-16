@@ -169,7 +169,7 @@ def test_grant_is_sealed_to_requester(world):
         node.sk, base64.b64decode(body["grant"])).decode()
     assert code == 200
     assert http.check_token(
-        handler.secret, "Bearer " + token, workspace) == node.pk[:16]
+        handler.secret, "Bearer " + token, workspace) == node.pk
     other, _ = keypair()
     with pytest.raises(CryptoError):
         unseal(other, base64.b64decode(body["grant"]))

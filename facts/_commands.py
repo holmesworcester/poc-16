@@ -102,8 +102,9 @@ def direct_upload(
 
     result = node.run_upload(
         source, broker_url, provider_origin, proof)
-    return {
-        "objects": result.object_count,
-        "session": result.session,
-        "upload": result.source_id,
-    }
+    answer = {"status": result.status, "session": result.session}
+    if result.status in {"applied", "noop"}:
+        node.collect_upload(workspace, source.source_id)
+    else:
+        answer["upload"] = source.source_id
+    return answer

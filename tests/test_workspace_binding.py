@@ -23,6 +23,7 @@ from full_peer import sql_store
 from facts.auth import request
 from facts.auth import user as user_family
 from facts.auth import user_invite as user_invite_family
+from .util import apply_planted, plant_for
 from facts.auth.signature import signature
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
@@ -97,9 +98,10 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
     monkeypatch.setattr(facts, "family_for", observed_family)
     store = FsStore(str(tmp_path / "receiver"))
     applier = RepositoryApplier(second, store)
-    source = run(applier.stage(node.member_for(second), hostile))
+    source = run(plant_for(
+        applier, node.member_for(second), hostile))
 
-    result = run(applier.apply(source))
+    result = run(apply_planted(applier, source))
 
     assert family_calls == []
     assert result.status == "rejected"
@@ -180,9 +182,10 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
         first, node.identity_id(first), "general", "not second", 101)
     foreign_pile = encode_pile([foreign], workspace=first)
     root = store.get("root")
-    source = run(node.applier(second).stage(
-        node.member_for(second), foreign_pile))
-    result = run(node.applier(second).apply(source))
+    applier = node.applier(second)
+    source = run(plant_for(
+        applier, node.member_for(second), foreign_pile))
+    result = run(apply_planted(applier, source))
 
     assert result.status == "rejected"
     assert store.get(source) == foreign_pile

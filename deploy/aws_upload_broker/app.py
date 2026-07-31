@@ -1,7 +1,7 @@
-"""AWS Lambda Function URL adapter for the upload-broker HTTP membrane.
+"""AWS Lambda Function URL adapter for exact-pile upload metadata.
 
-The Lambda receives only OPEN/ISSUE/FINALIZE metadata.  Exact object and pile
-bodies travel from the client to S3 ingress using the returned bearer PUTs.
+The Lambda receives only ``OPEN`` and ``FINALIZE`` metadata.  Each pile body
+travels directly from the client to S3 ingress using one returned bearer PUT.
 """
 import asyncio
 import base64
@@ -12,6 +12,8 @@ import time
 
 from adapters.s3 import S3Config, S3Store
 from core.limits import PayloadTooLarge
+from core.fact import canon
+from core.limits import decode_json
 from deploy.aws_upload_broker.config import (
     FUNCTION_TIMEOUT_SECONDS,
     MAX_LOG_METHOD_CHARS,
@@ -20,6 +22,7 @@ from deploy.aws_upload_broker.config import (
     SDK_CONNECT_TIMEOUT_SECONDS,
     SDK_READ_TIMEOUT_SECONDS,
     SDK_TOTAL_ATTEMPTS,
+    LAMBDA_ARN_RE,
     validate_sdk_budget,
 )
 from deploy.aws_upload_broker.signer import (
@@ -36,6 +39,11 @@ from deploy.upload_broker_http import (
 from deploy.upload_keyring import (
     MAX_KEYRING_BYTES,
     decode_keyring,
+)
+from deploy.repository_apply_wire import (
+    MAX_APPLY_RESULT_BYTES,
+    decode_apply_result,
+    encode_apply_request,
 )
 
 
@@ -159,23 +167,72 @@ def _store():
         connect_timeout=connect,
         read_timeout=read,
         read_total_max_attempts=attempts,
-        probe_access_denied_missing=True,
+        probe_access_denied_missing=False,
     )
     # The broker receives only this narrowed reader, and its IAM role grants no
     # canonical mutation even though the host adapter has a wider interface.
     return AsyncFromSyncReader(S3Store(config))
 
 
+def _applier(workspace):
+    """Return the mandatory synchronous Lambda RPC behind async broker code."""
+    import boto3
+
+    function = _required("TINYP2P_UPLOAD_APPLIER_FUNCTION_ARN")
+    if LAMBDA_ARN_RE.fullmatch(function) is None:
+        raise RuntimeError("invalid repository Applier function ARN")
+    client = boto3.client("lambda", config=_botocore_config())
+
+    async def apply_exact(key, digest):
+        request = canon(encode_apply_request(workspace, key, digest))
+        try:
+            response = client.invoke(
+                FunctionName=function,
+                InvocationType="RequestResponse",
+                Payload=request,
+            )
+        except Exception as error:
+            raise RuntimeError("repository Applier invocation failed") \
+                from error
+        if not isinstance(response, dict) \
+                or response.get("StatusCode") != 200 \
+                or response.get("FunctionError") is not None:
+            raise RuntimeError("repository Applier invocation failed")
+        payload = response.get("Payload")
+        if not callable(getattr(payload, "read", None)):
+            raise RuntimeError("repository Applier response body")
+        try:
+            raw = payload.read(MAX_APPLY_RESULT_BYTES + 1)
+        finally:
+            close = getattr(payload, "close", None)
+            if callable(close):
+                close()
+        if not isinstance(raw, bytes) or len(raw) > MAX_APPLY_RESULT_BYTES:
+            raise RuntimeError("repository Applier response body")
+        try:
+            value = decode_json(
+                raw, MAX_APPLY_RESULT_BYTES,
+                "repository Applier response")
+            decode_apply_result(value)
+        except ValueError as error:
+            raise RuntimeError("repository Applier response body") from error
+        return value
+
+    return apply_exact
+
+
 def _endpoint():
     global _endpoint_cache
     if _endpoint_cache is None:
         signer = _signer()
+        workspace = _required("TINYP2P_UPLOAD_WORKSPACE_ID")
         broker = UploadBroker(
             _store(),
-            _required("TINYP2P_UPLOAD_WORKSPACE_ID"),
+            workspace,
             signer,
             lambda: time.time_ns() // 1_000_000,
             _keyring(signer),
+            apply_exact=_applier(workspace),
         )
         _endpoint_cache = UploadBrokerEndpoint(broker)
     return _endpoint_cache

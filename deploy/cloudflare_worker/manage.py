@@ -26,6 +26,7 @@ from deploy.cloudflare_python import (  # noqa: E402
 from deploy.python_role_modules import (  # noqa: E402
     REPOSITORY_READER_CORE_MODULES,
 )
+from core.object_store import validate_store_prefix  # noqa: E402
 
 BUILD = PACKAGE / "build"
 WORKER = BUILD / "worker"
@@ -35,7 +36,6 @@ GENERATED = PACKAGE / "wrangler.generated.json"
 TEST_FILE = PACKAGE / "test_worker.py"
 
 FID = re.compile(r"^[0-9a-f]{64}$")
-STORE_KEY = re.compile(r"^[a-z0-9:._/-]+$")
 WORKERS_URL = re.compile(r"https://[a-z0-9.-]+\.workers\.dev")
 WORKER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -135,9 +135,9 @@ def _secret(environment):
 
 
 def _store_prefix(value):
-    parts = value.split("/")
-    if not STORE_KEY.fullmatch(value) \
-            or any(not part or part in {".", ".."} for part in parts):
+    try:
+        validate_store_prefix(value)
+    except (TypeError, ValueError, UnicodeError):
         raise ValueError("CF_STORE_PREFIX must be a relative object key")
     return value
 

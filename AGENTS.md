@@ -19,14 +19,15 @@ composition:
 
 - `RepositoryApplier` is database-free. It validates one closed pile, unions
   every durable fact into the validated set, establishes immutable objects,
-  compiles and compare-and-swaps `root`, records rejection evidence, and
-  retires only its exact internal generation.
+  compiles and compare-and-swaps `root`, and returns one bounded exact result.
+  It never deletes ingress.
 - `RepositoryReader` is database-free and side-effect free. It answers from
   one pinned root through `WorkerView` and `ValidatedView`.
 - `HttpGate` is database-free and owns the one peer route and authorization
   table over Applier and Reader.
 - `PileSender` may use SQLite. It closes local intent, encodes ordinary piles,
-  and delivers them. It cannot publish a root or retire ingress.
+  uploads each exact pile, and directly asks the recipient to apply that key.
+  It cannot publish a root or delete ingress.
 
 A hosted peer uses Applier, Reader, and HttpGate. `FullPeer` adds PileSender,
 local identities, scheduling, local control, attachment I/O, and the
@@ -62,10 +63,12 @@ wire:    one bounded, topologically ordered closed pile
 stored:  fid -> canonical fact-object oid
 ```
 
-The pile is the validation certificate. If any member fails, the whole pile
-fails and no valid prefix is published. After a successful root CAS, every
-durable fact is an equal resident; ephemeral facts are discarded. Do not store
-the selected dependency edges, proof DAGs, ranks, winners, eligibility labels,
+The pile supplies the one-time validation closure at the ingress door. If any
+member fails, the whole pile fails and no valid prefix is published. After a
+successful root CAS, authenticated residence is the durable admission
+certificate: every durable fact is an equal resident and ephemeral facts are
+discarded. Do not store the selected dependency edges, proof DAGs, ranks,
+winners, eligibility labels,
 dormant candidates, or a second settlement state.
 
 Validated storage is monotone:
@@ -91,8 +94,7 @@ closed pile
   -> repository_snapshot's pure three-map compiler
   -> immutable object establishment
   -> the sole root CAS
-  -> exact outcome spend
-  -> the sole internal-generation retirement attempt
+  -> applied, noop, rejected, or retryable result
   -> RepositoryReader
 ```
 
@@ -103,20 +105,23 @@ FactTree residence and its SuppTree scopes directly. SQLite mirrors canonical
 fact bytes plus generic index rows for local authorship and presentation only;
 it must be deletable and rebuildable from a pinned Reader.
 
-Direct-upload clients write one exact fact-only closed-pile marker into
-isolated ingress. File descriptors and each inline Bao slice are independent
-piles. Notifications and LIST results are liveness hints only. The Applier
-uses an exact marker as the stable identity of one durably reserved internal
-generation and invokes the same transition used by a full peer.
+Direct-upload clients write one exact closed pile to isolated ingress and then
+call broker `FINALIZE`; the broker invokes the recipient with that exact key.
+The sender retries retryable or lost results. There is no server-side ingress
+queue, LIST drain, detached-object completion pass, or internal pile copy. The
+Applier invokes the same transition for a hosted recipient and a full peer and
+leaves ingress immutable for a separate retention lifecycle.
 
 ## Fact families
 
 Use one module per family under `facts/auth/` or `facts/content/`. Families own
 construction, exact shape checks, named Needs, immutable refs/offers,
 suppression selectors/actions, authority scopes, ownership, commands, query
-assembly, and inline payload validation. `facts/__init__.py` is the checked
-registry. Keep core family-neutral; it may dispatch through `facts`, but it
-must not import concrete family modules or switch on their tags.
+assembly, and any inline authenticated payload format. `facts/__init__.py` is
+the checked registry. Keep core family-neutral; it may dispatch through
+`facts`, but it must not import concrete family modules or switch on their
+tags. Bao descriptors and slices are ordinary facts; each slice carries the
+payload and range proof needed for independent admission.
 
 Needs use complete offer addresses. A fact may also name an exact provider in
 its envelope when identity matters. Do not infer durable ownership from a
@@ -134,20 +139,16 @@ bounded APIs. Discovery uses bounded pagination. Never rely on ETags being
 content hashes, unconditional replacement, whole-GET/whole-LIST fallbacks, or
 LIST for safety.
 
-Internal generation identity comes from a never-deleted create-only reservation,
-not from a path segment, random nonce, or provider ETag. Identical workspace,
-member, payload, and marker bindings are one logical delivery. After exact
-publication or bounded, content-addressed rejection evidence exists, a
-create-only outcome-bound spend grants at most one DELETE. Rejection evidence
-binds the exact workspace, source, generation, payload, and permanent verdict;
-its definite fresh spend and exact read-backs are required before deletion.
-`EXISTS` and outcome-unknown deny deletion; a safe orphan is preferable to
-retiring recreated work.
+One exact create-only ingress key and its digest identify one delivery attempt.
+It is staging, not a server-side queue or repository authority. Provider
+retention may eventually collect it, but `RepositoryApplier` has no ingress
+DELETE capability and publication correctness never depends on collection.
+Lost requests and responses are recovered by sender retry; an already-applied
+pile returns an idempotent result from the authenticated repository.
 
 Stale workers may duplicate bounded immutable work or delay convergence. They
 must not overwrite different bytes at an object key, clobber a newer root,
-retire another generation, mint from unobserved state, or corrupt a Merkle
-tree.
+delete ingress, mint from unobserved state, or corrupt a Merkle tree.
 
 ## Change rules
 
@@ -180,7 +181,7 @@ Go repository and cannot be configured here. The repository-owned command
 runs these underlying gates:
 
 ```sh
-python3 -m compileall -q core full_peer facts adapters deploy bench tests tools
+python3 -m compileall -q core full_peer facts notifications adapters deploy bench tests tools
 python3 -m pytest -q
 python3 -m pytest -q tests/test_repository_layout.py
 git diff --check

@@ -1,48 +1,34 @@
-"""Full-peer-local durable authority for a resumable direct upload.
+"""Crash-safe full-peer state for one exact-pile upload.
 
-``source.json`` and its bodies are immutable. ``session.json`` is one atomic
-record whose separate cursor/cursor_index/delivered_index fields preserve the
-only important crash distinction: authority issued is not a delivery receipt.
-No database or provider credential is involved.
+Each source directory contains immutable ``source.json`` and ``pile`` files,
+plus at most one replaceable fixed-expiry lease.  This is local retry state,
+not repository authority or a server-side queue.
 """
 from bisect import bisect_right
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import fcntl
 import os
 import shutil
-import tempfile
+import stat
 import threading
 
 from core.crypto import h
 from core.fact import canon
-from core.limits import (
-    MAX_OBJECT_BYTES,
-    MAX_PILE_BYTES,
-    PAGE_BATCH,
-    decode_json,
-)
+from core.limits import MAX_PILE_BYTES, PAGE_BATCH, decode_json
 from core.shape import valid_fid
-from core.staged_intent import MEMBER_HEX_BYTES, SESSION_HEX_BYTES
-from deploy.upload_session import (
-    MAX_SESSION_CLOCK_SKEW_MS,
-    MAX_SESSION_OBJECTS,
-    UploadLeaf,
-    UploadManifest,
-    UploadVector,
-    valid_cursor,
-)
+from core.ingress import MEMBER_HEX_CHARS, SESSION_HEX_CHARS
+from deploy.upload_session import UploadLeaf, valid_cursor
+import deploy.upload_wire as wire
 
 
-SOURCE_SCHEMA = "poc16-upload-source-v1"
-SESSION_SCHEMA = "poc16-upload-client-session-v2"
-LEGACY_SESSION_SCHEMA = "poc16-upload-client-session-v1"
-ABANDONED_SCHEMA = "poc16-upload-abandoned-v1"
-MAX_SOURCE_DOCUMENT_BYTES = 16 * 1024 * 1024
-MAX_SESSION_DOCUMENT_BYTES = 16 * 1024
-MAX_ABANDONED_DOCUMENT_BYTES = 1024
-MAX_UPLOAD_SOURCES = 4096
+SOURCE_SCHEMA = "poc16-upload-source-v2"
+SESSION_SCHEMA = "poc16-upload-client-session-v4"
+MAX_SOURCE_DOCUMENT_BYTES = 1_024
+MAX_SESSION_DOCUMENT_BYTES = 16 * 1_024
+MAX_UPLOAD_SOURCES = 4_096
 MAX_UPLOAD_DIRECTORY_ENTRIES = MAX_UPLOAD_SOURCES * 2 + 16
+_TERMINAL = frozenset(("applied", "noop", "rejected"))
 
 
 class UploadJournalError(ValueError):
@@ -51,13 +37,7 @@ class UploadJournalError(ValueError):
 
 def _hex(value, length):
     return isinstance(value, str) and len(value) == length \
-        and all(c in "0123456789abcdef" for c in value)
-
-
-def _covers_expiry(proposed, current):
-    """None is the fail-closed top value: an unknowable historical expiry."""
-    return proposed is None if current is None \
-        else proposed is None or proposed >= current
+        and all(character in "0123456789abcdef" for character in value)
 
 
 def _sync_dir(path):
@@ -75,8 +55,9 @@ def _lock(path, *, blocking=True):
     try:
         try:
             fcntl.flock(
-                fd, fcntl.LOCK_EX
-                | (0 if blocking else fcntl.LOCK_NB))
+                fd,
+                fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB),
+            )
             locked = True
         except BlockingIOError as error:
             raise UploadJournalError("upload source is active") from error
@@ -88,18 +69,20 @@ def _lock(path, *, blocking=True):
 
 
 def _root_lock(root):
-    return _lock(os.path.join(root, ".catalog.lock"))
+    return _lock(os.path.join(root, ".journal.lock"))
 
 
 def _source_lock(root, source_id, *, blocking=True):
     locks = os.path.join(root, ".locks")
     os.makedirs(locks, exist_ok=True)
-    return _lock(
-        os.path.join(locks, source_id[:4]), blocking=blocking)
+    return _lock(os.path.join(locks, source_id[:4]), blocking=blocking)
 
 
 def _new(path, raw):
-    with open(path, "xb") as out:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL \
+        | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as out:
         out.write(raw)
         out.flush()
         os.fsync(out.fileno())
@@ -128,11 +111,16 @@ def _replace(path, raw):
 
 
 def _read(path, maximum, label):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        if not 0 <= os.path.getsize(path) <= maximum:
-            raise UploadJournalError(f"{label} exceeds limit")
-        with open(path, "rb") as source:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 <= info.st_size <= maximum:
+                raise UploadJournalError(f"{label} exceeds limit")
             raw = source.read(maximum + 1)
+    except UploadJournalError:
+        raise
     except OSError as error:
         raise UploadJournalError(f"{label} unavailable") from error
     if len(raw) > maximum:
@@ -140,40 +128,33 @@ def _read(path, maximum, label):
     return raw
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UploadProgress:
     source_id: str
     session: str
     cursor: str
-    cursor_index: int
-    delivered_index: int
     expires_at_ms: int
-    issued_until_ms: int | None
-    pile_delivered: bool = False
+    capability: wire.UploadCapability
+    status: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UploadStatus:
     source_id: str
     workspace: str
     member: str
     state: str
-    object_count: int
-    cursor_index: int
-    delivered_index: int
     expires_at_ms: int | None
-    collect_after_ms: int | None
     collectible: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class UploadStatusPage:
     uploads: tuple[UploadStatus, ...]
     cursor: str | None
 
 
 def _source_ids(root):
-    """Return one bounded snapshot of content-addressed source names."""
     names = []
     try:
         entries = os.scandir(root)
@@ -190,145 +171,120 @@ def _source_ids(root):
     return tuple(sorted(names))
 
 
-class UploadSourceBuilder:
-    """Spool present objects once, then atomically name the complete source."""
-
-    def __init__(self, root, workspace, member):
-        if not valid_fid(workspace) or not _hex(member, MEMBER_HEX_BYTES):
-            raise ValueError("upload source authority")
-        self.root = os.path.abspath(os.fspath(root))
-        os.makedirs(self.root, exist_ok=True)
-        building = os.path.join(self.root, ".building")
-        os.makedirs(building, exist_ok=True)
-        os.makedirs(os.path.join(self.root, ".locks"), exist_ok=True)
-        self.temporary = tempfile.mkdtemp(
-            prefix="source-", dir=building)
-        os.mkdir(os.path.join(self.temporary, "objects"))
-        self.workspace, self.member, self.sizes = workspace, member, {}
-        self.done = False
-
-    def add(self, raw):
-        if self.done or not isinstance(raw, bytes) \
-                or len(raw) > MAX_OBJECT_BYTES:
-            raise ValueError("upload object bytes")
-        digest = h(raw)
-        if digest in self.sizes:
-            return digest
-        if len(self.sizes) >= MAX_SESSION_OBJECTS:
-            raise UploadJournalError("upload object count")
-        _new(os.path.join(self.temporary, "objects", digest), raw)
-        self.sizes[digest] = len(raw)
-        return digest
-
-    def finish(self, pile):
-        if self.done or not isinstance(pile, bytes) \
-                or len(pile) > MAX_PILE_BYTES:
-            raise ValueError("upload pile bytes")
-        self.done = True
-        try:
-            leaves = tuple(
-                UploadLeaf(digest, self.sizes[digest])
-                for digest in sorted(self.sizes))
-            vector, pile_leaf = UploadVector(leaves), UploadLeaf(
-                h(pile), len(pile))
-            document = {
-                "manifest": asdict(vector.manifest),
-                "member": self.member,
-                "objects": [asdict(leaf) for leaf in leaves],
-                "pile": asdict(pile_leaf),
-                "schema": SOURCE_SCHEMA,
-                "workspace": self.workspace,
-            }
-            raw = canon(document)
-            source_id = h(raw)
-            if len(raw) > MAX_SOURCE_DOCUMENT_BYTES:
-                raise UploadJournalError("upload source document")
-            _new(os.path.join(self.temporary, "pile"), pile)
-            _new(os.path.join(self.temporary, "source.json"), raw)
-            _sync_dir(os.path.join(self.temporary, "objects"))
-            _sync_dir(self.temporary)
-            target = os.path.join(self.root, source_id)
-            with _root_lock(self.root):
-                if os.path.isdir(target):
-                    if _read(
-                            os.path.join(target, "source.json"),
-                            MAX_SOURCE_DOCUMENT_BYTES,
-                            "upload source") != raw:
-                        raise UploadJournalError("upload source collision")
-                    shutil.rmtree(self.temporary)
-                else:
-                    if len(_source_ids(self.root)) >= MAX_UPLOAD_SOURCES:
-                        raise UploadJournalError("upload source count")
-                    os.rename(self.temporary, target)
-                    _sync_dir(self.root)
-            return UploadSource.load(target)
-        except BaseException:
-            if os.path.isdir(self.temporary):
-                shutil.rmtree(self.temporary)
-            raise
-
-    def discard(self):
-        if not self.done:
-            self.done = True
-            shutil.rmtree(self.temporary)
-
-
 class UploadSource:
-    """Validated immutable upload inputs and their atomic session journal."""
+    """One immutable local pile and its replaceable current lease."""
 
-    def __init__(self, path, raw, workspace, member, vector, pile):
-        self.path, self.raw = os.path.abspath(path), raw
-        self.source_id, self.workspace, self.member = (
-            h(raw), workspace, member)
-        self.vector, self.pile = vector, pile
+    def __init__(self, path, source_id, workspace, member, pile):
+        self.path = os.path.abspath(path)
+        self.source_id, self.workspace, self.member = \
+            source_id, workspace, member
+        self.pile = pile
         self._writer = threading.local()
 
     @classmethod
-    def _load(cls, path, *, bodies):
+    def create(cls, root, workspace, member, pile):
+        """Atomically retain one exact pile; the call has no open builder."""
+        if not valid_fid(workspace) or not _hex(member, MEMBER_HEX_CHARS):
+            raise ValueError("upload source authority")
+        if not isinstance(pile, bytes) or len(pile) > MAX_PILE_BYTES:
+            raise ValueError("upload pile bytes")
+        root = os.path.abspath(os.fspath(root))
+        leaf = UploadLeaf(h(pile), len(pile))
+        raw = canon({
+            "member": member,
+            "pile": {"digest": leaf.digest, "size": leaf.size},
+            "schema": SOURCE_SCHEMA,
+            "workspace": workspace,
+        })
+        source_id = h(raw)
+        target = os.path.join(root, source_id)
+        temporary = os.path.join(root, ".creating")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(os.path.join(root, ".locks"), exist_ok=True)
+        with _root_lock(root):
+            # The journal lock makes this fixed path a crash-recovery slot, not
+            # an unbounded family of abandoned builder directories.
+            for stale in (temporary, os.path.join(root, ".building")):
+                if os.path.lexists(stale):
+                    if os.path.islink(stale) or not os.path.isdir(stale):
+                        raise UploadJournalError(
+                            "upload creation collision")
+                    shutil.rmtree(stale)
+                    _sync_dir(root)
+            os.mkdir(temporary, 0o700)
+            try:
+                _new(os.path.join(temporary, "pile"), pile)
+                _new(os.path.join(temporary, "source.json"), raw)
+                _sync_dir(temporary)
+                if os.path.isdir(target) and not os.path.islink(target):
+                    if _read(
+                            os.path.join(target, "source.json"),
+                            MAX_SOURCE_DOCUMENT_BYTES,
+                            "upload source") != raw \
+                            or _read(
+                                os.path.join(target, "pile"),
+                                MAX_PILE_BYTES,
+                                "upload pile") != pile:
+                        raise UploadJournalError(
+                            "upload source collision")
+                    shutil.rmtree(temporary)
+                    _sync_dir(root)
+                else:
+                    if os.path.lexists(target):
+                        raise UploadJournalError(
+                            "upload source collision")
+                    if len(_source_ids(root)) >= MAX_UPLOAD_SOURCES:
+                        raise UploadJournalError("upload source count")
+                    os.rename(temporary, target)
+                    _sync_dir(root)
+            except BaseException:
+                if os.path.isdir(temporary) \
+                        and not os.path.islink(temporary):
+                    shutil.rmtree(temporary)
+                    _sync_dir(root)
+                raise
+        return cls.load(target)
+
+    @classmethod
+    def _load(cls, path, *, body):
         path = os.path.abspath(os.fspath(path))
+        if os.path.islink(path):
+            raise UploadJournalError("upload source unavailable")
         raw = _read(
             os.path.join(path, "source.json"),
-            MAX_SOURCE_DOCUMENT_BYTES, "upload source")
+            MAX_SOURCE_DOCUMENT_BYTES,
+            "upload source",
+        )
         try:
-            value = decode_json(
-                raw, MAX_SOURCE_DOCUMENT_BYTES, "upload source")
-            if canon(value) != raw or set(value) != {
-                    "manifest", "member", "objects", "pile",
-                    "schema", "workspace"} \
+            value = decode_json(raw, MAX_SOURCE_DOCUMENT_BYTES, "upload source")
+            if canon(value) != raw or not isinstance(value, dict) \
+                    or set(value) != {"member", "pile", "schema", "workspace"} \
                     or value["schema"] != SOURCE_SCHEMA \
                     or not valid_fid(value["workspace"]) \
-                    or not _hex(value["member"], MEMBER_HEX_BYTES) \
-                    or not isinstance(value["objects"], list) \
-                    or len(value["objects"]) > MAX_SESSION_OBJECTS:
+                    or not _hex(value["member"], MEMBER_HEX_CHARS) \
+                    or not isinstance(value["pile"], dict) \
+                    or set(value["pile"]) != {"digest", "size"}:
                 raise ValueError
-            leaves = tuple(UploadLeaf(**item) for item in value["objects"])
-            vector, manifest = UploadVector(leaves), UploadManifest(
-                **value["manifest"])
-            pile = UploadLeaf(**value["pile"])
-            if vector.manifest != manifest or not valid_fid(pile.digest) \
-                    or type(pile.size) is not int \
+            pile = UploadLeaf(
+                value["pile"]["digest"], value["pile"]["size"])
+            if not valid_fid(pile.digest) or type(pile.size) is not int \
                     or not 0 <= pile.size <= MAX_PILE_BYTES \
                     or os.path.basename(path) != h(raw):
                 raise ValueError
-        except (TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise UploadJournalError("invalid upload source") from error
         source = cls(
-            path, raw, value["workspace"], value["member"], vector, pile)
-        if bodies:
-            source._verify(
-                source.body_path(pile, "pile"), pile, "pile")
-            for leaf in leaves:
-                source._verify(
-                    source.body_path(leaf, "obj"), leaf, "obj")
+            path, h(raw), value["workspace"], value["member"], pile)
+        if body:
+            source.verify_body()
         return source
 
     @classmethod
     def load(cls, path):
-        return cls._load(path, bodies=True)
+        return cls._load(path, body=True)
 
     @classmethod
     def discover(cls, root, now_ms, cursor=None, *, limit=PAGE_BATCH):
-        """Read one bounded page of validated local source manifests."""
         root = os.path.abspath(os.fspath(root))
         if type(now_ms) is not int or now_ms < 0 \
                 or cursor is not None and not valid_fid(cursor) \
@@ -336,46 +292,18 @@ class UploadSource:
             raise ValueError("upload status page")
         names = _source_ids(root)
         start = 0 if cursor is None else bisect_right(names, cursor)
-        selected, processed, used, uploads = (
-            names[start:start + limit], 0, 0, [])
-        for source_id in selected:
-            path = os.path.join(root, source_id)
-            try:
-                size = os.path.getsize(os.path.join(path, "source.json"))
-                if size > MAX_SOURCE_DOCUMENT_BYTES \
-                        or used and used + size > MAX_SOURCE_DOCUMENT_BYTES:
-                    break
-                status = cls._load(path, bodies=False).status(now_ms)
-            except (OSError, UploadJournalError):
-                if os.path.isdir(path):
-                    raise
-                processed += 1
-                continue
-            used += size
-            processed += 1
-            uploads.append(status)
-        if processed == 0 and selected:
-            raise UploadJournalError("upload status byte budget")
-        end = start + processed
+        selected = names[start:start + limit]
+        uploads = tuple(
+            cls._load(os.path.join(root, source_id), body=False).status(now_ms)
+            for source_id in selected
+        )
+        end = start + len(selected)
         return UploadStatusPage(
-            tuple(uploads), names[end - 1] if end < len(names) else None)
+            uploads, names[end - 1] if end < len(names) and selected else None)
 
-    @staticmethod
-    def _verify(path, leaf, kind):
-        maximum = MAX_PILE_BYTES if kind == "pile" \
-            else MAX_OBJECT_BYTES if kind == "obj" else None
-        if maximum is None:
-            raise UploadJournalError("foreign upload body")
-        raw = _read(path, maximum, f"upload {kind} body")
-        if len(raw) != leaf.size or h(raw) != leaf.digest:
-            raise UploadJournalError("upload body integrity")
-
-    def body_path(self, leaf, kind):
-        if kind == "obj" and leaf in self.vector.leaves:
-            return os.path.join(self.path, "objects", leaf.digest)
-        if kind == "pile" and leaf == self.pile:
-            return os.path.join(self.path, "pile")
-        raise UploadJournalError("foreign upload body")
+    @property
+    def body_path(self):
+        return os.path.join(self.path, "pile")
 
     @property
     def session_path(self):
@@ -383,11 +311,16 @@ class UploadSource:
 
     @property
     def abandoned_path(self):
-        return os.path.join(self.path, "abandoned.json")
+        return os.path.join(self.path, "abandoned")
+
+    def verify_body(self):
+        raw = _read(self.body_path, MAX_PILE_BYTES, "upload pile")
+        if len(raw) != self.pile.size or h(raw) != self.pile.digest:
+            raise UploadJournalError("upload pile integrity")
+        return raw
 
     @contextmanager
     def writer(self):
-        """Serialize a whole resume transition across threads and processes."""
         depth = getattr(self._writer, "depth", 0)
         if depth:
             self._writer.depth = depth + 1
@@ -396,9 +329,8 @@ class UploadSource:
             finally:
                 self._writer.depth -= 1
             return
-        with _source_lock(
-                os.path.dirname(self.path), self.source_id):
-            if not os.path.isdir(self.path):
+        with _source_lock(os.path.dirname(self.path), self.source_id):
+            if not os.path.isdir(self.path) or os.path.islink(self.path):
                 raise UploadJournalError("upload source unavailable")
             self._writer.depth = 1
             try:
@@ -406,145 +338,118 @@ class UploadSource:
             finally:
                 self._writer.depth = 0
 
-    def _checked_progress(self, progress):
-        count = len(self.vector.leaves)
-        if not isinstance(progress, UploadProgress) \
-                or progress.source_id != self.source_id \
-                or not _hex(progress.session, SESSION_HEX_BYTES) \
-                or not valid_cursor(progress.cursor) \
-                or type(progress.cursor_index) is not int \
-                or type(progress.delivered_index) is not int \
-                or not 0 <= progress.delivered_index \
-                <= progress.cursor_index <= count \
-                or type(progress.expires_at_ms) is not int \
-                or progress.issued_until_ms is not None and (
-                    type(progress.issued_until_ms) is not int
-                    or not 0 <= progress.expires_at_ms
-                    <= progress.issued_until_ms) \
-                or type(progress.pile_delivered) is not bool \
-                or progress.pile_delivered \
-                and progress.delivered_index != count:
+    def _checked_progress(self, value):
+        capability = value.capability if isinstance(value, UploadProgress) \
+            else None
+        if not isinstance(value, UploadProgress) \
+                or value.source_id != self.source_id \
+                or not _hex(value.session, SESSION_HEX_CHARS) \
+                or not valid_cursor(value.cursor) \
+                or type(value.expires_at_ms) is not int \
+                or value.expires_at_ms < 0 \
+                or not isinstance(capability, wire.UploadCapability) \
+                or not isinstance(capability.url, str) \
+                or not isinstance(capability.headers, tuple) \
+                or type(capability.expires_at_ms) is not int \
+                or capability.expires_at_ms > value.expires_at_ms \
+                or value.status is not None and value.status not in _TERMINAL:
             raise UploadJournalError("invalid upload session")
-        return progress
+        return value
 
     def progress(self):
         if not os.path.exists(self.session_path):
             return None
         try:
             raw = _read(
-                self.session_path, MAX_SESSION_DOCUMENT_BYTES,
-                "upload session")
-            value = decode_json(
-                raw, MAX_SESSION_DOCUMENT_BYTES, "upload session")
-            if canon(value) != raw:
+                self.session_path,
+                MAX_SESSION_DOCUMENT_BYTES,
+                "upload session",
+            )
+            value = decode_json(raw, MAX_SESSION_DOCUMENT_BYTES, "upload session")
+            if canon(value) != raw or not isinstance(value, dict) \
+                    or set(value) != {
+                        "capability", "cursor", "expires_at_ms", "schema",
+                        "session", "source_id", "status",
+                    } \
+                    or value["schema"] != SESSION_SCHEMA:
                 raise ValueError
-            schema = value.pop("schema")
-            if schema == LEGACY_SESSION_SCHEMA:
-                # v1 erased replaced sessions and did not constrain clock
-                # rollback, so no finite bound proves every old lease expired.
-                value["issued_until_ms"] = None
-            elif schema != SESSION_SCHEMA:
-                raise ValueError
-            return self._checked_progress(UploadProgress(**value))
+            return self._checked_progress(UploadProgress(
+                value["source_id"],
+                value["session"],
+                value["cursor"],
+                value["expires_at_ms"],
+                wire.decode_capability_document(value["capability"]),
+                value["status"],
+            ))
         except (KeyError, TypeError, ValueError) as error:
             raise UploadJournalError("invalid upload session") from error
 
-    def _write_progress(self, progress):
+    def _write_progress(self, value):
+        value = self._checked_progress(value)
         _replace(self.session_path, canon({
-            **asdict(self._checked_progress(progress)),
+            "capability": wire.capability_document(value.capability),
+            "cursor": value.cursor,
+            "expires_at_ms": value.expires_at_ms,
             "schema": SESSION_SCHEMA,
+            "session": value.session,
+            "source_id": value.source_id,
+            "status": value.status,
         }))
 
-    def save(self, progress):
-        """Advance one session monotonically; never replace a newer journal."""
+    def advance(self, value):
+        """Install a lease, replace a live lease, or make it terminal."""
         with self.writer():
             current = self.progress()
-            progress = self._checked_progress(progress)
-            if current is not None and (
-                    progress.session != current.session
-                    or progress.expires_at_ms != current.expires_at_ms
-                    or not _covers_expiry(
-                        progress.issued_until_ms,
-                        current.issued_until_ms)
-                    or progress.cursor_index < current.cursor_index
-                    or progress.delivered_index < current.delivered_index
-                    or current.pile_delivered and not progress.pile_delivered
-                    or progress.cursor_index == current.cursor_index
-                    and progress.cursor != current.cursor):
+            value = self._checked_progress(value)
+            if current is None and value.status is not None:
                 raise UploadJournalError("upload session rollback")
-            self._write_progress(progress)
+            if current is not None:
+                same = value.session == current.session
+                if current.status is not None and value != current \
+                        or same and (
+                            value.cursor != current.cursor
+                            or value.expires_at_ms != current.expires_at_ms
+                            or value.capability != current.capability
+                        ) \
+                        or not same and value.status is not None:
+                    raise UploadJournalError("upload session rollback")
+            self._write_progress(value)
 
-    def restart(self, progress):
-        """Atomically replace one unusable session while retaining its expiry."""
-        with self.writer():
-            current = self.progress()
-            progress = self._checked_progress(progress)
-            if current is not None and (
-                    current.pile_delivered
-                    or progress.session == current.session
-                    or not _covers_expiry(
-                        progress.issued_until_ms,
-                        current.issued_until_ms)):
-                raise UploadJournalError("upload session restart")
-            self._write_progress(progress)
-
-    def abandonment(self):
+    def abandoned(self):
         if not os.path.exists(self.abandoned_path):
-            return None
-        try:
-            raw = _read(
-                self.abandoned_path, MAX_ABANDONED_DOCUMENT_BYTES,
-                "upload abandonment")
-            value = decode_json(
-                raw, MAX_ABANDONED_DOCUMENT_BYTES,
-                "upload abandonment")
-            if canon(value) != raw or set(value) != {
-                    "abandoned_at_ms", "collect_after_ms",
-                    "schema", "source_id"} \
-                    or value["schema"] != ABANDONED_SCHEMA \
-                    or value["source_id"] != self.source_id \
-                    or type(value["abandoned_at_ms"]) is not int \
-                    or value["collect_after_ms"] is not None and (
-                        type(value["collect_after_ms"]) is not int
-                        or not 0 <= value["abandoned_at_ms"]
-                        <= value["collect_after_ms"]):
-                raise ValueError
-            return value
-        except (KeyError, TypeError, ValueError) as error:
-            raise UploadJournalError(
-                "invalid upload abandonment") from error
+            return False
+        if _read(self.abandoned_path, 0, "upload abandonment") != b"":
+            raise UploadJournalError("invalid upload abandonment")
+        return True
 
     def status(self, now_ms):
         if type(now_ms) is not int or now_ms < 0:
             raise ValueError("upload status clock")
-        progress, abandoned = self.progress(), self.abandonment()
-        completed = progress is not None and progress.pile_delivered
-        if completed:
-            state, collect_after = "completed", 0
-        elif abandoned is not None:
+        progress = self.progress()
+        if self.abandoned():
             state = "abandoned"
-            collect_after = abandoned["collect_after_ms"]
+        elif progress is not None and progress.status in {"applied", "noop"}:
+            state = "completed"
+        elif progress is not None and progress.status == "rejected":
+            state = "rejected"
         elif progress is not None and progress.expires_at_ms <= now_ms:
-            state, collect_after = "expired", None
+            state = "expired"
         else:
-            state, collect_after = "active", None
+            state = "active"
         return UploadStatus(
-            self.source_id, self.workspace, self.member, state,
-            len(self.vector.leaves),
-            progress.cursor_index if progress is not None else 0,
-            progress.delivered_index if progress is not None else 0,
+            self.source_id,
+            self.workspace,
+            self.member,
+            state,
             progress.expires_at_ms if progress is not None else None,
-            collect_after,
-            completed or state == "abandoned"
-            and collect_after is not None and now_ms >= collect_after,
+            state in {"abandoned", "completed", "rejected"},
         )
 
     def require_resumable(self):
-        if self.abandonment() is not None:
+        if self.abandoned():
             raise UploadJournalError("upload source abandoned")
 
     def abandon(self, now_ms):
-        """Durably abandon local retries without claiming remote publication."""
         if type(now_ms) is not int or now_ms < 0:
             raise ValueError("upload abandonment clock")
         with self.writer():
@@ -553,56 +458,35 @@ class UploadSource:
                 raise UploadJournalError("completed upload")
             if current.state == "abandoned":
                 return current
-            progress = self.progress()
-            if progress is None:
-                collect_after = now_ms
-            elif progress.issued_until_ms is None:
-                collect_after = None
-            else:
-                collect_after = max(
-                    now_ms,
-                    progress.issued_until_ms + MAX_SESSION_CLOCK_SKEW_MS)
-            _new(self.abandoned_path, canon({
-                "abandoned_at_ms": now_ms,
-                "collect_after_ms": collect_after,
-                "schema": ABANDONED_SCHEMA,
-                "source_id": self.source_id,
-            }))
+            _new(self.abandoned_path, b"")
             _sync_dir(self.path)
             return self.status(now_ms)
 
     @classmethod
     def collect(cls, root, workspace, source_id, now_ms):
-        """Atomically hide then remove one exact completed/abandoned source."""
         if not valid_fid(workspace) or not valid_fid(source_id) \
                 or type(now_ms) is not int or now_ms < 0:
             raise ValueError("upload collection")
         root = os.path.abspath(os.fspath(root))
         target = os.path.join(root, source_id)
-        tombstone = os.path.join(
-            root, f".collecting-{workspace}-{source_id}")
-        with _root_lock(root), _source_lock(
-                root, source_id, blocking=False):
-            recovering = os.path.isdir(tombstone)
-            if recovering:
+        tombstone = os.path.join(root, f".collecting-{workspace}-{source_id}")
+        with _root_lock(root), _source_lock(root, source_id, blocking=False):
+            if os.path.lexists(tombstone):
+                if os.path.islink(tombstone):
+                    raise UploadJournalError("upload collection collision")
                 shutil.rmtree(tombstone)
                 _sync_dir(root)
-            if not os.path.isdir(target):
-                if not recovering:
-                    raise UploadJournalError("upload source unavailable")
-                return source_id
-            source = cls._load(target, bodies=False)
+            if not os.path.isdir(target) or os.path.islink(target):
+                raise UploadJournalError("upload source unavailable")
+            source = cls._load(target, body=False)
             if source.workspace != workspace:
                 raise UploadJournalError("upload source workspace")
-            status = source.status(now_ms)
-            if not status.collectible:
+            if not source.status(now_ms).collectible:
                 raise UploadJournalError("upload source is not collectible")
             os.rename(target, tombstone)
             _sync_dir(root)
-            try:
-                shutil.rmtree(tombstone)
-            finally:
-                _sync_dir(root)
+            shutil.rmtree(tombstone)
+            _sync_dir(root)
             return source_id
 
 
@@ -610,7 +494,6 @@ __all__ = (
     "UploadJournalError",
     "UploadProgress",
     "UploadSource",
-    "UploadSourceBuilder",
     "UploadStatus",
     "UploadStatusPage",
 )

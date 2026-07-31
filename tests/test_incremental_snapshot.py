@@ -25,7 +25,7 @@ def test_ordinary_insert_reads_and_writes_only_changed_paths(tmp_path):
             ts=10 + ordinal)
     before = _facts(node, workspace)
     base = compile_snapshot(workspace, before)
-    objects = dict(base.outbox)
+    objects = dict(base.objects)
 
     facts.content.message.post(
         node, workspace, "general", "incremental", ts=100)
@@ -42,17 +42,17 @@ def test_ordinary_insert_reads_and_writes_only_changed_paths(tmp_path):
 
     assert incremental.root == full.root \
         == node.store(workspace).get("root")
-    assert len(incremental.outbox) < len(full.outbox)
+    assert len(incremental.objects) < len(full.objects)
     assert not set(fetched) & {
         h(encode(fact)) for fact in before.values()
     }
     assert len(set(fetched)) < len(before)
 
-    objects.update(incremental.outbox)
+    objects.update(incremental.objects)
     duplicate = extend_snapshot(
         workspace, incremental.root, incoming, objects.get)
     assert duplicate.root == incremental.root
-    assert duplicate.outbox == ()
+    assert duplicate.objects == ()
 
 
 def test_member_removal_does_not_visit_incident_provider_facts(tmp_path):
@@ -68,7 +68,7 @@ def test_member_removal_does_not_visit_incident_provider_facts(tmp_path):
             ts=20 + ordinal)
     before = _facts(node, workspace)
     base = compile_snapshot(workspace, before)
-    objects = dict(base.outbox)
+    objects = dict(base.objects)
 
     node.bind_identity(workspace, founder)
     facts.auth.removal.evict(node, workspace, bob)
@@ -92,7 +92,7 @@ def test_incremental_action_checks_suppression_named_fact_evidence(tmp_path):
     complete = _facts(source, workspace)
     incoming = complete.pop(deletions[0])
     base = compile_snapshot(workspace, complete)
-    objects = dict(base.outbox)
+    objects = dict(base.objects)
     decoded = snapshot.decode_root(base.root)
     sid, = facts.action_sids(incoming)
 

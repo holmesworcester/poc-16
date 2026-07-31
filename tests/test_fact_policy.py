@@ -279,10 +279,25 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
+    facts.auth.device.bind(node, workspace, "Bob phone")
     posted = facts.content.message.post(
         node, workspace, "general", "Bob's message", ts=20)
     descriptor = send_bytes(
         node, workspace, "bob.bin", b"Bob's bytes", ts=21)
+    _, push_node = keypair()
+    endpoint = facts.auth.push_endpoint.register(
+        node,
+        workspace,
+        "1" * 64,
+        push_node,
+        "android",
+        "poc16.mobile",
+        "production",
+        facts.auth.push_endpoint.encode_sealed_target(b"x" * 49),
+        ts=22,
+    )
+    setting = facts.content.notification_preference.set_global(
+        node, workspace, "all", ts=23)
     direct = {
         tag
         for tag, family in facts.FAMILIES.items()
@@ -294,11 +309,20 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     targets = {
         "msg": posted,
         "file_bao": descriptor,
+        "notification_preference": setting,
+        "push_endpoint": endpoint,
     }
     assert set(targets) == direct
 
     node.bind_identity(workspace, founder)
-    for ts, tag in enumerate(("msg", "file_bao"), start=30):
+    for ts, tag in enumerate(
+            (
+                "msg",
+                "file_bao",
+                "notification_preference",
+                "push_endpoint",
+            ),
+            start=30):
         target = targets[tag]
         action_fid = facts.content.delete.remove(
             node, workspace, target, ts=ts)

@@ -1,4 +1,4 @@
-"""AWS upload-broker packaging, IAM, and safe lifecycle tests."""
+"""AWS upload-broker packaging, IAM, and deployment-boundary tests."""
 import os
 from pathlib import Path
 import stat
@@ -16,6 +16,7 @@ from deploy.aws_upload_broker.config import (
     DEPLOYMENT_MARKER,
     DEPLOYMENT_TAG,
     FUNCTION_TIMEOUT_SECONDS,
+    MAX_STORE_PREFIX_LENGTH,
     PREFIX_PATTERN,
     SDK_CONNECT_TIMEOUT_SECONDS,
     SDK_READ_TIMEOUT_SECONDS,
@@ -37,6 +38,10 @@ PACKAGE = ROOT / "deploy" / "aws_upload_broker"
 def args(**changes):
     values = {
         "alarm_action_arn": None,
+        "applier_function_arn": (
+            "arn:aws:lambda:us-west-2:123456789012:"
+            "function:poc16-repository-applier"
+        ),
         "canonical_bucket": "canonical-bucket",
         "create": True,
         "deployment_id": "upload-west-2",
@@ -183,7 +188,7 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
     assert "secretsmanager:GetSecretValue" in template
     assert "Action: s3:GetObject" in template
     assert "Action: s3:PutObject" in template
-    assert "Action: s3:ListBucket" in template
+    assert "Action: s3:ListBucket" not in template
     assert "s3:DeleteObject" not in template
     assert "s3:DeleteObjectVersion" not in template
     assert "s3:PutLifecycleConfiguration" not in template
@@ -195,7 +200,7 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
     assert "s3:signatureversion: AWS4-HMAC-SHA256" in template
     assert "s3:if-none-match" in template
     assert template.count(
-        "s3:ResourceAccount: !Ref ExpectedBucketOwner") == 3
+        "s3:ResourceAccount: !Ref ExpectedBucketOwner") == 2
     assert 's3:signatureAge: !Sub "${PresignTtlSeconds}000"' in template
     assert "s3:signatureAge: 900000" not in template
     kms = template.split(
@@ -212,10 +217,7 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
         in kms
     )
     assert "SecretVersionId" not in kms
-    assert (
-        "ingress/v1/workspaces/${WorkspaceId}/objects/*"
-        in template
-    )
+    assert "/objects/*" not in template
     assert (
         "ingress/v1/workspaces/${WorkspaceId}/piles/*"
         in template
@@ -263,80 +265,20 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
     assert "s3:GetObject" not in ingress
     assert "s3:ListBucket" not in ingress
     assert "s3:DeleteObject" not in ingress
+    assert "lambda:InvokeFunction" in ingress
+    assert "Resource: !Ref RepositoryApplierFunctionArn" in ingress
 
     assert requirements == (
         ROOT / "deploy" / "aws_lambda" / "requirements.txt").read_text()
 
 
-def test_ingress_lifecycle_preflight_accepts_absence_and_rejects_rules(
-        monkeypatch):
-    candidate = args()
-    commands = []
-
-    def absent(command):
-        commands.append(command)
-        raise subprocess.CalledProcessError(
-            255,
-            command,
-            stderr="NoSuchLifecycleConfiguration",
-        )
-
-    monkeypatch.setattr(manage, "_json_command", absent)
-    manage._assert_no_ingress_lifecycle(candidate)
-    command = commands[0]
-    assert command[:3] == [
-        "aws", "s3api", "get-bucket-lifecycle-configuration"]
-    assert command[command.index("--bucket") + 1] == (
-        candidate.ingress_bucket)
-    assert command[command.index("--expected-bucket-owner") + 1] == (
-        candidate.expected_owner)
-
-    monkeypatch.setattr(
-        manage, "_json_command", lambda _command: {"Rules": []})
-    manage._assert_no_ingress_lifecycle(candidate)
-
-    monkeypatch.setattr(
-        manage,
-        "_json_command",
-        lambda _command: {"Rules": [{
-            "ID": "unproved-age-delete",
-            "Status": "Enabled",
-        }]},
-    )
-    with pytest.raises(RuntimeError, match="erase acknowledged"):
-        manage._assert_no_ingress_lifecycle(candidate)
-
-
-@pytest.mark.parametrize("outcome", (
-    {},
-    {"Rules": None},
-    subprocess.CalledProcessError(
-        254, ["aws"], stderr="AccessDenied"),
-))
-def test_ingress_lifecycle_preflight_rejects_ambiguous_outcome(
-        monkeypatch, outcome):
-    def lookup(_command):
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(manage, "_json_command", lookup)
-
-    with pytest.raises(RuntimeError, match="lifecycle"):
-        manage._assert_no_ingress_lifecycle(args())
-
-
-def test_deploy_checks_ingress_retention_before_build_or_stack_mutation(
-        monkeypatch):
+def test_deploy_builds_then_deploys_and_probes_exact_stack(monkeypatch):
     candidate = args()
     events = []
     target = "arn:aws:cloudformation:us-west-2:123456789012:stack/x/id"
     monkeypatch.setattr(
         manage, "_stack_for_deploy",
         lambda _args: events.append("target") or target)
-    monkeypatch.setattr(
-        manage, "_assert_no_ingress_lifecycle",
-        lambda _args: events.append("retention"))
     monkeypatch.setattr(
         manage, "build", lambda _args: events.append("build"))
     monkeypatch.setattr(
@@ -353,7 +295,6 @@ def test_deploy_checks_ingress_retention_before_build_or_stack_mutation(
 
     assert events == [
         "target",
-        "retention",
         "build",
         ("deploy", target),
         "url",
@@ -463,11 +404,17 @@ def test_keyring_create_rejects_invalid_or_insufficient_lifetime(changes):
         {"presign_ttl_seconds": 0},
         {"presign_ttl_seconds": 901},
         {"prefix": "/absolute"},
+        {"prefix": "a" * (MAX_STORE_PREFIX_LENGTH + 1)},
     ),
 )
 def test_deploy_validation_rejects_authority_ambiguity(changes):
     with pytest.raises(ValueError):
         manage._validate_deploy_args(args(**changes))
+
+
+def test_deploy_accepts_exact_provider_prefix_budget():
+    manage._validate_deploy_args(
+        args(prefix="a" * MAX_STORE_PREFIX_LENGTH))
 
 
 def test_parsers_require_region_and_exact_bucket_owner():

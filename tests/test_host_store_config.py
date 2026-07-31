@@ -9,7 +9,14 @@ import pytest
 from adapters import host
 import facts
 
+from core import ingress
 from core.crypto import keypair
+from core.object_store import (
+    MAX_INVITE_ID_BYTES,
+    MAX_LOGICAL_KEY_BYTES,
+    MAX_PROVIDER_KEY_BYTES,
+    MAX_STORE_PREFIX_BYTES,
+)
 from full_peer import cli, daemon
 from full_peer.node import FullPeer
 from core.store import FsStore
@@ -133,18 +140,33 @@ def test_strict_config_rejects_malformed_or_credential_fields_before_clients(
     assert clients == []
 
 
-def test_longest_node_key_must_fit_before_provider_client_creation():
+def test_every_logical_namespace_fits_before_provider_client_creation():
     fixed = len("/workspace/") + 64
-    longest = len("/pile/") + 16 + 1 + 32 + 1 + 64
-    maximum_base = "x" * (1024 - fixed - longest)
+    maximum_base = "x" * (MAX_STORE_PREFIX_BYTES - fixed)
     clients = []
 
     factory = host.factory_from_mapping(
         {**S3, "base_prefix": maximum_base},
         client_factory=lambda *args: clients.append(args) or object())
     store = factory("0" * 64)
-    longest_key = f"pile/{'0' * 16}/{'0' * 32}/{'0' * 64}"
-    assert len(store._physical(longest_key).encode("ascii")) == 1024
+    ingress_address = ingress.ingress_key(
+        "0" * 64,
+        "0" * ingress.SESSION_HEX_CHARS,
+        "0" * ingress.MEMBER_HEX_CHARS,
+        "0" * 64,
+    )
+    invite = "invite/" + "i" * MAX_INVITE_ID_BYTES
+    assert MAX_LOGICAL_KEY_BYTES == len(invite)
+    assert ingress.MAX_INGRESS_KEY_BYTES < MAX_LOGICAL_KEY_BYTES
+    assert len(store._physical(invite).encode("ascii")) \
+        == MAX_PROVIDER_KEY_BYTES
+    for key in (
+            "root",
+            "obj/" + "0" * 64,
+            invite,
+            ingress_address):
+        assert len(store._physical(key).encode("ascii")) \
+            <= MAX_PROVIDER_KEY_BYTES
     assert len(clients) == 1
 
     with pytest.raises(ValueError, match="exceeds 1024"):
