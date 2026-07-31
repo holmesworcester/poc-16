@@ -14,7 +14,7 @@ from core import (
 from core.crypto import h
 from core.fact import Fact, canon
 from core.grants import make_token
-from core.ingress import InvalidPile
+from core.ingress import InvalidPile, check_source
 from core.limits import (
     MAX_ATOM_NAME_BYTES,
     MAX_ATOM_VALUE_BYTES,
@@ -498,10 +498,12 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
         "0000000000000000", bad))
 
     listed = threading.Barrier(2)
-    retiring = threading.Barrier(2)
+    spending = threading.Barrier(2)
+    deletes = []
     for node in (first, second):
         store = node.store(workspace)
         list_page = store.list_page
+        put_if_absent = store.put_if_absent
         delete = store.delete
 
         def synchronized_list_page(
@@ -511,13 +513,19 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
                 listed.wait(timeout=5)
             return page
 
-        def synchronized_delete(key, delete=delete):
+        def synchronized_spend(key, value, put_if_absent=put_if_absent):
+            if key.startswith("applier/spent/"):
+                spending.wait(timeout=5)
+            return put_if_absent(key, value)
+
+        def recorded_delete(key, delete=delete):
             if key == source:
-                retiring.wait(timeout=5)
+                deletes.append(key)
             return delete(key)
 
         monkeypatch.setattr(store, "list_page", synchronized_list_page)
-        monkeypatch.setattr(store, "delete", synchronized_delete)
+        monkeypatch.setattr(store, "put_if_absent", synchronized_spend)
+        monkeypatch.setattr(store, "delete", recorded_delete)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [
@@ -528,6 +536,7 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
 
     store = first.store(workspace)
     assert store.get(source) is None
+    assert deletes == [source]
     assert store.get("failed/pile/" + h(bad)) == bad
     meta_keys = store.list("failed/meta/")
     assert len(meta_keys) == 1
@@ -741,7 +750,7 @@ def test_peer_adapter_rejects_claimed_oversize_without_reading(
         handler._body("POST", "/unknown")
 
 
-def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
+def test_failed_retirement_spends_once_and_never_risks_an_aba_retry(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -753,6 +762,7 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
     applier = node.applier(workspace)
     real_propose = applier.propose
     proposals = 0
+    deletes = 0
 
     async def counted_propose(value):
         nonlocal proposals
@@ -760,6 +770,8 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
         return await real_propose(value)
 
     def failed_delete(_key):
+        nonlocal deletes
+        deletes += 1
         raise OSError("injected retirement outage")
 
     monkeypatch.setattr(store, "delete", failed_delete)
@@ -770,14 +782,16 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
 
     assert store.get(source) == raw
     assert proposals == 1
-    assert len(applier._receipts) == 1
+    assert deletes == 1
+    assert applier._receipts == {}
+    generation = check_source(source, raw).generation
+    assert store.get("applier/spent/" + generation) is not None
     assert store.list("failed/") == []
-    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
-        "OSError: injected retirement outage"
+    assert node.ingress_attempt_failures(workspace) == []
 
     monkeypatch.setattr(store, "delete", real_delete)
     node.turn(workspace)
-    assert store.get(source) is None
+    assert store.get(source) == raw
     assert applier._receipts == {}
 
 

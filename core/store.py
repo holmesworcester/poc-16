@@ -2,13 +2,14 @@
 
 Layout: root (the CAS'd composite snapshot), obj/<hash> (bounded map pages
 and fact/file blobs — immutable),
-pile/<member>/<generation>/<hash> (internal ingress),
+pile/<member>/<reservation>/<hash> (internal ingress),
 invite/<id> (public reads), and
 failed/{pile,meta}/<hash> (shared immutable rejected-ingress evidence).
 
 The public mutation contract rejects unconditional root/object replacement
 and authoritative deletion. Objects use atomic put-if-absent; root uses CAS.
-Kernel-valid durable receipts live in the client catalog, not object keys.
+Never-deleted applier/generation and applier/spent records make internal
+retirement one-use without treating an ETag or path segment as identity.
 """
 import fcntl
 import heapq

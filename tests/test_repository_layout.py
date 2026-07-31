@@ -599,7 +599,7 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
         item.name: item
         for item in owner.body
         if isinstance(item, ast.AsyncFunctionDef)
-        and item.name in {"apply", "commit", "reject"}
+        and item.name in {"apply", "commit", "_reject"}
     }
     apply = methods["apply"]
     assert [arg.arg for arg in apply.args.args] == ["self", "source"]
@@ -609,7 +609,7 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
 
     for name, mutations in (
             ("commit", {"_establish_outbox", "cas"}),
-            ("reject", {"_put_evidence", "retire_exact_async"})):
+            ("_reject", {"_put_evidence", "retire_rejection"})):
         method = methods[name]
         exact_reads = [
             call for call in ast.walk(method)
@@ -647,6 +647,51 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
         assert mutation_calls
         assert exact_reads[0].lineno < guards[0].lineno \
             < min(call.lineno for call in mutation_calls)
+
+
+def test_internal_generation_identity_and_spend_have_one_runtime_path():
+    source = (ROOT / "core" / "repository_applier.py").read_text()
+    assert "secrets." not in source
+    assert "staged/claim/" not in source
+    assert "_staged_claim_key" not in source
+    assert "_claimed_staged_source" not in source
+    assert "applier/generation/" in source
+    assert "applier/spent/" in source
+
+    owner = next(
+        item for item in parsed(Path("core/repository_applier.py")).body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "RepositoryApplier")
+    methods = {
+        item.name: item
+        for item in owner.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def calls(method, name):
+        return [
+            call for call in ast.walk(methods[method])
+            if isinstance(call, ast.Call)
+            and (
+                isinstance(call.func, ast.Name) and call.func.id == name
+                or isinstance(call.func, ast.Attribute)
+                and call.func.attr == name)
+        ]
+
+    assert calls("stage", "_stage")
+    assert calls("_staged_source", "_stage")
+    assert calls("retire", "_spend_and_retire")
+    assert calls("retire_rejection", "_spend_and_retire")
+    assert calls("_spend_and_retire", "_claim_spend")
+    assert len(calls("_spend_and_retire", "retire_exact_async")) == 1
+    assert not any(
+        calls(method, "retire_exact_async")
+        for method in methods if method != "_spend_and_retire")
+    assert "reject" not in methods
+    assert len(calls("apply", "_reject")) == 1
+    assert not any(
+        calls(method, "_reject")
+        for method in methods if method != "apply")
 
 
 def test_protocol_front_doors_route_semantic_reads_through_one_reader():

@@ -177,19 +177,24 @@ An authored unit follows one path:
 ```text
 facts command
     -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
-    -> RepositoryApplier stages a fresh internal generation
+    -> RepositoryApplier reserves one stable internal generation
     -> kernel judges the exact closed pile
     -> pure compiler derives FactTree, SuppTree, AuthorityTree, FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
-    -> only that exact internal generation may be retired
+    -> one exact outcome-bound spend grants its sole retirement DELETE
     -> RepositoryReader pins the resulting root
 ```
 
-Root-CAS losers keep their exact work and retry from the newer root. A lost
-CAS response is reconciled by reading the root. A crash after CAS but before
-retirement replays as a token-checked no-op and then retires. One bad pile
-cannot wedge later pile generations.
+Generation identity is the durable create-only reservation, not the source
+path or a provider ETag. Byte-identical delivery by the same member is the
+same logical work and recovers the same reservation. Root-CAS losers keep that
+work and retry from the newer root. A lost CAS response is reconciled by
+reading the root. Retirement first creates one exact outcome-bound spend
+record; only a definitely fresh spend may issue DELETE. An ambiguous spend
+therefore fails safe by retaining already-discharged source bytes, and no
+restart or stale receipt may issue a second DELETE. One bad pile cannot wedge
+later pile generations.
 
 ## Facts, suppression, and deletion
 
@@ -294,9 +299,9 @@ exact bounded marker read can establish work.
 2. checks the exact key/session/member/digest binding and that every ordinary
    fact names the configured workspace (the workspace-genesis fact is the
    sole ws-less exception);
-3. copies it behind one Applier-minted internal generation;
+3. copies it behind the marker's one durably reserved internal generation;
 4. commits facts through the ordinary pile path;
-5. retires only the internal generation;
+5. spends and retires only that internal generation;
 6. promotes referenced attachments in bounded round-robin pages.
 
 The Applier never deletes the client marker. Marker lifecycle is an ingress

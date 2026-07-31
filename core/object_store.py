@@ -13,7 +13,8 @@ The root-authoritative snapshot uses only two namespaces:
 
 The same canonical bucket may also contain Applier-owned operational work:
 internal ``pile/`` generations, immutable ``failed/`` rejection evidence,
-``staged/`` receipts/claims, and ``applier/cursor/`` liveness hints. Those
+``staged/`` receipts, never-deleted ``applier/generation/`` reservations and
+``applier/spent/`` outcomes, and ``applier/cursor/`` liveness hints. Those
 objects are not repository answers and are never read through
 ``RepositoryReader``. Client-writable ``ingress/v1/`` markers and detached
 objects live in the separate ingress compartment.
@@ -52,7 +53,11 @@ def validate_key(key):
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key == "root" or key.startswith("root/") \
-        or key == "obj" or key.startswith("obj/")
+        or key == "obj" or key.startswith("obj/") \
+        or key == "applier/generation" \
+        or key.startswith("applier/generation/") \
+        or key == "applier/spent" \
+        or key.startswith("applier/spent/")
 
 
 @dataclass(frozen=True)

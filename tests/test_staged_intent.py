@@ -13,7 +13,11 @@ from core import staged_intent as staged_intent_module
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
-from core.ingress import InvalidStagedIntent, PermanentIngressRejection
+from core.ingress import (
+    InvalidStagedIntent,
+    PermanentIngressRejection,
+    check_source,
+)
 from core.limits import PayloadTooLarge
 from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
@@ -186,22 +190,23 @@ class _FaultStore:
             raise OutcomeUnknown("simulated lost write response")
 
 
-def test_verified_session_enters_the_applier_through_a_fresh_generation(
-        staged_file, monkeypatch, tmp_path):
+def test_verified_session_enters_the_applier_through_a_reserved_generation(
+        staged_file, tmp_path):
     node, workspace, raw, key = staged_file
     ingress = FsStore(str(tmp_path / "ingress"))
     intent = _put_staged_file(
         ingress, node, workspace, raw, key)
     canonical = FsStore(str(tmp_path / "canonical"))
-    generation = "e" * 32
-    monkeypatch.setattr(
-        applier_module.secrets, "token_hex", lambda size: generation)
 
     applied = asyncio.run(
         RepositoryApplier(workspace, canonical).apply_staged(
             ingress, key))
 
-    assert applied.source == f"pile/{MEMBER}/{generation}/{h(raw)}"
+    binding = check_source(applied.source, raw)
+    reservation = canonical.get(
+        "applier/generation/" + binding.generation)
+    assert len(binding.generation) == 64
+    assert json.loads(reservation)["origin"] == key
     assert applied.source != intent.key
     assert applied.result.status == "applied"
     assert applied.result.retired is True
@@ -210,6 +215,23 @@ def test_verified_session_enters_the_applier_through_a_fresh_generation(
     assert ingress.get(key) == raw
     assert set(applied.promoted) == set(intent.blob_refs)
     assert applied.unavailable == ()
+
+
+def test_direct_and_staged_origins_are_stable_but_distinct(
+        staged_file, tmp_path):
+    _, workspace, raw, key = staged_file
+    intent = decode_staged_pile(workspace, key, raw)
+    store = FsStore(str(tmp_path / "canonical-origins"))
+    applier = RepositoryApplier(workspace, store)
+
+    direct = asyncio.run(applier.stage(intent.member, intent.raw))
+    staged = asyncio.run(applier._staged_source(intent))
+
+    assert asyncio.run(
+        applier.stage(intent.member, intent.raw)) == direct
+    assert asyncio.run(applier._staged_source(intent)) == staged
+    assert direct != staged
+    assert len(store.list("applier/generation/")) == 2
 
 
 def test_staging_replay_and_concurrent_appliers_cannot_recreate_generation(
@@ -223,9 +245,9 @@ def test_staging_replay_and_concurrent_appliers_cannot_recreate_generation(
             ingress, key))
     first_root = canonical.get("root")
 
-    # Even a replay of the exact client-writable session object crosses the
-    # trusted copy door into a new internal key. Two concurrent notification
-    # handlers likewise cannot collide or recreate the first generation.
+    # Replays of the exact client-writable session recover its stable internal
+    # reservation. Completion receipts prevent concurrent notification
+    # handlers from recreating its source.
     with ThreadPoolExecutor(max_workers=2) as pool:
         replayed = tuple(pool.map(
             lambda _: asyncio.run(
@@ -415,7 +437,7 @@ def test_poisoned_detached_object_is_evidenced_and_does_not_repeat(
     assert canonical.get("root") == first.result.root
 
 
-def test_stale_marker_replay_reuses_one_claimed_internal_generation(
+def test_stale_marker_replay_reuses_one_reserved_internal_generation(
         staged_file, tmp_path):
     node, workspace, raw, key = staged_file
     ingress = FsStore(str(tmp_path / "ingress"))
@@ -440,7 +462,8 @@ def test_stale_marker_replay_reuses_one_claimed_internal_generation(
     assert first.result.status == replay.result.status == "stale"
     assert replay.source == first.source
     assert underlying.list("pile/") == sources == [first.source]
-    assert len(underlying.list("staged/claim/")) == 1
+    assert len(underlying.list("applier/generation/")) == 1
+    assert underlying.list("staged/claim/") == []
 
 
 def test_cross_kind_operational_bytes_never_gain_staged_authority(
@@ -475,13 +498,14 @@ def test_cross_kind_operational_bytes_never_gain_staged_authority(
             )._load_staged_object_cursor(intent, 1)
         )
 
-    claim_key = applier._staged_claim_key(intent.key, intent.raw)
-    store.put(claim_key, promoted.raw)
-    with pytest.raises(ValueError, match="staged claim shape"):
+    _, reservation = applier._generation_evidence(
+        intent.member, intent.raw, intent.key)
+    store._replace(reservation.key, promoted.raw)
+    with pytest.raises((ValueError, PayloadTooLarge)):
         asyncio.run(
             RepositoryApplier(
                 workspace, store,
-            )._claimed_staged_source(intent)
+            )._staged_source(intent)
         )
     assert store.list("pile/") == []
 
@@ -528,7 +552,7 @@ def test_operational_writes_reconcile_lost_responses_and_restart(
     assert store.get(collision.key) == foreign
 
 
-def test_claim_survives_lost_response_and_crash_before_internal_copy(
+def test_reservation_survives_lost_response_and_crash_before_internal_copy(
         staged_file, tmp_path):
     _, workspace, raw, key = staged_file
     intent = decode_staged_pile(workspace, key, raw)
@@ -536,29 +560,29 @@ def test_claim_survives_lost_response_and_crash_before_internal_copy(
 
     faulty = _FaultStore(
         store,
-        lose_create=("staged/claim/",),
+        lose_create=("applier/generation/",),
         crash_create=("pile/",),
     )
     with pytest.raises(RuntimeError, match="crash before create"):
         asyncio.run(
             RepositoryApplier(
                 workspace, faulty,
-            )._claimed_staged_source(intent)
+            )._staged_source(intent)
         )
 
-    claim_key = RepositoryApplier(
-        workspace, store)._staged_claim_key(intent.key, intent.raw)
-    claimed_source = json.loads(store.get(claim_key))["source"]
-    assert store.get(claimed_source) is None
+    applier = RepositoryApplier(workspace, store)
+    reserved_source, reservation = applier._generation_evidence(
+        intent.member, intent.raw, intent.key)
+    assert store.get(reservation.key) == reservation.raw
+    assert store.get(reserved_source) is None
 
     recovered = asyncio.run(
-        RepositoryApplier(
-            workspace, store,
-        )._claimed_staged_source(intent)
+        applier._staged_source(intent)
     )
-    assert recovered == claimed_source
+    assert recovered == reserved_source
     assert store.get(recovered) == raw
-    assert store.list("staged/claim/") == [claim_key]
+    assert store.list("applier/generation/") == [reservation.key]
+    assert store.list("staged/claim/") == []
 
 
 def test_invalid_marker_gets_one_deterministic_staged_rejection(

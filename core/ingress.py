@@ -11,7 +11,7 @@ from typing import NamedTuple
 from .crypto import h
 from .limits import PayloadTooLarge
 
-GENERATION_BYTES = 16
+GENERATION_BYTES = 32
 GENERATION_HEX_CHARS = 2 * GENERATION_BYTES
 
 
@@ -31,15 +31,6 @@ class KernelRejected(PermanentIngressRejection):
     """Decoded facts fail the immutable database-free kernel."""
 
 
-class RejectionReceipt(NamedTuple):
-    """Exact durable rejection evidence for one internal generation."""
-
-    source: str
-    payload: str
-    record: bytes
-    generation: str
-
-
 class IngressSource(NamedTuple):
     """Parsed identity of one never-reused internal pile generation."""
 
@@ -49,7 +40,7 @@ class IngressSource(NamedTuple):
 
 
 def pile_source(member, raw, generation):
-    """Bind exact pile bytes to an applier-minted generation key."""
+    """Bind exact pile bytes to one durable reservation identity."""
     if not isinstance(raw, bytes):
         raise TypeError("exact ingress bytes required")
     if not isinstance(member, str) or not member \
@@ -62,9 +53,9 @@ def pile_source(member, raw, generation):
     return f"pile/{member}/{generation}/{h(raw)}"
 
 
-def check_source(source, raw):
-    """Parse a complete internal key and bind it to these exact bytes."""
-    if not isinstance(raw, bytes):
+def check_source(source, raw=None):
+    """Parse one internal key and optionally bind its exact bytes."""
+    if raw is not None and not isinstance(raw, bytes):
         raise TypeError("exact ingress bytes required")
     parts = source.split("/") if isinstance(source, str) else ()
     if len(parts) != 4 \
@@ -73,7 +64,9 @@ def check_source(source, raw):
             or parts[1] != parts[1].lower() \
             or len(parts[2]) != GENERATION_HEX_CHARS \
             or any(char not in "0123456789abcdef" for char in parts[2]) \
-            or parts[3] != h(raw):
+            or len(parts[3]) != 64 \
+            or any(char not in "0123456789abcdef" for char in parts[3]) \
+            or raw is not None and parts[3] != h(raw):
         raise ValueError("ingress source is not bound to exact bytes")
     return IngressSource(parts[1], parts[2], parts[3])
 
@@ -83,7 +76,6 @@ __all__ = (
     "InvalidStagedIntent",
     "KernelRejected",
     "PermanentIngressRejection",
-    "RejectionReceipt",
     "check_source",
     "pile_source",
 )

@@ -87,7 +87,8 @@ closed pile
   -> repository_snapshot's pure four-map compiler
   -> immutable object establishment
   -> the sole root CAS
-  -> exact internal-generation retirement
+  -> exact outcome spend
+  -> the sole internal-generation retirement attempt
   -> RepositoryReader
 ```
 
@@ -99,8 +100,9 @@ must be deletable and rebuildable from a pinned Reader.
 
 Direct-upload clients write detached immutable objects first and one exact
 closed pile marker last into isolated ingress. Notifications and LIST results
-are liveness hints only. The Applier copies an exact marker behind its own
-internal generation and invokes the same transition used by a full peer.
+are liveness hints only. The Applier uses an exact marker as the stable identity
+of one durably reserved internal generation and invokes the same transition
+used by a full peer.
 
 ## Fact families
 
@@ -126,6 +128,13 @@ linearizable opaque-token CAS register named `root`. Exact untrusted reads use
 bounded APIs. Discovery uses bounded pagination. Never rely on ETags being
 content hashes, unconditional replacement, whole-GET/whole-LIST fallbacks, or
 LIST for safety.
+
+Internal generation identity comes from a never-deleted create-only reservation,
+not from a path segment, random nonce, or provider ETag. Identical workspace,
+member, payload, and marker bindings are one logical delivery. After exact
+publication or rejection evidence exists, a create-only outcome-bound spend
+grants at most one DELETE. `EXISTS` and outcome-unknown deny deletion; a safe
+orphan is preferable to retiring recreated work.
 
 Stale workers may duplicate bounded immutable work or delay convergence. They
 must not overwrite different bytes at an object key, clobber a newer root,

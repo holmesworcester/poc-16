@@ -463,7 +463,7 @@ class FullPeer:
         return self.sender(ws).send(news, deps_new)
 
     def receive_pile(self, ws, member, raw):
-        """Stage one fresh internal generation and invoke RepositoryApplier."""
+        """Stage one stable internal generation and invoke RepositoryApplier."""
         with self.lock:
             self.stage_received_pile(ws, member, raw)
             return self.turn(ws)

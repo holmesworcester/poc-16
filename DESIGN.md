@@ -329,19 +329,21 @@ resident.
 
 ## 5. RepositoryApplier transition
 
-For one exact internal generation the Applier:
+For one exact logical delivery the Applier:
 
-1. bounded-decodes the marker and pile;
-2. validates the entire pile before reading a potentially large root;
-3. pins `root` bytes and the provider's opaque CAS token;
-4. reconstructs the current validated set from authenticated residences;
-5. unions every durable `Valid.fact`;
-6. purely compiles the four maps;
-7. conditionally establishes immutable objects with collision checks;
-8. performs one CAS on `root`;
-9. records durable rejection evidence, or returns a process-local applied
+1. creates or recovers its stable create-only generation reservation;
+2. bounded-decodes the marker and pile;
+3. validates the entire pile before reading a potentially large root;
+4. pins `root` bytes and the provider's opaque CAS token;
+5. reconstructs the current validated set from authenticated residences;
+6. unions every durable `Valid.fact`;
+7. purely compiles the four maps;
+8. conditionally establishes immutable objects with collision checks;
+9. performs one CAS on `root`;
+10. records durable rejection evidence, or returns a process-local applied
    receipt bound to the committed root;
-10. retires only the exact internal generation bound by that receipt.
+11. create-only spends that exact outcome and issues DELETE only when the
+    spend is definitely fresh.
 
 The current full compiler is deliberately simple: it reconstructs the complete
 validated set and emits a history-independent root. Future incremental
@@ -349,10 +351,22 @@ compilation must path-copy affected authenticated routes and produce
 byte-identical roots.
 
 A CAS loser keeps its work and retries from the newer root. An unknown CAS
-result is reconciled by reading root. A crash after CAS but before retirement
-re-proposes against the committed root and receives a fresh process-local
-no-op receipt. No LIST result, notification, SQL row, cursor, or process-local
-lock authorizes root mutation or deletion.
+result is reconciled by reading root. A crash after CAS but before a spend
+re-proposes against the committed root and receives a process-local no-op
+receipt. An ambiguous spend never grants DELETE; the source may remain as
+bounded, already-discharged garbage, but every restart observes terminal state.
+No LIST result, notification, SQL row, cursor, path segment, provider ETag, or
+process-local lock authorizes root mutation or deletion.
+
+Piles carry facts, not delivery events. The generation reservation is the
+stable digest of workspace, member, exact payload, and—when present—the
+direct-upload marker. Thus byte-identical redelivery is one logical generation
+rather than an indistinguishable ABA instance. Reservation and spend records
+are never deleted. A valid receipt binds workspace, source, payload,
+reservation, exact outcome, and the applicable base/result-root or rejection
+evidence. The sole running delete path requires a definitely created spend;
+`EXISTS` and outcome-unknown both deny deletion. This remains correct when
+provider ETags repeat for byte-identical values.
 
 HTTP receipt acknowledges once the exact generation is durably staged, even
 when its first apply attempt fails transiently. The retained generation is the
@@ -419,8 +433,9 @@ Ordinary clients upload directly to isolated object-store ingress:
 4. optionally send a wake hint.
 
 The Applier fetches the marker itself, verifies workspace/member/session/path
-bindings, copies it behind an Applier-minted internal generation, and runs the
-same pile transition as P2P receipt. It never deletes client-writable ingress.
+bindings, uses that marker as the stable identity of a durably reserved
+internal generation, and runs the same pile transition as P2P receipt. It
+never deletes client-writable ingress.
 Provider lifecycle policy may expire those objects independently.
 
 Notifications and paginated LIST are discovery hints only. Scheduled bounded
@@ -461,6 +476,6 @@ The implementation and tests enforce:
 - one pure repository compiler and one root CAS owner;
 - one receiving path for full peers, Lambda, and Workers;
 - database-free hosted authorization and application;
-- exact-generation retirement with durable evidence;
+- stable generation reservation plus one outcome-bound retirement spend;
 - opaque-token CAS and immutable collision checks;
 - byte-identical convergence across arrival orders and concurrent workers.

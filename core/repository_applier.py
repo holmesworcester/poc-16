@@ -11,7 +11,6 @@ Cloudflare's native R2 binding implements the same awaited methods directly.
 """
 from dataclasses import dataclass, field
 import inspect
-import secrets
 
 import facts
 
@@ -20,7 +19,6 @@ from .crypto import h
 from .ingress import (
     KernelRejected,
     PermanentIngressRejection,
-    RejectionReceipt,
     check_source,
     pile_source,
 )
@@ -59,6 +57,7 @@ from .limits import (
 )
 
 _MAX_DISCOVERY_CURSOR_BYTES = 16 * 1024
+_MAX_OPERATION_RECORD_BYTES = 4 * 1024
 _STAGED_OBJECT_BATCH = PAGE_BATCH
 
 
@@ -140,18 +139,29 @@ class ApplyProposal:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
-class ApplyReceipt:
-    """Unforgeable one-use F10 authority for one internal pile generation."""
-
+class _RetirementReceipt:
     workspace: str
     source: str
     payload: str
     generation: str
+    outcome: str
+    issuer: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ApplyReceipt(_RetirementReceipt):
+    """Unforgeable one-use F10 authority for a published generation."""
+
     base_root: bytes | None
     root: bytes
     admitted: tuple
-    outcome: str
-    issuer: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class RejectionReceipt(_RetirementReceipt):
+    """Unforgeable one-use F10 authority for a rejected generation."""
+
+    record: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,36 +213,88 @@ class RepositoryApplier:
         self._issuer = object()
         self._receipts = {}
 
+    def _generation_evidence(self, actor, raw, origin):
+        record = canon({
+            "actor": actor,
+            "kind": "internal-generation-v1",
+            "origin": origin,
+            "payload": h(raw),
+            "workspace": self.workspace,
+        })
+        generation = h(record)
+        return (
+            pile_source(actor, raw, generation),
+            _Evidence("applier/generation/" + generation, record),
+        )
+
+    async def _generation(self, source, raw=None):
+        binding = check_source(source, raw)
+        reservation = await self._get_bounded(
+            self.store,
+            "applier/generation/" + binding.generation,
+            _MAX_OPERATION_RECORD_BYTES,
+        )
+        if reservation is None:
+            raise ValueError("internal generation is not reserved")
+        value = _decode_evidence(
+            reservation, "internal generation",
+            {"actor", "kind", "origin", "payload", "workspace"})
+        if value["actor"] != binding.member \
+                or value["kind"] != "internal-generation-v1" \
+                or not isinstance(value["origin"], str) \
+                or value["payload"] != binding.payload \
+                or value["workspace"] != self.workspace \
+                or h(reservation) != binding.generation:
+            raise ValueError("internal generation reservation")
+        record = await self._get_bounded(
+            self.store,
+            "applier/spent/" + binding.generation,
+            _MAX_OPERATION_RECORD_BYTES,
+        )
+        if record is None:
+            return binding, None
+        value = _decode_evidence(
+            record, "internal generation spend",
+            {"kind", "outcome", "proof"},
+        )
+        if value["kind"] != "internal-generation-spend-v1" \
+                or value["outcome"] not in {
+                    "applied", "confirmed", "noop", "rejected"} \
+                or not valid_fid(value["proof"]):
+            raise ValueError("internal generation spend")
+        return binding, value
+
+    async def _terminal_result(self, source):
+        try:
+            _, spent = await self._generation(source)
+        except ValueError:
+            return None
+        return None if spent is None else ApplyResult(
+            spent["outcome"], None, retired=True)
+
+    async def _stage(self, member, raw, origin):
+        """Recover one stable logical delivery, creating its source at most once."""
+        source, reservation = self._generation_evidence(member, raw, origin)
+        await self._put_evidence(reservation)
+        _, spent = await self._generation(source, raw)
+        if spent is None:
+            await self._put_evidence(_Evidence(source, raw))
+        return source
+
     async def stage(self, member, raw):
-        """Create one fresh internal generation behind the receiving boundary."""
+        """Idempotently create one reserved generation for exact logical work."""
         if not isinstance(raw, bytes):
             raise TypeError("exact ingress bytes required")
         if len(raw) > MAX_PILE_BYTES:
             raise PayloadTooLarge("pile exceeds byte limit")
-        unknown = None
-        for _ in range(2):
-            source = pile_source(
-                member, raw, secrets.token_hex(16))
-            try:
-                result = await self.store.put_if_absent(source, raw)
-            except OutcomeUnknown as error:
-                unknown = error
-                if await self._get_bounded(
-                        self.store, source, MAX_PILE_BYTES) == raw:
-                    return source
-                continue
-            if result is CREATED:
-                return source
-            if result is not EXISTS:
-                raise TypeError("internal pile create result")
-        raise unknown or OSError("could not create internal pile generation")
+        return await self._stage(member, raw, "")
 
     async def admit_object(self, oid, raw):
         """Verify and establish one inbound detached canonical object."""
         return await ensure_object_async(self.store, oid, raw)
 
     async def receive_pile(self, member, raw):
-        """Mint and apply the exact generation received by an HTTP gate."""
+        """Reserve and apply the exact logical delivery from an HTTP gate."""
         return await self._attempt(await self.stage(member, raw))
 
     async def _attempt(self, source):
@@ -372,65 +434,9 @@ class RepositoryApplier:
                 return page
         return None
 
-    def _staged_claim_key(self, key, raw):
-        binding = canon({
-            "key": key,
-            "payload": h(raw),
-            "workspace": self.workspace,
-        })
-        return "staged/claim/" + h(binding)
-
-    async def _claimed_staged_source(self, intent):
-        """Create or recover the marker's one durable internal generation."""
-        proposed_source = pile_source(
-            intent.member, intent.raw, secrets.token_hex(16))
-        claim = _Evidence(
-            self._staged_claim_key(intent.key, intent.raw),
-            canon({
-                "key": intent.key,
-                "payload": h(intent.raw),
-                "source": proposed_source,
-                "workspace": self.workspace,
-            }),
-        )
-        try:
-            created = await self.store.put_if_absent(
-                claim.key, claim.raw)
-        except OutcomeUnknown:
-            created = None
-        incumbent = await self._get_bounded(
-            self.store, claim.key, _MAX_DISCOVERY_CURSOR_BYTES)
-        if created is CREATED and incumbent != claim.raw:
-            raise OSError("staged claim disappeared")
-        if incumbent is None:
-            raise OSError("staged claim was not preserved")
-        value = _decode_evidence(
-            incumbent, "staged claim shape",
-            {"key", "payload", "source", "workspace"})
-        if value["key"] != intent.key \
-                or value["payload"] != h(intent.raw) \
-                or value["workspace"] != self.workspace:
-            raise ValueError("staged claim binding")
-        source = value["source"]
-        binding = check_source(source, intent.raw)
-        if binding.member != intent.member:
-            raise ValueError("staged claim member")
-
-        existing = await self._get_bounded(
-            self.store, source, MAX_PILE_BYTES)
-        if existing is None:
-            try:
-                result = await self.store.put_if_absent(
-                    source, intent.raw)
-            except OutcomeUnknown:
-                result = None
-            existing = await self._get_bounded(
-                self.store, source, MAX_PILE_BYTES)
-            if result not in {None, CREATED, EXISTS}:
-                raise TypeError("staged internal create result")
-        if existing != intent.raw:
-            raise OSError("staged internal generation was not preserved")
-        return source
+    async def _staged_source(self, intent):
+        """Use the marker itself as the stable delivery identity."""
+        return await self._stage(intent.member, intent.raw, intent.key)
 
     @staticmethod
     async def _get_bounded(store, key, maximum):
@@ -444,14 +450,14 @@ class RepositoryApplier:
         """Translate one direct-upload marker into the same internal path.
 
         The untrusted staging namespace is never a second repository.  The
-        exact marker is always fetched from ingress, copied behind a fresh
-        applier-minted generation, and committed first.  Only afterward are
+        exact marker is always fetched from ingress, bound to its stable
+        reserved generation, and committed first.  Only afterward are
         same-session detached objects promoted independently.  Slow, absent,
         poisoned, or failed object reads therefore cannot block valid facts.
 
         The client-writable marker is deliberately not deleted here.  Its
         lifecycle policy is independent of F10, which governs only the exact
-        internal generation minted below.  Immutable operational receipts
+        internal generation reserved below.  Immutable operational receipts
         prevent retained markers from creating generations forever and leave
         missing attachments as separately retryable completion work.
         """
@@ -491,12 +497,14 @@ class RepositoryApplier:
         if admitted:
             result = ApplyResult("admitted", None)
         else:
-            source = await self._claimed_staged_source(intent)
+            source = await self._staged_source(intent)
             result = await self.apply(source, retire=False)
             if result.status == "rejected":
                 await self._put_evidence(receipts["rejected"])
-                retired = await self.retire_rejection(
-                    source, intent.raw, result.rejection)
+                retired = result.retired
+                if result.rejection is not None:
+                    retired = await self.retire_rejection(
+                        source, intent.raw, result.rejection)
                 return StagedApplyResult(
                     key,
                     source,
@@ -510,9 +518,11 @@ class RepositoryApplier:
             if result.status not in {"applied", "confirmed", "noop"}:
                 return StagedApplyResult(key, source, result)
             await self._put_evidence(receipts["admitted"])
-            receipt = self._receipts[(source, h(intent.raw))]
-            retired = await self.retire(
-                source, intent.raw, receipt)
+            receipt = self._receipts.get(source)
+            retired = result.retired
+            if receipt is not None:
+                retired = await self.retire(
+                    source, intent.raw, receipt)
             result = ApplyResult(
                 result.status,
                 result.root,
@@ -719,12 +729,15 @@ class RepositoryApplier:
 
     async def commit(self, source, raw, proposal):
         """Interpret one pure proposal and mint F10 authority on exact success."""
-        binding = check_source(source, raw)
         incumbent = await self._get_bounded(
             self.store, source, MAX_PILE_BYTES)
         if incumbent != raw:
+            terminal = await self._terminal_result(source)
+            if terminal is not None:
+                return terminal
             raise ValueError(
                 "repository source is not a present exact generation")
+        binding, _ = await self._generation(source, raw)
         if not isinstance(proposal, ApplyProposal):
             raise TypeError("repository apply proposal")
         if proposal.workspace != self.workspace \
@@ -776,37 +789,89 @@ class RepositoryApplier:
                 outcome = "applied"
 
         receipt = ApplyReceipt(
-            self.workspace,
-            source,
-            h(raw),
-            binding.generation,
-            proposal.base_root,
-            proposal.root,
-            proposal.admitted,
-            outcome,
-            self._issuer,
+            workspace=self.workspace,
+            source=source,
+            payload=h(raw),
+            generation=binding.generation,
+            outcome=outcome,
+            issuer=self._issuer,
+            base_root=proposal.base_root,
+            root=proposal.root,
+            admitted=proposal.admitted,
         )
-        self._receipts[(source, h(raw))] = receipt
+        self._receipts[source] = receipt
         return ApplyResult(
             outcome, proposal.root, proposal.admitted,
             valids=proposal.valids)
 
-    async def retire(self, source, raw, receipt):
-        """Consume one exact F10 capability and retire only its generation."""
-        binding = check_source(source, raw)
-        key = (source, h(raw))
-        if not isinstance(receipt, ApplyReceipt) \
-                or self._receipts.get(key) is not receipt \
+    def _retirement_evidence(self, receipt):
+        rejected = isinstance(receipt, RejectionReceipt)
+        exact = [
+            receipt.workspace,
+            receipt.source,
+            receipt.payload,
+            receipt.generation,
+            receipt.outcome,
+            h(receipt.record) if rejected else (
+                "" if receipt.base_root is None else h(receipt.base_root)),
+            "" if rejected else h(receipt.root),
+            "" if rejected else h(canon(list(receipt.admitted))),
+        ]
+        record = canon({
+            "kind": "internal-generation-spend-v1",
+            "outcome": receipt.outcome,
+            "proof": h(canon(exact)),
+        })
+        return _Evidence("applier/spent/" + receipt.generation, record)
+
+    async def _claim_spend(self, receipt):
+        """Linearize the sole delete grant; ambiguity never grants deletion."""
+        evidence = self._retirement_evidence(receipt)
+        try:
+            result = await self.store.put_if_absent(
+                evidence.key, evidence.raw)
+        except OutcomeUnknown:
+            result = None
+        incumbent = await self._read_evidence(evidence)
+        if incumbent is not None and incumbent != evidence.raw:
+            # Another legitimate applier may have committed a different exact
+            # success outcome for the same logical delivery.  It owns the sole
+            # delete; this caller must only observe terminal state.
+            _, spent = await self._generation(receipt.source)
+            if spent is None:
+                raise ValueError("internal generation spend")
+        elif result is CREATED and incumbent != evidence.raw:
+            raise OSError("generation spend disappeared")
+        return result is CREATED and incumbent == evidence.raw
+
+    async def _spend_and_retire(self, source, raw, receipt):
+        """Use a definite fresh spend as the sole proof-facing delete grant."""
+        self._receipts.pop(source, None)
+        if not await self._claim_spend(receipt):
+            return await self._get_bounded(
+                self.store, source, MAX_PILE_BYTES) is None
+        return await retire_exact_async(self.store, source, raw)
+
+    async def _owned_receipt(
+            self, source, raw, receipt, kind, outcomes, label):
+        binding, _ = await self._generation(source, raw)
+        if not isinstance(receipt, kind) \
+                or self._receipts.get(source) is not receipt \
                 or receipt.issuer is not self._issuer \
                 or receipt.workspace != self.workspace \
                 or receipt.source != source \
                 or receipt.payload != h(raw) \
                 or receipt.generation != binding.generation \
-                or receipt.outcome not in {"applied", "confirmed", "noop"}:
-            raise ValueError("repository retirement receipt")
-        retired = await retire_exact_async(self.store, source, raw)
-        self._receipts.pop(key, None)
-        return retired
+                or receipt.outcome not in outcomes:
+            raise ValueError(label)
+
+    async def retire(self, source, raw, receipt):
+        """Consume one exact F10 capability and retire only its generation."""
+        await self._owned_receipt(
+            source, raw, receipt, ApplyReceipt,
+            {"applied", "confirmed", "noop"},
+            "repository retirement receipt")
+        return await self._spend_and_retire(source, raw, receipt)
 
     async def _read_evidence(self, evidence):
         return await self._get_bounded(
@@ -843,16 +908,19 @@ class RepositoryApplier:
                 raise ValueError("operational evidence conflict")
         raise unknown or OSError("operational evidence was not preserved")
 
-    async def reject(self, source, raw, error, *, retire=True):
+    async def _reject(self, source, raw, error, *, retire=True):
         """Persist exact typed permanent-rejection evidence, then retire."""
         if not isinstance(error, PermanentIngressRejection):
             raise TypeError("typed permanent ingress rejection required")
-        binding = check_source(source, raw)
         incumbent = await self._get_bounded(
             self.store, source, MAX_PILE_BYTES)
         if incumbent != raw:
+            terminal = await self._terminal_result(source)
+            if terminal is not None:
+                return terminal
             raise ValueError(
                 "repository source is not a present exact generation")
+        binding, _ = await self._generation(source, raw)
         payload = h(raw)
         await self._put_evidence(
             _Evidence("failed/pile/" + payload, raw))
@@ -864,20 +932,25 @@ class RepositoryApplier:
         await self._put_evidence(
             _Evidence("failed/meta/" + h(record), record))
         receipt = RejectionReceipt(
-            source, payload, record, binding.generation)
-        retired = await retire_exact_async(
-            self.store, source, raw) if retire else False
+            workspace=self.workspace,
+            source=source,
+            payload=payload,
+            generation=binding.generation,
+            outcome="rejected",
+            issuer=self._issuer,
+            record=record,
+        )
+        self._receipts[source] = receipt
+        retired = await self.retire_rejection(
+            source, raw, receipt) if retire else False
         return ApplyResult(
             "rejected", None, (), retired, receipt, ())
 
     async def retire_rejection(self, source, raw, receipt):
         """Retire exact rejected work only after rechecking its evidence."""
-        binding = check_source(source, raw)
-        if not isinstance(receipt, RejectionReceipt) \
-                or receipt.source != source \
-                or receipt.payload != h(raw) \
-                or receipt.generation != binding.generation:
-            raise ValueError("durable rejection witness")
+        await self._owned_receipt(
+            source, raw, receipt, RejectionReceipt, {"rejected"},
+            "durable rejection witness")
         pile_evidence = await self._get_bounded(
             self.store,
             "failed/pile/" + receipt.payload,
@@ -890,18 +963,25 @@ class RepositoryApplier:
         )
         if pile_evidence != raw or meta_evidence != receipt.record:
             raise ValueError("durable rejection witness")
-        return await retire_exact_async(self.store, source, raw)
+        return await self._spend_and_retire(source, raw, receipt)
 
     async def apply(self, source, *, retire=True):
         """Run one present exact internal generation through the transition."""
         raw = await self._get_bounded(
             self.store, source, MAX_PILE_BYTES)
         if raw is None:
-            return ApplyResult("missing", None)
-        check_source(source, raw)
-        key = (source, h(raw))
-        receipt = self._receipts.get(key)
+            return await self._terminal_result(source) \
+                or ApplyResult("missing", None)
+        _, spent = await self._generation(source, raw)
+        if spent is not None:
+            return ApplyResult(spent["outcome"], None)
+        receipt = self._receipts.get(source)
         if retire and receipt is not None:
+            if isinstance(receipt, RejectionReceipt):
+                retired = await self.retire_rejection(
+                    source, raw, receipt)
+                return ApplyResult(
+                    "rejected", None, (), retired, receipt, ())
             retired = await self.retire(source, raw, receipt)
             return ApplyResult(
                 receipt.outcome,
@@ -912,12 +992,14 @@ class RepositoryApplier:
         try:
             proposal = await self.propose(raw)
         except PermanentIngressRejection as error:
-            return await self.reject(
+            return await self._reject(
                 source, raw, error, retire=retire)
         result = await self.commit(source, raw, proposal)
         if not retire or result.status not in {"applied", "confirmed", "noop"}:
             return result
-        receipt = self._receipts[(source, h(raw))]
+        receipt = self._receipts.get(source)
+        if receipt is None:
+            return result
         retired = await self.retire(source, raw, receipt)
         return ApplyResult(
             result.status, result.root, result.admitted, retired,

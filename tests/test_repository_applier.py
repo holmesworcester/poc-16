@@ -13,7 +13,6 @@ from core.validated_set import reconstruct
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon
-from core.ingress import KernelRejected
 from full_peer.node import FullPeer
 from core.limits import (
     MAX_PILE_BYTES,
@@ -168,9 +167,7 @@ def test_apply_has_no_unstaged_raw_commit_door(tmp_path):
     proposal = run(applier.propose(pile))
     with pytest.raises(ValueError, match="present exact generation"):
         run(applier.commit(unstaged, pile, proposal))
-    with pytest.raises(ValueError, match="present exact generation"):
-        run(applier.reject(
-            unstaged, pile, KernelRejected("forged unstaged rejection")))
+    assert not hasattr(applier, "reject")
     assert store.get_bounded("root", MAX_ROOT_BYTES) is None
     assert store.list("obj/") == []
     assert store.list("failed/") == []
