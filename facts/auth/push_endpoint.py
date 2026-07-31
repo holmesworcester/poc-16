@@ -3,7 +3,9 @@ import base64
 import re
 
 from nacl import bindings
+from nacl.exceptions import CryptoError
 
+from core.crypto import seal_to, unseal
 from core.fact import Fact, Need
 from core.shape import valid_fid
 from .._commands import member_source, offer_source
@@ -18,6 +20,7 @@ MAX_APPLICATION_BYTES = 256
 MAX_ENVIRONMENT_BYTES = 64
 MAX_SEALED_TARGET_BYTES = 4096
 MIN_SEALED_TARGET_BYTES = 49
+MAX_TARGET_BYTES = MAX_SEALED_TARGET_BYTES - 48
 _APPLICATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _ENVIRONMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BODY_FIELDS = {
@@ -39,6 +42,7 @@ POLICY = FamilyPolicy(
 )
 
 
+# SHAPE
 def _application(value):
     if not isinstance(value, str) \
             or _APPLICATION_RE.fullmatch(value) is None \
@@ -98,7 +102,34 @@ def decode_sealed_target(value):
     return raw
 
 
-# SHAPE
+def checked_target(value):
+    if not isinstance(value, str) or not value.isascii() or not value \
+            or len(value) > MAX_TARGET_BYTES \
+            or any(not 0x21 <= ord(character) <= 0x7e
+                   for character in value):
+        raise ValueError("FCM installation target")
+    return value
+
+
+def seal_target(push_node_public, target):
+    try:
+        return encode_sealed_target(seal_to(
+            push_node_public, checked_target(target).encode("ascii")))
+    except (TypeError, ValueError) as error:
+        raise ValueError("push node public key") from error
+
+
+def open_target(push_node_secret, sealed):
+    try:
+        return checked_target(
+            unseal(
+                push_node_secret,
+                decode_sealed_target(sealed),
+            ).decode("ascii"))
+    except (CryptoError, TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("invalid sealed FCM target") from error
+
+
 def push_endpoint(
         workspace, pk, owner, installation, push_node, platform,
         application, environment, sealed_target, ts):
@@ -109,7 +140,7 @@ def push_endpoint(
     platform = _platform(platform)
     application = _application(application)
     environment = _environment(environment)
-    sealed = encode_sealed_target(sealed_target)
+    decode_sealed_target(sealed_target)
     return Fact(
         TAG,
         ts,
@@ -124,7 +155,7 @@ def push_endpoint(
             "pk": pk,
             "platform": platform,
             "push_node": push_node,
-            "sealed_target": sealed,
+            "sealed_target": sealed_target,
         },
         workspace,
     )
@@ -160,7 +191,7 @@ def validate(f, ctx):
                 body["platform"],
                 body["application"],
                 body["environment"],
-                decode_sealed_target(body["sealed_target"]),
+                body["sealed_target"],
                 f.ts,
             )
     except (KeyError, IndexError, TypeError, UnicodeError, ValueError):
@@ -210,7 +241,7 @@ def register(
             platform,
             application,
             environment,
-            decode_sealed_target(sealed_target),
+            sealed_target,
             timestamp,
         )
         signed = signature.signature(secret, public, item, timestamp)
@@ -249,7 +280,7 @@ def replace(node, workspace, endpoint, push_node, sealed_target, ts=None):
             body["platform"],
             body["application"],
             body["environment"],
-            decode_sealed_target(sealed_target),
+            sealed_target,
             timestamp,
         )
         if item.fid == old.fid:

@@ -84,9 +84,6 @@ Resources:
                       - !Sub "${CanonicalPrefix}/obj/*"
                       - !Sub "${CanonicalPrefix}/applier/*"
                       - !Sub "${CanonicalPrefix}/staged/*"
-                      - !Sub "${CanonicalPrefix}/push/pile/*"
-                      - !Sub "${CanonicalPrefix}/push/result/*"
-                      - !Sub "${CanonicalPrefix}/push/queued/*"
                   NumericLessThanEquals:
                     s3:max-keys: 1
               - Sid: DiscoverStagedPileMarkers
@@ -132,12 +129,6 @@ Resources:
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/staged/*"
                   - !Sub
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/applier/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/push/pile/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/push/result/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/push/queued/*"
               - Sid: ReadIsolatedIngress
                 Effect: Allow
                 Action:
@@ -163,10 +154,6 @@ Resources:
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/staged/*"
                   - !Sub
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/applier/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/push/pile/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/push/result/*"
               - Sid: RetireOnlyInternalPileGenerations
                 Effect: Allow
                 Action: s3:DeleteObject

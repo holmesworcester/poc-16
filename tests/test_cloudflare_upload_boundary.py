@@ -475,10 +475,8 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
                     "entry.py",
                     "applier_runtime.py",
                     "core/repository_applier.py",
-                    "core/repository_reader.py",
                     "core/repository_snapshot.py",
                     "core/staged_intent.py",
-                    "notifications/outbox.py",
                     "adapters/r2/worker.py",
                     "facts/auth/workspace.py"):
                 path = target / relative

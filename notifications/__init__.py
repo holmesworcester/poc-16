@@ -1,15 +1,19 @@
-"""Derived mobile-notification routing and delivery machinery."""
+"""Post-publication notification derivation and provider delivery."""
 
-from .model import (
-    NotificationTrigger,
-    RouteProbe,
-    ROUTE_CHANNEL_OFFER,
-    ROUTE_TYPE_OFFER,
+from .delivery import (
+    NotificationIntent,
+    PublicationHint,
+    deliver,
+    derive,
+    publication_hint,
+    seal_target,
 )
 
 __all__ = (
-    "NotificationTrigger",
-    "ROUTE_CHANNEL_OFFER",
-    "ROUTE_TYPE_OFFER",
-    "RouteProbe",
+    "NotificationIntent",
+    "PublicationHint",
+    "deliver",
+    "derive",
+    "publication_hint",
+    "seal_target",
 )

@@ -143,7 +143,6 @@ class ApplyProposal:
     root: bytes | None
     outbox: tuple
     admitted: tuple
-    fresh: tuple
     valids: tuple
     issuer: object = field(repr=False, compare=False)
 
@@ -215,16 +214,11 @@ class TurnItem:
 class RepositoryApplier:
     """One database-free receiving engine over an object-store CAS register."""
 
-    def __init__(self, workspace, store, *, publication_effect=None):
+    def __init__(self, workspace, store):
         if not valid_fid(workspace):
             raise ValueError("repository workspace")
         self.workspace = workspace
         self.store = async_store(store)
-        if publication_effect is not None \
-                and not callable(getattr(
-                    publication_effect, "establish", None)):
-            raise TypeError("repository publication effect")
-        self.publication_effect = publication_effect
         self._issuer = object()
         self._receipts = {}
 
@@ -762,7 +756,6 @@ class RepositoryApplier:
             compiled.root,
             tuple(sorted(pending.items())),
             admitted,
-            compiled.fresh_fids,
             tuple(durable_receipts),
             self._issuer,
         )
@@ -770,25 +763,6 @@ class RepositoryApplier:
     async def _establish_outbox(self, outbox):
         for oid, raw in outbox:
             await ensure_object_async(self.store, oid, raw)
-
-    async def _establish_publication_effect(
-            self, proposal, generation):
-        """Complete injected derived effects before granting retirement."""
-        if self.publication_effect is None:
-            return
-        triggers = proposal.fresh
-        if not triggers and proposal.root == proposal.base_root:
-            # A crash after a winning CAS can only retain the exact source
-            # generation. Replaying its trigger-capable durable facts against
-            # this newly pinned root is advisory and delivery-idempotent.
-            triggers = proposal.admitted
-        await self.publication_effect.establish(
-            workspace=self.workspace,
-            root_bytes=proposal.root,
-            trigger_fids=triggers,
-            generation=generation,
-            store=self.store,
-        )
 
     async def commit(self, source, raw, proposal):
         """Interpret one pure proposal and mint F10 authority on exact success."""
@@ -850,9 +824,6 @@ class RepositoryApplier:
                 if not isinstance(result, Applied):
                     raise TypeError("root CAS result")
                 outcome = "applied"
-
-        await self._establish_publication_effect(
-            proposal, binding.generation)
 
         receipt = ApplyReceipt(
             workspace=self.workspace,

@@ -24,15 +24,13 @@ class CompiledSnapshot:
     root: bytes | None
     outbox: tuple
     fact_oids: dict
-    fresh_fids: tuple
 
 
-def _compiled(anchor, maps, pending, fact_oids, fresh_fids, seed):
+def _compiled(anchor, maps, pending, fact_oids, seed):
     return CompiledSnapshot(
         snapshot.encode_root(anchor, maps, seed=seed),
         tuple(sorted(pending.items())),
         fact_oids,
-        tuple(sorted(fresh_fids)),
     )
 
 
@@ -211,13 +209,13 @@ def extend_snapshot(anchor, base_root, facts_by_fid, fetch):
         )
         maps[name] = snapshot.descriptor(built)
     return _compiled(
-        anchor, maps, pending, object_ids, fresh, view.root.layout_seed)
+        anchor, maps, pending, object_ids, view.root.layout_seed)
 
 
 def compile_snapshot(anchor, facts_by_fid):
     """Build one history-independent root and immutable object outbox."""
     if not facts_by_fid:
-        return CompiledSnapshot(None, (), {}, ())
+        return CompiledSnapshot(None, (), {})
     if anchor not in facts_by_fid:
         raise ValueError("repository anchor fact")
     rows, objects = logical_rows(anchor, facts_by_fid)
@@ -238,4 +236,4 @@ def compile_snapshot(anchor, facts_by_fid):
         built = merkle_map.build(
             tuple(rows[name].items()), seed, emit)
         maps[name] = snapshot.descriptor(built)
-    return _compiled(anchor, maps, pending, objects, objects, seed)
+    return _compiled(anchor, maps, pending, objects, seed)

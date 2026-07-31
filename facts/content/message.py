@@ -1,6 +1,7 @@
 """facts/content/message.py — a member-signed channel message."""
 from core.fact import Fact, Need
 from core.shape import valid_fid
+from .._notification import NotificationTrigger
 from .._policy import (
     DELETE_SELF,
     FamilyPolicy,
@@ -15,7 +16,6 @@ from .._commands import (
 from ..auth import signature
 
 TAG = "msg"
-MENTION_OFFER = "content.message.mention"
 MAX_MENTIONS = 32
 POLICY = FamilyPolicy(
     suppression=(Self(),),
@@ -43,10 +43,7 @@ def message(workspace, pk, channel, text, ts, owner=None, mentions=()):
     if mentions:
         body["mentions"] = list(mentions)
     return Fact(
-        TAG, ts, author_selectors(POLICY, {}) + [
-            ["offer", MENTION_OFFER, user]
-            for user in mentions
-        ],
+        TAG, ts, author_selectors(POLICY, {}),
         body, workspace,
     )
 
@@ -148,23 +145,11 @@ def messages(node, workspace, channel=None):
 
 def notification_trigger(fact):
     """Return checked routing metadata; display text is never parsed."""
-    from notifications.model import (
-        NotificationTrigger,
-        RouteProbe,
-    )
-    from .notification_preference import (
-        ROUTE_CHANNEL_OFFER,
-        ROUTE_TYPE_OFFER,
-    )
-
     body = fact.body
     return NotificationTrigger(
+        kind=TAG,
         channel=body["chan"],
         mentions=tuple(body.get("mentions", ())),
-        routes=tuple(sorted((
-            RouteProbe(ROUTE_TYPE_OFFER, TAG),
-            RouteProbe(ROUTE_CHANNEL_OFFER, body["chan"]),
-        ))),
     )
 
 

@@ -75,22 +75,12 @@ APPLIER_CORE_MODULES = (
     "merkle_map.py",
     "object_store.py",
     "repository_applier.py",
-    "repository_reader.py",
     "repository_snapshot.py",
     "shape.py",
     "snapshot.py",
     "staged_intent.py",
     "suppression.py",
     "validated_set.py",
-    "worker.py",
-)
-APPLIER_NOTIFICATION_MODULES = (
-    "__init__.py",
-    "job.py",
-    "matcher.py",
-    "model.py",
-    "outbox.py",
-    "queue_evidence.py",
 )
 
 
@@ -175,11 +165,6 @@ def stage_applier():
         pending / "facts",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    for name in APPLIER_NOTIFICATION_MODULES:
-        _copy(
-            REPOSITORY / "notifications" / name,
-            pending / "notifications" / name,
-        )
     _copy(
         REPOSITORY / "adapters" / "__init__.py",
         pending / "adapters" / "__init__.py",
@@ -273,10 +258,8 @@ def _verify_applier_bundle(directory):
         "entry.py",
         "applier_runtime.py",
         "core/repository_applier.py",
-        "core/repository_reader.py",
         "core/repository_snapshot.py",
         "core/staged_intent.py",
-        "notifications/outbox.py",
         "adapters/r2/worker.py",
         "facts/auth/workspace.py",
     }

@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from adapters.r2.worker import R2BindingStore
 from core.repository_applier import RepositoryApplier
 from core.shape import valid_fid
-from notifications.outbox import NotificationOutbox
 
 
 def _text(env, name):
@@ -61,11 +60,7 @@ async def drain(env):
     canonical = R2BindingStore(
         settings.canonical, settings.canonical_prefix)
     ingress = R2BindingStore(settings.ingress)
-    applier = RepositoryApplier(
-        settings.workspace,
-        canonical,
-        publication_effect=NotificationOutbox(),
-    )
+    applier = RepositoryApplier(settings.workspace, canonical)
     internal = await applier.turn()
     staged = await applier.drain_staged(ingress)
     return internal, staged

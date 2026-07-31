@@ -45,10 +45,10 @@ processes or stacks without creating another repository state machine.
     wrapper.
 12. `deploy/` and `adapters/`: shared upload wire/session values, provider
     adaptation, and packaging—never full-peer-local client state.
-13. `facts/auth/push_endpoint.py`,
+13. `facts/auth/push_endpoint.py` and
     `facts/content/notification_preference.py`, then `notifications/`:
-    replicated notification intent, the authenticated route join, independent
-    push outbox, queue dispatch, and provider delivery.
+    authenticated notification state followed by stateless post-publication
+    derivation and provider delivery.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -208,7 +208,6 @@ facts command
     -> pure compiler path-copies FactTree, SuppTree, and FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
-    -> an optional publication effect establishes derived push piles
     -> one exact outcome-bound spend grants its sole retirement DELETE
     -> RepositoryReader pins the resulting root
 ```
@@ -225,87 +224,50 @@ later pile generations.
 
 ## Mobile notifications
 
-Notifications are a derived delivery effect of authenticated state, not a
-second repository and not a general frontend subscription system. The running
-path is:
+Notifications derive from authenticated state after ordinary publication:
 
 ```text
 mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
-new message          -> family-owned route probes
-winning root         -> authenticated preference/endpoint join
-                     -> independent push/pile job
-dispatcher           -> at-least-once managed queue
-consumer             -> FCM -> Android or APNs-backed Apple delivery
+new message          -> family-owned notification trigger
+successful root CAS  -> advisory hint naming the exact root and admitted FIDs
+notification worker  -> authenticated preference/endpoint join -> FCM
 ```
 
-An endpoint belongs to one durable workspace user but identifies one mobile
-installation. It records the selected push-node public key, platform,
-application/environment mapping, and an FCM installation ID sealed to that
-push node. The replicated fact never contains the plaintext target. Endpoint
-replacement publishes the new endpoint and an ordinary exact deletion of the
-old one in the same pile. User or device removal prevents current endpoint use
-without erasing historical endpoint facts.
+An endpoint belongs to one workspace user and mobile installation. It carries
+the selected push-node key and provider mapping, with the FCM target sealed to
+that push node. The plaintext target never enters repository state. Rotation
+publishes the replacement and an ordinary exact deletion of the prior endpoint
+in one pile. Member and device removal make the endpoint unusable through the
+same liveness rules as other facts.
 
-Preferences belong to the user, so changing a mute or mentions setting on one
-device changes it for every device. There is one global cell and optional
-per-channel cells. Global modes are `none`, `mentions`, and `all`; a channel
-also supports `inherit`. Each update explicitly references every head it
-supersedes and uses clock zero initially or one plus the maximum parent clock.
-The clock validates the chain but does not order concurrent updates. Concurrent
-heads meet restrictively (`none < mentions < all`), so mute wins. Removing the
-device that authored an old preference prevents new authorship from that
-device but deliberately leaves the user preference in force.
+Preferences are shared user state: `none`, `mentions`, or `all` globally, with
+an optional per-channel override or `inherit`. An enrolled device replaces all
+observed values using ordinary exact deletion. Concurrent active values meet
+restrictively, so a concurrent mute wins. With no global preference the default
+is `none`.
 
-The matcher does not compare every fact with every subscription. A triggering
-family emits a bounded set of exact route keys; messages currently emit a
-message-type route, a channel route, and canonical mentioned-user IDs. The
-database-free matcher follows authenticated FactTree postings in this order:
+The database-free worker pins the exact root named by the hint and follows
+authenticated tree postings rather than scanning all facts:
 
 1. route key to candidate user preferences;
-2. user and cell key to the explicit preference heads;
+2. user and cell key to current preference values;
 3. user key to all current endpoint facts.
 
-It validates every posting and checks trigger and endpoint liveness through the
-same pinned `WorkerView`. Historical positive preferences may remain in the
-route index, but they only produce candidates: reconstructing current heads and
-applying the restrictive meet makes the final decision. Queue and provider
-workers receive already-resolved endpoint jobs and never read subscriptions.
+It opens that root through `RepositoryReader`, validates the postings, and
+checks suppression/liveness through the reader's `WorkerView`. Message facts
+carry canonical mention IDs; display text is never parsed. Each
+`(event, endpoint)` result has a stable delivery ID which the Firebase adapter
+uses as both the Android and Apple collapse key.
 
-The AWS and Cloudflare repository Appliers install `NotificationOutbox` as a
-generic post-CAS publication effect. A normal `FullPeer` does not produce push
-side effects unless its composition root explicitly injects that effect. Only
-fresh trigger residences from the winning transition are matched. All
-hash-bound `push/pile/<push-node>/<generation>/<digest>` jobs, followed by one
-`push/result/<generation>` completion record, must be verified before the
-source fact generation can retire. The result binds every pile to its delivery
-ID, so recovery accepts either the exact pile or compatible durable queue
-acceptance if a dispatcher already retired it. An empty result records a
-trigger that matched no endpoints. Each job is self-contained, so later
-delivery does not depend on retaining the fact pile or rereading repository
-state.
-
-If a process crashes after root CAS but before any outbox record, the retained
-source is replayed against the newly pinned current root. That deliberately
-uses current mute and endpoint state; it does not claim to recover an erased
-historical preference snapshot. Stable endpoint-level delivery IDs make retry
-and any already-created jobs idempotent.
-
-`notifications.dispatcher` verifies one bounded object-store page and hands
-each job to the provider-neutral delivery queue. A durable
-`push/queued/<delivery-id>` record precedes pile deletion. A publish timeout is
-treated as ambiguous and may duplicate a queue message; it never permits an
-unaccepted job to be discarded. `core/delivery_queue.py` defines the common
-publish/pull/ack/defer contract, and `adapters/gcp/pubsub.py` implements it for
-Google Cloud Pub/Sub.
-
-`notifications.consumer.PushConsumer` validates, expires, and decrypts a job,
-then `adapters/gcp/firebase.py` selects the configured Firebase app and sends
-to its FID. It writes `push/done/<delivery-id>` before acknowledging Pub/Sub.
-Retryable FCM/network outcomes are deferred with bounded backoff; malformed,
-permanent, and unregistered results are terminal evidence. An unregistered FID
-also creates `push/invalidation/...` operational input. Turning that input into
-authenticated exact endpoint suppression remains separate work.
+SNS, Pub/Sub, or another service may carry or wake work for a publication hint,
+but they hold no authority. Duplicate hints simply derive the same delivery
+IDs. There is no notification outbox, queue evidence, repository callback, or
+second publication path. In particular, a notification cannot be emitted from
+a stale CAS result, and delivery failure cannot block root publication or pile
+retention. Delivery is best-effort unless the deployment supplies a retrying
+hint service. Such retries can submit to the provider more than once, so
+applications must tolerate a duplicate visible notification.
 
 The preference commands are available now:
 
@@ -318,39 +280,14 @@ python3 -m full_peer auth.push_endpoint.list WORKSPACE
 
 Endpoint registration is intended to be called by mobile integration after it
 obtains notification permission and an FCM installation ID, seals that ID with
-`notifications.target.seal_target`, and has durable retry state for publishing
-the newest endpoint. Do not pass an unsealed target to the fact command.
+`notifications.seal_target`, and has durable retry state for publishing the
+newest endpoint. Do not pass an unsealed target to the fact command.
 
-Run the deterministic notification and queue suites with:
-
-```sh
-python3 -m pytest -q \
-  tests/test_notification_facts.py \
-  tests/test_notification_pipeline.py \
-  tests/test_notification_dispatcher.py \
-  tests/test_push_consumer.py \
-  tests/test_delivery_queue.py \
-  tests/test_google_pubsub_queue.py
-```
-
-The shared suite can also exercise the official Pub/Sub emulator or an
-explicit live Google project after installing `google-cloud-pubsub`:
+Run the deterministic fact, root-CAS, retry, and Firebase-adapter coverage with:
 
 ```sh
-PUBSUB_EMULATOR_HOST=127.0.0.1:8085 \
-  python3 -m pytest -q -m emulator tests/test_google_pubsub_live.py
-
-POC16_LIVE_PUBSUB=1 POC16_GCP_PROJECT=PROJECT \
-  python3 -m pytest -q -m live_pubsub tests/test_google_pubsub_live.py
+python3 -m pytest -q tests/test_notifications.py
 ```
-
-This is not yet a production-ready mobile release. The remaining work is
-tracked in beads: iOS/Android permission and FID lifecycle integration;
-reproducible Pub/Sub/Firebase IAM and worker deployment; authenticated endpoint
-suppression from terminal invalidation; live Pub/Sub, FCM, and physical-device
-tests; and production observability, runbooks, security review, and rollout
-gates. For Apple delivery, the APNs key or certificate belongs in Firebase,
-never in workspace facts or queue bytes.
 
 ## Facts, suppression, and deletion
 

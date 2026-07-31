@@ -304,6 +304,8 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
         facts.auth.push_endpoint.encode_sealed_target(b"x" * 49),
         ts=22,
     )
+    setting = facts.content.notification_preference.set_global(
+        node, workspace, "all", ts=23)
 
     direct = {
         tag
@@ -317,6 +319,7 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
         "msg": posted,
         "file_bao": descriptor,
         "chunk": chunk,
+        "notification_preference": setting,
         "push_endpoint": endpoint,
     }
     assert set(targets) == direct
@@ -325,7 +328,14 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     # A descriptor suppresses its chunks, so exercise the direct chunk target
     # first; every action still travels through the ordinary fact pipeline.
     for ts, tag in enumerate(
-            ("chunk", "msg", "file_bao", "push_endpoint"), start=30):
+            (
+                "chunk",
+                "msg",
+                "file_bao",
+                "notification_preference",
+                "push_endpoint",
+            ),
+            start=30):
         target = targets[tag]
         action_fid = facts.content.delete.remove(
             node, workspace, target, ts=ts)

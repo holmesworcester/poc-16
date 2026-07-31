@@ -3,12 +3,12 @@ import base64
 from datetime import timedelta
 import importlib
 
-from notifications.provider import (
-    FcmAccepted,
-    FcmPermanent,
-    FcmRequest,
-    FcmRetryable,
-    FcmUnregistered,
+from notifications.delivery import (
+    PushAccepted,
+    PushPermanent,
+    PushRequest,
+    PushRetryable,
+    PushUnregistered,
 )
 
 
@@ -65,11 +65,11 @@ class FirebaseAdminFcm:
         )
 
     def send(self, request):
-        if not isinstance(request, FcmRequest):
+        if not isinstance(request, PushRequest):
             raise TypeError("FCM request")
         app = self.apps.get((request.application, request.environment))
         if app is None:
-            raise FcmPermanent("unconfigured Firebase application")
+            raise PushPermanent("unconfigured Firebase application")
         messaging = self._module()
         title, body = self._titles(request.kind)
         message = messaging.Message(
@@ -79,6 +79,7 @@ class FirebaseAdminFcm:
             },
             notification=messaging.Notification(title=title, body=body),
             android=messaging.AndroidConfig(
+                collapse_key=request.delivery_id,
                 ttl=timedelta(seconds=request.ttl_seconds),
                 priority="normal",
             ),
@@ -86,24 +87,24 @@ class FirebaseAdminFcm:
                 "apns-collapse-id": request.delivery_id,
                 "apns-expiration": str(request.expires_at_ms // 1000),
             }),
-            fid=request.target,
+            token=request.target,
         )
         try:
             message_id = messaging.send(message, app=app)
         except Exception as error:
             name = type(error).__name__
             if name == "UnregisteredError":
-                raise FcmUnregistered("FCM target is unregistered") from error
+                raise PushUnregistered("FCM target is unregistered") from error
             if name in _RETRYABLE or isinstance(
                     error, (OSError, TimeoutError)):
-                raise FcmRetryable(f"FCM send failed: {name}") from error
+                raise PushRetryable(f"FCM send failed: {name}") from error
             if name in _PERMANENT or isinstance(error, ValueError):
-                raise FcmPermanent(f"FCM send failed: {name}") from error
-            raise FcmRetryable(f"FCM send failed: {name}") from error
+                raise PushPermanent(f"FCM send failed: {name}") from error
+            raise PushRetryable(f"FCM send failed: {name}") from error
         try:
-            return FcmAccepted(message_id)
+            return PushAccepted(message_id)
         except (TypeError, ValueError) as error:
-            raise FcmRetryable(
+            raise PushRetryable(
                 "FCM send returned no valid message id") from error
 
 

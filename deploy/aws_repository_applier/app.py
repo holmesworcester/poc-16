@@ -15,7 +15,6 @@ from adapters.s3 import S3Config, S3Store
 from core.repository_applier import RepositoryApplier
 from core.shape import valid_fid
 from core.staged_intent import parse_staging_key, staging_prefix
-from notifications.outbox import NotificationOutbox
 
 
 _stores = None
@@ -134,11 +133,7 @@ async def drain(event, *, canonical=None, ingress=None, workspace=None):
         configured_canonical, configured_ingress = _repository_stores()
         canonical = configured_canonical if canonical is None else canonical
         ingress = configured_ingress if ingress is None else ingress
-    applier = RepositoryApplier(
-        workspace,
-        canonical,
-        publication_effect=NotificationOutbox(),
-    )
+    applier = RepositoryApplier(workspace, canonical)
     internal = await applier.turn()
     bucket = os.environ.get("TINYP2P_UPLOAD_INGRESS_BUCKET", "")
     notified = isinstance(event, dict) and "Records" in event
