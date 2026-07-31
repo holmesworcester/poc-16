@@ -388,16 +388,14 @@ bytes, clobber a newer root, delete ingress, or corrupt a Merkle tree.
 
 ### 5.1 Mobile-notification derivation
 
-Notification preferences and endpoints are authenticated facts. The current
-code includes those families, pure derivation, and a Firebase adapter
-prototype; it has no commit emitter, carrier, or deployed notification Worker.
-Delivery remains a post-publication convenience, never repository state,
-admission evidence, or a condition of publication or source retention:
+Notification preferences and endpoints are authenticated facts. Delivery is
+durable operational work outside core, never repository state, admission
+evidence, or a condition of publication or source retention:
 
 ```text
 closed pile -> RepositoryApplier -> root CAS succeeds
-future emitter -> event root + newly resident trigger FIDs
-event root + separately pinned current root -> bounded join -> push provider
+scheduled scanner -> FactTree(base, target) diff -> managed carrier
+historical event root + separately pinned current root -> bounded join -> FCM
 ```
 
 `push_endpoint` binds one installation to its owning user and device, selected
@@ -419,26 +417,43 @@ parsed. Families without that hook cannot trigger notifications.
 
 An `ApplyResult`'s admitted closure is not an event set: it includes old
 dependencies and does not prove which trigger facts became newly resident.
-A future commit emitter must compute that exact root transition and name only
-its newly resident trigger facts. SNS, Pub/Sub, or another carrier would be a
-liveness hint only; it must not select facts, retain ingress, mutate a
-repository, or participate in correctness.
+There is therefore no post-CAS emitter. `NotificationDiscovery` keeps a
+separate operational `(base, target, continuation)` CAS cursor and performs a
+bounded authenticated Merkle diff of `FactTree`. It examines only newly
+resident `fact.type` postings for families with notification hooks. It never
+fetches fact blobs or consults `FactOrder`, SQL, ingress, or the Applier.
 
-The database-free derivation prototype currently opens only a supplied hint's
-root through `RepositoryReader` and uses its `WorkerView` to follow
-authenticated route, preference-cell, and endpoint postings. A deployable
-worker must instead authenticate the event in that historical root and pin a
-separate current root for endpoints, preferences, suppression, and liveness.
-That split is not implemented yet. Each intent and provider request has a
-deterministic delivery ID derived from the workspace, event, endpoint, and
-canonical payload.
+The scanner copies the exact target root bytes into content-addressed
+notification state and publishes one canonical bounded body containing its
+OID and the discovered FIDs. Carrier acceptance precedes cursor CAS. A crash,
+ambiguous publish response, or scanner race can repeat those bytes but cannot
+advance past unaccepted work. A schedule recovers a dropped wake. The initial
+empty cursor intentionally backfills the tree, so operational state is part of
+deployment continuity even though it carries no fact authority.
 
-There is currently no commit emitter, carrier, deployment, notification
-outbox, durable delivery queue, queue evidence, repository callback, or second
-pile-to-root path. Future derivation must check current suppression and
-liveness in a separately pinned current root. Provider failure must never hold
-up or roll back ordinary publication, and duplicate provider submission must
-remain safe.
+The carrier is an opaque at-least-once byte carrier only. On delivery,
+`NotificationWorker` resolves and hash-verifies the historical event root,
+authenticates each event there, and pins the current repository root
+separately. The current root alone selects current preferences, suppression,
+member/device liveness, unambiguous endpoint cells, and push-node ownership.
+Delayed work therefore cannot resurrect historical delivery authority.
+
+Each request has a deterministic installation-cell delivery ID derived from
+workspace, event, user, installation, and payload. FCM uses that value for
+platform collapse and the application must deduplicate it. The carrier is
+acknowledged only after FCM acceptance, a current-authority cancellation, or
+an explicit unregistered FID or locally malformed sealed endpoint. Transient,
+configuration, missing-state, and unknown outcomes retry. Partial acceptance
+can resend an already accepted request with the same ID; FCM acceptance is not
+evidence of device presentation.
+
+AWS uses S3 notification state, a scheduled scanner Lambda, SQS, and a
+delivery Lambda. Cloudflare uses segregated Workers, R2 notification state,
+and Cloudflare Queues. FullPeer may compose the same scanner and worker with a
+filesystem state store and in-process carrier. These deployments are outside
+core and remain disabled until real iOS and Android launch tests pass. Queue
+and DLQ retention are finite; preserved historical-root state must outlive the
+complete alert and redrive horizon.
 
 ## 6. RepositoryReader and sync
 

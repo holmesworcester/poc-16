@@ -881,7 +881,8 @@ class Reader:
         return RangePage(rows, rows[-1][0] if more else None)
 
     def diff_page(
-            self, local, *, after=None, limit=MAX_RANGE_ROWS,
+            self, local, *, start=None, stop=None, after=None,
+            limit=MAX_RANGE_ROWS,
             max_pages=None):
         """Return one resumable oid-pruned page of a remote map.
 
@@ -893,15 +894,16 @@ class Reader:
         both directions to discover deletions.
         """
         return _drive_diff(_diff_program(
-            self, local, after=after, limit=limit,
+            self, local, start=start, stop=stop, after=after, limit=limit,
             max_pages=max_pages))
 
     async def diff_page_awaited(
-            self, local, *, after=None, limit=MAX_RANGE_ROWS,
+            self, local, *, start=None, stop=None, after=None,
+            limit=MAX_RANGE_ROWS,
             max_pages=None):
         """Await the same bounded diff one authenticated page at a time."""
         return await diff_page_awaited(
-            self, local, after=after, limit=limit,
+            self, local, start=start, stop=stop, after=after, limit=limit,
             max_pages=max_pages)
 
     def items(self, known=None, *, max_pages=None):
@@ -970,14 +972,23 @@ class Reader:
 
 
 def _diff_program(
-        remote, local, *, after=None, limit=MAX_RANGE_ROWS,
+        remote, local, *, start=None, stop=None, after=None,
+        limit=MAX_RANGE_ROWS,
         max_pages=None):
     """Yield one remote/local page at a time for the shared diff traversal."""
     if not isinstance(remote, Reader) or not isinstance(local, Reader) \
             or local.seed != remote.seed \
+            or (start is None) != (stop is None) \
+            or start is not None and (
+                not isinstance(start, str) or not start
+                or not isinstance(stop, str) or start >= stop) \
             or after is not None and (
-                not isinstance(after, str) or not after):
+                not isinstance(after, str) or not after
+                or start is not None and (after < start or after >= stop)):
         raise ValueError("merkle map diff")
+    if start is not None:
+        _query_key(start)
+        _query_key(stop)
     if after is not None:
         _query_key(after)
     if type(limit) is not int or not 1 <= limit <= MAX_RANGE_ROWS:
@@ -1054,11 +1065,14 @@ def _diff_program(
         if local_ref is not None and remote_ref == local_ref:
             continue
         page, summary = yield from load(remote, remote_ref)
-        if after is not None and summary.last <= after:
+        if start is not None and (
+                summary.last < start or summary.first >= stop) \
+                or after is not None and summary.last <= after:
             continue
         if page["kind"] == "leaf":
             for key, value in page["rows"]:
-                if after is None or key > after:
+                if (start is None or start <= key < stop) \
+                        and (after is None or key > after):
                     rows.append((key, value))
                     if len(rows) > limit:
                         break
@@ -1080,7 +1094,9 @@ def _diff_program(
         prefix = _decode_prefix(page["prefix"])
         for row in reversed(page["children"]):
             child = _summary_row(row)
-            if after is not None and child.last <= after:
+            if start is not None and (
+                    child.last < start or child.first >= stop) \
+                    or after is not None and child.last <= after:
                 continue
             stack.append((
                 (
@@ -1117,11 +1133,13 @@ def _drive_diff(program):
 
 
 async def diff_page_awaited(
-        remote, local, *, after=None, limit=MAX_RANGE_ROWS,
+        remote, local, *, start=None, stop=None, after=None,
+        limit=MAX_RANGE_ROWS,
         max_pages=None):
     """Await the exact sync diff program without retaining fetched pages."""
     program = _diff_program(
-        remote, local, after=after, limit=limit, max_pages=max_pages)
+        remote, local, start=start, stop=stop, after=after,
+        limit=limit, max_pages=max_pages)
     try:
         operation = next(program)
         while True:

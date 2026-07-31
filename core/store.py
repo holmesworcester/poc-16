@@ -43,6 +43,9 @@ class FsStore:
         os.makedirs(root, exist_ok=True)
         self._root_lock = os.path.join(root, ".root.lock")
 
+    def namespace_id(self):
+        return "filesystem", os.path.realpath(os.path.abspath(self.root))
+
     def _p(self, key):
         return os.path.join(self.root, validate_key(key))
 

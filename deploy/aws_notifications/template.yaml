@@ -36,7 +36,7 @@ Parameters:
   NotificationStateMinimumRetentionDays:
     Type: Number
     Default: 30
-    MinValue: 28
+    MinValue: 30
   ExpectedBucketOwner:
     Type: String
     AllowedPattern: "^[0-9]{12}$"
@@ -90,14 +90,12 @@ Conditions:
 Resources:
   NotificationDeadLetterQueue:
     Type: AWS::SQS::Queue
-    Condition: NotificationsEnabled
     Properties:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
   NotificationQueue:
     Type: AWS::SQS::Queue
-    Condition: NotificationsEnabled
     Properties:
       MaximumMessageSize: 262144
       MessageRetentionPeriod: 1209600
@@ -388,16 +386,12 @@ Outputs:
   NotificationStateMinimumRetentionDays:
     Value: !Ref NotificationStateMinimumRetentionDays
   NotificationQueueUrl:
-    Condition: NotificationsEnabled
     Value: !Ref NotificationQueue
   NotificationQueueArn:
-    Condition: NotificationsEnabled
     Value: !GetAtt NotificationQueue.Arn
   NotificationDeadLetterQueueUrl:
-    Condition: NotificationsEnabled
     Value: !Ref NotificationDeadLetterQueue
   NotificationDeadLetterQueueArn:
-    Condition: NotificationsEnabled
     Value: !GetAtt NotificationDeadLetterQueue.Arn
   NotificationScannerFunctionArn:
     Condition: NotificationsEnabled

@@ -40,7 +40,7 @@ def args(**changes):
         "delivery_concurrency": 10,
         "deployment_id": "notify-west-2",
         "discard_pending": False,
-        "enable": False,
+        "enable": None,
         "expected_owner": ACCOUNT,
         "max_per_second": 10,
         "max_receive_count": 5,
@@ -79,18 +79,20 @@ def stack(candidate=None, *, enabled=True):
             "OutputValue": str(candidate.state_retention_days),
         },
     ]
+    outputs.extend((
+        {"OutputKey": "NotificationQueueArn", "OutputValue": QUEUE_ARN},
+        {"OutputKey": "NotificationQueueUrl", "OutputValue": QUEUE_URL},
+        {
+            "OutputKey": "NotificationDeadLetterQueueArn",
+            "OutputValue": DLQ_ARN,
+        },
+        {
+            "OutputKey": "NotificationDeadLetterQueueUrl",
+            "OutputValue": DLQ_URL,
+        },
+    ))
     if enabled:
         outputs.extend((
-            {"OutputKey": "NotificationQueueArn", "OutputValue": QUEUE_ARN},
-            {"OutputKey": "NotificationQueueUrl", "OutputValue": QUEUE_URL},
-            {
-                "OutputKey": "NotificationDeadLetterQueueArn",
-                "OutputValue": DLQ_ARN,
-            },
-            {
-                "OutputKey": "NotificationDeadLetterQueueUrl",
-                "OutputValue": DLQ_URL,
-            },
             {
                 "OutputKey": "NotificationScannerFunctionArn",
                 "OutputValue": (
@@ -159,7 +161,7 @@ def test_template_separates_roles_and_has_no_repository_write_door():
         "NotificationScannerFunction:", 1)[0]
 
     assert "Default: \"false\"" in template
-    assert template.count("Condition: NotificationsEnabled") >= 12
+    assert template.count("Condition: NotificationsEnabled") >= 8
     assert "Handler: deploy.aws_notifications.app.scanner_handler" in template
     assert "Handler: deploy.aws_notifications.app.delivery_handler" in template
     assert "FunctionResponseTypes:\n        - ReportBatchItemFailures" in template
@@ -168,11 +170,18 @@ def test_template_separates_roles_and_has_no_repository_write_door():
     assert "MinValue: 5" in template
     assert "RedrivePolicy:" in template
     assert "NotificationStateMinimumRetentionDays:" in template
-    assert "MinValue: 28" in template
+    assert "MinValue: 30" in template
     assert "ApproximateAgeOfOldestMessage" in template
     assert "ApproximateNumberOfMessagesVisible" in template
     assert "AWS::SQS::Queue" in template
     assert "FifoQueue" not in template
+    source_queue = template.split(
+        "NotificationQueue:", 1)[1].split("NotificationScannerRole:", 1)[0]
+    dead_queue = template.split(
+        "NotificationDeadLetterQueue:", 1)[1].split(
+            "NotificationQueue:", 1)[0]
+    assert "Condition: NotificationsEnabled" not in source_queue
+    assert "Condition: NotificationsEnabled" not in dead_queue
 
     assert "s3:GetObject" in scanner
     assert "s3:PutObject" in scanner
@@ -225,9 +234,9 @@ def test_same_bucket_requires_disjoint_state_and_repository_prefixes():
 
 def test_state_root_retention_covers_source_and_dlq_horizons():
     with pytest.raises(ValueError, match="state retention"):
-        manage._validated(args(state_retention_days=27))
+        manage._validated(args(state_retention_days=29))
     assert manage._validated(args(
-        state_retention_days=28)).state_retention_days == 28
+        state_retention_days=30)).state_retention_days == 30
 
 
 def test_deploy_is_disabled_unless_operator_explicitly_enables(
@@ -235,9 +244,11 @@ def test_deploy_is_disabled_unless_operator_explicitly_enables(
     candidate = args()
     commands = []
     monkeypatch.setattr(manage, "build", lambda _args: None)
-    monkeypatch.setattr(manage, "_stack_for_deploy", lambda _args: "stack")
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy", lambda _args: ("stack", False))
     monkeypatch.setattr(
         manage, "_owned_stack", lambda _args: stack(candidate, enabled=False))
+    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
     monkeypatch.setattr(manage, "_run", lambda command, **_kw: commands.append(
         command) or SimpleNamespace(stdout=""))
 
@@ -246,14 +257,44 @@ def test_deploy_is_disabled_unless_operator_explicitly_enables(
     command = next(row for row in commands if row[:2] == ["sam", "deploy"])
     assert "Enabled=false" in command
     assert outputs["Enabled"] == "false"
-    assert "NotificationQueueUrl" not in outputs
+    assert outputs["NotificationQueueUrl"] == QUEUE_URL
+
+
+@pytest.mark.parametrize("incumbent", (False, True))
+def test_update_without_switch_preserves_incumbent_traffic_state(
+        monkeypatch, incumbent):
+    candidate = args(create=False, update=True, enable=None)
+    current = stack(candidate, enabled=incumbent)
+    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args, _stack=None: current)
+
+    assert manage._stack_for_deploy(candidate) == (
+        current["StackId"], incumbent)
+
+
+def test_explicit_disable_retains_both_carrier_queues(monkeypatch):
+    candidate = args(create=False, update=True, enable=False)
+    current = stack(candidate, enabled=True)
+    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args, _stack=None: current)
+
+    assert manage._stack_for_deploy(candidate) == (
+        current["StackId"], False)
+    template = (PACKAGE / "template.yaml").read_text()
+    for name in (
+            "NotificationQueue", "NotificationDeadLetterQueue"):
+        resource = template.split(f"  {name}:\n", 1)[1].split("\n  ", 1)[0]
+        assert "Condition:" not in resource
 
 
 def test_enabled_deploy_checks_exact_queue_identity(monkeypatch):
     candidate = args(enable=True)
     commands = []
     monkeypatch.setattr(manage, "build", lambda _args: None)
-    monkeypatch.setattr(manage, "_stack_for_deploy", lambda _args: "stack")
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy", lambda _args: ("stack", True))
     monkeypatch.setattr(
         manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
@@ -267,18 +308,16 @@ def test_enabled_deploy_checks_exact_queue_identity(monkeypatch):
     assert outputs["NotificationQueueArn"] == QUEUE_ARN
 
 
-def test_remove_refuses_pending_source_or_dlq_work(monkeypatch):
+def test_remove_never_treats_approximate_zero_as_safe_deletion(monkeypatch):
     candidate = args()
     calls = []
     monkeypatch.setattr(
         manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_queue_depth", lambda _args, url: (
-        1 if url == DLQ_URL else 0))
     monkeypatch.setattr(manage, "_run", lambda command, **_kw: calls.append(
         command))
 
-    with pytest.raises(RuntimeError, match="refusing to remove"):
+    with pytest.raises(RuntimeError, match="durable notification carrier"):
         manage.remove(candidate)
     assert calls == []
 
@@ -288,6 +327,7 @@ def test_explicit_discard_removes_only_the_owned_stack(monkeypatch):
     calls = []
     owned = stack(candidate, enabled=True)
     monkeypatch.setattr(manage, "_owned_stack", lambda _args: owned)
+    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
     monkeypatch.setattr(manage, "_run", lambda command, **_kw: calls.append(
         command) or SimpleNamespace(stdout=""))
 

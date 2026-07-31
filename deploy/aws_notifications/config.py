@@ -13,7 +13,10 @@ DELIVERY_TIMEOUT_SECONDS = 60
 QUEUE_VISIBILITY_SECONDS = 360
 QUEUE_RETENTION_SECONDS = 14 * 24 * 60 * 60
 DLQ_RETENTION_SECONDS = 14 * 24 * 60 * 60
-MIN_STATE_RETENTION_DAYS = 28
+# One 14-day source/DLQ lifetime plus one 14-day post-redrive source lifetime,
+# with two days for alert response. SQS standard DLQ transfer preserves the
+# original enqueue age; an explicit redrive resets it.
+MIN_STATE_RETENTION_DAYS = 30
 MAX_RECEIVE_COUNT = 5
 MAX_SECRET_BYTES = 65_536
 MAX_FIREBASE_APPS = 32

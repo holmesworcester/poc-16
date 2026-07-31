@@ -343,15 +343,23 @@ def _stack_for_deploy(args):
     if args.create:
         if incumbent is not None:
             raise RuntimeError("create requires an absent stack name")
-        return args.stack_name
+        return args.stack_name, bool(args.enable)
     if incumbent is None:
         raise RuntimeError("update requires an existing owned stack")
-    return _owned_stack(args, incumbent)["StackId"]
+    owned = _owned_stack(args, incumbent)
+    enabled = _outputs(owned).get("Enabled")
+    if enabled not in {"true", "false"}:
+        raise RuntimeError("notification stack has no enabled state")
+    return owned["StackId"], (
+        enabled == "true" if args.enable is None else args.enable)
 
 
-def _parameters(args):
+def _parameters(args, enabled=None):
+    enabled = bool(args.enable) if enabled is None else enabled
+    if type(enabled) is not bool:
+        raise TypeError("notification enabled state")
     return (
-        f"Enabled={'true' if args.enable else 'false'}",
+        f"Enabled={'true' if enabled else 'false'}",
         f"DeploymentId={args.deployment_id}",
         f"WorkspaceId={args.workspace}",
         f"CanonicalBucketName={args.canonical_bucket}",
@@ -373,9 +381,9 @@ def _parameters(args):
 
 
 def deploy(args):
-    """Deploy disabled by default; ``--enable`` is the launch switch."""
+    """Create disabled; updates preserve state without an explicit switch."""
     args = _validated(args)
-    target = _stack_for_deploy(args)
+    target, enabled = _stack_for_deploy(args)
     build(args)
     _run([
         "sam", "deploy",
@@ -384,7 +392,7 @@ def deploy(args):
         "--capabilities", "CAPABILITY_IAM",
         "--resolve-s3",
         "--no-fail-on-empty-changeset",
-        "--parameter-overrides", *_parameters(args),
+        "--parameter-overrides", *_parameters(args, enabled),
         "--tags",
         f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}",
         f"{DEPLOYMENT_ID_TAG}={args.deployment_id}",
@@ -392,56 +400,25 @@ def deploy(args):
     ])
     outputs = _outputs(_owned_stack(args))
     if outputs.get("WorkspaceId") != args.workspace \
-            or outputs.get("Enabled") != (
-                "true" if args.enable else "false") \
+            or outputs.get("Enabled") != ("true" if enabled else "false") \
             or outputs.get("NotificationStateMinimumRetentionDays") \
             != str(args.state_retention_days):
         raise RuntimeError("deployed notification outputs are incomplete")
-    if args.enable:
-        _checked_queues(args, outputs)
+    _checked_queues(args, outputs)
     return outputs
 
 
-def _queue_depth(args, queue_url):
-    result = _run([
-        "aws", "sqs", "get-queue-attributes",
-        "--queue-url", queue_url,
-        "--attribute-names",
-        "ApproximateNumberOfMessages",
-        "ApproximateNumberOfMessagesDelayed",
-        "ApproximateNumberOfMessagesNotVisible",
-        "--output", "json",
-        *_provider_flags(args),
-    ], capture=True)
-    try:
-        values = json.loads(result.stdout)["Attributes"]
-        return sum(int(values.get(name, "0")) for name in (
-            "ApproximateNumberOfMessages",
-            "ApproximateNumberOfMessagesDelayed",
-            "ApproximateNumberOfMessagesNotVisible",
-        ))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("malformed SQS queue attributes") from error
-
-
 def remove(args):
-    """Delete only the owned stack and never silently discard queued work."""
+    """Delete an owned carrier only with explicit destructive authority."""
     if DEPLOYMENT_ID_RE.fullmatch(args.deployment_id or "") is None:
         raise ValueError("deployment ID")
     stack = _owned_stack(args)
     outputs = _outputs(stack)
-    if outputs.get("Enabled") == "true" and not args.discard_pending:
-        _checked_queues(args, outputs)
-        for name in (
-                "NotificationQueueUrl",
-                "NotificationDeadLetterQueueUrl"):
-            url = outputs.get(name)
-            if not isinstance(url, str) or not url:
-                raise RuntimeError("notification queue output is missing")
-            if _queue_depth(args, url):
-                raise RuntimeError(
-                    "refusing to remove notification work; redrive or pass "
-                    "--discard-pending")
+    _checked_queues(args, outputs)
+    if not args.discard_pending:
+        raise RuntimeError(
+            "refusing to delete the durable notification carrier; first "
+            "disable or redrive it, then explicitly pass --discard-pending")
     flags = _provider_flags(args)
     _run([
         "aws", "cloudformation", "delete-stack",
@@ -562,8 +539,8 @@ def parser():
     deploy_command.add_argument("--state-prefix", required=True)
     deploy_command.add_argument(
         "--state-retention-days", type=int, default=30,
-        help=("assert the external state lifecycle preserves objects for "
-              "at least this many days (minimum 28)"),
+        help=("assert the external state lifecycle preserves objects through "
+              "queue, DLQ, alert, and one redrive (minimum 30 days)"),
     )
     deploy_command.add_argument("--expected-owner", required=True)
     deploy_command.add_argument("--notification-secret-arn", required=True)
@@ -576,7 +553,12 @@ def parser():
     deploy_command.add_argument("--delivery-concurrency", type=int, default=10)
     deploy_command.add_argument(
         "--max-receive-count", type=int, default=MAX_RECEIVE_COUNT)
-    deploy_command.add_argument("--enable", action="store_true")
+    traffic = deploy_command.add_mutually_exclusive_group()
+    traffic.add_argument(
+        "--enable", dest="enable", action="store_const", const=True)
+    traffic.add_argument(
+        "--disable", dest="enable", action="store_const", const=False)
+    deploy_command.set_defaults(enable=None)
     mode = deploy_command.add_mutually_exclusive_group(required=True)
     mode.add_argument("--create", action="store_true")
     mode.add_argument("--update", action="store_true")

@@ -236,6 +236,27 @@ class SyncStoreAdapter:
     async def cas(self, key, token, value):
         return self.store.cas(key, token, value)
 
+    def namespace_id(self):
+        return store_namespace(self.store)
+
+
+def store_namespace(store):
+    """Return a concrete adapter's stable physical namespace, when known.
+
+    Service proxies may not expose this. Their deployment must prove disjoint
+    bindings structurally instead of inventing a capability identity.
+    """
+    identity = getattr(store, "namespace_id", None)
+    if not callable(identity):
+        return None
+    value = identity()
+    if value is not None:
+        try:
+            hash(value)
+        except TypeError as error:
+            raise TypeError("object-store namespace identity") from error
+    return value
+
 
 def async_store(store):
     """Return one awaited store without introducing provider branches."""

@@ -810,6 +810,70 @@ def test_awaited_diff_is_sync_identical_and_enforces_aggregate_page_budget():
     assert len(calls) == exact - 1
 
 
+def test_diff_range_prunes_unrelated_rows_and_sync_awaited_agree():
+    source = [
+        (f"a:{number:04d}", {"old": number}) for number in range(80)
+    ] + [
+        (f"type:{number:04d}", {"old": number}) for number in range(12)
+    ] + [
+        (f"z:{number:04d}", {"old": number}) for number in range(80)
+    ]
+    objects = {}
+    local_built = merkle_map.build(source, SEED, emitter(objects))
+    changes = tuple(
+        (f"{prefix}:{number:04d}", {"new": number})
+        for prefix, number in (
+            ("a", 1), ("type", 2), ("type", 7), ("z", 1))
+    )
+    remote_built = merkle_map.update(
+        local_built.root, SEED, changes, objects.get, emitter(objects))
+
+    def readers(fetch):
+        return (
+            merkle_map.Reader(
+                remote_built.root, SEED, fetch,
+                max_page_depth=remote_built.page_depth),
+            merkle_map.Reader(
+                local_built.root, SEED, fetch,
+                max_page_depth=local_built.page_depth),
+        )
+
+    remote, local = readers(objects.get)
+    cursor, found = None, []
+    while True:
+        page = remote.diff_page(
+            local, start="type:", stop="type:\uffff",
+            after=cursor, limit=1)
+        found.extend(page.differing)
+        if page.cursor is None:
+            break
+        assert page.cursor.startswith("type:")
+        cursor = page.cursor
+    assert dict(found) == {
+        "type:0002": {"new": 2},
+        "type:0007": {"new": 7},
+    }
+
+    async def fetch(oid):
+        await asyncio.sleep(0)
+        return objects.get(oid)
+
+    remote, local = readers(fetch)
+    first = asyncio.run(remote.diff_page_awaited(
+        local, start="type:", stop="type:\uffff", limit=1))
+    sync_remote, sync_local = readers(objects.get)
+    assert first == sync_remote.diff_page(
+        sync_local, start="type:", stop="type:\uffff", limit=1)
+
+    remote, local = readers(objects.get)
+    for kwargs in (
+            {"start": "type:"},
+            {"stop": "type:\uffff"},
+            {"start": "type:", "stop": "type:\uffff", "after": "z:0"}):
+        with pytest.raises(ValueError, match="merkle map diff"):
+            remote.diff_page(local, **kwargs)
+
+
 def test_stale_physically_held_page_is_not_a_current_reachability_witness():
     objects = {}
     original = merkle_map.build(rows(90), SEED, emitter(objects))
