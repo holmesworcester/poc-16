@@ -419,25 +419,31 @@ parsed. Families without that hook cannot trigger notifications.
 An `ApplyResult`'s admitted closure is not an event set: it includes old
 dependencies and does not prove which trigger facts became newly resident.
 There is therefore no post-CAS emitter. `NotificationDiscovery` keeps a
-separate operational `(base, target, continuation)` CAS cursor and performs a
-bounded authenticated Merkle diff of `FactTree`. It examines only newly
-resident `fact.type` postings for families with notification hooks. It never
-fetches fact blobs or consults `FactOrder`, SQL, ingress, or the Applier.
+separate operational CAS cursor and performs a bounded authenticated Merkle
+diff of `FactTree`. It examines only newly resident `fact.type` postings for
+families with notification hooks. It never fetches fact blobs or consults
+`FactOrder`, SQL, ingress, or the Applier.
 
-Bootstrap is an explicit compare-and-swap into either `current` mode, which
-skips existing history, or deliberate `backfill` mode. An absent cursor never
-silently initializes during scanning. Each successful bootstrap creates a
-fresh random generation, preventing a paused pre-recovery worker from
-completing byte-identical work after state loss and changed current authority.
+Bootstrap is an explicit cursor transition. `current` starts after the present
+FactTree; `backfill` starts at the empty tree. An absent cursor during normal
+scanning is an operational fault, not an instruction to choose one. Workspace,
+immutable deployment owner, bootstrap mode, and a fresh bootstrap generation
+are persisted so state loss or deployment rebinding fails closed. The
+generation is included in pending bytes: a worker paused before state loss
+cannot complete byte-identical work recreated after recovery under newer
+current authority.
 
-For a page with triggers, the scanner copies the exact target root bytes into
+For a page with triggers, the scanner copies the exact target root into
 content-addressed notification state and encodes one bounded body containing
 workspace, deployment owner, bootstrap generation, target-root OID, and sorted
 FIDs. It creates that body at `obj/<sha256(body)>`, then CASes the cursor to one
-pending body OID plus the page's exact successor, and only then publishes a
-wake. The scanner cannot pass pending work. Every fair turn republishes its
-exact stored bytes, so a crash, dropped publish, expired queue item, or unknown
-carrier response cannot lose work. Pages without triggers advance directly.
+pending body OID plus the page's exact successor before publishing a wake. The
+scanner cannot pass pending work. Every fair turn republishes the exact stored
+bytes. Queue or SQS acceptance never advances the cursor; a crash, ambiguous
+provider result, complete wake loss, finite carrier retention, or scanner race
+can duplicate work but cannot skip it. Pages without triggers advance
+directly. This is a serial per-workspace state machine, not an outbox or
+pending-item database.
 
 The carrier is a disposable opaque wake, not the durable work owner. On
 delivery, the handler first compares `sha256(body)` with the sole pending OID.
@@ -464,11 +470,12 @@ evidence of device presentation.
 AWS uses S3 notification state, a scheduled scanner Lambda, SQS, and a
 delivery Lambda. Cloudflare uses segregated Workers, R2 notification state,
 and Cloudflare Queues. FullPeer may compose the same scanner and worker with a
-filesystem state store and in-process carrier. These deployments are outside
+filesystem state store and an in-process wake. These deployments are outside
 core and remain disabled until real iOS and Android launch tests pass. Queue
-and DLQ retention may be finite without weakening correctness; fair scheduled
-scans republish durable pending state. The separate cursor and its immutable
-root/body objects are deployment continuity and must not be silently replaced.
+and DLQ retention are finite operational headroom; notification cursor,
+pending body, and historical root state must be non-expiring because they are
+the durable eventual-delivery record. Fair scheduled scans recreate disposable
+wakes; the state must not be silently replaced.
 
 ## 6. RepositoryReader and sync
 

@@ -230,8 +230,8 @@ mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
 new message          -> family-owned notification trigger
 scheduled scanner    -> authenticated FactTree diff -> durable pending cursor
-durable pending body -> disposable carrier wake
-carrier delivery     -> historical event proof + current authority join -> FCM
+disposable wake      -> historical event proof + current authority join -> FCM
+typed completion     -> pending-cursor CAS -> next FactTree page
 ```
 
 An endpoint belongs to one workspace user and mobile installation. It carries
@@ -260,13 +260,25 @@ generation so an old paused worker cannot complete identical work after state
 loss and rebootstrap.
 
 One canonical body contains only workspace, deployment owner, bootstrap
-generation, target-root object ID, and sorted trigger FIDs. The scanner stores
-the exact root and body by content OID, then CASes one pending body OID and its
-exact successor into the cursor before publishing. It never advances pending
-work. Every fair scheduled turn republishes the stored body, making carrier
-retention and dropped wakes irrelevant to correctness. A zero-trigger page
-advances directly. Preserve notification state across redeployments; state loss
-is an explicit recovery event, never an implicit reinitialization.
+generation, target-root object ID, and sorted trigger FIDs. Before publishing,
+the scanner preserves the exact target root and body in notification state and
+CASes one pending body OID with its exact successor. There is at most one
+pending page per workspace. Queue, SQS, and local deliveries are disposable
+wakes: every fair scheduled turn republishes the byte-identical pending body
+until the worker records completion. A lost wake, finite queue retention,
+ambiguous publish response, process crash, or scanner race can duplicate work
+but cannot make discovery forget it. A zero-trigger page advances directly.
+
+The worker advances the pending cursor only after typed FCM acceptance or an
+explicit current-authority or terminal outcome. A concurrent or stale delivery
+is acknowledged only after notification state proves it is no longer the exact
+pending item. Carrier acknowledgement by itself is never progress.
+
+Scheduled scanning also fails loudly when state belongs to a different
+immutable deployment or was deleted after bootstrap. It never guesses whether
+to skip history or flood it again. Preserve notification state across updates
+and rollback; state loss is an explicit recovery event, never implicit
+reinitialization.
 
 `NotificationWorker` resolves and hash-checks the historical event root from
 notification state, authenticates every named event there, then separately
@@ -298,11 +310,12 @@ is not proof that APNs or Android presented the notification.
 AWS composes the scanner and worker as separate Lambdas around S3 notification
 state and SQS. Cloudflare composes separate Workers around R2 state and a
 Cloudflare Queue. A full peer can run the same shared scanner and worker with
-filesystem notification state and an in-process carrier. Provider receipts and
-queue metadata carry no repository or endpoint authority. Managed queues may
-have finite retention: fair scans recreate wakes from the durable pending
-cursor. The cursor and immutable notification-state objects remain deployment
-continuity and must not be silently discarded.
+filesystem notification state and an in-process wake. Provider receipts and
+queue metadata carry no repository, endpoint, or completion authority. Queue
+and DLQ retention provide retry latency and operational headroom only; fair
+scans recreate wakes from the durable pending cursor. The cursor and immutable
+notification-state objects remain deployment continuity and must not expire or
+be silently discarded.
 
 The Cloudflare artifact under `deploy/cloudflare_notifications` divides that
 composition into four private Workers: a mutation-free canonical R2 reader, a
