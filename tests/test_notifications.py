@@ -319,7 +319,7 @@ def test_firebase_adapter_uses_fid_and_both_platform_collapse_ids():
 def test_largest_local_payload_fits_fcm_data_and_one_more_byte_is_invalid():
     module = FakeMessaging()
     adapter = FirebaseAdminFcm(
-        {("poc16.mobile", "production"): object()},
+        {("poc16.mobile", "production"): _firebase_app()},
         messaging_module=module)
     exact = PushRequest(
         "poc16.mobile", "production", "apple", "target-token",

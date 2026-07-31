@@ -340,22 +340,26 @@ the provider's 4,096-byte limit.
 Notification-state root bytes do not contain historical FactTree pages or
 facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
 configurations and reject an enabled deletion rule overlapping either the
-notification-state prefix or its canonical workspace prefix. The tool never
-changes lifecycle configuration or deletes either bucket or Queue.
+notification-state prefix or its canonical workspace prefix. R2 Standard and
+Infrequent Access storage remain synchronously readable, so that lifecycle
+transition is safe; an unknown future class that requires asynchronous restore
+fails closed. The tool never changes lifecycle configuration or deletes either
+bucket or Queue.
 Provisioning uses the free-plan-compatible one-day Queue retention. Paid
 retention can provide more operational headroom, but is not a correctness
 requirement because every fair scan recreates the pending wake from R2.
 
 All four Workers carry one SHA-256 semantic delivery identity over the
 Cloudflare account, workspace and canonical repository, notification-state
-namespace, Worker roles, push-node public key, exact Firebase
+namespace, push-node public key, exact Firebase
 application/environment/project, and completion domain. Queue, DLQ, schedule,
-and wake identity are deliberately excluded: they are replaceable carriers,
-not authority to declare delivery complete. The Workers also carry the exact
-staged software digest, one shared high-entropy release ID, their exact role,
-and enablement state. The scanner checks the reader's complete release marker
-before discovery. The consumer checks the reader, scanner, and FCM markers
-before each batch, then passes its expected marker into the same FCM RPC that
+wake, and Worker names are deliberately excluded: they are replaceable
+infrastructure, not authority to declare delivery complete. The Workers also
+carry the exact staged software digest, one shared high-entropy release ID,
+their exact role, and enablement state. The scanner checks the reader's
+complete release marker before discovery. The consumer checks the reader,
+scanner, and FCM markers before each batch, then passes its expected marker
+into the same FCM RPC that
 may issue the irreversible provider request. The FCM boundary rejects release
 skew inside that call. A partial or competing four-Worker rollout can therefore
 delay work but cannot send through a mismatched release. The deploy tool checks
@@ -459,6 +463,7 @@ bootstrap mode. The control tool cannot read the private R2 binding, so the
 successful scheduled invocation—not merely local config generation—is the
 bootstrap evidence. A later missing cursor remains a loud runtime fault and
 requires another explicit recovery decision.
+
 Disabled `verify` reconstructs the release from the four exact active Worker
 versions and does not require a production manifest or mobile launch records;
 it requires Queue and Cron effects to remain detached. Production `verify`

@@ -38,6 +38,7 @@ from deploy.notification_launch import (  # noqa: E402
 from deploy.python_role_modules import (  # noqa: E402
     REPOSITORY_READER_CORE_MODULES,
 )
+from notifications.delivery import delivery_domain_id  # noqa: E402
 
 
 SCANNER_TEMPLATE = PACKAGE / "wrangler.scanner.jsonc"
@@ -55,6 +56,7 @@ VENDORED = PACKAGE / "python_modules"
 RELEASE = BUILD / "release"
 RELEASE_MANIFEST_FORMAT = "poc16-cloudflare-notification-release-v1"
 RELEASE_MANIFEST_ENV = "CF_NOTIFICATION_RELEASE_MANIFEST"
+COMPLETION_PROTOCOL = "poc16-notification-completion-v1"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
@@ -429,6 +431,8 @@ def generated_configs(
         raise ValueError(
             "test mode requires a non-production environment and the exact "
             "allowed Firebase test project")
+    delivery_domain = delivery_domain_id(push_node, ((
+        application, firebase_environment, firebase_project),))
 
     canonical_prefix = _prefix(environment.get(
         "CF_CANONICAL_PREFIX", f"workspaces/{workspace}"),
@@ -440,16 +444,8 @@ def generated_configs(
         "canonical_bucket": canonical,
         "canonical_prefix": canonical_prefix,
         "cloudflare_account_id": account,
-        "completion_domain": "poc16-notification-delivery-v1",
-        "consumer": consumer_name,
-        "fcm_application": application,
-        "fcm_environment": firebase_environment,
-        "fcm_project": firebase_project,
-        "fcm_worker": fcm_name,
-        "format": "poc16-cloudflare-notification-deployment-v1",
-        "push_node": push_node,
-        "reader": reader_name,
-        "scanner": scanner_name,
+        "completion_protocol": COMPLETION_PROTOCOL,
+        "delivery_domain": delivery_domain,
         "state_bucket": state,
         "state_prefix": state_prefix,
         "workspace": workspace,
@@ -1047,9 +1043,9 @@ def _api(method, suffix, document=None, environment=os.environ):
     return value.get("result")
 
 
-def _require_prefix_no_expiry(
+def _require_prefix_synchronously_readable(
         config, prefix_binding, label, environment=os.environ):
-    """Reject every enabled deletion rule overlapping named objects."""
+    """Reject overlapping expiry or a storage class requiring restore."""
     rows = config.get("r2_buckets")
     if not isinstance(rows, list) or len(rows) != 1:
         raise RuntimeError(f"{label} R2 binding is malformed")
@@ -1068,26 +1064,39 @@ def _require_prefix_no_expiry(
     for rule in result.get("rules", []):
         if not isinstance(rule, dict) or type(rule.get("enabled")) is not bool:
             raise RuntimeError("malformed R2 lifecycle rule")
-        if not rule["enabled"] or "deleteObjectsTransition" not in rule:
+        if not rule["enabled"]:
+            continue
+        deletes = "deleteObjectsTransition" in rule
+        transitions = rule.get("storageClassTransitions", [])
+        if not isinstance(transitions, list):
+            raise RuntimeError("malformed R2 storage lifecycle rule")
+        asynchronous = any(
+                not isinstance(transition, dict)
+                or transition.get("storageClass") != "InfrequentAccess"
+                for transition in transitions)
+        if not deletes and not transitions:
             continue
         conditions = rule.get("conditions")
         rule_prefix = conditions.get("prefix") \
             if isinstance(conditions, dict) else None
         if not isinstance(rule_prefix, str):
-            raise RuntimeError("malformed R2 deletion lifecycle rule")
+            raise RuntimeError("malformed R2 object lifecycle rule")
         if prefix.startswith(rule_prefix) or rule_prefix.startswith(prefix):
-            raise RuntimeError(
-                f"{label} objects must never expire")
+            if deletes:
+                raise RuntimeError(f"{label} objects must never expire")
+            if asynchronous:
+                raise RuntimeError(
+                    f"{label} objects must remain synchronously readable")
 
 
 def _require_retained_notification_objects(
         reader, scanner, environment=os.environ):
     # Cursor root bytes alone are insufficient: historical FactTree pages and
     # fact objects are fetched from canonical state during lag and redrive.
-    _require_prefix_no_expiry(
+    _require_prefix_synchronously_readable(
         reader, "CANONICAL_PREFIX", "canonical notification history",
         environment)
-    _require_prefix_no_expiry(
+    _require_prefix_synchronously_readable(
         scanner, "NOTIFICATION_STATE_PREFIX", "notification cursor/root",
         environment)
 

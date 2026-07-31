@@ -19,6 +19,7 @@ from adapters.cloudflare.queue import (
 from adapters.r2.reader import R2ReadBindingStore
 from core.crypto import h, keypair, load_sk
 from core.limits import PayloadTooLarge
+from core.repository_reader import RepositoryReader
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.content import delete, message
@@ -532,6 +533,31 @@ def test_replacement_queue_republishes_and_completes_one_durable_cursor(
     assert item.action == "ack"
     assert len(fcm.documents) == 1
     assert run(state_service.pending(h(exact.encode()))) == PENDING_NONCURRENT
+
+
+def test_missing_historical_fact_after_pending_cursor_retries_without_send(
+        tmp_path):
+    (node, workspace, secret, event, canonical, _state, queue,
+     canonical_reader, state_service) = _published_world(tmp_path)
+    local = node.store(workspace)
+    fact_oid = RepositoryReader(
+        workspace, local.get("root"),
+        lambda oid: local.get("obj/" + oid)).validated().fact_oid(event)
+    key = f"workspaces/{workspace}/obj/{fact_oid}"
+    canonical.data.pop(key)
+    canonical.etags.pop(key)
+    fcm = FcmService()
+    body, = queue.bodies
+    item = QueueMessage(body, "missing-historical-fact")
+
+    run(consumer.consume(
+        _consumer_env(
+            workspace, canonical_reader, state_service, secret, fcm),
+        SimpleNamespace(messages=[item])))
+
+    assert item.action == "retry"
+    assert fcm.documents == []
+    assert run(state_service.pending(h(body.encode()))) == PENDING_CURRENT
 
 
 def test_crash_after_fcm_acceptance_retries_before_cursor_progress(
@@ -1229,11 +1255,47 @@ def test_non_deleting_or_disjoint_r2_lifecycle_rules_are_safe(monkeypatch):
             "deleteObjectsTransition": {
                 "condition": {"type": "Age", "maxAge": 604800}},
         },
+        {
+            "id": "synchronous-infrequent-access",
+            "enabled": True,
+            "conditions": {"prefix": ""},
+            "storageClassTransitions": [{
+                "condition": {"type": "Age", "maxAge": 604800},
+                "storageClass": "InfrequentAccess",
+            }],
+        },
     ]}
     monkeypatch.setattr(manage, "_api", lambda *args, **kwargs: rules)
 
     manage._require_retained_notification_objects(
         reader_config, scanner_config, {})
+
+
+@pytest.mark.parametrize("bucket,prefix", [
+    ("canonical", "workspaces/" + "a" * 64),
+    ("notification-state", "notifications/v1/" + "a" * 64),
+])
+def test_unknown_async_restore_class_is_rejected_for_both_r2_prefixes(
+        monkeypatch, bucket, prefix):
+    reader_config, scanner_config, _consumer, _fcm = \
+        manage.generated_configs(_manage_environment())
+
+    def api(_method, suffix, document=None, environment=None):
+        selected = suffix.split("/r2/buckets/", 1)[1].split("/", 1)[0]
+        return {"rules": ([{
+            "id": "future-async-archive",
+            "enabled": True,
+            "conditions": {"prefix": prefix},
+            "storageClassTransitions": [{
+                "condition": {"type": "Age", "maxAge": 604800},
+                "storageClass": "Glacier",
+            }],
+        }] if selected == bucket else [])}
+
+    monkeypatch.setattr(manage, "_api", api)
+    with pytest.raises(RuntimeError, match="synchronously readable"):
+        manage._require_retained_notification_objects(
+            reader_config, scanner_config, {})
 
 
 def test_r2_reader_checks_the_actual_body_after_provider_metadata():
@@ -1624,7 +1686,9 @@ def test_stale_launch_evidence_fails_before_provider_access(
     {"CLOUDFLARE_ACCOUNT_ID": "d" * 32},
     {"CF_WORKSPACE": "f" * 64},
     {"CF_CANONICAL_BUCKET": "canonical-other"},
+    {"CF_CANONICAL_PREFIX": "canonical/other"},
     {"CF_NOTIFICATION_STATE_BUCKET": "notification-state-other"},
+    {"CF_NOTIFICATION_STATE_PREFIX": "notification/other"},
     {"CF_PUSH_NODE_PUBLIC": "f" * 64},
     {"CF_FIREBASE_PROJECT_ID": "firebase-other"},
     {"CF_FIREBASE_APPLICATION": "another.app"},
@@ -1634,6 +1698,45 @@ def test_immutable_binding_changes_rotate_deployment_identity(change):
     new = manage.generated_configs(_manage_environment(**change))[1]
     assert old["vars"]["POC16_DEPLOYMENT_IDENTITY"] \
         != new["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+
+
+def test_cursor_identity_hashes_only_semantic_completion_authority():
+    environment = _manage_environment()
+    configs = manage.generated_configs(environment)
+    delivery_domain = manage.delivery_domain_id(
+        environment["CF_PUSH_NODE_PUBLIC"], ((
+            environment["CF_FIREBASE_APPLICATION"],
+            environment["CF_FIREBASE_ENVIRONMENT"],
+            environment["CF_FIREBASE_PROJECT_ID"],
+        ),))
+    document = {
+        "canonical_bucket": environment["CF_CANONICAL_BUCKET"],
+        "canonical_prefix": "workspaces/" + environment["CF_WORKSPACE"],
+        "cloudflare_account_id": environment["CLOUDFLARE_ACCOUNT_ID"],
+        "completion_protocol": manage.COMPLETION_PROTOCOL,
+        "delivery_domain": delivery_domain,
+        "state_bucket": environment["CF_NOTIFICATION_STATE_BUCKET"],
+        "state_prefix": "notifications/v1/" + environment["CF_WORKSPACE"],
+        "workspace": environment["CF_WORKSPACE"],
+    }
+    expected = manage.hashlib.sha256(json.dumps(
+        document, ensure_ascii=True, separators=(",", ":"),
+        sort_keys=True).encode("ascii")).hexdigest()
+
+    assert {config["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+            for config in configs} == {expected}
+
+
+def test_completion_protocol_change_rotates_cursor_identity(monkeypatch):
+    baseline = manage.generated_configs(_manage_environment())[0]["vars"][
+        "POC16_DEPLOYMENT_IDENTITY"]
+    monkeypatch.setattr(
+        manage, "COMPLETION_PROTOCOL", "poc16-notification-completion-v2")
+
+    changed = manage.generated_configs(_manage_environment())[0]["vars"][
+        "POC16_DEPLOYMENT_IDENTITY"]
+
+    assert changed != baseline
 
 
 def test_queue_and_dlq_replacement_preserves_semantic_cursor_owner():
@@ -1646,6 +1749,21 @@ def test_queue_and_dlq_replacement_preserves_semantic_cursor_owner():
         == replacement["vars"]["POC16_DEPLOYMENT_IDENTITY"]
     assert old["queues"]["producers"][0]["queue"] \
         != replacement["queues"]["producers"][0]["queue"]
+
+
+def test_worker_role_renames_preserve_semantic_cursor_owner():
+    old = manage.generated_configs(_manage_environment())
+    replacement = manage.generated_configs(_manage_environment(
+        CF_NOTIFICATION_READER="replacement-reader",
+        CF_NOTIFICATION_SCANNER="replacement-scanner",
+        CF_NOTIFICATION_CONSUMER="replacement-consumer",
+        CF_FCM_SERVICE="replacement-fcm"))
+
+    assert {config["vars"]["POC16_DEPLOYMENT_IDENTITY"] for config in old} \
+        == {config["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+            for config in replacement}
+    assert [config["name"] for config in old] \
+        != [config["name"] for config in replacement]
 
 
 def test_same_owner_cannot_rebind_an_existing_worker(monkeypatch):
