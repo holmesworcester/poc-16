@@ -34,6 +34,10 @@ def _publish(carrier, body):
     return asyncio.run(carrier.publish(body))
 
 
+def _deliver(carrier, indexes, handler, **kwargs):
+    return asyncio.run(carrier.deliver(indexes, handler, **kwargs))
+
+
 def test_publish_requires_typed_durable_acceptance_and_preserves_bytes():
     carrier, body = FaultCarrier(), _body()
     carrier.lose_next_publish_response = True
@@ -53,13 +57,13 @@ def test_retry_redelivers_stable_body_message_and_embedded_ids():
     body = _body("a", "b")
     accepted = _publish(carrier, body)
 
-    def handler(delivery):
+    async def handler(delivery):
         seen.append(delivery)
         return RETRY if len(seen) == 1 else ACK
 
-    assert carrier.deliver((0,), handler) == (
+    assert _deliver(carrier, (0,), handler) == (
         (accepted.message_id, RETRY),)
-    assert carrier.deliver((0,), handler) == (
+    assert _deliver(carrier, (0,), handler) == (
         (accepted.message_id, ACK),)
 
     assert [(item.body, item.message_id, item.attempt) for item in seen] == [
@@ -80,7 +84,7 @@ def test_reordered_delayed_poison_and_partial_batch_map_independently():
     ]
     observed = []
 
-    def handler(delivery):
+    async def handler(delivery):
         observed.append(delivery.message_id)
         try:
             event = json.loads(delivery.body)["event_id"]
@@ -88,7 +92,7 @@ def test_reordered_delayed_poison_and_partial_batch_map_independently():
             return ACK  # Typed terminal poison result.
         return RETRY if event == "r" * 64 else ACK
 
-    batch = carrier.deliver((2, 0, 1), handler)
+    batch = _deliver(carrier, (2, 0, 1), handler)
 
     assert observed == [
         accepted[2].message_id,
@@ -103,7 +107,7 @@ def test_reordered_delayed_poison_and_partial_batch_map_independently():
     assert carrier.pending == (
         accepted[2].message_id, accepted[3].message_id)
 
-    assert carrier.deliver((3,), handler) == (
+    assert _deliver(carrier, (3,), handler) == (
         (accepted[3].message_id, ACK),)
     assert carrier.pending == (accepted[2].message_id,)
 
@@ -113,13 +117,13 @@ def test_ack_loss_or_crash_after_completion_can_duplicate(fault):
     carrier, completed = FaultCarrier(), []
     accepted = _publish(carrier, _body())
 
-    def handler(delivery):
+    async def handler(delivery):
         completed.append((delivery.message_id, delivery.body))
         return ACK
 
-    carrier.deliver((0,), handler, **{fault: (0,)})
+    _deliver(carrier, (0,), handler, **{fault: (0,)})
     assert carrier.pending == (accepted.message_id,)
-    carrier.deliver((0,), handler)
+    _deliver(carrier, (0,), handler)
 
     assert completed == [
         (accepted.message_id, _body()),
@@ -135,21 +139,28 @@ class _WrongDisposition(Enum):
 @pytest.mark.parametrize(
     "handler",
     [
-        lambda _delivery: None,
-        lambda _delivery: "ack",
-        lambda _delivery: _WrongDisposition.ACK,
+        lambda _delivery: asyncio.sleep(0, result=None),
+        lambda _delivery: asyncio.sleep(0, result="ack"),
+        lambda _delivery: asyncio.sleep(0, result=_WrongDisposition.ACK),
         lambda _delivery: (_ for _ in ()).throw(RuntimeError("crash")),
     ],
 )
 def test_unknown_or_failed_handler_result_retries(handler):
     delivery = CarrierDelivery(_body(), "provider-id", 1)
-    assert delivery_disposition(delivery, handler) is RETRY
+    assert asyncio.run(delivery_disposition(delivery, handler)) is RETRY
 
 
 def test_only_explicit_typed_ack_acknowledges():
     delivery = CarrierDelivery(_body(), "provider-id", None)
-    assert delivery_disposition(delivery, lambda _item: ACK) is ACK
-    assert delivery_disposition(delivery, lambda _item: RETRY) is RETRY
+
+    async def acknowledge(_item):
+        return ACK
+
+    async def retry(_item):
+        return RETRY
+
+    assert asyncio.run(delivery_disposition(delivery, acknowledge)) is ACK
+    assert asyncio.run(delivery_disposition(delivery, retry)) is RETRY
 
 
 def test_body_and_attempt_metadata_are_bounded_before_provider_work():

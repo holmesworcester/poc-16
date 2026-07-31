@@ -87,16 +87,16 @@ RETRY = DeliveryDisposition.RETRY
 
 
 class DeliveryHandler(Protocol):
-    def __call__(self, delivery: CarrierDelivery) \
+    async def __call__(self, delivery: CarrierDelivery) \
             -> DeliveryDisposition: ...
 
 
-def delivery_disposition(delivery, handler):
+async def delivery_disposition(delivery, handler):
     """Fail closed: only an explicit typed ACK lets provider glue acknowledge."""
     if not isinstance(delivery, CarrierDelivery) or not callable(handler):
         raise TypeError("carrier delivery handler")
     try:
-        result = handler(delivery)
+        result = await handler(delivery)
     except Exception:
         return RETRY
     return result if isinstance(result, DeliveryDisposition) else RETRY

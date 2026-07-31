@@ -38,7 +38,7 @@ class FaultCarrier:
             raise PublishOutcomeUnknown("scripted publish response loss")
         return CarrierAccepted(message_id)
 
-    def deliver(self, indexes, handler, *, ack_loss=(), crash_after=()):
+    async def deliver(self, indexes, handler, *, ack_loss=(), crash_after=()):
         """Invoke one-message handling in provider-selected batch order."""
         results = []
         ack_loss, crash_after = set(ack_loss), set(crash_after)
@@ -49,7 +49,7 @@ class FaultCarrier:
             record.attempt += 1
             delivery = CarrierDelivery(
                 record.body, record.message_id, record.attempt)
-            disposition = delivery_disposition(delivery, handler)
+            disposition = await delivery_disposition(delivery, handler)
             results.append((record.message_id, disposition))
             self.history.append((
                 "handled", record.message_id,
