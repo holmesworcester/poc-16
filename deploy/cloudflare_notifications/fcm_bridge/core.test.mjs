@@ -6,6 +6,7 @@ import {
   FcmBridge,
   MAX_RESPONSE_BYTES,
   boundedJson,
+  messageFor,
 } from "./core.mjs";
 
 function base64UrlBytes(value) {
@@ -171,4 +172,16 @@ test("provider JSON is bounded with and without Content-Length", async () => {
   });
   await assert.rejects(
     boundedJson(new Response(stream, {status: 200})), /bound/);
+});
+
+test("one raw KiB fits the encoded FCM data map and one byte more fails", () => {
+  const exact = {...document(), payload: btoa("x".repeat(1024))};
+  const message = messageFor(exact, "poc16.mobile", "production");
+
+  assert.ok(new TextEncoder().encode(JSON.stringify(message.data)).byteLength < 4096);
+  assert.throws(
+    () => messageFor(
+      {...exact, payload: btoa("x".repeat(1025))},
+      "poc16.mobile", "production"),
+    /push document/);
 });

@@ -31,7 +31,10 @@ MAX_MATCH_ROWS = 16_384
 MAX_DELIVERIES = 4_096
 MAX_NOTIFICATION_FETCHES = 32_768
 MAX_NOTIFICATION_FETCH_BYTES = 32 * 1024 * 1024
-MAX_PAYLOAD_BYTES = 4_096
+# Notification data contains only workspace/event/channel/kind identifiers.
+# Keep its raw canonical form far below FCM's 4,096-byte encoded data budget;
+# Base64 expansion, delivery_id, and JSON keys must fit too.
+MAX_PAYLOAD_BYTES = 1_024
 MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000
 MAX_TTL_SECONDS = 28 * 24 * 60 * 60
 
@@ -454,6 +457,7 @@ __all__ = (
     "InvalidPublicationHint",
     "MAX_NOTIFICATION_FETCHES",
     "MAX_NOTIFICATION_FETCH_BYTES",
+    "MAX_PAYLOAD_BYTES",
     "NotificationIntent",
     "PublicationHint",
     "PushAccepted",

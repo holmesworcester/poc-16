@@ -315,6 +315,10 @@ Generic `INVALID_ARGUMENT`, project/auth failures, quotas, timeouts, and
 malformed provider responses retry; only an exact typed FCM `UNREGISTERED`
 detail makes that FID terminal.
 
+The shared raw notification data ceiling is 1 KiB. Exact/one-over tests include
+Base64 expansion, the stable delivery ID, and JSON keys, keeping every locally
+accepted FCM data map below the provider's 4,096-byte limit.
+
 Notification-state root bytes do not contain historical FactTree pages or
 facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
 configurations and reject an enabled deletion rule overlapping either the
