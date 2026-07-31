@@ -314,6 +314,16 @@ bounded broker POSTs and exact streaming PUTs. Provider brokers and deployment
 adapters remain under `deploy/`; only `upload_session.py` and `upload_wire.py`
 are shared by both sides.
 
+`content.file.uploads` pages the retained local sources and reports `active`,
+`expired`, `abandoned`, or `completed`. These are delivery states, never
+publication verdicts. One cross-process writer owns a source for an entire
+resume; atomic journal updates cannot move its authenticated cursor or
+delivered prefix backward. `content.file.abandon_upload` durably stops retries,
+but collection waits until every locally observed capability expiry.
+`content.file.collect_upload` then removes only that exact abandoned source, or
+an exact source whose pile-last delivery step was durably journaled. It never
+reads or mutates repository state.
+
 The marker is the durable work item. Notifications and LIST results are
 discovery hints; scheduled bounded rescans are the progress path, and only an
 exact bounded marker read can establish work.

@@ -215,12 +215,15 @@ def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
         item for item in parsed(Path("full_peer/node.py")).body
         if isinstance(item, ast.ClassDef) and item.name == "FullPeer")
     assert {
+        "abandon_upload",
         "attachment_io",
+        "collect_upload",
         "load_upload",
         "now_ms",
         "run_upload",
         "start_upload",
         "sync_peer",
+        "upload_status",
     } <= {
         item.name for item in node.body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))

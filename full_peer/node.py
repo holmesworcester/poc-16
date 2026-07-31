@@ -5,6 +5,7 @@ the committed authenticated repository and is never an input to receiving,
 immutable-object creation, root CAS, or retirement.
 """
 import asyncio
+from dataclasses import asdict
 import json
 import os
 import threading
@@ -201,6 +202,30 @@ class FullPeer:
     def load_upload(self, upload_id):
         return UploadSource.load(
             os.path.join(self.dir, "uploads", upload_id))
+
+    def upload_status(self, workspace, cursor=None):
+        """Return one bounded page of local delivery state, never publication."""
+        page = UploadSource.discover(
+            os.path.join(self.dir, "uploads"), self.now_ms(), cursor)
+        return {
+            "cursor": page.cursor,
+            "uploads": [
+                asdict(status)
+                for status in page.uploads
+                if status.workspace == workspace
+            ],
+        }
+
+    def abandon_upload(self, workspace, upload_id):
+        source = self.load_upload(upload_id)
+        if source.workspace != workspace:
+            raise ValueError("upload source workspace")
+        return asdict(source.abandon(self.now_ms()))
+
+    def collect_upload(self, workspace, upload_id):
+        return UploadSource.collect(
+            os.path.join(self.dir, "uploads"),
+            workspace, upload_id, self.now_ms())
 
     def run_upload(self, source, broker_url, provider_origin, proof):
         from full_peer.upload_client_http import run_http

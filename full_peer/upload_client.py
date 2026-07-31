@@ -136,7 +136,7 @@ class UploadClient:
             raise UploadClientError("upload batch policy")
         return min(stop, start + size)
 
-    def _open(self, proof_factory):
+    def _open(self, proof_factory, previous=None):
         proof = proof_factory() if callable(proof_factory) else proof_factory
         result = self.broker.open(
             proof, self.source.vector.manifest, self.source.pile)
@@ -149,8 +149,14 @@ class UploadClient:
             raise UploadProtocolError("invalid OPEN response")
         progress = UploadProgress(
             self.source.source_id, result.session, result.cursor,
-            0, 0, result.expires_at_ms)
-        self.source.save(progress)
+            0, 0, result.expires_at_ms, max(
+                result.expires_at_ms,
+                previous.issued_until_ms if previous is not None else 0,
+            ))
+        if previous is None:
+            self.source.save(progress)
+        else:
+            self.source.restart(progress)
         return progress
 
     def _capability(self, grant, leaf, kind, progress):
@@ -261,13 +267,19 @@ class UploadClient:
 
     def run(self, proof_factory):
         """Upload bounded object batches, then the sole precommitted pile."""
+        with self.source.writer():
+            self.source.require_resumable()
+            return self._run(proof_factory)
+
+    def _run(self, proof_factory):
         restarts = 0
+        progress = self.source.progress()
+        if progress is None:
+            progress = self._open(proof_factory)
+        elif progress.expires_at_ms <= self._now() \
+                and not progress.pile_delivered:
+            progress = self._open(proof_factory, progress)
         while True:
-            progress = self.source.progress()
-            if progress and progress.expires_at_ms <= self._now():
-                self.source.reset()
-                progress = None
-            progress = progress or self._open(proof_factory)
             if progress.pile_delivered:
                 return self._result(progress)
             try:
@@ -285,7 +297,7 @@ class UploadClient:
                 if restarts >= self.session_restarts:
                     raise
                 restarts += 1
-                self.source.reset()
+                progress = self._open(proof_factory, progress)
                 continue
             return self._result(progress)
 

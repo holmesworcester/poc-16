@@ -188,6 +188,27 @@ def resume_upload(
         node, workspace, source, broker_url, provider_origin)
 
 
+def uploads(node, workspace, cursor=None):
+    """List bounded local delivery state; completion does not mean published."""
+    if cursor is not None and not valid_fid(cursor):
+        raise ValueError("upload cursor")
+    return node.upload_status(workspace, cursor)
+
+
+def abandon_upload(node, workspace, upload_id):
+    """Stop retrying one local source without claiming recipient publication."""
+    if not valid_fid(upload_id):
+        raise ValueError("upload id")
+    return node.abandon_upload(workspace, upload_id)
+
+
+def collect_upload(node, workspace, upload_id):
+    """Remove one exact completed or safely expired abandoned local source."""
+    if not valid_fid(upload_id):
+        raise ValueError("upload id")
+    return node.collect_upload(workspace, upload_id)
+
+
 def save(node, workspace, selector, out_path):
     """Re-verify every slice, then atomically replace the requested path."""
     record, cids = _resolve_state(node, workspace, selector)
@@ -340,9 +361,12 @@ def bytes_for(node, workspace, fid):
 
 
 CLI = {
+    "content.file.abandon_upload": abandon_upload,
+    "content.file.collect_upload": collect_upload,
     "content.file.list": files,
     "content.file.resume_upload": resume_upload,
     "content.file.save": save,
     "content.file.send": send,
     "content.file.upload": upload,
+    "content.file.uploads": uploads,
 }

@@ -67,6 +67,14 @@ The direct-upload client is stateful-peer state:
 `full_peer/upload_client_http.py` owns its outbound HTTP effects. Provider
 brokers, signers, and deployment packaging remain under `deploy/`; only the
 shared `upload_session.py` and `upload_wire.py` values cross that boundary.
+Each content-addressed source has one cross-process writer for the complete
+resume transition. Session replacement retains the maximum expiry of every
+issued capability, progress only advances, and lifecycle discovery is a
+bounded manifest page. Active, expired, abandoned, and completed describe
+local delivery only. Collection atomically hides one exact source before
+deleting it and is allowed only after pile-last delivery was durably recorded,
+or explicit abandonment and the retained capability-expiry bound; none of
+these records is repository, root-CAS, or read authority.
 
 ### 1.1 Iroh is connection only
 
