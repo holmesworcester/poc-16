@@ -791,8 +791,7 @@ def test_root_contains_only_reader_maps_and_anchor(world):
     root = json.loads(node.reader(workspace).root_bytes)
     assert set(root) == {
         "anchor", "layout_seed", "maps", "stamp"}
-    assert set(root["maps"]) == {
-        "authority", "fact", "fact_order", "supp"}
+    assert set(root["maps"]) == {"fact", "fact_order", "supp"}
     assert "globals" not in root and "actions" not in root
 
 

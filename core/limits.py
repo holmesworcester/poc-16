@@ -31,6 +31,7 @@ MAX_REPOSITORY_OBJECT_BYTES = MAX_FACT_BYTES
 
 # One immutable closed pile. These are protocol limits, not merely
 # implementation budgets: every receiving engine enforces the same boundary.
+MAX_PILE_FACTS = 4_096
 MAX_CLOSURE_FACTS = 256
 MAX_RESOLVED_EDGES = 64
 

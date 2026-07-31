@@ -63,3 +63,17 @@ def test_scheduled_r2_actor_applies_and_reads_without_sql(
     assert not any(
         key.startswith(f"workspaces/{workspace}/pile/")
         for key in canonical.data)
+
+    latest = facts.content.message.post(
+        source, workspace, "general", "incremental R2", ts=20)
+    next_raw = closed_subset(source, workspace, (latest,))
+    next_marker = staging_key(
+        workspace, "b" * 16, "d" * 32, "pile", h(next_raw))
+    ingress.data[next_marker] = next_raw
+    ingress.etags[next_marker] = ingress._token()
+
+    _, outcomes = asyncio.run(drain(env))
+    applied = dict(outcomes)[next_marker]
+    assert applied.result.status == "applied"
+    assert canonical.data[physical] \
+        == source.store(workspace).get("root")

@@ -194,7 +194,7 @@ facts command
     -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
     -> RepositoryApplier reserves one stable internal generation
     -> kernel judges the exact closed pile
-    -> pure compiler derives FactTree, SuppTree, AuthorityTree, FactOrder
+    -> pure compiler path-copies FactTree, SuppTree, and FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
     -> one exact outcome-bound spend grants its sole retirement DELETE
@@ -269,8 +269,10 @@ Removal does not retroactively revoke validated storage. Once removal has
 propagated, peers stop granting that principal new sharing authority. Facts
 accepted by a peer that had not yet learned the removal remain legitimate
 workspace facts. The closed pile was the validation certificate; no selected
-dependency path is retained afterward. Commands and remote minting consult
-the pinned root's current suppression and authority maps.
+dependency path is retained afterward. A remote proof names its exact provider;
+the hosted Reader authenticates that FactTree residence and its current
+SuppTree scopes. Stateful commands assemble interchangeable candidates from
+their disposable SQL projection.
 
 ## Client persistence
 

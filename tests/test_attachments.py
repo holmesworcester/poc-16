@@ -120,8 +120,8 @@ def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
     assert refreshed.idx(workspace).execute(
         "SELECT COUNT(*) FROM fact_index WHERE kind=?",
         (fact_index.REF_INDEX,)).fetchone()[0] > 0
-    assert not refreshed.reader(workspace).worker().authority_known(
-        fact_index.REF_INDEX, "file", fid)
+    assert not hasattr(
+        refreshed.reader(workspace).worker(), "authority_known")
 
 
 def test_file_selector_compatibility_and_exact_suppression(tmp_path):

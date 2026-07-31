@@ -232,8 +232,7 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
     node.bind_identity(workspace_id, founder)
     facts.auth.admin.grant(node, workspace_id, member)
     node.bind_identity(workspace_id, member)
-    assert node.reader(workspace_id).worker().authority_provider(
-        "admin", member) is not None
+    assert node.select(workspace_id, "admin", member)
     assert_current_identity_mints(member)
 
     before = store.get("root")

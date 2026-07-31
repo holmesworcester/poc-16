@@ -1,6 +1,6 @@
 """Composite snapshot and the direct validated-fact order map.
 
-One mutable ``root`` value atomically names four immutable bounded Merkle
+One mutable ``root`` value atomically names three immutable bounded Merkle
 maps:
 
 ``fact_order``
@@ -8,9 +8,9 @@ maps:
     transfer projection only; successful closed-pile admission is the durable
     certificate and no historical validation path is stored.
 
-``fact``, ``supp``, ``authority``
-    The exact validated-fact, suppression, and selected-authority indexes described
-    by :mod:`core.indexes`.
+``fact``, ``supp``
+    The exact validated-fact/posting and suppression indexes described by
+    :mod:`core.indexes`.
 
 Every map uses the same history-independent codec and descriptor shape.  There
 is no range directory, grouped pile leaf, closure sibling, action cache stamp,
@@ -24,9 +24,9 @@ from .fact import canon
 from .limits import MAX_ROOT_BYTES, decode_json
 from .shape import is_key, valid_fid
 
-LAYOUT = "composite-merkle-map-v9-validated-facts"
+LAYOUT = "composite-merkle-map-v10-direct-provider-reads"
 FACT_ORDER = "fact_order"
-TREE_NAMES = ("fact", "supp", "authority")
+TREE_NAMES = ("fact", "supp")
 MAP_NAMES = (FACT_ORDER, *TREE_NAMES)
 
 
@@ -76,7 +76,7 @@ def _maps_ok(maps):
 
 
 def encode_root(anchor, maps=None, *, seed=None):
-    """Encode the exact four-map snapshot advanced by one root CAS."""
+    """Encode the exact three-map snapshot advanced by one root CAS."""
     seed = layout_seed(anchor) if seed is None else seed
     if seed != layout_seed(anchor):
         raise ValueError("snapshot layout seed")

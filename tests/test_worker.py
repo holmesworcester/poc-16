@@ -122,11 +122,8 @@ def test_worker_mint_rejects_forged_outer_map_metadata(
     with pytest.raises(ValueError, match="merkle map root metadata"):
         if name == indexes.FACT:
             view.fact(workspace)
-        elif name == indexes.SUPP:
-            view.principal_active(
-                "member", node.identity_id(workspace))
         else:
-            view.authority_known(
+            view.principal_active(
                 "member", node.identity_id(workspace))
     assert target_root in fetched
 

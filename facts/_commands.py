@@ -1,11 +1,12 @@
 """Shared mechanics for family commands; no fact policy lives here."""
 
 def offer_source(node, workspace, name, a0, a1=None):
-    """Return the current live provider from one pinned repository root."""
+    """Choose one current provider through the stateful peer's SQL projection."""
     with node.lock:
-        reader = node.reader(workspace)
-        return None if reader is None else reader.worker().authority_provider(
-            name, a0, a1)
+        providers = node.select(workspace, name, a0, a1)
+        return min(
+            providers, key=lambda fact: (fact.key, fact.fid)
+        ).fid if providers else None
 
 
 def member_source(node, workspace, public_key, owner=None):

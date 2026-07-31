@@ -301,7 +301,7 @@ def mb(b):
 def run_catchup(scales):
     print("\n=== CATCHUP: fresh node ingests a whole workspace from empty ===")
     print(f"    {MEMBERS} members, messages over {YEARS} years, {WORKERS} kernel "
-          "workers, one four-map validated snapshot\n")
+          "workers, one three-map validated snapshot\n")
     hdr = ("target", "facts", "msgs", "pages", "seed_build",
            "dl_MB", "streamed", "redund", "ingest_s", "facts/s", "rec/s", "ok")
     print("  {:>7} {:>8} {:>7} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8} {:>8} {:>3}"

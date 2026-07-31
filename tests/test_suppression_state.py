@@ -88,8 +88,7 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
     root = json.loads(node.store(workspace).get("root"))
     assert set(root) == {
         "anchor", "layout_seed", "maps", "stamp"}
-    assert set(root["maps"]) == {
-        "authority", "fact", "fact_order", "supp"}
+    assert set(root["maps"]) == {"fact", "fact_order", "supp"}
     assert "removals" not in root
     assert _action_rows(node, workspace)[0][:2] == (
         f"fact:{target}", action_fid)

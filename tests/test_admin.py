@@ -98,8 +98,8 @@ def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
     node.bind_identity(workspace, founder)
     facts.auth.removal.evict(node, workspace, bob)
     assert node.fact_of(workspace, carol_grant) is not None
-    assert node.reader(workspace).worker().authority_provider(
-        "admin", carol) == carol_grant
+    assert [fact.fid for fact in node.select(
+        workspace, "admin", carol)] == [carol_grant]
 
     node.bind_identity(workspace, carol)
     facts.auth.removal.evict(node, workspace, dave)
@@ -110,8 +110,7 @@ def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
     # delegated authority even though Bob's historical grant remains.
     node.bind_identity(workspace, founder)
     facts.auth.removal.evict(node, workspace, carol)
-    assert node.reader(workspace).worker().authority_provider(
-        "admin", carol) is None
+    assert node.select(workspace, "admin", carol) == ()
     node.bind_identity(workspace, carol)
     with pytest.raises(ValueError, match="not a workspace admin"):
         facts.auth.removal.evict(node, workspace, erin)

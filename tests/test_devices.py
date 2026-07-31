@@ -238,11 +238,10 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
         assert peer.fact_of(workspace, bob_claim.fid) == bob_claim
         assert peer.fact_of(workspace, alice_claim.fid) == alice_claim
         assert peer.fact_of(workspace, child_claim.fid) == child_claim
-        worker = peer.reader(workspace).worker()
-        assert worker.authority_provider(
-            "device_key", target, bob) == bob_claim.fid
-        assert worker.authority_provider(
-            "device_key", target, founder) == alice_claim.fid
+        assert [fact.fid for fact in peer.select(
+            workspace, "device_key", target, bob)] == [bob_claim.fid]
+        assert [fact.fid for fact in peer.select(
+            workspace, "device_key", target, founder)] == [alice_claim.fid]
     assert all_fids(source, workspace) \
         == all_fids(peers[0], workspace) \
         == all_fids(peers[1], workspace)

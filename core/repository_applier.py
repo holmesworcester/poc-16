@@ -14,7 +14,7 @@ import inspect
 
 import facts
 
-from .close import decode_pile
+from .close import check_pile_bounds, decode_pile
 from .crypto import h
 from .ingress import (
     KernelRejected,
@@ -38,8 +38,7 @@ from .object_store import (
     ensure_object_async,
     retire_exact_async,
 )
-from .repository_snapshot import compile_snapshot
-from .validated_set import reconstruct
+from .repository_snapshot import extend_snapshot
 from .shape import valid_fid
 from .staged_intent import (
     InvalidStagedObject,
@@ -97,8 +96,15 @@ class SyncStoreAdapter:
     def __init__(self, store):
         self.store = store
 
+    def get_bounded_now(self, key, max_bytes):
+        value = self.store.get_bounded(key, max_bytes)
+        if value is not None and (
+                not isinstance(value, bytes) or len(value) > max_bytes):
+            raise PayloadTooLarge("repository read exceeds byte limit")
+        return value
+
     async def get_bounded(self, key, max_bytes):
-        return self.store.get_bounded(key, max_bytes)
+        return self.get_bounded_now(key, max_bytes)
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
@@ -315,8 +321,7 @@ class RepositoryApplier:
         """Idempotently create one reserved generation for exact logical work."""
         if not isinstance(raw, bytes):
             raise TypeError("exact ingress bytes required")
-        if len(raw) > MAX_PILE_BYTES:
-            raise PayloadTooLarge("pile exceeds byte limit")
+        check_pile_bounds(raw)
         return await self._stage(member, raw, "")
 
     async def admit_object(self, oid, raw):
@@ -662,9 +667,16 @@ class RepositoryApplier:
         await self._save_discovery_cursor("staged", page.cursor)
         return tuple(outcomes)
 
-    async def _load_validated(self, root_bytes):
-        if root_bytes is None:
-            return None
+    async def _extend_snapshot(self, root_bytes, facts_by_fid):
+        """Run the pure path-copy compiler over an awaited object store."""
+        if isinstance(self.store, SyncStoreAdapter):
+            return extend_snapshot(
+                self.workspace,
+                root_bytes,
+                facts_by_fid,
+                lambda oid: self.store.get_bounded_now(
+                    "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES),
+            )
         objects = {}
 
         def fetch(oid):
@@ -674,17 +686,14 @@ class RepositoryApplier:
 
         while True:
             try:
-                validated = reconstruct(root_bytes, fetch)
+                return extend_snapshot(
+                    self.workspace, root_bytes, facts_by_fid, fetch)
             except _ObjectMiss as miss:
                 objects[miss.oid] = await self._get_bounded(
                     self.store,
                     "obj/" + miss.oid,
                     MAX_REPOSITORY_OBJECT_BYTES,
                 )
-                continue
-            if validated.workspace != self.workspace:
-                raise ValueError("repository root workspace")
-            return validated
 
     async def propose(self, raw):
         """Derive one proposal without mutating canonical repository state."""
@@ -705,8 +714,6 @@ class RepositoryApplier:
             base_root, base_token = versioned.value, versioned.token
         else:
             raise TypeError("versioned root read")
-        validated = await self._load_validated(base_root)
-
         pending = {}
 
         def emit(value):
@@ -716,7 +723,7 @@ class RepositoryApplier:
                 raise ValueError("repository object hash collision")
             return oid
 
-        facts_by_fid = {} if validated is None else dict(validated.facts)
+        facts_by_fid = {}
         durable, durable_receipts = [], []
         for receipt in judgment.valids:
             family = facts.family_for(receipt.fact.t)
@@ -725,21 +732,21 @@ class RepositoryApplier:
             fid = receipt.fact.fid
             durable.append(fid)
             durable_receipts.append(receipt)
-            incumbent = facts_by_fid.get(fid)
-            if incumbent is not None \
-                    and encode(incumbent) != encode(receipt.fact):
+            incumbent = facts_by_fid.setdefault(fid, receipt.fact)
+            if encode(incumbent) != encode(receipt.fact):
                 raise ValueError("repository fact conflict")
-            facts_by_fid[fid] = receipt.fact
 
-        if facts_by_fid and self.workspace not in facts_by_fid:
+        if base_root is None and facts_by_fid \
+                and self.workspace not in facts_by_fid:
             raise RepositoryAnchorPending(
                 "repository anchor fact is not available yet")
-        compiled = compile_snapshot(self.workspace, facts_by_fid)
+        compiled = await self._extend_snapshot(
+            base_root, facts_by_fid)
         for oid, value in compiled.outbox:
             emit(value)
         admitted = tuple(sorted(set(durable)))
         if compiled.root is not None \
-                and not set(admitted) <= set(compiled.objects):
+                and not set(admitted) <= set(compiled.fact_oids):
             raise ValueError("repository proposal omitted admission")
         return ApplyProposal(
             self.workspace,

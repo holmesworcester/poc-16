@@ -328,6 +328,23 @@ def test_one_semantic_root_cas_and_one_root_compiler():
                 encode_root.append(path)
     assert encode_root == [Path("core/repository_snapshot.py")]
 
+    applier = (ROOT / "core" / "repository_applier.py").read_text()
+    assert "extend_snapshot" in applier
+    assert "compile_snapshot" not in applier
+    assert "reconstruct" not in applier
+
+
+def test_provider_authentication_has_no_materialized_winner_tree():
+    from core import indexes, snapshot
+    from core.worker import WorkerView
+
+    assert snapshot.MAP_NAMES == ("fact_order", "fact", "supp")
+    assert indexes.TREE_NAMES == ("fact", "supp")
+    assert not hasattr(indexes, "AUTHORITY")
+    assert not hasattr(WorkerView, "authority_provider")
+    assert not hasattr(WorkerView, "authority_known")
+    assert hasattr(WorkerView, "fact_known")
+
 
 def test_applier_owns_object_establishment_generations_and_retirement():
     object_store_functions = {

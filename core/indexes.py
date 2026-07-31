@@ -7,9 +7,10 @@ family-declared suppression/liveness scope.  No row records a validation
 path, proof rank, admission witness, eligibility verdict, or dormant state.
 
 SuppTree maps each known suppression id to CLEAR or ACTIVE(action_fid).
-AuthorityTree maps each offer address to one deterministic provider.  Those
-two maps are current query projections over validated facts; they can change
-which facts are visible or usable without removing any fact from FactTree.
+Provider offers remain mechanical FactTree postings. A proof names its exact
+provider, so a database-free reader authenticates that fact directly and then
+checks its declared SuppTree scopes instead of maintaining a redundant winner
+projection.
 """
 
 import base64
@@ -25,8 +26,7 @@ from .shape import valid_fid
 
 FACT = "fact"
 SUPP = "supp"
-AUTHORITY = "authority"
-TREE_NAMES = (FACT, SUPP, AUTHORITY)
+TREE_NAMES = (FACT, SUPP)
 
 MAX_SCOPES = 64
 POSTING = "index:"
@@ -64,6 +64,27 @@ def checked_fact_oid(value):
     if not valid_fid(value):
         raise ValueError("fact object id")
     return value
+
+
+def suppression_slot(action=None):
+    """Construct one canonical current suppression value."""
+    if action is None:
+        return {"state": "clear"}
+    if not valid_fid(action):
+        raise ValueError("suppression action")
+    return {"state": "active", "action": action}
+
+
+def checked_suppression_slot(value):
+    """Validate one authenticated SuppTree value."""
+    if value == {"state": "clear"}:
+        return value
+    if isinstance(value, dict) \
+            and set(value) == {"state", "action"} \
+            and value.get("state") == "active" \
+            and valid_fid(value.get("action")):
+        return value
+    raise ValueError("missing SuppSlot")
 
 
 def _component(value):
@@ -169,13 +190,7 @@ def record_postings(fact):
     }
 
 
-def need_key(name, a0, a1=None):
-    """Canonical authority address for one exact or base offer."""
-    return canon(["need", name, a0, a1]).decode()
-
-
 __all__ = (
-    "AUTHORITY",
     "FACT",
     "IndexPosting",
     "MAX_SCOPES",
@@ -187,14 +202,15 @@ __all__ = (
     "TREE_NAMES",
     "action_key",
     "checked_fact_oid",
+    "checked_suppression_slot",
     "decode_posting_key",
     "fact_key",
     "is_posting_key",
     "layout_seed",
-    "need_key",
     "posting_key",
     "posting_page",
     "posting_prefix",
     "principal_sid",
     "record_postings",
+    "suppression_slot",
 )

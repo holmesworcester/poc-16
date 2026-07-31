@@ -289,28 +289,24 @@ edges. A later deleter never enumerates descendants.
 SuppTree supports exact fact deletion, member removal, device/owner liveness,
 and bounded Worker authorization reads without a database or fact-set scan.
 
-### 3.4 AuthorityTree
+### 3.4 Direct provider reads
 
-`AuthorityTree` maps a complete or base offer address to the deterministic
-current live provider, or `none` when the address is known but all providers
-are suppressed.
+A closed proof already names the exact fact that supplied each Need. A hosted
+Reader therefore authenticates `fact:<provider_fid>` directly, checks that its
+canonical offers contain the complete requested address, and point-reads each
+of its declared SuppTree scopes. There is no materialized authority winner.
 
-```text
-need(name, a0, a1) -> provider(fid) | none
-need(name, a0, *)  -> provider(fid) | none
-```
+This supports the required invariants with less state:
 
-It is a current projection, not an admission record. The compiler derives it
-from validated offers and each provider's declared current scopes. A Worker
-fetches and checks the provider fact before using the row.
-
-The invariants are:
-
-- every provider is a resident validated fact;
-- it offers the queried address;
+- the provider is a resident validated fact;
+- its immutable bytes offer the requested complete address;
 - every current scope is `CLEAR`;
-- ties affect only the mechanical provider returned for an equivalent address,
-  never stored fact validity or semantics.
+- an action changes one SuppTree route, regardless of how many historical
+  providers name that scope.
+
+A stateful peer may discover interchangeable candidates through its disposable
+SQL projection. A database-free proof path never scans candidates because the
+proof supplies the provider it asks the Reader to authenticate.
 
 ## 4. Suppression, deletion, and removal
 
@@ -348,20 +344,19 @@ For one exact logical delivery the Applier:
 2. bounded-decodes the marker and pile;
 3. validates the entire pile before reading a potentially large root;
 4. pins `root` bytes and the provider's opaque CAS token;
-5. reconstructs the current validated set from authenticated residences;
-6. unions every durable `Valid.fact`;
-7. purely compiles the four maps;
-8. conditionally establishes immutable objects with collision checks;
-9. performs one CAS on `root`;
-10. records durable rejection evidence, or returns a process-local applied
+5. point-checks incoming residences against the pinned FactTree;
+6. path-copies each newly validated fact and affected suppression route through
+   the three authenticated maps;
+7. conditionally establishes immutable objects with collision checks;
+8. performs one CAS on `root`;
+9. records durable rejection evidence, or returns a process-local applied
    receipt bound to the committed root;
-11. create-only spends that exact outcome and issues DELETE only when the
+10. create-only spends that exact outcome and issues DELETE only when the
     spend is definitely fresh.
 
-The current full compiler is deliberately simple: it reconstructs the complete
-validated set and emits a history-independent root. Future incremental
-compilation must path-copy affected authenticated routes and produce
-byte-identical roots.
+The pure full compiler remains the repair and test oracle. Normal publication
+path-copies affected authenticated routes and must produce its byte-identical
+root without enumerating unrelated validated facts.
 
 A CAS loser keeps its work and retries from the newer root. An unknown CAS
 result is reconciled by reading root. A crash after CAS but before a spend

@@ -39,16 +39,16 @@ def test_fact_residence_is_only_an_object_id(tmp_path):
     assert set(row) <= set("0123456789abcdef")
 
 
-def test_authority_rows_contain_no_proof_rank(tmp_path):
+def test_worker_authenticates_provider_without_a_winner_projection(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    public = node.identity_id(workspace)
     view = node.reader(workspace).worker()
-    row = view._reader(indexes.AUTHORITY).get(
-        indexes.need_key("member", public))
 
-    assert row == {"state": "provider", "fid": workspace}
-    assert view.authority_provider("member", public) == workspace
+    assert view.fact_known(workspace)
+    assert view.fact(workspace).fid == workspace
+    assert view.fact_active(workspace)
+    assert set(view._validated.root.maps) == {
+        "fact", "fact_order", "supp"}
 
 
 def test_compile_is_history_independent_over_same_validated_set(tmp_path):

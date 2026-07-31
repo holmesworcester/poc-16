@@ -47,7 +47,7 @@ def test_stage_rejects_bad_type_and_one_over_before_store_mutation(
 
     with pytest.raises(TypeError, match="exact ingress bytes"):
         run(applier.stage("member", "not bytes"))
-    with pytest.raises(PayloadTooLarge, match="pile exceeds"):
+    with pytest.raises(PayloadTooLarge, match="pile too large"):
         run(applier.stage("member", b"x" * (MAX_PILE_BYTES + 1)))
 
     assert store.mutations == []

@@ -88,7 +88,7 @@ closed pile
   -> RepositoryApplier
   -> kernel plus family policy
   -> monotone validated-fact union
-  -> repository_snapshot's pure four-map compiler
+  -> repository_snapshot's pure three-map compiler
   -> immutable object establishment
   -> the sole root CAS
   -> exact outcome spend
@@ -97,10 +97,11 @@ closed pile
 ```
 
 `FactTree` binds `fact:<fid>` directly to the canonical fact object's oid and
-also contains mechanical postings. `FactOrder`, `SuppTree`, and
-`AuthorityTree` are deterministic projections. SQLite mirrors canonical fact
-bytes plus generic index rows for local authorship and presentation only; it
-must be deletable and rebuildable from a pinned Reader.
+also contains mechanical postings. `FactOrder` and `SuppTree` are deterministic
+projections. A proof names its provider, so a hosted Reader authenticates that
+FactTree residence and its SuppTree scopes directly. SQLite mirrors canonical
+fact bytes plus generic index rows for local authorship and presentation only;
+it must be deletable and rebuildable from a pinned Reader.
 
 Direct-upload clients write detached immutable objects first and one exact
 closed pile marker last into isolated ingress. Notifications and LIST results

@@ -65,14 +65,13 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
             "member", body["pk"], body["owner"]) not in provider.offers():
         return None
     sid = facts.principal_sid("member", body["owner"])
-    if not view.authority_known("member", body["pk"], body["owner"]):
+    if not view.fact_known(provider.fid):
         # A never-seen address may bootstrap from its self-contained closure.
         # A terminal pre-tombstone must fail closed.
         if view.suppression_known(sid):
             return None
-    elif view.authority_provider(
-            "member", body["pk"], body["owner"]) is None \
-            or view.suppression(sid)["state"] != "clear":
+    elif view.fact(provider.fid) != provider \
+            or not view.fact_active(provider.fid):
         return None
     return body["pk"], body["verb"]
 

@@ -31,6 +31,11 @@ class WorkerView:
     def fact_oid(self, fid):
         return self._validated.fact_oid(fid)
 
+    def fact_known(self, fid):
+        """Whether this exact fact has an authenticated residence."""
+        row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
+        return row is not None and bool(indexes.checked_fact_oid(row))
+
     def fact(self, fid):
         return self._validated.fact(fid)
 
@@ -48,16 +53,7 @@ class WorkerView:
 
     def suppression(self, sid):
         row = self._reader(indexes.SUPP).get(sid)
-        if not isinstance(row, dict) or row.get("state") not in {
-                "clear", "active"}:
-            raise ValueError("missing SuppSlot")
-        if row["state"] == "clear" and set(row) != {"state"}:
-            raise ValueError("SuppSlot shape")
-        if row["state"] == "active" and (
-                set(row) != {"state", "action"}
-                or not isinstance(row["action"], str)):
-            raise ValueError("SuppSlot shape")
-        return row
+        return indexes.checked_suppression_slot(row)
 
     def scopes_active(self, scopes):
         return all(self.suppression(sid)["state"] == "clear" for sid in scopes)
@@ -73,28 +69,6 @@ class WorkerView:
     def suppression_known(self, sid):
         """Whether the published snapshot reserves this exact typed id."""
         return self._reader(indexes.SUPP).get(sid) is not None
-
-    def authority_known(self, name, a0, a1=None):
-        """Whether this exact base offer address exists in the snapshot."""
-        return self._reader(indexes.AUTHORITY).get(
-            indexes.need_key(name, a0, a1)) is not None
-
-    def authority_provider(self, name, a0, a1=None):
-        """Return the current provider for one complete authority address."""
-        row = self._reader(indexes.AUTHORITY).get(
-            indexes.need_key(name, a0, a1))
-        if row is None:
-            return None
-        if not isinstance(row, dict) or row.get("state") not in {
-                "none", "provider"}:
-            raise ValueError("missing AuthoritySlot")
-        if row["state"] == "none":
-            return None
-        if set(row) != {"state", "fid"} \
-                or not isinstance(row["fid"], str):
-            raise ValueError("AuthoritySlot shape")
-        fid = row["fid"]
-        return fid if fid is not None and self.fact_active(fid) else None
 
     def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
         """Validate one bounded closure for the caller's exact purpose.

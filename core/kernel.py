@@ -5,12 +5,18 @@ same judgment as kernel-minted ``Valid`` values to a client runtime. Families
 own exact shapes, named needs, and immutable validity. Ephemeral authorization
 is a separate family-owned Worker grant over authenticated point reads.
 """
+from itertools import islice
 from typing import NamedTuple
 
 import facts
 from facts._policy import FactContext
 from .fact import Fact, bound_to, encode
-from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
+from .limits import (
+    MAX_CLOSURE_FACTS,
+    MAX_PILE_FACTS,
+    MAX_RESOLVED_EDGES,
+    PayloadTooLarge,
+)
 from .shape import valid_fid
 
 class Valid(NamedTuple):
@@ -188,6 +194,10 @@ def _judge(stream, ctx):
 
 def kernel(stream, anchor):
     """Judge one bounded closure without a database or host state."""
+    stream = tuple(islice(stream, MAX_PILE_FACTS + 1))
+    if len(stream) > MAX_PILE_FACTS:
+        return Judgment(
+            False, (), PayloadTooLarge("pile has too many facts"))
     result = _judge(stream, MemoryContext(anchor))
     return result if result.ok else Judgment(False, (), result.failure)
 

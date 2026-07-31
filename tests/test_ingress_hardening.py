@@ -66,6 +66,41 @@ def test_pile_codec_requires_one_canonical_json_spelling():
             close.decode_pile(raw, workspace)
 
 
+def test_pile_fact_count_is_bounded_before_generation_or_kernel_work(
+        tmp_path, monkeypatch):
+    workspace = "0" * 64
+    items = tuple(
+        Fact("unknown", ts, [], {"text": f"item-{ts}"}, workspace)
+        for ts in range(1, 4)
+    )
+    monkeypatch.setattr(close, "MAX_PILE_FACTS", 2)
+    monkeypatch.setattr(kernel, "MAX_PILE_FACTS", 2)
+
+    exact = close.encode_pile(items[:2], workspace=workspace)
+    assert close.decode_pile(exact, workspace) == list(items[:2])
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        close.encode_pile(items, workspace=workspace)
+
+    over = canon({
+        "facts": [item.to_json() for item in items],
+        "ws": workspace,
+    })
+    with pytest.raises(InvalidPile, match="too many facts"):
+        close.decode_pile(over, workspace)
+    judgment = kernel.drain(items, workspace)
+    assert not judgment.ok
+    assert isinstance(judgment.failure, PayloadTooLarge)
+
+    class NeverMutated:
+        def put_if_absent(self, *_args):
+            raise AssertionError("oversized pile reserved a generation")
+
+    applier = repository_applier_module.RepositoryApplier(
+        workspace, NeverMutated())
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        run(applier.stage("member", over))
+
+
 def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
     workspace = "0" * 64
     fid = "f" * 64
