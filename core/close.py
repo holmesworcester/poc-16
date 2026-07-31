@@ -97,6 +97,8 @@ def _count_array(raw, at):
         elif byte == stack[-1]:
             stack.pop()
             at += 1
+            if not stack:
+                return at
         elif byte in (ord("}"), ord("]")):
             raise InvalidEncoding("pile facts array")
         elif byte == ord(",") and len(stack) == 1:
@@ -126,7 +128,8 @@ def _scan_root_facts(raw):
                     and _facts_key(raw, at, end):
                 value = _nonspace(raw, after + 1)
                 if value < len(raw) and raw[value] == ord("["):
-                    _count_array(raw, value)
+                    at = _count_array(raw, value)
+                    continue
             at = end
         elif byte in _OPEN:
             stack.append(_OPEN[byte])
