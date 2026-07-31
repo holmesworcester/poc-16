@@ -108,11 +108,15 @@ class LambdaResponse:
 class LambdaOpener:
     """Run urllib client requests through the real Function URL adapter."""
 
-    def __init__(self):
+    def __init__(self, *, cold=False):
+        self.cold = cold
+        self.endpoints = []
         self.events = []
 
     def __call__(self, request_value, timeout):
         del timeout
+        if self.cold:
+            app._endpoint_cache = None
         event = function_event(
             request_value.method,
             urlsplit(request_value.full_url).path,
@@ -122,6 +126,7 @@ class LambdaOpener:
         self.events.append(event)
         result = app.handler(
             event, SimpleNamespace(aws_request_id="request-1"))
+        self.endpoints.append(app._endpoint_cache)
         response = LambdaResponse(result)
         if response.status >= 400:
             raise urllib.error.HTTPError(
@@ -155,7 +160,7 @@ def function_event(
     }
 
 
-def world(tmp_path, monkeypatch, *, clock=None):
+def world(tmp_path, monkeypatch, *, clock=None, cold=False):
     clock = clock or Clock()
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -166,24 +171,36 @@ def world(tmp_path, monkeypatch, *, clock=None):
         key: backing.get(key) for key in backing.list("")
     })
     signer = Signer(clock)
-    broker = UploadBroker(
-        store,
-        workspace,
-        signer,
-        clock,
-        UploadSessionPolicy(
-            "aws-lambda-upload-test",
-            KEY.key_id,
-            (KEY,),
-            ttl_ms=120_000,
-            max_ttl_ms=120_000,
-            clock_skew_ms=1_000,
-        ),
-        nonce=lambda count: SESSION if count == len(SESSION) else b"",
+    session_policy = UploadSessionPolicy(
+        "aws-lambda-upload-test",
+        KEY.key_id,
+        (KEY,),
+        ttl_ms=120_000,
+        max_ttl_ms=120_000,
+        clock_skew_ms=1_000,
     )
-    endpoint = UploadBrokerEndpoint(broker)
-    monkeypatch.setattr(app, "_endpoint_cache", endpoint)
-    opener = LambdaOpener()
+    if cold:
+        monkeypatch.setattr(app, "_endpoint_cache", None)
+        monkeypatch.setattr(app, "_signer", lambda: signer)
+        monkeypatch.setattr(app, "_store", lambda: store)
+        monkeypatch.setattr(app, "_keyring", lambda candidate: (
+            session_policy if candidate is signer else None))
+        monkeypatch.setattr(
+            app.time, "time_ns", lambda: clock() * 1_000_000)
+        monkeypatch.setenv(
+            "TINYP2P_UPLOAD_WORKSPACE_ID", workspace)
+    else:
+        broker = UploadBroker(
+            store,
+            workspace,
+            signer,
+            clock,
+            session_policy,
+            nonce=lambda count: SESSION if count == len(SESSION) else b"",
+        )
+        monkeypatch.setattr(
+            app, "_endpoint_cache", UploadBrokerEndpoint(broker))
+    opener = LambdaOpener(cold=cold)
     return (
         proof,
         signer,
@@ -243,8 +260,8 @@ def test_function_url_runs_complete_direct_upload_session(
 def test_lambda_retries_only_until_the_open_session_deadline(
         tmp_path, monkeypatch):
     clock = Clock()
-    proof, signer, _, transport = world(
-        tmp_path, monkeypatch, clock=clock)
+    proof, signer, opener, transport = world(
+        tmp_path, monkeypatch, clock=clock, cold=True)
     vector = UploadVector((leaf(b"one object"),))
     pile = leaf(b"one closed fact pile")
     opened = transport.open(proof, vector.manifest, pile)
@@ -271,6 +288,17 @@ def test_lambda_retries_only_until_the_open_session_deadline(
             opened.cursor, 0, vector.leaves, vector.proof(0, 1))
     with pytest.raises(UploadSessionRejected):
         transport.finalize(issued.cursor)
+    assert len(opener.endpoints) == 6
+    assert all(
+        earlier is not later
+        for index, earlier in enumerate(opener.endpoints)
+        for later in opener.endpoints[index + 1:]
+    )
+    assert all(
+        isinstance(endpoint, UploadBrokerEndpoint)
+        and isinstance(endpoint.broker.store, CanonicalStore)
+        for endpoint in opener.endpoints
+    )
 
 
 class BombEndpoint:
