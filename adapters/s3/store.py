@@ -300,6 +300,14 @@ class S3Store:
         self._read_client = read_client
         self._mutation_client = mutation_client
 
+    def namespace_id(self):
+        return (
+            "s3",
+            self.config.endpoint_url or "aws",
+            self.config.bucket,
+            self.config.prefix,
+        )
+
     @staticmethod
     def _sdk_clients(config, **provider_credentials):
         from .sdk_smoke import require_s3_capabilities

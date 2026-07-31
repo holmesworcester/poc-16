@@ -47,8 +47,8 @@ processes or stacks without creating another repository state machine.
     adaptation, and packaging—never full-peer-local client state.
 13. `facts/auth/push_endpoint.py` and
     `facts/content/notification_preference.py`, then `notifications/`:
-    authenticated notification state followed by stateless post-publication
-    derivation and provider delivery.
+    authenticated notification state, durable post-publication discovery,
+    current-authority derivation, and provider delivery.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -221,16 +221,16 @@ One bad pile cannot wedge a later exact request.
 
 ## Mobile notifications
 
-The repository contains notification facts, pure derivation, and a Firebase
-adapter prototype. It does not yet contain a root-commit emitter, hint carrier,
-or deployed notification Worker. The intended flow is:
+Mobile notification delivery is durable operational work outside repository
+publication. A successful root CAS never invokes a notification callback and
+never waits for a queue or provider:
 
 ```text
 mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
 new message          -> family-owned notification trigger
-future commit emitter -> hint naming the exact root and newly resident triggers
-future worker         -> authenticated preference/endpoint join -> FCM
+scheduled scanner    -> authenticated FactTree diff -> durable carrier
+carrier delivery     -> historical event proof + current authority join -> FCM
 ```
 
 An endpoint belongs to one workspace user and mobile installation. It carries
@@ -246,29 +246,52 @@ observed values using ordinary exact deletion. Concurrent active values meet
 restrictively, so a concurrent mute wins. With no global preference the default
 is `none`.
 
-The database-free derivation prototype currently pins the exact root named by
-a supplied hint and follows authenticated tree postings rather than scanning
-all facts:
+`NotificationDiscovery` has a separate operational object store and CAS
+cursor. On each bounded turn it pins one repository target root, diffs only
+the authenticated `fact.type` postings in `FactTree` from its acknowledged
+base, and selects families with a `notification_trigger` hook. It does not
+read fact blobs, `FactOrder`, SQLite, ingress, or `RepositoryApplier`.
+
+One canonical carrier body contains only the workspace, target-root object ID,
+and sorted trigger FIDs. The scanner preserves the exact target root bytes in
+notification state, publishes the body to a durable carrier, and advances its
+cursor by CAS only after the carrier accepts those exact bytes. A dropped wake
+is repaired by the next scheduled turn. A lost publish response, process crash,
+or cursor race may duplicate a body but cannot skip it. The first run starts at
+the empty tree and therefore backfills historical triggers; preserve the
+notification-state store across redeployments to avoid repeating that
+backfill.
+
+`NotificationWorker` resolves and hash-checks the historical event root from
+notification state, authenticates every named event there, then separately
+pins the current repository root. Its bounded authenticated join follows:
 
 1. route key to candidate user preferences;
 2. user and cell key to current preference values;
 3. user key to all current endpoint facts.
 
-It opens that root through `RepositoryReader`, validates the postings, and
-checks suppression/liveness through the reader's `WorkerView`. Message facts
-carry canonical mention IDs; display text is never parsed. Each
-`(event, endpoint)` result has a stable delivery ID which the Firebase adapter
-uses as both the Android and Apple collapse key.
+It validates every posting and current suppression, membership/device
+liveness, endpoint cell, and push-node binding through `RepositoryReader`.
+Message facts carry canonical mention IDs; display text is never parsed. A
+delayed retry therefore honors a later mute, removal, endpoint rotation, or
+event suppression instead of replaying historical authority.
 
-A future SNS, Pub/Sub, or other carrier would hold no authority. Its hint must
-name only trigger facts newly resident in the successful root transition.
-Delivery must authenticate each event in that historical hint root, then use a
-separately pinned current root for endpoints, preferences, suppression, and
-liveness. The current one-root prototype does not implement that split and is
-not deployable. Duplicate hints must derive the same delivery IDs. There is
-currently no emitter, carrier, deployment, notification outbox, queue evidence,
-repository callback, or second publication path. Future delivery must remain
-post-commit and tolerate duplicate provider submission.
+The worker acknowledges carrier work only after FCM accepts every selected
+request, current authority selects no delivery, or an explicit unregistered
+FID or locally malformed sealed endpoint makes a request terminal. Missing
+state, configuration errors, provider failures, and unknown outcomes retry.
+Partial success retries the whole body, so an already accepted request can be
+submitted again. Each installation cell has a stable delivery ID and platform
+collapse ID across retries; the mobile client must deduplicate that ID. FCM
+acceptance is not proof that APNs or Android presented the notification.
+
+AWS composes the scanner and worker as separate Lambdas around S3 notification
+state and SQS. Cloudflare composes separate Workers around R2 state and a
+Cloudflare Queue. A full peer can run the same shared scanner and worker with
+filesystem notification state and an in-process carrier. Provider receipts and
+queue metadata carry no repository or endpoint authority. Managed queues have
+finite retention, so notification-state roots must outlive the source queue,
+DLQ, alert response, and bounded redrive horizon.
 
 The preference commands are available now:
 
@@ -279,15 +302,21 @@ python3 -m full_peer content.notification.list WORKSPACE
 python3 -m full_peer auth.push_endpoint.list WORKSPACE
 ```
 
-Endpoint registration is intended to be called by mobile integration after it
-obtains notification permission and an FCM installation ID, seals that ID with
-`notifications.seal_target`, and has durable retry state for publishing the
-newest endpoint. Do not pass an unsealed target to the fact command.
+Endpoint registration still needs the mobile integration to obtain permission
+and a current Firebase Installation ID, seal that FID with
+`notifications.seal_target`, and durably publish the newest endpoint fact. Do
+not pass an unsealed target to the fact command.
 
-Run the deterministic fact, derivation, and Firebase-adapter coverage with:
+All notification deployments remain disabled by default. Fake-provider and
+deployment tests establish crash/retry semantics, but production enablement is
+blocked on real iOS and Android registration, foreground/background launch,
+presentation deduplication, and deploy/smoke/remove records.
+
+Run the deterministic fact, discovery, worker, provider, and deployment
+coverage with:
 
 ```sh
-python3 -m pytest -q tests/test_notifications.py
+python3 -m pytest -q tests/test_notification*.py tests/test_*notifications*.py
 ```
 
 ## Facts, suppression, and deletion
@@ -594,6 +623,72 @@ Generated provider claims intentionally say `live_verified: false` until the
 live S3/R2 conformance suite has been run for the selected account and
 credential profile. Building the adapters and deploy artifacts is not a claim
 that this checkout has deployed them.
+
+### AWS notifications
+
+Notifications are a third, independent stack. It reads the canonical bucket,
+writes only a separate notification-state prefix, and owns its SQS source and
+DLQ. It does not receive the ingress bucket or canonical write authority. The
+Secrets Manager value has this exact shape; each `credential` is one Firebase
+service-account document and `push_node_seed` is 32 random bytes encoded as 64
+lowercase hex characters:
+
+```json
+{
+  "firebase_apps": [
+    {
+      "application": "APP",
+      "environment": "production",
+      "credential": {"type": "service_account"}
+    }
+  ],
+  "push_node_seed": "64_HEX_CHARACTERS"
+}
+```
+
+Create that secret from a protected file, configure the external state bucket
+to retain `root` and `obj/` longer than the complete queue/DLQ/redrive window,
+then create the stack disabled:
+
+```sh
+python3 -m deploy.aws_notifications.manage deploy --create \
+  --stack-name poc16-notifications \
+  --deployment-id DEPLOYMENT \
+  --workspace WS64 \
+  --canonical-bucket CANONICAL_BUCKET \
+  --canonical-prefix workspaces/WS64 \
+  --state-bucket NOTIFICATION_STATE_BUCKET \
+  --state-prefix workspaces/WS64/notifications \
+  --state-retention-days 30 \
+  --expected-owner ACCOUNT_ID \
+  --notification-secret-arn SECRET_ARN \
+  --region REGION
+```
+
+Without `--enable`, CloudFormation creates the owned stack identity but no
+scanner, delivery function, queue, or schedule. After the real mobile launch
+gate, repeat with `--update --enable`. The source queue and DLQ each retain
+work for 14 days; the deploy command rejects a claimed state-retention window
+below 30 days but never changes the bucket lifecycle itself. For standard SQS,
+DLQ transfer preserves the original enqueue age while an explicit redrive
+resets it; the 30-day floor covers the first finite lifetime, one bounded
+redrive lifetime, and a two-day response margin.
+
+An operator can submit one canonical hint fixture through the scanner and real
+Firebase boundary, redrive the DLQ at a bounded rate, or remove the owned
+compute. Removal refuses to discard queued work unless explicitly overridden
+and never deletes either external bucket or the secret:
+
+```sh
+python3 -m deploy.aws_notifications.manage live-smoke \
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT \
+  --hint-file notification-hint.json --region REGION
+python3 -m deploy.aws_notifications.manage redrive \
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT \
+  --max-per-second 10 --region REGION
+python3 -m deploy.aws_notifications.manage remove \
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT --region REGION
+```
 
 ## Current performance status
 

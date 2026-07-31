@@ -3,7 +3,7 @@ from core.crypto import h
 from core.limits import MAX_ROOT_BYTES
 
 
-def describe(node):
+def describe(node, notifications=None):
     """Describe local presentation and operational state without fact policy."""
     out = {"pk": node.pk, "member": node.member, "workspaces": {}}
     with node.lock:
@@ -27,4 +27,6 @@ def describe(node):
                     node.ingress_attempt_failures(workspace),
                 "sync_failures": node.sync_failures(workspace),
             }
+    if notifications is not None:
+        out["notifications"] = notifications.status()
     return out

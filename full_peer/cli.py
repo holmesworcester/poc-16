@@ -21,7 +21,7 @@ DEFAULT_NODE = "http://127.0.0.1:7101"
 USAGE = (
     "usage: full_peer [--node URL] <scope.family.verb> [args...]\n"
     "       full_peer daemon <dir> [--port PORT] [--control-port PORT] "
-    "[--iroh]\n"
+    "[--iroh] [--enable-experimental-notifications]\n"
     "       full_peer --commands"
 )
 STORE_HELP = """\
@@ -105,14 +105,45 @@ def _serve(argv):
     parser.add_argument(
         "--store-config", metavar="PATH",
         help="strict S3/R2 host-store JSON (default: local filesystem)")
+    parser.add_argument(
+        "--enable-experimental-notifications", action="store_true",
+        help="enable default-off FactTree scanning and FCM delivery")
+    parser.add_argument(
+        "--notification-cadence", type=float, default=30.0,
+        help="notification scan cadence in seconds (default: 30)")
+    parser.add_argument(
+        "--notification-application",
+        help="fact application mapped to the Firebase default app")
+    parser.add_argument(
+        "--notification-environment", default="production",
+        help="fact environment mapped to the Firebase default app")
     args = parser.parse_args(argv)
     if not args.iroh and (
             args.iroh_key_file is not None or args.iroh_loopback):
         parser.error("--iroh-key-file/--iroh-loopback require --iroh")
+    if args.enable_experimental_notifications \
+            and args.notification_application is None:
+        parser.error(
+            "--notification-application is required with "
+            "--enable-experimental-notifications")
+    if not args.enable_experimental_notifications and (
+            args.notification_application is not None
+            or args.notification_cadence != 30.0
+            or args.notification_environment != "production"):
+        parser.error(
+            "notification options require "
+            "--enable-experimental-notifications")
     store_factory = None
     if args.store_config is not None:
         from adapters.host import load_store_factory
         store_factory = load_store_factory(args.store_config)
+    notification_provider = None
+    if args.enable_experimental_notifications:
+        from .notifications import firebase_from_default_credentials
+        notification_provider = firebase_from_default_credentials(
+            args.notification_application,
+            args.notification_environment,
+        )
     from .daemon import serve
     return serve(
         args.dir, args.port, args.host, args.cadence, args.url,
@@ -122,6 +153,9 @@ def _serve(argv):
         iroh_binary=args.iroh_binary if args.iroh else None,
         iroh_key_file=args.iroh_key_file,
         iroh_loopback=args.iroh_loopback,
+        notification_enabled=args.enable_experimental_notifications,
+        notification_cadence=args.notification_cadence,
+        notification_provider=notification_provider,
     )
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 import facts
+from adapters.s3 import S3Config, S3Store
 from core import merkle_map
 from core.crypto import h
 from core.fact import encode
@@ -170,6 +171,22 @@ def test_first_activation_backfills_historical_triggers(tmp_path):
     assert _cursor(cursor) == Cursor(workspace, h(root))
 
 
+def test_type_range_emits_one_new_trigger_without_route_row_delay(tmp_path):
+    node, workspace = _world(tmp_path)
+    carrier, cursor = MemoryCarrier([]), FsStore(str(tmp_path / "cursor"))
+    asyncio.run(_drain(_discovery(node, workspace, cursor, carrier)))
+    carrier.payloads.clear()
+
+    event = message.post(node, workspace, "general", "one turn", ts=3)
+    result = asyncio.run(_discovery(
+        node, workspace, cursor, carrier,
+        page_rows=merkle_map.LEAF_MAX_ROWS).run_once())
+
+    assert result.status == "published"
+    assert decode_hint(carrier.payloads[0]).facts == (event,)
+    assert _cursor(cursor).target is None
+
+
 def test_maximum_hint_fits_cloudflare_queue_body_limit():
     fids = tuple(sorted(
         h(number.to_bytes(4, "big")) for number in range(MAX_PILE_FACTS)))
@@ -195,6 +212,28 @@ def test_hint_and_page_limits_accept_exact_and_reject_one_over():
         NotificationDiscovery(
             repository, cursor, "a" * 64, MemoryCarrier([]),
             page_rows=merkle_map.MAX_RANGE_ROWS + 1)
+
+
+def test_discovery_rejects_distinct_adapters_for_one_physical_namespace(
+        tmp_path):
+    root = tmp_path / "same"
+    root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    with pytest.raises(ValueError, match="notification discovery"):
+        NotificationDiscovery(
+            FsStore(str(root)), FsStore(str(alias)), "a" * 64,
+            MemoryCarrier([]))
+
+    first = S3Store(
+        S3Config(bucket="same-bucket", prefix="same/prefix"),
+        client=object())
+    second = S3Store(
+        S3Config(bucket="same-bucket", prefix="same/prefix"),
+        client=object())
+    with pytest.raises(ValueError, match="notification discovery"):
+        NotificationDiscovery(
+            first, second, "a" * 64, MemoryCarrier([]))
 
 
 def test_dropped_wakes_use_actual_async_stores_and_latest_root(tmp_path):

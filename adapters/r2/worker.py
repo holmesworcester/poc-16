@@ -63,6 +63,9 @@ class R2BindingStore:
             raise ValueError("R2 list page budget")
         self.max_list_pages = max_list_pages
 
+    def namespace_id(self):
+        return "r2-binding", id(self.bucket), self.prefix
+
     def _key(self, key):
         key = validate_key(key)
         physical = f"{self.prefix}/{key}" if self.prefix else key

@@ -27,6 +27,7 @@ from core.object_store import (
     OutcomeUnknown,
     Versioned,
     async_store,
+    store_namespace,
 )
 from core.repository_reader import RepositoryReader
 from core.shape import valid_fid
@@ -108,8 +109,12 @@ class NotificationDiscovery:
     def __init__(
             self, repository_store, cursor_store, workspace, carrier, *,
             page_rows=merkle_map.MAX_RANGE_ROWS):
+        repository_namespace = store_namespace(repository_store)
+        cursor_namespace = store_namespace(cursor_store)
         if not valid_fid(workspace) \
                 or repository_store is cursor_store \
+                or repository_namespace is not None \
+                and repository_namespace == cursor_namespace \
                 or not callable(getattr(carrier, "publish", None)) \
                 or type(page_rows) is not int \
                 or not 1 <= page_rows <= merkle_map.MAX_RANGE_ROWS:
@@ -224,8 +229,14 @@ class NotificationDiscovery:
             expected_count=base_descriptor["count"],
             expected_depth=base_descriptor["depth"],
         )
+        type_start = indexes.posting_prefix(TYPE_INDEX)
         page = await remote.diff_page_awaited(
-            local, after=cursor.after, limit=self.page_rows)
+            local,
+            start=type_start,
+            stop=type_start + "\uffff",
+            after=cursor.after,
+            limit=self.page_rows,
+        )
 
         discovered = []
         for key, value in page.differing:

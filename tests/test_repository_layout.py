@@ -1105,6 +1105,18 @@ print(json.dumps(sorted(sys.modules)))
     assert "core.repository_applier" not in loaded
 
 
+def test_full_peer_notifications_only_compose_the_shared_engine():
+    source = (ROOT / "full_peer" / "notifications.py").read_text()
+    assert source.count("NotificationDiscovery(") == 1
+    assert source.count("handle_carrier_delivery(") == 1
+    for duplicate_authority in (
+            "RepositoryApplier", "FactOrder", ".sql(", ".idx(",
+            ".list(", ".list_page(", ".cas("):
+        assert duplicate_authority not in source
+    node = (ROOT / "full_peer" / "node.py").read_text()
+    assert "notification" not in node
+
+
 def test_full_node_composes_roles_without_a_second_receiving_loop():
     node_tree = parsed(Path("full_peer/node.py"))
     node = next(

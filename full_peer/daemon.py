@@ -30,6 +30,7 @@ from .sync import sync
 LOCAL_COMMANDS = {
     "peer.iroh.remove": "_command_iroh_remove",
     "peer.iroh.set": "_command_iroh_set",
+    "peer.notifications.wake": "_command_notifications_wake",
     "peer.rebuild": "_command_rebuild",
     "peer.status": "_command_status",
     "peer.sync": "_command_sync",
@@ -103,7 +104,7 @@ def _socket_address(host, port):
 class ControlHandler(BaseHTTPRequestHandler):
     """The one local command envelope; it contains no peer-data routes."""
 
-    node = syncer = None
+    node = syncer = notifications = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_args):
@@ -192,7 +193,15 @@ class ControlHandler(BaseHTTPRequestHandler):
     def _command_status(self, argv):
         if argv:
             raise ValueError("usage: peer.status")
-        return status.describe(self.node)
+        return status.describe(self.node, self.notifications)
+
+    def _command_notifications_wake(self, argv):
+        if argv:
+            raise ValueError("usage: peer.notifications.wake")
+        if self.notifications is None:
+            raise ValueError("notifications are disabled")
+        self.notifications.kick()
+        return {"ok": True}
 
     def _command_sync(self, argv):
         workspace = self._workspace(argv, "peer.sync <workspace>")
@@ -222,18 +231,18 @@ class ControlHandler(BaseHTTPRequestHandler):
         return {"ok": True}
 
 
-def control_handler_for(node, syncer):
+def control_handler_for(node, syncer, notifications=None):
     return type(
         "BoundControlHandler",
         (ControlHandler,),
-        {"node": node, "syncer": syncer},
+        {"node": node, "syncer": syncer, "notifications": notifications},
     )
 
 
-def _control_server(node, syncer, host, port):
+def _control_server(node, syncer, host, port, notifications=None):
     _loopback(host, "control listener")
     server = ThreadingHTTPServer(
-        (host, port), control_handler_for(node, syncer))
+        (host, port), control_handler_for(node, syncer, notifications))
     server.daemon_threads = True
     return server
 
@@ -245,7 +254,9 @@ class FullPeerService:
             self, directory, port, host="127.0.0.1", cadence=1.0,
             url=None, *, control_port=7101, store_factory=None,
             gate_options=None, iroh_binary=None, iroh_key_file=None,
-            iroh_loopback=False):
+            iroh_loopback=False, notification_enabled=False,
+            notification_cadence=30.0, notification_provider=None,
+            notification_secret=None):
         if port == control_port and port != 0:
             raise ValueError("peer and control ports must differ")
         if iroh_binary is not None:
@@ -257,6 +268,20 @@ class FullPeerService:
         self.directory = directory
         self.node = FullPeer(directory, store_factory=store_factory)
         self.syncer = Syncer(self.node, cadence)
+        self.notifications = None
+        if notification_enabled:
+            if notification_provider is None:
+                raise ValueError(
+                    "notification provider required when notifications "
+                    "are enabled")
+            from .notifications import FullPeerNotifications
+            self.notifications = FullPeerNotifications(
+                self.node,
+                directory,
+                notification_secret or self.node.sk,
+                notification_provider,
+                cadence=notification_cadence,
+            )
         gate_options = HttpGateOptions() \
             if gate_options is None else gate_options
         self.peer_server = ThreadingHTTPServer(
@@ -268,7 +293,8 @@ class FullPeerService:
         self.peer_server.daemon_threads = True
         try:
             self.control_server = _control_server(
-                self.node, self.syncer, "127.0.0.1", control_port)
+                self.node, self.syncer, "127.0.0.1", control_port,
+                self.notifications)
         except BaseException:
             self.peer_server.server_close()
             raise
@@ -361,6 +387,8 @@ class FullPeerService:
                     self.iroh.ready.endpoint_id, self.iroh.ready.peer)
                 self.node.use_iroh(advertised, self.forwarders)
             self.syncer.start()
+            if self.notifications is not None:
+                self.notifications.start()
             self.monitor_thread = threading.Thread(
                 target=self._monitor,
                 name="full-peer-supervisor",
@@ -410,6 +438,8 @@ class FullPeerService:
             return
         self._closing.set()
         self.syncer.stop()
+        if self.notifications is not None:
+            self.notifications.stop()
         if self._started:
             self.peer_server.shutdown()
         if self._control_active.is_set() \
@@ -427,6 +457,8 @@ class FullPeerService:
             self.monitor_thread.join(STOP_SECONDS)
         if self.syncer.is_alive():
             self.syncer.join(STOP_SECONDS)
+        if self.notifications is not None:
+            self.notifications.join(STOP_SECONDS)
 
 
 def _run_service(service):
@@ -456,7 +488,9 @@ def _run_service(service):
 def serve(
         directory, port, host="127.0.0.1", cadence=1.0, url=None, *,
         control_port=7101, store_factory=None, gate_options=None,
-        iroh_binary=None, iroh_key_file=None, iroh_loopback=False):
+        iroh_binary=None, iroh_key_file=None, iroh_loopback=False,
+        notification_enabled=False, notification_cadence=30.0,
+        notification_provider=None, notification_secret=None):
     """Run one full peer; optionally expose peer data only through Iroh."""
     service = FullPeerService(
         directory,
@@ -470,5 +504,9 @@ def serve(
         iroh_binary=iroh_binary,
         iroh_key_file=iroh_key_file,
         iroh_loopback=iroh_loopback,
+        notification_enabled=notification_enabled,
+        notification_cadence=notification_cadence,
+        notification_provider=notification_provider,
+        notification_secret=notification_secret,
     )
     return _run_service(service)
