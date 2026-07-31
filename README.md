@@ -322,7 +322,9 @@ delivered prefix backward. `content.file.abandon_upload` durably stops retries,
 but collection waits until every locally observed capability expiry.
 `content.file.collect_upload` then removes only that exact abandoned source, or
 an exact source whose pile-last delivery step was durably journaled. It never
-reads or mutates repository state.
+reads or mutates repository state. A legacy v1 journal can still resume, but
+abandoned collection fails closed because v1 did not retain replaced-session
+expiry history.
 
 The marker is the durable work item. Notifications and LIST results are
 discovery hints; scheduled bounded rescans are the progress path, and only an

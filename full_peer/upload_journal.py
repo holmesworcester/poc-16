@@ -26,7 +26,6 @@ from core.shape import valid_fid
 from core.staged_intent import MEMBER_HEX_BYTES, SESSION_HEX_BYTES
 from deploy.upload_session import (
     MAX_SESSION_OBJECTS,
-    MAX_SESSION_TTL_MS,
     UploadLeaf,
     UploadManifest,
     UploadVector,
@@ -51,6 +50,12 @@ class UploadJournalError(ValueError):
 def _hex(value, length):
     return isinstance(value, str) and len(value) == length \
         and all(c in "0123456789abcdef" for c in value)
+
+
+def _covers_expiry(proposed, current):
+    """None is the fail-closed top value: an unknowable historical expiry."""
+    return proposed is None if current is None \
+        else proposed is None or proposed >= current
 
 
 def _sync_dir(path):
@@ -138,7 +143,7 @@ class UploadProgress:
     cursor_index: int
     delivered_index: int
     expires_at_ms: int
-    issued_until_ms: int
+    issued_until_ms: int | None
     pile_delivered: bool = False
 
 
@@ -152,7 +157,7 @@ class UploadStatus:
     cursor_index: int
     delivered_index: int
     expires_at_ms: int | None
-    collect_after_ms: int
+    collect_after_ms: int | None
     collectible: bool
 
 
@@ -402,9 +407,10 @@ class UploadSource:
                 or not 0 <= progress.delivered_index \
                 <= progress.cursor_index <= count \
                 or type(progress.expires_at_ms) is not int \
-                or type(progress.issued_until_ms) is not int \
-                or not 0 <= progress.expires_at_ms \
-                <= progress.issued_until_ms \
+                or progress.issued_until_ms is not None and (
+                    type(progress.issued_until_ms) is not int
+                    or not 0 <= progress.expires_at_ms
+                    <= progress.issued_until_ms) \
                 or type(progress.pile_delivered) is not bool \
                 or progress.pile_delivered \
                 and progress.delivered_index != count:
@@ -424,10 +430,9 @@ class UploadSource:
                 raise ValueError
             schema = value.pop("schema")
             if schema == LEGACY_SESSION_SCHEMA:
-                # v1 erased replaced sessions. One maximum lifetime beyond
-                # its surviving expiry safely covers an older longer lease.
-                value["issued_until_ms"] = (
-                    value["expires_at_ms"] + MAX_SESSION_TTL_MS)
+                # v1 erased replaced sessions and did not constrain clock
+                # rollback, so no finite bound proves every old lease expired.
+                value["issued_until_ms"] = None
             elif schema != SESSION_SCHEMA:
                 raise ValueError
             return self._checked_progress(UploadProgress(**value))
@@ -448,7 +453,9 @@ class UploadSource:
             if current is not None and (
                     progress.session != current.session
                     or progress.expires_at_ms != current.expires_at_ms
-                    or progress.issued_until_ms < current.issued_until_ms
+                    or not _covers_expiry(
+                        progress.issued_until_ms,
+                        current.issued_until_ms)
                     or progress.cursor_index < current.cursor_index
                     or progress.delivered_index < current.delivered_index
                     or current.pile_delivered and not progress.pile_delivered
@@ -465,7 +472,9 @@ class UploadSource:
             if current is not None and (
                     current.pile_delivered
                     or progress.session == current.session
-                    or progress.issued_until_ms < current.issued_until_ms):
+                    or not _covers_expiry(
+                        progress.issued_until_ms,
+                        current.issued_until_ms)):
                 raise UploadJournalError("upload session restart")
             self._write_progress(progress)
 
@@ -485,9 +494,10 @@ class UploadSource:
                     or value["schema"] != ABANDONED_SCHEMA \
                     or value["source_id"] != self.source_id \
                     or type(value["abandoned_at_ms"]) is not int \
-                    or type(value["collect_after_ms"]) is not int \
-                    or not 0 <= value["abandoned_at_ms"] \
-                    <= value["collect_after_ms"]:
+                    or value["collect_after_ms"] is not None and (
+                        type(value["collect_after_ms"]) is not int
+                        or not 0 <= value["abandoned_at_ms"]
+                        <= value["collect_after_ms"]):
                 raise ValueError
             return value
         except (KeyError, TypeError, ValueError) as error:
@@ -516,7 +526,8 @@ class UploadSource:
             progress.delivered_index if progress is not None else 0,
             progress.expires_at_ms if progress is not None else None,
             collect_after,
-            completed or state == "abandoned" and now_ms >= collect_after,
+            completed or state == "abandoned"
+            and collect_after is not None and now_ms >= collect_after,
         )
 
     def require_resumable(self):
@@ -534,10 +545,11 @@ class UploadSource:
             if current.state == "abandoned":
                 return current
             progress = self.progress()
-            collect_after = max(
-                now_ms,
-                progress.issued_until_ms if progress is not None else now_ms,
-            )
+            issued_until = (
+                progress.issued_until_ms
+                if progress is not None else now_ms)
+            collect_after = None if issued_until is None \
+                else max(now_ms, issued_until)
             _new(self.abandoned_path, canon({
                 "abandoned_at_ms": now_ms,
                 "collect_after_ms": collect_after,
@@ -567,7 +579,7 @@ class UploadSource:
                 if not recovering:
                     raise UploadJournalError("upload source unavailable")
                 return source_id
-            source = cls.load(target)
+            source = cls._load(target, bodies=False)
             if source.workspace != workspace:
                 raise UploadJournalError("upload source workspace")
             status = source.status(now_ms)

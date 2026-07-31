@@ -147,12 +147,17 @@ class UploadClient:
                 or type(result.expires_at_ms) is not int \
                 or result.expires_at_ms <= self._now():
             raise UploadProtocolError("invalid OPEN response")
-        progress = UploadProgress(
-            self.source.source_id, result.session, result.cursor,
-            0, 0, result.expires_at_ms, max(
+        issued_until = (
+            None if previous is not None
+            and previous.issued_until_ms is None
+            else max(
                 result.expires_at_ms,
                 previous.issued_until_ms if previous is not None else 0,
-            ))
+            )
+        )
+        progress = UploadProgress(
+            self.source.source_id, result.session, result.cursor,
+            0, 0, result.expires_at_ms, issued_until)
         if previous is None:
             self.source.save(progress)
         else:

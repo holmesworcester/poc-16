@@ -1,6 +1,7 @@
 """Crash, concurrency, discovery, and collection for local upload state."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+import multiprocessing
 from pathlib import Path
 import threading
 
@@ -15,7 +16,6 @@ from full_peer.upload_journal import (
     UploadSource,
 )
 import full_peer.upload_journal as journal
-from deploy.upload_session import MAX_SESSION_TTL_MS
 from tests.test_upload_client import (
     Crash,
     FakeProvider,
@@ -29,6 +29,13 @@ def _node_source(node, workspace, pile, objects=()):
     for raw in objects:
         builder.add(raw)
     return builder.finish(pile)
+
+
+def _hold_upload_writer(path, ready, release):
+    with UploadSource.load(path).writer():
+        ready.set()
+        if not release.wait(10):
+            raise RuntimeError("upload writer test timed out")
 
 
 def test_killed_upload_is_discoverable_after_restart_and_paginates(tmp_path):
@@ -104,6 +111,33 @@ def test_two_resume_commands_are_one_writer_and_one_delivery(tmp_path):
     assert source.progress().pile_delivered
 
 
+def test_writer_fence_is_cross_process(tmp_path):
+    (
+        _, _, _, clock, _, _, _, source, _,
+    ) = world(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    process = context.Process(
+        target=_hold_upload_writer,
+        args=(source.path, ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(10)
+        with pytest.raises(UploadJournalError) as caught:
+            UploadSource.collect(
+                Path(source.path).parent, source.workspace,
+                source.source_id, clock())
+        assert str(caught.value) == "upload source is active"
+    finally:
+        release.set()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    assert process.exitcode == 0
+
+
 def test_abandonment_retains_every_issued_session_expiry(tmp_path):
     (
         _, _, _, clock, nonces, _, broker, source, proof,
@@ -136,7 +170,7 @@ def test_abandonment_retains_every_issued_session_expiry(tmp_path):
             source.source_id, clock())
 
 
-def test_legacy_session_hydrates_expiry_high_water_and_resumes(tmp_path):
+def test_legacy_session_abandonment_fails_closed(tmp_path):
     (
         _, _, _, clock, _, _, broker, source, proof,
     ) = world(tmp_path, objects=(b"one",))
@@ -153,12 +187,14 @@ def test_legacy_session_hydrates_expiry_high_water_and_resumes(tmp_path):
         **value, "schema": "poc16-upload-client-session-v1"}))
 
     legacy = UploadSource.load(source.path)
-    assert legacy.progress().issued_until_ms == (
-        legacy.progress().expires_at_ms + MAX_SESSION_TTL_MS)
-    UploadClient(legacy, broker, FakeProvider(), clock).run(proof)
-    assert legacy.progress().pile_delivered
-    assert b"poc16-upload-client-session-v2" in Path(
-        source.session_path).read_bytes()
+    assert legacy.progress().issued_until_ms is None
+    abandoned = legacy.abandon(legacy.progress().expires_at_ms)
+    assert abandoned.collect_after_ms is None
+    assert not legacy.status(1 << 127).collectible
+    with pytest.raises(UploadJournalError, match="not collectible"):
+        UploadSource.collect(
+            Path(source.path).parent, source.workspace,
+            source.source_id, 1 << 127)
 
 
 def test_collection_refuses_partial_delivery_and_recovers_after_crash(

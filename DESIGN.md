@@ -75,6 +75,8 @@ local delivery only. Collection atomically hides one exact source before
 deleting it and is allowed only after pile-last delivery was durably recorded,
 or explicit abandonment and the retained capability-expiry bound; none of
 these records is repository, root-CAS, or read authority.
+Legacy v1 progress may resume, but its erased session history makes abandoned
+collection permanently ineligible unless delivery later completes.
 
 ### 1.1 Iroh is connection only
 
