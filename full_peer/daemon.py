@@ -21,11 +21,15 @@ from core.http_stdlib import HttpGateOptions
 from core.http_stdlib import handler_for as peer_handler_for
 
 from . import status
+from .iroh_forwarders import IrohForwarders
 from .iroh_process import IrohProcess, STOP_SECONDS
-from .node import FullPeer, now_ms
+from .keychain import iroh_peer
+from .node import FullPeer
 from .sync import sync
 
 LOCAL_COMMANDS = {
+    "peer.iroh.remove": "_command_iroh_remove",
+    "peer.iroh.set": "_command_iroh_set",
     "peer.rebuild": "_command_rebuild",
     "peer.status": "_command_status",
     "peer.sync": "_command_sync",
@@ -47,6 +51,27 @@ class Syncer(threading.Thread):
         self.stopping.set()
         self.wake.set()
 
+    @staticmethod
+    def _peer_name(peer):
+        return peer if isinstance(peer, str) \
+            else f"iroh:{peer['endpoint']}"
+
+    def sync_workspace(self, workspace, *, fail=False):
+        for peer in self.node.keyring["workspaces"][workspace]["peers"]:
+            name = self._peer_name(peer)
+            try:
+                url = self.node.resolve_peer(workspace, peer)
+                sync(self.node, workspace, url)
+            except Exception as error:
+                self.node.record_sync_failure(workspace, name, error)
+                if fail:
+                    raise
+                if os.environ.get("TINYP2P_DEBUG"):
+                    import traceback
+                    traceback.print_exc()
+            else:
+                self.node.record_sync_success(workspace, name)
+
     def run(self):
         while not self.stopping.is_set():
             self.wake.wait(self.cadence)
@@ -54,16 +79,7 @@ class Syncer(threading.Thread):
             if self.stopping.is_set():
                 return
             for workspace in self.node.workspaces():
-                for url in self.node.keyring["workspaces"][workspace]["peers"]:
-                    try:
-                        sync(self.node, workspace, url)
-                    except Exception as error:
-                        self.node.record_sync_failure(workspace, url, error)
-                        if os.environ.get("TINYP2P_DEBUG"):
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        self.node.record_sync_success(workspace, url)
+                self.sync_workspace(workspace)
 
 
 def _loopback(host, label):
@@ -180,14 +196,24 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def _command_sync(self, argv):
         workspace = self._workspace(argv, "peer.sync <workspace>")
-        for url in self.node.keyring["workspaces"][workspace]["peers"]:
-            try:
-                sync(self.node, workspace, url)
-            except Exception as error:
-                self.node.record_sync_failure(workspace, url, error)
-                raise
-            else:
-                self.node.record_sync_success(workspace, url)
+        self.syncer.sync_workspace(workspace, fail=True)
+        return {"ok": True}
+
+    def _command_iroh_set(self, argv):
+        if len(argv) != 3:
+            raise ValueError(
+                "usage: peer.iroh.set <workspace> <endpoint> <ticket>")
+        workspace = facts.workspace_for(self.node, argv[0])
+        self.node.set_iroh_peer(workspace, argv[1], argv[2])
+        self.syncer.kick()
+        return {"ok": True}
+
+    def _command_iroh_remove(self, argv):
+        if len(argv) != 2:
+            raise ValueError(
+                "usage: peer.iroh.remove <workspace> <endpoint>")
+        workspace = facts.workspace_for(self.node, argv[0])
+        self.node.remove_iroh_peer(workspace, argv[1])
         return {"ok": True}
 
     def _command_rebuild(self, argv):
@@ -231,14 +257,13 @@ class FullPeerService:
         self.directory = directory
         self.node = FullPeer(directory, store_factory=store_factory)
         self.syncer = Syncer(self.node, cadence)
-        self.secret = os.urandom(32)
-        self.gate_options = HttpGateOptions() \
+        gate_options = HttpGateOptions() \
             if gate_options is None else gate_options
         self.peer_server = ThreadingHTTPServer(
             (host, port), peer_handler_for(
                 self.node,
-                self.secret,
-                gate_options=self.gate_options,
+                os.urandom(32),
+                gate_options=gate_options,
             ))
         self.peer_server.daemon_threads = True
         try:
@@ -252,9 +277,8 @@ class FullPeerService:
         self.data_address = _http_address(data_host, actual_port)
         self.control_address = _http_address(
             "127.0.0.1", self.control_server.server_address[1])
-        # Until full_peer owns durable outbound Iroh locators (poc-16-32h),
-        # never serialize this accepting peer's private loopback seam.
-        self.node.url = None if iroh_binary is not None \
+        # Never serialize the accepting peer's private loopback seam.
+        self.node.peer_address = None if iroh_binary is not None \
             else url or self.data_address
         self.iroh_binary = iroh_binary
         self.iroh_key_file = Path(
@@ -262,6 +286,8 @@ class FullPeerService:
             or Path(directory) / "iroh" / "endpoint.key")
         self.iroh_loopback = iroh_loopback
         self.iroh = None
+        self.forwarders = None if iroh_binary is None else IrohForwarders(
+            iroh_binary, loopback=iroh_loopback)
         self.peer_thread = self.monitor_thread = None
         self._control_thread = None
         self._control_active = threading.Event()
@@ -283,7 +309,7 @@ class FullPeerService:
                 return
             self._failure = message
         # The control loop is the main wait point. Its shutdown unblocks run();
-        # stop peer data immediately when the supervised transport disappears.
+        # Stop peer data immediately when the supervised acceptor disappears.
         if threading.current_thread() is not self.peer_thread:
             self.peer_server.shutdown()
         if self._control_active.is_set():
@@ -309,12 +335,13 @@ class FullPeerService:
                 if code is not None:
                     self._fail(f"Iroh child exited unexpectedly ({code})")
                     return
+            if self.forwarders is not None:
+                self.forwarders.maintain()
 
     def start(self):
         if self._started:
             raise RuntimeError("full peer service already started")
         try:
-            self.syncer.start()
             self.peer_thread = threading.Thread(
                 target=self._serve_peer_data,
                 name="full-peer-data",
@@ -330,6 +357,10 @@ class FullPeerService:
                     self.iroh_key_file,
                     loopback=self.iroh_loopback,
                 )
+                advertised = iroh_peer(
+                    self.iroh.ready.endpoint_id, self.iroh.ready.peer)
+                self.node.use_iroh(advertised, self.forwarders)
+            self.syncer.start()
             self.monitor_thread = threading.Thread(
                 target=self._monitor,
                 name="full-peer-supervisor",
@@ -386,6 +417,8 @@ class FullPeerService:
             self.control_server.shutdown()
         self.peer_server.server_close()
         self.control_server.server_close()
+        if self.forwarders is not None:
+            self.forwarders.close()
         if self.iroh is not None:
             self.iroh.stop()
         if self.peer_thread is not None:

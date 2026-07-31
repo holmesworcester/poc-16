@@ -57,8 +57,7 @@ def make(node, workspace):
     """Publish a closed invite blob without adding the invitation to the set."""
     from full_peer.node import now_ms
 
-    if not isinstance(node.url, str) or not node.url:
-        raise ValueError("peer has no advertised URL")
+    peer = node.advertised_peer()
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()
     ts = now_ms()
@@ -80,7 +79,7 @@ def make(node, workspace):
     node.store(workspace).put(
         "invite/" + kdf(seed, "id").hex(), encrypted)
     return base64.urlsafe_b64encode(
-        canon({"u": node.url, "ws": workspace, "s": seed.hex()})).decode()
+        canon({"p": peer, "ws": workspace, "s": seed.hex()})).decode()
 
 
 # QUERIES — none; invite ids deliberately cannot be listed.

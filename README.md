@@ -119,10 +119,45 @@ python3 -m full_peer daemon ./state --port 0 --iroh \
 The command starts the peer-data gate on loopback, starts local control on a
 different loopback listener, starts and monitors Iroh, persists the endpoint
 key at `./state/iroh/endpoint.key`, and prints `IROH ... peer=TICKET`. If the
-Iroh child or data listener dies, the whole service fails shut. SIGINT and
-SIGTERM stop and reap every child. Add `--iroh-loopback` only for a
-single-machine test; normal mode enables Iroh's production reachability
+accepting Iroh child or data listener dies, the whole service fails shut.
+SIGINT and SIGTERM stop and reap every child. Add `--iroh-loopback` only for
+a single-machine test; normal mode enables Iroh's production reachability
 preset.
+
+An invite created by this daemon carries a bounded out-of-band peer record:
+
+```json
+{"kind":"iroh","endpoint":"ENDPOINT_ID","ticket":"TICKET"}
+```
+
+It never carries the private peer-data URL. The joiner stores that record in
+its full-peer keyring, registers a supervised outbound forwarder, and gives
+only the resulting `http://127.0.0.1:...` URL to the existing sync HTTP
+client. On restart it registers durable peers before scheduling and recreates
+each disposable forwarder on its next bounded scheduler or sync turn. Iroh
+mode rejects legacy plain-HTTP peer records, so an Iroh-enabled daemon cannot
+silently dial around the wrapper.
+
+Tickets are reachability data and can change while the endpoint ID remains
+stable. Refresh or remove a configured peer through local control:
+
+```sh
+python3 -m full_peer peer.iroh.set WORKSPACE ENDPOINT_ID NEW_TICKET
+python3 -m full_peer peer.iroh.remove WORKSPACE ENDPOINT_ID
+```
+
+Refresh stops and reaps the superseded child before using the new ticket.
+Removal deletes the durable record and reaps its child. An unexpected
+outbound-child exit closes that private dial, appears under
+`peer.status` → `iroh_connections`, and is recreated with bounded backoff;
+it does not stop unrelated peers or bypass a failed request. Configuration is
+bounded to 64 peers per workspace, 128 Iroh peers per full peer, one 64-hex
+endpoint ID, and the Rust wrapper's 4 KiB decoded ticket ceiling.
+Only one due background connection start is attempted per monitor turn, and
+an outbound child that never reports readiness is terminated and reaped
+inside the daemon's shutdown budget.
+The wrapper checks that a ticket names its configured endpoint, but endpoint
+IDs still select local reachability only and never enter a grant.
 
 The standalone commands remain useful for diagnosis. This creates a local
 HTTP seam whose bytes traverse Iroh to the accepting peer:
@@ -131,15 +166,9 @@ HTTP seam whose bytes traverse Iroh to the accepting peer:
 ./full_peer/iroh/target/release/poc16-iroh forward --peer=TICKET
 ```
 
-The remaining outbound integration is explicit in bead `poc-16-32h`.
-Workspace peer configuration currently stores HTTP URLs; `FullPeer` does not
-yet persist a peer ticket and recreate a local forwarder for its sync
-scheduler. Therefore the supervised accepting path and manual forwarder are
-working, but ordinary invites do not yet establish Iroh-only scheduled sync.
-Do not advertise the accepting peer's loopback data URL as a remote peer;
-`--url` is rejected in Iroh mode so it cannot accidentally advertise a plain
-HTTP endpoint, and invite creation fails with `peer has no advertised URL`
-instead of serializing the private loopback seam.
+`--url` remains rejected in Iroh mode. Plain-HTTP mode remains available for
+local deployments and compatibility, but one daemon configuration cannot mix
+plain remote URLs with Iroh peer records.
 
 ## Repository flow
 

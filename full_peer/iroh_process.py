@@ -9,6 +9,8 @@ from dataclasses import dataclass
 READY_BYTES = 16 * 1024
 READY_SECONDS = 30
 STOP_SECONDS = 10
+FORWARD_READY_SECONDS = 2
+FORWARD_STOP_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,15 @@ class IrohReady:
 
     endpoint_id: str
     peer: str
+
+
+@dataclass(frozen=True)
+class ForwardReady:
+    """Private loopback address reported by one outbound child."""
+
+    endpoint_id: str
+    peer_endpoint_id: str
+    listen: str
 
 
 def _readline(stream, timeout):
@@ -41,7 +52,7 @@ def _readline(stream, timeout):
     return line.rstrip("\r\n")
 
 
-def _parse_ready(line):
+def _fields(line, expected):
     fields = {}
     words = line.split()
     if words[:1] != ["READY"]:
@@ -51,16 +62,45 @@ def _parse_ready(line):
         if not separator or not name or not value or name in fields:
             raise ValueError("invalid Iroh child readiness")
         fields[name] = value
-    if set(fields) != {"endpoint_id", "peer"}:
+    if set(fields) != set(expected):
         raise ValueError("invalid Iroh child readiness")
-    return IrohReady(fields["endpoint_id"], fields["peer"])
+    return fields
 
 
 class IrohProcess:
     """Own exactly one byte-wrapper child and no repository authority."""
 
-    def __init__(self, process, ready):
+    def __init__(self, process, ready, stop_timeout=STOP_SECONDS):
         self.process, self.ready = process, ready
+        self.stop_timeout = stop_timeout
+
+    @classmethod
+    def _start(
+            cls, command, ready_type, expected, ready_timeout, stop_timeout):
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            if process.stdout is None:
+                raise RuntimeError("Iroh child has no readiness pipe")
+            fields = _fields(
+                _readline(process.stdout, ready_timeout), expected)
+            ready = ready_type(*(fields[name] for name in expected))
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Iroh child exited during startup ({process.returncode})")
+            return cls(process, ready, stop_timeout)
+        except BaseException:
+            cls(
+                process,
+                ready_type(*("" for _ in expected)),
+                stop_timeout,
+            ).stop()
+            raise
 
     @classmethod
     def start(
@@ -74,33 +114,41 @@ class IrohProcess:
         ]
         if loopback:
             command.append("--loopback")
-        process = subprocess.Popen(
+        return cls._start(
             command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            IrohReady,
+            ("endpoint_id", "peer"),
+            ready_timeout,
+            STOP_SECONDS,
         )
-        try:
-            if process.stdout is None:
-                raise RuntimeError("Iroh child has no readiness pipe")
-            ready = _parse_ready(
-                _readline(process.stdout, ready_timeout))
-            if process.poll() is not None:
-                raise RuntimeError(
-                    f"Iroh child exited during startup ({process.returncode})")
-            return cls(process, ready)
-        except BaseException:
-            cls(process, IrohReady("", "")).stop()
-            raise
+
+    @classmethod
+    def forward(
+            cls, binary, peer, *, loopback=False,
+            ready_timeout=FORWARD_READY_SECONDS):
+        command = [
+            os.fspath(binary),
+            "forward",
+            f"--peer={peer}",
+            "--listen", "127.0.0.1:0",
+        ]
+        if loopback:
+            command.append("--loopback")
+        return cls._start(
+            command,
+            ForwardReady,
+            ("endpoint_id", "peer_endpoint_id", "listen"),
+            ready_timeout,
+            FORWARD_STOP_SECONDS,
+        )
 
     def stop(self):
         if self.process.poll() is None:
             self.process.terminate()
         try:
-            self.process.wait(STOP_SECONDS)
+            self.process.wait(self.stop_timeout)
         except subprocess.TimeoutExpired:
             self.process.kill()
-            self.process.wait(STOP_SECONDS)
+            self.process.wait(self.stop_timeout)
         if self.process.stdout is not None:
             self.process.stdout.close()

@@ -34,7 +34,7 @@ class Peer:
 
     def __init__(self, node, ws, url):
         self.node, self.ws, self.url = node, ws, url
-        self.cache = node.sync_cache.setdefault((ws, url), {})
+        self.cache = node.sync_state(ws, url)
 
     @property
     def accepts_push(self):

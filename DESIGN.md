@@ -55,7 +55,7 @@ schedule turns and translate results, but it is not a fact-policy, compiler,
 suppression, or CAS authority. `full_peer/sql_store.py` is the sole SQL
 module, and deleting its database changes no repository answer.
 
-### 1.1 Iroh is connection authority only
+### 1.1 Iroh is connection only
 
 The optional full-peer path is deliberately a wrapper around the existing
 HTTP byte seam:
@@ -74,7 +74,7 @@ ordinary HTTP GET/PUT/mint bytes
 Only `full_peer` owns Iroh endpoint keys, tickets, child processes, and
 connection lifecycle. The Rust crate under `full_peer/iroh/` copies bytes; it
 has no HTTP parser, route table, grant codec, workspace model, repository
-operation, object-store client, or CAS. Iroh transport identity encrypts and
+operation, object-store client, or CAS. Iroh endpoint identity encrypts and
 reaches a peer but grants no fact, bucket, or workspace authority. Every
 request must independently pass the normal `HttpGate` grant decision.
 Full-peer host configuration becomes one validated immutable gate-options
@@ -87,12 +87,28 @@ Iroh upstream. A stopped Iroh child or peer-data listener stops the service;
 normal process shutdown reaps the child. The endpoint key is stable across
 restart, but that stable identity is still not an authorization principal.
 
-The accepting lifecycle is supervised today. Durable outbound mapping from a
-workspace peer to an Iroh ticket and scheduler-owned forwarder remains future
-work (`poc-16-32h`); until it lands, the standalone forwarder is diagnostic
-and ordinary invite/sync configuration must not be described as Iroh-only.
-The accepting process therefore has no advertised peer URL and refuses to
-create an invite rather than serialize its private loopback HTTP address.
+Full-peer keyring state stores bounded out-of-band records of the form
+`{kind: iroh, endpoint, ticket}`. It never stores a generated loopback URL.
+The endpoint field is a stable replacement/removal key for reachability only;
+the ticket is the current address. The wrapper rejects a ticket whose encoded
+endpoint does not match that local configuration key, but this consistency
+check still grants nothing. Ordinary invitations carry this same record.
+Their redemption asks `FullPeer` for a private URL, while the fact family
+remains unaware of Iroh. The daemon starts and monitors one outbound
+forwarder per configured workspace/endpoint and passes its loopback URL to
+the unchanged sync HTTP client.
+
+Startup registers every configured peer before scheduling. The monitor starts
+at most one due child per turn, and sync may resolve its selected peer on
+demand; neither path can wait beyond the bounded outbound-start and shutdown
+budget. Replacing a ticket stops and reaps the old child; removal both deletes
+the durable record and reaps the child. Unexpected outbound-child death closes
+the old local dial, is visible in local status, discards the exact obsolete
+URL-keyed sync walk, and retries with bounded backoff. It is a peer-local
+reachability failure, not a reason to stop the accepting service or grant
+access. Accepting-child death remains process-fatal because it would otherwise
+leave the daemon falsely advertised. Iroh mode rejects plain HTTP peer records
+and `--url`, so private loopback seams cannot become remote configuration.
 
 ## 2. Facts and closed piles
 

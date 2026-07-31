@@ -6,8 +6,64 @@ authors that workspace's facts.
 """
 import json
 import os
+import re
+import tempfile
 
 from core.crypto import keypair, load_sk
+
+MAX_PEERS_PER_WORKSPACE = 64
+MAX_IROH_PEERS = 128
+MAX_HTTP_URL_CHARS = 4096
+# Rust accepts at most a 4 KiB decoded EndpointAddr.
+MAX_IROH_TICKET_CHARS = ((4096 + 2) // 3) * 4
+
+
+def iroh_endpoint(endpoint):
+    if not isinstance(endpoint, str) \
+            or not re.fullmatch(r"[0-9a-f]{64}", endpoint):
+        raise ValueError("invalid Iroh endpoint id")
+    return endpoint
+
+
+def iroh_peer(endpoint, ticket):
+    """Return one bounded reachability record with no authority meaning."""
+    endpoint = iroh_endpoint(endpoint)
+    if not isinstance(ticket, str) or len(ticket) > MAX_IROH_TICKET_CHARS \
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", ticket):
+        raise ValueError("invalid Iroh ticket")
+    return {"kind": "iroh", "endpoint": endpoint, "ticket": ticket}
+
+
+def normalize_peer(peer):
+    """Validate one persisted peer address without resolving or trusting it."""
+    if isinstance(peer, str):
+        if not peer or len(peer) > MAX_HTTP_URL_CHARS:
+            raise ValueError("invalid HTTP peer URL")
+        return peer
+    if not isinstance(peer, dict) \
+            or set(peer) != {"kind", "endpoint", "ticket"} \
+            or peer.get("kind") != "iroh":
+        raise ValueError("invalid peer locator")
+    return iroh_peer(peer["endpoint"], peer["ticket"])
+
+
+def normalize_peers(peers):
+    if not isinstance(peers, list) or len(peers) > MAX_PEERS_PER_WORKSPACE:
+        raise ValueError("invalid workspace peers")
+    normalized, identities = [], set()
+    for peer in peers:
+        peer = normalize_peer(peer)
+        identity = ("http", peer) if isinstance(peer, str) \
+            else ("iroh", peer["endpoint"])
+        if identity in identities:
+            raise ValueError("duplicate workspace peer")
+        identities.add(identity)
+        normalized.append(peer)
+    return normalized
+
+
+def is_iroh_peer(peer):
+    return isinstance(peer, dict) and peer.get("kind") == "iroh"
 
 
 class Keychain:
@@ -18,8 +74,8 @@ class Keychain:
                 raw = json.load(source)
         else:
             raw = {}
-        self.data = self._normalize(raw, initial_secret)
-        self.save()
+        self.data = None
+        self.commit(self._normalize(raw, initial_secret))
 
     @staticmethod
     def _public_key(seed_hex):
@@ -54,6 +110,7 @@ class Keychain:
 
         default_id = next(iter(keys))
         normalized_workspaces = {}
+        iroh_count = 0
         for workspace, entry in workspaces.items():
             if not isinstance(entry, dict):
                 raise ValueError(f"workspace {workspace!r} metadata must be an object")
@@ -62,12 +119,49 @@ class Keychain:
             if normalized["identity"] not in keys:
                 raise ValueError(
                     f"workspace {workspace!r} names an unknown identity")
+            normalized["peers"] = normalize_peers(
+                normalized.get("peers", []))
+            iroh_count += sum(map(is_iroh_peer, normalized["peers"]))
             normalized_workspaces[workspace] = normalized
+        if iroh_count > MAX_IROH_PEERS:
+            raise ValueError("too many Iroh peers")
         return {"keys": keys, "workspaces": normalized_workspaces}
 
+    def commit(self, proposed):
+        """Atomically replace the complete durable value, then publish it live."""
+        proposed = self._normalize(proposed)
+        directory = os.path.dirname(self.path) or "."
+        raw = json.dumps(
+            proposed, separators=(",", ":")).encode()
+        descriptor, temporary = tempfile.mkstemp(
+            dir=directory, prefix=".keyring.", suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "wb") as destination:
+                destination.write(raw)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            # Once replace succeeds, readers of the path see proposed. Publish
+            # the same value in memory before the directory durability barrier;
+            # even an fsync error must not split disk and live configuration.
+            self.data = proposed
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(directory, flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
     def save(self):
-        with open(self.path, "w") as destination:
-            json.dump(self.data, destination)
+        """Persist intentional in-memory batching as one complete value."""
+        self.commit(self.data)
 
     def add_identity(self, secret=None, *, persist=True):
         """Add an equal signing identity and return its public-key id."""
@@ -79,9 +173,14 @@ class Keychain:
         existing = self.data["keys"].get(key_id)
         if existing is not None and existing != seed_hex:
             raise ValueError(f"identity collision for {key_id}")
-        self.data["keys"][key_id] = seed_hex
+        proposed = {
+            **self.data,
+            "keys": {**self.data["keys"], key_id: seed_hex},
+        }
         if persist:
-            self.save()
+            self.commit(proposed)
+        else:
+            self.data = self._normalize(proposed)
         return key_id
 
     def identity(self, key_id):
@@ -101,8 +200,12 @@ class Keychain:
             raise KeyError(f"unknown identity {key_id!r}")
         if workspace not in self.data["workspaces"]:
             raise KeyError(f"unknown workspace {workspace!r}")
-        self.data["workspaces"][workspace]["identity"] = key_id
-        self.save()
+        workspaces = dict(self.data["workspaces"])
+        workspaces[workspace] = {
+            **workspaces[workspace],
+            "identity": key_id,
+        }
+        self.commit({**self.data, "workspaces": workspaces})
 
     def for_workspace(self, workspace):
         entry = self.data["workspaces"].get(workspace)

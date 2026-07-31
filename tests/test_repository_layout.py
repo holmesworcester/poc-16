@@ -949,12 +949,23 @@ def test_iroh_is_a_full_peer_owned_connection_wrapper_only():
 
     daemon = (ROOT / "full_peer" / "daemon.py").read_text()
     process = (ROOT / "full_peer" / "iroh_process.py").read_text()
+    forwarders = (ROOT / "full_peer" / "iroh_forwarders.py").read_text()
+    node = (ROOT / "full_peer" / "node.py").read_text()
     assert "class IrohProcess" in process
     assert '"serve"' in process
+    assert '"forward"' in process
     assert '"--upstream"' in process
+    assert "class IrohForwarders" in forwarders
+    assert "IrohProcess.forward(" in forwarders
+    assert "urllib" not in forwarders
     assert "peer_handler_for(" in daemon
-    assert "gate_options=self.gate_options" in daemon
-    assert "self.node.url = None if iroh_binary is not None" in daemon
+    assert "gate_options=gate_options" in daemon
+    assert "self.node.peer_address = None if iroh_binary is not None" in daemon
+    assert "self.node.use_iroh(" in daemon
+    assert "url = self.node.resolve_peer(workspace, peer)" in daemon
+    assert "sync(self.node, workspace, url)" in daemon
+    assert "def set_iroh_peer(" in node
+    assert "def remove_iroh_peer(" in node
     assert "_control_server(" in daemon
     assert not any(
         path.suffix == ".rs"
@@ -964,6 +975,13 @@ def test_iroh_is_a_full_peer_owned_connection_wrapper_only():
         "endpoint_id" not in (ROOT / path).read_text()
         for path in source_paths()
         if path.parts[0] == "core"
+    )
+    assert all(
+        "iroh" not in (ROOT / path).read_text().lower()
+        for path in (
+            Path("facts/auth/user.py"),
+            Path("facts/auth/user_invite.py"),
+        )
     )
 
 

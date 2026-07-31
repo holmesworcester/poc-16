@@ -142,13 +142,15 @@ async fn main() -> Result<()> {
         } => {
             let listen = loopback_address(listen, "listen")?;
             let remote = decode_ticket(&peer)?;
+            let peer_endpoint_id = remote.id;
             let endpoint = bind_endpoint(loopback, false, secret(secret_key_file)?).await?;
             let listener = TcpListener::bind(listen)
                 .await
                 .context("bind local TCP forwarder")?;
             ready(&format!(
-                "READY endpoint_id={} listen={}",
+                "READY endpoint_id={} peer_endpoint_id={} listen={}",
                 endpoint.id(),
+                peer_endpoint_id,
                 listener.local_addr().context("read local TCP address")?
             ))?;
             let running = forward(

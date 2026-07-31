@@ -19,6 +19,8 @@ def describe(node):
                 "peers": entry["peers"],
                 "name": entry["name"],
                 "identity": entry["identity"],
+                "iroh_connections":
+                    node.peer_connection_status(workspace),
                 "ingress_failures": node.ingress_failures(workspace),
                 "ingress_attempt_failures":
                     node.ingress_attempt_failures(workspace),

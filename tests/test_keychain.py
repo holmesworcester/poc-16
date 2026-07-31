@@ -1,10 +1,17 @@
 """The node-local plural identity holder and workspace bindings."""
 import json
+import stat
 
 import facts
 import pytest
 
 from core.crypto import keypair
+from full_peer.keychain import (
+    MAX_IROH_TICKET_CHARS,
+    MAX_PEERS_PER_WORKSPACE,
+    iroh_peer,
+)
+from full_peer import keychain as keychain_module
 from full_peer.node import FullPeer, now_ms
 
 from .util import add_member
@@ -70,6 +77,145 @@ def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
     assert persisted == node.keyring
 
 
+def test_iroh_peer_reachability_is_bounded_canonical_and_durable(tmp_path):
+    directory = tmp_path / "node"
+    node = FullPeer(str(directory))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    peer = iroh_peer("a" * 64, "A_-0")
+
+    node.keyring["workspaces"][workspace]["peers"] = [peer]
+    node.save_keyring()
+    reopened = FullPeer(str(directory))
+
+    assert reopened.keyring["workspaces"][workspace]["peers"] == [peer]
+    assert set(peer) == {"kind", "endpoint", "ticket"}
+    assert "url" not in peer
+
+    for bad in (
+            {"kind": "iroh", "endpoint": "A" * 64, "ticket": "A"},
+            {"kind": "iroh", "endpoint": "a" * 64, "ticket": ""},
+            {
+                "kind": "iroh",
+                "endpoint": "a" * 64,
+                "ticket": "A" * (MAX_IROH_TICKET_CHARS + 1),
+            },
+            {
+                "kind": "iroh",
+                "endpoint": "a" * 64,
+                "ticket": "A",
+                "authority": True,
+            }):
+        with pytest.raises(ValueError):
+            reopened.add_workspace(
+                "b" * 64, "bad", peers=[bad])
+
+    too_many = [
+        iroh_peer(f"{index:064x}", "A")
+        for index in range(MAX_PEERS_PER_WORKSPACE + 1)
+    ]
+    with pytest.raises(ValueError, match="workspace peers"):
+        reopened.add_workspace("c" * 64, "too many", peers=too_many)
+
+
+def test_keyring_save_is_private_atomic_and_cleans_failed_temporary(
+        tmp_path, monkeypatch):
+    directory = tmp_path / "node"
+    node = FullPeer(str(directory))
+    path = directory / "keyring.json"
+    original = path.read_bytes()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def fail_replace(_source, _destination):
+        raise OSError("simulated replace failure")
+
+    with monkeypatch.context() as failed:
+        failed.setattr(keychain_module.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="simulated"):
+            node.add_workspace("a" * 64, "not published", peers=[])
+
+    assert path.read_bytes() == original
+    assert list(directory.glob(".keyring.*.tmp")) == []
+    assert node.keyring["workspaces"] == {}
+    node.keychain.add_identity()
+    assert json.loads(path.read_text())["workspaces"] == {}
+
+
+def test_failed_identity_commit_never_leaks_into_a_later_save(
+        tmp_path, monkeypatch):
+    directory = tmp_path / "node"
+    node = FullPeer(str(directory))
+    path = directory / "keyring.json"
+    original = json.loads(path.read_text())
+    secret, rejected_id = keypair()
+
+    with monkeypatch.context() as failed:
+        failed.setattr(
+            keychain_module.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(
+                OSError("simulated replace failure")),
+        )
+        with pytest.raises(OSError, match="simulated"):
+            node.keychain.add_identity(secret)
+
+    assert node.keyring == original
+    assert json.loads(path.read_text()) == original
+    node.add_workspace("a" * 64, "later", peers=[])
+    assert rejected_id not in node.keyring["keys"]
+    assert rejected_id not in json.loads(path.read_text())["keys"]
+
+
+def test_failed_binding_commit_never_leaks_into_a_later_save(
+        tmp_path, monkeypatch):
+    directory = tmp_path / "node"
+    node = FullPeer(str(directory))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    original_id = node.identity_id(workspace)
+    rejected_id = node.keychain.add_identity()
+    path = directory / "keyring.json"
+    original = json.loads(path.read_text())
+
+    with monkeypatch.context() as failed:
+        failed.setattr(
+            keychain_module.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(
+                OSError("simulated replace failure")),
+        )
+        with pytest.raises(OSError, match="simulated"):
+            node.bind_identity(workspace, rejected_id)
+
+    assert node.identity_id(workspace) == original_id
+    assert json.loads(path.read_text()) == original
+    node.add_workspace("b" * 64, "later", peers=[])
+    assert node.identity_id(workspace) == original_id
+    assert json.loads(path.read_text())["workspaces"][workspace][
+        "identity"] == original_id
+
+
+def test_post_replace_directory_fsync_failure_keeps_disk_and_live_aligned(
+        tmp_path, monkeypatch):
+    directory = tmp_path / "node"
+    node = FullPeer(str(directory))
+    path = directory / "keyring.json"
+    workspace = "a" * 64
+    real_fsync = keychain_module.os.fsync
+
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(keychain_module.os.fstat(descriptor).st_mode):
+            raise OSError("simulated directory fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(keychain_module.os, "fsync", fail_directory_fsync)
+    with pytest.raises(OSError, match="directory fsync"):
+        node.add_workspace(workspace, "visible replacement", peers=[])
+
+    persisted = json.loads(path.read_text())
+    assert persisted == node.keyring
+    assert persisted["workspaces"][workspace]["name"] == "visible replacement"
+    assert list(directory.glob(".keyring.*.tmp")) == []
+
+
 def test_commands_author_with_the_workspace_bound_identity(tmp_path):
     node = FullPeer(str(tmp_path / "bound"))
     workspace = facts.auth.workspace.create(node, "alice")
@@ -99,7 +245,7 @@ def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
 
     node.bind_identity(workspace, replacement)
 
-    assert stale == {}
+    assert stale == {"token": "minted-for-old-identity", "etag": "old"}
     assert (workspace, "http://peer-a") not in node.sync_cache
     assert node.sync_cache[(other_workspace, "http://peer-b")] is unrelated
 

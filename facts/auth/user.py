@@ -72,42 +72,60 @@ def accept(node, link, name):
     from full_peer.sync import sync
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
-    url, workspace = link_data["u"], link_data["ws"]
+    if not isinstance(link_data, dict):
+        raise ValueError("invite link")
+    if set(link_data) == {"u", "ws", "s"}:
+        peer = link_data["u"]  # legacy URL-only envelope
+    elif set(link_data) == {"p", "ws", "s"}:
+        peer = link_data["p"]
+    else:
+        raise ValueError("invite link")
+    workspace = link_data["ws"]
     seed = bytes.fromhex(link_data["s"])
-    response = urllib.request.urlopen(
-        f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15)
+    retained = False
     try:
-        encrypted = read_bounded(
-            response, MAX_INVITE_BYTES, "invite response")
+        url = node.resolve_peer(workspace, peer)
+        response = urllib.request.urlopen(
+            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}",
+            timeout=15,
+        )
+        try:
+            encrypted = read_bounded(
+                response, MAX_INVITE_BYTES, "invite response")
+        finally:
+            response.close()
+        blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
+        if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
+                or blob.get("ws") != workspace:
+            raise ValueError("invite workspace")
+        bootstrap = decode_pile(
+            base64.b64decode(blob["pile"], validate=True), workspace)
+        judgment = drain(bootstrap, workspace)
+        invitations = [
+            valid.fact for valid in judgment.valids
+            if valid.fact.t == user_invite.TAG
+        ]
+        if not judgment.ok or len(invitations) != 1:
+            raise ValueError("invite bootstrap")
+        invitation = invitations[0]
+        ts = now_ms()
+        secret, public = node.identity()
+        member = user(invitation, load_sk(blob["isk"]), public, name, ts)
+        sig = signature.signature(secret, public, member, ts)
+        node.add_workspace(
+            workspace, name, peers=[peer],
+            identity=node.keychain.default_id())
+        retained = True
+        # The bootstrap is already closed/topological; PileSender owns the one
+        # outbound wire encoding before the shared receiving boundary.
+        pile = node.sender(workspace).pack(bootstrap + [sig, member])
+        node.receive_pile(
+            workspace, node.member_for(workspace), pile)
+        sync(node, workspace, url)
+        return workspace
     finally:
-        response.close()
-    blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))
-    if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
-            or blob.get("ws") != workspace:
-        raise ValueError("invite workspace")
-    bootstrap = decode_pile(
-        base64.b64decode(blob["pile"], validate=True), workspace)
-    judgment = drain(bootstrap, workspace)
-    invitations = [
-        valid.fact for valid in judgment.valids
-        if valid.fact.t == user_invite.TAG
-    ]
-    if not judgment.ok or len(invitations) != 1:
-        raise ValueError("invite bootstrap")
-    invitation = invitations[0]
-    ts = now_ms()
-    secret, public = node.identity()
-    member = user(invitation, load_sk(blob["isk"]), public, name, ts)
-    sig = signature.signature(secret, public, member, ts)
-    node.add_workspace(
-        workspace, name, peers=[url], identity=node.keychain.default_id())
-    # The bootstrap is already closed/topological; PileSender owns the one
-    # outbound wire encoding before the shared receiving boundary.
-    pile = node.sender(workspace).pack(bootstrap + [sig, member])
-    node.receive_pile(
-        workspace, node.member_for(workspace), pile)
-    sync(node, workspace, url)
-    return workspace
+        if not retained:
+            node.release_peer(workspace, peer)
 
 
 # QUERIES

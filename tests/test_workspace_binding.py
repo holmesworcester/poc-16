@@ -342,7 +342,7 @@ def test_invite_creation_checks_encrypted_size_before_store(
         tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "inviter"))
     workspace = facts.auth.workspace.create(node, "inviter", ts=1)
-    node.url = "https://invite.example"
+    node.peer_address = "https://invite.example"
     monkeypatch.setattr(user_invite_family, "MAX_INVITE_BYTES", 8)
     monkeypatch.setattr(
         user_invite_family, "box_encrypt",

@@ -23,7 +23,15 @@ from core.repository_reader import RepositoryReader
 from core.store import FsStore
 
 from . import sql_store
-from .keychain import Keychain
+from .keychain import (
+    MAX_IROH_PEERS,
+    Keychain,
+    iroh_endpoint,
+    iroh_peer,
+    is_iroh_peer,
+    normalize_peer,
+    normalize_peers,
+)
 from .pile_sender import PileSender
 
 
@@ -60,10 +68,10 @@ class FullPeer:
         os.makedirs(dir, exist_ok=True)
         self.lock = threading.RLock()
         self._store_factory = store_factory
-        self.url = None  # the daemon sets its advertised base URL
+        self.peer_address = None  # daemon-owned URL or Iroh reachability
+        self._forwarders = None
         self._kr_path = os.path.join(dir, "keyring.json")
         self.keychain = Keychain(self._kr_path, initial_secret)
-        self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
         # app.db was a disposable projection cache. SqlStore now holds the
         # canonical blobs and generic index needed by family queries.
@@ -74,6 +82,7 @@ class FullPeer:
         self._stores, self._sql = {}, {}
         self._appliers, self._senders = {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
+        self._iroh_peer_urls = {}  # (ws, endpoint) -> disposable loopback URL
         self._sync_errors = {}
         self._ingress_attempt_errors = {}
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
@@ -83,6 +92,11 @@ class FullPeer:
 
     def save_keyring(self):
         self.keychain.save()
+
+    @property
+    def keyring(self):
+        """The currently committed full-peer-local configuration value."""
+        return self.keychain.data
 
     @property
     def member(self):
@@ -135,21 +149,160 @@ class FullPeer:
         with self.lock:
             identity = identity or self.keychain.default_id()
             self.keychain.identity(identity)
-            self.keyring["workspaces"][workspace] = {
-                "peers": list(peers), "name": name,
+            peers = normalize_peers(peers)
+            if self._forwarders is not None and any(
+                    not is_iroh_peer(peer) for peer in peers):
+                raise ValueError("Iroh mode requires Iroh peer locators")
+            current_iroh = sum(
+                is_iroh_peer(peer)
+                for candidate, entry in self.keyring["workspaces"].items()
+                if candidate != workspace
+                for peer in entry["peers"]
+            )
+            if current_iroh + sum(map(is_iroh_peer, peers)) \
+                    > MAX_IROH_PEERS:
+                raise ValueError("too many Iroh peers")
+            entry = {
+                "peers": peers, "name": name,
                 "identity": identity}
-            self.save_keyring()
+            self._save_workspace(workspace, entry)
+            self._evict_sync_cache(workspace)
+            self._forget_iroh_workspace(workspace)
+            self._peers_changed()
+
+    def use_iroh(self, advertised, forwarders):
+        """Attach daemon-owned Iroh reachability; never repository authority."""
+        advertised = normalize_peer(advertised)
+        if not is_iroh_peer(advertised):
+            raise ValueError("Iroh advertisement must be an Iroh peer")
+        with self.lock:
+            if any(
+                    not is_iroh_peer(peer)
+                    for entry in self.keyring["workspaces"].values()
+                    for peer in entry["peers"]):
+                raise ValueError("Iroh mode requires Iroh peer locators")
+            self.peer_address = advertised
+            self._forwarders = forwarders
+            self._peers_changed()
+
+    def advertised_peer(self):
+        if isinstance(self.peer_address, dict):
+            return dict(self.peer_address)
+        if isinstance(self.peer_address, str) and self.peer_address:
+            return self.peer_address
+        raise ValueError("peer has no advertised address")
+
+    def resolve_peer(self, workspace, peer):
+        """Resolve local reachability; callers still use the ordinary HTTP client."""
+        peer = normalize_peer(peer)
+        if isinstance(peer, str):
+            if self._forwarders is not None:
+                raise ValueError("Iroh mode rejects plain HTTP peers")
+            return peer
+        if self._forwarders is None:
+            raise ValueError("Iroh peer requires an Iroh-enabled full peer")
+        url = self._forwarders.resolve(workspace, peer)
+        key = workspace, peer["endpoint"]
+        with self.lock:
+            previous = self._iroh_peer_urls.get(key)
+            if previous is not None and previous != url:
+                self._evict_sync_cache(workspace, previous)
+            self._iroh_peer_urls[key] = url
+        return url
+
+    def release_peer(self, workspace, peer):
+        peer = normalize_peer(peer)
+        if is_iroh_peer(peer) and self._forwarders is not None:
+            with self.lock:
+                if self._forwarders.release(workspace, peer):
+                    self._forget_iroh_peer(workspace, peer["endpoint"])
+
+    def iroh_peers(self):
+        return tuple(
+            (workspace, dict(peer))
+            for workspace, entry in self.keyring["workspaces"].items()
+            for peer in entry["peers"]
+            if is_iroh_peer(peer)
+        )
+
+    def set_iroh_peer(self, workspace, endpoint, ticket):
+        """Durably add or refresh one reachability record by endpoint id."""
+        peer = iroh_peer(endpoint, ticket)
+        self._edit_iroh_peer(workspace, peer["endpoint"], peer)
+
+    def remove_iroh_peer(self, workspace, endpoint):
+        """Durably remove one reachability record and its local forwarder."""
+        self._edit_iroh_peer(workspace, iroh_endpoint(endpoint), None)
+
+    def _edit_iroh_peer(self, workspace, endpoint, replacement):
+        with self.lock:
+            if self._forwarders is None:
+                raise ValueError("peer.iroh requires an Iroh-enabled daemon")
+            entry = self.keyring["workspaces"][workspace]
+            peers, found = [], False
+            for peer in entry["peers"]:
+                if is_iroh_peer(peer) and peer["endpoint"] == endpoint:
+                    found = True
+                    if replacement is not None:
+                        peers.append(replacement)
+                else:
+                    peers.append(peer)
+            if replacement is None and not found:
+                raise KeyError(f"unknown Iroh peer {endpoint!r}")
+            if replacement is not None and not found:
+                if len(self.iroh_peers()) >= MAX_IROH_PEERS:
+                    raise ValueError("too many Iroh peers")
+                peers.append(replacement)
+            peers = normalize_peers(peers)
+            self._save_workspace(workspace, {**entry, "peers": peers})
+            self._forget_iroh_peer(workspace, endpoint)
+            self._peers_changed()
+
+    def peer_connection_status(self, workspace):
+        return [] if self._forwarders is None \
+            else self._forwarders.status(workspace)
+
+    def _peers_changed(self):
+        if self._forwarders is not None:
+            self._forwarders.refresh(self.iroh_peers())
+
+    def _save_workspace(self, workspace, entry):
+        workspaces = dict(self.keyring["workspaces"])
+        workspaces[workspace] = entry
+        self.keychain.commit({**self.keyring, "workspaces": workspaces})
 
     def bind_identity(self, workspace, identity):
         with self.lock:
             self.keychain.bind(workspace, identity)
-            self._invalidate_sync_cache(workspace)
+            self._evict_sync_cache(workspace)
 
-    def _invalidate_sync_cache(self, workspace):
-        """Make every peer recompare this workspace on its next walk."""
-        for key in [
-                key for key in self.sync_cache if key[0] == workspace]:
-            self.sync_cache.pop(key).clear()
+    def _evict_sync_cache(self, workspace, url=None):
+        """Detach reachability state without mutating an in-flight walk."""
+        with self.lock:
+            for key in [
+                key for key in self.sync_cache
+                if key[0] == workspace
+                and (url is None or key[1] == url)
+            ]:
+                self.sync_cache.pop(key)
+
+    def sync_state(self, workspace, url):
+        """Acquire one walk state at the same lock boundary used for eviction."""
+        with self.lock:
+            return self.sync_cache.setdefault((workspace, url), {})
+
+    def _forget_iroh_peer(self, workspace, endpoint):
+        with self.lock:
+            previous = self._iroh_peer_urls.pop((workspace, endpoint), None)
+            if previous is not None:
+                self._evict_sync_cache(workspace, previous)
+
+    def _forget_iroh_workspace(self, workspace):
+        with self.lock:
+            for key in [
+                    key for key in self._iroh_peer_urls
+                    if key[0] == workspace]:
+                self._forget_iroh_peer(*key)
 
     def record_ingress_attempt_failure(self, ws, source, error):
         """Expose a retained retryable/program failure without deleting it."""
@@ -309,7 +462,7 @@ class FullPeer:
                 self.clear_ingress_attempt_failure(ws, item.source)
                 fresh.extend(result.valids)
             if store.get_bounded("root", MAX_ROOT_BYTES) != before:
-                self._invalidate_sync_cache(ws)
+                self._evict_sync_cache(ws)
             self._sync_sql(ws)
             return fresh
 
