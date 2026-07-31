@@ -36,19 +36,20 @@ from .carrier import Carrier, CarrierAccepted
 from .hints import NotificationHint, encode_hint, hint_id
 
 
-CURSOR_FORMAT = "notification-cursor-v1"
+CURSOR_FORMAT = "notification-cursor-v2"
 MAX_CURSOR_BYTES = 4 * 1024
 
 
 @dataclass(frozen=True, slots=True)
 class Cursor:
     workspace: str
+    owner: str
     base: str | None = None
     target: str | None = None
     after: str | None = None
 
     def __post_init__(self):
-        if not valid_fid(self.workspace) \
+        if not valid_fid(self.workspace) or not valid_fid(self.owner) \
                 or self.base is not None and not valid_fid(self.base) \
                 or self.target is not None and not valid_fid(self.target) \
                 or self.after is not None and self.target is None \
@@ -76,6 +77,7 @@ def encode_cursor(cursor):
         "after": cursor.after,
         "base": cursor.base,
         "format": CURSOR_FORMAT,
+        "owner": cursor.owner,
         "target": cursor.target,
         "workspace": cursor.workspace,
     })
@@ -87,11 +89,11 @@ def encode_cursor(cursor):
 def decode_cursor(raw):
     value = decode_json(raw, MAX_CURSOR_BYTES, "notification cursor")
     if not isinstance(value, dict) or set(value) != {
-            "after", "base", "format", "target", "workspace"} \
+            "after", "base", "format", "owner", "target", "workspace"} \
             or value.get("format") != CURSOR_FORMAT:
         raise ValueError("notification cursor shape")
     cursor = Cursor(
-        value.get("workspace"), value.get("base"),
+        value.get("workspace"), value.get("owner"), value.get("base"),
         value.get("target"), value.get("after"))
     if encode_cursor(cursor) != raw:
         raise ValueError("notification cursor encoding")
@@ -108,10 +110,10 @@ class NotificationDiscovery:
 
     def __init__(
             self, repository_store, cursor_store, workspace, carrier, *,
-            page_rows=merkle_map.MAX_RANGE_ROWS):
+            owner, page_rows=merkle_map.MAX_RANGE_ROWS):
         repository_namespace = store_namespace(repository_store)
         cursor_namespace = store_namespace(cursor_store)
-        if not valid_fid(workspace) \
+        if not valid_fid(workspace) or not valid_fid(owner) \
                 or repository_store is cursor_store \
                 or repository_namespace is not None \
                 and repository_namespace == cursor_namespace \
@@ -122,6 +124,7 @@ class NotificationDiscovery:
         self.repository_store = async_store(repository_store)
         self.cursor_store = async_store(cursor_store)
         self.workspace = workspace
+        self.owner = owner
         self.carrier = carrier
         self.page_rows = page_rows
 
@@ -161,12 +164,12 @@ class NotificationDiscovery:
     async def _read_cursor(self):
         current = await self.cursor_store.read_versioned("root")
         if current is ABSENT:
-            return Cursor(self.workspace), ABSENT
+            return Cursor(self.workspace, self.owner), ABSENT
         if not isinstance(current, Versioned):
             raise TypeError("notification cursor read")
         cursor = decode_cursor(current.value)
-        if cursor.workspace != self.workspace:
-            raise ValueError("notification cursor workspace")
+        if cursor.workspace != self.workspace or cursor.owner != self.owner:
+            raise ValueError("notification cursor owner")
         return cursor, current.token
 
     async def _pin(self, cursor, token):
@@ -179,7 +182,7 @@ class NotificationDiscovery:
         oid = await self._ensure_root(current.value)
         if oid == cursor.base:
             return cursor, token, DiscoveryResult("idle", oid)
-        pinned = Cursor(self.workspace, cursor.base, oid)
+        pinned = Cursor(self.workspace, self.owner, cursor.base, oid)
         result = await self.cursor_store.cas(
             "root", token, encode_cursor(pinned))
         if result is STALE:
@@ -271,6 +274,7 @@ class NotificationDiscovery:
 
         advanced = Cursor(
             self.workspace,
+            self.owner,
             cursor.target if continuation is None else cursor.base,
             None if continuation is None else cursor.target,
             continuation,

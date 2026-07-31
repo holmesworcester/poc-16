@@ -34,6 +34,9 @@ from notifications.hints import (
 from tests.util import send_bytes
 
 
+OWNER = "c" * 64
+
+
 @dataclass
 class MemoryCarrier:
     payloads: list
@@ -135,7 +138,8 @@ def _world(tmp_path):
 
 def _discovery(node, workspace, cursor, carrier, **kwargs):
     return NotificationDiscovery(
-        node.store(workspace), cursor, workspace, carrier, **kwargs)
+        node.store(workspace), cursor, workspace, carrier,
+        owner=OWNER, **kwargs)
 
 
 async def _drain(discovery, maximum=100):
@@ -168,7 +172,7 @@ def test_first_activation_backfills_historical_triggers(tmp_path):
     assert materialize_hint(hint, root).root == root
     assert encode_hint(hint) == carrier.payloads[0]
     assert hint_id(decode_hint(encode_hint(hint))) == hint_id(hint)
-    assert _cursor(cursor) == Cursor(workspace, h(root))
+    assert _cursor(cursor) == Cursor(workspace, OWNER, h(root))
 
 
 def test_type_range_emits_one_new_trigger_without_route_row_delay(tmp_path):
@@ -207,11 +211,11 @@ def test_hint_and_page_limits_accept_exact_and_reject_one_over():
     repository, cursor = object(), object()
     NotificationDiscovery(
         repository, cursor, "a" * 64, MemoryCarrier([]),
-        page_rows=merkle_map.MAX_RANGE_ROWS)
+        owner=OWNER, page_rows=merkle_map.MAX_RANGE_ROWS)
     with pytest.raises(ValueError, match="notification discovery"):
         NotificationDiscovery(
             repository, cursor, "a" * 64, MemoryCarrier([]),
-            page_rows=merkle_map.MAX_RANGE_ROWS + 1)
+            owner=OWNER, page_rows=merkle_map.MAX_RANGE_ROWS + 1)
 
 
 def test_discovery_rejects_distinct_adapters_for_one_physical_namespace(
@@ -223,7 +227,7 @@ def test_discovery_rejects_distinct_adapters_for_one_physical_namespace(
     with pytest.raises(ValueError, match="notification discovery"):
         NotificationDiscovery(
             FsStore(str(root)), FsStore(str(alias)), "a" * 64,
-            MemoryCarrier([]))
+            MemoryCarrier([]), owner=OWNER)
 
     first = S3Store(
         S3Config(bucket="same-bucket", prefix="same/prefix"),
@@ -233,7 +237,7 @@ def test_discovery_rejects_distinct_adapters_for_one_physical_namespace(
         client=object())
     with pytest.raises(ValueError, match="notification discovery"):
         NotificationDiscovery(
-            first, second, "a" * 64, MemoryCarrier([]))
+            first, second, "a" * 64, MemoryCarrier([]), owner=OWNER)
 
 
 def test_dropped_wakes_use_actual_async_stores_and_latest_root(tmp_path):
@@ -242,7 +246,7 @@ def test_dropped_wakes_use_actual_async_stores_and_latest_root(tmp_path):
     repository = AwaitedStore(node.store(workspace))
     cursor = AwaitedStore(FsStore(str(tmp_path / "cursor")))
     discovery = NotificationDiscovery(
-        repository, cursor, workspace, carrier)
+        repository, cursor, workspace, carrier, owner=OWNER)
     asyncio.run(_drain(discovery))
     carrier.payloads.clear()
 
@@ -295,7 +299,7 @@ def test_large_bao_fact_is_classified_without_fetching_its_blob(tmp_path):
     repository = AwaitedStore(node.store(workspace))
     carrier = MemoryCarrier([])
     asyncio.run(_drain(NotificationDiscovery(
-        repository, cursor, workspace, carrier)))
+        repository, cursor, workspace, carrier, owner=OWNER)))
 
     assert carrier.payloads == []
     assert ("get", "obj/" + h(slice_raw)) not in repository.calls
@@ -398,12 +402,27 @@ def test_substituted_root_from_another_workspace_fails_closed(tmp_path):
     version = cursor.read_versioned("root")
     current = decode_cursor(version.value)
     cursor.cas("root", version.token, encode_cursor(Cursor(
-        workspace, current.base, other_oid)))
+        workspace, OWNER, current.base, other_oid)))
 
     with pytest.raises(ValueError, match="repository reader workspace"):
         asyncio.run(discovery.run_once())
 
     assert carrier.payloads == []
+
+
+def test_different_deployment_owner_cannot_advance_shared_cursor(tmp_path):
+    node, workspace = _world(tmp_path)
+    cursor, carrier = FsStore(str(tmp_path / "cursor")), MemoryCarrier([])
+    asyncio.run(_drain(_discovery(node, workspace, cursor, carrier)))
+    before = cursor.read_versioned("root")
+    foreign = NotificationDiscovery(
+        node.store(workspace), cursor, workspace, carrier,
+        owner="d" * 64)
+
+    with pytest.raises(ValueError, match="notification cursor owner"):
+        asyncio.run(foreign.run_once())
+
+    assert cursor.read_versioned("root") == before
 
 
 def test_concurrent_workers_may_duplicate_but_one_advances(tmp_path):

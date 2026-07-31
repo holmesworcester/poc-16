@@ -38,6 +38,7 @@ URL = (
     "https://sqs.us-west-2.amazonaws.com/"
     "123456789012/poc16-notifications"
 )
+OWNER = "c" * 64
 
 
 def test_scanner_state_store_is_separate_conditional_s3_namespace(
@@ -297,6 +298,7 @@ async def _drain(repository, state, workspace, carrier, maximum=100):
             state=state,
             workspace=workspace,
             carrier=carrier,
+            owner=OWNER,
         )
         results.append(result)
         if result.status == "idle":
@@ -343,6 +345,7 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
             state=state,
             workspace=workspace,
             carrier=RejectCarrier(),
+            owner=OWNER,
         ))
     except OSError:
         pass
@@ -355,6 +358,7 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
                 state=AwaitedStore(state),
                 workspace=workspace,
                 carrier=carrier,
+                owner=OWNER,
             )
             for _ in range(2)
         ))
