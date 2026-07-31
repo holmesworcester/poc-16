@@ -274,7 +274,7 @@ class RepositoryApplier:
             if rejection is None or h(rejection) != value["proof"]:
                 raise ValueError("internal generation spend")
             try:
-                decode_rejection_record(
+                rejection_value = decode_rejection_record(
                     rejection,
                     workspace=self.workspace,
                     source=source,
@@ -283,6 +283,15 @@ class RepositoryApplier:
                 )
             except ValueError as error:
                 raise ValueError("internal generation spend") from error
+            rejected_raw = await self._get_bounded(
+                self.store,
+                rejection_value["pile"],
+                MAX_PILE_BYTES,
+            )
+            if rejected_raw is None \
+                    or h(rejected_raw) != binding.payload \
+                    or raw is not None and rejected_raw != raw:
+                raise ValueError("internal generation spend")
         return binding, value
 
     async def _terminal_result(self, source):

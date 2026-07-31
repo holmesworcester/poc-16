@@ -290,11 +290,20 @@ def test_failed_evidence_is_content_addressed_and_never_mutable(
             key, max(1, len(exact)))) == exact
 
 
-@pytest.mark.parametrize("damage", ("missing", "corrupt"))
-def test_cold_rejected_spend_requires_its_linked_metadata(
-        damage, tmp_path):
-    workspace, rejected, _ = _world(tmp_path / f"cold-author-{damage}")
-    store = FsStore(str(tmp_path / f"cold-recipient-{damage}"))
+@pytest.mark.parametrize(
+    ("artifact", "damage"),
+    (
+        ("metadata", "missing"),
+        ("metadata", "corrupt"),
+        ("payload", "missing"),
+        ("payload", "corrupt"),
+    ),
+)
+def test_cold_rejected_spend_requires_every_linked_evidence(
+        artifact, damage, tmp_path):
+    label = f"{artifact}-{damage}"
+    workspace, rejected, _ = _world(tmp_path / f"cold-author-{label}")
+    store = FsStore(str(tmp_path / f"cold-recipient-{label}"))
     applier = RepositoryApplier(workspace, store)
     source = run(applier.stage("member", rejected))
     result = run(applier.apply(source))
@@ -302,12 +311,15 @@ def test_cold_rejected_spend_requires_its_linked_metadata(
     payload = "failed/pile/" + h(rejected)
     assert store.get(payload) == rejected
 
+    target = metadata if artifact == "metadata" else payload
     if damage == "missing":
-        store._delete(metadata)
-    else:
+        store._delete(target)
+    elif artifact == "metadata":
         changed = json.loads(result.rejection.record)
         changed["diagnostic"] = "different but still valid metadata"
-        store._replace(metadata, canon(changed))
+        store._replace(target, canon(changed))
+    else:
+        store._replace(target, b"different rejected pile bytes")
 
     cold = RepositoryApplier(workspace, store)
     assert run(cold.apply(source)).status == "missing"
@@ -315,7 +327,8 @@ def test_cold_rejected_spend_requires_its_linked_metadata(
     with pytest.raises(ValueError, match="internal generation spend"):
         run(cold.apply(source))
     assert store.get(source) == rejected
-    assert store.get(payload) == rejected
+    if artifact == "metadata":
+        assert store.get(payload) == rejected
 
 
 class _MetadataCollision:
