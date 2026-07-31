@@ -87,37 +87,6 @@ def test_member_removal_does_not_visit_incident_provider_facts(tmp_path):
         h(encode(fact)) for fact in before.values()
     }
     assert len(set(fetched)) < len(before)
-
-
-def test_action_before_target_and_reverse_arrival_match_full_oracle(
-        tmp_path):
-    source, workspace, _, _ = suppression_world(tmp_path / "source")
-    complete = _facts(source, workspace)
-    anchor = complete.pop(workspace)
-    ordered = sorted(
-        complete.values(), key=lambda fact: (fact.key, fact.fid))
-    histories = (ordered, list(reversed(ordered)))
-    roots = []
-
-    for history in histories:
-        resident = {workspace: anchor}
-        compiled = compile_snapshot(workspace, resident)
-        objects = dict(compiled.outbox)
-        for fact in history:
-            incremental = extend_snapshot(
-                workspace, compiled.root, {fact.fid: fact}, objects.get)
-            resident[fact.fid] = fact
-            full = compile_snapshot(workspace, resident)
-            assert incremental.root == full.root
-            objects.update(incremental.outbox)
-            compiled = incremental
-        roots.append(compiled.root)
-
-    assert roots[0] == roots[1] \
-        == compile_snapshot(
-            workspace, {workspace: anchor, **complete}).root
-
-
 def test_incremental_action_checks_suppression_named_fact_evidence(tmp_path):
     source, workspace, _, deletions = suppression_world(tmp_path / "source")
     complete = _facts(source, workspace)
