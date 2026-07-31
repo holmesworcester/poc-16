@@ -72,6 +72,31 @@ def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
     assert view.mint(pile, now) == (node.identity_id(workspace), "sync")
 
 
+def test_worker_shares_integrity_reads_without_gaining_validated_set_authority(
+        tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    reader = node.reader(workspace)
+    worker, validated = reader.worker(), reader.validated()
+
+    assert worker.fact(workspace) == validated.fact(workspace)
+    assert not hasattr(worker, "closure")
+    assert not hasattr(worker, "providers")
+    assert not hasattr(validated, "mint")
+    assert not hasattr(validated, "authority_provider")
+
+    oid = validated.fact_oid(workspace)
+
+    def corrupt(candidate):
+        return b"corrupt" if candidate == oid \
+            else node.store(workspace).get("obj/" + candidate)
+
+    with pytest.raises(ValueError):
+        WorkerView.from_root(reader.root_bytes, corrupt).fact(workspace)
+    with pytest.raises(ValueError):
+        type(validated)(reader.root_bytes, corrupt).fact(workspace)
+
+
 @pytest.mark.parametrize("name", indexes.TREE_NAMES)
 @pytest.mark.parametrize("field", ("count", "depth"))
 def test_worker_mint_rejects_forged_outer_map_metadata(

@@ -361,7 +361,8 @@ def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
     for path in source_paths():
         if path in {
                 Path("core/repository_reader.py"),
-                Path("core/validated_set.py")}:
+                Path("core/validated_set.py"),
+                Path("core/worker.py")}:
             continue
         for call in ast.walk(parsed(path)):
             if not isinstance(call, ast.Call):
@@ -377,6 +378,38 @@ def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
             if direct_validated or direct_worker:
                 bypasses.append(path.as_posix())
     assert bypasses == []
+
+
+def test_worker_delegates_integrity_loading_without_gaining_view_authority():
+    worker = parsed(Path("core/worker.py"))
+    imports = {
+        alias.name
+        for item in worker.body
+        if isinstance(item, ast.ImportFrom)
+        for alias in item.names
+    }
+    assert "ValidatedView" in imports
+    forbidden = {"decode_root", "Reader", "verified_object", "decode"}
+    assert not [
+        call.func.attr if isinstance(call.func, ast.Attribute)
+        else call.func.id
+        for call in ast.walk(worker)
+        if isinstance(call, ast.Call)
+        and (
+            isinstance(call.func, ast.Name) and call.func.id in forbidden
+            or isinstance(call.func, ast.Attribute)
+            and call.func.attr in forbidden
+        )
+    ]
+
+    owner = next(
+        item for item in worker.body
+        if isinstance(item, ast.ClassDef) and item.name == "WorkerView")
+    methods = {
+        item.name for item in owner.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not methods & {"closure", "providers", "fact_ids"}
 
 
 def test_untrusted_read_boundaries_have_no_whole_get_fallback():

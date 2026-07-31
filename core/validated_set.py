@@ -27,7 +27,7 @@ class ValidatedSet:
 class ValidatedView:
     """Authenticated point/range reads over validated fact residences."""
 
-    def __init__(self, root_bytes, fetch):
+    def __init__(self, root_bytes, fetch, *, cache_objects=True):
         self._root_bytes = root_bytes
         self.root = snapshot.decode_root(root_bytes)
         if self.root.layout_seed != indexes.layout_seed(self.root.anchor):
@@ -36,12 +36,16 @@ class ValidatedView:
                 self.root.maps[name]["root"]
                 for name in snapshot.MAP_NAMES):
             raise ValueError("validated repository is incomplete")
+        if type(cache_objects) is not bool:
+            raise TypeError("validated object cache")
         self._source_fetch = fetch
-        self._objects = {}
+        self._objects = {} if cache_objects else None
         self._facts = {}
         self._oids = {}
 
     def fetch(self, oid):
+        if self._objects is None:
+            return self._source_fetch(oid)
         if oid not in self._objects:
             self._objects[oid] = self._source_fetch(oid)
         return self._objects[oid]

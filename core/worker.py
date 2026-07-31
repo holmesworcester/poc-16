@@ -1,61 +1,38 @@
 """Bounded, SQLite-free authorization reads over one composite root."""
-from dataclasses import dataclass
-
 import facts
 
-from . import indexes, merkle_map, snapshot
+from . import indexes, merkle_map
 from .close import decode_pile
 from .crypto import h
-from .fact import decode
 from .kernel import drain
-from .object_store import verified_object
+from .validated_set import ValidatedView
 
 MAX_PROOF_FACTS = 64
 
 
-@dataclass
 class WorkerView:
-    etag: str
-    anchor: str
-    seed: str
-    trees: dict
-    fetch: object
+    """Authorization-only facade over shared authenticated read mechanics."""
+
+    def __init__(self, root_bytes, fetch):
+        # The awaited HTTP driver owns authorization-read memoization and its
+        # fetch budget; synchronous Worker reads must expose every cold fetch.
+        self._validated = ValidatedView(
+            root_bytes, fetch, cache_objects=False)
+        self.etag = h(root_bytes)
+        self.anchor = self._validated.root.anchor
 
     @classmethod
     def from_root(cls, root_bytes, fetch):
-        root = snapshot.decode_root(root_bytes)
-        if root.layout_seed != indexes.layout_seed(root.anchor):
-            raise ValueError("composite layout seed")
-        if not all(root.maps[name]["root"] for name in indexes.TREE_NAMES):
-            raise ValueError("composite root is not Worker-readable")
-        return cls(
-            h(root_bytes), root.anchor, root.layout_seed,
-            {
-                name: root.maps[name]
-                for name in indexes.TREE_NAMES
-            },
-            fetch,
-        )
+        return cls(root_bytes, fetch)
 
     def _reader(self, name):
-        descriptor = self.trees[name]
-        return merkle_map.Reader(
-            descriptor["root"], self.seed, self.fetch,
-            max_page_depth=descriptor["depth"],
-            expected_count=descriptor["count"],
-            expected_depth=descriptor["depth"])
+        return self._validated._reader(name)
 
     def fact_oid(self, fid):
-        row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
-        if row is None:
-            raise ValueError("missing validated fact")
-        return indexes.checked_fact_oid(row)
+        return self._validated.fact_oid(fid)
 
     def fact(self, fid):
-        fact = decode(verified_object(self.fact_oid(fid), self.fetch))
-        if fact.fid != fid:
-            raise ValueError("validated fact identity")
-        return fact
+        return self._validated.fact(fid)
 
     def postings(
             self, kind, k0=None, k1=None, *, after=None,
