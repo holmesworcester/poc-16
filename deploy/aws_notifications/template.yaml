@@ -7,11 +7,18 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["false", "true"]
+  DirectSmokeEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
   DeploymentId:
     Type: String
     MinLength: 3
     MaxLength: 64
     AllowedPattern: "^[a-z0-9][a-z0-9-]{2,63}$"
+  SoftwareDigest:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{64}$"
   WorkspaceId:
     Type: String
     AllowedPattern: "^[0-9a-f]{64}$"
@@ -33,16 +40,20 @@ Parameters:
     MinLength: 1
     MaxLength: 760
     AllowedPattern: '^[a-z0-9:_-][a-z0-9:._-]*(?:/[a-z0-9:_-][a-z0-9:._-]*)*$'
-  NotificationStateMinimumRetentionDays:
-    Type: Number
-    Default: 30
-    MinValue: 30
   ExpectedBucketOwner:
     Type: String
     AllowedPattern: "^[0-9]{12}$"
   NotificationSecretArn:
     Type: String
     AllowedPattern: '^arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$'
+  NotificationSecretVersionId:
+    Type: String
+    MinLength: 32
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9-]{32,64}$'
+  PushNodeId:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
   RepositoryKmsKeyArn:
     Type: String
     Default: ""
@@ -98,7 +109,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       MaximumMessageSize: 262144
-      MessageRetentionPeriod: 1209600
+      MessageRetentionPeriod: 345600
       VisibilityTimeout: 360
       SqsManagedSseEnabled: true
       RedrivePolicy:
@@ -107,7 +118,6 @@ Resources:
 
   NotificationScannerRole:
     Type: AWS::IAM::Role
-    Condition: NotificationsEnabled
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -165,7 +175,6 @@ Resources:
 
   NotificationDeliveryRole:
     Type: AWS::IAM::Role
-    Condition: NotificationsEnabled
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -189,6 +198,12 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"
+              - Sid: CompleteNotificationCursor
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/root"
               - Sid: ReadExactNotificationSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -210,9 +225,12 @@ Resources:
                 - !Ref AWS::NoValue
               - !If
                 - HasStateKmsKey
-                - Sid: DecryptNotificationState
+                - Sid: CompleteEncryptedNotificationCursor
                   Effect: Allow
-                  Action: kms:Decrypt
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
                   Resource: !Ref NotificationStateKmsKeyArn
                 - !Ref AWS::NoValue
               - !If
@@ -238,7 +256,6 @@ Resources:
 
   NotificationScannerFunction:
     Type: AWS::Serverless::Function
-    Condition: NotificationsEnabled
     Properties:
       FunctionName: !Sub "${AWS::StackName}-notification-scanner"
       CodeUri: stage/
@@ -259,12 +276,14 @@ Resources:
           TINYP2P_NOTIFICATION_STATE_BUCKET: !Ref NotificationStateBucketName
           TINYP2P_NOTIFICATION_STATE_PREFIX: !Ref NotificationStatePrefix
           TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
+          TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
+          TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
+          TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
           TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
           TINYP2P_NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
 
   NotificationDeliveryFunction:
     Type: AWS::Serverless::Function
-    Condition: NotificationsEnabled
     Properties:
       FunctionName: !Sub "${AWS::StackName}-notification-delivery"
       CodeUri: stage/
@@ -277,6 +296,7 @@ Resources:
       ReservedConcurrentExecutions: !Ref DeliveryReservedConcurrency
       Environment:
         Variables:
+          TINYP2P_NOTIFICATION_DEPLOYMENT_ID: !Ref DeploymentId
           TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
           TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
           TINYP2P_NOTIFICATION_CANONICAL_PREFIX: !Ref CanonicalPrefix
@@ -285,13 +305,15 @@ Resources:
           TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
           TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
           TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
+          TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
+          TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
+          TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED: !Ref DirectSmokeEnabled
 
   NotificationDeliveryMapping:
     Type: AWS::Lambda::EventSourceMapping
-    Condition: NotificationsEnabled
     Properties:
       BatchSize: 10
-      Enabled: true
+      Enabled: !If [NotificationsEnabled, true, false]
       EventSourceArn: !GetAtt NotificationQueue.Arn
       FunctionName: !Ref NotificationDeliveryFunction
       FunctionResponseTypes:
@@ -299,17 +321,15 @@ Resources:
 
   NotificationScanSchedule:
     Type: AWS::Events::Rule
-    Condition: NotificationsEnabled
     Properties:
       ScheduleExpression: !Ref ScheduleExpression
-      State: ENABLED
+      State: !If [NotificationsEnabled, ENABLED, DISABLED]
       Targets:
         - Arn: !GetAtt NotificationScannerFunction.Arn
           Id: notification-scanner
 
   NotificationScanPermission:
     Type: AWS::Lambda::Permission
-    Condition: NotificationsEnabled
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !Ref NotificationScannerFunction
@@ -318,7 +338,6 @@ Resources:
 
   NotificationScannerLogGroup:
     Type: AWS::Logs::LogGroup
-    Condition: NotificationsEnabled
     DeletionPolicy: Delete
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notification-scanner"
@@ -326,7 +345,6 @@ Resources:
 
   NotificationDeliveryLogGroup:
     Type: AWS::Logs::LogGroup
-    Condition: NotificationsEnabled
     DeletionPolicy: Delete
     Properties:
       LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-notification-delivery"
@@ -334,7 +352,6 @@ Resources:
 
   NotificationQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: NotificationsEnabled
     Properties:
       AlarmDescription: Notification work is not reaching FCM promptly
       Namespace: AWS/SQS
@@ -356,7 +373,6 @@ Resources:
 
   NotificationDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: NotificationsEnabled
     Properties:
       AlarmDescription: Notification work reached the finite-retention DLQ
       Namespace: AWS/SQS
@@ -380,12 +396,40 @@ Outputs:
     Value: poc16-aws-notifications-v1
   DeploymentId:
     Value: !Ref DeploymentId
+  SoftwareDigest:
+    Value: !Ref SoftwareDigest
   Enabled:
     Value: !Ref Enabled
+  DirectSmokeEnabled:
+    Value: !Ref DirectSmokeEnabled
   WorkspaceId:
     Value: !Ref WorkspaceId
-  NotificationStateMinimumRetentionDays:
-    Value: !Ref NotificationStateMinimumRetentionDays
+  CanonicalBucketName:
+    Value: !Ref CanonicalBucketName
+  CanonicalPrefix:
+    Value: !Ref CanonicalPrefix
+  NotificationStateBucketName:
+    Value: !Ref NotificationStateBucketName
+  NotificationStatePrefix:
+    Value: !Ref NotificationStatePrefix
+  ExpectedBucketOwner:
+    Value: !Ref ExpectedBucketOwner
+  NotificationSecretArn:
+    Value: !Ref NotificationSecretArn
+  NotificationSecretVersionId:
+    Value: !Ref NotificationSecretVersionId
+  PushNodeId:
+    Value: !Ref PushNodeId
+  RepositoryKmsKeyArn:
+    Value: !Ref RepositoryKmsKeyArn
+  NotificationStateKmsKeyArn:
+    Value: !Ref NotificationStateKmsKeyArn
+  NotificationSecretKmsKeyArn:
+    Value: !Ref NotificationSecretKmsKeyArn
+  NotificationQueueRetentionSeconds:
+    Value: "345600"
+  NotificationDeadLetterRetentionSeconds:
+    Value: "1209600"
   NotificationQueueUrl:
     Value: !Ref NotificationQueue
   NotificationQueueArn:
@@ -395,8 +439,6 @@ Outputs:
   NotificationDeadLetterQueueArn:
     Value: !GetAtt NotificationDeadLetterQueue.Arn
   NotificationScannerFunctionArn:
-    Condition: NotificationsEnabled
     Value: !GetAtt NotificationScannerFunction.Arn
   NotificationDeliveryFunctionArn:
-    Condition: NotificationsEnabled
     Value: !GetAtt NotificationDeliveryFunction.Arn

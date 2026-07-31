@@ -821,6 +821,7 @@ def test_consumer_rejects_a_push_secret_rebound_under_old_config():
 
 def _manage_environment(**extra):
     return {
+        "CLOUDFLARE_ACCOUNT_ID": "c" * 32,
         "CF_WORKSPACE": "a" * 64,
         "CF_DEPLOYMENT_OWNER": "production-owner",
         "CF_CANONICAL_BUCKET": "canonical",
@@ -842,27 +843,8 @@ def _launch_binding(environment, software_digest=SOFTWARE_DIGEST):
     reader_config, scanner_config, consumer_config, fcm_config = \
         manage.generated_configs(
             disabled, software_digest=software_digest)
-    return {
-        "canonical_bucket": reader_config["r2_buckets"][0]["bucket_name"],
-        "canonical_prefix": reader_config["vars"]["CANONICAL_PREFIX"],
-        "deployment_identity": scanner_config["vars"][
-            "POC16_DEPLOYMENT_IDENTITY"],
-        "deployment_owner": scanner_config["vars"][
-            "POC16_DEPLOYMENT_OWNER"],
-        "firebase_application": fcm_config["vars"]["FCM_APPLICATION"],
-        "firebase_environment": fcm_config["vars"]["FCM_ENVIRONMENT"],
-        "firebase_project": fcm_config["vars"]["FCM_PROJECT_ID"],
-        "notification_queue": scanner_config["queues"]["producers"][0][
-            "queue"],
-        "notification_state_bucket": scanner_config["r2_buckets"][0][
-            "bucket_name"],
-        "notification_state_prefix": scanner_config["vars"][
-            "NOTIFICATION_STATE_PREFIX"],
-        "provider": "cloudflare",
-        "push_node_id": consumer_config["vars"]["PUSH_NODE"],
-        "software_digest": software_digest,
-        "workspace": scanner_config["vars"]["WORKSPACE"],
-    }
+    return manage._mobile_launch_binding((
+        reader_config, scanner_config, consumer_config, fcm_config))
 
 
 def _with_launch_records(
@@ -1022,6 +1004,20 @@ def test_test_mode_binds_the_exact_service_account_project():
             CF_NOTIFICATION_TEST_MODE="1"))
 
 
+def test_launch_binding_command_describes_disabled_staged_release(
+        monkeypatch, capsys):
+    environment = _manage_environment(CF_NOTIFICATIONS_ENABLED="1")
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+
+    manage.print_launch_binding()
+
+    assert json.loads(capsys.readouterr().out) == _launch_binding(
+        environment, SOFTWARE_DIGEST)
+
+
 def test_firebase_secret_must_match_the_bound_project():
     secret = json.dumps({
         "project_id": "firebase-other",
@@ -1031,6 +1027,20 @@ def test_firebase_secret_must_match_the_bound_project():
     with pytest.raises(ValueError, match="bound project"):
         manage._firebase_secret(
             "firebase-project", {"FIREBASE_SERVICE_ACCOUNT_JSON": secret})
+
+
+def test_same_project_firebase_credential_rotation_is_availability_only():
+    for email, private_key in (
+            ("old@example.test", "old-private-key"),
+            ("new@example.test", "new-private-key")):
+        raw = json.dumps({
+            "project_id": "firebase-project",
+            "client_email": email,
+            "private_key": private_key,
+        })
+        assert manage._firebase_secret(
+            "firebase-project", {"FIREBASE_SERVICE_ACCOUNT_JSON": raw}) \
+            == raw
 
 
 @pytest.mark.parametrize("bucket,prefix", [
@@ -1119,6 +1129,7 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
         "POC16_DEPLOYMENT_OWNER": "production-owner",
         "POC16_DEPLOYMENT_ROLE": "notification-fcm-boundary",
         "POC16_SOFTWARE_DIGEST": "0" * 64,
+        "POC16_CLOUDFLARE_ACCOUNT_ID": "c" * 32,
         "NOTIFICATIONS_ENABLED": "0",
         "NOTIFICATION_TEST_MODE": "0",
         "FCM_APPLICATION": "poc16.mobile",
@@ -1152,7 +1163,18 @@ def test_generated_builds_lock_the_exact_prepared_software():
     } == {f"python manage.py stage-locked {SOFTWARE_DIGEST}"}
 
 
+def test_locked_stage_refuses_changed_deploy_inputs(monkeypatch):
+    calls = []
+    monkeypatch.setattr(manage, "stage", lambda: calls.append("stage"))
+    monkeypatch.setattr(manage, "_software_digest", lambda: "e" * 64)
+
+    with pytest.raises(RuntimeError, match="deploy inputs changed"):
+        manage._stage_locked(SOFTWARE_DIGEST)
+    assert calls == ["stage"]
+
+
 @pytest.mark.parametrize("change", [
+    {"CLOUDFLARE_ACCOUNT_ID": "d" * 32},
     {"CF_WORKSPACE": "f" * 64},
     {"CF_CANONICAL_BUCKET": "canonical-other"},
     {"CF_NOTIFICATION_STATE_BUCKET": "notification-state-other"},
@@ -1184,6 +1206,32 @@ def test_same_owner_cannot_rebind_an_existing_worker(monkeypatch):
 
     with pytest.raises(RuntimeError, match="immutable notification"):
         manage._require_deployable(changed, create=True)
+
+
+def test_worker_state_reads_digest_and_enablement_from_one_settings_result(
+        monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    calls = []
+    bindings = [{"name": name, "type": "plain_text", "text": value}
+                for name, value in (
+                    ("POC16_DEPLOYMENT_OWNER", "production-owner"),
+                    ("POC16_DEPLOYMENT_IDENTITY",
+                     config["vars"]["POC16_DEPLOYMENT_IDENTITY"]),
+                    ("POC16_SOFTWARE_DIGEST", SOFTWARE_DIGEST),
+                    ("NOTIFICATIONS_ENABLED", "1"))]
+    monkeypatch.setattr(
+        manage, "_worker_bindings",
+        lambda _config, environment=None:
+            calls.append(_config["name"]) or bindings)
+
+    assert manage._worker_markers(config) == (
+        "production-owner",
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        SOFTWARE_DIGEST,
+        "1",
+    )
+    assert calls == [config["name"]]
 
 
 def test_disabled_deploy_may_replace_software_before_retesting(monkeypatch):

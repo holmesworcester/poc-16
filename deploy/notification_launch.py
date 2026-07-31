@@ -36,7 +36,8 @@ def _require(path, platform, binding):
         raise RuntimeError(
             f"{platform} real-device launch record is required")
     try:
-        raw = Path(path).read_bytes()
+        with Path(path).open("rb") as source:
+            raw = source.read(MAX_LAUNCH_RECORD_BYTES + 1)
     except (OSError, TypeError):
         raise RuntimeError(
             f"cannot read {platform} real-device launch record") from None

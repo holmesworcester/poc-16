@@ -147,14 +147,56 @@ class NotificationWorker:
         )
 
 
+def _reference(delivery, workspace, owner):
+    try:
+        reference = decode_hint(delivery.body)
+    except (TypeError, ValueError):
+        return None, "invalid-carrier-hint"
+    if reference.workspace != workspace or reference.owner != owner:
+        return None, "foreign-authority"
+    return reference, ""
+
+
+async def _process(reference, notification_state, worker):
+    read = getattr(notification_state, "get_bounded", None)
+    if not callable(read):
+        raise TypeError("notification carrier handler")
+    try:
+        raw = await _resolve(read(
+            "obj/" + reference.root_oid, MAX_ROOT_BYTES))
+    except PayloadTooLarge:
+        return WorkerResult(RETRY, reason="oversized-state-root")
+    except Exception:
+        return WorkerResult(RETRY, reason="state-unavailable")
+    if raw is None or not isinstance(raw, bytes):
+        return WorkerResult(RETRY, reason="state-root-missing")
+    try:
+        hint = materialize_hint(reference, raw)
+    except (TypeError, ValueError):
+        return WorkerResult(RETRY, reason="invalid-state-root")
+    return await worker.process(hint)
+
+
+async def process_carrier_delivery(
+        delivery, workspace, notification_state, worker):
+    """Evaluate one body without advancing durable discovery state."""
+    read = getattr(notification_state, "get_bounded", None)
+    owner = getattr(notification_state, "owner", None)
+    if not isinstance(delivery, CarrierDelivery) \
+            or not valid_fid(workspace) \
+            or not callable(read) \
+            or not valid_fid(owner) \
+            or not isinstance(worker, NotificationWorker):
+        raise TypeError("notification carrier handler")
+    reference, reason = _reference(delivery, workspace, owner)
+    if reference is None:
+        return WorkerResult(TERMINAL, reason=reason)
+    return await _process(reference, notification_state, worker)
+
+
 async def handle_carrier_delivery(
         delivery, workspace, notification_state, worker):
-    """Resolve one canonical carrier body through the shared worker path.
-
-    The trusted deployment supplies ``workspace`` and a narrow cursor-state
-    capability. Carrier metadata is never authority. Only the exact durable
-    pending hint may invoke the provider or advance discovery.
-    """
+    """Evaluate and complete only the exact durable pending body."""
     read = getattr(notification_state, "get_bounded", None)
     pending = getattr(notification_state, "pending", None)
     complete = getattr(notification_state, "complete", None)
@@ -167,11 +209,8 @@ async def handle_carrier_delivery(
             or not valid_fid(owner) \
             or not isinstance(worker, NotificationWorker):
         raise TypeError("notification carrier handler")
-    try:
-        reference = decode_hint(delivery.body)
-    except (TypeError, ValueError):
-        return CARRIER_ACK
-    if reference.workspace != workspace or reference.owner != owner:
+    reference, _reason = _reference(delivery, workspace, owner)
+    if reference is None:
         return CARRIER_ACK
     body_oid = h(delivery.body)
     try:
@@ -182,20 +221,7 @@ async def handle_carrier_delivery(
         return CARRIER_ACK
     if status != PENDING_CURRENT:
         return CARRIER_RETRY
-    try:
-        raw = await _resolve(read(
-            "obj/" + reference.root_oid, MAX_ROOT_BYTES))
-    except PayloadTooLarge:
-        return CARRIER_RETRY
-    except Exception:
-        return CARRIER_RETRY
-    if raw is None or not isinstance(raw, bytes):
-        return CARRIER_RETRY
-    try:
-        hint = materialize_hint(reference, raw)
-    except (TypeError, ValueError):
-        return CARRIER_RETRY
-    result = await worker.process(hint)
+    result = await _process(reference, notification_state, worker)
     if not isinstance(result, WorkerResult) \
             or result.action is RETRY \
             or result.reason == "invalid-hint":
@@ -216,4 +242,5 @@ __all__ = (
     "WorkerResult",
     "carrier_disposition",
     "handle_carrier_delivery",
+    "process_carrier_delivery",
 )

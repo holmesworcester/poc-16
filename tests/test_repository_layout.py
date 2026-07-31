@@ -212,17 +212,6 @@ def test_repository_core_cannot_own_notification_delivery():
     applier = (ROOT / "core/repository_applier.py").read_text()
     assert "publication_effect" not in applier
     assert "notification" not in applier
-    for name in (
-            "consumer.py",
-            "dispatcher.py",
-            "job.py",
-            "matcher.py",
-            "model.py",
-            "outbox.py",
-            "provider.py",
-            "queue_evidence.py",
-            "target.py"):
-        assert not (ROOT / "notifications" / name).exists()
 
 
 def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():

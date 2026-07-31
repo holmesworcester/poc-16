@@ -54,6 +54,7 @@ RELEASE = BUILD / "release"
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
 SOFTWARE_BINDING = "POC16_SOFTWARE_DIGEST"
+ACCOUNT_BINDING = "POC16_CLOUDFLARE_ACCOUNT_ID"
 WRANGLER = "wrangler@4.118.0"
 # The free plan fixes retention at 24 hours. Correctness does not depend on
 # Queue retention because the scanner republishes the durable pending body.
@@ -209,6 +210,28 @@ def _prefix(value, label):
         raise ValueError(f"{label} is not a safe store prefix") from error
 
 
+def _mobile_launch_binding(configs):
+    reader, scanner, consumer, fcm = configs
+    return {
+        "canonical_bucket": reader["r2_buckets"][0]["bucket_name"],
+        "canonical_prefix": reader["vars"]["CANONICAL_PREFIX"],
+        "cloudflare_account_id": scanner["vars"][ACCOUNT_BINDING],
+        "deployment_identity": scanner["vars"][IDENTITY_BINDING],
+        "deployment_owner": scanner["vars"][OWNER_BINDING],
+        "firebase_application": fcm["vars"]["FCM_APPLICATION"],
+        "firebase_environment": fcm["vars"]["FCM_ENVIRONMENT"],
+        "firebase_project": fcm["vars"]["FCM_PROJECT_ID"],
+        "notification_queue": scanner["queues"]["producers"][0]["queue"],
+        "notification_state_bucket": scanner["r2_buckets"][0]["bucket_name"],
+        "notification_state_prefix": scanner["vars"][
+            "NOTIFICATION_STATE_PREFIX"],
+        "provider": "cloudflare",
+        "push_node_id": consumer["vars"]["PUSH_NODE"],
+        "software_digest": scanner["vars"][SOFTWARE_BINDING],
+        "workspace": scanner["vars"]["WORKSPACE"],
+    }
+
+
 def generated_configs(
         environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE,
         software_digest=None):
@@ -220,11 +243,14 @@ def generated_configs(
     if not FID.fullmatch(software_digest or ""):
         raise ValueError("software digest must be 64 lowercase hex")
     workspace = _text(environment, "CF_WORKSPACE")
+    account = _text(environment, "CLOUDFLARE_ACCOUNT_ID")
     owner = _text(environment, "CF_DEPLOYMENT_OWNER")
     canonical = _text(environment, "CF_CANONICAL_BUCKET")
     state = _text(environment, "CF_NOTIFICATION_STATE_BUCKET")
     if not FID.fullmatch(workspace):
         raise ValueError("CF_WORKSPACE must be 64 lowercase hex characters")
+    if not ACCOUNT_ID.fullmatch(account):
+        raise ValueError("CLOUDFLARE_ACCOUNT_ID must be 32 lowercase hex")
     if not OWNER.fullmatch(owner):
         raise ValueError("CF_DEPLOYMENT_OWNER is not a safe owner marker")
     if canonical == state:
@@ -283,6 +309,7 @@ def generated_configs(
     identity_document = {
         "canonical_bucket": canonical,
         "canonical_prefix": canonical_prefix,
+        "cloudflare_account_id": account,
         "consumer": consumer_name,
         "fcm_application": application,
         "fcm_environment": firebase_environment,
@@ -301,26 +328,6 @@ def generated_configs(
     identity = hashlib.sha256(json.dumps(
         identity_document, ensure_ascii=True, separators=(",", ":"),
         sort_keys=True).encode("ascii")).hexdigest()
-    if enabled == "1" and test_mode == "0":
-        require_mobile_launches({
-            "ios": environment.get("CF_IOS_LAUNCH_RECORD"),
-            "android": environment.get("CF_ANDROID_LAUNCH_RECORD"),
-        }, {
-            "canonical_bucket": canonical,
-            "canonical_prefix": canonical_prefix,
-            "deployment_identity": identity,
-            "deployment_owner": owner,
-            "firebase_application": application,
-            "firebase_environment": firebase_environment,
-            "firebase_project": firebase_project,
-            "notification_queue": queue,
-            "notification_state_bucket": state,
-            "notification_state_prefix": state_prefix,
-            "provider": "cloudflare",
-            "push_node_id": push_node,
-            "software_digest": software_digest,
-            "workspace": workspace,
-        })
     common = {
         "WORKSPACE": workspace,
         "NOTIFICATIONS_ENABLED": enabled,
@@ -328,6 +335,7 @@ def generated_configs(
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        ACCOUNT_BINDING: account,
     }
 
     reader = json.loads(READER_TEMPLATE.read_text())
@@ -340,6 +348,7 @@ def generated_configs(
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        ACCOUNT_BINDING: account,
     })
     reader["r2_buckets"][0].update({
         "bucket_name": canonical, "preview_bucket_name": canonical})
@@ -381,6 +390,7 @@ def generated_configs(
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
         SOFTWARE_BINDING: software_digest,
+        ACCOUNT_BINDING: account,
         "NOTIFICATIONS_ENABLED": enabled,
         "NOTIFICATION_TEST_MODE": test_mode,
         "FCM_APPLICATION": application,
@@ -390,7 +400,13 @@ def generated_configs(
     for config in (reader, scanner, consumer):
         config["build"]["command"] = (
             f"python manage.py stage-locked {software_digest}")
-    return reader, scanner, consumer, fcm
+    configs = reader, scanner, consumer, fcm
+    if enabled == "1" and test_mode == "0":
+        require_mobile_launches({
+            "ios": environment.get("CF_IOS_LAUNCH_RECORD"),
+            "android": environment.get("CF_ANDROID_LAUNCH_RECORD"),
+        }, _mobile_launch_binding(configs))
+    return configs
 
 
 def _write_configs(configs):
@@ -432,6 +448,7 @@ def build():
     software_digest = _prepare_software()
     configs = generated_configs({
         "CF_WORKSPACE": "a" * 64,
+        "CLOUDFLARE_ACCOUNT_ID": "b" * 32,
         "CF_DEPLOYMENT_OWNER": "local-build-owner",
         "CF_CANONICAL_BUCKET": "canonical-build",
         "CF_NOTIFICATION_STATE_BUCKET": "notification-state-build",
@@ -465,6 +482,19 @@ def build():
                 path.suffix in {".js", ".mjs"}
                 for path in Path(output).rglob("*")):
             raise RuntimeError("FCM dry-run omitted bridge code")
+
+
+def print_launch_binding():
+    """Print the exact tested-deployment subject for the device harness."""
+    software_digest = _prepare_software()
+    environment = dict(os.environ)
+    environment["CF_NOTIFICATIONS_ENABLED"] = "0"
+    environment["CF_NOTIFICATION_TEST_MODE"] = "0"
+    configs = generated_configs(
+        environment, software_digest=software_digest)
+    print(json.dumps(
+        _mobile_launch_binding(configs), sort_keys=True,
+        separators=(",", ":")))
 
 
 def _control_environment(environment=os.environ):
@@ -874,6 +904,7 @@ Commands:
   sync       materialize locked Python Worker dependencies
   stage      internal exact-source build hook
   build      dry-run all four default-disabled Worker bundles
+  launch-binding     print the exact real-device launch subject
   provision  explicitly create primary and DLQ with one-day retention
   deploy     deploy owned FCM/read boundaries, consumer, then scanner
   bootstrap-current   initialize at the current root on the next schedule
@@ -894,6 +925,7 @@ def main(argv):
         "sync": sync,
         "stage": stage,
         "build": build,
+        "launch-binding": print_launch_binding,
         "provision": provision,
         "deploy": deploy,
         "bootstrap-current": bootstrap_current,

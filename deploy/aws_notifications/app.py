@@ -1,37 +1,50 @@
 """Two small AWS Lambda adapters around shared notification code.
 
 The scheduled scanner owns only an operational cursor and SQS publication.
-The SQS consumer is read-only over repository/state objects and maps the
-shared worker's typed result to Lambda's partial-batch response.  Neither
+The SQS consumer is read-only over repository objects and may CAS only the
+operational notification cursor after the shared worker finishes. Neither
 function is a repository publication hook or an alternate fact processor.
 """
 import asyncio
-import json
+import base64
+import binascii
 import os
 import time
 
 from adapters.aws import SqsCarrier, consume_sqs_batch, queue_binding
 from adapters.gcp.firebase import FirebaseAdminFcm
 from adapters.s3 import S3Config, S3Store
-from core.crypto import h, load_sk
+from core.crypto import h
 from core.fact import canon
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
-from notifications.discovery import NotificationDiscovery
+from notifications.carrier import CarrierDelivery
+from notifications.discovery import (
+    BOOTSTRAP_BACKFILL,
+    BOOTSTRAP_CURRENT,
+    NotificationDiscovery,
+    NotificationState,
+)
 from notifications.worker import (
+    RETRY,
+    TERMINAL,
     NotificationWorker,
     handle_carrier_delivery,
+    process_carrier_delivery,
 )
 
 from .config import (
-    MAX_FIREBASE_APPS,
-    MAX_SECRET_BYTES,
+    BOOTSTRAP_RESULT_SCHEMA,
+    BOOTSTRAP_SCHEMA,
+    DIRECT_SMOKE_RESULT_SCHEMA,
+    DIRECT_SMOKE_SCHEMA,
     SCAN_RESULT_SCHEMA,
     SCAN_WAKE_SCHEMA,
     SDK_CONNECT_TIMEOUT_SECONDS,
     SDK_READ_TIMEOUT_SECONDS,
     SDK_TOTAL_ATTEMPTS,
 )
+from .secret import decode_secret, push_node_id
 
 
 _scanner_cache = None
@@ -54,9 +67,17 @@ def _workspace():
 
 def _notification_owner():
     return h(canon([
-        "aws-notification-owner-v1",
+        "aws-notification-owner-v2",
         _required("TINYP2P_NOTIFICATION_DEPLOYMENT_ID"),
         _workspace(),
+        _required("TINYP2P_NOTIFICATION_CANONICAL_BUCKET"),
+        _required("TINYP2P_NOTIFICATION_CANONICAL_PREFIX"),
+        _required("TINYP2P_NOTIFICATION_STATE_BUCKET"),
+        _required("TINYP2P_NOTIFICATION_STATE_PREFIX"),
+        _owner(),
+        _required("TINYP2P_NOTIFICATION_SECRET_ARN"),
+        _required("TINYP2P_NOTIFICATION_SECRET_VERSION_ID"),
+        _required("TINYP2P_NOTIFICATION_PUSH_NODE_ID"),
     ]))
 
 
@@ -129,9 +150,8 @@ def _scanner_dependencies():
     return _scanner_cache
 
 
-async def scan_once(*, repository=None, state=None, workspace=None,
-                    carrier=None, owner=None):
-    """Advance at most one shared bounded discovery page."""
+def _discovery(*, repository=None, state=None, workspace=None,
+               carrier=None, owner=None):
     if any(value is None for value in (repository, state, workspace, carrier)):
         configured = _scanner_dependencies()
         repository = configured[0] if repository is None else repository
@@ -139,9 +159,24 @@ async def scan_once(*, repository=None, state=None, workspace=None,
         workspace = configured[2] if workspace is None else workspace
         carrier = configured[3] if carrier is None else carrier
     owner = _notification_owner() if owner is None else owner
-    return await NotificationDiscovery(
+    return NotificationDiscovery(
         repository, state, workspace, carrier,
-        owner=owner).run_once()
+        owner=owner)
+
+
+async def scan_once(**dependencies):
+    """Advance at most one shared bounded discovery page."""
+    return await _discovery(**dependencies).run_once()
+
+
+async def bootstrap_once(mode, **dependencies):
+    """Explicitly initialize absent discovery state in one selected mode."""
+    discovery = _discovery(**dependencies)
+    if mode == BOOTSTRAP_CURRENT:
+        return await discovery.bootstrap_current()
+    if mode == BOOTSTRAP_BACKFILL:
+        return await discovery.bootstrap_backfill()
+    raise ValueError("notification bootstrap mode")
 
 
 def _scan_event(event, workspace):
@@ -152,39 +187,43 @@ def _scan_event(event, workspace):
         "schema": SCAN_WAKE_SCHEMA,
         "workspace": workspace,
     }
-    if not scheduled and not wake:
-        raise ValueError("notification scan invocation")
+    if scheduled or wake:
+        return None
+    if isinstance(event, dict) \
+            and set(event) == {"mode", "schema", "workspace"} \
+            and event.get("schema") == BOOTSTRAP_SCHEMA \
+            and event.get("workspace") == workspace \
+            and event.get("mode") in {
+                BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL}:
+        return event["mode"]
+    raise ValueError("notification scanner invocation")
 
 
 def scanner_handler(event, _context):
-    """Handle one schedule or explicit non-authoritative wake."""
+    """Handle a schedule/wake or one explicit bootstrap operation."""
     workspace = _workspace()
-    _scan_event(event, workspace)
+    mode = _scan_event(event, workspace)
+    if mode is not None:
+        cursor = asyncio.run(bootstrap_once(mode, workspace=workspace))
+        return {
+            "mode": cursor.bootstrap,
+            "schema": BOOTSTRAP_RESULT_SCHEMA,
+            "status": "initialized",
+        }
     result = asyncio.run(scan_once(workspace=workspace))
     return {"schema": SCAN_RESULT_SCHEMA, "status": result.status}
 
 
-def _secret_document(client):
+def _secret(client):
+    arn = _required("TINYP2P_NOTIFICATION_SECRET_ARN")
+    version = _required("TINYP2P_NOTIFICATION_SECRET_VERSION_ID")
     response = client.get_secret_value(
-        SecretId=_required("TINYP2P_NOTIFICATION_SECRET_ARN"))
-    value = response.get("SecretString") \
-        if isinstance(response, dict) else None
-    if not isinstance(value, str):
-        raise RuntimeError("notification secret has no SecretString")
-    raw = value.encode("utf-8")
-    if not 0 < len(raw) <= MAX_SECRET_BYTES:
-        raise RuntimeError("notification secret size")
-    try:
-        document = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("notification secret JSON") from error
-    if not isinstance(document, dict) or set(document) != {
-            "firebase_apps", "push_node_seed"}:
-        raise RuntimeError("notification secret shape")
-    rows = document["firebase_apps"]
-    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_FIREBASE_APPS:
-        raise RuntimeError("notification Firebase applications")
-    return document
+        SecretId=arn, VersionId=version)
+    if not isinstance(response, dict) \
+            or response.get("ARN") != arn \
+            or response.get("VersionId") != version:
+        raise RuntimeError("notification secret binding")
+    return decode_secret(response.get("SecretString"))
 
 
 def _push_provider():
@@ -192,27 +231,15 @@ def _push_provider():
     from firebase_admin import credentials
     import boto3
 
-    document = _secret_document(
+    secret, rows = _secret(
         boto3.client("secretsmanager", config=_sdk_config()))
+    if push_node_id(secret) != _required(
+            "TINYP2P_NOTIFICATION_PUSH_NODE_ID"):
+        raise RuntimeError("notification push-node identity")
+    configured, apps, created = [], {}, []
     try:
-        secret = load_sk(document["push_node_seed"])
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("notification push-node seed") from error
-    configured, keys, apps, created = [], set(), {}, []
-    try:
-        for index, row in enumerate(document["firebase_apps"]):
-            if not isinstance(row, dict) or set(row) != {
-                    "application", "credential", "environment"} \
-                    or not isinstance(row["application"], str) \
-                    or not row["application"] \
-                    or not isinstance(row["environment"], str) \
-                    or not row["environment"] \
-                    or not isinstance(row["credential"], dict):
-                raise ValueError
+        for index, row in enumerate(rows):
             key = row["application"], row["environment"]
-            if key in keys:
-                raise ValueError
-            keys.add(key)
             configured.append((
                 key,
                 credentials.Certificate(row["credential"]),
@@ -241,11 +268,13 @@ def _delivery_dependencies():
             "TINYP2P_NOTIFICATION_CANONICAL_PREFIX",
             state=False,
         )
-        state = _store(
+        state_store = _store(
             "TINYP2P_NOTIFICATION_STATE_BUCKET",
             "TINYP2P_NOTIFICATION_STATE_PREFIX",
-            state=False,
+            state=True,
         )
+        state = NotificationState(
+            state_store, workspace, _notification_owner())
         secret, provider = _push_provider()
 
         def current_root(requested):
@@ -292,14 +321,65 @@ async def deliver_batch(event, *, state=None, worker=None, workspace=None,
         event, handle, expected_queue_arn=queue_arn)
 
 
+def _smoke_body(value):
+    if not isinstance(value, str):
+        raise ValueError("notification direct-smoke body")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("notification direct-smoke body") from error
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise ValueError("notification direct-smoke body")
+    return raw
+
+
+async def direct_smoke(event, *, state=None, worker=None, workspace=None):
+    """Attempt one hint directly and return only aggregate acceptance facts."""
+    if not isinstance(event, dict) or set(event) != {"body", "schema"} \
+            or event.get("schema") != DIRECT_SMOKE_SCHEMA:
+        raise ValueError("notification direct-smoke invocation")
+    if any(value is None for value in (state, worker, workspace)):
+        configured = _delivery_dependencies()
+        workspace = configured[0] if workspace is None else workspace
+        state = configured[1] if state is None else state
+        worker = configured[2] if worker is None else worker
+    result = await process_carrier_delivery(
+        CarrierDelivery(_smoke_body(event["body"]), "direct-smoke", 1),
+        workspace,
+        state,
+        worker,
+    )
+    statuses = tuple(row.status for row in result.deliveries)
+    retry_count = statuses.count("retry")
+    terminal_count = sum(status in {
+        "invalid-endpoint", "unregistered"} for status in statuses)
+    if result.action is RETRY and retry_count == 0:
+        retry_count = 1
+    if result.action is TERMINAL:
+        terminal_count += 1
+    return {
+        "accepted_count": statuses.count("accepted"),
+        "retry_count": retry_count,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": terminal_count,
+    }
+
+
 def delivery_handler(event, _context):
-    """Return only Lambda's documented partial-batch failure shape."""
+    """Handle SQS normally or an independently enabled direct launch test."""
+    if isinstance(event, dict) and event.get("schema") == DIRECT_SMOKE_SCHEMA:
+        if os.environ.get("TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED") \
+                != "true":
+            raise RuntimeError("notification direct smoke is disabled")
+        return asyncio.run(direct_smoke(event))
     return asyncio.run(deliver_batch(event))
 
 
 __all__ = (
     "deliver_batch",
     "delivery_handler",
+    "direct_smoke",
+    "bootstrap_once",
     "scan_once",
     "scanner_handler",
 )

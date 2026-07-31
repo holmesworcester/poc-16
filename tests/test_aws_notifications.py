@@ -5,11 +5,11 @@ from dataclasses import dataclass
 import hashlib
 import sys
 import traceback
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import facts
 import pytest
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.store import FsStore
 from facts.auth import push_endpoint
 from facts.auth.device import bind
@@ -23,14 +23,19 @@ from notifications.delivery import (
     PushUnregistered,
     seal_target,
 )
-from notifications.hints import (
-    NotificationHint,
-    decode_hint,
-    encode_hint,
+from notifications.discovery import (
+    CursorNotInitialized,
+    NotificationDiscovery,
+    NotificationState,
 )
+from notifications.hints import decode_hint
 from notifications.worker import NotificationWorker
 from adapters.aws import SqsCarrier
 from deploy.aws_notifications import app
+from deploy.aws_notifications.config import (
+    DIRECT_SMOKE_RESULT_SCHEMA,
+    DIRECT_SMOKE_SCHEMA,
+)
 
 
 ARN = "arn:aws:sqs:us-west-2:123456789012:poc16-notifications"
@@ -67,22 +72,108 @@ def test_scanner_state_store_is_separate_conditional_s3_namespace(
     assert captured == [canonical, state]
 
 
+def test_delivery_composes_shared_notification_state_for_cursor_completion(
+        tmp_path, monkeypatch):
+    workspace = "a" * 64
+    canonical = FsStore(str(tmp_path / "canonical"))
+    operational = FsStore(str(tmp_path / "operational"))
+    push_secret, _push_node = keypair()
+    stores = {
+        "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": canonical,
+        "TINYP2P_NOTIFICATION_STATE_BUCKET": operational,
+    }
+    monkeypatch.setattr(app, "_delivery_cache", None)
+    monkeypatch.setattr(app, "_workspace", lambda: workspace)
+    monkeypatch.setattr(app, "_notification_owner", lambda: OWNER)
+    monkeypatch.setattr(
+        app, "_store", lambda bucket, _prefix, **_kwargs: stores[bucket])
+    monkeypatch.setattr(
+        app, "_push_provider", lambda: (push_secret, Push([])))
+
+    configured = app._delivery_dependencies()
+
+    assert configured[0] == workspace
+    assert isinstance(configured[1], NotificationState)
+    assert configured[1].owner == OWNER
+    assert configured[1].store.store is operational
+
+
+def test_cursor_owner_binds_the_complete_semantic_deployment(monkeypatch):
+    values = {
+        "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": "canonical-bucket",
+        "TINYP2P_NOTIFICATION_CANONICAL_PREFIX": "canonical/workspace",
+        "TINYP2P_NOTIFICATION_DEPLOYMENT_ID": "notify-west",
+        "TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER": "123456789012",
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID": "b" * 64,
+        "TINYP2P_NOTIFICATION_SECRET_ARN": "secret-arn",
+        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID": "v" * 32,
+        "TINYP2P_NOTIFICATION_STATE_BUCKET": "notification-state",
+        "TINYP2P_NOTIFICATION_STATE_PREFIX": "notification/workspace",
+        "TINYP2P_NOTIFICATION_WORKSPACE_ID": "a" * 64,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    baseline = app._notification_owner()
+
+    for name, value in values.items():
+        changed = "c" * 64 if name.endswith((
+            "PUSH_NODE_ID", "WORKSPACE_ID")) else value + "-changed"
+        if name.endswith("EXPECTED_BUCKET_OWNER"):
+            changed = "210987654321"
+        monkeypatch.setenv(name, changed)
+        assert app._notification_owner() != baseline
+        monkeypatch.setenv(name, value)
+
+
 def test_secret_parse_failures_never_echo_secret_material(monkeypatch):
     material = "private-key-must-not-appear"
+    version = "a" * 32
+    arn = (
+        "arn:aws:secretsmanager:us-west-2:123456789012:"
+        "secret:poc16/notification-AbCdEf")
+    requests = []
 
     class Secrets:
-        def get_secret_value(self, **_request):
-            return {"SecretString": material}
+        def get_secret_value(self, **request):
+            requests.append(request)
+            return {
+                "ARN": arn,
+                "SecretString": material,
+                "VersionId": version,
+            }
 
-    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", (
-        "arn:aws:secretsmanager:us-west-2:123456789012:"
-        "secret:poc16/notification-AbCdEf"))
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", arn)
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_VERSION_ID", version)
     try:
-        app._secret_document(Secrets())
+        app._secret(Secrets())
     except RuntimeError as error:
         assert material not in str(error)
+        assert material not in "".join(traceback.format_exception(error))
     else:
         raise AssertionError("malformed secret was accepted")
+    assert requests == [{"SecretId": arn, "VersionId": version}]
+
+
+def test_secret_response_cannot_substitute_another_version(monkeypatch):
+    arn = (
+        "arn:aws:secretsmanager:us-west-2:123456789012:"
+        "secret:poc16/notification-AbCdEf")
+    requested = "a" * 32
+
+    class Secrets:
+        def get_secret_value(self, **request):
+            assert request == {"SecretId": arn, "VersionId": requested}
+            return {
+                "ARN": arn,
+                "SecretString": "private-material",
+                "VersionId": "b" * 32,
+            }
+
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", arn)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID", requested)
+    with pytest.raises(RuntimeError, match="secret binding"):
+        app._secret(Secrets())
 
 
 def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
@@ -108,9 +199,13 @@ def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
     monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
     monkeypatch.setitem(sys.modules, "boto3", boto3)
     monkeypatch.setattr(app, "_sdk_config", lambda: object())
-    monkeypatch.setattr(app, "_secret_document", lambda _client: {
-        "push_node_seed": "11" * 32,
-        "firebase_apps": [
+    push_secret = load_sk("11" * 32)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
+        push_secret.verify_key.encode().hex())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        push_secret,
+        (
             {
                 "application": "poc16.mobile",
                 "environment": "production",
@@ -121,8 +216,8 @@ def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
                 "environment": "staging",
                 "credential": {"project_id": "two"},
             },
-        ],
-    })
+        ),
+    ))
 
     with pytest.raises(
             RuntimeError, match="notification Firebase initialization") \
@@ -153,14 +248,18 @@ def test_firebase_credential_exception_is_redacted(monkeypatch):
     monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
     monkeypatch.setitem(sys.modules, "boto3", boto3)
     monkeypatch.setattr(app, "_sdk_config", lambda: object())
-    monkeypatch.setattr(app, "_secret_document", lambda _client: {
-        "push_node_seed": "11" * 32,
-        "firebase_apps": [{
+    push_secret = load_sk("11" * 32)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
+        push_secret.verify_key.encode().hex())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        push_secret,
+        ({
             "application": "poc16.mobile",
             "environment": "production",
             "credential": {"private_key": private},
-        }],
-    })
+        },),
+    ))
 
     with pytest.raises(
             RuntimeError, match="notification Firebase initialization") \
@@ -169,6 +268,30 @@ def test_firebase_credential_exception_is_redacted(monkeypatch):
 
     assert private not in str(caught.value)
     assert private not in "".join(traceback.format_exception(caught.value))
+
+
+def test_runtime_rejects_push_identity_different_from_stack(monkeypatch):
+    firebase = ModuleType("firebase_admin")
+    credentials = ModuleType("firebase_admin.credentials")
+    boto3 = ModuleType("boto3")
+    firebase.credentials = credentials
+    boto3.client = lambda *_args, **_kwargs: object()
+    monkeypatch.setitem(sys.modules, "firebase_admin", firebase)
+    monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setattr(app, "_sdk_config", lambda: object())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        load_sk("11" * 32),
+        ({
+            "application": "poc16.mobile",
+            "credential": {},
+            "environment": "production",
+        },),
+    ))
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_PUSH_NODE_ID", "b" * 64)
+
+    with pytest.raises(RuntimeError, match="push-node identity"):
+        app._push_provider()
 
 
 class Queue:
@@ -262,11 +385,16 @@ def _world(tmp_path, *, invalid_endpoint=False):
         ts=2,
     )
     preference.set_global(node, workspace, preference.ALL, ts=3)
+    state_store = FsStore(str(tmp_path / "notification-state"))
+    carrier = QueueCarrier([])
+    discovery = NotificationDiscovery(
+        node.store(workspace), state_store, workspace, carrier,
+        owner=OWNER, generation_factory=lambda: "e" * 64)
+    asyncio.run(discovery.bootstrap_current())
     event = message.post(node, workspace, "general", "hello", ts=4)
-    root = node.reader(workspace).root_bytes
-    state = FsStore(str(tmp_path / "notification-state"))
-    state.put_if_absent("obj/" + h(root), root)
-    raw = encode_hint(NotificationHint(workspace, h(root), (event,)))
+    assert asyncio.run(discovery.run_once()).status == "published"
+    raw, = carrier.bodies
+    state = NotificationState(state_store, workspace, OWNER)
     return node, workspace, push_secret, event, state, raw
 
 
@@ -290,22 +418,6 @@ def _record(body, message_id="work", attempt=1):
     }
 
 
-async def _drain(repository, state, workspace, carrier, maximum=100):
-    results = []
-    for _ in range(maximum):
-        result = await app.scan_once(
-            repository=repository,
-            state=state,
-            workspace=workspace,
-            carrier=carrier,
-            owner=OWNER,
-        )
-        results.append(result)
-        if result.status == "idle":
-            return results
-    raise AssertionError("AWS notification scanner did not become idle")
-
-
 def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
     node = FullPeer(str(tmp_path / "scanner-node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -313,16 +425,24 @@ def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
     state = FsStore(str(tmp_path / "scanner-state"))
     queue = Queue()
     carrier = SqsCarrier(queue, URL, ARN)
-    asyncio.run(_drain(node.store(workspace), state, workspace, carrier))
-    queue.bodies.clear()
+    asyncio.run(app.bootstrap_once(
+        "current", repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
 
     first = message.post(node, workspace, "general", "one", ts=10)
-    # Its wake is dropped. A second publication and the next schedule are the
-    # only liveness event the scanner receives.
     second = message.post(node, workspace, "general", "two", ts=11)
-    asyncio.run(_drain(node.store(workspace), state, workspace, carrier))
+    published = asyncio.run(app.scan_once(
+        repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
+    first_body, = queue.bodies
+    queue.bodies.clear()  # The accepted wake is dropped after cursor CAS.
+    repeated = asyncio.run(app.scan_once(
+        repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
 
-    hints = [decode_hint(body) for body in queue.bodies]
+    assert (published.status, repeated.status) == ("published", "republished")
+    assert queue.bodies == [first_body]
+    hints = [decode_hint(first_body)]
     assert {fid for hint in hints for fid in hint.facts} == {first, second}
     assert len({hint.root_oid for hint in hints}) == 1
 
@@ -333,8 +453,9 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
     state = FsStore(str(tmp_path / "race-state"))
-    asyncio.run(_drain(
-        node.store(workspace), state, workspace, QueueCarrier([])))
+    asyncio.run(app.bootstrap_once(
+        "current", repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=QueueCarrier([]), owner=OWNER))
     event = message.post(node, workspace, "general", "race", ts=10)
 
     # Pin the target without progressing, then let both invocations read the
@@ -365,11 +486,58 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
 
     results = asyncio.run(race())
 
-    assert sorted(result.status for result in results) \
-        == ["published", "raced"]
+    assert [result.status for result in results] \
+        == ["republished", "republished"]
     assert len(carrier.bodies) == 2
     assert carrier.bodies[0] == carrier.bodies[1]
     assert decode_hint(carrier.bodies[0]).facts == (event,)
+
+
+def test_scanner_requires_explicit_bootstrap_before_first_fair_run(tmp_path):
+    node = FullPeer(str(tmp_path / "bootstrap-node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    state = FsStore(str(tmp_path / "bootstrap-state"))
+    carrier = QueueCarrier([])
+    dependencies = {
+        "repository": node.store(workspace),
+        "state": state,
+        "workspace": workspace,
+        "carrier": carrier,
+        "owner": OWNER,
+    }
+
+    with pytest.raises(CursorNotInitialized):
+        asyncio.run(app.scan_once(**dependencies))
+    cursor = asyncio.run(app.bootstrap_once("current", **dependencies))
+
+    assert cursor.bootstrap == "current"
+    assert asyncio.run(app.scan_once(**dependencies)).status == "idle"
+
+
+def test_scanner_handler_accepts_only_explicit_bootstrap_event(
+        monkeypatch):
+    workspace = "a" * 64
+    calls = []
+
+    async def initialize(mode, **dependencies):
+        calls.append((mode, dependencies))
+        return SimpleNamespace(bootstrap=mode)
+
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_WORKSPACE_ID", workspace)
+    monkeypatch.setattr(app, "bootstrap_once", initialize)
+
+    response = app.scanner_handler({
+        "mode": "backfill",
+        "schema": "poc16-notification-bootstrap-v1",
+        "workspace": workspace,
+    }, None)
+
+    assert response == {
+        "mode": "backfill",
+        "schema": "poc16-notification-bootstrap-result-v1",
+        "status": "initialized",
+    }
+    assert calls == [("backfill", {"workspace": workspace})]
 
 
 @dataclass
@@ -542,18 +710,97 @@ def test_unregistered_fid_is_terminal_but_missing_event_root_retries(
     worker = _worker(node, secret, provider)
     sqs = {"Records": [_record(raw)]}
 
-    terminal = asyncio.run(app.deliver_batch(
-        sqs, state=state, worker=worker,
-        workspace=workspace, queue_arn=ARN))
+    class MissingRoot:
+        def __init__(self, backing):
+            self.owner = backing.owner
+            self.pending = backing.pending
+            self.complete = backing.complete
+
+        async def get_bounded(self, _key, _maximum):
+            return None
+
     missing = asyncio.run(app.deliver_batch(
-        sqs,
-        state=FsStore(str(tmp_path / "missing-state")),
-        worker=worker,
+        sqs, state=MissingRoot(state), worker=worker,
         workspace=workspace,
         queue_arn=ARN,
     ))
+    terminal = asyncio.run(app.deliver_batch(
+        sqs, state=state, worker=worker,
+        workspace=workspace, queue_arn=ARN))
 
     assert terminal == {"batchItemFailures": []}
     assert missing == {
         "batchItemFailures": [{"itemIdentifier": "work"}],
     }
+
+
+def _smoke_event(raw):
+    return {
+        "body": base64.b64encode(raw).decode("ascii"),
+        "schema": DIRECT_SMOKE_SCHEMA,
+    }
+
+
+def test_direct_smoke_reports_only_clean_aggregate_acceptance(tmp_path):
+    node, workspace, secret, _event, state, raw = _world(tmp_path)
+
+    result = asyncio.run(app.direct_smoke(
+        _smoke_event(raw),
+        state=state,
+        worker=_worker(node, secret, Push([])),
+        workspace=workspace,
+    ))
+
+    assert result == {
+        "accepted_count": 1,
+        "retry_count": 0,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": 0,
+    }
+    assert not any("fid" in name or "id" in name for name in result)
+
+
+def test_direct_smoke_distinguishes_no_recipient_retry_and_terminal(
+        tmp_path):
+    muted, workspace, secret, _event, state, raw = _world(
+        tmp_path / "muted")
+    preference.set_global(muted, workspace, preference.NONE, ts=5)
+    no_recipient = asyncio.run(app.direct_smoke(
+        _smoke_event(raw), state=state,
+        worker=_worker(muted, secret, Push([])), workspace=workspace))
+
+    retry_node, retry_workspace, retry_secret, _event, retry_state, retry_raw \
+        = _world(tmp_path / "retry")
+    retry = asyncio.run(app.direct_smoke(
+        _smoke_event(retry_raw), state=retry_state,
+        worker=_worker(
+            retry_node, retry_secret, Push([PushRetryable("quota")])),
+        workspace=retry_workspace))
+
+    bad_node, bad_workspace, bad_secret, _event, bad_state, bad_raw = _world(
+        tmp_path / "invalid", invalid_endpoint=True)
+    terminal = asyncio.run(app.direct_smoke(
+        _smoke_event(bad_raw), state=bad_state,
+        worker=_worker(bad_node, bad_secret, Push([])),
+        workspace=bad_workspace))
+
+    assert no_recipient == {
+        "accepted_count": 0,
+        "retry_count": 0,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": 0,
+    }
+    assert retry["retry_count"] == 1
+    assert retry["accepted_count"] == retry["terminal_count"] == 0
+    assert terminal["terminal_count"] == 1
+    assert terminal["accepted_count"] == terminal["retry_count"] == 0
+
+
+def test_direct_smoke_handler_is_separately_disabled(monkeypatch):
+    monkeypatch.delenv(
+        "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED", raising=False)
+    with pytest.raises(RuntimeError, match="direct smoke is disabled"):
+        app.delivery_handler({
+            "body": base64.b64encode(b"hint").decode("ascii"),
+            "schema": DIRECT_SMOKE_SCHEMA,
+        }, None)

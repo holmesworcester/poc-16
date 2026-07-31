@@ -259,15 +259,16 @@ absent cursor fails loudly. Each successful bootstrap creates a fresh random
 generation so an old paused worker cannot complete identical work after state
 loss and rebootstrap.
 
-One canonical body contains only workspace, deployment owner, bootstrap
-generation, target-root object ID, and sorted trigger FIDs. Before publishing,
-the scanner preserves the exact target root and body in notification state and
-CASes one pending body OID with its exact successor. There is at most one
-pending page per workspace. Queue, SQS, and local deliveries are disposable
-wakes: every fair scheduled turn republishes the byte-identical pending body
-until the worker records completion. A lost wake, finite queue retention,
-ambiguous publish response, process crash, or scanner race can duplicate work
-but cannot make discovery forget it. A zero-trigger page advances directly.
+One canonical body contains only workspace, immutable deployment owner,
+bootstrap generation, target-root object ID, and sorted trigger FIDs. Before
+publishing, the scanner preserves the exact target root and body in
+notification state and CASes one pending body OID with its exact successor.
+There is at most one pending page per workspace. Queue, SQS, and local
+deliveries are disposable wakes: every fair scheduled turn republishes the
+byte-identical pending body until the worker records completion. A lost wake,
+finite queue retention, ambiguous publish response, process crash, or scanner
+race can duplicate work but cannot make discovery forget it. A zero-trigger
+page advances directly.
 
 The worker advances the pending cursor only after typed FCM acceptance or an
 explicit current-authority or terminal outcome. A concurrent or stale delivery
@@ -345,14 +346,22 @@ Provisioning uses the free-plan-compatible one-day Queue retention. Paid
 retention can provide more operational headroom, but is not a correctness
 requirement because every fair scan recreates the pending wake from R2.
 
-All four Workers carry one SHA-256 deployment identity over the workspace,
-buckets and prefixes, Queue/DLQ, Worker names, push-node public key, and exact
-Firebase application/environment/project. The deploy tool checks both this
-identity and the human owner marker before any update. Changing one of those
-bindings is a drain/migration, not an in-place update; the owner marker alone
+All four Workers carry one SHA-256 deployment identity over the Cloudflare
+account, workspace, buckets and prefixes, Queue/DLQ, Worker names, push-node
+public key, and exact Firebase application/environment/project. They also carry
+the exact staged software digest and enablement state. The deploy tool checks
+these markers and the human owner before any update. Changing an identity
+binding is a drain/migration, not an in-place update; the owner marker alone
 cannot authorize it. The FactTree cursor uses that same identity as its owner,
 so a second deployment pointed at the same R2 prefix cannot advance work into
 a different Queue.
+
+The Firebase service-account key is deliberately not part of that immutable
+identity or the mobile launch record. Rotating to another credential for the
+same bound Firebase project is an availability-only cutover: authentication or
+configuration failure returns `RETRY` and leaves the durable pending cursor
+unchanged. A different project is an identity change and cannot be substituted
+in place.
 
 The preference commands are available now:
 
@@ -430,6 +439,28 @@ bootstrap mode. The control tool cannot read the private R2 binding, so the
 successful scheduled invocation—not merely local config generation—is the
 bootstrap evidence. A later missing cursor remains a loud runtime fault and
 requires another explicit recovery decision.
+
+Production enablement additionally requires `CF_IOS_LAUNCH_RECORD` and
+`CF_ANDROID_LAUNCH_RECORD`. Run `launch-binding` against the disabled staged
+deployment and give its exact JSON output to the physical-device harness; that
+harness writes each record with `deploy.notification_launch.launch_record()`
+only after the corresponding real device launches:
+
+```sh
+python3 -m deploy.cloudflare_notifications.manage launch-binding
+export CF_IOS_LAUNCH_RECORD=/protected/ios.json
+export CF_ANDROID_LAUNCH_RECORD=/protected/android.json
+export CF_NOTIFICATIONS_ENABLED=1
+python3 -m deploy.cloudflare_notifications.manage deploy
+```
+
+Both records bind the Cloudflare account, deployment identity, workspace,
+R2/Queue locations, push-node ID, Firebase app/environment/project, and exact
+staged software digest. The old `CF_MOBILE_LAUNCH_GATE=1` flag has no effect.
+Upgrades use three distinct deploys: disable with the incumbent digest, deploy
+new code only after all four incumbent Workers report disabled, then repeat
+both real-device tests for the new digest and enable. The tool rejects a
+one-step disable-plus-code-change because provider rollout order is not atomic.
 
 ## Facts, suppression, and deletion
 
@@ -758,9 +789,11 @@ lowercase hex characters:
 }
 ```
 
-Create that secret from a protected file, configure the external state bucket
-to retain `root` and `obj/` longer than the complete queue/DLQ/redrive window,
-then create the stack disabled:
+Create that secret from a protected file. Record its exact Secrets Manager
+`VersionId`; deployments never follow `AWSCURRENT`. Provision a dedicated
+notification-state bucket whose current and noncurrent `root` and `obj/`
+objects have no enabled expiration rule. Transitions are fine, but deleting
+that state loses the durable delivery cursor. Then create the stack disabled:
 
 ```sh
 python3 -m deploy.aws_notifications.manage deploy --create \
@@ -771,35 +804,74 @@ python3 -m deploy.aws_notifications.manage deploy --create \
   --canonical-prefix workspaces/WS64 \
   --state-bucket NOTIFICATION_STATE_BUCKET \
   --state-prefix workspaces/WS64/notifications \
-  --state-retention-days 30 \
   --expected-owner ACCOUNT_ID \
   --notification-secret-arn SECRET_ARN \
+  --notification-secret-version-id SECRET_VERSION_ID \
   --region REGION
 ```
 
-Without `--enable`, CloudFormation creates the owned stack identity but no
-scanner, delivery function, queue, or schedule. After the real mobile launch
-gate, repeat with `--update --enable`. The source queue and DLQ each retain
-work for 14 days; the deploy command rejects a claimed state-retention window
-below 30 days but never changes the bucket lifecycle itself. For standard SQS,
-DLQ transfer preserves the original enqueue age while an explicit redrive
-resets it; the 30-day floor covers the first finite lifetime, one bounded
-redrive lifetime, and a two-day response margin.
-
-An operator can submit one canonical hint fixture through the scanner and real
-Firebase boundary, redrive the DLQ at a bounded rate, or remove the owned
-compute. Removal refuses to discard queued work unless explicitly overridden
-and never deletes either external bucket or the secret:
+The disabled stack still contains both Lambdas, the source queue, the DLQ, and
+their IAM roles. Its schedule and SQS event source are disabled, so no
+production delivery runs. Initialize the durable cursor explicitly; `current`
+is the normal first deployment and `backfill` is an intentional historical
+replay:
 
 ```sh
-python3 -m deploy.aws_notifications.manage live-smoke \
+python3 -m deploy.aws_notifications.manage bootstrap --current \
+  --stack-name poc16-notifications \
+  --deployment-id DEPLOYMENT --region REGION
+```
+
+Direct smoke is an independent, normally disabled path. Enable its switch with
+a disabled `deploy --update --enable-smoke`, using the same immutable arguments
+as create, then invoke it with one canonical hint. It bypasses SQS and does not
+complete notification cursor state. A pass proves current authority and at
+least one FCM acceptance; it does not prove that iOS or Android launched:
+
+```sh
+python3 -m deploy.aws_notifications.manage direct-smoke \
   --stack-name poc16-notifications --deployment-id DEPLOYMENT \
   --hint-file notification-hint.json --region REGION
+```
+
+Production remains fail-closed until a real-device harness has observed both
+an iOS and an Android launch and written one canonical record per platform.
+Records have the exact shape below. `binding` must equal the owned stack's
+immutable bucket/workspace/secret/push values and its full StackId and
+`SoftwareDigest` outputs; use `deploy.notification_launch.launch_record()` to
+encode it only after the corresponding device test passes:
+
+```json
+{"binding":{"canonical_bucket":"CANONICAL_BUCKET","canonical_prefix":"workspaces/WS64","deployment_id":"DEPLOYMENT","expected_bucket_owner":"ACCOUNT_ID","notification_secret_arn":"SECRET_ARN","notification_secret_version_id":"SECRET_VERSION_ID","notification_state_bucket":"NOTIFICATION_STATE_BUCKET","notification_state_prefix":"workspaces/WS64/notifications","provider":"aws","push_node_id":"PUSH_NODE_ID","software_digest":"SOFTWARE_DIGEST","stack_id":"FULL_STACK_ARN","workspace":"WS64"},"platform":"ios","result":"passed","schema":"poc16-mobile-notification-launch-v1"}
+```
+
+Repeat `deploy` with `--update --enable`, the same immutable arguments, and
+`--ios-launch-record IOS.json --android-launch-record ANDROID.json`. An enabled
+deployment rejects a changed software digest. Upgrade in three distinct steps:
+disable using the incumbent code, deploy the new code after the stack is already
+disabled, then repeat both launch tests against that digest and enable it. The
+tool rejects a one-step disable-plus-code-change because CloudFormation need not
+disable triggers before replacing function code.
+
+The source queue retains wakes for four days and the DLQ for fourteen. A
+carrier wake is not the durable record; non-expiring notification state is.
+Redrive is allowed only while production delivery is disabled:
+
+```sh
 python3 -m deploy.aws_notifications.manage redrive \
   --stack-name poc16-notifications --deployment-id DEPLOYMENT \
   --max-per-second 10 --region REGION
+```
+
+Removal never trusts approximate SQS depth. First update with both `--disable`
+and `--disable-smoke`, allow or redrive work as appropriate, then explicitly
+accept carrier destruction. This preserves both external buckets and the
+secret but can discard any wakes still in SQS:
+
+```sh
 python3 -m deploy.aws_notifications.manage remove \
-  --stack-name poc16-notifications --deployment-id DEPLOYMENT --region REGION
+  --stack-name poc16-notifications --deployment-id DEPLOYMENT \
+  --destroy-carrier --region REGION
 ```
 
 ## Current performance status

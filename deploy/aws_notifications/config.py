@@ -5,18 +5,18 @@ import re
 DEPLOYMENT_MARKER = "poc16-aws-notifications-v1"
 DEPLOYMENT_TAG = "poc16:deployment"
 DEPLOYMENT_ID_TAG = "poc16:deployment-id"
+BOOTSTRAP_SCHEMA = "poc16-notification-bootstrap-v1"
+BOOTSTRAP_RESULT_SCHEMA = "poc16-notification-bootstrap-result-v1"
 SCAN_WAKE_SCHEMA = "poc16-notification-scan-wake-v1"
 SCAN_RESULT_SCHEMA = "poc16-notification-scan-result-v1"
+DIRECT_SMOKE_SCHEMA = "poc16-notification-direct-smoke-v1"
+DIRECT_SMOKE_RESULT_SCHEMA = "poc16-notification-direct-smoke-result-v1"
 
 SCANNER_TIMEOUT_SECONDS = 60
 DELIVERY_TIMEOUT_SECONDS = 60
 QUEUE_VISIBILITY_SECONDS = 360
-QUEUE_RETENTION_SECONDS = 14 * 24 * 60 * 60
+QUEUE_RETENTION_SECONDS = 4 * 24 * 60 * 60
 DLQ_RETENTION_SECONDS = 14 * 24 * 60 * 60
-# One 14-day source/DLQ lifetime plus one 14-day post-redrive source lifetime,
-# with two days for alert response. SQS standard DLQ transfer preserves the
-# original enqueue age; an explicit redrive resets it.
-MIN_STATE_RETENTION_DAYS = 30
 MAX_RECEIVE_COUNT = 5
 MAX_SECRET_BYTES = 65_536
 MAX_FIREBASE_APPS = 32
@@ -37,6 +37,7 @@ PREFIX_PATTERN = (
 SECRET_ARN_PATTERN = (
     r"^arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:[a-z0-9-]+:"
     r"[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$")
+SECRET_VERSION_PATTERN = r"^[A-Za-z0-9-]{32,64}$"
 KMS_KEY_ARN_PATTERN = (
     r"^arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:"
     r"[0-9]{12}:key/[A-Za-z0-9-]+$")
@@ -45,6 +46,7 @@ ALARM_ACTION_ARN_PATTERN = r"^arn:[a-z0-9-]+:[a-z0-9-]+:[^:]*:[^:]*:.+$"
 DEPLOYMENT_ID_RE = re.compile(DEPLOYMENT_ID_PATTERN)
 OWNER_RE = re.compile(OWNER_PATTERN)
 SECRET_ARN_RE = re.compile(SECRET_ARN_PATTERN)
+SECRET_VERSION_RE = re.compile(SECRET_VERSION_PATTERN)
 KMS_KEY_ARN_RE = re.compile(KMS_KEY_ARN_PATTERN)
 ALARM_ACTION_ARN_RE = re.compile(ALARM_ACTION_ARN_PATTERN)
 
