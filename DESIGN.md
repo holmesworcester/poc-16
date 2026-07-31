@@ -114,7 +114,10 @@ Inbound connection permits are acquired without waiting: an attempt observed
 while every configured permit is occupied is refused before a per-connection
 task, bidirectional stream, or loopback upstream is created. Each admitted
 task has one aggregate setup deadline and one complete byte-session deadline,
-so hostile handshakes and half-closed streams return their exact permit.
+so hostile handshakes and half-closed streams return their exact permit. The
+transport advertises exactly that one peer-initiated bidirectional stream and
+no unidirectional streams; dialing-only endpoints advertise neither, and
+application datagrams are disabled everywhere.
 
 Full-peer keyring state stores bounded out-of-band records of the form
 `{kind: iroh, endpoint, ticket}`. It never stores a generated loopback URL.

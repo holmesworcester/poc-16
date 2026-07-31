@@ -172,6 +172,9 @@ The wrapper admits at most its configured connection count; it immediately
 refuses overflow Iroh attempts before they can open a stream or loopback
 upstream. One setup deadline covers handshake, first stream, and upstream
 connect together, and one session deadline bounds the complete byte copy.
+Each admitted connection allows only its one protocol bidirectional stream;
+extra bidirectional and all unidirectional streams remain flow-control blocked,
+and application datagrams are disabled.
 Only one due background connection start is attempted per monitor turn, and
 an outbound child that never reports readiness is terminated and reaped
 inside the daemon's shutdown budget.

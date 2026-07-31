@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use iroh::endpoint::{Incoming, PortmapperConfig, presets};
+use iroh::endpoint::{Incoming, PortmapperConfig, QuicTransportConfig, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, Watcher};
 use tokio::io::{copy_bidirectional, join};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +50,12 @@ pub async fn bind_endpoint(
     accepts_connections: bool,
     secret: Option<SecretKey>,
 ) -> Result<Endpoint> {
+    let incoming_bidi_streams = u32::from(accepts_connections);
+    let transport = QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(incoming_bidi_streams))
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .datagram_receive_buffer_size(None)
+        .build();
     let builder = if loopback {
         Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
@@ -59,7 +65,8 @@ pub async fn bind_endpoint(
             .context("configure loopback Iroh socket")?
     } else {
         Endpoint::builder(presets::N0)
-    };
+    }
+    .transport_config(transport);
     let builder = if accepts_connections {
         builder.alpns(vec![ALPN.to_vec()])
     } else {
@@ -391,9 +398,8 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use iroh::endpoint::VarInt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
     use tokio::time::{Instant, sleep};
 
@@ -436,6 +442,29 @@ mod tests {
         recv.read_to_end(1024)
             .await
             .context("read ordinary test response")
+    }
+
+    async fn assert_no_extra_peer_channels(
+        connection: &iroh::endpoint::Connection,
+        endpoint_kind: &str,
+    ) {
+        let blocked_stream_wait = Duration::from_millis(200);
+        assert!(
+            timeout(blocked_stream_wait, connection.open_bi())
+                .await
+                .is_err(),
+            "{endpoint_kind} endpoint admitted an extra bidirectional stream"
+        );
+        assert!(
+            timeout(blocked_stream_wait, connection.open_uni())
+                .await
+                .is_err(),
+            "{endpoint_kind} endpoint admitted a unidirectional stream"
+        );
+        assert!(
+            connection.send_datagram(vec![b'D'].into()).is_err(),
+            "{endpoint_kind} endpoint admitted a datagram"
+        );
     }
 
     fn spawn_upstream(listener: TcpListener) -> (mpsc::UnboundedReceiver<u8>, JoinHandle<()>) {
@@ -647,6 +676,46 @@ mod tests {
         })
         .await
         .unwrap();
+        dialing.close().await;
+        accepting.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_iroh_connection_allows_only_its_one_protocol_stream() {
+        let (accepting, remote) = loopback_server(10).await;
+        let accepting_for_task = accepting.clone();
+        let (accepted, accepted_rx) = oneshot::channel();
+        let (server_checked, server_checked_rx) = oneshot::channel();
+        let (release_server, release_server_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let incoming = accepting_for_task.accept().await.unwrap();
+            let connection = incoming.await.unwrap();
+            let (server_send, mut server_recv) = connection.accept_bi().await.unwrap();
+            let mut marker = [0];
+            server_recv.read_exact(&mut marker).await.unwrap();
+            accepted.send(()).unwrap();
+
+            assert_no_extra_peer_channels(&connection, "dialing-only").await;
+            server_checked.send(()).unwrap();
+            release_server_rx.await.unwrap();
+            drop((server_send, server_recv));
+        });
+
+        let dialing = seeded_endpoint(9, false).await;
+        let connection = dialing.connect(remote, ALPN).await.unwrap();
+        let (mut protocol_send, protocol_recv) = connection.open_bi().await.unwrap();
+        protocol_send.write_all(b"P").await.unwrap();
+        timeout(TEST_TIMEOUT, accepted_rx).await.unwrap().unwrap();
+
+        assert_no_extra_peer_channels(&connection, "accepting").await;
+        timeout(TEST_TIMEOUT, server_checked_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release_server.send(()).unwrap();
+
+        drop((protocol_send, protocol_recv, connection));
+        timeout(TEST_TIMEOUT, server).await.unwrap().unwrap();
         dialing.close().await;
         accepting.close().await;
     }
