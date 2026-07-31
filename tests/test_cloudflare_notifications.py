@@ -514,11 +514,35 @@ def test_generated_deployment_is_disabled_and_effectless_by_default():
         manage.generated_configs(_manage_environment())
 
     assert scanner_config["triggers"]["crons"] == []
+    assert scanner_config["vars"]["NOTIFICATION_BOOTSTRAP_MODE"] == "none"
     assert consumer_config["queues"]["consumers"] == []
     assert scanner_config["vars"]["NOTIFICATIONS_ENABLED"] == "0"
     assert consumer_config["vars"]["NOTIFICATIONS_ENABLED"] == "0"
     assert fcm_config["workers_dev"] is False
     assert fcm_config["routes"] == []
+
+
+@pytest.mark.parametrize("mode", ["current", "backfill"])
+def test_explicit_bootstrap_mode_schedules_only_the_scanner(mode):
+    ordinary = manage.generated_configs(_manage_environment())
+    reader_config, scanner_config, consumer_config, fcm_config = \
+        manage.generated_configs(
+            _manage_environment(), bootstrap_mode=mode)
+
+    assert scanner_config["vars"]["NOTIFICATION_BOOTSTRAP_MODE"] == mode
+    assert scanner_config["triggers"]["crons"] == ["* * * * *"]
+    assert consumer_config["queues"]["consumers"] == []
+    assert scanner_config["vars"]["POC16_DEPLOYMENT_IDENTITY"] \
+        == ordinary[1]["vars"]["POC16_DEPLOYMENT_IDENTITY"]
+    assert reader_config == ordinary[0]
+    assert consumer_config == ordinary[2]
+    assert fcm_config == ordinary[3]
+
+
+def test_unknown_bootstrap_mode_is_rejected():
+    with pytest.raises(ValueError, match="bootstrap mode"):
+        manage.generated_configs(
+            _manage_environment(), bootstrap_mode="automatic")
 
 
 def test_launch_gate_enables_exact_bounded_queue_configuration():
@@ -719,6 +743,72 @@ def test_same_owner_cannot_rebind_an_existing_worker(monkeypatch):
 
     with pytest.raises(RuntimeError, match="immutable notification"):
         manage._require_deployable(changed, create=True)
+
+
+@pytest.mark.parametrize("observed", [
+    [],
+    [{
+        "name": "NOTIFICATION_BOOTSTRAP_MODE",
+        "type": "plain_text",
+        "text": "current",
+    }],
+])
+def test_verify_rejects_absent_or_unsealed_bootstrap_binding(
+        monkeypatch, observed):
+    scanner_config = manage.generated_configs(_manage_environment())[1]
+    monkeypatch.setattr(
+        manage, "_worker_bindings", lambda config, environment=None: observed)
+
+    with pytest.raises(RuntimeError, match="bootstrap is not sealed"):
+        manage._require_bootstrap_sealed(scanner_config, {})
+
+
+def test_verify_accepts_exact_sealed_bootstrap_binding(monkeypatch):
+    scanner_config = manage.generated_configs(_manage_environment())[1]
+    monkeypatch.setattr(manage, "_worker_bindings", lambda *args: [{
+        "name": "NOTIFICATION_BOOTSTRAP_MODE",
+        "type": "plain_text",
+        "text": "none",
+    }])
+
+    manage._require_bootstrap_sealed(scanner_config, {})
+
+
+@pytest.mark.parametrize("mode", ["current", "backfill", "none"])
+def test_bootstrap_commands_only_redeploy_the_owned_scanner(
+        monkeypatch, mode):
+    calls = []
+    configs = manage.generated_configs(
+        _manage_environment(), bootstrap_mode=mode)
+    monkeypatch.setattr(manage, "sync", lambda: calls.append(("sync",)))
+    monkeypatch.setattr(
+        manage, "generated_configs",
+        lambda *, bootstrap_mode: configs)
+    monkeypatch.setattr(
+        manage, "_write_configs", lambda value: calls.append(("write", value)))
+    monkeypatch.setattr(
+        manage, "_require_owned",
+        lambda config: calls.append(("owned", config["name"])))
+    monkeypatch.setattr(
+        manage, "_require_retained_notification_objects",
+        lambda reader_config, scanner_config: calls.append(("retained",)))
+    monkeypatch.setattr(
+        manage, "_pywrangler",
+        lambda *arguments, **options: calls.append(
+            ("pywrangler", arguments, options)))
+
+    manage._deploy_scanner_mode(mode)
+
+    assert calls[0] == ("sync",)
+    assert calls[1] == ("write", configs)
+    assert calls[2] == ("owned", configs[1]["name"])
+    assert calls[3] == ("retained",)
+    assert calls[4] == (
+        "pywrangler",
+        ("deploy", "--strict", "--config", str(manage.SCANNER_CONFIG)),
+        {},
+    )
+    assert calls[5] == ("owned", configs[1]["name"])
 
 
 def test_redrive_accepts_primary_copy_before_acknowledging_dlq(

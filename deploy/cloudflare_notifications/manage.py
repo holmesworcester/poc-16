@@ -56,6 +56,12 @@ MAX_CONCURRENCY = 4
 RETRY_DELAY_SECONDS = 30
 API_RESPONSE_BYTES = 512 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
+BOOTSTRAP_NONE = "none"
+BOOTSTRAP_CURRENT = "current"
+BOOTSTRAP_BACKFILL = "backfill"
+BOOTSTRAP_MODES = {
+    BOOTSTRAP_NONE, BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL,
+}
 
 FID = re.compile(r"^[0-9a-f]{64}$")
 ACCOUNT_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -148,8 +154,10 @@ def _prefix(value, label):
         raise ValueError(f"{label} is not a safe store prefix") from error
 
 
-def generated_configs(environment=os.environ):
+def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
     """Resolve one workspace and keep live effects disabled by default."""
+    if bootstrap_mode not in BOOTSTRAP_MODES:
+        raise ValueError("notification bootstrap mode")
     workspace = _text(environment, "CF_WORKSPACE")
     owner = _text(environment, "CF_DEPLOYMENT_OWNER")
     canonical = _text(environment, "CF_CANONICAL_BUCKET")
@@ -257,6 +265,7 @@ def generated_configs(environment=os.environ):
     scanner["name"] = scanner_name
     scanner["vars"].update({
         **common,
+        "NOTIFICATION_BOOTSTRAP_MODE": bootstrap_mode,
         "NOTIFICATION_STATE_PREFIX": state_prefix,
     })
     scanner["r2_buckets"][0].update({
@@ -265,7 +274,7 @@ def generated_configs(environment=os.environ):
     scanner["queues"]["producers"][0]["queue"] = queue
     scanner["triggers"]["crons"] = (
         [environment.get("CF_NOTIFICATION_CRON", "* * * * *")]
-        if enabled == "1" else [])
+        if enabled == "1" or bootstrap_mode != BOOTSTRAP_NONE else [])
 
     consumer = json.loads(CONSUMER_TEMPLATE.read_text())
     consumer["name"] = consumer_name
@@ -529,6 +538,20 @@ def _require_secret(config, name):
         raise RuntimeError(f"Worker is missing required secret {name}")
 
 
+def _require_bootstrap_sealed(config, environment=os.environ):
+    bindings = _worker_bindings(config, environment)
+    if bindings is _ABSENT:
+        raise RuntimeError("notification scanner is absent")
+    matches = [
+        item for item in bindings
+        if isinstance(item, dict)
+        and item.get("name") == "NOTIFICATION_BOOTSTRAP_MODE"]
+    if len(matches) != 1 or matches[0].get("type") != "plain_text" \
+            or matches[0].get("text") != BOOTSTRAP_NONE:
+        raise RuntimeError(
+            "notification scanner bootstrap is not sealed")
+
+
 def _firebase_secret(expected_project, environment=os.environ):
     if not PROJECT.fullmatch(expected_project or ""):
         raise ValueError("expected Firebase project is invalid")
@@ -607,10 +630,39 @@ def deploy():
     _require_owned(configs[1])
 
 
+def _deploy_scanner_mode(mode):
+    """Deploy one explicit initialization mode on an existing scanner."""
+    if mode not in BOOTSTRAP_MODES:
+        raise ValueError("notification bootstrap mode")
+    sync()
+    configs = generated_configs(bootstrap_mode=mode)
+    _write_configs(configs)
+    _require_owned(configs[1])
+    _require_retained_notification_objects(configs[0], configs[1])
+    _pywrangler("deploy", "--strict", "--config", str(SCANNER_CONFIG))
+    _require_owned(configs[1])
+
+
+def bootstrap_current():
+    """Temporarily schedule an idempotent current-root bootstrap."""
+    _deploy_scanner_mode(BOOTSTRAP_CURRENT)
+
+
+def bootstrap_backfill():
+    """Temporarily schedule an idempotent historical backfill bootstrap."""
+    _deploy_scanner_mode(BOOTSTRAP_BACKFILL)
+
+
+def seal_bootstrap():
+    """Return an initialized scanner to its ordinary fail-closed mode."""
+    _deploy_scanner_mode(BOOTSTRAP_NONE)
+
+
 def verify():
     configs = generated_configs()
     for config in configs:
         _require_owned(config)
+    _require_bootstrap_sealed(configs[1])
     _require_secret(configs[3], "FIREBASE_SERVICE_ACCOUNT_JSON")
     _require_retained_notification_objects(configs[0], configs[1])
     queue = configs[1]["queues"]["producers"][0]["queue"]
@@ -697,6 +749,9 @@ Commands:
   build      dry-run all four default-disabled Worker bundles
   provision  explicitly create primary and DLQ with 14-day retention
   deploy     deploy owned FCM/read boundaries, consumer, then scanner
+  bootstrap-current   initialize at the current root on the next schedule
+  bootstrap-backfill  initialize from the empty FactTree on the next schedule
+  seal-bootstrap      disable initialization after observing its completion
   verify     verify ownership and print queue status/required alarms
   redrive    safely move one bounded DLQ batch to the primary queue
   remove     remove only owned Workers; retain queues and R2 state
@@ -711,6 +766,9 @@ def main(argv):
         "build": build,
         "provision": provision,
         "deploy": deploy,
+        "bootstrap-current": bootstrap_current,
+        "bootstrap-backfill": bootstrap_backfill,
+        "seal-bootstrap": seal_bootstrap,
         "verify": verify,
         "redrive": redrive,
         "remove": remove,
