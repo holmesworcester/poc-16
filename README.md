@@ -253,15 +253,16 @@ the authenticated `fact.type` postings in `FactTree` from its acknowledged
 base, and selects families with a `notification_trigger` hook. It does not
 read fact blobs, `FactOrder`, SQLite, ingress, or `RepositoryApplier`.
 
-One canonical work body contains only the workspace, target-root object ID,
-and sorted trigger FIDs. Before publishing anything, the scanner preserves the
-exact target root and body in notification state and CASes one cursor into a
-pending state with its exact successor. There is at most one pending page per
-workspace. Queue, SQS, and local deliveries are disposable wakes: every fair
-scheduled turn republishes the byte-identical pending body until the worker
-records completion. A lost wake, finite queue retention, ambiguous publish
-response, process crash, or scanner race can duplicate work but cannot make
-discovery forget it.
+One canonical work body contains only the workspace, immutable deployment
+owner, bootstrap generation, target-root object ID, and sorted trigger FIDs.
+Before publishing anything, the scanner preserves the exact target root and
+body in notification state and CASes one cursor into a pending state with its
+exact successor. There is at most one pending page per workspace. Queue, SQS,
+and local deliveries are disposable wakes: every fair scheduled turn
+republishes the byte-identical pending body until the worker records
+completion. A lost wake, finite queue retention, ambiguous publish response,
+process crash, or scanner race can duplicate work but cannot make discovery
+forget it.
 
 The worker advances the pending cursor only after typed FCM acceptance or an
 explicit current-authority or terminal outcome. A concurrent or stale delivery
@@ -317,6 +318,23 @@ python3 -m full_peer content.notification.set_channel WORKSPACE general none
 python3 -m full_peer content.notification.list WORKSPACE
 python3 -m full_peer auth.push_endpoint.list WORKSPACE
 ```
+
+An experimental FullPeer notification process must initialize every workspace
+explicitly after the daemon starts. `current` is the normal first launch and
+does not notify for existing history; `backfill` deliberately begins at the
+empty tree:
+
+```sh
+python3 -m full_peer --node http://127.0.0.1:7101 \
+  peer.notifications.bootstrap WORKSPACE current
+# Or, only when historical delivery is intentional:
+python3 -m full_peer --node http://127.0.0.1:7101 \
+  peer.notifications.bootstrap WORKSPACE backfill
+```
+
+Repeating the same mode is harmless. A conflicting mode, absent state during
+scanning, or a cursor owned by another deployment fails closed. The periodic
+scanner runs after bootstrap; `peer.notifications.wake` is only a latency hint.
 
 Endpoint registration still needs the mobile integration to obtain permission
 and a current Firebase Installation ID, seal that FID with
