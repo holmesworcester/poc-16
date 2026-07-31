@@ -394,7 +394,8 @@ evidence, or a condition of publication or source retention:
 
 ```text
 closed pile -> RepositoryApplier -> root CAS succeeds
-scheduled scanner -> FactTree(base, target) diff -> managed carrier
+scheduled scanner -> FactTree(base, target) diff -> durable pending cursor
+disposable carrier wake -> exact pending body
 historical event root + separately pinned current root -> bounded join -> FCM
 ```
 
@@ -423,28 +424,41 @@ bounded authenticated Merkle diff of `FactTree`. It examines only newly
 resident `fact.type` postings for families with notification hooks. It never
 fetches fact blobs or consults `FactOrder`, SQL, ingress, or the Applier.
 
-The scanner copies the exact target root bytes into content-addressed
-notification state and publishes one canonical bounded body containing its
-OID and the discovered FIDs. Carrier acceptance precedes cursor CAS. A crash,
-ambiguous publish response, or scanner race can repeat those bytes but cannot
-advance past unaccepted work. A schedule recovers a dropped wake. The initial
-empty cursor intentionally backfills the tree, so operational state is part of
-deployment continuity even though it carries no fact authority.
+Bootstrap is an explicit compare-and-swap into either `current` mode, which
+skips existing history, or deliberate `backfill` mode. An absent cursor never
+silently initializes during scanning. Each successful bootstrap creates a
+fresh random generation, preventing a paused pre-recovery worker from
+completing byte-identical work after state loss and changed current authority.
 
-The carrier is an opaque at-least-once byte carrier only. On delivery,
+For a page with triggers, the scanner copies the exact target root bytes into
+content-addressed notification state and encodes one bounded body containing
+workspace, deployment owner, bootstrap generation, target-root OID, and sorted
+FIDs. It creates that body at `obj/<sha256(body)>`, then CASes the cursor to one
+pending body OID plus the page's exact successor, and only then publishes a
+wake. The scanner cannot pass pending work. Every fair turn republishes its
+exact stored bytes, so a crash, dropped publish, expired queue item, or unknown
+carrier response cannot lose work. Pages without triggers advance directly.
+
+The carrier is a disposable opaque wake, not the durable work owner. On
+delivery, the handler first compares `sha256(body)` with the sole pending OID.
+A noncurrent body is acknowledged; a future legitimate body will be published
+again after its pending CAS. For the exact current body,
 `NotificationWorker` resolves and hash-verifies the historical event root,
 authenticates each event there, and pins the current repository root
-separately. The current root alone selects current preferences, suppression,
+separately. Missing or corrupt state now retries rather than clearing the
+pending item. The current root alone selects current preferences, suppression,
 member/device liveness, unambiguous endpoint cells, and push-node ownership.
 Delayed work therefore cannot resurrect historical delivery authority.
 
 Each request has a deterministic installation-cell delivery ID derived from
 workspace, event, user, installation, and payload. FCM uses that value for
-platform collapse and the application must deduplicate it. The carrier is
-acknowledged only after FCM acceptance, a current-authority cancellation, or
-an explicit unregistered FID or locally malformed sealed endpoint. Transient,
-configuration, missing-state, and unknown outcomes retry. Partial acceptance
-can resend an already accepted request with the same ID; FCM acceptance is not
+platform collapse and the application must deduplicate it. Only after FCM
+acceptance, a current-authority cancellation, or an explicit unregistered FID
+or locally malformed sealed endpoint does the handler CAS the exact pending
+cursor to its stored successor. A stale or unknown completion CAS is reconciled
+by rereading that exact OID. Transient, configuration, missing-state, and
+unknown outcomes leave it pending and retry. A crash after FCM acceptance or
+partial acceptance can resend the same delivery ID; FCM acceptance is not
 evidence of device presentation.
 
 AWS uses S3 notification state, a scheduled scanner Lambda, SQS, and a
@@ -452,8 +466,9 @@ delivery Lambda. Cloudflare uses segregated Workers, R2 notification state,
 and Cloudflare Queues. FullPeer may compose the same scanner and worker with a
 filesystem state store and in-process carrier. These deployments are outside
 core and remain disabled until real iOS and Android launch tests pass. Queue
-and DLQ retention are finite; preserved historical-root state must outlive the
-complete alert and redrive horizon.
+and DLQ retention may be finite without weakening correctness; fair scheduled
+scans republish durable pending state. The separate cursor and its immutable
+root/body objects are deployment continuity and must not be silently replaced.
 
 ## 6. RepositoryReader and sync
 

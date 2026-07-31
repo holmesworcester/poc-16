@@ -229,7 +229,8 @@ never waits for a queue or provider:
 mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
 new message          -> family-owned notification trigger
-scheduled scanner    -> authenticated FactTree diff -> durable carrier
+scheduled scanner    -> authenticated FactTree diff -> durable pending cursor
+durable pending body -> disposable carrier wake
 carrier delivery     -> historical event proof + current authority join -> FCM
 ```
 
@@ -252,15 +253,20 @@ the authenticated `fact.type` postings in `FactTree` from its acknowledged
 base, and selects families with a `notification_trigger` hook. It does not
 read fact blobs, `FactOrder`, SQLite, ingress, or `RepositoryApplier`.
 
-One canonical carrier body contains only the workspace, target-root object ID,
-and sorted trigger FIDs. The scanner preserves the exact target root bytes in
-notification state, publishes the body to a durable carrier, and advances its
-cursor by CAS only after the carrier accepts those exact bytes. A dropped wake
-is repaired by the next scheduled turn. A lost publish response, process crash,
-or cursor race may duplicate a body but cannot skip it. The first run starts at
-the empty tree and therefore backfills historical triggers; preserve the
-notification-state store across redeployments to avoid repeating that
-backfill.
+Bootstrap is explicit: normal launch initializes at the current repository
+root, while a deliberate backfill starts at the empty tree. Scanning with an
+absent cursor fails loudly. Each successful bootstrap creates a fresh random
+generation so an old paused worker cannot complete identical work after state
+loss and rebootstrap.
+
+One canonical body contains only workspace, deployment owner, bootstrap
+generation, target-root object ID, and sorted trigger FIDs. The scanner stores
+the exact root and body by content OID, then CASes one pending body OID and its
+exact successor into the cursor before publishing. It never advances pending
+work. Every fair scheduled turn republishes the stored body, making carrier
+retention and dropped wakes irrelevant to correctness. A zero-trigger page
+advances directly. Preserve notification state across redeployments; state loss
+is an explicit recovery event, never an implicit reinitialization.
 
 `NotificationWorker` resolves and hash-checks the historical event root from
 notification state, authenticates every named event there, then separately
@@ -276,22 +282,27 @@ Message facts carry canonical mention IDs; display text is never parsed. A
 delayed retry therefore honors a later mute, removal, endpoint rotation, or
 event suppression instead of replaying historical authority.
 
-The worker acknowledges carrier work only after FCM accepts every selected
-request, current authority selects no delivery, or an explicit unregistered
-FID or locally malformed sealed endpoint makes a request terminal. Missing
-state, configuration errors, provider failures, and unknown outcomes retry.
-Partial success retries the whole body, so an already accepted request can be
-submitted again. Each installation cell has a stable delivery ID and platform
-collapse ID across retries; the mobile client must deduplicate that ID. FCM
-acceptance is not proof that APNs or Android presented the notification.
+The handler invokes the worker only when the delivered body's SHA-256 equals
+the cursor's sole pending OID. Noncurrent wakes are acknowledged; the scanner
+will republish any work that later becomes current. For current work, missing
+or corrupt historical data retries instead of clearing the cursor. Only after
+FCM accepts every selected request, current authority selects no delivery, or
+an explicit unregistered FID or locally malformed sealed endpoint is terminal
+does the handler CAS to the stored successor. CAS ambiguity is resolved by
+rereading the exact pending OID. Configuration errors, provider failures, and
+unknown outcomes remain pending. A crash after acceptance or partial success
+can resubmit the same request. Each installation cell has a stable delivery ID
+and platform collapse ID; the mobile client must deduplicate it. FCM acceptance
+is not proof that APNs or Android presented the notification.
 
 AWS composes the scanner and worker as separate Lambdas around S3 notification
 state and SQS. Cloudflare composes separate Workers around R2 state and a
 Cloudflare Queue. A full peer can run the same shared scanner and worker with
 filesystem notification state and an in-process carrier. Provider receipts and
-queue metadata carry no repository or endpoint authority. Managed queues have
-finite retention, so notification-state roots must outlive the source queue,
-DLQ, alert response, and bounded redrive horizon.
+queue metadata carry no repository or endpoint authority. Managed queues may
+have finite retention: fair scans recreate wakes from the durable pending
+cursor. The cursor and immutable notification-state objects remain deployment
+continuity and must not be silently discarded.
 
 The preference commands are available now:
 
