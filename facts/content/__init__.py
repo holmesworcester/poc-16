@@ -1,4 +1,4 @@
 """Content fact-family table of contents."""
-from . import chunk, delete, file, message
+from . import chunk, delete, file, message, notification_preference
 
-MODULES = (message, file, chunk, delete)
+MODULES = (message, file, chunk, delete, notification_preference)

@@ -16,6 +16,10 @@ from full_peer.node import FullPeer
 
 
 EXPECTED = {
+    "auth.push_endpoint.list",
+    "auth.push_endpoint.register",
+    "auth.push_endpoint.remove",
+    "auth.push_endpoint.replace",
     "auth.removal.evict",
     "auth.user.join",
     "auth.user.list",
@@ -33,6 +37,9 @@ EXPECTED = {
     "content.message.list",
     "content.message.post",
     "content.message.upload",
+    "content.notification.list",
+    "content.notification.set_channel",
+    "content.notification.set_global",
 }
 
 

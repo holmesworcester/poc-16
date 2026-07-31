@@ -45,6 +45,10 @@ processes or stacks without creating another repository state machine.
     wrapper.
 12. `deploy/` and `adapters/`: shared upload wire/session values, provider
     adaptation, and packaging—never full-peer-local client state.
+13. `facts/auth/push_endpoint.py` and
+    `facts/content/notification_preference.py`, then `notifications/`:
+    authenticated notification state followed by stateless post-publication
+    derivation and provider delivery.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -214,6 +218,73 @@ is reconciled by reading the root. Repeating an already-applied pile returns
 an idempotent result. The source remains immutable staging for provider
 retention, so concurrent workers have no destructive ingress action to race.
 One bad pile cannot wedge a later exact request.
+
+## Mobile notifications
+
+Notifications derive from authenticated state after ordinary publication:
+
+```text
+mobile installation -> sealed push_endpoint fact
+user setting         -> notification_preference fact
+new message          -> family-owned notification trigger
+successful root CAS  -> advisory hint naming the exact root and admitted FIDs
+notification worker  -> authenticated preference/endpoint join -> FCM
+```
+
+An endpoint belongs to one workspace user and mobile installation. It carries
+the selected push-node key and provider mapping, with the FCM target sealed to
+that push node. The plaintext target never enters repository state. Rotation
+publishes the replacement and an ordinary exact deletion of the prior endpoint
+in one pile. Member and device removal make the endpoint unusable through the
+same liveness rules as other facts.
+
+Preferences are shared user state: `none`, `mentions`, or `all` globally, with
+an optional per-channel override or `inherit`. An enrolled device replaces all
+observed values using ordinary exact deletion. Concurrent active values meet
+restrictively, so a concurrent mute wins. With no global preference the default
+is `none`.
+
+The database-free worker pins the exact root named by the hint and follows
+authenticated tree postings rather than scanning all facts:
+
+1. route key to candidate user preferences;
+2. user and cell key to current preference values;
+3. user key to all current endpoint facts.
+
+It opens that root through `RepositoryReader`, validates the postings, and
+checks suppression/liveness through the reader's `WorkerView`. Message facts
+carry canonical mention IDs; display text is never parsed. Each
+`(event, endpoint)` result has a stable delivery ID which the Firebase adapter
+uses as both the Android and Apple collapse key.
+
+SNS, Pub/Sub, or another service may carry or wake work for a publication hint,
+but they hold no authority. Duplicate hints simply derive the same delivery
+IDs. There is no notification outbox, queue evidence, repository callback, or
+second publication path. In particular, a notification cannot be emitted from
+a stale CAS result, and delivery failure cannot block root publication or pile
+retention. Delivery is best-effort unless the deployment supplies a retrying
+hint service. Such retries can submit to the provider more than once, so
+applications must tolerate a duplicate visible notification.
+
+The preference commands are available now:
+
+```sh
+python3 -m full_peer content.notification.set_global WORKSPACE all
+python3 -m full_peer content.notification.set_channel WORKSPACE general none
+python3 -m full_peer content.notification.list WORKSPACE
+python3 -m full_peer auth.push_endpoint.list WORKSPACE
+```
+
+Endpoint registration is intended to be called by mobile integration after it
+obtains notification permission and an FCM installation ID, seals that ID with
+`notifications.seal_target`, and has durable retry state for publishing the
+newest endpoint. Do not pass an unsealed target to the fact command.
+
+Run the deterministic fact, root-CAS, retry, and Firebase-adapter coverage with:
+
+```sh
+python3 -m pytest -q tests/test_notifications.py
+```
 
 ## Facts, suppression, and deletion
 

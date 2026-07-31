@@ -9,7 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_DOCS = {"AGENTS.md", "DESIGN.md", "README.md"}
-SOURCE_ROOTS = ("core", "full_peer", "facts", "adapters", "deploy")
+SOURCE_ROOTS = (
+    "core", "full_peer", "facts", "notifications", "adapters", "deploy")
 EXCLUDED_PARTS = {
     "__pycache__",
     ".pytest_cache",
@@ -188,6 +189,41 @@ def test_core_dispatches_through_facts_without_importing_family_modules():
                         or name.startswith("facts.content."):
                     offenders.append((path.as_posix(), name))
     assert offenders == []
+
+
+def test_repository_core_cannot_own_notification_delivery():
+    """Push is a replayable consequence of a root, never a commit effect."""
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] != "core":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            offenders.extend(
+                (path.as_posix(), name)
+                for name in names
+                if name == "notifications" or name.startswith("notifications."))
+    assert offenders == []
+    assert not (ROOT / "core/delivery_queue.py").exists()
+    applier = (ROOT / "core/repository_applier.py").read_text()
+    assert "publication_effect" not in applier
+    assert "notification" not in applier
+    for name in (
+            "consumer.py",
+            "dispatcher.py",
+            "job.py",
+            "matcher.py",
+            "model.py",
+            "outbox.py",
+            "provider.py",
+            "queue_evidence.py",
+            "target.py"):
+        assert not (ROOT / "notifications" / name).exists()
 
 
 def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():

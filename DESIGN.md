@@ -45,6 +45,8 @@ Each effect has one owner:
 | establish immutable repository objects | `RepositoryApplier` |
 | compile authenticated maps | `repository_snapshot` |
 | compare-and-swap `root` | `RepositoryApplier` |
+| describe notification routing | triggering and preference fact families |
+| derive and deliver notifications | post-publication worker |
 | answer from a pinned root | `RepositoryReader` |
 | assemble local presentation | family queries over disposable SQL |
 
@@ -382,6 +384,57 @@ observation authorizes root mutation. The closed-pile kernel and root CAS do.
 Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
 bytes, clobber a newer root, delete ingress, or corrupt a Merkle tree.
+
+### 5.1 Mobile-notification derivation
+
+Notification preferences and endpoints are authenticated facts. Delivery is a
+post-publication convenience, never repository state, admission evidence, or a
+condition of root publication or source retention:
+
+```text
+closed pile -> RepositoryApplier -> root CAS succeeds
+                                  -> advisory publication hint
+exact pinned root + admitted FIDs -> bounded indexed join -> push provider
+```
+
+`push_endpoint` binds one installation to its owning user and device, selected
+push-node public key, platform, application/environment, and a provider target
+sealed to that push node. The plaintext target is never replicated. Endpoint
+rotation is a new endpoint plus ordinary exact deletion of the old fact; member
+and device liveness determine whether an endpoint is currently usable.
+
+`notification_preference` is user state. A cell is either global or scoped to
+one channel. Any enrolled device for the user may replace its observed values
+using ordinary exact deletion in the same pile. Concurrent active values meet
+restrictively (`none < mentions < all`); channel `inherit` falls back to the
+global value, whose absence means `none`. Preferences do not inherit device
+liveness, so removing one device does not erase the user's shared setting.
+
+A triggering fact family owns a small pure `notification_trigger` hook. Message
+facts carry canonical mentioned-user IDs explicitly; display text is never
+parsed. Families without that hook cannot trigger notifications.
+
+Only a successful `ApplyResult` can be translated into a `PublicationHint`.
+The hint contains the exact root bytes and the admitted FIDs from that result.
+It may be carried by SNS, Pub/Sub, or another wake mechanism, but those systems
+are only liveness hints. They do not select facts, retain ingress, mutate a
+repository, or participate in correctness.
+
+The database-free notification worker opens the hint's exact root through
+`RepositoryReader` and uses its `WorkerView` to follow authenticated route,
+preference-cell, and endpoint postings. It validates every posting and checks
+current suppression/liveness before producing a bounded set of intents. Each
+intent and provider request has a deterministic delivery ID derived from the
+workspace, event, endpoint, and canonical payload. Replaying a hint therefore
+does the same work and exposes the same idempotency key.
+
+There is deliberately no notification outbox, durable delivery queue, queue
+evidence, repository callback, or second pile-to-root path. A CAS loser emits no
+hint, and provider failure cannot hold up or roll back ordinary publication.
+Provider-specific message construction and credentials remain under
+`adapters/`; the fact and repository layers do not import them. Delivery is
+best-effort unless the deployment supplies a retrying hint service, and even
+then provider submission is at least once, so consumers tolerate duplicates.
 
 ## 6. RepositoryReader and sync
 
