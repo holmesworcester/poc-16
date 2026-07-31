@@ -256,14 +256,18 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     seen = {}
 
     monkeypatch.setattr(host, "load_store_factory", lambda path: factory)
+
     def serve(
             directory, port, host_name, cadence, url, *,
             control_port, store_factory, gate_options,
             iroh_binary, iroh_key_file,
-            iroh_loopback):
+            iroh_loopback, notification_enabled,
+            notification_cadence, notification_provider):
         seen["arguments"] = (
             directory, port, host_name, cadence, url, control_port,
-            gate_options, iroh_binary, iroh_key_file, iroh_loopback)
+            gate_options, iroh_binary, iroh_key_file, iroh_loopback,
+            notification_enabled, notification_cadence,
+            notification_provider)
         seen["peer"] = FullPeer(
             directory, initial_secret=secret,
             store_factory=store_factory)
@@ -279,7 +283,8 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
         == bootstrap.store(workspace).get("root")
     assert seen["arguments"][1:3] == (0, "127.0.0.1")
     assert seen["arguments"][6].grant_ttl_ms == 60_000
-    assert seen["arguments"][7:] == (None, None, False)
+    assert seen["arguments"][7:] == (
+        None, None, False, False, 30.0, None)
 
 
 def test_daemon_help_documents_reproducible_s3_r2_config(capsys):
