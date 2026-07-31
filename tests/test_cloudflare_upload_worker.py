@@ -30,6 +30,7 @@ from deploy.upload_session import (
     UploadVector,
 )
 from deploy.upload_wire import encode_open_request
+from full_peer.upload_client import UploadSessionRejected
 from full_peer.upload_client_http import HttpBrokerTransport
 from facts.auth import request as request_fact
 
@@ -40,6 +41,14 @@ READ_SECRET = "reader-secret"
 INGRESS_ACCESS = "parent-access"
 INGRESS_SECRET = "parent-secret"
 SESSION = b"s" * 16
+
+
+class Clock:
+    def __init__(self, value=NOW):
+        self.value = value
+
+    def __call__(self):
+        return self.value
 
 
 def run(awaitable):
@@ -188,9 +197,10 @@ class WorkerResponse:
 
 
 class WorkerOpener:
-    def __init__(self, environment, fetch):
+    def __init__(self, environment, fetch, clock):
         self.environment = environment
         self.fetch = fetch
+        self.clock = clock
         self.requests = []
 
     def __call__(self, request, timeout):
@@ -206,7 +216,7 @@ class WorkerOpener:
             incoming,
             self.environment,
             fetch=self.fetch,
-            clock=lambda: NOW,
+            clock=self.clock,
             nonce=lambda count: (
                 SESSION if count == len(SESSION) else b""),
         ))
@@ -222,7 +232,8 @@ class WorkerOpener:
         return wrapped
 
 
-def world(tmp_path):
+def world(tmp_path, *, clock=None):
+    clock = clock or Clock()
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request_fact.payload(
@@ -232,7 +243,7 @@ def world(tmp_path):
         candidate,
         INGRESS_ACCESS,
         INGRESS_SECRET,
-        clock=lambda: NOW,
+        clock=clock,
     )
     key = SessionKey(
         "key00001", b"k" * 32, 0, NOW + 10_000_000)
@@ -269,7 +280,7 @@ def world(tmp_path):
     canonical = CanonicalFetch(candidate, {
         key: backing.get(key) for key in backing.list("")
     })
-    opener = WorkerOpener(environment, canonical)
+    opener = WorkerOpener(environment, canonical, clock)
     return (
         proof,
         candidate,
@@ -326,6 +337,37 @@ def test_worker_runs_stateless_direct_upload_session_without_provider_bodies(
         for request in canonical.requests)
     assert not hasattr(opener.environment, "CANONICAL")
     assert not hasattr(opener.environment, "INGRESS")
+
+
+def test_cold_workers_retry_only_until_the_open_session_deadline(tmp_path):
+    clock = Clock()
+    proof, _, _, _, transport = world(tmp_path, clock=clock)
+    vector = UploadVector((leaf(b"one object"),))
+    pile = leaf(b"one closed fact pile")
+    opened = transport.open(proof, vector.manifest, pile)
+    issued = transport.issue(
+        opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+
+    # Every request constructs a fresh broker from the Worker bindings. The
+    # cursor, not isolate-local state, preserves retry authority.
+    clock.value = opened.expires_at_ms - 1
+    retried = transport.issue(
+        opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+    finalized = transport.finalize(issued.cursor)
+    assert retried.cursor == issued.cursor
+    assert finalized.expires_at_ms == opened.expires_at_ms
+    assert all(
+        capability.expires_at_ms <= opened.expires_at_ms
+        for capability in (
+            retried.objects[0].capability, finalized.pile.capability)
+    )
+
+    clock.value = opened.expires_at_ms
+    with pytest.raises(UploadSessionRejected):
+        transport.issue(
+            opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+    with pytest.raises(UploadSessionRejected):
+        transport.finalize(issued.cursor)
 
 
 def test_worker_rejects_query_percent_and_oversize_streams_body_free(

@@ -214,7 +214,7 @@ def encode_finalize(result):
 
 
 class UploadBroker:
-    """Authorize a finite, resumable objects-first upload session."""
+    """Authorize one finite fixed-expiry bearer lease from a pinned OPEN."""
 
     def __init__(
             self, store, workspace, signer, now, session_policy, *,
@@ -327,7 +327,7 @@ class UploadBroker:
         return raw.hex()
 
     async def open(self, proof, upload_manifest, pile):
-        """Authorize the closure and return an index-zero cursor, no PUTs."""
+        """Pin current authority and return an index-zero cursor, no PUTs."""
         policy = self.session_policy
         if not valid_manifest(
                 upload_manifest,
@@ -398,7 +398,7 @@ class UploadBroker:
         )
 
     def issue(self, cursor, start_index, leaves, proof):
-        """Issue one verified prefix slice or reissue covered exact keys."""
+        """Issue one lease-confined slice without rereading repository state."""
         trusted_now = self._now()
         state = self._state(cursor, trusted_now)
         try:
@@ -451,7 +451,7 @@ class UploadBroker:
         return result
 
     def finalize(self, cursor):
-        """Issue only the precommitted pile after the entire vector."""
+        """Issue the precommitted pile without extending or rechecking lease."""
         trusted_now = self._now()
         state = self._state(cursor, trusted_now)
         if state.next_index != state.manifest.count \

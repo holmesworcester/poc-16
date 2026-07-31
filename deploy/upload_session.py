@@ -107,7 +107,7 @@ class SessionKey:
 
 @dataclass(frozen=True)
 class UploadSessionPolicy:
-    """Deployment-local issuer, rotation set, lifetime, and hard quotas."""
+    """Issuer, keys, quotas, and fixed maximum authorization staleness."""
 
     issuer: str
     active_key_id: str

@@ -51,6 +51,7 @@ from deploy.upload_session import (
     UploadVector,
 )
 from facts.auth import request
+from .util import add_member
 
 
 NOW = 100_000
@@ -650,6 +651,95 @@ def test_expiry_is_fixed_and_key_window_must_cover_session_plus_skew(
     with pytest.raises(
             UploadUnavailable, match="insufficient lifetime"):
         asyncio.run(blocked.open(proof, vector.manifest, pile()))
+
+
+def test_removal_staleness_is_exactly_one_cold_resumable_lease(tmp_path):
+    """OPEN observes removal; an already-open lease only observes its expiry."""
+    clock = Clock()
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(
+        node, workspace, "bob", ts=10)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+    proof = encode_pile(request.payload(
+        node, workspace, "upload", NOW + 60_000, NOW))
+    signer = RecordingSigner(clock)
+    lease_policy = policy(ttl_ms=100, max_ttl_ms=100)
+    broker = UploadBroker(
+        AsyncFromSyncReader(node.store(workspace)),
+        workspace,
+        signer,
+        clock,
+        lease_policy,
+        nonce=lambda count: SESSION if count == 16 else b"",
+    )
+    vector = UploadVector((leaf(0), leaf(1)))
+    opened = open_session(broker, proof, vector)
+    in_flight = broker.issue(
+        opened.cursor, 0, vector.leaves[:1], vector.proof(0, 1))
+
+    # The current root changes while one exact PUT is in flight. A new OPEN
+    # sees that removal and fails, but the old cursor is a deliberately bounded
+    # bearer lease rather than a broker-side membership record.
+    node.bind_identity(workspace, founder)
+    facts.auth.removal.evict(node, workspace, bob)
+    with pytest.raises(InvalidUploadSession, match="authorization"):
+        asyncio.run(broker.open(proof, vector.manifest, pile()))
+
+    class NoRepositoryReads:
+        async def get_bounded(self, _key, _maximum):
+            raise AssertionError("ISSUE/FINALIZE rechecked repository state")
+
+    def cold():
+        return UploadBroker(
+            NoRepositoryReads(),
+            workspace,
+            signer,
+            clock,
+            lease_policy,
+            nonce=lambda count: SESSION if count == 16 else b"",
+        )
+
+    # Lost ISSUE responses may be retried through cold instances. Both
+    # instances can only sign the exact precommitted staging address.
+    clock.value = opened.expires_at_ms - 1
+    retried = cold().issue(
+        opened.cursor, 0, vector.leaves[:1], vector.proof(0, 1))
+    issued = cold().issue(
+        in_flight.cursor, 1, vector.leaves[1:], vector.proof(1, 2))
+    finalized = cold().finalize(issued.cursor)
+    assert retried.cursor == in_flight.cursor
+    assert grant_keys(retried) == grant_keys(in_flight)
+    assert in_flight.expires_at_ms == issued.expires_at_ms \
+        == finalized.expires_at_ms \
+        == opened.expires_at_ms
+    grants = (*in_flight.objects, *issued.objects, finalized.pile)
+    assert all(
+        grant.capability.expires_at_ms <= opened.expires_at_ms
+        for grant in grants
+    )
+    assert all(
+        put.not_after_ms == opened.expires_at_ms for put in signer.puts)
+    assert all(
+        put.key.startswith(
+            f"ingress/v1/workspaces/{workspace}/")
+        and "/root" not in put.key
+        and "/applier/" not in put.key
+        for put in signer.puts
+    )
+
+    # The lease uses a half-open time interval. Neither retry nor pile
+    # finalization can stretch it by one millisecond.
+    for trusted_now in (
+            opened.expires_at_ms, opened.expires_at_ms + 1):
+        clock.value = trusted_now
+        with pytest.raises(InvalidUploadSession, match="cursor"):
+            cold().issue(
+                opened.cursor, 0, vector.leaves[:1], vector.proof(0, 1))
+        with pytest.raises(InvalidUploadSession, match="cursor"):
+            cold().finalize(issued.cursor)
 
 
 class StaticSigner:

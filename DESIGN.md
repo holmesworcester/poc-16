@@ -453,6 +453,24 @@ rescans are the progress path. Missing attachments do not block fact
 validation; detached completion uses immutable page receipts and a
 non-authoritative cursor.
 
+The broker grants one fixed-expiry resumable authorization lease. `OPEN`
+alone reads a pinned `RepositoryReader` snapshot and proves current upload
+authority. Its authenticated cursor fixes workspace, uploader path component,
+provider, finite source commitment, progress, quotas, issue time, and expiry.
+`ISSUE` and `FINALIZE` perform no later liveness lookup: they accept only an
+unmodified cursor, a monotonic committed prefix, remaining quota, and trusted
+time strictly before that expiry. A removal committed before `OPEN` denies the
+lease; one committed after `OPEN` cannot revoke already-issued provider
+requests and therefore takes effect for this path no later than the lease
+expiry. Each provider request has its own immutable deadline no later than the
+same expiry. Restart, retry, key-ring rotation, notification delay, and a
+changed default TTL cannot extend an existing lease.
+
+This cursor is ingress authority only. It cannot address canonical objects,
+`root`, or an Applier internal generation, and the broker never turns its
+pinned observation into admission state. `RepositoryApplier` independently
+verifies staged bytes and the closed pile before the sole root CAS.
+
 ## 9. Object-store contract
 
 The database-free engine requires:

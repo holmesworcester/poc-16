@@ -344,6 +344,18 @@ canonical credentials and exposes only exact create-only ingress PUT grants;
 it has no repository mutation route. The Applier alone can mutate the
 canonical bucket.
 
+Upload authorization has one explicit staleness bound. `OPEN` reads one
+pinned repository root and checks the uploader's current authority. A
+successful `OPEN` exchanges that observation for one bearer lease whose fixed
+expiry is the key-ring session TTL after the broker's trusted time. `ISSUE`
+and `FINALIZE` verify the authenticated cursor, monotonic prefix, quotas, and
+that same deadline; they do not reread liveness and cannot extend the lease.
+Thus removal before a new `OPEN` denies it, while removal after `OPEN` leaves
+only the already-confined session usable until expiry. Every exact provider
+PUT expires no later than the session. Neither the cursor nor a successful PUT
+is repository admission: the Applier still validates the pile and owns the
+only root CAS.
+
 ## Object-store contract
 
 The algorithm depends on properties available from current S3 and R2

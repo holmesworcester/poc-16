@@ -28,6 +28,7 @@ from deploy.upload_broker import (
 from deploy.upload_broker_http import UploadBrokerEndpoint
 from deploy.upload_wire import UploadCapability
 from full_peer.upload_client_http import HttpBrokerTransport
+from full_peer.upload_client import UploadSessionRejected
 from deploy.upload_keyring import UploadKeyring, encode_keyring
 from deploy.upload_session import (
     SessionKey,
@@ -42,6 +43,14 @@ NOW = 5_000_000
 SESSION = b"s" * 16
 PROVIDER = "fake-aws-lambda-ingress-v1"
 KEY = SessionKey("key00001", b"k" * 32, 0, NOW + 10_000_000)
+
+
+class Clock:
+    def __init__(self, value=NOW):
+        self.value = value
+
+    def __call__(self):
+        return self.value
 
 
 class CanonicalStore:
@@ -61,7 +70,8 @@ class CanonicalStore:
 class Signer:
     provider_binding = PROVIDER
 
-    def __init__(self):
+    def __init__(self, clock=None):
+        self.clock = clock or (lambda: NOW)
         self.puts = []
 
     def sign(self, put):
@@ -75,7 +85,7 @@ class Signer:
                 ("content-type", put.content_type),
                 ("if-none-match", "*"),
             ),
-            min(NOW + 60_000, put.not_after_ms),
+            min(self.clock() + 60_000, put.not_after_ms),
         )
 
 
@@ -145,7 +155,8 @@ def function_event(
     }
 
 
-def world(tmp_path, monkeypatch):
+def world(tmp_path, monkeypatch, *, clock=None):
+    clock = clock or Clock()
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request.payload(
@@ -154,12 +165,12 @@ def world(tmp_path, monkeypatch):
     store = CanonicalStore({
         key: backing.get(key) for key in backing.list("")
     })
-    signer = Signer()
+    signer = Signer(clock)
     broker = UploadBroker(
         store,
         workspace,
         signer,
-        lambda: NOW,
+        clock,
         UploadSessionPolicy(
             "aws-lambda-upload-test",
             KEY.key_id,
@@ -227,6 +238,39 @@ def test_function_url_runs_complete_direct_upload_session(
     for raw in (*objects, b"one closed fact pile"):
         assert all(raw not in body for body in decoded_requests)
     assert all(not hasattr(put, "body") for put in signer.puts)
+
+
+def test_lambda_retries_only_until_the_open_session_deadline(
+        tmp_path, monkeypatch):
+    clock = Clock()
+    proof, signer, _, transport = world(
+        tmp_path, monkeypatch, clock=clock)
+    vector = UploadVector((leaf(b"one object"),))
+    pile = leaf(b"one closed fact pile")
+    opened = transport.open(proof, vector.manifest, pile)
+    issued = transport.issue(
+        opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+
+    clock.value = opened.expires_at_ms - 1
+    retried = transport.issue(
+        opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+    finalized = transport.finalize(issued.cursor)
+    assert retried.cursor == issued.cursor
+    assert finalized.expires_at_ms == opened.expires_at_ms
+    assert all(
+        put.not_after_ms == opened.expires_at_ms for put in signer.puts)
+    assert all(
+        capability.expires_at_ms <= opened.expires_at_ms
+        for capability in (
+            retried.objects[0].capability, finalized.pile.capability)
+    )
+
+    clock.value = opened.expires_at_ms
+    with pytest.raises(UploadSessionRejected):
+        transport.issue(
+            opened.cursor, 0, vector.leaves, vector.proof(0, 1))
+    with pytest.raises(UploadSessionRejected):
+        transport.finalize(issued.cursor)
 
 
 class BombEndpoint:
