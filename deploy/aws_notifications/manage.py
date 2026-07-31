@@ -21,13 +21,17 @@ from .config import (
     DEPLOYMENT_ID_TAG,
     DEPLOYMENT_MARKER,
     DEPLOYMENT_TAG,
+    DIRECT_SMOKE_RESULT_SCHEMA,
+    DIRECT_SMOKE_SCHEMA,
+    DLQ_RETENTION_SECONDS,
     KMS_KEY_ARN_RE,
     MAX_RECEIVE_COUNT,
-    MIN_STATE_RETENTION_DAYS,
     OWNER_RE,
-    SCAN_WAKE_SCHEMA,
+    QUEUE_RETENTION_SECONDS,
     SECRET_ARN_RE,
+    SECRET_VERSION_RE,
 )
+from .secret import decode_secret, push_node_id
 
 
 HERE = Path(__file__).resolve().parent
@@ -63,6 +67,7 @@ DEPLOY_FILES = (
     "deploy/aws_notifications/__init__.py",
     "deploy/aws_notifications/app.py",
     "deploy/aws_notifications/config.py",
+    "deploy/aws_notifications/secret.py",
 )
 
 
@@ -117,6 +122,7 @@ def verify_stage(directory):
         "adapters/s3/store.py",
         "core/repository_reader.py",
         "deploy/aws_notifications/app.py",
+        "deploy/aws_notifications/secret.py",
         "facts/auth/push_endpoint.py",
         "notifications/discovery.py",
         "notifications/hints.py",
@@ -170,12 +176,6 @@ def _provider_flags(args):
     return flags
 
 
-def _prefixes_overlap(left, right):
-    left, right = left.rstrip("/"), right.rstrip("/")
-    return left == right or left.startswith(right + "/") \
-        or right.startswith(left + "/")
-
-
 def _optional_arn(value, pattern, label):
     if value is not None and value != "" and pattern.fullmatch(value) is None:
         raise ValueError(label)
@@ -206,11 +206,13 @@ def _validated(args):
         prefix=args.state_prefix,
         expected_bucket_owner=args.expected_owner,
     )
-    if args.canonical_bucket == args.state_bucket \
-            and _prefixes_overlap(args.canonical_prefix, args.state_prefix):
-        raise ValueError("canonical and notification-state prefixes overlap")
+    if args.canonical_bucket == args.state_bucket:
+        raise ValueError("notification state requires a dedicated bucket")
     if SECRET_ARN_RE.fullmatch(args.notification_secret_arn or "") is None:
         raise ValueError("notification secret ARN")
+    if SECRET_VERSION_RE.fullmatch(
+            args.notification_secret_version_id or "") is None:
+        raise ValueError("notification secret version ID")
     for name, label in (
             ("repository_kms_key_arn", "repository KMS key ARN"),
             ("state_kms_key_arn", "notification-state KMS key ARN"),
@@ -227,9 +229,6 @@ def _validated(args):
     if type(args.max_receive_count) is not int \
             or not MAX_RECEIVE_COUNT <= args.max_receive_count <= 100:
         raise ValueError("notification max receive count")
-    if type(args.state_retention_days) is not int \
-            or args.state_retention_days < MIN_STATE_RETENTION_DAYS:
-        raise ValueError("notification-state retention")
     if not isinstance(args.schedule, str) or len(args.schedule) > 256 \
             or not args.schedule.startswith(("rate(", "cron(")) \
             or not args.schedule.endswith(")"):
@@ -274,11 +273,95 @@ def _caller_account(args):
     return account
 
 
+def _verify_state_lifecycle(args):
+    """Fail closed unless the dedicated state bucket has no expiration."""
+    try:
+        result = _run([
+            "aws", "s3api", "get-bucket-lifecycle-configuration",
+            "--bucket", args.state_bucket,
+            "--expected-bucket-owner", args.expected_owner,
+            "--output", "json",
+            *_provider_flags(args),
+        ], capture=True)
+    except subprocess.CalledProcessError as error:
+        detail = " ".join(value for value in (
+            error.stdout, error.stderr) if isinstance(value, str))
+        if "NoSuchLifecycleConfiguration" in detail:
+            return
+        raise RuntimeError(
+            "cannot verify notification-state bucket lifecycle") from error
+    try:
+        rules = json.loads(result.stdout)["Rules"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "malformed notification-state bucket lifecycle") from error
+    if not isinstance(rules, list) or not all(
+            isinstance(rule, dict) for rule in rules):
+        raise RuntimeError("malformed notification-state bucket lifecycle")
+    for rule in rules:
+        if rule.get("Status") not in {"Enabled", "Disabled"}:
+            raise RuntimeError(
+                "malformed notification-state bucket lifecycle")
+        if rule["Status"] == "Enabled" and any(
+                name in rule for name in (
+                    "Expiration", "NoncurrentVersionExpiration")):
+            raise RuntimeError(
+                "notification-state bucket has enabled expiration")
+
+
+def _secret_binding(args):
+    """Read and verify exactly the secret version the stack will use."""
+    result = _run([
+        "aws", "secretsmanager", "get-secret-value",
+        "--secret-id", args.notification_secret_arn,
+        "--version-id", args.notification_secret_version_id,
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True)
+    try:
+        response = json.loads(result.stdout)
+        if response.get("ARN") != args.notification_secret_arn \
+                or response.get("VersionId") \
+                != args.notification_secret_version_id:
+            raise ValueError
+        secret, _rows = decode_secret(response.get("SecretString"))
+        return push_node_id(secret)
+    except (AttributeError, RuntimeError, TypeError, ValueError,
+            json.JSONDecodeError):
+        raise RuntimeError("invalid pinned notification secret") from None
+
+
 def _outputs(stack):
     return {
         row.get("OutputKey"): row.get("OutputValue")
         for row in stack.get("Outputs", ()) if isinstance(row, dict)
     }
+
+
+def _binding(args, push_node):
+    return {
+        "WorkspaceId": args.workspace,
+        "CanonicalBucketName": args.canonical_bucket,
+        "CanonicalPrefix": args.canonical_prefix,
+        "NotificationStateBucketName": args.state_bucket,
+        "NotificationStatePrefix": args.state_prefix,
+        "ExpectedBucketOwner": args.expected_owner,
+        "NotificationSecretArn": args.notification_secret_arn,
+        "NotificationSecretVersionId": args.notification_secret_version_id,
+        "PushNodeId": push_node,
+        "RepositoryKmsKeyArn": args.repository_kms_key_arn or "",
+        "NotificationStateKmsKeyArn": args.state_kms_key_arn or "",
+        "NotificationSecretKmsKeyArn": args.secret_kms_key_arn or "",
+    }
+
+
+def _check_binding(outputs, expected):
+    changed = sorted(
+        name for name, value in expected.items()
+        if outputs.get(name) != value)
+    if changed:
+        raise RuntimeError(
+            "immutable notification binding differs: " + ", ".join(changed))
 
 
 def _checked_queues(args, outputs):
@@ -297,6 +380,12 @@ def _checked_queues(args, outputs):
     )
     if source == dead:
         raise RuntimeError("notification source and DLQ must differ")
+    if outputs.get("NotificationQueueRetentionSeconds") \
+            != str(QUEUE_RETENTION_SECONDS) \
+            or outputs.get("NotificationDeadLetterRetentionSeconds") \
+            != str(DLQ_RETENTION_SECONDS) \
+            or not QUEUE_RETENTION_SECONDS < DLQ_RETENTION_SECONDS:
+        raise RuntimeError("notification queue retention binding")
     return outputs
 
 
@@ -343,32 +432,45 @@ def _stack_for_deploy(args):
     if args.create:
         if incumbent is not None:
             raise RuntimeError("create requires an absent stack name")
-        return args.stack_name, bool(args.enable)
+        return (
+            args.stack_name,
+            bool(args.enable),
+            bool(args.direct_smoke),
+            None,
+        )
     if incumbent is None:
         raise RuntimeError("update requires an existing owned stack")
     owned = _owned_stack(args, incumbent)
-    enabled = _outputs(owned).get("Enabled")
-    if enabled not in {"true", "false"}:
-        raise RuntimeError("notification stack has no enabled state")
-    return owned["StackId"], (
-        enabled == "true" if args.enable is None else args.enable)
+    outputs = _outputs(owned)
+    switches = []
+    for output, selected in (
+            ("Enabled", args.enable),
+            ("DirectSmokeEnabled", args.direct_smoke)):
+        incumbent = outputs.get(output)
+        if incumbent not in {"true", "false"}:
+            raise RuntimeError("notification stack has no traffic state")
+        switches.append(
+            incumbent == "true" if selected is None else selected)
+    return owned["StackId"], *switches, outputs
 
 
-def _parameters(args, enabled=None):
-    enabled = bool(args.enable) if enabled is None else enabled
-    if type(enabled) is not bool:
-        raise TypeError("notification enabled state")
+def _parameters(args, enabled, direct_smoke, push_node):
+    if type(enabled) is not bool or type(direct_smoke) is not bool \
+            or not valid_fid(push_node):
+        raise TypeError("notification deployment state")
     return (
         f"Enabled={'true' if enabled else 'false'}",
+        f"DirectSmokeEnabled={'true' if direct_smoke else 'false'}",
         f"DeploymentId={args.deployment_id}",
         f"WorkspaceId={args.workspace}",
         f"CanonicalBucketName={args.canonical_bucket}",
         f"CanonicalPrefix={args.canonical_prefix}",
         f"NotificationStateBucketName={args.state_bucket}",
         f"NotificationStatePrefix={args.state_prefix}",
-        f"NotificationStateMinimumRetentionDays={args.state_retention_days}",
         f"ExpectedBucketOwner={args.expected_owner}",
         f"NotificationSecretArn={args.notification_secret_arn}",
+        f"NotificationSecretVersionId={args.notification_secret_version_id}",
+        f"PushNodeId={push_node}",
         f"RepositoryKmsKeyArn={args.repository_kms_key_arn or ''}",
         f"NotificationStateKmsKeyArn={args.state_kms_key_arn or ''}",
         f"NotificationSecretKmsKeyArn={args.secret_kms_key_arn or ''}",
@@ -383,7 +485,12 @@ def _parameters(args, enabled=None):
 def deploy(args):
     """Create disabled; updates preserve state without an explicit switch."""
     args = _validated(args)
-    target, enabled = _stack_for_deploy(args)
+    target, enabled, direct_smoke_enabled, incumbent = _stack_for_deploy(args)
+    push_node = _secret_binding(args)
+    binding = _binding(args, push_node)
+    if incumbent is not None:
+        _check_binding(incumbent, binding)
+    _verify_state_lifecycle(args)
     build(args)
     _run([
         "sam", "deploy",
@@ -392,17 +499,18 @@ def deploy(args):
         "--capabilities", "CAPABILITY_IAM",
         "--resolve-s3",
         "--no-fail-on-empty-changeset",
-        "--parameter-overrides", *_parameters(args, enabled),
+        "--parameter-overrides", *_parameters(
+            args, enabled, direct_smoke_enabled, push_node),
         "--tags",
         f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}",
         f"{DEPLOYMENT_ID_TAG}={args.deployment_id}",
         *_provider_flags(args),
     ])
     outputs = _outputs(_owned_stack(args))
-    if outputs.get("WorkspaceId") != args.workspace \
-            or outputs.get("Enabled") != ("true" if enabled else "false") \
-            or outputs.get("NotificationStateMinimumRetentionDays") \
-            != str(args.state_retention_days):
+    _check_binding(outputs, binding)
+    if outputs.get("Enabled") != ("true" if enabled else "false") \
+            or outputs.get("DirectSmokeEnabled") \
+            != ("true" if direct_smoke_enabled else "false"):
         raise RuntimeError("deployed notification outputs are incomplete")
     _checked_queues(args, outputs)
     return outputs
@@ -415,10 +523,14 @@ def remove(args):
     stack = _owned_stack(args)
     outputs = _outputs(stack)
     _checked_queues(args, outputs)
-    if not args.discard_pending:
+    if not args.destroy_carrier:
         raise RuntimeError(
-            "refusing to delete the durable notification carrier; first "
-            "disable or redrive it, then explicitly pass --discard-pending")
+            "refusing to delete the notification carrier; explicitly pass "
+            "--destroy-carrier after disabling the deployment")
+    if outputs.get("Enabled") != "false" \
+            or outputs.get("DirectSmokeEnabled") != "false":
+        raise RuntimeError(
+            "disable production and direct-smoke invocation before removal")
     flags = _provider_flags(args)
     _run([
         "aws", "cloudformation", "delete-stack",
@@ -435,8 +547,8 @@ def redrive(args):
     if not 1 <= args.max_per_second <= 500:
         raise ValueError("redrive rate")
     outputs = _outputs(_owned_stack(args))
-    if outputs.get("Enabled") != "true":
-        raise RuntimeError("notification deployment is disabled")
+    if outputs.get("Enabled") != "false":
+        raise RuntimeError("disable notification delivery before redrive")
     _checked_queues(args, outputs)
     result = _run([
         "aws", "sqs", "start-message-move-task",
@@ -484,36 +596,35 @@ def _invoke(args, function, payload):
     return response
 
 
-def live_smoke(args):
-    """Opt-in scanner plus real Firebase attempt for an operator-owned hint."""
+def direct_smoke(args):
+    """Directly prove current authority plus at least one FCM acceptance."""
     outputs = _outputs(_owned_stack(args))
-    if outputs.get("Enabled") != "true":
-        raise RuntimeError("notification deployment is disabled")
-    _checked_queues(args, outputs)
+    if outputs.get("DirectSmokeEnabled") != "true":
+        raise RuntimeError("notification direct smoke is disabled")
     raw = Path(args.hint_file).read_bytes()
     hint = decode_hint(raw)
     if hint.workspace != outputs.get("WorkspaceId"):
-        raise ValueError("live-smoke hint workspace")
-    scan = _invoke(
-        args,
-        outputs["NotificationScannerFunctionArn"],
-        {"schema": SCAN_WAKE_SCHEMA, "workspace": hint.workspace},
-    )
-    arn = outputs["NotificationQueueArn"]
-    delivery = _invoke(
+        raise ValueError("direct-smoke hint workspace")
+    response = _invoke(
         args,
         outputs["NotificationDeliveryFunctionArn"],
-        {"Records": [{
-            "attributes": {"ApproximateReceiveCount": "1"},
+        {
             "body": base64.b64encode(raw).decode("ascii"),
-            "eventSource": "aws:sqs",
-            "eventSourceARN": arn,
-            "messageId": "operator-live-smoke",
-        }]},
+            "schema": DIRECT_SMOKE_SCHEMA,
+        },
     )
-    if delivery != {"batchItemFailures": []}:
-        raise RuntimeError("live Firebase smoke was not accepted")
-    return {"scanner": scan, "delivery": delivery}
+    if not isinstance(response, dict) or set(response) != {
+            "accepted_count", "retry_count", "schema", "terminal_count"} \
+            or response.get("schema") != DIRECT_SMOKE_RESULT_SCHEMA \
+            or any(type(response.get(name)) is not int
+                   or response[name] < 0 for name in (
+                       "accepted_count", "retry_count", "terminal_count")) \
+            or response["accepted_count"] < 1 \
+            or response["retry_count"] != 0 \
+            or response["terminal_count"] != 0:
+        raise RuntimeError(
+            "direct Firebase smoke proved no clean provider acceptance")
+    return response
 
 
 def _identity_arguments(command):
@@ -537,13 +648,10 @@ def parser():
     deploy_command.add_argument("--canonical-prefix", required=True)
     deploy_command.add_argument("--state-bucket", required=True)
     deploy_command.add_argument("--state-prefix", required=True)
-    deploy_command.add_argument(
-        "--state-retention-days", type=int, default=30,
-        help=("assert the external state lifecycle preserves objects through "
-              "queue, DLQ, alert, and one redrive (minimum 30 days)"),
-    )
     deploy_command.add_argument("--expected-owner", required=True)
     deploy_command.add_argument("--notification-secret-arn", required=True)
+    deploy_command.add_argument(
+        "--notification-secret-version-id", required=True)
     deploy_command.add_argument("--repository-kms-key-arn")
     deploy_command.add_argument("--state-kms-key-arn")
     deploy_command.add_argument("--secret-kms-key-arn")
@@ -559,16 +667,24 @@ def parser():
     traffic.add_argument(
         "--disable", dest="enable", action="store_const", const=False)
     deploy_command.set_defaults(enable=None)
+    smoke = deploy_command.add_mutually_exclusive_group()
+    smoke.add_argument(
+        "--enable-smoke", dest="direct_smoke",
+        action="store_const", const=True)
+    smoke.add_argument(
+        "--disable-smoke", dest="direct_smoke",
+        action="store_const", const=False)
+    deploy_command.set_defaults(direct_smoke=None)
     mode = deploy_command.add_mutually_exclusive_group(required=True)
     mode.add_argument("--create", action="store_true")
     mode.add_argument("--update", action="store_true")
     remove_command = commands.add_parser("remove")
     _identity_arguments(remove_command)
-    remove_command.add_argument("--discard-pending", action="store_true")
+    remove_command.add_argument("--destroy-carrier", action="store_true")
     redrive_command = commands.add_parser("redrive")
     _identity_arguments(redrive_command)
     redrive_command.add_argument("--max-per-second", type=int, default=10)
-    smoke_command = commands.add_parser("live-smoke")
+    smoke_command = commands.add_parser("direct-smoke")
     _identity_arguments(smoke_command)
     smoke_command.add_argument("--hint-file", required=True)
     return result
@@ -593,7 +709,7 @@ def main(argv=None):
     elif args.command == "redrive":
         print(redrive(args))
     else:
-        print(json.dumps(live_smoke(args), sort_keys=True))
+        print(json.dumps(direct_smoke(args), sort_keys=True))
     return 0
 
 

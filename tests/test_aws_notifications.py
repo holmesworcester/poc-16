@@ -9,7 +9,7 @@ from types import ModuleType
 
 import facts
 import pytest
-from core.crypto import h, keypair
+from core.crypto import h, keypair, load_sk
 from core.store import FsStore
 from facts.auth import push_endpoint
 from facts.auth.device import bind
@@ -31,6 +31,10 @@ from notifications.hints import (
 from notifications.worker import NotificationWorker
 from adapters.aws import SqsCarrier
 from deploy.aws_notifications import app
+from deploy.aws_notifications.config import (
+    DIRECT_SMOKE_RESULT_SCHEMA,
+    DIRECT_SMOKE_SCHEMA,
+)
 
 
 ARN = "arn:aws:sqs:us-west-2:123456789012:poc16-notifications"
@@ -67,22 +71,82 @@ def test_scanner_state_store_is_separate_conditional_s3_namespace(
     assert captured == [canonical, state]
 
 
+def test_cursor_owner_binds_the_complete_semantic_deployment(monkeypatch):
+    values = {
+        "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": "canonical-bucket",
+        "TINYP2P_NOTIFICATION_CANONICAL_PREFIX": "canonical/workspace",
+        "TINYP2P_NOTIFICATION_DEPLOYMENT_ID": "notify-west",
+        "TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER": "123456789012",
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID": "b" * 64,
+        "TINYP2P_NOTIFICATION_SECRET_ARN": "secret-arn",
+        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID": "v" * 32,
+        "TINYP2P_NOTIFICATION_STATE_BUCKET": "notification-state",
+        "TINYP2P_NOTIFICATION_STATE_PREFIX": "notification/workspace",
+        "TINYP2P_NOTIFICATION_WORKSPACE_ID": "a" * 64,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    baseline = app._notification_owner()
+
+    for name, value in values.items():
+        changed = "c" * 64 if name.endswith((
+            "PUSH_NODE_ID", "WORKSPACE_ID")) else value + "-changed"
+        if name.endswith("EXPECTED_BUCKET_OWNER"):
+            changed = "210987654321"
+        monkeypatch.setenv(name, changed)
+        assert app._notification_owner() != baseline
+        monkeypatch.setenv(name, value)
+
+
 def test_secret_parse_failures_never_echo_secret_material(monkeypatch):
     material = "private-key-must-not-appear"
+    version = "a" * 32
+    arn = (
+        "arn:aws:secretsmanager:us-west-2:123456789012:"
+        "secret:poc16/notification-AbCdEf")
+    requests = []
 
     class Secrets:
-        def get_secret_value(self, **_request):
-            return {"SecretString": material}
+        def get_secret_value(self, **request):
+            requests.append(request)
+            return {
+                "ARN": arn,
+                "SecretString": material,
+                "VersionId": version,
+            }
 
-    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", (
-        "arn:aws:secretsmanager:us-west-2:123456789012:"
-        "secret:poc16/notification-AbCdEf"))
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", arn)
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_VERSION_ID", version)
     try:
-        app._secret_document(Secrets())
+        app._secret(Secrets())
     except RuntimeError as error:
         assert material not in str(error)
+        assert material not in "".join(traceback.format_exception(error))
     else:
         raise AssertionError("malformed secret was accepted")
+    assert requests == [{"SecretId": arn, "VersionId": version}]
+
+
+def test_secret_response_cannot_substitute_another_version(monkeypatch):
+    arn = (
+        "arn:aws:secretsmanager:us-west-2:123456789012:"
+        "secret:poc16/notification-AbCdEf")
+    requested = "a" * 32
+
+    class Secrets:
+        def get_secret_value(self, **request):
+            assert request == {"SecretId": arn, "VersionId": requested}
+            return {
+                "ARN": arn,
+                "SecretString": "private-material",
+                "VersionId": "b" * 32,
+            }
+
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_SECRET_ARN", arn)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID", requested)
+    with pytest.raises(RuntimeError, match="secret binding"):
+        app._secret(Secrets())
 
 
 def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
@@ -108,9 +172,13 @@ def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
     monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
     monkeypatch.setitem(sys.modules, "boto3", boto3)
     monkeypatch.setattr(app, "_sdk_config", lambda: object())
-    monkeypatch.setattr(app, "_secret_document", lambda _client: {
-        "push_node_seed": "11" * 32,
-        "firebase_apps": [
+    push_secret = load_sk("11" * 32)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
+        push_secret.verify_key.encode().hex())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        push_secret,
+        (
             {
                 "application": "poc16.mobile",
                 "environment": "production",
@@ -121,8 +189,8 @@ def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
                 "environment": "staging",
                 "credential": {"project_id": "two"},
             },
-        ],
-    })
+        ),
+    ))
 
     with pytest.raises(
             RuntimeError, match="notification Firebase initialization") \
@@ -153,14 +221,18 @@ def test_firebase_credential_exception_is_redacted(monkeypatch):
     monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
     monkeypatch.setitem(sys.modules, "boto3", boto3)
     monkeypatch.setattr(app, "_sdk_config", lambda: object())
-    monkeypatch.setattr(app, "_secret_document", lambda _client: {
-        "push_node_seed": "11" * 32,
-        "firebase_apps": [{
+    push_secret = load_sk("11" * 32)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
+        push_secret.verify_key.encode().hex())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        push_secret,
+        ({
             "application": "poc16.mobile",
             "environment": "production",
             "credential": {"private_key": private},
-        }],
-    })
+        },),
+    ))
 
     with pytest.raises(
             RuntimeError, match="notification Firebase initialization") \
@@ -169,6 +241,30 @@ def test_firebase_credential_exception_is_redacted(monkeypatch):
 
     assert private not in str(caught.value)
     assert private not in "".join(traceback.format_exception(caught.value))
+
+
+def test_runtime_rejects_push_identity_different_from_stack(monkeypatch):
+    firebase = ModuleType("firebase_admin")
+    credentials = ModuleType("firebase_admin.credentials")
+    boto3 = ModuleType("boto3")
+    firebase.credentials = credentials
+    boto3.client = lambda *_args, **_kwargs: object()
+    monkeypatch.setitem(sys.modules, "firebase_admin", firebase)
+    monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setattr(app, "_sdk_config", lambda: object())
+    monkeypatch.setattr(app, "_secret", lambda _client: (
+        load_sk("11" * 32),
+        ({
+            "application": "poc16.mobile",
+            "credential": {},
+            "environment": "production",
+        },),
+    ))
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_PUSH_NODE_ID", "b" * 64)
+
+    with pytest.raises(RuntimeError, match="push-node identity"):
+        app._push_provider()
 
 
 class Queue:
@@ -557,3 +653,75 @@ def test_unregistered_fid_is_terminal_but_missing_event_root_retries(
     assert missing == {
         "batchItemFailures": [{"itemIdentifier": "work"}],
     }
+
+
+def _smoke_event(raw):
+    return {
+        "body": base64.b64encode(raw).decode("ascii"),
+        "schema": DIRECT_SMOKE_SCHEMA,
+    }
+
+
+def test_direct_smoke_reports_only_clean_aggregate_acceptance(tmp_path):
+    node, workspace, secret, _event, state, raw = _world(tmp_path)
+
+    result = asyncio.run(app.direct_smoke(
+        _smoke_event(raw),
+        state=state,
+        worker=_worker(node, secret, Push([])),
+        workspace=workspace,
+    ))
+
+    assert result == {
+        "accepted_count": 1,
+        "retry_count": 0,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": 0,
+    }
+    assert not any("fid" in name or "id" in name for name in result)
+
+
+def test_direct_smoke_distinguishes_no_recipient_retry_and_terminal(
+        tmp_path):
+    muted, workspace, secret, _event, state, raw = _world(
+        tmp_path / "muted")
+    preference.set_global(muted, workspace, preference.NONE, ts=5)
+    no_recipient = asyncio.run(app.direct_smoke(
+        _smoke_event(raw), state=state,
+        worker=_worker(muted, secret, Push([])), workspace=workspace))
+
+    retry_node, retry_workspace, retry_secret, _event, retry_state, retry_raw \
+        = _world(tmp_path / "retry")
+    retry = asyncio.run(app.direct_smoke(
+        _smoke_event(retry_raw), state=retry_state,
+        worker=_worker(
+            retry_node, retry_secret, Push([PushRetryable("quota")])),
+        workspace=retry_workspace))
+
+    bad_node, bad_workspace, bad_secret, _event, bad_state, bad_raw = _world(
+        tmp_path / "invalid", invalid_endpoint=True)
+    terminal = asyncio.run(app.direct_smoke(
+        _smoke_event(bad_raw), state=bad_state,
+        worker=_worker(bad_node, bad_secret, Push([])),
+        workspace=bad_workspace))
+
+    assert no_recipient == {
+        "accepted_count": 0,
+        "retry_count": 0,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": 0,
+    }
+    assert retry["retry_count"] == 1
+    assert retry["accepted_count"] == retry["terminal_count"] == 0
+    assert terminal["terminal_count"] == 1
+    assert terminal["accepted_count"] == terminal["retry_count"] == 0
+
+
+def test_direct_smoke_handler_is_separately_disabled(monkeypatch):
+    monkeypatch.delenv(
+        "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED", raising=False)
+    with pytest.raises(RuntimeError, match="direct smoke is disabled"):
+        app.delivery_handler({
+            "body": base64.b64encode(b"hint").decode("ascii"),
+            "schema": DIRECT_SMOKE_SCHEMA,
+        }, None)

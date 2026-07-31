@@ -142,9 +142,9 @@ class NotificationWorker:
         )
 
 
-async def handle_carrier_delivery(
+async def process_carrier_delivery(
         delivery, workspace, notification_state, worker):
-    """Resolve one canonical carrier body through the shared worker path.
+    """Resolve one canonical carrier body into a typed worker result.
 
     The trusted deployment supplies ``workspace`` and a read-only
     notification-state capability.  Carrier metadata is never authority.
@@ -158,23 +158,30 @@ async def handle_carrier_delivery(
     try:
         reference = decode_hint(delivery.body)
     except (TypeError, ValueError):
-        return CARRIER_ACK
+        return WorkerResult(TERMINAL, reason="invalid-carrier-hint")
     if reference.workspace != workspace:
-        return CARRIER_ACK
+        return WorkerResult(TERMINAL, reason="foreign-workspace")
     try:
         raw = await _resolve(read(
             "obj/" + reference.root_oid, MAX_ROOT_BYTES))
     except PayloadTooLarge:
-        return CARRIER_ACK
+        return WorkerResult(TERMINAL, reason="oversized-state-root")
     except Exception:
-        return CARRIER_RETRY
+        return WorkerResult(RETRY, reason="state-unavailable")
     if raw is None or not isinstance(raw, bytes):
-        return CARRIER_RETRY
+        return WorkerResult(RETRY, reason="state-root-missing")
     try:
         hint = materialize_hint(reference, raw)
     except (TypeError, ValueError):
-        return CARRIER_ACK
-    return carrier_disposition(await worker.process(hint))
+        return WorkerResult(TERMINAL, reason="invalid-state-root")
+    return await worker.process(hint)
+
+
+async def handle_carrier_delivery(
+        delivery, workspace, notification_state, worker):
+    """Map the one shared typed path into carrier ACK/RETRY vocabulary."""
+    return carrier_disposition(await process_carrier_delivery(
+        delivery, workspace, notification_state, worker))
 
 
 __all__ = (
@@ -186,4 +193,5 @@ __all__ = (
     "WorkerResult",
     "carrier_disposition",
     "handle_carrier_delivery",
+    "process_carrier_delivery",
 )

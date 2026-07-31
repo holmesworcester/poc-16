@@ -10,10 +10,16 @@ from facts.auth.device import bind
 from facts.content import message
 from facts.content import notification_preference as preference
 from full_peer.node import FullPeer
-from notifications.carrier import ACK, RETRY
+from notifications.carrier import ACK, RETRY, CarrierDelivery
 from notifications.delivery import PushAccepted, seal_target
 from notifications.hints import NotificationHint, encode_hint
-from notifications.worker import NotificationWorker, handle_carrier_delivery
+from notifications.worker import (
+    RETRY as WORKER_RETRY,
+    TERMINAL,
+    NotificationWorker,
+    handle_carrier_delivery,
+    process_carrier_delivery,
+)
 from tests.notification_carrier import FaultCarrier
 
 
@@ -172,3 +178,24 @@ def test_oversized_root_is_terminal_poison(tmp_path):
     assert result == ((accepted.message_id, ACK),)
     assert provider.requests == []
     assert carrier.pending == ()
+
+
+def test_typed_carrier_path_distinguishes_terminal_from_retry(tmp_path):
+    _node, workspace, _root, reference, _provider, worker = _world(tmp_path)
+    malformed = asyncio.run(process_carrier_delivery(
+        CarrierDelivery(b"not a hint", "malformed", 1),
+        workspace,
+        AsyncState(),
+        worker,
+    ))
+    missing = asyncio.run(process_carrier_delivery(
+        CarrierDelivery(encode_hint(reference), "missing", 1),
+        workspace,
+        AsyncState(),
+        worker,
+    ))
+
+    assert malformed.action is TERMINAL
+    assert malformed.reason == "invalid-carrier-hint"
+    assert missing.action is WORKER_RETRY
+    assert missing.reason == "state-root-missing"

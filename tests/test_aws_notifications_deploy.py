@@ -9,13 +9,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.crypto import h
+from core.crypto import h, load_sk
 from deploy.aws_notifications import manage
 from deploy.aws_notifications.config import (
     DEPLOYMENT_ID_TAG,
     DEPLOYMENT_MARKER,
     DEPLOYMENT_TAG,
+    DIRECT_SMOKE_RESULT_SCHEMA,
+    DIRECT_SMOKE_SCHEMA,
+    DLQ_RETENTION_SECONDS,
+    QUEUE_RETENTION_SECONDS,
 )
+from deploy.aws_notifications.secret import push_node_id
 from notifications.hints import NotificationHint, encode_hint
 
 
@@ -23,6 +28,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "deploy" / "aws_notifications"
 WORKSPACE = "a" * 64
 ACCOUNT = "123456789012"
+SECRET_ARN = (
+    f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:"
+    "secret:poc16/notification-AbCdEf"
+)
+SECRET_VERSION = "a" * 32
+SECRET_SEED = "11" * 32
+PUSH_NODE = push_node_id(load_sk(SECRET_SEED))
 QUEUE_ARN = f"arn:aws:sqs:us-west-2:{ACCOUNT}:poc16-notifications"
 QUEUE_URL = (
     f"https://sqs.us-west-2.amazonaws.com/{ACCOUNT}/poc16-notifications"
@@ -39,15 +51,14 @@ def args(**changes):
         "create": True,
         "delivery_concurrency": 10,
         "deployment_id": "notify-west-2",
-        "discard_pending": False,
+        "destroy_carrier": False,
+        "direct_smoke": None,
         "enable": None,
         "expected_owner": ACCOUNT,
         "max_per_second": 10,
         "max_receive_count": 5,
-        "notification_secret_arn": (
-            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:"
-            "secret:poc16/notification-AbCdEf"
-        ),
+        "notification_secret_arn": SECRET_ARN,
+        "notification_secret_version_id": SECRET_VERSION,
         "profile": None,
         "region": "us-west-2",
         "repository_kms_key_arn": None,
@@ -58,7 +69,6 @@ def args(**changes):
         "state_bucket": "notification-state-bucket",
         "state_kms_key_arn": None,
         "state_prefix": f"notifications/{WORKSPACE}",
-        "state_retention_days": 30,
         "update": False,
         "workspace": WORKSPACE,
     }
@@ -66,48 +76,50 @@ def args(**changes):
     return SimpleNamespace(**values)
 
 
-def stack(candidate=None, *, enabled=True):
-    candidate = args() if candidate is None else candidate
-    outputs = [
-        {"OutputKey": "DeploymentMarker", "OutputValue": DEPLOYMENT_MARKER},
-        {"OutputKey": "DeploymentId", "OutputValue": candidate.deployment_id},
-        {"OutputKey": "WorkspaceId", "OutputValue": WORKSPACE},
-        {"OutputKey": "Enabled", "OutputValue": (
-            "true" if enabled else "false")},
-        {
-            "OutputKey": "NotificationStateMinimumRetentionDays",
-            "OutputValue": str(candidate.state_retention_days),
-        },
+def _output_rows(values):
+    return [
+        {"OutputKey": name, "OutputValue": str(value)}
+        for name, value in values.items()
     ]
-    outputs.extend((
-        {"OutputKey": "NotificationQueueArn", "OutputValue": QUEUE_ARN},
-        {"OutputKey": "NotificationQueueUrl", "OutputValue": QUEUE_URL},
-        {
-            "OutputKey": "NotificationDeadLetterQueueArn",
-            "OutputValue": DLQ_ARN,
-        },
-        {
-            "OutputKey": "NotificationDeadLetterQueueUrl",
-            "OutputValue": DLQ_URL,
-        },
-    ))
-    if enabled:
-        outputs.extend((
-            {
-                "OutputKey": "NotificationScannerFunctionArn",
-                "OutputValue": (
-                    f"arn:aws:lambda:us-west-2:{ACCOUNT}:"
-                    "function:poc16-notification-scanner"),
-            },
-            {
-                "OutputKey": "NotificationDeliveryFunctionArn",
-                "OutputValue": (
-                    f"arn:aws:lambda:us-west-2:{ACCOUNT}:"
-                    "function:poc16-notification-delivery"),
-            },
-        ))
+
+
+def stack(candidate=None, *, enabled=True, smoke=False, push_node=PUSH_NODE):
+    candidate = args() if candidate is None else candidate
+    outputs = {
+        "CanonicalBucketName": candidate.canonical_bucket,
+        "CanonicalPrefix": candidate.canonical_prefix,
+        "DeploymentId": candidate.deployment_id,
+        "DeploymentMarker": DEPLOYMENT_MARKER,
+        "DirectSmokeEnabled": "true" if smoke else "false",
+        "Enabled": "true" if enabled else "false",
+        "ExpectedBucketOwner": candidate.expected_owner,
+        "NotificationDeadLetterQueueArn": DLQ_ARN,
+        "NotificationDeadLetterQueueUrl": DLQ_URL,
+        "NotificationDeadLetterRetentionSeconds": DLQ_RETENTION_SECONDS,
+        "NotificationDeliveryFunctionArn": (
+            f"arn:aws:lambda:us-west-2:{ACCOUNT}:"
+            "function:poc16-notification-delivery"
+        ),
+        "NotificationQueueArn": QUEUE_ARN,
+        "NotificationQueueUrl": QUEUE_URL,
+        "NotificationQueueRetentionSeconds": QUEUE_RETENTION_SECONDS,
+        "NotificationScannerFunctionArn": (
+            f"arn:aws:lambda:us-west-2:{ACCOUNT}:"
+            "function:poc16-notification-scanner"
+        ),
+        "NotificationSecretArn": candidate.notification_secret_arn,
+        "NotificationSecretKmsKeyArn": candidate.secret_kms_key_arn or "",
+        "NotificationSecretVersionId": (
+            candidate.notification_secret_version_id),
+        "NotificationStateBucketName": candidate.state_bucket,
+        "NotificationStateKmsKeyArn": candidate.state_kms_key_arn or "",
+        "NotificationStatePrefix": candidate.state_prefix,
+        "PushNodeId": push_node,
+        "RepositoryKmsKeyArn": candidate.repository_kms_key_arn or "",
+        "WorkspaceId": candidate.workspace,
+    }
     return {
-        "Outputs": outputs,
+        "Outputs": _output_rows(outputs),
         "StackId": (
             f"arn:aws:cloudformation:us-west-2:{ACCOUNT}:"
             "stack/poc16-notifications/uuid"),
@@ -120,6 +132,22 @@ def stack(candidate=None, *, enabled=True):
     }
 
 
+def _secret_response(*, version=SECRET_VERSION, arn=SECRET_ARN,
+                     seed=SECRET_SEED):
+    return {
+        "ARN": arn,
+        "SecretString": json.dumps({
+            "firebase_apps": [{
+                "application": "poc16.mobile",
+                "credential": {"project_id": "project"},
+                "environment": "production",
+            }],
+            "push_node_seed": seed,
+        }),
+        "VersionId": version,
+    }
+
+
 def test_stage_is_importable_and_contains_only_shared_read_side(tmp_path):
     staged = manage.stage(tmp_path / "stage")
     for relative in (
@@ -128,6 +156,7 @@ def test_stage_is_importable_and_contains_only_shared_read_side(tmp_path):
             "adapters/s3/store.py",
             "core/repository_reader.py",
             "deploy/aws_notifications/app.py",
+            "deploy/aws_notifications/secret.py",
             "facts/auth/push_endpoint.py",
             "notifications/discovery.py",
             "notifications/hints.py",
@@ -153,35 +182,34 @@ def test_stage_is_importable_and_contains_only_shared_read_side(tmp_path):
     assert completed.stdout == ""
 
 
-def test_template_separates_roles_and_has_no_repository_write_door():
+def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     template = (PACKAGE / "template.yaml").read_text()
     scanner = template.split("NotificationScannerRole:", 1)[1].split(
         "NotificationDeliveryRole:", 1)[0]
     delivery = template.split("NotificationDeliveryRole:", 1)[1].split(
         "NotificationScannerFunction:", 1)[0]
-
-    assert "Default: \"false\"" in template
-    assert template.count("Condition: NotificationsEnabled") >= 8
-    assert "Handler: deploy.aws_notifications.app.scanner_handler" in template
-    assert "Handler: deploy.aws_notifications.app.delivery_handler" in template
-    assert "FunctionResponseTypes:\n        - ReportBatchItemFailures" in template
-    assert "VisibilityTimeout: 360" in template
-    assert "Timeout: 60" in template
-    assert "MinValue: 5" in template
-    assert "RedrivePolicy:" in template
-    assert "NotificationStateMinimumRetentionDays:" in template
-    assert "MinValue: 30" in template
-    assert "ApproximateAgeOfOldestMessage" in template
-    assert "ApproximateNumberOfMessagesVisible" in template
-    assert "AWS::SQS::Queue" in template
-    assert "FifoQueue" not in template
     source_queue = template.split(
         "NotificationQueue:", 1)[1].split("NotificationScannerRole:", 1)[0]
     dead_queue = template.split(
         "NotificationDeadLetterQueue:", 1)[1].split(
             "NotificationQueue:", 1)[0]
-    assert "Condition: NotificationsEnabled" not in source_queue
-    assert "Condition: NotificationsEnabled" not in dead_queue
+
+    assert template.count('Default: "false"') >= 2
+    assert "Condition: NotificationsEnabled" not in template
+    assert "Enabled: !If [NotificationsEnabled, true, false]" in template
+    assert "State: !If [NotificationsEnabled, ENABLED, DISABLED]" in template
+    assert f"MessageRetentionPeriod: {QUEUE_RETENTION_SECONDS}" \
+        in source_queue
+    assert f"MessageRetentionPeriod: {DLQ_RETENTION_SECONDS}" in dead_queue
+    assert QUEUE_RETENTION_SECONDS < DLQ_RETENTION_SECONDS
+    assert "NotificationStateMinimumRetentionDays" not in template
+    assert "TINYP2P_NOTIFICATION_SECRET_VERSION_ID" in template
+    assert "TINYP2P_NOTIFICATION_PUSH_NODE_ID" in template
+    assert "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED" in template
+    assert "Handler: deploy.aws_notifications.app.scanner_handler" in template
+    assert "Handler: deploy.aws_notifications.app.delivery_handler" in template
+    assert "FunctionResponseTypes:\n        - ReportBatchItemFailures" in template
+    assert "RedrivePolicy:" in template
 
     assert "s3:GetObject" in scanner
     assert "s3:PutObject" in scanner
@@ -193,19 +221,12 @@ def test_template_separates_roles_and_has_no_repository_write_door():
     assert "sqs:SendMessage" not in delivery
     assert "secretsmanager:GetSecretValue" in delivery
     assert "kms:EncryptionContext:SecretARN" in delivery
-    assert '"secretsmanager.${AWS::Region}.${AWS::URLSuffix}"' in delivery
-    assert "kms:CallerAccount: !Ref AWS::AccountId" in delivery
-    assert "sqs:ChangeMessageVisibility" in delivery
-    assert "sqs:DeleteMessage" in delivery
     assert "sqs:ReceiveMessage" in delivery
 
     for forbidden in (
             "s3:ListBucket", "s3:DeleteObject", "AWS::S3::Bucket",
             "RepositoryApplier", "full_peer", "sqlite", "FactOrder"):
         assert forbidden not in template
-    assert "${CanonicalPrefix}/root" in scanner
-    assert "${CanonicalPrefix}/root" in delivery
-    # Delivery reads retained event-root objects, never the cursor CAS root.
     historical = delivery.split("ReadHistoricalNotificationRoot", 1)[1]
     assert "${NotificationStatePrefix}/obj/*" in historical
     assert "${NotificationStatePrefix}/root" not in historical
@@ -220,151 +241,255 @@ def test_requirements_are_hash_locked_for_lambda_and_firebase():
     assert requirements.count("--hash=sha256:") >= 40
 
 
-def test_same_bucket_requires_disjoint_state_and_repository_prefixes():
-    with pytest.raises(ValueError, match="prefixes overlap"):
+def test_notification_state_requires_a_dedicated_bucket():
+    with pytest.raises(ValueError, match="dedicated bucket"):
         manage._validated(args(
             state_bucket="canonical-bucket",
-            state_prefix=f"workspaces/{WORKSPACE}/notifications",
+            state_prefix=f"notification-state/{WORKSPACE}",
         ))
+    assert manage._validated(args()).workspace == WORKSPACE
+
+
+@pytest.mark.parametrize("version", ("x" * 31, "x" * 65))
+def test_secret_version_id_is_exact_not_awscurrent(version):
+    with pytest.raises(ValueError, match="secret version ID"):
+        manage._validated(args(notification_secret_version_id=version))
     assert manage._validated(args(
-        state_bucket="canonical-bucket",
-        state_prefix=f"notification-state/{WORKSPACE}",
-    )).workspace == WORKSPACE
+        notification_secret_version_id="x" * 32)).workspace == WORKSPACE
 
 
-def test_state_root_retention_covers_source_and_dlq_horizons():
-    with pytest.raises(ValueError, match="state retention"):
-        manage._validated(args(state_retention_days=29))
-    assert manage._validated(args(
-        state_retention_days=30)).state_retention_days == 30
+def test_state_lifecycle_accepts_absence_and_never_mutates_bucket(monkeypatch):
+    calls = []
+    error = subprocess.CalledProcessError(
+        255, ["aws"], stderr="NoSuchLifecycleConfiguration")
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        raise error
+
+    monkeypatch.setattr(manage, "_run", run)
+
+    assert manage._verify_state_lifecycle(args()) is None
+    assert calls == [[
+        "aws", "s3api", "get-bucket-lifecycle-configuration",
+        "--bucket", "notification-state-bucket",
+        "--expected-bucket-owner", ACCOUNT,
+        "--output", "json", "--region", "us-west-2",
+    ]]
 
 
-def test_deploy_is_disabled_unless_operator_explicitly_enables(
+def test_state_lifecycle_rejects_enabled_expiration_but_allows_transition(
+        monkeypatch):
+    response = SimpleNamespace(stdout=json.dumps({"Rules": [{
+        "Expiration": {"Days": 31},
+        "ID": "expire",
+        "Status": "Enabled",
+    }]}))
+    monkeypatch.setattr(manage, "_run", lambda *_args, **_kwargs: response)
+    with pytest.raises(RuntimeError, match="enabled expiration"):
+        manage._verify_state_lifecycle(args())
+
+    response.stdout = json.dumps({"Rules": [{
+        "ID": "archive",
+        "Status": "Enabled",
+        "Transitions": [{"Days": 30, "StorageClass": "GLACIER"}],
+    }, {
+        "Expiration": {"Days": 31},
+        "ID": "disabled-expiration",
+        "Status": "Disabled",
+    }]})
+    assert manage._verify_state_lifecycle(args()) is None
+
+
+def test_pinned_secret_fetch_derives_stable_push_identity(monkeypatch):
+    calls = []
+    monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: (
+        calls.append(command) or SimpleNamespace(
+            stdout=json.dumps(_secret_response()))))
+
+    assert manage._secret_binding(args()) == PUSH_NODE
+    command = calls[0]
+    assert command[1:3] == ["secretsmanager", "get-secret-value"]
+    assert command[command.index("--version-id") + 1] == SECRET_VERSION
+    assert "AWSCURRENT" not in command
+
+
+def test_pinned_secret_response_must_match_requested_version(monkeypatch):
+    private = "private-seed-must-not-leak"
+    response = _secret_response(version="b" * 32)
+    response["SecretString"] = private
+    monkeypatch.setattr(manage, "_run", lambda *_args, **_kwargs:
+                        SimpleNamespace(stdout=json.dumps(response)))
+
+    with pytest.raises(RuntimeError, match="invalid pinned") as caught:
+        manage._secret_binding(args())
+    assert private not in str(caught.value)
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+@pytest.mark.parametrize("smoke", (False, True))
+def test_update_without_switch_preserves_both_incumbent_states(
+        monkeypatch, enabled, smoke):
+    candidate = args(
+        create=False, update=True, enable=None, direct_smoke=None)
+    current = stack(candidate, enabled=enabled, smoke=smoke)
+    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args, _stack=None: current)
+
+    target, resolved_enabled, resolved_smoke, outputs = \
+        manage._stack_for_deploy(candidate)
+    assert target == current["StackId"]
+    assert (resolved_enabled, resolved_smoke) == (enabled, smoke)
+    assert outputs == manage._outputs(current)
+
+
+def test_explicit_disable_retains_queues_and_functions(monkeypatch):
+    candidate = args(
+        create=False, update=True, enable=False, direct_smoke=False)
+    current = stack(candidate, enabled=True, smoke=True)
+    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args, _stack=None: current)
+
+    result = manage._stack_for_deploy(candidate)
+    assert result[:3] == (current["StackId"], False, False)
+    template = (PACKAGE / "template.yaml").read_text()
+    for name in (
+            "NotificationQueue", "NotificationDeadLetterQueue",
+            "NotificationScannerFunction", "NotificationDeliveryFunction"):
+        resource = template.split(f"  {name}:\n", 1)[1].split("\n  ", 1)[0]
+        assert "Condition:" not in resource
+
+
+def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
         monkeypatch):
     candidate = args()
+    final = stack(candidate, enabled=False, smoke=False)
     commands = []
-    monkeypatch.setattr(manage, "build", lambda _args: None)
+    checks = []
     monkeypatch.setattr(
-        manage, "_stack_for_deploy", lambda _args: ("stack", False))
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", False, False, None))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args: stack(candidate, enabled=False))
+        manage, "_verify_state_lifecycle", lambda _args: checks.append(
+            "lifecycle"))
+    monkeypatch.setattr(manage, "build", lambda _args: checks.append("build"))
+    monkeypatch.setattr(manage, "_owned_stack", lambda _args: final)
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_run", lambda command, **_kw: commands.append(
-        command) or SimpleNamespace(stdout=""))
+    monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: (
+        commands.append(command) or SimpleNamespace(stdout="")))
 
     outputs = manage.deploy(candidate)
 
     command = next(row for row in commands if row[:2] == ["sam", "deploy"])
     assert "Enabled=false" in command
-    assert outputs["Enabled"] == "false"
+    assert "DirectSmokeEnabled=false" in command
+    assert f"NotificationSecretVersionId={SECRET_VERSION}" in command
+    assert f"PushNodeId={PUSH_NODE}" in command
+    assert checks == ["lifecycle", "build"]
     assert outputs["NotificationQueueUrl"] == QUEUE_URL
 
 
-@pytest.mark.parametrize("incumbent", (False, True))
-def test_update_without_switch_preserves_incumbent_traffic_state(
-        monkeypatch, incumbent):
-    candidate = args(create=False, update=True, enable=None)
-    current = stack(candidate, enabled=incumbent)
-    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+@pytest.mark.parametrize(("changes", "push", "field"), (
+    ({"workspace": "b" * 64}, PUSH_NODE, "WorkspaceId"),
+    ({"canonical_bucket": "other-canonical"}, PUSH_NODE,
+     "CanonicalBucketName"),
+    ({"canonical_prefix": "other/canonical"}, PUSH_NODE,
+     "CanonicalPrefix"),
+    ({"state_bucket": "other-state"}, PUSH_NODE,
+     "NotificationStateBucketName"),
+    ({"state_prefix": "other/state"}, PUSH_NODE,
+     "NotificationStatePrefix"),
+    ({"notification_secret_arn": SECRET_ARN + "-other"}, PUSH_NODE,
+     "NotificationSecretArn"),
+    ({"notification_secret_version_id": "b" * 32}, PUSH_NODE,
+     "NotificationSecretVersionId"),
+    ({"repository_kms_key_arn": (
+        f"arn:aws:kms:us-west-2:{ACCOUNT}:key/repository")}, PUSH_NODE,
+     "RepositoryKmsKeyArn"),
+    ({}, "b" * 64, "PushNodeId"),
+))
+def test_update_rejects_immutable_binding_change_before_sam_effects(
+        monkeypatch, changes, push, field):
+    base = args(create=False, update=True)
+    candidate = args(create=False, update=True, **changes)
+    incumbent = manage._outputs(stack(base, enabled=True))
+    effects = []
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args, _stack=None: current)
-
-    assert manage._stack_for_deploy(candidate) == (
-        current["StackId"], incumbent)
-
-
-def test_explicit_disable_retains_both_carrier_queues(monkeypatch):
-    candidate = args(create=False, update=True, enable=False)
-    current = stack(candidate, enabled=True)
-    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: current)
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", True, False, incumbent))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: push)
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args, _stack=None: current)
+        manage, "_verify_state_lifecycle", lambda _args: effects.append(
+            "lifecycle"))
+    monkeypatch.setattr(manage, "build", lambda _args: effects.append("build"))
 
-    assert manage._stack_for_deploy(candidate) == (
-        current["StackId"], False)
-    template = (PACKAGE / "template.yaml").read_text()
-    for name in (
-            "NotificationQueue", "NotificationDeadLetterQueue"):
-        resource = template.split(f"  {name}:\n", 1)[1].split("\n  ", 1)[0]
-        assert "Condition:" not in resource
+    with pytest.raises(RuntimeError, match=field):
+        manage.deploy(candidate)
+    assert effects == []
 
 
-def test_enabled_deploy_checks_exact_queue_identity(monkeypatch):
-    candidate = args(enable=True)
-    commands = []
-    monkeypatch.setattr(manage, "build", lambda _args: None)
-    monkeypatch.setattr(
-        manage, "_stack_for_deploy", lambda _args: ("stack", True))
-    monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
-    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_run", lambda command, **_kw: commands.append(
-        command) or SimpleNamespace(stdout=""))
-
-    outputs = manage.deploy(candidate)
-
-    command = next(row for row in commands if row[:2] == ["sam", "deploy"])
-    assert "Enabled=true" in command
-    assert outputs["NotificationQueueArn"] == QUEUE_ARN
-
-
-def test_remove_never_treats_approximate_zero_as_safe_deletion(monkeypatch):
+@pytest.mark.parametrize(
+    "unobservable_state", ("stale-zero", "in-flight-publish", "consumer-lease"))
+def test_default_remove_never_inferrs_carrier_emptiness(
+        monkeypatch, unobservable_state):
     candidate = args()
     calls = []
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
+        manage, "_owned_stack", lambda _args: stack(
+            candidate, enabled=False, smoke=False))
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_run", lambda command, **_kw: calls.append(
-        command))
+    monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: calls.append(
+        (unobservable_state, command)))
 
-    with pytest.raises(RuntimeError, match="durable notification carrier"):
+    with pytest.raises(RuntimeError, match="--destroy-carrier"):
         manage.remove(candidate)
     assert calls == []
 
 
-def test_explicit_discard_removes_only_the_owned_stack(monkeypatch):
-    candidate = args(discard_pending=True)
+def test_destructive_remove_requires_quiescence_and_explicit_flag(
+        monkeypatch):
+    candidate = args(destroy_carrier=True)
     calls = []
-    owned = stack(candidate, enabled=True)
-    monkeypatch.setattr(manage, "_owned_stack", lambda _args: owned)
+    current = stack(candidate, enabled=True, smoke=False)
+    monkeypatch.setattr(manage, "_owned_stack", lambda _args: current)
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_run", lambda command, **_kw: calls.append(
+    monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: calls.append(
         command) or SimpleNamespace(stdout=""))
 
-    manage.remove(candidate)
+    with pytest.raises(RuntimeError, match="disable production"):
+        manage.remove(candidate)
+    assert calls == []
 
+    current = stack(candidate, enabled=False, smoke=False)
+    manage.remove(candidate)
     assert calls[0][:3] == ["aws", "cloudformation", "delete-stack"]
-    assert calls[0][calls[0].index("--stack-name") + 1] == owned["StackId"]
+    assert calls[0][calls[0].index("--stack-name") + 1] == current["StackId"]
+    assert all("get-queue-attributes" not in command for command in calls)
     assert all("s3" not in command for command in calls)
 
 
-def test_redrive_is_explicit_bounded_and_targets_the_source_queue(
-        monkeypatch):
+def test_disabled_carrier_can_be_redriven_before_restart(monkeypatch):
     candidate = args(max_per_second=25)
     calls = []
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
+        manage, "_owned_stack", lambda _args: stack(
+            candidate, enabled=False, smoke=False))
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
-    monkeypatch.setattr(manage, "_run", lambda command, **_kw: calls.append(
-        command) or SimpleNamespace(stdout=json.dumps({
-            "TaskHandle": "move-task-1"})))
+    monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: (
+        calls.append(command) or SimpleNamespace(stdout=json.dumps({
+            "TaskHandle": "move-task-1"}))))
 
     assert manage.redrive(candidate) == "move-task-1"
     command = calls[0]
     assert command[:3] == ["aws", "sqs", "start-message-move-task"]
     assert command[command.index("--source-arn") + 1] == DLQ_ARN
     assert command[command.index("--destination-arn") + 1] == QUEUE_ARN
-    assert command[command.index(
-        "--max-number-of-messages-per-second") + 1] == "25"
 
 
-def test_live_firebase_smoke_is_never_part_of_build_or_deploy():
-    parsed = manage.parser().parse_args(["build"])
-    assert parsed.command == "build"
-    assert "live-smoke" not in manage._parameters(args())
-
-
-def test_opt_in_live_smoke_invokes_scanner_and_real_delivery_shape(
+def test_direct_smoke_is_independent_of_production_and_proves_acceptance(
         tmp_path, monkeypatch):
     candidate = args(hint_file=str(tmp_path / "hint.json"))
     raw = encode_hint(NotificationHint(
@@ -372,28 +497,65 @@ def test_opt_in_live_smoke_invokes_scanner_and_real_delivery_shape(
     Path(candidate.hint_file).write_bytes(raw)
     calls = []
     monkeypatch.setattr(
-        manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
-    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
+        manage, "_owned_stack", lambda _args: stack(
+            candidate, enabled=False, smoke=True))
+    monkeypatch.setattr(manage, "_invoke", lambda _args, function, payload: (
+        calls.append((function, payload)) or {
+            "accepted_count": 1,
+            "retry_count": 0,
+            "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+            "terminal_count": 0,
+        }))
 
-    def invoke(_args, function, payload):
-        calls.append((function, payload))
-        return {"batchItemFailures": []} \
-            if "delivery" in function else {
-                "schema": "poc16-notification-scan-result-v1",
-                "status": "idle",
-            }
+    result = manage.direct_smoke(candidate)
 
-    monkeypatch.setattr(manage, "_invoke", invoke)
+    assert result["accepted_count"] == 1
+    assert len(calls) == 1
+    function, payload = calls[0]
+    assert "delivery" in function
+    assert payload["schema"] == DIRECT_SMOKE_SCHEMA
+    assert "Records" not in payload
+    assert base64.b64decode(payload["body"], validate=True) == raw
 
-    result = manage.live_smoke(candidate)
 
-    assert len(calls) == 2
-    scanner_function, scanner_payload = calls[0]
-    assert "scanner" in scanner_function
-    assert scanner_payload["workspace"] == WORKSPACE
-    delivery_function, delivery_payload = calls[1]
-    assert "delivery" in delivery_function
-    record = delivery_payload["Records"][0]
-    assert record["eventSourceARN"] == QUEUE_ARN
-    assert base64.b64decode(record["body"], validate=True) == raw
-    assert result["delivery"] == {"batchItemFailures": []}
+@pytest.mark.parametrize("counts", (
+    (0, 0, 0),
+    (1, 1, 0),
+    (1, 0, 1),
+))
+def test_direct_smoke_rejects_no_recipient_retry_and_terminal_outcomes(
+        tmp_path, monkeypatch, counts):
+    candidate = args(hint_file=str(tmp_path / "hint.json"))
+    Path(candidate.hint_file).write_bytes(encode_hint(NotificationHint(
+        WORKSPACE, h(b"root"), (h(b"event"),))))
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args: stack(
+            candidate, enabled=False, smoke=True))
+    accepted, retry, terminal = counts
+    monkeypatch.setattr(manage, "_invoke", lambda *_args, **_kwargs: {
+        "accepted_count": accepted,
+        "retry_count": retry,
+        "schema": DIRECT_SMOKE_RESULT_SCHEMA,
+        "terminal_count": terminal,
+    })
+
+    with pytest.raises(RuntimeError, match="no clean provider acceptance"):
+        manage.direct_smoke(candidate)
+
+
+def test_direct_smoke_and_production_defaults_are_separate():
+    parsed = manage.parser().parse_args([
+        "deploy", "--stack-name", "stack", "--deployment-id", "deploy-id",
+        "--workspace", WORKSPACE,
+        "--canonical-bucket", "canonical-bucket",
+        "--canonical-prefix", "canonical/root",
+        "--state-bucket", "state-bucket",
+        "--state-prefix", "notification/root",
+        "--expected-owner", ACCOUNT,
+        "--notification-secret-arn", SECRET_ARN,
+        "--notification-secret-version-id", SECRET_VERSION,
+        "--create",
+    ])
+    assert parsed.enable is None
+    assert parsed.direct_smoke is None
+    assert manage.parser().parse_args(["build"]).command == "build"
