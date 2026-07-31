@@ -265,10 +265,10 @@ def run_plan(corpus, plan, incremental=extend_snapshot):
 
             full_outbox = dict(full.outbox)
             assert len(full_outbox) == len(full.outbox)
-            assert all(
-                full_outbox.get(oid) == raw
-                for oid, raw in candidate.outbox
-            )
+            candidate_outbox = dict(candidate.outbox)
+            assert len(candidate_outbox) == len(candidate.outbox)
+            assert all(full_outbox.get(oid) == raw
+                       for oid, raw in candidate_outbox.items())
             _retain(objects, candidate.outbox)
             assert all(
                 objects.get(oid) == raw for oid, raw in full.outbox)
