@@ -1,0 +1,37 @@
+[package]
+name = "poc16-full-peer-iroh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "poc16-iroh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
+postcard = { version = "1.1", features = ["alloc"] }
+tokio = { version = "1.49", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
