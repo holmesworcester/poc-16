@@ -7,11 +7,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
 from core.staged_intent import staging_key
-from deploy.upload_broker import (
-    AuthorizedPut,
-    UPLOAD_CONTENT_TYPE,
-    UploadCapability,
-)
+from deploy.upload_broker import AuthorizedPut
+from deploy.upload_wire import UPLOAD_CONTENT_TYPE, UploadCapability
 
 
 S3_UPLOAD_BUCKET_PATTERN = (

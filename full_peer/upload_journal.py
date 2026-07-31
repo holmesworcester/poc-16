@@ -1,4 +1,4 @@
-"""Durable local authority for a resumable direct upload.
+"""Full-peer-local durable authority for a resumable direct upload.
 
 ``source.json`` and its bodies are immutable. ``session.json`` is one atomic
 record whose separate cursor/cursor_index/delivered_index fields preserve the

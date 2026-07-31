@@ -22,7 +22,6 @@ from deploy.cloudflare_upload.reader import (
 )
 from deploy.cloudflare_upload.signer import R2UploadSigner
 from deploy.cloudflare_upload.worker import runtime
-from deploy.upload_client_http import HttpBrokerTransport
 from deploy.upload_keyring import UploadKeyring, encode_keyring
 from deploy.upload_session import (
     SessionKey,
@@ -31,6 +30,7 @@ from deploy.upload_session import (
     UploadVector,
 )
 from deploy.upload_wire import encode_open_request
+from full_peer.upload_client_http import HttpBrokerTransport
 from facts.auth import request as request_fact
 
 

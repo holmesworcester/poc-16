@@ -43,11 +43,15 @@ Read implementation authority in this order:
    `core/repository_reader.py` for the database-free repository engine.
 4. `core/http.py` for peer routes and authorization.
 5. `full_peer/` for the stateful local composition; `sql_store.py` is its sole
-   SQL boundary.
+   SQL boundary and `upload_journal.py`, `upload_client.py`, and
+   `upload_client_http.py` own resumable outbound upload state and effects.
 6. `full_peer/daemon.py`, `full_peer/iroh_forwarders.py`,
    `full_peer/iroh_process.py`, and `full_peer/iroh/` for process composition,
    bounded outbound children, and the connection-only Iroh byte wrapper.
 7. `adapters/` and `deploy/` for provider adaptation and packaging.
+   `deploy/upload_session.py` and `deploy/upload_wire.py` are the shared
+   client/broker protocol values; no client journal or outbound runtime lives
+   under `deploy/`.
 
 ## The central theorem
 

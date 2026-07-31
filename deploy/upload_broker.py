@@ -6,7 +6,7 @@ provider PUT requests. ``FINALIZE`` can name only the pile fixed by ``OPEN``.
 The HMAC cursor is the complete broker state; file and pile bytes never cross
 this module.
 """
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from itertools import islice
 import json
 import secrets
@@ -29,6 +29,7 @@ from core.staged_intent import (
     SESSION_HEX_BYTES,
     staging_key,
 )
+import deploy.upload_wire as wire
 from deploy.upload_session import (
     InvalidUploadSession,
     SessionState,
@@ -45,7 +46,6 @@ from deploy.upload_session import (
 
 
 UPLOAD_PURPOSE = "upload"
-UPLOAD_CONTENT_TYPE = "application/octet-stream"
 SESSION_BYTES = SESSION_HEX_BYTES // 2
 
 MAX_CAPABILITY_URL_BYTES = 2_048
@@ -55,10 +55,6 @@ MAX_CAPABILITY_HEADER_NAME_BYTES = 64
 MAX_CAPABILITY_HEADER_VALUE_BYTES = 512
 MAX_CAPABILITY_HEADER_BYTES = 2_048
 MAX_CAPABILITY_DOCUMENT_BYTES = 1_536
-MAX_OPEN_RESPONSE_BYTES = 2_048
-MAX_ISSUE_RESPONSE_BYTES = 512 * 1024
-MAX_FINALIZE_RESPONSE_BYTES = 4_096
-
 _EMPTY_MANIFEST = UploadVector(()).manifest
 
 
@@ -79,48 +75,6 @@ class AuthorizedPut:
     content_type: str
     key: str
     not_after_ms: int
-
-
-@dataclass(frozen=True)
-class UploadCapability:
-    """The exact provider request a client may perform.
-
-    Bearer material remains inside ``url`` and the signed headers. No bucket
-    credential or semantic path input crosses this interface.
-    """
-
-    method: str
-    url: str = field(repr=False)
-    headers: tuple[tuple[str, str], ...] = field(repr=False)
-    expires_at_ms: int
-
-
-@dataclass(frozen=True)
-class GrantedUpload:
-    leaf: UploadLeaf
-    capability: UploadCapability
-
-
-@dataclass(frozen=True)
-class OpenedUpload:
-    session: str
-    cursor: str
-    expires_at_ms: int
-
-
-@dataclass(frozen=True)
-class IssuedUpload:
-    cursor: str
-    next_index: int
-    objects: tuple[GrantedUpload, ...]
-    expires_at_ms: int
-
-
-@dataclass(frozen=True)
-class FinalizedUpload:
-    cursor: str
-    pile: GrantedUpload
-    expires_at_ms: int
 
 
 def _wire_size(value):
@@ -154,9 +108,9 @@ def _bounded_document(value, maximum, label):
 
 def _checked_capability(value, trusted_now, session_expires_at):
     parsed = urlsplit(value.url) \
-        if isinstance(value, UploadCapability) \
+        if isinstance(value, wire.UploadCapability) \
         and isinstance(value.url, str) else None
-    if not isinstance(value, UploadCapability) \
+    if not isinstance(value, wire.UploadCapability) \
             or value.method != "PUT" \
             or parsed is None \
             or parsed.scheme != "https" or not parsed.hostname \
@@ -207,7 +161,7 @@ def _granted_document(grant):
 
 
 def open_document(result):
-    if not isinstance(result, OpenedUpload):
+    if not isinstance(result, wire.OpenedUpload):
         raise TypeError("opened upload")
     return {
         "cursor": result.cursor,
@@ -218,7 +172,7 @@ def open_document(result):
 
 
 def issue_document(result):
-    if not isinstance(result, IssuedUpload):
+    if not isinstance(result, wire.IssuedUpload):
         raise TypeError("issued upload")
     return {
         "cursor": result.cursor,
@@ -231,7 +185,7 @@ def issue_document(result):
 
 
 def finalize_document(result):
-    if not isinstance(result, FinalizedUpload):
+    if not isinstance(result, wire.FinalizedUpload):
         raise TypeError("finalized upload")
     return {
         "cursor": result.cursor,
@@ -243,18 +197,18 @@ def finalize_document(result):
 
 def encode_open(result):
     return _bounded_document(
-        open_document(result), MAX_OPEN_RESPONSE_BYTES, "OPEN response")
+        open_document(result), wire.MAX_OPEN_RESPONSE_BYTES, "OPEN response")
 
 
 def encode_issue(result):
     return _bounded_document(
-        issue_document(result), MAX_ISSUE_RESPONSE_BYTES, "ISSUE response")
+        issue_document(result), wire.MAX_ISSUE_RESPONSE_BYTES, "ISSUE response")
 
 
 def encode_finalize(result):
     return _bounded_document(
         finalize_document(result),
-        MAX_FINALIZE_RESPONSE_BYTES,
+        wire.MAX_FINALIZE_RESPONSE_BYTES,
         "FINALIZE response",
     )
 
@@ -407,7 +361,7 @@ class UploadBroker:
             expires_at_ms,
             key.key_id,
         )
-        result = OpenedUpload(
+        result = wire.OpenedUpload(
             state.session,
             self.tokens.encode(state),
             expires_at_ms,
@@ -423,7 +377,7 @@ class UploadBroker:
             object_class,
             leaf.digest,
             leaf.size,
-            UPLOAD_CONTENT_TYPE,
+            wire.UPLOAD_CONTENT_TYPE,
             staging_key(
                 state.workspace,
                 state.member,
@@ -437,7 +391,7 @@ class UploadBroker:
             capability = self.signer.sign(authorized)
         except Exception as error:
             raise UploadUnavailable("provider signing failed") from error
-        return GrantedUpload(
+        return wire.GrantedUpload(
             leaf,
             _checked_capability(
                 capability, trusted_now, state.expires_at_ms),
@@ -465,7 +419,7 @@ class UploadBroker:
                 self._sign(state, leaf, "obj", trusted_now)
                 for leaf in leaves
             )
-            result = IssuedUpload(
+            result = wire.IssuedUpload(
                 cursor, state.next_index, grants, state.expires_at_ms)
             encode_issue(result)
             return result
@@ -491,7 +445,7 @@ class UploadBroker:
             self._sign(state, leaf, "obj", trusted_now)
             for leaf in leaves
         )
-        result = IssuedUpload(
+        result = wire.IssuedUpload(
             next_cursor, end_index, grants, state.expires_at_ms)
         encode_issue(result)
         return result
@@ -503,7 +457,7 @@ class UploadBroker:
         if state.next_index != state.manifest.count \
                 or state.issued_bytes != state.manifest.total_bytes:
             raise InvalidUploadSession("upload FINALIZE incomplete")
-        result = FinalizedUpload(
+        result = wire.FinalizedUpload(
             cursor,
             self._sign(state, state.pile, "pile", trusted_now),
             state.expires_at_ms,

@@ -120,6 +120,9 @@ def test_retired_authority_implementations_cannot_return():
             "core/suppression_state.py",
             "core/sync.py",
             "core/walk.py",
+            "deploy/upload_client.py",
+            "deploy/upload_client_http.py",
+            "deploy/upload_journal.py",
             "deploy/gateway.py",
             "deploy/cloudflare_upload/worker/publisher_stub.py"):
         assert not (ROOT / relative).exists()
@@ -131,6 +134,12 @@ def test_retired_authority_implementations_cannot_return():
     assert class_definitions("PileSender") == [
         Path("full_peer/pile_sender.py")]
     assert class_definitions("FullPeer") == [Path("full_peer/node.py")]
+    assert class_definitions("UploadClient") == [
+        Path("full_peer/upload_client.py")]
+    assert class_definitions("UploadSource") == [
+        Path("full_peer/upload_journal.py")]
+    assert class_definitions("UploadSourceBuilder") == [
+        Path("full_peer/upload_journal.py")]
     assert class_definitions("Node") == []
     assert class_definitions("RepositoryApplier") == [
         Path("core/repository_applier.py")]
@@ -216,6 +225,61 @@ def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
         item.name for item in node.body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def test_full_peer_owns_upload_client_state_not_provider_runtime():
+    """Client state flows down to shared wire values, never broker code."""
+    allowed_shared_protocol = {
+        "deploy.upload_session",
+        "deploy.upload_wire",
+    }
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] != "full_peer":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            offenders.extend(
+                (path.as_posix(), name)
+                for name in names
+                if name == "deploy" or name.startswith("deploy.")
+                if name not in allowed_shared_protocol
+            )
+    assert offenders == []
+
+    deploy_to_client = []
+    for path in source_paths():
+        if path.parts[0] != "deploy":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            deploy_to_client.extend(
+                (path.as_posix(), name)
+                for name in names
+                if name in {
+                    "full_peer.upload_client",
+                    "full_peer.upload_client_http",
+                    "full_peer.upload_journal",
+                }
+            )
+    assert deploy_to_client == []
+    for name in (
+            "FinalizedUpload",
+            "GrantedUpload",
+            "IssuedUpload",
+            "OpenedUpload",
+            "UploadCapability"):
+        assert class_definitions(name) == [Path("deploy/upload_wire.py")]
 
 
 def test_one_explicit_fact_context_serves_core_and_full_peer_authoring():

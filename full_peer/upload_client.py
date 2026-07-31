@@ -1,4 +1,4 @@
-"""Crash-safe OPEN/ISSUE/FINALIZE delivery to exact provider PUTs."""
+"""Full-peer crash-safe OPEN/ISSUE/FINALIZE delivery to exact provider PUTs."""
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import BinaryIO, Protocol
@@ -6,15 +6,8 @@ from urllib.parse import unquote, urlsplit
 
 from core.limits import PAGE_BATCH
 from core.staged_intent import SESSION_HEX_BYTES, staging_key
-from deploy.upload_broker import (
-    FinalizedUpload,
-    GrantedUpload,
-    IssuedUpload,
-    OpenedUpload,
-    UPLOAD_CONTENT_TYPE,
-    UploadCapability,
-)
-from deploy.upload_journal import (
+import deploy.upload_wire as wire
+from full_peer.upload_journal import (
     UploadProgress,
     UploadSource,
 )
@@ -67,18 +60,18 @@ CREATED = PutResult.CREATED
 class BrokerTransport(Protocol):
     def open(
             self, proof: bytes, manifest: UploadManifest,
-            pile: UploadLeaf) -> OpenedUpload: ...
+            pile: UploadLeaf) -> wire.OpenedUpload: ...
 
     def issue(
             self, cursor: str, start: int, leaves: tuple[UploadLeaf, ...],
-            proof: bytes) -> IssuedUpload: ...
+            proof: bytes) -> wire.IssuedUpload: ...
 
-    def finalize(self, cursor: str) -> FinalizedUpload: ...
+    def finalize(self, cursor: str) -> wire.FinalizedUpload: ...
 
 
 class PutTransport(Protocol):
     def put(
-            self, capability: UploadCapability, body: BinaryIO,
+            self, capability: wire.UploadCapability, body: BinaryIO,
             size: int) -> PutResult: ...
 
 
@@ -148,7 +141,7 @@ class UploadClient:
         result = self.broker.open(
             proof, self.source.vector.manifest, self.source.pile)
         if not isinstance(proof, bytes) \
-                or not isinstance(result, OpenedUpload) \
+                or not isinstance(result, wire.OpenedUpload) \
                 or not _hex(result.session, SESSION_HEX_BYTES) \
                 or not isinstance(result.cursor, str) or not result.cursor \
                 or type(result.expires_at_ms) is not int \
@@ -161,11 +154,11 @@ class UploadClient:
         return progress
 
     def _capability(self, grant, leaf, kind, progress):
-        if not isinstance(grant, GrantedUpload) or grant.leaf != leaf:
+        if not isinstance(grant, wire.GrantedUpload) or grant.leaf != leaf:
             raise UploadProtocolError("broker changed upload leaf")
         cap = grant.capability
         parsed = urlsplit(cap.url) if isinstance(
-            cap, UploadCapability) and isinstance(cap.url, str) else None
+            cap, wire.UploadCapability) and isinstance(cap.url, str) else None
         if parsed is None or cap.method != "PUT" \
                 or parsed.scheme != "https" or not parsed.hostname \
                 or (parsed.scheme, parsed.hostname, parsed.port) \
@@ -187,7 +180,7 @@ class UploadClient:
                     name != name.lower()
                     for name, value in cap.headers) \
                 or headers.get("content-length") != str(leaf.size) \
-                or headers.get("content-type") != UPLOAD_CONTENT_TYPE \
+                or headers.get("content-type") != wire.UPLOAD_CONTENT_TYPE \
                 or headers.get("if-none-match") != "*":
             raise UploadProtocolError("unsafe upload headers")
         key = staging_key(
@@ -223,7 +216,7 @@ class UploadClient:
         result = self.broker.issue(
             progress.cursor, start, leaves,
             self.source.vector.proof(start, end))
-        if not isinstance(result, IssuedUpload) \
+        if not isinstance(result, wire.IssuedUpload) \
                 or type(result.next_index) is not int:
             raise UploadProtocolError("invalid ISSUE response")
         if result.next_index < progress.cursor_index:
@@ -255,7 +248,7 @@ class UploadClient:
 
     def _finalize(self, progress):
         result = self.broker.finalize(progress.cursor)
-        if not isinstance(result, FinalizedUpload) \
+        if not isinstance(result, wire.FinalizedUpload) \
                 or result.cursor != progress.cursor \
                 or result.expires_at_ms != progress.expires_at_ms:
             raise UploadProtocolError("FINALIZE response changed session")

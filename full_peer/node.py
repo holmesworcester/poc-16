@@ -21,7 +21,7 @@ from core.limits import (
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
-from deploy.upload_journal import UploadSource, UploadSourceBuilder
+from full_peer.upload_journal import UploadSource, UploadSourceBuilder
 
 from . import bao_native, sql_store
 from .keychain import (
@@ -201,7 +201,7 @@ class FullPeer:
             os.path.join(self.dir, "uploads", upload_id))
 
     def run_upload(self, source, broker_url, provider_origin, proof):
-        from deploy.upload_client_http import run_http
+        from full_peer.upload_client_http import run_http
         return run_http(source, broker_url, provider_origin, proof)
 
     def resolve_peer(self, workspace, peer):

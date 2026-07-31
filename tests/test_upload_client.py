@@ -21,9 +21,9 @@ from core.staged_intent import (
 from deploy.upload_broker import (
     AuthorizedPut,
     UploadBroker,
-    UploadCapability,
 )
-from deploy.upload_client import (
+from deploy.upload_wire import UploadCapability
+from full_peer.upload_client import (
     CREATED,
     UploadClient as RunningUploadClient,
     UploadCreateConflict,
@@ -31,7 +31,7 @@ from deploy.upload_client import (
     UploadRetryable,
     UploadRollback,
 )
-from deploy.upload_journal import UploadSource, UploadSourceBuilder
+from full_peer.upload_journal import UploadSource, UploadSourceBuilder
 from deploy.upload_session import (
     SessionKey,
     UploadSessionPolicy,
@@ -215,7 +215,7 @@ def test_4096_objects_use_random_bounded_batches_and_one_body_memory(
         tmp_path, monkeypatch):
     # Keep the scale test about protocol/request bounds; durability fsync is
     # exercised by the crash tests below.
-    monkeypatch.setattr("deploy.upload_journal.os.fsync", lambda fd: None)
+    monkeypatch.setattr("full_peer.upload_journal.os.fsync", lambda fd: None)
     objects = tuple(
         index.to_bytes(4, "big") for index in range(4_096))
     (
@@ -642,7 +642,7 @@ def test_generic_family_commands_direct_upload_without_writable_daemon(
 
     monkeypatch.setattr(node, "run_upload", observed)
     monkeypatch.setattr(
-        "deploy.upload_client_http.run_http", direct)
+        "full_peer.upload_client_http.run_http", direct)
     message = facts.invoke_command(
         node,
         "content.message.upload",

@@ -36,11 +36,15 @@ processes or stacks without creating another repository state machine.
    standard-library HTTP server/byte adapter.
 7. `full_peer/pile_sender.py`: stateful-client authorship and closure.
 8. `full_peer/node.py`: `FullPeer`, the composition root, not a policy owner.
-9. `full_peer/sql_store.py`: the sole SQL boundary.
-10. `full_peer/daemon.py`, `full_peer/iroh_process.py`, `full_peer/iroh/`:
+9. `full_peer/upload_journal.py`, `full_peer/upload_client.py`,
+   `full_peer/upload_client_http.py`: durable outbound state, the resumable
+   state machine, then its narrow HTTP effects.
+10. `full_peer/sql_store.py`: the sole SQL boundary.
+11. `full_peer/daemon.py`, `full_peer/iroh_process.py`, `full_peer/iroh/`:
     process composition, child lifecycle, then the connection-only Iroh byte
     wrapper.
-11. `deploy/` and `adapters/`: provider adaptation and packaging only.
+12. `deploy/` and `adapters/`: shared upload wire/session values, provider
+    adaptation, and packaging—never full-peer-local client state.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -299,6 +303,14 @@ create-only PUT capabilities. The client uploads:
 
 1. detached objects to an isolated ingress bucket;
 2. one exact fact pile marker last.
+
+The stateful client owns this side of the protocol:
+`full_peer/upload_journal.py` durably spools immutable source bytes and one
+atomic progress record, `full_peer/upload_client.py` advances only persisted
+OPEN/ISSUE/FINALIZE authority, and `full_peer/upload_client_http.py` performs
+bounded broker POSTs and exact streaming PUTs. Provider brokers and deployment
+adapters remain under `deploy/`; only `upload_session.py` and `upload_wire.py`
+are shared by both sides.
 
 The marker is the durable work item. Notifications and LIST results are
 discovery hints; scheduled bounded rescans are the progress path, and only an

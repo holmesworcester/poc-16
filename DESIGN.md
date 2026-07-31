@@ -61,6 +61,13 @@ attachment I/O, and direct-upload journal/runtime. `facts/` imports neither
 `full_peer` nor provider/deployment packages. This keeps commands reusable
 without moving their semantic decisions into the host composition.
 
+The direct-upload client is stateful-peer state:
+`full_peer/upload_journal.py` owns crash-safe source/progress persistence,
+`full_peer/upload_client.py` owns the bounded resumable transition, and
+`full_peer/upload_client_http.py` owns its outbound HTTP effects. Provider
+brokers, signers, and deployment packaging remain under `deploy/`; only the
+shared `upload_session.py` and `upload_wire.py` values cross that boundary.
+
 ### 1.1 Iroh is connection only
 
 The optional full-peer path is deliberately a wrapper around the existing

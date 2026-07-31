@@ -24,10 +24,10 @@ from core.http import Response
 from deploy.upload_broker import (
     AuthorizedPut,
     UploadBroker,
-    UploadCapability,
 )
 from deploy.upload_broker_http import UploadBrokerEndpoint
-from deploy.upload_client_http import HttpBrokerTransport
+from deploy.upload_wire import UploadCapability
+from full_peer.upload_client_http import HttpBrokerTransport
 from deploy.upload_keyring import UploadKeyring, encode_keyring
 from deploy.upload_session import (
     SessionKey,

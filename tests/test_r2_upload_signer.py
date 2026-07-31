@@ -23,8 +23,9 @@ from deploy.cloudflare_upload.signer import (
     PAYLOAD,
     R2UploadSigner,
 )
-from deploy.upload_broker import AuthorizedPut, UploadCapability
+from deploy.upload_broker import AuthorizedPut
 from deploy.upload_session import valid_provider_binding
+from deploy.upload_wire import UploadCapability
 
 
 FIXED = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)

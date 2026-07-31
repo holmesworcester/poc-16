@@ -1,4 +1,4 @@
-"""Narrow HTTP adapters for :mod:`deploy.upload_client`.
+"""Narrow HTTP adapters for :mod:`full_peer.upload_client`.
 
 Broker JSON carries only proof/manifest metadata and exact bearer requests.
 Provider bodies go straight to the capability URL through a streaming PUT.
@@ -14,17 +14,8 @@ import urllib.request
 from urllib.parse import urlsplit
 
 from core.limits import PAGE_BATCH, PayloadTooLarge
-from deploy.upload_broker import (
-    MAX_FINALIZE_RESPONSE_BYTES,
-    MAX_ISSUE_RESPONSE_BYTES,
-    MAX_OPEN_RESPONSE_BYTES,
-    FinalizedUpload,
-    GrantedUpload,
-    IssuedUpload,
-    OpenedUpload,
-    UploadCapability,
-)
-from deploy.upload_client import (
+import deploy.upload_wire as wire
+from full_peer.upload_client import (
     CREATED,
     UploadCapabilityRejected,
     UploadClient,
@@ -37,18 +28,6 @@ from deploy.upload_client import (
 from deploy.upload_session import (
     UploadLeaf,
     UploadManifest,
-)
-from deploy.upload_wire import (
-    FINALIZE_REQUEST_SCHEMA,
-    ISSUE_REQUEST_SCHEMA,
-    InvalidUploadWire,
-    MAX_FINALIZE_REQUEST_BYTES,
-    MAX_ISSUE_REQUEST_BYTES,
-    MAX_OPEN_REQUEST_BYTES,
-    OPEN_REQUEST_SCHEMA,
-    encode_finalize_request,
-    encode_issue_request,
-    encode_open_request,
 )
 
 
@@ -68,7 +47,7 @@ def _capability(value):
                     isinstance(name, str) and isinstance(header, str)
                     for name, header in value["headers"].items()):
             raise ValueError
-        return UploadCapability(
+        return wire.UploadCapability(
             value["method"],
             value["url"],
             tuple(sorted(value["headers"].items())),
@@ -83,7 +62,7 @@ def _grant(value, label):
         if not isinstance(value, dict) \
                 or set(value) != {"digest", "put", "size"}:
             raise ValueError
-        return GrantedUpload(
+        return wire.GrantedUpload(
             UploadLeaf(value["digest"], value["size"]),
             _capability(value["put"]),
         )
@@ -146,20 +125,20 @@ class HttpBrokerTransport:
         if not isinstance(manifest, UploadManifest):
             raise TypeError("upload manifest")
         try:
-            request = encode_open_request(proof, manifest, pile)
-        except (InvalidUploadWire, PayloadTooLarge) as error:
+            request = wire.encode_open_request(proof, manifest, pile)
+        except (wire.InvalidUploadWire, PayloadTooLarge) as error:
             raise UploadProtocolError("invalid OPEN request") from error
         value = self._post(
             "OPEN",
             request,
-            MAX_OPEN_RESPONSE_BYTES,
+            wire.MAX_OPEN_RESPONSE_BYTES,
         )
         if set(value) != {
                 "cursor", "expires_at_ms", "schema", "session"} \
                 or value.get("schema") != "poc16-upload-open-v1":
             raise UploadProtocolError("invalid OPEN response")
         try:
-            return OpenedUpload(
+            return wire.OpenedUpload(
                 value["session"], value["cursor"], value["expires_at_ms"])
         except (KeyError, TypeError) as error:
             raise UploadProtocolError("invalid OPEN response") from error
@@ -167,14 +146,14 @@ class HttpBrokerTransport:
     def issue(self, cursor, start_index, leaves, proof):
         leaves = tuple(leaves)
         try:
-            request = encode_issue_request(
+            request = wire.encode_issue_request(
                 cursor, start_index, leaves, proof)
-        except (InvalidUploadWire, PayloadTooLarge) as error:
+        except (wire.InvalidUploadWire, PayloadTooLarge) as error:
             raise UploadProtocolError("invalid ISSUE request") from error
         value = self._post(
             "ISSUE",
             request,
-            MAX_ISSUE_RESPONSE_BYTES,
+            wire.MAX_ISSUE_RESPONSE_BYTES,
         )
         if set(value) != {
                 "cursor", "expires_at_ms", "next_index",
@@ -184,7 +163,7 @@ class HttpBrokerTransport:
                 or len(value["objects"]) > PAGE_BATCH:
             raise UploadProtocolError("invalid ISSUE response")
         try:
-            return IssuedUpload(
+            return wire.IssuedUpload(
                 value["cursor"],
                 value["next_index"],
                 tuple(
@@ -198,21 +177,21 @@ class HttpBrokerTransport:
 
     def finalize(self, cursor):
         try:
-            request = encode_finalize_request(cursor)
-        except (InvalidUploadWire, PayloadTooLarge) as error:
+            request = wire.encode_finalize_request(cursor)
+        except (wire.InvalidUploadWire, PayloadTooLarge) as error:
             raise UploadProtocolError(
                 "invalid FINALIZE request") from error
         value = self._post(
             "FINALIZE",
             request,
-            MAX_FINALIZE_RESPONSE_BYTES,
+            wire.MAX_FINALIZE_RESPONSE_BYTES,
         )
         if set(value) != {
                 "cursor", "expires_at_ms", "pile", "schema"} \
                 or value.get("schema") != "poc16-upload-finalize-v1":
             raise UploadProtocolError("invalid FINALIZE response")
         try:
-            return FinalizedUpload(
+            return wire.FinalizedUpload(
                 value["cursor"],
                 _grant(value["pile"], "pile grant"),
                 value["expires_at_ms"],
@@ -237,7 +216,7 @@ class HttpPutTransport:
             parsed.hostname, parsed.port, timeout=self.timeout)
 
     def put(self, capability, body, size):
-        if not isinstance(capability, UploadCapability) \
+        if not isinstance(capability, wire.UploadCapability) \
                 or capability.method != "PUT" \
                 or not callable(getattr(body, "read", None)) \
                 or type(size) is not int or size < 0:

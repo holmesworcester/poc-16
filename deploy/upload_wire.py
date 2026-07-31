@@ -5,6 +5,7 @@ It carries only bounded metadata: authorization proofs, Merkle descriptors,
 and authenticated cursors. Provider bodies and credentials never cross it.
 """
 import base64
+from dataclasses import dataclass, field
 from itertools import islice
 
 from core.fact import canon
@@ -28,6 +29,11 @@ from deploy.upload_session import (
 OPEN_REQUEST_SCHEMA = "poc16-upload-open-request-v1"
 ISSUE_REQUEST_SCHEMA = "poc16-upload-issue-request-v1"
 FINALIZE_REQUEST_SCHEMA = "poc16-upload-finalize-request-v1"
+UPLOAD_CONTENT_TYPE = "application/octet-stream"
+
+MAX_OPEN_RESPONSE_BYTES = 2_048
+MAX_ISSUE_RESPONSE_BYTES = 512 * 1024
+MAX_FINALIZE_RESPONSE_BYTES = 4_096
 
 # Base64 expands the largest accepted mint proof by 4/3. Keep the HTTP
 # envelope from silently imposing a smaller authorization-proof limit than
@@ -41,6 +47,44 @@ MAX_FINALIZE_REQUEST_BYTES = 16 * 1024
 
 class InvalidUploadWire(ValueError):
     """A request is not the one canonical upload protocol document."""
+
+
+@dataclass(frozen=True)
+class UploadCapability:
+    """One exact provider request issued by the broker to the client."""
+
+    method: str
+    url: str = field(repr=False)
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
+    expires_at_ms: int
+
+
+@dataclass(frozen=True)
+class GrantedUpload:
+    leaf: UploadLeaf
+    capability: UploadCapability
+
+
+@dataclass(frozen=True)
+class OpenedUpload:
+    session: str
+    cursor: str
+    expires_at_ms: int
+
+
+@dataclass(frozen=True)
+class IssuedUpload:
+    cursor: str
+    next_index: int
+    objects: tuple[GrantedUpload, ...]
+    expires_at_ms: int
+
+
+@dataclass(frozen=True)
+class FinalizedUpload:
+    cursor: str
+    pile: GrantedUpload
+    expires_at_ms: int
 
 
 def _invalid(label, error=None):
@@ -261,12 +305,21 @@ def decode_finalize_request(raw):
 
 __all__ = (
     "FINALIZE_REQUEST_SCHEMA",
+    "FinalizedUpload",
+    "GrantedUpload",
     "ISSUE_REQUEST_SCHEMA",
     "InvalidUploadWire",
     "MAX_FINALIZE_REQUEST_BYTES",
+    "MAX_FINALIZE_RESPONSE_BYTES",
     "MAX_ISSUE_REQUEST_BYTES",
+    "MAX_ISSUE_RESPONSE_BYTES",
     "MAX_OPEN_REQUEST_BYTES",
+    "MAX_OPEN_RESPONSE_BYTES",
     "OPEN_REQUEST_SCHEMA",
+    "OpenedUpload",
+    "IssuedUpload",
+    "UPLOAD_CONTENT_TYPE",
+    "UploadCapability",
     "decode_finalize_request",
     "decode_issue_request",
     "decode_open_request",

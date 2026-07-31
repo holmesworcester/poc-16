@@ -8,29 +8,33 @@ import pytest
 
 from core.crypto import h
 from deploy.upload_broker import (
+    finalize_document,
+    issue_document,
+    open_document,
+)
+from deploy.upload_wire import (
     FinalizedUpload,
     GrantedUpload,
     IssuedUpload,
     OpenedUpload,
     UploadCapability,
-    finalize_document,
-    issue_document,
-    open_document,
 )
-from deploy.upload_client import (
+from full_peer.upload_client import (
     CREATED,
     UploadCreateConflict,
     UploadOutcomeUnknown,
     UploadSessionRejected,
 )
-from deploy.upload_client_http import (
-    FINALIZE_REQUEST_SCHEMA,
-    ISSUE_REQUEST_SCHEMA,
-    OPEN_REQUEST_SCHEMA,
+from full_peer.upload_client_http import (
     HttpBrokerTransport,
     HttpPutTransport,
 )
 from deploy.upload_session import TOKEN_BYTES, UploadLeaf, UploadVector
+from deploy.upload_wire import (
+    FINALIZE_REQUEST_SCHEMA,
+    ISSUE_REQUEST_SCHEMA,
+    OPEN_REQUEST_SCHEMA,
+)
 
 
 SESSION = "a" * 32

@@ -16,11 +16,7 @@ from core.limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
 from full_peer.node import FullPeer
 from deploy.upload_broker import (
     AuthorizedPut,
-    MAX_FINALIZE_RESPONSE_BYTES,
-    MAX_ISSUE_RESPONSE_BYTES,
-    MAX_OPEN_RESPONSE_BYTES,
     UploadBroker,
-    UploadCapability,
 )
 from deploy.upload_broker_http import (
     MAX_UPLOAD_HTTP_HEADER_VALUE_BYTES,
@@ -28,8 +24,8 @@ from deploy.upload_broker_http import (
     MAX_UPLOAD_HTTP_PATH_BYTES,
     UploadBrokerEndpoint,
 )
-from deploy.upload_client import UploadRetryable, UploadSessionRejected
-from deploy.upload_client_http import HttpBrokerTransport
+from full_peer.upload_client import UploadRetryable, UploadSessionRejected
+from full_peer.upload_client_http import HttpBrokerTransport
 from deploy.upload_session import (
     MAX_RANGE_PROOF_BYTES,
     SessionKey,
@@ -38,7 +34,11 @@ from deploy.upload_session import (
     UploadVector,
 )
 from deploy.upload_wire import (
+    MAX_FINALIZE_RESPONSE_BYTES,
+    MAX_ISSUE_RESPONSE_BYTES,
     MAX_OPEN_REQUEST_BYTES,
+    MAX_OPEN_RESPONSE_BYTES,
+    UploadCapability,
     encode_finalize_request,
     encode_issue_request,
     encode_open_request,

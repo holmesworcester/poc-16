@@ -22,12 +22,7 @@ from deploy.upload_broker import (
     MAX_CAPABILITY_HEADER_VALUE_BYTES,
     MAX_CAPABILITY_QUERY_BYTES,
     MAX_CAPABILITY_URL_BYTES,
-    MAX_ISSUE_RESPONSE_BYTES,
-    FinalizedUpload,
-    IssuedUpload,
-    OpenedUpload,
     UploadBroker,
-    UploadCapability,
     UploadUnavailable,
     encode_finalize,
     encode_issue,
@@ -35,6 +30,13 @@ from deploy.upload_broker import (
     finalize_document,
     issue_document,
     open_document,
+)
+from deploy.upload_wire import (
+    MAX_ISSUE_RESPONSE_BYTES,
+    FinalizedUpload,
+    IssuedUpload,
+    OpenedUpload,
+    UploadCapability,
 )
 from deploy import upload_session as session_codec
 from deploy.upload_session import (
