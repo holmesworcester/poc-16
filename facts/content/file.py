@@ -12,7 +12,7 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from .._commands import member_source, upload_builder, upload_source
+from .._commands import direct_upload, member_source
 from ..auth import signature
 from .. import _bao as bao
 from . import chunk as chunkfam
@@ -95,10 +95,8 @@ DURABLE = True
 # COMMANDS
 def _prepare(node, workspace, channel, path, name, ts, put_object):
     """Author one file/chunk fact set; choose its detached object sink."""
-    from full_peer import bao_native
-    from full_peer.node import now_ms
-
-    timestamp = now_ms() if ts is None else ts
+    native = node.attachment_io()
+    timestamp = node.now_ms() if ts is None else ts
     source = os.path.abspath(os.fspath(path))
     if not os.path.isfile(source):
         raise ValueError("file path is not a regular file")
@@ -115,11 +113,11 @@ def _prepare(node, workspace, channel, path, name, ts, put_object):
         raise ValueError("publishing identity is not a workspace member")
     with tempfile.TemporaryDirectory(prefix="tinyp2p-bao-") as scratch:
         outboard = os.path.join(scratch, "outboard")
-        root = bao_native.prepare(source, outboard)
+        root = native.prepare(source, outboard)
         count, cids = bao.geometry(size), []
         for index in range(count):
-            blob = bao_native.proof(source, outboard, index, size)
-            payload = bao_native.verify(blob, root, index, size)
+            blob = native.proof(source, outboard, index, size)
+            payload = native.verify(blob, root, index, size)
             if len(payload) != bao.span(index, size)[1]:
                 raise RuntimeError("Bao returned a short slice")
             cid = h(blob)
@@ -159,7 +157,7 @@ def upload(
         node, workspace, channel, path, broker_url, provider_origin,
         name=None, ts=None):
     """Author once, then send objects directly to exact provider PUTs."""
-    builder = upload_builder(node, workspace)
+    builder = node.start_upload(workspace)
 
     def spool(cid, blob):
         if builder.add(blob) != cid:
@@ -175,7 +173,7 @@ def upload(
     except BaseException:
         builder.discard()
         raise
-    result = upload_source(
+    result = direct_upload(
         node, workspace, source, broker_url, provider_origin)
     return {"fid": descriptor.fid, **result}
 
@@ -183,13 +181,10 @@ def upload(
 def resume_upload(
         node, workspace, upload_id, broker_url, provider_origin):
     """Resume any retained direct-upload source by its content id."""
-    from deploy.upload_journal import UploadSource
-
     if not valid_fid(upload_id):
         raise ValueError("upload id")
-    source = UploadSource.load(
-        os.path.join(node.dir, "uploads", upload_id))
-    return upload_source(
+    source = node.load_upload(upload_id)
+    return direct_upload(
         node, workspace, source, broker_url, provider_origin)
 
 
@@ -227,10 +222,8 @@ def save(node, workspace, selector, out_path):
 
 
 # QUERIES
-def _state(store, descriptor, chunks):
+def _state(store, native, descriptor, chunks):
     """Verify only one descriptor's selected Bao slices."""
-    from full_peer import bao_native
-
     body, cids = descriptor.body, {}
     for fact in chunks:
         child = fact.body
@@ -245,7 +238,7 @@ def _state(store, descriptor, chunks):
                 "obj/" + child["cid"], bao.MAX_PROOF_BYTES)
             if raw is None or h(raw) != child["cid"]:
                 continue
-            bao_native.verify(raw, body["root"], child["i"], body["size"])
+            native.verify(raw, body["root"], child["i"], body["size"])
         except Exception:
             continue
         cids.setdefault(child["i"], child["cid"])
@@ -299,7 +292,7 @@ def _states(node, workspace, selector=None):
             target = descriptor.fid if descriptor is not None else None
         chunks = () if selector is not None and not descriptors else select(
             REF_INDEX, "file", target, source_type=chunkfam.TAG)
-        store = node.store(workspace)
+        store, native = node.store(workspace), node.attachment_io()
 
     by_file = {fact.fid: [] for fact in descriptors}
     for fact in chunks:
@@ -307,7 +300,7 @@ def _states(node, workspace, selector=None):
         if parent in by_file:
             by_file[parent].append(fact)
     return sorted([
-        _state(store, descriptor, by_file[descriptor.fid])
+        _state(store, native, descriptor, by_file[descriptor.fid])
         for descriptor in descriptors
     ], key=lambda item: (item[0]["ts"], item[0]["fid"]))
 
@@ -322,11 +315,9 @@ def _resolve_state(node, workspace, selector):
 
 
 def _payloads(node, workspace, record, cids):
-    from full_peer import bao_native
-
-    store = node.store(workspace)
+    store, native = node.store(workspace), node.attachment_io()
     return (
-        bao_native.verify(
+        native.verify(
             store.get_bounded(
                 "obj/" + cids[index], bao.MAX_PROOF_BYTES),
             record["root"], index, record["size"])

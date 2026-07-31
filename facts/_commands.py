@@ -1,6 +1,4 @@
 """Shared mechanics for family commands; no fact policy lives here."""
-import os
-
 
 def offer_source(node, workspace, name, a0, a1=None):
     """Return the current live provider from one pinned repository root."""
@@ -87,22 +85,9 @@ def publish(node, workspace, fact, signature, role="member"):
     return fact.fid
 
 
-def upload_builder(node, workspace):
-    """Spool direct-upload bytes outside the workspace/object-store answer."""
-    from deploy.upload_journal import UploadSourceBuilder
-
-    return UploadSourceBuilder(
-        os.path.join(node.dir, "uploads"),
-        workspace,
-        node.member_for(workspace),
-    )
-
-
-def upload_source(
+def direct_upload(
         node, workspace, source, broker_url, provider_origin):
     """Run the one provider-neutral direct uploader with a fresh auth proof."""
-    from full_peer.node import now_ms
-    from deploy.upload_client_http import run_http
     import facts
 
     if source.workspace != workspace \
@@ -110,11 +95,12 @@ def upload_source(
         raise ValueError("upload source authority")
 
     def proof():
-        now = now_ms()
+        now = node.now_ms()
         return node.sender(workspace).pack(facts.proof_payload(
             node, workspace, "upload", now + 120_000, now))
 
-    result = run_http(source, broker_url, provider_origin, proof)
+    result = node.run_upload(
+        source, broker_url, provider_origin, proof)
     return {
         "objects": result.object_count,
         "session": result.session,

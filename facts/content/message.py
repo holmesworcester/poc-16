@@ -7,10 +7,9 @@ from .._policy import (
     author_selectors,
 )
 from .._commands import (
+    direct_upload,
     member_source,
     publish,
-    upload_builder,
-    upload_source,
 )
 from ..auth import signature
 
@@ -60,9 +59,7 @@ DURABLE = True
 
 # COMMANDS
 def _author(node, workspace, channel, text, ts):
-    from full_peer.node import now_ms
-
-    timestamp = now_ms() if ts is None else ts
+    timestamp = node.now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     _, owner = member_source(node, workspace, public)
     if owner is None:
@@ -88,14 +85,14 @@ def upload(
     if member is None:
         raise ValueError("publishing identity is not a workspace member")
     deps = {item.fid: [signed.fid, member], signed.fid: []}
-    builder = upload_builder(node, workspace)
+    builder = node.start_upload(workspace)
     try:
         source = builder.finish(node.sender(workspace).pile(
             [signed, item], deps))
     except BaseException:
         builder.discard()
         raise
-    return {"fid": item.fid, **upload_source(
+    return {"fid": item.fid, **direct_upload(
         node, workspace, source, broker_url, provider_origin)}
 
 

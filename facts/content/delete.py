@@ -97,7 +97,6 @@ DURABLE = True
 def remove(node, workspace, target, ts=None):
     """Choose OWNER when principals match, otherwise require ADMIN."""
     import facts
-    from full_peer.node import now_ms
     from .._commands import member_source
 
     with node.lock:
@@ -113,7 +112,7 @@ def remove(node, workspace, target, ts=None):
     if policy is None or not _policy.allows_direct_target(
             policy, _policy.CONTENT_DELETE, SELF, _policy.OWNER):
         raise ValueError("fact type is not directly deleteable")
-    ts = now_ms() if ts is None else ts
+    ts = node.now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     with node.lock:
         target_principal = victim.body.get(policy.owner_field, "")

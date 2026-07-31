@@ -21,8 +21,9 @@ from core.limits import (
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
+from deploy.upload_journal import UploadSource, UploadSourceBuilder
 
-from . import sql_store
+from . import bao_native, sql_store
 from .keychain import (
     MAX_IROH_PEERS,
     Keychain,
@@ -175,6 +176,33 @@ class FullPeer:
         if isinstance(self.peer_address, str) and self.peer_address:
             return self.peer_address
         raise ValueError("peer has no advertised address")
+
+    # ---- fact-family command host -------------------------------------------
+
+    def now_ms(self):
+        return now_ms()
+
+    def sync_peer(self, workspace, url):
+        from .sync import sync
+        return sync(self, workspace, url)
+
+    def attachment_io(self):
+        return bao_native
+
+    def start_upload(self, workspace):
+        return UploadSourceBuilder(
+            os.path.join(self.dir, "uploads"),
+            workspace,
+            self.member_for(workspace),
+        )
+
+    def load_upload(self, upload_id):
+        return UploadSource.load(
+            os.path.join(self.dir, "uploads", upload_id))
+
+    def run_upload(self, source, broker_url, provider_origin, proof):
+        from deploy.upload_client_http import run_http
+        return run_http(source, broker_url, provider_origin, proof)
 
     def resolve_peer(self, workspace, peer):
         """Resolve local reachability; callers still use the ordinary HTTP client."""

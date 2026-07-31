@@ -2,6 +2,7 @@
 import os
 import random
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,33 @@ def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     output = tmp_path / "saved.bin"
     assert facts.content.file.save(rebuilt, workspace, fid, output)["bytes"] == len(data)
     assert output.read_bytes() == data
+
+
+def test_file_commands_take_native_work_from_the_host_capability(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    path = tmp_path / "hosted.bin"
+    path.write_bytes(b"host-supplied Bao")
+    native, calls = node.attachment_io(), []
+    observed = SimpleNamespace(
+        prepare=lambda *args: (
+            calls.append("prepare") or native.prepare(*args)),
+        proof=lambda *args: (
+            calls.append("proof") or native.proof(*args)),
+        verify=lambda *args: (
+            calls.append("verify") or native.verify(*args)),
+    )
+    monkeypatch.setattr(node, "attachment_io", lambda: observed)
+
+    fid = facts.content.file.send(
+        node, workspace, "general", path, ts=2)
+    saved = tmp_path / "saved.bin"
+    facts.content.file.save(node, workspace, fid, saved)
+
+    assert saved.read_bytes() == path.read_bytes()
+    assert calls.count("prepare") == calls.count("proof") == 1
+    assert calls.count("verify") >= 3
 
 
 def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):

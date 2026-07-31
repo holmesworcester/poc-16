@@ -632,6 +632,15 @@ def test_generic_family_commands_direct_upload_without_writable_daemon(
         return UploadClient(
             source, broker, bucket, clock).run(proof_factory)
 
+    host_calls = []
+    run_upload = node.run_upload
+
+    def observed(source, broker_url, provider_origin, proof_factory):
+        host_calls.append(source.source_id)
+        return run_upload(
+            source, broker_url, provider_origin, proof_factory)
+
+    monkeypatch.setattr(node, "run_upload", observed)
     monkeypatch.setattr(
         "deploy.upload_client_http.run_http", direct)
     message = facts.invoke_command(
@@ -653,6 +662,7 @@ def test_generic_family_commands_direct_upload_without_writable_daemon(
 
     assert message["objects"] == 0
     assert attachment["objects"] == 2
+    assert host_calls == [message["upload"], attachment["upload"]]
     assert nonces.count == 2
     assert node.fact_of(workspace, message["fid"]) is None
     assert node.fact_of(workspace, attachment["fid"]) is None

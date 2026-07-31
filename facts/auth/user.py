@@ -68,8 +68,6 @@ DURABLE = True
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
     from core.kernel import drain
-    from full_peer.node import now_ms
-    from full_peer.sync import sync
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
     if not isinstance(link_data, dict):
@@ -108,7 +106,7 @@ def accept(node, link, name):
         if not judgment.ok or len(invitations) != 1:
             raise ValueError("invite bootstrap")
         invitation = invitations[0]
-        ts = now_ms()
+        ts = node.now_ms()
         secret, public = node.identity()
         member = user(invitation, load_sk(blob["isk"]), public, name, ts)
         sig = signature.signature(secret, public, member, ts)
@@ -121,7 +119,7 @@ def accept(node, link, name):
         pile = node.sender(workspace).pack(bootstrap + [sig, member])
         node.receive_pile(
             workspace, node.member_for(workspace), pile)
-        sync(node, workspace, url)
+        node.sync_peer(workspace, url)
         return workspace
     finally:
         if not retained:

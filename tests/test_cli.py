@@ -121,6 +121,20 @@ def test_one_binder_serves_new_commands_prefixes_and_integer_time(
             node, "test.echo.run", [workspace, "value", "tomorrow"])
 
 
+def test_real_family_commands_take_time_from_the_host_capability(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path))
+    ticks = iter((101, 102))
+    monkeypatch.setattr(node, "now_ms", lambda: next(ticks))
+
+    workspace = facts.auth.workspace.create(node, "alice")
+    fid = facts.content.message.post(
+        node, workspace, "general", "host clock")
+
+    assert node.fact_of(workspace, workspace).ts == 101
+    assert node.fact_of(workspace, fid).ts == 102
+
+
 def test_workspace_prefix_must_be_unique():
     node = SimpleNamespace(
         workspaces=lambda: ("a" * 63 + "0", "a" * 63 + "1"))

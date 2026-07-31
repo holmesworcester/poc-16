@@ -55,6 +55,12 @@ schedule turns and translate results, but it is not a fact-policy, compiler,
 suppression, or CAS authority. `full_peer/sql_store.py` is the sole SQL
 module, and deleting its database changes no repository answer.
 
+Family modules own commands as well as validation policy, but depend only on
+the host capabilities passed as `node`: clock, peer reachability/sync,
+attachment I/O, and direct-upload journal/runtime. `facts/` imports neither
+`full_peer` nor provider/deployment packages. This keeps commands reusable
+without moving their semantic decisions into the host composition.
+
 ### 1.1 Iroh is connection only
 
 The optional full-peer path is deliberately a wrapper around the existing

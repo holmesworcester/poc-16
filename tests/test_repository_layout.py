@@ -181,6 +181,43 @@ def test_core_dispatches_through_facts_without_importing_family_modules():
     assert offenders == []
 
 
+def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
+    """Family policy/commands name behavior, never one host implementation."""
+    offenders = []
+    for path in source_paths():
+        if path.parts[0] != "facts":
+            continue
+        for item in ast.walk(parsed(path)):
+            if isinstance(item, ast.ImportFrom):
+                names = (item.module or "",)
+            elif isinstance(item, ast.Import):
+                names = tuple(alias.name for alias in item.names)
+            else:
+                continue
+            offenders.extend(
+                (path.as_posix(), name)
+                for name in names
+                if name.split(".", 1)[0] in {
+                    "adapters", "deploy", "full_peer"}
+            )
+    assert offenders == []
+
+    node = next(
+        item for item in parsed(Path("full_peer/node.py")).body
+        if isinstance(item, ast.ClassDef) and item.name == "FullPeer")
+    assert {
+        "attachment_io",
+        "load_upload",
+        "now_ms",
+        "run_upload",
+        "start_upload",
+        "sync_peer",
+    } <= {
+        item.name for item in node.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
 def test_one_explicit_fact_context_serves_core_and_full_peer_authoring():
     assert class_definitions("FactContext") == [Path("facts/_policy.py")]
     for path, owner in (

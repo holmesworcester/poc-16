@@ -58,8 +58,6 @@ DURABLE = True
 
 # COMMANDS — build a fact, admit it, stop.
 def grant(node, workspace, target):
-    from full_peer.node import now_ms
-
     target_pk = member_key(node, workspace, target)
     secret, public = node.identity(workspace)
     signer_admin = offer_source(node, workspace, "admin", public)
@@ -70,7 +68,7 @@ def grant(node, workspace, target):
     if target_member is None:
         raise ValueError("target is not a workspace member")
 
-    ts = now_ms()
+    ts = node.now_ms()
     item = admin(
         workspace, public, target_pk, ts, target_owner)
     signed = signature.signature(secret, public, item, ts)

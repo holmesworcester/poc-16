@@ -46,10 +46,8 @@ DURABLE = True
 
 # COMMANDS
 def evict(node, workspace, target):
-    from full_peer.node import now_ms
-
     target_pk = member_key(node, workspace, target)
-    ts = now_ms()
+    ts = node.now_ms()
     secret, public = node.identity(workspace)
     admin = offer_source(node, workspace, "admin", public)
     target_member = offer_source(node, workspace, "member", target_pk)

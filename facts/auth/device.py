@@ -55,13 +55,11 @@ DURABLE = True
 
 # COMMANDS — build a fact, admit it, stop.
 def bind(node, workspace, label):
-    from full_peer.node import now_ms
-
     secret, public = node.identity(workspace)
     if offer_source(
             node, workspace, "device_key", public) is not None:
         raise ValueError("local identity is already in a device set")
-    ts = now_ms()
+    ts = node.now_ms()
     item = device(workspace, public, label, ts)
     return publish(
         node, workspace, item,
