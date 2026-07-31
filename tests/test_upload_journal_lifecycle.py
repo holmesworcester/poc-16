@@ -1,12 +1,13 @@
 """Crash, concurrency, discovery, and collection for local upload state."""
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import threading
 
 import pytest
 
 import facts
+from core.fact import canon
 from full_peer.node import FullPeer
 from full_peer.upload_client import UploadRetryable
 from full_peer.upload_journal import (
@@ -132,6 +133,30 @@ def test_abandonment_retains_every_issued_session_expiry(tmp_path):
         UploadSource.collect(
             Path(source.path).parent, source.workspace,
             source.source_id, clock())
+
+
+def test_legacy_session_hydrates_expiry_high_water_and_resumes(tmp_path):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path, objects=(b"one",))
+
+    with pytest.raises(Crash):
+        UploadClient(
+            source, broker,
+            FakeProvider(lambda bucket, key, raw: "crash-before"),
+            clock,
+        ).run(proof)
+    value = asdict(source.progress())
+    value.pop("issued_until_ms")
+    Path(source.session_path).write_bytes(canon({
+        **value, "schema": "poc16-upload-client-session-v1"}))
+
+    legacy = UploadSource.load(source.path)
+    assert legacy.progress().issued_until_ms == legacy.progress().expires_at_ms
+    UploadClient(legacy, broker, FakeProvider(), clock).run(proof)
+    assert legacy.progress().pile_delivered
+    assert b"poc16-upload-client-session-v2" in Path(
+        source.session_path).read_bytes()
 
 
 def test_collection_refuses_partial_delivery_and_recovers_after_crash(
