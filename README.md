@@ -229,8 +229,9 @@ never waits for a queue or provider:
 mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
 new message          -> family-owned notification trigger
-scheduled scanner    -> authenticated FactTree diff -> durable carrier
-carrier delivery     -> historical event proof + current authority join -> FCM
+scheduled scanner    -> authenticated FactTree diff -> durable pending cursor
+Queue/SQS/local wake -> historical event proof + current authority join -> FCM
+typed completion     -> pending-cursor CAS -> next FactTree page
 ```
 
 An endpoint belongs to one workspace user and mobile installation. It carries
@@ -252,15 +253,30 @@ the authenticated `fact.type` postings in `FactTree` from its acknowledged
 base, and selects families with a `notification_trigger` hook. It does not
 read fact blobs, `FactOrder`, SQLite, ingress, or `RepositoryApplier`.
 
-One canonical carrier body contains only the workspace, target-root object ID,
-and sorted trigger FIDs. The scanner preserves the exact target root bytes in
-notification state, publishes the body to a durable carrier, and advances its
-cursor by CAS only after the carrier accepts those exact bytes. A dropped wake
-is repaired by the next scheduled turn. A lost publish response, process crash,
-or cursor race may duplicate a body but cannot skip it. The first run starts at
-the empty tree and therefore backfills historical triggers; preserve the
-notification-state store across redeployments to avoid repeating that
-backfill.
+One canonical work body contains only the workspace, target-root object ID,
+and sorted trigger FIDs. Before publishing anything, the scanner preserves the
+exact target root and body in notification state and CASes one cursor into a
+pending state with its exact successor. There is at most one pending page per
+workspace. Queue, SQS, and local deliveries are disposable wakes: every fair
+scheduled turn republishes the byte-identical pending body until the worker
+records completion. A lost wake, finite queue retention, ambiguous publish
+response, process crash, or scanner race can duplicate work but cannot make
+discovery forget it.
+
+The worker advances the pending cursor only after typed FCM acceptance or an
+explicit current-authority or terminal outcome. A concurrent or stale delivery
+is acknowledged only after notification state proves it is no longer the exact
+pending item. Carrier acknowledgement by itself is never progress.
+
+Cursor creation is also explicit. A normal first deployment initializes its
+base at the current repository root; a deliberate backfill initializes at the
+empty tree. Each bootstrap mints a fresh generation that is part of every
+pending body, preventing a paused pre-recovery worker from completing an
+identical post-recovery item after current authority changes. Scheduled
+scanning fails loudly when state is absent, belongs to a different immutable
+deployment, or was deleted after bootstrap. It never guesses whether to skip
+history or flood it again. Preserve the notification state across updates and
+rollback.
 
 `NotificationWorker` resolves and hash-checks the historical event root from
 notification state, authenticates every named event there, then separately
@@ -288,10 +304,10 @@ acceptance is not proof that APNs or Android presented the notification.
 AWS composes the scanner and worker as separate Lambdas around S3 notification
 state and SQS. Cloudflare composes separate Workers around R2 state and a
 Cloudflare Queue. A full peer can run the same shared scanner and worker with
-filesystem notification state and an in-process carrier. Provider receipts and
-queue metadata carry no repository or endpoint authority. Managed queues have
-finite retention, so notification-state roots must outlive the source queue,
-DLQ, alert response, and bounded redrive horizon.
+filesystem notification state and an in-process wake. Provider receipts and
+queue metadata carry no repository, endpoint, or completion authority. Queue
+and DLQ retention provide retry latency and operational headroom only; durable
+pending notification state is the correctness boundary and must not expire.
 
 The preference commands are available now:
 

@@ -10,18 +10,22 @@ from .carrier import MAX_CARRIER_BYTES
 from .delivery import PublicationHint
 
 
-FORMAT = "notification-hint-v1"
+FORMAT = "notification-hint-v2"
 MAX_HINT_BYTES = MAX_CARRIER_BYTES
 
 
 @dataclass(frozen=True, slots=True)
 class NotificationHint:
     workspace: str
+    owner: str
+    generation: str
     root_oid: str
     facts: tuple[str, ...]
 
     def __post_init__(self):
-        if not valid_fid(self.workspace) or not valid_fid(self.root_oid) \
+        if not valid_fid(self.workspace) or not valid_fid(self.owner) \
+                or not valid_fid(self.generation) \
+                or not valid_fid(self.root_oid) \
                 or not isinstance(self.facts, tuple) \
                 or len(self.facts) > MAX_PILE_FACTS \
                 or tuple(sorted(set(self.facts))) != self.facts \
@@ -35,19 +39,15 @@ def _body(hint):
     return {
         "facts": list(hint.facts),
         "format": FORMAT,
+        "generation": hint.generation,
+        "owner": hint.owner,
         "root_oid": hint.root_oid,
         "workspace": hint.workspace,
     }
 
 
-def hint_id(hint):
-    """Stable id for every retry of the exact event-root fact bundle."""
-    return h(canon(_body(hint)))
-
-
 def encode_hint(hint):
-    body = _body(hint)
-    raw = canon({**body, "id": h(canon(body))})
+    raw = canon(_body(hint))
     if len(raw) > MAX_HINT_BYTES:
         raise ValueError("notification hint too large")
     return raw
@@ -56,14 +56,16 @@ def encode_hint(hint):
 def decode_hint(raw):
     value = decode_json(raw, MAX_HINT_BYTES, "notification hint")
     if not isinstance(value, dict) or set(value) != {
-            "facts", "format", "id", "root_oid", "workspace"} \
+            "facts", "format", "generation", "owner", "root_oid",
+            "workspace"} \
             or value.get("format") != FORMAT \
             or not isinstance(value.get("facts"), list):
         raise ValueError("notification hint shape")
     hint = NotificationHint(
-        value.get("workspace"), value.get("root_oid"),
+        value.get("workspace"), value.get("owner"),
+        value.get("generation"), value.get("root_oid"),
         tuple(value["facts"]))
-    if value.get("id") != hint_id(hint) or encode_hint(hint) != raw:
+    if encode_hint(hint) != raw:
         raise ValueError("notification hint identity")
     return hint
 
@@ -81,6 +83,5 @@ __all__ = (
     "NotificationHint",
     "decode_hint",
     "encode_hint",
-    "hint_id",
     "materialize_hint",
 )

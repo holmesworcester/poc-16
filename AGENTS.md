@@ -56,8 +56,10 @@ Read implementation authority in this order:
 8. `notifications/hints.py`, `notifications/discovery.py`,
    `notifications/carrier.py`, `notifications/delivery.py`, and
    `notifications/worker.py` for post-publication work. Notification state is
-   durable operational state outside core; it never grants fact authority or
-   enters `RepositoryApplier`.
+   durable operational state outside core. It holds at most one pending diff
+   page per workspace before any disposable wake is emitted; only typed worker
+   completion advances it. It never grants fact authority or enters
+   `RepositoryApplier`.
 
 ## The central theorem
 

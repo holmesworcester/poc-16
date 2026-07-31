@@ -1,14 +1,15 @@
 """One carrier-neutral, post-publication notification attempt.
 
-A managed carrier durably owns redelivery.  It decodes a ``PublicationHint``,
-awaits :meth:`NotificationWorker.process`, acknowledges ``ACK`` and
-``TERMINAL``, and redelivers ``RETRY``.  The worker never mutates repository
-state and never treats the carrier as authority.
+The notification cursor durably owns one pending body. A managed carrier is a
+disposable wake that may expire or duplicate it. The handler advances only the
+exact pending body after :meth:`NotificationWorker.process` succeeds; every
+fair scanner run republishes work that remains pending.
 """
 from dataclasses import dataclass
 from enum import Enum
 from inspect import isawaitable
 
+from core.crypto import h
 from core.limits import MAX_ROOT_BYTES, PayloadTooLarge
 from core.shape import FACT_TS_MAX, valid_fid
 
@@ -26,6 +27,10 @@ from .delivery import (
     request_for,
 )
 from .hints import decode_hint, materialize_hint
+from .discovery import (
+    PENDING_CURRENT,
+    PENDING_NONCURRENT,
+)
 
 
 class NotificationAction(Enum):
@@ -142,30 +147,25 @@ class NotificationWorker:
         )
 
 
-async def process_carrier_delivery(
-        delivery, workspace, notification_state, worker):
-    """Resolve one canonical carrier body into a typed worker result.
-
-    The trusted deployment supplies ``workspace`` and a read-only
-    notification-state capability.  Carrier metadata is never authority.
-    """
-    read = getattr(notification_state, "get_bounded", None)
-    if not isinstance(delivery, CarrierDelivery) \
-            or not valid_fid(workspace) \
-            or not callable(read) \
-            or not isinstance(worker, NotificationWorker):
-        raise TypeError("notification carrier handler")
+def _reference(delivery, workspace, owner):
     try:
         reference = decode_hint(delivery.body)
     except (TypeError, ValueError):
-        return WorkerResult(TERMINAL, reason="invalid-carrier-hint")
-    if reference.workspace != workspace:
-        return WorkerResult(TERMINAL, reason="foreign-workspace")
+        return None, "invalid-carrier-hint"
+    if reference.workspace != workspace or reference.owner != owner:
+        return None, "foreign-authority"
+    return reference, ""
+
+
+async def _process(reference, notification_state, worker):
+    read = getattr(notification_state, "get_bounded", None)
+    if not callable(read):
+        raise TypeError("notification carrier handler")
     try:
         raw = await _resolve(read(
             "obj/" + reference.root_oid, MAX_ROOT_BYTES))
     except PayloadTooLarge:
-        return WorkerResult(TERMINAL, reason="oversized-state-root")
+        return WorkerResult(RETRY, reason="oversized-state-root")
     except Exception:
         return WorkerResult(RETRY, reason="state-unavailable")
     if raw is None or not isinstance(raw, bytes):
@@ -173,15 +173,64 @@ async def process_carrier_delivery(
     try:
         hint = materialize_hint(reference, raw)
     except (TypeError, ValueError):
-        return WorkerResult(TERMINAL, reason="invalid-state-root")
+        return WorkerResult(RETRY, reason="invalid-state-root")
     return await worker.process(hint)
+
+
+async def process_carrier_delivery(
+        delivery, workspace, notification_state, worker):
+    """Evaluate one body without advancing durable discovery state."""
+    read = getattr(notification_state, "get_bounded", None)
+    owner = getattr(notification_state, "owner", None)
+    if not isinstance(delivery, CarrierDelivery) \
+            or not valid_fid(workspace) \
+            or not callable(read) \
+            or not valid_fid(owner) \
+            or not isinstance(worker, NotificationWorker):
+        raise TypeError("notification carrier handler")
+    reference, reason = _reference(delivery, workspace, owner)
+    if reference is None:
+        return WorkerResult(TERMINAL, reason=reason)
+    return await _process(reference, notification_state, worker)
 
 
 async def handle_carrier_delivery(
         delivery, workspace, notification_state, worker):
-    """Map the one shared typed path into carrier ACK/RETRY vocabulary."""
-    return carrier_disposition(await process_carrier_delivery(
-        delivery, workspace, notification_state, worker))
+    """Evaluate and complete only the exact durable pending body."""
+    read = getattr(notification_state, "get_bounded", None)
+    pending = getattr(notification_state, "pending", None)
+    complete = getattr(notification_state, "complete", None)
+    owner = getattr(notification_state, "owner", None)
+    if not isinstance(delivery, CarrierDelivery) \
+            or not valid_fid(workspace) \
+            or not callable(read) \
+            or not callable(pending) \
+            or not callable(complete) \
+            or not valid_fid(owner) \
+            or not isinstance(worker, NotificationWorker):
+        raise TypeError("notification carrier handler")
+    reference, _reason = _reference(delivery, workspace, owner)
+    if reference is None:
+        return CARRIER_ACK
+    body_oid = h(delivery.body)
+    try:
+        status = await _resolve(pending(body_oid))
+    except Exception:
+        return CARRIER_RETRY
+    if status == PENDING_NONCURRENT:
+        return CARRIER_ACK
+    if status != PENDING_CURRENT:
+        return CARRIER_RETRY
+    result = await _process(reference, notification_state, worker)
+    if not isinstance(result, WorkerResult) \
+            or result.action is RETRY \
+            or result.reason == "invalid-hint":
+        return CARRIER_RETRY
+    try:
+        status = await _resolve(complete(body_oid))
+    except Exception:
+        return CARRIER_RETRY
+    return CARRIER_ACK if status == PENDING_NONCURRENT else CARRIER_RETRY
 
 
 __all__ = (
