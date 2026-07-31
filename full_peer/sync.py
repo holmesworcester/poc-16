@@ -7,8 +7,7 @@ The replicated value is:
 FactOrder, generic fact postings, and suppression are mechanical projections
 of that monotone set. A sender assembles a fresh closure for each missing fact;
 no stored validation path crosses the wire. Every closure re-enters through
-the ordinary exact-pile door. Detached file bytes remain a separate
-best-effort completion pass.
+the ordinary exact-pile door, including inline file slices.
 """
 from dataclasses import dataclass
 
@@ -18,7 +17,7 @@ from core.crypto import h
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.repository_reader import RepositoryReader
 from core.store import RemoteStore
-from .walk import Peer, _fetch_blobs
+from .walk import Peer
 
 
 @dataclass(frozen=True)
@@ -51,9 +50,8 @@ def _delta(local, remote):
 def _push_facts(view, fids, peer, sender):
     """Deliver freshly closed validated-fact deltas as ordinary piles.
 
-    Bad closures remain independent: every valid closure is still delivered.
-    Detached objects precede every pile that can name them, and the receiver
-    invokes its one RepositoryApplier path per bounded batch.
+    Bad closures remain independent: every valid closure is delivered as its
+    own pile, and the receiver invokes its one RepositoryApplier for each.
     """
     closures, failures = [], []
     for fid in fids:
@@ -140,10 +138,6 @@ def sync(node, workspace, url):
         local_etag = _root_digest(node.store(workspace))
         if local_etag == cache.get("local") and not (
                 cache.get("pending_push") and accepts_push):
-            if cache.get("blobs") != local_etag:
-                _, complete = _fetch_blobs(node, workspace, peer)
-                if complete:
-                    cache["blobs"] = local_etag
             return 0, 0
         remote_root, remote_etag = cache.get("root"), cache.get("etag")
     else:
@@ -172,7 +166,6 @@ def sync(node, workspace, url):
         # The peer consumed an ordinary pile and may now expose a new root.
         remote_etag = None
 
-    _, blobs_complete = _fetch_blobs(node, workspace, peer)
     cache.update({"etag": remote_etag, "root": remote_root})
     if pulled:
         # The turn produced a new local snapshot after the compared root.  A
@@ -184,12 +177,6 @@ def sync(node, workspace, url):
         cache["pending_push"] = True
     else:
         cache.pop("pending_push", None)
-    current_etag = _root_digest(node.store(workspace))
-    compared_etag = h(local_root) if local_root is not None else None
-    if blobs_complete and not pulled and current_etag == compared_etag:
-        cache["blobs"] = compared_etag
-    else:
-        cache.pop("blobs", None)
     return pulled, pushed
 
 

@@ -215,12 +215,11 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
         "alice-target", 102)
     alice_pile = closed_subset(source, workspace, (alice_claim.fid,))
 
-    # The two independently closed units are safely combinable because their
-    # complete member/device addresses differ.
+    # Independent closed units remain independent wire piles.
     assert len(source.sender(workspace).pack_batches((
         decode_pile(bob_chain, workspace),
         decode_pile(alice_pile, workspace),
-    ))) == 1
+    ))) == 2
 
     peers = []
     for name, order in (

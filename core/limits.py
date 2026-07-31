@@ -23,8 +23,7 @@ MAX_REJECTION_RECORD_BYTES = 4 * 1024
 MAX_REJECTION_DIAGNOSTIC_BYTES = 512
 
 # Every database-free hosted Reader must be able to return canonical facts and
-# public invite envelopes admitted by the shared engine. Detached file objects
-# use their own direct-upload/completion path and retain MAX_OBJECT_BYTES.
+# public invite envelopes admitted by the shared engine.
 MAX_FACT_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_REPOSITORY_OBJECT_BYTES = MAX_FACT_BYTES

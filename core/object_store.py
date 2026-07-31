@@ -16,8 +16,8 @@ internal ``pile/`` generations, immutable ``failed/`` rejection evidence,
 ``staged/`` receipts, never-deleted ``applier/generation/`` reservations and
 ``applier/spent/`` outcomes, and ``applier/cursor/`` liveness hints. Those
 objects are not repository answers and are never read through
-``RepositoryReader``. Client-writable ``ingress/v1/`` markers and detached
-objects live in the separate ingress compartment.
+``RepositoryReader``. Client-writable ``ingress/v1/`` pile markers live in the
+separate ingress compartment.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes

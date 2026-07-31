@@ -308,10 +308,10 @@ serialized form, not preserve an obsolete original encoding.
 
 Peers do not proxy file bytes through Lambda or a Worker. A broker reads a
 pinned repository root to authorize an upload and returns exact, short-lived,
-create-only PUT capabilities. The client uploads:
-
-1. detached objects to an isolated ingress bucket;
-2. one exact fact pile marker last.
+create-only PUT capabilities. Each source uploads one exact fact-only closed
+pile marker to isolated ingress. A file upload sends the signed descriptor
+first and then one independently admissible inline Bao slice pile per range;
+there is no detached attachment-object phase.
 
 The stateful client owns this side of the protocol:
 `full_peer/upload_journal.py` durably spools immutable source bytes and one
@@ -345,18 +345,15 @@ exact bounded marker read can establish work.
    sole ws-less exception);
 3. copies it behind the marker's one durably reserved internal generation;
 4. commits facts through the ordinary pile path;
-5. spends and retires only that internal generation;
-6. promotes referenced attachments in bounded round-robin pages.
+5. spends and retires only that internal generation.
 
-The Applier never deletes the client marker or detached ingress objects.
-F10 retires only the marker's separately reserved internal generation. Until
-an exact abandoned-session collection rule is proved, provider policy retains
-the complete client-writable namespace: the AWS broker role is conditional
-PUT-only and deployment admits only a no-lifecycle bucket, while Cloudflare
-uses an indefinite R2 bucket lock over the ingress prefix. Missing attachments
-do not block valid fact admission; immutable page receipts and a
-non-authoritative cursor let concurrent Workers duplicate bounded work without
-skipping completion or corrupting the tree.
+The Applier never deletes the client marker. F10 retires only the marker's
+separately reserved internal generation. Until an exact abandoned-session
+collection rule is proved, provider policy retains the complete client-writable
+namespace: the AWS broker role is conditional PUT-only and deployment admits
+only a no-lifecycle bucket, while Cloudflare uses an indefinite R2 bucket lock
+over the ingress prefix. Immutable generation evidence lets concurrent Workers
+duplicate bounded work without skipping a marker or corrupting the tree.
 
 The marker's member component names the broker-authenticated upload session,
 not the author of every fact in a relayed closure. Per-fact signatures and

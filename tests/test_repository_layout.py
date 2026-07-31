@@ -377,7 +377,7 @@ def test_applier_owns_object_establishment_generations_and_retirement():
         assert callers == expected
 
 
-def test_inbound_canonical_objects_have_one_semantic_write_door():
+def test_canonical_pages_have_no_inbound_write_door():
     callers = {
         path.as_posix()
         for path in source_paths()
@@ -386,11 +386,7 @@ def test_inbound_canonical_objects_have_one_semantic_write_door():
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "admit_object"
     }
-    assert callers == {
-        "core/http.py",
-        "core/repository_applier.py",
-        "full_peer/node.py",
-    }
+    assert callers == set()
 
     # Provider adapters expose mutation mechanics and deployment code may
     # conditionally create isolated ingress. Neither is another canonical
@@ -457,10 +453,7 @@ def test_only_cursor_savers_may_use_overwriteable_operational_hints():
             for call in ast.walk(method)
         )
     }
-    assert callers == {
-        "_save_discovery_cursor",
-        "_save_staged_object_cursor",
-    }
+    assert callers == {"_save_discovery_cursor"}
 
 
 def test_pile_sender_is_the_only_production_encoder():
@@ -514,11 +507,11 @@ def test_ordinary_pile_surfaces_have_no_embedded_object_channel():
 
 
 def test_pile_sender_owns_outbound_peer_delivery():
-    for method in ("put_obj", "put_pile"):
-        assert {
-            path.as_posix()
-            for path, _ in calls_named(method)
-        } == {"full_peer/pile_sender.py"}
+    assert {
+        path.as_posix()
+        for path, _ in calls_named("put_pile")
+    } == {"full_peer/pile_sender.py"}
+    assert calls_named("put_obj") == []
 
 
 def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
@@ -701,7 +694,7 @@ def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
         if isinstance(item, ast.FunctionDef)
         and item.name == "ingress_failures")
 
-    for method in (remote_fetch, *file_reads):
+    for method in (remote_fetch,):
         attributes = {
             call.func.attr
             for call in ast.walk(method)
@@ -709,6 +702,17 @@ def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
             and isinstance(call.func, ast.Attribute)
         }
         assert "get_bounded" in attributes
+        assert "get" not in attributes
+    # Inline Bao proof bytes are already canonical fact bodies. File assembly
+    # calls the family verifier and never opens a second object-store path.
+    for method in file_reads:
+        attributes = {
+            call.func.attr
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+        }
+        assert "get_bounded" not in attributes
         assert "get" not in attributes
     failure_attributes = {
         call.func.attr
@@ -1308,10 +1312,16 @@ def test_full_peer_projection_has_no_repository_authority_residue():
     assert "PRAGMA user_version=1" in source
 
 
-def test_bao_native_io_is_full_peer_only():
+def test_bao_authoring_is_native_but_admission_is_pure_python():
     assert (ROOT / "facts" / "_bao.py").is_file()
+    assert (ROOT / "facts" / "_bao_verify.py").is_file()
     assert (ROOT / "full_peer" / "bao_native.py").is_file()
     assert not (ROOT / "core" / "bao.py").exists()
+    assert all(
+        "tinyp2p_bao" not in (ROOT / path).read_text()
+        for path in source_paths()
+        if path.parts[0] == "facts"
+    )
 
 
 def test_production_vocabulary_has_no_retired_positive_roles():

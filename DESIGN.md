@@ -166,7 +166,7 @@ The clear envelope contains only generic protocol atoms:
 
 Every fact type is a module under `facts/`. A family owns construction, exact
 shape validation, declared `Need`s, durability, suppression and direct-action
-policy, liveness guards, commands, queries, and detached blob references.
+policy, liveness guards, commands, queries, and inline payload validation.
 Core dispatches through the checked family registry and contains no tag switch.
 Registry compilation rejects malformed or ambiguous selector, action,
 liveness, and typed-suppression declarations before a family can be admitted.
@@ -179,10 +179,9 @@ dependency count, and per-fact transitive closure are independently bounded.
 The count is checked lexically before generation reservation, then rechecked
 by the exact decoder and kernel. Each canonical fact and public invite envelope
 also fits the smallest hosted Reader's single-object response ceiling. Detached
-Bao objects use their separate direct-upload and completion path.
-Authenticated-root traversal reads only `MAX_REPOSITORY_OBJECT_BYTES`; the
-larger generic object ceiling is reserved for detached ingress and exact
-collision/retirement work.
+Bao proofs therefore fit inside ordinary fact bodies. Authenticated-root
+traversal reads only `MAX_REPOSITORY_OBJECT_BYTES`; the larger generic object
+ceiling remains an outer HTTP/storage bound.
 
 The database-free kernel streams the pile into a temporary `MemoryContext`.
 For each fact it:
@@ -223,6 +222,31 @@ stored:  fid -> canonical fact bytes
 There is no losing, dormant, inactive, or second-class validated fact. Current
 suppression can hide a fact from a query or disable authority without revoking
 its residence.
+
+### 2.3 Inline Bao slices
+
+A signed `file_bao` descriptor commits the file root, length, 256 KiB width,
+and slice count. Each unsigned `file_slice` names that exact descriptor with a
+`file` ref and carries its index plus canonical Bao range proof in its ordinary
+fact body. The descriptor signature and Bao root are sufficient authority;
+signing every slice would add no claim. The slice handler verifies the proof in
+the database-free kernel with the small pure-Python verifier adapted from Bao
+0.13.1's readable reference implementation. The Rust binding only authors
+roots and proofs and is cross-tested against that verifier.
+
+The descriptor and every slice travel as separate closed piles. A slice
+inherits only its descriptor's suppression ID, so deleting the descriptor
+hides every range without individual deletion actions. After admission there
+is no detached object, completion scan, or alternate sync path. Stateful file
+queries count the generic `file` ref index and load proof-bearing fact bodies
+only for the selected descriptor.
+
+The 256 KiB width keeps one encoded slice below 512 KiB while reducing fact,
+kernel-turn, and root-CAS count fourfold versus POC-17's 64 KiB geometry. A
+4 MiB + 17 byte local comparison produced 65 versus 17 facts; total proof wire
+bytes and pure-verifier throughput were effectively equal (5.98/5.95 MB of
+base64 and 1.65/1.64 MiB/s respectively). The larger width therefore buys
+simplicity and fewer turns without increasing total verification work.
 
 Provider identity follows one rule:
 
@@ -408,8 +432,8 @@ hosted recipient.
 
 Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
-bytes, clobber a newer root, retire another generation, skip detached-object
-completion, or corrupt a Merkle tree.
+bytes, clobber a newer root, retire another generation, or corrupt a Merkle
+tree.
 
 ## 6. RepositoryReader and sync
 
@@ -459,9 +483,8 @@ projection codec change, not a second validation path.
 Ordinary clients upload directly to isolated object-store ingress:
 
 1. ask a read-only broker for exact short-lived create-only capabilities;
-2. PUT detached objects first;
-3. PUT one exact closed pile marker last;
-4. optionally send a wake hint.
+2. PUT one exact fact-only closed-pile marker;
+3. optionally send a wake hint.
 
 The Applier fetches the marker itself, verifies workspace/member/session/path
 bindings, uses that marker as the stable identity of a durably reserved
@@ -470,7 +493,7 @@ never deletes client-writable ingress. F10 spends and retires only the
 internal generation.
 
 Acknowledgement creates an availability obligation for the exact client
-object. No receipt, F10 spend, Worker teardown, or unproved age heuristic may
+marker. No receipt, F10 spend, Worker teardown, or unproved age heuristic may
 retire it. AWS confines the broker parent to conditional `PutObject` and
 requires an exact no-lifecycle audit of its externally owned ingress bucket.
 Later S3 bucket-configuration mutation is outside broker-parent compromise;
@@ -490,9 +513,9 @@ collector must first prove a separate, exact abandoned-session lifecycle and
 cannot impersonate F10.
 
 Notifications and paginated LIST are discovery hints only. Scheduled bounded
-rescans are the progress path. Missing attachments do not block fact
-validation; detached completion uses immutable page receipts and a
-non-authoritative cursor.
+rescans are the progress path. Each marker is already the complete fact-only
+work unit; duplicate discovery is harmless because its internal generation and
+terminal outcome are immutable. There is no second completion state.
 
 The broker grants one fixed-expiry resumable authorization lease. `OPEN`
 alone reads a pinned `RepositoryReader` snapshot and proves current upload

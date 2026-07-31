@@ -118,9 +118,11 @@ def serving(node, profile, tamper_cap=None):
 
 def test_full_peer_serves_one_object_larger_than_the_batch_limit(tmp_path):
     remote, workspace, local = replicas(tmp_path)
-    raw = b"x" * (MAX_PAGE_BATCH_BYTES + 1)
+    # The raw object fits the repository-object ceiling, while its base64
+    # representation cannot fit one batch response.
+    raw = b"x" * (MAX_PAGE_BATCH_BYTES * 3 // 4 + 1)
     oid = h(raw)
-    remote.receive_object(workspace, oid, raw)
+    remote.store(workspace).put_if_absent("obj/" + oid, raw)
 
     with serving(
             remote, peer_capability.FULL) as (url, _observed, _edge):
@@ -327,9 +329,9 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         assert pushed > 0
         assert remote.fact_of(workspace, local_fid) \
             == local.fact_of(workspace, local_fid)
-        # The signature and message are two facts but one verified,
-        # closed outbound batch and therefore one receiver transition.
-        assert len(observed["puts"]) == 1
+        # Each missing fact gets its own fresh closure and independent
+        # receiver transition; one poisoned closure cannot hide another.
+        assert len(observed["puts"]) == 2
         assert all(path.startswith("/pile/") for path in observed["puts"])
 
         staged = []
@@ -343,7 +345,7 @@ def test_full_and_legacy_peers_still_sync_both_directions(
         remote_fid = facts.content.message.post(
             remote, workspace, "general", "from remote", ts=20)
         assert sync(local, workspace, url) == (1, 0)
-        assert len(staged) == 1
+        assert len(staged) == 2
         assert local.fact_of(workspace, remote_fid) \
             == remote.fact_of(workspace, remote_fid)
         assert local.store(workspace).get("root") \
@@ -463,8 +465,6 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert observed["mints"] == 3
         with pytest.raises(PushUnsupported, match="pull-only"):
             cold.put_pile(b"unsupported")
-        with pytest.raises(PushUnsupported, match="pull-only"):
-            cold.put_obj(h(b"unsupported"), b"unsupported")
         assert observed["puts"] == []
 
         pending = facts.content.message.post(
@@ -482,30 +482,6 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert "pending_push" not in local.sync_cache[(workspace, url)]
         assert observed["puts"]
         assert all(path.startswith("/pile/") for path in observed["puts"])
-
-
-def test_full_peer_accepts_only_correctly_addressed_immutable_objects(
-        tmp_path):
-    remote, workspace, local = replicas(tmp_path)
-    raw = b"independent attachment proof"
-    oid = h(raw)
-
-    with serving(
-            remote, peer_capability.FULL) as (url, observed, _):
-        peer = Peer(local, workspace, url)
-        peer.put_obj(oid, raw)
-        assert remote.store(workspace).get("obj/" + oid) == raw
-
-        request = urllib.request.Request(
-            f"{url}/page/{oid}?ws={workspace}",
-            data=b"different bytes", method="PUT",
-            headers={"Authorization": "Bearer " + peer.cache["token"]},
-        )
-        with pytest.raises(urllib.error.HTTPError) as denied:
-            urllib.request.urlopen(request)
-        assert denied.value.code == 400
-        assert remote.store(workspace).get("obj/" + oid) == raw
-        assert len(observed["puts"]) == 2
 
 
 def test_capability_is_hmac_bound_and_unknown_signed_versions_are_rejected():

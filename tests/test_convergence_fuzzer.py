@@ -142,7 +142,6 @@ def test_final_union_divergence_is_prefix_replayable(tmp_path):
     broken = replace(
         corpus,
         staged_raw=corpus.work["post-b"],
-        staged_objects={},
     )
     plan = build_plan(2, 0xF2F1A)
     final_at = len(plan.stages) + len(plan.remaining) \

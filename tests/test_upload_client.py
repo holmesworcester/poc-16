@@ -13,8 +13,6 @@ from core.close import encode_pile
 from core.crypto import h
 from full_peer.node import FullPeer
 from core.staged_intent import (
-    StagedObjectsPending,
-    confirm_staged_object,
     decode_staged_pile,
     parse_staging_key,
 )
@@ -37,10 +35,7 @@ from deploy.upload_session import (
     UploadSessionPolicy,
 )
 from core.http import AsyncFromSyncReader
-from facts._commands import offer_source
 from facts.auth import request
-from facts.content import file as file_family
-from facts.content import message as message_family
 
 
 NOW = 2_000_000
@@ -565,58 +560,6 @@ def test_source_manifest_and_session_journal_are_separate_and_restartable(
     assert reloaded.progress().delivered_index == 0
 
 
-def test_real_message_and_multichunk_pile_derives_missing_bao_object(
-        tmp_path):
-    (
-        node, workspace, member, clock, _, _, broker, _, proof,
-    ) = world(tmp_path)
-    path = tmp_path / "two-slices.bin"
-    path.write_bytes(b"a" * (bao.WIDTH + 17))
-    builder = UploadSourceBuilder(
-        tmp_path / "real-upload", workspace, member)
-    blobs = []
-    descriptor, news, deps = file_family._prepare(
-        node, workspace, "general", path, None, 10,
-        lambda digest, raw: blobs.append((digest, raw)),
-    )
-    message, signed = message_family._author(
-        node, workspace, "general", "attachment follows", 11)
-    provider = offer_source(
-        node, workspace, "member", message.body["pk"])
-    news += [signed, message]
-    deps.update({
-        signed.fid: [],
-        message.fid: [signed.fid, provider],
-    })
-    stream = node.sender(workspace).close(news, deps)
-    # Deliberately spool only one of two available Bao proofs. Fact validity
-    # and the pile marker are independent of detached byte completeness.
-    assert len(blobs) == 2
-    builder.add(blobs[0][1])
-    source = builder.finish(node.sender(workspace).pack(stream))
-    bucket = FakeProvider()
-
-    UploadClient(source, broker, bucket, clock).run(proof)
-
-    pile_key = bucket.calls[-1]
-    intent = decode_staged_pile(
-        workspace, pile_key, bucket.objects[pile_key])
-    assert {fact.t for fact in intent.stream} >= {
-        "msg", "file_bao", "chunk"}
-    assert descriptor.fid in {fact.fid for fact in intent.stream}
-    assert intent.blob_refs == tuple(sorted(digest for digest, _ in blobs))
-    present = []
-    missing = []
-    for key in intent.object_keys:
-        raw = bucket.objects.get(key)
-        try:
-            confirm_staged_object(intent, key, raw)
-            present.append(key)
-        except StagedObjectsPending:
-            missing.append(key)
-    assert len(present) == len(missing) == 1
-
-
 def test_generic_family_commands_direct_upload_without_writable_daemon(
         tmp_path, monkeypatch):
     (
@@ -661,10 +604,11 @@ def test_generic_family_commands_direct_upload_without_writable_daemon(
     )
 
     assert message["objects"] == 0
-    assert attachment["objects"] == 2
-    assert host_calls == [message["upload"], attachment["upload"]]
-    assert nonces.count == 2
+    assert "objects" not in attachment
+    assert attachment["piles"] == 3
+    assert host_calls == [message["upload"], *attachment["uploads"]]
+    assert nonces.count == 4
     assert node.fact_of(workspace, message["fid"]) is None
     assert node.fact_of(workspace, attachment["fid"]) is None
-    assert [parse_staging_key(key).object_class for key in bucket.calls] == [
-        "pile", "obj", "obj", "pile"]
+    assert [parse_staging_key(key).object_class for key in bucket.calls] \
+        == ["pile"] * 4

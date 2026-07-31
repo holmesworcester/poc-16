@@ -1,7 +1,6 @@
 """The one disposable fact catalog and combined generic index."""
 import json
 import sqlite3
-import threading
 
 import pytest
 
@@ -11,7 +10,6 @@ from core import fact_index
 from core.fact import Fact, canon, decode, encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
-from full_peer.walk import _fetch_blobs
 from core.repository_snapshot import action_bindings
 
 
@@ -239,87 +237,6 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
     _assert_exact_projection(node, workspace)
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [message_fid]
-
-
-def test_background_blob_scan_serializes_query_authoring_and_rebuild(
-        tmp_path, monkeypatch):
-    """One SQLite connection never receives concurrent production calls."""
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    existing = facts.content.message.post(
-        node, workspace, "general", "existing", ts=2)
-    projection = node.sql(workspace)
-    original = sql_store.SqlStore.fact
-    entered = threading.Event()
-    release = threading.Event()
-    collision = threading.Event()
-    active = 0
-    active_lock = threading.Lock()
-
-    def observed(self, fid):
-        nonlocal active
-        if self is not projection:
-            return original(self, fid)
-        with active_lock:
-            active += 1
-            if active > 1:
-                collision.set()
-        try:
-            if threading.current_thread().name == "blob-scan":
-                entered.set()
-                assert release.wait(5)
-            return original(self, fid)
-        finally:
-            with active_lock:
-                active -= 1
-
-    monkeypatch.setattr(sql_store.SqlStore, "fact", observed)
-    results, errors = {}, []
-
-    def run(name, operation):
-        try:
-            results[name] = operation()
-        except Exception as error:
-            errors.append(error)
-
-    scan = threading.Thread(
-        name="blob-scan",
-        target=lambda: run(
-            "scan", lambda: _fetch_blobs(node, workspace, object())),
-    )
-    scan.start()
-    assert entered.wait(5)
-
-    workers = [
-        threading.Thread(
-            name="query",
-            target=lambda: run(
-                "query", lambda: node.fact_of(workspace, existing))),
-        threading.Thread(
-            name="author",
-            target=lambda: run(
-                "author",
-                lambda: facts.content.message.post(
-                    node, workspace, "general", "concurrent", ts=3))),
-        threading.Thread(
-            name="rebuild",
-            target=lambda: run(
-                "rebuild", lambda: node.rebuild(workspace))),
-    ]
-    for worker in workers:
-        worker.start()
-
-    assert not collision.wait(0.2)
-    release.set()
-    for worker in (scan, *workers):
-        worker.join(5)
-        assert not worker.is_alive()
-
-    assert errors == []
-    assert results["query"].fid == existing
-    assert node.fact_of(workspace, results["author"]) is not None
-    assert results["scan"][1] is True
-    _assert_exact_projection(node, workspace)
 
 
 def test_foreign_root_format_fails_closed_without_local_republish(

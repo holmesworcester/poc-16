@@ -398,9 +398,6 @@ def test_fact_sync_carries_actions_and_their_projection(
         def put_pile(self, raw):
             source.receive_pile(self.ws, "peer", raw)
 
-        def put_obj(self, oid, raw):
-            source.receive_object(self.ws, oid, raw)
-
     monkeypatch.setattr(sync_module, "Peer", LocalPeer)
     sync_module.sync(destination, workspace, "local")
 

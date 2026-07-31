@@ -62,8 +62,6 @@ def test_seed_replays_and_covers_single_batch_duplicate_and_noop():
         "action-before-target",
         "target-after-action",
         "target-action-batch",
-        "multi-scope-file",
-        "multi-scope-chunk",
         "competing-action-late",
         "competing-action-earlier",
         "duplicate-existing",
@@ -78,20 +76,23 @@ def test_differential_oracle_rejects_a_dropped_suppression_scope(
     corpus = fuzzer.build_corpus()
     plan = fuzzer.build_plan(corpus, fuzzer.FIXED_SEEDS[0])
     current_scopes = facts.current_scopes
+    target = corpus.groups["target-first"][-1]
 
     def broken(anchor, base_root, incoming, fetch):
         with monkeypatch.context() as patch:
             patch.setattr(
                 facts,
                 "current_scopes",
-                lambda fact: frozenset(sorted(current_scopes(fact))[:1]),
+                lambda fact: frozenset()
+                if fact.fid == target else current_scopes(fact),
             )
             return extend_snapshot(anchor, base_root, incoming, fetch)
 
     with pytest.raises(AssertionError) as caught:
         fuzzer.run_plan(corpus, plan, broken)
     assert any(
-        "multi-scope-chunk" in note for note in caught.value.__notes__)
+        "single-target-before-action" in note
+        for note in caught.value.__notes__)
 
 
 def test_failure_shrinks_to_one_fact_and_reports_seed_and_prefix():

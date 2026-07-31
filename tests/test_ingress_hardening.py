@@ -8,7 +8,7 @@ import pytest
 import facts
 
 from core import (
-    close, fact, http, http_stdlib, kernel, merkle_map, object_store,
+    close, fact, http, http_stdlib, kernel, merkle_map,
     repository_applier as repository_applier_module, snapshot,
 )
 from core.crypto import h
@@ -685,27 +685,12 @@ def test_pile_and_root_codecs_reject_size_before_parsing(monkeypatch):
             decoder(raw)
 
 
-def test_pile_encoder_and_object_admission_enforce_the_reader_bounds(
-        monkeypatch):
+def test_pile_encoder_enforces_the_wire_bound(monkeypatch):
     workspace = "0" * 64
     empty = close.encode_pile((), workspace=workspace)
     monkeypatch.setattr(close, "MAX_PILE_BYTES", len(empty) - 1)
     with pytest.raises(PayloadTooLarge):
         close.encode_pile((), workspace=workspace)
-
-    class NeverWritten:
-        def put_if_absent(self, *_args):
-            raise AssertionError("oversized object was written")
-
-        def get(self, _key):
-            raise AssertionError("oversized object was read")
-
-    raw = b"too large"
-    monkeypatch.setattr(object_store, "MAX_OBJECT_BYTES", len(raw) - 1)
-    with pytest.raises(ValueError, match="address"):
-        run(repository_applier_module.RepositoryApplier(
-            workspace, NeverWritten()).admit_object(h(raw), raw))
-
 
 def _message_with_encoded_size(workspace, public, size, ts):
     probe = message_family.message(

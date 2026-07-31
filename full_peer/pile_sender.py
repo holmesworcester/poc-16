@@ -2,9 +2,7 @@
 import facts
 
 from core.close import close, encode_pile
-from core.crypto import h
 from core.kernel import drain, resolve_deps
-from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
 
 
 class PileSender:
@@ -37,83 +35,22 @@ class PileSender:
         return encode_pile(closed, workspace=self.workspace)
 
     def pack_batches(self, closed_units):
-        """Coalesce closed units while preserving whole-pile validity."""
-        def valid_unit(unit, *, strict=True):
-            judgment = drain(unit, self.workspace)
-            if not judgment.ok or len(judgment.valids) != len(unit):
-                if strict:
-                    raise ValueError("outbound unit is not an exact closure")
-                return False
-            return True
-
-        def checked_unit(unit):
-            valid_unit(unit)
-            # Fail before delivery if one indivisible closure is too large.
-            self.pack(unit)
-            return unit
-
-        batches, current, current_fids = [], [], set()
+        """Encode each independent closure as its own ordinary pile."""
+        batches = []
         for raw_unit in closed_units:
             unit = tuple(raw_unit)
             if not unit:
                 continue
-            unit = checked_unit(unit)
-            if not current:
-                current = list(unit)
-                current_fids = {fact.fid for fact in unit}
-                continue
-
-            additions = [
-                fact for fact in unit
-                if fact.fid not in current_fids
-            ]
-            if not additions:
-                continue
-            trial = (*current, *additions)
-            try:
-                self.pack(trial)
-            except PayloadTooLarge:
-                batches.append(self.pack(current))
-                current = list(unit)
-                current_fids = {fact.fid for fact in unit}
-                continue
-
-            if not valid_unit(trial, strict=False):
-                batches.append(self.pack(current))
-                current = list(unit)
-                current_fids = {fact.fid for fact in unit}
-                continue
-
-            current.extend(additions)
-            current_fids.update(fact.fid for fact in additions)
-        if current:
-            batches.append(self.pack(current))
+            judgment = drain(unit, self.workspace)
+            if not judgment.ok or len(judgment.valids) != len(unit):
+                raise ValueError("outbound unit is not an exact closure")
+            batches.append(self.pack(unit))
         return tuple(batches)
 
     def deliver(self, peer, closed_units):
-        """Deliver local verified closures through one outbound capability.
-
-        Detached immutable objects go first.  Piles are encoded and bounded
-        before the first network mutation, then delivered through the peer's
-        narrow byte interface.
-        """
+        """Deliver fact-only verified closures through one capability."""
         units = tuple(tuple(unit) for unit in closed_units)
         batches = self.pack_batches(units)
-        store = self.node.store(self.workspace)
-        object_ids = sorted({
-            oid
-            for unit in units
-            for fact in unit
-            for oid in facts.blob_refs(fact)
-        })
-        for oid in object_ids:
-            raw = store.get_bounded(
-                "obj/" + oid, MAX_OBJECT_BYTES)
-            if raw is None:
-                continue
-            if h(raw) != oid:
-                raise ValueError("local immutable object integrity")
-            peer.put_obj(oid, raw)
         for raw in batches:
             peer.put_pile(raw)
         return len(batches)

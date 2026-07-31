@@ -548,9 +548,9 @@ def test_malformed_pile_is_rejected_before_root_or_validated_set_reads(
     assert store.get("failed/pile/" + h(raw)) == raw
 
 
-def test_embedded_object_member_is_rejected_without_establishing_bytes(
+def test_non_fact_pile_member_is_rejected_without_establishing_bytes(
         tmp_path):
-    """An ordinary pile cannot bypass detached immutable-object ingress."""
+    """An ordinary pile cannot smuggle a second object representation."""
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     ordinary = closed_subset(

@@ -17,14 +17,13 @@ import struct
 from core.limits import MAX_OBJECT_BYTES, PAGE_BATCH
 from core.shape import valid_fid
 from core.staged_intent import (
-    MAX_STAGED_OBJECTS,
     MEMBER_HEX_BYTES,
     SESSION_HEX_BYTES,
 )
 
 
 PROTOCOL_VERSION = 1
-MAX_SESSION_OBJECTS = MAX_STAGED_OBJECTS
+MAX_SESSION_OBJECTS = 65_536
 MAX_SESSION_BYTES = 1 << 40
 MAX_SESSION_TTL_MS = 24 * 60 * 60 * 1000
 MAX_SESSION_CLOCK_SKEW_MS = 5 * 60 * 1000

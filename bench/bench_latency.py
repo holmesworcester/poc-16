@@ -2,8 +2,7 @@
 
 Hot posts report total latency and immutable path-copy touches; calling the
 corpus-wide ``FullPeer.keys`` reference path is a benchmark failure. Idle dials
-report local engine cost after a 304; the first dial establishes blob
-completeness and every measured dial must do no fact/index/blob work.
+report local engine cost after a 304 and do no fact/index work.
 
 Run:
     python3 bench/bench_latency.py
@@ -109,16 +108,7 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
         raise AssertionError("hot posts entered the full fact-key path")
 
     old_peer = sync_module.Peer
-    old_fetch_blobs = sync_module._fetch_blobs
-    blob_scans = 0
-
-    def counted_fetch_blobs(*args):
-        nonlocal blob_scans
-        blob_scans += 1
-        return old_fetch_blobs(*args)
-
     sync_module.Peer = SameStorePeer
-    sync_module._fetch_blobs = counted_fetch_blobs
     try:
         sync_module.sync(node, workspace, "local://same-store")
         idle_times = []
@@ -129,7 +119,6 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
             idle_times.append(time.perf_counter() - started)
     finally:
         sync_module.Peer = old_peer
-        sync_module._fetch_blobs = old_fetch_blobs
 
     unique_writes = {}
     for oid, size in writes:
@@ -156,7 +145,6 @@ def measure_scale(directory, scale, posts=7, idle=100, members=100):
             "samples": len(idle_times),
             "p50_ms": 1000 * statistics.median(idle_times),
             "p95_ms": 1000 * percentile(idle_times, .95),
-            "blob_scans_including_prime": blob_scans,
         },
     }
 

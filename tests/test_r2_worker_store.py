@@ -16,9 +16,10 @@ from core.object_store import (
     RetryableStoreError,
     STALE,
     StoreError,
+    ensure_object_async,
     retire_exact_async,
 )
-from core.repository_applier import RepositoryApplier
+from core.repository_applier import async_store
 
 
 class R2Object:
@@ -126,12 +127,12 @@ def test_native_r2_immutable_create_collision_is_verified():
     bucket = store.bucket
     raw, oid = b"same", h(b"same")
 
-    applier = RepositoryApplier("0" * 64, store)
-    assert run(applier.admit_object(oid, raw)) is CREATED
-    assert run(applier.admit_object(oid, raw)) is EXISTS
+    awaited = async_store(store)
+    assert run(ensure_object_async(awaited, oid, raw)) is CREATED
+    assert run(ensure_object_async(awaited, oid, raw)) is EXISTS
     bucket.data[f"workspaces/w/obj/{oid}"] = b"corrupt"
     with pytest.raises(ValueError, match="conflict"):
-        run(applier.admit_object(oid, raw))
+        run(ensure_object_async(awaited, oid, raw))
 
 
 def test_native_r2_list_uses_truncation_and_opaque_cursors():

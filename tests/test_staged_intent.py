@@ -8,32 +8,25 @@ import pytest
 
 import facts
 
-from full_peer import bao_native as bao
-from core import repository_applier as applier_module
-from core import staged_intent as staged_intent_module
+from facts import _bao as bao
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
 from core.ingress import (
     InvalidStagedIntent,
-    PermanentIngressRejection,
     check_source,
 )
-from core.limits import PayloadTooLarge
 from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.object_store import CREATED, OutcomeUnknown, STALE
 from core.staged_intent import (
-    InvalidStagedObject,
-    StagedObjectsPending,
-    confirm_staged_object,
     decode_staged_pile,
     parse_staging_key,
     staging_key,
     staging_prefix,
 )
 from core.store import FsStore
-from facts.content import chunk
+from facts.content import file_slice
 from tests.direct_upload_method import (
     BODY_SHA256_HEADER,
     WirePutCapability,
@@ -58,98 +51,34 @@ def staged_file(tmp_path):
         b"a" * (bao.WIDTH + 17),
         ts=10,
     )
-    chunks = tuple(
-        fact.fid for fact in node.by_type(workspace, chunk.TAG))
-    assert len(chunks) == 2
-    raw = closed_subset(node, workspace, chunks)
+    slice_fids = tuple(
+        fact.fid for fact in node.by_type(workspace, file_slice.TAG))
+    assert len(slice_fids) == 2
+    raw = closed_subset(node, workspace, slice_fids[:1])
     key = staging_key(
         workspace, MEMBER, SESSION, "pile", h(raw))
     return node, workspace, raw, key
 
 
-def test_real_multi_chunk_pile_derives_exact_same_session_object_set(
-        staged_file):
-    node, workspace, raw, key = staged_file
+def test_inline_slice_marker_binds_one_exact_fact_only_pile(staged_file):
+    _, workspace, raw, key = staged_file
 
     first = decode_staged_pile(workspace, key, raw)
     replay = decode_staged_pile(workspace, key, raw)
-    expected_refs = tuple(sorted(
-        fact.body["cid"]
-        for fact in node.by_type(workspace, chunk.TAG)
-    ))
-
     assert first == replay
     assert first.workspace == workspace
     assert first.member == MEMBER
     assert first.session == SESSION
     assert first.digest == h(raw)
-    assert first.blob_refs == expected_refs
-    assert first.object_keys == tuple(
-        staging_key(workspace, MEMBER, SESSION, "obj", digest)
-        for digest in expected_refs
-    )
     assert first.key.startswith(staging_prefix(workspace, "pile"))
-    assert all(
-        key.startswith(staging_prefix(workspace, "obj"))
-        for key in first.object_keys)
     assert not staging_prefix(workspace, "pile").startswith(
         staging_prefix(workspace, "obj"))
-    for object_key, digest in zip(first.object_keys, expected_refs):
-        blob = node.store(workspace).get("obj/" + digest)
-        assert blob is not None and h(blob) == digest
-        assert confirm_staged_object(first, object_key, blob) == blob
-
-
-@pytest.mark.parametrize("failure_type", (RuntimeError, AssertionError))
-def test_blob_reference_program_failure_is_retryable_at_staging_door(
-        staged_file, monkeypatch, tmp_path, failure_type):
-    _, workspace, raw, key = staged_file
-    ingress = FsStore(str(tmp_path / "ingress"))
-    canonical = FsStore(str(tmp_path / "canonical"))
-    ingress.put_if_absent(key, raw)
-    original = chunk.blob_refs
-
-    def program_failure(_fact):
-        raise failure_type("blob reference program failure")
-
-    monkeypatch.setattr(chunk, "blob_refs", program_failure)
-    with pytest.raises(
-            failure_type, match="blob reference program failure"):
-        asyncio.run(
-            RepositoryApplier(workspace, canonical).apply_staged(
-                ingress, key))
-
-    assert ingress.get(key) == raw
-    assert canonical.list("staged/rejected/") == []
-    assert canonical.list("pile/") == []
-    assert canonical.get("root") is None
-
-    monkeypatch.setattr(chunk, "blob_refs", original)
-    applied = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-    assert applied.result.status == "applied"
-    assert canonical.get("root") == applied.result.root
-    assert canonical.list("staged/rejected/") == []
-
-
-@pytest.mark.parametrize("malformed", (None, [], ("not-a-fid",)))
-def test_malformed_blob_reference_results_are_explicit_staging_rejections(
-        staged_file, monkeypatch, malformed):
-    _, workspace, raw, key = staged_file
-    monkeypatch.setattr(chunk, "blob_refs", lambda _fact: malformed)
-
-    with pytest.raises(InvalidStagedIntent, match="object reference"):
-        decode_staged_pile(workspace, key, raw)
+    assert any(fact.t == file_slice.TAG for fact in first.stream)
 
 
 def _put_staged_file(ingress, node, workspace, raw, key):
     ingress.put_if_absent(key, raw)
-    intent = decode_staged_pile(workspace, key, raw)
-    for object_key, digest in zip(intent.object_keys, intent.blob_refs):
-        ingress.put_if_absent(
-            object_key, node.store(workspace).get("obj/" + digest))
-    return intent
+    return decode_staged_pile(workspace, key, raw)
 
 
 class _FaultStore:
@@ -220,8 +149,7 @@ def test_verified_session_enters_the_applier_through_a_reserved_generation(
     assert canonical.get(applied.source) is None
     assert canonical.get("root") == applied.result.root
     assert ingress.get(key) == raw
-    assert set(applied.promoted) == set(intent.blob_refs)
-    assert applied.unavailable == ()
+    assert any(fact.t == file_slice.TAG for fact in intent.stream)
 
 
 def test_preexpiry_put_completes_after_expiry_without_f10_marker_delete(
@@ -340,178 +268,6 @@ def test_staging_replay_and_concurrent_appliers_cannot_recreate_generation(
     assert ingress.get(key) == raw
 
 
-def test_object_confirmation_separates_retryable_delay_from_poison(
-        staged_file):
-    _, workspace, raw, key = staged_file
-    intent = decode_staged_pile(workspace, key, raw)
-
-    with pytest.raises(StagedObjectsPending):
-        confirm_staged_object(intent, intent.object_keys[0], None)
-
-    surplus = staging_key(
-        workspace, MEMBER, SESSION, "obj", "e" * 64)
-    foreign = staging_key(
-        workspace, MEMBER, "f" * 32, "obj", intent.blob_refs[0])
-    for observed in (surplus, foreign):
-        with pytest.raises(InvalidStagedObject, match="surplus"):
-            confirm_staged_object(intent, observed, b"")
-    with pytest.raises(InvalidStagedObject, match="object key"):
-        confirm_staged_object(intent, "not/a/staging/key", b"")
-    with pytest.raises(InvalidStagedObject, match="integrity"):
-        confirm_staged_object(
-            intent, intent.object_keys[0], b"not the named bytes")
-
-    assert issubclass(InvalidStagedIntent, PermanentIngressRejection)
-    assert not issubclass(InvalidStagedObject, PermanentIngressRejection)
-    assert not issubclass(StagedObjectsPending, PermanentIngressRejection)
-
-
-def test_missing_staged_blob_does_not_block_valid_fact_admission(
-        staged_file, tmp_path):
-    node, workspace, raw, key = staged_file
-    ingress = FsStore(str(tmp_path / "ingress"))
-    canonical = FsStore(str(tmp_path / "canonical"))
-    intent = decode_staged_pile(workspace, key, raw)
-    ingress.put_if_absent(key, raw)
-
-    applied = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-
-    assert applied.result.status == "applied"
-    assert applied.result.retired is True
-    assert applied.promoted == ()
-    assert applied.unavailable == intent.object_keys
-    assert canonical.get("root") == applied.result.root
-    assert all(
-        canonical.get("obj/" + oid) is None
-        for oid in intent.blob_refs)
-
-
-def test_attachment_failure_is_observed_only_after_root_commit(
-        staged_file, tmp_path):
-    node, workspace, raw, key = staged_file
-    underlying = FsStore(str(tmp_path / "ingress"))
-    intent = _put_staged_file(
-        underlying, node, workspace, raw, key)
-    canonical = FsStore(str(tmp_path / "canonical"))
-
-    class FailingObjects:
-        def get_bounded(self, object_key, maximum):
-            if object_key.startswith(staging_prefix(workspace, "obj")):
-                assert canonical.get("root") is not None
-                raise OSError("simulated detached-object outage")
-            value = underlying.get(object_key)
-            assert value is None or len(value) <= maximum
-            return value
-
-    applied = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            FailingObjects(), key))
-
-    assert applied.result.status == "applied"
-    assert applied.result.retired is True
-    assert applied.promoted == ()
-    assert applied.unavailable == intent.object_keys
-    assert canonical.get("root") is not None
-    assert canonical.list("staged/admitted/")
-    assert not canonical.list("staged/done/")
-
-
-def test_detached_completion_is_bounded_to_one_page_per_turn(
-        staged_file, monkeypatch, tmp_path):
-    node, workspace, raw, key = staged_file
-    ingress = FsStore(str(tmp_path / "ingress"))
-    intent = _put_staged_file(
-        ingress, node, workspace, raw, key)
-    canonical = FsStore(str(tmp_path / "canonical"))
-    monkeypatch.setattr(applier_module, "_STAGED_OBJECT_BATCH", 1)
-
-    first = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-    second = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-
-    assert len(intent.blob_refs) == 2
-    assert len(first.promoted) == len(second.promoted) == 1
-    assert set(first.promoted + second.promoted) == set(intent.blob_refs)
-    assert not first.unavailable and not second.unavailable
-    assert len(canonical.list("staged/object-page/")) == 2
-    assert canonical.list("staged/done/")
-    assert ingress.get(key) == raw
-
-
-def test_detached_completion_round_robin_does_not_wedge_behind_a_gap(
-        staged_file, monkeypatch, tmp_path):
-    node, workspace, raw, key = staged_file
-    ingress = FsStore(str(tmp_path / "ingress"))
-    canonical = FsStore(str(tmp_path / "canonical"))
-    intent = decode_staged_pile(workspace, key, raw)
-    assert len(intent.blob_refs) == 2
-    ingress.put_if_absent(key, raw)
-    available_key, available_oid = (
-        intent.object_keys[1], intent.blob_refs[1])
-    ingress.put_if_absent(
-        available_key,
-        node.store(workspace).get("obj/" + available_oid),
-    )
-    monkeypatch.setattr(applier_module, "_STAGED_OBJECT_BATCH", 1)
-
-    blocked = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-    progressed = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-
-    assert blocked.unavailable == (intent.object_keys[0],)
-    assert progressed.promoted == (available_oid,)
-    assert not canonical.list("staged/done/")
-    missing_oid = intent.blob_refs[0]
-    ingress.put_if_absent(
-        intent.object_keys[0],
-        node.store(workspace).get("obj/" + missing_oid),
-    )
-
-    completed = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-
-    assert completed.promoted == (missing_oid,)
-    assert canonical.list("staged/done/")
-    assert canonical.get("obj/" + missing_oid) == \
-        node.store(workspace).get("obj/" + missing_oid)
-
-
-def test_poisoned_detached_object_is_evidenced_and_does_not_repeat(
-        staged_file, tmp_path):
-    _, workspace, raw, key = staged_file
-    ingress = FsStore(str(tmp_path / "ingress"))
-    canonical = FsStore(str(tmp_path / "canonical"))
-    intent = decode_staged_pile(workspace, key, raw)
-    ingress.put_if_absent(key, raw)
-    for object_key in intent.object_keys:
-        ingress.put_if_absent(object_key, b"wrong same-session bytes")
-
-    first = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-    second = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, key))
-
-    assert first.result.status == "applied"
-    assert first.unavailable == ()
-    assert first.poisoned == intent.object_keys
-    assert canonical.list("staged/object-poisoned/")
-    assert canonical.list("staged/done/")
-    assert second.result.status == "admitted"
-    assert second.poisoned == ()
-    assert canonical.get("root") == first.result.root
-
-
 def test_stale_marker_replay_reuses_one_reserved_internal_generation(
         staged_file, tmp_path):
     node, workspace, raw, key = staged_file
@@ -548,35 +304,10 @@ def test_cross_kind_operational_bytes_never_gain_staged_authority(
     store = FsStore(str(tmp_path / "canonical"))
     applier = RepositoryApplier(workspace, store)
     marker = applier._marker_receipt("admitted", key, raw)
-    promoted = applier._object_receipt(
-        "promoted", intent, intent.blob_refs[0])
-    page = applier._page_receipt(intent, 0, 1)
-
-    for expected, foreign in (
-            (marker, promoted), (promoted, page), (page, marker)):
-        store.put(expected.key, foreign.raw)
-        restarted = RepositoryApplier(workspace, store)
-        with pytest.raises((ValueError, PayloadTooLarge)):
-            asyncio.run(restarted._has_evidence(expected))
-        assert store.get(expected.key) == foreign.raw
-
-    discovery = canon({
-        "cursor": "foreign-page",
-        "kind": "staged",
-        "workspace": workspace,
-    })
-    store.put(applier._staged_object_cursor_key(intent), discovery)
-    with pytest.raises(ValueError, match="staged object cursor"):
-        asyncio.run(
-            RepositoryApplier(
-                workspace, store,
-            )._load_staged_object_cursor(intent, 1)
-        )
-
     _, reservation = applier._generation_evidence(
         intent.member, intent.raw, intent.key)
-    store._replace(reservation.key, promoted.raw)
-    with pytest.raises((ValueError, PayloadTooLarge)):
+    store._replace(reservation.key, marker.raw)
+    with pytest.raises(ValueError):
         asyncio.run(
             RepositoryApplier(
                 workspace, store,
@@ -804,8 +535,7 @@ def test_digest_and_object_notification_cannot_become_pile_authority(
         decode_staged_pile(workspace, object_key, raw)
 
 
-def test_pile_without_object_references_is_a_valid_ready_marker(
-        staged_file):
+def test_fact_only_pile_is_a_valid_ready_marker(staged_file):
     node, workspace, _, _ = staged_file
     raw = closed_subset(node, workspace, [workspace])
     key = staging_key(
@@ -813,14 +543,4 @@ def test_pile_without_object_references_is_a_valid_ready_marker(
 
     intent = decode_staged_pile(workspace, key, raw)
 
-    assert intent.blob_refs == ()
-    assert intent.object_keys == ()
-
-
-def test_staged_object_reference_count_is_bounded_without_large_fixture(
-        staged_file, monkeypatch):
-    _, workspace, raw, key = staged_file
-    monkeypatch.setattr(staged_intent_module, "MAX_STAGED_OBJECTS", 1)
-
-    with pytest.raises(InvalidStagedIntent, match="reference count"):
-        decode_staged_pile(workspace, key, raw)
+    assert tuple(intent.stream)

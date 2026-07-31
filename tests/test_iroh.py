@@ -23,7 +23,7 @@ from core.crypto import h, unseal
 from core.limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
-    MAX_OBJECT_BYTES,
+    MAX_PILE_BYTES,
     MAX_ROOT_BYTES,
 )
 from core.repository_reader import RepositoryReader
@@ -475,6 +475,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     issued = now_ms()
     pile = encode_pile(request.payload(
         bootstrap, workspace, "sync", issued + 300_000, issued))
+    published = repository_bytes(state, workspace)
+    object_key, raw = next(
+        (key, value) for key, value in published.items()
+        if key.startswith("obj/"))
+    oid = object_key.removeprefix("obj/")
     bootstrap.sql(workspace).db.close()
 
     daemon, ready = start_full_peer(
@@ -525,14 +530,16 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, capability = mint(
             through_iroh[0], workspace, pile, identity_secret)
         assert capability == "sync-v1/full"
-        raw = b"ordinary object bytes through Iroh"
-        oid = h(raw)
+        baseline = repository_bytes(state, workspace)
+        # Canonical pages are read-only HTTP resources. The Applier is their
+        # sole writer; peers can mutate repository state only with piles.
         assert parity(
             "PUT",
             f"/page/{oid}?ws={workspace}",
             body=raw,
             token=token,
-        )[0] == 204
+        )[0] == 404
+        assert repository_bytes(state, workspace) == baseline
 
         token, _ = mint(
             through_iroh[1], workspace, pile, identity_secret)
@@ -542,7 +549,6 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             token=token,
         )[:2] == (200, raw)
 
-        baseline = repository_bytes(state, workspace)
         time.sleep(2.2)
         assert parity(
             "GET",
@@ -571,15 +577,6 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             "/root?ws=" + "0" * 64,
             token=token,
         )[0] == 404
-
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
-        assert parity(
-            "PUT",
-            f"/page/{'f' * 64}?ws={workspace}",
-            body=b"wrong digest",
-            token=token,
-        )[0] == 400
 
         token, _ = mint(
             through_iroh[1], workspace, pile, identity_secret)
@@ -615,10 +612,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, _ = mint(
             direct, workspace, pile, identity_secret)
         oversized = (
-            f"PUT /page/{h(b'never lands')}?ws={workspace} HTTP/1.1\r\n"
+            f"PUT /pile/{member}/{h(b'never lands')}?"
+            f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
-            f"Content-Length: {MAX_OBJECT_BYTES + 1}\r\n"
+            f"Content-Length: {MAX_PILE_BYTES + 1}\r\n"
             "Connection: close\r\n\r\n"
         ).encode()
         oversized_results = [
@@ -631,7 +629,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, _ = mint(
             through_iroh[0], workspace, pile, identity_secret)
         malformed = (
-            f"PUT /page/{h(b'malformed never lands')}?"
+            f"PUT /pile/{member}/{h(b'malformed never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"

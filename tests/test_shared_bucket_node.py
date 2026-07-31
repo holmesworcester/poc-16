@@ -22,6 +22,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.delete import delete
+from facts.content import file_slice
 from facts.content.message import message
 
 from .shared_bucket import ScriptedBucket
@@ -354,12 +355,12 @@ def test_later_authority_changes_never_remove_validated_facts(
     )
     before = author.reader(workspace)
     before_facts = before.validated()
-    chunk_fids = {
+    slice_fids = {
         fid
         for fid in before_facts.fact_ids()
-        if before_facts.fact(fid).t == "chunk"
+        if before_facts.fact(fid).t == file_slice.TAG
     }
-    assert len(chunk_fids) == 2
+    assert len(slice_fids) == 2
     assert before_facts.fact(descriptor).fid == descriptor
 
     _, child = keypair()
@@ -387,7 +388,7 @@ def test_later_authority_changes_never_remove_validated_facts(
     changed = _reader(
         workspace, bucket.handle("cold-reader"), changed_root)
     changed_facts = changed.validated()
-    for fid in (child_claim.fid, descriptor, *chunk_fids):
+    for fid in (child_claim.fid, descriptor, *slice_fids):
         assert changed_facts.fact(fid).fid == fid
 
     invite_secret, invite_public = keypair()
@@ -422,11 +423,11 @@ def test_later_authority_changes_never_remove_validated_facts(
     active = _reader(
         workspace, bucket.handle("reactivated"))
     active_facts = active.validated()
-    for fid in (child_claim.fid, descriptor, *chunk_fids):
+    for fid in (child_claim.fid, descriptor, *slice_fids):
         assert active_facts.fact(fid).fid == fid
-    for fid in chunk_fids:
-        chunk = active_facts.fact(fid)
-        assert active.object(chunk.body["cid"])
+    assert all(
+        file_slice.proof_bytes(active_facts.fact(fid))
+        for fid in slice_fids)
     assert bucket.assert_valid_history()
 
 

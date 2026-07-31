@@ -21,7 +21,6 @@ from core.close import decode_pile
 from core.crypto import h, load_sk
 from core.grants import make_token
 from core.limits import (
-    MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
 )
@@ -60,7 +59,6 @@ class Corpus:
     workspace: str
     work: dict
     staged_raw: bytes
-    staged_objects: dict
     expected_facts: dict
     expected_root: bytes
 
@@ -115,23 +113,11 @@ def build_corpus(directory):
 
     attachment, = node.by_type(
         workspace, facts.content.file.TAG, include_suppressed=True)
-    chunks = node.by_type(
-        workspace, facts.content.chunk.TAG, include_suppressed=True)
+    slices = node.by_type(
+        workspace, facts.content.file_slice.TAG, include_suppressed=True)
     staged_raw = _pile(
-        node, workspace, (attachment.fid, *(fact.fid for fact in chunks)))
-    staged_refs = {
-        oid
-        for fact in decode_pile(staged_raw, workspace)
-        for oid in facts.blob_refs(fact)
-    }
-    staged_objects = {
-        oid: node.store(workspace).get_bounded(
-            "obj/" + oid, MAX_OBJECT_BYTES)
-        for oid in staged_refs
-    }
-    assert staged_objects and all(
-        raw is not None and h(raw) == oid
-        for oid, raw in staged_objects.items())
+        node, workspace, (attachment.fid, *(fact.fid for fact in slices)))
+    assert slices
 
     published = (
         raw_a, raw_b, raw_delete, raw_join,
@@ -156,7 +142,6 @@ def build_corpus(directory):
             "malformed": b"{}",
         },
         staged_raw,
-        staged_objects,
         expected,
         compiled.root,
     )
@@ -264,8 +249,6 @@ class F1Oracle:
         final = self.bucket.handle("oracle-final")
         assert final.get("root") == self.corpus.expected_root
         assert not final.list("pile/")
-        for oid, raw in self.corpus.staged_objects.items():
-            assert final.get("obj/" + oid) == raw
         assert self._previous == frozenset(self.corpus.expected_facts)
         self.bucket.assert_valid_history()
 
@@ -422,12 +405,6 @@ def _put_staged(corpus, ingress, seed):
         corpus.workspace, member, session,
         "pile", h(corpus.staged_raw))
     ingress.put_if_absent(marker, corpus.staged_raw)
-    for oid, raw in corpus.staged_objects.items():
-        ingress.put_if_absent(
-            staging_key(
-                corpus.workspace, member, session, "obj", oid),
-            raw,
-        )
     return marker
 
 
@@ -444,9 +421,6 @@ async def _verify_provider(corpus, backend):
     reader = RepositoryReader(corpus.workspace, root, objects.get)
     assert reader.all_facts().facts == corpus.expected_facts
     assert compiled.root == root
-    for oid, raw in corpus.staged_objects.items():
-        assert await applier.store.get_bounded(
-            "obj/" + oid, MAX_OBJECT_BYTES) == raw
 
 
 async def _race(corpus, backend, sources, order):
@@ -557,7 +531,7 @@ async def execute(
                 ingress, marker)
             assert outcome.result.status in {
                 "applied", "confirmed", "noop", "admitted"}
-            assert set(outcome.promoted) == set(corpus.staged_objects)
+            assert not hasattr(outcome, "promoted")
             assert ingress.get(marker) == corpus.staged_raw
 
         await take(f"staged(attachment) actor={actor}", staged)

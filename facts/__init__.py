@@ -229,9 +229,3 @@ def action_sids(fact):
 def principal_sid(namespace, public_key):
     """Address one family-declared principal slot for an exact Worker read."""
     return scoped_id(namespace, public_key)
-
-
-def blob_refs(fact):
-    """Return immutable object hashes named by a fact, if that family has any."""
-    hook = getattr(FAMILIES[fact.t], "blob_refs", None)
-    return hook(fact) if hook is not None else ()

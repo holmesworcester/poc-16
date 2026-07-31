@@ -32,7 +32,6 @@ from .object_store import (
     STALE,
     Applied,
     OutcomeUnknown,
-    StoreError,
     Versioned,
     ListPage,
     ensure_object_async,
@@ -40,16 +39,9 @@ from .object_store import (
 )
 from .repository_snapshot import extend_snapshot
 from .shape import valid_fid
-from .staged_intent import (
-    InvalidStagedObject,
-    confirm_staged_object,
-    decode_staged_pile,
-    staging_key,
-    staging_prefix,
-)
+from .staged_intent import decode_staged_pile, staging_prefix
 from .fact import canon, encode
 from .limits import (
-    MAX_OBJECT_BYTES,
     MAX_PILE_BYTES,
     MAX_REJECTION_RECORD_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -60,7 +52,6 @@ from .limits import (
 
 _MAX_DISCOVERY_CURSOR_BYTES = 16 * 1024
 _MAX_OPERATION_RECORD_BYTES = 4 * 1024
-_STAGED_OBJECT_BATCH = PAGE_BATCH
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,14 +178,11 @@ class ApplyResult:
 
 @dataclass(frozen=True, slots=True)
 class StagedApplyResult:
-    """One isolated staging marker translated through the canonical engine."""
+    """One fact-only staging marker translated through the canonical engine."""
 
     key: str
     source: str | None
     result: ApplyResult
-    promoted: tuple = ()
-    unavailable: tuple = ()
-    poisoned: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,10 +312,6 @@ class RepositoryApplier:
         check_pile_bounds(raw)
         return await self._stage(member, raw, "")
 
-    async def admit_object(self, oid, raw):
-        """Verify and establish one inbound detached canonical object."""
-        return await ensure_object_async(self.store, oid, raw)
-
     async def receive_pile(self, member, raw):
         """Reserve and apply the exact logical delivery from an HTTP gate."""
         return await self._attempt(await self.stage(member, raw))
@@ -391,84 +375,6 @@ class RepositoryApplier:
         })
         return _Evidence(f"staged/{kind}/{h(record)}", record)
 
-    def _object_receipt(self, kind, intent, oid):
-        record = canon({
-            "kind": f"staged-object-{kind}-v1",
-            "marker": intent.key,
-            "object": oid,
-            "payload": h(intent.raw),
-            "workspace": self.workspace,
-        })
-        return _Evidence(
-            f"staged/object-{kind}/{h(record)}", record)
-
-    def _page_receipt(self, intent, page, pages):
-        record = canon({
-            "kind": "staged-object-page-v1",
-            "marker": intent.key,
-            "page": page,
-            "pages": pages,
-            "payload": h(intent.raw),
-            "workspace": self.workspace,
-        })
-        return _Evidence(f"staged/object-page/{h(record)}", record)
-
-    def _staged_object_cursor_key(self, intent):
-        binding = canon({
-            "kind": "staged-object-cursor-v1",
-            "marker": intent.key,
-            "payload": h(intent.raw),
-            "workspace": self.workspace,
-        })
-        return f"staged/object-cursor/{h(binding)}"
-
-    async def _load_staged_object_cursor(self, intent, pages):
-        if pages < 1:
-            return None
-        key = self._staged_object_cursor_key(intent)
-        raw = await self._get_bounded(
-            self.store, key, _MAX_DISCOVERY_CURSOR_BYTES)
-        if raw is None:
-            return 0
-        value = _decode_evidence(
-            raw, "staged object cursor",
-            {"kind", "marker", "page", "pages", "payload", "workspace"})
-        if value["kind"] != "staged-object-cursor-v1" \
-                or value["marker"] != intent.key \
-                or value["pages"] != pages \
-                or value["payload"] != h(intent.raw) \
-                or value["workspace"] != self.workspace \
-                or type(value["page"]) is not int \
-                or not 0 <= value["page"] < pages:
-            raise ValueError("staged object cursor")
-        return value["page"]
-
-    async def _save_staged_object_cursor(
-            self, intent, page, pages):
-        if type(page) is not int or type(pages) is not int \
-                or not 0 <= page < pages:
-            raise ValueError("staged object cursor")
-        raw = canon({
-            "kind": "staged-object-cursor-v1",
-            "marker": intent.key,
-            "page": page,
-            "pages": pages,
-            "payload": h(intent.raw),
-            "workspace": self.workspace,
-        })
-        await self._put_hint(_Evidence(
-            self._staged_object_cursor_key(intent), raw))
-
-    async def _next_staged_object_page(
-            self, intent, start, pages):
-        """Find one unfinished page; every scan is bounded by 256 receipts."""
-        for offset in range(pages):
-            page = (start + offset) % pages
-            if not await self._has_evidence(
-                    self._page_receipt(intent, page, pages)):
-                return page
-        return None
-
     async def _staged_source(self, intent):
         """Use the marker itself as the stable delivery identity."""
         return await self._stage(intent.member, intent.raw, intent.key)
@@ -486,15 +392,12 @@ class RepositoryApplier:
 
         The untrusted staging namespace is never a second repository.  The
         exact marker is always fetched from ingress, bound to its stable
-        reserved generation, and committed first.  Only afterward are
-        same-session detached objects promoted independently.  Slow, absent,
-        poisoned, or failed object reads therefore cannot block valid facts.
+        reserved generation, and committed as one fact-only closed pile.
 
         The client-writable marker is deliberately not deleted here.  Its
         lifecycle policy is independent of F10, which governs only the exact
         internal generation reserved below.  Immutable operational receipts
-        prevent retained markers from creating generations forever and leave
-        missing attachments as separately retryable completion work.
+        prevent retained markers from creating generations forever.
         """
         ingress = async_store(ingress_store)
         raw = await self._get_bounded(ingress, key, MAX_PILE_BYTES)
@@ -566,91 +469,8 @@ class RepositoryApplier:
                 valids=result.valids,
             )
 
-        promoted, unavailable, poisoned = [], [], []
-        pages = (
-            len(intent.blob_refs) + _STAGED_OBJECT_BATCH - 1
-        ) // _STAGED_OBJECT_BATCH
-        if pages == 0:
-            await self._put_evidence(receipts["done"])
-            return StagedApplyResult(
-                key, source, result, (), (), ())
-
-        cursor = await self._load_staged_object_cursor(intent, pages)
-        page = await self._next_staged_object_page(
-            intent, cursor, pages)
-        if page is None:
-            await self._put_evidence(receipts["done"])
-            return StagedApplyResult(
-                key, source, result, (), (), ())
-
-        start = page * _STAGED_OBJECT_BATCH
-        stop = min(
-            start + _STAGED_OBJECT_BATCH,
-            len(intent.blob_refs),
-        )
-        for oid in intent.blob_refs[start:stop]:
-            object_key = staging_key(
-                intent.workspace,
-                intent.member,
-                intent.session,
-                "obj",
-                oid,
-            )
-            promoted_receipt = self._object_receipt(
-                "promoted", intent, oid)
-            poisoned_receipt = self._object_receipt(
-                "poisoned", intent, oid)
-            if await self._has_evidence(promoted_receipt) \
-                    or await self._has_evidence(poisoned_receipt):
-                continue
-            try:
-                value = await self._get_bounded(
-                    ingress, object_key, MAX_OBJECT_BYTES)
-            except PayloadTooLarge:
-                await self._put_evidence(poisoned_receipt)
-                poisoned.append(object_key)
-                continue
-            except (OSError, StoreError):
-                unavailable.append(object_key)
-                continue
-            if value is None:
-                unavailable.append(object_key)
-                continue
-            try:
-                confirm_staged_object(intent, object_key, value)
-            except InvalidStagedObject:
-                await self._put_evidence(poisoned_receipt)
-                poisoned.append(object_key)
-                continue
-            try:
-                await self.admit_object(oid, value)
-            except (OSError, StoreError):
-                unavailable.append(object_key)
-                continue
-            await self._put_evidence(promoted_receipt)
-            promoted.append(oid)
-
-        if not unavailable:
-            await self._put_evidence(
-                self._page_receipt(intent, page, pages))
-        following = await self._next_staged_object_page(
-            intent, (page + 1) % pages, pages)
-        if following is None:
-            await self._put_evidence(receipts["done"])
-        else:
-            # This cursor is a fairness hint, never completion authority.
-            # Concurrent regressions only duplicate bounded work because
-            # immutable page receipts remain the source of truth.
-            await self._save_staged_object_cursor(
-                intent, following, pages)
-        return StagedApplyResult(
-            key,
-            source,
-            result,
-            tuple(promoted),
-            tuple(unavailable),
-            tuple(poisoned),
-        )
+        await self._put_evidence(receipts["done"])
+        return StagedApplyResult(key, source, result)
 
     async def drain_staged(self, ingress_store, *, limit=PAGE_BATCH):
         """Process one bounded discovery snapshot without cross-item wedges."""

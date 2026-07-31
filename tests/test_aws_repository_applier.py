@@ -19,7 +19,7 @@ from core.staged_intent import staging_key
 from core.store import FsStore
 from deploy.aws_repository_applier.app import drain
 from deploy.aws_repository_applier import manage
-from facts.content import chunk
+from facts.content import file_slice
 
 from .util import closed_subset, send_bytes
 from .provider_fakes import FakeS3Bucket, ProviderError
@@ -40,23 +40,14 @@ def _stage_file(tmp_path):
         ts=10,
     )
     fids = tuple(
-        fact.fid for fact in source.by_type(workspace, chunk.TAG))
+        fact.fid for fact in source.by_type(workspace, file_slice.TAG))
+    assert fids
     raw = closed_subset(source, workspace, fids)
-    stream = decode_pile(raw, workspace)
     ingress = FsStore(str(tmp_path / "ingress"))
     marker = staging_key(
         workspace, MEMBER, SESSION, "pile", h(raw))
     ingress.put_if_absent(marker, raw)
-    refs = sorted({
-        oid for fact in stream
-        for oid in facts.blob_refs(fact)
-    })
-    for oid in refs:
-        ingress.put_if_absent(
-            staging_key(workspace, MEMBER, SESSION, "obj", oid),
-            source.store(workspace).get("obj/" + oid),
-        )
-    return source, workspace, ingress, marker, refs
+    return source, workspace, ingress, marker, ()
 
 
 def test_scheduled_lambda_drain_is_database_free_and_reader_visible(
@@ -79,7 +70,7 @@ def test_scheduled_lambda_drain_is_database_free_and_reader_visible(
     staged = outcomes.staged[0][1]
     assert staged.result.status == "applied"
     assert staged.result.retired is True
-    assert set(staged.promoted) == set(refs)
+    assert not hasattr(staged, "promoted")
     reader = RepositoryReader(
         workspace,
         canonical.get("root"),
@@ -431,43 +422,6 @@ def test_403_missing_operational_cursors_do_not_wedge_cold_discovery(
         key for _, operation, key, _ in bucket.history
         if operation == "put" and key in cursor_keys
     } == cursor_keys
-
-
-def test_403_missing_ingress_object_is_bounded_unavailable_work(
-        tmp_path):
-    _, workspace, staged, marker, refs = _stage_file(tmp_path)
-    bucket = FakeS3Bucket()
-    raw = staged.get(marker)
-    ingress = S3Store(
-        S3Config(
-            "isolated-ingress",
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-            probe_access_denied_missing=True,
-        ),
-        client=bucket.client("applier"),
-    )
-    ingress.put_if_absent(marker, raw)
-    bucket.deny_missing_get = True
-    canonical = FsStore(str(tmp_path / "canonical-missing-object"))
-
-    outcomes = asyncio.run(
-        RepositoryApplier(workspace, canonical).drain_staged(ingress))
-
-    result = outcomes[0][1]
-    expected = {
-        staging_key(workspace, MEMBER, SESSION, "obj", oid)
-        for oid in refs
-    }
-    assert result.result.status == "applied"
-    assert set(result.unavailable) == expected
-    probes = {
-        key for _, operation, key, values in bucket.history
-        if operation == "list" and values == ()
-        and key.startswith(
-            f"ingress/v1/workspaces/{workspace}/objects/")
-    }
-    assert probes == expected
 
 
 def test_cold_staged_apply_obeys_probe_prefixes_from_sam_policy(
