@@ -165,14 +165,15 @@ liveness, and typed-suppression declarations before a family can be admitted.
 ### 2.1 The closed-pile boundary
 
 A pile is one canonical, workspace-bound, topologically ordered fact closure.
-Dependencies precede dependents. Pile bytes, each fact's dependency count, and
-per-fact transitive closure are bounded. An independent aggregate fact-count
-ceiling is future hardening; the current byte ceiling is the aggregate pile
-bound. Each canonical fact and public invite envelope also fits the smallest
-hosted Reader's single-object response ceiling. Detached Bao objects use their
-separate direct-upload and completion path. Authenticated-root traversal reads
-only `MAX_REPOSITORY_OBJECT_BYTES`; the larger generic object ceiling is
-reserved for detached ingress and exact collision/retirement work.
+Dependencies precede dependents. Pile bytes, aggregate fact count, each fact's
+dependency count, and per-fact transitive closure are independently bounded.
+The count is checked lexically before generation reservation, then rechecked
+by the exact decoder and kernel. Each canonical fact and public invite envelope
+also fits the smallest hosted Reader's single-object response ceiling. Detached
+Bao objects use their separate direct-upload and completion path.
+Authenticated-root traversal reads only `MAX_REPOSITORY_OBJECT_BYTES`; the
+larger generic object ceiling is reserved for detached ingress and exact
+collision/retirement work.
 
 The database-free kernel streams the pile into a temporary `MemoryContext`.
 For each fact it:
