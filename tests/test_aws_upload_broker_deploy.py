@@ -265,6 +265,76 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
         ROOT / "deploy" / "aws_lambda" / "requirements.txt").read_text()
 
 
+def test_ingress_lifecycle_preflight_accepts_absence_and_rejects_rules(
+        monkeypatch):
+    candidate = args()
+    commands = []
+
+    def absent(command):
+        commands.append(command)
+        raise subprocess.CalledProcessError(
+            255,
+            command,
+            stderr="NoSuchLifecycleConfiguration",
+        )
+
+    monkeypatch.setattr(manage, "_json_command", absent)
+    manage._assert_no_ingress_lifecycle(candidate)
+    command = commands[0]
+    assert command[:3] == [
+        "aws", "s3api", "get-bucket-lifecycle-configuration"]
+    assert command[command.index("--bucket") + 1] == (
+        candidate.ingress_bucket)
+    assert command[command.index("--expected-bucket-owner") + 1] == (
+        candidate.expected_owner)
+
+    monkeypatch.setattr(
+        manage,
+        "_json_command",
+        lambda _command: {"Rules": [{
+            "ID": "unproved-age-delete",
+            "Status": "Enabled",
+        }]},
+    )
+    with pytest.raises(RuntimeError, match="erase acknowledged"):
+        manage._assert_no_ingress_lifecycle(candidate)
+
+
+def test_deploy_checks_ingress_retention_before_build_or_stack_mutation(
+        monkeypatch):
+    candidate = args()
+    events = []
+    target = "arn:aws:cloudformation:us-west-2:123456789012:stack/x/id"
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy",
+        lambda _args: events.append("target") or target)
+    monkeypatch.setattr(
+        manage, "_assert_no_ingress_lifecycle",
+        lambda _args: events.append("retention"))
+    monkeypatch.setattr(
+        manage, "build", lambda _args: events.append("build"))
+    monkeypatch.setattr(
+        manage, "_deploy_stack",
+        lambda _args, observed: events.append(("deploy", observed)))
+    monkeypatch.setattr(
+        manage, "_stack_url",
+        lambda _args: events.append("url") or "https://broker.example")
+    monkeypatch.setattr(
+        manage, "_readiness",
+        lambda url: events.append(("ready", url)))
+
+    manage.deploy(candidate)
+
+    assert events == [
+        "target",
+        "retention",
+        "build",
+        ("deploy", target),
+        "url",
+        ("ready", "https://broker.example"),
+    ]
+
+
 def test_keyring_create_keeps_secret_out_of_argv_and_returns_exact_version(
         monkeypatch):
     candidate = keyring_args()

@@ -1,9 +1,11 @@
-"""Cloudflare R2 ingress-role policy, signer, and lifecycle tests."""
+"""Cloudflare R2 ingress-role policy, signer, and retention tests."""
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -20,7 +22,7 @@ from deploy.cloudflare_upload.boundary import (
     broker_config,
     bucket_resource,
     generated_boundary,
-    ingress_lifecycle,
+    ingress_lock,
     applier_config,
 )
 from deploy.cloudflare_upload.signer import R2UploadSigner
@@ -188,9 +190,8 @@ def test_ingress_parent_cannot_address_any_canonical_operation():
     {"ingress_prefix": "../escape"},
     {"ingress_prefix": "some/other/safe/prefix"},
     {"canonical_bucket_profile": "shared-prefixes"},
+    {"ingress_bucket_profile": "shared-control-plane"},
     {"presign_ttl_seconds": 3601},
-    {"stage_retention_seconds": 23 * 60 * 60},
-    {"stage_retention_seconds": 900, "presign_ttl_seconds": 900},
 ))
 def test_deployment_rejects_ambiguous_or_collapsed_authority(changes):
     with pytest.raises(ValueError):
@@ -225,6 +226,9 @@ def test_staging_capability_makes_no_false_canonical_body_binding_claim():
     assert claim == {
         "kind": "isolated-ingress-presigned-put-v1",
         "live_verified": False,
+        "acknowledged_ingress_retention":
+            "r2-bucket-lock-indefinite-v1",
+        "lock_control_profile": "exclusive-dedicated",
         "canonical_raw_put_sha256_safe": False,
         "payload_mode": "UNSIGNED-PAYLOAD",
         "upload_protocol": "isolated-ingress-v1",
@@ -242,24 +246,21 @@ def test_staging_capability_makes_no_false_canonical_body_binding_claim():
     }
 
 
-def test_lifecycle_collects_loose_objects_but_never_durable_pile_markers():
+def test_bucket_lock_retains_every_acknowledged_ingress_key_indefinitely():
+    # Contract: https://developers.cloudflare.com/r2/buckets/bucket-locks/
+    # Prefix locks cover existing/future objects and outrank lifecycle rules.
     candidate = deployment()
-    lifecycle = ingress_lifecycle(candidate)
-    rule = lifecycle["rules"][0]
+    lock = ingress_lock(candidate)
+    rule = lock["rules"][0]
 
     assert rule["enabled"] is True
-    assert rule["conditions"] == {
-        "prefix": staging_prefix(candidate.workspace, "obj"),
-    }
-    assert rule["deleteObjectsTransition"]["condition"] == {
-        "type": "Age",
-        "maxAge": 7 * 24 * 60 * 60,
-    }
-    assert candidate.canonical_bucket not in json.dumps(lifecycle)
-    assert rule["conditions"]["prefix"] != candidate.canonical_prefix + "/"
-    assert not staging_prefix(
-        candidate.workspace, "pile").startswith(
-            rule["conditions"]["prefix"])
+    assert rule["prefix"] == candidate.ingress_prefix + "/"
+    assert rule["condition"] == {"type": "Indefinite"}
+    assert candidate.canonical_bucket not in json.dumps(lock)
+    assert staging_prefix(
+        candidate.workspace, "obj").startswith(rule["prefix"])
+    assert staging_prefix(
+        candidate.workspace, "pile").startswith(rule["prefix"])
 
 
 def _deploy_environment():
@@ -296,6 +297,9 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     candidate = deployment()
     generated = tmp_path / "generated"
     monkeypatch.setattr(manage, "GENERATED", generated)
+    generated.mkdir()
+    obsolete = generated / "ingress-lifecycle.json"
+    obsolete.write_text('{"rules":[{"delete":"acknowledged ingress"}]}')
     monkeypatch.setattr(
         manage, "stage_broker", lambda: tmp_path / "broker")
     monkeypatch.setattr(
@@ -339,20 +343,28 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         _deploy_environment(),
         runner=runner,
         identity_reader=identity_reader,
+        lock_configurer=lambda deployment, _environment:
+            calls.append(("lock", deployment.ingress_bucket)),
     )
     assert list(workers.values()) == [
         (candidate.owner, "applier"),
         (candidate.owner, "broker"),
     ]
-    assert [call[3] for call in calls] == [
-        "sync", "deploy", "deploy",
+    assert [
+        call[3] if call[0] == "uv" else call[0]
+        for call in calls
+    ] == [
+        "lock", "sync", "deploy", "deploy",
     ]
     assert all(
         "--strict" in call
         for call in calls
-        if call[3] == "deploy"
+        if call[0] == "uv" and call[3] == "deploy"
     )
     assert json.loads(paths["broker"].read_text())["r2_buckets"] == []
+    assert not obsolete.exists()
+    assert json.loads(paths["ingress-lock"].read_text()) == (
+        ingress_lock(candidate))
     assert secret_documents == [{
         "CANONICAL_READ_ACCESS_KEY_ID": "reader-id",
         "CANONICAL_READ_SECRET_ACCESS_KEY": "reader-secret",
@@ -382,8 +394,11 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
 
     assert workers == {}
     assert buckets == before
-    assert [call[3] for call in calls] == [
-        "sync", "deploy", "deploy", "delete", "delete",
+    assert [
+        call[3] if call[0] == "uv" else call[0]
+        for call in calls
+    ] == [
+        "lock", "sync", "deploy", "deploy", "delete", "delete",
     ]
     assert [call[4] for call in calls[-2:]] == [
         candidate.broker_name, candidate.applier_name,
@@ -696,6 +711,130 @@ def test_control_plane_identity_requires_one_exact_owner_and_role(
         candidate, config, environment) is None
 
 
+def test_lock_control_request_is_exact_bounded_and_jurisdiction_scoped(
+        monkeypatch):
+    candidate = deployment(jurisdiction="eu")
+    desired = ingress_lock(candidate)
+    seen = []
+
+    def open_lock(request, timeout):
+        seen.append((request, timeout))
+        return _APIResponse({
+            "success": True,
+            "result": desired,
+        })
+
+    monkeypatch.setattr(manage, "urlopen", open_lock)
+    observed = manage._lock_request(
+        candidate,
+        {"CLOUDFLARE_API_TOKEN": "control-secret"},
+        "GET",
+    )
+    replaced = manage._lock_request(
+        candidate,
+        {"CLOUDFLARE_API_TOKEN": "control-secret"},
+        "PUT",
+        desired,
+    )
+
+    assert observed == replaced == desired
+    request, timeout = seen[0]
+    assert request.full_url.endswith(
+        f"/r2/buckets/{candidate.ingress_bucket}/lock")
+    assert request.get_header(
+        "Authorization") == "Bearer control-secret"
+    assert request.get_header("Cf-r2-jurisdiction") == "eu"
+    assert timeout == manage.SETTINGS_TIMEOUT_SECONDS
+    request, timeout = seen[1]
+    assert request.method == "PUT"
+    assert json.loads(request.data) == desired
+    assert request.get_header("Content-type") == "application/json"
+    assert timeout == manage.SETTINGS_TIMEOUT_SECONDS
+
+
+def test_lock_install_reconciles_crash_and_refuses_foreign_rules():
+    candidate = deployment()
+    desired = ingress_lock(candidate)
+    state = {"rules": []}
+    writes = []
+
+    def reader():
+        return json.loads(json.dumps(state))
+
+    def before_apply(_value):
+        raise ConnectionError("crash before provider apply")
+
+    with pytest.raises(ConnectionError, match="before provider apply"):
+        manage.ensure_ingress_lock(
+            candidate,
+            {},
+            reader=reader,
+            writer=before_apply,
+        )
+    assert state == {"rules": []}
+
+    def lost_response(value):
+        writes.append(value)
+        state.clear()
+        state.update(value)
+        raise ConnectionError("response lost after provider apply")
+
+    assert manage.ensure_ingress_lock(
+        candidate, {}, reader=reader, writer=lost_response)
+    assert state == desired
+    assert writes == [desired]
+    assert not manage.ensure_ingress_lock(
+        candidate, {}, reader=reader,
+        writer=lambda _value: pytest.fail("idempotent retry wrote"))
+
+    state["rules"].append({
+        "id": "foreign",
+        "enabled": True,
+        "prefix": "other/",
+        "condition": {"type": "Indefinite"},
+    })
+    with pytest.raises(RuntimeError, match="foreign"):
+        manage.ensure_ingress_lock(
+            candidate, {}, reader=reader,
+            writer=lambda _value: pytest.fail("foreign rules overwritten"))
+
+
+def test_concurrent_lock_installers_only_write_the_same_exact_value():
+    candidate = deployment()
+    desired = ingress_lock(candidate)
+    state = {"rules": []}
+    mutex = threading.Lock()
+    first_reads = threading.Barrier(2)
+    local = threading.local()
+    writes = []
+
+    def reader():
+        with mutex:
+            observed = json.loads(json.dumps(state))
+        count = getattr(local, "reads", 0)
+        local.reads = count + 1
+        if count == 0:
+            first_reads.wait(5)
+        return observed
+
+    def writer(value):
+        with mutex:
+            writes.append(value)
+            state.clear()
+            state.update(value)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(
+            lambda _ordinal: manage.ensure_ingress_lock(
+                candidate, {}, reader=reader, writer=writer),
+            range(2),
+        ))
+
+    assert outcomes == (True, True)
+    assert state == desired
+    assert writes == [desired, desired]
+
+
 def test_environment_requires_explicit_dedicated_canonical_profile():
     values = {
         "CLOUDFLARE_ACCOUNT_ID": "a" * 32,
@@ -711,5 +850,9 @@ def test_environment_requires_explicit_dedicated_canonical_profile():
         Deployment.from_environment(values)
 
     values["CF_UPLOAD_CANONICAL_BUCKET_PROFILE"] = "dedicated-workspace"
+    with pytest.raises(ValueError, match="exclusive deployment"):
+        Deployment.from_environment(values)
+
+    values["CF_UPLOAD_INGRESS_BUCKET_PROFILE"] = "exclusive-dedicated"
     assert Deployment.from_environment(
         values).canonical_bucket_profile == "dedicated-workspace"

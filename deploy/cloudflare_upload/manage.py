@@ -183,6 +183,9 @@ def stage_applier():
 def render(deployment):
     """Write non-secret Worker configs and provider-policy inputs."""
     boundary = generated_boundary(deployment)
+    obsolete = GENERATED / "ingress-lifecycle.json"
+    if obsolete.exists() or obsolete.is_symlink():
+        obsolete.unlink()
     paths = {}
     for role in ROLE_ORDER:
         path = GENERATED / role / "wrangler.json"
@@ -193,7 +196,7 @@ def render(deployment):
         paths[role] = path
     for name, value in (
             ("access-policies", boundary["access_policies"]),
-            ("ingress-lifecycle", boundary["ingress_lifecycle"]),
+            ("ingress-lock", boundary["ingress_lock"]),
             ("boundary-claim", boundary["provider_claim"])):
         path = GENERATED / f"{name}.json"
         _write_json(path, value)
@@ -433,46 +436,128 @@ def _control_token(environment):
     return value
 
 
+def _lock_url(deployment):
+    return (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{quote(deployment.account_id, safe='')}/r2/buckets/"
+        f"{quote(deployment.ingress_bucket, safe='')}/lock"
+    )
+
+
+def _control_request(
+        endpoint, environment, *, method="GET", document=None,
+        headers=None, absent_404=False):
+    """Perform one bounded Cloudflare control-plane JSON exchange."""
+    headers = {
+        "Authorization": f"Bearer {_control_token(environment)}",
+        "Accept": "application/json",
+        **({} if headers is None else headers),
+    }
+    body = None
+    if document is not None:
+        body = json.dumps(
+            document, sort_keys=True, separators=(",", ":")).encode()
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        endpoint,
+        data=body,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urlopen(
+                request, timeout=SETTINGS_TIMEOUT_SECONDS) as response:
+            raw = response.read(API_RESPONSE_BYTES + 1)
+    except HTTPError as error:
+        if absent_404 and error.code == 404:
+            return _ABSENT
+        raise RuntimeError("Cloudflare control request failed") from error
+    except (OSError, URLError) as error:
+        raise RuntimeError("Cloudflare control request failed") from error
+    if len(raw) > API_RESPONSE_BYTES:
+        raise RuntimeError("Cloudflare control response is too large")
+    try:
+        envelope = json.loads(raw)
+        if not isinstance(envelope, dict) \
+                or envelope.get("success") is not True \
+                or "result" not in envelope:
+            raise ValueError
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("malformed Cloudflare control response") from error
+    return envelope["result"]
+
+
+def _lock_request(deployment, environment, method, document=None):
+    """Read or replace the exact dedicated-ingress lock configuration."""
+    headers = {}
+    if deployment.jurisdiction != "default":
+        headers["cf-r2-jurisdiction"] = deployment.jurisdiction
+    result = _control_request(
+        _lock_url(deployment),
+        environment,
+        method=method,
+        document=document,
+        headers=headers,
+    )
+    if not isinstance(result, dict) \
+            or not isinstance(result.get("rules"), list):
+        raise RuntimeError("malformed Cloudflare ingress bucket lock")
+    return {"rules": result["rules"]}
+
+
+def ensure_ingress_lock(
+        deployment, environment, *, reader=None, writer=None):
+    """Install the lock under one exclusive bucket-configuration owner.
+
+    Cloudflare's whole-document lock PUT has no compare precondition.  The
+    ``exclusive-dedicated`` profile therefore permits only this deployment to
+    mutate this bucket's lock configuration.  A pre-existing foreign document
+    is refused, concurrent same-owner installers write identical bytes, and a
+    lost PUT response is reconciled by the following exact GET.  This read
+    check does not pretend to defeat a racing account administrator.
+    """
+    desired = generated_boundary(deployment)["ingress_lock"]
+    reader = reader or (
+        lambda: _lock_request(deployment, environment, "GET"))
+    writer = writer or (
+        lambda value: _lock_request(
+            deployment, environment, "PUT", value))
+    observed = reader()
+    if observed == desired:
+        return False
+    if observed != {"rules": []}:
+        raise RuntimeError(
+            "refusing to replace foreign ingress bucket lock rules")
+    write_error = None
+    try:
+        writer(desired)
+    except (OSError, RuntimeError) as error:
+        write_error = error
+    if reader() != desired:
+        if write_error is not None:
+            raise write_error
+        raise RuntimeError(
+            "Cloudflare ingress bucket lock was not preserved")
+    return True
+
+
 def _worker_identity(
         deployment, config, environment=os.environ):
     """Read the exact non-secret owner/role pair from Worker settings."""
-    token = _control_token(environment)
     name = config["name"]
     endpoint = (
         "https://api.cloudflare.com/client/v4/accounts/"
         f"{quote(deployment.account_id, safe='')}/workers/scripts/"
         f"{quote(name, safe='')}/settings"
     )
-    request = Request(endpoint, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    })
-    try:
-        with urlopen(
-                request, timeout=SETTINGS_TIMEOUT_SECONDS) as response:
-            raw = response.read(API_RESPONSE_BYTES + 1)
-    except HTTPError as error:
-        if error.code == 404:
-            return _ABSENT
-        raise RuntimeError("Cloudflare Worker identity lookup failed") \
-            from error
-    except (OSError, URLError) as error:
-        raise RuntimeError("Cloudflare Worker identity lookup failed") \
-            from error
-    if len(raw) > API_RESPONSE_BYTES:
-        raise RuntimeError("Cloudflare Worker settings response is too large")
-    try:
-        document = json.loads(raw)
-        if not isinstance(document, dict) \
-                or document.get("success") is not True \
-                or not isinstance(document.get("result"), dict) \
-                or not isinstance(
-                    document["result"].get("bindings"), list):
-            raise ValueError
-        bindings = document["result"]["bindings"]
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError("malformed Cloudflare Worker settings response") \
-            from error
+    result = _control_request(
+        endpoint, environment, absent_404=True)
+    if result is _ABSENT:
+        return _ABSENT
+    if not isinstance(result, dict) \
+            or not isinstance(result.get("bindings"), list):
+        raise RuntimeError("malformed Cloudflare Worker settings")
+    bindings = result["bindings"]
 
     def marker(name):
         matches = [
@@ -558,7 +643,7 @@ def _deploy_one(role, path, runner, broker_secrets):
 
 def deploy(
         deployment, environment=os.environ, *,
-        runner=None, identity_reader=None):
+        runner=None, identity_reader=None, lock_configurer=None):
     """Deploy Applier then broker after checking both exact identities."""
     runner = _run if runner is None else runner
     identity_reader = (
@@ -576,6 +661,8 @@ def deploy(
         create=environment.get("CF_UPLOAD_CREATE") == "1",
         identity_reader=identity_reader,
     )
+    (ensure_ingress_lock if lock_configurer is None else lock_configurer)(
+        deployment, environment)
     runner([
         "uv", "run", "pywrangler", "sync", "--allow-build",
     ])

@@ -341,11 +341,15 @@ exact bounded marker read can establish work.
 5. spends and retires only that internal generation;
 6. promotes referenced attachments in bounded round-robin pages.
 
-The Applier never deletes the client marker. Marker lifecycle is an ingress
-retention policy, separate from the repository's exact internal-retirement
-rule. Missing attachments do not block valid fact admission; immutable page
-receipts and a non-authoritative cursor let concurrent Workers duplicate
-bounded work without skipping completion or corrupting the tree.
+The Applier never deletes the client marker or detached ingress objects.
+F10 retires only the marker's separately reserved internal generation. Until
+an exact abandoned-session collection rule is proved, provider policy retains
+the complete client-writable namespace: the AWS broker role is conditional
+PUT-only and installs no lifecycle, while Cloudflare uses an indefinite R2
+bucket lock over the ingress prefix. Missing attachments do not block valid
+fact admission; immutable page receipts and a non-authoritative cursor let
+concurrent Workers duplicate bounded work without skipping completion or
+corrupting the tree.
 
 The marker's member component names the broker-authenticated upload session,
 not the author of every fact in a relayed closure. Per-fact signatures and
@@ -407,6 +411,7 @@ Prerequisites:
 - Python 3.13, AWS CLI, SAM CLI, and credentials for the target account;
 - two distinct buckets;
 - a Secrets Manager upload-session key ring;
+- deployment credentials allowed to read the ingress bucket lifecycle;
 - bucket policies that allow clients only their broker-issued create-only
   PUTs and allow the Applier role the exact canonical/ingress operations in
   its template.
@@ -441,6 +446,11 @@ python3 -m deploy.aws_upload_broker.manage deploy --create \
   --region REGION
 ```
 
+Deployment refuses an ingress bucket with any lifecycle rules:
+[S3 bucket policies do not stop lifecycle actions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html),
+so a rule could otherwise hide or expire acknowledged work. Stack removal
+never adds one and leaves the bucket intact.
+
 Deploy the database-free Applier:
 
 ```sh
@@ -465,11 +475,13 @@ secret.
 Cloudflare likewise uses distinct canonical and ingress R2 buckets. The
 broker has no native R2 binding: it receives a read-only canonical S3 token
 and an ingress S3 signing token, while its code surface mints only exact
-create-only PUTs. R2 currently gives that parent credential broader object
-mutation authority than the grants the broker exposes; eliminating or
-externally fencing that credential-level gap is tracked as a P0 provider
-hardening bead. The Applier has native bindings to both buckets and a
-one-minute cron.
+create-only PUTs. R2 gives that parent credential broad object mutation
+verbs, so deployment first installs and reads back an indefinite provider
+bucket lock over the complete ingress prefix. The lock prevents overwrite,
+DELETE, and lifecycle expiry after an acknowledged PUT even if the parent
+credential is compromised, following the provider's
+[bucket-lock contract](https://developers.cloudflare.com/r2/buckets/bucket-locks/).
+The Applier has native bindings to both buckets and a one-minute cron.
 
 Set the non-secret deployment inputs:
 
@@ -480,13 +492,20 @@ export CF_UPLOAD_CANONICAL_BUCKET=CANONICAL_BUCKET
 export CF_UPLOAD_INGRESS_BUCKET=INGRESS_BUCKET
 export CF_UPLOAD_DEPLOYMENT_OWNER=OWNER
 export CF_UPLOAD_CANONICAL_BUCKET_PROFILE=dedicated-workspace
+export CF_UPLOAD_INGRESS_BUCKET_PROFILE=exclusive-dedicated
 export CF_R2_BUCKET_ITEM_READ_PERMISSION_ID=READ_PERMISSION_ID32
 export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_PERMISSION_ID32
 export CF_UPLOAD_ISSUER=ISSUER
 ```
 
-Set `CLOUDFLARE_API_TOKEN`, the two canonical/ingress S3 credential pairs,
-and `UPLOAD_SESSION_KEYRING`. For first creation set:
+Set a narrowly scoped `CLOUDFLARE_API_TOKEN` with Worker control and exclusive
+R2 bucket-configuration authority for this dedicated ingress bucket, the two
+canonical/ingress S3 credential pairs, and `UPLOAD_SESSION_KEYRING`.
+Cloudflare's lock update replaces one whole document and exposes no CAS
+precondition, so this profile permits no second lock-configuration writer.
+Concurrent instances of this same deployment write the same document;
+deployment refuses a foreign document already present, but does not claim to
+defeat a racing account administrator. For first creation set:
 
 ```sh
 export CF_UPLOAD_CREATE=1
@@ -501,8 +520,8 @@ python3 -m deploy.cloudflare_upload.manage test
 python3 -m deploy.cloudflare_upload.manage deploy
 ```
 
-Deployment order is Applier then broker. Removal reverses that order and
-preserves both R2 buckets:
+Deployment installs the ingress lock before the Applier and broker. Removal
+reverses the compute order and preserves both R2 buckets and the lock:
 
 ```sh
 python3 -m deploy.cloudflare_upload.manage remove

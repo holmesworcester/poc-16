@@ -457,8 +457,22 @@ Ordinary clients upload directly to isolated object-store ingress:
 The Applier fetches the marker itself, verifies workspace/member/session/path
 bindings, uses that marker as the stable identity of a durably reserved
 internal generation, and runs the same pile transition as P2P receipt. It
-never deletes client-writable ingress.
-Provider lifecycle policy may expire those objects independently.
+never deletes client-writable ingress. F10 spends and retires only the
+internal generation.
+
+Acknowledgement creates an availability obligation for the exact client
+object. No receipt, F10 spend, Worker teardown, or unproved age heuristic may
+retire it. AWS confines the broker parent to conditional `PutObject` and
+installs no ingress lifecycle. R2's S3 parent necessarily has broader verbs,
+so a provider bucket lock retains the complete ingress prefix indefinitely;
+the lock applies to existing and future objects and takes precedence over
+lifecycle. Deployment verifies that exact lock before either Worker is
+installed and removal leaves it in place. The lock API replaces the complete
+rule document without CAS, so the ingress bucket and a narrowly scoped
+configuration token have one exclusive deployment owner. Concurrent
+same-owner installers write the same document; a racing account administrator
+is outside the broker-parent boundary. A future collector must first prove a
+separate, exact abandoned-session lifecycle and cannot impersonate F10.
 
 Notifications and paginated LIST are discovery hints only. Scheduled bounded
 rescans are the progress path. Missing attachments do not block fact

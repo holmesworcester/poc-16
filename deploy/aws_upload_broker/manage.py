@@ -446,6 +446,35 @@ def _stack_for_deploy(args):
     return _validate_owned_stack(args, stack)["StackId"]
 
 
+def _assert_no_ingress_lifecycle(args):
+    """Refuse a bucket whose independent lifecycle can erase upload work."""
+    try:
+        document = _json_command([
+            "aws",
+            "s3api",
+            "get-bucket-lifecycle-configuration",
+            "--bucket",
+            args.ingress_bucket,
+            "--expected-bucket-owner",
+            args.expected_owner,
+            "--output",
+            "json",
+            *_provider_flags(args),
+        ])
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr if isinstance(error.stderr, str) else ""
+        if "NoSuchLifecycleConfiguration" in detail:
+            return
+        raise RuntimeError(
+            "AWS ingress lifecycle lookup failed") from error
+    rules = document.get("Rules")
+    if not isinstance(rules, list):
+        raise RuntimeError("AWS ingress lifecycle response is malformed")
+    if rules:
+        raise RuntimeError(
+            "AWS ingress bucket lifecycle can erase acknowledged work")
+
+
 def _deploy_stack(args, target=None):
     _validate_deploy_args(args)
     target = _stack_for_deploy(args) if target is None else target
@@ -533,8 +562,10 @@ def _readiness(url):
 
 def deploy(args):
     _validate_deploy_args(args)
+    target = _stack_for_deploy(args)
+    _assert_no_ingress_lifecycle(args)
     build(args)
-    _deploy_stack(args)
+    _deploy_stack(args, target)
     _readiness(_stack_url(args))
 
 

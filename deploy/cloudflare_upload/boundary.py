@@ -1,19 +1,16 @@
 """Generate the Cloudflare authority boundary for staged R2 uploads.
 
-This module describes provider resources; it does not pretend that a Wrangler
-binding is read-only.  The broker receives no native R2 binding.  Its
-canonical reads use a separately provisioned Object Read-only S3 credential,
-and its only write-capable parent credential is scoped to the distinct ingress
-bucket.  The RepositoryApplier alone receives native bindings to both buckets.
+The broker receives no native R2 binding.  Its canonical reads use a separate
+Object Read-only credential, and its write-capable S3 parent is confined to a
+distinct ingress bucket.  An indefinite provider lock makes that parent's
+broad mutation verbs harmless to acknowledged ingress.  The
+RepositoryApplier alone receives native bindings to both buckets.
 """
 from dataclasses import dataclass
 import hashlib
 import json
 import re
 from urllib.parse import urlsplit
-
-from core.staged_intent import staging_prefix
-
 
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
 BUCKET = re.compile(
@@ -41,7 +38,6 @@ BROKER_SECRET_NAMES = (
 
 COMPATIBILITY_DATE = "2026-07-29"
 DEFAULT_PRESIGN_TTL_SECONDS = 15 * 60
-DEFAULT_STAGE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 UPLOAD_PROTOCOL = "isolated-ingress-v1"
 UPLOAD_ORDER = "objects-first-pile-last"
 
@@ -73,10 +69,10 @@ class Deployment:
     upload_issuer: str = "cloudflare-upload-production"
     jurisdiction: str = "default"
     canonical_bucket_profile: str = "dedicated-workspace"
+    ingress_bucket_profile: str = "exclusive-dedicated"
     canonical_prefix: str | None = None
     ingress_prefix: str | None = None
     presign_ttl_seconds: int = DEFAULT_PRESIGN_TTL_SECONDS
-    stage_retention_seconds: int = DEFAULT_STAGE_RETENTION_SECONDS
 
     def __post_init__(self):
         fields = (
@@ -105,6 +101,9 @@ class Deployment:
         if self.canonical_bucket_profile != "dedicated-workspace":
             raise ValueError(
                 "canonical bucket must use the dedicated-workspace profile")
+        if self.ingress_bucket_profile != "exclusive-dedicated":
+            raise ValueError(
+                "ingress bucket lock must use exclusive deployment authority")
         canonical = _safe_prefix(
             self.canonical_prefix
             or f"workspaces/{self.workspace}",
@@ -125,13 +124,6 @@ class Deployment:
                 or isinstance(self.presign_ttl_seconds, bool) \
                 or not 1 <= self.presign_ttl_seconds <= 60 * 60:
             raise ValueError("presigned PUT TTL")
-        if not isinstance(self.stage_retention_seconds, int) \
-                or isinstance(self.stage_retention_seconds, bool) \
-                or not 24 * 60 * 60 <= self.stage_retention_seconds \
-                <= 30 * 24 * 60 * 60:
-            raise ValueError("stage retention")
-        if self.stage_retention_seconds <= self.presign_ttl_seconds:
-            raise ValueError("stage retention must exceed presigned PUT TTL")
 
     @property
     def endpoint(self):
@@ -167,6 +159,8 @@ class Deployment:
                 "CF_R2_JURISDICTION", "default"),
             canonical_bucket_profile=environment.get(
                 "CF_UPLOAD_CANONICAL_BUCKET_PROFILE", ""),
+            ingress_bucket_profile=environment.get(
+                "CF_UPLOAD_INGRESS_BUCKET_PROFILE", ""),
             canonical_prefix=environment.get(
                 "CF_UPLOAD_CANONICAL_PREFIX",
                 f"workspaces/{workspace}"),
@@ -178,12 +172,6 @@ class Deployment:
                     "CF_UPLOAD_PRESIGN_TTL_SECONDS",
                     DEFAULT_PRESIGN_TTL_SECONDS),
                 "presigned PUT TTL",
-            ),
-            stage_retention_seconds=_integer(
-                environment.get(
-                    "CF_UPLOAD_STAGE_RETENTION_SECONDS",
-                    DEFAULT_STAGE_RETENTION_SECONDS),
-                "stage retention",
             ),
         )
 
@@ -227,8 +215,8 @@ def access_policies(deployment):
     """Return the two R2 S3-token policies the broker needs.
 
     Cloudflare's bucket-item write permission is intentionally represented as
-    broad within ingress.  Isolation comes from the resource naming the
-    ingress bucket and never the canonical bucket.
+    broad within ingress.  Canonical isolation comes from the distinct bucket;
+    ``ingress_lock`` independently prevents acknowledged-value mutation.
     """
     return {
         "broker_canonical_reader": _access_policy(
@@ -341,24 +329,17 @@ def applier_config(deployment):
     return config
 
 
-def ingress_lifecycle(deployment):
-    """Collect only loose object bytes; durable pile markers are excluded."""
+def ingress_lock(deployment):
+    """Retain the complete client-writable namespace until proved cleanup."""
     suffix = hashlib.sha256(
         f"{deployment.owner}:{deployment.ingress_prefix}".encode()
     ).hexdigest()[:16]
     return {
         "rules": [{
-            "id": f"poc16-abandoned-stage-{suffix}",
+            "id": f"poc16-retained-ingress-{suffix}",
             "enabled": True,
-            "conditions": {
-                "prefix": staging_prefix(deployment.workspace, "obj"),
-            },
-            "deleteObjectsTransition": {
-                "condition": {
-                    "type": "Age",
-                    "maxAge": deployment.stage_retention_seconds,
-                },
-            },
+            "prefix": deployment.ingress_prefix + "/",
+            "condition": {"type": "Indefinite"},
         }],
     }
 
@@ -368,10 +349,13 @@ def generated_boundary(deployment):
         "broker": broker_config(deployment),
         "applier": applier_config(deployment),
         "access_policies": access_policies(deployment),
-        "ingress_lifecycle": ingress_lifecycle(deployment),
+        "ingress_lock": ingress_lock(deployment),
         "provider_claim": {
             "kind": "isolated-ingress-presigned-put-v1",
             "live_verified": False,
+            "acknowledged_ingress_retention":
+                "r2-bucket-lock-indefinite-v1",
+            "lock_control_profile": "exclusive-dedicated",
             "canonical_raw_put_sha256_safe": False,
             "payload_mode": "UNSIGNED-PAYLOAD",
             "upload_protocol": UPLOAD_PROTOCOL,
