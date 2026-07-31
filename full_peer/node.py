@@ -183,10 +183,6 @@ class FullPeer:
     def now_ms(self):
         return now_ms()
 
-    def sync_peer(self, workspace, url):
-        from .sync import sync
-        return sync(self, workspace, url)
-
     def attachment_io(self):
         return bao_native
 

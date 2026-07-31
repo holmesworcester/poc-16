@@ -199,6 +199,45 @@ def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
     assert handler.syncer.kicks == 1
 
 
+def test_join_commits_locally_then_kicks_the_only_network_reconciler(
+        tmp_path, monkeypatch):
+    inviter = FullPeer(str(tmp_path / "inviter"))
+    inviter.peer_address = "https://inviter.invalid"
+    workspace = facts.auth.workspace.create(inviter, "alice")
+    link = facts.auth.user_invite.make(inviter, workspace)
+    store = inviter.store(workspace)
+    invite_key, = store.list("invite/")
+    encrypted = store.get(invite_key)
+    response = io.BytesIO(encrypted)
+    response.headers = {"Content-Length": str(len(encrypted))}
+    monkeypatch.setattr(
+        facts.auth.user.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: response,
+    )
+    joiner = FullPeer(str(tmp_path / "joiner"))
+
+    def duplicate_sync(*_args):
+        raise urllib.error.HTTPError(
+            "https://inviter.invalid/root", 503,
+            "stale root CAS", {}, None)
+
+    # This obsolete host capability reproduces the transient 503 which used
+    # to turn an already-committed join into control HTTP 500. A family command
+    # must leave publication to the successful control dispatch's one kick.
+    monkeypatch.setattr(joiner, "sync_peer", duplicate_sync, raising=False)
+    handler = _handler(joiner)
+
+    assert _request(
+        handler, "auth.user.join", [link, "bob"],
+    ) == (200, workspace)
+    assert handler.syncer.kicks == 1
+    assert any(
+        member["name"] == "bob"
+        for member in facts.auth.user.members(joiner, workspace)
+    )
+
+
 def test_peer_status_is_local_control_not_a_fact_family_command(tmp_path):
     node = FullPeer(str(tmp_path))
     handler = _handler(node)

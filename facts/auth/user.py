@@ -66,7 +66,7 @@ DURABLE = True
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
 def accept(node, link, name):
-    """Redeem a self-contained invite, then push the authored join."""
+    """Redeem a self-contained invite and commit the authored join locally."""
     from core.kernel import drain
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
@@ -119,7 +119,6 @@ def accept(node, link, name):
         pile = node.sender(workspace).pack(bootstrap + [sig, member])
         node.receive_pile(
             workspace, node.member_for(workspace), pile)
-        node.sync_peer(workspace, url)
         return workspace
     finally:
         if not retained:

@@ -257,7 +257,6 @@ def test_facts_depend_on_host_capabilities_not_full_peer_or_deploy():
         "load_upload",
         "now_ms",
         "run_upload",
-        "sync_peer",
         "upload_status",
     } <= {
         item.name for item in node.body
