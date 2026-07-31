@@ -103,7 +103,7 @@ def direct_upload(
     result = node.run_upload(
         source, broker_url, provider_origin, proof)
     return {
-        "objects": result.object_count,
+        "status": result.status,
         "session": result.session,
         "upload": result.source_id,
     }

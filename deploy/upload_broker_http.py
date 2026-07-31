@@ -1,4 +1,4 @@
-"""Hostile HTTP membrane for the provider-neutral upload broker.
+"""Hostile HTTP membrane for exact-pile OPEN and FINALIZE.
 
 Deployment adapters are responsible only for reading a bounded body and
 normalizing their provider request into :meth:`UploadBrokerEndpoint.handle`.
@@ -11,17 +11,14 @@ from deploy.upload_broker import (
     UploadBroker,
     UploadUnavailable,
     encode_finalize,
-    encode_issue,
     encode_open,
 )
 from deploy.upload_session import InvalidUploadSession
 from deploy.upload_wire import (
     InvalidUploadWire,
     MAX_FINALIZE_REQUEST_BYTES,
-    MAX_ISSUE_REQUEST_BYTES,
     MAX_OPEN_REQUEST_BYTES,
     decode_finalize_request,
-    decode_issue_request,
     decode_open_request,
 )
 
@@ -35,7 +32,6 @@ MAX_UPLOAD_HTTP_HEADER_BYTES = 16 * 1024
 
 _ROUTES = {
     "/upload/open": MAX_OPEN_REQUEST_BYTES,
-    "/upload/issue": MAX_ISSUE_REQUEST_BYTES,
     "/upload/finalize": MAX_FINALIZE_REQUEST_BYTES,
 }
 _SAFE_HEADERS = {
@@ -111,7 +107,7 @@ def _request_headers(headers, body_size, body_limit):
 
 
 class UploadBrokerEndpoint:
-    """Serve exactly OPEN, ISSUE, and FINALIZE for one ``UploadBroker``."""
+    """Serve exactly OPEN and FINALIZE for one ``UploadBroker``."""
 
     def __init__(self, broker):
         if not isinstance(broker, UploadBroker):
@@ -155,12 +151,8 @@ class UploadBrokerEndpoint:
                 result = await self.broker.open(
                     *decode_open_request(body))
                 encoded = encode_open(result)
-            elif path == "/upload/issue":
-                result = self.broker.issue(
-                    *decode_issue_request(body))
-                encoded = encode_issue(result)
             else:
-                result = self.broker.finalize(
+                result = await self.broker.finalize(
                     decode_finalize_request(body))
                 encoded = encode_finalize(result)
         except PayloadTooLarge:

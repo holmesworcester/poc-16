@@ -279,7 +279,6 @@ def test_full_peer_owns_upload_client_state_not_provider_runtime():
     for name in (
             "FinalizedUpload",
             "GrantedUpload",
-            "IssuedUpload",
             "OpenedUpload",
             "UploadCapability"):
         assert class_definitions(name) == [Path("deploy/upload_wire.py")]

@@ -1,244 +1,111 @@
-"""Pure codec and commitment tests for database-free upload sessions."""
-import base64
+"""Exact-pile lease codec tests."""
 from dataclasses import replace
-import random
+import base64
 
 import pytest
 
-from core.limits import MAX_OBJECT_BYTES, PAGE_BATCH
 from deploy.upload_session import (
     InvalidUploadSession,
-    MAX_RANGE_PROOF_BYTES,
-    MAX_RANGE_PROOF_NODES,
-    MAX_SESSION_BYTES,
-    MAX_SESSION_OBJECTS,
+    MAX_SESSION_TTL_MS,
     SessionKey,
     SessionState,
     SessionTokenCodec,
-    TOKEN_BYTES,
     UploadLeaf,
-    UploadManifest,
     UploadSessionPolicy,
-    UploadVector,
-    decode_range_proof,
-    encode_range_proof,
-    verify_range,
 )
 
 
-KEY = SessionKey("key00001", b"k" * 32, 0, 10**12)
+NOW = 1_900_000_000_000
+WORKSPACE = "a" * 64
+MEMBER = "b" * 16
+SESSION = "c" * 32
+PILE = UploadLeaf("d" * 64, 1234)
+KEY = SessionKey(
+    "active01", b"k" * 32, NOW - 10_000, NOW + MAX_SESSION_TTL_MS + 10_000)
 POLICY = UploadSessionPolicy(
-    "test-broker-v1",
-    KEY.key_id,
-    (KEY,),
-    ttl_ms=600_000,
-    max_ttl_ms=600_000,
-    clock_skew_ms=1_000,
-)
+    "test-upload", KEY.key_id, (KEY,), ttl_ms=60_000,
+    max_ttl_ms=120_000, clock_skew_ms=1_000)
 
 
-def leaf(number, size=None):
-    return UploadLeaf(
-        f"{number + 1:064x}",
-        number % 29 if size is None else size,
-    )
+def state(**changes):
+    value = SessionState(
+        WORKSPACE, MEMBER, SESSION, PILE, NOW, NOW + 60_000, KEY.key_id)
+    return replace(value, **changes)
 
 
-def state(manifest, *, next_index=0, issued_bytes=0, last=None):
-    return SessionState(
-        "a" * 64,
-        "b" * 16,
-        "c" * 32,
-        manifest,
-        UploadLeaf("d" * 64, 7),
-        next_index,
-        issued_bytes,
-        last,
-        100_000,
-        700_000,
-        KEY.key_id,
-    )
+def test_cursor_round_trip_binds_one_exact_pile_and_provider():
+    codec = SessionTokenCodec(POLICY, "fake-s3:bucket")
+    token = codec.encode(state())
+    assert codec.decode(token, NOW + 1) == state()
 
-
-def test_4096_leaf_vector_proves_random_bounded_contiguous_ranges():
-    vector = UploadVector(tuple(leaf(index) for index in range(4_096)))
-    rng = random.Random(0xA11CE)
-
-    for _ in range(256):
-        start = rng.randrange(len(vector.leaves))
-        end = min(
-            len(vector.leaves),
-            start + rng.randint(1, PAGE_BATCH),
-        )
-        proof = vector.proof(start, end)
-        assert len(proof) <= MAX_RANGE_PROOF_BYTES
-        assert len(decode_range_proof(proof)) \
-            <= MAX_RANGE_PROOF_NODES
-        assert verify_range(
-            vector.manifest,
-            start,
-            vector.leaves[start:end],
-            proof,
-        ) == vector.leaves[start:end]
-
-
-@pytest.mark.parametrize("count", (1, 2, 3, 255, 256, 257))
-def test_merkle_boundary_shapes_and_positions_are_unambiguous(count):
-    vector = UploadVector(tuple(leaf(index) for index in range(count)))
-    ranges = {
-        (0, min(count, PAGE_BATCH)),
-        (max(0, count - PAGE_BATCH), count),
-    }
-    for start, end in ranges:
-        proof = vector.proof(start, end)
-        verify_range(
-            vector.manifest,
-            start,
-            vector.leaves[start:end],
-            proof,
-        )
-
-    changed_size = tuple(vector.leaves)
-    changed_size = (
-        replace(changed_size[0], size=changed_size[0].size + 1),
-        *changed_size[1:],
-    )
-    assert UploadVector(changed_size).manifest.root \
-        != vector.manifest.root
-
-
-def test_proof_codec_rejects_noncanonical_and_mutated_nodes():
-    vector = UploadVector(tuple(leaf(index) for index in range(300)))
-    start, end = 73, 291
-    proof = vector.proof(start, end)
-    mutations = []
-    for offset in (0, 4, 5, len(proof) - 1):
-        changed = bytearray(proof)
-        changed[offset] ^= 1
-        mutations.append(bytes(changed))
-    mutations.extend((proof[:-1], proof + b"x", b"", b"not-a-proof"))
-
-    for changed in mutations:
+    for foreign in (
+            SessionTokenCodec(POLICY, "fake-s3:other"),
+            SessionTokenCodec(replace(POLICY, issuer="other"), "fake-s3:bucket")):
         with pytest.raises(InvalidUploadSession):
-            verify_range(
-                vector.manifest,
-                start,
-                vector.leaves[start:end],
-                changed,
-            )
+            foreign.decode(token, NOW + 1)
+
+
+def test_cursor_tampering_and_noncanonical_base64_fail_closed():
+    codec = SessionTokenCodec(POLICY, "fake-s3:bucket")
+    token = codec.encode(state())
+    midpoint = len(token) // 2
+    replacement = "A" if token[midpoint] != "A" else "B"
     with pytest.raises(InvalidUploadSession):
-        encode_range_proof(
-            tuple(b"x" * 32 for _ in range(
-                MAX_RANGE_PROOF_NODES + 1)))
-
-
-@pytest.mark.parametrize(
-    "leaves",
-    (
-        (UploadLeaf("a" * 64, 1), UploadLeaf("a" * 64, 2)),
-        (UploadLeaf("b" * 64, 1), UploadLeaf("a" * 64, 1)),
-        (UploadLeaf("A" * 64, 1),),
-        (UploadLeaf("a" * 63, 1),),
-        (UploadLeaf("a" * 64, -1),),
-        (UploadLeaf("a" * 64, True),),
-        (UploadLeaf("a" * 64, MAX_OBJECT_BYTES + 1),),
-    ),
-)
-def test_vector_rejects_duplicates_ordering_and_invalid_leaves(leaves):
+        codec.decode(token[:midpoint] + replacement + token[midpoint + 1:], NOW)
     with pytest.raises(InvalidUploadSession):
-        UploadVector(leaves)
+        codec.decode(token + "=", NOW)
 
-
-def test_empty_vector_has_one_canonical_commitment_and_no_range():
-    first = UploadVector(())
-    second = UploadVector(iter(()))
-
-    assert first.manifest == second.manifest
-    assert first.manifest.count == first.manifest.total_bytes == 0
+    raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    # A valid alphabet and length do not help a token with a forged MAC.
+    forged = base64.urlsafe_b64encode(raw[:-1] + bytes([raw[-1] ^ 1])) \
+        .rstrip(b"=").decode()
     with pytest.raises(InvalidUploadSession):
-        first.proof(0, 0)
+        codec.decode(forged, NOW)
 
 
-def test_cursor_size_is_constant_at_empty_and_absolute_metadata_caps():
-    codec = SessionTokenCodec(POLICY, "test-ingress-v1")
-    empty = state(UploadVector(()).manifest)
-    maximum = state(UploadManifest(
-        "e" * 64,
-        MAX_SESSION_OBJECTS,
-        MAX_SESSION_BYTES - 7,
-    ))
-
-    empty_token = codec.encode(empty)
-    maximum_token = codec.encode(maximum)
-    assert len(empty_token) == len(maximum_token) == TOKEN_BYTES
-    assert codec.decode(empty_token, 100_000) == empty
-    assert codec.decode(maximum_token, 100_000) == maximum
-
-
-def test_cursor_wire_is_unpadded_canonical_base64url():
-    codec = SessionTokenCodec(POLICY, "test-ingress-v1")
-    token = codec.encode(state(UploadVector(()).manifest))
-    variants = (
-        token + "=",
-        token[:-1],
-        "!" + token[1:],
-        token.lower(),
-    )
-
-    for variant in variants:
-        with pytest.raises(InvalidUploadSession):
-            codec.decode(variant, 100_000)
-    raw = base64.urlsafe_b64decode(
-        token + "=" * (-len(token) % 4))
-    assert base64.urlsafe_b64encode(
-        raw).rstrip(b"=").decode() == token
-
-
-@pytest.mark.parametrize(
-    "change",
-    (
-        lambda value: replace(value, next_index=1),
-        lambda value: replace(value, issued_bytes=1),
-        lambda value: replace(value, last_digest="e" * 64),
-        lambda value: replace(
-            value, issued_at_ms=value.expires_at_ms),
-        lambda value: replace(
-            value, expires_at_ms=value.issued_at_ms),
-        lambda value: replace(
-            value,
-            expires_at_ms=value.issued_at_ms + 600_001),
-    ),
-)
-def test_cursor_encoder_refuses_impossible_progress(change):
-    codec = SessionTokenCodec(POLICY, "test-ingress-v1")
-    candidate = change(state(UploadVector(()).manifest))
+def test_cursor_has_one_fixed_time_window():
+    codec = SessionTokenCodec(POLICY, "fake-s3:bucket")
+    token = codec.encode(state())
+    with pytest.raises(InvalidUploadSession):
+        codec.decode(token, NOW - 1)
+    with pytest.raises(InvalidUploadSession):
+        codec.decode(token, NOW + 60_000)
 
     with pytest.raises(InvalidUploadSession):
-        codec.encode(candidate)
+        codec.encode(state(expires_at_ms=NOW + POLICY.max_ttl_ms + 1))
+    with pytest.raises(InvalidUploadSession):
+        codec.encode(state(issued_at_ms=NOW + 60_000))
 
 
-def test_keyring_and_policy_inputs_are_finite_and_unambiguous():
-    assert repr(KEY) == (
-        "SessionKey(key_id='key00001', issue_from_ms=0, "
-        "verify_until_ms=1000000000000)")
-    assert "kkkk" not in repr(POLICY)
-    with pytest.raises(ValueError):
-        SessionKey("short", b"k" * 32, 0, 10)
-    with pytest.raises(ValueError):
-        SessionKey("key00001", b"short", 0, 10)
-    with pytest.raises(ValueError):
-        UploadSessionPolicy(
-            "issuer",
-            "key00001",
-            (KEY, KEY),
-        )
-    with pytest.raises(ValueError):
-        UploadSessionPolicy(
-            "issuer",
-            "missing1",
-            (KEY,),
-        )
-    with pytest.raises(ValueError):
-        replace(POLICY, max_bytes=0)
-    with pytest.raises(ValueError):
-        replace(POLICY, ttl_ms=POLICY.max_ttl_ms + 1)
+def test_key_rotation_verifies_old_lease_but_cannot_extend_it():
+    old = SessionKey(
+        "oldkey01", b"o" * 32, NOW - 20_000, NOW + 100_000)
+    new = SessionKey(
+        "newkey01", b"n" * 32, NOW, NOW + 200_000)
+    policy = UploadSessionPolicy(
+        "test-upload", new.key_id, (old, new), ttl_ms=50_000,
+        max_ttl_ms=60_000, clock_skew_ms=1_000)
+    codec = SessionTokenCodec(policy, "fake-r2:bucket")
+    old_state = replace(
+        state(), key_id=old.key_id, issued_at_ms=NOW - 10_000,
+        expires_at_ms=NOW + 40_000)
+    token = codec.encode(old_state)
+    assert codec.decode(token, NOW) == old_state
+
+    retired = replace(policy, keys=(new,))
+    with pytest.raises(InvalidUploadSession):
+        SessionTokenCodec(retired, "fake-r2:bucket").decode(token, NOW)
+
+
+@pytest.mark.parametrize("change", [
+    {"workspace": "x"},
+    {"member": "B" * 16},
+    {"session": "0" * 31},
+    {"pile": UploadLeaf("d" * 63, 1)},
+    {"pile": UploadLeaf("d" * 64, -1)},
+    {"key_id": "missing1"},
+])
+def test_state_shape_is_exact(change):
+    codec = SessionTokenCodec(POLICY, "fake-s3:bucket")
+    with pytest.raises(InvalidUploadSession):
+        codec.encode(state(**change))

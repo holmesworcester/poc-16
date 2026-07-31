@@ -21,7 +21,6 @@ from deploy.upload_session import (
     SessionState,
     SessionTokenCodec,
     UploadLeaf,
-    UploadManifest,
     UploadSessionPolicy,
 )
 
@@ -66,11 +65,7 @@ def state(key_id="oldkey01", *, expires_at=NOW + TTL):
         "a" * 64,
         "b" * 16,
         "c" * 32,
-        UploadManifest("d" * 64, 2, 11),
         UploadLeaf("e" * 64, 7),
-        0,
-        0,
-        None,
         NOW,
         expires_at,
         key_id,
