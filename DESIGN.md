@@ -91,6 +91,8 @@ The accepting lifecycle is supervised today. Durable outbound mapping from a
 workspace peer to an Iroh ticket and scheduler-owned forwarder remains future
 work (`poc-16-32h`); until it lands, the standalone forwarder is diagnostic
 and ordinary invite/sync configuration must not be described as Iroh-only.
+The accepting process therefore has no advertised peer URL and refuses to
+create an invite rather than serialize its private loopback HTTP address.
 
 ## 2. Facts and closed piles
 

@@ -57,6 +57,8 @@ def make(node, workspace):
     """Publish a closed invite blob without adding the invitation to the set."""
     from full_peer.node import now_ms
 
+    if not isinstance(node.url, str) or not node.url:
+        raise ValueError("peer has no advertised URL")
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()
     ts = now_ms()

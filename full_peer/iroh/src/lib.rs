@@ -11,8 +11,9 @@ use std::io::{ErrorKind, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -33,6 +34,7 @@ pub const MAX_TICKET_BYTES: usize = 4 * 1024;
 
 /// Wait this long for a usable local or relay address.
 const ADDRESS_TIMEOUT: Duration = Duration::from_secs(30);
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Establish one endpoint.
 ///
@@ -150,26 +152,86 @@ pub fn load_or_create_secret(path: &Path) -> Result<SecretKey> {
         Err(error) => return Err(error).context("read Iroh endpoint key"),
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("create Iroh key directory")?;
-    }
+    let parent = parent_dir(path);
+    fs::create_dir_all(parent).context("create Iroh key directory")?;
     let generated = SecretKey::generate();
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    match options.open(path) {
-        Ok(mut file) => {
-            file.write_all(&generated.to_bytes())
-                .context("write Iroh endpoint key")?;
-            file.sync_all().context("sync Iroh endpoint key")?;
+    let (temporary, mut file) = create_secret_temp(path)?;
+    let result = (|| {
+        file.write_all(&generated.to_bytes())
+            .context("write Iroh endpoint key temporary")?;
+        file.sync_all()
+            .context("sync Iroh endpoint key temporary")?;
+        drop(file);
+
+        if publish_secret(&temporary, path)? {
             Ok(generated)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+        } else {
             decode_secret(&fs::read(path).context("read raced Iroh endpoint key")?)
         }
-        Err(error) => Err(error).context("create Iroh endpoint key"),
+    })();
+    let cleanup = fs::remove_file(&temporary);
+    if let Err(error) = cleanup
+        && error.kind() != ErrorKind::NotFound
+        && result.is_ok()
+    {
+        return Err(error).context("remove Iroh endpoint key temporary");
     }
+    sync_directory(parent)?;
+    result
+}
+
+fn create_secret_temp(path: &Path) -> Result<(PathBuf, fs::File)> {
+    let parent = parent_dir(path);
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("Iroh endpoint key needs a file name")?;
+
+    for _ in 0..128 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).context("create Iroh endpoint key temporary");
+            }
+        }
+    }
+    bail!("could not allocate Iroh endpoint key temporary");
+}
+
+fn publish_secret(temporary: &Path, path: &Path) -> Result<bool> {
+    match fs::hard_link(temporary, path) {
+        Ok(()) => {
+            sync_directory(parent_dir(path))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).context("publish Iroh endpoint key"),
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .context("sync Iroh key directory")
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn decode_secret(raw: &[u8]) -> Result<SecretKey> {
@@ -321,6 +383,8 @@ async fn copy_with_limit(
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -355,6 +419,86 @@ mod tests {
 
         fs::write(&path, b"short").unwrap();
         assert!(load_or_create_secret(&path).is_err());
+    }
+
+    #[test]
+    fn prepared_key_publication_is_atomic_and_no_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("endpoint.key");
+        let keys = [SecretKey::generate(), SecretKey::generate()];
+        let temporary = [
+            directory.path().join("first.tmp"),
+            directory.path().join("second.tmp"),
+        ];
+        for (path, key) in temporary.iter().zip(&keys) {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.write_all(&key.to_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let joins = temporary.map(|path| {
+            let barrier = Arc::clone(&barrier);
+            let final_path = final_path.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                publish_secret(&path, &final_path).unwrap()
+            })
+        });
+        barrier.wait();
+        let published = joins.map(|join| join.join().unwrap());
+
+        assert_eq!(published.into_iter().filter(|value| *value).count(), 1);
+        let raw = fs::read(final_path).unwrap();
+        assert_eq!(raw.len(), 32);
+        assert!(keys.iter().any(|key| raw == key.to_bytes()));
+    }
+
+    #[test]
+    fn concurrent_creators_share_one_complete_key_and_clean_their_temps() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("endpoint.key");
+        let barrier = Arc::new(Barrier::new(17));
+        let joins: Vec<_> = (0..16)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_secret(&path).unwrap().to_bytes()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let keys: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(fs::read(&path).unwrap(), keys[0]);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn abandoned_partial_temps_cannot_brick_key_creation_or_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("endpoint.key");
+        let residues = [
+            directory.path().join(".endpoint.key.crash.empty.tmp"),
+            directory.path().join(".endpoint.key.crash.partial.tmp"),
+        ];
+        fs::write(&residues[0], b"").unwrap();
+        fs::write(&residues[1], b"partial").unwrap();
+
+        let first = load_or_create_secret(&path).unwrap();
+        let second = load_or_create_secret(&path).unwrap();
+
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        assert_eq!(fs::read(path).unwrap(), first.to_bytes());
+        assert!(residues.iter().all(|residue| residue.exists()));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

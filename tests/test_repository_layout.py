@@ -842,6 +842,7 @@ def test_iroh_is_a_full_peer_owned_connection_wrapper_only():
     assert '"--upstream"' in process
     assert "peer_handler_for(" in daemon
     assert "gate_options=self.gate_options" in daemon
+    assert "self.node.url = None if iroh_binary is not None" in daemon
     assert "_control_server(" in daemon
     assert not any(
         path.suffix == ".rs"

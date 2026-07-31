@@ -252,7 +252,10 @@ class FullPeerService:
         self.data_address = _http_address(data_host, actual_port)
         self.control_address = _http_address(
             "127.0.0.1", self.control_server.server_address[1])
-        self.node.url = url or self.data_address
+        # Until full_peer owns durable outbound Iroh locators (poc-16-32h),
+        # never serialize this accepting peer's private loopback seam.
+        self.node.url = None if iroh_binary is not None \
+            else url or self.data_address
         self.iroh_binary = iroh_binary
         self.iroh_key_file = Path(
             iroh_key_file

@@ -360,6 +360,18 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         )
         assert status == 200
         assert workspace in json.loads(body)["workspaces"]
+        status, body, _ = call(
+            address(ready["control"]),
+            "POST",
+            f"/ctl/command?ws={workspace}",
+            body=json.dumps({
+                "path": "auth.user_invite.create",
+                "argv": [workspace],
+            }).encode(),
+        )
+        assert status == 400
+        assert "peer has no advertised URL" in json.loads(body)["error"]
+        assert repository_bytes(state, workspace) == baseline
 
         for forwarder in children[1:]:
             stop(forwarder)

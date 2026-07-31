@@ -138,7 +138,8 @@ scheduler. Therefore the supervised accepting path and manual forwarder are
 working, but ordinary invites do not yet establish Iroh-only scheduled sync.
 Do not advertise the accepting peer's loopback data URL as a remote peer;
 `--url` is rejected in Iroh mode so it cannot accidentally advertise a plain
-HTTP endpoint.
+HTTP endpoint, and invite creation fails with `peer has no advertised URL`
+instead of serializing the private loopback seam.
 
 ## Repository flow
 
