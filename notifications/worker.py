@@ -1,14 +1,15 @@
 """One carrier-neutral, post-publication notification attempt.
 
-A managed carrier durably owns redelivery.  It decodes a ``PublicationHint``,
-awaits :meth:`NotificationWorker.process`, acknowledges ``ACK`` and
-``TERMINAL``, and redelivers ``RETRY``.  The worker never mutates repository
-state and never treats the carrier as authority.
+The notification cursor durably owns one pending body. A managed carrier is a
+disposable wake that may expire or duplicate it. The handler advances only the
+exact pending body after :meth:`NotificationWorker.process` succeeds; every
+fair scanner run republishes work that remains pending.
 """
 from dataclasses import dataclass
 from enum import Enum
 from inspect import isawaitable
 
+from core.crypto import h
 from core.limits import MAX_ROOT_BYTES, PayloadTooLarge
 from core.shape import FACT_TS_MAX, valid_fid
 
@@ -26,6 +27,10 @@ from .delivery import (
     request_for,
 )
 from .hints import decode_hint, materialize_hint
+from .discovery import (
+    PENDING_CURRENT,
+    PENDING_NONCURRENT,
+)
 
 
 class NotificationAction(Enum):
@@ -146,26 +151,42 @@ async def handle_carrier_delivery(
         delivery, workspace, notification_state, worker):
     """Resolve one canonical carrier body through the shared worker path.
 
-    The trusted deployment supplies ``workspace`` and a read-only
-    notification-state capability.  Carrier metadata is never authority.
+    The trusted deployment supplies ``workspace`` and a narrow cursor-state
+    capability. Carrier metadata is never authority. Only the exact durable
+    pending hint may invoke the provider or advance discovery.
     """
     read = getattr(notification_state, "get_bounded", None)
+    pending = getattr(notification_state, "pending", None)
+    complete = getattr(notification_state, "complete", None)
+    owner = getattr(notification_state, "owner", None)
     if not isinstance(delivery, CarrierDelivery) \
             or not valid_fid(workspace) \
             or not callable(read) \
+            or not callable(pending) \
+            or not callable(complete) \
+            or not valid_fid(owner) \
             or not isinstance(worker, NotificationWorker):
         raise TypeError("notification carrier handler")
     try:
         reference = decode_hint(delivery.body)
     except (TypeError, ValueError):
         return CARRIER_ACK
-    if reference.workspace != workspace:
+    if reference.workspace != workspace or reference.owner != owner:
         return CARRIER_ACK
+    body_oid = h(delivery.body)
+    try:
+        status = await _resolve(pending(body_oid))
+    except Exception:
+        return CARRIER_RETRY
+    if status == PENDING_NONCURRENT:
+        return CARRIER_ACK
+    if status != PENDING_CURRENT:
+        return CARRIER_RETRY
     try:
         raw = await _resolve(read(
             "obj/" + reference.root_oid, MAX_ROOT_BYTES))
     except PayloadTooLarge:
-        return CARRIER_ACK
+        return CARRIER_RETRY
     except Exception:
         return CARRIER_RETRY
     if raw is None or not isinstance(raw, bytes):
@@ -173,8 +194,17 @@ async def handle_carrier_delivery(
     try:
         hint = materialize_hint(reference, raw)
     except (TypeError, ValueError):
-        return CARRIER_ACK
-    return carrier_disposition(await worker.process(hint))
+        return CARRIER_RETRY
+    result = await worker.process(hint)
+    if not isinstance(result, WorkerResult) \
+            or result.action is RETRY \
+            or result.reason == "invalid-hint":
+        return CARRIER_RETRY
+    try:
+        status = await _resolve(complete(body_oid))
+    except Exception:
+        return CARRIER_RETRY
+    return CARRIER_ACK if status == PENDING_NONCURRENT else CARRIER_RETRY
 
 
 __all__ = (
