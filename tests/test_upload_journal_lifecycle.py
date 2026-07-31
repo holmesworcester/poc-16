@@ -229,6 +229,32 @@ def test_completed_collection_is_local_and_does_not_mutate_repository(
     assert node.store(workspace).get_bounded("root", 1024 * 1024) == before
 
 
+def test_discovery_skips_a_source_collected_after_directory_snapshot(
+        tmp_path, monkeypatch):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path)
+    UploadClient(source, broker, FakeProvider(), clock).run(proof)
+    root, target = Path(source.path).parent, Path(
+        source.path) / "source.json"
+    real_getsize, collected = journal.os.path.getsize, False
+
+    def collect_during_stat(path):
+        nonlocal collected
+        if Path(path) == target and not collected:
+            collected = True
+            UploadSource.collect(
+                root, source.workspace, source.source_id, clock())
+        return real_getsize(path)
+
+    monkeypatch.setattr(journal.os.path, "getsize", collect_during_stat)
+    page = UploadSource.discover(root, clock())
+
+    assert collected
+    assert page.uploads == ()
+    assert page.cursor is None
+
+
 def test_abandoned_source_cannot_resume(tmp_path):
     (
         _, _, _, clock, _, _, broker, source, proof,

@@ -87,7 +87,7 @@ def _source_lock(root, source_id, *, blocking=True):
     locks = os.path.join(root, ".locks")
     os.makedirs(locks, exist_ok=True)
     return _lock(
-        os.path.join(locks, source_id[:2]), blocking=blocking)
+        os.path.join(locks, source_id[:4]), blocking=blocking)
 
 
 def _new(path, raw):
@@ -323,20 +323,27 @@ class UploadSource:
             raise ValueError("upload status page")
         names = _source_ids(root)
         start = 0 if cursor is None else bisect_right(names, cursor)
-        selected, used, uploads = names[start:start + limit], 0, []
+        selected, processed, used, uploads = (
+            names[start:start + limit], 0, 0, [])
         for source_id in selected:
             path = os.path.join(root, source_id)
-            size = os.path.getsize(os.path.join(path, "source.json"))
-            if size > MAX_SOURCE_DOCUMENT_BYTES \
-                    or used and used + size > MAX_SOURCE_DOCUMENT_BYTES:
-                break
-            source = cls._load(path, bodies=False)
+            try:
+                size = os.path.getsize(os.path.join(path, "source.json"))
+                if size > MAX_SOURCE_DOCUMENT_BYTES \
+                        or used and used + size > MAX_SOURCE_DOCUMENT_BYTES:
+                    break
+                status = cls._load(path, bodies=False).status(now_ms)
+            except (OSError, UploadJournalError):
+                if os.path.isdir(path):
+                    raise
+                processed += 1
+                continue
             used += size
-            uploads.append(source.status(now_ms))
-        consumed = len(uploads)
-        if consumed == 0 and selected:
+            processed += 1
+            uploads.append(status)
+        if processed == 0 and selected:
             raise UploadJournalError("upload status byte budget")
-        end = start + consumed
+        end = start + processed
         return UploadStatusPage(
             tuple(uploads), names[end - 1] if end < len(names) else None)
 
