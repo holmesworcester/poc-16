@@ -28,6 +28,7 @@ from core.limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
+    MAX_STORE_READ_BYTES,
     PayloadTooLarge,
 )
 from core.store import FsStore, RemoteStore
@@ -103,7 +104,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
     assert store.get_bounded("pile/member/missing", 5) is None
     with pytest.raises(PayloadTooLarge, match="read exceeds"):
         store.get_bounded("pile/member/value", 4)
-    for invalid in (0, -1, True, MAX_OBJECT_BYTES + 1):
+    for invalid in (0, -1, True, MAX_STORE_READ_BYTES + 1):
         with pytest.raises(ValueError, match="read byte limit"):
             store.get_bounded("pile/member/value", invalid)
 

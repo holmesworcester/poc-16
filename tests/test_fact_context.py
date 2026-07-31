@@ -2,11 +2,17 @@
 
 import facts
 
+from core import indexes
 from core.close import decode_pile
 from core.crypto import keypair
 from core.fact import Fact, encode
 from core.fact_index import index_rows
 from core.kernel import MemoryContext, accepts, resolve_edges
+from core.limits import (
+    MAX_REGISTERED_FACT_ROUTES,
+    MAX_REGISTERED_FACT_ROWS,
+    MAX_REGISTERED_SUPPRESSION_ROUTES,
+)
 from full_peer.node import FullPeer, now_ms
 from full_peer.sql_store import SqlStore
 
@@ -106,6 +112,42 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     corpus, seen = list(durable), {fact.fid for fact in durable}
     corpus.extend(fact for fact in ephemeral if fact.fid not in seen)
     assert {fact.t for fact in corpus} == set(facts.FAMILIES)
+    routes = {
+        fact.t: (
+            len(fact.refs()),
+            len(fact.offers()),
+            len(facts.current_scopes(fact)),
+            len(facts.action_sids(fact)),
+            2 + len(indexes.record_postings(fact))
+            + len(facts.current_scopes(fact) | facts.action_sids(fact)),
+        )
+        for fact in corpus
+    }
+    assert routes == {
+        "admin": (0, 1, 1, 0, 7),
+        "chunk": (1, 0, 2, 0, 9),
+        "delete": (1, 0, 0, 1, 6),
+        "device": (0, 2, 3, 0, 12),
+        "device_invite": (0, 3, 5, 0, 17),
+        "evict": (0, 1, 0, 1, 6),
+        "file_bao": (0, 2, 1, 0, 8),
+        "msg": (0, 0, 1, 0, 6),
+        "req": (0, 0, 0, 0, 4),
+        "signature": (0, 1, 0, 0, 5),
+        "user": (1, 1, 2, 0, 10),
+        "user_invite": (0, 1, 0, 0, 5),
+        "workspace": (0, 2, 1, 0, 8),
+    }
+    assert max(row[-1] for row in routes.values()) \
+        == MAX_REGISTERED_FACT_ROUTES
+    assert max(
+        1 + len(indexes.record_postings(fact))
+        for fact in corpus
+    ) == MAX_REGISTERED_FACT_ROWS
+    assert max(
+        len(facts.current_scopes(fact) | facts.action_sids(fact))
+        for fact in corpus
+    ) == MAX_REGISTERED_SUPPRESSION_ROUTES
 
     memory = MemoryContext(workspace)
     for fact in corpus:

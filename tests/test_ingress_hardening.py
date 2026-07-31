@@ -9,9 +9,9 @@ import facts
 
 from core import (
     close, fact, http, http_stdlib, kernel, merkle_map, object_store,
-    repository_applier as repository_applier_module, snapshot,
+    repository_applier as repository_applier_module, snapshot, limits,
 )
-from core.crypto import h
+from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.grants import make_token
 from core.ingress import InvalidPile, check_source
@@ -27,6 +27,7 @@ from full_peer import status
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from facts.content import message as message_family
+from facts.auth.workspace import workspace as workspace_fact
 from tests.util import all_fids, closed_subset, deliver
 
 
@@ -118,6 +119,64 @@ def test_pile_fact_count_is_bounded_before_generation_or_kernel_work(
     malformed = b'{"facts":[{},"unterminated'
     with pytest.raises(ValueError, match="pile facts array"):
         run(applier.stage("member", malformed))
+
+
+def test_pile_decoder_work_is_bounded_before_reservation_and_recovers(
+        tmp_path, monkeypatch):
+    secret, public = keypair()
+    root = workspace_fact(secret, public, "memory-bound", 1)
+    healthy = close.encode_pile((root,), workspace=root.fid)
+    exact = canon({
+        "facts": [],
+        "junk": list(range(64)),
+        "ws": root.fid,
+    })
+    over = canon({
+        "facts": [],
+        "junk": list(range(65)),
+        "ws": root.fid,
+    })
+    exact_values = close._scan_json_values(exact)
+    assert close._scan_json_values(over) == exact_values + 1
+    monkeypatch.setattr(close, "MAX_PILE_JSON_VALUES", exact_values)
+    close.check_pile_bounds(exact)
+
+    store = FsStore(tmp_path / "store")
+    applier = repository_applier_module.RepositoryApplier(root.fid, store)
+    with pytest.raises(PayloadTooLarge, match="too many JSON values"):
+        run(applier.stage("member", over))
+    assert store.list("applier/generation/") == []
+
+    result = run(applier.receive_pile("member", healthy)).result
+    assert result.status == "applied"
+    assert store.get("root") is not None
+
+
+def test_shared_pile_limits_fit_the_smallest_hosted_memory_ceiling():
+    peak = limits.applier_peak_bound(
+        limits.MAX_PILE_BYTES,
+        limits.MAX_PILE_JSON_VALUES,
+        limits.MAX_PILE_FACTS,
+    )
+    empty = len(canon({
+        "facts": [],
+        "ws": "0" * 64,
+    }))
+    maximum_canonical_envelope = (
+        empty - 2
+        + limits.MAX_PILE_FACTS * limits.MAX_FACT_BYTES
+        + limits.MAX_PILE_FACTS - 1
+    )
+    assert limits.MAX_FACT_BYTES == 16 * 1024
+    assert limits.MAX_PILE_FACTS == 256
+    assert limits.MAX_PILE_BYTES == 5 * limits.MIB
+    assert maximum_canonical_envelope < limits.MAX_PILE_BYTES
+    assert peak == 113_008_656
+    assert peak < limits.MIN_HOSTED_MEMORY_BYTES
+    assert limits.MIN_HOSTED_MEMORY_BYTES - peak > 14 * 1024 * 1024
+    assert limits.MAX_APPLIER_SUBREQUESTS == 8_137_488
+    assert limits.MAX_APPLIER_SUBREQUESTS \
+        < limits.MAX_HOSTED_SUBREQUESTS
 
 
 def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
@@ -831,10 +890,10 @@ def test_failed_retirement_spends_once_and_never_risks_an_aba_retry(
     proposals = 0
     deletes = 0
 
-    async def counted_propose(value):
+    async def counted_propose(*args):
         nonlocal proposals
         proposals += 1
-        return await real_propose(value)
+        return await real_propose(*args)
 
     def failed_delete(_key):
         nonlocal deletes

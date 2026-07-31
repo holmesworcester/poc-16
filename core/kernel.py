@@ -43,6 +43,7 @@ class MemoryContext:
         self.facts = {}
         self.depths = {}
         self.closures = {}
+        self._next_bit = 1
 
     def has_fact(self, fid):
         return fid in self.facts
@@ -89,13 +90,16 @@ class MemoryContext:
     def closure(self, deps):
         if any(fid not in self.closures for fid in deps):
             return None
-        return frozenset().union(
-            *(self.closures[fid] for fid in deps))
+        closure = 0
+        for fid in deps:
+            closure |= self.closures[fid]
+        return closure
 
     def admit(self, fact, depth, edges):
         self.facts[fact.fid], self.depths[fact.fid] = fact, depth
         closure = self.closure(tuple(edge.fid for edge in edges))
-        self.closures[fact.fid] = frozenset((fact.fid,)) | closure
+        self.closures[fact.fid] = closure | self._next_bit
+        self._next_bit <<= 1
 
 
 def resolve_edges(f: Fact, ctx: FactContext, strict=False):
@@ -185,7 +189,7 @@ def _judge(stream, ctx):
         depth = ctx.depth(deps) if good else None
         closure = ctx.closure(deps) if depth is not None else None
         if depth is None or closure is None \
-                or len(closure) + 1 > MAX_CLOSURE_FACTS:
+                or closure.bit_count() + 1 > MAX_CLOSURE_FACTS:
             return Judgment(False, tuple(valids))
         ctx.admit(fact, depth, edges)
         valids.append(Valid(fact, tuple(edges)))

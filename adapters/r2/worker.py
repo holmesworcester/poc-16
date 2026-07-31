@@ -1,6 +1,11 @@
 """Cloudflare Worker R2-binding implementation of AsyncObjectStore."""
 from core.crypto import h
-from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    MAX_STORE_READ_BYTES,
+    PayloadTooLarge,
+)
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -143,7 +148,8 @@ class R2BindingStore:
 
     async def get_bounded(self, key, max_bytes):
         """Reject a known oversized R2 body before allocating its ArrayBuffer."""
-        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+        if type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("R2 read byte limit")
         try:
             obj = await self.bucket.get(self._key(key))

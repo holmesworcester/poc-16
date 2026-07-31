@@ -122,6 +122,10 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     assert applier["main"] == "build/applier/entry.py"
     assert applier["base_dir"] == "build/applier"
     assert applier["triggers"] == {"crons": ["*/1 * * * *"]}
+    assert applier["limits"] == {
+        "cpu_ms": 30_000,
+        "subrequests": 10_000_000,
+    }
 
 
 def test_checked_in_wrangler_input_cannot_expose_the_real_broker():

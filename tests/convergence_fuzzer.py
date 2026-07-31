@@ -453,8 +453,10 @@ async def _race(corpus, backend, sources, order):
     first = backend.applier("worker-0-race")
     second = backend.applier("worker-1-race")
     winner, loser = order
-    left = await first.propose(corpus.work[winner])
-    right = await second.propose(corpus.work[loser])
+    left = await first.propose(
+        sources[winner], corpus.work[winner])
+    right = await second.propose(
+        sources[loser], corpus.work[loser])
     assert left.base_token == right.base_token
     won = await first.commit(
         sources[winner], corpus.work[winner], left)

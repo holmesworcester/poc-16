@@ -529,8 +529,8 @@ def test_concurrent_appliers_rebase_without_retiring_the_cas_loser(
     worker_b = RepositoryApplier(workspace, store)
     source_a = run(worker_a.stage("worker-a", first_raw))
     source_b = run(worker_b.stage("worker-b", second_raw))
-    proposal_a = run(worker_a.propose(first_raw))
-    proposal_b = run(worker_b.propose(second_raw))
+    proposal_a = run(worker_a.propose(source_a, first_raw))
+    proposal_b = run(worker_b.propose(source_b, second_raw))
 
     won = run(worker_a.commit(source_a, first_raw, proposal_a))
     lost = run(worker_b.commit(source_b, second_raw, proposal_b))

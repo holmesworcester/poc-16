@@ -33,6 +33,7 @@ from .object_store import (
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
+    MAX_STORE_READ_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
 )
@@ -57,7 +58,7 @@ class FsStore:
     def get_bounded(self, key, max_bytes):
         """Read at most one byte beyond the caller's explicit budget."""
         if type(max_bytes) is not int \
-                or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+                or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("filesystem read byte limit")
         try:
             with open(self._p(key), "rb") as f:
@@ -224,7 +225,7 @@ class RemoteStore:
 
     def get_bounded(self, key, max_bytes):
         if type(max_bytes) is not int \
-                or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+                or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("remote read byte limit")
         if key == "root":
             got = self.peer.root(response_limit=max_bytes)

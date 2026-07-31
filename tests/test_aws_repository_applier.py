@@ -383,14 +383,19 @@ def test_403_missing_validated_map_page_uses_exact_probe_not_access_denied(
     bucket.data.pop(missing)
     bucket.tokens.pop(missing)
     bucket.history.clear()
+    probe = asyncio.run(
+        RepositoryApplier(workspace, canonical).stage("probe", raw))
+    bucket.history.clear()
 
     with pytest.raises(ValueError, match="integrity"):
         asyncio.run(
-            RepositoryApplier(workspace, canonical).propose(raw))
+            RepositoryApplier(
+                workspace, canonical).propose(probe, raw))
 
     probes = [
         key for _, operation, key, result in bucket.history
         if operation == "list" and result == ()
+        and "/obj/" in key
     ]
     assert probes == [missing]
 

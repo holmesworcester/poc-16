@@ -315,9 +315,11 @@ class UploadSource:
         source = cls(
             path, raw, value["workspace"], value["member"], vector, pile)
         if bodies:
-            source._verify(source.body_path(pile, "pile"), pile)
+            source._verify(
+                source.body_path(pile, "pile"), pile, "pile")
             for leaf in leaves:
-                source._verify(source.body_path(leaf, "obj"), leaf)
+                source._verify(
+                    source.body_path(leaf, "obj"), leaf, "obj")
         return source
 
     @classmethod
@@ -359,8 +361,12 @@ class UploadSource:
             tuple(uploads), names[end - 1] if end < len(names) else None)
 
     @staticmethod
-    def _verify(path, leaf):
-        raw = _read(path, MAX_OBJECT_BYTES, "upload body")
+    def _verify(path, leaf, kind):
+        maximum = MAX_PILE_BYTES if kind == "pile" \
+            else MAX_OBJECT_BYTES if kind == "obj" else None
+        if maximum is None:
+            raise UploadJournalError("foreign upload body")
+        raw = _read(path, maximum, f"upload {kind} body")
         if len(raw) != leaf.size or h(raw) != leaf.digest:
             raise UploadJournalError("upload body integrity")
 

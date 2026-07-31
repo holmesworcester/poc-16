@@ -794,7 +794,7 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
     assert [arg.arg for arg in apply.args.kwonlyargs] == ["retire"]
 
     for name, mutations in (
-            ("commit", {"_establish_outbox", "cas"}),
+            ("commit", {"cas"}),
             ("_reject", {"_put_evidence", "retire_rejection"})):
         method = methods[name]
         exact_reads = [
@@ -874,10 +874,10 @@ def test_internal_generation_identity_and_spend_have_one_runtime_path():
         calls(method, "retire_exact_async")
         for method in methods if method != "_spend_and_retire")
     assert "reject" not in methods
-    assert len(calls("apply", "_reject")) == 1
+    assert len(calls("_apply", "_reject")) == 1
     assert not any(
         calls(method, "_reject")
-        for method in methods if method != "apply")
+        for method in methods if method != "_apply")
 
 
 def test_rejection_schema_and_create_address_have_one_definition():

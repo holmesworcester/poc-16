@@ -147,6 +147,33 @@ def test_apply_fetches_internal_pile_through_bounded_contract(
     assert (key, MAX_PILE_BYTES) in store.bounded_reads
 
 
+def test_just_staged_receive_reuses_body_but_rechecks_write_authority(
+        tmp_path):
+    secret, public = keypair()
+    root = facts.auth.workspace.workspace(
+        secret, public, "one-live-pile-body", 1)
+    raw = encode_pile((root,), workspace=root.fid)
+
+    class SourceReads(FsStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.source_reads = 0
+
+        def get_bounded(self, key, maximum):
+            if key.startswith("pile/"):
+                self.source_reads += 1
+            return super().get_bounded(key, maximum)
+
+    store = SourceReads(str(tmp_path / "hosted"))
+    result = run(RepositoryApplier(
+        root.fid, store).receive_pile("member", raw)).result
+
+    assert result.status == "applied"
+    # Create readback, pre-Ensure authority, commit, and two retirement reads.
+    # None exists merely to recover bytes the caller already holds.
+    assert store.source_reads == 5
+
+
 def test_apply_has_no_unstaged_raw_commit_door(tmp_path):
     source, workspace, _, _ = suppression_world(tmp_path / "source")
     pile = closed_subset(source, workspace, all_fids(source, workspace))
@@ -164,13 +191,34 @@ def test_apply_has_no_unstaged_raw_commit_door(tmp_path):
 
     missing = run(applier.apply(unstaged))
     assert missing.status == "missing"
-    proposal = run(applier.propose(pile))
-    with pytest.raises(ValueError, match="present exact generation"):
-        run(applier.commit(unstaged, pile, proposal))
+    with pytest.raises(
+            ValueError, match="not bound|not reserved|present exact"):
+        run(applier.propose(unstaged, pile))
     assert not hasattr(applier, "reject")
     assert store.get_bounded("root", MAX_ROOT_BYTES) is None
     assert store.list("obj/") == []
     assert store.list("failed/") == []
+
+
+@pytest.mark.parametrize("tamper", ("delete", "replace"))
+def test_prepare_requires_present_exact_source_before_first_object_write(
+        tmp_path, tamper):
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
+    pile = closed_subset(source, workspace, all_fids(source, workspace))
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    key = run(applier.stage("member", pile))
+    if tamper == "delete":
+        store.delete(key)
+    else:
+        store._replace(key, b"different")
+
+    with pytest.raises(
+            ValueError, match="present exact generation"):
+        run(applier.propose(key, pile))
+
+    assert store.get("root") is None
+    assert store.list("obj/") == []
 
 
 def test_cold_applier_reproduces_full_p2p_root_without_sql(
@@ -276,8 +324,8 @@ def test_concurrent_cold_appliers_rebase_retained_loser(
     first_key = run(first.stage("feed7feed7feed7f", first_pile))
     second_key = run(second.stage("feed7feed7feed7f", second_pile))
 
-    first_proposal = run(first.propose(first_pile))
-    second_proposal = run(second.propose(second_pile))
+    first_proposal = run(first.propose(first_key, first_pile))
+    second_proposal = run(second.propose(second_key, second_pile))
     won = run(first.commit(first_key, first_pile, first_proposal))
     lost = run(second.commit(second_key, second_pile, second_proposal))
 
@@ -313,13 +361,13 @@ def test_proposal_for_one_pile_cannot_commit_or_retire_another(tmp_path):
     applier = RepositoryApplier(workspace, store)
     first_key = run(applier.stage("first", first_raw))
     second_key = run(applier.stage("second", second_raw))
-    proposal = run(applier.propose(first_raw))
+    proposal = run(applier.propose(first_key, first_raw))
 
     with pytest.raises(ValueError, match="proposal binding"):
         run(applier.commit(second_key, second_raw, proposal))
 
     assert store.get("root") is None
-    assert store.list("obj/") == []
+    assert store.list("obj/")
     assert store.get(first_key) == first_raw
     assert store.get(second_key) == second_raw
     assert applier._receipts == {}
@@ -332,14 +380,14 @@ def test_proposal_is_an_ephemeral_capability_of_its_minting_applier(
     store = FsStore(str(tmp_path / "hosted"))
     first = RepositoryApplier(workspace, store)
     key = run(first.stage("member", raw))
-    proposal = run(first.propose(raw))
+    proposal = run(first.propose(key, raw))
 
     with pytest.raises(ValueError, match="proposal binding"):
         run(RepositoryApplier(
             workspace, store).commit(key, raw, proposal))
 
     assert store.get("root") is None
-    assert store.list("obj/") == []
+    assert store.list("obj/")
     assert store.get(key) == raw
 
 
@@ -611,7 +659,11 @@ def test_turn_reports_one_failed_generation_without_wedging_the_next(
 
         def get_bounded(self, key, maximum):
             if key == self.blocked:
-                raise OSError("injected exact-source read failure")
+                try:
+                    raise ValueError("provider detail")
+                except ValueError as cause:
+                    raise OSError(
+                        "injected exact-source read failure") from cause
             return super().get_bounded(key, maximum)
 
     store = OneReadFails(str(tmp_path / "hosted"))
@@ -624,6 +676,9 @@ def test_turn_reports_one_failed_generation_without_wedging_the_next(
 
     by_source = {item.source: item for item in report}
     assert isinstance(by_source[blocked].error, OSError)
+    assert by_source[blocked].error.__traceback__ is None
+    assert by_source[blocked].error.__cause__ is None
+    assert by_source[blocked].error.__context__ is None
     assert by_source[blocked].result is None
     assert by_source[live].error is None
     assert by_source[live].result.status == "applied"

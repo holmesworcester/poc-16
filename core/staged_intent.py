@@ -119,7 +119,6 @@ class StagedPileIntent:
     digest: str
     key: str
     raw: bytes
-    stream: tuple
     blob_refs: tuple[str, ...]
 
     @property
@@ -192,7 +191,6 @@ def decode_staged_pile(configured_workspace, key, raw):
         address.digest,
         key,
         raw,
-        tuple(stream),
         tuple(sorted(refs)),
     )
 

@@ -12,6 +12,9 @@ import json
 import re
 from urllib.parse import urlsplit
 
+from core.limits import MAX_HOSTED_CPU_MS, MAX_HOSTED_SUBREQUESTS
+
+
 ACCOUNT = re.compile(r"^[0-9a-f]{32}$")
 BUCKET = re.compile(
     r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
@@ -326,6 +329,10 @@ def applier_config(deployment):
         },
     ]
     config["triggers"] = {"crons": ["*/1 * * * *"]}
+    config["limits"] = {
+        "cpu_ms": MAX_HOSTED_CPU_MS,
+        "subrequests": MAX_HOSTED_SUBREQUESTS,
+    }
     return config
 
 

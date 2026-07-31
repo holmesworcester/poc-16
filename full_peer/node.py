@@ -516,7 +516,7 @@ class FullPeer:
                         RuntimeError("repository root changed"))
                     continue
                 self.clear_ingress_attempt_failure(ws, item.source)
-                fresh.extend(result.valids)
+                fresh.extend(result.admitted)
             if store.get_bounded("root", MAX_ROOT_BYTES) != before:
                 self._evict_sync_cache(ws)
             self._sync_sql(ws)

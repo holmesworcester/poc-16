@@ -9,8 +9,9 @@ import pytest
 
 import facts
 from full_peer import bao_native as bao
-from core.close import encode_pile
+from core.close import decode_pile, encode_pile
 from core.crypto import h
+from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
 from full_peer.node import FullPeer
 from core.staged_intent import (
     StagedObjectsPending,
@@ -565,6 +566,19 @@ def test_source_manifest_and_session_journal_are_separate_and_restartable(
     assert reloaded.progress().delivered_index == 0
 
 
+def test_upload_journal_reads_piles_larger_than_detached_object_limit(
+        tmp_path):
+    raw = b"x" * (MAX_OBJECT_BYTES + 1)
+    assert len(raw) < MAX_PILE_BYTES
+    source = UploadSourceBuilder(
+        tmp_path / "uploads", "0" * 64, "a" * 16).finish(raw)
+
+    reloaded = UploadSource.load(source.path)
+
+    assert reloaded.pile.size == len(raw)
+    assert (Path(reloaded.path) / "pile").read_bytes() == raw
+
+
 def test_real_message_and_multichunk_pile_derives_missing_bao_object(
         tmp_path):
     (
@@ -601,9 +615,10 @@ def test_real_message_and_multichunk_pile_derives_missing_bao_object(
     pile_key = bucket.calls[-1]
     intent = decode_staged_pile(
         workspace, pile_key, bucket.objects[pile_key])
-    assert {fact.t for fact in intent.stream} >= {
+    decoded = decode_pile(intent.raw, intent.workspace)
+    assert {fact.t for fact in decoded} >= {
         "msg", "file_bao", "chunk"}
-    assert descriptor.fid in {fact.fid for fact in intent.stream}
+    assert descriptor.fid in {fact.fid for fact in decoded}
     assert intent.blob_refs == tuple(sorted(digest for digest, _ in blobs))
     present = []
     missing = []

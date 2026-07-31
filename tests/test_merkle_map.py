@@ -291,7 +291,7 @@ def test_incremental_value_update_matches_bulk_and_rewrites_one_path():
     assert len(fresh) <= initial.page_depth
 
 
-def test_batch_update_emits_exactly_the_new_final_reachable_union():
+def test_batch_update_establishes_every_final_page_before_returning_root():
     original = rows()
     objects = {}
     initial = merkle_map.build(original, SEED, emitter(objects))
@@ -342,7 +342,134 @@ def test_batch_update_emits_exactly_the_new_final_reachable_union():
 
     visit(updated.root)
     assert len(emitted) == len(set(emitted)) == updated.pages
-    assert set(emitted) == reachable - original_oids
+    assert reachable - original_oids <= set(emitted)
+    assert all(h(objects[oid]) == oid for oid in emitted)
+
+
+def test_batch_update_releases_superseded_decoded_paths_immediately(
+        monkeypatch):
+    objects = {}
+    initial = merkle_map.build(
+        rows(64), SEED, emitter(objects))
+    real_decode = merkle_map._decode
+    live = peak = calls = 0
+
+    class TrackedPage(dict):
+        def __init__(self, value):
+            nonlocal live, peak
+            super().__init__(value)
+            live += 1
+            peak = max(peak, live)
+
+        def __del__(self):
+            nonlocal live
+            live -= 1
+
+    def tracked_decode(*args):
+        nonlocal calls
+        page, summary = real_decode(*args)
+        calls += 1
+        return TrackedPage(page), summary
+
+    monkeypatch.setattr(merkle_map, "_decode", tracked_decode)
+    changes = tuple(
+        (f"key:new:{index:04d}", {"new": index})
+        for index in range(128)
+    )
+    updated = merkle_map.update(
+        initial.root,
+        SEED,
+        changes,
+        objects.get,
+        emitter(objects),
+        expected_count=initial.count,
+        expected_depth=initial.page_depth,
+    )
+
+    # Superseded versions are reference-released during the batch. Recursive
+    # helper cycles are emptied before return, so the next map cannot overlap
+    # this map's decoded graph.
+    assert live == 0
+    assert peak <= updated.pages + 2 * updated.page_depth
+    assert calls <= 2 * len(changes) * (
+        initial.page_depth + updated.page_depth)
+
+
+def test_deleting_final_row_releases_decoded_graph(monkeypatch):
+    objects = {}
+    initial = merkle_map.build(
+        (("only", {"value": 1}),), SEED, emitter(objects))
+    real_decode = merkle_map._decode
+    live = 0
+
+    class TrackedPage(dict):
+        def __init__(self, value):
+            nonlocal live
+            super().__init__(value)
+            live += 1
+
+        def __del__(self):
+            nonlocal live
+            live -= 1
+
+    def tracked_decode(*args):
+        page, summary = real_decode(*args)
+        return TrackedPage(page), summary
+
+    monkeypatch.setattr(merkle_map, "_decode", tracked_decode)
+    emptied = merkle_map.update(
+        initial.root, SEED, (("only", None),), objects.get,
+        emitter(objects),
+        expected_count=initial.count,
+        expected_depth=initial.page_depth,
+    )
+
+    assert emptied == merkle_map.Built("", 0, 0, 0)
+    assert live == 0
+
+
+def test_failed_publication_releases_decoded_graph_before_error_escapes(
+        monkeypatch):
+    objects = {}
+    initial = merkle_map.build(
+        rows(64), SEED, emitter(objects))
+    real_decode = merkle_map._decode
+    live = 0
+
+    class TrackedPage(dict):
+        def __init__(self, value):
+            nonlocal live
+            super().__init__(value)
+            live += 1
+
+        def __del__(self):
+            nonlocal live
+            live -= 1
+
+    def tracked_decode(*args):
+        page, summary = real_decode(*args)
+        return TrackedPage(page), summary
+
+    def unavailable(_raw):
+        raise OSError("injected immutable-page outage")
+
+    monkeypatch.setattr(merkle_map, "_decode", tracked_decode)
+    with pytest.raises(OSError, match="immutable-page outage") as caught:
+        merkle_map.update(
+            initial.root,
+            SEED,
+            tuple(
+                (f"key:new:{index:04d}", {"new": index})
+                for index in range(128)
+            ),
+            objects.get,
+            unavailable,
+            expected_count=initial.count,
+            expected_depth=initial.page_depth,
+        )
+
+    assert caught.value.__traceback__ is not None
+    assert live == 0
 
 
 def test_items_prunes_remote_reads_and_validates_changed_paths():

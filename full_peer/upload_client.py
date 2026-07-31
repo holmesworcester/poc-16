@@ -213,7 +213,7 @@ class UploadClient:
         path = self.source.body_path(leaf, kind)
         failure = None
         for _ in range(self.put_attempts):
-            self.source._verify(path, leaf)
+            self.source._verify(path, leaf, kind)
             try:
                 with open(path, "rb") as body:
                     receipt = self.puts.put(

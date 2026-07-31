@@ -541,12 +541,35 @@ that this checkout has deployed them.
 
 ## Current performance status
 
-The honest `PileSender -> RepositoryApplier -> RepositoryReader` benchmark
-path is wired. It exposed that the snapshot compiler still reconstructs the
-full validated fact set for each commit. That is a correctness-preserving but
-expensive baseline. Incremental insertion must be byte-identical to a full
-compile before it replaces the baseline.
+The honest `PileSender -> RepositoryApplier -> RepositoryReader` path uses the
+incremental compiler. It path-copies only affected authenticated routes and is
+continuously checked against the byte-identical full compiler oracle.
+Superseded intermediate Merkle pages are released during the batch, kernel
+closure sets are compact bitsets, and a just-staged pile reuses its already
+verified body instead of fetching a second live copy.
 
-No 50k/200k fact-rate or file-throughput number is asserted here until the
-incremental compiler lands and the benchmark is rerun. The corresponding bead
-requires facts/s at both sizes and MiB/s for file transfer.
+The shared hard cuts are a 16 KiB inline fact, 256 facts per closed pile,
+5 MiB per pile, 4 MiB per detached object, 48 KiB authenticated pages, and a
+512-page path. The executable conservative accounting peaks at 113,008,656
+bytes, leaving 14,991,344 bytes below Cloudflare's 128,000,000-byte isolate
+limit. It is an implementation ratchet, not a formal heap proof or a live
+workerd/Pyodide measurement.
+
+The smaller incremental algorithm establishes one immutable changed path at a
+time and CASes only the final composite root. A real R2-adapter test covers a
+249-fact genesis and a second nonempty 249-fact append in fewer than 25,000
+provider calls; the conservative maximum-shape ceiling is 8,137,488 against
+the configured 10,000,000. Current one-pile Bao authoring is honestly capped
+at 16 MiB until multi-pile file authoring exists.
+
+Cloudflare deployment is not yet complete at this maximum. The checked-in
+one-minute cron has its real 30-second CPU cap, and process-local singleflight
+does not serialize different isolates. The open Queue work makes an R2-event
+and cron-recovery Queue the sole trigger, with batch size and concurrency one;
+live provider conformance follows. See
+[DESIGN.md](DESIGN.md#51-hosted-turn-envelope).
+
+No 50k/200k fact-rate or file-throughput number is asserted here. Those larger
+throughput runs remain a separate benchmark bead requiring facts/s at both
+sizes and MiB/s for file transfer; they are not part of the hosted-turn memory
+accounting work.

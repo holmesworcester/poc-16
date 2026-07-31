@@ -167,10 +167,14 @@ liveness, and typed-suppression declarations before a family can be admitted.
 A pile is one canonical, workspace-bound, topologically ordered fact closure.
 Dependencies precede dependents. Pile bytes, aggregate fact count, each fact's
 dependency count, and per-fact transitive closure are independently bounded.
-The count is checked lexically before generation reservation, then rechecked
-by the exact decoder and kernel. Each canonical fact and public invite envelope
-also fits the smallest hosted Reader's single-object response ceiling. Detached
-Bao objects use their separate direct-upload and completion path.
+The shared limits are 5 MiB of canonical pile bytes, 256 facts, 12,304
+lexical JSON values, 16 KiB per canonical fact, 64 resolved edges per fact,
+and 256 facts in any one transitive closure. Bytes, the root facts-array count,
+and lexical JSON work are checked before generation reservation, then
+rechecked by the exact decoder and kernel. The maximum canonical fact array
+fits inside the pile bound by construction. `PileSender` divides larger
+independent work into multiple closed piles. Public invites and detached Bao
+objects use their separate 4 MiB object path.
 Authenticated-root traversal reads only `MAX_REPOSITORY_OBJECT_BYTES`; the
 larger generic object ceiling is reserved for detached ingress and exact
 collision/retirement work.
@@ -401,6 +405,71 @@ Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
 bytes, clobber a newer root, retire another generation, skip detached-object
 completion, or corrupt a Merkle tree.
+
+### 5.1 Hosted turn envelope
+
+`check_pile_bounds()` calls the running `applier_peak_bound()` before
+`json.loads`. POC-16 deliberately makes these protocol cuts, shared by every
+sender and receiver:
+
+```text
+inline fact              16 KiB
+facts in one closure/pile   256
+canonical pile             5 MiB
+detached object             4 MiB
+bounded store read          5 MiB
+Merkle page                48 KiB
+Merkle path depth             512
+```
+
+The 256 maximum-sized canonical fact values plus their JSON envelope fit below
+5 MiB by construction. Piles and detached objects therefore have separate
+limits, while the store's bounded-read contract admits the larger of the two.
+Bao proof objects remain below 4 MiB. Current one-pile file authoring is
+limited to 16 MiB (64 slices, 130 authored descriptor/chunk facts); restoring
+large-file authoring requires a multi-pile command rather than claiming a
+10 GiB operation that cannot close.
+
+At all maxima the executable accounting function returns:
+
+```text
+decode phase   96,755,728 bytes
+compile phase 113,008,656 bytes
+isolate limit 128,000,000 bytes
+margin         14,991,344 bytes
+```
+
+The compile phase includes a 64 MiB warm-runtime reserve, two pile buffers,
+12,304 lexical JSON values, 256 decoded facts, compact transitive-closure
+bitsets, the registered 17-route family maximum, compact suppression evidence,
+and one 512-page Merkle path. Family-corpus tests ratchet the 17 total routes,
+11 FactTree rows, and five suppression routes independently.
+
+This is conservative implementation accounting, not a formal proof of Python
+object size and not a workerd/Pyodide heap measurement. Live hosted
+conformance remains required. It is nevertheless enforced before allocation,
+and its coefficients are executable ratchets rather than prose estimates.
+
+Work is independently finite. The lexical scan reads at most 5 MiB; the kernel
+judges at most 256 facts and 64 resolved edges per fact; and a maximum current
+pile contributes at most 4,352 authenticated route changes. Multi-point reads
+visit the union of requested paths. Updates intentionally use the smaller
+algorithm: apply one sorted logical change, establish that immutable changed
+path, release its decoded graph, and continue. Intermediate roots are harmless
+unreachable objects; only the final composite root is CASed. The conservative
+provider-call ceiling is 8,137,488, below the configured 10,000,000. A real
+R2-adapter test applies both a 249-fact genesis and a 249-fact nonempty append
+in fewer than 25,000 fake-provider calls.
+
+The checked-in Cloudflare trigger is still a one-minute cron and is therefore
+configured for its actual 30-second CPU cap, not the five-minute Queue cap.
+Module-local singleflight only prevents overlap within one isolate. The P0
+Queue migration remains open: R2 events and cron recovery enqueue one marker
+hint, and a `max_concurrency = 1`, `max_batch_size = 1` consumer becomes the
+sole compiler trigger. Until that lands and live workerd conformance runs,
+these bounds are not a claim that every maximum pile completes on Cloudflare.
+A returned failed-item diagnostic recursively detaches traceback, cause, and
+context so one failure cannot retain a decoded proposal during later items.
 
 ## 6. RepositoryReader and sync
 

@@ -83,7 +83,7 @@ class Bucket:
         self.calls.append(("list", prefix, limit, cursor))
         keys = sorted(key for key in self.data if key.startswith(prefix))
         start = int(cursor or 0)
-        stop = min(len(keys), start + self.page_size)
+        stop = min(len(keys), start + self.page_size, start + limit)
         objects = [
             R2Object(key, b"", self.etags[key])
             for key in keys[start:stop]

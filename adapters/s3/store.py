@@ -15,6 +15,7 @@ from core.crypto import h
 from core.limits import (
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
+    MAX_STORE_READ_BYTES,
     PayloadTooLarge,
 )
 from core.object_store import (
@@ -385,7 +386,8 @@ class S3Store:
     @staticmethod
     def _response_body(
             response, operation, max_bytes, max_body_read_calls):
-        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_OBJECT_BYTES:
+        if type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("S3 read byte limit")
         _positive_int(
             max_body_read_calls, "max_body_read_calls",

@@ -38,7 +38,7 @@ from .object_store import (
     ensure_object_async,
     retire_exact_async,
 )
-from .repository_snapshot import extend_snapshot
+from .repository_snapshot import extend_snapshot_awaited
 from .shape import valid_fid
 from .staged_intent import (
     InvalidStagedObject,
@@ -80,14 +80,30 @@ def _decode_evidence(raw, label, fields):
     return value
 
 
-class _ObjectMiss(Exception):
-    def __init__(self, oid):
-        super().__init__(oid)
-        self.oid = oid
-
-
 class RepositoryAnchorPending(RuntimeError):
     """A valid closed pile arrived before the workspace genesis."""
+
+
+def _detached_error(error):
+    """Drop every retained frame while preserving diagnostic exception types."""
+    pending, seen = [error], set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        links = (
+            getattr(item, "__cause__", None),
+            getattr(item, "__context__", None),
+            *getattr(item, "exceptions", ()),
+        )
+        item.with_traceback(None)
+        item.__cause__ = None
+        item.__context__ = None
+        pending.extend(
+            nested for nested in links
+            if isinstance(nested, BaseException))
+    return error
 
 
 class SyncStoreAdapter:
@@ -96,15 +112,12 @@ class SyncStoreAdapter:
     def __init__(self, store):
         self.store = store
 
-    def get_bounded_now(self, key, max_bytes):
+    async def get_bounded(self, key, max_bytes):
         value = self.store.get_bounded(key, max_bytes)
         if value is not None and (
                 not isinstance(value, bytes) or len(value) > max_bytes):
             raise PayloadTooLarge("repository read exceeds byte limit")
         return value
-
-    async def get_bounded(self, key, max_bytes):
-        return self.get_bounded_now(key, max_bytes)
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
@@ -141,9 +154,7 @@ class ApplyProposal:
     base_root: bytes | None
     base_token: object
     root: bytes | None
-    outbox: tuple
     admitted: tuple
-    valids: tuple
     issuer: object = field(repr=False, compare=False)
 
 
@@ -182,7 +193,6 @@ class ApplyResult:
     admitted: tuple = ()
     retired: bool = False
     rejection: RejectionReceipt | None = None
-    valids: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,14 +340,18 @@ class RepositoryApplier:
 
     async def receive_pile(self, member, raw):
         """Reserve and apply the exact logical delivery from an HTTP gate."""
-        return await self._attempt(await self.stage(member, raw))
+        return await self._attempt(
+            await self.stage(member, raw), raw)
 
-    async def _attempt(self, source):
+    async def _attempt(self, source, raw=None):
         """Isolate one retained generation from every other ingress unit."""
         try:
-            result = await self.apply(source)
+            result = await self._apply(source, raw=raw)
         except Exception as error:
-            return TurnItem(source, error=error)
+            # A returned diagnostic must not retain the failed proposal's
+            # decoded pile and authenticated-map frames while later ingress
+            # units run in this same hosted turn.
+            return TurnItem(source, error=_detached_error(error))
         return TurnItem(source, result=result)
 
     def _cursor_key(self, kind):
@@ -533,7 +547,8 @@ class RepositoryApplier:
             result = ApplyResult("admitted", None)
         else:
             source = await self._staged_source(intent)
-            result = await self.apply(source, retire=False)
+            result = await self._apply(
+                source, raw=intent.raw, retire=False)
             if result.status == "rejected":
                 await self._put_evidence(receipts["rejected"])
                 retired = result.retired
@@ -563,7 +578,6 @@ class RepositoryApplier:
                 result.root,
                 result.admitted,
                 retired,
-                valids=result.valids,
             )
 
         promoted, unavailable, poisoned = [], [], []
@@ -663,40 +677,42 @@ class RepositoryApplier:
             try:
                 outcomes.append((key, await self.apply_staged(ingress, key)))
             except Exception as error:
-                outcomes.append((key, error))
+                outcomes.append((key, _detached_error(error)))
         await self._save_discovery_cursor("staged", page.cursor)
         return tuple(outcomes)
 
     async def _extend_snapshot(self, root_bytes, facts_by_fid):
-        """Run the pure path-copy compiler over an awaited object store."""
-        if isinstance(self.store, SyncStoreAdapter):
-            return extend_snapshot(
-                self.workspace,
-                root_bytes,
-                facts_by_fid,
-                lambda oid: self.store.get_bounded_now(
-                    "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES),
+        """Compile through one awaited page path and immediate immutables."""
+        async def fetch(oid):
+            return await self._get_bounded(
+                self.store,
+                "obj/" + oid,
+                MAX_REPOSITORY_OBJECT_BYTES,
             )
-        objects = {}
 
-        def fetch(oid):
-            if oid not in objects:
-                raise _ObjectMiss(oid)
-            return objects[oid]
+        async def establish(raw):
+            oid = h(raw)
+            await ensure_object_async(self.store, oid, raw)
+            return oid
 
-        while True:
-            try:
-                return extend_snapshot(
-                    self.workspace, root_bytes, facts_by_fid, fetch)
-            except _ObjectMiss as miss:
-                objects[miss.oid] = await self._get_bounded(
-                    self.store,
-                    "obj/" + miss.oid,
-                    MAX_REPOSITORY_OBJECT_BYTES,
-                )
+        return await extend_snapshot_awaited(
+            self.workspace,
+            root_bytes,
+            facts_by_fid,
+            fetch,
+            establish,
+        )
 
-    async def propose(self, raw):
-        """Derive one proposal without mutating canonical repository state."""
+    async def propose(self, source, raw):
+        """Prepare one source-bound proposal and harmless immutable objects."""
+        incumbent = await self._get_bounded(
+            self.store, source, MAX_PILE_BYTES)
+        if incumbent != raw:
+            raise ValueError(
+                "repository source is not a present exact generation")
+        _, spent = await self._generation(source, raw)
+        if spent is not None:
+            raise ValueError("internal generation is already spent")
         # Reject untrusted bytes before they can force traversal of the
         # authenticated validated-fact tree. Only a valid kernel judgment
         # earns reads beyond the exact pile itself.
@@ -714,24 +730,15 @@ class RepositoryApplier:
             base_root, base_token = versioned.value, versioned.token
         else:
             raise TypeError("versioned root read")
-        pending = {}
-
-        def emit(value):
-            oid = h(value)
-            incumbent = pending.setdefault(oid, value)
-            if incumbent != value:
-                raise ValueError("repository object hash collision")
-            return oid
 
         facts_by_fid = {}
-        durable, durable_receipts = [], []
+        durable = []
         for receipt in judgment.valids:
             family = facts.family_for(receipt.fact.t)
             if family is None or not family.DURABLE:
                 continue
             fid = receipt.fact.fid
             durable.append(fid)
-            durable_receipts.append(receipt)
             incumbent = facts_by_fid.setdefault(fid, receipt.fact)
             if encode(incumbent) != encode(receipt.fact):
                 raise ValueError("repository fact conflict")
@@ -742,8 +749,6 @@ class RepositoryApplier:
                 "repository anchor fact is not available yet")
         compiled = await self._extend_snapshot(
             base_root, facts_by_fid)
-        for oid, value in compiled.outbox:
-            emit(value)
         admitted = tuple(sorted(set(durable)))
         if compiled.root is not None \
                 and not set(admitted) <= set(compiled.fact_oids):
@@ -754,18 +759,12 @@ class RepositoryApplier:
             base_root,
             base_token,
             compiled.root,
-            tuple(sorted(pending.items())),
             admitted,
-            tuple(durable_receipts),
             self._issuer,
         )
 
-    async def _establish_outbox(self, outbox):
-        for oid, raw in outbox:
-            await ensure_object_async(self.store, oid, raw)
-
     async def commit(self, source, raw, proposal):
-        """Interpret one pure proposal and mint F10 authority on exact success."""
+        """CAS one source-bound prepared root and mint F10 authority."""
         incumbent = await self._get_bounded(
             self.store, source, MAX_PILE_BYTES)
         if incumbent != raw:
@@ -783,18 +782,15 @@ class RepositoryApplier:
             raise ValueError("repository apply proposal binding")
         if proposal.root is None:
             return ApplyResult(
-                "rootless", None, proposal.admitted,
-                valids=proposal.valids)
+                "rootless", None, proposal.admitted)
 
-        await self._establish_outbox(proposal.outbox)
         if proposal.root == proposal.base_root:
             current = await self.store.read_versioned("root")
             if not isinstance(current, Versioned) \
                     or current.token != proposal.base_token \
                     or current.value != proposal.base_root:
                 return ApplyResult(
-                    "stale", proposal.base_root, proposal.admitted,
-                    valids=proposal.valids)
+                    "stale", proposal.base_root, proposal.admitted)
             outcome = "noop"
         else:
             try:
@@ -814,13 +810,11 @@ class RepositoryApplier:
                     raise
                 else:
                     return ApplyResult(
-                        "stale", proposal.base_root, proposal.admitted,
-                        valids=proposal.valids)
+                        "stale", proposal.base_root, proposal.admitted)
             else:
                 if result is STALE:
                     return ApplyResult(
-                        "stale", proposal.base_root, proposal.admitted,
-                        valids=proposal.valids)
+                        "stale", proposal.base_root, proposal.admitted)
                 if not isinstance(result, Applied):
                     raise TypeError("root CAS result")
                 outcome = "applied"
@@ -837,9 +831,7 @@ class RepositoryApplier:
             admitted=proposal.admitted,
         )
         self._receipts[source] = receipt
-        return ApplyResult(
-            outcome, proposal.root, proposal.admitted,
-            valids=proposal.valids)
+        return ApplyResult(outcome, proposal.root, proposal.admitted)
 
     def _retirement_evidence(self, receipt):
         rejected = isinstance(receipt, RejectionReceipt)
@@ -975,7 +967,7 @@ class RepositoryApplier:
         retired = await self.retire_rejection(
             source, raw, receipt) if retire else False
         return ApplyResult(
-            "rejected", None, (), retired, receipt, ())
+            "rejected", None, (), retired, receipt)
 
     async def retire_rejection(self, source, raw, receipt):
         """Retire exact rejected work only after rechecking its evidence."""
@@ -1008,8 +1000,13 @@ class RepositoryApplier:
 
     async def apply(self, source, *, retire=True):
         """Run one present exact internal generation through the transition."""
-        raw = await self._get_bounded(
-            self.store, source, MAX_PILE_BYTES)
+        return await self._apply(source, retire=retire)
+
+    async def _apply(self, source, *, raw=None, retire=True):
+        """Apply a just-verified exact body or recover it after restart."""
+        if raw is None:
+            raw = await self._get_bounded(
+                self.store, source, MAX_PILE_BYTES)
         if raw is None:
             return await self._terminal_result(source) \
                 or ApplyResult("missing", None)
@@ -1022,7 +1019,7 @@ class RepositoryApplier:
                 retired = await self.retire_rejection(
                     source, raw, receipt)
                 return ApplyResult(
-                    "rejected", None, (), retired, receipt, ())
+                    "rejected", None, (), retired, receipt)
             retired = await self.retire(source, raw, receipt)
             return ApplyResult(
                 receipt.outcome,
@@ -1031,7 +1028,7 @@ class RepositoryApplier:
                 retired,
             )
         try:
-            proposal = await self.propose(raw)
+            proposal = await self.propose(source, raw)
         except PermanentIngressRejection as error:
             return await self._reject(
                 source, raw, error, retire=retire)
@@ -1043,8 +1040,7 @@ class RepositoryApplier:
             return result
         retired = await self.retire(source, raw, receipt)
         return ApplyResult(
-            result.status, result.root, result.admitted, retired,
-            valids=result.valids)
+            result.status, result.root, result.admitted, retired)
 
     async def turn(self, *, limit=PAGE_BATCH):
         """Drain one bounded page; each exact pile remains independent."""

@@ -14,10 +14,13 @@ from itertools import islice
 from .fact import bound_to, canon, encode, from_json, workspace_of
 from .ingress import InvalidPile
 from .limits import (
+    MIN_HOSTED_MEMORY_BYTES,
     InvalidEncoding,
     MAX_PILE_BYTES,
     MAX_PILE_FACTS,
+    MAX_PILE_JSON_VALUES,
     PayloadTooLarge,
+    applier_peak_bound,
     decode_json,
 )
 from .shape import valid_fid
@@ -36,11 +39,42 @@ def check_pile_bounds(raw):
         raise InvalidEncoding("pile bytes")
     if len(raw) > MAX_PILE_BYTES:
         raise PayloadTooLarge("pile too large")
-    _scan_root_facts(raw)
+    values = _scan_json_values(raw)
+    facts = _scan_root_facts(raw)
+    if applier_peak_bound(len(raw), values, facts) \
+            > MIN_HOSTED_MEMORY_BYTES:
+        raise PayloadTooLarge("pile exceeds hosted memory budget")
 
 
 _JSON_SPACE = b" \t\r\n"
 _OPEN = {ord("{"): ord("}"), ord("["): ord("]")}
+_JSON_DELIMITERS = _JSON_SPACE + b'{}[],:\"'
+
+
+def _scan_json_values(raw):
+    """Bound decoder objects lexically before the JSON graph is allocated."""
+    at = count = 0
+    while at < len(raw):
+        byte = raw[at]
+        if byte == ord('"'):
+            count += 1
+            end = _string_end(raw, at)
+            if end is None:
+                return count
+            at = end
+        elif byte in _OPEN:
+            count += 1
+            at += 1
+        elif byte in _JSON_DELIMITERS:
+            at += 1
+        else:
+            count += 1
+            at += 1
+            while at < len(raw) and raw[at] not in _JSON_DELIMITERS:
+                at += 1
+        if count > MAX_PILE_JSON_VALUES:
+            raise PayloadTooLarge("pile has too many JSON values")
+    return count
 
 
 def _nonspace(raw, at):
@@ -98,7 +132,7 @@ def _count_array(raw, at):
             stack.pop()
             at += 1
             if not stack:
-                return at
+                return at, count
         elif byte in (ord("}"), ord("]")):
             raise InvalidEncoding("pile facts array")
         elif byte == ord(",") and len(stack) == 1:
@@ -113,22 +147,23 @@ def _count_array(raw, at):
 def _scan_root_facts(raw):
     at = _nonspace(raw, 0)
     if at >= len(raw) or raw[at] != ord("{"):
-        return
-    stack = [ord("}")]
+        return 0
+    stack, maximum = [ord("}")], 0
     at += 1
     while at < len(raw) and stack:
         byte = raw[at]
         if byte == ord('"'):
             end = _string_end(raw, at)
             if end is None:
-                return
+                return maximum
             after = _nonspace(raw, end)
             if len(stack) == 1 and after < len(raw) \
                     and raw[after] == ord(":") \
                     and _facts_key(raw, at, end):
                 value = _nonspace(raw, after + 1)
                 if value < len(raw) and raw[value] == ord("["):
-                    at = _count_array(raw, value)
+                    at, count = _count_array(raw, value)
+                    maximum = max(maximum, count)
                     continue
             at = end
         elif byte in _OPEN:
@@ -138,9 +173,10 @@ def _scan_root_facts(raw):
             stack.pop()
             at += 1
         elif byte in (ord("}"), ord("]")):
-            return
+            return maximum
         else:
             at += 1
+    return maximum
 
 
 def close(news, deps_of, fact_of):
@@ -187,8 +223,7 @@ def encode_pile(facts, *, workspace=None) -> bytes:
         "ws": workspace,
         "facts": [f.to_json() for f in facts],
     })
-    if len(raw) > MAX_PILE_BYTES:
-        raise PayloadTooLarge("pile too large")
+    check_pile_bounds(raw)
     return raw
 
 

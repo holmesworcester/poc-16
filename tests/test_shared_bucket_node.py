@@ -124,8 +124,8 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
     source_a = run(worker_a.stage("alice", first_raw))
     source_b = run(worker_b.stage("bob", second_raw))
 
-    proposal_a = run(worker_a.propose(first_raw))
-    proposal_b = run(worker_b.propose(second_raw))
+    proposal_a = run(worker_a.propose(source_a, first_raw))
+    proposal_b = run(worker_b.propose(source_b, second_raw))
     assert proposal_a.base_token == proposal_b.base_token
     assert proposal_a.base_token.value.startswith("opaque:")
 
@@ -480,9 +480,10 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     low_source = run(low_applier.stage("low", low[0]))
     addition_source = run(addition_applier.stage(
         "addition", addition_raw))
-    low_proposal = run(low_applier.propose(low[0]))
+    low_proposal = run(low_applier.propose(low_source, low[0]))
     addition_proposal = run(
-        addition_applier.propose(addition_raw))
+        addition_applier.propose(
+            addition_source, addition_raw))
     assert low_proposal.base_token == addition_proposal.base_token
 
     paused = bucket.pause("low", "cas", "root", when="before")

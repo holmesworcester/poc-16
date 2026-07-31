@@ -243,12 +243,12 @@ def test_retryable_failure_has_no_terminal_evidence_and_later_progresses(
     propose = applier.propose
     attempts = 0
 
-    async def fail_once(raw):
+    async def fail_once(*args):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise OutcomeUnknown("temporary repository read outage")
-        return await propose(raw)
+        return await propose(*args)
 
     monkeypatch.setattr(applier, "propose", fail_once)
 

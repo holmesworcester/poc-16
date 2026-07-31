@@ -87,7 +87,7 @@ def test_publication_root_without_exact_spend_cannot_authorize_delete(
     applier = RepositoryApplier(workspace, store)
     source = run(applier.stage("member", raw))
     result = run(applier.commit(
-        source, raw, run(applier.propose(raw))))
+        source, raw, run(applier.propose(source, raw))))
     trace = ObligationTrace(bucket, workspace)
     trace.observe_publication(source, raw, applier._receipts[source])
 
@@ -107,7 +107,8 @@ def test_publication_observation_derives_every_durable_fact_from_pile(
     bucket = ScriptedBucket(seed=0xF10D)
     applier = RepositoryApplier(workspace, bucket.handle("worker"))
     source = run(applier.stage("member", raw))
-    run(applier.commit(source, raw, run(applier.propose(raw))))
+    run(applier.commit(
+        source, raw, run(applier.propose(source, raw))))
     receipt = applier._receipts[source]
     assert receipt.admitted
 
@@ -123,7 +124,7 @@ def test_stale_apply_receipt_cannot_delete_a_recreated_generation(tmp_path):
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
     source = run(applier.stage("member", raw))
-    proposal = run(applier.propose(raw))
+    proposal = run(applier.propose(source, raw))
     result = run(applier.commit(source, raw, proposal))
     receipt = applier._receipts[source]
 
@@ -196,7 +197,7 @@ def test_live_receipt_cannot_retarget_source_bytes_or_applier(
         receipt = result.rejection
         retire = owner.retire_rejection
     else:
-        proposal = run(owner.propose(first_raw))
+        proposal = run(owner.propose(first_source, first_raw))
         run(owner.commit(first_source, first_raw, proposal))
         receipt = owner._receipts[first_source]
         retire = owner.retire
@@ -487,7 +488,8 @@ def test_stage_racing_spend_leaves_one_terminal_source_without_amplifying(
     store = FsStore(str(tmp_path / "stage-spend-recipient"))
     winner = RepositoryApplier(workspace, store)
     source = run(winner.stage("member", raw))
-    result = run(winner.commit(source, raw, run(winner.propose(raw))))
+    result = run(winner.commit(
+        source, raw, run(winner.propose(source, raw))))
     receipt = winner._receipts[source]
     ready = threading.Event()
     spent = threading.Event()

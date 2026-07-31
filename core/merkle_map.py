@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from .crypto import h
 from .fact import canon
+from .limits import MAX_MERKLE_PAGE_BYTES, MAX_MERKLE_PAGE_DEPTH
 from .shape import valid_fid
 
 FORMAT = "merkle-map-v1"
@@ -37,11 +38,12 @@ LEAF_MAX_BYTES = 8 * 1024
 # A branch therefore has at most 32 digit children plus the terminal symbol.
 # This leaves room for authenticated child bounds without a wide page.
 MAX_FANOUT = 32
-MAX_PAGE_BYTES = 48 * 1024
+MAX_PAGE_BYTES = MAX_MERKLE_PAGE_BYTES
 
-# A compressed Patricia path has at most two branches per key byte, then a
-# leaf.  The extra slot makes descriptor validation deliberately conservative.
-MAX_PAGE_DEPTH = 2 * MAX_KEY_BYTES + 2
+# The wire protocol accepts at most this many authenticated pages on a path.
+# It is deliberately below the theoretical two-radix-digits-per-byte ceiling:
+# serviceable work, not key length alone, defines a valid repository map.
+MAX_PAGE_DEPTH = MAX_MERKLE_PAGE_DEPTH
 MAX_RANGE_ROWS = 256
 
 _TERMINAL = -1
@@ -54,6 +56,16 @@ class Built:
     count: int
     page_depth: int
     pages: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Read:
+    oid: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Write:
+    raw: bytes
 
 
 @dataclass(frozen=True)
@@ -481,6 +493,142 @@ def _expected_metadata(root, count, depth, max_depth):
     return count, depth
 
 
+def _get_many_program(
+        root, seed, keys, *,
+        max_page_depth=MAX_PAGE_DEPTH,
+        expected_count=None, expected_depth=None):
+    """Yield each page in the union of sorted authenticated lookup paths."""
+    if root and not valid_fid(root):
+        raise ValueError("merkle map root")
+    _validate_seed(seed)
+    if type(max_page_depth) is not int \
+            or not 0 <= max_page_depth <= MAX_PAGE_DEPTH:
+        raise ValueError("merkle map read budget")
+    expected_root = _expected_metadata(
+        root, expected_count, expected_depth, max_page_depth)
+    checked = tuple(sorted(keys))
+    for key in checked:
+        _query_key(key)
+    if any(a == b for a, b in zip(checked, checked[1:])):
+        raise ValueError("duplicate merkle map lookup")
+    answers = {key: None for key in checked}
+    if not root or not checked:
+        return answers, 0
+
+    # Iterative DFS matters here: recursive parent frames would retain one
+    # copy of the whole requested-key set at every hostile radix depth.
+    stack = [(root, None, None, checked)]
+    seen, pages = set(), 0
+    while stack:
+        oid, expected, route, selected = stack.pop()
+        if oid in seen or not valid_fid(oid):
+            raise ValueError("repeated merkle map page")
+        seen.add(oid)
+        pages += 1
+        if pages > len(checked) * max_page_depth:
+            raise ValueError("merkle map read budget")
+        page, summary = _decode((yield _Read(oid)), oid, seed)
+        if oid == root and expected_root is not None \
+                and (summary.count, summary.depth) != expected_root:
+            raise ValueError("merkle map root metadata")
+        if expected is not None and _descriptor(summary) != expected:
+            raise ValueError("merkle map child metadata")
+        if route is not None:
+            prefix, label = route
+            if any(
+                    not _matches_route(edge, prefix, label)
+                    for edge in (summary.first, summary.last)):
+                raise ValueError("merkle map child route")
+        selected = tuple(
+            key for key in selected
+            if summary.first <= key <= summary.last)
+        if not selected:
+            continue
+        if page["kind"] == "leaf":
+            rows = {row[0]: row[1] for row in page["rows"]}
+            answers.update(
+                (key, rows[key]) for key in selected if key in rows)
+            continue
+
+        prefix = _decode_prefix(page["prefix"])
+        groups = {}
+        for key in selected:
+            tokens = _query_tokens(key)
+            if tokens[:len(prefix)] == prefix:
+                groups.setdefault(
+                    _label(tokens, len(prefix)), []).append(key)
+        children = {
+            row[0]: _summary_row(row)
+            for row in page["children"]
+        }
+        for label in sorted(groups, reverse=True):
+            child = children.get(label)
+            if child is not None:
+                stack.append((
+                    child.oid,
+                    _descriptor(child),
+                    (prefix, label),
+                    tuple(groups[label]),
+                ))
+    return answers, pages
+
+
+def _drive_get_many(program, fetch):
+    try:
+        operation = next(program)
+        while True:
+            if not isinstance(operation, _Read):
+                raise TypeError("merkle map lookup operation")
+            operation = program.send(fetch(operation.oid))
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
+
+
+def get_many(
+        root, seed, keys, fetch, *,
+        max_page_depth=MAX_PAGE_DEPTH,
+        expected_count=None, expected_depth=None):
+    """Read one sorted union of paths without retaining a page corpus."""
+    return _drive_get_many(
+        _get_many_program(
+            root,
+            seed,
+            keys,
+            max_page_depth=max_page_depth,
+            expected_count=expected_count,
+            expected_depth=expected_depth,
+        ),
+        fetch,
+    )
+
+
+async def get_many_awaited(
+        root, seed, keys, fetch, *,
+        max_page_depth=MAX_PAGE_DEPTH,
+        expected_count=None, expected_depth=None):
+    """Await the same exact multi-point traversal one page at a time."""
+    program = _get_many_program(
+        root,
+        seed,
+        keys,
+        max_page_depth=max_page_depth,
+        expected_count=expected_count,
+        expected_depth=expected_depth,
+    )
+    try:
+        operation = next(program)
+        while True:
+            if not isinstance(operation, _Read):
+                raise TypeError("merkle map lookup operation")
+            operation = program.send(await fetch(operation.oid))
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
+
+
 class Reader:
     """Hash-verifying exact, neighbor, range, and resumable diff reads."""
 
@@ -894,10 +1042,16 @@ class Reader:
         return tuple(out)
 
 
-def update(
-        root, seed, changes, fetch, emit, *,
+def _update_program(
+        root, seed, changes, *,
         expected_count=None, expected_depth=None):
-    """Apply a canonical batch by path-copying only affected radix paths."""
+    """Yield one bounded path-copy transition per sorted logical change.
+
+    Each intermediate root is immutable and harmless: only the caller's final
+    root is ever installed in the repository register.  Establishing one
+    changed path before starting the next bounds the live decoded graph
+    without retaining a replay corpus or a final-tree publication planner.
+    """
     _validate_seed(seed)
     expected_root = _expected_metadata(
         root, expected_count, expected_depth, MAX_PAGE_DEPTH)
@@ -916,6 +1070,7 @@ def update(
         raise ValueError("duplicate merkle map change")
 
     cache, pending = {}, {}
+    written = 0
 
     def load(summary, route=None):
         if summary.oid in cache:
@@ -923,7 +1078,7 @@ def update(
         else:
             raw = pending.get(summary.oid)
             if raw is None:
-                raw = fetch(summary.oid)
+                raw = yield _Read(summary.oid)
             page, actual = _decode(raw, summary.oid, seed)
             cache[summary.oid] = (page, actual)
         if summary.first and _descriptor(actual) != _descriptor(summary):
@@ -938,9 +1093,11 @@ def update(
 
     def stage_raw(raw):
         oid = h(raw)
-        pending[oid] = raw
-        page, summary = _decode(raw, oid, seed)
-        cache[oid] = (page, summary)
+        incumbent = pending.setdefault(oid, raw)
+        if incumbent != raw:
+            raise ValueError("merkle map object hash collision")
+        if oid not in cache:
+            cache[oid] = _decode(raw, oid, seed)
         return oid
 
     def build_local(rows):
@@ -960,21 +1117,30 @@ def update(
         oid = stage_raw(raw)
         return cache[oid][1]
 
+    def forget(summary):
+        """Keep only the compact authenticated summary while unwinding."""
+        if summary.oid not in pending:
+            cache.pop(summary.oid, None)
+
     def collect(summary, route=None):
-        page, actual = load(summary, route)
+        page, actual = yield from load(summary, route)
         if page["kind"] == "leaf":
             return [(row[0], row[1]) for row in page["rows"]]
         prefix = _decode_prefix(page["prefix"])
+        children = tuple(page["children"])
+        forget(actual)
+        page = None
         rows = []
-        for row in page["children"]:
+        for row in children:
             child = _summary_row(row)
-            rows.extend(collect(child, (prefix, row[0])))
+            rows.extend((yield from collect(
+                child, (prefix, row[0]))))
             if len(rows) > LEAF_MAX_ROWS:
                 raise ValueError("merkle map collapse budget")
         return rows
 
     def modify(summary, key, value, route=None):
-        page, actual = load(summary, route)
+        page, actual = yield from load(summary, route)
         if page["kind"] == "leaf":
             rows = [(row[0], row[1]) for row in page["rows"]]
             keys = [row[0] for row in rows]
@@ -1011,13 +1177,16 @@ def update(
         children = {}
         for row in page["children"]:
             children[row[0]] = _summary_row(row)
+        forget(actual)
+        page = None
         child = children.get(label)
         if child is None:
             if value is None:
                 return actual
             children[label] = build_local(((key, value),))
         else:
-            changed = modify(child, key, value, (prefix, label))
+            changed = yield from modify(
+                child, key, value, (prefix, label))
             if changed is None:
                 children.pop(label)
             else:
@@ -1026,56 +1195,115 @@ def update(
             return None
         if len(children) == 1:
             survivor = next(iter(children.values()))
-            _, survivor = load(survivor)
+            _, survivor = yield from load(survivor)
+            forget(survivor)
             return survivor
         count = sum(child.count for child in children.values())
         items = sum(child.items for child in children.values())
         if _fits_leaf(count, items):
             rows = []
             for child_label, child in sorted(children.items()):
-                rows.extend(collect(child, (prefix, child_label)))
+                rows.extend((yield from collect(
+                    child, (prefix, child_label))))
             return build_local(rows)
-        # The remaining labels still differ immediately after this absolute
-        # prefix, so no sibling interval or downstream boundary can move.
-        hydrated = {}
-        for child_label, child in children.items():
-            _, hydrated[child_label] = load(
-                child, (prefix, child_label))
-        return store_branch(prefix, hydrated)
+        # The authenticated parent already binds every unchanged child's hash,
+        # bounds, count, and depth. Only the selected child path must be
+        # fetched; rebuilding a parent must not hydrate unrelated siblings.
+        return store_branch(prefix, children)
 
-    if root:
-        page, current = _decode(fetch(root), root, seed)
-        if expected_root is not None \
-                and (current.count, current.depth) != expected_root:
-            raise ValueError("merkle map root metadata")
-        cache[root] = (page, current)
-    else:
-        current = None
-    for key, value in checked_changes:
+    try:
+        if root:
+            page, current = _decode((yield _Read(root)), root, seed)
+            if expected_root is not None \
+                    and (current.count, current.depth) != expected_root:
+                raise ValueError("merkle map root metadata")
+            cache[root] = (page, current)
+        else:
+            current = None
+        for key, value in checked_changes:
+            if current is None:
+                if value is not None:
+                    current = build_local(((key, value),))
+            else:
+                current = yield from modify(current, key, value)
+            if current is not None and current.depth > MAX_PAGE_DEPTH:
+                raise ValueError("merkle map depth budget")
+
+            # _build_rows and store_branch stage children before parents.
+            # Every value is immutable, and repository publication still
+            # waits until the complete batch returns its final root.
+            for raw in tuple(pending.values()):
+                written += 1
+                yield _Write(raw)
+            pending.clear()
+            cache.clear()
         if current is None:
-            if value is not None:
-                current = build_local(((key, value),))
-            continue
-        current = modify(current, key, value)
-    if current is None:
-        return Built("", 0, 0, 0)
-    if current.depth > MAX_PAGE_DEPTH:
-        raise ValueError("merkle map depth budget")
+            return Built("", 0, 0, written)
+        return Built(
+            current.oid, current.count, current.depth, written)
+    finally:
+        cache.clear()
+        pending.clear()
 
-    # Intermediate split/collapse pages are content-addressed but need not be
-    # published.  Walk only the final pending closure.
-    emitted = set()
 
-    def publish(oid):
-        if oid in emitted or oid not in pending:
-            return
-        emitted.add(oid)
-        page, _ = cache[oid]
-        if page["kind"] == "branch":
-            for row in page["children"]:
-                publish(row[1])
-        _emit(pending[oid], emit)
+def _drive_update(program, fetch, emit):
+    try:
+        operation = next(program)
+        while True:
+            if isinstance(operation, _Read):
+                answer = fetch(operation.oid)
+            elif isinstance(operation, _Write):
+                answer = _emit(operation.raw, emit)
+            else:
+                raise TypeError("merkle map update operation")
+            operation = program.send(answer)
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
 
-    publish(current.oid)
-    return Built(
-        current.oid, current.count, current.depth, len(emitted))
+
+def update(
+        root, seed, changes, fetch, emit, *,
+        expected_count=None, expected_depth=None):
+    """Apply a canonical batch by path-copying only affected radix paths."""
+    return _drive_update(
+        _update_program(
+            root, seed, changes,
+            expected_count=expected_count,
+            expected_depth=expected_depth,
+        ),
+        fetch,
+        emit,
+    )
+
+
+async def update_awaited(
+        root, seed, changes, fetch, emit, *,
+        expected_count=None, expected_depth=None):
+    """Await the same update program without retaining a replay cache."""
+    program = _update_program(
+        root, seed, changes,
+        expected_count=expected_count,
+        expected_depth=expected_depth,
+    )
+    try:
+        operation = next(program)
+        while True:
+            if isinstance(operation, _Read):
+                answer = await fetch(operation.oid)
+            elif isinstance(operation, _Write):
+                raw = operation.raw
+                answer = await emit(raw)
+                oid = h(raw)
+                if answer is not None and answer != oid:
+                    raise ValueError(
+                        "merkle map emitter changed object identity")
+                answer = oid
+            else:
+                raise TypeError("merkle map update operation")
+            operation = program.send(answer)
+    except StopIteration as done:
+        return done.value
+    finally:
+        program.close()
