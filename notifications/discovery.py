@@ -26,9 +26,9 @@ from core.object_store import (
     Applied,
     OutcomeUnknown,
     Versioned,
+    async_store,
 )
 from core.repository_reader import RepositoryReader
-from core.repository_applier import async_store
 from core.shape import valid_fid
 
 from .carrier import Carrier, CarrierAccepted

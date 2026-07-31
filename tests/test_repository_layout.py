@@ -1091,6 +1091,20 @@ print(json.dumps(sorted(sys.modules)))
         "core.repository_reader"]
 
 
+def test_notification_scanner_does_not_import_applier_authority():
+    script = """
+import json
+import sys
+import notifications.discovery
+print(json.dumps(sorted(sys.modules)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT, check=True, capture_output=True, text=True)
+    loaded = set(json.loads(result.stdout))
+    assert "core.repository_applier" not in loaded
+
+
 def test_full_node_composes_roles_without_a_second_receiving_loop():
     node_tree = parsed(Path("full_peer/node.py"))
     node = next(

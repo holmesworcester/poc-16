@@ -9,7 +9,6 @@ object-completion path. Retrying the same immutable source is idempotent
 because the authenticated repository is a monotone set.
 """
 from dataclasses import dataclass
-import inspect
 
 import facts
 
@@ -37,41 +36,13 @@ from .object_store import (
     STALE,
     Applied,
     OutcomeUnknown,
+    SyncStoreAdapter,
     Versioned,
+    async_store,
     ensure_object_async,
 )
 from .repository_snapshot import extend_snapshot_awaited
 from .shape import valid_fid
-
-
-class SyncStoreAdapter:
-    """Awaited adapter for one already-conforming synchronous store."""
-
-    def __init__(self, store):
-        self.store = store
-
-    async def get_bounded(self, key, max_bytes):
-        value = self.store.get_bounded(key, max_bytes)
-        if value is not None and (
-                not isinstance(value, bytes) or len(value) > max_bytes):
-            raise PayloadTooLarge("repository read exceeds byte limit")
-        return value
-
-    async def read_versioned(self, key):
-        return self.store.read_versioned(key)
-
-    async def put_if_absent(self, key, value):
-        return self.store.put_if_absent(key, value)
-
-    async def cas(self, key, token, value):
-        return self.store.cas(key, token, value)
-
-
-def async_store(store):
-    """Return one awaited store without introducing provider branches."""
-    method = getattr(type(store), "get_bounded", None)
-    return store if inspect.iscoroutinefunction(method) \
-        else SyncStoreAdapter(store)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,5 +223,6 @@ class RepositoryApplier:
 __all__ = (
     "ApplyResult",
     "RepositoryApplier",
+    "SyncStoreAdapter",
     "async_store",
 )

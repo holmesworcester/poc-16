@@ -21,6 +21,7 @@ without files, locks, threads, or SQLite.
 """
 from dataclasses import dataclass
 from enum import Enum
+import inspect
 import re
 from typing import Protocol
 
@@ -198,7 +199,7 @@ class ObjectStore(Protocol):
             value: bytes) -> Applied | Stale: ...
 
 class AsyncObjectStore(Protocol):
-    """Awaited equivalent of the exact RepositoryApplier contract."""
+    """Awaited equivalent of the exact object-store contract."""
 
     async def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
@@ -211,6 +212,37 @@ class AsyncObjectStore(Protocol):
     async def cas(
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
+
+
+class SyncStoreAdapter:
+    """Expose one already-conforming synchronous store as awaited methods."""
+
+    def __init__(self, store):
+        self.store = store
+
+    async def get_bounded(self, key, max_bytes):
+        value = self.store.get_bounded(key, max_bytes)
+        if value is not None and (
+                not isinstance(value, bytes) or len(value) > max_bytes):
+            raise PayloadTooLarge("object-store read exceeds byte limit")
+        return value
+
+    async def read_versioned(self, key):
+        return self.store.read_versioned(key)
+
+    async def put_if_absent(self, key, value):
+        return self.store.put_if_absent(key, value)
+
+    async def cas(self, key, token, value):
+        return self.store.cas(key, token, value)
+
+
+def async_store(store):
+    """Return one awaited store without introducing provider branches."""
+    method = getattr(type(store), "get_bounded", None)
+    return store if inspect.iscoroutinefunction(method) \
+        else SyncStoreAdapter(store)
+
 
 def verified_object(
         oid, fetch, *, max_bytes=MAX_REPOSITORY_OBJECT_BYTES):
