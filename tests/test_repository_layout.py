@@ -355,12 +355,14 @@ def test_one_repository_root_cas_and_one_root_compiler():
         Path("notifications/discovery.py"),
         Path("notifications/discovery.py"),
     ]
+    notification_owners = []
     for _path, call in semantic[1:]:
         owner = call.func.value
         assert isinstance(owner, ast.Attribute) \
-            and isinstance(owner.value, ast.Name) \
-            and owner.value.id == "self" \
-            and owner.attr == "cursor_store"
+                and isinstance(owner.value, ast.Name) \
+                and owner.value.id == "self"
+        notification_owners.append(owner.attr)
+    assert notification_owners == ["store", "cursor_store"]
 
     encode_root = []
     for path in source_paths():
@@ -400,7 +402,10 @@ def test_applier_owns_object_establishment_and_exact_source_identity():
     assert "ensure_object" not in object_store_functions
 
     for function, expected in (
-            ("ensure_object_async", {"core/repository_applier.py"}),):
+            ("ensure_object_async", {
+                "core/repository_applier.py",
+                "notifications/discovery.py",
+            }),):
         callers = {
             path.as_posix()
             for path in source_paths()

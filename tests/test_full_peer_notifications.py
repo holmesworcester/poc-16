@@ -62,8 +62,14 @@ def _world(tmp_path, provider=None):
     provider = provider or ScriptedProvider([])
     service = FullPeerNotifications(
         node, node.dir, push_secret, provider, cadence=.05)
+    bootstrap = service.bootstrap(workspace, "current")
+    assert bootstrap == {
+        "base": h(node.reader(workspace).root_bytes),
+        "mode": "current",
+        "workspace": workspace,
+    }
     baseline, = service.run_once()
-    assert baseline.status == "advanced"
+    assert baseline.status == "idle"
     assert provider.requests == []
     return node, workspace, provider, service
 
@@ -83,6 +89,21 @@ def _cursor(service, workspace):
     return decode_cursor(current.value)
 
 
+def test_workspace_requires_explicit_notification_bootstrap(tmp_path):
+    node = FullPeer(str(tmp_path / "peer"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    secret, _public = keypair()
+    provider = ScriptedProvider([])
+    service = FullPeerNotifications(node, node.dir, secret, provider)
+
+    result, = service.run_once()
+
+    assert result.status == "retry"
+    assert service.status()["workspaces"][workspace]["error"] \
+        == "CursorNotInitialized"
+    assert provider.requests == []
+
+
 def test_transient_fcm_retry_preserves_cursor_and_restart_resumes(
         tmp_path):
     provider = ScriptedProvider([
@@ -94,13 +115,13 @@ def test_transient_fcm_retry_preserves_cursor_and_restart_resumes(
     failed, = service.run_once()
     pinned = _cursor(service, workspace)
     assert failed.status == "retry"
-    assert pinned.target is not None
+    assert pinned.pending is not None
 
     restarted = FullPeerNotifications(
         node, node.dir, service.secret, provider, cadence=.05)
     accepted, = restarted.run_once()
 
-    assert accepted.status == "published"
+    assert accepted.status == "republished"
     assert _cursor(restarted, workspace).target is None
     assert len(provider.requests) == 2
     assert provider.requests[0].delivery_id \
@@ -124,7 +145,7 @@ def test_crash_after_fcm_acceptance_replays_stable_delivery(tmp_path):
     def crash_on_progress(key, token, value):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 3:
             raise RuntimeError("crash after FCM acceptance")
         return real_cas(key, token, value)
 
@@ -134,7 +155,7 @@ def test_crash_after_fcm_acceptance_replays_stable_delivery(tmp_path):
     replayed, = service.run_once()
 
     assert crashed.status == "retry"
-    assert replayed.status == "published"
+    assert replayed.status == "republished"
     assert len(provider.requests) == 2
     assert provider.requests[0].delivery_id \
         == provider.requests[1].delivery_id
@@ -159,7 +180,7 @@ def test_delayed_retry_uses_current_authority(
         facts.auth.removal.evict(node, workspace, node.pk)
     cancelled, = service.run_once()
 
-    assert cancelled.status == "published"
+    assert cancelled.status == "republished"
     assert len(provider.requests) == 1
     assert _cursor(service, workspace).target is None
 
@@ -285,7 +306,8 @@ def test_two_peers_sync_through_applier_then_shared_worker_delivers(
         provider = ScriptedProvider([])
         notifications = FullPeerNotifications(
             destination, destination.dir, push_secret, provider)
-        assert notifications.run_once()[0].status == "advanced"
+        notifications.bootstrap(workspace, "current")
+        assert notifications.run_once()[0].status == "idle"
 
         event = message.post(
             source, workspace, "general", "replicated event", ts=4)
@@ -410,6 +432,7 @@ def test_hung_provider_cannot_block_peer_publication_or_fail_service(
     )
     preference.set_global(node, workspace, preference.ALL, ts=3)
     message.post(node, workspace, "general", "blocks provider only", ts=4)
+    service.notifications.bootstrap(workspace, "backfill")
     service.start()
     try:
         assert provider.entered.wait(5)

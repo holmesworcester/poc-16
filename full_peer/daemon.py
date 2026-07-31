@@ -30,6 +30,7 @@ from .sync import sync
 LOCAL_COMMANDS = {
     "peer.iroh.remove": "_command_iroh_remove",
     "peer.iroh.set": "_command_iroh_set",
+    "peer.notifications.bootstrap": "_command_notifications_bootstrap",
     "peer.notifications.wake": "_command_notifications_wake",
     "peer.rebuild": "_command_rebuild",
     "peer.status": "_command_status",
@@ -202,6 +203,18 @@ class ControlHandler(BaseHTTPRequestHandler):
             raise ValueError("notifications are disabled")
         self.notifications.kick()
         return {"ok": True}
+
+    def _command_notifications_bootstrap(self, argv):
+        if len(argv) != 2:
+            raise ValueError(
+                "usage: peer.notifications.bootstrap "
+                "<workspace> <current|backfill>")
+        if self.notifications is None:
+            raise ValueError("notifications are disabled")
+        workspace = facts.workspace_for(self.node, argv[0])
+        result = self.notifications.bootstrap(workspace, argv[1])
+        self.notifications.kick()
+        return result
 
     def _command_sync(self, argv):
         workspace = self._workspace(argv, "peer.sync <workspace>")

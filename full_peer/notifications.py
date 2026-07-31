@@ -24,7 +24,7 @@ from notifications.carrier import (
     CarrierError,
     delivery_disposition,
 )
-from notifications.discovery import NotificationDiscovery
+from notifications.discovery import NotificationDiscovery, NotificationState
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 
 
@@ -176,15 +176,36 @@ class FullPeerNotifications:
     def _discovery(self, workspace):
         repository = self.node.store(workspace)
         state = self.state_store(workspace)
+        progress = NotificationState(state, workspace, self.owner)
         worker = self._worker(workspace, repository)
 
         async def handle(delivery):
             return await handle_carrier_delivery(
-                delivery, workspace, state, worker)
+                delivery, workspace, progress, worker)
 
         return NotificationDiscovery(
             repository, state, workspace, DirectCarrier(handle),
             owner=self.owner)
+
+    async def _bootstrap(self, workspace, mode):
+        discovery = self._discovery(workspace)
+        if mode == "current":
+            cursor = await discovery.bootstrap_current()
+        elif mode == "backfill":
+            cursor = await discovery.bootstrap_backfill()
+        else:
+            raise ValueError("notification bootstrap mode")
+        return {
+            "base": cursor.base,
+            "mode": cursor.bootstrap,
+            "workspace": workspace,
+        }
+
+    def bootstrap(self, workspace, mode):
+        """Explicitly initialize one workspace before scheduled scanning."""
+        if not valid_fid(workspace):
+            raise ValueError("notification workspace")
+        return asyncio.run(self._bootstrap(workspace, mode))
 
     async def _run_once(self):
         out = []
