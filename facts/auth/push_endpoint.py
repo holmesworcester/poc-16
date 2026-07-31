@@ -21,6 +21,7 @@ MAX_ENVIRONMENT_BYTES = 64
 MAX_SEALED_TARGET_BYTES = 4096
 MIN_SEALED_TARGET_BYTES = 49
 MAX_TARGET_BYTES = MAX_SEALED_TARGET_BYTES - 48
+MAX_ACTIVE_ENDPOINTS = 32
 _APPLICATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _ENVIRONMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BODY_FIELDS = {
@@ -257,7 +258,7 @@ def register(
 
 
 def replace(node, workspace, endpoint, push_node, sealed_target, ts=None):
-    """Publish a new target and suppress the exact previous endpoint."""
+    """Publish one target and suppress every observed installation sibling."""
     from .. import _policy
     from ..content import delete as deletion
 
@@ -269,6 +270,12 @@ def replace(node, workspace, endpoint, push_node, sealed_target, ts=None):
         member, device, owner = _authority(node, workspace, public)
         if old.body["owner"] != owner:
             raise ValueError("push endpoint belongs to another user")
+        siblings = _current(
+            node, workspace, owner, old.body["installation"])
+        if old not in siblings:
+            raise ValueError("no active push endpoint")
+        if len(siblings) > MAX_ACTIVE_ENDPOINTS:
+            raise ValueError("too many concurrent push endpoints")
         timestamp = node.now_ms() if ts is None else ts
         body = old.body
         item = push_endpoint(
@@ -287,21 +294,22 @@ def replace(node, workspace, endpoint, push_node, sealed_target, ts=None):
             raise ValueError("push endpoint replacement is unchanged")
         item_signature = signature.signature(
             secret, public, item, timestamp)
-        removal = deletion.delete(
-            workspace, public, old.key, _policy.OWNER, timestamp, owner)
-        removal_signature = signature.signature(
-            secret, public, removal, timestamp)
-        node.ingest_new(
-            workspace,
-            [item_signature, item, removal_signature, removal],
-            {
-                item_signature.fid: (),
-                item.fid: (item_signature.fid, member, device),
-                removal_signature.fid: (),
-                removal.fid: (
-                    removal_signature.fid, old.fid, member),
-            },
-        )
+        news = [item_signature, item]
+        deps = {
+            item_signature.fid: (),
+            item.fid: (item_signature.fid, member, device),
+        }
+        for sibling in siblings:
+            removal = deletion.delete(
+                workspace, public, sibling.key,
+                _policy.OWNER, timestamp, owner)
+            removal_signature = signature.signature(
+                secret, public, removal, timestamp)
+            news.extend((removal_signature, removal))
+            deps[removal_signature.fid] = ()
+            deps[removal.fid] = (
+                removal_signature.fid, sibling.fid, member)
+        node.ingest_new(workspace, news, deps)
         return item.fid
 
 
