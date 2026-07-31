@@ -405,6 +405,8 @@ async def derive_awaited(
             oid = miss.oid
         if oid in cache:
             raise AssertionError("notification fetch replay")
+        if len(cache) >= max_fetches:
+            raise FetchBudgetExceeded("unique object-fetch budget")
         raw = fetch(oid)
         if isawaitable(raw):
             raw = await raw
@@ -414,6 +416,10 @@ async def derive_awaited(
         if fetched_bytes > max_fetch_bytes:
             raise FetchBudgetExceeded("object-fetch byte budget")
         cache[oid] = raw
+        # The budget wrapper already charged this miss before it escaped.
+        # Seed its memo directly so replay neither charges nor fetches twice.
+        bounded_fetch.cache[oid] = raw
+        bounded_fetch.bytes = fetched_bytes
 
 
 def request_for(intent, push_node_secret, now_ms):
@@ -441,27 +447,6 @@ def request_for(intent, push_node_secret, now_ms):
     )
 
 
-def deliver(hint, fetch, current_root, push_node_secret, provider, now_ms):
-    """Attempt each current delivery once; a carrier owns retry and ack."""
-    try:
-        public = push_node_secret.verify_key.encode().hex()
-    except Exception as error:
-        raise TypeError("push node secret key") from error
-    if not valid_fid(public) or not callable(getattr(provider, "send", None)) \
-            or type(now_ms) is not int or not 0 <= now_ms <= FACT_TS_MAX:
-        raise ValueError("notification delivery")
-    outcomes = []
-    for intent in derive(
-            hint, fetch, current_root, push_node=public):
-        request = request_for(intent, push_node_secret, now_ms)
-        accepted = provider.send(request)
-        if not isinstance(accepted, PushAccepted):
-            raise PushRetryable("push provider returned no acceptance")
-        outcomes.append(DeliveryResult(
-            intent.delivery_id, "accepted", accepted.message_id))
-    return tuple(outcomes)
-
-
 __all__ = (
     "CurrentRootBehind",
     "DeliveryResult",
@@ -476,7 +461,6 @@ __all__ = (
     "PushRequest",
     "PushRetryable",
     "PushUnregistered",
-    "deliver",
     "derive",
     "derive_awaited",
     "request_for",

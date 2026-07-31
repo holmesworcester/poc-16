@@ -11,6 +11,8 @@ from inspect import isawaitable
 
 from core.shape import FACT_TS_MAX, valid_fid
 
+from .carrier import ACK as CARRIER_ACK
+from .carrier import RETRY as CARRIER_RETRY
 from .delivery import (
     DeliveryResult,
     InvalidPublicationHint,
@@ -49,6 +51,13 @@ class WorkerResult:
                            for row in self.deliveries) \
                 or not isinstance(self.reason, str):
             raise TypeError("notification worker result")
+
+
+def carrier_disposition(result):
+    """Map only this worker's typed result into the carrier vocabulary."""
+    if not isinstance(result, WorkerResult):
+        return CARRIER_RETRY
+    return CARRIER_RETRY if result.action is RETRY else CARRIER_ACK
 
 
 class NotificationWorker:
@@ -137,4 +146,5 @@ __all__ = (
     "RETRY",
     "TERMINAL",
     "WorkerResult",
+    "carrier_disposition",
 )

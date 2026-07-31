@@ -21,6 +21,7 @@ from notifications.delivery import (
     PushRetryable,
     PushUnregistered,
     derive,
+    derive_awaited,
     seal_target,
 )
 from notifications.worker import (
@@ -28,7 +29,11 @@ from notifications.worker import (
     RETRY,
     TERMINAL,
     NotificationWorker,
+    WorkerResult,
+    carrier_disposition,
 )
+from notifications.carrier import ACK as CARRIER_ACK
+from notifications.carrier import RETRY as CARRIER_RETRY
 
 
 @dataclass
@@ -92,6 +97,13 @@ def _process(worker, hint):
 def _event(node, workspace):
     preference.set_global(node, workspace, preference.ALL, ts=3)
     return message.post(node, workspace, "general", "hello", ts=4)
+
+
+def test_worker_result_maps_to_carrier_disposition_fail_closed():
+    assert carrier_disposition(WorkerResult(ACK)) is CARRIER_ACK
+    assert carrier_disposition(WorkerResult(TERMINAL)) is CARRIER_ACK
+    assert carrier_disposition(WorkerResult(RETRY)) is CARRIER_RETRY
+    assert carrier_disposition("ack") is CARRIER_RETRY
 
 
 def test_transient_fcm_failure_retries_until_acceptance(tmp_path):
@@ -424,3 +436,44 @@ def test_derivation_enforces_unique_object_fetch_budget(tmp_path):
             node.reader(workspace).root_bytes,
             max_fetches=0,
         )
+
+
+def test_async_fetch_limit_stops_before_one_over_provider_call(tmp_path):
+    node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
+    event = _event(node, workspace)
+    hint = _hint(node, workspace, event)
+    root = node.reader(workspace).root_bytes
+
+    async def run(limit):
+        calls = []
+
+        async def fetch(oid):
+            calls.append(oid)
+            return node.store(workspace).get("obj/" + oid)
+
+        result = await derive_awaited(
+            hint, fetch, root, max_fetches=limit)
+        return result, calls
+
+    baseline, baseline_calls = asyncio.run(run(32_768))
+    needed = len(baseline_calls)
+    assert needed > 1
+
+    exact, exact_calls = asyncio.run(run(needed))
+    assert exact == baseline
+    assert len(exact_calls) == needed
+
+    one_over_calls = []
+
+    async def one_over_fetch(oid):
+        one_over_calls.append(oid)
+        return node.store(workspace).get("obj/" + oid)
+
+    with pytest.raises(FetchBudgetExceeded):
+        asyncio.run(derive_awaited(
+            hint,
+            one_over_fetch,
+            root,
+            max_fetches=needed - 1,
+        ))
+    assert len(one_over_calls) == needed - 1

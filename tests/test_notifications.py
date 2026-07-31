@@ -1,5 +1,4 @@
 """Authenticated facts and stateless post-publication push delivery."""
-from dataclasses import dataclass
 
 import pytest
 
@@ -15,11 +14,9 @@ from facts.content import notification_preference as preference
 from full_peer.node import FullPeer
 from notifications.delivery import (
     PublicationHint,
-    PushAccepted,
     PushRequest,
     PushRetryable,
     PushUnregistered,
-    deliver,
     derive,
     seal_target,
 )
@@ -247,56 +244,6 @@ def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
         preference.INHERIT, 5)
     assert derive(_hint(node, workspace, event),
                   _fetch(node, workspace), _root(node, workspace)) == ()
-
-
-@dataclass
-class FakePush:
-    requests: list
-
-    def send(self, request):
-        self.requests.append(request)
-        return PushAccepted(f"message-{len(self.requests)}")
-
-
-def test_duplicate_retry_derives_the_same_delivery_id_without_state(tmp_path):
-    node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
-    preference.set_global(node, workspace, preference.ALL, ts=3)
-    event = message.post(
-        node, workspace, "general", "retry", ts=4)
-    hint = _hint(node, workspace, event)
-    provider = FakePush([])
-
-    root = _root(node, workspace)
-    first = deliver(
-        hint, _fetch(node, workspace), root, secret, provider, 4)
-    second = deliver(
-        hint, _fetch(node, workspace), root, secret, provider, 5)
-
-    assert first[0].delivery_id == second[0].delivery_id
-    assert provider.requests[0].delivery_id \
-        == provider.requests[1].delivery_id
-    assert provider.requests[0].payload == provider.requests[1].payload
-
-
-def test_retry_uses_event_root_but_current_preferences(tmp_path):
-    node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
-    preference.set_global(node, workspace, preference.ALL, ts=3)
-    event = message.post(node, workspace, "general", "pinned", ts=4)
-    hint = _hint(node, workspace, event)
-    preference.set_global(node, workspace, preference.NONE, ts=5)
-
-    provider = FakePush([])
-    result = deliver(
-        hint,
-        _fetch(node, workspace),
-        _root(node, workspace),
-        secret,
-        provider,
-        5,
-    )
-
-    assert result == ()
-    assert provider.requests == []
 
 
 class _Message:
