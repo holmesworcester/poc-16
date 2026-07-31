@@ -123,13 +123,13 @@ def visible_fids(node, workspace):
 
 
 def add_member(
-        n, ws, name, ts=None, inviter=None, member_identity=None):
+        n, ws, name, ts=None, inviter=None, member_identity=None,
+        invite_identity=None):
     """Add a user through an existing member and return ``(sk, pk, user)``.
 
-    ``inviter`` is that member's ``(sk, pk)`` identity and defaults to the
-    workspace founder. ``member_identity`` can pin the joining key in
-    adversarial fixtures. ``ts`` is the invite timestamp; the user follows
-    one tick later so every delegation edge is strictly forward in time.
+    ``inviter`` defaults to the workspace founder. The two ``*_identity``
+    arguments pin otherwise-random keys in replayable adversarial fixtures.
+    The user follows ``ts`` by one tick.
     """
     inviter_sk, inviter_pk = inviter or n.identity(ws)
     with n.lock:
@@ -141,7 +141,7 @@ def add_member(
     if invite_ts <= member_ts:
         raise ValueError("invite timestamp must follow the inviter's membership")
     user_ts = invite_ts + 1
-    isk, ipk = keypair()
+    isk, ipk = invite_identity or keypair()
     inv = user_invite(ws, inviter_pk, ipk, invite_ts)
     si = signature(inviter_sk, inviter_pk, inv, invite_ts)
     bsk, bpk = member_identity or keypair()
