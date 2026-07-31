@@ -297,7 +297,8 @@ def test_async_driver_never_repins_root_during_an_await(tmp_path):
         await first_fetch.wait()
         node.bind_identity(workspace, founder)
         try:
-            facts.auth.removal.evict(node, workspace, bob)
+            await asyncio.to_thread(
+                facts.auth.removal.evict, node, workspace, bob)
         finally:
             release_fetch.set()
         return await decision, calls

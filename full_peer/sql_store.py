@@ -66,7 +66,13 @@ def _compatible(db):
 
 
 class SqlStore:
-    """Query and rebuild one workspace's subordinate local SQL state."""
+    """Query and rebuild one workspace's subordinate local SQL state.
+
+    A ``FullPeer`` owns each connection and serializes every production use
+    with its one reentrant lock. ``check_same_thread=False`` permits that
+    ownership to move between daemon threads; it does not permit concurrent
+    entry into a connection.
+    """
 
     @classmethod
     def open(cls, path, anchor):

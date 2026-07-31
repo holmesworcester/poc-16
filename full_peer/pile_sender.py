@@ -18,11 +18,12 @@ class PileSender:
         """Close local intent using the disposable SQL projection."""
         node, workspace = self.node, self.workspace
         with node.lock:
+            node._sync_sql(workspace)
             context = node.sql(workspace)
             newmap = {fact.fid: fact for fact in news}
 
             def fact_of(fid):
-                return newmap.get(fid) or node.fact_of(workspace, fid)
+                return newmap.get(fid) or context.fact(fid)
 
             def deps_of(fid):
                 if fid in deps_new:

@@ -180,10 +180,12 @@ def _fetch_blobs(node, ws, peer):
     """
     st = node.store(ws)
     with node.lock:
+        node._sync_sql(ws)
+        projection = node.sql(ws)
         pending = []
-        for fid in node.sql(ws).fact_ids():
-            fact = node.fact_of(ws, fid)
-            if node.suppressed(ws, fact):
+        for fid in projection.fact_ids():
+            fact = projection.fact(fid)
+            if projection.suppresses(fact):
                 continue
             refs = families.blob_refs(fact)
             if refs:

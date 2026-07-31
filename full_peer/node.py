@@ -40,26 +40,8 @@ def now_ms():
 
 
 def _run_applier(awaitable):
-    """Run the async provider-neutral engine from the synchronous full peer."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(awaitable)
-
-    outcome = {}
-
-    def run():
-        try:
-            outcome["value"] = asyncio.run(awaitable)
-        except BaseException as error:
-            outcome["error"] = error
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join()
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["value"]
+    """Run core at the blocking FullPeer boundary; async hosts use to_thread."""
+    return asyncio.run(awaitable)
 
 
 class FullPeer:
@@ -120,16 +102,18 @@ class FullPeer:
 
     def applier(self, workspace):
         """Return the exact receiving engine shared with hosted recipients."""
-        if workspace not in self._appliers:
-            self._appliers[workspace] = RepositoryApplier(
-                workspace, self.store(workspace))
-        return self._appliers[workspace]
+        with self.lock:
+            if workspace not in self._appliers:
+                self._appliers[workspace] = RepositoryApplier(
+                    workspace, self.store(workspace))
+            return self._appliers[workspace]
 
     def sender(self, workspace):
         """Return the SQL-permitted local pile author."""
-        if workspace not in self._senders:
-            self._senders[workspace] = PileSender(self, workspace)
-        return self._senders[workspace]
+        with self.lock:
+            if workspace not in self._senders:
+                self._senders[workspace] = PileSender(self, workspace)
+            return self._senders[workspace]
 
     def reader(self, workspace):
         """Pin the same DB-free read capability used by hosted recipients."""
@@ -387,21 +371,23 @@ class FullPeer:
             ]
 
     def store(self, ws):
-        if ws not in self._stores:
-            self._stores[ws] = self._store_factory(ws) \
-                if self._store_factory is not None \
-                else FsStore(os.path.join(self.dir, "ws", ws))
-        return self._stores[ws]
+        with self.lock:
+            if ws not in self._stores:
+                self._stores[ws] = self._store_factory(ws) \
+                    if self._store_factory is not None \
+                    else FsStore(os.path.join(self.dir, "ws", ws))
+            return self._stores[ws]
 
     def idx(self, ws):
         """Expose the raw connection only to SQL-backed authoring helpers."""
         return self.sql(ws).db
 
     def sql(self, ws):
-        if ws not in self._sql:
-            self._sql[ws] = sql_store.SqlStore.open(
-                os.path.join(self.dir, "ws", ws + ".idx.db"), ws)
-        return self._sql[ws]
+        with self.lock:
+            if ws not in self._sql:
+                self._sql[ws] = sql_store.SqlStore.open(
+                    os.path.join(self.dir, "ws", ws + ".idx.db"), ws)
+            return self._sql[ws]
 
     def _sync_sql(self, ws):
         """Refresh the disposable client projection without repository writes."""
@@ -412,7 +398,9 @@ class FullPeer:
         projection.refresh(reader)
 
     def fact_of(self, ws, fid) -> Fact:
-        return self.sql(ws).fact(fid)
+        with self.lock:
+            self._sync_sql(ws)
+            return self.sql(ws).fact(fid)
 
     def select(
             self, ws, kind, k0=None, k1=None, *,
@@ -420,12 +408,13 @@ class FullPeer:
         """Select current facts through the one generic type/offer index."""
         with self.lock:
             self._sync_sql(ws)
-            rows = self.sql(ws).indexed(kind, k0, k1)
+            projection = self.sql(ws)
+            rows = projection.indexed(kind, k0, k1)
             if include_suppressed:
                 return rows
             return tuple(
                 fact for fact in rows
-                if not self.suppressed(ws, fact)
+                if not projection.suppresses(fact)
             )
 
     def by_type(self, ws, tag, **options):
@@ -433,12 +422,14 @@ class FullPeer:
 
     def keys(self, ws):
         """Canonical validated keys for client-only query assembly."""
-        return [
-            fact_key for (fact_key,) in self.idx(ws).execute(
-                "SELECT i.k0 FROM fact_index i "
-                "WHERE i.kind='fact.key' ORDER BY i.k0",
-            )
-        ]
+        with self.lock:
+            self._sync_sql(ws)
+            return [
+                fact_key for (fact_key,) in self.idx(ws).execute(
+                    "SELECT i.k0 FROM fact_index i "
+                    "WHERE i.kind='fact.key' ORDER BY i.k0",
+                )
+            ]
 
     # ---- the turn ------------------------------------------------------------
 
@@ -502,7 +493,11 @@ class FullPeer:
 
     def suppressed(self, ws, fact):
         """The one local mask: explicit fact scopes intersect active actions."""
-        return self.sql(ws).suppresses(fact)
+        with self.lock:
+            self._sync_sql(ws)
+            return self.sql(ws).suppresses(fact)
 
     def suppression_active(self, ws, sid):
-        return self.sql(ws).active(sid)
+        with self.lock:
+            self._sync_sql(ws)
+            return self.sql(ws).active(sid)

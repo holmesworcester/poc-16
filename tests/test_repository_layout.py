@@ -812,6 +812,35 @@ def test_full_node_composes_roles_without_a_second_receiving_loop():
     assert "list_page" not in attributes
 
 
+def test_stdlib_http_receives_directly_through_repository_applier():
+    adapter = parsed(Path("core/http_stdlib.py"))
+    assert class_definitions("_SyncReceiver") == []
+
+    dispatch = next(
+        item for item in ast.walk(adapter)
+        if isinstance(item, ast.FunctionDef) and item.name == "_dispatch")
+    gates = [
+        call for call in ast.walk(dispatch)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "HttpGate"
+    ]
+    assert len(gates) == 1
+    receiver = gates[0].args[4]
+    assert isinstance(receiver, ast.Call)
+    assert isinstance(receiver.func, ast.Attribute)
+    assert receiver.func.attr == "applier"
+    runner = next(
+        item for item in parsed(Path("full_peer/node.py")).body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_run_applier")
+    assert len(runner.body) == 2
+    assert isinstance(runner.body[1], ast.Return)
+    assert isinstance(runner.body[1].value, ast.Call)
+    assert isinstance(runner.body[1].value.func, ast.Attribute)
+    assert runner.body[1].value.func.attr == "run"
+
+
 def test_core_is_the_complete_database_free_repository_engine():
     """Hosted correctness stops at core; full_peer is only a composition."""
     assert class_definitions("RepositoryApplier") == [

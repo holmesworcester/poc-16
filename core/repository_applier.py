@@ -231,6 +231,18 @@ class RepositoryApplier:
         """Verify and establish one inbound detached canonical object."""
         return await ensure_object_async(self.store, oid, raw)
 
+    async def receive_pile(self, member, raw):
+        """Mint and apply the exact generation received by an HTTP gate."""
+        return await self._attempt(await self.stage(member, raw))
+
+    async def _attempt(self, source):
+        """Isolate one retained generation from every other ingress unit."""
+        try:
+            result = await self.apply(source)
+        except Exception as error:
+            return TurnItem(source, error=error)
+        return TurnItem(source, result=result)
+
     def _cursor_key(self, kind):
         if kind not in {"internal", "staged"}:
             raise ValueError("repository discovery kind")
@@ -917,13 +929,6 @@ class RepositoryApplier:
         page = await self._discovery_page(
             self.store, "internal", "pile/", limit)
         for source in page.keys:
-            try:
-                result = await self.apply(source)
-            except Exception as error:
-                # A turn is an availability loop: one retryable/program/store
-                # failure retains its exact source and cannot wedge later work.
-                results.append(TurnItem(source, error=error))
-            else:
-                results.append(TurnItem(source, result=result))
+            results.append(await self._attempt(source))
         await self._save_discovery_cursor("internal", page.cursor)
         return tuple(results)

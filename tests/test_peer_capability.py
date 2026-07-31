@@ -20,6 +20,8 @@ from core.close import decode_pile
 from core.crypto import h
 from core.grants import check_token, make_token
 from core.limits import MAX_PAGE_BATCH_BYTES, MAX_ROOT_BYTES
+from core.object_store import OutcomeUnknown
+from full_peer import node as node_module
 from full_peer.node import FullPeer, now_ms
 from full_peer.sync import sync
 from full_peer.walk import Peer, PushUnsupported
@@ -126,6 +128,188 @@ def test_full_peer_serves_one_object_larger_than_the_batch_limit(tmp_path):
         # falls back to the single-object GET, and that host path must cover
         # every object RepositoryApplier can establish.
         assert Peer(local, workspace, url).objs((oid,)) == (raw,)
+
+
+def test_http_receive_retains_transient_failure_for_direct_poke_retry(
+        tmp_path, monkeypatch):
+    remote, workspace, local = replicas(tmp_path)
+    fid = facts.content.message.post(
+        local, workspace, "general", "retry me", ts=10)
+    raw = local.sender(workspace).pack(
+        local.reader(workspace).validated().closure((fid,)))
+    applier = remote.applier(workspace)
+    commit = applier.commit
+    calls = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OutcomeUnknown("transient root CAS")
+        return await commit(*args, **kwargs)
+
+    def wrong_full_peer_path(*_args, **_kwargs):
+        raise AssertionError("HTTP bypassed RepositoryApplier")
+
+    monkeypatch.setattr(applier, "commit", fail_once)
+    monkeypatch.setattr(remote, "receive_pile", wrong_full_peer_path)
+    monkeypatch.setattr(remote, "turn", wrong_full_peer_path)
+
+    with serving(
+            remote, peer_capability.FULL) as (url, _observed, edge):
+        member = local.member_for(workspace)
+        token = make_token(
+            edge.secret, member, workspace,
+            capability=peer_capability.FULL)
+        request = urllib.request.Request(
+            f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+            data=raw, method="PUT",
+            headers={"Authorization": "Bearer " + token},
+        )
+
+        assert urllib.request.urlopen(request).status == 204
+        assert len(remote.store(workspace).list("pile/")) == 1
+        assert remote.fact_of(workspace, fid) is None
+
+        poke = urllib.request.Request(
+            f"{url}/poke?ws={workspace}", data=b"", method="POST")
+        assert urllib.request.urlopen(poke).status == 204
+
+    assert remote.store(workspace).list("pile/") == []
+    assert remote.fact_of(workspace, fid) is not None
+
+
+def test_full_peer_constructs_one_applier_during_cold_concurrent_lookup(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = "0" * 64
+    real = node_module.RepositoryApplier
+    entered = threading.Event()
+    release = threading.Event()
+    duplicate = threading.Event()
+    calls, receivers = 0, []
+    calls_lock = threading.Lock()
+
+    def construct(*args, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            first = calls == 1
+            if first:
+                entered.set()
+            else:
+                duplicate.set()
+        if first:
+            assert release.wait(5)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(node_module, "RepositoryApplier", construct)
+    workers = [
+        threading.Thread(
+            target=lambda: receivers.append(node.applier(workspace)))
+        for _ in range(2)
+    ]
+    workers[0].start()
+    assert entered.wait(5)
+    workers[1].start()
+    try:
+        assert not duplicate.wait(0.2)
+    finally:
+        release.set()
+    for worker in workers:
+        worker.join(5)
+        assert not worker.is_alive()
+
+    assert calls == 1
+    assert len(receivers) == 2
+    assert receivers[0] is receivers[1]
+
+
+def test_concurrent_http_receives_converge_through_one_applier(
+        tmp_path, monkeypatch):
+    remote, workspace, local = replicas(tmp_path)
+    fids = [
+        facts.content.message.post(
+            local, workspace, "general", body, ts=timestamp)
+        for timestamp, body in ((10, "first"), (11, "second"))
+    ]
+    raws = [
+        local.sender(workspace).pack(
+            local.reader(workspace).validated().closure((fid,)))
+        for fid in fids
+    ]
+    applier = remote.applier(workspace)
+    commit = applier.commit
+    committing = threading.Barrier(2)
+    receiver_ids = []
+    applier_for = remote.applier
+
+    async def race_commits(*args, **kwargs):
+        committing.wait(timeout=5)
+        return await commit(*args, **kwargs)
+
+    def observed_applier(ws):
+        receiver = applier_for(ws)
+        receiver_ids.append(id(receiver))
+        return receiver
+
+    def wrong_full_peer_path(*_args, **_kwargs):
+        raise AssertionError("HTTP bypassed RepositoryApplier")
+
+    monkeypatch.setattr(applier, "commit", race_commits)
+    monkeypatch.setattr(remote, "applier", observed_applier)
+    monkeypatch.setattr(remote, "receive_pile", wrong_full_peer_path)
+    monkeypatch.setattr(remote, "turn", wrong_full_peer_path)
+    statuses, errors = [], []
+
+    with serving(
+            remote, peer_capability.FULL) as (url, _observed, edge):
+        member = local.member_for(workspace)
+        token = make_token(
+            edge.secret, member, workspace,
+            capability=peer_capability.FULL)
+
+        def upload(raw):
+            try:
+                request = urllib.request.Request(
+                    f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+                    data=raw, method="PUT",
+                    headers={"Authorization": "Bearer " + token},
+                )
+                statuses.append(urllib.request.urlopen(request).status)
+            except Exception as error:
+                errors.append(error)
+
+        workers = [
+            threading.Thread(target=upload, args=(raw,))
+            for raw in raws
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(5)
+            assert not worker.is_alive()
+
+        assert errors == []
+        assert statuses == [204, 204]
+        assert len(receiver_ids) == 2
+        assert len(set(receiver_ids)) == 1
+        assert len(remote.store(workspace).list("pile/")) == 1
+        assert sum(
+            remote.fact_of(workspace, fid) is not None
+            for fid in fids
+        ) == 1
+
+        monkeypatch.setattr(applier, "commit", commit)
+        poke = urllib.request.Request(
+            f"{url}/poke?ws={workspace}", data=b"", method="POST")
+        assert urllib.request.urlopen(poke).status == 204
+
+    assert remote.store(workspace).list("pile/") == []
+    assert all(
+        remote.fact_of(workspace, fid) is not None
+        for fid in fids
+    )
 
 
 @pytest.mark.parametrize(

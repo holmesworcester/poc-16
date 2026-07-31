@@ -46,21 +46,6 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-class _SyncReceiver:
-    def __init__(self, peer, workspace):
-        self.peer = peer
-        self.workspace = workspace
-
-    async def admit_object(self, oid, raw):
-        return self.peer.receive_object(self.workspace, oid, raw)
-
-    async def receive_pile(self, member, raw):
-        return self.peer.receive_pile(self.workspace, member, raw)
-
-    async def turn(self):
-        return self.peer.turn(self.workspace)
-
-
 class StdlibPeerHandler(BaseHTTPRequestHandler):
     """Translate ordinary HTTP bytes; ``HttpGate`` still owns the routes."""
 
@@ -130,7 +115,7 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             workspace,
             self.secret,
             now_ms,
-            _SyncReceiver(self.peer, workspace),
+            self.peer.applier(workspace),
             sync_profile=self.sync_profile,
             grant_ttl_ms=self.gate_options.grant_ttl_ms,
             max_mint_fetches=self.gate_options.max_mint_fetches,

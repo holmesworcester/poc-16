@@ -8,6 +8,7 @@ def describe(node):
     out = {"pk": node.pk, "member": node.member, "workspaces": {}}
     with node.lock:
         for workspace, entry in node.keyring["workspaces"].items():
+            node._sync_sql(workspace)
             database = node.idx(workspace)
             root = node.store(workspace).get_bounded(
                 "root", MAX_ROOT_BYTES)

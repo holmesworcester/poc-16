@@ -276,7 +276,7 @@ def _states(node, workspace, selector=None):
             return tuple(
                 fact for fact in admitted.indexed(
                     kind, k0, k1, **filters)
-                if not node.suppressed(workspace, fact)
+                if not admitted.suppresses(fact)
             )
 
         if selector is None:

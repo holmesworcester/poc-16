@@ -354,6 +354,13 @@ re-proposes against the committed root and receives a fresh process-local
 no-op receipt. No LIST result, notification, SQL row, cursor, or process-local
 lock authorizes root mutation or deletion.
 
+HTTP receipt acknowledges once the exact generation is durably staged, even
+when its first apply attempt fails transiently. The retained generation is the
+database-free retry record and a later poke or scheduled turn retries it.
+`FullPeer` may additionally show failures observed by its own local scheduler;
+that process-local diagnostic is not repository state and is not required of a
+hosted recipient.
+
 Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
 bytes, clobber a newer root, retire another generation, skip detached-object
