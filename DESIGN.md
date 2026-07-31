@@ -242,7 +242,7 @@ interchangeable address. Explicit provider selectors remain exact.
 
 ## 3. Authenticated repository state
 
-One canonical root names four Merkle maps and their authenticated metadata.
+One canonical root names three Merkle maps and their authenticated metadata.
 
 ### 3.1 FactTree
 
@@ -404,7 +404,7 @@ completion, or corrupt a Merkle tree.
 
 `RepositoryReader` pins exact root bytes. Its subordinate views are:
 
-- `WorkerView` for bounded fact, suppression, authority, and mint reads;
+- `WorkerView` for bounded fact, suppression, and mint reads;
 - `ValidatedView` for authenticated fact residences and fresh closure assembly.
 
 Neither view writes or consults SQLite.

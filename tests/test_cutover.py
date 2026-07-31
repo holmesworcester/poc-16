@@ -10,7 +10,7 @@ from core.fact import canon
 from full_peer.node import FullPeer
 
 
-def test_root_atomically_names_the_four_current_bounded_maps(tmp_path):
+def test_root_atomically_names_the_three_current_bounded_maps(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "indexed", ts=10)

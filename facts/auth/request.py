@@ -50,8 +50,8 @@ DURABLE = False
 def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
     """Authorize this ephemeral closure using only bounded Worker reads.
 
-    ``view`` is the database-free CF capability: authenticated Fact,
-    Authority, and Suppression tree point reads over one root.
+    ``view`` is the database-free CF capability: authenticated Fact and
+    Suppression tree point reads over one root.
     """
     import facts
 

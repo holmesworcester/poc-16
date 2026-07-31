@@ -97,8 +97,27 @@ def test_pile_fact_count_is_bounded_before_generation_or_kernel_work(
 
     applier = repository_applier_module.RepositoryApplier(
         workspace, NeverMutated())
-    with pytest.raises(PayloadTooLarge, match="too many facts"):
-        run(applier.stage("member", over))
+    hostile_spellings = (
+        over,
+        b'{"facts" : [null,{},{}], "ws":"' + workspace.encode() + b'"}',
+        b'{"ws":"' + workspace.encode()
+        + b'","facts":[[],[{},{}],0]}',
+        b'{"fa\\u0063ts":[\"[,]\",{},{}],\"ws\":\"'
+        + workspace.encode() + b'\"}',
+        b'{"facts":[],"fa\\u0063ts":[null,{},{}],\"ws\":\"'
+        + workspace.encode() + b'\"}',
+    )
+    for hostile in hostile_spellings:
+        with pytest.raises(PayloadTooLarge, match="too many facts"):
+            run(applier.stage("member", hostile))
+
+    nested = b'{"other":{"facts":[null,{},{},{}]},"facts":[{},{}],"ws":"' \
+        + workspace.encode() + b'"}'
+    close.check_pile_bounds(nested)
+
+    malformed = b'{"facts":[{},"unterminated'
+    with pytest.raises(ValueError, match="pile facts array"):
+        run(applier.stage("member", malformed))
 
 
 def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():

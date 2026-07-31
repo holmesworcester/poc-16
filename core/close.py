@@ -26,52 +26,118 @@ from .shape import valid_fid
 def check_pile_bounds(raw):
     """Reject byte/count amplification before reserving untrusted work.
 
-    The small scanner recognizes only the canonical ``facts`` prefix and
-    counts top-level fact objects without decoding their bodies. Malformed
-    input that cannot be counted continues to the exact decoder, where the
-    RepositoryApplier can retain typed rejection evidence.
+    The small lexical scanner finds a root ``facts`` key under any JSON
+    whitespace/key order and counts arbitrary top-level array values without
+    decoding their bodies. Malformed input that cannot amplify that array
+    continues to the exact decoder, where the RepositoryApplier can retain
+    typed rejection evidence.
     """
     if not isinstance(raw, bytes):
         raise InvalidEncoding("pile bytes")
     if len(raw) > MAX_PILE_BYTES:
         raise PayloadTooLarge("pile too large")
-    prefix = b'{"facts":['
-    if not raw.startswith(prefix):
-        return
-    at = len(prefix)
-    if at < len(raw) and raw[at] == ord("]"):
-        return
-    count = 0
-    while at < len(raw) and raw[at] == ord("{"):
-        depth, quoted, escaped = 0, False, False
-        while at < len(raw):
-            byte = raw[at]
-            at += 1
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif byte == ord("\\"):
-                    escaped = True
-                elif byte == ord('"'):
-                    quoted = False
-            elif byte == ord('"'):
-                quoted = True
-            elif byte in (ord("{"), ord("[")):
-                depth += 1
-            elif byte in (ord("}"), ord("]")):
-                depth -= 1
-                if depth == 0:
-                    break
-        else:
-            return
-        count += 1
-        if count > MAX_PILE_FACTS:
-            raise PayloadTooLarge("pile has too many facts")
-        if at >= len(raw) or raw[at] == ord("]"):
-            return
-        if raw[at] != ord(","):
-            return
+    _scan_root_facts(raw)
+
+
+_JSON_SPACE = b" \t\r\n"
+_OPEN = {ord("{"): ord("}"), ord("["): ord("]")}
+
+
+def _nonspace(raw, at):
+    while at < len(raw) and raw[at] in _JSON_SPACE:
         at += 1
+    return at
+
+
+def _string_end(raw, at):
+    at += 1
+    while at < len(raw):
+        if raw[at] == ord("\\"):
+            at += 2
+        elif raw[at] == ord('"'):
+            return at + 1
+        else:
+            at += 1
+    return None
+
+
+def _facts_key(raw, start, end):
+    token = raw[start:end]
+    if token == b'"facts"':
+        return True
+    if len(token) > 64:
+        return False
+    try:
+        return decode_json(token, 64, "pile key") == "facts"
+    except ValueError:
+        return False
+
+
+def _count_array(raw, at):
+    stack, count, expecting = [ord("]")], 0, True
+    at += 1
+    while at < len(raw) and stack:
+        byte = raw[at]
+        if byte in _JSON_SPACE:
+            at += 1
+            continue
+        if len(stack) == 1 and expecting and byte != ord("]"):
+            count += 1
+            if count > MAX_PILE_FACTS:
+                raise PayloadTooLarge("pile has too many facts")
+            expecting = False
+        if byte == ord('"'):
+            end = _string_end(raw, at)
+            if end is None:
+                raise InvalidEncoding("pile facts array")
+            at = end
+        elif byte in _OPEN:
+            stack.append(_OPEN[byte])
+            at += 1
+        elif byte == stack[-1]:
+            stack.pop()
+            at += 1
+        elif byte in (ord("}"), ord("]")):
+            raise InvalidEncoding("pile facts array")
+        elif byte == ord(",") and len(stack) == 1:
+            expecting = True
+            at += 1
+        else:
+            at += 1
+    if stack:
+        raise InvalidEncoding("pile facts array")
+
+
+def _scan_root_facts(raw):
+    at = _nonspace(raw, 0)
+    if at >= len(raw) or raw[at] != ord("{"):
+        return
+    stack = [ord("}")]
+    at += 1
+    while at < len(raw) and stack:
+        byte = raw[at]
+        if byte == ord('"'):
+            end = _string_end(raw, at)
+            if end is None:
+                return
+            after = _nonspace(raw, end)
+            if len(stack) == 1 and after < len(raw) \
+                    and raw[after] == ord(":") \
+                    and _facts_key(raw, at, end):
+                value = _nonspace(raw, after + 1)
+                if value < len(raw) and raw[value] == ord("["):
+                    _count_array(raw, value)
+            at = end
+        elif byte in _OPEN:
+            stack.append(_OPEN[byte])
+            at += 1
+        elif byte == stack[-1]:
+            stack.pop()
+            at += 1
+        elif byte in (ord("}"), ord("]")):
+            return
+        else:
+            at += 1
 
 
 def close(news, deps_of, fact_of):

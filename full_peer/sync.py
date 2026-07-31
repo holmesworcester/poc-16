@@ -4,11 +4,11 @@ The replicated value is:
 
 ``fid -> canonical fact bytes``
 
-FactOrder, suppression, and authority are mechanical projections of that
-monotone set.  A sender assembles a fresh closure for each missing fact; no
-stored validation path crosses the wire. Every closure re-enters through the
-ordinary exact-pile door. Detached file bytes remain a separate best-effort
-completion pass.
+FactOrder, generic fact postings, and suppression are mechanical projections
+of that monotone set. A sender assembles a fresh closure for each missing fact;
+no stored validation path crosses the wire. Every closure re-enters through
+the ordinary exact-pile door. Detached file bytes remain a separate
+best-effort completion pass.
 """
 from dataclasses import dataclass
 
