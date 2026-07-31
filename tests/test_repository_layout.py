@@ -423,6 +423,30 @@ def test_untrusted_read_boundaries_have_no_whole_get_fallback():
             and item.name == "get"
         ]
 
+    stdlib = parsed(Path("core/http_stdlib.py"))
+    assert not any(
+        isinstance(item, ast.ClassDef) and item.name == "_SyncStore"
+        for item in stdlib.body
+    )
+    assert any(
+        isinstance(call.func, ast.Name)
+        and call.func.id == "AsyncFromSyncReader"
+        for call in ast.walk(stdlib)
+        if isinstance(call, ast.Call)
+    )
+    for path, class_name in (
+            (Path("core/http.py"), "AsyncFromSyncReader"),
+            (Path("deploy/cloudflare_worker/runtime.py"), "ReadOnlyStore"),
+    ):
+        owner = next(
+            item for item in parsed(path).body
+            if isinstance(item, ast.ClassDef) and item.name == class_name)
+        assert not any(
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == "has"
+            for item in owner.body
+        )
+
 
 def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
     remote_store = next(

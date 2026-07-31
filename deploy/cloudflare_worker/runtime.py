@@ -151,9 +151,6 @@ class ReadOnlyStore:
     async def get_bounded(self, key, max_bytes):
         return await self._store.get_bounded(key, max_bytes)
 
-    async def has(self, key):
-        return await self._store.has(key)
-
 
 def now_ms():
     return time_ns() // 1_000_000

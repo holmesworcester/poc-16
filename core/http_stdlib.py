@@ -11,7 +11,7 @@ import time
 from urllib.parse import parse_qs, urlparse
 
 from . import peer_capability
-from .http import HttpGate, Response
+from .http import AsyncFromSyncReader, HttpGate, Response
 from .limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
@@ -44,17 +44,6 @@ class HttpGateOptions:
 
 def now_ms():
     return int(time.time() * 1000)
-
-
-class _SyncStore:
-    def __init__(self, store):
-        self.store = store
-
-    async def get_bounded(self, key, max_bytes):
-        return self.store.get_bounded(key, max_bytes)
-
-    async def has(self, key):
-        return self.store.has(key)
 
 
 class _SyncReceiver:
@@ -137,7 +126,7 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
         if not self.peer.has_workspace(workspace):
             return self._send(Response(404))
         gate = HttpGate(
-            _SyncStore(self.peer.store(workspace)),
+            AsyncFromSyncReader(self.peer.store(workspace)),
             workspace,
             self.secret,
             now_ms,

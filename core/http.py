@@ -50,9 +50,6 @@ class AsyncFromSyncReader:
     async def get_bounded(self, key, max_bytes):
         return self.reader.get_bounded(key, max_bytes)
 
-    async def has(self, key):
-        return self.reader.has(key)
-
 
 class HttpGate:
     """One-workspace peer authorization and immutable-object service.
