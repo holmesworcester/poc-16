@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from types import SimpleNamespace
 
 import facts
 from adapters.gcp.firebase import FirebaseAdminFcm
@@ -20,9 +21,14 @@ from notifications.delivery import (
     PushRequest,
     PushRetryable,
     PushUnregistered,
+    delivery_domain_id,
     derive,
     seal_target,
 )
+
+
+def _firebase_app(project="firebase-project"):
+    return SimpleNamespace(project_id=project)
 
 
 def _world(tmp_path, name="node"):
@@ -270,24 +276,44 @@ class FakeMessaging:
 
 def _request():
     return PushRequest(
-        "poc16.mobile", "production", "apple", "target-token",
+        "poc16.mobile", "production", "apple", "registered-fid",
         b'{"kind":"mention"}', "d" * 64, 60_000, 60, "mention")
+
+
+def test_delivery_domain_binds_routes_but_not_their_input_order():
+    _secret, push_node = keypair()
+    routes = (
+        ("poc16.mobile", "production", "firebase-production"),
+        ("poc16.preview", "staging", "firebase-staging"),
+    )
+
+    domain = delivery_domain_id(push_node, routes)
+
+    assert domain == delivery_domain_id(push_node, tuple(reversed(routes)))
+    assert domain != delivery_domain_id(push_node, (
+        ("poc16.mobile", "production", "different-project"),
+        routes[1],
+    ))
+    with pytest.raises(ValueError, match="duplicate"):
+        delivery_domain_id(push_node, (routes[0], routes[0]))
 
 
 def test_firebase_adapter_uses_fid_and_both_platform_collapse_ids():
     module = FakeMessaging()
     adapter = FirebaseAdminFcm(
-        {("poc16.mobile", "production"): object()},
+        {("poc16.mobile", "production"): _firebase_app()},
         messaging_module=module)
 
     accepted = adapter.send(_request())
 
     assert accepted.message_id == "provider-message"
     built, _app = module.sent[0]
-    assert built.fid == "target-token"
+    assert built.fid == "registered-fid"
     assert built.android.collapse_key == "d" * 64
     assert built.apns.headers["apns-collapse-id"] == "d" * 64
     assert not hasattr(built, "token")
+    assert adapter.delivery_routes == (
+        ("poc16.mobile", "production", "firebase-project"),)
 
 
 def test_largest_local_payload_fits_fcm_data_and_one_more_byte_is_invalid():
@@ -315,7 +341,7 @@ def test_largest_local_payload_fits_fcm_data_and_one_more_byte_is_invalid():
 def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
     module = FakeMessaging()
     adapter = FirebaseAdminFcm(
-        {("another.app", "production"): object()},
+        {("another.app", "production"): _firebase_app()},
         messaging_module=module)
 
     with pytest.raises(PushRetryable, match="unconfigured"):
@@ -339,7 +365,7 @@ def test_firebase_adapter_classifies_errors_without_leaking_details(
     module = FakeMessaging()
     module.error = type(name, (Exception,), {})("secret provider detail")
     adapter = FirebaseAdminFcm(
-        {("poc16.mobile", "production"): object()},
+        {("poc16.mobile", "production"): _firebase_app()},
         messaging_module=module)
 
     with pytest.raises(expected) as caught:
@@ -351,7 +377,7 @@ def test_firebase_adapter_retries_generic_send_value_error():
     module = FakeMessaging()
     module.error = ValueError("bad provider payload with secret detail")
     adapter = FirebaseAdminFcm(
-        {("poc16.mobile", "production"): object()},
+        {("poc16.mobile", "production"): _firebase_app()},
         messaging_module=module)
 
     with pytest.raises(PushRetryable) as caught:

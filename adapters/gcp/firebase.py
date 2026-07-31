@@ -4,6 +4,7 @@ from datetime import timedelta
 import importlib
 
 from notifications.delivery import (
+    MAX_FIREBASE_ROUTES,
     PushAccepted,
     PushPermanent,
     PushRequest,
@@ -38,12 +39,23 @@ class FirebaseAdminFcm:
 
     def __init__(self, apps, *, messaging_module=None):
         if not isinstance(apps, dict) or not apps \
+                or len(apps) > MAX_FIREBASE_ROUTES \
                 or not all(
                     isinstance(key, tuple) and len(key) == 2
                     and all(isinstance(part, str) and part for part in key)
                     for key in apps):
             raise ValueError("Firebase app mapping")
         self.apps = dict(apps)
+        try:
+            self.delivery_routes = tuple(sorted(
+                (application, environment, app.project_id)
+                for (application, environment), app in self.apps.items()))
+        except Exception as error:
+            raise ValueError("Firebase app project identity") from error
+        if not all(isinstance(project, str) and project
+                   for _application, _environment, project
+                   in self.delivery_routes):
+            raise ValueError("Firebase app project identity")
         self._messaging = messaging_module
 
     def _module(self):

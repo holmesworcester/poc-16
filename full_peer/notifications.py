@@ -25,6 +25,7 @@ from notifications.carrier import (
     delivery_disposition,
 )
 from notifications.discovery import NotificationDiscovery, NotificationState
+from notifications.delivery import delivery_domain_id
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 
 
@@ -123,10 +124,12 @@ class FullPeerNotifications:
         self.node = node
         self.directory = directory
         self.secret, self.push_node = _secret(push_node_secret)
+        routes = getattr(provider, "delivery_routes", None)
+        self.delivery_domain = delivery_domain_id(self.push_node, routes)
         self.owner = h(canon([
-            "full-peer-notification-owner-v1",
+            "full-peer-notification-owner-v2",
             node.pk,
-            self.push_node,
+            self.delivery_domain,
         ]))
         self.provider = provider
         self.cadence = float(cadence)
