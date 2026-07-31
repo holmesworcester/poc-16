@@ -128,7 +128,7 @@ The standalone commands remain useful for diagnosis. This creates a local
 HTTP seam whose bytes traverse Iroh to the accepting peer:
 
 ```sh
-./full_peer/iroh/target/release/poc16-iroh forward --peer TICKET
+./full_peer/iroh/target/release/poc16-iroh forward --peer=TICKET
 ```
 
 The remaining outbound integration is explicit in bead `poc-16-32h`.

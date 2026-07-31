@@ -48,7 +48,7 @@ enum Command {
     /// Expose a local TCP listener whose byte connections dial an Iroh peer.
     Forward {
         /// Bounded ticket printed by the accepting peer.
-        #[arg(long)]
+        #[arg(long, require_equals = true)]
         peer: String,
         #[arg(long, default_value = "127.0.0.1:0")]
         listen: SocketAddr,
@@ -181,5 +181,16 @@ mod tests {
         assert!(loopback_address("[::1]:1".parse().unwrap(), "value").is_ok());
         assert!(loopback_address("0.0.0.0:1".parse().unwrap(), "value").is_err());
         assert!(loopback_address("192.0.2.1:1".parse().unwrap(), "value").is_err());
+    }
+
+    #[test]
+    fn forward_ticket_can_begin_with_a_hyphen_without_becoming_an_option() {
+        let parsed =
+            Arguments::try_parse_from(["poc16-iroh", "forward", "--peer=-ticket", "--loopback"])
+                .unwrap();
+        let Command::Forward { peer, .. } = parsed.command else {
+            panic!("expected forward command");
+        };
+        assert_eq!(peer, "-ticket");
     }
 }

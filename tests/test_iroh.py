@@ -20,7 +20,11 @@ import pytest
 import facts
 from core.close import encode_pile
 from core.crypto import h, unseal
-from core.limits import MAX_MINT_FETCHES, MAX_MINT_FETCH_BYTES
+from core.limits import (
+    MAX_MINT_FETCHES,
+    MAX_MINT_FETCH_BYTES,
+    MAX_OBJECT_BYTES,
+)
 from core.repository_reader import RepositoryReader
 from facts.auth import request
 from full_peer.daemon import FullPeerService
@@ -190,6 +194,28 @@ def call(target, method, path, *, body=b"", token=None, headers=None):
     return result
 
 
+def raw_call(target, raw):
+    with socket.create_connection(target, timeout=15) as stream:
+        stream.settimeout(15)
+        stream.sendall(raw)
+        reader = stream.makefile("rb")
+        status_line = reader.readline(4096)
+        assert status_line.startswith(b"HTTP/1.1 ")
+        status = int(status_line.split()[1])
+        headers = {}
+        while True:
+            line = reader.readline(16 * 1024)
+            if line == b"\r\n":
+                break
+            name, value = line.decode("ascii").split(":", 1)
+            headers[name.lower()] = value.strip()
+        size = int(headers.get("content-length", "0"))
+        return status, reader.read(size), {
+            name: value for name, value in headers.items()
+            if name in {"content-type", "etag"}
+        }
+
+
 def repository_bytes(node_dir, workspace):
     root = Path(node_dir) / "ws" / workspace
     return {
@@ -249,6 +275,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     state = tmp_path / "peer"
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
+    member = bootstrap.member_for(workspace)
     identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
     pile = encode_pile(request.payload(
@@ -258,7 +285,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     daemon, ready = start_full_peer(
         state,
         iroh_binary,
-        {"TINYP2P_GRANT_TTL": "1000"},
+        {"TINYP2P_GRANT_TTL": "2000"},
     )
     children = [daemon]
     first_endpoint = ready["endpoint_id"]
@@ -269,7 +296,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             forwarder, forwarded = ready_process([
                 str(iroh_binary),
                 "forward",
-                "--peer", ready["peer"],
+                f"--peer={ready['peer']}",
                 "--loopback",
             ])
             children.append(forwarder)
@@ -284,6 +311,16 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
 
         direct = address(ready["data"])
         through_iroh = [target for _, target in forwarders]
+        paths = [direct, *through_iroh]
+
+        def parity(method, path, **kwargs):
+            results = [
+                call(target, method, path, **kwargs)
+                for target in paths
+            ]
+            assert results[1:] == results[:1] * (len(results) - 1)
+            return results[0]
+
         assert call(direct, "GET", "/healthz")[0] == 200
         assert all(
             call(target, "GET", "/healthz")[0] == 200
@@ -295,8 +332,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         assert capability == "sync-v1/full"
         raw = b"ordinary object bytes through Iroh"
         oid = h(raw)
-        assert call(
-            through_iroh[0],
+        assert parity(
             "PUT",
             f"/page/{oid}?ws={workspace}",
             body=raw,
@@ -305,51 +341,114 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
 
         token, _ = mint(
             through_iroh[1], workspace, pile, identity_secret)
-        assert call(
-            through_iroh[1],
+        assert parity(
             "GET",
             f"/page/{oid}?ws={workspace}",
             token=token,
         )[:2] == (200, raw)
 
         baseline = repository_bytes(state, workspace)
-        time.sleep(1.2)
-        assert call(
-            through_iroh[1],
+        time.sleep(2.2)
+        assert parity(
             "GET",
             f"/page/{oid}?ws={workspace}",
             token=token,
         )[0] == 401
         assert repository_bytes(state, workspace) == baseline
-        assert call(
-            through_iroh[0],
+
+        assert parity(
             "GET",
             f"/root?ws={workspace}",
         )[0] == 401
         token, _ = mint(
             through_iroh[0], workspace, pile, identity_secret)
-        assert call(
-            through_iroh[0],
+        tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+        assert parity(
+            "GET",
+            f"/root?ws={workspace}",
+            token=tampered,
+        )[0] == 401
+
+        token, _ = mint(
+            direct, workspace, pile, identity_secret)
+        assert parity(
+            "GET",
+            "/root?ws=" + "0" * 64,
+            token=token,
+        )[0] == 404
+
+        token, _ = mint(
+            through_iroh[0], workspace, pile, identity_secret)
+        assert parity(
             "PUT",
             f"/page/{'f' * 64}?ws={workspace}",
             body=b"wrong digest",
             token=token,
         )[0] == 400
+
+        token, _ = mint(
+            through_iroh[1], workspace, pile, identity_secret)
+        assert parity(
+            "PUT",
+            f"/pile/not-{member}/{h(b'pile')}?ws={workspace}",
+            body=b"pile",
+            token=token,
+        )[0] == 403
+
+        for method, path in (
+                ("POST", f"/root?ws={workspace}"),
+                ("GET", f"/unknown?ws={workspace}")):
+            route_token, _ = mint(
+                through_iroh[0], workspace, pile, identity_secret)
+            assert parity(
+                method,
+                path,
+                token=route_token,
+            )[0] == 404
+
         control_request = b'{"path":"peer.status","argv":[]}'
-        peer_control = call(
-            direct,
+        token, _ = mint(
+            through_iroh[0], workspace, pile, identity_secret)
+        peer_control = parity(
             "POST",
             f"/ctl/command?ws={workspace}",
             body=control_request,
-        )
-        tunneled_control = call(
-            through_iroh[0],
-            "POST",
-            f"/ctl/command?ws={workspace}",
-            body=control_request,
+            token=token,
         )
         assert peer_control[0] == 405
-        assert tunneled_control == peer_control
+
+        token, _ = mint(
+            direct, workspace, pile, identity_secret)
+        oversized = (
+            f"PUT /page/{h(b'never lands')}?ws={workspace} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Content-Length: {MAX_OBJECT_BYTES + 1}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        oversized_results = [
+            raw_call(target, oversized) for target in paths
+        ]
+        assert oversized_results[1:] == \
+            oversized_results[:1] * (len(oversized_results) - 1)
+        assert oversized_results[0][0] == 413
+
+        token, _ = mint(
+            through_iroh[0], workspace, pile, identity_secret)
+        malformed = (
+            f"PUT /page/{h(b'malformed never lands')}?"
+            f"ws={workspace} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            "Content-Length: nope\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        malformed_results = [
+            raw_call(target, malformed) for target in paths
+        ]
+        assert malformed_results[1:] == \
+            malformed_results[:1] * (len(malformed_results) - 1)
+        assert malformed_results[0][0] == 400
         assert repository_bytes(state, workspace) == baseline
 
         status, body, _ = call(
@@ -386,7 +485,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         daemon, ready = start_full_peer(
             state,
             iroh_binary,
-            {"TINYP2P_GRANT_TTL": "1000"},
+            {"TINYP2P_GRANT_TTL": "2000"},
         )
         children.append(daemon)
         assert ready["endpoint_id"] == first_endpoint
