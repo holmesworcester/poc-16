@@ -13,6 +13,7 @@ from full_peer import bao_native as bao
 from full_peer import sql_store
 from core.close import decode_pile, encode_pile
 from core.crypto import h
+from core.limits import MAX_OBJECT_BYTES, MAX_PILE_FACTS
 from full_peer.node import FullPeer
 from full_peer.walk import _fetch_blobs
 from facts.content import chunk, file as file_family
@@ -45,6 +46,12 @@ def push_all(node, workspace, peer):
         for fid in candidates.fact_ids()
     )
     return node.sender(workspace).deliver(peer, closures)
+
+
+def test_current_one_pile_file_geometry_fits_shared_protocol_bounds():
+    assert bao.MAX_FILE_BYTES == 16 * 1024 * 1024
+    assert 2 + 2 * bao.MAX_SLICES <= MAX_PILE_FACTS
+    assert bao.MAX_PROOF_BYTES < MAX_OBJECT_BYTES
 
 
 def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
