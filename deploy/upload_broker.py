@@ -6,10 +6,10 @@ privately invokes the database-free RepositoryApplier with its fixed key.
 """
 from dataclasses import dataclass
 import inspect
-import json
 import secrets
 from urllib.parse import urlsplit
 
+from core.fact import canon
 from core.limits import (
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_FETCHES,
@@ -50,18 +50,20 @@ class UploadUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class AuthorizedPut:
-    """One exact provider PUT derived only from an authenticated lease."""
+class AuthorizedPilePut:
+    """One exact pile PUT derived only from an authenticated lease."""
 
     workspace: str
     member: str
     session: str
-    object_class: str
     digest: str
     size: int
-    content_type: str
-    key: str
     not_after_ms: int
+
+    @property
+    def key(self):
+        return staging_key(
+            self.workspace, self.member, self.session, "pile", self.digest)
 
 
 def _wire_size(value):
@@ -72,29 +74,11 @@ def _wire_size(value):
             from error
 
 
-def _capability_document(value):
-    return {
-        "expires_at_ms": value.expires_at_ms,
-        "headers": dict(value.headers),
-        "method": value.method,
-        "url": value.url,
-    }
-
-
-def _bounded_document(value, maximum, label):
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":")).encode()
-    if len(encoded) > maximum:
-        raise UploadUnavailable(f"{label} exceeds wire limit")
-    return encoded
-
-
 def _checked_capability(value, trusted_now, session_expires_at):
     parsed = urlsplit(value.url) \
         if isinstance(value, wire.UploadCapability) \
         and isinstance(value.url, str) else None
-    if parsed is None or value.method != "PUT" \
-            or parsed.scheme != "https" or not parsed.hostname \
+    if parsed is None or parsed.scheme != "https" or not parsed.hostname \
             or parsed.username is not None or parsed.password is not None \
             or parsed.fragment \
             or _wire_size(value.url) > MAX_CAPABILITY_URL_BYTES \
@@ -119,54 +103,14 @@ def _checked_capability(value, trusted_now, session_expires_at):
     if header_bytes > MAX_CAPABILITY_HEADER_BYTES \
             or names != sorted(names) or len(names) != len(set(names)):
         raise UploadUnavailable("provider signer returned ambiguous headers")
-    _bounded_document(
-        _capability_document(value),
-        MAX_CAPABILITY_DOCUMENT_BYTES,
-        "provider capability",
-    )
+    try:
+        encoded = canon(wire.capability_document(value))
+    except (TypeError, ValueError) as error:
+        raise UploadUnavailable(
+            "provider signer returned an invalid request") from error
+    if len(encoded) > MAX_CAPABILITY_DOCUMENT_BYTES:
+        raise UploadUnavailable("provider capability exceeds wire limit")
     return value
-
-
-def _grant_document(grant):
-    return {
-        "digest": grant.leaf.digest,
-        "put": _capability_document(grant.capability),
-        "size": grant.leaf.size,
-    }
-
-
-def open_document(result):
-    if not isinstance(result, wire.OpenedUpload):
-        raise TypeError("opened upload")
-    return {
-        "cursor": result.cursor,
-        "expires_at_ms": result.expires_at_ms,
-        "pile": _grant_document(result.pile),
-        "schema": wire.OPEN_RESPONSE_SCHEMA,
-        "session": result.session,
-    }
-
-
-def finalize_document(result):
-    if not isinstance(result, wire.FinalizedUpload):
-        raise TypeError("finalized upload")
-    return {
-        "schema": wire.FINALIZE_RESPONSE_SCHEMA,
-        "status": result.status,
-    }
-
-
-def encode_open(result):
-    return _bounded_document(
-        open_document(result), wire.MAX_OPEN_RESPONSE_BYTES, "OPEN response")
-
-
-def encode_finalize(result):
-    return _bounded_document(
-        finalize_document(result),
-        wire.MAX_FINALIZE_RESPONSE_BYTES,
-        "FINALIZE response",
-    )
 
 
 def _final_status(value):
@@ -288,32 +232,20 @@ class UploadBroker:
 
     def _sign(self, state, trusted_now):
         leaf = state.pile
-        put = AuthorizedPut(
+        put = AuthorizedPilePut(
             state.workspace,
             state.member,
             state.session,
-            "pile",
             leaf.digest,
             leaf.size,
-            wire.UPLOAD_CONTENT_TYPE,
-            staging_key(
-                state.workspace,
-                state.member,
-                state.session,
-                "pile",
-                leaf.digest,
-            ),
             state.expires_at_ms,
         )
         try:
             capability = self.signer.sign(put)
         except Exception as error:
             raise UploadUnavailable("provider signing failed") from error
-        return wire.GrantedUpload(
-            leaf,
-            _checked_capability(
-                capability, trusted_now, state.expires_at_ms),
-        )
+        return _checked_capability(
+            capability, trusted_now, state.expires_at_ms)
 
     async def open(self, proof, pile):
         """Pin current authority and return the sole exact PUT capability."""
@@ -345,7 +277,6 @@ class UploadBroker:
             self._sign(state, trusted_now),
             state.expires_at_ms,
         )
-        encode_open(result)
         return result
 
     async def finalize(self, cursor):
@@ -369,16 +300,11 @@ class UploadBroker:
         except Exception as error:
             raise UploadUnavailable("private Applier unavailable") from error
         result = wire.FinalizedUpload(_final_status(value))
-        encode_finalize(result)
         return result
 
 
 __all__ = (
-    "AuthorizedPut",
+    "AuthorizedPilePut",
     "UploadBroker",
     "UploadUnavailable",
-    "encode_finalize",
-    "encode_open",
-    "finalize_document",
-    "open_document",
 )

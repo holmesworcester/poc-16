@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
+from core.limits import MAX_PILE_BYTES
 from core.staged_intent import staging_key
 from deploy.cloudflare_upload.boundary import Deployment
 from deploy.cloudflare_upload.signer import (
@@ -23,7 +23,7 @@ from deploy.cloudflare_upload.signer import (
     PAYLOAD,
     R2UploadSigner,
 )
-from deploy.upload_broker import AuthorizedPut
+from deploy.upload_broker import AuthorizedPilePut
 from deploy.upload_session import valid_provider_binding
 from deploy.upload_wire import UploadCapability
 
@@ -43,8 +43,8 @@ SIGNED_HEADERS = (
     "if-none-match",
 )
 EXPECTED_SIGNATURE = (
-    "ad6d3a4e08ca5760822948e8736cb721"
-    "293c02405aac26f50e42d0b5370abbb8"
+    "a48032abe505331ab4d22c8c17792ff2"
+    "edaa62615376d75791e9cf2f3f1012d6"
 )
 
 
@@ -66,22 +66,15 @@ def deployment(**changes):
 
 
 def authorized(
-        *, object_class="obj", digest=DIGEST, size=42,
+        *, digest=DIGEST, size=42,
         workspace=WORKSPACE, member=MEMBER, session=SESSION,
-        content_type="application/octet-stream",
-        not_after_ms=FIXED_MS + 5_500, key=None):
-    key = staging_key(
-        workspace, member, session, object_class, digest
-    ) if key is None else key
-    return AuthorizedPut(
+        not_after_ms=FIXED_MS + 5_500):
+    return AuthorizedPilePut(
         workspace,
         member,
         session,
-        object_class,
         digest,
         size,
-        content_type,
-        key,
         not_after_ms,
     )
 
@@ -120,7 +113,7 @@ def _signature_valid(
         capability, secret, now_ms, body, *, access_key=ACCESS,
         method=None, url=None, headers=None):
     """Independent strict verifier for the request surface under test."""
-    method = capability.method if method is None else method
+    method = "PUT" if method is None else method
     url = capability.url if url is None else url
     headers = dict(capability.headers) \
         if headers is None else dict(headers)
@@ -240,7 +233,7 @@ class Staging:
 def test_frozen_vector_matches_exact_path_style_r2_sigv4():
     capability = signer().sign(authorized())
     expected_key = staging_key(
-        WORKSPACE, MEMBER, SESSION, "obj", DIGEST)
+        WORKSPACE, MEMBER, SESSION, "pile", DIGEST)
     expected_url = (
         "https://" + "a" * 32 + ".r2.cloudflarestorage.com/"
         "poc16-untrusted-ingress/" + expected_key
@@ -256,7 +249,6 @@ def test_frozen_vector_matches_exact_path_style_r2_sigv4():
     )
 
     assert capability == UploadCapability(
-        "PUT",
         expected_url,
         (
             ("content-length", "42"),
@@ -399,22 +391,15 @@ def test_deadline_rounds_down_and_subsecond_authority_fails_closed():
             not_after_ms=FIXED_MS + 999))
 
 
-@pytest.mark.parametrize(
-    "object_class,maximum",
-    (("obj", MAX_OBJECT_BYTES), ("pile", MAX_PILE_BYTES)),
-)
-def test_object_and_pile_metadata_accept_n_and_reject_n_plus_one(
-        object_class, maximum):
-    accepted = signer().sign(authorized(
-        object_class=object_class, size=maximum))
+def test_pile_metadata_accepts_n_and_rejects_n_plus_one():
+    accepted = signer().sign(authorized(size=MAX_PILE_BYTES))
 
-    assert dict(accepted.headers)["content-length"] == str(maximum)
+    assert dict(accepted.headers)["content-length"] == str(MAX_PILE_BYTES)
     expected = staging_key(
-        WORKSPACE, MEMBER, SESSION, object_class, DIGEST)
+        WORKSPACE, MEMBER, SESSION, "pile", DIGEST)
     assert urlsplit(accepted.url).path.endswith("/" + expected)
     with pytest.raises(ValueError, match="size"):
-        signer().sign(authorized(
-            object_class=object_class, size=maximum + 1))
+        signer().sign(authorized(size=MAX_PILE_BYTES + 1))
 
 
 @pytest.mark.parametrize(
@@ -423,10 +408,7 @@ def test_object_and_pile_metadata_accept_n_and_reject_n_plus_one(
         lambda value: replace(value, workspace="9" * 64),
         lambda value: replace(value, member="E" * 16),
         lambda value: replace(value, session="F" * 32),
-        lambda value: replace(value, object_class="root"),
         lambda value: replace(value, digest="9" * 63),
-        lambda value: replace(value, key="root"),
-        lambda value: replace(value, content_type="text/plain"),
         lambda value: replace(value, size=-1),
         lambda value: replace(value, not_after_ms="later"),
     ),

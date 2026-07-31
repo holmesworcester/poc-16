@@ -43,6 +43,12 @@ class UploadLeaf:
     digest: str
     size: int
 
+    def __post_init__(self):
+        if not valid_fid(self.digest) \
+                or type(self.size) is not int \
+                or not 0 <= self.size <= MAX_PILE_BYTES:
+            raise ValueError("upload pile")
+
 
 @dataclass(frozen=True, slots=True)
 class SessionKey:
@@ -134,8 +140,7 @@ def valid_provider_binding(value):
 
 def valid_leaf(value, *, maximum=MAX_PILE_BYTES):
     return isinstance(value, UploadLeaf) \
-        and valid_fid(value.digest) \
-        and _uint(value.size, maximum)
+        and value.size <= maximum
 
 
 def valid_cursor(value):

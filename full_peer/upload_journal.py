@@ -20,11 +20,11 @@ from core.limits import MAX_PILE_BYTES, PAGE_BATCH, decode_json
 from core.shape import valid_fid
 from core.staged_intent import MEMBER_HEX_BYTES, SESSION_HEX_BYTES
 from deploy.upload_session import UploadLeaf, valid_cursor
-from deploy.upload_wire import UploadCapability
+import deploy.upload_wire as wire
 
 
 SOURCE_SCHEMA = "poc16-upload-source-v2"
-SESSION_SCHEMA = "poc16-upload-client-session-v3"
+SESSION_SCHEMA = "poc16-upload-client-session-v4"
 ABANDONED_SCHEMA = "poc16-upload-abandoned-v2"
 MAX_SOURCE_DOCUMENT_BYTES = 1_024
 MAX_SESSION_DOCUMENT_BYTES = 16 * 1_024
@@ -131,40 +131,13 @@ def _read(path, maximum, label):
     return raw
 
 
-def _capability_document(value):
-    return {
-        "expires_at_ms": value.expires_at_ms,
-        "headers": [list(pair) for pair in value.headers],
-        "method": value.method,
-        "url": value.url,
-    }
-
-
-def _capability(value):
-    try:
-        if not isinstance(value, dict) or set(value) != {
-                "expires_at_ms", "headers", "method", "url"} \
-                or not isinstance(value["headers"], list):
-            raise ValueError
-        headers = tuple(tuple(pair) for pair in value["headers"])
-        if any(len(pair) != 2 or not all(
-                isinstance(item, str) for item in pair) for pair in headers):
-            raise ValueError
-        return UploadCapability(
-            value["method"], value["url"], headers,
-            value["expires_at_ms"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise UploadJournalError("invalid upload capability") from error
-
-
 @dataclass(frozen=True, slots=True)
 class UploadProgress:
     source_id: str
     session: str
     cursor: str
     expires_at_ms: int
-    capability: UploadCapability
-    uploaded: bool = False
+    capability: wire.UploadCapability
     status: str | None = None
 
 
@@ -374,15 +347,12 @@ class UploadSource:
                 or not valid_cursor(value.cursor) \
                 or type(value.expires_at_ms) is not int \
                 or value.expires_at_ms < 0 \
-                or not isinstance(capability, UploadCapability) \
-                or capability.method != "PUT" \
+                or not isinstance(capability, wire.UploadCapability) \
                 or not isinstance(capability.url, str) \
                 or not isinstance(capability.headers, tuple) \
                 or type(capability.expires_at_ms) is not int \
                 or capability.expires_at_ms > value.expires_at_ms \
-                or type(value.uploaded) is not bool \
-                or value.status is not None and value.status not in _TERMINAL \
-                or value.status is not None and not value.uploaded:
+                or value.status is not None and value.status not in _TERMINAL:
             raise UploadJournalError("invalid upload session")
         return value
 
@@ -399,7 +369,7 @@ class UploadSource:
             if canon(value) != raw or not isinstance(value, dict) \
                     or set(value) != {
                         "capability", "cursor", "expires_at_ms", "schema",
-                        "session", "source_id", "status", "uploaded",
+                        "session", "source_id", "status",
                     } \
                     or value["schema"] != SESSION_SCHEMA:
                 raise ValueError
@@ -408,8 +378,7 @@ class UploadSource:
                 value["session"],
                 value["cursor"],
                 value["expires_at_ms"],
-                _capability(value["capability"]),
-                value["uploaded"],
+                wire.decode_capability_document(value["capability"]),
                 value["status"],
             ))
         except (KeyError, TypeError, ValueError) as error:
@@ -418,40 +387,32 @@ class UploadSource:
     def _write_progress(self, value):
         value = self._checked_progress(value)
         _replace(self.session_path, canon({
-            "capability": _capability_document(value.capability),
+            "capability": wire.capability_document(value.capability),
             "cursor": value.cursor,
             "expires_at_ms": value.expires_at_ms,
             "schema": SESSION_SCHEMA,
             "session": value.session,
             "source_id": value.source_id,
             "status": value.status,
-            "uploaded": value.uploaded,
         }))
 
-    def save(self, value):
-        """Advance one lease without rolling back PUT or terminal evidence."""
+    def advance(self, value):
+        """Install a lease, replace a live lease, or make it terminal."""
         with self.writer():
             current = self.progress()
             value = self._checked_progress(value)
-            if current is not None and (
-                    value.session != current.session
-                    or value.cursor != current.cursor
-                    or value.expires_at_ms != current.expires_at_ms
-                    or value.capability != current.capability
-                    or current.uploaded and not value.uploaded
-                    or current.status is not None and value.status != current.status):
+            if current is None and value.status is not None:
                 raise UploadJournalError("upload session rollback")
-            self._write_progress(value)
-
-    def restart(self, value):
-        """Replace a nonterminal lease; old authority can only write staging."""
-        with self.writer():
-            current = self.progress()
-            value = self._checked_progress(value)
-            if current is not None and (
-                    current.status is not None
-                    or value.session == current.session):
-                raise UploadJournalError("upload session restart")
+            if current is not None:
+                same = value.session == current.session
+                if current.status is not None and value != current \
+                        or same and (
+                            value.cursor != current.cursor
+                            or value.expires_at_ms != current.expires_at_ms
+                            or value.capability != current.capability
+                        ) \
+                        or not same and value.status is not None:
+                    raise UploadJournalError("upload session rollback")
             self._write_progress(value)
 
     def abandonment(self):

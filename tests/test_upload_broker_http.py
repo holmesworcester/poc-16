@@ -14,7 +14,7 @@ from core.crypto import h
 from core.fact import canon
 from core.http import AsyncFromSyncReader
 from core.limits import MAX_MINT_REQUEST_BYTES
-from deploy.upload_broker import AuthorizedPut, UploadBroker
+from deploy.upload_broker import AuthorizedPilePut, UploadBroker
 from deploy.upload_broker_http import (
     MAX_UPLOAD_HTTP_HEADER_VALUE_BYTES,
     MAX_UPLOAD_HTTP_METHOD_BYTES,
@@ -53,16 +53,15 @@ class Signer:
         self.clock, self.puts, self.failure = clock, [], None
 
     def sign(self, put):
-        assert isinstance(put, AuthorizedPut)
+        assert isinstance(put, AuthorizedPilePut)
         if self.failure is not None:
             raise self.failure
         self.puts.append(put)
         return UploadCapability(
-            "PUT",
             "https://bucket.example/" + put.key + "?signature=opaque",
             tuple(sorted((
                 ("content-length", str(put.size)),
-                ("content-type", put.content_type),
+                ("content-type", "application/octet-stream"),
                 ("if-none-match", "*"),
             ))),
             min(self.clock() + 60_000, put.not_after_ms),

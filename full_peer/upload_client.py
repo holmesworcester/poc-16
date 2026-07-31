@@ -1,6 +1,5 @@
 """Full-peer ``OPEN -> exact pile PUT -> FINALIZE`` state machine."""
 from dataclasses import dataclass, replace
-from enum import Enum
 from typing import BinaryIO, Protocol
 from urllib.parse import unquote, urlsplit
 
@@ -43,15 +42,11 @@ class UploadRetryable(UploadClientError):
     pass
 
 
-class UploadOutcomeUnknown(UploadClientError):
+class UploadOutcomeUnknown(UploadRetryable):
     pass
 
 
-class PutResult(Enum):
-    CREATED = "created"
-
-
-CREATED = PutResult.CREATED
+CREATED = object()
 
 
 class BrokerTransport(Protocol):
@@ -63,14 +58,13 @@ class BrokerTransport(Protocol):
 class PutTransport(Protocol):
     def put(
             self, capability: wire.UploadCapability, body: BinaryIO,
-            size: int) -> PutResult: ...
+            size: int) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
 class UploadResult:
     source_id: str
     session: str
-    pile_digest: str
     status: str
 
 
@@ -114,15 +108,11 @@ class UploadClient:
             raise UploadClientError("upload client clock")
         return value
 
-    def _capability(self, grant, progress):
-        if not isinstance(grant, wire.GrantedUpload) \
-                or grant.leaf != self.source.pile:
-            raise UploadProtocolError("broker changed upload pile")
-        cap = grant.capability
+    def _capability(self, cap, progress):
         parsed = urlsplit(cap.url) if isinstance(
             cap, wire.UploadCapability) and isinstance(cap.url, str) else None
-        if parsed is None or cap.method != "PUT" \
-                or parsed.scheme != "https" or not parsed.hostname \
+        if parsed is None or parsed.scheme != "https" \
+                or not parsed.hostname \
                 or (parsed.scheme, parsed.hostname, parsed.port) \
                 != self.provider_origin \
                 or parsed.username is not None or parsed.password is not None \
@@ -154,7 +144,7 @@ class UploadClient:
             raise UploadProtocolError("upload capability authority mismatch")
         return cap
 
-    def _open(self, proof_factory, previous=None):
+    def _open(self, proof_factory):
         proof = proof_factory() if callable(proof_factory) else proof_factory
         result = self.broker.open(proof, self.source.pile)
         now = self._now()
@@ -171,18 +161,14 @@ class UploadClient:
             result.session,
             result.cursor,
             result.expires_at_ms,
-            result.pile.capability,
+            result.capability,
         )
-        capability = self._capability(result.pile, provisional)
+        capability = self._capability(result.capability, provisional)
         progress = replace(provisional, capability=capability)
-        if previous is None:
-            self.source.save(progress)
-        else:
-            self.source.restart(progress)
+        self.source.advance(progress)
         return progress
 
     def _put(self, progress):
-        failure = None
         for _ in range(self.put_attempts):
             self.source.verify_body()
             try:
@@ -194,19 +180,13 @@ class UploadClient:
                 # response was lost. FINALIZE performs the authoritative hash
                 # check, so a conflict is safe to probe rather than restart.
                 break
-            except (UploadOutcomeUnknown, UploadRetryable) as error:
-                failure = error
+            except UploadRetryable:
                 continue
             if receipt is not CREATED:
                 raise UploadProtocolError("invalid provider PUT receipt")
             break
-        else:
-            if failure is None:
-                raise UploadRetryable("provider PUT did not complete")
-            # FINALIZE distinguishes a successful lost response from a body
-            # that is still absent. A retryable result keeps this lease live.
-        progress = replace(progress, uploaded=True)
-        self.source.save(progress)
+        # FINALIZE distinguishes a successful lost response from a body that
+        # is still absent. A retryable result keeps this lease live.
         return progress
 
     def _finalize(self, progress):
@@ -216,7 +196,7 @@ class UploadClient:
         if result.status == "retryable":
             raise UploadRetryable("recipient has not applied the exact pile")
         progress = replace(progress, status=result.status)
-        self.source.save(progress)
+        self.source.advance(progress)
         return progress
 
     def run(self, proof_factory):
@@ -231,8 +211,16 @@ class UploadClient:
             return self._result(progress)
         if progress is None:
             progress = self._open(proof_factory)
-        elif progress.expires_at_ms <= self._now():
-            progress = self._open(proof_factory, progress)
+        elif min(
+                progress.expires_at_ms,
+                progress.capability.expires_at_ms,
+        ) <= self._now():
+            progress = self._open(proof_factory)
+        else:
+            # Local retry state is attacker-controlled after a crash.  Pin it
+            # back to this source, provider, and exact session key before the
+            # first resumed network effect.
+            self._capability(progress.capability, progress)
         while True:
             try:
                 progress = self._put(progress)
@@ -241,7 +229,7 @@ class UploadClient:
                 if restarts >= self.session_restarts:
                     raise
                 restarts += 1
-                progress = self._open(proof_factory, progress)
+                progress = self._open(proof_factory)
                 continue
             return self._result(progress)
 
@@ -249,7 +237,6 @@ class UploadClient:
         return UploadResult(
             self.source.source_id,
             progress.session,
-            self.source.pile.digest,
             progress.status,
         )
 

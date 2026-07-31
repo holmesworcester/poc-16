@@ -7,12 +7,8 @@ It never receives provider bodies or returns exception text.
 """
 from core.limits import PayloadTooLarge
 from core.http import Response
-from deploy.upload_broker import (
-    UploadBroker,
-    UploadUnavailable,
-    encode_finalize,
-    encode_open,
-)
+from deploy.upload_broker import UploadBroker, UploadUnavailable
+import deploy.upload_wire as wire
 from deploy.upload_session import InvalidUploadSession
 from deploy.upload_wire import (
     InvalidUploadWire,
@@ -150,11 +146,11 @@ class UploadBrokerEndpoint:
             if path == "/upload/open":
                 result = await self.broker.open(
                     *decode_open_request(body))
-                encoded = encode_open(result)
+                encoded = wire.encode_open_response(result)
             else:
                 result = await self.broker.finalize(
                     decode_finalize_request(body))
-                encoded = encode_finalize(result)
+                encoded = wire.encode_finalize_response(result)
         except PayloadTooLarge:
             return upload_error_response(413)
         except UnsupportedUploadMediaType:

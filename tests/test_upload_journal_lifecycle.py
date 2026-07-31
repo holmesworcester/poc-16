@@ -38,7 +38,7 @@ def progress(source, number=1, **changes):
         f"cursor_{number}",
         expiry,
         UploadCapability(
-            "PUT", f"https://bucket.example/pile/{session}",
+            f"https://bucket.example/pile/{session}",
             (("if-none-match", "*"),), expiry - 1),
     )
     return replace(value, **changes)
@@ -54,7 +54,7 @@ def _hold_writer(path, ready, release):
 def _die_before_replace(path, value):
     source = UploadSource.load(path)
     journal.os.replace = lambda _old, _new: os._exit(23)
-    source.save(value)
+    source.advance(value)
 
 
 def test_builder_is_atomic_content_addressed_and_deduplicates(tmp_path):
@@ -90,28 +90,24 @@ def test_discovery_is_bounded_sorted_and_restart_safe(tmp_path):
 def test_session_updates_are_atomic_monotone_and_restartable(tmp_path):
     source = build(tmp_path / "uploads")
     first = progress(source)
-    source.save(first)
-    delivered = replace(first, uploaded=True)
-    source.save(delivered)
-
-    with pytest.raises(UploadJournalError, match="rollback"):
-        source.save(first)
+    source.advance(first)
+    source.advance(first)
     second = progress(source, 2)
-    source.restart(second)
+    source.advance(second)
     assert UploadSource.load(source.path).progress() == second
 
-    done = replace(second, uploaded=True, status="applied")
-    source.save(done)
-    with pytest.raises(UploadJournalError, match="restart"):
-        source.restart(progress(source, 3))
+    done = replace(second, status="applied")
+    source.advance(done)
+    with pytest.raises(UploadJournalError, match="rollback"):
+        source.advance(progress(source, 3))
     assert source.status(NOW).state == "completed"
 
 
 def test_crash_before_replace_preserves_the_last_complete_session(tmp_path):
     source = build(tmp_path / "uploads")
     retained = progress(source)
-    source.save(retained)
-    advanced = replace(retained, uploaded=True)
+    source.advance(retained)
+    advanced = progress(source, 2)
     context = multiprocessing.get_context("spawn")
 
     process = context.Process(
@@ -124,14 +120,15 @@ def test_crash_before_replace_preserves_the_last_complete_session(tmp_path):
 
     assert process.exitcode == 23
     assert source.progress() == retained
-    source.save(advanced)
+    source.advance(advanced)
     assert source.progress() == advanced
     assert not list(Path(source.path).glob(".session.json*"))
 
 
 def test_writer_fence_is_cross_process_and_collection_never_races(tmp_path):
     source = build(tmp_path / "uploads")
-    source.save(replace(progress(source), uploaded=True, status="noop"))
+    source.advance(progress(source))
+    source.advance(replace(progress(source), status="noop"))
     context = multiprocessing.get_context("spawn")
     ready, release = context.Event(), context.Event()
     process = context.Process(
@@ -155,7 +152,7 @@ def test_abandonment_is_local_immediate_and_does_not_delete_bucket_data(
         tmp_path):
     root = tmp_path / "uploads"
     source = build(root)
-    source.save(progress(source))
+    source.advance(progress(source))
 
     assert source.status(NOW).state == "active"
     abandoned = source.abandon(NOW)
@@ -173,8 +170,8 @@ def test_abandonment_is_local_immediate_and_does_not_delete_bucket_data(
 ])
 def test_terminal_apply_results_are_collectible(tmp_path, status, state):
     source = build(tmp_path / status)
-    source.save(replace(
-        progress(source), uploaded=True, status=status))
+    source.advance(progress(source))
+    source.advance(replace(progress(source), status=status))
     row = source.status(NOW)
     assert row.state == state and row.collectible
     assert UploadSource.collect(
@@ -184,7 +181,7 @@ def test_terminal_apply_results_are_collectible(tmp_path, status, state):
 def test_expiry_alone_is_not_completion_but_user_may_abandon(tmp_path):
     source = build(tmp_path / "uploads")
     lease = progress(source)
-    source.save(lease)
+    source.advance(lease)
     row = source.status(lease.expires_at_ms)
     assert row.state == "expired" and not row.collectible
     with pytest.raises(UploadJournalError, match="not collectible"):

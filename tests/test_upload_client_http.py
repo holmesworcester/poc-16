@@ -7,21 +7,23 @@ import urllib.error
 import pytest
 
 from core.crypto import h
-from deploy.upload_broker import finalize_document, open_document
+from core.fact import canon
 from deploy.upload_session import UploadLeaf
 from deploy.upload_wire import (
     FINALIZE_REQUEST_SCHEMA,
     OPEN_REQUEST_SCHEMA,
     FinalizedUpload,
-    GrantedUpload,
     OpenedUpload,
     UploadCapability,
+    finalize_document,
+    open_document,
 )
 from full_peer.upload_client import (
     CREATED,
     UploadCapabilityRejected,
     UploadCreateConflict,
     UploadOutcomeUnknown,
+    UploadProtocolError,
     UploadRetryable,
     UploadSessionRejected,
 )
@@ -33,7 +35,6 @@ CURSOR = "opaque_cursor"
 EXPIRY = 50_000
 PILE = UploadLeaf(h(b"pile"), 4)
 CAP = UploadCapability(
-    "PUT",
     "https://bucket.example/ingress/pile?signature=opaque",
     tuple(sorted((
         ("content-length", "4"),
@@ -59,10 +60,15 @@ class Response:
         return self.raw[:maximum]
 
 
+class RawResponse(Response):
+    def __init__(self, raw):
+        self.raw = raw
+
+
 def test_broker_transport_has_exactly_open_and_finalize_documents():
     calls = []
     opened_value = OpenedUpload(
-        SESSION, CURSOR, GrantedUpload(PILE, CAP), EXPIRY)
+        SESSION, CURSOR, CAP, EXPIRY)
     replies = [open_document(opened_value),
                finalize_document(FinalizedUpload("applied"))]
 
@@ -85,6 +91,24 @@ def test_broker_transport_has_exactly_open_and_finalize_documents():
     assert calls[0][1]["pile"] == {
         "digest": PILE.digest, "size": PILE.size}
     assert all(call[2:] == ("POST", 7) for call in calls)
+
+
+@pytest.mark.parametrize("mutate", (
+    lambda raw: b" " + raw,
+    lambda raw: raw.replace(
+        b'"schema":', b'"schema":"duplicate","schema":', 1),
+))
+def test_broker_transport_rejects_noncanonical_or_ambiguous_responses(
+        mutate):
+    raw = canon(open_document(OpenedUpload(
+        SESSION, CURSOR, CAP, EXPIRY)))
+    transport = HttpBrokerTransport(
+        "https://broker.example",
+        opener=lambda *_args, **_kwargs: RawResponse(mutate(raw)),
+    )
+
+    with pytest.raises(UploadProtocolError, match="invalid OPEN response"):
+        transport.open(b"proof", PILE)
 
 
 @pytest.mark.parametrize("status,error", [

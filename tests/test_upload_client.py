@@ -1,13 +1,14 @@
 """Crash/retry refinement tests for one exact-pile sender."""
 from dataclasses import replace
+import json
 from urllib.parse import unquote, urlsplit
 
 import pytest
 
 from core.staged_intent import staging_key
+from core.fact import canon
 from deploy.upload_wire import (
     FinalizedUpload,
-    GrantedUpload,
     OpenedUpload,
     UploadCapability,
 )
@@ -54,7 +55,7 @@ class Broker:
             self.source.workspace, self.source.member, session,
             "pile", pile.digest)
         capability = UploadCapability(
-            "PUT", f"https://s3.example/{key}?opaque=1",
+            f"https://s3.example/{key}?opaque=1",
             tuple(sorted((
                 ("content-length", str(pile.size)),
                 ("content-type", "application/octet-stream"),
@@ -65,7 +66,7 @@ class Broker:
         if self.mutate_capability is not None:
             capability = self.mutate_capability(capability)
         return OpenedUpload(
-            session, f"cursor_{count}", GrantedUpload(pile, capability),
+            session, f"cursor_{count}", capability,
             self.clock() + 60_000)
 
     def finalize(self, cursor):
@@ -123,11 +124,10 @@ def test_sender_puts_one_exact_immutable_pile_then_pokes_applier(tmp_path):
 
     progress = upload.progress()
     assert result.status == "applied"
-    assert result.pile_digest == upload.pile.digest
     assert len(provider.calls) == 1
     assert provider.calls[0][1] == upload.verify_body()
     assert broker.finalizes == [progress.cursor]
-    assert progress.uploaded and progress.status == "applied"
+    assert progress.status == "applied"
     assert upload.status(clock()).collectible
 
 
@@ -154,7 +154,7 @@ def test_absent_or_delayed_pile_is_retryable_on_same_persisted_lease(tmp_path):
     with pytest.raises(UploadRetryable):
         client(upload, broker, provider, clock, put_attempts=2).run(b"proof")
     retained = upload.progress()
-    assert retained.uploaded and retained.status is None
+    assert retained.status is None
     assert len(broker.opens) == 1
 
     broker.status = "applied"
@@ -231,3 +231,23 @@ def test_terminal_result_is_idempotent_and_body_tampering_fails_closed(
         client(other, other_broker, other_provider, clock).run(b"proof")
     assert len(other_broker.opens) == 1
     assert not other_provider.calls and not other_broker.finalizes
+
+
+def test_resumed_journal_cannot_redirect_the_exact_put(tmp_path):
+    upload, clock = source(tmp_path), Clock()
+    broker, provider = Broker(upload, clock), Provider()
+    broker.status = "retryable"
+    with pytest.raises(UploadRetryable):
+        client(upload, broker, provider, clock, put_attempts=1).run(b"proof")
+
+    document = json.loads(open(upload.session_path, "rb").read())
+    document["capability"]["url"] = \
+        "https://attacker.example/collect-the-pile"
+    with open(upload.session_path, "wb") as out:
+        out.write(canon(document))
+
+    resumed = type(upload).load(upload.path)
+    effects = Provider()
+    with pytest.raises(UploadProtocolError, match="capability"):
+        client(resumed, broker, effects, clock).run(b"unused")
+    assert not effects.calls

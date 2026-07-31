@@ -14,9 +14,8 @@ import re
 import time
 from urllib.parse import quote, urlsplit
 
-from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES
-from core.staged_intent import staging_key
-from deploy.upload_broker import AuthorizedPut
+from core.limits import MAX_PILE_BYTES
+from deploy.upload_broker import AuthorizedPilePut
 from deploy.upload_wire import UPLOAD_CONTENT_TYPE, UploadCapability
 from .boundary import Deployment
 
@@ -304,31 +303,21 @@ class R2UploadSigner:
 
     def _authorized(self, put):
         deployment = self.deployment
-        if not isinstance(put, AuthorizedPut) \
+        if not isinstance(put, AuthorizedPilePut) \
                 or put.workspace != deployment.workspace \
-                or put.key != staging_key(
-                    put.workspace,
-                    put.member,
-                    put.session,
-                    put.object_class,
-                    put.digest,
-                ) \
                 or not put.key.startswith(deployment.ingress_prefix + "/") \
-                or put.content_type != UPLOAD_CONTENT_TYPE \
                 or type(put.size) is not int or put.size < 0 \
                 or type(put.not_after_ms) is not int \
                 or put.not_after_ms < 0:
             raise ValueError("authorized R2 upload")
-        maximum = MAX_OBJECT_BYTES \
-            if put.object_class == "obj" else MAX_PILE_BYTES
-        if put.size > maximum:
+        if put.size > MAX_PILE_BYTES:
             raise ValueError("authorized R2 upload size")
 
     def sign(self, put):
         self._authorized(put)
         headers = {
             "content-length": str(put.size),
-            "content-type": put.content_type,
+            "content-type": UPLOAD_CONTENT_TYPE,
             "if-none-match": "*",
         }
         request = self._sigv4.sign(
@@ -339,8 +328,9 @@ class R2UploadSigner:
             self.deployment.presign_ttl_seconds,
             not_after_ms=put.not_after_ms,
         )
+        if request.method != "PUT":
+            raise RuntimeError("R2 presigner method")
         return UploadCapability(
-            request.method,
             request.url,
             request.headers,
             request.expires_at_ms,

@@ -12,7 +12,7 @@ from core.http import AsyncFromSyncReader, HttpGate
 from core.limits import MAX_PILE_BYTES
 from core.staged_intent import staging_key
 from deploy.upload_broker import (
-    AuthorizedPut,
+    AuthorizedPilePut,
     MAX_CAPABILITY_HEADERS,
     MAX_CAPABILITY_HEADER_NAME_BYTES,
     MAX_CAPABILITY_HEADER_VALUE_BYTES,
@@ -20,10 +20,6 @@ from deploy.upload_broker import (
     MAX_CAPABILITY_URL_BYTES,
     UploadBroker,
     UploadUnavailable,
-    encode_finalize,
-    encode_open,
-    finalize_document,
-    open_document,
 )
 from deploy.upload_session import (
     InvalidUploadSession,
@@ -32,7 +28,15 @@ from deploy.upload_session import (
     UploadLeaf,
     UploadSessionPolicy,
 )
-from deploy.upload_wire import FinalizedUpload, OpenedUpload, UploadCapability
+from deploy.upload_wire import (
+    FinalizedUpload,
+    OpenedUpload,
+    UploadCapability,
+    encode_finalize_response,
+    encode_open_response,
+    finalize_document,
+    open_document,
+)
 from facts.auth import request
 from full_peer.node import FullPeer
 from .util import add_member
@@ -58,14 +62,13 @@ class RecordingSigner:
         self.clock, self.lifetime_ms, self.puts = clock, lifetime_ms, []
 
     def sign(self, put):
-        assert isinstance(put, AuthorizedPut)
+        assert isinstance(put, AuthorizedPilePut)
         self.puts.append(put)
         return UploadCapability(
-            "PUT",
             "https://uploads.example/" + put.key + "?signed=1",
             (
                 ("content-length", str(put.size)),
-                ("content-type", put.content_type),
+                ("content-type", "application/octet-stream"),
                 ("if-none-match", "*"),
                 ("x-checksum-sha256", put.digest),
             ),
@@ -136,18 +139,18 @@ def test_open_returns_the_only_put_and_finalize_invokes_exact_applier(tmp_path):
     result = opened(broker, proof, leaf)
     assert isinstance(result, OpenedUpload)
     assert result.session == "d" * 32
-    assert result.pile.leaf == leaf
     assert len(signer.puts) == 1
     expected = staging_key(
         workspace, member, result.session, "pile", leaf.digest)
     assert signer.puts[0].key == expected
-    assert signer.puts[0].object_class == "pile"
+    assert expected in result.capability.url
 
     final = asyncio.run(broker.finalize(result.cursor))
     assert final == FinalizedUpload("applied")
     assert apply.calls == [(expected, leaf.digest)]
-    assert json.loads(encode_open(result)) == open_document(result)
-    assert json.loads(encode_finalize(final)) == finalize_document(final)
+    assert json.loads(encode_open_response(result)) == open_document(result)
+    assert json.loads(encode_finalize_response(final)) == \
+        finalize_document(final)
 
 
 @pytest.mark.parametrize("raw_status,wire_status", [
@@ -215,8 +218,8 @@ def test_removal_is_observed_by_new_open_not_an_existing_fixed_lease(tmp_path):
 
 def test_pile_limit_and_bad_authorization_fail_before_provider_effects(tmp_path):
     _, _, _, proof, _, signer, apply, broker = world(tmp_path)
-    with pytest.raises(InvalidUploadSession, match="OPEN metadata"):
-        opened(broker, proof, UploadLeaf("e" * 64, MAX_PILE_BYTES + 1))
+    with pytest.raises(ValueError, match="upload pile"):
+        UploadLeaf("e" * 64, MAX_PILE_BYTES + 1)
     with pytest.raises(InvalidUploadSession, match="authorization"):
         opened(broker, b"not a proof")
     assert signer.puts == []
@@ -235,24 +238,23 @@ class StaticSigner:
 
 @pytest.mark.parametrize("capability", (
     UploadCapability(
-        "PUT", "https://uploads.example/pile?" +
+        "https://uploads.example/pile?" +
         "q" * (MAX_CAPABILITY_QUERY_BYTES + 1), (), NOW + 1),
     UploadCapability(
-        "PUT", "https://uploads.example/" +
+        "https://uploads.example/" +
         "x" * MAX_CAPABILITY_URL_BYTES, (), NOW + 1),
     UploadCapability(
-        "PUT", "https://uploads.example/pile",
+        "https://uploads.example/pile",
         tuple((f"x-{index}", "v")
               for index in range(MAX_CAPABILITY_HEADERS + 1)), NOW + 1),
     UploadCapability(
-        "PUT", "https://uploads.example/pile",
+        "https://uploads.example/pile",
         (("x" * (MAX_CAPABILITY_HEADER_NAME_BYTES + 1), "v"),), NOW + 1),
     UploadCapability(
-        "PUT", "https://uploads.example/pile",
+        "https://uploads.example/pile",
         (("x", "v" * (MAX_CAPABILITY_HEADER_VALUE_BYTES + 1)),), NOW + 1),
-    UploadCapability("GET", "https://uploads.example/pile", (), NOW + 1),
-    UploadCapability("PUT", "http://uploads.example/pile", (), NOW + 1),
-    UploadCapability("PUT", "https://uploads.example/pile", (), NOW),
+    UploadCapability("http://uploads.example/pile", (), NOW + 1),
+    UploadCapability("https://uploads.example/pile", (), NOW),
 ))
 def test_provider_signer_output_is_bounded_and_session_scoped(
         tmp_path, capability):

@@ -19,8 +19,7 @@ from deploy.aws_upload_broker.signer import (
     S3UploadConfig,
     S3UploadSigner,
 )
-from core.staged_intent import staging_key
-from deploy.upload_broker import AuthorizedPut
+from deploy.upload_broker import AuthorizedPilePut
 
 
 ACCESS_KEY = "AKIDEXAMPLE"
@@ -34,20 +33,14 @@ BODY = b"provider-enforced collision-resistant body"
 DIGEST = hashlib.sha256(BODY).hexdigest()
 
 
-def authorized(
-        object_class="pile", body=BODY,
-        not_after_ms=FIXED_TIME_MS + 60_000):
+def authorized(body=BODY, not_after_ms=FIXED_TIME_MS + 60_000):
     digest = hashlib.sha256(body).hexdigest()
-    return AuthorizedPut(
+    return AuthorizedPilePut(
         WORKSPACE,
         MEMBER,
         SESSION,
-        object_class,
         digest,
         len(body),
-        "application/octet-stream",
-        staging_key(
-            WORKSPACE, MEMBER, SESSION, object_class, digest),
         not_after_ms,
     )
 
@@ -145,7 +138,7 @@ class DeterministicS3:
     def execute(
             self, capability, body, *,
             method=None, url=None, headers=None, now=None):
-        method = method or capability.method
+        method = method or "PUT"
         url = url or capability.url
         headers = dict(capability.headers) \
             if headers is None else dict(headers)
@@ -389,22 +382,18 @@ def test_signer_rejects_a_provider_response_that_drops_constraints():
 @pytest.mark.parametrize(
     "put",
     (
-        lambda value: AuthorizedPut(
+        lambda value: AuthorizedPilePut(
+            "z" * 64, value.member, value.session,
+            value.digest, value.size, value.not_after_ms),
+        lambda value: AuthorizedPilePut(
             value.workspace, value.member, value.session,
-            value.object_class, value.digest, value.size,
-            value.content_type, "root", value.not_after_ms),
-        lambda value: AuthorizedPut(
+            value.digest, -1, value.not_after_ms),
+        lambda value: AuthorizedPilePut(
             value.workspace, value.member, value.session,
-            value.object_class, value.digest, -1,
-            value.content_type, value.key, value.not_after_ms),
-        lambda value: AuthorizedPut(
+            "z" * 64, value.size, value.not_after_ms),
+        lambda value: AuthorizedPilePut(
             value.workspace, value.member, value.session,
-            value.object_class, value.digest, value.size,
-            "text/plain", value.key, value.not_after_ms),
-        lambda value: AuthorizedPut(
-            value.workspace, value.member, value.session,
-            value.object_class, value.digest, value.size,
-            value.content_type, value.key, "later"),
+            value.digest, value.size, "later"),
     ),
 )
 def test_signer_does_not_treat_forged_internal_values_as_authority(put):
@@ -428,16 +417,10 @@ def test_presigner_role_and_cors_expose_only_exact_put_authority():
     statement = document["Statement"][0]
 
     assert statement["Action"] == "s3:PutObject"
-    assert statement["Resource"] == [
-        (
-            "arn:aws:s3:::direct-upload-bucket/"
-            f"ingress/v1/workspaces/{WORKSPACE}/objects/*"
-        ),
-        (
-            "arn:aws:s3:::direct-upload-bucket/"
-            f"ingress/v1/workspaces/{WORKSPACE}/piles/*"
-        ),
-    ]
+    assert statement["Resource"] == (
+        "arn:aws:s3:::direct-upload-bucket/"
+        f"ingress/v1/workspaces/{WORKSPACE}/piles/*"
+    )
     assert statement["Condition"] == {
         "Null": {"s3:if-none-match": "false"},
         "NumericLessThanEquals": {"s3:signatureAge": 90_000},

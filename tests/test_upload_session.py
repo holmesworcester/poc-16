@@ -101,11 +101,18 @@ def test_key_rotation_verifies_old_lease_but_cannot_extend_it():
     {"workspace": "x"},
     {"member": "B" * 16},
     {"session": "0" * 31},
-    {"pile": UploadLeaf("d" * 63, 1)},
-    {"pile": UploadLeaf("d" * 64, -1)},
     {"key_id": "missing1"},
 ])
 def test_state_shape_is_exact(change):
     codec = SessionTokenCodec(POLICY, "fake-s3:bucket")
     with pytest.raises(InvalidUploadSession):
         codec.encode(state(**change))
+
+
+@pytest.mark.parametrize("digest,size", [
+    ("d" * 63, 1),
+    ("d" * 64, -1),
+])
+def test_pile_identity_is_intrinsically_valid(digest, size):
+    with pytest.raises(ValueError, match="upload pile"):
+        UploadLeaf(digest, size)

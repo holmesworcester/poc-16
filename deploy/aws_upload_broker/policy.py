@@ -17,13 +17,10 @@ def presigner_policy(config, workspace, *, partition="aws"):
         raise ValueError("workspace")
     if partition not in _PARTITIONS:
         raise ValueError("AWS partition")
-    resources = [
-        (
-            f"arn:{partition}:s3:::{config.bucket}/"
-            f"{staging_prefix(workspace, object_class)}*"
-        )
-        for object_class in ("obj", "pile")
-    ]
+    resource = (
+        f"arn:{partition}:s3:::{config.bucket}/"
+        f"{staging_prefix(workspace, 'pile')}*"
+    )
     string_equals = {
         "s3:authType": "REST-QUERY-STRING",
         "s3:signatureversion": "AWS4-HMAC-SHA256",
@@ -43,7 +40,7 @@ def presigner_policy(config, workspace, *, partition="aws"):
                 "StringEquals": string_equals,
             },
             "Effect": "Allow",
-            "Resource": resources,
+            "Resource": resource,
             "Sid": "PresignOneWorkspaceIngressPut",
         }],
         "Version": "2012-10-17",
