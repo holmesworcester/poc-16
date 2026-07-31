@@ -185,6 +185,9 @@ def test_template_has_only_broker_authority_and_external_data_ownership():
     assert "Action: s3:PutObject" in template
     assert "Action: s3:ListBucket" in template
     assert "s3:DeleteObject" not in template
+    assert "s3:DeleteObjectVersion" not in template
+    assert "s3:PutLifecycleConfiguration" not in template
+    assert "s3:DeleteLifecycleConfiguration" not in template
     assert "s3:PutBucket" not in template
     assert "s3:DeleteBucket" not in template
     assert "s3:PutObjectAcl" not in template
@@ -289,6 +292,10 @@ def test_ingress_lifecycle_preflight_accepts_absence_and_rejects_rules(
         candidate.expected_owner)
 
     monkeypatch.setattr(
+        manage, "_json_command", lambda _command: {"Rules": []})
+    manage._assert_no_ingress_lifecycle(candidate)
+
+    monkeypatch.setattr(
         manage,
         "_json_command",
         lambda _command: {"Rules": [{
@@ -298,6 +305,25 @@ def test_ingress_lifecycle_preflight_accepts_absence_and_rejects_rules(
     )
     with pytest.raises(RuntimeError, match="erase acknowledged"):
         manage._assert_no_ingress_lifecycle(candidate)
+
+
+@pytest.mark.parametrize("outcome", (
+    {},
+    {"Rules": None},
+    subprocess.CalledProcessError(
+        254, ["aws"], stderr="AccessDenied"),
+))
+def test_ingress_lifecycle_preflight_rejects_ambiguous_outcome(
+        monkeypatch, outcome):
+    def lookup(_command):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(manage, "_json_command", lookup)
+
+    with pytest.raises(RuntimeError, match="lifecycle"):
+        manage._assert_no_ingress_lifecycle(args())
 
 
 def test_deploy_checks_ingress_retention_before_build_or_stack_mutation(

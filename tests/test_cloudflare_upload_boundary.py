@@ -716,28 +716,29 @@ def test_lock_control_request_is_exact_bounded_and_jurisdiction_scoped(
     candidate = deployment(jurisdiction="eu")
     desired = ingress_lock(candidate)
     seen = []
+    results = iter(({}, None))
 
     def open_lock(request, timeout):
         seen.append((request, timeout))
         return _APIResponse({
             "success": True,
-            "result": desired,
+            "result": next(results),
         })
 
     monkeypatch.setattr(manage, "urlopen", open_lock)
-    observed = manage._lock_request(
+    observed = manage._read_ingress_lock(
         candidate,
         {"CLOUDFLARE_API_TOKEN": "control-secret"},
-        "GET",
     )
-    replaced = manage._lock_request(
+    replaced = manage._write_ingress_lock(
         candidate,
         {"CLOUDFLARE_API_TOKEN": "control-secret"},
-        "PUT",
         desired,
     )
 
-    assert observed == replaced == desired
+    # The GET schema makes rules optional; the PUT result is opaque.
+    assert observed == {"rules": []}
+    assert replaced is None
     request, timeout = seen[0]
     assert request.full_url.endswith(
         f"/r2/buckets/{candidate.ingress_bucket}/lock")
@@ -750,6 +751,24 @@ def test_lock_control_request_is_exact_bounded_and_jurisdiction_scoped(
     assert json.loads(request.data) == desired
     assert request.get_header("Content-type") == "application/json"
     assert timeout == manage.SETTINGS_TIMEOUT_SECONDS
+
+
+def test_lock_reader_rejects_malformed_provider_document(monkeypatch):
+    candidate = deployment()
+    monkeypatch.setattr(
+        manage,
+        "urlopen",
+        lambda _request, timeout: _APIResponse({
+            "success": True,
+            "result": {"rules": None},
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="malformed.*bucket lock"):
+        manage._read_ingress_lock(
+            candidate,
+            {"CLOUDFLARE_API_TOKEN": "control-secret"},
+        )
 
 
 def test_lock_install_reconciles_crash_and_refuses_foreign_rules():

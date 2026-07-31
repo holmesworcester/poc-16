@@ -487,22 +487,37 @@ def _control_request(
     return envelope["result"]
 
 
-def _lock_request(deployment, environment, method, document=None):
-    """Read or replace the exact dedicated-ingress lock configuration."""
+def _lock_headers(deployment):
     headers = {}
     if deployment.jurisdiction != "default":
         headers["cf-r2-jurisdiction"] = deployment.jurisdiction
+    return headers
+
+
+def _read_ingress_lock(deployment, environment):
+    """Read the documented lock document, normalizing omitted rules."""
     result = _control_request(
         _lock_url(deployment),
         environment,
-        method=method,
-        document=document,
-        headers=headers,
+        headers=_lock_headers(deployment),
     )
-    if not isinstance(result, dict) \
-            or not isinstance(result.get("rules"), list):
+    if not isinstance(result, dict):
         raise RuntimeError("malformed Cloudflare ingress bucket lock")
-    return {"rules": result["rules"]}
+    rules = result.get("rules", [])
+    if not isinstance(rules, list):
+        raise RuntimeError("malformed Cloudflare ingress bucket lock")
+    return {"rules": rules}
+
+
+def _write_ingress_lock(deployment, environment, document):
+    """Replace the lock document; the provider's response is opaque."""
+    _control_request(
+        _lock_url(deployment),
+        environment,
+        method="PUT",
+        document=document,
+        headers=_lock_headers(deployment),
+    )
 
 
 def ensure_ingress_lock(
@@ -510,18 +525,19 @@ def ensure_ingress_lock(
     """Install the lock under one exclusive bucket-configuration owner.
 
     Cloudflare's whole-document lock PUT has no compare precondition.  The
-    ``exclusive-dedicated`` profile therefore permits only this deployment to
-    mutate this bucket's lock configuration.  A pre-existing foreign document
-    is refused, concurrent same-owner installers write identical bytes, and a
-    lost PUT response is reconciled by the following exact GET.  This read
-    check does not pretend to defeat a racing account administrator.
+    ``exclusive-dedicated`` profile therefore declares this deployment the
+    sole configuration writer; Cloudflare does not enforce bucket-scoped REST
+    configuration tokens.  A pre-existing foreign document is refused,
+    concurrent same-owner installers write identical bytes, and a lost PUT
+    response is reconciled by the following exact GET.  This read check does
+    not pretend to defeat a racing account administrator.
     """
     desired = generated_boundary(deployment)["ingress_lock"]
     reader = reader or (
-        lambda: _lock_request(deployment, environment, "GET"))
+        lambda: _read_ingress_lock(deployment, environment))
     writer = writer or (
-        lambda value: _lock_request(
-            deployment, environment, "PUT", value))
+        lambda value: _write_ingress_lock(
+            deployment, environment, value))
     observed = reader()
     if observed == desired:
         return False

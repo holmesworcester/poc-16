@@ -431,8 +431,8 @@ def test_live_r2_lock_defeats_parent_mutation():
         jurisdiction=os.environ.get("POC16_R2_JURISDICTION", "default"),
         presign_ttl_seconds=30,
     )
-    observed = cloudflare_manage._lock_request(
-        candidate, os.environ, "GET")
+    observed = cloudflare_manage._read_ingress_lock(
+        candidate, os.environ)
     assert observed == ingress_lock(candidate), (
         "refusing a destructive parent probe without the exact "
         "indefinite ingress lock")

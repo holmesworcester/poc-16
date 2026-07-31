@@ -345,11 +345,11 @@ The Applier never deletes the client marker or detached ingress objects.
 F10 retires only the marker's separately reserved internal generation. Until
 an exact abandoned-session collection rule is proved, provider policy retains
 the complete client-writable namespace: the AWS broker role is conditional
-PUT-only and installs no lifecycle, while Cloudflare uses an indefinite R2
-bucket lock over the ingress prefix. Missing attachments do not block valid
-fact admission; immutable page receipts and a non-authoritative cursor let
-concurrent Workers duplicate bounded work without skipping completion or
-corrupting the tree.
+PUT-only and deployment admits only a no-lifecycle bucket, while Cloudflare
+uses an indefinite R2 bucket lock over the ingress prefix. Missing attachments
+do not block valid fact admission; immutable page receipts and a
+non-authoritative cursor let concurrent Workers duplicate bounded work without
+skipping completion or corrupting the tree.
 
 The marker's member component names the broker-authenticated upload session,
 not the author of every fact in a relayed closure. Per-fact signatures and
@@ -449,7 +449,10 @@ python3 -m deploy.aws_upload_broker.manage deploy --create \
 Deployment refuses an ingress bucket with any lifecycle rules:
 [S3 bucket policies do not stop lifecycle actions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html),
 so a rule could otherwise hide or expire acknowledged work. Stack removal
-never adds one and leaves the bucket intact.
+never adds one and leaves the bucket intact. The bucket is externally owned;
+later lifecycle or bucket-policy mutation by its storage administrator is
+outside broker-parent compromise, so that configuration authority must remain
+deploy-only and absent from both Lambda roles.
 
 Deploy the database-free Applier:
 
@@ -498,14 +501,18 @@ export CF_R2_BUCKET_ITEM_WRITE_PERMISSION_ID=WRITE_PERMISSION_ID32
 export CF_UPLOAD_ISSUER=ISSUER
 ```
 
-Set a narrowly scoped `CLOUDFLARE_API_TOKEN` with Worker control and exclusive
-R2 bucket-configuration authority for this dedicated ingress bucket, the two
-canonical/ingress S3 credential pairs, and `UPLOAD_SESSION_KEYRING`.
-Cloudflare's lock update replaces one whole document and exposes no CAS
-precondition, so this profile permits no second lock-configuration writer.
-Concurrent instances of this same deployment write the same document;
-deployment refuses a foreign document already present, but does not claim to
-defeat a racing account administrator. For first creation set:
+Set a deploy-only `CLOUDFLARE_API_TOKEN` with account-scoped Workers Scripts
+Edit and Workers R2 Storage Edit, the two canonical/ingress S3 credential
+pairs, and `UPLOAD_SESSION_KEYRING`. Cloudflare's REST configuration authority
+is [account-scoped](https://developers.cloudflare.com/r2/api/tokens/); its
+bucket-scoped object tokens cannot call this API. The
+`exclusive-dedicated` profile is therefore an operator invariant: this
+deployment is the sole lock-configuration writer for its dedicated ingress
+bucket, and the control token is never a Worker secret. Lock update replaces
+one whole document and exposes no CAS precondition. Concurrent instances of
+this same deployment write the same document; deployment refuses a foreign
+document already present, but does not claim to defeat a racing account
+administrator or compromised control token. For first creation set:
 
 ```sh
 export CF_UPLOAD_CREATE=1

@@ -463,16 +463,22 @@ internal generation.
 Acknowledgement creates an availability obligation for the exact client
 object. No receipt, F10 spend, Worker teardown, or unproved age heuristic may
 retire it. AWS confines the broker parent to conditional `PutObject` and
-installs no ingress lifecycle. R2's S3 parent necessarily has broader verbs,
-so a provider bucket lock retains the complete ingress prefix indefinitely;
-the lock applies to existing and future objects and takes precedence over
-lifecycle. Deployment verifies that exact lock before either Worker is
-installed and removal leaves it in place. The lock API replaces the complete
-rule document without CAS, so the ingress bucket and a narrowly scoped
-configuration token have one exclusive deployment owner. Concurrent
+requires an exact no-lifecycle audit of its externally owned ingress bucket.
+Later S3 bucket-configuration mutation is outside broker-parent compromise;
+that authority is deploy-only and absent from both Lambda roles. R2's S3
+parent necessarily has broader verbs, so a provider bucket lock retains the
+complete ingress prefix indefinitely; the lock applies to existing and future
+objects and takes precedence over lifecycle. Deployment verifies that exact
+lock before either Worker is installed and removal leaves it in place. The
+lock API replaces the complete rule document without CAS. R2 REST
+configuration authority is account-scoped. Its deploy-only control token is
+not a Worker secret, and
+`exclusive-dedicated` is an operator invariant: one deployment process is the
+sole designated lock writer for the dedicated ingress bucket. Concurrent
 same-owner installers write the same document; a racing account administrator
-is outside the broker-parent boundary. A future collector must first prove a
-separate, exact abandoned-session lifecycle and cannot impersonate F10.
+or compromised control token is outside the broker-parent boundary. A future
+collector must first prove a separate, exact abandoned-session lifecycle and
+cannot impersonate F10.
 
 Notifications and paginated LIST are discovery hints only. Scheduled bounded
 rescans are the progress path. Missing attachments do not block fact
