@@ -168,6 +168,10 @@ outbound-child exit closes that private dial, appears under
 it does not stop unrelated peers or bypass a failed request. Configuration is
 bounded to 64 peers per workspace, 128 Iroh peers per full peer, one 64-hex
 endpoint ID, and the Rust wrapper's 4 KiB decoded ticket ceiling.
+The wrapper admits at most its configured connection count; it immediately
+refuses overflow Iroh attempts before they can open a stream or loopback
+upstream. One setup deadline covers handshake, first stream, and upstream
+connect together, and one session deadline bounds the complete byte copy.
 Only one due background connection start is attempted per monitor turn, and
 an outbound child that never reports readiness is terminated and reaped
 inside the daemon's shutdown budget.

@@ -255,6 +255,15 @@ def repository_bytes(node_dir, workspace):
     }
 
 
+def http_request_threads():
+    return {
+        thread.ident for thread in threading.enumerate()
+        if thread.is_alive()
+        and thread.ident is not None
+        and "(process_request_thread)" in thread.name
+    }
+
+
 def mint(target, workspace, pile, identity_secret):
     status, body, _ = call(
         target,
@@ -296,6 +305,164 @@ def iroh_binary(tmp_path_factory):
         timeout=300,
     )
     return target / "debug" / "poc16-iroh"
+
+
+@pytest.mark.parametrize(
+    "ticket",
+    (
+        "not-valid-base64!",
+        base64.urlsafe_b64encode(b"\xff").decode().rstrip("="),
+        "A" * ((((4096 + 2) // 3) * 4) + 1),
+    ),
+    ids=("base64", "postcard", "oversized"),
+)
+def test_malformed_ticket_exits_before_binding_a_forwarder(
+        iroh_binary, ticket):
+    completed = subprocess.run(
+        [
+            str(iroh_binary),
+            "forward",
+            f"--peer={ticket}",
+            "--loopback",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert "READY " not in completed.stdout
+    assert "ticket" in completed.stderr.lower()
+
+
+def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
+        tmp_path, iroh_binary):
+    state = tmp_path / "peer"
+    bootstrap = FullPeer(str(state))
+    workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
+    identity_secret = bootstrap.identity(workspace)[0]
+    issued = now_ms()
+    pile = encode_pile(request.payload(
+        bootstrap, workspace, "sync", issued + 300_000, issued))
+    bootstrap.sql(workspace).db.close()
+
+    service = FullPeerService(
+        str(state),
+        0,
+        cadence=3600,
+        control_port=0,
+    )
+    children = []
+    hostile_sockets = []
+    try:
+        service.start()
+        direct = address(service.data_address)
+        token, capability = mint(
+            direct, workspace, pile, identity_secret)
+        assert capability == "sync-v1/full"
+        expected = call(
+            direct,
+            "GET",
+            f"/root?ws={workspace}",
+            token=token,
+        )
+        assert expected[0] == 200
+        baseline = repository_bytes(state, workspace)
+        wait_until(
+            lambda: not http_request_threads(),
+            message="direct HTTP request thread cleanup",
+        )
+        baseline_threads = http_request_threads()
+
+        acceptor, accepting = ready_process([
+            str(iroh_binary),
+            "serve",
+            "--upstream", f"{direct[0]}:{direct[1]}",
+            "--loopback",
+            "--max-connections", "2",
+            "--setup-seconds", "1",
+            "--session-seconds", "2",
+        ])
+        children.append(acceptor)
+        forward_targets = []
+        for _ in range(3):
+            forwarder, forwarded = ready_process([
+                str(iroh_binary),
+                "forward",
+                f"--peer={accepting['peer']}",
+                "--loopback",
+                "--setup-seconds", "5",
+                "--session-seconds", "5",
+            ])
+            children.append(forwarder)
+            forward_targets.append(address("http://" + forwarded["listen"]))
+
+        for target in forward_targets[:2]:
+            stream = socket.create_connection(target, timeout=5)
+            stream.sendall(b"G")
+            hostile_sockets.append(stream)
+
+        wait_until(
+            lambda: len(http_request_threads() - baseline_threads) == 2,
+            message="both admitted Iroh streams to reach core HTTP",
+        )
+        admitted_threads = http_request_threads() - baseline_threads
+        assert len(admitted_threads) == 2
+
+        overflow_results = []
+        overflow_errors = []
+        overflow = threading.Thread(
+            target=lambda: _capture_error(
+                overflow_errors,
+                lambda: overflow_results.append(call(
+                    forward_targets[2],
+                    "GET",
+                    f"/root?ws={workspace}",
+                    token=token,
+                )),
+            ),
+        )
+        overflow.start()
+        overflow.join(2)
+        assert not overflow.is_alive()
+        assert overflow_results == []
+        assert len(overflow_errors) == 1
+        assert isinstance(
+            overflow_errors[0],
+            (OSError, http.client.HTTPException),
+        )
+        assert http_request_threads() - baseline_threads == admitted_threads
+        assert repository_bytes(state, workspace) == baseline
+
+        for stream in hostile_sockets:
+            stream.settimeout(5)
+            try:
+                closed = stream.recv(1)
+            except (ConnectionResetError, BrokenPipeError):
+                closed = b""
+            assert closed == b""
+        wait_until(
+            lambda: http_request_threads() == baseline_threads,
+            message="expired hostile core HTTP handlers to exit",
+        )
+
+        recovered_at = time.monotonic()
+        recovered = call(
+            forward_targets[2],
+            "GET",
+            f"/root?ws={workspace}",
+            token=token,
+        )
+        assert time.monotonic() - recovered_at < 2
+        assert recovered == expected
+        assert repository_bytes(state, workspace) == baseline
+    finally:
+        for stream in hostile_sockets:
+            stream.close()
+        for process in reversed(children):
+            stop(process)
+        service.close()
 
 
 def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(

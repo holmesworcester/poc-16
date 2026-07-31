@@ -246,8 +246,8 @@ fn decode_secret(raw: &[u8]) -> Result<SecretKey> {
 ///
 /// # Errors
 ///
-/// Returns an error when the endpoint closes unexpectedly or the connection
-/// limiter cannot continue.  Per-connection failures are isolated.
+/// Returns an error for an invalid connection bound. The loop ends normally
+/// when the endpoint closes; per-connection failures are isolated.
 pub async fn serve(
     endpoint: Endpoint,
     upstream: SocketAddr,
@@ -260,10 +260,10 @@ pub async fn serve(
     }
     let permits = Arc::new(Semaphore::new(max_connections));
     while let Some(incoming) = endpoint.accept().await {
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
-            .await
-            .context("Iroh connection limiter closed")?;
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            incoming.refuse();
+            continue;
+        };
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(error) = accept_one(incoming, upstream, setup_timeout, session_timeout).await
@@ -281,20 +281,20 @@ async fn accept_one(
     setup_timeout: Duration,
     session_timeout: Duration,
 ) -> Result<()> {
-    let connection = timeout(setup_timeout, incoming)
-        .await
-        .context("Iroh handshake timed out")?
-        .context("Iroh handshake failed")?;
-    let (send, recv) = timeout(setup_timeout, connection.accept_bi())
-        .await
-        .context("Iroh stream open timed out")?
-        .context("accept Iroh byte stream")?;
-    let local = timeout(setup_timeout, TcpStream::connect(upstream))
-        .await
-        .context("core HTTP connect timed out")?
-        .context("connect core HTTP listener")?;
-    copy_with_limit(local, recv, send, session_timeout).await?;
-    Ok(())
+    let (local, recv, send) = timeout(setup_timeout, async {
+        let connection = incoming.await.context("Iroh handshake failed")?;
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .context("accept Iroh byte stream")?;
+        let local = TcpStream::connect(upstream)
+            .await
+            .context("connect core HTTP listener")?;
+        Ok::<_, anyhow::Error>((local, recv, send))
+    })
+    .await
+    .context("Iroh byte stream setup timed out")??;
+    copy_with_limit(local, recv, send, session_timeout).await
 }
 
 /// Accept local TCP connections and wrap each one in a fresh Iroh
@@ -317,11 +317,11 @@ pub async fn forward(
     }
     let permits = Arc::new(Semaphore::new(max_connections));
     loop {
-        let (local, _) = listener.accept().await.context("accept local TCP")?;
         let permit = Arc::clone(&permits)
             .acquire_owned()
             .await
             .context("local connection limiter closed")?;
+        let (local, _) = listener.accept().await.context("accept local TCP")?;
         let endpoint = endpoint.clone();
         let remote = remote.clone();
         tokio::spawn(async move {
@@ -342,16 +342,20 @@ async fn forward_one(
     setup_timeout: Duration,
     session_timeout: Duration,
 ) -> Result<()> {
-    let connection = timeout(setup_timeout, endpoint.connect(remote, ALPN))
-        .await
-        .context("Iroh dial timed out")?
-        .context("dial Iroh peer")?;
-    let (send, recv) = timeout(setup_timeout, connection.open_bi())
-        .await
-        .context("Iroh stream open timed out")?
-        .context("open Iroh byte stream")?;
-    copy_with_limit(local, recv, send, session_timeout).await?;
-    Ok(())
+    let (recv, send) = timeout(setup_timeout, async {
+        let connection = endpoint
+            .connect(remote, ALPN)
+            .await
+            .context("dial Iroh peer")?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .context("open Iroh byte stream")?;
+        Ok::<_, anyhow::Error>((recv, send))
+    })
+    .await
+    .context("Iroh byte stream setup timed out")??;
+    copy_with_limit(local, recv, send, session_timeout).await
 }
 
 async fn copy_with_limit(
@@ -387,9 +391,94 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use iroh::endpoint::VarInt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+    use tokio::time::{Instant, sleep};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+    const ADVERSARIAL_SETUP_TIMEOUT: Duration = Duration::from_secs(1);
+    const ADVERSARIAL_SESSION_TIMEOUT: Duration = Duration::from_secs(2);
+    const OVERFLOW_ATTEMPTS: u8 = 16;
+
+    async fn seeded_endpoint(seed: u8, accepts_connections: bool) -> Endpoint {
+        bind_endpoint(
+            true,
+            accepts_connections,
+            Some(SecretKey::from_bytes(&[seed; 32])),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn loopback_server(seed: u8) -> (Endpoint, EndpointAddr) {
+        let endpoint = seeded_endpoint(seed, true).await;
+        let address = reachable_addr(&endpoint, true).await.unwrap();
+        (endpoint, address)
+    }
+
+    async fn ordinary_round_trip(endpoint: &Endpoint, remote: &EndpointAddr) -> Result<Vec<u8>> {
+        let connection = endpoint
+            .connect(remote.clone(), ALPN)
+            .await
+            .context("connect ordinary test client")?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .context("open ordinary test stream")?;
+        send.write_all(b"L")
+            .await
+            .context("write ordinary test request")?;
+        send.shutdown()
+            .await
+            .context("finish ordinary test request")?;
+        recv.read_to_end(1024)
+            .await
+            .context("read ordinary test response")
+    }
+
+    fn spawn_upstream(listener: TcpListener) -> (mpsc::UnboundedReceiver<u8>, JoinHandle<()>) {
+        let (seen, received) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut marker = [0];
+                    if stream.read_exact(&mut marker).await.is_err() {
+                        return;
+                    }
+                    let _ = seen.send(marker[0]);
+                    match marker[0] {
+                        b'L' => {
+                            let _ = stream.write_all(b"ordinary response").await;
+                            let _ = stream.shutdown().await;
+                        }
+                        b'H' => loop {
+                            sleep(Duration::from_millis(20)).await;
+                            if stream.write_all(b".").await.is_err() {
+                                break;
+                            }
+                        },
+                        _ => {
+                            let mut discarded = Vec::new();
+                            let _ = stream.read_to_end(&mut discarded).await;
+                        }
+                    }
+                });
+            }
+        });
+        (received, task)
+    }
+
+    async fn stop_server(endpoint: &Endpoint, task: JoinHandle<Result<()>>) {
+        endpoint.close().await;
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("server task did not stop")
+            .expect("server task panicked")
+            .expect("server returned an error");
+    }
 
     #[test]
     fn ticket_round_trip_and_bounds() {
@@ -560,5 +649,282 @@ mod tests {
         .unwrap();
         dialing.close().await;
         accepting.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_stalled_and_half_closed_streams_are_bounded_and_recover() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (mut received, upstream_task) = spawn_upstream(upstream);
+        let (accepting, remote) = loopback_server(11).await;
+        let accepting_for_task = accepting.clone();
+        let server = tokio::spawn(serve(
+            accepting_for_task,
+            upstream_addr,
+            2,
+            ADVERSARIAL_SETUP_TIMEOUT,
+            ADVERSARIAL_SESSION_TIMEOUT,
+        ));
+        let mut overflow_endpoints = Vec::new();
+        for seed in 14..14 + OVERFLOW_ATTEMPTS {
+            overflow_endpoints.push(seeded_endpoint(seed, false).await);
+        }
+
+        let stalled_endpoint = seeded_endpoint(12, false).await;
+        let stalled_connection = stalled_endpoint
+            .connect(remote.clone(), ALPN)
+            .await
+            .unwrap();
+        let (mut stalled_send, mut stalled_recv) = stalled_connection.open_bi().await.unwrap();
+        stalled_send.write_all(b"S").await.unwrap();
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'S')
+        );
+
+        let half_endpoint = seeded_endpoint(13, false).await;
+        let half_connection = half_endpoint.connect(remote.clone(), ALPN).await.unwrap();
+        let (mut half_send, mut half_recv) = half_connection.open_bi().await.unwrap();
+        half_send.write_all(b"H").await.unwrap();
+        half_send.shutdown().await.unwrap();
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'H')
+        );
+
+        let overflow_started = Instant::now();
+        let mut overflow = tokio::task::JoinSet::new();
+        for endpoint in &overflow_endpoints {
+            let endpoint = endpoint.clone();
+            let remote = remote.clone();
+            overflow.spawn(async move { endpoint.connect(remote, ALPN).await });
+        }
+        let rejected = timeout(ADVERSARIAL_SETUP_TIMEOUT, async {
+            let mut rejected = 0;
+            while let Some(result) = overflow.join_next().await {
+                assert!(result.unwrap().is_err());
+                rejected += 1;
+            }
+            rejected
+        })
+        .await
+        .expect("overflow handshakes were retained instead of refused");
+        assert_eq!(rejected, usize::from(OVERFLOW_ATTEMPTS));
+        assert!(overflow_started.elapsed() < ADVERSARIAL_SESSION_TIMEOUT);
+        assert_eq!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "overflow connection reached the upstream listener"
+        );
+
+        timeout(TEST_TIMEOUT, async {
+            let (stalled_result, half_result) =
+                tokio::join!(stalled_recv.read_to_end(1024), half_recv.read_to_end(1024),);
+            let _ = stalled_result;
+            let _ = half_result;
+        })
+        .await
+        .expect("admitted hostile streams survived their session deadline");
+        drop((stalled_send, half_send));
+
+        let legitimate_endpoint = seeded_endpoint(15, false).await;
+        assert_eq!(
+            ordinary_round_trip(&legitimate_endpoint, &remote)
+                .await
+                .unwrap(),
+            b"ordinary response"
+        );
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'L')
+        );
+        assert_eq!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "more upstream sessions were created than admitted permits"
+        );
+
+        drop((stalled_connection, half_connection));
+        stop_server(&accepting, server).await;
+        upstream_task.abort();
+        for endpoint in [stalled_endpoint, half_endpoint, legitimate_endpoint] {
+            endpoint.close().await;
+        }
+        for endpoint in overflow_endpoints {
+            endpoint.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handshake_without_stream_expires_and_the_next_attempt_succeeds() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (mut received, upstream_task) = spawn_upstream(upstream);
+        let (accepting, remote) = loopback_server(21).await;
+        let accepting_for_task = accepting.clone();
+        let server = tokio::spawn(serve(
+            accepting_for_task,
+            upstream_addr,
+            1,
+            ADVERSARIAL_SETUP_TIMEOUT,
+            Duration::from_secs(5),
+        ));
+
+        let hostile_endpoint = seeded_endpoint(22, false).await;
+        let hostile = hostile_endpoint
+            .connect(remote.clone(), ALPN)
+            .await
+            .unwrap();
+        let refused_endpoint = seeded_endpoint(23, false).await;
+        let refused = timeout(
+            ADVERSARIAL_SETUP_TIMEOUT,
+            ordinary_round_trip(&refused_endpoint, &remote),
+        )
+        .await
+        .expect("saturated handshake was retained instead of refused");
+        assert!(refused.is_err());
+        assert_eq!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "a handshake without a stream reached upstream"
+        );
+
+        timeout(TEST_TIMEOUT, hostile.closed())
+            .await
+            .expect("handshake without stream survived its setup deadline");
+        let legitimate_endpoint = seeded_endpoint(24, false).await;
+        assert_eq!(
+            ordinary_round_trip(&legitimate_endpoint, &remote)
+                .await
+                .unwrap(),
+            b"ordinary response"
+        );
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'L')
+        );
+
+        stop_server(&accepting, server).await;
+        upstream_task.abort();
+        for endpoint in [hostile_endpoint, refused_endpoint, legitimate_endpoint] {
+            endpoint.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn alpn_mismatch_and_stream_reset_release_the_only_permit() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (mut received, upstream_task) = spawn_upstream(upstream);
+        let (accepting, remote) = loopback_server(31).await;
+        let accepting_for_task = accepting.clone();
+        let server = tokio::spawn(serve(
+            accepting_for_task,
+            upstream_addr,
+            1,
+            ADVERSARIAL_SETUP_TIMEOUT,
+            Duration::from_secs(5),
+        ));
+
+        let mismatch_endpoint = seeded_endpoint(32, false).await;
+        let mismatch = timeout(
+            TEST_TIMEOUT,
+            mismatch_endpoint.connect(remote.clone(), b"wrong/alpn"),
+        )
+        .await
+        .unwrap();
+        assert!(mismatch.is_err());
+        assert_eq!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "ALPN mismatch reached upstream"
+        );
+
+        let reset_endpoint = seeded_endpoint(33, false).await;
+        let reset_connection = reset_endpoint.connect(remote.clone(), ALPN).await.unwrap();
+        let (mut reset_send, reset_recv) = reset_connection.open_bi().await.unwrap();
+        reset_send.write_all(b"R").await.unwrap();
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'R')
+        );
+        reset_send.reset(VarInt::from_u32(7)).unwrap();
+        drop((reset_send, reset_recv, reset_connection));
+
+        let legitimate_endpoint = seeded_endpoint(34, false).await;
+        let response = timeout(Duration::from_millis(500), async {
+            loop {
+                if let Ok(response) = ordinary_round_trip(&legitimate_endpoint, &remote).await {
+                    break response;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stream reset retained its permit until the session deadline");
+        assert_eq!(response, b"ordinary response");
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'L')
+        );
+
+        stop_server(&accepting, server).await;
+        upstream_task.abort();
+        for endpoint in [mismatch_endpoint, reset_endpoint, legitimate_endpoint] {
+            endpoint.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unavailable_upstream_does_not_wedge_the_next_stream() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let (accepting, remote) = loopback_server(41).await;
+        let accepting_for_task = accepting.clone();
+        let server = tokio::spawn(serve(
+            accepting_for_task,
+            upstream_addr,
+            1,
+            ADVERSARIAL_SETUP_TIMEOUT,
+            Duration::from_secs(5),
+        ));
+
+        let unavailable_endpoint = seeded_endpoint(42, false).await;
+        let unavailable_connection = unavailable_endpoint
+            .connect(remote.clone(), ALPN)
+            .await
+            .unwrap();
+        let (mut unavailable_send, mut unavailable_recv) =
+            unavailable_connection.open_bi().await.unwrap();
+        unavailable_send.write_all(b"U").await.unwrap();
+        unavailable_send.shutdown().await.unwrap();
+        let _ = timeout(
+            Duration::from_millis(500),
+            unavailable_recv.read_to_end(1024),
+        )
+        .await
+        .expect("unavailable upstream retained its permit");
+        drop((unavailable_send, unavailable_connection));
+
+        let upstream = TcpListener::bind(upstream_addr).await.unwrap();
+        let (mut received, upstream_task) = spawn_upstream(upstream);
+        let legitimate_endpoint = seeded_endpoint(43, false).await;
+        assert_eq!(
+            ordinary_round_trip(&legitimate_endpoint, &remote)
+                .await
+                .unwrap(),
+            b"ordinary response"
+        );
+        assert_eq!(
+            timeout(TEST_TIMEOUT, received.recv()).await.unwrap(),
+            Some(b'L')
+        );
+
+        stop_server(&accepting, server).await;
+        upstream_task.abort();
+        for endpoint in [unavailable_endpoint, legitimate_endpoint] {
+            endpoint.close().await;
+        }
     }
 }

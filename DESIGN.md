@@ -110,6 +110,12 @@ Iroh upstream. A stopped Iroh child or peer-data listener stops the service;
 normal process shutdown reaps the child. The endpoint key is stable across
 restart, but that stable identity is still not an authorization principal.
 
+Inbound connection permits are acquired without waiting: an attempt observed
+while every configured permit is occupied is refused before a per-connection
+task, bidirectional stream, or loopback upstream is created. Each admitted
+task has one aggregate setup deadline and one complete byte-session deadline,
+so hostile handshakes and half-closed streams return their exact permit.
+
 Full-peer keyring state stores bounded out-of-band records of the form
 `{kind: iroh, endpoint, ticket}`. It never stores a generated loopback URL.
 The endpoint field is a stable replacement/removal key for reachability only;
