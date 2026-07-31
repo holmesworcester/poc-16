@@ -19,6 +19,7 @@ from core.fact import canon
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from notifications.carrier import CarrierDelivery
+from notifications.delivery import delivery_domain_id
 from notifications.discovery import (
     BOOTSTRAP_BACKFILL,
     BOOTSTRAP_CURRENT,
@@ -66,18 +67,24 @@ def _workspace():
 
 
 def _notification_owner():
+    domain = _required("TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID")
+    partition = _required("TINYP2P_NOTIFICATION_AWS_PARTITION")
+    if not valid_fid(domain):
+        raise RuntimeError("invalid notification delivery domain")
+    if partition not in {"aws", "aws-cn", "aws-us-gov"}:
+        raise RuntimeError("invalid AWS partition")
     return h(canon([
-        "aws-notification-owner-v2",
-        _required("TINYP2P_NOTIFICATION_DEPLOYMENT_ID"),
-        _workspace(),
-        _required("TINYP2P_NOTIFICATION_CANONICAL_BUCKET"),
-        _required("TINYP2P_NOTIFICATION_CANONICAL_PREFIX"),
-        _required("TINYP2P_NOTIFICATION_STATE_BUCKET"),
-        _required("TINYP2P_NOTIFICATION_STATE_PREFIX"),
-        _owner(),
-        _required("TINYP2P_NOTIFICATION_SECRET_ARN"),
-        _required("TINYP2P_NOTIFICATION_SECRET_VERSION_ID"),
-        _required("TINYP2P_NOTIFICATION_PUSH_NODE_ID"),
+        "aws-notification-owner-v3",
+        ["partition", partition],
+        ["workspace", _workspace()],
+        ["repository", "s3", _owner(),
+         _required("TINYP2P_NOTIFICATION_CANONICAL_BUCKET"),
+         _required("TINYP2P_NOTIFICATION_CANONICAL_PREFIX")],
+        ["state", "s3", _owner(),
+         _required("TINYP2P_NOTIFICATION_STATE_BUCKET"),
+         _required("TINYP2P_NOTIFICATION_STATE_PREFIX")],
+        ["delivery-domain", domain],
+        ["completion", "fcm-acceptance-cursor-v1"],
     ]))
 
 
@@ -233,9 +240,16 @@ def _push_provider():
 
     secret, rows = _secret(
         boto3.client("secretsmanager", config=_sdk_config()))
-    if push_node_id(secret) != _required(
-            "TINYP2P_NOTIFICATION_PUSH_NODE_ID"):
+    push_node = push_node_id(secret)
+    if push_node != _required("TINYP2P_NOTIFICATION_PUSH_NODE_ID"):
         raise RuntimeError("notification push-node identity")
+    routes = tuple(sorted(
+        (row["application"], row["environment"],
+         row["credential"]["project_id"])
+        for row in rows))
+    if delivery_domain_id(push_node, routes) != _required(
+            "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID"):
+        raise RuntimeError("notification Firebase delivery domain")
     configured, apps, created = [], {}, []
     try:
         for index, row in enumerate(rows):
@@ -249,6 +263,9 @@ def _push_provider():
             item = firebase_admin.initialize_app(credential, name=name)
             apps[key] = item
             created.append(item)
+        provider = FirebaseAdminFcm(apps)
+        if provider.delivery_routes != routes:
+            raise ValueError("notification Firebase delivery domain")
     except Exception:
         for item in created:
             try:
@@ -256,7 +273,7 @@ def _push_provider():
             except Exception:
                 pass
         raise RuntimeError("notification Firebase initialization") from None
-    return secret, FirebaseAdminFcm(apps)
+    return secret, provider
 
 
 def _delivery_dependencies():

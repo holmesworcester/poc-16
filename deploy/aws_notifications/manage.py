@@ -16,12 +16,14 @@ from adapters.s3 import S3Config
 from core.object_store import validate_store_prefix
 from core.shape import valid_fid
 from deploy.notification_launch import require_mobile_launches, tree_digest
+from notifications.delivery import delivery_domain_id
 from notifications.hints import decode_hint
 
 from .config import (
     ALARM_ACTION_ARN_RE,
     BOOTSTRAP_RESULT_SCHEMA,
     BOOTSTRAP_SCHEMA,
+    CODE_SHA256_RE,
     DEPLOYMENT_ID_RE,
     DEPLOYMENT_ID_TAG,
     DEPLOYMENT_MARKER,
@@ -46,8 +48,13 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[1]
 STAGE = HERE / "stage"
 BUILD = HERE / ".aws-sam"
-PACKAGED = BUILD / "packaged.yaml"
+PACKAGED = BUILD / "packaged.json"
 LOG_RETENTION_DAYS = 14
+MAX_PACKAGED_TEMPLATE_BYTES = 1_048_576
+MAX_LAMBDA_ZIP_BYTES = 256 * 1024 * 1024
+SYNCHRONOUS_STORAGE_CLASSES = frozenset({
+    "STANDARD_IA", "ONEZONE_IA", "GLACIER_IR",
+})
 OPERABLE_STACK_STATUSES = frozenset({
     "CREATE_COMPLETE",
     "UPDATE_COMPLETE",
@@ -57,6 +64,9 @@ TEMPLATE_PARAMETERS = (
     "Enabled",
     "DeploymentId",
     "SoftwareDigest",
+    "ScannerCodeSha256",
+    "DeliveryCodeSha256",
+    "DeliveryDomainId",
     "WorkspaceId",
     "CanonicalBucketName",
     "CanonicalPrefix",
@@ -79,6 +89,10 @@ TEMPLATE_PARAMETERS = (
 TRAFFIC_RESOURCES = {
     "NotificationDeliveryMapping": "AWS::Lambda::EventSourceMapping",
     "NotificationScanSchedule": "AWS::Events::Rule",
+}
+CODE_HASH_PARAMETERS = {
+    "NotificationScannerFunction": "ScannerCodeSha256",
+    "NotificationDeliveryFunction": "DeliveryCodeSha256",
 }
 SOURCE_PACKAGES = ("facts", "notifications")
 SOURCE_TREES = ("adapters/aws", "adapters/gcp", "adapters/s3")
@@ -342,40 +356,116 @@ def _caller_account(args):
     return account
 
 
+def _lifecycle_prefix(rule, label):
+    def malformed():
+        raise RuntimeError(f"malformed {label} bucket lifecycle filter")
+
+    def valid_tag(value):
+        return isinstance(value, dict) and set(value) == {"Key", "Value"} \
+            and all(isinstance(item, str) for item in value.values())
+
+    if "Prefix" in rule and "Filter" in rule:
+        malformed()
+    if "Prefix" in rule:
+        prefix = rule["Prefix"]
+        if not isinstance(prefix, str):
+            malformed()
+        return prefix
+    if "Filter" not in rule:
+        return ""
+    value = rule["Filter"]
+    if not isinstance(value, dict):
+        malformed()
+    if not value:
+        return ""
+    direct = {
+        "Prefix", "Tag", "ObjectSizeGreaterThan", "ObjectSizeLessThan",
+    }
+    if len(value) != 1 or not set(value) <= direct | {"And"}:
+        malformed()
+    if "And" in value:
+        value = value["And"]
+        allowed = {
+            "Prefix", "Tags", "ObjectSizeGreaterThan", "ObjectSizeLessThan",
+        }
+        if not isinstance(value, dict) or not value \
+                or not set(value) <= allowed \
+                or "Tags" in value and (
+                    not isinstance(value["Tags"], list)
+                    or not value["Tags"]
+                    or not all(valid_tag(tag) for tag in value["Tags"])):
+            malformed()
+    elif "Tag" in value and not valid_tag(value["Tag"]):
+        malformed()
+    for size in ("ObjectSizeGreaterThan", "ObjectSizeLessThan"):
+        if size in value and (type(value[size]) is not int or value[size] < 0):
+            malformed()
+    prefix = value.get("Prefix", "")
+    if not isinstance(prefix, str):
+        malformed()
+    return prefix
+
+
+def _prefixes_overlap(rule_prefix, authoritative_prefix):
+    targets = (
+        authoritative_prefix + "/root",
+        authoritative_prefix + "/obj/",
+    )
+    return any(target.startswith(rule_prefix) or rule_prefix.startswith(target)
+               for target in targets)
+
+
 def _verify_state_lifecycle(args):
-    """Fail closed unless the dedicated state bucket has no expiration."""
-    try:
-        result = _run([
-            "aws", "s3api", "get-bucket-lifecycle-configuration",
-            "--bucket", args.state_bucket,
-            "--expected-bucket-owner", args.expected_owner,
-            "--output", "json",
-            *_provider_flags(args),
-        ], capture=True)
-    except subprocess.CalledProcessError as error:
-        detail = " ".join(value for value in (
-            error.stdout, error.stderr) if isinstance(value, str))
-        if "NoSuchLifecycleConfiguration" in detail:
-            return
-        raise RuntimeError(
-            "cannot verify notification-state bucket lifecycle") from error
-    try:
-        rules = json.loads(result.stdout)["Rules"]
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            "malformed notification-state bucket lifecycle") from error
-    if not isinstance(rules, list) or not all(
-            isinstance(rule, dict) for rule in rules):
-        raise RuntimeError("malformed notification-state bucket lifecycle")
-    for rule in rules:
-        if rule.get("Status") not in {"Enabled", "Disabled"}:
+    """Require every authoritative object to remain synchronously readable."""
+    for bucket, prefix, label in (
+            (args.canonical_bucket, args.canonical_prefix, "canonical"),
+            (args.state_bucket, args.state_prefix, "notification-state")):
+        try:
+            result = _run([
+                "aws", "s3api", "get-bucket-lifecycle-configuration",
+                "--bucket", bucket,
+                "--expected-bucket-owner", args.expected_owner,
+                "--output", "json",
+                *_provider_flags(args),
+            ], capture=True)
+        except subprocess.CalledProcessError as error:
+            detail = " ".join(value for value in (
+                error.stdout, error.stderr) if isinstance(value, str))
+            if "NoSuchLifecycleConfiguration" in detail:
+                continue
             raise RuntimeError(
-                "malformed notification-state bucket lifecycle")
-        if rule["Status"] == "Enabled" and any(
-                name in rule for name in (
+                f"cannot verify {label} bucket lifecycle") from error
+        try:
+            rules = json.loads(result.stdout)["Rules"]
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"malformed {label} bucket lifecycle") from error
+        if not isinstance(rules, list) or not all(
+                isinstance(rule, dict) for rule in rules):
+            raise RuntimeError(f"malformed {label} bucket lifecycle")
+        for rule in rules:
+            if rule.get("Status") not in {"Enabled", "Disabled"}:
+                raise RuntimeError(f"malformed {label} bucket lifecycle")
+            if rule["Status"] != "Enabled":
+                continue
+            rule_prefix = _lifecycle_prefix(rule, label)
+            if not _prefixes_overlap(rule_prefix, prefix):
+                continue
+            if any(name in rule for name in (
                     "Expiration", "NoncurrentVersionExpiration")):
-            raise RuntimeError(
-                "notification-state bucket has enabled expiration")
+                raise RuntimeError(
+                    f"{label} authoritative objects may expire")
+            for name in ("Transitions", "NoncurrentVersionTransitions"):
+                if name not in rule:
+                    continue
+                transitions = rule.get(name, ())
+                if not isinstance(transitions, list) or not transitions or any(
+                        not isinstance(row, dict)
+                        or row.get("StorageClass")
+                        not in SYNCHRONOUS_STORAGE_CLASSES
+                        for row in transitions):
+                    raise RuntimeError(
+                        f"{label} authoritative objects may require restore")
 
 
 def _secret_binding(args):
@@ -393,8 +483,13 @@ def _secret_binding(args):
                 or response.get("VersionId") \
                 != args.notification_secret_version_id:
             raise ValueError
-        secret, _rows = decode_secret(response.get("SecretString"))
-        return push_node_id(secret)
+        secret, rows = decode_secret(response.get("SecretString"))
+        push_node = push_node_id(secret)
+        routes = tuple(sorted(
+            (row["application"], row["environment"],
+             row["credential"]["project_id"])
+            for row in rows))
+        return push_node, delivery_domain_id(push_node, routes)
     except (AttributeError, RuntimeError, TypeError, ValueError,
             json.JSONDecodeError):
         raise RuntimeError("invalid pinned notification secret") from None
@@ -407,7 +502,7 @@ def _outputs(stack):
     }
 
 
-def _binding(args, push_node):
+def _binding(args, push_node, delivery_domain):
     return {
         "WorkspaceId": args.workspace,
         "CanonicalBucketName": args.canonical_bucket,
@@ -416,8 +511,8 @@ def _binding(args, push_node):
         "NotificationStatePrefix": args.state_prefix,
         "ExpectedBucketOwner": args.expected_owner,
         "NotificationSecretArn": args.notification_secret_arn,
-        "NotificationSecretVersionId": args.notification_secret_version_id,
         "PushNodeId": push_node,
+        "DeliveryDomainId": delivery_domain,
         "RepositoryKmsKeyArn": args.repository_kms_key_arn or "",
         "NotificationStateKmsKeyArn": args.state_kms_key_arn or "",
         "NotificationSecretKmsKeyArn": args.secret_kms_key_arn or "",
@@ -431,6 +526,26 @@ def _check_binding(outputs, expected):
     if changed:
         raise RuntimeError(
             "immutable notification binding differs: " + ", ".join(changed))
+
+
+def _check_requested_release(args, outputs):
+    expected = {
+        "NotificationSecretVersionId": args.notification_secret_version_id,
+        "NotificationScanScheduleExpression": args.schedule,
+        "NotificationScannerReservedConcurrency": str(
+            args.scanner_concurrency),
+        "NotificationDeliveryReservedConcurrency": str(
+            args.delivery_concurrency),
+        "NotificationMaxReceiveCount": str(args.max_receive_count),
+        "NotificationLogRetentionDays": str(LOG_RETENTION_DAYS),
+        "NotificationAlarmActionArn": args.alarm_action_arn or "",
+    }
+    changed = sorted(
+        name for name, value in expected.items()
+        if outputs.get(name) != value)
+    if changed:
+        raise RuntimeError(
+            "requested notification release differs: " + ", ".join(changed))
 
 
 def _checked_queues(args, outputs):
@@ -519,14 +634,36 @@ def _stack_for_deploy(args):
     return owned["StackId"], enabled, outputs
 
 
-def _parameter_values(args, enabled, push_node, software_digest):
+def _checked_code_hashes(code_hashes):
+    if not isinstance(code_hashes, dict) \
+            or set(code_hashes) != set(CODE_HASH_PARAMETERS.values()) \
+            or any(CODE_SHA256_RE.fullmatch(value or "") is None
+                   for value in code_hashes.values()):
+        raise TypeError("notification packaged code hashes")
+    return code_hashes
+
+
+def _output_code_hashes(outputs):
+    return _checked_code_hashes({
+        name: outputs.get(name) for name in CODE_HASH_PARAMETERS.values()
+    })
+
+
+def _parameter_values(
+        args, enabled, push_node, delivery_domain, software_digest,
+        code_hashes):
     if type(enabled) is not bool or not valid_fid(push_node) \
+            or not valid_fid(delivery_domain) \
             or not valid_fid(software_digest):
         raise TypeError("notification deployment state")
+    code_hashes = _checked_code_hashes(code_hashes)
     values = {
         "Enabled": "true" if enabled else "false",
         "DeploymentId": args.deployment_id,
         "SoftwareDigest": software_digest,
+        "ScannerCodeSha256": code_hashes["ScannerCodeSha256"],
+        "DeliveryCodeSha256": code_hashes["DeliveryCodeSha256"],
+        "DeliveryDomainId": delivery_domain,
         "WorkspaceId": args.workspace,
         "CanonicalBucketName": args.canonical_bucket,
         "CanonicalPrefix": args.canonical_prefix,
@@ -551,10 +688,13 @@ def _parameter_values(args, enabled, push_node, software_digest):
     return values
 
 
-def _parameters(args, enabled, push_node, software_digest):
+def _parameters(
+        args, enabled, push_node, delivery_domain, software_digest,
+        code_hashes):
     return tuple(
         f"{name}={value}" for name, value in _parameter_values(
-            args, enabled, push_node, software_digest).items())
+            args, enabled, push_node, delivery_domain, software_digest,
+            code_hashes).items())
 
 
 def _version_arns(outputs, stack_id=None):
@@ -569,23 +709,30 @@ def _version_arns(outputs, stack_id=None):
         raise RuntimeError("notification deployment has no immutable versions")
     if stack_id is not None:
         parts = stack_id.split(":", 5) if isinstance(stack_id, str) else ()
-        boundaries = [
-            value.split(":", 6) for value in values.values()
-        ]
-        if len(parts) != 6 or any(
-                len(value) != 7 or value[1] != parts[1]
-                or value[3:5] != parts[3:5]
-                for value in boundaries):
-            raise RuntimeError(
-                "notification immutable versions cross stack boundary")
+        resource = parts[5].split("/", 2) if len(parts) == 6 else ()
+        if len(resource) != 3 or resource[0] != "stack" or not resource[1]:
+            raise RuntimeError("notification stack identity ARN")
+        if outputs.get("AwsPartition") != parts[1] \
+                or outputs.get("StackAccountId") != parts[4]:
+            raise RuntimeError("notification stack partition/account mismatch")
+        for role in ("delivery", "scanner"):
+            value = values[f"{role}_version_arn"].split(":", 6)
+            function = value[6].rsplit(":", 1)[0] if len(value) == 7 else ""
+            if len(value) != 7 or value[1] != parts[1] \
+                    or value[3:5] != parts[3:5] \
+                    or function != f"{resource[1]}-notification-{role}":
+                raise RuntimeError(
+                    "notification immutable versions cross stack boundary")
     return values
 
 
 def _launch_binding(stack_id, outputs):
     result = {
+        "aws_partition": outputs.get("AwsPartition"),
         "canonical_bucket": outputs.get("CanonicalBucketName"),
         "canonical_prefix": outputs.get("CanonicalPrefix"),
         "deployment_id": outputs.get("DeploymentId"),
+        "delivery_domain_id": outputs.get("DeliveryDomainId"),
         **_version_arns(outputs, stack_id),
         "expected_bucket_owner": outputs.get("ExpectedBucketOwner"),
         "notification_secret_arn": outputs.get("NotificationSecretArn"),
@@ -597,12 +744,14 @@ def _launch_binding(stack_id, outputs):
         "provider": "aws",
         "push_node_id": outputs.get("PushNodeId"),
         "software_digest": outputs.get("SoftwareDigest"),
+        "stack_account_id": outputs.get("StackAccountId"),
         "stack_id": stack_id,
         "workspace": outputs.get("WorkspaceId"),
     }
     if not all(isinstance(value, str) and value for value in result.values()) \
             or not all(valid_fid(result[name]) for name in (
-                "push_node_id", "software_digest", "workspace")):
+                "delivery_domain_id", "push_node_id", "software_digest",
+                "workspace")):
         raise RuntimeError("notification launch binding is incomplete")
     return result
 
@@ -687,6 +836,324 @@ def _ready_change_set(args, stack_id, change_set, kind):
     return document
 
 
+def _expected_version_environment(outputs, role):
+    common = {
+        "TINYP2P_NOTIFICATION_AWS_PARTITION": outputs.get("AwsPartition"),
+        "TINYP2P_NOTIFICATION_DEPLOYMENT_ID": outputs.get("DeploymentId"),
+        "TINYP2P_NOTIFICATION_WORKSPACE_ID": outputs.get("WorkspaceId"),
+        "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": outputs.get(
+            "CanonicalBucketName"),
+        "TINYP2P_NOTIFICATION_CANONICAL_PREFIX": outputs.get(
+            "CanonicalPrefix"),
+        "TINYP2P_NOTIFICATION_STATE_BUCKET": outputs.get(
+            "NotificationStateBucketName"),
+        "TINYP2P_NOTIFICATION_STATE_PREFIX": outputs.get(
+            "NotificationStatePrefix"),
+        "TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER": outputs.get(
+            "ExpectedBucketOwner"),
+        "TINYP2P_NOTIFICATION_QUEUE_ARN": outputs.get(
+            "NotificationQueueArn"),
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID": outputs.get(
+            "DeliveryDomainId"),
+        "TINYP2P_NOTIFICATION_SOFTWARE_DIGEST": outputs.get(
+            "SoftwareDigest"),
+    }
+    if role == "scanner":
+        common.update({
+            "TINYP2P_NOTIFICATION_AWS_ACCOUNT_ID": outputs.get(
+                "StackAccountId"),
+            "TINYP2P_NOTIFICATION_QUEUE_URL": outputs.get(
+                "NotificationQueueUrl"),
+        })
+    elif role == "delivery":
+        common.update({
+            "TINYP2P_NOTIFICATION_SECRET_ARN": outputs.get(
+                "NotificationSecretArn"),
+            "TINYP2P_NOTIFICATION_SECRET_VERSION_ID": outputs.get(
+                "NotificationSecretVersionId"),
+            "TINYP2P_NOTIFICATION_PUSH_NODE_ID": outputs.get("PushNodeId"),
+        })
+    else:
+        raise ValueError("notification Lambda role")
+    if any(not isinstance(value, str) or not value for value in common.values()):
+        raise RuntimeError("notification version environment binding")
+    return common
+
+
+def _version_extensions_are_default(configured, function_name):
+    # GetFunctionConfiguration grows as Lambda gains capabilities.  Exact
+    # release verification must classify every returned field: either the
+    # caller checks it as authority, it is inert observation metadata, or it
+    # is an extension whose execution semantics we require to be the default.
+    # Unknown fields fail closed until they have been classified here.
+    known = {
+        "Architectures", "CapacityProviderConfig", "CodeSha256", "CodeSize",
+        "ConfigSha256", "DeadLetterConfig", "Description", "DurableConfig",
+        "Environment", "EphemeralStorage", "FileSystemConfigs", "FunctionArn",
+        "FunctionName", "Handler", "ImageConfigResponse", "KMSKeyArn",
+        "LastModified", "LastUpdateStatus", "LastUpdateStatusReason",
+        "LastUpdateStatusReasonCode", "Layers", "LoggingConfig", "MasterArn",
+        "MemorySize", "PackageType", "RevisionId", "Role", "Runtime",
+        "RuntimeVersionConfig", "SigningJobArn", "SigningProfileVersionArn",
+        "SnapStart", "State", "StateReason", "StateReasonCode",
+        "TenancyConfig", "Timeout", "TracingConfig", "Version", "VpcConfig",
+    }
+    if set(configured) - known:
+        return False
+    vpc = configured.get("VpcConfig")
+    vpc_ok = vpc in (None, {}) or (
+        isinstance(vpc, dict)
+        and set(vpc) <= {
+            "SubnetIds", "SecurityGroupIds", "VpcId",
+            "Ipv6AllowedForDualStack",
+        }
+        and vpc.get("SubnetIds", []) == []
+        and vpc.get("SecurityGroupIds", []) == []
+        and vpc.get("VpcId", "") == ""
+        and vpc.get("Ipv6AllowedForDualStack", False) is False)
+    logging = configured.get("LoggingConfig")
+    logging_ok = logging is None or (
+        isinstance(logging, dict)
+        and set(logging) <= {
+            "ApplicationLogLevel", "LogFormat", "LogGroup",
+            "SystemLogLevel",
+        }
+        and logging.get("LogFormat", "Text") == "Text"
+        and logging.get("LogGroup", f"/aws/lambda/{function_name}")
+        == f"/aws/lambda/{function_name}"
+        and logging.get("ApplicationLogLevel") is None
+        and logging.get("SystemLogLevel") is None)
+    config_hash = configured.get("ConfigSha256")
+    return vpc_ok \
+        and logging_ok \
+        and (config_hash is None
+             or CODE_SHA256_RE.fullmatch(config_hash or "") is not None) \
+        and configured.get("Layers") in (None, []) \
+        and configured.get("FileSystemConfigs") in (None, []) \
+        and configured.get("DeadLetterConfig") in (None, {}) \
+        and configured.get("TracingConfig") in (
+            None, {"Mode": "PassThrough"}) \
+        and configured.get("KMSKeyArn") in (None, "") \
+        and configured.get("ImageConfigResponse") in (None, {}) \
+        and configured.get("EphemeralStorage") in (None, {"Size": 512}) \
+        and configured.get("SnapStart") in (
+            None, {"ApplyOn": "None", "OptimizationStatus": "Off"}) \
+        and configured.get("CapacityProviderConfig") in (None, {}) \
+        and configured.get("DurableConfig") in (None, {}) \
+        and configured.get("TenancyConfig") in (None, {}) \
+        and configured.get("MasterArn") in (None, "")
+
+
+def _schedule_rule_is_exact(rule, outputs, versions, name, schedule, enabled):
+    known = {
+        "Arn", "CreatedBy", "Description", "EventBusName", "EventPattern",
+        "ManagedBy", "Name", "RoleArn", "ScheduleExpression", "State",
+    }
+    scanner = versions.get("scanner_version_arn", "").split(":", 6)
+    partition = outputs.get("AwsPartition")
+    account = outputs.get("StackAccountId")
+    if len(scanner) != 7 or scanner[0] != "arn" \
+            or scanner[1] != partition or scanner[2] != "lambda" \
+            or scanner[4] != account:
+        return False
+    expected_arn = f"arn:{partition}:events:{scanner[3]}:{account}:rule/{name}"
+    return set(rule) <= known \
+        and rule.get("Name") == name \
+        and rule.get("Arn") == expected_arn \
+        and rule.get("CreatedBy") == account \
+        and rule.get("EventBusName") == "default" \
+        and rule.get("ScheduleExpression") == schedule \
+        and rule.get("State") == ("ENABLED" if enabled else "DISABLED") \
+        and rule.get("Description") in (None, "") \
+        and rule.get("EventPattern") is None \
+        and rule.get("RoleArn") is None \
+        and rule.get("ManagedBy") is None
+
+
+def _mapping_extensions_are_default(mapping):
+    known = {
+        "AmazonManagedKafkaEventSourceConfig", "BatchSize",
+        "BisectBatchOnFunctionError", "DestinationConfig",
+        "DocumentDBEventSourceConfig", "EventSourceArn",
+        "EventSourceMappingArn", "FilterCriteria", "FilterCriteriaError",
+        "FunctionArn", "FunctionResponseTypes", "KMSKeyArn", "KmsKeyArn",
+        "LastModified", "LastProcessingResult",
+        "MaximumBatchingWindowInSeconds", "MaximumRecordAgeInSeconds",
+        "MaximumRetryAttempts", "MetricsConfig", "ParallelizationFactor",
+        "ProvisionedPollerConfig", "Queues", "ScalingConfig",
+        "SelfManagedEventSource", "SelfManagedKafkaEventSourceConfig",
+        "SourceAccessConfigurations", "StartingPosition",
+        "StartingPositionTimestamp", "State", "StateTransitionReason",
+        "Tags", "Topics", "TumblingWindowInSeconds", "UUID",
+    }
+    return set(mapping) <= known \
+        and mapping.get("MaximumBatchingWindowInSeconds", 0) == 0 \
+        and mapping.get("ParallelizationFactor") in (None, 1) \
+        and mapping.get("TumblingWindowInSeconds", 0) == 0 \
+        and mapping.get("BisectBatchOnFunctionError") in (None, False) \
+        and mapping.get("MaximumRecordAgeInSeconds") is None \
+        and mapping.get("MaximumRetryAttempts") is None \
+        and mapping.get("StartingPosition") is None \
+        and mapping.get("StartingPositionTimestamp") is None \
+        and mapping.get("FilterCriteria") in (None, {}) \
+        and mapping.get("FilterCriteriaError") in (None, {}) \
+        and mapping.get("DestinationConfig") in (None, {}) \
+        and mapping.get("ScalingConfig") in (None, {}) \
+        and mapping.get("ProvisionedPollerConfig") in (None, {}) \
+        and mapping.get("MetricsConfig") in (None, {}, {"Metrics": []}) \
+        and mapping.get("KMSKeyArn") in (None, "") \
+        and mapping.get("KmsKeyArn") in (None, "") \
+        and mapping.get("SourceAccessConfigurations") in (None, []) \
+        and mapping.get("Topics") in (None, []) \
+        and mapping.get("Queues") in (None, []) \
+        and all(mapping.get(name) in (None, {}) for name in (
+            "AmazonManagedKafkaEventSourceConfig",
+            "DocumentDBEventSourceConfig", "SelfManagedEventSource",
+            "SelfManagedKafkaEventSourceConfig")) \
+        and (mapping.get("Tags") is None
+             or isinstance(mapping["Tags"], dict))
+
+
+def _live_traffic(args, outputs, versions, enabled):
+    """Verify the provider's actual traffic targets, not stack intentions."""
+    if type(enabled) is not bool:
+        raise TypeError("notification traffic state")
+    mapping_id = outputs.get("NotificationDeliveryMappingUuid")
+    rule_name = outputs.get("NotificationScanScheduleName")
+    schedule = outputs.get("NotificationScanScheduleExpression")
+    queue_arn = outputs.get("NotificationQueueArn")
+    if any(not isinstance(value, str) or not value or len(value) > 1024
+           for value in (mapping_id, rule_name, schedule, queue_arn)):
+        raise RuntimeError("notification live traffic identity")
+
+    code_hashes = _output_code_hashes(outputs)
+    for role, handler in (
+            ("scanner", "deploy.aws_notifications.app.scanner_handler"),
+            ("delivery", "deploy.aws_notifications.app.delivery_handler")):
+        arn = versions[f"{role}_version_arn"]
+        arn_parts = arn.split(":")
+        name, version = arn_parts[-2:]
+        configured = _change_set_document(_run([
+            "aws", "lambda", "get-function-configuration",
+            "--function-name", arn,
+            "--output", "json",
+            *_provider_flags(args),
+        ], capture=True), f"live {role} version")
+        runtime = configured.get("RuntimeVersionConfig")
+        runtime_ok = runtime is None or (
+            isinstance(runtime, dict)
+            and isinstance(runtime.get("RuntimeVersionArn"), str)
+            and bool(runtime["RuntimeVersionArn"])
+            and runtime.get("Error") is None)
+        description = outputs.get("SoftwareDigest") if role == "scanner" \
+            else f'{outputs.get("SoftwareDigest")}:' \
+            f'{outputs.get("NotificationSecretVersionId")}'
+        if configured.get("FunctionArn") != arn \
+                or configured.get("FunctionName") != name \
+                or configured.get("Version") != version \
+                or configured.get("CodeSha256") \
+                != code_hashes[f"{role.title()}CodeSha256"] \
+                or configured.get("Handler") != handler \
+                or configured.get("Runtime") != "python3.13" \
+                or configured.get("State") != "Active" \
+                or configured.get("Role") \
+                != outputs.get(f"Notification{role.title()}RoleArn") \
+                or configured.get("MemorySize") != 1024 \
+                or configured.get("Timeout") != 60 \
+                or configured.get("Architectures") != ["x86_64"] \
+                or configured.get("PackageType") != "Zip" \
+                or configured.get("Description") != description \
+                or configured.get("Environment") != {
+                    "Variables": _expected_version_environment(
+                        outputs, role)} \
+                or configured.get("LastUpdateStatus", "Successful") \
+                != "Successful" \
+                or not runtime_ok \
+                or not _version_extensions_are_default(configured, name):
+            raise RuntimeError(
+                f"notification live {role} version drift")
+        function_arn = arn.rsplit(":", 1)[0]
+        concurrency = _change_set_document(_run([
+            "aws", "lambda", "get-function-concurrency",
+            "--function-name", function_arn,
+            "--output", "json",
+            *_provider_flags(args),
+        ], capture=True), f"live {role} reserved concurrency")
+        try:
+            expected_concurrency = int(outputs.get(
+                f"Notification{role.title()}ReservedConcurrency"))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"notification live {role} reserved concurrency binding") \
+                from None
+        if set(concurrency) != {"ReservedConcurrentExecutions"} \
+                or concurrency.get("ReservedConcurrentExecutions") \
+                != expected_concurrency:
+            raise RuntimeError(
+                f"notification live {role} reserved concurrency drift")
+        runtime_management = _change_set_document(_run([
+            "aws", "lambda", "get-runtime-management-config",
+            "--function-name", function_arn,
+            "--qualifier", version,
+            "--output", "json",
+            *_provider_flags(args),
+        ], capture=True), f"live {role} runtime management")
+        managed_runtime = runtime_management.get("RuntimeVersionArn")
+        configured_runtime = runtime.get("RuntimeVersionArn") \
+            if isinstance(runtime, dict) else None
+        if runtime_management.get("FunctionArn") != arn \
+                or runtime_management.get("UpdateRuntimeOn") \
+                != "FunctionUpdate" \
+                or managed_runtime not in (
+                    None, configured_runtime):
+            raise RuntimeError(
+                f"notification live {role} runtime management drift")
+
+    mapping = _change_set_document(_run([
+        "aws", "lambda", "get-event-source-mapping",
+        "--uuid", mapping_id,
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True), "live event source mapping")
+    if mapping.get("UUID") != mapping_id \
+            or mapping.get("FunctionArn") \
+            != versions["delivery_version_arn"] \
+            or mapping.get("EventSourceArn") != queue_arn \
+            or mapping.get("State") != ("Enabled" if enabled else "Disabled") \
+            or mapping.get("BatchSize") != 10 \
+            or mapping.get("FunctionResponseTypes") \
+            != ["ReportBatchItemFailures"] \
+            or not _mapping_extensions_are_default(mapping):
+        raise RuntimeError("notification live event source mapping drift")
+
+    rule = _change_set_document(_run([
+        "aws", "events", "describe-rule",
+        "--name", rule_name,
+        "--event-bus-name", "default",
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True), "live schedule")
+    if not _schedule_rule_is_exact(
+            rule, outputs, versions, rule_name, schedule, enabled):
+        raise RuntimeError("notification live schedule drift")
+
+    targets = _change_set_document(_run([
+        "aws", "events", "list-targets-by-rule",
+        "--rule", rule_name,
+        "--no-paginate",
+        "--output", "json",
+        *_provider_flags(args),
+    ], capture=True), "live schedule targets")
+    rows = targets.get("Targets")
+    if targets.get("NextToken") is not None \
+            or not isinstance(rows, list) or len(rows) != 1 \
+            or not isinstance(rows[0], dict) \
+            or set(rows[0]) != {"Arn", "Id"} \
+            or rows[0].get("Id") != "notification-scanner" \
+            or rows[0].get("Arn") != versions["scanner_version_arn"]:
+        raise RuntimeError("notification live schedule target drift")
+
+
 def _create_traffic_change_set(args, stack_id, enabled):
     """Create and prove one traffic-only, previous-template stack update."""
     action = "enable" if enabled else "disable"
@@ -734,11 +1201,13 @@ def _create_traffic_change_set(args, stack_id, enabled):
     return change_set
 
 
-def _release_parameters(args, push_node, software_digest):
+def _release_parameters(
+        args, push_node, delivery_domain, software_digest, code_hashes):
     return tuple(
         f"ParameterKey={name},ParameterValue={value}"
         for name, value in _parameter_values(
-            args, False, push_node, software_digest).items())
+            args, False, push_node, delivery_domain, software_digest,
+            code_hashes).items())
 
 
 def _package_release(args):
@@ -747,20 +1216,123 @@ def _package_release(args):
         "--template-file", str(BUILD / "template.yaml"),
         "--output-template-file", str(PACKAGED),
         "--resolve-s3",
+        "--use-json",
         *_provider_flags(args),
     ])
+    return _packaged_code_hashes(args, _caller_account(args))
+
+
+def _packaged_document():
+    try:
+        raw = PACKAGED.read_bytes()
+        if not 0 < len(raw) <= MAX_PACKAGED_TEMPLATE_BYTES:
+            raise ValueError
+        document = json.loads(raw)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise RuntimeError("malformed packaged notification template") \
+            from None
+    if not isinstance(document, dict):
+        raise RuntimeError("malformed packaged notification template")
+    return document
+
+
+def _packaged_location(document, logical):
+    try:
+        value = document["Resources"][logical]["Properties"]["CodeUri"]
+    except (KeyError, TypeError):
+        raise RuntimeError("packaged notification code location") from None
+    version = None
+    if isinstance(value, str) and value.startswith("s3://"):
+        bucket, separator, key = value[5:].partition("/")
+        if not separator:
+            bucket = key = ""
+    elif isinstance(value, dict) and set(value) in (
+            {"Bucket", "Key"}, {"Bucket", "Key", "Version"}):
+        bucket, key = value.get("Bucket"), value.get("Key")
+        version = value.get("Version")
+    else:
+        bucket = key = ""
+    if not isinstance(bucket, str) or not bucket \
+            or not isinstance(key, str) or not key \
+            or version is not None \
+            and (not isinstance(version, str) or not version):
+        raise RuntimeError("packaged notification code location")
+    return bucket, key, version
+
+
+def _downloaded_code_hash(args, location, target, expected_owner):
+    bucket, key, version = location
+    command = [
+        "aws", "s3api", "get-object",
+        "--bucket", bucket,
+        "--key", key,
+        "--expected-bucket-owner", expected_owner,
+    ]
+    if version is not None:
+        command += ["--version-id", version]
+    _run([
+        *command, "--output", "json", *_provider_flags(args), str(target),
+    ])
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        with target.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_LAMBDA_ZIP_BYTES:
+                    raise ValueError
+                digest.update(chunk)
+        if size == 0:
+            raise ValueError
+    except (OSError, ValueError):
+        raise RuntimeError("invalid packaged notification code") from None
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _packaged_code_hashes(args, expected_owner):
+    document = _packaged_document()
+    cached = {}
+    result = {}
+    with tempfile.TemporaryDirectory(
+            prefix="poc16-notification-package-") as directory:
+        for logical, parameter in CODE_HASH_PARAMETERS.items():
+            location = _packaged_location(document, logical)
+            if location not in cached:
+                target = Path(directory) / f"artifact-{len(cached)}.zip"
+                cached[location] = _downloaded_code_hash(
+                    args, location, target, expected_owner)
+            result[parameter] = cached[location]
+    return _checked_code_hashes(result)
+
+
+def _release_publication(args, incumbent, software_digest, code_hashes):
+    previous_digest = incumbent.get("SoftwareDigest")
+    previous_code_hashes = _output_code_hashes(incumbent)
+    shared = software_digest != previous_digest
+    return {
+        "scanner": shared or code_hashes["ScannerCodeSha256"]
+        != previous_code_hashes["ScannerCodeSha256"],
+        "delivery": shared or code_hashes["DeliveryCodeSha256"]
+        != previous_code_hashes["DeliveryCodeSha256"]
+        or args.notification_secret_version_id
+        != incumbent.get("NotificationSecretVersionId"),
+    }
 
 
 def _create_release_change_set(
-        args, stack_id, push_node, software_digest, previous_digest):
-    """Package a release, then create but do not execute its exact update."""
-    _package_release(args)
-    expected = _parameter_values(args, False, push_node, software_digest)
+        args, stack_id, push_node, delivery_domain, software_digest,
+        incumbent, code_hashes):
+    """Create but do not execute one exact packaged release update."""
+    publish = _release_publication(
+        args, incumbent, software_digest, code_hashes)
+    expected = _parameter_values(
+        args, False, push_node, delivery_domain, software_digest,
+        code_hashes)
     change_set = _start_change_set(args, stack_id, "release", [
         "--template-body", "file://" + str(PACKAGED),
         "--capabilities", "CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND",
         "--parameters", *_release_parameters(
-            args, push_node, software_digest),
+            args, push_node, delivery_domain, software_digest, code_hashes),
     ])
     try:
         document = _ready_change_set(
@@ -778,7 +1350,7 @@ def _create_release_change_set(
         changes = document.get("Changes")
         if not isinstance(changes, list) or not changes:
             raise RuntimeError("release change set has no resource changes")
-        logical = set()
+        logical = {}
         for row in changes:
             change = row.get("ResourceChange") \
                 if isinstance(row, dict) and row.get("Type") == "Resource" \
@@ -787,14 +1359,13 @@ def _create_release_change_set(
                 if isinstance(change, dict) else None
             if not isinstance(name, str) or not name or name in logical:
                 raise RuntimeError("release change set resource scope")
-            logical.add(name)
-        if software_digest != previous_digest and not {
-                "NotificationScannerFunction",
-                "NotificationDeliveryFunction",
-                "NotificationScannerVersion",
-                "NotificationDeliveryVersion",
-        }.issubset(logical):
-            raise RuntimeError("release did not publish exact Lambda versions")
+            logical[name] = change
+        for role in ("scanner", "delivery"):
+            function = f"Notification{role.title()}Function"
+            version = f"Notification{role.title()}Version"
+            if publish[role] and not {function, version}.issubset(logical):
+                raise RuntimeError(
+                    "release did not publish exact Lambda versions")
     except Exception:
         _discard_change_set(args, change_set)
         raise
@@ -828,8 +1399,10 @@ def _set_production(
         raise RuntimeError("notification deployment has no software digest")
     versions = _version_arns(incumbent, stack_id)
     if enabled:
+        _check_requested_release(args, incumbent)
         _check_launch_gate(args, stack_id, incumbent)
         _check_initialized(args, incumbent, stack_id)
+        _live_traffic(args, incumbent, versions, False)
     change_set = _create_traffic_change_set(args, stack_id, enabled)
     current_stack = _owned_stack(args)
     current = _outputs(current_stack)
@@ -864,18 +1437,23 @@ def _set_production(
     if enabled:
         _check_binding(outputs, binding)
         _checked_queues(args, outputs)
+    _live_traffic(args, outputs, versions, enabled)
     return outputs
 
 
 def _deploy_release(
-        args, stack_id, incumbent, binding, push_node, software_digest):
+        args, stack_id, incumbent, binding, push_node, delivery_domain,
+        software_digest, code_hashes):
     """Execute a built release only against the same disabled predecessor."""
     previous_digest = incumbent.get("SoftwareDigest")
     if not valid_fid(previous_digest):
         raise RuntimeError("notification deployment has no software digest")
     previous_versions = _version_arns(incumbent, stack_id)
+    publish = _release_publication(
+        args, incumbent, software_digest, code_hashes)
     change_set = _create_release_change_set(
-        args, stack_id, push_node, software_digest, previous_digest)
+        args, stack_id, push_node, delivery_domain, software_digest,
+        incumbent, code_hashes)
     current_stack = _owned_stack(args)
     current = _outputs(current_stack)
     try:
@@ -886,6 +1464,7 @@ def _deploy_release(
             raise RuntimeError("notification release preflight became stale")
         _check_binding(current, binding)
         _checked_queues(args, current)
+        _live_traffic(args, current, previous_versions, False)
     except Exception:
         _discard_change_set(args, change_set)
         raise
@@ -893,14 +1472,22 @@ def _deploy_release(
     final_stack = _owned_stack(args)
     outputs = _outputs(final_stack)
     versions = _version_arns(outputs, stack_id)
+    final_code_hashes = _output_code_hashes(outputs)
     if final_stack.get("StackId") != stack_id \
             or outputs.get("Enabled") != "false" \
             or outputs.get("SoftwareDigest") != software_digest \
-            or (software_digest != previous_digest
-                and versions == previous_versions):
+            or final_code_hashes != code_hashes \
+            or any(
+                (versions[f"{role}_version_arn"]
+                 != previous_versions[f"{role}_version_arn"])
+                != publish[role]
+                for role in ("scanner", "delivery")
+            ):
         raise RuntimeError("notification release postcondition failed")
     _check_binding(outputs, binding)
+    _check_requested_release(args, outputs)
     _checked_queues(args, outputs)
+    _live_traffic(args, outputs, versions, False)
     return outputs
 
 
@@ -913,8 +1500,8 @@ def deploy(args):
         return _set_production(args, target, enabled, incumbent)
     args = _validated(args)
     target, enabled, incumbent = _stack_for_deploy(args)
-    push_node = _secret_binding(args)
-    binding = _binding(args, push_node)
+    push_node, delivery_domain = _secret_binding(args)
+    binding = _binding(args, push_node, delivery_domain)
     if incumbent is not None:
         _check_binding(incumbent, binding)
     _verify_state_lifecycle(args)
@@ -926,18 +1513,20 @@ def deploy(args):
             "disable notification production before updating deployment")
     software_digest = _prepare_software()
     build(args, expected_digest=software_digest)
+    code_hashes = _package_release(args)
     if incumbent is not None:
         return _deploy_release(
-            args, target, incumbent, binding, push_node, software_digest)
+            args, target, incumbent, binding, push_node, delivery_domain,
+            software_digest, code_hashes)
     _run([
         "sam", "deploy",
-        "--template-file", str(BUILD / "template.yaml"),
+        "--template-file", str(PACKAGED),
         "--stack-name", target,
         "--capabilities", "CAPABILITY_IAM",
-        "--resolve-s3",
         "--no-fail-on-empty-changeset",
         "--parameter-overrides", *_parameters(
-            args, enabled, push_node, software_digest),
+            args, enabled, push_node, delivery_domain, software_digest,
+            code_hashes),
         "--tags",
         f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}",
         f"{DEPLOYMENT_ID_TAG}={args.deployment_id}",
@@ -946,11 +1535,14 @@ def deploy(args):
     deployed_stack = _owned_stack(args)
     outputs = _outputs(deployed_stack)
     _check_binding(outputs, binding)
-    _version_arns(outputs, deployed_stack["StackId"])
+    _check_requested_release(args, outputs)
+    versions = _version_arns(outputs, deployed_stack["StackId"])
     if outputs.get("Enabled") != ("true" if enabled else "false") \
-            or outputs.get("SoftwareDigest") != software_digest:
+            or outputs.get("SoftwareDigest") != software_digest \
+            or _output_code_hashes(outputs) != code_hashes:
         raise RuntimeError("deployed notification outputs are incomplete")
     _checked_queues(args, outputs)
+    _live_traffic(args, outputs, versions, enabled)
     return outputs
 
 

@@ -98,31 +98,48 @@ def test_delivery_composes_shared_notification_state_for_cursor_completion(
     assert configured[1].store.store is operational
 
 
-def test_cursor_owner_binds_the_complete_semantic_deployment(monkeypatch):
-    values = {
+def test_cursor_owner_binds_namespace_partition_and_delivery_domain_only(
+        monkeypatch):
+    semantic = {
+        "TINYP2P_NOTIFICATION_AWS_PARTITION": "aws",
         "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": "canonical-bucket",
         "TINYP2P_NOTIFICATION_CANONICAL_PREFIX": "canonical/workspace",
-        "TINYP2P_NOTIFICATION_DEPLOYMENT_ID": "notify-west",
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID": "d" * 64,
         "TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER": "123456789012",
-        "TINYP2P_NOTIFICATION_PUSH_NODE_ID": "b" * 64,
-        "TINYP2P_NOTIFICATION_SECRET_ARN": "secret-arn",
-        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID": "v" * 32,
         "TINYP2P_NOTIFICATION_STATE_BUCKET": "notification-state",
         "TINYP2P_NOTIFICATION_STATE_PREFIX": "notification/workspace",
         "TINYP2P_NOTIFICATION_WORKSPACE_ID": "a" * 64,
     }
-    for name, value in values.items():
+    nonsemantic = {
+        "TINYP2P_NOTIFICATION_DEPLOYMENT_ID": "notify-west",
+        "TINYP2P_NOTIFICATION_PUSH_NODE_ID": "b" * 64,
+        "TINYP2P_NOTIFICATION_SECRET_ARN": "secret-arn",
+        "TINYP2P_NOTIFICATION_SECRET_VERSION_ID": "v" * 32,
+        "TINYP2P_NOTIFICATION_SOFTWARE_DIGEST": "e" * 64,
+    }
+    for name, value in {**semantic, **nonsemantic}.items():
         monkeypatch.setenv(name, value)
     baseline = app._notification_owner()
 
-    for name, value in values.items():
+    for name, value in semantic.items():
         changed = "c" * 64 if name.endswith((
-            "PUSH_NODE_ID", "WORKSPACE_ID")) else value + "-changed"
+            "DOMAIN_ID", "WORKSPACE_ID")) else value + "-changed"
         if name.endswith("EXPECTED_BUCKET_OWNER"):
             changed = "210987654321"
+        if name.endswith("AWS_PARTITION"):
+            changed = "aws-cn"
         monkeypatch.setenv(name, changed)
         assert app._notification_owner() != baseline
         monkeypatch.setenv(name, value)
+
+    for name, value in nonsemantic.items():
+        monkeypatch.setenv(name, value + "-rotated")
+        assert app._notification_owner() == baseline
+        monkeypatch.setenv(name, value)
+
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_AWS_PARTITION", "invalid")
+    with pytest.raises(RuntimeError, match="partition"):
+        app._notification_owner()
 
 
 def test_secret_parse_failures_never_echo_secret_material(monkeypatch):
@@ -203,6 +220,13 @@ def test_partial_firebase_initialization_is_cleaned_before_retry(monkeypatch):
     monkeypatch.setenv(
         "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
         push_secret.verify_key.encode().hex())
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID",
+        app.delivery_domain_id(
+            push_secret.verify_key.encode().hex(), (
+                ("poc16.mobile", "production", "one"),
+                ("poc16.mobile", "staging", "two"),
+            )))
     monkeypatch.setattr(app, "_secret", lambda _client: (
         push_secret,
         (
@@ -252,12 +276,21 @@ def test_firebase_credential_exception_is_redacted(monkeypatch):
     monkeypatch.setenv(
         "TINYP2P_NOTIFICATION_PUSH_NODE_ID",
         push_secret.verify_key.encode().hex())
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID",
+        app.delivery_domain_id(
+            push_secret.verify_key.encode().hex(), (
+                ("poc16.mobile", "production", "project"),
+            )))
     monkeypatch.setattr(app, "_secret", lambda _client: (
         push_secret,
         ({
             "application": "poc16.mobile",
             "environment": "production",
-            "credential": {"private_key": private},
+            "credential": {
+                "private_key": private,
+                "project_id": "project",
+            },
         },),
     ))
 
@@ -292,6 +325,83 @@ def test_runtime_rejects_push_identity_different_from_stack(monkeypatch):
 
     with pytest.raises(RuntimeError, match="push-node identity"):
         app._push_provider()
+
+
+def test_delivery_validates_decoded_firebase_routes_before_provider_use(
+        monkeypatch):
+    firebase = ModuleType("firebase_admin")
+    credentials = ModuleType("firebase_admin.credentials")
+    boto3 = ModuleType("boto3")
+    deleted = []
+    credentials.Certificate = lambda value: value
+    firebase.credentials = credentials
+    firebase.initialize_app = lambda credential, **_kwargs: SimpleNamespace(
+        project_id=credential["project_id"])
+    firebase.delete_app = deleted.append
+    boto3.client = lambda *_args, **_kwargs: object()
+    monkeypatch.setitem(sys.modules, "firebase_admin", firebase)
+    monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setattr(app, "_sdk_config", lambda: object())
+    push_secret = load_sk("11" * 32)
+    push_node = push_secret.verify_key.encode().hex()
+    routes = (("poc16.mobile", "production", "project-one"),)
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_PUSH_NODE_ID", push_node)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID",
+        app.delivery_domain_id(push_node, routes))
+    rows = ({
+        "application": "poc16.mobile",
+        "environment": "production",
+        "credential": {"project_id": "project-one"},
+    },)
+    monkeypatch.setattr(app, "_secret", lambda _client: (push_secret, rows))
+
+    secret, provider = app._push_provider()
+
+    assert secret is push_secret
+    assert provider.delivery_routes == routes
+    assert deleted == []
+
+
+def test_delivery_rejects_changed_firebase_project_before_provider_use(
+        monkeypatch):
+    firebase = ModuleType("firebase_admin")
+    credentials = ModuleType("firebase_admin.credentials")
+    boto3 = ModuleType("boto3")
+    initialized, deleted = [], []
+    credentials.Certificate = lambda value: value
+
+    def initialize(credential, **_kwargs):
+        item = SimpleNamespace(project_id=credential["project_id"])
+        initialized.append(item)
+        return item
+
+    firebase.credentials = credentials
+    firebase.initialize_app = initialize
+    firebase.delete_app = deleted.append
+    boto3.client = lambda *_args, **_kwargs: object()
+    monkeypatch.setitem(sys.modules, "firebase_admin", firebase)
+    monkeypatch.setitem(sys.modules, "firebase_admin.credentials", credentials)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setattr(app, "_sdk_config", lambda: object())
+    push_secret = load_sk("11" * 32)
+    push_node = push_secret.verify_key.encode().hex()
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_PUSH_NODE_ID", push_node)
+    monkeypatch.setenv(
+        "TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID",
+        app.delivery_domain_id(push_node, (
+            ("poc16.mobile", "production", "project-one"),)))
+    monkeypatch.setattr(app, "_secret", lambda _client: (push_secret, ({
+        "application": "poc16.mobile",
+        "environment": "production",
+        "credential": {"project_id": "project-two"},
+    },)))
+
+    with pytest.raises(RuntimeError, match="Firebase delivery domain"):
+        app._push_provider()
+
+    assert initialized == deleted == []
 
 
 class Queue:

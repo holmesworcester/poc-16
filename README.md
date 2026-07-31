@@ -877,10 +877,20 @@ lowercase hex characters:
 ```
 
 Create that secret from a protected file. Record its exact Secrets Manager
-`VersionId`; deployments never follow `AWSCURRENT`. Provision a dedicated
-notification-state bucket whose current and noncurrent `root` and `obj/`
-objects have no enabled expiration rule. Transitions are fine, but deleting
-that state loses the durable delivery cursor. Then create the stack disabled:
+`VersionId`; deployments never follow `AWSCURRENT`. Every Firebase credential
+must name its `project_id`. The deploy tool derives a stable delivery domain
+from the push-node public key and the sorted `(application, environment,
+project_id)` routes. Credential bytes and secret versions are deliberately not
+part of that identity.
+
+Both the canonical repository and dedicated notification-state bucket must
+keep their authoritative `root` and `obj/` objects synchronously readable.
+The deploy preflight reads both lifecycle configurations. For rules whose S3
+prefix overlaps those objects it rejects expiration and any transition except
+`STANDARD_IA`, `ONEZONE_IA`, or `GLACIER_IR`; Glacier Flexible Retrieval, Deep
+Archive, Intelligent-Tiering, and unknown classes fail closed. Rules with a
+provably disjoint prefix do not block deployment. Then create the stack
+disabled:
 
 ```sh
 python3 -m deploy.aws_notifications.manage deploy --create \
@@ -939,7 +949,7 @@ and call `deploy.notification_launch.launch_record()` only after the
 corresponding device test passes:
 
 ```json
-{"binding":{"canonical_bucket":"CANONICAL_BUCKET","canonical_prefix":"workspaces/WS64","delivery_version_arn":"DELIVERY_VERSION_ARN","deployment_id":"DEPLOYMENT","expected_bucket_owner":"ACCOUNT_ID","notification_secret_arn":"SECRET_ARN","notification_secret_version_id":"SECRET_VERSION_ID","notification_state_bucket":"NOTIFICATION_STATE_BUCKET","notification_state_prefix":"workspaces/WS64/notifications","provider":"aws","push_node_id":"PUSH_NODE_ID","scanner_version_arn":"SCANNER_VERSION_ARN","software_digest":"SOFTWARE_DIGEST","stack_id":"FULL_STACK_ARN","workspace":"WS64"},"platform":"ios","result":"passed","schema":"poc16-mobile-notification-launch-v1"}
+{"binding":{"aws_partition":"aws","canonical_bucket":"CANONICAL_BUCKET","canonical_prefix":"workspaces/WS64","delivery_domain_id":"DELIVERY_DOMAIN_ID","delivery_version_arn":"DELIVERY_VERSION_ARN","deployment_id":"DEPLOYMENT","expected_bucket_owner":"ACCOUNT_ID","notification_secret_arn":"SECRET_ARN","notification_secret_version_id":"SECRET_VERSION_ID","notification_state_bucket":"NOTIFICATION_STATE_BUCKET","notification_state_prefix":"workspaces/WS64/notifications","provider":"aws","push_node_id":"PUSH_NODE_ID","scanner_version_arn":"SCANNER_VERSION_ARN","software_digest":"SOFTWARE_DIGEST","stack_account_id":"ACCOUNT_ID","stack_id":"FULL_STACK_ARN","workspace":"WS64"},"platform":"ios","result":"passed","schema":"poc16-mobile-notification-launch-v1"}
 ```
 
 Repeat `deploy` with `--update --enable`, the same immutable arguments, and
@@ -950,26 +960,45 @@ creates a previous-template CloudFormation change set, requires its resolved
 traffic parameter to match the requested state and every other parameter to
 reuse its existing value, requires its only resource changes to be the
 EventBridge schedule and SQS event-source switch, rechecks the exact disabled
-stack, and only then executes it. A concurrent stack update makes that preflight
-fail closed. Afterward it verifies the same StackId, binding,
-software digest, queues, and scanner/delivery version ARNs.
+stack, and only then executes it. The disabled stack must also match the
+requested secret version, schedule, concurrency, retry, logging, and alarm
+settings; a same-domain request for a not-yet-deployed credential version does
+not silently enable the incumbent. It also reads the live numeric Lambda
+versions, SQS mapping, EventBridge rule, and target. Exact code hash,
+role-specific environment, role ARN, handler, runtime, memory, timeout,
+architecture, function-level reserved concurrency, schedule, unfiltered SQS
+wakes, and an input-free schedule target must match. Unknown Lambda or
+EventBridge behavior fields, including durable or per-tenant execution, fail
+closed. A concurrent stack update or out-of-band provider drift fails closed.
+The same checks run after every traffic transition and release.
 
 Upgrade in three distinct steps: disable using the incumbent code, deploy the
 new code after the stack is already disabled, then repeat both launch tests
 against that digest and enable it. A release update builds and packages first,
-then creates but does not immediately execute its CloudFormation change set.
-It requires the resolved `Enabled` parameter to remain false, requires a new
-software digest to update both functions and publish both Version resources,
-and rechecks the exact disabled predecessor before execution. Thus a concurrent
-operator cannot turn a stale disabled preflight into a combined live code
-replacement and disable. SQS, EventBridge, bootstrap, and direct smoke all
-invoke immutable numeric version ARNs; no unqualified function ARN is an
-output. Both the functions and their published versions use `FunctionUpdate`
-runtime management, so a tested version's managed runtime cannot drift before
-activation.
+downloads the exact SAM-uploaded ZIPs, and passes each provider Base64 SHA-256
+to `AWS::Lambda::Version.CodeSha256` before creating the inspected
+CloudFormation change set. A mismatched or raced artifact therefore cannot be
+published as the named Version. The update keeps `Enabled=false`, rechecks the
+exact disabled predecessor, and requires a changed software release to publish
+new scanner and delivery Versions.
 
-The source queue retains wakes for four days and the DLQ for fourteen. A
-carrier wake is not the durable record; non-expiring notification state is.
+A same-project credential rotation is narrower: create a new secret version
+with the same push key and Firebase route projects, disable, and deploy it. The
+delivery domain and cursor owner remain stable; only the delivery function and
+numeric Version may change. The scanner has no Firebase secret ARN, version, or
+push key in its environment. Changing a route project or push key fails closed
+as a different delivery authority. Either kind of release invalidates the old
+mobile launch evidence, so rerun both real-device tests before enabling. SQS,
+EventBridge, bootstrap, and direct smoke all invoke immutable numeric Version
+ARNs; no unqualified function ARN is an output. Function and Version resources
+use `FunctionUpdate` runtime management, and live preflight verifies the exact
+published configuration before activation.
+
+The source queue retains wakes for four days and the DLQ for fourteen. Queue
+identity is not authoritative: a lost wake is rediscovered by the fair scanner.
+The durable record is the partition- and namespace-bound notification cursor,
+whose owner also binds the stable delivery domain and FCM-acceptance completion
+protocol.
 Redrive is allowed only while production delivery is disabled:
 
 ```sh
