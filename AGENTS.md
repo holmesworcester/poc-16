@@ -161,10 +161,21 @@ from unobserved state, or corrupt a Merkle tree.
 When working in a worktree, edit only that worktree and commit completed work
 on its branch before handoff or review. Preserve unrelated changes.
 
-Useful gates:
+Run the authoritative repository preflight before handoff:
 
 ```sh
+python3 tools/preflight.py
+```
+
+The installed beads v1.1.0 `bd preflight --check` is hardcoded for the beads
+Go repository and cannot be configured here. The repository-owned command
+runs these underlying gates:
+
+```sh
+python3 -m compileall -q core full_peer facts adapters deploy bench tests tools
 python3 -m pytest -q
 python3 -m pytest -q tests/test_repository_layout.py
 git diff --check
+bd lint
+bd dep cycles
 ```

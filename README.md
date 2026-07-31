@@ -47,7 +47,18 @@ semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
 
 ## Local use
 
-Run the tests:
+Run the authoritative repository preflight:
+
+```sh
+python3 tools/preflight.py
+```
+
+It checks Python syntax, the structural authority ratchets, the full test
+suite, patch whitespace, uncommitted beads-export pollution, and beads ledger
+integrity. The external `bd preflight --check` in beads v1.1.0 is
+Go-repository-specific and is not this project's gate.
+
+To run only the tests:
 
 ```sh
 python3 -m pytest -q
