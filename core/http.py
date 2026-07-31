@@ -279,7 +279,7 @@ class HttpGate:
     def _read_only_path(path):
         return any(
             path == prefix or path.startswith(prefix + "/")
-            for prefix in ("/pile", "/poke", "/ctl")
+            for prefix in ("/pile", "/ctl")
         )
 
     @staticmethod
@@ -343,16 +343,6 @@ class HttpGate:
                 })
         if path.startswith("/ctl"):
             return Response(405)
-        if path == "/poke" and method == "POST":
-            if self.receiver is None:
-                return Response(405)
-            if body:
-                return Response(400)
-            try:
-                await self.receiver.turn()
-            except Exception:
-                return Response(503)
-            return Response(204)
         if method == "PUT" and path.startswith("/page/"):
             if self.receiver is None:
                 return Response(405)

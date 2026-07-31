@@ -1442,7 +1442,7 @@ INTEGRATION_SEAMS = (
         "segregated Cloudflare RepositoryReader entrypoint"),
     IntegrationSeam(
         "deploy/cloudflare_upload/worker/applier_runtime.py",
-        "drain",
+        "apply",
         "segregated Cloudflare RepositoryApplier entrypoint"),
 )
 

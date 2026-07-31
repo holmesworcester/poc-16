@@ -249,15 +249,17 @@ def test_stale_token_is_only_a_repository_root_commit_outcome(
     assert run(first.apply(base_source)).status == "applied"
     first_source = run(first.stage("first", first_raw))
     second_source = run(second.stage("second", second_raw))
-    first_proposal = run(first.propose(first_source, first_raw))
-    second_proposal = run(second.propose(second_source, second_raw))
+    first_proposal = run(first.propose(
+        first_source, h(first_raw), first_raw))
+    second_proposal = run(second.propose(
+        second_source, h(second_raw), second_raw))
     assert first_proposal.base_token == second_proposal.base_token
 
     assert run(first.commit(
-        first_source, first_raw, first_proposal)).status == "applied"
+        first_source, h(first_raw), first_proposal)).status == "applied"
     stale = run(second.commit(
-        second_source, second_raw, second_proposal))
+        second_source, h(second_raw), second_proposal))
 
-    assert stale.status == "stale"
+    assert stale.status == "retryable"
     assert run(second.store.get_bounded(
         second_source, len(second_raw))) == second_raw

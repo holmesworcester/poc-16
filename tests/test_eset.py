@@ -212,6 +212,12 @@ def test_suppression_stays_behind_the_root_commit(
     assert canonical_observed and all(canonical_observed)
     assert visible()
     assert store.list("pile/")
+    failed_source = next(
+        source for source in store.list("pile/")
+        if store.get(source) is not None
+        and deletion.fid in {
+            fact.fid for fact in decode_pile(store.get(source), workspace)
+        })
 
     if restart:
         index = node.idx(workspace)
@@ -235,8 +241,8 @@ def test_suppression_stays_behind_the_root_commit(
         return retry_cas(key, etag, raw)
 
     monkeypatch.setattr(store, "cas", observe_retry)
-    node.turn(workspace)
 
+    node.turn(workspace, failed_source)
     assert retried == candidate
     assert store.get("root") == candidate[0]
     assert node.fact_of(workspace, deletion.fid) == deletion

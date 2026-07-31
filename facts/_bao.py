@@ -1,10 +1,7 @@
 """Pure Bao attachment geometry shared by fact shapes and full peers."""
 
 WIDTH = 256 * 1024
-# The current authoring command publishes every descriptor/chunk fact in one
-# closed pile.  Keep that honest under the shared 256-fact closure limit;
-# multi-pile authoring is required before this protocol cap can grow again.
-MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 MAX_SLICES = MAX_FILE_BYTES // WIDTH
 BAO_CHUNK_BYTES = 1024
 _DEPTH = (

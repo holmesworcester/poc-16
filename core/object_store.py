@@ -11,13 +11,9 @@ The root-authoritative snapshot uses only two namespaces:
     comparison capability for the exact bytes returned by the same read; it is
     not a content digest or a globally unique generation.
 
-The same canonical bucket may also contain Applier-owned operational work:
-internal ``pile/`` generations, immutable ``failed/`` rejection evidence,
-``staged/`` receipts, never-deleted ``applier/generation/`` reservations and
-``applier/spent/`` outcomes, and ``applier/cursor/`` liveness hints. Those
-objects are not repository answers and are never read through
-``RepositoryReader``. Client-writable ``ingress/v1/`` markers and detached
-objects live in the separate ingress compartment.
+The same local store may retain exact ``pile/`` sources. Direct-upload
+``ingress/v1/`` sources live in a separate provider compartment. Neither
+namespace is a repository answer or part of ``RepositoryReader``.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes
@@ -53,13 +49,7 @@ def validate_key(key):
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key == "root" or key.startswith("root/") \
-        or key == "obj" or key.startswith("obj/") \
-        or key == "failed/pile" or key.startswith("failed/pile/") \
-        or key == "failed/meta" or key.startswith("failed/meta/") \
-        or key == "applier/generation" \
-        or key.startswith("applier/generation/") \
-        or key == "applier/spent" \
-        or key.startswith("applier/spent/")
+        or key == "obj" or key.startswith("obj/")
 
 
 def validate_create(key, value):
@@ -69,7 +59,7 @@ def validate_create(key, value):
         raise TypeError("object value must be bytes")
     if key == "root" or key.startswith("root/"):
         raise ValueError("root requires compare-and-swap")
-    for prefix in ("obj/", "failed/pile/", "failed/meta/"):
+    for prefix in ("obj/",):
         if key == prefix[:-1] or (
                 key.startswith(prefix) and key[len(prefix):] != h(value)):
             raise ValueError("immutable object address")
@@ -261,48 +251,3 @@ async def ensure_object_async(store, oid, raw):
             raise ValueError("immutable object conflict")
         return EXISTS
     raise unknown
-
-
-async def retire_exact_async(store, key, raw):
-    """Retire one exact hosted work item and reconcile an unknown response.
-
-    This helper reconciles bounded deletion mechanics only. The caller must
-    first prove through F10 that the exact durable work item may be retired.
-    """
-    if not isinstance(raw, bytes):
-        raise TypeError("exact retirement bytes required")
-    if len(raw) > MAX_OBJECT_BYTES:
-        raise PayloadTooLarge("exact retirement bytes exceed limit")
-    maximum = max(1, len(raw))
-
-    async def current_value():
-        try:
-            return await store.get_bounded(key, maximum)
-        except PayloadTooLarge as error:
-            raise OSError("retirement source changed") from error
-
-    current = await current_value()
-    if current is None:
-        return False
-    if current != raw:
-        raise OSError("retirement source changed")
-    try:
-        await store.delete(key)
-    except Exception as error:
-        try:
-            current = await store.get_bounded(key, maximum)
-        except PayloadTooLarge as changed:
-            raise OSError("retirement source changed") from changed
-        except Exception:
-            raise error
-        if current is None:
-            return True
-        if current != raw:
-            raise OSError("retirement source changed") from error
-        raise error
-    current = await current_value()
-    if current is None:
-        return True
-    if current != raw:
-        raise OSError("retirement source changed")
-    raise OSError("retirement did not remove the source")

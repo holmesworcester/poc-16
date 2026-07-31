@@ -102,8 +102,7 @@ def _prepare(node, workspace, channel, path, name, ts, put_object):
         raise ValueError("file path is not a regular file")
     size = os.path.getsize(source)
     if size > MAX_FILE_BYTES:
-        raise ValueError(
-            f"file exceeds the {MAX_FILE_BYTES >> 20} MiB limit")
+        raise ValueError(f"file exceeds the {MAX_FILE_BYTES >> 30} GiB limit")
     label = name or os.path.basename(source)
     if not label or len(label.encode()) > MAX_NAME:
         raise ValueError("file name is empty or too long")

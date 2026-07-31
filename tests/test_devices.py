@@ -228,10 +228,8 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
             ("alice-first", (alice_pile, bob_chain))):
         peer = FullPeer(str(tmp_path / name))
         deliver(peer, workspace, common)
-        peer.turn(workspace)
         for pile in order:
             deliver(peer, workspace, pile)
-            peer.turn(workspace)
         peers.append(peer)
 
     for peer in (source, *peers):
@@ -281,10 +279,8 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
             ("conflict-first", (alice_pile, bob_pile))):
         peer = FullPeer(str(tmp_path / name))
         deliver(peer, workspace, common)
-        peer.turn(workspace)
         for pile in order:
             deliver(peer, workspace, pile)
-            peer.turn(workspace)
         peers.append(peer)
 
     for peer in (source, *peers):

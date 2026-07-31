@@ -121,7 +121,7 @@ def test_generated_roles_put_provider_enforcement_before_python_wrappers():
     assert broker["base_dir"] == "build/broker"
     assert applier["main"] == "build/applier/entry.py"
     assert applier["base_dir"] == "build/applier"
-    assert applier["triggers"] == {"crons": ["*/1 * * * *"]}
+    assert "triggers" not in applier
     assert applier["limits"] == {
         "cpu_ms": 30_000,
         "subrequests": 10_000_000,
@@ -478,6 +478,7 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
             for relative in (
                     "entry.py",
                     "applier_runtime.py",
+                    "deploy/repository_apply_wire.py",
                     "core/repository_applier.py",
                     "core/repository_snapshot.py",
                     "core/staged_intent.py",
@@ -591,6 +592,7 @@ def test_stage_applier_contains_shared_engine_and_no_host_or_sql_authority(
     for relative in (
             "entry.py",
             "applier_runtime.py",
+            "deploy/repository_apply_wire.py",
             "core/repository_applier.py",
             "core/repository_snapshot.py",
             "core/staged_intent.py",

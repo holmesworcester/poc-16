@@ -328,7 +328,6 @@ def applier_config(deployment):
             "jurisdiction": deployment.jurisdiction,
         },
     ]
-    config["triggers"] = {"crons": ["*/1 * * * *"]}
     config["limits"] = {
         "cpu_ms": MAX_HOSTED_CPU_MS,
         "subrequests": MAX_HOSTED_SUBREQUESTS,

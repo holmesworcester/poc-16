@@ -517,7 +517,7 @@ os._exit(72)
             b"replacement" if when == "after" else b"base")
 
 
-def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
+def test_real_process_exit_after_root_cas_replays_retained_exact_source(
         tmp_path):
     from full_peer.node import FullPeer
 
@@ -532,18 +532,23 @@ def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
 import os
 import sys
 import facts
+from core.object_store import Applied
+from core.store import FsStore
 from full_peer.node import FullPeer
-from core.repository_applier import RepositoryApplier
 
 directory, workspace = sys.argv[1:]
 node = FullPeer(directory)
+original_cas = FsStore.cas
 
-async def die_before_retirement(*args, **kwargs):
-    os._exit(73)
+def commit_then_die(store, key, token, value):
+    result = original_cas(store, key, token, value)
+    if key == "root" and isinstance(result, Applied):
+        os._exit(73)
+    return result
 
-RepositoryApplier.retire = die_before_retirement
+FsStore.cas = commit_then_die
 facts.content.message.post(node, workspace, "general", "process crash", ts=2)
-raise AssertionError("applier did not reach retirement")
+raise AssertionError("applier did not reach root CAS")
 """
     completed = _run_python(script, node_dir, workspace)
     assert completed.returncode == 73
@@ -552,18 +557,18 @@ raise AssertionError("applier did not reach retirement")
     assert reopened.store(workspace).get("root") != old_root
     assert [entry["text"] for entry in facts.content.message.messages(
         reopened, workspace)] == ["process crash"]
-    pending = reopened.store(workspace).list("pile/")
-    assert len(pending) == 1
+    retained = reopened.store(workspace).list("pile/")
+    assert len(retained) >= 2
     committed_root = reopened.store(workspace).get("root")
 
-    report = asyncio.run(reopened.applier(workspace).turn())
+    results = [
+        asyncio.run(reopened.applier(workspace).apply(source))
+        for source in retained
+    ]
 
-    assert len(report) == 1
-    assert report[0].source == pending[0]
-    assert report[0].result.status == "noop"
-    assert report[0].result.retired is True
+    assert {result.status for result in results} == {"noop"}
     assert reopened.store(workspace).get("root") == committed_root
-    assert reopened.store(workspace).list("pile/") == []
+    assert reopened.store(workspace).list("pile/") == retained
 
 
 def test_real_process_probe_terminates_a_hung_child():

@@ -205,6 +205,7 @@ class S3Config:
     max_list_pages: int = 10_000
     max_body_read_calls: int = 4096
     probe_access_denied_missing: bool = False
+    access_denied_is_absent: bool = False
 
     def __post_init__(self):
         if not isinstance(self.bucket, str) \
@@ -255,8 +256,16 @@ class S3Config:
         _positive_int(
             self.max_body_read_calls, "max_body_read_calls",
             maximum=_MAX_BODY_READ_CALLS)
-        if not isinstance(self.probe_access_denied_missing, bool):
-            raise ValueError("probe_access_denied_missing")
+        for value, name in (
+                (self.probe_access_denied_missing,
+                 "probe_access_denied_missing"),
+                (self.access_denied_is_absent,
+                 "access_denied_is_absent")):
+            if not isinstance(value, bool):
+                raise ValueError(name)
+        if self.probe_access_denied_missing \
+                and self.access_denied_is_absent:
+            raise ValueError("choose one AccessDenied missing-key policy")
 
 
 class S3Store:
@@ -457,6 +466,13 @@ class S3Store:
             return self._read_client.get_object(**self._read_args(key))
         except Exception as error:
             if _is_missing_key(error):
+                return None
+            # S3 reports a missing key as 403 when the principal intentionally
+            # lacks ListBucket.  This mode is safe only for callers whose
+            # writes are conditional: an existing unreadable value then
+            # produces EXISTS/STALE rather than an overwrite.
+            if self.config.access_denied_is_absent \
+                    and _is_access_denied(error):
                 return None
             if self.config.probe_access_denied_missing \
                     and _is_access_denied(error) \

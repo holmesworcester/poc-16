@@ -124,30 +124,28 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
     source_a = run(worker_a.stage("alice", first_raw))
     source_b = run(worker_b.stage("bob", second_raw))
 
-    proposal_a = run(worker_a.propose(source_a, first_raw))
-    proposal_b = run(worker_b.propose(source_b, second_raw))
+    proposal_a = run(worker_a.propose(source_a, h(first_raw), first_raw))
+    proposal_b = run(worker_b.propose(source_b, h(second_raw), second_raw))
     assert proposal_a.base_token == proposal_b.base_token
     assert proposal_a.base_token.value.startswith("opaque:")
 
-    won = run(worker_a.commit(source_a, first_raw, proposal_a))
-    lost = run(worker_b.commit(source_b, second_raw, proposal_b))
+    won = run(worker_a.commit(source_a, h(first_raw), proposal_a))
+    lost = run(worker_b.commit(source_b, h(second_raw), proposal_b))
     assert won.status == "applied"
-    assert lost.status == "stale"
+    assert lost.status == "retryable"
     assert store_a.get(source_a) == first_raw
     assert store_b.get(source_b) == second_raw
 
     retried = run(RepositoryApplier(
         workspace, store_b).apply(source_b))
     assert retried.status == "applied"
-    assert retried.retired is True
-    assert store_b.get(source_b) is None
+    assert store_b.get(source_b) == second_raw
     assert store_a.get(source_a) == first_raw
 
     recovered = run(RepositoryApplier(
         workspace, store_a).apply(source_a))
     assert recovered.status == "noop"
-    assert recovered.retired is True
-    assert store_a.get(source_a) is None
+    assert store_a.get(source_a) == first_raw
     reader = _reader(workspace, store_a)
     assert reader.validated().fact(first.fid) == first
     assert reader.validated().fact(second.fid) == second
@@ -203,18 +201,14 @@ def test_applier_reconciles_unknown_root_cas(
     if applied_before_loss:
         result = run(applier.apply(source))
         assert result.status == "confirmed"
-        assert result.retired is True
     else:
-        with pytest.raises(
-                OutcomeUnknown, match="conditional response lost"):
-            run(applier.apply(source))
+        assert run(applier.apply(source)).status == "retryable"
         assert store.get(source) == raw
         result = run(RepositoryApplier(
             workspace, store).apply(source))
         assert result.status == "applied"
-        assert result.retired is True
 
-    assert store.get(source) is None
+    assert store.get(source) == raw
     assert calls == (1 if applied_before_loss else 2)
     assert _reader(workspace, store).validated().fact(item.fid) == item
 
@@ -243,22 +237,20 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
         later = run(RepositoryApplier(
             workspace, bob_store).apply(source_b))
         assert later.status == "applied"
-        assert later.retired is True
         lost_response.error = OutcomeUnknown(
             "response lost after a later root won")
         lost_response.release.set()
         stale = applying.result(timeout=10)
 
-    assert stale.status == "stale"
+    assert stale.status == "retryable"
     assert alice_store.get("root") == later.root
     assert alice_store.get(source_a) == first_raw
-    assert bob_store.get(source_b) is None
+    assert bob_store.get(source_b) == second_raw
 
     replay = run(RepositoryApplier(
         workspace, alice_store).apply(source_a))
     assert replay.status == "noop"
-    assert replay.retired is True
-    assert alice_store.get(source_a) is None
+    assert alice_store.get(source_a) == first_raw
     reader = _reader(workspace, alice_store)
     assert reader.validated().fact(first.fid) == first
     assert reader.validated().fact(second.fid) == second
@@ -480,10 +472,11 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
     low_source = run(low_applier.stage("low", low[0]))
     addition_source = run(addition_applier.stage(
         "addition", addition_raw))
-    low_proposal = run(low_applier.propose(low_source, low[0]))
+    low_proposal = run(low_applier.propose(
+        low_source, h(low[0]), low[0]))
     addition_proposal = run(
         addition_applier.propose(
-            addition_source, addition_raw))
+            addition_source, h(addition_raw), addition_raw))
     assert low_proposal.base_token == addition_proposal.base_token
 
     paused = bucket.pause("low", "cas", "root", when="before")
@@ -491,31 +484,29 @@ def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
         losing = pool.submit(
             run,
             low_applier.commit(
-                low_source, low[0], low_proposal),
+                low_source, h(low[0]), low_proposal),
         )
         paused.wait()
         try:
             added = run(addition_applier.commit(
                 addition_source,
-                addition_raw,
+                h(addition_raw),
                 addition_proposal,
             ))
             assert added.status == "applied"
         finally:
             paused.release.set()
         stale = losing.result(timeout=10)
-    assert stale.status == "stale"
+    assert stale.status == "retryable"
     assert low_store.get(low_source) == low[0]
     assert addition_store.get(addition_source) == addition_raw
 
     low_retry = run(RepositoryApplier(
         workspace, low_store).apply(low_source))
     assert low_retry.status == "applied"
-    assert low_retry.retired is True
     addition_replay = run(RepositoryApplier(
         workspace, addition_store).apply(addition_source))
     assert addition_replay.status == "noop"
-    assert addition_replay.retired is True
 
     final_reader = _reader(workspace, low_store)
     assert final_reader.worker().suppression(sid) == {

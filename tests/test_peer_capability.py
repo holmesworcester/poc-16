@@ -20,7 +20,7 @@ from core.close import decode_pile
 from core.crypto import h
 from core.grants import check_token, make_token
 from core.limits import MAX_PAGE_BATCH_BYTES, MAX_ROOT_BYTES
-from core.object_store import OutcomeUnknown
+from core.repository_applier import ApplyResult
 from full_peer import node as node_module
 from full_peer.node import FullPeer, now_ms
 from full_peer.sync import sync
@@ -39,7 +39,6 @@ def replicas(tmp_path):
     deliver(
         local, workspace,
         closed_subset(remote, workspace, all_fids(remote, workspace)))
-    local.turn(workspace)
     assert local.store(workspace).get("root") \
         == remote.store(workspace).get("root")
     return remote, workspace, local
@@ -133,7 +132,7 @@ def test_full_peer_falls_back_when_one_object_exceeds_encoded_batch(
         assert Peer(local, workspace, url).objs((oid,)) == (raw,)
 
 
-def test_http_receive_retains_transient_failure_for_direct_poke_retry(
+def test_http_receive_retains_retryable_exact_source_for_reupload(
         tmp_path, monkeypatch):
     remote, workspace, local = replicas(tmp_path)
     fid = facts.content.message.post(
@@ -142,13 +141,16 @@ def test_http_receive_retains_transient_failure_for_direct_poke_retry(
         local.reader(workspace).validated().closure((fid,)))
     applier = remote.applier(workspace)
     commit = applier.commit
+    before_sources = set(remote.store(workspace).list("pile/"))
     calls = 0
 
     async def fail_once(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise OutcomeUnknown("transient root CAS")
+            proposal = args[-1]
+            return ApplyResult(
+                "retryable", proposal.base_root, proposal.admitted)
         return await commit(*args, **kwargs)
 
     def wrong_full_peer_path(*_args, **_kwargs):
@@ -171,14 +173,21 @@ def test_http_receive_retains_transient_failure_for_direct_poke_retry(
         )
 
         assert urllib.request.urlopen(request).status == 204
-        assert len(remote.store(workspace).list("pile/")) == 1
+        assert len(
+            set(remote.store(workspace).list("pile/")) - before_sources
+        ) == 1
         assert remote.fact_of(workspace, fid) is None
 
-        poke = urllib.request.Request(
-            f"{url}/poke?ws={workspace}", data=b"", method="POST")
-        assert urllib.request.urlopen(poke).status == 204
+        retry = urllib.request.Request(
+            f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+            data=raw, method="PUT",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert urllib.request.urlopen(retry).status == 204
 
-    assert remote.store(workspace).list("pile/") == []
+    assert len(
+        set(remote.store(workspace).list("pile/")) - before_sources
+    ) == 1
     assert remote.fact_of(workspace, fid) is not None
 
 
@@ -243,6 +252,7 @@ def test_concurrent_http_receives_converge_through_one_applier(
     ]
     applier = remote.applier(workspace)
     commit = applier.commit
+    before_sources = set(remote.store(workspace).list("pile/"))
     committing = threading.Barrier(2)
     receiver_ids = []
     applier_for = remote.applier
@@ -297,18 +307,26 @@ def test_concurrent_http_receives_converge_through_one_applier(
         assert statuses == [204, 204]
         assert len(receiver_ids) == 2
         assert len(set(receiver_ids)) == 1
-        assert len(remote.store(workspace).list("pile/")) == 1
+        assert len(
+            set(remote.store(workspace).list("pile/")) - before_sources
+        ) == 2
         assert sum(
             remote.fact_of(workspace, fid) is not None
             for fid in fids
         ) == 1
 
         monkeypatch.setattr(applier, "commit", commit)
-        poke = urllib.request.Request(
-            f"{url}/poke?ws={workspace}", data=b"", method="POST")
-        assert urllib.request.urlopen(poke).status == 204
+        for raw in raws:
+            retry = urllib.request.Request(
+                f"{url}/pile/{member}/{h(raw)}?ws={workspace}",
+                data=raw, method="PUT",
+                headers={"Authorization": "Bearer " + token},
+            )
+            assert urllib.request.urlopen(retry).status == 204
 
-    assert remote.store(workspace).list("pile/") == []
+    assert len(
+        set(remote.store(workspace).list("pile/")) - before_sources
+    ) == 2
     assert all(
         remote.fact_of(workspace, fid) is not None
         for fid in fids

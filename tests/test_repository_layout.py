@@ -350,7 +350,7 @@ def test_provider_authentication_has_no_materialized_winner_tree():
     assert hasattr(WorkerView, "fact_known")
 
 
-def test_applier_owns_object_establishment_generations_and_retirement():
+def test_applier_owns_object_establishment_and_exact_source_identity():
     object_store_functions = {
         item.name for item in parsed(Path("core/object_store.py")).body
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -359,8 +359,7 @@ def test_applier_owns_object_establishment_generations_and_retirement():
 
     for function, expected in (
             ("ensure_object_async", {"core/repository_applier.py"}),
-            ("pile_source", {"core/repository_applier.py"}),
-            ("retire_exact_async", {"core/repository_applier.py"})):
+            ("pile_source", {"core/repository_applier.py"})):
         callers = {
             path.as_posix()
             for path in source_paths()
@@ -376,6 +375,19 @@ def test_applier_owns_object_establishment_generations_and_retirement():
         }
         assert callers == expected
 
+    assert not {
+        path.as_posix()
+        for path in source_paths()
+        if path != Path("core/object_store.py")
+        for call in ast.walk(parsed(path))
+        if isinstance(call, ast.Call)
+        and (
+            isinstance(call.func, ast.Name)
+            and call.func.id == "retire_exact_async"
+            or isinstance(call.func, ast.Attribute)
+            and call.func.attr == "retire_exact_async")
+    }
+
 
 def test_inbound_canonical_objects_have_one_semantic_write_door():
     callers = {
@@ -388,7 +400,6 @@ def test_inbound_canonical_objects_have_one_semantic_write_door():
     }
     assert callers == {
         "core/http.py",
-        "core/repository_applier.py",
         "full_peer/node.py",
     }
 
@@ -441,7 +452,7 @@ def test_inbound_canonical_objects_have_one_semantic_write_door():
     assert not offenders
 
 
-def test_only_cursor_savers_may_use_overwriteable_operational_hints():
+def test_exact_applier_has_no_overwriteable_operational_hints():
     applier = next(
         item for item in parsed(Path("core/repository_applier.py")).body
         if isinstance(item, ast.ClassDef)
@@ -457,10 +468,7 @@ def test_only_cursor_savers_may_use_overwriteable_operational_hints():
             for call in ast.walk(method)
         )
     }
-    assert callers == {
-        "_save_discovery_cursor",
-        "_save_staged_object_cursor",
-    }
+    assert callers == set()
 
 
 def test_pile_sender_is_the_only_production_encoder():
@@ -716,8 +724,7 @@ def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
     }
-    assert "list_page" in failure_attributes
-    assert "list" not in failure_attributes
+    assert failure_attributes == {"ingress_attempt_failures"}
 
 
 def test_http_and_worker_boundaries_never_whole_materialize_bodies():
@@ -785,64 +792,40 @@ def test_repository_apply_and_mutations_require_exact_stored_source():
         item.name: item
         for item in owner.body
         if isinstance(item, ast.AsyncFunctionDef)
-        and item.name in {"apply", "commit", "_reject"}
+        and item.name in {"apply", "apply_exact", "propose", "commit"}
     }
     apply = methods["apply"]
     assert [arg.arg for arg in apply.args.args] == ["self", "source"]
     assert apply.args.vararg is None
     assert apply.args.kwarg is None
-    assert [arg.arg for arg in apply.args.kwonlyargs] == ["retire"]
+    assert apply.args.kwonlyargs == []
+    assert [arg.arg for arg in methods["apply_exact"].args.args] == [
+        "self", "source_store", "source", "payload"]
+    assert [arg.arg for arg in methods["propose"].args.args] == [
+        "self", "source", "payload", "raw"]
+    assert [arg.arg for arg in methods["commit"].args.args] == [
+        "self", "source", "payload", "proposal"]
 
-    for name, mutations in (
-            ("commit", {"cas"}),
-            ("_reject", {"_put_evidence", "retire_rejection"})):
-        method = methods[name]
-        exact_reads = [
-            call for call in ast.walk(method)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_get_bounded"
-            and len(call.args) == 3
-            and isinstance(call.args[1], ast.Name)
-            and call.args[1].id == "source"
-            and isinstance(call.args[2], ast.Name)
-            and call.args[2].id == "MAX_PILE_BYTES"
-        ]
-        guards = [
-            compare for compare in ast.walk(method)
-            if isinstance(compare, ast.Compare)
-            and isinstance(compare.left, ast.Name)
-            and compare.left.id == "incumbent"
-            and len(compare.ops) == 1
-            and isinstance(compare.ops[0], ast.NotEq)
-            and len(compare.comparators) == 1
-            and isinstance(compare.comparators[0], ast.Name)
-            and compare.comparators[0].id == "raw"
-        ]
-        mutation_calls = [
-            call for call in ast.walk(method)
-            if isinstance(call, ast.Call)
-            and (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr in mutations
-                or isinstance(call.func, ast.Name)
-                and call.func.id in mutations
-            )
-        ]
-        assert len(exact_reads) == len(guards) == 1
-        assert mutation_calls
-        assert exact_reads[0].lineno < guards[0].lineno \
-            < min(call.lineno for call in mutation_calls)
+    calls = [
+        call.func.attr
+        for call in ast.walk(owner)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+    ]
+    assert calls.count("cas") == 1
+    assert {"list", "list_page", "delete", "retire_exact_async"} \
+        .isdisjoint(calls)
 
 
-def test_internal_generation_identity_and_spend_have_one_runtime_path():
+def test_internal_source_identity_has_one_retained_runtime_path():
     source = (ROOT / "core" / "repository_applier.py").read_text()
     assert "secrets." not in source
     assert "staged/claim/" not in source
     assert "_staged_claim_key" not in source
     assert "_claimed_staged_source" not in source
-    assert "applier/generation/" in source
-    assert "applier/spent/" in source
+    assert "applier/generation/" not in source
+    assert "applier/spent/" not in source
+    assert "failed/" not in source
 
     owner = next(
         item for item in parsed(Path("core/repository_applier.py")).body
@@ -864,23 +847,17 @@ def test_internal_generation_identity_and_spend_have_one_runtime_path():
                 and call.func.attr == name)
         ]
 
-    assert calls("stage", "_stage")
-    assert calls("_staged_source", "_stage")
-    assert calls("retire", "_spend_and_retire")
-    assert calls("retire_rejection", "_spend_and_retire")
-    assert calls("_spend_and_retire", "_claim_spend")
-    assert len(calls("_spend_and_retire", "retire_exact_async")) == 1
+    assert len(calls("stage", "pile_source")) == 1
+    assert len(calls("apply", "check_source")) == 1
+    assert len(calls("apply", "apply_exact")) == 1
     assert not any(
-        calls(method, "retire_exact_async")
-        for method in methods if method != "_spend_and_retire")
-    assert "reject" not in methods
-    assert len(calls("_apply", "_reject")) == 1
-    assert not any(
-        calls(method, "_reject")
-        for method in methods if method != "_apply")
+        calls(method, name)
+        for method in methods
+        for name in ("delete", "list", "list_page", "retire_exact_async")
+    )
 
 
-def test_rejection_schema_and_create_address_have_one_definition():
+def test_exact_sources_need_no_shared_rejection_schema():
     definitions = {
         name: [
             path for path in source_paths()
@@ -895,8 +872,8 @@ def test_rejection_schema_and_create_address_have_one_definition():
         )
     }
     assert definitions == {
-        "decode_rejection_record": [Path("core/ingress.py")],
-        "encode_rejection_record": [Path("core/ingress.py")],
+        "decode_rejection_record": [],
+        "encode_rejection_record": [],
         "validate_create": [Path("core/object_store.py")],
     }
 
@@ -909,12 +886,8 @@ def test_rejection_schema_and_create_address_have_one_definition():
             and any(alias.name == name for alias in item.names)
         }
 
-    assert importers("decode_rejection_record") == {
-        Path("core/repository_applier.py"),
-        Path("full_peer/node.py"),
-    }
-    assert importers("encode_rejection_record") == {
-        Path("core/repository_applier.py")}
+    assert importers("decode_rejection_record") == set()
+    assert importers("encode_rejection_record") == set()
     assert importers("validate_create") == {
         Path("adapters/r2/worker.py"),
         Path("adapters/s3/store.py"),
@@ -925,7 +898,7 @@ def test_rejection_schema_and_create_address_have_one_definition():
     assert {
         "decode_rejection_record",
         "encode_rejection_record",
-    } <= set(ingress.__all__)
+    }.isdisjoint(ingress.__all__)
 
 
 def test_protocol_front_doors_route_semantic_reads_through_one_reader():
@@ -1086,7 +1059,8 @@ def test_full_node_composes_roles_without_a_second_receiving_loop():
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
     ]
-    assert attributes.count("turn") == 1
+    assert attributes.count("apply") == 1
+    assert "turn" not in attributes
     assert "list" not in attributes
     assert "list_page" not in attributes
 
@@ -1168,7 +1142,6 @@ def test_one_core_http_gate_owns_peer_routes_and_control_is_separate():
         "/page",
         "/page/",
         "/pile/",
-        "/poke",
         "/readyz",
         "/root",
     } <= route_literals

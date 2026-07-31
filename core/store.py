@@ -3,13 +3,11 @@
 Layout: root (the CAS'd composite snapshot), obj/<hash> (bounded map pages
 and fact/file blobs — immutable),
 pile/<member>/<reservation>/<hash> (internal ingress),
-invite/<id> (public reads), and
-failed/{pile,meta}/<hash> (shared immutable rejected-ingress evidence).
+and invite/<id> (public reads).
 
 The public mutation contract rejects unconditional root/object replacement
-and authoritative deletion. Objects use atomic put-if-absent; root uses CAS.
-Never-deleted applier/generation and applier/spent records make internal
-retirement one-use without treating an ETag or path segment as identity.
+and authoritative deletion. Objects and retained piles use atomic
+put-if-absent; root uses CAS.
 """
 import fcntl
 import heapq

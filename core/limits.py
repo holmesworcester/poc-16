@@ -18,9 +18,6 @@ MAX_MINT_FETCH_BYTES = 4 * MIB
 MAX_PAGE_REQUEST_BYTES = 64 * 1024
 MAX_PAGE_BATCH_BYTES = 4 * MIB
 MAX_OBJECT_BYTES = MAX_PAGE_BATCH_BYTES
-MAX_REJECTION_RECORD_BYTES = 4 * 1024
-MAX_REJECTION_DIAGNOSTIC_BYTES = 512
-
 # Shared authenticated-map geometry.
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
@@ -129,10 +126,7 @@ MAX_APPLIER_SUBREQUESTS = (
     + 4 * MAX_PILE_FACTS
     + 10_000
 )
-# The checked-in applier is still cron-triggered. Cloudflare caps cron
-# invocations scheduled more frequently than hourly at 30 seconds even when a
-# larger Workers CPU limit is requested. The Queue migration tracked by
-# poc-16-x1p.17.4.1 may raise this to the Queue consumer's five-minute limit.
+# Per exact hosted invocation. Provider adapters may choose a lower limit.
 MAX_HOSTED_CPU_MS = 30_000
 MAX_HOSTED_SUBREQUESTS = 10_000_000
 

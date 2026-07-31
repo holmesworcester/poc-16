@@ -76,6 +76,7 @@ def stage(destination=STAGE):
     )
     for relative in (
             "deploy/__init__.py",
+            "deploy/repository_apply_wire.py",
             "deploy/aws_repository_applier/__init__.py",
             "deploy/aws_repository_applier/app.py"):
         _copy(REPOSITORY / relative, destination / relative)

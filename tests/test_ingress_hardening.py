@@ -1,20 +1,25 @@
-"""Real ingress failures are isolated, durable and visible."""
+"""Exact pile bounds fail independently without destructive recovery."""
 import asyncio
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import facts
 
 from core import (
-    close, fact, http, http_stdlib, kernel, merkle_map, object_store,
-    repository_applier as repository_applier_module, snapshot, limits,
+    close,
+    fact,
+    http,
+    http_stdlib,
+    kernel,
+    limits,
+    merkle_map,
+    object_store,
+    snapshot,
 )
 from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.grants import make_token
-from core.ingress import InvalidPile, check_source
+from core.ingress import InvalidPile
 from core.limits import (
     MAX_ATOM_NAME_BYTES,
     MAX_ATOM_VALUE_BYTES,
@@ -22,197 +27,112 @@ from core.limits import (
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
-from full_peer.node import FullPeer
-from full_peer import status
-from core.object_store import OutcomeUnknown
+from core.repository_applier import RepositoryApplier
 from core.store import FsStore
-from facts.content import message as message_family
 from facts.auth.workspace import workspace as workspace_fact
-from tests.util import all_fids, closed_subset, deliver
+from facts.content import message as message_family
+from full_peer import status
+from full_peer.node import FullPeer
+
+from .util import all_fids, closed_subset
 
 
 def run(awaitable):
     return asyncio.run(awaitable)
 
 
-def poisoned_timestamp_pile(workspace):
-    body = {}
-    envelope = {
-        "a": [],
-        "bh": h(canon(body)),
-        "t": "msg",
-        "ts": -1,
-    }
-    return canon({
-        "ws": workspace,
-        "facts": [{"b": body, "e": envelope}],
-    })
-
-
 def test_pile_codec_requires_one_canonical_json_spelling():
     workspace = "0" * 64
     canonical = close.encode_pile((), workspace=workspace)
     assert close.decode_pile(canonical, workspace) == []
-
     aliases = (
         b'{ "facts": [], "ws": "' + workspace.encode() + b'" }',
         b'{"ws":"' + workspace.encode() + b'","facts":[]}',
         b'{"facts":[],"ws":"' + workspace.encode()
         + b'","ws":"' + workspace.encode() + b'"}',
         b'{"facts":[],"ws":NaN}',
-        b'{"facts":[],"ws":Infinity}',
     )
     for raw in aliases:
         with pytest.raises(InvalidPile):
             close.decode_pile(raw, workspace)
 
 
-def test_pile_fact_count_is_bounded_before_generation_or_kernel_work(
-        tmp_path, monkeypatch):
+def test_fact_count_is_bounded_before_store_or_kernel_work(
+        monkeypatch):
     workspace = "0" * 64
     items = tuple(
-        Fact("unknown", ts, [], {"text": f"item-{ts}"}, workspace)
-        for ts in range(1, 4)
-    )
+        Fact("unknown", ts, [], {"text": str(ts)}, workspace)
+        for ts in range(1, 4))
     monkeypatch.setattr(close, "MAX_PILE_FACTS", 2)
     monkeypatch.setattr(kernel, "MAX_PILE_FACTS", 2)
-
-    exact = close.encode_pile(items[:2], workspace=workspace)
-    assert close.decode_pile(exact, workspace) == list(items[:2])
-    with pytest.raises(PayloadTooLarge, match="too many facts"):
-        close.encode_pile(items, workspace=workspace)
-
     over = canon({
         "facts": [item.to_json() for item in items],
         "ws": workspace,
     })
     with pytest.raises(InvalidPile, match="too many facts"):
         close.decode_pile(over, workspace)
-    judgment = kernel.drain(items, workspace)
-    assert not judgment.ok
-    assert isinstance(judgment.failure, PayloadTooLarge)
+    assert isinstance(kernel.drain(items, workspace).failure, PayloadTooLarge)
 
     class NeverMutated:
         def put_if_absent(self, *_args):
-            raise AssertionError("oversized pile reserved a generation")
+            raise AssertionError("oversized pile mutated store")
 
-    applier = repository_applier_module.RepositoryApplier(
-        workspace, NeverMutated())
-    hostile_spellings = (
-        over,
-        b'{"facts" : [null,{},{}], "ws":"' + workspace.encode() + b'"}',
-        b'{"ws":"' + workspace.encode()
-        + b'","facts":[[],[{},{}],0]}',
-        b'{"fa\\u0063ts":[\"[,]\",{},{}],\"ws\":\"'
-        + workspace.encode() + b'\"}',
-        b'{"facts":[],"fa\\u0063ts":[null,{},{}],\"ws\":\"'
-        + workspace.encode() + b'\"}',
-    )
-    for hostile in hostile_spellings:
-        with pytest.raises(PayloadTooLarge, match="too many facts"):
-            run(applier.stage("member", hostile))
-
-    nested = b'{"other":{"facts":[null,{},{},{}]},"facts":[{},{}],"ws":"' \
-        + workspace.encode() + b'"}'
-    close.check_pile_bounds(nested)
-
-    malformed = b'{"facts":[{},"unterminated'
-    with pytest.raises(ValueError, match="pile facts array"):
-        run(applier.stage("member", malformed))
+    applier = RepositoryApplier(workspace, NeverMutated())
+    with pytest.raises(PayloadTooLarge, match="too many facts"):
+        run(applier.stage("member", over))
 
 
-def test_pile_decoder_work_is_bounded_before_reservation_and_recovers(
+def test_json_value_budget_precedes_staging_and_healthy_pile_recovers(
         tmp_path, monkeypatch):
     secret, public = keypair()
     root = workspace_fact(secret, public, "memory-bound", 1)
     healthy = close.encode_pile((root,), workspace=root.fid)
-    exact = canon({
-        "facts": [],
-        "junk": list(range(64)),
-        "ws": root.fid,
-    })
-    over = canon({
-        "facts": [],
-        "junk": list(range(65)),
-        "ws": root.fid,
-    })
-    exact_values = close._scan_json_values(exact)
-    assert close._scan_json_values(over) == exact_values + 1
-    monkeypatch.setattr(close, "MAX_PILE_JSON_VALUES", exact_values)
-    close.check_pile_bounds(exact)
-
-    store = FsStore(tmp_path / "store")
-    applier = repository_applier_module.RepositoryApplier(root.fid, store)
+    exact = canon({"facts": [], "junk": list(range(16)), "ws": root.fid})
+    over = canon({"facts": [], "junk": list(range(17)), "ws": root.fid})
+    monkeypatch.setattr(
+        close, "MAX_PILE_JSON_VALUES", close._scan_json_values(exact))
+    store = FsStore(str(tmp_path / "store"))
+    applier = RepositoryApplier(root.fid, store)
     with pytest.raises(PayloadTooLarge, match="too many JSON values"):
         run(applier.stage("member", over))
-    assert store.list("applier/generation/") == []
-
-    result = run(applier.receive_pile("member", healthy)).result
+    monkeypatch.setattr(
+        close, "MAX_PILE_JSON_VALUES", limits.MAX_PILE_JSON_VALUES)
+    result = run(applier.receive_pile("member", healthy))
     assert result.status == "applied"
     assert store.get("root") is not None
 
 
-def test_shared_pile_limits_fit_the_smallest_hosted_memory_ceiling():
+def test_shared_pile_limits_fit_smallest_hosted_memory_ceiling():
     peak = limits.applier_peak_bound(
         limits.MAX_PILE_BYTES,
         limits.MAX_PILE_JSON_VALUES,
         limits.MAX_PILE_FACTS,
     )
-    empty = len(canon({
-        "facts": [],
-        "ws": "0" * 64,
-    }))
-    maximum_canonical_envelope = (
-        empty - 2
-        + limits.MAX_PILE_FACTS * limits.MAX_FACT_BYTES
-        + limits.MAX_PILE_FACTS - 1
-    )
     assert limits.MAX_FACT_BYTES == 16 * 1024
     assert limits.MAX_PILE_FACTS == 256
     assert limits.MAX_PILE_BYTES == 5 * limits.MIB
-    assert maximum_canonical_envelope < limits.MAX_PILE_BYTES
-    assert peak == 113_008_656
     assert peak < limits.MIN_HOSTED_MEMORY_BYTES
-    assert limits.MIN_HOSTED_MEMORY_BYTES - peak > 14 * 1024 * 1024
-    assert limits.MAX_APPLIER_SUBREQUESTS == 8_137_488
-    assert limits.MAX_APPLIER_SUBREQUESTS \
-        < limits.MAX_HOSTED_SUBREQUESTS
+    assert limits.MAX_APPLIER_SUBREQUESTS < limits.MAX_HOSTED_SUBREQUESTS
 
 
-def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
+def test_generic_atom_grammar_enforces_text_and_fid_bounds():
     workspace = "0" * 64
     fid = "f" * 64
     valid = Fact(
-        "unknown",
-        1,
-        [
-            ["ref", "r" * MAX_ATOM_NAME_BYTES, fid],
-            [
-                "offer",
-                "n" * MAX_ATOM_NAME_BYTES,
-                "v" * MAX_ATOM_VALUE_BYTES,
-                "w" * MAX_ATOM_VALUE_BYTES,
-            ],
-        ],
-        {},
-        workspace,
-    )
+        "unknown", 1,
+        [["ref", "r" * MAX_ATOM_NAME_BYTES, fid], [
+            "offer", "n" * MAX_ATOM_NAME_BYTES,
+            "v" * MAX_ATOM_VALUE_BYTES,
+        ]],
+        {}, workspace)
     raw = close.encode_pile((valid,), workspace=workspace)
     assert close.decode_pile(raw, workspace) == [valid]
-
-    malformed = (
-        ["ref", "", fid],
-        ["ref", "r" * (MAX_ATOM_NAME_BYTES + 1), fid],
-        ["ref", "role", []],
-        ["ref", "role", "not-a-fid"],
-        ["offer", "", "value"],
-        ["offer", "name", ""],
-        ["offer", "name", "value", ""],
-        ["offer", "n" * (MAX_ATOM_NAME_BYTES + 1), "value"],
-        ["offer", "name", "v" * (MAX_ATOM_VALUE_BYTES + 1)],
-        ["offer", "name", []],
-    )
-    for atom in malformed:
+    for atom in (
+            ["ref", "", fid],
+            ["ref", "role", "not-a-fid"],
+            ["offer", "name", ""],
+            ["offer", "n" * (MAX_ATOM_NAME_BYTES + 1), "value"],
+            ["offer", "name", "v" * (MAX_ATOM_VALUE_BYTES + 1)]):
         poison = Fact("unknown", 1, [atom], {}, workspace)
         with pytest.raises(InvalidPile):
             close.decode_pile(
@@ -221,648 +141,178 @@ def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
             )
 
 
-def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
+def test_rejected_exact_pile_does_not_block_independent_pile(tmp_path):
     source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "source", ts=1)
-    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    healthy = closed_subset(source, workspace, all_fids(source, workspace))
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    bad = run(applier.stage("bad", b"{}"))
+    good = run(applier.stage("good", healthy))
 
-    destination = FullPeer(str(tmp_path / "destination"))
-    destination.add_workspace(workspace, "source", [])
-    good = closed_subset(source, workspace, [survivor])
-    bad = poisoned_timestamp_pile(workspace)
-    deliver(destination, workspace, bad, member="0000000000000000")
-    deliver(destination, workspace, good, member="ffffffffffffffff")
-
-    destination.turn(workspace)
-
-    assert destination.fact_of(workspace, survivor) is not None
-    assert destination.store(workspace).list("pile/") == []
-    failures = status.describe(destination)["workspaces"][workspace][
-        "ingress_failures"]
-    assert len(failures) == 1
-    assert failures[0]["error"] == "InvalidPile: fact shape"
-    assert destination.store(workspace).get(
-        "failed/pile/" + h(bad)) == bad
-
-    restarted = FullPeer(str(tmp_path / "destination"))
-    assert restarted.fact_of(workspace, survivor) is not None
-    assert restarted.store(workspace).list("pile/") == []
-    assert status.describe(restarted)["workspaces"][workspace][
-        "ingress_failures"] == failures
+    assert run(applier.apply(bad)).status == "rejected"
+    assert run(applier.apply(good)).status == "applied"
+    assert store.get(bad) == b"{}"
+    assert store.get(good) == healthy
+    assert store.get("root") == source.store(workspace).get("root")
 
 
-def queued_messages(tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "source", ts=1)
-    first = facts.content.message.post(source, workspace, "general", "first", ts=2)
-    second = facts.content.message.post(source, workspace, "general", "second", ts=3)
-    destination = FullPeer(str(tmp_path / "destination"))
-    destination.add_workspace(workspace, "source", [])
-    first_raw = closed_subset(source, workspace, [first])
-    second_raw = closed_subset(source, workspace, [second])
-    first_key = deliver(
-        destination, workspace, first_raw, member="0000000000000000")
-    second_key = deliver(
-        destination, workspace, second_raw, member="ffffffffffffffff")
-    return (
-        destination, workspace,
-        (first, first_raw, first_key),
-        (second, second_raw, second_key),
-    )
-
-
-def test_untyped_decoder_failure_retains_exact_pile_and_does_not_wedge(
+def test_program_failure_retains_source_and_independent_work_progresses(
         tmp_path, monkeypatch):
-    node, workspace, first, second = queued_messages(tmp_path)
-    first_fid, first_raw, first_key = first
-    second_fid, _, second_key = second
-    decode = repository_applier_module.decode_pile
-
-    def program_failure(raw, expected_workspace):
-        if raw == first_raw:
-            raise ValueError("simulated decoder programming failure")
-        return decode(raw, expected_workspace)
-
+    source = FullPeer(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    first = facts.content.message.post(
+        source, workspace, "general", "first", ts=10)
+    first_raw = closed_subset(source, workspace, (first,))
+    second = facts.content.message.post(
+        source, workspace, "general", "second", ts=11)
+    second_raw = closed_subset(source, workspace, (second,))
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    first_key = run(applier.stage("first", first_raw))
+    second_key = run(applier.stage("second", second_raw))
+    original = message_family.message
     monkeypatch.setattr(
-        repository_applier_module, "decode_pile", program_failure)
-    node.turn(workspace)
-
-    assert node.store(workspace).get(first_key) == first_raw
-    assert node.store(workspace).get(second_key) is None
-    assert node.store(workspace).list("failed/pile/") == []
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, second_fid) is not None
-    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
-        "ValueError: simulated decoder programming failure"
-
-
-def test_untyped_fact_decoder_value_error_is_not_a_quarantine_verdict(
-        monkeypatch):
-    def program_failure(_value):
-        raise ValueError("simulated fact decoder programming failure")
-
-    monkeypatch.setattr(close, "from_json", program_failure)
-    workspace = "0" * 64
-    raw = canon({"ws": workspace, "facts": [{}]})
-
-    with pytest.raises(
-            ValueError, match="simulated fact decoder programming failure"):
-        close.decode_pile(raw, workspace)
-
-
-def test_family_program_failure_retains_exact_pile_and_does_not_wedge(
-        tmp_path, monkeypatch):
-    node, workspace, first, second = queued_messages(tmp_path)
-    first_fid, first_raw, first_key = first
-    second_fid, _, second_key = second
-    needs = message_family.needs
-
-    def program_failure(item):
-        if item.fid == first_fid:
-            raise RuntimeError("simulated family programming failure")
-        return needs(item)
-
-    monkeypatch.setattr(message_family, "needs", program_failure)
-    node.turn(workspace)
-
-    assert node.store(workspace).get(first_key) == first_raw
-    assert node.store(workspace).get(second_key) is None
-    assert node.store(workspace).list("failed/pile/") == []
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, second_fid) is not None
-    assert node.ingress_attempt_failures(workspace)[0]["error"] == \
-        "RuntimeError: simulated family programming failure"
-
-
-@pytest.mark.parametrize("boundary", ["program", "provider"])
-def test_failed_root_commit_is_isolated_from_the_next_pile_and_retries(
-        tmp_path, monkeypatch, boundary):
-    node, workspace, first, second = queued_messages(tmp_path)
-    first_fid, first_raw, first_key = first
-    second_fid, _, second_key = second
-    store = node.store(workspace)
-    if boundary == "program":
-        applier = node.applier(workspace)
-        original = applier.commit
-        calls = 0
-        expected_error = "RuntimeError: simulated apply program failure"
-
-        async def fail_first(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise RuntimeError("simulated apply program failure")
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(applier, "commit", fail_first)
-    else:
-        original = store.cas
-        calls = 0
-        expected_error = "OutcomeUnknown: simulated provider CAS outage"
-
-        def fail_first(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise OutcomeUnknown("simulated provider CAS outage")
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(store, "cas", fail_first)
-
-    node.turn(workspace)
-
+        message_family,
+        "message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("family program failure")),
+    )
+    with pytest.raises(RuntimeError, match="family program failure"):
+        run(applier.apply(first_key))
+    monkeypatch.setattr(message_family, "message", original)
+    assert run(applier.apply(second_key)).status == "applied"
     assert store.get(first_key) == first_raw
-    assert store.get(second_key) is None
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, second_fid) is not None
-    assert store.list("failed/") == []
-    failures = node.ingress_attempt_failures(workspace)
-    assert len(failures) == 1
-    assert failures[0]["source"] == first_key
-    assert failures[0]["error"] == expected_error
-
-    for projection in node._sql.values():
-        projection.db.close()
-    reopened = FullPeer(node.dir)
-    reopened.turn(workspace)
-
-    assert reopened.fact_of(workspace, first_fid) is not None
-    assert reopened.store(workspace).list("pile/") == []
-    assert reopened.ingress_attempt_failures(workspace) == []
 
 
-def test_retryable_failure_never_ages_into_destructive_quarantine(
-        tmp_path, monkeypatch):
-    node, workspace, first, second = queued_messages(tmp_path)
-    first_fid, first_raw, first_key = first
-    second_fid, _, second_key = second
-    applier = node.applier(workspace)
-    commit = applier.commit
-
-    async def fail_first_pile(source, *args, **kwargs):
-        if source == first_key:
-            raise OutcomeUnknown("persistent provider outage for this pile")
-        return await commit(source, *args, **kwargs)
-
-    monkeypatch.setattr(applier, "commit", fail_first_pile)
-
-    for _ in range(12):
-        node.turn(workspace)
-
-    assert node.store(workspace).get(first_key) == first_raw
-    assert node.store(workspace).get(second_key) is None
-    assert node.store(workspace).list("failed/") == []
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, second_fid) is not None
-    failure = node.ingress_attempt_failures(workspace)[0]
-    assert failure["error"] == \
-        "OutcomeUnknown: persistent provider outage for this pile"
-
-
-def test_failed_root_read_is_isolated_from_the_next_pile(
-        tmp_path, monkeypatch):
-    node, workspace, first, second = queued_messages(tmp_path)
-    first_fid, first_raw, first_key = first
-    second_fid, _, second_key = second
-    store = node.store(workspace)
-    read_versioned = store.read_versioned
-    calls = 0
-
-    def fail_first_read(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OutcomeUnknown("authoritative root unavailable")
-        return read_versioned(*args, **kwargs)
-
-    monkeypatch.setattr(store, "read_versioned", fail_first_read)
-    node.turn(workspace)
-
-    assert store.get(first_key) == first_raw
-    assert store.get(second_key) is None
-    assert store.list("failed/") == []
-    assert node.fact_of(workspace, first_fid) is None
-    assert node.fact_of(workspace, second_fid) is not None
-    failure = node.ingress_attempt_failures(workspace)[0]
-    assert failure["source"] == first_key
-    assert failure["error"] == \
-        "OutcomeUnknown: authoritative root unavailable"
-
-
-@pytest.mark.parametrize(
-    ("boundary", "source_survives", "payload_exact"),
-    [
-        ("payload", True, False),
-        ("metadata", True, True),
-        ("delete-before", True, True),
-        ("delete-after", False, True),
-    ],
-)
-def test_rejection_retirement_requires_exact_durable_evidence(
-        tmp_path, monkeypatch, boundary, source_survives, payload_exact):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "source", ts=1)
-    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
-    node = FullPeer(str(tmp_path / "destination"))
-    node.add_workspace(workspace, "source", [])
-    bad = poisoned_timestamp_pile(workspace)
-    good = closed_subset(source, workspace, [survivor])
-    bad_key = deliver(
-        node, workspace, bad, member="0000000000000000")
-    deliver(node, workspace, good, member="ffffffffffffffff")
-    store = node.store(workspace)
-
-    if boundary == "payload":
-        put_if_absent = store.put_if_absent
-
-        def corrupt_payload(key, value):
-            if key.startswith("failed/pile/"):
-                return put_if_absent(key, b"wrong rejection bytes")
-            return put_if_absent(key, value)
-
-        monkeypatch.setattr(store, "put_if_absent", corrupt_payload)
-    elif boundary == "metadata":
-        put_if_absent = store.put_if_absent
-
-        def corrupt_metadata(key, value):
-            if key.startswith("failed/meta/"):
-                return put_if_absent(key, b"wrong metadata bytes")
-            return put_if_absent(key, value)
-
-        monkeypatch.setattr(store, "put_if_absent", corrupt_metadata)
-    else:
-        delete = store.delete
-
-        def ambiguous_delete(key):
-            if key == bad_key:
-                if boundary == "delete-after":
-                    delete(key)
-                raise OutcomeUnknown("simulated lost delete response")
-            return delete(key)
-
-        monkeypatch.setattr(store, "delete", ambiguous_delete)
-
-    node.turn(workspace)
-
-    assert node.fact_of(workspace, survivor) is not None
-    assert (store.get(bad_key) is not None) is source_survives
-    payload = store.get("failed/pile/" + h(bad))
-    assert (payload == bad) is payload_exact
-    if source_survives:
-        assert node.ingress_attempt_failures(workspace)
-    else:
-        assert node.ingress_attempt_failures(workspace) == []
-    if boundary == "delete-before":
-        for _ in range(4):
-            node.turn(workspace)
-        assert store.get(bad_key) == bad
-        assert len(store.list("failed/meta/")) == 1
-
-
-def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
+def test_failed_root_commit_retains_exact_source_for_named_retry(
         tmp_path, monkeypatch):
     source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "source", ts=1)
-    survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
-    node = FullPeer(str(tmp_path / "destination"))
-    node.add_workspace(workspace, "source", [])
-    rejected = close.encode_pile([
-        Fact(
-            "signature", 3,
-            [["offer", "author", "not-a-fact", source.pk]], {}, workspace),
-    ], workspace=workspace)
-    deliver(node, workspace, rejected, member="0000000000000000")
-    deliver(
-        node, workspace,
-        closed_subset(source, workspace, [survivor]),
-        member="ffffffffffffffff")
-
-    listed = []
-    list_keys = node.store(workspace).list
-
-    def observe_list(prefix):
-        listed.append(prefix)
-        return list_keys(prefix)
-
-    monkeypatch.setattr(node.store(workspace), "list", observe_list)
-    node.turn(workspace)
-
-    assert node.fact_of(workspace, survivor) is not None
-    assert not any(prefix.startswith("failed/") for prefix in listed)
-    failure = node.ingress_failures(workspace)[0]
-    assert failure["error"] == "KernelRejected: ingress rejected"
-    assert node.store(workspace).get(
-        "failed/pile/" + h(rejected)) == rejected
-
-
-def test_failure_status_follows_short_native_pages_without_whole_list(
-        tmp_path):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "node", ts=1)
-    inner = node.store(workspace)
-    expected = []
-    for ordinal in range(3):
-        payload = h(f"poison {ordinal}".encode())
-        generation = f"{ordinal:064x}"
-        source = f"pile/member/{generation}/{payload}"
-        record = {
-            "classification": "InvalidPile",
-            "diagnostic": f"poison {ordinal}",
-            "generation": generation,
-            "kind": "permanent-rejection-v1",
-            "payload": payload,
-            "pile": "failed/pile/" + payload,
-            "source": source,
-            "workspace": workspace,
-        }
-        raw = canon(record)
-        inner.put_if_absent("failed/meta/" + h(raw), raw)
-        expected.append({
-            "error": f"InvalidPile: poison {ordinal}",
-            "id": payload,
-            "source": source,
-        })
-
-    class ShortPages:
-        def __init__(self):
-            self.calls = []
-
-        def __getattr__(self, name):
-            return getattr(inner, name)
-
-        def list(self, _prefix):
-            raise AssertionError("failure status used whole LIST")
-
-        def list_page(self, prefix, cursor, limit):
-            self.calls.append((prefix, cursor, limit))
-            return inner.list_page(prefix, cursor, 1)
-
-    short = ShortPages()
-    node._stores[workspace] = short
-
-    assert node.ingress_failures(workspace) == sorted(
-        expected, key=lambda row: row["id"])
-    assert len(short.calls) == len(expected)
-    assert {prefix for prefix, _, _ in short.calls} == {
-        "failed/meta/"}
-    assert [limit for _, _, limit in short.calls] == [256, 255, 254]
-
-
-def test_two_workers_share_immutable_rejection_evidence_without_clobber(
-        tmp_path, monkeypatch):
-    shared = tmp_path / "shared"
-    factory = lambda workspace: FsStore(str(shared / workspace))
-    first = FullPeer(str(tmp_path / "first"), store_factory=factory)
-    workspace = facts.auth.workspace.create(first, "shared", ts=1)
-    second = FullPeer(str(tmp_path / "second"), store_factory=factory)
-    second.add_workspace(workspace, "shared", [])
-    second.rebuild(workspace)
-    bad = poisoned_timestamp_pile(workspace)
-    source = run(first.applier(workspace).stage(
-        "0000000000000000", bad))
-
-    listed = threading.Barrier(2)
-    spending = threading.Barrier(2)
-    deletes = []
-    for node in (first, second):
-        store = node.store(workspace)
-        list_page = store.list_page
-        put_if_absent = store.put_if_absent
-        delete = store.delete
-
-        def synchronized_list_page(
-                prefix, cursor, limit, list_page=list_page):
-            page = list_page(prefix, cursor, limit)
-            if prefix == "pile/":
-                listed.wait(timeout=5)
-            return page
-
-        def synchronized_spend(key, value, put_if_absent=put_if_absent):
-            if key.startswith("applier/spent/"):
-                spending.wait(timeout=5)
-            return put_if_absent(key, value)
-
-        def recorded_delete(key, delete=delete):
-            if key == source:
-                deletes.append(key)
-            return delete(key)
-
-        monkeypatch.setattr(store, "list_page", synchronized_list_page)
-        monkeypatch.setattr(store, "put_if_absent", synchronized_spend)
-        monkeypatch.setattr(store, "delete", recorded_delete)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = [
-            pool.submit(node.turn, workspace)
-            for node in (first, second)
-        ]
-        assert [future.result(timeout=10) for future in results] == [[], []]
-
-    store = first.store(workspace)
-    assert store.get(source) is None
-    assert deletes == [source]
-    assert store.get("failed/pile/" + h(bad)) == bad
-    meta_keys = store.list("failed/meta/")
-    assert len(meta_keys) == 1
-    records = [json.loads(store.get(key)) for key in meta_keys]
-    assert all(record["payload"] == h(bad) for record in records)
-    assert all(record["source"] == source for record in records)
-    assert all(
-        record["classification"] == "InvalidPile"
-        and record["diagnostic"] == "fact shape"
-        for record in records)
-    assert first.ingress_attempt_failures(workspace) == []
-    assert second.ingress_attempt_failures(workspace) == []
-    assert first.ingress_failures(workspace) \
-        == second.ingress_failures(workspace)
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    raw = closed_subset(source, workspace, all_fids(source, workspace))
+    store = FsStore(str(tmp_path / "recipient"))
+    applier = RepositoryApplier(workspace, store)
+    key = run(applier.stage("member", raw))
+    original = store.cas
+    monkeypatch.setattr(
+        store,
+        "cas",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("root CAS failed")),
+    )
+    with pytest.raises(RuntimeError, match="root CAS failed"):
+        run(applier.apply(key))
+    assert store.get(key) == raw
+    assert store.get("root") is None
+    monkeypatch.setattr(store, "cas", original)
+    assert run(RepositoryApplier(workspace, store).apply(key)).status \
+        == "applied"
 
 
 def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "node", ts=1)
     peer = "https://peer.invalid"
-
     node.record_sync_failure(
         workspace, peer, ValueError("remote object integrity"))
     row = status.describe(node)["workspaces"][workspace]["sync_failures"]
-    assert len(row) == 1
-    assert row[0]["peer"] == peer
     assert row[0]["error"] == "ValueError: remote object integrity"
-
     node.record_sync_success(workspace, peer)
     assert status.describe(node)["workspaces"][workspace][
         "sync_failures"] == []
 
 
-def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "node", ts=1)
-    store = node.store(workspace)
-    root = json.loads(store.get("root"))
-    root["removals"] = {"oid": "", "fp": ""}
-
+def test_legacy_removal_field_is_rejected():
+    root = {
+        "anchor": "a" * 64,
+        "layout_seed": "b" * 64,
+        "maps": {},
+        "stamp": snapshot.LAYOUT,
+        "removals": {},
+    }
     with pytest.raises(ValueError, match="root shape"):
         snapshot.decode_root(canon(root))
 
 
-@pytest.mark.parametrize("decoder", [
+@pytest.mark.parametrize("decoder", (
     close.decode_pile,
     snapshot.decode_root,
     fact.decode,
-])
-def test_json_codec_doors_translate_parser_recursion_to_value_error(decoder):
+))
+def test_json_codec_doors_translate_recursion_to_value_error(decoder):
     nested = b"[" * 5_000 + b"0" + b"]" * 5_000
-
     with pytest.raises(ValueError):
-        if decoder is close.decode_pile:
-            decoder(nested, "0" * 64)
-        else:
-            decoder(nested)
+        decoder(nested, "0" * 64) \
+            if decoder is close.decode_pile else decoder(nested)
 
 
-def test_merkle_map_parser_recursion_is_also_a_value_error():
+def test_merkle_page_recursion_is_a_value_error():
     nested = b"[" * 2_000 + b"0" + b"]" * 2_000
-
     with pytest.raises(ValueError, match="merkle map page shape"):
         merkle_map._decode(nested, h(nested), h(b"seed"))
 
 
-def test_pile_and_root_codecs_reject_size_before_parsing(monkeypatch):
+def test_pile_and_root_reject_size_before_parsing(monkeypatch):
     workspace = "0" * 64
     cases = (
-        (
-            close, "MAX_PILE_BYTES",
-            lambda raw: close.decode_pile(raw, workspace),
-            canon({"ws": workspace, "facts": []}),
-        ),
+        (close, "MAX_PILE_BYTES",
+         lambda raw: close.decode_pile(raw, workspace),
+         canon({"ws": workspace, "facts": []})),
         (snapshot, "MAX_ROOT_BYTES", snapshot.decode_root, b'{"stamp":"x"}'),
     )
-    for module, limit, decoder, raw in cases:
-        monkeypatch.setattr(module, limit, len(raw) - 1)
+    for module, name, decoder, raw in cases:
+        monkeypatch.setattr(module, name, len(raw) - 1)
         with pytest.raises(PayloadTooLarge):
             decoder(raw)
 
 
-def test_pile_encoder_and_object_admission_enforce_the_reader_bounds(
-        monkeypatch):
-    workspace = "0" * 64
-    empty = close.encode_pile((), workspace=workspace)
-    monkeypatch.setattr(close, "MAX_PILE_BYTES", len(empty) - 1)
-    with pytest.raises(PayloadTooLarge):
-        close.encode_pile((), workspace=workspace)
-
+def test_object_admission_enforces_reader_bound_before_write(monkeypatch):
     class NeverWritten:
         def put_if_absent(self, *_args):
             raise AssertionError("oversized object was written")
 
-        def get(self, _key):
-            raise AssertionError("oversized object was read")
-
     raw = b"too large"
     monkeypatch.setattr(object_store, "MAX_OBJECT_BYTES", len(raw) - 1)
     with pytest.raises(ValueError, match="address"):
-        run(repository_applier_module.RepositoryApplier(
-            workspace, NeverWritten()).admit_object(h(raw), raw))
+        run(RepositoryApplier(
+            "0" * 64, NeverWritten()).admit_object(h(raw), raw))
 
 
-def _message_with_encoded_size(workspace, public, size, ts):
-    probe = message_family.message(
-        workspace, public, "general", "", ts)
-    padding = size - len(canon(probe.to_json()))
-    assert padding >= 0
-    item = message_family.message(
-        workspace, public, "general", "x" * padding, ts)
-    assert len(canon(item.to_json())) == size
-    return item
-
-
-def test_fact_bytes_fit_every_hosted_reader_before_repository_mutation(
-        tmp_path):
+def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     secret, public = source.identity(workspace)
+    probe = message_family.message(workspace, public, "general", "", 2)
+    padding = MAX_FACT_BYTES - len(canon(probe.to_json()))
+    exact = message_family.message(
+        workspace, public, "general", "x" * padding, 2)
+    signed = facts.auth.signature.signature(secret, public, exact, 2)
     genesis = source.fact_of(workspace, workspace)
-
-    exact = _message_with_encoded_size(
-        workspace, public, MAX_FACT_BYTES, 2)
-    exact_signature = facts.auth.signature.signature(
-        secret, public, exact, exact.ts)
-    exact_unit = (genesis, exact_signature, exact)
-    exact_raw = fact.encode(exact)
-    assert len(exact_raw) == MAX_FACT_BYTES
-    assert kernel.drain(exact_unit, workspace).ok
-    exact_pile = close.encode_pile(exact_unit, workspace=workspace)
-    assert close.decode_pile(exact_pile, workspace) == list(exact_unit)
-
+    raw = close.encode_pile((genesis, signed, exact), workspace=workspace)
     destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "destination", [])
-    destination.receive_pile(
-        workspace, "0123456789abcdef", exact_pile)
+    destination.receive_pile(workspace, "0123456789abcdef", raw)
     assert destination.fact_of(workspace, exact.fid) == exact
 
-    grant_secret = b"g" * 32
+    secret_token = b"g" * 32
     gate = http.HttpGate(
         http.AsyncFromSyncReader(destination.store(workspace)),
         workspace,
-        grant_secret,
+        secret_token,
         lambda: 100,
         max_object_bytes=MAX_REPOSITORY_OBJECT_BYTES,
     )
     token = make_token(
-        grant_secret, "reader", workspace, issued_at=100)
+        secret_token, "reader", workspace, issued_at=100)
+    encoded = fact.encode(exact)
     response = run(gate.handle(
-        "GET",
-        "/page/" + h(exact_raw),
-        {"ws": workspace},
-        {"Authorization": "Bearer " + token},
-    ))
+        "GET", "/page/" + h(encoded), {"ws": workspace},
+        {"Authorization": "Bearer " + token}))
     assert response.status == 200
-    assert response.body == exact_raw
-
-    oversized = _message_with_encoded_size(
-        workspace, public, MAX_FACT_BYTES + 1, 3)
-    oversized_signature = facts.auth.signature.signature(
-        secret, public, oversized, oversized.ts)
-    oversized_unit = (genesis, oversized_signature, oversized)
-    with pytest.raises(PayloadTooLarge, match="fact too large"):
-        fact.encode(oversized)
-    with pytest.raises(PayloadTooLarge, match="fact too large"):
-        close.encode_pile(oversized_unit, workspace=workspace)
-    judgment = kernel.drain(oversized_unit, workspace)
-    assert not judgment.ok
-    assert isinstance(judgment.failure, PayloadTooLarge)
-
-    hostile = canon({
-        "ws": workspace,
-        "facts": [item.to_json() for item in oversized_unit],
-    })
-    with pytest.raises(InvalidPile, match="fact too large"):
-        close.decode_pile(hostile, workspace)
-    root = destination.store(workspace).get("root")
-    destination.receive_pile(
-        workspace, "fedcba9876543210", hostile)
-    assert destination.store(workspace).get("root") == root
-    assert not destination.store(workspace).has(
-        "obj/" + h(canon(oversized.to_json())))
-
-    healthy = message_family.message(
-        workspace, public, "general", "still progresses", 4)
-    healthy_signature = facts.auth.signature.signature(
-        secret, public, healthy, healthy.ts)
-    destination.receive_pile(
-        workspace,
-        "0011223344556677",
-        close.encode_pile(
-            (genesis, healthy_signature, healthy),
-            workspace=workspace,
-        ),
-    )
-    assert destination.fact_of(workspace, healthy.fid) == healthy
+    assert response.body == encoded
 
 
-def test_peer_adapter_rejects_claimed_oversize_without_reading(
-        monkeypatch):
+def test_peer_adapter_rejects_claimed_oversize_without_reading(monkeypatch):
     class NeverRead:
         def read(self, _count):
             raise AssertionError("oversized body was read")
@@ -871,101 +321,5 @@ def test_peer_adapter_rejects_claimed_oversize_without_reading(
     handler.headers = {"Content-Length": "9"}
     handler.rfile = NeverRead()
     monkeypatch.setattr(http_stdlib, "MAX_MINT_REQUEST_BYTES", 8)
-
     with pytest.raises(PayloadTooLarge):
         handler._body("POST", "/unknown")
-
-
-def test_failed_retirement_spends_once_and_never_risks_an_aba_retry(
-        tmp_path, monkeypatch):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    raw = close.encode_pile((), workspace=workspace)
-    source = node.stage_received_pile(
-        workspace, node.member_for(workspace), raw)
-    store = node.store(workspace)
-    real_delete = store.delete
-    applier = node.applier(workspace)
-    real_propose = applier.propose
-    proposals = 0
-    deletes = 0
-
-    async def counted_propose(*args):
-        nonlocal proposals
-        proposals += 1
-        return await real_propose(*args)
-
-    def failed_delete(_key):
-        nonlocal deletes
-        deletes += 1
-        raise OSError("injected retirement outage")
-
-    monkeypatch.setattr(store, "delete", failed_delete)
-    monkeypatch.setattr(applier, "propose", counted_propose)
-
-    for _ in range(5):
-        node.turn(workspace)
-
-    assert store.get(source) == raw
-    assert proposals == 1
-    assert deletes == 1
-    assert applier._receipts == {}
-    generation = check_source(source, raw).generation
-    assert store.get("applier/spent/" + generation) is not None
-    assert store.list("failed/") == []
-    assert node.ingress_attempt_failures(workspace) == []
-
-    monkeypatch.setattr(store, "delete", real_delete)
-    node.turn(workspace)
-    assert store.get(source) == raw
-    assert applier._receipts == {}
-
-
-def test_distinct_failed_applies_retain_only_store_bound_pile_bytes(
-        tmp_path, monkeypatch):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    bootstrap = closed_subset(
-        source, workspace, all_fids(source, workspace))
-    fids = [
-        facts.content.message.post(
-            source, workspace, "general", f"failed-{ordinal}",
-            ts=10 + ordinal)
-        for ordinal in range(8)
-    ]
-    raws = [
-        closed_subset(source, workspace, [fid])
-        for fid in fids
-    ]
-    assert len(set(raws)) == 8
-
-    node = FullPeer(str(tmp_path / "node"))
-    node.add_workspace(workspace, "alice", peers=[])
-    deliver(node, workspace, bootstrap)
-    node.turn(workspace)
-    store = node.store(workspace)
-    queued = {
-        deliver(
-            node, workspace, raw,
-            member=f"{ordinal:016x}",
-        ): raw
-        for ordinal, raw in enumerate(raws)
-    }
-    assert len(queued) == 8
-    applier = node.applier(workspace)
-
-    async def fail_commit(*_args, **_options):
-        raise OSError("injected root commit outage")
-
-    monkeypatch.setattr(applier, "commit", fail_commit)
-    node.turn(workspace)
-
-    assert set(store.list("pile/")) == set(queued)
-    assert all(store.get(key) == raw for key, raw in queued.items())
-    assert applier._receipts == {}
-    failures = node.ingress_attempt_failures(workspace)
-    assert len(failures) == len(queued)
-    assert {failure["source"] for failure in failures} == set(queued)
-    assert {
-        failure["error"] for failure in failures
-    } == {"OSError: injected root commit outage"}

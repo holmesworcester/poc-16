@@ -59,59 +59,6 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: DiscoverCanonicalWork
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub
-                  "arn:${AWS::Partition}:s3:::${CanonicalBucketName}"
-                Condition:
-                  StringEquals:
-                    s3:ResourceAccount: !Ref ExpectedBucketOwner
-                  StringLike:
-                    s3:prefix:
-                      - !Sub "${CanonicalPrefix}/pile/*"
-              - Sid: DistinguishMissingCanonicalKeys
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub
-                  "arn:${AWS::Partition}:s3:::${CanonicalBucketName}"
-                Condition:
-                  StringEquals:
-                    s3:ResourceAccount: !Ref ExpectedBucketOwner
-                  StringLike:
-                    s3:prefix:
-                      - !Sub "${CanonicalPrefix}/root"
-                      - !Sub "${CanonicalPrefix}/obj/*"
-                      - !Sub "${CanonicalPrefix}/applier/*"
-                      - !Sub "${CanonicalPrefix}/staged/*"
-                  NumericLessThanEquals:
-                    s3:max-keys: 1
-              - Sid: DiscoverStagedPileMarkers
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub
-                  "arn:${AWS::Partition}:s3:::${IngressBucketName}"
-                Condition:
-                  StringEquals:
-                    s3:ResourceAccount: !Ref ExpectedBucketOwner
-                  StringLike:
-                    s3:prefix:
-                      - !Sub
-                        "ingress/v1/workspaces/${WorkspaceId}/piles/*"
-              - Sid: DistinguishMissingIngressObjects
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !Sub
-                  "arn:${AWS::Partition}:s3:::${IngressBucketName}"
-                Condition:
-                  StringEquals:
-                    s3:ResourceAccount: !Ref ExpectedBucketOwner
-                  StringLike:
-                    s3:prefix:
-                      - !Sub
-                        "ingress/v1/workspaces/${WorkspaceId}/objects/*"
-                  NumericLessThanEquals:
-                    s3:max-keys: 1
               - Sid: ReadCanonicalRepository
                 Effect: Allow
                 Action:
@@ -121,21 +68,11 @@ Resources:
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
                   - !Sub
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/pile/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/failed/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/staged/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/applier/*"
               - Sid: ReadIsolatedIngress
                 Effect: Allow
                 Action:
                   - s3:GetObject
                 Resource:
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${IngressBucketName}/ingress/v1/workspaces/${WorkspaceId}/objects/*"
                   - !Sub
                     "arn:${AWS::Partition}:s3:::${IngressBucketName}/ingress/v1/workspaces/${WorkspaceId}/piles/*"
               - Sid: ConditionallyWriteCanonicalRepository
@@ -146,19 +83,6 @@ Resources:
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
                   - !Sub
                     "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/pile/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/failed/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/staged/*"
-                  - !Sub
-                    "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/applier/*"
-              - Sid: RetireOnlyInternalPileGenerations
-                Effect: Allow
-                Action: s3:DeleteObject
-                Resource: !Sub
-                  "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/pile/*"
               - !If
                 - HasKmsKey
                 - Sid: UseRepositoryEncryptionKey
@@ -196,16 +120,6 @@ Resources:
           TINYP2P_UPLOAD_CANONICAL_PREFIX: !Ref CanonicalPrefix
           TINYP2P_UPLOAD_INGRESS_BUCKET: !Ref IngressBucketName
           TINYP2P_UPLOAD_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
-      Events:
-        Recovery:
-          Type: ScheduleV2
-          Properties:
-            ScheduleExpression: "rate(1 minute)"
-            State: ENABLED
-            RetryPolicy:
-              MaximumRetryAttempts: 2
-              MaximumEventAgeInSeconds: 300
-
   RepositoryApplierLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Delete

@@ -73,17 +73,19 @@ def replay_random(source, workspace, destination, seed):
     shuffled = all_fids(source, workspace)
     rng.shuffle(shuffled)
     position = batch = 0
+    pending = []
     while position < len(shuffled):
         for pile in range(rng.randint(1, 3)):
             take = rng.randint(1, 5)
             chunk = shuffled[position:position + take]
             position += take
             if chunk:
-                deliver(
+                pending.append(deliver(
                     destination, workspace,
                     closed_subset(source, workspace, chunk),
-                    member=f"seed{seed}batch{batch}pile{pile}")
-        destination.turn(workspace)
+                    member=f"seed{seed}batch{batch}pile{pile}"))
+        for exact_source in pending:
+            destination.turn(workspace, exact_source)
         batch += 1
     return destination
 
@@ -203,7 +205,10 @@ def closed_subset(n, ws, fids):
 
 
 def deliver(dst, ws, pile_bytes, member="feed7feed7feed7f"):
-    return asyncio.run(dst.applier(ws).stage(member, pile_bytes))
+    """Deliver and apply one exact pile; there is no discovery turn."""
+    source = dst.stage_received_pile(ws, member, pile_bytes)
+    dst.turn(ws, source)
+    return source
 
 
 def all_fids(n, ws):

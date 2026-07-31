@@ -2,7 +2,7 @@
 
 SQLite is a disposable local query/authorship projection.  It is rebuilt from
 the committed authenticated repository and is never an input to receiving,
-immutable-object creation, root CAS, or retirement.
+immutable-object creation, or root CAS.
 """
 import asyncio
 from dataclasses import asdict
@@ -12,14 +12,10 @@ import threading
 import time
 
 from core import fact_index
-from core.crypto import h
 from core.fact import Fact
-from core.ingress import decode_rejection_record
 from core.limits import (
-    MAX_REJECTION_RECORD_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
-    PAGE_BATCH,
 )
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
@@ -374,46 +370,8 @@ class FullPeer:
         return row[0] if row is not None else None
 
     def ingress_failures(self, ws):
-        """Shared immutable rejection evidence, projected as status rows."""
-        store = self.store(ws)
-        names, cursor, seen = [], None, set()
-        for _ in range(PAGE_BATCH):
-            page = store.list_page(
-                "failed/meta/", cursor, PAGE_BATCH - len(names))
-            names.extend(
-                name for name in page.keys if name not in names)
-            if page.cursor is None or len(names) >= PAGE_BATCH:
-                break
-            if page.cursor in seen:
-                raise ValueError("failure record cursor did not advance")
-            seen.add(page.cursor)
-            cursor = page.cursor
-
-        out = []
-        for name in names:
-            try:
-                raw = store.get_bounded(
-                    name, MAX_REJECTION_RECORD_BYTES)
-                if raw is None or name != "failed/meta/" + h(raw):
-                    raise ValueError("rejection record address")
-                value = decode_rejection_record(raw, workspace=ws)
-                out.append({
-                    "error": (
-                        f'{value["classification"]}: '
-                        f'{value["diagnostic"]}'
-                    ),
-                    "id": value["payload"],
-                    "source": value["source"],
-                })
-            except (TypeError, ValueError):
-                out.append({
-                    "error": "ValueError: unreadable failure record",
-                    "id": name.rsplit("/", 1)[-1],
-                    "source": name,
-                    "ts": 0,
-                })
-        return sorted(
-            out, key=lambda row: (row.get("ts", 0), row.get("id", "")))
+        """Process-local failures; retained source bytes carry retry work."""
+        return self.ingress_attempt_failures(ws)
 
     def record_sync_failure(self, ws, url, error):
         with self.lock:
@@ -498,29 +456,29 @@ class FullPeer:
 
     # ---- the turn ------------------------------------------------------------
 
-    def turn(self, ws):
-        """Apply each discovered exact pile independently through one engine."""
+    def turn(self, ws, source):
+        """Apply one caller-named local source through the shared engine."""
         with self.lock:
             store = self.store(ws)
             before = store.get_bounded("root", MAX_ROOT_BYTES)
-            fresh = []
-            for item in _run_applier(self.applier(ws).turn()):
-                if item.error is not None:
-                    self.record_ingress_attempt_failure(
-                        ws, item.source, item.error)
-                    continue
-                result = item.result
-                if result.status == "stale":
-                    self.record_ingress_attempt_failure(
-                        ws, item.source,
-                        RuntimeError("repository root changed"))
-                    continue
-                self.clear_ingress_attempt_failure(ws, item.source)
-                fresh.extend(result.admitted)
+            try:
+                result = _run_applier(self.applier(ws).apply(source))
+            except Exception as error:
+                self.record_ingress_attempt_failure(ws, source, error)
+                return []
+            if result.status == "retryable":
+                self.record_ingress_attempt_failure(
+                    ws, source, RuntimeError("repository apply retryable"))
+                return []
+            if result.status == "rejected":
+                self.record_ingress_attempt_failure(
+                    ws, source, ValueError("repository rejected exact pile"))
+                return []
+            self.clear_ingress_attempt_failure(ws, source)
             if store.get_bounded("root", MAX_ROOT_BYTES) != before:
                 self._evict_sync_cache(ws)
             self._sync_sql(ws)
-            return fresh
+            return list(result.admitted)
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
 
@@ -530,8 +488,8 @@ class FullPeer:
     def receive_pile(self, ws, member, raw):
         """Stage one stable internal generation and invoke RepositoryApplier."""
         with self.lock:
-            self.stage_received_pile(ws, member, raw)
-            return self.turn(ws)
+            source = self.stage_received_pile(ws, member, raw)
+            return self.turn(ws, source)
 
     def stage_received_pile(self, ws, member, raw):
         """Create an internal generation without duplicating apply semantics."""

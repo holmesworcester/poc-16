@@ -226,7 +226,7 @@ def test_gateway_is_read_only_and_workspace_scoped(tmp_path):
     assert call(
         gateway,
         "POST", "/poke", {"ws": workspace}, headers
-    ).status == 405
+    ).status == 404
 
 
 def test_gateway_mint_fails_closed_on_fetch_and_request_budgets(tmp_path):

@@ -1,175 +1,140 @@
-"""AWS events are hints into the one provider-neutral repository applier."""
+"""AWS invokes the shared applier with exact immutable S3 addresses."""
 import asyncio
 from pathlib import Path
-import re
 import sqlite3
 
 import facts
 import pytest
 
 from adapters.s3 import S3Config, S3Store
-from core import indexes, snapshot
-from full_peer import bao_native as bao
-from core.close import decode_pile
 from core.crypto import h
-from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.staged_intent import staging_key
 from core.store import FsStore
-from deploy.aws_repository_applier.app import drain
-from deploy.aws_repository_applier import manage
-from facts.content import chunk
+from deploy.aws_repository_applier import app, manage
+from deploy.aws_repository_applier.app import apply_request
+from deploy.repository_apply_wire import (
+    APPLY_REQUEST_SCHEMA,
+    APPLY_RESULT_SCHEMA,
+    MAX_APPLY_KEY_BYTES,
+    decode_apply_result,
+    encode_apply_request,
+)
+from full_peer.node import FullPeer
 
-from .util import closed_subset, send_bytes
 from .provider_fakes import FakeS3Bucket, ProviderError
+from .util import all_fids, closed_subset
 
 
 SESSION = "a" * 32
 MEMBER = "b" * 16
+BUCKET = "isolated-ingress"
 
 
-def _stage_file(tmp_path):
+def _stage(tmp_path):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    send_bytes(
-        source,
-        workspace,
-        "provider.bin",
-        b"provider-applier" * (bao.WIDTH // 8),
-        ts=10,
-    )
-    fids = tuple(
-        fact.fid for fact in source.by_type(workspace, chunk.TAG))
-    raw = closed_subset(source, workspace, fids)
-    stream = decode_pile(raw, workspace)
+    facts.content.message.post(
+        source, workspace, "general", "provider applier", ts=10)
+    raw = closed_subset(source, workspace, all_fids(source, workspace))
     ingress = FsStore(str(tmp_path / "ingress"))
-    marker = staging_key(
-        workspace, MEMBER, SESSION, "pile", h(raw))
-    ingress.put_if_absent(marker, raw)
-    refs = sorted({
-        oid for fact in stream
-        for oid in facts.blob_refs(fact)
-    })
-    for oid in refs:
-        ingress.put_if_absent(
-            staging_key(workspace, MEMBER, SESSION, "obj", oid),
-            source.store(workspace).get("obj/" + oid),
-        )
-    return source, workspace, ingress, marker, refs
+    key = staging_key(workspace, MEMBER, SESSION, "pile", h(raw))
+    ingress.put_if_absent(key, raw)
+    return source, workspace, ingress, key, raw
 
 
-def test_scheduled_lambda_drain_is_database_free_and_reader_visible(
-        tmp_path, monkeypatch):
-    _, workspace, ingress, marker, refs = _stage_file(tmp_path)
-    canonical = FsStore(str(tmp_path / "canonical"))
-
-    monkeypatch.setattr(
-        sqlite3, "connect",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("hosted applier touched SQLite")),
+def _request(workspace, key, *, digest=None):
+    return encode_apply_request(
+        workspace,
+        key,
+        key.rsplit("/", 1)[-1] if digest is None else digest,
     )
-    outcomes = asyncio.run(drain(
-        {}, canonical=canonical, ingress=ingress,
+
+
+def test_exact_lambda_event_is_database_free_reader_visible_and_retained(
+        tmp_path, monkeypatch):
+    source, workspace, ingress, key, raw = _stage(tmp_path)
+    canonical = FsStore(str(tmp_path / "canonical"))
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("Lambda opened SQLite"),
+    )
+
+    result = asyncio.run(apply_request(
+        _request(workspace, key),
+        canonical=canonical,
+        ingress=ingress,
         workspace=workspace,
     ))
 
-    assert outcomes.internal == ()
-    assert [key for key, _ in outcomes.staged] == [marker]
-    staged = outcomes.staged[0][1]
-    assert staged.result.status == "applied"
-    assert staged.result.retired is True
-    assert set(staged.promoted) == set(refs)
+    assert result.status == "applied"
+    assert ingress.get(key) == raw
     reader = RepositoryReader(
         workspace,
         canonical.get("root"),
         lambda oid: canonical.get("obj/" + oid),
     )
-    assert reader.worker().fact_active(workspace)
-    assert ingress.get(marker) is not None
+    assert reader.root_bytes == source.reader(workspace).root_bytes
 
 
-def test_duplicate_s3_notifications_replay_as_safe_noops(
-        tmp_path, monkeypatch):
-    _, workspace, ingress, marker, _ = _stage_file(tmp_path)
+def test_exact_private_invocation_replays_as_noop(tmp_path):
+    _, workspace, ingress, key, _ = _stage(tmp_path)
     canonical = FsStore(str(tmp_path / "canonical"))
-    monkeypatch.setenv(
-        "TINYP2P_UPLOAD_INGRESS_BUCKET", "isolated-ingress")
-    event = {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {"name": "isolated-ingress"},
-                    "object": {"key": marker},
-                },
-            },
-            {
-                "s3": {
-                    "bucket": {"name": "isolated-ingress"},
-                    "object": {"key": marker},
-                },
-            },
-        ],
-    }
-
-    first = asyncio.run(drain(
-        event, canonical=canonical, ingress=ingress,
-        workspace=workspace,
-    ))
+    request = _request(workspace, key)
+    first = asyncio.run(apply_request(
+        request, canonical=canonical, ingress=ingress,
+        workspace=workspace))
     root = canonical.get("root")
-    replay = asyncio.run(drain(
-        event, canonical=canonical, ingress=ingress,
-        workspace=workspace,
-    ))
+    replay = asyncio.run(apply_request(
+        request, canonical=canonical, ingress=ingress,
+        workspace=workspace))
 
-    assert len(first.staged) == 1
-    assert first.staged[0][1].result.status == "applied"
-    assert len(replay.staged) == 1
-    assert replay.staged[0][1].result.status == "admitted"
+    assert first.status == "applied"
+    assert replay.status == "noop"
     assert canonical.get("root") == root
-    assert not canonical.list("pile/")
 
 
-def test_internal_retry_precedes_staging_and_bad_hint_does_not_wedge_batch(
-        tmp_path, monkeypatch):
-    _, workspace, ingress, marker, _ = _stage_file(tmp_path)
+@pytest.mark.parametrize("bad", (
+    {},
+    {"Records": []},
+    {"workspace": "wrong", "key": "key", "digest": "0" * 64},
+    {"workspace": "WORKSPACE", "key": "KEY", "digest": "f" * 64},
+))
+def test_malformed_or_misbound_private_invocation_fails_closed(
+        bad, tmp_path):
+    _, workspace, ingress, key, _ = _stage(tmp_path)
     canonical = FsStore(str(tmp_path / "canonical"))
-    raw = ingress.get(marker)
-    internal = asyncio.run(
-        RepositoryApplier(workspace, canonical).stage(MEMBER, raw))
-    monkeypatch.setenv(
-        "TINYP2P_UPLOAD_INGRESS_BUCKET", "isolated-ingress")
-    event = {
-        "Records": [
-            {"not": "an s3 notification"},
-            {
-                "s3": {
-                    "bucket": {"name": "isolated-ingress"},
-                    "object": {"key": marker},
-                },
-            },
-        ],
+    request = {
+        name: workspace if value == "WORKSPACE" else key
+        if value == "KEY" else value
+        for name, value in bad.items()
     }
 
-    result = asyncio.run(drain(
-        event, canonical=canonical, ingress=ingress,
-        workspace=workspace,
-    ))
-
-    assert result.rejected_hints == 1
-    assert [item.result.status for item in result.internal] == ["applied"]
-    assert result.staged[0][1].result.status == "noop"
-    assert canonical.get(internal) is None
-    assert not canonical.list("pile/")
+    with pytest.raises(ValueError, match="request|binding"):
+        asyncio.run(apply_request(
+            request, canonical=canonical, ingress=ingress,
+            workspace=workspace))
+    assert canonical.list("") == []
 
 
-def test_lambda_stage_contains_only_db_free_applier_authority(
-        tmp_path):
+def test_private_invocation_cannot_fall_back_to_list(tmp_path):
+    _, workspace, ingress, _, _ = _stage(tmp_path)
+    canonical = FsStore(str(tmp_path / "canonical"))
+    with pytest.raises(ValueError, match="request"):
+        asyncio.run(apply_request(
+            {}, canonical=canonical, ingress=ingress,
+            workspace=workspace))
+    assert canonical.list("") == []
+
+
+def test_lambda_stage_contains_only_db_free_applier_authority(tmp_path):
     staged = manage.stage(tmp_path / "stage")
-
     for relative in (
             "core/repository_applier.py",
             "core/repository_snapshot.py",
+            "deploy/repository_apply_wire.py",
             "deploy/aws_repository_applier/app.py",
             "adapters/s3/store.py",
             "facts/auth/workspace.py"):
@@ -185,351 +150,209 @@ def test_lambda_stage_contains_only_db_free_applier_authority(
         assert not (staged / forbidden).exists()
 
 
-def test_sam_role_can_retire_only_internal_piles():
+def test_sam_role_has_exact_get_conditional_put_and_no_discovery_or_delete():
     raw = (
         Path(__file__).parents[1]
         / "deploy/aws_repository_applier/template.yaml"
     ).read_text()
-
     assert "deploy.aws_repository_applier.app.handler" in raw
-    assert 'ScheduleExpression: "rate(1 minute)"' in raw
-    assert "RetireOnlyInternalPileGenerations" in raw
-    delete_section = raw.split(
-        "RetireOnlyInternalPileGenerations", 1)[1].split(
-        "- !If", 1)[0]
-    assert "CanonicalPrefix}/pile/*" in delete_section
-    assert "IngressBucketName" not in delete_section
-    assert "CanonicalPrefix}/root" not in delete_section
-
-
-def test_sam_role_limits_canonical_missing_key_probes():
-    raw = (
-        Path(__file__).parents[1]
-        / "deploy/aws_repository_applier/template.yaml"
-    ).read_text()
-    probe = raw.split(
-        "- Sid: DistinguishMissingCanonicalKeys", 1)[1].split(
-        "- Sid: DiscoverStagedPileMarkers", 1)[0]
-
-    assert "Action: s3:ListBucket" in probe
-    assert "CanonicalBucketName" in probe
-    assert "ExpectedBucketOwner" in probe
-    assert "CanonicalPrefix}/root" in probe
-    assert "CanonicalPrefix}/obj/*" in probe
-    assert "CanonicalPrefix}/applier/*" in probe
-    assert "CanonicalPrefix}/staged/*" in probe
-    assert "s3:max-keys: 1" in probe
+    assert "s3:GetObject" in raw
+    assert "s3:PutObject" in raw
+    assert "${CanonicalPrefix}/root" in raw
+    assert "${CanonicalPrefix}/obj/*" in raw
+    assert (
+        "ingress/v1/workspaces/${WorkspaceId}/piles/*" in raw)
     for forbidden in (
-            "CanonicalPrefix}/pile",
-            "CanonicalPrefix}/failed",
-            "IngressBucketName",
-            "s3:GetObject",
-            "s3:PutObject",
-            "s3:DeleteObject"):
-        assert forbidden not in probe
+            "s3:ListBucket", "s3:DeleteObject", "ScheduleV2",
+            "AWS::SQS", "/objects/*", "/failed/*", "/staged/*",
+            "/applier/*", "${CanonicalPrefix}/pile/*"):
+        assert forbidden not in raw
 
 
-def test_sam_role_grants_only_required_operational_cursor_authority():
-    raw = (
-        Path(__file__).parents[1]
-        / "deploy/aws_repository_applier/template.yaml"
-    ).read_text()
-    read = raw.split(
-        "- Sid: ReadCanonicalRepository", 1)[1].split(
-        "- Sid: ReadIsolatedIngress", 1)[0]
-    write = raw.split(
-        "- Sid: ConditionallyWriteCanonicalRepository", 1)[1].split(
-        "- Sid: RetireOnlyInternalPileGenerations", 1)[0]
-    delete = raw.split(
-        "- Sid: RetireOnlyInternalPileGenerations", 1)[1].split(
-        "- !If", 1)[0]
-
-    assert "Action:\n                  - s3:GetObject" in read
-    assert "CanonicalPrefix}/applier/*" in read
-    assert "Action: s3:PutObject" in write
-    assert "CanonicalPrefix}/applier/*" in write
-    assert "CanonicalPrefix}/applier/*" not in delete
-
-
-def test_sam_role_limits_ingress_missing_probe_to_detached_objects():
-    raw = (
-        Path(__file__).parents[1]
-        / "deploy/aws_repository_applier/template.yaml"
-    ).read_text()
-    probe = raw.split(
-        "- Sid: DistinguishMissingIngressObjects", 1)[1].split(
-        "- Sid: ReadCanonicalRepository", 1)[0]
-
-    assert "Action: s3:ListBucket" in probe
-    assert "IngressBucketName" in probe
-    assert "ExpectedBucketOwner" in probe
-    assert "ingress/v1/workspaces/${WorkspaceId}/objects/*" in probe
-    assert "s3:max-keys: 1" in probe
-    for forbidden in (
-            "CanonicalBucketName",
-            "/piles/*",
-            "s3:GetObject",
-            "s3:PutObject",
-            "s3:DeleteObject"):
-        assert forbidden not in probe
-
-
-def test_real_s3_adapters_keep_ingress_and_canonical_prefixes_disjoint(
-        tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    facts.content.message.post(source, workspace, "general", "S3 adapter", ts=2)
-    raw = closed_subset(
-        source,
-        workspace,
-        [fact.fid for fact in source.by_type(workspace, "msg")],
-    )
-    marker = staging_key(
-        workspace, MEMBER, SESSION, "pile", h(raw))
-    canonical_bucket, ingress_bucket = FakeS3Bucket(), FakeS3Bucket()
-    canonical = S3Store(
+def _s3_store(bucket, name, prefix=""):
+    return S3Store(
         S3Config(
-            "canonical-bucket",
-            f"workspaces/{workspace}",
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-        ),
-        client=canonical_bucket.client("applier"),
-    )
-    ingress = S3Store(
-        S3Config(
-            "isolated-ingress",
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-        ),
-        client=ingress_bucket.client("applier"),
-    )
-    ingress.put_if_absent(marker, raw)
-
-    result = asyncio.run(drain(
-        {}, canonical=canonical, ingress=ingress,
-        workspace=workspace,
-    ))
-
-    assert result.staged[0][1].result.status == "applied"
-    assert f"workspaces/{workspace}/root" in canonical_bucket.data
-    assert marker in ingress_bucket.data
-    assert not any(
-        key.startswith("ingress/")
-        for key in canonical_bucket.data)
-    assert not any(
-        key.startswith(f"workspaces/{workspace}/")
-        for key in ingress_bucket.data)
-
-
-def test_403_missing_root_probe_bootstraps_repository_genesis(tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    raw = closed_subset(
-        source, workspace,
-        [fact.fid for fact in source.by_type(workspace, "workspace")],
-    )
-    bucket = FakeS3Bucket()
-    bucket.deny_missing_get = True
-    prefix = f"workspaces/{workspace}"
-    canonical = S3Store(
-        S3Config(
-            "canonical-bucket",
+            name,
             prefix,
             expected_bucket_owner="123456789012",
             read_total_max_attempts=1,
-            probe_access_denied_missing=True,
+            access_denied_is_absent=True,
         ),
         client=bucket.client("applier"),
     )
 
-    applier = RepositoryApplier(workspace, canonical)
-    internal = asyncio.run(applier.stage(MEMBER, raw))
-    result = asyncio.run(applier.apply(internal))
+
+def test_real_s3_adapters_keep_exact_ingress_and_canonical_disjoint(
+        tmp_path):
+    _, workspace, _, key, raw = _stage(tmp_path)
+    canonical_bucket, ingress_bucket = FakeS3Bucket(), FakeS3Bucket()
+    canonical = _s3_store(
+        canonical_bucket, "canonical-bucket", f"workspaces/{workspace}")
+    ingress = _s3_store(ingress_bucket, BUCKET)
+    ingress.put_if_absent(key, raw)
+
+    result = asyncio.run(apply_request(
+        _request(workspace, key), canonical=canonical, ingress=ingress,
+        workspace=workspace))
 
     assert result.status == "applied"
-    assert bucket.data[prefix + "/root"] == result.root
-    assert (
-        "applier", "list", prefix + "/root", ()
-    ) in bucket.history
+    assert f"workspaces/{workspace}/root" in canonical_bucket.data
+    assert key in ingress_bucket.data
+    assert not any(
+        operation in {"list", "delete"}
+        for _, operation, _, _ in (
+            canonical_bucket.history + ingress_bucket.history))
 
 
-def test_403_missing_validated_map_page_uses_exact_probe_not_access_denied(
-        tmp_path):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    raw = closed_subset(
-        source, workspace,
-        [fact.fid for fact in source.by_type(workspace, "workspace")],
-    )
+def test_missing_403_bootstraps_without_list(tmp_path):
+    _, workspace, _, key, raw = _stage(tmp_path)
+    canonical_bucket, ingress_bucket = FakeS3Bucket(), FakeS3Bucket()
+    canonical_bucket.deny_missing_get = True
+    canonical = _s3_store(
+        canonical_bucket, "canonical-bucket", f"workspaces/{workspace}")
+    ingress = _s3_store(ingress_bucket, BUCKET)
+    ingress.put_if_absent(key, raw)
+
+    result = asyncio.run(apply_request(
+        _request(workspace, key), canonical=canonical, ingress=ingress,
+        workspace=workspace))
+
+    assert result.status == "applied"
+    assert not any(
+        operation == "list"
+        for _, operation, _, _ in canonical_bucket.history)
+
+
+def test_existing_but_unreadable_root_cannot_be_overwritten(tmp_path):
+    _, workspace, _, key, raw = _stage(tmp_path)
     bucket = FakeS3Bucket()
-    bucket.deny_missing_get = True
     prefix = f"workspaces/{workspace}"
-    canonical = S3Store(
-        S3Config(
-            "canonical-bucket",
-            prefix,
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-            probe_access_denied_missing=True,
-        ),
-        client=bucket.client("applier"),
+    incumbent = b"an existing opaque root"
+    base = bucket.client("seed")
+    base.put_object(
+        Bucket="canonical-bucket",
+        Key=prefix + "/root",
+        Body=incumbent,
+        IfNoneMatch="*",
     )
-    applier = RepositoryApplier(workspace, canonical)
-    internal = asyncio.run(applier.stage(MEMBER, raw))
-    assert asyncio.run(applier.apply(internal)).status == "applied"
-    root = snapshot.decode_root(bucket.data[prefix + "/root"])
-    missing = prefix + "/obj/" + root.maps[indexes.FACT]["root"]
-    bucket.data.pop(missing)
-    bucket.tokens.pop(missing)
-    bucket.history.clear()
-    probe = asyncio.run(
-        RepositoryApplier(workspace, canonical).stage("probe", raw))
-    bucket.history.clear()
 
-    with pytest.raises(ValueError, match="integrity"):
-        asyncio.run(
-            RepositoryApplier(
-                workspace, canonical).propose(probe, raw))
-
-    probes = [
-        key for _, operation, key, result in bucket.history
-        if operation == "list" and result == ()
-        and "/obj/" in key
-    ]
-    assert probes == [missing]
-
-
-def test_403_missing_operational_cursors_do_not_wedge_cold_discovery(
-        tmp_path):
-    workspace = "c" * 64
-    bucket = FakeS3Bucket()
-    bucket.deny_missing_get = True
-    prefix = f"workspaces/{workspace}"
-    canonical = S3Store(
-        S3Config(
-            "canonical-bucket",
-            prefix,
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-            probe_access_denied_missing=True,
-        ),
-        client=bucket.client("applier"),
-    )
-    applier = RepositoryApplier(workspace, canonical)
-
-    assert asyncio.run(applier.turn()) == ()
-    assert asyncio.run(applier.drain_staged(
-        FsStore(str(tmp_path / "empty-ingress")))) == ()
-
-    cursor_keys = {
-        prefix + "/applier/cursor/internal",
-        prefix + "/applier/cursor/staged",
-    }
-    assert cursor_keys <= set(bucket.data)
-    probes = {
-        key for _, operation, key, result in bucket.history
-        if operation == "list" and result == () and key in cursor_keys
-    }
-    assert probes == cursor_keys
-    assert {
-        key for _, operation, key, _ in bucket.history
-        if operation == "put" and key in cursor_keys
-    } == cursor_keys
-
-
-def test_403_missing_ingress_object_is_bounded_unavailable_work(
-        tmp_path):
-    _, workspace, staged, marker, refs = _stage_file(tmp_path)
-    bucket = FakeS3Bucket()
-    raw = staged.get(marker)
-    ingress = S3Store(
-        S3Config(
-            "isolated-ingress",
-            expected_bucket_owner="123456789012",
-            read_total_max_attempts=1,
-            probe_access_denied_missing=True,
-        ),
-        client=bucket.client("applier"),
-    )
-    ingress.put_if_absent(marker, raw)
-    bucket.deny_missing_get = True
-    canonical = FsStore(str(tmp_path / "canonical-missing-object"))
-
-    outcomes = asyncio.run(
-        RepositoryApplier(workspace, canonical).drain_staged(ingress))
-
-    result = outcomes[0][1]
-    expected = {
-        staging_key(workspace, MEMBER, SESSION, "obj", oid)
-        for oid in refs
-    }
-    assert result.result.status == "applied"
-    assert set(result.unavailable) == expected
-    probes = {
-        key for _, operation, key, values in bucket.history
-        if operation == "list" and values == ()
-        and key.startswith(
-            f"ingress/v1/workspaces/{workspace}/objects/")
-    }
-    assert probes == expected
-
-
-def test_cold_staged_apply_obeys_probe_prefixes_from_sam_policy(
-        tmp_path):
-    _, workspace, ingress, marker, _ = _stage_file(tmp_path)
-    raw_template = (
-        Path(__file__).parents[1]
-        / "deploy/aws_repository_applier/template.yaml"
-    ).read_text()
-    probe = raw_template.split(
-        "- Sid: DistinguishMissingCanonicalKeys", 1)[1].split(
-        "- Sid: DiscoverStagedPileMarkers", 1)[0]
-    suffixes = re.findall(
-        r'\$\{CanonicalPrefix\}(/[^"]+)"', probe)
-    prefix = f"workspaces/{workspace}"
-
-    bucket = FakeS3Bucket()
-    bucket.deny_missing_get = True
-    inner = bucket.client("applier")
-
-    def allowed(physical):
-        return physical.startswith(prefix + "/pile/") or any(
-            re.fullmatch(
-                re.escape(prefix + suffix).replace(r"\*", ".*"),
-                physical,
-            )
-            for suffix in suffixes)
-
-    class PolicyClient:
+    class DenyRootRead:
         def __getattr__(self, name):
-            return getattr(inner, name)
+            return getattr(base, name)
 
-        def list_objects_v2(self, **request):
-            physical = request["Prefix"]
-            if request.get("MaxKeys") != 1 or not allowed(physical):
+        def get_object(self, **request):
+            if request["Key"] == prefix + "/root":
                 raise ProviderError(403, "AccessDenied")
-            return inner.list_objects_v2(**request)
+            return base.get_object(**request)
 
     canonical = S3Store(
         S3Config(
-            "canonical-bucket",
-            prefix,
+            "canonical-bucket", prefix,
             expected_bucket_owner="123456789012",
             read_total_max_attempts=1,
-            probe_access_denied_missing=True,
+            access_denied_is_absent=True,
         ),
-        client=PolicyClient(),
+        client=DenyRootRead(),
+    )
+    ingress = FsStore(str(tmp_path / "ingress"))
+    ingress.put_if_absent(key, raw)
+
+    result = asyncio.run(RepositoryApplier(
+        workspace, canonical).apply_exact(ingress, key, h(raw)))
+
+    assert result.status == "retryable"
+    assert bucket.data[prefix + "/root"] == incumbent
+
+
+def test_existing_but_unreadable_immutable_never_confirms_equality():
+    workspace = "a" * 64
+    raw, oid = b"incumbent", h(b"incumbent")
+    bucket = FakeS3Bucket()
+    base = bucket.client("seed")
+    base.put_object(
+        Bucket="canonical-bucket",
+        Key=f"workspaces/{workspace}/obj/{oid}",
+        Body=raw,
+        IfNoneMatch="*",
     )
 
-    result = asyncio.run(
-        RepositoryApplier(workspace, canonical).apply_staged(
-            ingress, marker))
+    class DenyReads:
+        def __getattr__(self, name):
+            return getattr(base, name)
 
-    assert result.result.status == "applied"
-    probes = [
-        key for _, operation, key, values in bucket.history
-        if operation == "list" and values == ()
-    ]
-    assert any(key.startswith(prefix + "/staged/") for key in probes)
-    assert all(allowed(key) for key in probes)
+        @staticmethod
+        def get_object(**_request):
+            raise ProviderError(403, "AccessDenied")
+
+    store = S3Store(
+        S3Config(
+            "canonical-bucket", f"workspaces/{workspace}",
+            expected_bucket_owner="123456789012",
+            read_total_max_attempts=1,
+            access_denied_is_absent=True,
+        ),
+        client=DenyReads(),
+    )
+    with pytest.raises(ValueError, match="conflict"):
+        asyncio.run(RepositoryApplier(
+            workspace, store).admit_object(oid, raw))
+
+
+def test_lambda_handler_returns_retryable_exact_result(monkeypatch):
+    async def retryable(_event):
+        return type("Result", (), {
+            "admitted": (),
+            "root": None,
+            "status": "retryable",
+        })()
+
+    monkeypatch.setattr(app, "apply_request", retryable)
+    assert app.handler({}, None) == {
+        "schema": APPLY_RESULT_SCHEMA, "status": "retryable"}
+
+
+@pytest.mark.parametrize(("internal", "public"), (
+    ("applied", "applied"),
+    ("confirmed", "applied"),
+    ("admitted", "applied"),
+    ("noop", "noop"),
+    ("rootless", "noop"),
+    ("rejected", "rejected"),
+    ("retryable", "retryable"),
+))
+def test_private_apply_result_has_one_small_provider_shape(
+        internal, public, monkeypatch):
+    async def outcome(_event):
+        return type("Result", (), {"status": internal})()
+
+    monkeypatch.setattr(app, "apply_request", outcome)
+    document = app.handler({}, None)
+    assert document == {
+        "schema": "poc16-repository-apply-result-v1",
+        "status": public,
+    }
+    assert decode_apply_result(document) == public
+    assert set(document) == {"schema", "status"}
+    assert APPLY_REQUEST_SCHEMA == "poc16-repository-apply-v1"
+
+
+@pytest.mark.parametrize("value", (
+    None,
+    {},
+    {"schema": APPLY_RESULT_SCHEMA, "status": "confirmed"},
+    {"schema": "wrong", "status": "applied"},
+    {"schema": APPLY_RESULT_SCHEMA, "status": "applied", "extra": 1},
+))
+def test_private_apply_result_decoder_rejects_every_noncanonical_shape(value):
+    with pytest.raises(ValueError, match="apply result"):
+        decode_apply_result(value)
+
+
+def test_private_apply_request_has_an_explicit_provider_key_bound():
+    workspace, digest = "a" * 64, "b" * 64
+    assert encode_apply_request(
+        workspace, "k" * MAX_APPLY_KEY_BYTES, digest)["key"] \
+        == "k" * MAX_APPLY_KEY_BYTES
+    for key in ("k" * (MAX_APPLY_KEY_BYTES + 1), "snowman-☃"):
+        with pytest.raises(ValueError, match="apply request"):
+            encode_apply_request(workspace, key, digest)

@@ -65,21 +65,13 @@ def _push_facts(view, fids, peer, sender):
     return failures
 
 
-def pull(node, workspace, oid, raw):
-    """Stage one freshly verified closure through ordinary pile ingress."""
-    if raw is None or h(raw) != oid:
-        raise ValueError("remote object integrity")
-    node.stage_received_pile(
-        workspace, node.member_for(workspace), raw)
-
-
 def reconcile_facts(
         node, workspace, peer, remote_root, fetch_remote, *,
         deliver=True, local_root=_UNREAD):
     """Join validated facts, landing independent valid closures first.
 
     A poisoned closure cannot become a cached false convergence.  Valid
-    independent facts are staged and applied, then the first unresolved
+    independent facts are applied, then the first unresolved
     difference is raised so the remote root remains available for retry or
     operator diagnosis.
     """
@@ -115,9 +107,8 @@ def reconcile_facts(
             except (TypeError, ValueError) as error:
                 failures.append(error)
         for raw in node.sender(workspace).pack_batches(closures):
-            pull(node, workspace, h(raw), raw)
-    if landed:
-        node.turn(workspace)
+            node.receive_pile(
+                workspace, node.member_for(workspace), raw)
     if failures:
         raise ValueError(
             "unresolved validated-fact difference") from failures[0]

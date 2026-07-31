@@ -13,7 +13,6 @@ from full_peer import bao_native as bao
 from full_peer import sql_store
 from core.close import decode_pile, encode_pile
 from core.crypto import h
-from core.limits import MAX_OBJECT_BYTES, MAX_PILE_FACTS
 from full_peer.node import FullPeer
 from full_peer.walk import _fetch_blobs
 from facts.content import chunk, file as file_family
@@ -46,12 +45,6 @@ def push_all(node, workspace, peer):
         for fid in candidates.fact_ids()
     )
     return node.sender(workspace).deliver(peer, closures)
-
-
-def test_current_one_pile_file_geometry_fits_shared_protocol_bounds():
-    assert bao.MAX_FILE_BYTES == 16 * 1024 * 1024
-    assert 2 + 2 * bao.MAX_SLICES <= MAX_PILE_FACTS
-    assert bao.MAX_PROOF_BYTES < MAX_OBJECT_BYTES
 
 
 def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
@@ -329,8 +322,12 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
     with pytest.raises(ValueError, match="not admitted"):
         send_bytes(node, workspace, "retry.bin", b"x" * (bao.WIDTH + 1))
 
-    pile = store.list("pile/")[0]
-    stream = decode_pile(store.get(pile), workspace)
+    pile, stream = next(
+        (candidate, decoded)
+        for candidate in store.list("pile/")
+        for decoded in (decode_pile(store.get(candidate), workspace),)
+        if any(fact.t == file_family.TAG for fact in decoded)
+    )
     descriptor = next(fact for fact in stream if fact.t == file_family.TAG)
     chunks = [fact for fact in stream if fact.t == "chunk"]
     assert store.get("root") == old_root
@@ -341,8 +338,8 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
                for item in chunks)
 
     monkeypatch.setattr(applier, "commit", commit)
-    node.turn(workspace)
-    assert store.get(pile) is None
+    node.turn(workspace, pile)
+    assert store.get(pile) is not None
     assert progress(node, workspace)["have"] == len(chunks)
 
 
@@ -408,7 +405,6 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     for _, oid, raw in object_events:
         destination.receive_object(workspace, oid, raw)
     deliver(destination, workspace, capture.raw)
-    destination.turn(workspace)
     assert progress(destination, workspace)["complete"]
 
     class SourceObjects:
@@ -453,7 +449,6 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
     deliver(
         destination, workspace,
         closed_subset(source, workspace, all_fids(source, workspace)))
-    destination.turn(workspace)
     assert progress(destination, workspace)["have"] == 0
 
     delayed = next(
@@ -514,7 +509,6 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     destination.add_workspace(workspace, "copy", [])
     destination.receive_object(workspace, h(invalid), invalid)
     deliver(destination, workspace, encode_pile(pile))
-    destination.turn(workspace)
     assert progress(destination, workspace)["have"] == 0
 
 

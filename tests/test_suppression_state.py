@@ -128,12 +128,11 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
         {signed.fid: (), item.fid: (signed.fid, provider)})
     deliver(node, workspace, pile)
 
-    node.turn(workspace)
     assert node.fact_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) == item
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [item.fid]
-    assert node.store(workspace).list("pile/") == []
+    assert node.store(workspace).list("pile/")
     assert node.ingress_failures(workspace) == []
 
     root = node.store(workspace).get("root")
@@ -170,7 +169,6 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
         })
     deliver(node, workspace, pile)
 
-    node.turn(workspace)
     assert node.fact_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) == item
     assert node.suppression_active(
@@ -223,10 +221,8 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
         peer = FullPeer(str(tmp_path / name))
         peer.add_workspace(workspace, "alice", peers=[])
         deliver(peer, workspace, base)
-        peer.turn(workspace)
         for ordinal, pile in enumerate(order):
             deliver(peer, workspace, pile)
-            peer.turn(workspace)
             if name == "fact-first" and ordinal == 0:
                 assert peer.fact_of(workspace, posted.fid) == posted
         peers.append(peer)
@@ -289,10 +285,8 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
         peer = FullPeer(str(tmp_path / name))
         peer.add_workspace(workspace, "alice", peers=[])
         deliver(peer, workspace, base)
-        peer.turn(workspace)
         for pile in (*order, message_pile):
             deliver(peer, workspace, pile)
-            peer.turn(workspace)
         sid = facts.principal_sid("member", bob)
         assert peer.idx(workspace).execute(
             "SELECT src FROM fact_index WHERE kind=? AND k0=?",
@@ -317,7 +311,6 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
     destination.add_workspace(
         workspace, "alice", peers=[], identity=founder)
     deliver(destination, workspace, common)
-    destination.turn(workspace)
     later = _author_eviction(destination, workspace, bob, 41)
     assert later.key > first.key
     assert later.fid < first.fid  # the obsolete tuple-order shortcut
@@ -373,7 +366,6 @@ def test_fact_sync_carries_actions_and_their_projection(
     destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", peers=[])
     deliver(destination, workspace, before)
-    destination.turn(workspace)
     action_fid = facts.content.delete.remove(source, workspace, target, ts=20)
 
     class LocalPeer:
@@ -422,7 +414,6 @@ def test_one_poisoned_fact_lands_honest_state_without_caching(
     destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", peers=[])
     deliver(destination, workspace, before)
-    destination.turn(workspace)
 
     facts.content.delete.remove(source, workspace, poisoned_target, ts=20)
     facts.content.delete.remove(source, workspace, honest_target, ts=21)

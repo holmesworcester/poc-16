@@ -10,7 +10,7 @@ import pytest
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
 from core.staged_intent import staging_key
-from deploy.aws_repository_applier.app import drain as drain_s3
+from deploy.aws_repository_applier.app import apply_request
 from deploy.aws_upload_broker.policy import presigner_policy
 from deploy.aws_upload_broker.signer import S3UploadConfig
 from deploy.cloudflare_upload.boundary import (
@@ -18,7 +18,8 @@ from deploy.cloudflare_upload.boundary import (
     access_policies,
     ingress_lock,
 )
-from deploy.cloudflare_upload.worker.applier_runtime import drain as drain_r2
+from deploy.cloudflare_upload.worker.applier_runtime import apply as apply_r2
+from deploy.repository_apply_wire import encode_apply_request
 from full_peer.node import FullPeer
 
 from .provider_fakes import (
@@ -32,6 +33,7 @@ from .util import all_fids, closed_subset
 
 MEMBER = "b" * 16
 SESSION = "c" * 32
+AWS_BUCKET = "ingress"
 
 
 def _pile(tmp_path):
@@ -44,6 +46,11 @@ def _pile(tmp_path):
     marker = staging_key(
         workspace, MEMBER, SESSION, "pile", h(raw))
     return workspace, marker, raw
+
+
+def _request(workspace, marker):
+    return encode_apply_request(
+        workspace, marker, marker.rsplit("/", 1)[-1])
 
 
 class _RetainedS3Client(FakeS3Client):
@@ -122,8 +129,9 @@ def test_aws_parent_race_restart_and_teardown_preserve_acknowledged_marker(
 
     def apply():
         start.wait(5)
-        return asyncio.run(drain_s3(
-            {}, canonical=canonical, ingress=ingress,
+        return asyncio.run(apply_request(
+            _request(workspace, marker),
+            canonical=canonical, ingress=ingress,
             workspace=workspace,
         ))
 
@@ -133,17 +141,18 @@ def test_aws_parent_race_restart_and_teardown_preserve_acknowledged_marker(
         assert attacked.result(10) == (403, 403)
         first = applied.result(10)
 
-    assert first.staged[0][1].result.status == "applied"
+    assert first.status == "applied"
     assert ingress_bucket.data[marker] == raw
     assert not ingress_bucket.lifecycle_delete(marker)
 
     # Cold restart and stack teardown both leave the externally owned bucket.
     root = canonical.get("root")
-    replay = asyncio.run(drain_s3(
-        {}, canonical=canonical, ingress=ingress,
+    replay = asyncio.run(apply_request(
+        _request(workspace, marker),
+        canonical=canonical, ingress=ingress,
         workspace=workspace,
     ))
-    assert replay.staged[0][1].result.status == "admitted"
+    assert replay.status == "noop"
     assert canonical.get("root") == root
     assert ingress_bucket.data[marker] == raw
     assert not any(
@@ -261,19 +270,19 @@ def test_r2_lock_defeats_broad_parent_race_lifecycle_and_cold_restart(
 
         async def apply():
             start.set()
-            return await drain_r2(env)
+            return await apply_r2(env, marker, h(raw))
 
-        (denied, (_internal, staged)) = await asyncio.gather(
+        denied, result = await asyncio.gather(
             attack(), apply())
         assert denied == (403, 403)
-        assert staged[0][1].result.status == "applied"
+        assert result.status == "applied"
         assert ingress_bucket.data[marker] == raw
         assert not await ingress_bucket.lifecycle_delete(marker)
 
         root = canonical_bucket.data[
             f"workspaces/{workspace}/root"]
-        _internal, replay = await drain_r2(env)
-        assert replay[0][1].result.status == "admitted"
+        replay = await apply_r2(env, marker, h(raw))
+        assert replay.status == "noop"
         assert canonical_bucket.data[
             f"workspaces/{workspace}/root"] == root
         assert ingress_bucket.data[marker] == raw

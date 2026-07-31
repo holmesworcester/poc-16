@@ -155,6 +155,10 @@ def stage_applier():
         PACKAGE / "worker" / "applier_runtime.py",
         pending / "applier_runtime.py",
     )
+    for relative in (
+            "deploy/__init__.py",
+            "deploy/repository_apply_wire.py"):
+        _copy(REPOSITORY / relative, pending / relative)
     for name in APPLIER_CORE_MODULES:
         _copy(
             REPOSITORY / "core" / name,
@@ -257,6 +261,7 @@ def _verify_applier_bundle(directory):
     required = {
         "entry.py",
         "applier_runtime.py",
+        "deploy/repository_apply_wire.py",
         "core/repository_applier.py",
         "core/repository_snapshot.py",
         "core/staged_intent.py",

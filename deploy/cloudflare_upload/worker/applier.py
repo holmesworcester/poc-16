@@ -1,15 +1,16 @@
-"""Cloudflare scheduled entrypoint for Applier+Reader hosted storage."""
+"""Cloudflare private RPC entrypoint for one exact ingress pile."""
 from workers import Response, WorkerEntrypoint
+from deploy.repository_apply_wire import encode_apply_result
 
 if __package__:
-    from .applier_runtime import Settings, drain
+    from .applier_runtime import Settings, apply
 else:
-    from applier_runtime import Settings, drain
+    from applier_runtime import Settings, apply
 
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
-        """Expose health only; HTTP callers receive no mutation authority."""
+        """Expose health only; public HTTP receives no mutation authority."""
         try:
             Settings.from_env(self.env)
         except Exception:
@@ -39,5 +40,6 @@ class Default(WorkerEntrypoint):
             headers={"Cache-Control": "no-store"},
         )
 
-    async def scheduled(self, _controller, environment, _context):
-        await drain(environment)
+    async def apply(self, key, digest):
+        """Provider-private service-binding RPC; bytes remain in R2."""
+        return encode_apply_result(await apply(self.env, key, digest))
