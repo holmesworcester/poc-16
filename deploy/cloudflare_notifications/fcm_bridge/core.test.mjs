@@ -8,7 +8,10 @@ import {
   MAX_RESPONSE_BYTES,
   boundedJson,
   messageFor,
+  sendFromWorkerVersion,
 } from "./core.mjs";
+
+const WORKER_VERSION = "44444444-4444-4444-8444-444444444444";
 
 function base64UrlBytes(value) {
   return Buffer.from(value.replaceAll("-", "+").replaceAll("_", "/"), "base64");
@@ -34,6 +37,7 @@ async function fixture() {
       POC16_SOFTWARE_DIGEST: "d".repeat(64),
       POC16_RELEASE_ID: "e".repeat(64),
       NOTIFICATIONS_ENABLED: "1",
+      CF_VERSION_METADATA: {id: WORKER_VERSION},
       FCM_APPLICATION: "poc16.mobile",
       FCM_ENVIRONMENT: "production",
       FCM_PROJECT_ID: "firebase-project",
@@ -78,6 +82,42 @@ test("FCM acceptance is atomically bound to the caller release", async () => {
   assert.equal(acceptsConsumerRelease(
     env, {...caller, role: "notification-scanner"}), false);
   assert.equal(acceptsConsumerRelease(env, {...caller, extra: true}), false);
+});
+
+test("FCM acceptance reports the causally executing Worker version", async () => {
+  const {env} = await fixture();
+  const caller = {
+    enabled: true,
+    format: "poc16-cloudflare-notification-runtime-v1",
+    identity: env.POC16_DEPLOYMENT_IDENTITY,
+    release_id: env.POC16_RELEASE_ID,
+    role: "notification-consumer",
+    software_digest: env.POC16_SOFTWARE_DIGEST,
+  };
+  const bridge = {
+    calls: 0,
+    async send() {
+      this.calls += 1;
+      return {status: "accepted", message_id: "provider-message"};
+    },
+  };
+
+  assert.deepEqual(
+    await sendFromWorkerVersion(env, bridge, document(), caller),
+    {
+      status: "accepted",
+      message_id: "provider-message",
+      worker_version_id: WORKER_VERSION,
+    });
+  assert.equal(bridge.calls, 1);
+
+  for (const metadata of [undefined, {}, {id: "not-a-version"}]) {
+    const changed = {...env, CF_VERSION_METADATA: metadata};
+    assert.deepEqual(
+      await sendFromWorkerVersion(changed, bridge, document(), caller),
+      {status: "retry"});
+  }
+  assert.equal(bridge.calls, 1);
 });
 
 function jsonResponse(value, status = 200, headers = {}) {

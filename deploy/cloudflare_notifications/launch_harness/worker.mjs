@@ -70,6 +70,8 @@ export default {
       software_digest: env.POC16_SOFTWARE_DIGEST,
     };
     const result = await env.FCM_BOUNDARY.send(document, callerRelease);
-    return response(result, result?.status === "accepted" ? 200 : 503);
+    const exact = result?.status === "accepted"
+      && result.worker_version_id === env.POC16_EXPECTED_FCM_VERSION;
+    return response(exact ? result : {status: "retry"}, exact ? 200 : 503);
   },
 };

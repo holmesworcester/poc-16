@@ -479,12 +479,18 @@ manifest path for each candidate; `prepare-launch` refuses to overwrite one.
 `stage-launch-fcm` promotes only that exact FCM version while Queue and Cron
 effects remain detached and the other three Workers remain on the disabled
 incumbent. `deploy-launch-harness` then creates a temporary Workers.dev route
-whose only capability is a service binding to that FCM version. The route
-requires a 32-byte bearer secret and a canonical, at-most-16-KiB
-`Content-Length`; it has no R2 or Queue binding. Give the output of
-`launch-binding` to the physical-device harness. It writes each record with
-`deploy.notification_launch.launch_record()` only after that exact candidate
-causes the corresponding real device to launch:
+whose only capability is a service binding to the FCM boundary. Cloudflare RPC
+bindings cannot pin a version, so the FCM boundary reads its immutable runtime
+version-metadata ID before calling Firebase and returns that ID in the same
+accepted RPC result. The harness accepts only the exact FCM version recorded in
+the release manifest; an active-version switch during a device test therefore
+fails closed even when both versions carry identical release markers. The
+route requires a 32-byte bearer secret and a canonical, at-most-16-KiB
+`Content-Length`; it has no R2 or Queue binding. Its name is derived only from
+the Cloudflare account and workspace, not an operator override. Give the
+output of `launch-binding` to the physical-device harness. It writes each
+record with `deploy.notification_launch.launch_record()` only after that exact
+candidate causes the corresponding real device to launch:
 
 ```sh
 export CF_NOTIFICATIONS_ENABLED=1
@@ -507,8 +513,10 @@ R2/Queue locations, push-node ID, Firebase app/environment/project, and exact
 source digest, shared release ID, and four Worker version IDs. Production
 `deploy` validates those records before provider access, revalidates every
 candidate and active version around each promotion, promotes those same IDs,
-and only then attaches the Queue consumer and Cron schedule. A partial or
-concurrent four-Worker rollout fails closed. The old
+requires the deterministic launch harness to be absent before and after
+effect activation and after rollback, and only then leaves the Queue consumer
+and Cron schedule attached. Harness removal likewise verifies exact absence.
+A partial or concurrent four-Worker rollout fails closed. The old
 `CF_MOBILE_LAUNCH_GATE=1` flag has no effect.
 
 For an emergency traffic stop, `manage disable` performs only ownership checks
@@ -522,6 +530,7 @@ incumbent, select a fresh manifest path for the new source, then repeat
 
 Cloudflare's version model and machine-readable upload evidence are documented
 under [Workers Versions and Deployments](https://developers.cloudflare.com/workers/versions-and-deployments/),
+[Version metadata bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/version-metadata/),
 [Wrangler commands](https://developers.cloudflare.com/workers/wrangler/commands/workers/),
 and [Wrangler system environment variables](https://developers.cloudflare.com/workers/wrangler/system-environment-variables/).
 

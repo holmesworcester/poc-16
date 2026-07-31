@@ -57,6 +57,8 @@ RELEASE = BUILD / "release"
 RELEASE_MANIFEST_FORMAT = "poc16-cloudflare-notification-release-v1"
 RELEASE_MANIFEST_ENV = "CF_NOTIFICATION_RELEASE_MANIFEST"
 COMPLETION_PROTOCOL = "poc16-notification-completion-v1"
+EXPECTED_FCM_VERSION_BINDING = "POC16_EXPECTED_FCM_VERSION"
+BUILD_VERSION_ID = "00000000-0000-4000-8000-000000000000"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
@@ -542,16 +544,26 @@ def _write_configs(configs):
         path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
-def _harness_config(configs, environment=os.environ):
-    _reader, _scanner, _consumer, fcm = configs
-    name = _safe_name(
-        environment, "CF_NOTIFICATION_LAUNCH_HARNESS",
-        "poc16-notify-launch-" + configs[1]["vars"]["WORKSPACE"][:12])
+def _harness_name(configs):
+    account = configs[1]["vars"].get(ACCOUNT_BINDING, "")
+    workspace = configs[1]["vars"].get("WORKSPACE", "")
+    if not ACCOUNT_ID.fullmatch(account) or not FID.fullmatch(workspace):
+        raise ValueError("launch harness identity")
+    name = f"poc16-notify-launch-{account[:8]}-{workspace[:12]}"
+    if not SAFE_NAME.fullmatch(name):
+        raise ValueError("launch harness name")
     if name in {config["name"] for config in configs}:
         raise ValueError("launch harness name must differ from release Workers")
+    return name
+
+
+def _harness_config(configs, fcm_version):
+    _reader, _scanner, _consumer, fcm = configs
+    if not VERSION_ID.fullmatch(fcm_version or ""):
+        raise ValueError("exact FCM Worker version")
     return {
         "$schema": "node_modules/wrangler/config-schema.json",
-        "name": name,
+        "name": _harness_name(configs),
         "main": HARNESS_SOURCE.relative_to(PACKAGE).as_posix(),
         "compatibility_date": "2026-07-31",
         "workers_dev": True,
@@ -565,6 +577,7 @@ def _harness_config(configs, environment=os.environ):
             RELEASE_BINDING: fcm["vars"][RELEASE_BINDING],
             ROLE_BINDING: "notification-launch-harness",
             SOFTWARE_BINDING: fcm["vars"][SOFTWARE_BINDING],
+            EXPECTED_FCM_VERSION_BINDING: fcm_version,
             "NOTIFICATIONS_ENABLED": "1",
         },
     }
@@ -751,6 +764,25 @@ def _version_markers(role, config, version_id):
     ))
 
 
+def _owned_incumbent(role, config, *, allow_absent=False):
+    """Pin one active version and prove its immutable mutation authority."""
+    version = _active_version(config)
+    if version is _ABSENT:
+        if allow_absent:
+            return version, _ABSENT
+        raise RuntimeError("notification Worker is absent")
+    markers = _version_markers(role, config, version)
+    variables = config["vars"]
+    if markers is None or (markers[0], markers[1], markers[5]) != (
+            variables[OWNER_BINDING], variables[IDENTITY_BINDING],
+            variables[ROLE_BINDING]):
+        raise RuntimeError(
+            "refusing to mutate an unowned or rebound notification Worker")
+    if _active_version(config) != version:
+        raise RuntimeError("concurrent notification deployment")
+    return version, markers
+
+
 def _expected_markers(config):
     variables = config["vars"]
     return (
@@ -802,9 +834,7 @@ def build():
         "CF_NOTIFICATIONS_ENABLED": "0",
     }, software_digest=software_digest)
     _write_configs(configs)
-    harness = _harness_config(configs, {
-        "CF_NOTIFICATION_LAUNCH_HARNESS": "poc16-notify-launch-build",
-    })
+    harness = _harness_config(configs, BUILD_VERSION_ID)
     _write_harness(harness)
     for config in (READER_CONFIG, SCANNER_CONFIG, CONSUMER_CONFIG):
         with tempfile.TemporaryDirectory(
@@ -909,6 +939,12 @@ def stage_launch_fcm():
     _release_secrets(configs)
     _stage_locked(software_digest)
     _require_effects_detached(configs)
+    allow_absent = os.environ.get("CF_CREATE") == "1"
+    incumbent = {}
+    for role, config in zip(ROLE_KEYS, configs):
+        incumbent[role], _markers = _owned_incumbent(
+            role, config, allow_absent=allow_absent)
+    _require_snapshot(configs, incumbent)
     for role, config in zip(ROLE_KEYS, configs):
         _require_candidate(
             role, config, manifest["worker_versions"][role],
@@ -916,9 +952,12 @@ def stage_launch_fcm():
              (("PUSH_NODE_SECRET",) if role == "consumer" else ())))
     # FCM may be invoked only through a temporary private service-bound
     # harness.  Scanner and Queue effects remain detached throughout.
-    _promote("fcm", configs[3], manifest["worker_versions"]["fcm"])
-    if _active_version(configs[3]) != manifest["worker_versions"]["fcm"]:
-        raise RuntimeError("Cloudflare promoted the wrong FCM version")
+    _require_snapshot(configs, incumbent)
+    expected = dict(incumbent)
+    expected["fcm"] = manifest["worker_versions"]["fcm"]
+    if incumbent["fcm"] != expected["fcm"]:
+        _promote("fcm", configs[3], expected["fcm"])
+    _require_snapshot(configs, expected)
     _require_effects_detached(configs)
 
 
@@ -940,17 +979,18 @@ def _manifest_configs(*, launch_gate=False):
 def deploy_launch_harness():
     """Create one temporary authenticated route to the staged FCM RPC."""
     manifest, configs = _manifest_configs()
-    harness = _harness_config(configs)
+    fcm_version = manifest["worker_versions"]["fcm"]
+    harness = _harness_config(configs, fcm_version)
     _write_configs(configs)
     _write_harness(harness)
     _stage_locked(manifest["software_digest"])
     _require_effects_detached(configs)
-    if _active_version(configs[3]) != manifest["worker_versions"]["fcm"]:
+    if _active_version(configs[3]) != fcm_version:
         raise RuntimeError("exact staged FCM version is not active")
     _require_candidate(
-        "fcm", configs[3], manifest["worker_versions"]["fcm"],
+        "fcm", configs[3], fcm_version,
         ("FIREBASE_SERVICE_ACCOUNT_JSON",))
-    if _worker_markers(harness) is not _ABSENT:
+    if _active_version(harness) is not _ABSENT:
         raise RuntimeError("temporary launch harness already exists")
     secret = _text(os.environ, "CF_NOTIFICATION_HARNESS_SECRET")
     if not FID.fullmatch(secret):
@@ -970,7 +1010,8 @@ def deploy_launch_harness():
     if _binding_values(bindings, (
             OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
             RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
-    )) != _expected_markers(harness) or len([
+            EXPECTED_FCM_VERSION_BINDING,
+    )) != (*_expected_markers(harness), fcm_version) or len([
         row for row in bindings if isinstance(row, dict)
         and row.get("name") == "LAUNCH_HARNESS_SECRET"
         and row.get("type") == "secret_text"
@@ -980,6 +1021,8 @@ def deploy_launch_harness():
         "versions", "deploy", "--version-id", version, "-y",
         "--config", str(HARNESS_CONFIG))
     _require_owned(harness)
+    if _active_version(harness) != version:
+        raise RuntimeError("Cloudflare promoted the wrong launch harness")
     subdomain = _text(os.environ, "CF_WORKERS_SUBDOMAIN")
     if not WORKERS_SUBDOMAIN.fullmatch(subdomain):
         raise ValueError("CF_WORKERS_SUBDOMAIN")
@@ -988,17 +1031,18 @@ def deploy_launch_harness():
 
 def remove_launch_harness():
     """Delete only the exact temporary harness; never touch release state."""
-    _manifest, configs = _manifest_configs()
-    harness = _harness_config(configs)
+    manifest, configs = _manifest_configs()
+    harness = _harness_config(configs, manifest["worker_versions"]["fcm"])
     _write_harness(harness)
     _require_owned(harness)
     _wrangler(
         "delete", harness["name"], "--force", "--config",
         str(HARNESS_CONFIG))
+    _require_harness_absent(configs, manifest["worker_versions"]["fcm"])
 
 
-def _require_harness_absent(configs):
-    if _worker_markers(_harness_config(configs)) is not _ABSENT:
+def _require_harness_absent(configs, fcm_version):
+    if _active_version(_harness_config(configs, fcm_version)) is not _ABSENT:
         raise RuntimeError("remove the temporary launch harness before enablement")
 
 
@@ -1411,16 +1455,26 @@ def _attach_effects(configs, environment=os.environ):
 def _activate_effects(configs, versions):
     """Attach traffic only while the exact complete release remains active."""
     _require_snapshot(configs, versions)
+    _require_harness_absent(configs, versions["fcm"])
     try:
         _attach_effects(configs)
         _require_snapshot(configs, versions)
+        _require_harness_absent(configs, versions["fcm"])
     except Exception:
+        rollback_error = None
         try:
             _detach_effects(configs)
         except Exception as detach_error:
+            rollback_error = detach_error
+        try:
+            _require_harness_absent(configs, versions["fcm"])
+        except Exception as harness_error:
+            if rollback_error is None:
+                rollback_error = harness_error
+        if rollback_error is not None:
             raise RuntimeError(
-                "notification activation failed and effects could not be "
-                "detached") from detach_error
+                "notification activation failed and rollback verification "
+                "failed") from rollback_error
         raise
 
 
@@ -1469,7 +1523,7 @@ def deploy():
     initial = _snapshot(configs)
     if production:
         _require_effects_detached(configs)
-        _require_harness_absent(configs)
+        _require_harness_absent(configs, versions["fcm"])
         for role, config in zip(ROLE_KEYS, configs):
             _require_candidate(
                 role, config, versions[role],
@@ -1507,9 +1561,12 @@ def _deploy_scanner_mode(mode):
         raise ValueError("notification bootstrap mode")
     software_digest = _prepare_software()
     ordinary = generated_configs(software_digest=software_digest)
-    observed = [_worker_markers(config) for config in ordinary]
-    if any(value in {_ABSENT, None} for value in observed):
-        raise RuntimeError("notification release is not fully deployed")
+    incumbent = {}
+    observed = []
+    for role, config in zip(ROLE_KEYS, ordinary):
+        version, markers = _owned_incumbent(role, config)
+        incumbent[role] = version
+        observed.append(markers)
     releases = {value[3] for value in observed}
     software = {value[2] for value in observed}
     enabled_states = {value[4] for value in observed}
@@ -1523,23 +1580,28 @@ def _deploy_scanner_mode(mode):
         release_id=release_id)
     _write_configs(configs)
     if mode == BOOTSTRAP_NONE:
+        _require_snapshot(configs, incumbent)
         _wrangler(
             "triggers", "deploy", "--config", str(SCANNER_CONFIG))
     else:
         _require_effects_detached(configs)
     _require_retained_notification_objects(configs[0], configs[1])
+    _require_snapshot(configs, incumbent)
     version = _upload_version(
         "scanner", configs[1], release_id=release_id)
     _require_candidate("scanner", configs[1], version)
+    _require_snapshot(configs, incumbent)
     _promote("scanner", configs[1], version)
-    if _active_version(configs[1]) != version:
-        raise RuntimeError("Cloudflare promoted the wrong scanner version")
+    expected = dict(incumbent)
+    expected["scanner"] = version
+    _require_snapshot(configs, expected)
     if mode == BOOTSTRAP_NONE:
         _require_effects_detached(configs)
     else:
         cron = os.environ.get("CF_NOTIFICATION_CRON", "* * * * *")
         if not isinstance(cron, str) or not 0 < len(cron) <= 128:
             raise ValueError("CF_NOTIFICATION_CRON")
+        _require_snapshot(configs, expected)
         _wrangler(
             "triggers", "deploy", "--triggers", cron,
             "--config", str(SCANNER_CONFIG))
@@ -1600,7 +1662,7 @@ def verify():
         if _active_version(config) != versions[role]:
             raise RuntimeError("active Worker version differs from release")
         _require_owned(config)
-    _require_harness_absent(configs)
+    _require_harness_absent(configs, versions["fcm"])
     _require_bootstrap_sealed(configs[1])
     _require_secret(configs[3], "FIREBASE_SERVICE_ACCOUNT_JSON")
     _require_secret(configs[2], "PUSH_NODE_SECRET")

@@ -9,6 +9,7 @@ const FID = /^[0-9a-f]{64}$/;
 const APPLICATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const ENVIRONMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PROJECT = /^[a-z][a-z0-9-]{4,62}$/;
+const VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ROLE = "notification-fcm-boundary";
 
 function retry() {
@@ -287,10 +288,37 @@ function acceptsConsumerRelease(env, callerRelease) {
     && keys.every(key => callerRelease[key] === expected[key]);
 }
 
+function workerVersionFor(env) {
+  const version = env?.CF_VERSION_METADATA?.id;
+  if (typeof version !== "string" || !VERSION_ID.test(version)) {
+    throw new Error("FCM Worker version metadata");
+  }
+  return version;
+}
+
+async function sendFromWorkerVersion(env, bridge, document, callerRelease) {
+  if (!acceptsConsumerRelease(env, callerRelease)) return retry();
+  let workerVersion;
+  try {
+    // Resolve the identity of this executing Worker before making the
+    // irreversible provider call.  Release markers can be copied to another
+    // version; Cloudflare's runtime version ID cannot.
+    workerVersion = workerVersionFor(env);
+  } catch (_error) {
+    return retry();
+  }
+  const result = await bridge.send(document);
+  return result?.status === "accepted"
+    ? {...result, worker_version_id: workerVersion}
+    : result;
+}
+
 export {
   acceptsConsumerRelease,
   FcmBridge,
   releaseFor,
+  sendFromWorkerVersion,
+  workerVersionFor,
   FORMAT,
   MAX_RESPONSE_BYTES,
   boundedJson,
