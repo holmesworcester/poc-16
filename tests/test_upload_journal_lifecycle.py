@@ -89,6 +89,10 @@ def test_two_resume_commands_are_one_writer_and_one_delivery(tmp_path):
             UploadClient(copies[1], broker, bucket, clock).run, proof)
         assert not second.done()
         assert opens == 1
+        with pytest.raises(UploadJournalError, match="active"):
+            UploadSource.collect(
+                Path(source.path).parent, source.workspace,
+                source.source_id, clock())
         release.set()
         results = first.result(5), second.result(5)
 

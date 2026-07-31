@@ -61,13 +61,21 @@ def _sync_dir(path):
 
 
 @contextmanager
-def _lock(path):
+def _lock(path, *, blocking=True):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(
+                fd, fcntl.LOCK_EX
+                | (0 if blocking else fcntl.LOCK_NB))
+            locked = True
+        except BlockingIOError as error:
+            raise UploadJournalError("upload source is active") from error
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -75,10 +83,11 @@ def _root_lock(root):
     return _lock(os.path.join(root, ".catalog.lock"))
 
 
-def _source_lock(root, source_id):
+def _source_lock(root, source_id, *, blocking=True):
     locks = os.path.join(root, ".locks")
     os.makedirs(locks, exist_ok=True)
-    return _lock(os.path.join(locks, source_id[:2]))
+    return _lock(
+        os.path.join(locks, source_id[:2]), blocking=blocking)
 
 
 def _new(path, raw):
@@ -537,7 +546,8 @@ class UploadSource:
         target = os.path.join(root, source_id)
         tombstone = os.path.join(
             root, f".collecting-{workspace}-{source_id}")
-        with _root_lock(root), _source_lock(root, source_id):
+        with _root_lock(root), _source_lock(
+                root, source_id, blocking=False):
             if not os.path.isdir(target):
                 if not os.path.isdir(tombstone):
                     raise UploadJournalError("upload source unavailable")
