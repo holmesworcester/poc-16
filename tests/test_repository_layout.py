@@ -344,6 +344,7 @@ def test_provider_authentication_has_no_materialized_winner_tree():
     assert snapshot.MAP_NAMES == ("fact_order", "fact", "supp")
     assert indexes.TREE_NAMES == ("fact", "supp")
     assert not hasattr(indexes, "AUTHORITY")
+    assert not hasattr(indexes, "action_key")
     assert not hasattr(WorkerView, "authority_provider")
     assert not hasattr(WorkerView, "authority_known")
     assert hasattr(WorkerView, "fact_known")

@@ -65,19 +65,11 @@ def _merge_rows(target, rows):
             raise ValueError("conflicting repository row")
 
 
-def _fact_rows(fact, oid, slot):
-    """Rows contributed by one fact under the supplied current-slot reader."""
+def _fact_rows(fact, oid):
+    """Mechanical FactTree rows contributed by one validated fact."""
     rows = {indexes.fact_key(fact.fid): oid}
     posting = {"state": indexes.POSTING_VALUE, "fid": fact.fid}
     rows.update((key, posting) for key in indexes.record_postings(fact))
-    action_sids = set(facts.principal_sids(fact))
-    if facts.family_for(fact.t).POLICY.direct_targets:
-        action_sids.add(indexes.fact_key(fact.fid))
-    action_sids.update(facts.action_sids(fact))
-    rows.update(
-        (indexes.action_key(sid), slot(sid))
-        for sid in action_sids
-    )
     return rows
 
 
@@ -92,17 +84,14 @@ def logical_rows(anchor, facts_by_fid):
     slot = lambda sid: indexes.suppression_slot(actions.get(sid))
     fact_rows, supp_rows = {}, {}
     for fid, fact in checked.items():
-        _merge_rows(fact_rows, _fact_rows(fact, objects[fid], slot))
+        _merge_rows(fact_rows, _fact_rows(fact, objects[fid]))
         supp_rows.update(
             (sid, slot(sid)) for sid in facts.current_scopes(fact))
     for sid, fid in actions.items():
         fact = checked.get(fid)
         if fact is None or sid not in facts.action_sids(fact):
             raise ValueError("action evidence binding")
-        value = indexes.suppression_slot(fid)
-        supp_rows[sid] = value
-        _merge_rows(
-            fact_rows, {indexes.action_key(sid): value})
+        supp_rows[sid] = indexes.suppression_slot(fid)
 
     return {
         snapshot.FACT_ORDER: {
@@ -181,8 +170,7 @@ def extend_snapshot(anchor, base_root, facts_by_fid, fetch):
         candidates = list(actions[sid])
         if previous is not None and previous["state"] == "active":
             incumbent = view.fact(previous["action"])
-            if sid not in facts.action_sids(incumbent) \
-                    or fact_reader.get(indexes.action_key(sid)) != previous:
+            if sid not in facts.action_sids(incumbent):
                 raise ValueError("action evidence binding")
             candidates.append(incumbent)
         selected = min(
@@ -190,26 +178,14 @@ def extend_snapshot(anchor, base_root, facts_by_fid, fetch):
         ).fid if candidates else None
         next_slots[sid] = indexes.suppression_slot(selected)
 
-    def current_slot(sid):
-        value = next_slots.get(sid)
-        if value is None:
-            value = old_slot(sid)
-        if value is None:
-            raise ValueError("missing suppression scope")
-        return value
-
     fact_changes = {}
     order_changes = {}
     for fid, fact in fresh.items():
         _merge_rows(
             fact_changes,
-            _fact_rows(fact, object_ids[fid], current_slot),
+            _fact_rows(fact, object_ids[fid]),
         )
         order_changes[fact.key] = object_ids[fid]
-    for sid in affected_sids:
-        if next_slots[sid]["state"] == "active":
-            _merge_rows(fact_changes, {
-                indexes.action_key(sid): next_slots[sid]})
 
     changes = {
         snapshot.FACT_ORDER: order_changes,

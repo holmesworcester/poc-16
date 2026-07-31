@@ -252,7 +252,6 @@ One canonical root names three Merkle maps and their authenticated metadata.
 ```text
 fact:<fid> -> object_oid
 index:<kind>:<k0>:<k1>:<fid> -> validated posting
-action:<suppression_id> -> current action slot
 ```
 
 The object is exactly the canonical fact bytes; its digest must match the
@@ -287,8 +286,10 @@ ACTIVE(action_fid)
 ```
 
 `CLEAR` means the ID is known and no effective action exists at this root.
-`ACTIVE` names the immutable action. Missing is distinct from `CLEAR`; an
-exact liveness check which needs a missing slot fails closed.
+`ACTIVE` names the immutable action. Its ordinary FactTree residence and
+canonical bytes prove that it declares this exact suppression ID; duplicating
+the slot in FactTree would add no authority. Missing is distinct from `CLEAR`;
+an exact liveness check which needs a missing slot fails closed.
 
 Selectors may name SELF, a parent, an ancestor path, several IDs, or none.
 PARENT pins its one direct dependency. ANCESTOR traverses only exact named

@@ -24,7 +24,7 @@ from .fact import canon
 from .limits import MAX_ROOT_BYTES, decode_json
 from .shape import is_key, valid_fid
 
-LAYOUT = "composite-merkle-map-v10-direct-provider-reads"
+LAYOUT = "composite-merkle-map-v11-suppression-action-evidence"
 FACT_ORDER = "fact_order"
 TREE_NAMES = ("fact", "supp")
 MAP_NAMES = (FACT_ORDER, *TREE_NAMES)

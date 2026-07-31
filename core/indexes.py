@@ -55,10 +55,6 @@ def fact_key(fid):
     return "fact:" + fid
 
 
-def action_key(sid):
-    return "action:" + sid
-
-
 def checked_fact_oid(value):
     """Validate a FactTree residence value before it can drive an object read."""
     if not valid_fid(value):
@@ -200,7 +196,6 @@ __all__ = (
     "SCOPE_INDEX",
     "SUPP",
     "TREE_NAMES",
-    "action_key",
     "checked_fact_oid",
     "checked_suppression_slot",
     "decode_posting_key",

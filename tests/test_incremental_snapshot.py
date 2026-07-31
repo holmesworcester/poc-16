@@ -1,7 +1,9 @@
 """Incremental publication is byte-identical to the full repair compiler."""
 
 import facts
+import pytest
 
+from core import indexes, merkle_map, snapshot
 from core.crypto import h
 from core.fact import encode
 from core.repository_snapshot import compile_snapshot, extend_snapshot
@@ -114,3 +116,47 @@ def test_action_before_target_and_reverse_arrival_match_full_oracle(
     assert roots[0] == roots[1] \
         == compile_snapshot(
             workspace, {workspace: anchor, **complete}).root
+
+
+def test_incremental_action_checks_suppression_named_fact_evidence(tmp_path):
+    source, workspace, _, deletions = suppression_world(tmp_path / "source")
+    complete = _facts(source, workspace)
+    incoming = complete.pop(deletions[0])
+    base = compile_snapshot(workspace, complete)
+    objects = dict(base.outbox)
+    decoded = snapshot.decode_root(base.root)
+    sid, = facts.action_sids(incoming)
+
+    for forged_action in ("f" * 64, deletions[1]):
+        pending = {}
+
+        def emit(raw):
+            oid = h(raw)
+            pending[oid] = raw
+            return oid
+
+        descriptor = decoded.maps[indexes.SUPP]
+        built = merkle_map.update(
+            descriptor["root"],
+            decoded.layout_seed,
+            ((sid, indexes.suppression_slot(forged_action)),),
+            objects.get,
+            emit,
+            expected_count=descriptor["count"],
+            expected_depth=descriptor["depth"],
+        )
+        maps = dict(decoded.maps)
+        maps[indexes.SUPP] = snapshot.descriptor(built)
+        forged_root = snapshot.encode_root(
+            workspace, maps, seed=decoded.layout_seed)
+        forged_objects = {**objects, **pending}
+
+        with pytest.raises(
+                ValueError,
+                match="missing validated fact|action evidence binding"):
+            extend_snapshot(
+                workspace,
+                forged_root,
+                {incoming.fid: incoming},
+                forged_objects.get,
+            )

@@ -187,7 +187,7 @@ def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
     assert after.mint(pile, now) is None
 
 
-def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
+def test_suppression_action_names_ordinary_fact_evidence(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
@@ -197,8 +197,6 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
         old_root, lambda oid: store.get("obj/" + oid))
     sid = indexes.fact_key(target)
     assert old.suppression(sid) == {"state": "clear"}
-    assert old._reader(indexes.FACT).get(
-        indexes.action_key(sid)) == {"state": "clear"}
 
     action_fid = facts.content.delete.remove(node, workspace, target, ts=20)
     new_root = store.get("root")
@@ -207,8 +205,10 @@ def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
         new_root, lambda oid: store.get("obj/" + oid))
     active = {"state": "active", "action": action_fid}
     assert new.suppression(sid) == active
-    assert new._reader(indexes.FACT).get(indexes.action_key(sid)) == active
     assert new.fact(action_fid).fid == action_fid
+    assert sid in facts.action_sids(new.fact(action_fid))
+    assert new._reader(indexes.FACT).range_page(
+        "action:", "action:\uffff").rows == ()
 
     maps = snapshot.decode_root(new_root).maps
     assert set(maps) == set(snapshot.MAP_NAMES)
