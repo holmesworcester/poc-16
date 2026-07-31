@@ -1,4 +1,5 @@
 """Amazon S3 adapter requests, races, and failure classification."""
+import asyncio
 import base64
 import hashlib
 import io
@@ -24,11 +25,17 @@ from core.object_store import (
     StoreError,
     Versioned,
     VersionToken,
-    ensure_object,
 )
+from core.repository_applier import RepositoryApplier
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE = "0" * 64
+
+
+def establish(store, oid, raw):
+    return asyncio.run(
+        RepositoryApplier(WORKSPACE, store).admit_object(oid, raw))
 
 
 class ServiceError(Exception):
@@ -208,7 +215,7 @@ def test_conditional_object_create_sends_address_checksum_and_header():
     })]
 
 
-def test_ensure_object_verifies_both_collision_and_unknown_outcome():
+def test_applier_verifies_both_collision_and_unknown_outcome():
     raw = b"immutable bytes"
     oid = h(raw)
 
@@ -216,7 +223,7 @@ def test_ensure_object_verifies_both_collision_and_unknown_outcome():
     collision_client = ScriptedClient(
         put_object=[ServiceError(412, "PreconditionFailed")],
         get_object=[{"Body": same_body, "ETag": '"incumbent"'}])
-    assert ensure_object(
+    assert establish(
         S3Store(config(), client=collision_client), oid, raw) is EXISTS
     assert [call[0] for call in collision_client.calls] == [
         "put_object", "get_object"]
@@ -225,7 +232,7 @@ def test_ensure_object_verifies_both_collision_and_unknown_outcome():
     unknown_client = ScriptedClient(
         put_object=[ServiceError(500, "InternalError")],
         get_object=[{"Body": unknown_body, "ETag": '"applied"'}])
-    assert ensure_object(
+    assert establish(
         S3Store(config(), client=unknown_client), oid, raw) is EXISTS
     assert [call[0] for call in unknown_client.calls] == [
         "put_object", "get_object"]
@@ -234,10 +241,10 @@ def test_ensure_object_verifies_both_collision_and_unknown_outcome():
         put_object=[ServiceError(412, "PreconditionFailed")],
         get_object=[{"Body": Body(b"wrong"), "ETag": '"wrong"'}])
     with pytest.raises(ValueError, match="immutable object conflict"):
-        ensure_object(S3Store(config(), client=wrong_client), oid, raw)
+        establish(S3Store(config(), client=wrong_client), oid, raw)
 
 
-def test_ensure_object_retries_once_after_unknown_and_strong_absent_read():
+def test_applier_retries_once_after_unknown_and_strong_absent_read():
     raw = b"immutable bytes"
     oid = h(raw)
     client = ScriptedClient(
@@ -247,7 +254,7 @@ def test_ensure_object_retries_once_after_unknown_and_strong_absent_read():
         ],
         get_object=[ServiceError(404, "NoSuchKey")])
 
-    assert ensure_object(
+    assert establish(
         S3Store(config(), client=client), oid, raw) is CREATED
     assert [call[0] for call in client.calls] == [
         "put_object", "get_object", "put_object"]

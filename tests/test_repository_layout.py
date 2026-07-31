@@ -181,6 +181,33 @@ def test_core_dispatches_through_facts_without_importing_family_modules():
     assert offenders == []
 
 
+def test_one_explicit_fact_context_serves_core_and_full_peer_authoring():
+    assert class_definitions("FactContext") == [Path("facts/_policy.py")]
+    for path, owner in (
+            (Path("core/kernel.py"), "MemoryContext"),
+            (Path("full_peer/sql_store.py"), "SqlStore")):
+        definition = next(
+            item for item in parsed(path).body
+            if isinstance(item, ast.ClassDef) and item.name == owner)
+        members = {
+            item.name for item in definition.body
+            if isinstance(item, ast.FunctionDef)
+        } | {
+            target.id
+            for item in definition.body if isinstance(item, ast.Assign)
+            for target in item.targets if isinstance(target, ast.Name)
+        }
+        assert {"fact_of", "offers_from", "resolve_offer"} <= members
+
+    for path in (Path("core/kernel.py"), Path("facts/_policy.py")):
+        assert not [
+            call for call in ast.walk(parsed(path))
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "hasattr"
+        ]
+
+
 def test_one_semantic_root_cas_and_one_root_compiler():
     semantic = []
     for path, call in calls_named("cas"):
@@ -202,6 +229,12 @@ def test_one_semantic_root_cas_and_one_root_compiler():
 
 
 def test_applier_owns_object_establishment_generations_and_retirement():
+    object_store_functions = {
+        item.name for item in parsed(Path("core/object_store.py")).body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "ensure_object" not in object_store_functions
+
     for function, expected in (
             ("ensure_object_async", {"core/repository_applier.py"}),
             ("pile_source", {"core/repository_applier.py"}),

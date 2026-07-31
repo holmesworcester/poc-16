@@ -43,7 +43,7 @@ def test_random_seed_is_deep_and_its_leaf_closes_over_the_real_path(tmp_path):
     inviter_pk = stats["parents"][deepest_pk]
     inviter_user = stats["user_by_member"][inviter_pk]
     assert inviter_user in resolve_deps(
-        node.fact_of(workspace, invite_fid), node.idx(workspace))
+        node.fact_of(workspace, invite_fid), node.sql(workspace))
 
     stream = decode_pile(
         closed_subset(node, workspace, [user_fid]), workspace)
@@ -126,14 +126,14 @@ def test_bulk_author_closes_signatures_before_messages(tmp_path):
     message_fid = next(
         fid for fid in added if node.fact_of(workspace, fid).t == "msg")
     message = node.fact_of(workspace, message_fid)
-    deps = resolve_deps(message, node.idx(workspace))
+    deps = resolve_deps(message, node.sql(workspace))
     assert deps is not None
     assert {node.fact_of(workspace, fid).t for fid in deps} \
         == {"signature", "workspace"}
     pile = close(
         [message],
         lambda fid: resolve_deps(
-            node.fact_of(workspace, fid), node.idx(workspace)) or (),
+            node.fact_of(workspace, fid), node.sql(workspace)) or (),
         lambda fid: node.fact_of(workspace, fid),
     )
     assert drain(pile, workspace).ok

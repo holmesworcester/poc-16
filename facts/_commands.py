@@ -26,7 +26,7 @@ def member_source(node, workspace, public_key, owner=None):
     with node.lock:
         choices = {
             (_policy.member_principal(
-                node.idx(workspace), fact.fid, public_key), fact.fid)
+                node.sql(workspace), fact.fid, public_key), fact.fid)
             for fact in node.select(workspace, "member", public_key)
         }
     choices = {(principal, fid) for principal, fid in choices if principal}

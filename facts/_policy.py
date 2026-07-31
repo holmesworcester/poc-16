@@ -6,6 +6,7 @@ dependency roles, suppression inheritance, direct action targets, ownership,
 and continuing authority liveness.
 """
 from dataclasses import dataclass
+from typing import Protocol
 
 from core.limits import MAX_ATOM_NAME_BYTES, valid_bounded_text
 from core.suppression import (
@@ -22,6 +23,18 @@ NEVER = None
 OWNER = "owner"
 ADMIN = "admin"
 CONTENT_DELETE = "content.delete"
+
+
+class FactContext(Protocol):
+    """The immutable relationship reads shared by families and authoring."""
+
+    anchor: str
+
+    def fact_of(self, fid): ...
+
+    def offers_from(self, source, name): ...
+
+    def resolve_offer(self, name, a0, a1=None, source=None): ...
 
 
 @dataclass(frozen=True)
@@ -257,15 +270,11 @@ def allows_direct_target(policy, action, selector, mode):
     )
 
 
-def member_principal(db_or_ctx, provider_fid, actor_key):
+def member_principal(ctx: FactContext, provider_fid, actor_key):
     """Read the durable principal from one exact ``member(key, owner)`` offer."""
-    offers_from = db_or_ctx.offers_from if hasattr(db_or_ctx, "offers_from") \
-        else lambda source, name: db_or_ctx.execute(
-            "SELECT k0, k1 FROM fact_index WHERE src=? AND kind=? "
-            "ORDER BY k0, k1", (source, name)).fetchall()
     owners = {
         owner
-        for key, owner in offers_from(provider_fid, "member")
+        for key, owner in ctx.offers_from(provider_fid, "member")
         if key == actor_key and owner
     }
     return next(iter(owners)) if len(owners) == 1 else None

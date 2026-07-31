@@ -201,51 +201,8 @@ def verified_object(oid, fetch):
     return raw
 
 
-def ensure_object(store, oid, raw):
-    """Establish one immutable object before a root may reference it.
-
-    A conditional collision is not success until the incumbent has been
-    fetched and byte-verified.  An ambiguous create is reconciled by a strong
-    read and retried once when the key is still absent; it is never collapsed
-    into ``EXISTS``.
-    """
-    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
-            or not isinstance(oid, str) or h(raw) != oid:
-        raise ValueError("immutable object address")
-    key = "obj/" + oid
-    maximum = max(1, len(raw))
-    unknown = None
-    for _ in range(2):
-        try:
-            result = store.put_if_absent(key, raw)
-        except OutcomeUnknown as error:
-            unknown = error
-            try:
-                incumbent = store.get_bounded(key, maximum)
-            except PayloadTooLarge as conflict:
-                raise ValueError(
-                    "immutable object conflict") from conflict
-            if incumbent == raw:
-                return EXISTS
-            if incumbent is not None:
-                raise ValueError("immutable object conflict") from error
-            continue
-        if result is CREATED:
-            return CREATED
-        if result is not EXISTS:
-            raise TypeError("conditional-create result")
-        try:
-            incumbent = store.get_bounded(key, maximum)
-        except PayloadTooLarge as conflict:
-            raise ValueError("immutable object conflict") from conflict
-        if incumbent != raw:
-            raise ValueError("immutable object conflict")
-        return EXISTS
-    raise unknown
-
-
 async def ensure_object_async(store, oid, raw):
-    """Awaited equivalent of :func:`ensure_object` for edge bindings."""
+    """Establish one immutable object before a root may reference it."""
     if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
             or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")

@@ -16,7 +16,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
-from core.kernel import offer_src, resolve_deps
+from core.kernel import resolve_deps
 from full_peer.node import FullPeer, now_ms
 
 
@@ -133,8 +133,7 @@ def add_member(
     """
     inviter_sk, inviter_pk = inviter or n.identity(ws)
     with n.lock:
-        from core.kernel import offer_src
-        member_source = offer_src(n.idx(ws), "member", inviter_pk)
+        member_source = n.sql(ws).resolve_offer("member", inviter_pk)
         if member_source is None:
             raise ValueError("inviter is not a workspace member")
         member_ts = n.fact_of(ws, member_source).ts
@@ -166,7 +165,7 @@ def author_msg(n, ws, sk, pk, text, ts=None, chan="general"):
 
 def member_src(n, ws, pk):
     with n.lock:
-        return offer_src(n.idx(ws), "member", pk)
+        return n.sql(ws).resolve_offer("member", pk)
 
 
 def inject_device_claim(
@@ -182,10 +181,10 @@ def inject_device_claim(
             signed.fid: [],
             item.fid: [
                 signed.fid,
-                offer_src(
-                    node.idx(workspace), "member", public, user),
-                offer_src(
-                    node.idx(workspace), "device_key", public, user),
+                node.sql(workspace).resolve_offer(
+                    "member", public, user),
+                node.sql(workspace).resolve_offer(
+                    "device_key", public, user),
             ],
         },
     )
@@ -195,9 +194,10 @@ def inject_device_claim(
 def closed_subset(n, ws, fids):
     """close() an arbitrary subset out of a node's index — a valid pile."""
     with n.lock:
-        idx = n.idx(ws)
+        context = n.sql(ws)
         facts = close([n.fact_of(ws, fid) for fid in fids],
-                      lambda fid: resolve_deps(n.fact_of(ws, fid), idx) or [],
+                      lambda fid: resolve_deps(
+                          n.fact_of(ws, fid), context) or [],
                       lambda fid: n.fact_of(ws, fid))
     return encode_pile(facts, workspace=ws)
 

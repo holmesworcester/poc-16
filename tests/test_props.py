@@ -27,7 +27,7 @@ from core import snapshot
 from core.close import decode_pile
 from core.crypto import keypair, load_sk
 from core.fact import Fact, canon
-from core.kernel import drain, offer_src
+from core.kernel import drain
 from full_peer.node import FullPeer, now_ms
 from core.object_store import OutcomeUnknown
 from full_peer.pile_sender import PileSender
@@ -856,8 +856,7 @@ def test_ephemeral_request_never_enters_validated_repository(world):
     ephemeral = request(
         workspace, node.pk, "sync", ts + 9_999, ts)
     signed = signature(node.sk, node.pk, ephemeral, ts)
-    member = offer_src(
-        node.idx(workspace), "member", node.pk)
+    member = node.sql(workspace).resolve_offer("member", node.pk)
     chain = decode_pile(
         fact_pile(node, workspace, member),
         workspace,

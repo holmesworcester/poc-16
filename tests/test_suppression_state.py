@@ -8,7 +8,7 @@ import facts
 from core import fact_index
 from core.close import close, encode_pile
 from core.crypto import h, keypair, load_sk
-from core.kernel import offer_src, resolve_deps
+from core.kernel import resolve_deps
 from full_peer.node import FullPeer
 from full_peer import sync as sync_module
 from facts.auth.removal import removal
@@ -42,7 +42,7 @@ def _signed_pile(node, workspace, fact, signed, deps):
     return encode_pile(close(
         [signed, fact],
         lambda fid: deps[fid] if fid in deps else (
-            resolve_deps(fact_of(fid), node.idx(workspace)) or ()),
+            resolve_deps(fact_of(fid), node.sql(workspace)) or ()),
         fact_of,
     ))
 
@@ -51,8 +51,8 @@ def _author_eviction(node, workspace, target, ts):
     secret, public = node.identity(workspace)
     item = removal(workspace, public, target, ts)
     signed = signature(secret, public, item, ts)
-    admin = offer_src(node.idx(workspace), "admin", public)
-    target_member = offer_src(node.idx(workspace), "member", target)
+    admin = node.sql(workspace).resolve_offer("admin", public)
+    target_member = node.sql(workspace).resolve_offer("member", target)
     node.ingest_new(
         workspace, [signed, item],
         {

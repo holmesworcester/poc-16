@@ -8,6 +8,7 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
+from facts._policy import FactContext
 from .fact import Fact, bound_to, encode
 from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
 from .shape import valid_fid
@@ -40,10 +41,6 @@ class MemoryContext:
     def has_fact(self, fid):
         return fid in self.facts
 
-    def fact_meta(self, fid):
-        fact = self.facts.get(fid)
-        return (fact.ts, fact.t) if fact is not None else None
-
     def fact_of(self, fid):
         return self.facts.get(fid)
 
@@ -54,17 +51,16 @@ class MemoryContext:
             if offer == name
         )
 
-    def provider(self, name, a0, a1=None, source=None):
-        return self.resolve_offer(name, a0, a1, source)
-
     def resolve_offer(self, name, a0, a1=None, source=None):
         if source is not None:
             fact = self.facts.get(source)
             if fact is None or source not in self.depths:
                 return None
-            offered = set(fact.offers())
-            address = (name, a0, a1 or "")
-            return source if address in offered else None
+            return source if any(
+                offer == name and value0 == a0
+                and (a1 is None or value1 == a1)
+                for offer, value0, value1 in fact.offers()
+            ) else None
         candidates = []
         for fid, fact in self.facts.items():
             if fid not in self.depths or not any(
@@ -96,33 +92,7 @@ class MemoryContext:
         self.closures[fact.fid] = frozenset((fact.fid,)) | closure
 
 
-def offer_src(db, name, a0, a1=None, source=None):
-    """Deterministic provider for an offer address, or an exact named source.
-
-    A fact that semantically depends on one provider names it in an explicit
-    envelope selector and ``resolve_edges`` passes that fid as ``source``.
-    Otherwise providers of the same address are validation-interchangeable;
-    choosing the lowest fid is only deterministic closure assembly, never a
-    persisted admission verdict.
-    """
-    if hasattr(db, "resolve_offer"):
-        return db.resolve_offer(name, a0, a1, source)
-    query = "SELECT src FROM fact_index WHERE kind=? AND k0=?"
-    args = [name, a0]
-    if a1 is not None:
-        query, args = query + " AND k1=?", args + [a1]
-    if source is not None:
-        query, args = query + " AND src=?", args + [source]
-    row = db.execute(
-        query + " ORDER BY src LIMIT 1",
-        args,
-    ).fetchone()
-    if row is None:
-        return None
-    return row[0]
-
-
-def resolve_edges(f: Fact, db, strict=False):
+def resolve_edges(f: Fact, ctx: FactContext, strict=False):
     """Resolve self-named refs and needs to deterministic dependency edges."""
     handler = facts.family_for(f.t)
     if handler is None:
@@ -134,8 +104,8 @@ def resolve_edges(f: Fact, db, strict=False):
     try:
         for need in handler.needs(f):
             source = facts.explicit_provider(f, need.role)
-            source = offer_src(
-                db, need.name, need.a0, need.a1, source=source)
+            source = ctx.resolve_offer(
+                need.name, need.a0, need.a1, source=source)
             if source is None:
                 return None
             edges.append(ResolvedEdge(need.role, source))
@@ -152,13 +122,13 @@ def resolve_edges(f: Fact, db, strict=False):
     return tuple(edges)
 
 
-def resolve_deps(f: Fact, db):
+def resolve_deps(f: Fact, ctx: FactContext):
     """Resolve refs and family needs to deterministic provider ids.
 
     ``None`` means an unmet need or unknown family. The same resolver is used
     for local closed-pile construction and database-free judgment.
     """
-    edges = resolve_edges(f, db)
+    edges = resolve_edges(f, ctx)
     return None if edges is None else [edge.fid for edge in edges]
 
 

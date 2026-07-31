@@ -35,7 +35,7 @@ from full_peer import sync as sync_module
 from core.close import close
 from facts.auth.signature import signature
 from facts.content.message import message
-from core.kernel import kernel, offer_src, resolve_deps
+from core.kernel import kernel, resolve_deps
 from core.limits import MAX_CLOSURE_FACTS
 from full_peer.node import FullPeer, now_ms
 from core.repository_reader import RepositoryReader
@@ -75,7 +75,7 @@ def bulk_author(
         owners=None):
     """Author ``n_msgs`` messages in production-sized exact piles."""
     authored, deps = [], {}
-    index = node.idx(ws)
+    context = node.sql(ws)
 
     def flush():
         if authored:
@@ -90,7 +90,7 @@ def bulk_author(
         fact = message(
             ws, pk, "general", f"{tag}m{i}", ts, owner)
         signed = signature(sk, pk, fact, ts)
-        member = offer_src(index, "member", pk, owner)
+        member = context.resolve_offer("member", pk, owner)
         if member is None:
             raise ValueError("bulk author is not a member")
         authored.extend((signed, fact))
@@ -205,7 +205,7 @@ def copy_facts(dst, ws, src, fids):
     facts = close(
         selected,
         lambda fid: resolve_deps(
-            src.fact_of(ws, fid), src.idx(ws)) or (),
+            src.fact_of(ws, fid), src.sql(ws)) or (),
         lambda fid: src.fact_of(ws, fid),
     )
     if ws not in dst.workspaces():

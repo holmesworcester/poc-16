@@ -30,7 +30,6 @@ from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
-from core.kernel import offer_src
 from full_peer.node import FullPeer
 
 SHAPES = ("star", "wide", "random", "chain")
@@ -137,14 +136,14 @@ def grow_devices(
     devices_by_user = {}
     device_to_user = {}
     authored, deps, ts = [], {}, base_ts
-    index = node.idx(workspace)
+    context = node.sql(workspace)
     for user_number, (user_secret, user_public) in enumerate(identities):
         primary = device(
             workspace, user_public, f"u{user_number}-d0", ts)
         primary_sig = signature(
             user_secret, user_public, primary, ts)
         authored.extend((primary_sig, primary))
-        member_source = offer_src(index, "member", user_public)
+        member_source = context.resolve_offer("member", user_public)
         if member_source is None:
             raise ValueError("device seed user is not a member")
         deps[primary_sig.fid] = ()

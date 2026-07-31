@@ -5,7 +5,7 @@ import pytest
 import facts
 from core.close import decode_pile, encode_pile
 from core.crypto import keypair
-from core.kernel import offer_src, resolve_deps
+from core.kernel import resolve_deps
 from full_peer.node import FullPeer, now_ms
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import grant
@@ -34,7 +34,7 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     granted = node.fact_of(workspace, first)
     dependencies = [
         node.fact_of(workspace, fid)
-        for fid in resolve_deps(granted, node.idx(workspace))
+        for fid in resolve_deps(granted, node.sql(workspace))
     ]
     assert {fact.t for fact in dependencies} \
         == {"signature", "workspace", "device"}
@@ -167,11 +167,11 @@ def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
         node, workspace, bob_secret, bob, bob, sibling,
         "bob-sibling", 101)
 
-    assert offer_src(
-        node.idx(workspace), "member", sibling, founder
+    assert node.sql(workspace).resolve_offer(
+        "member", sibling, founder
     ) == alice_claim.fid
-    assert offer_src(
-        node.idx(workspace), "member", sibling, bob
+    assert node.sql(workspace).resolve_offer(
+        "member", sibling, bob
     ) == bob_claim.fid
     assert {
         (row["user"], row["pk"])

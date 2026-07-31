@@ -21,9 +21,9 @@ from core.object_store import (
     OutcomeUnknown,
     STALE,
     VersionToken,
-    ensure_object,
     verified_object,
 )
+from core.repository_applier import RepositoryApplier
 from core.limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -33,6 +33,13 @@ from core.limits import (
 from core.store import FsStore, RemoteStore
 from full_peer import walk
 from full_peer.walk import Peer as WalkPeer
+
+WORKSPACE = "0" * 64
+
+
+def establish(store, oid, raw):
+    return asyncio.run(
+        RepositoryApplier(WORKSPACE, store).admit_object(oid, raw))
 
 
 def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
@@ -81,7 +88,7 @@ def test_fs_put_if_absent_is_one_atomic_immutable_create(tmp_path):
 
     stores[0]._replace(key, b"corrupt")
     with pytest.raises(ValueError, match="conflict"):
-        ensure_object(stores[1], h(raw), raw)
+        establish(stores[1], h(raw), raw)
     with pytest.raises(ValueError, match="address"):
         stores[1].put_if_absent("obj/" + "0" * 64, raw)
 
@@ -109,7 +116,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
     assert store.read_versioned("root").value == b"root"
 
 
-def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
+def test_applier_reconciles_ambiguous_create_and_verifies_collision():
     raw, other = b"wanted", b"wrong"
     oid = h(raw)
 
@@ -143,21 +150,21 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
             return value
 
     applied = Store(["applied-unknown"])
-    assert ensure_object(applied, oid, raw) is EXISTS
+    assert establish(applied, oid, raw) is EXISTS
     assert applied.calls == 1
     assert applied.read_limits == [len(raw)]
 
     retried = Store(["unknown", CREATED])
-    assert ensure_object(retried, oid, raw) is CREATED
+    assert establish(retried, oid, raw) is CREATED
     assert retried.calls == 2
     assert retried.read_limits == [len(raw)]
 
     with pytest.raises(ValueError, match="conflict"):
-        ensure_object(Store([EXISTS], other), oid, raw)
+        establish(Store([EXISTS], other), oid, raw)
 
     absent = Store(["unknown", "unknown"])
     with pytest.raises(OutcomeUnknown):
-        ensure_object(absent, oid, raw)
+        establish(absent, oid, raw)
     assert absent.calls == 2
 
 

@@ -106,6 +106,23 @@ class SqlStore:
             "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
         return self._fact(row, fid)
 
+    fact_of = fact
+
+    def offers_from(self, source, name):
+        return self.db.execute(
+            "SELECT k0, k1 FROM fact_index WHERE src=? AND kind=? "
+            "ORDER BY k0, k1", (source, name),
+        ).fetchall()
+
+    def resolve_offer(self, name, a0, a1=None, source=None):
+        row = self.db.execute(
+            "SELECT src FROM fact_index WHERE kind=? AND k0=? "
+            "AND (? IS NULL OR k1=?) AND (? IS NULL OR src=?) "
+            "ORDER BY src LIMIT 1",
+            (name, a0, a1, a1, source, source),
+        ).fetchone()
+        return None if row is None else row[0]
+
     def fact_ids(self):
         return {
             fid for (fid,) in self.db.execute("SELECT fid FROM facts")
