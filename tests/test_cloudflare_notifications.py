@@ -42,7 +42,11 @@ from notifications.discovery import (
     PENDING_CURRENT,
     PENDING_NONCURRENT,
 )
+from deploy.notification_launch import launch_record
 from deploy.cloudflare_notifications import consumer, manage, reader, scanner
+
+
+SOFTWARE_DIGEST = "d" * 64
 
 
 def run(awaitable):
@@ -829,6 +833,50 @@ def _manage_environment(**extra):
     }
 
 
+def _launch_binding(environment, software_digest=SOFTWARE_DIGEST):
+    disabled = {
+        **environment,
+        "CF_NOTIFICATIONS_ENABLED": "0",
+        "CF_NOTIFICATION_TEST_MODE": "0",
+    }
+    reader_config, scanner_config, consumer_config, fcm_config = \
+        manage.generated_configs(
+            disabled, software_digest=software_digest)
+    return {
+        "canonical_bucket": reader_config["r2_buckets"][0]["bucket_name"],
+        "canonical_prefix": reader_config["vars"]["CANONICAL_PREFIX"],
+        "deployment_identity": scanner_config["vars"][
+            "POC16_DEPLOYMENT_IDENTITY"],
+        "deployment_owner": scanner_config["vars"][
+            "POC16_DEPLOYMENT_OWNER"],
+        "firebase_application": fcm_config["vars"]["FCM_APPLICATION"],
+        "firebase_environment": fcm_config["vars"]["FCM_ENVIRONMENT"],
+        "firebase_project": fcm_config["vars"]["FCM_PROJECT_ID"],
+        "notification_queue": scanner_config["queues"]["producers"][0][
+            "queue"],
+        "notification_state_bucket": scanner_config["r2_buckets"][0][
+            "bucket_name"],
+        "notification_state_prefix": scanner_config["vars"][
+            "NOTIFICATION_STATE_PREFIX"],
+        "provider": "cloudflare",
+        "push_node_id": consumer_config["vars"]["PUSH_NODE"],
+        "software_digest": software_digest,
+        "workspace": scanner_config["vars"]["WORKSPACE"],
+    }
+
+
+def _with_launch_records(
+        tmp_path, environment, *, platforms=("ios", "android"),
+        software_digest=SOFTWARE_DIGEST):
+    environment = dict(environment)
+    binding = _launch_binding(environment, software_digest)
+    for platform in platforms:
+        path = tmp_path / f"{platform}.json"
+        path.write_bytes(launch_record(platform, binding))
+        environment[f"CF_{platform.upper()}_LAUNCH_RECORD"] = str(path)
+    return environment
+
+
 def test_generated_deployment_is_disabled_and_effectless_by_default():
     reader_config, scanner_config, consumer_config, fcm_config = \
         manage.generated_configs(_manage_environment())
@@ -865,10 +913,12 @@ def test_unknown_bootstrap_mode_is_rejected():
             _manage_environment(), bootstrap_mode="automatic")
 
 
-def test_launch_gate_enables_exact_bounded_queue_configuration():
+def test_launch_gate_enables_exact_bounded_queue_configuration(tmp_path):
+    environment = _with_launch_records(
+        tmp_path, _manage_environment(CF_NOTIFICATIONS_ENABLED="1"))
     (_reader_config, scanner_config, consumer_config, _fcm_config) = \
-        manage.generated_configs(_manage_environment(
-            CF_NOTIFICATIONS_ENABLED="1", CF_MOBILE_LAUNCH_GATE="1"))
+        manage.generated_configs(
+            environment, software_digest=SOFTWARE_DIGEST)
 
     assert scanner_config["triggers"]["crons"] == ["* * * * *"]
     row, = consumer_config["queues"]["consumers"]
@@ -899,10 +949,48 @@ def test_provision_uses_free_plan_queue_retention(monkeypatch):
         "--message-retention-period-secs", "86400") for call in calls)
 
 
-def test_enable_is_rejected_without_real_mobile_launch_gate():
-    with pytest.raises(ValueError, match="iOS and Android"):
-        manage.generated_configs(_manage_environment(
-            CF_NOTIFICATIONS_ENABLED="1"))
+def test_enable_is_rejected_without_real_mobile_launch_records():
+    with pytest.raises(RuntimeError, match="ios.*required"):
+        manage.generated_configs(
+            _manage_environment(
+                CF_NOTIFICATIONS_ENABLED="1",
+                CF_MOBILE_LAUNCH_GATE="1"),
+            software_digest=SOFTWARE_DIGEST)
+
+
+def test_enable_requires_both_mobile_platforms(tmp_path):
+    environment = _with_launch_records(
+        tmp_path, _manage_environment(CF_NOTIFICATIONS_ENABLED="1"),
+        platforms=("ios",))
+
+    with pytest.raises(RuntimeError, match="android.*required"):
+        manage.generated_configs(
+            environment, software_digest=SOFTWARE_DIGEST)
+
+
+@pytest.mark.parametrize("change", [
+    {"CF_FIREBASE_PROJECT_ID": "firebase-other"},
+    {"CF_NOTIFICATION_QUEUE": "notification-other"},
+    {"CF_PUSH_NODE_PUBLIC": "f" * 64},
+])
+def test_launch_records_are_bound_to_the_exact_deployment(
+        tmp_path, change):
+    environment = _with_launch_records(
+        tmp_path, _manage_environment(CF_NOTIFICATIONS_ENABLED="1"))
+    environment.update(change)
+
+    with pytest.raises(RuntimeError, match="invalid ios"):
+        manage.generated_configs(
+            environment, software_digest=SOFTWARE_DIGEST)
+
+
+def test_launch_records_for_old_software_cannot_enable_new_code(tmp_path):
+    environment = _with_launch_records(
+        tmp_path, _manage_environment(CF_NOTIFICATIONS_ENABLED="1"))
+
+    with pytest.raises(RuntimeError, match="invalid ios"):
+        manage.generated_configs(
+            environment, software_digest="e" * 64)
 
 
 def test_nonproduction_test_enablement_does_not_claim_mobile_launch_gate():
@@ -1030,6 +1118,9 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
         "POC16_DEPLOYMENT_IDENTITY": identity,
         "POC16_DEPLOYMENT_OWNER": "production-owner",
         "POC16_DEPLOYMENT_ROLE": "notification-fcm-boundary",
+        "POC16_SOFTWARE_DIGEST": "0" * 64,
+        "NOTIFICATIONS_ENABLED": "0",
+        "NOTIFICATION_TEST_MODE": "0",
         "FCM_APPLICATION": "poc16.mobile",
         "FCM_ENVIRONMENT": "production",
         "FCM_PROJECT_ID": "firebase-project",
@@ -1047,6 +1138,18 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
     ]
     assert "repository_applier.py" not in manage.CORE_MODULES
     assert "full_peer" not in scanner.__file__
+
+
+def test_generated_builds_lock_the_exact_prepared_software():
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)
+
+    assert {
+        config["vars"]["POC16_SOFTWARE_DIGEST"] for config in configs
+    } == {SOFTWARE_DIGEST}
+    assert {
+        config["build"]["command"] for config in configs[:3]
+    } == {f"python manage.py stage-locked {SOFTWARE_DIGEST}"}
 
 
 @pytest.mark.parametrize("change", [
@@ -1075,10 +1178,79 @@ def test_same_owner_cannot_rebind_an_existing_worker(monkeypatch):
         lambda config: (
             old["vars"]["POC16_DEPLOYMENT_OWNER"],
             old["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+            old["vars"]["POC16_SOFTWARE_DIGEST"],
+            "0",
         ))
 
     with pytest.raises(RuntimeError, match="immutable notification"):
         manage._require_deployable(changed, create=True)
+
+
+def test_disabled_deploy_may_replace_software_before_retesting(monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    monkeypatch.setattr(manage, "_worker_markers", lambda _config: (
+        config["vars"]["POC16_DEPLOYMENT_OWNER"],
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        "e" * 64,
+        "0",
+    ))
+
+    manage._require_deployable(config, create=False)
+
+
+def test_production_enable_rejects_untested_incumbent_software(monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    config["vars"]["NOTIFICATIONS_ENABLED"] = "1"
+    monkeypatch.setattr(manage, "_worker_markers", lambda _config: (
+        config["vars"]["POC16_DEPLOYMENT_OWNER"],
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        "e" * 64,
+        "0",
+    ))
+
+    with pytest.raises(RuntimeError, match="disable.*changing software"):
+        manage._require_deployable(config, create=False)
+
+
+def test_production_enable_requires_an_existing_disabled_deployment(
+        monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    config["vars"]["NOTIFICATIONS_ENABLED"] = "1"
+    monkeypatch.setattr(
+        manage, "_worker_markers", lambda _config: manage._ABSENT)
+
+    with pytest.raises(RuntimeError, match="deploy notifications disabled"):
+        manage._require_deployable(config, create=True)
+
+
+def test_disabling_and_changing_code_must_be_two_deployments(monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    monkeypatch.setattr(manage, "_worker_markers", lambda _config: (
+        config["vars"]["POC16_DEPLOYMENT_OWNER"],
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        "e" * 64,
+        "1",
+    ))
+
+    with pytest.raises(RuntimeError, match="disable the incumbent software"):
+        manage._require_deployable(config, create=False)
+
+
+def test_same_software_can_be_disabled_before_upgrade(monkeypatch):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST)[1]
+    monkeypatch.setattr(manage, "_worker_markers", lambda _config: (
+        config["vars"]["POC16_DEPLOYMENT_OWNER"],
+        config["vars"]["POC16_DEPLOYMENT_IDENTITY"],
+        SOFTWARE_DIGEST,
+        "1",
+    ))
+
+    manage._require_deployable(config, create=False)
 
 
 @pytest.mark.parametrize("observed", [
@@ -1116,10 +1288,12 @@ def test_bootstrap_commands_only_redeploy_the_owned_scanner(
     calls = []
     configs = manage.generated_configs(
         _manage_environment(), bootstrap_mode=mode)
-    monkeypatch.setattr(manage, "sync", lambda: calls.append(("sync",)))
+    monkeypatch.setattr(
+        manage, "_prepare_software",
+        lambda: calls.append(("prepare",)) or SOFTWARE_DIGEST)
     monkeypatch.setattr(
         manage, "generated_configs",
-        lambda *, bootstrap_mode: configs)
+        lambda *, bootstrap_mode, software_digest: configs)
     monkeypatch.setattr(
         manage, "_write_configs", lambda value: calls.append(("write", value)))
     monkeypatch.setattr(
@@ -1135,7 +1309,7 @@ def test_bootstrap_commands_only_redeploy_the_owned_scanner(
 
     manage._deploy_scanner_mode(mode)
 
-    assert calls[0] == ("sync",)
+    assert calls[0] == ("prepare",)
     assert calls[1] == ("write", configs)
     assert calls[2] == ("owned", configs[1]["name"])
     assert calls[3] == ("retained",)
@@ -1188,8 +1362,11 @@ def test_deploy_installs_private_fcm_bridge_and_secret_before_consumer(
     })
     monkeypatch.setenv("CF_PUSH_NODE_SECRET", "b" * 64)
     monkeypatch.setenv("FIREBASE_SERVICE_ACCOUNT_JSON", firebase_secret)
-    monkeypatch.setattr(manage, "sync", lambda: calls.append(("sync",)))
-    monkeypatch.setattr(manage, "generated_configs", lambda: configs)
+    monkeypatch.setattr(
+        manage, "_prepare_software",
+        lambda: calls.append(("prepare",)) or SOFTWARE_DIGEST)
+    monkeypatch.setattr(
+        manage, "generated_configs", lambda *, software_digest: configs)
     monkeypatch.setattr(manage, "_write_configs", lambda value: None)
     monkeypatch.setattr(
         manage, "_require_deployable", lambda config, create: None)
@@ -1207,6 +1384,7 @@ def test_deploy_installs_private_fcm_bridge_and_secret_before_consumer(
         manage, "_pywrangler",
         lambda *arguments, **options: calls.append(
             ("pywrangler", arguments, options)))
+    monkeypatch.setattr(manage, "_stage_locked", lambda digest: None)
 
     manage.deploy()
 
@@ -1230,7 +1408,8 @@ def test_remove_never_deletes_queues_or_r2(monkeypatch):
     calls = []
     monkeypatch.setattr(manage, "generated_configs", lambda: configs)
     monkeypatch.setattr(manage, "_write_configs", lambda values: None)
-    monkeypatch.setattr(manage, "_require_owned", lambda config: None)
+    monkeypatch.setattr(
+        manage, "_require_immutable_owned", lambda config: None)
     monkeypatch.setattr(
         manage, "_pywrangler",
         lambda *arguments, **options: calls.append(arguments))

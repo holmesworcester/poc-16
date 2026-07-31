@@ -30,6 +30,10 @@ from adapters.cloudflare.queue import (  # noqa: E402
 from core.crypto import load_sk  # noqa: E402
 from core.object_store import validate_store_prefix  # noqa: E402
 from deploy.cloudflare_python import patch_pynacl  # noqa: E402
+from deploy.notification_launch import (  # noqa: E402
+    require_mobile_launches,
+    tree_digest,
+)
 from deploy.python_role_modules import (  # noqa: E402
     REPOSITORY_READER_CORE_MODULES,
 )
@@ -49,6 +53,7 @@ RELEASE = BUILD / "release"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
+SOFTWARE_BINDING = "POC16_SOFTWARE_DIGEST"
 WRANGLER = "wrangler@4.118.0"
 # The free plan fixes retention at 24 hours. Correctness does not depend on
 # Queue retention because the scanner republishes the durable pending body.
@@ -148,6 +153,7 @@ def stage():
             PACKAGE / "pyproject.toml",
             PACKAGE / "uv.lock",
             REPOSITORY / "deploy" / "cloudflare_python.py",
+            REPOSITORY / "deploy" / "notification_launch.py",
             REPOSITORY / "deploy" / "python_role_modules.py",
             *(
                 PACKAGE / name for name in (
@@ -161,6 +167,24 @@ def stage():
             shutil.rmtree(destination)
         (pending / role).rename(destination)
     pending.rmdir()
+
+
+def _software_digest():
+    return tree_digest(RELEASE)
+
+
+def _prepare_software():
+    sync()
+    stage()
+    return _software_digest()
+
+
+def _stage_locked(expected):
+    if not FID.fullmatch(expected or ""):
+        raise ValueError("expected software digest")
+    stage()
+    if _software_digest() != expected:
+        raise RuntimeError("Cloudflare notification deploy inputs changed")
 
 
 def _text(environment, name):
@@ -185,10 +209,16 @@ def _prefix(value, label):
         raise ValueError(f"{label} is not a safe store prefix") from error
 
 
-def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
+def generated_configs(
+        environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE,
+        software_digest=None):
     """Resolve one workspace and keep live effects disabled by default."""
     if bootstrap_mode not in BOOTSTRAP_MODES:
         raise ValueError("notification bootstrap mode")
+    software_digest = "0" * 64 \
+        if software_digest is None else software_digest
+    if not FID.fullmatch(software_digest or ""):
+        raise ValueError("software digest must be 64 lowercase hex")
     workspace = _text(environment, "CF_WORKSPACE")
     owner = _text(environment, "CF_DEPLOYMENT_OWNER")
     canonical = _text(environment, "CF_CANONICAL_BUCKET")
@@ -236,15 +266,13 @@ def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
     test_mode = environment.get("CF_NOTIFICATION_TEST_MODE", "0")
     if enabled not in {"0", "1"} or test_mode not in {"0", "1"}:
         raise ValueError("notification enablement bindings must be 0 or 1")
-    if enabled == "1" and environment.get("CF_MOBILE_LAUNCH_GATE") != "1":
-        if test_mode != "1" or firebase_environment.lower() in {
-                "prod", "production"} \
-                or environment.get("CF_FIREBASE_TEST_PROJECT_ID") \
-                != firebase_project:
-            raise ValueError(
-                "production enablement requires the live iOS and Android "
-                "gate; test mode requires a non-production environment "
-                "and the exact allowed Firebase test project")
+    if enabled == "1" and test_mode == "1" \
+            and (firebase_environment.lower() in {"prod", "production"}
+                 or environment.get("CF_FIREBASE_TEST_PROJECT_ID")
+                 != firebase_project):
+        raise ValueError(
+            "test mode requires a non-production environment and the exact "
+            "allowed Firebase test project")
 
     canonical_prefix = _prefix(environment.get(
         "CF_CANONICAL_PREFIX", f"workspaces/{workspace}"),
@@ -273,12 +301,33 @@ def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
     identity = hashlib.sha256(json.dumps(
         identity_document, ensure_ascii=True, separators=(",", ":"),
         sort_keys=True).encode("ascii")).hexdigest()
+    if enabled == "1" and test_mode == "0":
+        require_mobile_launches({
+            "ios": environment.get("CF_IOS_LAUNCH_RECORD"),
+            "android": environment.get("CF_ANDROID_LAUNCH_RECORD"),
+        }, {
+            "canonical_bucket": canonical,
+            "canonical_prefix": canonical_prefix,
+            "deployment_identity": identity,
+            "deployment_owner": owner,
+            "firebase_application": application,
+            "firebase_environment": firebase_environment,
+            "firebase_project": firebase_project,
+            "notification_queue": queue,
+            "notification_state_bucket": state,
+            "notification_state_prefix": state_prefix,
+            "provider": "cloudflare",
+            "push_node_id": push_node,
+            "software_digest": software_digest,
+            "workspace": workspace,
+        })
     common = {
         "WORKSPACE": workspace,
         "NOTIFICATIONS_ENABLED": enabled,
         "NOTIFICATION_TEST_MODE": test_mode,
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
+        SOFTWARE_BINDING: software_digest,
     }
 
     reader = json.loads(READER_TEMPLATE.read_text())
@@ -286,8 +335,11 @@ def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
     reader["vars"].update({
         "WORKSPACE": workspace,
         "CANONICAL_PREFIX": canonical_prefix,
+        "NOTIFICATIONS_ENABLED": enabled,
+        "NOTIFICATION_TEST_MODE": test_mode,
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
+        SOFTWARE_BINDING: software_digest,
     })
     reader["r2_buckets"][0].update({
         "bucket_name": canonical, "preview_bucket_name": canonical})
@@ -328,10 +380,16 @@ def generated_configs(environment=os.environ, *, bootstrap_mode=BOOTSTRAP_NONE):
     fcm["vars"].update({
         IDENTITY_BINDING: identity,
         OWNER_BINDING: owner,
+        SOFTWARE_BINDING: software_digest,
+        "NOTIFICATIONS_ENABLED": enabled,
+        "NOTIFICATION_TEST_MODE": test_mode,
         "FCM_APPLICATION": application,
         "FCM_ENVIRONMENT": firebase_environment,
         "FCM_PROJECT_ID": firebase_project,
     })
+    for config in (reader, scanner, consumer):
+        config["build"]["command"] = (
+            f"python manage.py stage-locked {software_digest}")
     return reader, scanner, consumer, fcm
 
 
@@ -371,7 +429,7 @@ def sync():
 
 
 def build():
-    sync()
+    software_digest = _prepare_software()
     configs = generated_configs({
         "CF_WORKSPACE": "a" * 64,
         "CF_DEPLOYMENT_OWNER": "local-build-owner",
@@ -382,7 +440,7 @@ def build():
         "CF_FIREBASE_PROJECT_ID": "firebase-build",
         "CF_PUSH_NODE_PUBLIC": "c" * 64,
         "CF_NOTIFICATIONS_ENABLED": "0",
-    })
+    }, software_digest=software_digest)
     _write_configs(configs)
     for config in (READER_CONFIG, SCANNER_CONFIG, CONSUMER_CONFIG):
         with tempfile.TemporaryDirectory(
@@ -519,10 +577,16 @@ def _worker_markers(config, environment=os.environ):
     if bindings is _ABSENT:
         return _ABSENT
     values = []
-    for name in (OWNER_BINDING, IDENTITY_BINDING):
+    for name in (
+            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
+            "NOTIFICATIONS_ENABLED"):
         matches = [
             item for item in bindings
             if isinstance(item, dict) and item.get("name") == name]
+        if name in {SOFTWARE_BINDING, "NOTIFICATIONS_ENABLED"} \
+                and not matches:
+            values.append(None)
+            continue
         if len(matches) != 1 or matches[0].get("type") != "plain_text":
             return None
         values.append(matches[0].get("text"))
@@ -536,26 +600,54 @@ def _worker_owner(config, environment=os.environ):
 
 def _require_deployable(config, *, create):
     observed = _worker_markers(config)
-    expected = (
+    production = config["vars"]["NOTIFICATIONS_ENABLED"] == "1" \
+        and config["vars"]["NOTIFICATION_TEST_MODE"] == "0"
+    immutable = (
         config["vars"][OWNER_BINDING],
         config["vars"][IDENTITY_BINDING],
     )
     if observed is _ABSENT:
+        if production:
+            raise RuntimeError(
+                "deploy notifications disabled before production enablement")
         if not create:
             raise RuntimeError(
                 "Worker is absent; set CF_CREATE=1 for explicit creation")
-    elif observed != expected:
+    elif observed is None or observed[:2] != immutable:
         raise RuntimeError(
             "refusing to overwrite a Worker with different ownership or "
             "immutable notification bindings")
+    elif production and observed[2] != config["vars"][SOFTWARE_BINDING]:
+        raise RuntimeError(
+            "disable notifications before changing software; production "
+            "may enable only the exact tested digest")
+    elif config["vars"]["NOTIFICATION_TEST_MODE"] == "0" \
+            and observed[2] != config["vars"][SOFTWARE_BINDING] \
+            and (observed[3] != "0"
+                 or config["vars"]["NOTIFICATIONS_ENABLED"] != "0"):
+        raise RuntimeError(
+            "disable the incumbent software before changing its digest")
 
 
 def _require_owned(config):
     expected = (
         config["vars"][OWNER_BINDING],
         config["vars"][IDENTITY_BINDING],
+        config["vars"][SOFTWARE_BINDING],
+        config["vars"]["NOTIFICATIONS_ENABLED"],
     )
     if _worker_markers(config) != expected:
+        raise RuntimeError(
+            "refusing to mutate an absent, unowned, or rebound Worker")
+
+
+def _require_immutable_owned(config):
+    observed = _worker_markers(config)
+    expected = (
+        config["vars"][OWNER_BINDING],
+        config["vars"][IDENTITY_BINDING],
+    )
+    if observed in {_ABSENT, None} or observed[:2] != expected:
         raise RuntimeError(
             "refusing to mutate an absent, unowned, or rebound Worker")
 
@@ -622,8 +714,8 @@ def provision():
 
 def deploy():
     """Deploy private boundaries before the default-inert queue roles."""
-    sync()
-    configs = generated_configs()
+    software_digest = _prepare_software()
+    configs = generated_configs(software_digest=software_digest)
     _write_configs(configs)
     create = os.environ.get("CF_CREATE") == "1"
     for config in configs:
@@ -641,6 +733,7 @@ def deploy():
             "CF_PUSH_NODE_SECRET does not match CF_PUSH_NODE_PUBLIC")
     firebase_secret = _firebase_secret(
         configs[3]["vars"]["FCM_PROJECT_ID"])
+    _stage_locked(software_digest)
     _wrangler("deploy", "--config", str(FCM_CONFIG))
     _require_owned(configs[3])
     _wrangler(
@@ -665,8 +758,9 @@ def _deploy_scanner_mode(mode):
     """Deploy one explicit initialization mode on an existing scanner."""
     if mode not in BOOTSTRAP_MODES:
         raise ValueError("notification bootstrap mode")
-    sync()
-    configs = generated_configs(bootstrap_mode=mode)
+    software_digest = _prepare_software()
+    configs = generated_configs(
+        bootstrap_mode=mode, software_digest=software_digest)
     _write_configs(configs)
     _require_owned(configs[1])
     _require_retained_notification_objects(configs[0], configs[1])
@@ -690,7 +784,8 @@ def seal_bootstrap():
 
 
 def verify():
-    configs = generated_configs()
+    software_digest = _prepare_software()
+    configs = generated_configs(software_digest=software_digest)
     for config in configs:
         _require_owned(config)
     _require_bootstrap_sealed(configs[1])
@@ -757,7 +852,7 @@ def remove():
     configs = generated_configs()
     _write_configs(configs)
     for config in configs:
-        _require_owned(config)
+        _require_immutable_owned(config)
     # Stop new discovery before removing delivery capacity.
     for config in (configs[1], configs[2], configs[0]):
         _pywrangler(
@@ -791,6 +886,9 @@ Commands:
 
 
 def main(argv):
+    if len(argv) == 3 and argv[1] == "stage-locked":
+        _stage_locked(argv[2])
+        return 0
     command = argv[1] if len(argv) == 2 else "help"
     commands = {
         "sync": sync,
