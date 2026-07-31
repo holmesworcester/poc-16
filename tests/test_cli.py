@@ -199,6 +199,37 @@ def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
     assert handler.syncer.kicks == 1
 
 
+def test_notification_bootstrap_control_is_explicit_and_wakes(tmp_path):
+    node = FullPeer(str(tmp_path))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    handler = _handler(node)
+
+    class Notifications:
+        def __init__(self):
+            self.calls = []
+            self.kicks = 0
+
+        def bootstrap(self, selected, mode):
+            self.calls.append((selected, mode))
+            return {"workspace": selected, "mode": mode}
+
+        def kick(self):
+            self.kicks += 1
+
+    handler.notifications = Notifications()
+
+    assert _request(handler, "peer.notifications.bootstrap", [
+        workspace[:8], "current",
+    ]) == (200, {"workspace": workspace, "mode": "current"})
+    assert handler.notifications.calls == [(workspace, "current")]
+    assert handler.notifications.kicks == 1
+
+    disabled = _handler(node)
+    assert _request(disabled, "peer.notifications.bootstrap", [
+        workspace, "backfill",
+    ])[0] == 400
+
+
 def test_join_commits_locally_then_kicks_the_only_network_reconciler(
         tmp_path, monkeypatch):
     inviter = FullPeer(str(tmp_path / "inviter"))
