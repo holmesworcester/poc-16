@@ -2,8 +2,11 @@
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1383,6 +1386,240 @@ def test_locked_stage_refuses_changed_deploy_inputs(monkeypatch):
     assert calls == ["stage"]
 
 
+def _lock_actor(tmp_path):
+    path = tmp_path / "cloudflare_lock_actor.py"
+    path.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import time\n"
+        "from deploy.cloudflare_notifications import manage\n"
+        "build = Path(sys.argv[1])\n"
+        "action = sys.argv[2]\n"
+        "marker = Path(sys.argv[3])\n"
+        "release = Path(sys.argv[4]) if len(sys.argv) > 4 else None\n"
+        "manage.BUILD = build\n"
+        "manage.STAGE_LOCK = build / '.operation.lock'\n"
+        "if action == 'hold':\n"
+        "    with manage._worktree_operation_lock():\n"
+        "        marker.write_text(os.environ[manage.STAGE_OWNER_ENV])\n"
+        "        while not release.exists(): time.sleep(0.01)\n"
+        "elif action == 'try':\n"
+        "    with manage._worktree_operation_lock(): marker.write_text('mutated')\n"
+        "elif action == 'stage-locked':\n"
+        "    manage._stage_locked = lambda digest: marker.write_text(digest)\n"
+        "    raise SystemExit(manage.main(['manage.py', 'stage-locked', 'd' * 64]))\n"
+        "elif action == 'nested-parent':\n"
+        "    with manage._worktree_operation_lock():\n"
+        "        manage._run([sys.executable, __file__, str(build),\n"
+        "                     'stage-locked', str(marker)])\n"
+        "elif action == 'orphan-parent':\n"
+        "    with manage._worktree_operation_lock():\n"
+        "        manage._run([sys.executable, __file__, str(build),\n"
+        "                     'wait', str(marker), str(release)])\n"
+        "elif action == 'wait':\n"
+        "    marker.write_text(str(os.getpid()))\n"
+        "    while not release.exists(): time.sleep(0.01)\n")
+    return path
+
+
+def _actor_environment():
+    environment = dict(os.environ)
+    repository = str(Path(__file__).resolve().parents[1])
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = repository + (
+        os.pathsep + existing if existing else "")
+    environment.pop(manage.STAGE_OWNER_ENV, None)
+    return environment
+
+
+def _wait_for_path(path, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+def test_unrelated_process_cannot_enter_staging_or_fake_owner(tmp_path):
+    actor = _lock_actor(tmp_path)
+    build = tmp_path / "build"
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    mutated = tmp_path / "mutated"
+    holder = subprocess.Popen([
+        sys.executable, str(actor), str(build), "hold", str(ready),
+        str(release)], cwd=Path(__file__).resolve().parents[1],
+        env=_actor_environment())
+    try:
+        _wait_for_path(ready)
+        stale_owner = ready.read_text()
+        for claimed_owner in (None, "0" * 64):
+            environment = _actor_environment()
+            if claimed_owner is not None:
+                environment[manage.STAGE_OWNER_ENV] = claimed_owner
+            attempt = subprocess.run([
+                sys.executable, str(actor), str(build), "try",
+                str(mutated)], cwd=Path(__file__).resolve().parents[1],
+                env=environment, capture_output=True, text=True)
+            assert attempt.returncode != 0
+            assert "another Cloudflare notification operation" \
+                in attempt.stderr
+            assert not mutated.exists()
+    finally:
+        release.write_text("release")
+        holder.wait(timeout=5)
+
+    ready2, release2 = tmp_path / "ready-2", tmp_path / "release-2"
+    holder2 = subprocess.Popen([
+        sys.executable, str(actor), str(build), "hold", str(ready2),
+        str(release2)], cwd=Path(__file__).resolve().parents[1],
+        env=_actor_environment())
+    try:
+        _wait_for_path(ready2)
+        assert ready2.read_text() != stale_owner
+        environment = _actor_environment()
+        environment[manage.STAGE_OWNER_ENV] = stale_owner
+        attempt = subprocess.run([
+            sys.executable, str(actor), str(build), "try", str(mutated)],
+            cwd=Path(__file__).resolve().parents[1], env=environment,
+            capture_output=True, text=True)
+        assert attempt.returncode != 0
+        assert not mutated.exists()
+    finally:
+        release2.write_text("release")
+        holder2.wait(timeout=5)
+
+
+def test_main_fences_every_staging_command_before_its_function(tmp_path,
+                                                               monkeypatch):
+    actor = _lock_actor(tmp_path)
+    build = tmp_path / "build"
+    ready, release = tmp_path / "ready", tmp_path / "release"
+    holder = subprocess.Popen([
+        sys.executable, str(actor), str(build), "hold", str(ready),
+        str(release)], cwd=Path(__file__).resolve().parents[1],
+        env=_actor_environment())
+    calls = []
+    functions = {
+        "sync": "sync",
+        "stage": "stage",
+        "build": "build",
+        "prepare-launch": "prepare_launch",
+        "stage-launch-fcm": "stage_launch_fcm",
+        "deploy-launch-harness": "deploy_launch_harness",
+        "remove-launch-harness": "remove_launch_harness",
+        "launch-binding": "print_launch_binding",
+        "deploy": "deploy",
+        "disable": "disable",
+        "bootstrap-current": "bootstrap_current",
+        "bootstrap-backfill": "bootstrap_backfill",
+        "seal-bootstrap": "seal_bootstrap",
+        "verify": "verify",
+        "remove": "remove",
+        "provision": "provision",
+        "redrive": "redrive",
+    }
+    for command, name in functions.items():
+        monkeypatch.setattr(
+            manage, name, lambda selected=command: calls.append(selected))
+    monkeypatch.setattr(manage, "BUILD", build)
+    monkeypatch.setattr(manage, "STAGE_LOCK", build / ".operation.lock")
+    monkeypatch.delenv(manage.STAGE_OWNER_ENV, raising=False)
+    try:
+        _wait_for_path(ready)
+        for command in set(functions) - {"provision", "redrive"}:
+            with pytest.raises(RuntimeError, match="another Cloudflare"):
+                manage.main(["manage.py", command])
+        assert calls == []
+
+        assert manage.main(["manage.py", "provision"]) == 0
+        assert manage.main(["manage.py", "redrive"]) == 0
+        assert calls == ["provision", "redrive"]
+    finally:
+        release.write_text("release")
+        holder.wait(timeout=5)
+
+
+def test_descendant_stage_locked_reuses_only_the_inherited_owner(tmp_path):
+    actor = _lock_actor(tmp_path)
+    marker = tmp_path / "nested-stage"
+    result = subprocess.run([
+        sys.executable, str(actor), str(tmp_path / "build"),
+        "nested-parent", str(marker)],
+        cwd=Path(__file__).resolve().parents[1], env=_actor_environment(),
+        capture_output=True, text=True, timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == SOFTWARE_DIGEST
+
+
+def test_crashed_owner_releases_lock_and_stale_file_is_harmless(tmp_path):
+    actor = _lock_actor(tmp_path)
+    build = tmp_path / "build"
+    ready, release = tmp_path / "ready", tmp_path / "never-release"
+    holder = subprocess.Popen([
+        sys.executable, str(actor), str(build), "hold", str(ready),
+        str(release)], cwd=Path(__file__).resolve().parents[1],
+        env=_actor_environment())
+    _wait_for_path(ready)
+    holder.kill()
+    holder.wait(timeout=5)
+    assert (build / ".operation.lock").exists()
+
+    marker = tmp_path / "after-crash"
+    attempt = subprocess.run([
+        sys.executable, str(actor), str(build), "try", str(marker)],
+        cwd=Path(__file__).resolve().parents[1], env=_actor_environment(),
+        capture_output=True, text=True, timeout=5)
+
+    assert attempt.returncode == 0, attempt.stderr
+    assert marker.read_text() == "mutated"
+
+
+def test_orphan_wrangler_keeps_lock_until_its_provider_call_exits(tmp_path):
+    actor = _lock_actor(tmp_path)
+    build = tmp_path / "build"
+    child_ready, release = tmp_path / "child-ready", tmp_path / "release"
+    parent = subprocess.Popen([
+        sys.executable, str(actor), str(build), "orphan-parent",
+        str(child_ready), str(release)],
+        cwd=Path(__file__).resolve().parents[1], env=_actor_environment())
+    try:
+        _wait_for_path(child_ready)
+        parent.kill()
+        parent.wait(timeout=5)
+        blocked = subprocess.run([
+            sys.executable, str(actor), str(build), "try",
+            str(tmp_path / "too-early")],
+            cwd=Path(__file__).resolve().parents[1],
+            env=_actor_environment(), capture_output=True, text=True,
+            timeout=5)
+        assert blocked.returncode != 0
+        assert not (tmp_path / "too-early").exists()
+
+        release.write_text("release")
+        deadline = time.monotonic() + 5
+        while True:
+            marker = tmp_path / "after-child"
+            acquired = subprocess.run([
+                sys.executable, str(actor), str(build), "try", str(marker)],
+                cwd=Path(__file__).resolve().parents[1],
+                env=_actor_environment(), capture_output=True, text=True,
+                timeout=5)
+            if acquired.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(acquired.stderr)
+            time.sleep(0.01)
+        assert marker.read_text() == "mutated"
+    finally:
+        release.write_text("release")
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+
+
 def test_release_manifest_is_canonical_exact_and_never_clobbered(tmp_path):
     path = tmp_path / "release.json"
     environment = {manage.RELEASE_MANIFEST_ENV: str(path)}
@@ -1479,11 +1716,74 @@ def test_version_upload_uses_machine_evidence_and_never_deploys(
 
 
 def _candidate_bindings(config, *, role=None):
+    """Provider Version Detail bindings for one generated config."""
     values = dict(config["vars"])
     if role is not None:
         values["POC16_DEPLOYMENT_ROLE"] = role
-    return [{"name": name, "type": "plain_text", "text": value}
-            for name, value in values.items()]
+    bindings = [
+        {"name": name, "type": "plain_text", "text": value}
+        for name, value in values.items()]
+    bindings.extend({
+        "name": row["binding"], "type": "r2_bucket",
+        "bucket_name": row["bucket_name"],
+        **({"jurisdiction": row["jurisdiction"]}
+           if "jurisdiction" in row else {}),
+    } for row in config.get("r2_buckets", ()))
+    bindings.extend({
+        "name": row["binding"], "type": "service",
+        "service": row["service"],
+        **({"environment": row["environment"]}
+           if "environment" in row else {}),
+        **({"entrypoint": row["entrypoint"]}
+           if "entrypoint" in row else {}),
+    } for row in config.get("services", ()))
+    bindings.extend({
+        "name": row["binding"], "type": "queue",
+        "queue_name": row["queue"],
+    } for row in config.get("queues", {}).get("producers", ()))
+    if "version_metadata" in config:
+        bindings.append({
+            "name": config["version_metadata"]["binding"],
+            "type": "version_metadata",
+        })
+    bindings.extend({"name": name, "type": "secret_text"}
+                    for name in manage._required_secrets(config))
+    return bindings
+
+
+def _candidate_capability(config, *, handlers=None):
+    return {
+        "handlers": manage._expected_handlers(config)
+        if handlers is None else tuple(sorted(handlers)),
+        "named_handlers": (),
+        "runtime": {
+            "compatibility_date": config["compatibility_date"],
+            "compatibility_flags": list(
+                config.get("compatibility_flags", ())),
+            "exports": {"default": {
+                "cache": {"enabled": False},
+                "state": "created",
+                "type": "worker",
+            }},
+            "limits": {},
+            "usage_model": "standard",
+        },
+    }
+
+
+def _incumbent_profile(config, markers, *, bootstrap=None, test_mode=None):
+    incumbent = json.loads(json.dumps(config))
+    for name, value in zip((
+            manage.OWNER_BINDING, manage.IDENTITY_BINDING,
+            manage.SOFTWARE_BINDING, manage.RELEASE_BINDING,
+            "NOTIFICATIONS_ENABLED", manage.ROLE_BINDING,
+    ), markers):
+        incumbent["vars"][name] = value
+    if bootstrap is not None:
+        incumbent["vars"]["NOTIFICATION_BOOTSTRAP_MODE"] = bootstrap
+    if test_mode is not None:
+        incumbent["vars"]["NOTIFICATION_TEST_MODE"] = test_mode
+    return _candidate_bindings(incumbent), _candidate_capability(incumbent)
 
 
 def test_candidate_validation_rejects_wrong_role_at_expected_name(
@@ -1492,11 +1792,13 @@ def test_candidate_validation_rejects_wrong_role_at_expected_name(
         _manage_environment(), software_digest=SOFTWARE_DIGEST,
         release_id=RELEASE_ID)[1]
     monkeypatch.setattr(
-        manage, "_version_bindings",
-        lambda role, candidate, version: _candidate_bindings(
-            candidate, role="notification-consumer"))
+        manage, "_version_capabilities",
+        lambda role, candidate, version: (
+            _candidate_bindings(
+                candidate, role="notification-consumer"),
+            _candidate_capability(candidate)))
 
-    with pytest.raises(RuntimeError, match="markers differ"):
+    with pytest.raises(RuntimeError, match="capability inventory"):
         manage._require_candidate(
             "scanner", config, WORKER_VERSIONS["scanner"])
 
@@ -1512,11 +1814,344 @@ def test_candidate_validation_rejects_duplicate_release_marker(monkeypatch):
         "text": RELEASE_ID,
     })
     monkeypatch.setattr(
-        manage, "_version_bindings", lambda role, candidate, version: bindings)
+        manage, "_version_capabilities",
+        lambda role, candidate, version: (
+            bindings, _candidate_capability(candidate)))
 
-    with pytest.raises(RuntimeError, match="markers differ"):
+    with pytest.raises(RuntimeError, match="capability inventory"):
         manage._require_candidate(
             "scanner", config, WORKER_VERSIONS["scanner"])
+
+
+def _harness_config(configs):
+    return manage._harness_config(configs, WORKER_VERSIONS["fcm"])
+
+
+def test_exact_provider_capabilities_cover_every_role_and_harness():
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    for config in (*configs, _harness_config(configs)):
+        manage._require_capabilities(
+            config, _candidate_bindings(config),
+            _candidate_capability(config))
+
+
+@pytest.mark.parametrize("change", [
+    "variable", "r2", "service", "queue", "missing-secret",
+    "extra-secret", "unknown-binding", "missing-metadata", "duplicate",
+])
+def test_candidate_rejects_every_binding_authority_change(change):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    config = configs[2] if change == "missing-secret" else (
+        configs[3] if change == "missing-metadata" else configs[1])
+    bindings = _candidate_bindings(config)
+    if change == "variable":
+        next(row for row in bindings if row["name"] == "WORKSPACE")[
+            "text"] = "b" * 64
+    elif change == "r2":
+        next(row for row in bindings if row["type"] == "r2_bucket")[
+            "bucket_name"] = "other-bucket"
+    elif change == "service":
+        next(row for row in bindings if row["type"] == "service")[
+            "service"] = "other-worker"
+    elif change == "queue":
+        next(row for row in bindings if row["type"] == "queue")[
+            "queue_name"] = "other-queue"
+    elif change == "missing-secret":
+        bindings = [row for row in bindings
+                    if row["name"] != "PUSH_NODE_SECRET"]
+    elif change == "extra-secret":
+        bindings.append({"name": "UNDECLARED_SECRET", "type": "secret_text"})
+    elif change == "unknown-binding":
+        bindings.append({"name": "KV", "type": "kv_namespace", "id": "x"})
+    elif change == "missing-metadata":
+        bindings = [row for row in bindings
+                    if row["type"] != "version_metadata"]
+    elif change == "duplicate":
+        bindings.append(dict(bindings[0]))
+
+    with pytest.raises(RuntimeError, match="capability inventory"):
+        manage._require_capabilities(
+            config, bindings, _candidate_capability(config))
+
+
+def test_secret_values_are_neither_read_nor_leaked():
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)[2]
+
+    class OpaqueSecret(dict):
+        def get(self, name, default=None):
+            if name == "text":
+                raise AssertionError("secret value was read")
+            return super().get(name, default)
+
+        def __repr__(self):
+            raise AssertionError("secret value was formatted")
+
+    bindings = _candidate_bindings(config)
+    index = next(index for index, row in enumerate(bindings)
+                 if row["name"] == "PUSH_NODE_SECRET")
+    bindings[index] = OpaqueSecret(bindings[index])
+
+    manage._require_capabilities(
+        config, bindings, _candidate_capability(config))
+
+
+@pytest.mark.parametrize("change", [
+    "missing-handler", "extra-handler", "wrong-handler", "named-handler",
+    "durable-object", "cache", "compatibility-date", "flags", "limits",
+    "migration", "usage", "unknown-runtime",
+])
+def test_candidate_rejects_runtime_or_invocation_authority_change(change):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)[1]
+    capability = _candidate_capability(config)
+    if change == "missing-handler":
+        capability["handlers"] = ()
+    elif change == "extra-handler":
+        capability["handlers"] = ("fetch", "scheduled")
+    elif change == "wrong-handler":
+        capability["handlers"] = ("queue",)
+    elif change == "named-handler":
+        capability["named_handlers"] = (("public", ("fetch",)),)
+    elif change == "durable-object":
+        capability["runtime"]["exports"]["Admin"] = {
+            "type": "durable-object", "state": "created"}
+    elif change == "cache":
+        capability["runtime"]["exports"]["default"]["cache"] = {
+            "enabled": True}
+    elif change == "compatibility-date":
+        capability["runtime"]["compatibility_date"] = "2025-01-01"
+    elif change == "flags":
+        capability["runtime"]["compatibility_flags"] = ["nodejs_compat"]
+    elif change == "limits":
+        capability["runtime"]["limits"] = {"cpu_ms": 30_000}
+    elif change == "migration":
+        capability["runtime"]["migration_tag"] = "v1"
+    elif change == "usage":
+        capability["runtime"]["usage_model"] = "unbound"
+    elif change == "unknown-runtime":
+        capability["runtime"]["future_authority"] = True
+
+    with pytest.raises(RuntimeError, match="runtime capability"):
+        manage._require_capabilities(
+            config, _candidate_bindings(config), capability)
+
+
+@pytest.mark.parametrize("role,handlers", [
+    ("reader", ()),
+    ("scanner", ("scheduled",)),
+    ("consumer", ("queue",)),
+    ("fcm", ()),
+    ("harness", ("fetch",)),
+])
+def test_each_role_rejects_one_extra_provider_handler(role, handlers):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    config = _harness_config(configs) if role == "harness" else (
+        configs[manage.ROLE_KEYS.index(role)])
+    capability = _candidate_capability(
+        config, handlers=(*handlers, "email"))
+
+    with pytest.raises(RuntimeError, match="runtime capability"):
+        manage._require_capabilities(
+            config, _candidate_bindings(config), capability)
+
+
+def _version_document(config, version):
+    capability = _candidate_capability(config)
+    return {
+        "id": version,
+        "metadata": {"hasPreview": False},
+        "resources": {
+            "bindings": _candidate_bindings(config),
+            "script": {
+                "handlers": list(capability["handlers"]),
+                "named_handlers": [],
+            },
+            "script_runtime": capability["runtime"],
+        },
+    }
+
+
+@pytest.mark.parametrize("change", [
+    "preview", "missing-preview", "extra-resource", "unknown-script",
+    "malformed-named-handler",
+])
+def test_version_detail_requires_complete_fail_closed_provider_evidence(
+        change):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)[1]
+    version = WORKER_VERSIONS["scanner"]
+    document = _version_document(config, version)
+    if change == "preview":
+        document["metadata"]["hasPreview"] = True
+    elif change == "missing-preview":
+        document["metadata"] = {}
+    elif change == "extra-resource":
+        document["resources"]["future"] = {}
+    elif change == "unknown-script":
+        document["resources"]["script"]["future"] = True
+    elif change == "malformed-named-handler":
+        document["resources"]["script"]["named_handlers"] = [{
+            "name": "public", "handlers": ["fetch"], "extra": True}]
+
+    runner = lambda *args, **kwargs: SimpleNamespace(
+        stdout=json.dumps(document))
+    with pytest.raises(RuntimeError, match="Worker version"):
+        manage._version_capabilities_at(
+            runner, Path("worker.json"), version)
+
+
+def _private_script_row(config):
+    return {
+        "compatibility_date": config["compatibility_date"],
+        "compatibility_flags": list(config.get("compatibility_flags", ())),
+        "exports": {"default": {
+            "cache": {"enabled": False},
+            "state": "created",
+            "type": "worker",
+        }},
+        "handlers": list(manage._expected_handlers(config)),
+        "has_assets": False,
+        "has_modules": True,
+        "id": config["name"],
+        "logpush": False,
+        "named_handlers": [],
+        "observability": config.get("observability"),
+        "routes": [],
+        "tags": [],
+        "tail_consumers": [],
+        "usage_model": "standard",
+    }
+
+
+def _stub_private_inventory(
+        monkeypatch, configs, *, rows=None, subdomain=None, domains=None,
+        result_info=None):
+    rows = [_private_script_row(config) for config in configs] \
+        if rows is None else rows
+    subdomain = {"enabled": False, "previews_enabled": False} \
+        if subdomain is None else subdomain
+    domains = [] if domains is None else domains
+    result_info = {
+        "count": len(domains),
+        "page": 1,
+        "per_page": 20,
+        "total_count": len(domains),
+        "total_pages": 1 if domains else 0,
+    } if result_info is None else result_info
+
+    def api(_method, suffix, document=None, environment=None):
+        return rows if suffix == "/workers/scripts" else subdomain
+
+    monkeypatch.setattr(manage, "_api", api)
+    monkeypatch.setattr(
+        manage, "_api_response",
+        lambda *args, **kwargs: {
+            "result": domains, "result_info": result_info})
+
+
+def test_provider_inventory_proves_all_workers_are_private(monkeypatch):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    _stub_private_inventory(monkeypatch, configs)
+
+    manage._require_private_release(configs, {})
+
+
+@pytest.mark.parametrize("change", [
+    "route", "tail", "named-handler", "durable-object", "cache",
+    "cache-empty", "cross-version-cache", "export-cache-false", "assets",
+    "service-worker", "logpush", "placement", "tag", "handler",
+    "observability",
+])
+def test_provider_inventory_rejects_public_or_extra_script_authority(
+        monkeypatch, change):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    rows = [_private_script_row(config) for config in configs]
+    row = rows[0]
+    if change == "route":
+        row["routes"] = [{"pattern": "example.test/*"}]
+    elif change == "tail":
+        row["tail_consumers"] = [{"service": "observer"}]
+    elif change == "named-handler":
+        row["named_handlers"] = [{"name": "admin", "handlers": ["fetch"]}]
+    elif change == "durable-object":
+        row["exports"]["Admin"] = {"type": "durable-object"}
+    elif change == "cache":
+        row["cache_options"] = {"enabled": True}
+    elif change == "cache-empty":
+        row["cache_options"] = {}
+    elif change == "cross-version-cache":
+        row["cache_options"] = {
+            "enabled": False, "cross_version_cache": True}
+    elif change == "export-cache-false":
+        row["exports"]["default"]["cache"] = False
+    elif change == "assets":
+        row["has_assets"] = True
+    elif change == "service-worker":
+        row["has_modules"] = False
+    elif change == "logpush":
+        row["logpush"] = True
+    elif change == "placement":
+        row["placement"] = {"mode": "smart"}
+    elif change == "tag":
+        row["tags"] = ["public"]
+    elif change == "handler":
+        row["handlers"] = ["fetch"]
+    elif change == "observability":
+        row["observability"] = {"enabled": True}
+    _stub_private_inventory(monkeypatch, configs, rows=rows)
+
+    with pytest.raises(RuntimeError, match="provider authority differs"):
+        manage._require_private_release(configs, {})
+
+
+@pytest.mark.parametrize("change", [
+    "workers-dev", "preview", "domain", "hidden-domain", "truncated",
+])
+def test_provider_inventory_rejects_every_public_hostname_or_incomplete_page(
+        monkeypatch, change):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    subdomain = {"enabled": False, "previews_enabled": False}
+    domains = []
+    result_info = None
+    if change == "workers-dev":
+        subdomain["enabled"] = True
+    elif change == "preview":
+        subdomain["previews_enabled"] = True
+    elif change == "domain":
+        domains = [{"hostname": "push.example.test"}]
+    elif change == "hidden-domain":
+        result_info = {
+            "count": 0, "page": 1, "per_page": 20,
+            "total_count": 1, "total_pages": 0,
+        }
+    elif change == "truncated":
+        result_info = {
+            "count": 0, "page": 1, "per_page": 20,
+            "total_count": 0, "total_pages": 2,
+        }
+    _stub_private_inventory(
+        monkeypatch, configs, subdomain=subdomain, domains=domains,
+        result_info=result_info)
+
+    with pytest.raises(RuntimeError, match=(
+            "public subdomain|custom domain|custom-domain inventory")):
+        manage._require_private_release(configs, {})
 
 
 def test_split_deployment_is_rejected(monkeypatch):
@@ -1670,7 +2305,10 @@ def test_stage_launch_fcm_rejects_foreign_incumbent_before_promotion(
             values[index] = replacement
         return tuple(values)
 
-    monkeypatch.setattr(manage, "_version_markers", markers)
+    monkeypatch.setattr(
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, markers(role, config, version)))
     monkeypatch.setattr(
         manage, "_require_candidate",
         lambda *args: pytest.fail("foreign incumbent reached candidate use"))
@@ -1713,8 +2351,9 @@ def test_stage_launch_fcm_rechecks_incumbent_after_candidate_validation(
         manage, "_active_version",
         lambda config: active[manage._config_role(config)])
     monkeypatch.setattr(
-        manage, "_version_markers",
-        lambda role, config, version: manage._expected_markers(config))
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, manage._expected_markers(config)))
 
     def candidate(role, config, version, secrets=()):
         if role == "fcm":
@@ -1729,6 +2368,79 @@ def test_stage_launch_fcm_rechecks_incumbent_after_candidate_validation(
         manage.stage_launch_fcm()
 
 
+def test_stage_launch_fcm_rechecks_after_private_inventory(monkeypatch):
+    environment = _manage_environment(CF_NOTIFICATIONS_ENABLED="1")
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    configs = manage.generated_configs(
+        environment, software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID, launch_gate=False)
+    manifest = {
+        "deployment_identity": configs[0]["vars"][
+            "POC16_DEPLOYMENT_IDENTITY"],
+        "format": manage.RELEASE_MANIFEST_FORMAT,
+        "release_id": RELEASE_ID,
+        "software_digest": SOFTWARE_DIGEST,
+        "worker_versions": WORKER_VERSIONS,
+    }
+    active = dict(WORKER_VERSIONS)
+    monkeypatch.setattr(manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(manage, "_load_release", lambda: manifest)
+    monkeypatch.setattr(manage, "_write_configs", lambda values: None)
+    monkeypatch.setattr(manage, "_release_secrets", lambda values: {})
+    monkeypatch.setattr(manage, "_stage_locked", lambda value: None)
+    monkeypatch.setattr(manage, "_require_effects_detached", lambda values: None)
+    monkeypatch.setattr(
+        manage, "_owned_incumbent",
+        lambda role, config, allow_absent=False: (
+            active[role], manage._expected_markers(config)))
+    monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+
+    def private_inventory(_configs):
+        active["reader"] = "99999999-9999-4999-8999-999999999999"
+
+    monkeypatch.setattr(manage, "_require_private_release", private_inventory)
+
+    with pytest.raises(RuntimeError, match="concurrent"):
+        manage.stage_launch_fcm()
+
+
+def test_switch_during_post_attach_private_inventory_is_detached(
+        monkeypatch):
+    configs = manage.generated_configs(
+        _manage_environment(CF_NOTIFICATIONS_ENABLED="1"),
+        software_digest=SOFTWARE_DIGEST, release_id=RELEASE_ID,
+        launch_gate=False)
+    active = dict(WORKER_VERSIONS)
+    events = []
+    inventory_reads = 0
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+    monkeypatch.setattr(manage, "_require_harness_absent", lambda *args: None)
+    monkeypatch.setattr(
+        manage, "_attach_effects", lambda values: events.append("attach"))
+    monkeypatch.setattr(
+        manage, "_detach_effects", lambda values: events.append("detach"))
+
+    def private_inventory(_configs):
+        nonlocal inventory_reads
+        inventory_reads += 1
+        if inventory_reads == 2:
+            active["consumer"] = \
+                "99999999-9999-4999-8999-999999999999"
+
+    monkeypatch.setattr(manage, "_require_private_release", private_inventory)
+
+    with pytest.raises(RuntimeError, match="concurrent"):
+        manage._activate_effects(configs, WORKER_VERSIONS)
+
+    assert events == ["attach", "detach"]
+
+
 def test_concurrent_switch_after_effect_attachment_is_detached(monkeypatch):
     configs = manage.generated_configs(
         _manage_environment(CF_NOTIFICATIONS_ENABLED="1"),
@@ -1741,13 +2453,16 @@ def test_concurrent_switch_after_effect_attachment_is_detached(monkeypatch):
         nonlocal checks
         checks += 1
         calls.append("check")
-        if checks == 2:
+        if checks == 3:
             raise RuntimeError("concurrent notification deployment")
 
     monkeypatch.setattr(manage, "_require_snapshot", require_snapshot)
     monkeypatch.setattr(
         manage, "_require_harness_absent",
         lambda values, version: calls.append("harness"))
+    monkeypatch.setattr(
+        manage, "_require_private_release",
+        lambda values: calls.append("private"))
     monkeypatch.setattr(
         manage, "_attach_effects", lambda values: calls.append("attach"))
     monkeypatch.setattr(
@@ -1757,7 +2472,8 @@ def test_concurrent_switch_after_effect_attachment_is_detached(monkeypatch):
         manage._activate_effects(configs, WORKER_VERSIONS)
 
     assert calls == [
-        "check", "harness", "attach", "check", "detach", "harness"]
+        "check", "harness", "private", "check", "attach", "check",
+        "detach", "harness", "private"]
 
 
 def test_stale_launch_evidence_fails_before_provider_access(
@@ -1936,6 +2652,7 @@ def test_disabled_deploy_may_replace_software_before_retesting(monkeypatch):
         "0",
         config["vars"]["POC16_DEPLOYMENT_ROLE"],
     ))
+    monkeypatch.setattr(manage, "_require_immutable_owned", lambda value: None)
 
     manage._require_deployable(config, create=False)
 
@@ -1952,6 +2669,7 @@ def test_disabled_incumbent_may_stage_new_production_software(monkeypatch):
         "0",
         config["vars"]["POC16_DEPLOYMENT_ROLE"],
     ))
+    monkeypatch.setattr(manage, "_require_immutable_owned", lambda value: None)
 
     manage._require_deployable(config, create=False)
 
@@ -1995,6 +2713,7 @@ def test_same_software_can_be_disabled_before_upgrade(monkeypatch):
         "1",
         config["vars"]["POC16_DEPLOYMENT_ROLE"],
     ))
+    monkeypatch.setattr(manage, "_require_immutable_owned", lambda value: None)
 
     manage._require_deployable(config, create=False)
 
@@ -2056,8 +2775,9 @@ def test_verify_uses_manifest_release_and_exact_active_versions(
             config["vars"]["POC16_RELEASE_ID"]))
     monkeypatch.setattr(
         manage, "_require_harness_absent", lambda values, version: None)
+    monkeypatch.setattr(manage, "_require_snapshot", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda values: None)
     monkeypatch.setattr(manage, "_require_bootstrap_sealed", lambda value: None)
-    monkeypatch.setattr(manage, "_require_secret", lambda *args: None)
     monkeypatch.setattr(
         manage, "_require_retained_notification_objects", lambda *args: None)
     monkeypatch.setattr(manage, "_require_effects_attached", lambda values: None)
@@ -2068,6 +2788,51 @@ def test_verify_uses_manifest_release_and_exact_active_versions(
     manage.verify()
 
     assert owned == [RELEASE_ID] * 4
+
+
+def test_verify_rechecks_versions_after_queue_provider_reads(monkeypatch):
+    monkeypatch.setenv("CF_NOTIFICATIONS_ENABLED", "1")
+    monkeypatch.setenv("CF_NOTIFICATION_TEST_MODE", "0")
+    configs = manage.generated_configs(
+        _manage_environment(CF_NOTIFICATIONS_ENABLED="1"),
+        software_digest=SOFTWARE_DIGEST, release_id=RELEASE_ID,
+        launch_gate=False)
+    manifest = {
+        "deployment_identity": configs[0]["vars"][
+            "POC16_DEPLOYMENT_IDENTITY"],
+        "format": manage.RELEASE_MANIFEST_FORMAT,
+        "release_id": RELEASE_ID,
+        "software_digest": SOFTWARE_DIGEST,
+        "worker_versions": WORKER_VERSIONS,
+    }
+    active = dict(WORKER_VERSIONS)
+    queue_reads = 0
+    monkeypatch.setattr(
+        manage, "_manifest_configs",
+        lambda launch_gate: (manifest, configs))
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+    monkeypatch.setattr(manage, "_require_owned", lambda config: None)
+    monkeypatch.setattr(manage, "_require_harness_absent", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda value: None)
+    monkeypatch.setattr(manage, "_require_bootstrap_sealed", lambda value: None)
+    monkeypatch.setattr(
+        manage, "_require_retained_notification_objects", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_effects_attached", lambda value: None)
+
+    def queue_info(*args, **kwargs):
+        nonlocal queue_reads
+        queue_reads += 1
+        if queue_reads == 2:
+            active["scanner"] = \
+                "99999999-9999-4999-8999-999999999999"
+        return SimpleNamespace(stdout="queue\n")
+
+    monkeypatch.setattr(manage, "_wrangler", queue_info)
+
+    with pytest.raises(RuntimeError, match="concurrent"):
+        manage.verify()
 
 
 def test_initial_disabled_release_verifies_without_a_manifest(monkeypatch):
@@ -2095,8 +2860,10 @@ def test_initial_disabled_release_verifies_without_a_manifest(monkeypatch):
         if config["vars"]["POC16_DEPLOYMENT_ROLE"]
         == "notification-launch-harness"
         else WORKER_VERSIONS[manage._config_role(config)])
+    monkeypatch.setattr(manage, "_require_owned", lambda value: None)
+    monkeypatch.setattr(manage, "_require_snapshot", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda values: None)
     monkeypatch.setattr(manage, "_require_bootstrap_sealed", lambda value: None)
-    monkeypatch.setattr(manage, "_require_secret", lambda *args: None)
     monkeypatch.setattr(
         manage, "_require_retained_notification_objects", lambda *args: None)
     monkeypatch.setattr(
@@ -2187,6 +2954,9 @@ def test_concurrent_harness_recreation_rolls_back_activation(monkeypatch):
     monkeypatch.setattr(
         manage, "_require_harness_absent", require_harness_absent)
     monkeypatch.setattr(
+        manage, "_require_private_release",
+        lambda values: events.append("private"))
+    monkeypatch.setattr(
         manage, "_attach_effects", lambda values: events.append("attach"))
     monkeypatch.setattr(
         manage, "_detach_effects", lambda values: events.append("detach"))
@@ -2195,8 +2965,8 @@ def test_concurrent_harness_recreation_rolls_back_activation(monkeypatch):
         manage._activate_effects(configs, WORKER_VERSIONS)
 
     assert events == [
-        "snapshot", "harness", "attach", "snapshot", "harness",
-        "detach", "harness",
+        "snapshot", "harness", "private", "snapshot", "attach",
+        "snapshot", "harness", "detach", "harness", "private",
     ]
 
 
@@ -2248,7 +3018,10 @@ def test_scanner_mode_rejects_foreign_authority_before_provider_mutation(
             values[index] = replacement
         return tuple(values)
 
-    monkeypatch.setattr(manage, "_version_markers", markers)
+    monkeypatch.setattr(
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, markers(role, config, version)))
     monkeypatch.setattr(
         manage, "_wrangler",
         lambda *args, **kwargs: provider_calls.append(("wrangler", args)))
@@ -2282,8 +3055,9 @@ def test_scanner_mode_rechecks_snapshot_before_first_provider_mutation(
 
     monkeypatch.setattr(manage, "_active_version", active_version)
     monkeypatch.setattr(
-        manage, "_version_markers",
-        lambda role, config, version: manage._expected_markers(config))
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, manage._expected_markers(config)))
     monkeypatch.setattr(
         manage, "_wrangler",
         lambda *args, **kwargs: provider_calls.append(("wrangler", args)))
@@ -2315,12 +3089,13 @@ def test_bootstrap_commands_promote_only_one_exact_scanner_version(
     monkeypatch.setattr(
         manage, "generated_configs",
         lambda **options: configs if "bootstrap_mode" in options else ordinary)
-    monkeypatch.setattr(manage, "_version_markers", lambda role, config,
-                        version: (
-        config["vars"]["POC16_DEPLOYMENT_OWNER"],
-        config["vars"]["POC16_DEPLOYMENT_IDENTITY"], SOFTWARE_DIGEST,
-        RELEASE_ID, "0", config["vars"]["POC16_DEPLOYMENT_ROLE"],
-    ))
+    monkeypatch.setattr(
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(config, (
+            config["vars"]["POC16_DEPLOYMENT_OWNER"],
+            config["vars"]["POC16_DEPLOYMENT_IDENTITY"], SOFTWARE_DIGEST,
+            RELEASE_ID, "0", config["vars"]["POC16_DEPLOYMENT_ROLE"],
+        )))
     monkeypatch.setattr(
         manage, "_write_configs", lambda value: calls.append(("write", value)))
     monkeypatch.setattr(
@@ -2334,6 +3109,7 @@ def test_bootstrap_commands_promote_only_one_exact_scanner_version(
         lambda role, config, release_id: calls.append(("upload", role))
         or WORKER_VERSIONS["scanner"])
     monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda value: None)
     monkeypatch.setattr(
         manage, "_promote",
         lambda role, config, version: calls.append(("promote", role, version)))
@@ -2350,6 +3126,160 @@ def test_bootstrap_commands_promote_only_one_exact_scanner_version(
     assert ("promote", "scanner", WORKER_VERSIONS["scanner"]) in calls
     assert not any(
         call[0] == "wrangler" and call[1][0] == "deploy" for call in calls)
+
+
+@pytest.mark.parametrize("active_mode", ["current", "backfill"])
+def test_active_bootstrap_mode_can_be_sealed_without_rebinding(
+        monkeypatch, active_mode):
+    for name, value in _manage_environment().items():
+        monkeypatch.setenv(name, value)
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    active = dict(WORKER_VERSIONS)
+    promotions = []
+    monkeypatch.setattr(manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(manage, "_write_configs", lambda values: None)
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+
+    def profile(role, config, version):
+        return _incumbent_profile(
+            config, manage._expected_markers(config),
+            bootstrap=active_mode if role == "scanner" else None)
+
+    monkeypatch.setattr(manage, "_version_capabilities", profile)
+    monkeypatch.setattr(manage, "_require_effects_detached", lambda value: None)
+    monkeypatch.setattr(
+        manage, "_require_retained_notification_objects", lambda *args: None)
+    monkeypatch.setattr(
+        manage, "_upload_version",
+        lambda *args, **kwargs: WORKER_VERSIONS["scanner"])
+    monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda value: None)
+    monkeypatch.setattr(manage, "_wrangler", lambda *args, **kwargs: None)
+
+    def promote(role, config, version):
+        promotions.append(role)
+        active[role] = version
+
+    monkeypatch.setattr(manage, "_promote", promote)
+
+    manage._deploy_scanner_mode(manage.BOOTSTRAP_NONE)
+
+    assert promotions == ["scanner"]
+
+
+def test_emergency_disable_accepts_a_valid_active_bootstrap(monkeypatch):
+    configs = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)
+    active = dict(WORKER_VERSIONS)
+    detached = []
+    monkeypatch.setattr(manage, "generated_configs", lambda: configs)
+    monkeypatch.setattr(manage, "_write_configs", lambda values: None)
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+    monkeypatch.setattr(
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, manage._expected_markers(config),
+            bootstrap="current" if role == "scanner" else None))
+    monkeypatch.setattr(
+        manage, "_detach_effects", lambda values: detached.append(True))
+
+    manage.disable()
+
+    assert detached == [True]
+
+
+@pytest.mark.parametrize("requested,active", [("0", "1"), ("1", "0")])
+def test_test_mode_can_transition_under_the_same_immutable_identity(
+        monkeypatch, requested, active):
+    environment = _manage_environment(
+        CF_FIREBASE_ENVIRONMENT="staging",
+        CF_FIREBASE_TEST_PROJECT_ID="firebase-project",
+        CF_NOTIFICATION_TEST_MODE=requested)
+    config = manage.generated_configs(
+        environment, software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)[2]
+    version = WORKER_VERSIONS["consumer"]
+    monkeypatch.setattr(manage, "_active_version", lambda value: version)
+    monkeypatch.setattr(
+        manage, "_capabilities_for_version",
+        lambda value, observed: _incumbent_profile(
+            value, manage._expected_markers(value), test_mode=active))
+
+    manage._require_immutable_owned(config)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("NOTIFICATION_TEST_MODE", "maybe"),
+    ("NOTIFICATION_BOOTSTRAP_MODE", "automatic"),
+])
+def test_unknown_mutable_incumbent_state_is_rejected(
+        monkeypatch, name, value):
+    config = manage.generated_configs(
+        _manage_environment(), software_digest=SOFTWARE_DIGEST,
+        release_id=RELEASE_ID)[1]
+    incumbent = json.loads(json.dumps(config))
+    incumbent["vars"][name] = value
+    version = WORKER_VERSIONS["scanner"]
+    monkeypatch.setattr(manage, "_active_version", lambda observed: version)
+    monkeypatch.setattr(
+        manage, "_capabilities_for_version",
+        lambda observed, active: (
+            _candidate_bindings(incumbent),
+            _candidate_capability(incumbent)))
+
+    with pytest.raises(RuntimeError, match="invalid mutable"):
+        manage._require_immutable_owned(config)
+
+
+def test_bootstrap_swap_after_cron_attach_is_rolled_back(monkeypatch):
+    for name, value in _manage_environment().items():
+        monkeypatch.setenv(name, value)
+    active = dict(WORKER_VERSIONS)
+    replacement = "55555555-5555-4555-8555-555555555555"
+    trigger_calls = []
+    monkeypatch.setattr(manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(manage, "_write_configs", lambda values: None)
+    monkeypatch.setattr(
+        manage, "_active_version",
+        lambda config: active[manage._config_role(config)])
+    monkeypatch.setattr(
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, manage._expected_markers(config)))
+    monkeypatch.setattr(manage, "_require_effects_detached", lambda value: None)
+    monkeypatch.setattr(
+        manage, "_require_retained_notification_objects", lambda *args: None)
+    monkeypatch.setattr(
+        manage, "_upload_version", lambda *args, **kwargs: replacement)
+    monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda value: None)
+
+    def promote(role, config, version):
+        active[role] = version
+
+    def wrangler(*arguments, **options):
+        if arguments[:2] == ("triggers", "deploy"):
+            trigger_calls.append(arguments)
+            if "--triggers" in arguments:
+                active["reader"] = \
+                    "99999999-9999-4999-8999-999999999999"
+
+    monkeypatch.setattr(manage, "_promote", promote)
+    monkeypatch.setattr(manage, "_wrangler", wrangler)
+
+    with pytest.raises(RuntimeError, match="concurrent"):
+        manage._deploy_scanner_mode(manage.BOOTSTRAP_CURRENT)
+
+    assert len(trigger_calls) == 2
+    assert "--triggers" in trigger_calls[0]
+    assert "--triggers" not in trigger_calls[1]
 
 
 def test_redrive_accepts_primary_copy_before_acknowledging_dlq(
@@ -2438,6 +3368,8 @@ def test_first_create_deploy_never_touches_cron_before_scanner_exists(
     monkeypatch.setattr(
         manage, "_promote_release",
         lambda configs, versions, initial: events.append("promote"))
+    monkeypatch.setattr(manage, "_require_private_release", lambda values: None)
+    monkeypatch.setattr(manage, "_require_snapshot", lambda *args: None)
 
     manage.deploy()
 
@@ -2488,6 +3420,7 @@ def test_first_create_uploads_workers_before_any_active_deployment(
     monkeypatch.setattr(manage, "_upload_version", upload)
     monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
     monkeypatch.setattr(manage, "_promote", promote)
+    monkeypatch.setattr(manage, "_require_private_release", lambda values: None)
 
     manage.deploy()
 
@@ -2544,6 +3477,8 @@ def test_physically_staged_fcm_resumes_the_exact_production_release(
     monkeypatch.setattr(
         manage, "_require_retained_notification_objects", lambda *args: None)
     monkeypatch.setattr(manage, "_require_candidate", lambda *args: None)
+    monkeypatch.setattr(manage, "_require_immutable_owned", lambda value: None)
+    monkeypatch.setattr(manage, "_require_private_release", lambda values: None)
     monkeypatch.setattr(
         manage, "_attach_effects", lambda configs: attached.append(True))
 
@@ -2566,8 +3501,9 @@ def test_physically_staged_fcm_resumes_the_exact_production_release(
 
     monkeypatch.setattr(manage, "_worker_markers", worker_markers)
     monkeypatch.setattr(
-        manage, "_version_markers",
-        lambda role, config, version: markers[role])
+        manage, "_version_capabilities",
+        lambda role, config, version: _incumbent_profile(
+            config, markers[role]))
     monkeypatch.setattr(manage, "_active_version", active_version)
     monkeypatch.setattr(manage, "_promote", promote)
 

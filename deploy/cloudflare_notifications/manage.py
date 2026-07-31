@@ -5,6 +5,8 @@ Queue and R2 data are intentionally never deleted by this tool.  Worker
 removal first disables the producer and checks the deployment-owner marker;
 the retained cursor, primary queue, and DLQ make rollback recoverable.
 """
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -59,6 +61,8 @@ RELEASE_MANIFEST_ENV = "CF_NOTIFICATION_RELEASE_MANIFEST"
 COMPLETION_PROTOCOL = "poc16-notification-completion-v1"
 EXPECTED_FCM_VERSION_BINDING = "POC16_EXPECTED_FCM_VERSION"
 BUILD_VERSION_ID = "00000000-0000-4000-8000-000000000000"
+STAGE_LOCK = BUILD / ".operation.lock"
+STAGE_OWNER_ENV = "POC16_CLOUDFLARE_STAGE_OWNER"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
@@ -103,6 +107,19 @@ ROLE_NAMES = {
     "consumer": "notification-consumer",
     "fcm": "notification-fcm-boundary",
 }
+ROLE_SECRETS = {
+    "reader": (),
+    "scanner": (),
+    "consumer": ("PUSH_NODE_SECRET",),
+    "fcm": ("FIREBASE_SERVICE_ACCOUNT_JSON",),
+}
+ROLE_HANDLERS = {
+    "reader": (),
+    "scanner": ("scheduled",),
+    "consumer": ("queue",),
+    "fcm": (),
+    "notification-launch-harness": ("fetch",),
+}
 CONFIG_PATHS = {
     "reader": READER_CONFIG,
     "scanner": SCANNER_CONFIG,
@@ -112,6 +129,52 @@ CONFIG_PATHS = {
 
 CORE_MODULES = tuple(dict.fromkeys(
     (*REPOSITORY_READER_CORE_MODULES, "fetch_budget.py")))
+_STAGE_LOCK_FD = None
+
+
+@contextmanager
+def _worktree_operation_lock(environment=os.environ):
+    """Fail fast when another process can mutate this worktree's staging."""
+    global _STAGE_LOCK_FD
+    BUILD.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(STAGE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    inherited = environment.get(STAGE_OWNER_ENV, "")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as error:
+            owner = os.pread(descriptor, 128, 0).decode("ascii", "ignore")
+            if not inherited or not secrets.compare_digest(owner, inherited):
+                raise RuntimeError(
+                    "another Cloudflare notification operation owns this "
+                    "worktree") from error
+            # A build hook descended from the lock owner may use the same
+            # fixed staging tree.  Its parent Wrangler process inherits the
+            # owner's locked descriptor through _run().
+            yield
+            return
+        owner = secrets.token_hex(32)
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, owner.encode("ascii"))
+        os.fsync(descriptor)
+        previous = environment.get(STAGE_OWNER_ENV)
+        environment[STAGE_OWNER_ENV] = owner
+        old_descriptor = _STAGE_LOCK_FD
+        _STAGE_LOCK_FD = descriptor
+        try:
+            yield
+        finally:
+            _STAGE_LOCK_FD = old_descriptor
+            if previous is None:
+                environment.pop(STAGE_OWNER_ENV, None)
+            else:
+                environment[STAGE_OWNER_ENV] = previous
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _copy(source, destination):
@@ -597,7 +660,9 @@ def _run(command, *, capture=False, timeout=CONTROL_TIMEOUT_SECONDS,
         return subprocess.run(
             command, cwd=PACKAGE, env=environment, check=True,
             capture_output=capture, text=True, input=input_text,
-            timeout=timeout)
+            timeout=timeout,
+            pass_fds=(() if _STAGE_LOCK_FD is None else
+                      (_STAGE_LOCK_FD,)))
     except FileNotFoundError as error:
         raise RuntimeError(
             f"required executable is unavailable: {command[0]}") from error
@@ -725,24 +790,81 @@ def _config_role(config):
     return matches[0]
 
 
-def _version_bindings_at(runner, config_path, version_id):
+def _version_capabilities_at(runner, config_path, version_id):
     result = runner(
         "versions", "view", version_id, "--json", "--config",
         str(config_path), capture=True)
     document = _json_output(result, "Worker version")
-    if not isinstance(document, dict) or document.get("id") != version_id:
+    metadata = document.get("metadata") if isinstance(document, dict) \
+        else None
+    if not isinstance(document, dict) or document.get("id") != version_id \
+            or not isinstance(metadata, dict) \
+            or metadata.get("hasPreview") is not False:
         raise RuntimeError("Cloudflare returned the wrong Worker version")
     resources = document.get("resources")
     bindings = resources.get("bindings") if isinstance(resources, dict) \
         else None
-    if not isinstance(bindings, list):
+    script = resources.get("script") if isinstance(resources, dict) else None
+    runtime = resources.get("script_runtime") \
+        if isinstance(resources, dict) else None
+    if not isinstance(resources, dict) \
+            or set(resources) != {"bindings", "script", "script_runtime"} \
+            or not isinstance(bindings, list) or len(bindings) > 128 \
+            or not isinstance(script, dict) \
+            or not isinstance(runtime, dict) \
+            or not set(script).issubset({
+                "etag", "handlers", "last_deployed_from", "named_handlers",
+            }) \
+            or not set(runtime).issubset({
+                "compatibility_date", "compatibility_flags", "exports",
+                "limits", "migration_tag", "usage_model",
+            }):
         raise RuntimeError("malformed Cloudflare Worker version")
-    return bindings
+    handlers = script.get("handlers", [])
+    named_handlers = script.get("named_handlers", [])
+    if not _handler_names(handlers) \
+            or not isinstance(named_handlers, list) \
+            or len(named_handlers) > 32 \
+            or any(not isinstance(row, dict)
+                   or set(row) != {"name", "handlers"}
+                   or not isinstance(row["name"], str)
+                   or not row["name"] or len(row["name"]) > 128
+                   or not _handler_names(row["handlers"])
+                   for row in named_handlers):
+        raise RuntimeError("malformed Cloudflare Worker version")
+    etag = script.get("etag")
+    source = script.get("last_deployed_from")
+    if etag is not None and (not isinstance(etag, str)
+                             or not 0 < len(etag) <= 256) \
+            or source is not None and (not isinstance(source, str)
+                                       or not 0 < len(source) <= 64):
+        raise RuntimeError("malformed Cloudflare Worker version")
+    return bindings, {
+        "handlers": tuple(sorted(handlers)),
+        "named_handlers": tuple(sorted(
+            (row["name"], tuple(sorted(row["handlers"])))
+            for row in named_handlers)),
+        "runtime": runtime,
+    }
+
+
+def _handler_names(value):
+    return isinstance(value, list) and len(value) <= 32 \
+        and all(isinstance(name, str) and 0 < len(name) <= 128
+                for name in value) and len(set(value)) == len(value)
+
+
+def _version_bindings_at(runner, config_path, version_id):
+    return _version_capabilities_at(runner, config_path, version_id)[0]
+
+
+def _version_capabilities(role, config, version_id):
+    runner = _wrangler if role == "fcm" else _pywrangler
+    return _version_capabilities_at(runner, CONFIG_PATHS[role], version_id)
 
 
 def _version_bindings(role, config, version_id):
-    runner = _wrangler if role == "fcm" else _pywrangler
-    return _version_bindings_at(runner, CONFIG_PATHS[role], version_id)
+    return _version_capabilities(role, config, version_id)[0]
 
 
 def _binding_values(bindings, names):
@@ -757,13 +879,6 @@ def _binding_values(bindings, names):
     return tuple(values)
 
 
-def _version_markers(role, config, version_id):
-    return _binding_values(_version_bindings(role, config, version_id), (
-        OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
-        "NOTIFICATIONS_ENABLED", ROLE_BINDING,
-    ))
-
-
 def _owned_incumbent(role, config, *, allow_absent=False):
     """Pin one active version and prove its immutable mutation authority."""
     version = _active_version(config)
@@ -771,13 +886,20 @@ def _owned_incumbent(role, config, *, allow_absent=False):
         if allow_absent:
             return version, _ABSENT
         raise RuntimeError("notification Worker is absent")
-    markers = _version_markers(role, config, version)
+    bindings, capability = _version_capabilities(role, config, version)
+    markers = _binding_values(bindings, (
+        OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
+        "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    ))
     variables = config["vars"]
     if markers is None or (markers[0], markers[1], markers[5]) != (
             variables[OWNER_BINDING], variables[IDENTITY_BINDING],
             variables[ROLE_BINDING]):
         raise RuntimeError(
             "refusing to mutate an unowned or rebound notification Worker")
+    _require_capabilities(
+        _config_for_incumbent(config, markers, bindings), bindings,
+        capability)
     if _active_version(config) != version:
         raise RuntimeError("concurrent notification deployment")
     return version, markers
@@ -792,19 +914,169 @@ def _expected_markers(config):
     )
 
 
-def _require_candidate(role, config, version_id, secrets=()):
-    bindings = _version_bindings(role, config, version_id)
-    if _binding_values(bindings, (
-            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
-            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
-    )) != _expected_markers(config):
-        raise RuntimeError("Cloudflare candidate version markers differ")
-    for name in secrets:
-        matches = [item for item in bindings
-                   if isinstance(item, dict) and item.get("name") == name]
-        if len(matches) != 1 or matches[0].get("type") != "secret_text":
-            raise RuntimeError(
-                f"candidate Worker is missing required secret {name}")
+def _binding_capability(binding):
+    if not isinstance(binding, dict):
+        return None
+    name = binding.get("name")
+    kind = binding.get("type")
+    if not isinstance(name, str) or not 0 < len(name) <= 256 \
+            or not isinstance(kind, str):
+        return None
+    fields = {
+        "plain_text": {"name", "type", "text"},
+        "secret_text": {"name", "type", "text"},
+        "r2_bucket": {"name", "type", "bucket_name", "jurisdiction"},
+        "service": {"name", "type", "service", "environment", "entrypoint"},
+        "queue": {"name", "type", "queue_name"},
+        "version_metadata": {"name", "type"},
+    }.get(kind)
+    if fields is None or not set(binding).issubset(fields):
+        return None
+    if kind == "secret_text":
+        # The value is deliberately never fetched, compared, formatted, or
+        # logged.  Name plus provider type is the complete usable authority.
+        return kind, name
+    if kind == "plain_text":
+        value = binding.get("text")
+        return (kind, name, value) if isinstance(value, str) else None
+    if kind == "version_metadata":
+        return kind, name
+    value_name = {
+        "r2_bucket": "bucket_name",
+        "service": "service",
+        "queue": "queue_name",
+    }[kind]
+    value = binding.get(value_name)
+    if not isinstance(value, str) or not value:
+        return None
+    if kind == "r2_bucket":
+        jurisdiction = binding.get("jurisdiction")
+        if jurisdiction not in {None, "eu", "fedramp", "fedramp-high"}:
+            return None
+        return kind, name, value, jurisdiction
+    if kind == "service":
+        environment = binding.get("environment")
+        entrypoint = binding.get("entrypoint")
+        if any(item is not None and (not isinstance(item, str) or not item)
+               for item in (environment, entrypoint)):
+            return None
+        return kind, name, value, environment, entrypoint
+    return kind, name, value
+
+
+def _binding_inventory(bindings):
+    if not isinstance(bindings, list) or len(bindings) > 128:
+        return None
+    result = []
+    names = set()
+    for binding in bindings:
+        capability = _binding_capability(binding)
+        if capability is None or capability[1] in names:
+            return None
+        names.add(capability[1])
+        result.append(capability)
+    return tuple(sorted(result))
+
+
+def _required_secrets(config):
+    role_name = config.get("vars", {}).get(ROLE_BINDING)
+    if role_name == "notification-launch-harness":
+        return ("LAUNCH_HARNESS_SECRET",)
+    roles = [role for role, name in ROLE_NAMES.items() if name == role_name]
+    if len(roles) != 1:
+        raise ValueError("notification Worker role")
+    return ROLE_SECRETS[roles[0]]
+
+
+def _expected_binding_inventory(config):
+    bindings = [
+        {"name": name, "type": "plain_text", "text": value}
+        for name, value in config.get("vars", {}).items()]
+    bindings.extend(
+        {"name": row.get("binding"), "type": "r2_bucket",
+         "bucket_name": row.get("bucket_name"),
+         **({"jurisdiction": row["jurisdiction"]}
+            if "jurisdiction" in row else {})}
+        for row in config.get("r2_buckets", ()))
+    bindings.extend(
+        {"name": row.get("binding"), "type": "service",
+         "service": row.get("service"),
+         **({"environment": row["environment"]}
+            if "environment" in row else {}),
+         **({"entrypoint": row["entrypoint"]}
+            if "entrypoint" in row else {})}
+        for row in config.get("services", ()))
+    bindings.extend(
+        {"name": row.get("binding"), "type": "queue",
+         "queue_name": row.get("queue")}
+        for row in config.get("queues", {}).get("producers", ()))
+    metadata = config.get("version_metadata")
+    if metadata is not None:
+        bindings.append({
+            "name": metadata.get("binding"), "type": "version_metadata"})
+    bindings.extend(
+        {"name": name, "type": "secret_text"}
+        for name in _required_secrets(config))
+    inventory = _binding_inventory(bindings)
+    if inventory is None:
+        raise ValueError("generated Worker binding inventory")
+    return inventory
+
+
+def _expected_handlers(config):
+    role_name = config.get("vars", {}).get(ROLE_BINDING)
+    if role_name == "notification-launch-harness":
+        return ROLE_HANDLERS[role_name]
+    return ROLE_HANDLERS[_config_role(config)]
+
+
+def _runtime_is_exact(config, capability):
+    if not isinstance(capability, dict) \
+            or set(capability) != {
+                "handlers", "named_handlers", "runtime"} \
+            or capability["handlers"] != _expected_handlers(config) \
+            or capability["named_handlers"]:
+        return False
+    runtime = capability["runtime"]
+    if not isinstance(runtime, dict) or not set(runtime).issubset({
+            "compatibility_date", "compatibility_flags", "exports",
+            "limits", "migration_tag", "usage_model",
+    }):
+        return False
+    flags = runtime.get("compatibility_flags", [])
+    expected_flags = config.get("compatibility_flags", [])
+    if not _handler_names(flags) or tuple(sorted(flags)) != tuple(
+            sorted(expected_flags)):
+        return False
+    exports = runtime.get("exports")
+    if not isinstance(exports, dict) or set(exports) != {"default"}:
+        return False
+    default = exports["default"]
+    if not isinstance(default, dict) \
+            or not set(default).issubset({"cache", "state", "type"}) \
+            or default.get("type") != "worker" \
+            or default.get("state", "created") != "created":
+        return False
+    cache = default.get("cache")
+    if cache is not None and cache != {"enabled": False}:
+        return False
+    return runtime.get("compatibility_date") \
+        == config.get("compatibility_date") \
+        and runtime.get("migration_tag") is None \
+        and runtime.get("limits", {}) == {} \
+        and runtime.get("usage_model", "standard") == "standard"
+
+
+def _require_capabilities(config, bindings, capability):
+    if _binding_inventory(bindings) != _expected_binding_inventory(config):
+        raise RuntimeError("Cloudflare Worker capability inventory differs")
+    if not _runtime_is_exact(config, capability):
+        raise RuntimeError("Cloudflare Worker runtime capability differs")
+
+
+def _require_candidate(role, config, version_id):
+    bindings, capability = _version_capabilities(role, config, version_id)
+    _require_capabilities(config, bindings, capability)
 
 
 def _promote(role, config, version_id):
@@ -947,9 +1219,7 @@ def stage_launch_fcm():
     _require_snapshot(configs, incumbent)
     for role, config in zip(ROLE_KEYS, configs):
         _require_candidate(
-            role, config, manifest["worker_versions"][role],
-            (("FIREBASE_SERVICE_ACCOUNT_JSON",) if role == "fcm" else
-             (("PUSH_NODE_SECRET",) if role == "consumer" else ())))
+            role, config, manifest["worker_versions"][role])
     # FCM may be invoked only through a temporary private service-bound
     # harness.  Scanner and Queue effects remain detached throughout.
     _require_snapshot(configs, incumbent)
@@ -958,7 +1228,9 @@ def stage_launch_fcm():
     if incumbent["fcm"] != expected["fcm"]:
         _promote("fcm", configs[3], expected["fcm"])
     _require_snapshot(configs, expected)
+    _require_private_release(configs)
     _require_effects_detached(configs)
+    _require_snapshot(configs, expected)
 
 
 def _manifest_configs(*, launch_gate=False):
@@ -987,9 +1259,7 @@ def deploy_launch_harness():
     _require_effects_detached(configs)
     if _active_version(configs[3]) != fcm_version:
         raise RuntimeError("exact staged FCM version is not active")
-    _require_candidate(
-        "fcm", configs[3], fcm_version,
-        ("FIREBASE_SERVICE_ACCOUNT_JSON",))
+    _require_candidate("fcm", configs[3], fcm_version)
     if _active_version(harness) is not _ABSENT:
         raise RuntimeError("temporary launch harness already exists")
     secret = _text(os.environ, "CF_NOTIFICATION_HARNESS_SECRET")
@@ -1006,17 +1276,9 @@ def deploy_launch_harness():
             or event.get("worker_name") != harness["name"] \
             or not VERSION_ID.fullmatch(version or ""):
         raise RuntimeError("malformed launch harness upload evidence")
-    bindings = _version_bindings_at(_wrangler, HARNESS_CONFIG, version)
-    if _binding_values(bindings, (
-            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
-            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
-            EXPECTED_FCM_VERSION_BINDING,
-    )) != (*_expected_markers(harness), fcm_version) or len([
-        row for row in bindings if isinstance(row, dict)
-        and row.get("name") == "LAUNCH_HARNESS_SECRET"
-        and row.get("type") == "secret_text"
-    ]) != 1:
-        raise RuntimeError("launch harness candidate bindings differ")
+    bindings, handlers = _version_capabilities_at(
+        _wrangler, HARNESS_CONFIG, version)
+    _require_capabilities(harness, bindings, handlers)
     _wrangler(
         "versions", "deploy", "--version-id", version, "-y",
         "--config", str(HARNESS_CONFIG))
@@ -1056,7 +1318,7 @@ def _control_environment(environment=os.environ):
     return account, token
 
 
-def _api(method, suffix, document=None, environment=os.environ):
+def _api_response(method, suffix, document=None, environment=os.environ):
     account, token = _control_environment(environment)
     raw = None if document is None else json.dumps(document).encode()
     request = Request(
@@ -1084,7 +1346,12 @@ def _api(method, suffix, document=None, environment=os.environ):
         raise RuntimeError("malformed Cloudflare control response") from error
     if not isinstance(value, dict) or value.get("success") is not True:
         raise RuntimeError("Cloudflare control request was rejected")
-    return value.get("result")
+    return value
+
+
+def _api(method, suffix, document=None, environment=os.environ):
+    return _api_response(
+        method, suffix, document, environment).get("result")
 
 
 def _require_prefix_synchronously_readable(
@@ -1145,6 +1412,98 @@ def _require_retained_notification_objects(
         environment)
 
 
+def _default_worker_export(value):
+    if not isinstance(value, dict) or set(value) != {"default"}:
+        return False
+    default = value["default"]
+    if not isinstance(default, dict) \
+            or not set(default).issubset({"cache", "state", "type"}) \
+            or default.get("type") != "worker" \
+            or default.get("state", "created") != "created":
+        return False
+    cache = default.get("cache")
+    return cache is None or cache == {"enabled": False}
+
+
+def _script_row_is_private(config, row):
+    allowed = {
+        "cache_options", "compatibility_date", "compatibility_flags",
+        "created_on", "etag", "exports", "handlers", "has_assets",
+        "has_modules", "id", "last_deployed_from", "logpush",
+        "migration_tag", "modified_on", "named_handlers", "observability",
+        "placement", "placement_mode", "placement_status", "routes", "tag",
+        "tags", "tail_consumers", "usage_model",
+    }
+    flags = row.get("compatibility_flags", [])
+    cache = row.get("cache_options")
+    if not isinstance(row, dict) or not set(row).issubset(allowed) \
+            or row.get("id") != config["name"] \
+            or row.get("compatibility_date") \
+            != config.get("compatibility_date") \
+            or not _handler_names(flags) \
+            or tuple(sorted(flags)) != tuple(sorted(
+                config.get("compatibility_flags", []))) \
+            or not _handler_names(row.get("handlers", [])) \
+            or tuple(sorted(row.get("handlers", []))) \
+            != _expected_handlers(config) \
+            or row.get("named_handlers", []) != [] \
+            or not _default_worker_export(row.get("exports")) \
+            or row.get("routes") != [] \
+            or row.get("tail_consumers", []) != [] \
+            or row.get("tags", []) != [] \
+            or row.get("has_assets", False) is not False \
+            or row.get("has_modules") is not True \
+            or row.get("logpush", False) is not False \
+            or row.get("migration_tag") is not None \
+            or row.get("placement") is not None \
+            or row.get("placement_mode") is not None \
+            or row.get("placement_status") is not None \
+            or row.get("usage_model", "standard") != "standard" \
+            or row.get("observability") != config.get("observability"):
+        return False
+    return cache is None or isinstance(cache, dict) \
+        and set(cache) in ({"enabled"}, {"cross_version_cache", "enabled"}) \
+        and cache["enabled"] is False \
+        and cache.get("cross_version_cache", False) is False
+
+
+def _require_private_release(configs, environment=os.environ):
+    """Prove production roles have no provider-level public invocation."""
+    rows = _api("GET", "/workers/scripts", environment=environment)
+    if not isinstance(rows, list) or len(rows) > 10_000 \
+            or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("malformed Cloudflare Worker inventory")
+    for config in configs:
+        matches = [row for row in rows if row.get("id") == config["name"]]
+        if len(matches) != 1 or not _script_row_is_private(
+                config, matches[0]):
+            raise RuntimeError(
+                "notification Worker provider authority differs")
+        subdomain = _api(
+            "GET", "/workers/scripts/" + quote(config["name"], safe="")
+            + "/subdomain", environment=environment)
+        if subdomain != {"enabled": False, "previews_enabled": False}:
+            raise RuntimeError("notification Worker has a public subdomain")
+        response = _api_response(
+            "GET", "/workers/domains?service="
+            + quote(config["name"], safe=""), environment=environment)
+        domains = response.get("result")
+        info = response.get("result_info")
+        if not isinstance(domains, list) or not isinstance(info, dict) \
+                or set(info) != {
+                    "count", "page", "per_page", "total_count", "total_pages"} \
+                or any(type(info[name]) is not int or info[name] < 0
+                       for name in info) \
+                or info["count"] != len(domains) \
+                or info["total_count"] != len(domains) \
+                or info["page"] != 1 \
+                or info["total_pages"] not in {0, 1} \
+                or info["per_page"] < len(domains):
+            raise RuntimeError("malformed Cloudflare custom-domain inventory")
+        if domains:
+            raise RuntimeError("notification Worker has a custom domain")
+
+
 def _worker_bindings(config, environment=os.environ):
     version = _active_version(config, environment)
     if version is _ABSENT:
@@ -1165,11 +1524,6 @@ def _worker_markers(config, environment=os.environ):
         OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
         "NOTIFICATIONS_ENABLED", ROLE_BINDING,
     ))
-
-
-def _worker_owner(config, environment=os.environ):
-    markers = _worker_markers(config, environment)
-    return markers if markers in {_ABSENT, None} else markers[0]
 
 
 def _require_deployable(config, *, create):
@@ -1204,33 +1558,76 @@ def _require_deployable(config, *, create):
             and observed[4] != "0":
         raise RuntimeError(
             "disable the incumbent release before replacing it")
+    if observed is not _ABSENT:
+        _require_immutable_owned(config)
+
+
+def _capabilities_for_version(config, version):
+    role_name = config.get("vars", {}).get(ROLE_BINDING)
+    if role_name == "notification-launch-harness":
+        return _version_capabilities_at(_wrangler, HARNESS_CONFIG, version)
+    return _version_capabilities(_config_role(config), config, version)
+
+
+def _config_for_incumbent(config, markers, bindings):
+    incumbent = json.loads(json.dumps(config))
+    for name, value in zip((
+            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
+            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    ), markers):
+        incumbent["vars"][name] = value
+    mutable = ["NOTIFICATION_TEST_MODE"]
+    if incumbent["vars"][ROLE_BINDING] == ROLE_NAMES["scanner"]:
+        mutable.append("NOTIFICATION_BOOTSTRAP_MODE")
+    observed = _binding_values(bindings, mutable)
+    if observed is None or observed[0] not in {"0", "1"} \
+            or len(observed) == 2 and observed[1] not in BOOTSTRAP_MODES:
+        raise RuntimeError("invalid mutable notification Worker state")
+    for name, value in zip(mutable, observed):
+        incumbent["vars"][name] = value
+    return incumbent
 
 
 def _require_owned(config):
-    if _worker_markers(config) != _expected_markers(config):
+    version = _active_version(config)
+    if version is _ABSENT:
+        raise RuntimeError(
+            "refusing to mutate an absent, unowned, or rebound Worker")
+    bindings, capability = _capabilities_for_version(config, version)
+    if _active_version(config) != version:
+        raise RuntimeError("concurrent notification deployment")
+    _require_capabilities(config, bindings, capability)
+    if _binding_values(bindings, (
+            OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING,
+            RELEASE_BINDING, "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    )) != _expected_markers(config):
         raise RuntimeError(
             "refusing to mutate an absent, unowned, or rebound Worker")
 
 
 def _require_immutable_owned(config):
-    observed = _worker_markers(config)
+    version = _active_version(config)
+    if version is _ABSENT:
+        raise RuntimeError(
+            "refusing to mutate an absent, unowned, or rebound Worker")
+    bindings, capability = _capabilities_for_version(config, version)
+    observed = _binding_values(bindings, (
+        OWNER_BINDING, IDENTITY_BINDING, SOFTWARE_BINDING, RELEASE_BINDING,
+        "NOTIFICATIONS_ENABLED", ROLE_BINDING,
+    ))
     expected = (
         config["vars"][OWNER_BINDING],
         config["vars"][IDENTITY_BINDING],
     )
-    if observed in {_ABSENT, None} or observed[:2] != expected \
+    if observed is None or observed[:2] != expected \
             or observed[5] != config["vars"][ROLE_BINDING]:
         raise RuntimeError(
             "refusing to mutate an absent, unowned, or rebound Worker")
-
-
-def _require_secret(config, name):
-    bindings = _worker_bindings(config)
-    matches = [
-        item for item in bindings
-        if isinstance(item, dict) and item.get("name") == name]
-    if len(matches) != 1 or matches[0].get("type") != "secret_text":
-        raise RuntimeError(f"Worker is missing required secret {name}")
+    _require_capabilities(
+        _config_for_incumbent(config, observed, bindings), bindings,
+        capability)
+    if _active_version(config) != version:
+        raise RuntimeError("concurrent notification deployment")
 
 
 def _require_bootstrap_sealed(config, environment=os.environ):
@@ -1308,9 +1705,7 @@ def _upload_release(configs, release_id, secrets_by_role):
             role, config, release_id=release_id,
             secrets_document=secrets_by_role.get(role))
         versions[role] = version
-        _require_candidate(
-            role, config, version,
-            tuple((secrets_by_role.get(role) or {}).keys()))
+        _require_candidate(role, config, version)
     return versions
 
 
@@ -1456,10 +1851,14 @@ def _activate_effects(configs, versions):
     """Attach traffic only while the exact complete release remains active."""
     _require_snapshot(configs, versions)
     _require_harness_absent(configs, versions["fcm"])
+    _require_private_release(configs)
+    _require_snapshot(configs, versions)
     try:
         _attach_effects(configs)
         _require_snapshot(configs, versions)
         _require_harness_absent(configs, versions["fcm"])
+        _require_private_release(configs)
+        _require_snapshot(configs, versions)
     except Exception:
         rollback_error = None
         try:
@@ -1471,6 +1870,11 @@ def _activate_effects(configs, versions):
         except Exception as harness_error:
             if rollback_error is None:
                 rollback_error = harness_error
+        try:
+            _require_private_release(configs)
+        except Exception as private_error:
+            if rollback_error is None:
+                rollback_error = private_error
         if rollback_error is not None:
             raise RuntimeError(
                 "notification activation failed and rollback verification "
@@ -1525,9 +1929,7 @@ def deploy():
         _require_effects_detached(configs)
         _require_harness_absent(configs, versions["fcm"])
         for role, config in zip(ROLE_KEYS, configs):
-            _require_candidate(
-                role, config, versions[role],
-                tuple((credentials.get(role) or {}).keys()))
+            _require_candidate(role, config, versions[role])
         if initial["fcm"] != versions["fcm"]:
             raise RuntimeError(
                 "stage and physically test the exact FCM version first")
@@ -1536,6 +1938,8 @@ def deploy():
             configs, scanner_absent=initial["scanner"] is _ABSENT)
         versions = _upload_release(configs, release_id, credentials)
     _promote_release(configs, versions, initial)
+    _require_private_release(configs)
+    _require_snapshot(configs, versions)
     if production or configs[0]["vars"]["NOTIFICATION_TEST_MODE"] == "1" \
             and configs[0]["vars"]["NOTIFICATIONS_ENABLED"] == "1":
         _activate_effects(configs, versions)
@@ -1595,6 +1999,8 @@ def _deploy_scanner_mode(mode):
     expected = dict(incumbent)
     expected["scanner"] = version
     _require_snapshot(configs, expected)
+    _require_private_release(configs)
+    _require_snapshot(configs, expected)
     if mode == BOOTSTRAP_NONE:
         _require_effects_detached(configs)
     else:
@@ -1602,9 +2008,24 @@ def _deploy_scanner_mode(mode):
         if not isinstance(cron, str) or not 0 < len(cron) <= 128:
             raise ValueError("CF_NOTIFICATION_CRON")
         _require_snapshot(configs, expected)
-        _wrangler(
-            "triggers", "deploy", "--triggers", cron,
-            "--config", str(SCANNER_CONFIG))
+        try:
+            _wrangler(
+                "triggers", "deploy", "--triggers", cron,
+                "--config", str(SCANNER_CONFIG))
+            _require_snapshot(configs, expected)
+            _require_private_release(configs)
+            _require_snapshot(configs, expected)
+        except Exception:
+            try:
+                _wrangler(
+                    "triggers", "deploy", "--config",
+                    str(SCANNER_CONFIG))
+                _require_effects_detached(configs)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "notification bootstrap activation failed and rollback "
+                    "verification failed") from rollback_error
+            raise
 
 
 def bootstrap_current():
@@ -1663,19 +2084,22 @@ def verify():
             raise RuntimeError("active Worker version differs from release")
         _require_owned(config)
     _require_harness_absent(configs, versions["fcm"])
+    _require_snapshot(configs, versions)
+    _require_private_release(configs)
+    _require_snapshot(configs, versions)
     _require_bootstrap_sealed(configs[1])
-    _require_secret(configs[3], "FIREBASE_SERVICE_ACCOUNT_JSON")
-    _require_secret(configs[2], "PUSH_NODE_SECRET")
     _require_retained_notification_objects(configs[0], configs[1])
     if configs[0]["vars"]["NOTIFICATIONS_ENABLED"] == "1":
         _require_effects_attached(configs)
     else:
         _require_effects_detached(configs)
+    _require_snapshot(configs, versions)
     queue = configs[1]["queues"]["producers"][0]["queue"]
     dlq = _safe_name(os.environ, "CF_NOTIFICATION_DLQ", queue + "-dlq")
     for name in (queue, dlq):
         result = _wrangler("queues", "info", name, capture=True)
         print(result.stdout, end="")
+    _require_snapshot(configs, versions)
     print(
         "ALERT REQUIRED: page on DLQ backlog_count > 0 and stale primary "
         "work; the R2 pending cursor preserves correctness while schedules "
@@ -1773,7 +2197,8 @@ Commands:
 
 def main(argv):
     if len(argv) == 3 and argv[1] == "stage-locked":
-        _stage_locked(argv[2])
+        with _worktree_operation_lock():
+            _stage_locked(argv[2])
         return 0
     command = argv[1] if len(argv) == 2 else "help"
     commands = {
@@ -1802,7 +2227,12 @@ def main(argv):
     if function is None:
         print(help_text(), file=sys.stderr, end="")
         return 2
-    function()
+    staging_commands = set(commands) - {"provision", "redrive"}
+    if command in staging_commands:
+        with _worktree_operation_lock():
+            function()
+    else:
+        function()
     return 0
 
 

@@ -363,7 +363,14 @@ into the same FCM RPC that
 may issue the irreversible provider request. The FCM boundary rejects release
 skew inside that call. A partial or competing four-Worker rollout can therefore
 delay work but cannot send through a mismatched release. The deploy tool checks
-these markers and the human owner before any update.
+these markers and the human owner before any update. It also compares each
+immutable provider version's complete binding inventory, default and named
+handlers, runtime flags, and exports with the generated least-authority role;
+unknown, missing, duplicated, or redirected authority fails closed without
+reading secret values. Before effects or a successful verification it checks
+the account-level Worker inventory, Workers.dev and preview subdomain state,
+and complete custom-domain result page, so a public or additional invocation
+surface cannot hide behind otherwise correct release markers.
 
 Changing a semantic identity binding is a drain/migration, not an in-place
 update; the owner marker alone cannot authorize it. The FactTree cursor uses
@@ -434,6 +441,14 @@ same exact project in `CF_FIREBASE_TEST_PROJECT_ID`; the service-account JSON
 must carry that bound project ID. The control token needs Worker and Queue
 permissions plus Workers R2 Storage Write, which Cloudflare currently requires
 even to read bucket lifecycle rules. First creation is explicit:
+
+Every staging command holds one fail-fast lock for this worktree from config
+generation through the last provider call. Wrangler and its `stage-locked`
+build descendant inherit that ownership, so another process cannot mix fixed
+config, bundle, secret, or manifest paths; an orphan provider child keeps the
+lock until it exits, while a crashed process with no child releases it without
+trusting or deleting the stale lock file. Use another worktree for a concurrent
+release.
 
 ```sh
 export CF_CREATE=1
