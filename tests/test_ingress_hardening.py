@@ -13,7 +13,6 @@ from core import (
     kernel,
     limits,
     merkle_map,
-    object_store,
     snapshot,
 )
 from core.crypto import h, keypair
@@ -108,7 +107,7 @@ def test_shared_pile_limits_fit_smallest_hosted_memory_ceiling():
         limits.MAX_PILE_JSON_VALUES,
         limits.MAX_PILE_FACTS,
     )
-    assert limits.MAX_FACT_BYTES == 16 * 1024
+    assert limits.MAX_FACT_BYTES == 4 * limits.MIB
     assert limits.MAX_PILE_FACTS == 256
     assert limits.MAX_PILE_BYTES == 5 * limits.MIB
     assert peak < limits.MIN_HOSTED_MEMORY_BYTES
@@ -264,18 +263,6 @@ def test_pile_and_root_reject_size_before_parsing(monkeypatch):
         monkeypatch.setattr(module, name, len(raw) - 1)
         with pytest.raises(PayloadTooLarge):
             decoder(raw)
-
-
-def test_object_admission_enforces_reader_bound_before_write(monkeypatch):
-    class NeverWritten:
-        def put_if_absent(self, *_args):
-            raise AssertionError("oversized object was written")
-
-    raw = b"too large"
-    monkeypatch.setattr(object_store, "MAX_OBJECT_BYTES", len(raw) - 1)
-    with pytest.raises(ValueError, match="address"):
-        run(RepositoryApplier(
-            "0" * 64, NeverWritten()).admit_object(h(raw), raw))
 
 
 def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):

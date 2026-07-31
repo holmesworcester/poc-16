@@ -496,12 +496,6 @@ class FullPeer:
         with self.lock:
             return _run_applier(self.applier(ws).stage(member, raw))
 
-    def receive_object(self, ws, oid, raw):
-        """Pass one inbound detached object through RepositoryApplier."""
-        with self.lock:
-            return _run_applier(
-                self.applier(ws).admit_object(oid, raw))
-
     # ---- rebuild: the store's own units through the same kernel --------------
 
     def rebuild(self, ws, *, republish=False):

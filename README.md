@@ -8,8 +8,8 @@ disposable full-client query and authorship accelerator.
 The implementation is deliberately strict about authority and direction:
 
 - `RepositoryApplier` is the only fact-pile-to-root capability. It is
-  database-free and owns immutable establishment, the root CAS, rejection
-  evidence, and retirement of its own internal pile generations.
+  database-free and owns immutable establishment and the root CAS for one
+  caller-named, retained source pile.
 - `RepositoryReader` is a pinned, database-free, side-effect-free read
   capability.
 - `HttpGate` is the one peer route and authorization capability over those
@@ -168,6 +168,13 @@ outbound-child exit closes that private dial, appears under
 it does not stop unrelated peers or bypass a failed request. Configuration is
 bounded to 64 peers per workspace, 128 Iroh peers per full peer, one 64-hex
 endpoint ID, and the Rust wrapper's 4 KiB decoded ticket ceiling.
+The wrapper admits at most its configured connection count; it immediately
+refuses overflow Iroh attempts before they can open a stream or loopback
+upstream. One setup deadline covers handshake, first stream, and upstream
+connect together, and one session deadline bounds the complete byte copy.
+Each admitted connection allows only its one protocol bidirectional stream;
+extra bidirectional and all unidirectional streams remain flow-control blocked,
+and application datagrams are disabled.
 Only one due background connection start is attempted per monitor turn, and
 an outbound child that never reports readiness is terminated and reaped
 inside the daemon's shutdown budget.
@@ -192,24 +199,21 @@ An authored unit follows one path:
 ```text
 facts command
     -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
-    -> RepositoryApplier reserves one stable internal generation
+    -> caller conditionally creates one exact, digest-addressed source
     -> kernel judges the exact closed pile
     -> pure compiler path-copies FactTree, SuppTree, and FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
-    -> one exact outcome-bound spend grants its sole retirement DELETE
     -> RepositoryReader pins the resulting root
 ```
 
-Generation identity is the durable create-only reservation, not the source
-path or a provider ETag. Byte-identical delivery by the same member is the
-same logical work and recovers the same reservation. Root-CAS losers keep that
-work and retry from the newer root. A lost CAS response is reconciled by
-reading the root. Retirement first creates one exact outcome-bound spend
-record; only a definitely fresh spend may issue DELETE. An ambiguous spend
-therefore fails safe by retaining already-discharged source bytes, and no
-restart or stale receipt may issue a second DELETE. One bad pile cannot wedge
-later pile generations.
+The exact immutable source is the retry record. Byte-identical delivery by the
+same member names the same local source; direct upload supplies its exact
+ingress key and digest. Root-CAS losers reapply that one source against the
+newer root. A lost CAS response is reconciled by reading `root`; replay after a
+confirmed commit is a no-op. The Applier never discovers work with LIST and
+never deletes a source, so concurrent workers can duplicate bounded immutable
+work without a queue, cursor, receipt, or destructive cleanup protocol.
 
 ## Facts, suppression, and deletion
 
@@ -301,10 +305,10 @@ serialized form, not preserve an obsolete original encoding.
 
 Peers do not proxy file bytes through Lambda or a Worker. A broker reads a
 pinned repository root to authorize an upload and returns exact, short-lived,
-create-only PUT capabilities. The client uploads:
-
-1. detached objects to an isolated ingress bucket;
-2. one exact fact pile marker last.
+create-only PUT capabilities. Each source uploads one exact fact-only closed
+pile marker to isolated ingress. A file upload sends the signed descriptor
+first and then one independently admissible inline Bao slice pile per range;
+there is no detached attachment-object phase.
 
 The stateful client owns this side of the protocol:
 `full_peer/upload_journal.py` durably spools immutable source bytes and one
@@ -326,30 +330,29 @@ reads or mutates repository state. A legacy v1 journal can still resume, but
 abandoned collection fails closed because v1 did not retain replaced-session
 expiry history.
 
-The marker is the durable work item. Notifications and LIST results are
-discovery hints; scheduled bounded rescans are the progress path, and only an
-exact bounded marker read can establish work.
+The pile is the durable work item. After its exact create-only PUT succeeds,
+`FINALIZE` names that pile's key and digest to the provider's private Applier.
+The request itself is the wake-up and work identity; no notification, LIST,
+queue, cron, or database is needed to discover it. A retry sends the same
+bounded request again.
 
 `RepositoryApplier` then:
 
-1. fetches and validates the exact marker;
+1. bounded-fetches and digest-checks the exact pile;
 2. checks the exact key/session/member/digest binding and that every ordinary
    fact names the configured workspace (the workspace-genesis fact is the
    sole ws-less exception);
-3. copies it behind the marker's one durably reserved internal generation;
-4. commits facts through the ordinary pile path;
-5. spends and retires only that internal generation;
-6. promotes referenced attachments in bounded round-robin pages.
+3. validates the complete closed pile through the ordinary kernel;
+4. establishes immutable fact and Merkle objects;
+5. performs the one root CAS and returns `applied`, `noop`, `rejected`, or
+   `retryable`.
 
-The Applier never deletes the client marker or detached ingress objects.
-F10 retires only the marker's separately reserved internal generation. Until
-an exact abandoned-session collection rule is proved, provider policy retains
-the complete client-writable namespace: the AWS broker role is conditional
-PUT-only and deployment admits only a no-lifecycle bucket, while Cloudflare
-uses an indefinite R2 bucket lock over the ingress prefix. Missing attachments
-do not block valid fact admission; immutable page receipts and a
-non-authoritative cursor let concurrent Workers duplicate bounded work without
-skipping completion or corrupting the tree.
+The Applier never deletes the client pile. Until an exact abandoned-session
+collection rule is proved, provider policy retains the complete client-writable
+namespace: the AWS broker role is conditional PUT-only and deployment admits
+only a no-lifecycle bucket, while Cloudflare uses an indefinite R2 bucket lock
+over the ingress prefix. Immutable source bytes plus root CAS let concurrent
+Workers duplicate bounded work without losing a pile or corrupting the tree.
 
 The marker's member component names the broker-authenticated upload session,
 not the author of every fact in a relayed closure. Per-fact signatures and
@@ -381,11 +384,12 @@ adapters:
   materialization;
 - create-only immutable writes with collision verification;
 - one linearizable conditional replace of `root`;
-- an opaque version token returned with the exact root bytes;
-- bounded, paginated LIST for discovery only.
+- an opaque version token returned with the exact root bytes.
 
-`get_bounded` and `list_page` are mandatory store operations, not compatibility
-wrappers around whole-object GET or whole-result LIST.
+`RepositoryApplier` requires only exact reads and conditional writes. It does
+not require LIST or DELETE. Other provider administration may expose bounded
+pagination, but it is outside pile application and cannot authorize a root
+mutation.
 
 The opaque provider version token is not the root content hash. Readers use
 the content hash as snapshot identity; Appliers use the opaque token only as
@@ -400,8 +404,9 @@ runtime uses the native R2 binding through `adapters/r2/worker.py`.
 
 AWS uses two externally owned buckets:
 
-- canonical: `root`, immutable `obj/`, internal `pile/`, and evidence;
-- ingress: client-created objects and pile markers.
+- canonical: `root` and immutable `obj/` (a full peer also stages exact local
+  `pile/` sources in this store);
+- ingress: client-created, immutable closed piles.
 
 The upload broker and repository Applier are separate Lambda stacks so their
 IAM authorities do not overlap.
@@ -468,10 +473,11 @@ python3 -m deploy.aws_repository_applier.manage deploy \
   --region REGION
 ```
 
-The template installs a one-minute recovery schedule. The handler also
-accepts bounded S3 notification records as hints. Stack removal deletes
-compute and logs only; it does not delete either bucket or the external
-secret.
+The Applier has no Function URL, bucket event, queue, or schedule. The broker's
+private `FINALIZE` path invokes it with exactly
+`{schema, workspace, key, digest}` after the client PUT; only the four-state
+result crosses back. Stack removal deletes compute and logs only; it does not
+delete either bucket or the external secret.
 
 ## Cloudflare deployment
 
@@ -484,7 +490,9 @@ bucket lock over the complete ingress prefix. The lock prevents overwrite,
 DELETE, and lifecycle expiry after an acknowledged PUT even if the parent
 credential is compromised, following the provider's
 [bucket-lock contract](https://developers.cloudflare.com/r2/buckets/bucket-locks/).
-The Applier has native bindings to both buckets and a one-minute cron.
+The Applier has native bindings to both buckets and a private service binding
+from the broker. It has no public route or cron trigger: broker `FINALIZE`
+invokes exactly one named pile after its create-only PUT.
 
 Set the non-secret deployment inputs:
 
@@ -548,9 +556,9 @@ Superseded intermediate Merkle pages are released during the batch, kernel
 closure sets are compact bitsets, and a just-staged pile reuses its already
 verified body instead of fetching a second live copy.
 
-The shared hard cuts are a 16 KiB inline fact, 256 facts per closed pile,
-5 MiB per pile, 4 MiB per detached object, 48 KiB authenticated pages, and a
-512-page path. The executable conservative accounting peaks at 113,008,656
+The shared hard cuts are a 4 MiB canonical fact, 256 facts per closed pile,
+5 MiB per pile, 48 KiB authenticated pages, and a 512-page path. The executable
+conservative accounting peaks at 113,008,656
 bytes, leaving 14,991,344 bytes below Cloudflare's 128,000,000-byte isolate
 limit. It is an implementation ratchet, not a formal heap proof or a live
 workerd/Pyodide measurement.
@@ -559,14 +567,14 @@ The smaller incremental algorithm establishes one immutable changed path at a
 time and CASes only the final composite root. A real R2-adapter test covers a
 249-fact genesis and a second nonempty 249-fact append in fewer than 25,000
 provider calls; the conservative maximum-shape ceiling is 8,137,488 against
-the configured 10,000,000. Current one-pile Bao authoring is honestly capped
-at 16 MiB until multi-pile file authoring exists.
+the configured 10,000,000. File authoring emits a small signed descriptor pile
+and one independently closed inline Bao-slice pile per range, so file size no
+longer has to fit one pile and no detached object protocol is involved.
 
-Cloudflare deployment is not yet complete at this maximum. The checked-in
-one-minute cron has its real 30-second CPU cap, and process-local singleflight
-does not serialize different isolates. The open Queue work makes an R2-event
-and cron-recovery Queue the sole trigger, with batch size and concurrency one;
-live provider conformance follows. See
+Each hosted invocation applies exactly one caller-named pile. Concurrent
+isolates may race on the root CAS; losers return `retryable` and the caller
+reinvokes that same retained source. Live provider conformance still follows.
+See
 [DESIGN.md](DESIGN.md#51-hosted-turn-envelope).
 
 No 50k/200k fact-rate or file-throughput number is asserted here. Those larger

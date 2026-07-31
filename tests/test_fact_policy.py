@@ -16,7 +16,7 @@ from core.suppression import (
 )
 from facts import _policy
 from facts.auth.signature import signature
-from facts.content import chunk as chunk_family
+from facts.content import file_slice as slice_family
 from facts.content import message as message_family
 
 from .util import add_member, member_src, send_bytes
@@ -43,9 +43,10 @@ def test_one_registry_exhaustively_covers_the_router():
     ) == (SELF,)
     assert tuple(
         rule.kind
-        for rule in facts.family_for("chunk").POLICY.suppression
-    ) == (SELF, PARENT)
-    for tag in ("msg", "file_bao", "chunk"):
+        for rule in facts.family_for("file_slice").POLICY.suppression
+    ) == (PARENT,)
+    assert facts.family_for("file_slice").POLICY.direct_targets == ()
+    for tag in ("msg", "file_bao"):
         direct = facts.family_for(tag).POLICY.direct_targets
         assert direct
         assert all(
@@ -211,28 +212,20 @@ def test_runtime_policy_rejects_a_forged_nonparent(
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     descriptor_fid = send_bytes(
         node, workspace, "one.bin", b"ancestor", ts=10)
-    original = node.by_type(workspace, "chunk")[0]
+    original = node.by_type(workspace, "file_slice")[0]
     atoms = [
         marker[:] if not (
             marker[0] == "supp" and marker[1] == PARENT
         ) else [*marker[:3], "f" * 64]
         for marker in original.atoms
     ]
-    forged = Fact(original.t, 11, atoms, dict(original.body), workspace)
-    secret, public = node.identity(workspace)
-    signed = signature(secret, public, forged, forged.ts)
-    monkeypatch.setattr(chunk_family, "validate", lambda fact, ctx: True)
+    forged = Fact(
+        original.t, original.ts, atoms, dict(original.body), workspace)
+    monkeypatch.setattr(slice_family, "validate", lambda fact, ctx: True)
 
     with pytest.raises(ValueError, match="not admitted"):
         node.ingest_new(
-            workspace, [signed, forged], {
-                signed.fid: [],
-                forged.fid: [
-                    descriptor_fid,
-                    signed.fid,
-                    member_src(node, workspace, public),
-                ],
-            })
+            workspace, [forged], {forged.fid: [descriptor_fid]})
     assert node.fact_of(workspace, forged.fid) is None
 
 
@@ -290,8 +283,6 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
         node, workspace, "general", "Bob's message", ts=20)
     descriptor = send_bytes(
         node, workspace, "bob.bin", b"Bob's bytes", ts=21)
-    chunk = node.by_type(workspace, "chunk")[0].fid
-
     direct = {
         tag
         for tag, family in facts.FAMILIES.items()
@@ -303,14 +294,11 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
     targets = {
         "msg": posted,
         "file_bao": descriptor,
-        "chunk": chunk,
     }
     assert set(targets) == direct
 
     node.bind_identity(workspace, founder)
-    # A descriptor suppresses its chunks, so exercise the direct chunk target
-    # first; every action still travels through the ordinary fact pipeline.
-    for ts, tag in enumerate(("chunk", "msg", "file_bao"), start=30):
+    for ts, tag in enumerate(("msg", "file_bao"), start=30):
         target = targets[tag]
         action_fid = facts.content.delete.remove(
             node, workspace, target, ts=ts)

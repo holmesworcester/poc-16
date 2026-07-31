@@ -118,15 +118,6 @@ class Peer:
             "GET", f"/page/{oh}", response_limit=response_limit)
         return b
 
-    def put_obj(self, oid, value):
-        """Deliver one immutable object before facts that may name it."""
-        if not isinstance(value, bytes) or len(value) > MAX_OBJECT_BYTES \
-                or h(value) != oid:
-            raise ValueError("immutable object address")
-        self._http(
-            "PUT", f"/page/{oid}", data=value, require_push=True,
-            response_limit=MAX_CONTROL_BYTES)
-
     def objs(self, oids):
         """Fetch an ordered object batch, splitting a provider-sized 413."""
         oids = tuple(oids)
@@ -166,44 +157,3 @@ class Peer:
         self._http(
             "PUT", f"/pile/{self.node.member_for(self.ws)}/{h(b)}", data=b,
             require_push=True, response_limit=MAX_CONTROL_BYTES)
-
-    def poke(self):
-        self._http("POST", "/poke", data=b"", auth=False)
-
-
-def _fetch_blobs(node, ws, peer):
-    """Fetch missing spilled objects.
-
-    Return ``(landed_fids, complete)`` so a caller stamps an ETag only after
-    every live reference is present; a transient bad/missing proof must retry
-    on the next unchanged-root dial.
-    """
-    st = node.store(ws)
-    with node.lock:
-        node._sync_sql(ws)
-        projection = node.sql(ws)
-        pending = []
-        for fid in projection.fact_ids():
-            fact = projection.fact(fid)
-            if projection.suppresses(fact):
-                continue
-            refs = families.blob_refs(fact)
-            if refs:
-                pending.append((fid, refs))
-    landed, complete = [], True
-    for fid, refs in pending:
-        fetched = False
-        whole = True
-        for oid in refs:
-            if st.has("obj/" + oid):
-                continue
-            blob = peer.obj(oid, response_limit=MAX_OBJECT_BYTES)
-            if blob and h(blob) == oid:
-                node.receive_object(ws, oid, blob)
-                fetched = True
-            else:
-                whole = False
-                complete = False
-        if whole and fetched:
-            landed.append(fid)
-    return landed, complete

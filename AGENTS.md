@@ -103,18 +103,18 @@ FactTree residence and its SuppTree scopes directly. SQLite mirrors canonical
 fact bytes plus generic index rows for local authorship and presentation only;
 it must be deletable and rebuildable from a pinned Reader.
 
-Direct-upload clients write detached immutable objects first and one exact
-closed pile marker last into isolated ingress. Notifications and LIST results
-are liveness hints only. The Applier uses an exact marker as the stable identity
-of one durably reserved internal generation and invokes the same transition
-used by a full peer.
+Direct-upload clients write one exact fact-only closed-pile marker into
+isolated ingress. File descriptors and each inline Bao slice are independent
+piles. Notifications and LIST results are liveness hints only. The Applier
+uses an exact marker as the stable identity of one durably reserved internal
+generation and invokes the same transition used by a full peer.
 
 ## Fact families
 
 Use one module per family under `facts/auth/` or `facts/content/`. Families own
 construction, exact shape checks, named Needs, immutable refs/offers,
 suppression selectors/actions, authority scopes, ownership, commands, query
-assembly, and detached blob references. `facts/__init__.py` is the checked
+assembly, and inline payload validation. `facts/__init__.py` is the checked
 registry. Keep core family-neutral; it may dispatch through `facts`, but it
 must not import concrete family modules or switch on their tags.
 
@@ -146,8 +146,8 @@ retiring recreated work.
 
 Stale workers may duplicate bounded immutable work or delay convergence. They
 must not overwrite different bytes at an object key, clobber a newer root,
-retire another generation, skip required detached-object completion, mint
-from unobserved state, or corrupt a Merkle tree.
+retire another generation, mint from unobserved state, or corrupt a Merkle
+tree.
 
 ## Change rules
 

@@ -389,7 +389,7 @@ def test_applier_owns_object_establishment_and_exact_source_identity():
     }
 
 
-def test_inbound_canonical_objects_have_one_semantic_write_door():
+def test_canonical_objects_have_no_detached_write_door():
     callers = {
         path.as_posix()
         for path in source_paths()
@@ -398,10 +398,7 @@ def test_inbound_canonical_objects_have_one_semantic_write_door():
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "admit_object"
     }
-    assert callers == {
-        "core/http.py",
-        "full_peer/node.py",
-    }
+    assert callers == set()
 
     # Provider adapters expose mutation mechanics and deployment code may
     # conditionally create isolated ingress. Neither is another canonical
@@ -522,11 +519,11 @@ def test_ordinary_pile_surfaces_have_no_embedded_object_channel():
 
 
 def test_pile_sender_owns_outbound_peer_delivery():
-    for method in ("put_obj", "put_pile"):
-        assert {
-            path.as_posix()
-            for path, _ in calls_named(method)
-        } == {"full_peer/pile_sender.py"}
+    assert {
+        path.as_posix()
+        for path, _ in calls_named("put_pile")
+    } == {"full_peer/pile_sender.py"}
+    assert calls_named("put_obj") == []
 
 
 def test_reader_is_side_effect_free_and_owns_subordinate_view_construction():
@@ -709,15 +706,22 @@ def test_sync_file_and_status_boundaries_keep_explicit_io_budgets():
         if isinstance(item, ast.FunctionDef)
         and item.name == "ingress_failures")
 
-    for method in (remote_fetch, *file_reads):
+    remote_attributes = {
+        call.func.attr
+        for call in ast.walk(remote_fetch)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+    }
+    assert "get_bounded" in remote_attributes
+    assert "get" not in remote_attributes
+    for method in file_reads:
         attributes = {
             call.func.attr
             for call in ast.walk(method)
             if isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
         }
-        assert "get_bounded" in attributes
-        assert "get" not in attributes
+        assert {"get", "get_bounded"}.isdisjoint(attributes)
     failure_attributes = {
         call.func.attr
         for call in ast.walk(failures)

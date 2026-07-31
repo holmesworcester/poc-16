@@ -1,10 +1,9 @@
 """close(): the canonical-topo serializer, and the wire ingress unit codec.
 
 Ingress, request, invite, and sync-push piles use the same ordered fact-list
-codec. Detached immutable objects have their own object-ingress capability;
-they are never smuggled through a pile. Published fact bodies instead have one
-canonical content-addressed residence; FactOrder stores only key-to-object
-references and deliberately does not introduce a second body or pile codec.
+codec. Published fact bodies have one canonical content-addressed residence;
+FactOrder stores only key-to-object references and deliberately does not
+introduce a second body or pile codec.
 close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
@@ -32,8 +31,8 @@ def check_pile_bounds(raw):
     The small lexical scanner finds a root ``facts`` key under any JSON
     whitespace/key order and counts arbitrary top-level array values without
     decoding their bodies. Malformed input that cannot amplify that array
-    continues to the exact decoder, where the RepositoryApplier can retain
-    typed rejection evidence.
+    continues to the exact decoder, where the RepositoryApplier returns the
+    typed result for that one retained source.
     """
     if not isinstance(raw, bytes):
         raise InvalidEncoding("pile bytes")

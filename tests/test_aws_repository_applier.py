@@ -8,7 +8,8 @@ import pytest
 
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
-from core.repository_applier import RepositoryApplier
+from core.object_store import ensure_object_async
+from core.repository_applier import RepositoryApplier, async_store
 from core.repository_reader import RepositoryReader
 from core.staged_intent import staging_key
 from core.store import FsStore
@@ -294,8 +295,7 @@ def test_existing_but_unreadable_immutable_never_confirms_equality():
         client=DenyReads(),
     )
     with pytest.raises(ValueError, match="conflict"):
-        asyncio.run(RepositoryApplier(
-            workspace, store).admit_object(oid, raw))
+        asyncio.run(ensure_object_async(async_store(store), oid, raw))
 
 
 def test_lambda_handler_returns_retryable_exact_result(monkeypatch):

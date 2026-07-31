@@ -3,9 +3,10 @@
 ``RepositoryApplier`` is database-free and provider-neutral.  Its caller
 names one create-only source object.  The applier exact-reads and validates
 that complete closed pile, establishes immutable fact and Merkle objects,
-advances the one mutable root by CAS, and returns.  It never discovers or
-deletes work and never completes detached objects.  Retrying the same immutable
-source is idempotent because the authenticated repository is a monotone set.
+advances the one mutable root by CAS, and returns. It never discovers or
+deletes work. Inline Bao slices are ordinary facts, so there is no secondary
+object-completion path. Retrying the same immutable source is idempotent
+because the authenticated repository is a monotone set.
 """
 from dataclasses import dataclass, field
 import inspect
@@ -149,10 +150,6 @@ class RepositoryApplier:
         await self._put_exact(self.store, source, raw)
         return source
 
-    async def admit_object(self, oid, raw):
-        """Establish one independently supplied immutable object."""
-        return await ensure_object_async(self.store, oid, raw)
-
     async def receive_pile(self, member, raw):
         """Create and immediately apply one local exact source."""
         source = await self.stage(member, raw)
@@ -259,13 +256,6 @@ class RepositoryApplier:
                     and current.value == proposal.root:
                 return ApplyResult(
                     "confirmed", proposal.root, proposal.admitted)
-            if (
-                    current is ABSENT and proposal.base_root is None
-                    or isinstance(current, Versioned)
-                    and current.value == proposal.base_root
-                    and current.token == proposal.base_token):
-                return ApplyResult(
-                    "retryable", proposal.base_root, proposal.admitted)
             return ApplyResult(
                 "retryable", proposal.base_root, proposal.admitted)
         if result is STALE:
@@ -297,6 +287,8 @@ class RepositoryApplier:
 
         try:
             proposal = await self.propose(source, payload, raw)
+        except RepositoryAnchorPending:
+            return ApplyResult("retryable", None)
         except PermanentIngressRejection:
             return ApplyResult("rejected", None)
         return await self.commit(source, payload, proposal)

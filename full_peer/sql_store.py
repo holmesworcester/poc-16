@@ -54,6 +54,23 @@ def _tables(db):
     }
 
 
+def _index_filter(kind, k0, k1, source_type, source_prefix=None):
+    clauses, args = ["i.kind=?"], [kind]
+    for column, value in (("i.k0", k0), ("i.k1", k1)):
+        if value is not None:
+            clauses.append(column + "=?")
+            args.append(value)
+    if source_type is not None:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM fact_index t "
+            "WHERE t.src=i.src AND t.kind=? AND t.k0=? AND t.k1='')")
+        args.extend((TYPE_INDEX, source_type))
+    if source_prefix is not None:
+        clauses.extend(("i.src>=?", "i.src<?"))
+        args.extend((source_prefix, source_prefix + "\uffff"))
+    return " AND ".join(clauses), args
+
+
 def _compatible(db):
     return db.execute("PRAGMA user_version").fetchone()[0] \
         == SCHEMA_VERSION and _tables(db) == set(_COLUMNS) and all(
@@ -138,25 +155,12 @@ class SqlStore:
             self, kind, k0=None, k1=None, *,
             source_type=None, source_prefix=None):
         """Return validated facts at one generic address in fid order."""
-        clauses, args = ["i.kind=?"], [kind]
-        if k0 is not None:
-            clauses.append("i.k0=?")
-            args.append(k0)
-        if k1 is not None:
-            clauses.append("i.k1=?")
-            args.append(k1)
-        if source_type is not None:
-            clauses.append(
-                "EXISTS (SELECT 1 FROM fact_index t "
-                "WHERE t.src=i.src AND t.kind=? AND t.k0=? AND t.k1='')")
-            args.extend((TYPE_INDEX, source_type))
-        if source_prefix is not None:
-            clauses.extend(("i.src>=?", "i.src<?"))
-            args.extend((source_prefix, source_prefix + "\uffff"))
+        where, args = _index_filter(
+            kind, k0, k1, source_type, source_prefix)
         rows = self.db.execute(
             "SELECT i.src, f.blob FROM fact_index i "
             "JOIN facts f ON f.fid=i.src "
-            f"WHERE {' AND '.join(clauses)} ORDER BY i.src",
+            f"WHERE {where} ORDER BY i.src",
             args,
         )
         seen, out = set(), []
@@ -166,6 +170,15 @@ class SqlStore:
             seen.add(fid)
             out.append(self._fact((raw,), fid))
         return tuple(out)
+
+    def count_indexed(
+            self, kind, k0=None, k1=None, *, source_type=None):
+        """Count distinct facts at one generic address without loading bodies."""
+        where, args = _index_filter(kind, k0, k1, source_type)
+        return self.db.execute(
+            "SELECT COUNT(DISTINCT i.src) FROM fact_index i "
+            f"WHERE {where}", args,
+        ).fetchone()[0]
 
     def active(self, sid):
         return self.db.execute(

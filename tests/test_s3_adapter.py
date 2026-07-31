@@ -25,8 +25,9 @@ from core.object_store import (
     StoreError,
     Versioned,
     VersionToken,
+    ensure_object_async,
 )
-from core.repository_applier import RepositoryApplier
+from core.repository_applier import async_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,8 +35,7 @@ WORKSPACE = "0" * 64
 
 
 def establish(store, oid, raw):
-    return asyncio.run(
-        RepositoryApplier(WORKSPACE, store).admit_object(oid, raw))
+    return asyncio.run(ensure_object_async(async_store(store), oid, raw))
 
 
 class ServiceError(Exception):
@@ -215,7 +215,7 @@ def test_conditional_object_create_sends_address_checksum_and_header():
     })]
 
 
-def test_applier_verifies_both_collision_and_unknown_outcome():
+def test_immutable_create_verifies_collision_and_unknown_outcome():
     raw = b"immutable bytes"
     oid = h(raw)
 
@@ -244,7 +244,7 @@ def test_applier_verifies_both_collision_and_unknown_outcome():
         establish(S3Store(config(), client=wrong_client), oid, raw)
 
 
-def test_applier_retries_once_after_unknown_and_strong_absent_read():
+def test_immutable_create_retries_once_after_unknown_and_absent_read():
     raw = b"immutable bytes"
     oid = h(raw)
     client = ScriptedClient(

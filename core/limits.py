@@ -22,10 +22,10 @@ MAX_OBJECT_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
-# Inline facts stay small; detached Bao objects carry large content.  This
-# makes the complete 256-fact closure fit one pile by construction instead of
-# relying on every present and future family to invent a second size system.
-MAX_FACT_BYTES = 16 * 1024
+# Every database-free hosted Reader must be able to return canonical facts and
+# public invite envelopes admitted by the shared engine. Inline Bao proofs
+# are ordinary fact bodies under the same bound.
+MAX_FACT_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_REPOSITORY_OBJECT_BYTES = max(
     MAX_FACT_BYTES, MAX_MERKLE_PAGE_BYTES)

@@ -75,22 +75,26 @@ def bench_overhead(sizes):
             outboard = os.path.join(scratch, "outboard")
             root = bao.prepare(path, outboard)
             count = bao.geometry(size)
-            proof_bytes = sum(
+            proof_sizes = [
                 len(bao.proof(path, outboard, index, size))
-                for index in range(count))
+                for index in range(count)
+            ]
+            proof_bytes = sum(proof_sizes)
             descriptor = file_family.file(
                 "0" * 64, "a" * 64, "general", "x.bin",
                 size, root, count, 1)
             rows.append({
                 "mb": size / 1e6,
-                "chunks": count,
+                "slices": count,
                 "proof_pct": (
                     (proof_bytes - size) / size * 100 if size else 0),
-                "proof_per_chunk": (
+                "proof_per_slice": (
                     (proof_bytes - size) // count if count else 0),
+                "max_proof_b64": (
+                    4 * ((max(proof_sizes) + 2) // 3)
+                    if proof_sizes else 0),
                 "descriptor_b": len(json.dumps(descriptor.to_json())),
                 "outboard_mb": os.path.getsize(outboard) / 1e6,
-                "tree_keys": 2 * count + 2,
             })
     return rows
 
@@ -114,7 +118,7 @@ def bench_send(size):
         saved = now()
         return {
             "mb": size / 1e6,
-            "chunks": record["total"],
+            "slices": record["total"],
             "send_s": sent - start,
             "send_mb_s": size / 1e6 / (sent - start),
             "save_s": saved - save_start,
@@ -203,7 +207,7 @@ def bench_download(size, timeout=3600):
             else:
                 have = record["have"] if rows else 0
                 total = record["total"] if rows else "?"
-                raise RuntimeError(f"timed out at {have}/{total} chunks")
+                raise RuntimeError(f"timed out at {have}/{total} slices")
             received = now()
             finished.set()
             sampler.join(timeout=2)
@@ -215,7 +219,7 @@ def bench_download(size, timeout=3600):
             mb = size / 1e6
             return {
                 "mb": mb,
-                "chunks": record["total"],
+                "slices": record["total"],
                 "send_mb_s": mb / (sent - start),
                 "ttfvc_s": first - sent,
                 "dl_s": received - sent,
@@ -232,31 +236,31 @@ def bench_download(size, timeout=3600):
 
 def print_rows(mode, sizes):
     if mode == "overhead":
-        print("      MB  chunks  proof%   B/chunk  descr B  outboard MB  tree keys")
+        print("      MB  slices  proof%   B/slice  max b64  descr B  outboard MB")
         for row in bench_overhead(sizes):
             print(
-                f"{row['mb']:8.0f} {row['chunks']:7} "
-                f"{row['proof_pct']:7.3f} {row['proof_per_chunk']:9} "
-                f"{row['descriptor_b']:8} {row['outboard_mb']:12.2f} "
-                f"{row['tree_keys']:10}")
+                f"{row['mb']:8.0f} {row['slices']:7} "
+                f"{row['proof_pct']:7.3f} {row['proof_per_slice']:9} "
+                f"{row['max_proof_b64']:8} {row['descriptor_b']:8} "
+                f"{row['outboard_mb']:12.2f}")
         return
     if mode == "send":
-        print("      MB  chunks   send s  send MB/s   save s  save MB/s"
+        print("      MB  slices   send s  send MB/s   save s  save MB/s"
               "  store MB  RSS GB  ok")
         for size in sizes:
             row = bench_send(size)
             print(
-                f"{row['mb']:8.0f} {row['chunks']:7} {row['send_s']:8.2f} "
+                f"{row['mb']:8.0f} {row['slices']:7} {row['send_s']:8.2f} "
                 f"{row['send_mb_s']:10.1f} {row['save_s']:8.2f} "
                 f"{row['save_mb_s']:10.1f} {row['store_mb']:9.1f} "
                 f"{row['peak_rss_gb']:7.2f} {'✓' if row['ok'] else '✗':>3}")
         return
-    print("      MB  chunks  send MB/s  first s     dl s  dl MB/s"
+    print("      MB  slices  send MB/s  first s     dl s  dl MB/s"
           "  wall MB/s  RSS tx  RSS rx  ok")
     for size in sizes:
         row = bench_download(size)
         print(
-            f"{row['mb']:8.0f} {row['chunks']:7} {row['send_mb_s']:10.1f} "
+            f"{row['mb']:8.0f} {row['slices']:7} {row['send_mb_s']:10.1f} "
             f"{row['ttfvc_s']:8.2f} {row['dl_s']:8.2f} "
             f"{row['dl_mb_s']:8.1f} {row['wall_mb_s']:10.1f} "
             f"{row['rss_send_gb']:7.2f} {row['rss_recv_gb']:7.2f} "

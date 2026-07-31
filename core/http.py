@@ -294,8 +294,6 @@ class HttpGate:
         """Maximum request bytes before any transport reads the body."""
         method = method.upper()
         path = "/" + path.strip("/")
-        if method == "PUT" and path.startswith("/page/"):
-            return MAX_OBJECT_BYTES
         if method == "PUT" and path.startswith("/pile/"):
             return MAX_PILE_BYTES
         if method == "POST" and path == "/mint":
@@ -343,22 +341,6 @@ class HttpGate:
                 })
         if path.startswith("/ctl"):
             return Response(405)
-        if method == "PUT" and path.startswith("/page/"):
-            if self.receiver is None:
-                return Response(405)
-            if not self._member(headers, trusted_now, require_push=True):
-                return Response(401)
-            oid = path.removeprefix("/page/")
-            if not OID_RE.fullmatch(oid):
-                return Response(404)
-            if not isinstance(body, bytes) or len(body) > MAX_OBJECT_BYTES \
-                    or h(body) != oid:
-                return Response(400)
-            try:
-                await self.receiver.admit_object(oid, body)
-            except Exception:
-                return Response(400)
-            return Response(204)
         if method == "PUT" and path.startswith("/pile/"):
             if self.receiver is None:
                 return Response(405)

@@ -21,9 +21,10 @@ from core.object_store import (
     OutcomeUnknown,
     STALE,
     VersionToken,
+    ensure_object_async,
     verified_object,
 )
-from core.repository_applier import RepositoryApplier
+from core.repository_applier import async_store
 from core.limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -39,8 +40,7 @@ WORKSPACE = "0" * 64
 
 
 def establish(store, oid, raw):
-    return asyncio.run(
-        RepositoryApplier(WORKSPACE, store).admit_object(oid, raw))
+    return asyncio.run(ensure_object_async(async_store(store), oid, raw))
 
 
 def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
@@ -117,7 +117,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
     assert store.read_versioned("root").value == b"root"
 
 
-def test_applier_reconciles_ambiguous_create_and_verifies_collision():
+def test_immutable_create_reconciles_ambiguity_and_verifies_collision():
     raw, other = b"wanted", b"wrong"
     oid = h(raw)
 
