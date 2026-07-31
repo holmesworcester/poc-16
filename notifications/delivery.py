@@ -34,6 +34,7 @@ MAX_NOTIFICATION_FETCH_BYTES = 32 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 4_096
 MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000
 MAX_TTL_SECONDS = 28 * 24 * 60 * 60
+MAX_FIREBASE_ROUTES = 32
 
 
 class InvalidPublicationHint(ValueError):
@@ -173,6 +174,28 @@ class _Budget:
         self.rows += count
         if self.rows > MAX_MATCH_ROWS:
             raise ValueError("notification match row budget")
+
+
+def delivery_domain_id(push_node, routes):
+    """Name one stable Firebase delivery authority, not its wake carrier."""
+    if not valid_fid(push_node) or not isinstance(routes, tuple) \
+            or not 1 <= len(routes) <= MAX_FIREBASE_ROUTES:
+        raise ValueError("notification delivery domain")
+    normalized = []
+    for route in routes:
+        if not isinstance(route, tuple) or len(route) != 3 \
+                or not all(valid_bounded_text(
+                    value, MAX_ATOM_VALUE_BYTES) for value in route):
+            raise ValueError("notification delivery route")
+        normalized.append(route)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("duplicate notification delivery route")
+    normalized.sort()
+    return h(canon([
+        "notification-delivery-domain-v1",
+        push_node,
+        [list(route) for route in normalized],
+    ]))
 
 
 def _postings(view, kind, k0, k1, budget):
@@ -452,6 +475,7 @@ __all__ = (
     "CurrentRootBehind",
     "DeliveryResult",
     "InvalidPublicationHint",
+    "MAX_FIREBASE_ROUTES",
     "MAX_NOTIFICATION_FETCHES",
     "MAX_NOTIFICATION_FETCH_BYTES",
     "NotificationIntent",
@@ -464,6 +488,7 @@ __all__ = (
     "PushUnregistered",
     "derive",
     "derive_awaited",
+    "delivery_domain_id",
     "request_for",
     "seal_target",
     "trigger_for",

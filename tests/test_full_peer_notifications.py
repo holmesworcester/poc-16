@@ -27,8 +27,11 @@ from tests.util import all_fids, closed_subset, deliver
 @dataclass
 class ScriptedProvider:
     outcomes: list
+    project: str = "firebase-project"
 
     def __post_init__(self):
+        self.delivery_routes = (
+            ("poc16.mobile", "production", self.project),)
         self.requests = []
         self.lock = threading.Lock()
 
@@ -102,6 +105,22 @@ def test_workspace_requires_explicit_notification_bootstrap(tmp_path):
     assert service.status()["workspaces"][workspace]["error"] \
         == "CursorNotInitialized"
     assert provider.requests == []
+
+
+def test_cursor_owner_binds_firebase_project_not_provider_instance(tmp_path):
+    node, workspace, _provider, service = _world(tmp_path)
+    replacement = FullPeerNotifications(
+        node, node.dir, service.secret, ScriptedProvider([]))
+
+    assert replacement.owner == service.owner
+    assert replacement.bootstrap(workspace, "current")["mode"] == "current"
+
+    changed = FullPeerNotifications(
+        node, node.dir, service.secret,
+        ScriptedProvider([], project="different-firebase-project"))
+    assert changed.owner != service.owner
+    with pytest.raises(ValueError, match="bootstrap conflict"):
+        changed.bootstrap(workspace, "current")
 
 
 def test_transient_fcm_retry_preserves_cursor_and_restart_resumes(
@@ -395,6 +414,9 @@ def test_notification_scheduler_failure_never_fails_peer_service(tmp_path):
 def test_hung_provider_cannot_block_peer_publication_or_fail_service(
         tmp_path):
     class BlockingProvider:
+        delivery_routes = (
+            ("poc16.mobile", "production", "firebase-project"),)
+
         def __init__(self):
             self.entered = threading.Event()
             self.release = threading.Event()

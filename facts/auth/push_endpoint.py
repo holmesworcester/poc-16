@@ -226,7 +226,7 @@ def _current(node, workspace, owner, installation):
 def register(
         node, workspace, installation, push_node, platform, application,
         environment, sealed_target, ts=None):
-    """Register canonical base64 ciphertext; never accept a raw FCM token."""
+    """Register canonical base64 ciphertext; never accept a raw FID."""
     secret, public = node.identity(workspace)
     with node.lock:
         member, device, owner = _authority(node, workspace, public)
