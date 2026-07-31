@@ -45,6 +45,9 @@ Each effect has one owner:
 | establish immutable repository objects | `RepositoryApplier` |
 | compile authenticated maps | `repository_snapshot` |
 | compare-and-swap `root` | `RepositoryApplier` |
+| derive notification jobs from a committed root | injected publication effect |
+| publish a resolved job to a managed queue | push dispatcher |
+| send a resolved job to FCM | selected push-node consumer |
 | retire an internal pile generation | `RepositoryApplier` |
 | answer from a pinned root | `RepositoryReader` |
 | assemble local presentation | family queries over disposable SQL |
@@ -410,6 +413,178 @@ Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
 bytes, clobber a newer root, retire another generation, skip detached-object
 completion, or corrupt a Merkle tree.
+
+### 5.1 Mobile-notification derivation
+
+Notification intent is authenticated workspace state, while notification
+delivery is derived operational state. It is deliberately not a fourth Merkle
+map, PushTree, SQL authority, queue-side selector, or general UI watch system.
+The authority flow is:
+
+```text
+endpoint + preference + trigger facts
+    -> winning committed root
+    -> bounded authenticated indexed join
+    -> create-only independent push jobs and completion result
+    -> source-generation retirement
+    -> bounded dispatcher scan
+    -> at-least-once managed queue
+    -> selected push-node consumer
+    -> FCM for Android or Apple/APNs
+```
+
+The `push_endpoint` family describes one mobile installation. Its immutable
+body binds an authoring device key, durable owner user, stable installation ID,
+selected push-node public key, platform, application, environment, and the FCM
+installation ID sealed to that push node. The plaintext target is never a fact,
+offer, index row, queue log field, or provider error. Its Needs prove the fact
+signature, the complete `member(device, owner)` address, and the complete
+`device_key(device, owner)` address. Continuing member and device scopes make
+the endpoint ineligible after owner/device removal without deleting history.
+The family permits ordinary exact SELF deletion. Rotation publishes a new
+endpoint and exact deletion of the old endpoint in one pile; old and new facts
+remain durable while only the replacement is current.
+
+The `notification_preference` family describes user state, not device state.
+One cell is `(user, global, "")` or `(user, channel, channel-id)`. Every enrolled
+device for that user may author an update through signature, member, and device
+Needs. A preference deliberately declares no continuing device scope: removal
+ends future connection and authorship but cannot erase a setting already shared
+by all of the user's devices.
+
+Each preference update contains numbered exact `supersedes` refs. Its Lamport
+counter is zero with no parents and otherwise one plus the maximum parent
+counter. The counter validates the declared DAG; it neither manufactures an
+edge nor chooses a winner. The current heads are exactly resident cell facts
+not named by another resident cell fact's explicit supersedes refs. Normal
+commands supersede every observed head. Concurrent heads coexist and meet by
+restrictiveness:
+
+```text
+none < mentions < all
+```
+
+Thus a concurrent mute wins. A channel head may also be `inherit`; if the
+resolved channel cell inherits, the global cell decides. No endpoint appears
+in a preference fact, so one preference change applies to every current and
+future installation for that user.
+
+Positive preference values emit mechanical route offers as a discovery
+superset. Global `mentions` or `all` offers
+`notification.route.type(msg, user)`; a positive channel override offers
+`notification.route.channel(channel, user)`. Every preference also offers
+`notification.preference(user, cell-id)`. Superseded positive facts remain
+indexed, as all durable facts do. They can nominate a candidate user but cannot
+decide delivery; the matcher always reconstructs the full cell and resolves
+its explicit heads.
+
+A trigger-capable fact family owns a small pure `notification_trigger` hook.
+For a message, the hook returns the canonical channel, canonical mentioned-user
+IDs carried by the message fact, and the exact `msg` and channel route probes.
+It never parses display text or supplies an arbitrary predicate. A family with
+no hook cannot trigger notification work.
+
+For the exact root bytes produced by a successful proposal, the matcher uses a
+database-free `WorkerView` and performs this indexed join:
+
+1. authenticate each fresh trigger residence and obtain its bounded probes;
+2. range-read only each exact route posting prefix to collect candidate users;
+3. for each candidate, range-read its global and relevant channel cell,
+   validate every posting, reconstruct explicit heads, and apply the meet;
+4. range-read `notification.endpoint(user, *)`, validate every posting, and
+   keep only endpoints whose SuppTree authority scopes are current;
+5. emit at most one deterministic intent per `(event, endpoint)`.
+
+The implementation bounds trigger routes, mention IDs, posting rows, and final
+intents. It never scans all facts against all preferences. The matched payload
+contains only canonical workspace, event, channel, and notification kind; the
+queue worker does not need and cannot reinterpret subscription state.
+
+`RepositoryApplier` accepts one optional, family-neutral publication effect.
+Hosted AWS and Cloudflare Appliers inject `NotificationOutbox`; ordinary
+`FullPeer` composition defaults to no push side effect and may opt in explicitly.
+The effect runs only after a definite or reconciled root CAS (or a pinned no-op
+replay), and before it creates the receipt that can retire the exact source
+generation. A CAS loser returns stale before invoking it.
+
+For one source generation the outbox writes one canonical, self-contained job
+per resolved endpoint at:
+
+```text
+push/pile/<push-node>/<source-generation>/<sha256(job)>
+```
+
+The job binds workspace, trigger event, endpoint, push node, platform,
+application/environment, sealed target, versioned payload, trusted expiry, and
+a deterministic delivery ID derived from event, endpoint, payload version, and
+payload hash. Once every job is exact-read verified, the effect creates:
+
+```text
+push/result/<source-generation>
+```
+
+That typed result binds the workspace, proposed root hash, considered triggers,
+and complete sorted `(pile, delivery-id)` set. A trigger with no recipients gets
+the same result with an empty delivery set. Unknown create outcomes are
+reconciled by exact bounded readback; conflicting bytes fail closed. On replay,
+each delivery must still have either its exact hash-bound pile or compatible
+durable queue-acceptance evidence. This permits the dispatcher to retire an
+accepted pile without racing fact-generation recovery. Only after the result is
+durable may normal source retirement proceed. Push jobs then have no dependency
+on the retained fact pile.
+
+A crash after CAS but before the first outbox write cannot recover an exact
+historical preference snapshot without putting an effect commitment inside the
+root CAS. Instead, the retained source replays its trigger-capable admitted
+facts against a newly pinned current root. This makes later mutes and endpoint
+removal effective during recovery and may include an endpoint that became
+current before replay. It is an explicit conservative current-state recovery
+rule, not an exact commit-log claim. Once any result exists, replay verifies
+its exact original jobs or their durable queue handoff rather than rematching.
+
+The dispatcher treats LIST and object-created notifications only as discovery.
+It scans a bounded `push/pile/<push-node>/` page, verifies the path bindings,
+hash, codec, selected push node, and deterministic delivery ID, then publishes
+the already-resolved job through the provider-neutral queue contract. After a
+managed queue returns an acceptance ID, it create-only records
+`push/queued/<delivery-id>` and only then deletes that push pile. Existing
+compatible acceptance evidence makes retry safe. An ambiguous publish retains
+the pile and may publish a duplicate on retry. Poison input moves to bounded
+`push/failed` evidence without blocking siblings. A scan cursor is only a
+turn-local scheduling hint; repeated prefix scans are the lost-wakeup path.
+
+The initial managed queue adapter is Google Cloud Pub/Sub. The common contract
+is bounded `publish`, `pull`, `ack`, and `defer`, with explicit lease identity
+and ambiguous-publish errors. It assumes at-least-once delivery, not ordering or
+exactly-once provider semantics. A shared conformance schedule exercises the
+memory implementation, injected Pub/Sub clients, the official emulator, and an
+opt-in live project through the same behavioral assertions.
+
+One `PushConsumer` owns one push-node secret and one queue subscription. It
+validates the self-contained job, returns already-discharged duplicates without
+sending, enforces trusted expiry, verifies the selected push-node key, opens the
+sealed FID, validates the canonical payload, and selects a Firebase app by
+application/environment. The Firebase adapter constructs one visible message
+for the FID with bounded Android TTL and Apple `apns-expiration` and collapse
+headers. Firebase holds the APNs credential; it never enters repository state.
+
+On FCM acceptance, expiry, or an unregistered FID, the consumer first creates
+`push/done/<delivery-id>` and then acknowledges the queue lease. Retryable
+provider/network failures defer with deterministic bounded exponential backoff.
+Malformed targets/payloads and permanent provider errors create bounded failure
+evidence and acknowledge. An unregistered result additionally creates
+`push/invalidation/<endpoint>/<delivery-id>` as operational input. Converting
+that input into a narrowly delegated, authenticated exact endpoint suppression
+fact is future work; the consumer cannot mutate FactTree or SuppTree directly.
+
+This pipeline provides at-least-once queue and FCM submission. A crash after
+FCM accepts a request but before `push/done` becomes durable can submit the same
+delivery ID again. FCM acceptance is not proof that an OS displayed the
+notification. Production readiness additionally requires mobile OS permission
+and FID lifecycle integration, reproducible least-privilege queue/consumer
+infrastructure, terminal endpoint suppression, live Android/Apple evidence,
+observability, security/privacy review, runbooks, and rollout gates. Those
+unfinished items live in beads, not this design document.
 
 ## 6. RepositoryReader and sync
 

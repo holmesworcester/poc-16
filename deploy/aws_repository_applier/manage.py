@@ -30,12 +30,22 @@ CORE_MODULES = (
     "merkle_map.py",
     "object_store.py",
     "repository_applier.py",
+    "repository_reader.py",
     "repository_snapshot.py",
     "shape.py",
     "snapshot.py",
     "staged_intent.py",
     "suppression.py",
     "validated_set.py",
+    "worker.py",
+)
+NOTIFICATION_MODULES = (
+    "__init__.py",
+    "job.py",
+    "matcher.py",
+    "model.py",
+    "outbox.py",
+    "queue_evidence.py",
 )
 DEPLOYMENT = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 OWNER = re.compile(r"^[0-9]{12}$")
@@ -65,6 +75,11 @@ def stage(destination=STAGE):
         destination / "facts",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    for name in NOTIFICATION_MODULES:
+        _copy(
+            REPOSITORY / "notifications" / name,
+            destination / "notifications" / name,
+        )
     _copy(
         REPOSITORY / "adapters" / "__init__.py",
         destination / "adapters" / "__init__.py",
@@ -94,8 +109,10 @@ def verify_stage(directory):
     }
     required = {
         "core/repository_applier.py",
+        "core/repository_reader.py",
         "core/repository_snapshot.py",
         "deploy/aws_repository_applier/app.py",
+        "notifications/outbox.py",
         "adapters/s3/store.py",
         "facts/auth/workspace.py",
         "requirements.txt",

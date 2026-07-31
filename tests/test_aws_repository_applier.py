@@ -169,8 +169,10 @@ def test_lambda_stage_contains_only_db_free_applier_authority(
 
     for relative in (
             "core/repository_applier.py",
+            "core/repository_reader.py",
             "core/repository_snapshot.py",
             "deploy/aws_repository_applier/app.py",
+            "notifications/outbox.py",
             "adapters/s3/store.py",
             "facts/auth/workspace.py"):
         assert (staged / relative).is_file()
@@ -200,6 +202,25 @@ def test_sam_role_can_retire_only_internal_piles():
     assert "CanonicalPrefix}/pile/*" in delete_section
     assert "IngressBucketName" not in delete_section
     assert "CanonicalPrefix}/root" not in delete_section
+
+
+def test_sam_role_can_create_but_not_retire_notification_outbox():
+    raw = (
+        Path(__file__).parents[1]
+        / "deploy/aws_repository_applier/template.yaml"
+    ).read_text()
+
+    write_section = raw.split(
+        "- Sid: ConditionallyWriteCanonicalRepository", 1)[1].split(
+        "- Sid: RetireOnlyInternalPileGenerations", 1)[0]
+    delete_section = raw.split(
+        "- Sid: RetireOnlyInternalPileGenerations", 1)[1].split(
+        "- !If", 1)[0]
+    assert "CanonicalPrefix}/push/pile/*" in write_section
+    assert "CanonicalPrefix}/push/result/*" in write_section
+    assert "CanonicalPrefix}/push/queued/*" not in write_section
+    assert "CanonicalPrefix}/push/done/*" not in write_section
+    assert "CanonicalPrefix}/push/pile/*" not in delete_section
 
 
 def test_sam_role_limits_canonical_missing_key_probes():

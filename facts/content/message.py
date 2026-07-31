@@ -1,5 +1,6 @@
 """facts/content/message.py — a member-signed channel message."""
 from core.fact import Fact, Need
+from core.shape import valid_fid
 from .._policy import (
     DELETE_SELF,
     FamilyPolicy,
@@ -14,6 +15,8 @@ from .._commands import (
 from ..auth import signature
 
 TAG = "msg"
+MENTION_OFFER = "content.message.mention"
+MAX_MENTIONS = 32
 POLICY = FamilyPolicy(
     suppression=(Self(),),
     direct_targets=DELETE_SELF,
@@ -22,11 +25,29 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def message(workspace, pk, channel, text, ts, owner=None):
+def _mentions(values):
+    try:
+        values = tuple(sorted(set(values)))
+    except TypeError as error:
+        raise ValueError("message mentions") from error
+    if len(values) > MAX_MENTIONS \
+            or not all(valid_fid(value) for value in values):
+        raise ValueError("message mentions")
+    return values
+
+
+def message(workspace, pk, channel, text, ts, owner=None, mentions=()):
     owner = pk if owner is None else owner
+    mentions = _mentions(mentions)
+    body = {"pk": pk, "owner": owner, "chan": channel, "text": text}
+    if mentions:
+        body["mentions"] = list(mentions)
     return Fact(
-        TAG, ts, author_selectors(POLICY, {}),
-        {"pk": pk, "owner": owner, "chan": channel, "text": text}, workspace,
+        TAG, ts, author_selectors(POLICY, {}) + [
+            ["offer", MENTION_OFFER, user]
+            for user in mentions
+        ],
+        body, workspace,
     )
 
 
@@ -44,11 +65,15 @@ def needs(f):
 def validate(f, ctx):
     try:
         body = f.body
-        return set(body) == {"pk", "owner", "chan", "text"} \
-            and all(isinstance(body[key], str) for key in body) \
+        return set(body) in (
+                {"pk", "owner", "chan", "text"},
+                {"pk", "owner", "chan", "text", "mentions"},
+            ) \
+            and all(isinstance(body[key], str)
+                    for key in ("pk", "owner", "chan", "text")) \
             and f == message(
                 f.ws, body["pk"], body["chan"], body["text"], f.ts,
-                body["owner"])
+                body["owner"], body.get("mentions", ()))
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -58,27 +83,29 @@ DURABLE = True
 
 
 # COMMANDS
-def _author(node, workspace, channel, text, ts):
+def _author(node, workspace, channel, text, ts, mentions=()):
     timestamp = node.now_ms() if ts is None else ts
     secret, public = node.identity(workspace)
     _, owner = member_source(node, workspace, public)
     if owner is None:
         raise ValueError("publishing identity is not a workspace member")
     item = message(
-        workspace, public, channel, text, timestamp, owner)
+        workspace, public, channel, text, timestamp, owner, mentions)
     return item, signature.signature(secret, public, item, timestamp)
 
 
-def post(node, workspace, channel, text, ts=None):
-    item, signed = _author(node, workspace, channel, text, ts)
+def post(node, workspace, channel, text, ts=None, mentions=()):
+    item, signed = _author(
+        node, workspace, channel, text, ts, mentions)
     return publish(node, workspace, item, signed)
 
 
 def upload(
         node, workspace, channel, text, broker_url, provider_origin,
-        ts=None):
+        ts=None, mentions=()):
     """Author one message and send its closed pile directly to ingress."""
-    item, signed = _author(node, workspace, channel, text, ts)
+    item, signed = _author(
+        node, workspace, channel, text, ts, mentions)
     public = item.body["pk"]
     member, _ = member_source(
         node, workspace, public, item.body["owner"])
@@ -111,11 +138,34 @@ def messages(node, workspace, channel=None):
             "chan": fact.body["chan"],
             "from": names.get(fact.body["pk"], fact.body["pk"][:8]),
             "text": fact.body["text"],
+            "mentions": list(fact.body.get("mentions", ())),
             "ts": fact.ts,
             "fid": fact.fid,
         }
         for fact in sorted(selected, key=lambda fact: (fact.ts, fact.fid))
     ]
+
+
+def notification_trigger(fact):
+    """Return checked routing metadata; display text is never parsed."""
+    from notifications.model import (
+        NotificationTrigger,
+        RouteProbe,
+    )
+    from .notification_preference import (
+        ROUTE_CHANNEL_OFFER,
+        ROUTE_TYPE_OFFER,
+    )
+
+    body = fact.body
+    return NotificationTrigger(
+        channel=body["chan"],
+        mentions=tuple(body.get("mentions", ())),
+        routes=tuple(sorted((
+            RouteProbe(ROUTE_TYPE_OFFER, TAG),
+            RouteProbe(ROUTE_CHANNEL_OFFER, body["chan"]),
+        ))),
+    )
 
 
 CLI = {

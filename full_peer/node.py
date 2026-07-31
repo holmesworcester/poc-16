@@ -49,11 +49,17 @@ def _run_applier(awaitable):
 
 
 class FullPeer:
-    def __init__(self, dir, initial_secret=None, *, store_factory=None):
+    def __init__(
+            self, dir, initial_secret=None, *, store_factory=None,
+            publication_effect_factory=None):
         self.dir = dir
         os.makedirs(dir, exist_ok=True)
         self.lock = threading.RLock()
         self._store_factory = store_factory
+        if publication_effect_factory is not None \
+                and not callable(publication_effect_factory):
+            raise TypeError("publication effect factory")
+        self._publication_effect_factory = publication_effect_factory
         self.peer_address = None  # daemon-owned URL or Iroh reachability
         self._forwarders = None
         self._kr_path = os.path.join(dir, "keyring.json")
@@ -109,7 +115,15 @@ class FullPeer:
         with self.lock:
             if workspace not in self._appliers:
                 self._appliers[workspace] = RepositoryApplier(
-                    workspace, self.store(workspace))
+                    workspace,
+                    self.store(workspace),
+                    publication_effect=(
+                        None
+                        if self._publication_effect_factory is None
+                        else self._publication_effect_factory(
+                            workspace, self.store(workspace))
+                    ),
+                )
             return self._appliers[workspace]
 
     def sender(self, workspace):

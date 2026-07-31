@@ -3,6 +3,7 @@ from . import (
     admin,
     device,
     device_invite,
+    push_endpoint,
     removal,
     request,
     signature,
@@ -19,6 +20,7 @@ MODULES = (
     admin,
     device,
     device_invite,
+    push_endpoint,
     removal,
     request,
 )
