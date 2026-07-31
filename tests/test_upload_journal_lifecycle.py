@@ -15,6 +15,7 @@ from full_peer.upload_journal import (
     UploadSource,
 )
 import full_peer.upload_journal as journal
+from deploy.upload_session import MAX_SESSION_TTL_MS
 from tests.test_upload_client import (
     Crash,
     FakeProvider,
@@ -152,7 +153,8 @@ def test_legacy_session_hydrates_expiry_high_water_and_resumes(tmp_path):
         **value, "schema": "poc16-upload-client-session-v1"}))
 
     legacy = UploadSource.load(source.path)
-    assert legacy.progress().issued_until_ms == legacy.progress().expires_at_ms
+    assert legacy.progress().issued_until_ms == (
+        legacy.progress().expires_at_ms + MAX_SESSION_TTL_MS)
     UploadClient(legacy, broker, FakeProvider(), clock).run(proof)
     assert legacy.progress().pile_delivered
     assert b"poc16-upload-client-session-v2" in Path(

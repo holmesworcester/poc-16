@@ -26,6 +26,7 @@ from core.shape import valid_fid
 from core.staged_intent import MEMBER_HEX_BYTES, SESSION_HEX_BYTES
 from deploy.upload_session import (
     MAX_SESSION_OBJECTS,
+    MAX_SESSION_TTL_MS,
     UploadLeaf,
     UploadManifest,
     UploadVector,
@@ -423,7 +424,10 @@ class UploadSource:
                 raise ValueError
             schema = value.pop("schema")
             if schema == LEGACY_SESSION_SCHEMA:
-                value["issued_until_ms"] = value["expires_at_ms"]
+                # v1 erased replaced sessions. One maximum lifetime beyond
+                # its surviving expiry safely covers an older longer lease.
+                value["issued_until_ms"] = (
+                    value["expires_at_ms"] + MAX_SESSION_TTL_MS)
             elif schema != SESSION_SCHEMA:
                 raise ValueError
             return self._checked_progress(UploadProgress(**value))
