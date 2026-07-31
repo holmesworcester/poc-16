@@ -15,13 +15,14 @@ from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
 from core.grants import make_token
 from core.ingress import InvalidPile
-from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
 from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
 from full_peer import sql_store
 from facts.auth import request
 from facts.auth import user as user_family
+from facts.auth import user_invite as user_invite_family
 from facts.auth.signature import signature
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
@@ -237,7 +238,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
         headers = {}
 
         def read(self, maximum):
-            assert maximum == MAX_OBJECT_BYTES + 1
+            assert maximum == MAX_INVITE_BYTES + 1
             return b"encrypted"
 
         def close(self):
@@ -285,7 +286,7 @@ def test_invite_redemption_bounds_and_closes_untrusted_http_body(
             self.closed = True
 
     response = Response()
-    monkeypatch.setattr(user_family, "MAX_OBJECT_BYTES", 8)
+    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
     monkeypatch.setattr(
         user_family.urllib.request, "urlopen",
         lambda *_args, **_kwargs: response)
@@ -322,7 +323,7 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
             self.closed = True
 
     response = Response()
-    monkeypatch.setattr(user_family, "MAX_OBJECT_BYTES", 8)
+    monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
     monkeypatch.setattr(
         user_family.urllib.request, "urlopen",
         lambda *_args, **_kwargs: response)
@@ -335,6 +336,32 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
     with pytest.raises(ValueError, match="invite workspace"):
         user_family.accept(node, link, "new member")
     assert response.closed is True
+
+
+def test_invite_creation_checks_encrypted_size_before_store(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "inviter"))
+    workspace = facts.auth.workspace.create(node, "inviter", ts=1)
+    node.url = "https://invite.example"
+    monkeypatch.setattr(user_invite_family, "MAX_INVITE_BYTES", 8)
+    monkeypatch.setattr(
+        user_invite_family, "box_encrypt",
+        lambda _key, _raw: b"x" * 8,
+    )
+
+    user_invite_family.make(node, workspace)
+    store = node.store(workspace)
+    invite_keys = store.list("invite/")
+    assert len(invite_keys) == 1
+    assert store.get(invite_keys[0]) == b"x" * 8
+
+    monkeypatch.setattr(
+        user_invite_family, "box_encrypt",
+        lambda _key, _raw: b"x" * 9,
+    )
+    with pytest.raises(PayloadTooLarge, match="invite too large"):
+        user_invite_family.make(node, workspace)
+    assert store.list("invite/") == invite_keys
 
 
 def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):

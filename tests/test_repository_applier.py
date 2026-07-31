@@ -15,7 +15,12 @@ from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.ingress import KernelRejected
 from full_peer.node import FullPeer
-from core.limits import MAX_PILE_BYTES, MAX_ROOT_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PayloadTooLarge,
+)
 from core.repository_applier import RepositoryApplier, SyncStoreAdapter
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
@@ -193,6 +198,43 @@ def test_cold_applier_reproduces_full_p2p_root_without_sql(
     validated = reconstruct(
         expected, lambda oid: store.get("obj/" + oid))
     assert set(result.admitted) <= set(validated.facts)
+
+
+def test_cold_rebase_bounds_authenticated_repository_objects(tmp_path):
+    class RecordingStore(FsStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.object_reads = []
+
+        def get_bounded(self, key, maximum):
+            if key.startswith("obj/"):
+                self.object_reads.append((key, maximum))
+            return super().get_bounded(key, maximum)
+
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
+    initial = closed_subset(
+        source, workspace, all_fids(source, workspace))
+    store = RecordingStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    first = run(applier.stage("0123456789abcdef", initial))
+    assert run(applier.apply(first)).status == "applied"
+
+    new_fid = facts.content.message.post(
+        source, workspace, "general", "after the pinned root", ts=100)
+    update = closed_subset(source, workspace, [new_fid])
+    store.object_reads.clear()
+    second = run(applier.stage("fedcba9876543210", update))
+    assert run(applier.apply(second)).status == "applied"
+
+    assert store.object_reads
+    assert all(
+        maximum <= MAX_REPOSITORY_OBJECT_BYTES
+        for _key, maximum in store.object_reads
+    )
+    assert any(
+        maximum == MAX_REPOSITORY_OBJECT_BYTES
+        for _key, maximum in store.object_reads
+    )
 
 
 def test_crash_after_cas_replays_as_token_checked_noop_and_retires(

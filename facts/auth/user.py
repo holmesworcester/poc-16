@@ -7,10 +7,11 @@ from core.close import decode_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
 from core.http_body import read_bounded
-from core.limits import MAX_OBJECT_BYTES
+from core.limits import MAX_INVITE_BYTES
 from core.suppression import scoped_id
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from . import signature, user_invite
+from ._display import display
 
 TAG = "user"
 POLICY = FamilyPolicy(
@@ -21,6 +22,7 @@ POLICY = FamilyPolicy(
 
 # SHAPE
 def user(invite_fact, invite_sk, pk, name, ts):
+    name = display(name)
     atoms = author_selectors(POLICY, {}) + [
         ["ref", "invite", invite_fact.fid], ["offer", "member", pk, pk]]
     return Fact(TAG, ts, atoms,
@@ -47,11 +49,12 @@ def validate(f, ctx):
         if len(invited) != 1:
             return False
         invite_pk = invited[0][0]
+        name = display(f.body["name"])
         shaped = Fact(TAG, f.ts,
                       author_selectors(POLICY, {}) + [
                        ["ref", "invite", ref_fid],
                        ["offer", "member", f.body["pk"], f.body["pk"]]],
-                      dict(f.body), f.ws)
+                      {**f.body, "name": name}, f.ws)
         return f == shaped and verify(invite_pk, f.body["pk"], f.body["countersig"])
     except (KeyError, IndexError, TypeError, ValueError):
         return False
@@ -75,7 +78,7 @@ def accept(node, link, name):
         f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}", timeout=15)
     try:
         encrypted = read_bounded(
-            response, MAX_OBJECT_BYTES, "invite response")
+            response, MAX_INVITE_BYTES, "invite response")
     finally:
         response.close()
     blob = json.loads(box_decrypt(kdf(seed, "key"), encrypted))

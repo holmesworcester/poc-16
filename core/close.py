@@ -9,7 +9,7 @@ close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
 """
-from .fact import bound_to, canon, from_json, workspace_of
+from .fact import bound_to, canon, encode, from_json, workspace_of
 from .ingress import InvalidPile
 from .limits import (
     InvalidEncoding,
@@ -56,6 +56,8 @@ def encode_pile(facts, *, workspace=None) -> bytes:
         raise ValueError("pile workspace")
     if not all(bound_to(fact, workspace) for fact in facts):
         raise ValueError("mixed workspace pile")
+    for fact in facts:
+        encode(fact)
     raw = canon({
         "ws": workspace,
         "facts": [f.to_json() for f in facts],

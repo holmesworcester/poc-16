@@ -2,6 +2,7 @@
 from core.crypto import h, sign, verify
 from core.fact import Fact, canon
 from .._policy import FamilyPolicy, SidOffer
+from ._display import display
 
 TAG = "workspace"
 GENESIS = True
@@ -16,6 +17,7 @@ def _presig(ts, atoms):
 
 
 def workspace(sk, pk, name, ts):
+    name = display(name)
     atoms = [["offer", "member", pk, pk], ["offer", "admin", pk]]
     return Fact(TAG, ts, atoms,
                 {"name": name, "pk": pk, "sig": sign(sk, _presig(ts, atoms))},
@@ -34,6 +36,7 @@ def validate(f, ctx):
         if set(body) != {"name", "pk", "sig"}:
             return False
         pk, name, signature = body["pk"], body["name"], body["sig"]
+        name = display(name)
         atoms = [["offer", "member", pk, pk], ["offer", "admin", pk]]
         shaped = Fact(
             TAG, f.ts, atoms, {"name": name, "pk": pk, "sig": signature},

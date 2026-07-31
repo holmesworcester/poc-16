@@ -12,7 +12,12 @@ import time
 
 from core import fact_index
 from core.fact import Fact
-from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PAGE_BATCH
+from core.limits import (
+    MAX_OBJECT_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
+    PAGE_BATCH,
+)
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
@@ -122,7 +127,7 @@ class FullPeer:
             workspace,
             root,
             lambda oid: store.get_bounded(
-                "obj/" + oid, MAX_OBJECT_BYTES),
+                "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES),
         )
 
     def add_workspace(self, workspace, name, peers, identity=None):

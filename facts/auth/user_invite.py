@@ -9,6 +9,7 @@ import os
 
 from core.crypto import box_encrypt, kdf, keypair
 from core.fact import Fact, Need, canon
+from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
 from .._commands import offer_source
 from .._policy import FamilyPolicy
 from . import signature
@@ -71,8 +72,11 @@ def make(node, workspace):
     )
     blob = canon({"pile": base64.b64encode(pile).decode(),
                   "isk": invite_sk.encode().hex(), "ws": workspace})
-    node.store(workspace).put("invite/" + kdf(seed, "id").hex(),
-                              box_encrypt(kdf(seed, "key"), blob))
+    encrypted = box_encrypt(kdf(seed, "key"), blob)
+    if len(encrypted) > MAX_INVITE_BYTES:
+        raise PayloadTooLarge("invite too large")
+    node.store(workspace).put(
+        "invite/" + kdf(seed, "id").hex(), encrypted)
     return base64.urlsafe_b64encode(
         canon({"u": node.url, "ws": workspace, "s": seed.hex()})).decode()
 

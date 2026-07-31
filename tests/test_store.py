@@ -22,9 +22,11 @@ from core.object_store import (
     STALE,
     VersionToken,
     ensure_object,
+    verified_object,
 )
 from core.limits import (
     MAX_OBJECT_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PayloadTooLarge,
 )
@@ -116,6 +118,7 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
             self.outcomes = list(outcomes)
             self.value = incumbent
             self.calls = 0
+            self.read_limits = []
 
         def put_if_absent(self, key, value):
             self.calls += 1
@@ -133,6 +136,7 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
             return self.value
 
         def get_bounded(self, key, maximum):
+            self.read_limits.append(maximum)
             value = self.get(key)
             if value is not None and len(value) > maximum:
                 raise PayloadTooLarge("test value exceeds byte limit")
@@ -141,10 +145,12 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
     applied = Store(["applied-unknown"])
     assert ensure_object(applied, oid, raw) is EXISTS
     assert applied.calls == 1
+    assert applied.read_limits == [len(raw)]
 
     retried = Store(["unknown", CREATED])
     assert ensure_object(retried, oid, raw) is CREATED
     assert retried.calls == 2
+    assert retried.read_limits == [len(raw)]
 
     with pytest.raises(ValueError, match="conflict"):
         ensure_object(Store([EXISTS], other), oid, raw)
@@ -153,6 +159,15 @@ def test_ensure_object_reconciles_ambiguous_create_and_verifies_collision():
     with pytest.raises(OutcomeUnknown):
         ensure_object(absent, oid, raw)
     assert absent.calls == 2
+
+
+def test_verified_repository_object_enforces_the_hosted_reader_ceiling():
+    exact = b"x" * MAX_REPOSITORY_OBJECT_BYTES
+    assert verified_object(h(exact), lambda _oid: exact) == exact
+
+    oversized = exact + b"x"
+    with pytest.raises(ValueError, match="integrity"):
+        verified_object(h(oversized), lambda _oid: oversized)
 
 
 def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):

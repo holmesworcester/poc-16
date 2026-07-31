@@ -20,6 +20,13 @@ MAX_MINT_FETCH_BYTES = 4 * MIB
 MAX_PAGE_REQUEST_BYTES = 64 * 1024
 MAX_PAGE_BATCH_BYTES = 4 * MIB
 
+# Every database-free hosted Reader must be able to return canonical facts and
+# public invite envelopes admitted by the shared engine. Detached file objects
+# use their own direct-upload/completion path and retain MAX_OBJECT_BYTES.
+MAX_FACT_BYTES = MAX_PAGE_BATCH_BYTES
+MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
+MAX_REPOSITORY_OBJECT_BYTES = MAX_FACT_BYTES
+
 # One immutable closed pile. These are protocol limits, not merely
 # implementation budgets: every receiving engine enforces the same boundary.
 MAX_CLOSURE_FACTS = 256

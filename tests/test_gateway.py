@@ -11,7 +11,12 @@ from core import peer_capability
 from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
-from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_INVITE_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    PayloadTooLarge,
+)
 from full_peer.node import FullPeer
 from core.http import AsyncFromSyncReader, HttpGate
 from facts.auth import request
@@ -298,12 +303,13 @@ def test_gateway_rejects_corrupt_content_addressed_reads(tmp_path):
     _, _, token = mint(node, workspace, pile, healthy)
     headers = {"Authorization": "Bearer " + token}
     oid = "1" * 64
+    reads = []
 
     class CorruptReader:
-        async def get(self, key):
-            if key == "obj/" + oid:
-                return b"wrong"
-            return node.store(workspace).get(key)
+        async def get_bounded(self, key, limit):
+            reads.append((key, limit))
+            assert key == "obj/" + oid
+            return b"wrong"
 
     gateway = HttpGate(
         CorruptReader(), workspace, b"s" * 32, lambda: 100)
@@ -315,6 +321,10 @@ def test_gateway_rejects_corrupt_content_addressed_reads(tmp_path):
         gateway, "POST", "/page",
         {"ws": workspace}, headers,
         json.dumps([oid]).encode()).status == 503
+    assert reads == [
+        ("obj/" + oid, gateway.max_object_bytes),
+        ("obj/" + oid, gateway.max_object_bytes),
+    ]
 
 
 def test_gateway_pins_trusted_time_once_per_request(tmp_path):
@@ -334,7 +344,7 @@ def test_gateway_pins_trusted_time_once_per_request(tmp_path):
     assert calls == [100]
 
 
-def test_gateway_rejects_deployment_limits_above_protocol_ceiling(tmp_path):
+def test_gateway_rejects_object_limits_outside_serviceable_range(tmp_path):
     node, workspace, _, _, _ = world(tmp_path)
 
     with pytest.raises(ValueError, match="HTTP gate limits"):
@@ -342,6 +352,43 @@ def test_gateway_rejects_deployment_limits_above_protocol_ceiling(tmp_path):
             AsyncFromSyncReader(node.store(workspace)),
             workspace, b"s" * 32, lambda: 100,
             max_object_bytes=MAX_OBJECT_BYTES + 1)
+    with pytest.raises(ValueError, match="serve canonical facts"):
+        HttpGate(
+            AsyncFromSyncReader(node.store(workspace)),
+            workspace, b"s" * 32, lambda: 100,
+            max_object_bytes=MAX_REPOSITORY_OBJECT_BYTES - 1)
+
+
+@pytest.mark.parametrize(
+    ("size", "status"),
+    (
+        (MAX_INVITE_BYTES, 200),
+        (MAX_INVITE_BYTES + 1, 413),
+    ),
+)
+def test_public_invites_use_the_hosted_reader_ceiling(size, status):
+    raw = b"x" * size
+    reads = []
+
+    class InviteStore:
+        async def get_bounded(self, key, limit):
+            reads.append((key, limit))
+            if len(raw) > limit:
+                raise PayloadTooLarge("invite body")
+            return raw
+
+    gateway = HttpGate(
+        InviteStore(), "0" * 64, b"s" * 32, lambda: 100)
+    response = call(
+        gateway,
+        "GET",
+        "/invite/valid",
+        {"ws": "0" * 64},
+    )
+
+    assert response.status == status
+    assert response.body == (raw if status == 200 else b"")
+    assert reads == [("invite/valid", MAX_INVITE_BYTES)]
 
 
 def test_gateway_translates_preallocation_read_limit_to_413(tmp_path):

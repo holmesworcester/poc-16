@@ -8,6 +8,7 @@ from core.fact import Fact, Need
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from .._commands import offer_source, publish
 from . import signature
+from ._display import display
 
 TAG = "device"
 POLICY = FamilyPolicy(
@@ -19,6 +20,7 @@ POLICY = FamilyPolicy(
 
 # SHAPE
 def device(workspace, pk, label, ts):
+    label = display(label)
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [

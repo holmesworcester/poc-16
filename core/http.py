@@ -14,6 +14,7 @@ from . import peer_capability
 from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
+    MAX_INVITE_BYTES,
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -21,6 +22,7 @@ from .limits import (
     MAX_PAGE_BATCH_BYTES,
     MAX_PAGE_REQUEST_BYTES,
     MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
@@ -67,7 +69,7 @@ class HttpGate:
             *, sync_profile=peer_capability.READ_ONLY,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
             max_root_bytes=MAX_ROOT_BYTES,
-            max_object_bytes=MAX_PAGE_BATCH_BYTES,
+            max_object_bytes=MAX_OBJECT_BYTES,
             max_batch_count=PAGE_BATCH,
             max_batch_bytes=MAX_PAGE_BATCH_BYTES,
             max_mint_fetches=MAX_MINT_FETCHES,
@@ -102,6 +104,8 @@ class HttpGate:
                     (max_mint_fetch_bytes, MAX_MINT_FETCH_BYTES),
                 )):
             raise ValueError("HTTP gate limits")
+        if max_object_bytes < MAX_REPOSITORY_OBJECT_BYTES:
+            raise ValueError("HTTP gate cannot serve canonical facts")
         self.sync_profile = sync_profile
         self.max_request_bytes = max_request_bytes
         self.max_root_bytes = max_root_bytes
@@ -193,7 +197,7 @@ class HttpGate:
             nonlocal fetch_error
             try:
                 return await self._get(
-                    "obj/" + oid, self.max_object_bytes)
+                    "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
             except Exception as error:
                 fetch_error = error
                 return None
@@ -328,7 +332,7 @@ class HttpGate:
                 return Response(404)
             try:
                 raw = await self._get(
-                    "invite/" + invite, self.max_object_bytes)
+                    "invite/" + invite, MAX_INVITE_BYTES)
             except PayloadTooLarge:
                 return Response(413)
             except Exception:

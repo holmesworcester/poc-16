@@ -8,15 +8,18 @@ import pytest
 import facts
 
 from core import (
-    close, fact, http_stdlib, merkle_map, object_store,
+    close, fact, http, http_stdlib, kernel, merkle_map, object_store,
     repository_applier as repository_applier_module, snapshot,
 )
 from core.crypto import h
 from core.fact import Fact, canon
+from core.grants import make_token
 from core.ingress import InvalidPile
 from core.limits import (
     MAX_ATOM_NAME_BYTES,
     MAX_ATOM_VALUE_BYTES,
+    MAX_FACT_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
 from full_peer.node import FullPeer
@@ -626,6 +629,101 @@ def test_pile_encoder_and_object_admission_enforce_the_reader_bounds(
     with pytest.raises(ValueError, match="address"):
         run(repository_applier_module.RepositoryApplier(
             workspace, NeverWritten()).admit_object(h(raw), raw))
+
+
+def _message_with_encoded_size(workspace, public, size, ts):
+    probe = message_family.message(
+        workspace, public, "general", "", ts)
+    padding = size - len(canon(probe.to_json()))
+    assert padding >= 0
+    item = message_family.message(
+        workspace, public, "general", "x" * padding, ts)
+    assert len(canon(item.to_json())) == size
+    return item
+
+
+def test_fact_bytes_fit_every_hosted_reader_before_repository_mutation(
+        tmp_path):
+    source = FullPeer(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "source", ts=1)
+    secret, public = source.identity(workspace)
+    genesis = source.fact_of(workspace, workspace)
+
+    exact = _message_with_encoded_size(
+        workspace, public, MAX_FACT_BYTES, 2)
+    exact_signature = facts.auth.signature.signature(
+        secret, public, exact, exact.ts)
+    exact_unit = (genesis, exact_signature, exact)
+    exact_raw = fact.encode(exact)
+    assert len(exact_raw) == MAX_FACT_BYTES
+    assert kernel.drain(exact_unit, workspace).ok
+    exact_pile = close.encode_pile(exact_unit, workspace=workspace)
+    assert close.decode_pile(exact_pile, workspace) == list(exact_unit)
+
+    destination = FullPeer(str(tmp_path / "destination"))
+    destination.add_workspace(workspace, "destination", [])
+    destination.receive_pile(
+        workspace, "0123456789abcdef", exact_pile)
+    assert destination.fact_of(workspace, exact.fid) == exact
+
+    grant_secret = b"g" * 32
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(destination.store(workspace)),
+        workspace,
+        grant_secret,
+        lambda: 100,
+        max_object_bytes=MAX_REPOSITORY_OBJECT_BYTES,
+    )
+    token = make_token(
+        grant_secret, "reader", workspace, issued_at=100)
+    response = run(gate.handle(
+        "GET",
+        "/page/" + h(exact_raw),
+        {"ws": workspace},
+        {"Authorization": "Bearer " + token},
+    ))
+    assert response.status == 200
+    assert response.body == exact_raw
+
+    oversized = _message_with_encoded_size(
+        workspace, public, MAX_FACT_BYTES + 1, 3)
+    oversized_signature = facts.auth.signature.signature(
+        secret, public, oversized, oversized.ts)
+    oversized_unit = (genesis, oversized_signature, oversized)
+    with pytest.raises(PayloadTooLarge, match="fact too large"):
+        fact.encode(oversized)
+    with pytest.raises(PayloadTooLarge, match="fact too large"):
+        close.encode_pile(oversized_unit, workspace=workspace)
+    judgment = kernel.drain(oversized_unit, workspace)
+    assert not judgment.ok
+    assert isinstance(judgment.failure, PayloadTooLarge)
+
+    hostile = canon({
+        "ws": workspace,
+        "facts": [item.to_json() for item in oversized_unit],
+    })
+    with pytest.raises(InvalidPile, match="fact too large"):
+        close.decode_pile(hostile, workspace)
+    root = destination.store(workspace).get("root")
+    destination.receive_pile(
+        workspace, "fedcba9876543210", hostile)
+    assert destination.store(workspace).get("root") == root
+    assert not destination.store(workspace).has(
+        "obj/" + h(canon(oversized.to_json())))
+
+    healthy = message_family.message(
+        workspace, public, "general", "still progresses", 4)
+    healthy_signature = facts.auth.signature.signature(
+        secret, public, healthy, healthy.ts)
+    destination.receive_pile(
+        workspace,
+        "0011223344556677",
+        close.encode_pile(
+            (genesis, healthy_signature, healthy),
+            workspace=workspace,
+        ),
+    )
+    assert destination.fact_of(workspace, healthy.fid) == healthy
 
 
 def test_peer_adapter_rejects_claimed_oversize_without_reading(

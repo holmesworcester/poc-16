@@ -88,7 +88,11 @@ A pile is one canonical, workspace-bound, topologically ordered fact closure.
 Dependencies precede dependents. Pile bytes, each fact's dependency count, and
 per-fact transitive closure are bounded. An independent aggregate fact-count
 ceiling is future hardening; the current byte ceiling is the aggregate pile
-bound.
+bound. Each canonical fact and public invite envelope also fits the smallest
+hosted Reader's single-object response ceiling. Detached Bao objects use their
+separate direct-upload and completion path. Authenticated-root traversal reads
+only `MAX_REPOSITORY_OBJECT_BYTES`; the larger generic object ceiling is
+reserved for detached ingress and exact collision/retirement work.
 
 The database-free kernel streams the pile into a temporary `MemoryContext`.
 For each fact it:
@@ -147,6 +151,11 @@ key first and its owner second. Content persists `owner` and declares an exact
 membership Need. A later affiliation at another complete address therefore
 cannot rewrite content ownership, delete authority, device descendants, or a
 delegated admin's liveness.
+
+Human-readable workspace/member names and device labels are family-owned
+presentation fields, not authority addresses. Each is nonempty and at most 255
+UTF-8 bytes so every worst-shaped current-authority closure remains mintable by
+the smallest supported hosted gate.
 
 Fresh sync closures may choose any finite acyclic provider closure for an
 interchangeable address. Explicit provider selectors remain exact.

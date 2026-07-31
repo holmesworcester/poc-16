@@ -8,7 +8,11 @@ import time
 from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
-from core.limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_MINT_REQUEST_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    PayloadTooLarge,
+)
 from deploy.aws_lambda.config import (
     FUNCTION_TIMEOUT_SECONDS,
     MAX_LOG_METHOD_CHARS,
@@ -132,7 +136,7 @@ def _gateway():
             max_root_bytes=_positive(
                 "TINYP2P_MAX_ROOT_BYTES", 1024 * 1024),
             max_object_bytes=_positive(
-                "TINYP2P_MAX_OBJECT_BYTES", 4 * 1024 * 1024),
+                "TINYP2P_MAX_OBJECT_BYTES", MAX_REPOSITORY_OBJECT_BYTES),
             max_batch_count=_positive(
                 "TINYP2P_MAX_BATCH_COUNT", 256),
             max_batch_bytes=_positive(

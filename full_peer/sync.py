@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import facts
 
 from core.crypto import h
-from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
+from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.repository_reader import RepositoryReader
 from core.store import RemoteStore
 from .walk import Peer, _fetch_blobs
@@ -93,7 +93,7 @@ def reconcile_facts(
         workspace,
         local_root,
         lambda oid: store.get_bounded(
-            "obj/" + oid, MAX_OBJECT_BYTES),
+            "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES),
     ).validated() if local_root else None
     delta = _delta(local, remote)
     failures = []
@@ -154,7 +154,7 @@ def sync(node, workspace, url):
     def fetch_remote(oid):
         if oid not in objects:
             objects[oid] = remote_store.get_bounded(
-                "obj/" + oid, MAX_OBJECT_BYTES)
+                "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
         return objects[oid]
 
     local_root = node.store(workspace).get_bounded(

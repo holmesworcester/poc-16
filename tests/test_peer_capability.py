@@ -19,7 +19,7 @@ from full_peer import sync as sync_module
 from core.close import decode_pile
 from core.crypto import h
 from core.grants import check_token, make_token
-from core.limits import MAX_ROOT_BYTES
+from core.limits import MAX_PAGE_BATCH_BYTES, MAX_ROOT_BYTES
 from full_peer.node import FullPeer, now_ms
 from full_peer.sync import sync
 from full_peer.walk import Peer, PushUnsupported
@@ -112,6 +112,20 @@ def serving(node, profile, tamper_cap=None):
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def test_full_peer_serves_one_object_larger_than_the_batch_limit(tmp_path):
+    remote, workspace, local = replicas(tmp_path)
+    raw = b"x" * (MAX_PAGE_BATCH_BYTES + 1)
+    oid = h(raw)
+    remote.receive_object(workspace, oid, raw)
+
+    with serving(
+            remote, peer_capability.FULL) as (url, _observed, _edge):
+        # The batch gate remains provider-sized. Peer.objs receives its 413,
+        # falls back to the single-object GET, and that host path must cover
+        # every object RepositoryApplier can establish.
+        assert Peer(local, workspace, url).objs((oid,)) == (raw,)
 
 
 @pytest.mark.parametrize(

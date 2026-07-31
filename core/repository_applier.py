@@ -53,6 +53,7 @@ from .fact import canon, encode
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
     decode_json,
@@ -673,7 +674,10 @@ class RepositoryApplier:
                 validated = reconstruct(root_bytes, fetch)
             except _ObjectMiss as miss:
                 objects[miss.oid] = await self._get_bounded(
-                    self.store, "obj/" + miss.oid, MAX_OBJECT_BYTES)
+                    self.store,
+                    "obj/" + miss.oid,
+                    MAX_REPOSITORY_OBJECT_BYTES,
+                )
                 continue
             if validated.workspace != self.workspace:
                 raise ValueError("repository root workspace")

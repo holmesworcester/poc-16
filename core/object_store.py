@@ -28,7 +28,11 @@ import re
 from typing import Protocol
 
 from .crypto import h
-from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from .limits import (
+    MAX_OBJECT_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+    PayloadTooLarge,
+)
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 
@@ -190,7 +194,8 @@ class AsyncObjectStore(Protocol):
 def verified_object(oid, fetch):
     """Fetch one content-addressed object and verify its name."""
     raw = fetch(oid) if oid else None
-    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+    if not isinstance(raw, bytes) \
+            or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
             or h(raw) != oid:
         raise ValueError("object integrity")
     return raw
@@ -208,13 +213,18 @@ def ensure_object(store, oid, raw):
             or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid
+    maximum = max(1, len(raw))
     unknown = None
     for _ in range(2):
         try:
             result = store.put_if_absent(key, raw)
         except OutcomeUnknown as error:
             unknown = error
-            incumbent = store.get_bounded(key, MAX_OBJECT_BYTES)
+            try:
+                incumbent = store.get_bounded(key, maximum)
+            except PayloadTooLarge as conflict:
+                raise ValueError(
+                    "immutable object conflict") from conflict
             if incumbent == raw:
                 return EXISTS
             if incumbent is not None:
@@ -224,7 +234,10 @@ def ensure_object(store, oid, raw):
             return CREATED
         if result is not EXISTS:
             raise TypeError("conditional-create result")
-        incumbent = store.get_bounded(key, MAX_OBJECT_BYTES)
+        try:
+            incumbent = store.get_bounded(key, maximum)
+        except PayloadTooLarge as conflict:
+            raise ValueError("immutable object conflict") from conflict
         if incumbent != raw:
             raise ValueError("immutable object conflict")
         return EXISTS
@@ -237,14 +250,18 @@ async def ensure_object_async(store, oid, raw):
             or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid
+    maximum = max(1, len(raw))
     unknown = None
     for _ in range(2):
         try:
             result = await store.put_if_absent(key, raw)
         except OutcomeUnknown as error:
             unknown = error
-            incumbent = await store.get_bounded(
-                key, MAX_OBJECT_BYTES)
+            try:
+                incumbent = await store.get_bounded(key, maximum)
+            except PayloadTooLarge as conflict:
+                raise ValueError(
+                    "immutable object conflict") from conflict
             if incumbent == raw:
                 return EXISTS
             if incumbent is not None:
@@ -254,7 +271,11 @@ async def ensure_object_async(store, oid, raw):
             return CREATED
         if result is not EXISTS:
             raise TypeError("conditional-create result")
-        if await store.get_bounded(key, MAX_OBJECT_BYTES) != raw:
+        try:
+            incumbent = await store.get_bounded(key, maximum)
+        except PayloadTooLarge as conflict:
+            raise ValueError("immutable object conflict") from conflict
+        if incumbent != raw:
             raise ValueError("immutable object conflict")
         return EXISTS
     raise unknown

@@ -13,7 +13,8 @@ from .limits import (
     InvalidEncoding,
     MAX_ATOM_NAME_BYTES,
     MAX_ATOM_VALUE_BYTES,
-    MAX_OBJECT_BYTES,
+    MAX_FACT_BYTES,
+    PayloadTooLarge,
     decode_json,
     valid_bounded_text,
 )
@@ -146,7 +147,10 @@ def encode(fact: Fact) -> bytes:
     """The one canonical byte representation stored and carried for a fact."""
     if not isinstance(fact, Fact):
         raise ValueError("not a fact")
-    return canon(fact.to_json())
+    raw = canon(fact.to_json())
+    if len(raw) > MAX_FACT_BYTES:
+        raise PayloadTooLarge("fact too large")
+    return raw
 
 
 def workspace_of(fact: Fact) -> str:
@@ -171,7 +175,7 @@ def decode(raw: bytes) -> Fact:
     """Strictly decode one canonical fact blob and re-check its content id."""
     if not isinstance(raw, bytes):
         raise ValueError("fact bytes")
-    value = decode_json(raw, MAX_OBJECT_BYTES, "fact")
+    value = decode_json(raw, MAX_FACT_BYTES, "fact")
     try:
         fact = from_json(value)
         if encode(fact) != raw:

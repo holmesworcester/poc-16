@@ -8,6 +8,7 @@ from core.fact import Fact, Need
 from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
 from .._commands import offer_source
 from . import signature
+from ._display import display
 
 TAG = "device_invite"
 POLICY = FamilyPolicy(
@@ -24,6 +25,7 @@ POLICY = FamilyPolicy(
 def device_invite(workspace, pk, user, device_pk, label, ts):
     if pk == device_pk:
         raise ValueError("a device grant must target another key")
+    label = display(label)
     return Fact(
         TAG, ts,
         author_selectors(POLICY, {}) + [

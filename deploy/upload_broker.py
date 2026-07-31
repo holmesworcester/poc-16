@@ -18,6 +18,7 @@ from core.limits import (
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
     MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
@@ -321,7 +322,8 @@ class UploadBroker:
         async def fetch(oid):
             nonlocal fetch_error
             try:
-                return await self._get("obj/" + oid, MAX_OBJECT_BYTES)
+                return await self._get(
+                    "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
             except Exception as error:
                 fetch_error = error
                 return None

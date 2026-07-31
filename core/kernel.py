@@ -8,7 +8,7 @@ is a separate family-owned Worker grant over authenticated point reads.
 from typing import NamedTuple
 
 import facts
-from .fact import Fact, bound_to
+from .fact import Fact, bound_to, encode
 from .limits import MAX_CLOSURE_FACTS, MAX_RESOLVED_EDGES
 from .shape import valid_fid
 
@@ -195,6 +195,7 @@ def _judge(stream, ctx):
         if ctx.has_fact(fact.fid):
             continue
         try:
+            encode(fact)
             handler = facts.family_for(fact.t)
             refs_seen = all(ctx.has_fact(fid) for _, fid in fact.refs())
             edges = resolve_edges(
