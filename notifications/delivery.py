@@ -1,16 +1,19 @@
-"""Prototype stateless push derivation from an explicit repository hint.
+"""Bounded notification derivation from historical event work.
 
-No production root-commit path, carrier, or provider deployment invokes this
-library yet. A future emitter must name only newly published event facts and
-must not treat an Applier's whole admitted closure as that event set.
+The event root proves what happened.  A separately pinned current root owns
+every mutable delivery decision: event suppression, recipient preferences,
+member/device liveness, and endpoint liveness.  Delivery is never a repository
+commit effect.
 """
 from dataclasses import dataclass
-from typing import Protocol
+from inspect import isawaitable
+from typing import Awaitable, Protocol
 
 import facts
 
 from core.crypto import h
 from core.fact import canon
+from core.fetch_budget import BudgetedFetch, FetchBudgetExceeded
 from core.limits import (
     MAX_ATOM_VALUE_BYTES,
     MAX_PILE_FACTS,
@@ -26,9 +29,27 @@ from facts.content import notification_preference as preference
 
 MAX_MATCH_ROWS = 16_384
 MAX_DELIVERIES = 4_096
+MAX_NOTIFICATION_FETCHES = 32_768
+MAX_NOTIFICATION_FETCH_BYTES = 32 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 4_096
 MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000
 MAX_TTL_SECONDS = 28 * 24 * 60 * 60
+
+
+class InvalidPublicationHint(ValueError):
+    """The named fact is not an authenticated event at the named root."""
+
+
+class _ObjectMiss(BaseException):
+    """Escape synchronous tree traversal so an async driver can fetch."""
+
+    __slots__ = ("oid",)
+
+    def __init__(self, oid):
+        super().__init__(oid)
+        self.oid = oid
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationHint:
     """Advisory work created only after this exact root was published."""
@@ -120,12 +141,21 @@ class PushPermanent(PushError):
     pass
 
 
-class PushUnregistered(PushPermanent):
+class PushInvalidEndpoint(PushPermanent):
     pass
 
 
+class PushUnregistered(PushInvalidEndpoint):
+    pass
+
+
+class CurrentRootBehind(PushRetryable):
+    """The current authority view has not observed the event root yet."""
+
+
 class PushProvider(Protocol):
-    def send(self, request: PushRequest) -> PushAccepted: ...
+    def send(self, request: PushRequest) \
+            -> PushAccepted | Awaitable[PushAccepted]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +231,7 @@ def _users(view, trigger, budget):
 
 
 def _endpoints(view, user, push_node, budget):
-    selected = []
+    cells = {}
     for row, fact in _postings(
             view, push_endpoint.ENDPOINT_OFFER, user, None, budget):
         body = fact.body
@@ -210,9 +240,19 @@ def _endpoints(view, user, push_node, budget):
                 or (push_endpoint.ENDPOINT_OFFER, user,
                     body.get("installation", "")) not in fact.offers():
             raise ValueError("notification endpoint posting")
-        if view.fact_active(row.fid) \
-                and (push_node is None or body["push_node"] == push_node):
-            selected.append(fact)
+        if view.fact_active(row.fid):
+            cells.setdefault(body["installation"], []).append(fact)
+
+    # Concurrent registration can leave two otherwise valid facts in the
+    # same logical installation cell.  Neither target is authoritative until
+    # ordinary suppression resolves that conflict.  Group before filtering
+    # by push node so two workers cannot each select one side of the conflict.
+    selected = [
+        values[0]
+        for _installation, values in sorted(cells.items())
+        if len(values) == 1 and (
+            push_node is None or values[0].body["push_node"] == push_node)
+    ]
     return sorted(selected, key=lambda fact: fact.fid)
 
 
@@ -229,20 +269,52 @@ def trigger_for(fact):
     return value
 
 
-def derive(hint, fetch, *, push_node=None):
-    """Join triggers, preferences, and endpoints in the hint's exact root."""
-    if not isinstance(hint, PublicationHint) or not callable(fetch) \
+def _check_derivation(
+        hint, current_root, push_node, max_fetches, max_fetch_bytes):
+    if not isinstance(hint, PublicationHint) \
+            or not isinstance(current_root, bytes) \
+            or not 0 < len(current_root) <= MAX_ROOT_BYTES \
+            or type(max_fetches) is not int \
+            or not 0 <= max_fetches <= MAX_NOTIFICATION_FETCHES \
+            or type(max_fetch_bytes) is not int \
+            or not 0 <= max_fetch_bytes <= MAX_NOTIFICATION_FETCH_BYTES \
             or push_node is not None and not valid_fid(push_node):
         raise ValueError("notification derivation")
-    view = RepositoryReader(hint.workspace, hint.root, fetch).worker()
+
+
+def _derive_from(hint, fetch, current_root, push_node):
+    try:
+        event_view = RepositoryReader(
+            hint.workspace, hint.root, fetch).worker()
+    except (TypeError, ValueError) as error:
+        raise InvalidPublicationHint(
+            "invalid notification event root") from error
+    current_view = RepositoryReader(
+        hint.workspace, current_root, fetch).worker()
     budget, intents = _Budget(), {}
     for fid in hint.facts:
-        fact = view.fact(fid)
-        trigger = trigger_for(fact)
-        if trigger is None or not view.fact_active(fid):
+        try:
+            fact = event_view.fact(fid)
+            trigger = trigger_for(fact)
+            event_active = event_view.fact_active(fid)
+        except (FetchBudgetExceeded, OSError):
+            raise
+        except Exception as error:
+            raise InvalidPublicationHint(
+                "invalid notification event fact") from error
+        if trigger is None or not event_active:
             continue
-        for user in _users(view, trigger, budget):
-            mode = _effective(view, user, trigger.channel, budget)
+        if not current_view.fact_known(fid):
+            raise CurrentRootBehind(
+                "current notification root has not observed event")
+        current_fact = current_view.fact(fid)
+        if current_fact != fact:
+            raise ValueError("notification event residence conflict")
+        if not current_view.fact_active(fid):
+            continue
+        for user in _users(current_view, trigger, budget):
+            mode = _effective(
+                current_view, user, trigger.channel, budget)
             mentioned = user in trigger.mentions
             if mode == preference.NONE \
                     or mode == preference.MENTIONS and not mentioned:
@@ -255,7 +327,7 @@ def derive(hint, fetch, *, push_node=None):
                 "workspace": hint.workspace,
             })
             for endpoint in _endpoints(
-                    view, user, push_node, budget):
+                    current_view, user, push_node, budget):
                 body = endpoint.body
                 delivery_id = h(canon([
                     "notification-delivery-v1",
@@ -288,8 +360,89 @@ def derive(hint, fetch, *, push_node=None):
     return tuple(intents[key] for key in sorted(intents))
 
 
-def deliver(hint, fetch, push_node_secret, provider, now_ms):
-    """Perform stateless at-least-once delivery for one push-node key."""
+def derive(
+        hint, fetch, current_root, *, push_node=None,
+        max_fetches=MAX_NOTIFICATION_FETCHES,
+        max_fetch_bytes=MAX_NOTIFICATION_FETCH_BYTES):
+    """Prove historical events, then join only current delivery authority."""
+    if not callable(fetch):
+        raise ValueError("notification derivation")
+    _check_derivation(
+        hint, current_root, push_node, max_fetches, max_fetch_bytes)
+    return _derive_from(
+        hint,
+        BudgetedFetch(
+            fetch, max_fetches=max_fetches, max_bytes=max_fetch_bytes),
+        current_root,
+        push_node,
+    )
+
+
+async def derive_awaited(
+        hint, fetch, current_root, *, push_node=None,
+        max_fetches=MAX_NOTIFICATION_FETCHES,
+        max_fetch_bytes=MAX_NOTIFICATION_FETCH_BYTES):
+    """Drive the same synchronous matcher with sync or awaited object reads."""
+    if not callable(fetch):
+        raise ValueError("notification derivation")
+    _check_derivation(
+        hint, current_root, push_node, max_fetches, max_fetch_bytes)
+    cache = {}
+    fetched_bytes = 0
+
+    def cached_fetch(oid):
+        if oid not in cache:
+            raise _ObjectMiss(oid)
+        return cache[oid]
+
+    bounded_fetch = BudgetedFetch(
+        cached_fetch, max_fetches=max_fetches, max_bytes=max_fetch_bytes)
+    while True:
+        try:
+            return _derive_from(
+                hint, bounded_fetch, current_root, push_node)
+        except _ObjectMiss as miss:
+            oid = miss.oid
+        if oid in cache:
+            raise AssertionError("notification fetch replay")
+        raw = fetch(oid)
+        if isawaitable(raw):
+            raw = await raw
+        if raw is not None and not isinstance(raw, bytes):
+            raise TypeError("object fetch returned non-bytes")
+        fetched_bytes += len(raw) if raw is not None else 0
+        if fetched_bytes > max_fetch_bytes:
+            raise FetchBudgetExceeded("object-fetch byte budget")
+        cache[oid] = raw
+
+
+def request_for(intent, push_node_secret, now_ms):
+    """Open one current endpoint and assign TTL from this send attempt."""
+    if not isinstance(intent, NotificationIntent) \
+            or type(now_ms) is not int or not 0 <= now_ms <= FACT_TS_MAX:
+        raise ValueError("notification request")
+    try:
+        target = push_endpoint.open_target(
+            push_node_secret, intent.sealed_target)
+    except (TypeError, ValueError) as error:
+        raise PushInvalidEndpoint(
+            "invalid sealed FCM installation") from error
+    expires = min(FACT_TS_MAX, now_ms + MAX_TTL_MS)
+    return PushRequest(
+        intent.application,
+        intent.environment,
+        intent.platform,
+        target,
+        intent.payload,
+        intent.delivery_id,
+        expires,
+        min(MAX_TTL_SECONDS, (expires - now_ms + 999) // 1000),
+        intent.kind,
+    )
+
+
+def deliver(hint, fetch, current_root, push_node_secret, provider, now_ms):
+    """Attempt each current delivery once; a carrier owns retry and ack."""
     try:
         public = push_node_secret.verify_key.encode().hex()
     except Exception as error:
@@ -298,23 +451,9 @@ def deliver(hint, fetch, push_node_secret, provider, now_ms):
             or type(now_ms) is not int or not 0 <= now_ms <= FACT_TS_MAX:
         raise ValueError("notification delivery")
     outcomes = []
-    for intent in derive(hint, fetch, push_node=public):
-        expires = min(FACT_TS_MAX, intent.event_ts + MAX_TTL_MS)
-        if now_ms >= expires:
-            outcomes.append(DeliveryResult(intent.delivery_id, "expired"))
-            continue
-        request = PushRequest(
-            intent.application,
-            intent.environment,
-            intent.platform,
-            push_endpoint.open_target(
-                push_node_secret, intent.sealed_target),
-            intent.payload,
-            intent.delivery_id,
-            expires,
-            min(MAX_TTL_SECONDS, (expires - now_ms + 999) // 1000),
-            intent.kind,
-        )
+    for intent in derive(
+            hint, fetch, current_root, push_node=public):
+        request = request_for(intent, push_node_secret, now_ms)
         accepted = provider.send(request)
         if not isinstance(accepted, PushAccepted):
             raise PushRetryable("push provider returned no acceptance")
@@ -324,16 +463,23 @@ def deliver(hint, fetch, push_node_secret, provider, now_ms):
 
 
 __all__ = (
+    "CurrentRootBehind",
     "DeliveryResult",
+    "InvalidPublicationHint",
+    "MAX_NOTIFICATION_FETCHES",
+    "MAX_NOTIFICATION_FETCH_BYTES",
     "NotificationIntent",
     "PublicationHint",
     "PushAccepted",
+    "PushInvalidEndpoint",
     "PushPermanent",
     "PushRequest",
     "PushRetryable",
     "PushUnregistered",
     "deliver",
     "derive",
+    "derive_awaited",
+    "request_for",
     "seal_target",
     "trigger_for",
 )

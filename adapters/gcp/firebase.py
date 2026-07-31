@@ -5,6 +5,7 @@ import importlib
 
 from notifications.delivery import (
     PushAccepted,
+    PushInvalidEndpoint,
     PushPermanent,
     PushRequest,
     PushRetryable,
@@ -22,10 +23,12 @@ _RETRYABLE = frozenset({
     "UnavailableError",
     "UnknownError",
 })
-_PERMANENT = frozenset({
-    "FailedPreconditionError",
+_INVALID_ENDPOINT = frozenset({
     "InvalidArgumentError",
     "NotFoundError",
+})
+_RETRYABLE_CONFIGURATION = frozenset({
+    "FailedPreconditionError",
     "PermissionDeniedError",
     "SenderIdMismatchError",
     "ThirdPartyAuthError",
@@ -69,7 +72,7 @@ class FirebaseAdminFcm:
             raise TypeError("FCM request")
         app = self.apps.get((request.application, request.environment))
         if app is None:
-            raise PushPermanent("unconfigured Firebase application")
+            raise PushRetryable("unconfigured Firebase application")
         messaging = self._module()
         title, body = self._titles(request.kind)
         message = messaging.Message(
@@ -87,7 +90,7 @@ class FirebaseAdminFcm:
                 "apns-collapse-id": request.delivery_id,
                 "apns-expiration": str(request.expires_at_ms // 1000),
             }),
-            token=request.target,
+            fid=request.target,
         )
         try:
             message_id = messaging.send(message, app=app)
@@ -95,11 +98,15 @@ class FirebaseAdminFcm:
             name = type(error).__name__
             if name == "UnregisteredError":
                 raise PushUnregistered("FCM target is unregistered") from error
-            if name in _RETRYABLE or isinstance(
+            if name in _RETRYABLE or name in _RETRYABLE_CONFIGURATION \
+                    or isinstance(
                     error, (OSError, TimeoutError)):
                 raise PushRetryable(f"FCM send failed: {name}") from error
-            if name in _PERMANENT or isinstance(error, ValueError):
-                raise PushPermanent(f"FCM send failed: {name}") from error
+            if name in _INVALID_ENDPOINT or isinstance(error, ValueError):
+                raise PushInvalidEndpoint(
+                    f"FCM target was rejected: {name}") from error
+            if isinstance(error, PushPermanent):
+                raise
             raise PushRetryable(f"FCM send failed: {name}") from error
         try:
             return PushAccepted(message_id)

@@ -16,7 +16,6 @@ from full_peer.node import FullPeer
 from notifications.delivery import (
     PublicationHint,
     PushAccepted,
-    PushPermanent,
     PushRequest,
     PushRetryable,
     PushUnregistered,
@@ -55,6 +54,10 @@ def _hint(node, workspace, *fids):
         node.reader(workspace).root_bytes,
         tuple(sorted(set(fids))),
     )
+
+
+def _root(node, workspace):
+    return node.reader(workspace).root_bytes
 
 
 def _author_preference(node, workspace, scope, target, mode, ts):
@@ -220,11 +223,11 @@ def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
         node, workspace, "quiet", "channel opt-in", ts=7)
 
     assert derive(_hint(node, workspace, text),
-                  _fetch(node, workspace)) == ()
+                  _fetch(node, workspace), _root(node, workspace)) == ()
     mention, = derive(_hint(node, workspace, explicit),
-                      _fetch(node, workspace))
+                      _fetch(node, workspace), _root(node, workspace))
     ordinary, = derive(_hint(node, workspace, channel),
-                       _fetch(node, workspace))
+                       _fetch(node, workspace), _root(node, workspace))
     assert mention.endpoint == ordinary.endpoint == endpoint
     assert mention.kind == "mention"
     assert ordinary.kind == "message"
@@ -234,7 +237,7 @@ def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
     node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
     event = message.post(node, workspace, "general", "quiet", ts=3)
     assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace)) == ()
+                  _fetch(node, workspace), _root(node, workspace)) == ()
 
     _author_preference(
         node, workspace, preference.CHANNEL, "general",
@@ -243,7 +246,7 @@ def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
         node, workspace, preference.CHANNEL, "general",
         preference.INHERIT, 5)
     assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace)) == ()
+                  _fetch(node, workspace), _root(node, workspace)) == ()
 
 
 @dataclass
@@ -263,8 +266,11 @@ def test_duplicate_retry_derives_the_same_delivery_id_without_state(tmp_path):
     hint = _hint(node, workspace, event)
     provider = FakePush([])
 
-    first = deliver(hint, _fetch(node, workspace), secret, provider, 4)
-    second = deliver(hint, _fetch(node, workspace), secret, provider, 5)
+    root = _root(node, workspace)
+    first = deliver(
+        hint, _fetch(node, workspace), root, secret, provider, 4)
+    second = deliver(
+        hint, _fetch(node, workspace), root, secret, provider, 5)
 
     assert first[0].delivery_id == second[0].delivery_id
     assert provider.requests[0].delivery_id \
@@ -272,7 +278,7 @@ def test_duplicate_retry_derives_the_same_delivery_id_without_state(tmp_path):
     assert provider.requests[0].payload == provider.requests[1].payload
 
 
-def test_retry_reads_the_hints_exact_root_not_later_preferences(tmp_path):
+def test_retry_uses_event_root_but_current_preferences(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     preference.set_global(node, workspace, preference.ALL, ts=3)
     event = message.post(node, workspace, "general", "pinned", ts=4)
@@ -280,9 +286,17 @@ def test_retry_reads_the_hints_exact_root_not_later_preferences(tmp_path):
     preference.set_global(node, workspace, preference.NONE, ts=5)
 
     provider = FakePush([])
-    result = deliver(hint, _fetch(node, workspace), secret, provider, 5)
+    result = deliver(
+        hint,
+        _fetch(node, workspace),
+        _root(node, workspace),
+        secret,
+        provider,
+        5,
+    )
 
-    assert len(result) == len(provider.requests) == 1
+    assert result == ()
+    assert provider.requests == []
 
 
 class _Message:
@@ -310,7 +324,7 @@ def _request():
         b'{"kind":"mention"}', "d" * 64, 60_000, 60, "mention")
 
 
-def test_firebase_adapter_uses_token_and_both_platform_collapse_ids():
+def test_firebase_adapter_uses_fid_and_both_platform_collapse_ids():
     module = FakeMessaging()
     adapter = FirebaseAdminFcm(
         {("poc16.mobile", "production"): object()},
@@ -320,10 +334,10 @@ def test_firebase_adapter_uses_token_and_both_platform_collapse_ids():
 
     assert accepted.message_id == "provider-message"
     built, _app = module.sent[0]
-    assert built.token == "target-token"
+    assert built.fid == "target-token"
     assert built.android.collapse_key == "d" * 64
     assert built.apns.headers["apns-collapse-id"] == "d" * 64
-    assert not hasattr(built, "fid")
+    assert not hasattr(built, "token")
 
 
 def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
@@ -332,7 +346,7 @@ def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
         {("another.app", "production"): object()},
         messaging_module=module)
 
-    with pytest.raises(PushPermanent, match="unconfigured"):
+    with pytest.raises(PushRetryable, match="unconfigured"):
         adapter.send(_request())
     assert module.sent == []
 
@@ -342,7 +356,8 @@ def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
     [
         ("UnregisteredError", PushUnregistered),
         ("QuotaExceededError", PushRetryable),
-        ("ThirdPartyAuthError", PushPermanent),
+        ("SenderIdMismatchError", PushRetryable),
+        ("ThirdPartyAuthError", PushRetryable),
     ],
 )
 def test_firebase_adapter_classifies_errors_without_leaking_details(
