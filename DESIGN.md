@@ -418,20 +418,32 @@ parsed. Families without that hook cannot trigger notifications.
 An `ApplyResult`'s admitted closure is not an event set: it includes old
 dependencies and does not prove which trigger facts became newly resident.
 There is therefore no post-CAS emitter. `NotificationDiscovery` keeps a
-separate operational `(base, target, continuation)` CAS cursor and performs a
-bounded authenticated Merkle diff of `FactTree`. It examines only newly
-resident `fact.type` postings for families with notification hooks. It never
-fetches fact blobs or consults `FactOrder`, SQL, ingress, or the Applier.
+separate operational CAS cursor and performs a bounded authenticated Merkle
+diff of `FactTree`. It examines only newly resident `fact.type` postings for
+families with notification hooks. It never fetches fact blobs or consults
+`FactOrder`, SQL, ingress, or the Applier.
 
-The scanner copies the exact target root bytes into content-addressed
-notification state and publishes one canonical bounded body containing its
-OID and the discovered FIDs. Carrier acceptance precedes cursor CAS. A crash,
-ambiguous publish response, or scanner race can repeat those bytes but cannot
-advance past unaccepted work. A schedule recovers a dropped wake. The initial
-empty cursor intentionally backfills the tree, so operational state is part of
-deployment continuity even though it carries no fact authority.
+The scanner copies the exact target root and canonical bounded body into
+content-addressed notification state, then CASes the cursor into one pending
+page with its exact successor before publishing a wake. While that item is
+pending, every fair scheduled turn republishes the same bytes. Queue or SQS
+acceptance does not advance the cursor. The shared worker alone records
+completion, after typed FCM acceptance or an explicit current-authority or
+terminal outcome. A crash, ambiguous provider result, complete wake loss,
+finite carrier retention, or scanner race can duplicate work but cannot skip
+it. This is a deliberately serial per-workspace state machine rather than an
+outbox or pending-item database.
 
-The carrier is an opaque at-least-once byte carrier only. On delivery,
+Bootstrap is an explicit cursor transition. `current` starts after the present
+FactTree; `backfill` starts at the empty tree. An absent cursor during normal
+scanning is an operational fault, not an instruction to choose one. Workspace,
+immutable deployment owner, bootstrap mode, and a fresh bootstrap generation
+are persisted so state loss or deployment rebinding fails closed. The
+generation is included in pending bytes: a worker paused before state loss
+cannot complete byte-identical work recreated after recovery under newer
+current authority.
+
+The carrier is an opaque wake carrier only. On delivery,
 `NotificationWorker` resolves and hash-verifies the historical event root,
 authenticates each event there, and pins the current repository root
 separately. The current root alone selects current preferences, suppression,
@@ -450,10 +462,11 @@ evidence of device presentation.
 AWS uses S3 notification state, a scheduled scanner Lambda, SQS, and a
 delivery Lambda. Cloudflare uses segregated Workers, R2 notification state,
 and Cloudflare Queues. FullPeer may compose the same scanner and worker with a
-filesystem state store and in-process carrier. These deployments are outside
+filesystem state store and an in-process wake. These deployments are outside
 core and remain disabled until real iOS and Android launch tests pass. Queue
-and DLQ retention are finite; preserved historical-root state must outlive the
-complete alert and redrive horizon.
+and DLQ retention are finite operational headroom; notification cursor,
+pending body, and historical root state must be non-expiring because they are
+the durable eventual-delivery record.
 
 ## 6. RepositoryReader and sync
 
