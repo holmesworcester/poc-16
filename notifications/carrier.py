@@ -20,6 +20,14 @@ MAX_CARRIER_ID_BYTES = 4_096
 MAX_DELIVERY_ATTEMPT = (1 << 31) - 1
 
 
+class CarrierError(OSError):
+    """A carrier operation did not complete normally."""
+
+
+class PublishOutcomeUnknown(CarrierError):
+    """The body may be durable, but no acceptance response was received."""
+
+
 def checked_body(body):
     if not isinstance(body, bytes):
         raise TypeError("carrier body")
@@ -97,9 +105,11 @@ __all__ = (
     "Carrier",
     "CarrierAccepted",
     "CarrierDelivery",
+    "CarrierError",
     "DeliveryDisposition",
     "DeliveryHandler",
     "MAX_CARRIER_BYTES",
+    "PublishOutcomeUnknown",
     "RETRY",
     "checked_body",
     "delivery_disposition",
