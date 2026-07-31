@@ -377,9 +377,11 @@ direct-upload marker. Thus byte-identical redelivery is one logical generation
 rather than an indistinguishable ABA instance. Reservation and spend records
 are never deleted. A valid receipt binds workspace, source, payload,
 reservation, exact outcome, and the applicable base/result-root or rejection
-evidence. The sole running delete path requires a definitely created spend;
-`EXISTS` and outcome-unknown both deny deletion. This remains correct when
-provider ETags repeat for byte-identical values.
+evidence. Permanent rejection evidence is bounded, content-addressed, and binds
+the exact workspace, source, generation, payload, and verdict. The sole running
+delete path requires its exact read-backs and a definitely created outcome
+spend; `EXISTS` and outcome-unknown both deny deletion. This remains correct
+when provider ETags repeat for byte-identical values.
 
 HTTP receipt acknowledges once the exact generation is durably staged, even
 when its first apply attempt fails transiently. The retained generation is the

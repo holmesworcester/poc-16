@@ -19,6 +19,8 @@ MAX_MINT_FETCHES = 128
 MAX_MINT_FETCH_BYTES = 4 * MIB
 MAX_PAGE_REQUEST_BYTES = 64 * 1024
 MAX_PAGE_BATCH_BYTES = 4 * MIB
+MAX_REJECTION_RECORD_BYTES = 4 * 1024
+MAX_REJECTION_DIAGNOSTIC_BYTES = 512
 
 # Every database-free hosted Reader must be able to return canonical facts and
 # public invite envelopes admitted by the shared engine. Detached file objects

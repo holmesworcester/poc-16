@@ -16,7 +16,6 @@ LIST may delay an obligation, but may never erase one.
 """
 import ast
 from dataclasses import dataclass
-import json
 from pathlib import Path
 
 import facts
@@ -24,8 +23,18 @@ import facts
 from core.validated_set import reconstruct
 from core.close import decode_pile
 from core.crypto import h
-from core.ingress import KernelRejected, PermanentIngressRejection
+from core.fact import canon
+from core.ingress import (
+    KernelRejected,
+    PermanentIngressRejection,
+    check_source,
+    decode_rejection_record,
+)
 from core.kernel import drain
+from core.limits import (
+    MAX_REJECTION_RECORD_BYTES,
+    decode_json,
+)
 from core.object_store import CREATED, Applied
 
 
@@ -91,6 +100,14 @@ class _Snapshot:
     objects: tuple
 
 
+def _record(raw, maximum, fields):
+    value = decode_json(raw, maximum, "F10 evidence")
+    if not isinstance(value, dict) or set(value) != set(fields) \
+            or canon(value) != raw:
+        raise ValueError("F10 evidence")
+    return value
+
+
 class ObligationTrace:
     """Check pile lifetimes against authenticated publication/rejection proof."""
 
@@ -142,11 +159,16 @@ class ObligationTrace:
             for key, raw in data.items() if key.startswith("pile/")
         }
         verified = {}
+        definite_creates = {}
+        ambiguous = self._ambiguous_mutations()
         discharges = []
 
         for event in self.bucket.history:
             if event.op == "get":
-                if event.key.startswith("failed/") \
+                if event.key.startswith((
+                        "failed/", "applier/generation/",
+                        "applier/spent/",
+                )) \
                         and event.result is not None:
                     verified[event.key] = (event.seq, event.result)
             elif event.op == "put":
@@ -154,6 +176,10 @@ class ObligationTrace:
             elif event.op == "put_if_absent":
                 if event.result is CREATED:
                     self._apply_create(event, data, obligations)
+                    if event.seq not in ambiguous:
+                        definite_creates.setdefault(
+                            event.key, []).append((
+                                event.seq, event.value, event.actor))
             elif event.op == "cas":
                 if isinstance(event.result, Applied):
                     data[event.key] = event.value
@@ -166,7 +192,7 @@ class ObligationTrace:
                     publication, publication_reason = \
                         self._publication_witness(obligation, event.seq)
                     rejection, rejection_reason = self._rejection_witness(
-                        obligation, event.seq, data, verified)
+                        obligation, event, data, verified, definite_creates)
                     witness = publication or rejection
                     if witness is None:
                         self._fail(
@@ -235,10 +261,40 @@ class ObligationTrace:
             "kernel-valid durable fact")
 
     def _rejection_witness(
-            self, obligation, delete_seq, data, verified):
+            self, obligation, deletion, data, verified, definite_creates):
+        delete_seq = deletion.seq
+        try:
+            binding = check_source(obligation.key, obligation.raw)
+        except ValueError:
+            return None, "rejected obligation has no exact generation binding"
+        reservation_key = "applier/generation/" + binding.generation
+        reservation = verified.get(reservation_key)
+        if reservation is None \
+                or not obligation.created_seq <= reservation[0] < delete_seq \
+                or data.get(reservation_key) != reservation[1]:
+            return None, "no exact durable generation reservation read-back"
+        try:
+            generation = _record(
+                reservation[1], MAX_REJECTION_RECORD_BYTES,
+                {
+                    "actor", "kind", "origin", "payload", "workspace",
+                })
+        except ValueError:
+            return None, "invalid generation reservation"
+        if generation != {
+                "actor": binding.member,
+                "kind": "internal-generation-v1",
+                "origin": generation["origin"],
+                "payload": binding.payload,
+                "workspace": self.workspace,
+        } or not isinstance(generation["origin"], str) \
+                or h(reservation[1]) != binding.generation:
+            return None, "generation reservation binding mismatch"
+
         payload_key = "failed/pile/" + h(obligation.raw)
         payload = verified.get(payload_key)
         if payload is None or payload[0] >= delete_seq \
+                or payload[0] < obligation.created_seq \
                 or payload[1] != obligation.raw \
                 or data.get(payload_key) != obligation.raw:
             return None, "no exact durable rejection payload read-back"
@@ -249,29 +305,82 @@ class ObligationTrace:
                 obligation.raw, self.workspace)
         if rejection_type is None:
             return None, classification_reason
+        rejection_reason = (
+            "no exact durable metadata agreeing with deterministic "
+            f"{rejection_type} classification")
         for key, (verified_seq, raw) in verified.items():
             if not key.startswith("failed/meta/") \
                     or verified_seq >= delete_seq \
+                    or verified_seq < obligation.created_seq \
                     or data.get(key) != raw \
                     or key != "failed/meta/" + h(raw):
                 continue
             try:
-                record = json.loads(raw)
-            except (TypeError, ValueError):
+                record = decode_rejection_record(
+                    raw,
+                    workspace=self.workspace,
+                    source=obligation.key,
+                    payload=expected_id,
+                    generation=binding.generation,
+                )
+            except ValueError:
                 continue
-            if not isinstance(record, dict) or set(record) != {
-                    "error", "id", "source"}:
+            if record["classification"] != rejection_type \
+                    or record["pile"] != payload_key:
                 continue
-            error_type = record["error"].split(":", 1)[0] \
-                if isinstance(record["error"], str) else ""
-            if record["id"] == expected_id \
-                    and record["source"] == obligation.key \
-                    and error_type == rejection_type:
-                return (
-                    "rejection", max(payload[0], verified_seq)), ""
-        return None, (
-            "no exact durable metadata agreeing with deterministic "
-            f"{rejection_type} classification")
+            spend_key = "applier/spent/" + binding.generation
+            spend_raw = canon({
+                "kind": "internal-generation-spend-v1",
+                "outcome": "rejected",
+                "proof": h(raw),
+            })
+            created = [
+                seq for seq, value, actor
+                in definite_creates.get(spend_key, ())
+                if value == spend_raw
+                and actor == deletion.actor
+                and max(
+                    obligation.created_seq,
+                    reservation[0],
+                    payload[0],
+                    verified_seq,
+                ) < seq < delete_seq
+            ]
+            if not created:
+                rejection_reason = "no definite fresh rejection spend"
+                continue
+            spend = verified.get(spend_key)
+            if spend is None \
+                    or not max(created) < spend[0] < delete_seq \
+                    or spend[1] != spend_raw \
+                    or data.get(spend_key) != spend_raw:
+                rejection_reason = (
+                    "no exact durable rejection spend read-back")
+                continue
+            return (
+                "rejection",
+                max(
+                    reservation[0], payload[0], verified_seq,
+                    max(created), spend[0],
+                ),
+            ), ""
+        return None, rejection_reason
+
+    def _ambiguous_mutations(self):
+        """Locate history events whose after-linearization result was not seen."""
+        ambiguous = set()
+        for gate in getattr(self.bucket, "_rules", ()):
+            if gate.when != "after" or gate.error is None \
+                    or gate.seen < gate.nth:
+                continue
+            matches = [
+                event for event in self.bucket.history
+                if (event.actor, event.op, event.key) == (
+                    gate.actor, gate.op, gate.key)
+            ]
+            if len(matches) >= gate.nth:
+                ambiguous.add(matches[gate.nth - 1].seq)
+        return ambiguous
 
     def _snapshots(self):
         initial_root = self.bucket.initial.get("root")

@@ -31,6 +31,7 @@ from core.object_store import (
     VersionToken,
     KEY_RE,
     authoritative_key,
+    validate_create,
     validate_key,
 )
 
@@ -533,13 +534,8 @@ class S3Store:
             _raise_mutation_error("PutObject", error)
 
     def put_if_absent(self, key, value):
-        key = validate_key(key)
         value = _value_bytes(value)
-        if key == "root" or key.startswith("root/"):
-            raise ValueError("root requires compare-and-swap")
-        if key == "obj" or (
-                key.startswith("obj/") and key[4:] != h(value)):
-            raise ValueError("immutable object address")
+        key = validate_create(key, value)
         args = self._put_args(key, value)
         args["IfNoneMatch"] = "*"
         try:

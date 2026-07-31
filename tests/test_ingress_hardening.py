@@ -450,15 +450,26 @@ def test_failure_status_follows_short_native_pages_without_whole_list(
     inner = node.store(workspace)
     expected = []
     for ordinal in range(3):
+        payload = h(f"poison {ordinal}".encode())
+        generation = f"{ordinal:064x}"
+        source = f"pile/member/{generation}/{payload}"
         record = {
-            "error": f"InvalidPile: poison {ordinal}",
-            "id": f"failure-{ordinal}",
-            "source": f"pile/member/{ordinal}",
-            "ts": ordinal,
+            "classification": "InvalidPile",
+            "diagnostic": f"poison {ordinal}",
+            "generation": generation,
+            "kind": "permanent-rejection-v1",
+            "payload": payload,
+            "pile": "failed/pile/" + payload,
+            "source": source,
+            "workspace": workspace,
         }
         raw = canon(record)
         inner.put_if_absent("failed/meta/" + h(raw), raw)
-        expected.append(record)
+        expected.append({
+            "error": f"InvalidPile: poison {ordinal}",
+            "id": payload,
+            "source": source,
+        })
 
     class ShortPages:
         def __init__(self):
@@ -477,7 +488,8 @@ def test_failure_status_follows_short_native_pages_without_whole_list(
     short = ShortPages()
     node._stores[workspace] = short
 
-    assert node.ingress_failures(workspace) == expected
+    assert node.ingress_failures(workspace) == sorted(
+        expected, key=lambda row: row["id"])
     assert len(short.calls) == len(expected)
     assert {prefix for prefix, _, _ in short.calls} == {
         "failed/meta/"}
@@ -541,10 +553,11 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
     meta_keys = store.list("failed/meta/")
     assert len(meta_keys) == 1
     records = [json.loads(store.get(key)) for key in meta_keys]
-    assert all(record["id"] == h(bad) for record in records)
+    assert all(record["payload"] == h(bad) for record in records)
     assert all(record["source"] == source for record in records)
     assert all(
-        record["error"] == "InvalidPile: fact shape"
+        record["classification"] == "InvalidPile"
+        and record["diagnostic"] == "fact shape"
         for record in records)
     assert first.ingress_attempt_failures(workspace) == []
     assert second.ingress_attempt_failures(workspace) == []

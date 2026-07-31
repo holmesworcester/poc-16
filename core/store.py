@@ -27,6 +27,7 @@ from .object_store import (
     VersionToken,
     ListPage,
     authoritative_key,
+    validate_create,
     validate_key,
 )
 from .limits import (
@@ -122,11 +123,7 @@ class FsStore:
 
     def put_if_absent(self, key, b):
         """Atomically create one key; immutable objects verify on collision."""
-        if key == "root" or key.startswith("root/"):
-            raise ValueError("root requires compare-and-swap")
-        if key == "obj" or (
-                key.startswith("obj/") and key[4:] != h(b)):
-            raise ValueError("immutable object address")
+        key = validate_create(key, b)
         p = self._p(key)
         directory = os.path.dirname(p)
         os.makedirs(directory, exist_ok=True)

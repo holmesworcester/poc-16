@@ -11,9 +11,11 @@ import threading
 import time
 
 from core import fact_index
+from core.crypto import h
 from core.fact import Fact
+from core.ingress import decode_rejection_record
 from core.limits import (
-    MAX_OBJECT_BYTES,
+    MAX_REJECTION_RECORD_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
@@ -365,10 +367,19 @@ class FullPeer:
         out = []
         for name in names:
             try:
-                value = json.loads(store.get_bounded(
-                    name, MAX_OBJECT_BYTES))
-                if isinstance(value, dict):
-                    out.append(value)
+                raw = store.get_bounded(
+                    name, MAX_REJECTION_RECORD_BYTES)
+                if raw is None or name != "failed/meta/" + h(raw):
+                    raise ValueError("rejection record address")
+                value = decode_rejection_record(raw, workspace=ws)
+                out.append({
+                    "error": (
+                        f'{value["classification"]}: '
+                        f'{value["diagnostic"]}'
+                    ),
+                    "id": value["payload"],
+                    "source": value["source"],
+                })
             except (TypeError, ValueError):
                 out.append({
                     "error": "ValueError: unreadable failure record",
@@ -376,7 +387,8 @@ class FullPeer:
                     "source": name,
                     "ts": 0,
                 })
-        return sorted(out, key=lambda row: (row.get("ts", 0), row.get("id", "")))
+        return sorted(
+            out, key=lambda row: (row.get("ts", 0), row.get("id", "")))
 
     def record_sync_failure(self, ws, url, error):
         with self.lock:

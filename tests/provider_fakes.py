@@ -257,3 +257,25 @@ class FakeR2Bucket:
         self.history.append(("delete", key))
         self.data.pop(key, None)
         self.tokens.pop(key, None)
+
+
+def provider_store(kind, directory, *, prefix="tenant"):
+    """Build one provider-neutral store over the realistic shared fakes."""
+    from adapters.r2 import R2BindingStore
+    from adapters.s3 import S3Config, S3Store
+    from core.store import FsStore
+
+    if kind == "fs":
+        return FsStore(str(directory))
+    if kind == "s3":
+        return S3Store(
+            S3Config(
+                "receipt-bucket",
+                prefix,
+                read_total_max_attempts=1,
+            ),
+            client=FakeS3Bucket().client("applier"),
+        )
+    if kind == "r2":
+        return R2BindingStore(FakeR2Bucket(), prefix)
+    raise ValueError("provider store kind")

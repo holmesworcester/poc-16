@@ -859,6 +859,54 @@ def test_internal_generation_identity_and_spend_have_one_runtime_path():
         for method in methods if method != "apply")
 
 
+def test_rejection_schema_and_create_address_have_one_definition():
+    definitions = {
+        name: [
+            path for path in source_paths()
+            for item in ast.walk(parsed(path))
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and item.name == name
+        ]
+        for name in (
+            "decode_rejection_record",
+            "encode_rejection_record",
+            "validate_create",
+        )
+    }
+    assert definitions == {
+        "decode_rejection_record": [Path("core/ingress.py")],
+        "encode_rejection_record": [Path("core/ingress.py")],
+        "validate_create": [Path("core/object_store.py")],
+    }
+
+    def importers(name):
+        return {
+            path
+            for path in source_paths()
+            for item in parsed(path).body
+            if isinstance(item, ast.ImportFrom)
+            and any(alias.name == name for alias in item.names)
+        }
+
+    assert importers("decode_rejection_record") == {
+        Path("core/repository_applier.py"),
+        Path("full_peer/node.py"),
+    }
+    assert importers("encode_rejection_record") == {
+        Path("core/repository_applier.py")}
+    assert importers("validate_create") == {
+        Path("adapters/r2/worker.py"),
+        Path("adapters/s3/store.py"),
+        Path("core/store.py"),
+    }
+
+    from core import ingress
+    assert {
+        "decode_rejection_record",
+        "encode_rejection_record",
+    } <= set(ingress.__all__)
+
+
 def test_protocol_front_doors_route_semantic_reads_through_one_reader():
     boundaries = (
         (Path("core/http.py"), "HttpGate", "_mint", {"mint_awaited"}),

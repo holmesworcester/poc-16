@@ -20,6 +20,8 @@ from .ingress import (
     KernelRejected,
     PermanentIngressRejection,
     check_source,
+    decode_rejection_record,
+    encode_rejection_record,
     pile_source,
 )
 from .kernel import drain
@@ -50,6 +52,7 @@ from .fact import canon, encode
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_PILE_BYTES,
+    MAX_REJECTION_RECORD_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
@@ -262,6 +265,24 @@ class RepositoryApplier:
                     "applied", "confirmed", "noop", "rejected"} \
                 or not valid_fid(value["proof"]):
             raise ValueError("internal generation spend")
+        if value["outcome"] == "rejected":
+            rejection = await self._get_bounded(
+                self.store,
+                "failed/meta/" + value["proof"],
+                MAX_REJECTION_RECORD_BYTES,
+            )
+            if rejection is None or h(rejection) != value["proof"]:
+                raise ValueError("internal generation spend")
+            try:
+                decode_rejection_record(
+                    rejection,
+                    workspace=self.workspace,
+                    source=source,
+                    payload=binding.payload,
+                    generation=binding.generation,
+                )
+            except ValueError as error:
+                raise ValueError("internal generation spend") from error
         return binding, value
 
     async def _terminal_result(self, source):
@@ -806,21 +827,20 @@ class RepositoryApplier:
 
     def _retirement_evidence(self, receipt):
         rejected = isinstance(receipt, RejectionReceipt)
-        exact = [
+        proof = h(receipt.record) if rejected else h(canon([
             receipt.workspace,
             receipt.source,
             receipt.payload,
             receipt.generation,
             receipt.outcome,
-            h(receipt.record) if rejected else (
-                "" if receipt.base_root is None else h(receipt.base_root)),
-            "" if rejected else h(receipt.root),
-            "" if rejected else h(canon(list(receipt.admitted))),
-        ]
+            "" if receipt.base_root is None else h(receipt.base_root),
+            h(receipt.root),
+            h(canon(list(receipt.admitted))),
+        ]))
         record = canon({
             "kind": "internal-generation-spend-v1",
             "outcome": receipt.outcome,
-            "proof": h(canon(exact)),
+            "proof": proof,
         })
         return _Evidence("applier/spent/" + receipt.generation, record)
 
@@ -910,8 +930,6 @@ class RepositoryApplier:
 
     async def _reject(self, source, raw, error, *, retire=True):
         """Persist exact typed permanent-rejection evidence, then retire."""
-        if not isinstance(error, PermanentIngressRejection):
-            raise TypeError("typed permanent ingress rejection required")
         incumbent = await self._get_bounded(
             self.store, source, MAX_PILE_BYTES)
         if incumbent != raw:
@@ -922,15 +940,8 @@ class RepositoryApplier:
                 "repository source is not a present exact generation")
         binding, _ = await self._generation(source, raw)
         payload = h(raw)
-        await self._put_evidence(
-            _Evidence("failed/pile/" + payload, raw))
-        record = canon({
-            "error": f"{type(error).__name__}: {error}",
-            "id": payload,
-            "source": source,
-        })
-        await self._put_evidence(
-            _Evidence("failed/meta/" + h(record), record))
+        record = encode_rejection_record(
+            error, self.workspace, source, raw)
         receipt = RejectionReceipt(
             workspace=self.workspace,
             source=source,
@@ -940,6 +951,10 @@ class RepositoryApplier:
             issuer=self._issuer,
             record=record,
         )
+        await self._put_evidence(
+            _Evidence("failed/pile/" + payload, raw))
+        await self._put_evidence(
+            _Evidence("failed/meta/" + h(record), record))
         self._receipts[source] = receipt
         retired = await self.retire_rejection(
             source, raw, receipt) if retire else False
@@ -951,15 +966,25 @@ class RepositoryApplier:
         await self._owned_receipt(
             source, raw, receipt, RejectionReceipt, {"rejected"},
             "durable rejection witness")
+        try:
+            value = decode_rejection_record(
+                receipt.record,
+                workspace=self.workspace,
+                source=source,
+                payload=h(raw),
+                generation=receipt.generation,
+            )
+        except ValueError as error:
+            raise ValueError("durable rejection witness") from error
         pile_evidence = await self._get_bounded(
             self.store,
-            "failed/pile/" + receipt.payload,
+            value["pile"],
             max(1, len(raw)),
         )
         meta_evidence = await self._get_bounded(
             self.store,
             "failed/meta/" + h(receipt.record),
-            max(1, len(receipt.record)),
+            MAX_REJECTION_RECORD_BYTES,
         )
         if pile_evidence != raw or meta_evidence != receipt.record:
             raise ValueError("durable rejection witness")

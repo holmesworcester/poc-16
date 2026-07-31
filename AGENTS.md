@@ -136,9 +136,12 @@ LIST for safety.
 Internal generation identity comes from a never-deleted create-only reservation,
 not from a path segment, random nonce, or provider ETag. Identical workspace,
 member, payload, and marker bindings are one logical delivery. After exact
-publication or rejection evidence exists, a create-only outcome-bound spend
-grants at most one DELETE. `EXISTS` and outcome-unknown deny deletion; a safe
-orphan is preferable to retiring recreated work.
+publication or bounded, content-addressed rejection evidence exists, a
+create-only outcome-bound spend grants at most one DELETE. Rejection evidence
+binds the exact workspace, source, generation, payload, and permanent verdict;
+its definite fresh spend and exact read-backs are required before deletion.
+`EXISTS` and outcome-unknown deny deletion; a safe orphan is preferable to
+retiring recreated work.
 
 Stale workers may duplicate bounded immutable work or delay convergence. They
 must not overwrite different bytes at an object key, clobber a newer root,

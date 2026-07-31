@@ -1,6 +1,7 @@
 """F10 retirement is exact, witnessed, generation-bound, and replay-safe."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import threading
 
 import facts
@@ -10,13 +11,16 @@ from adapters.r2 import R2BindingStore
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
 from core.fact import canon
-from core.ingress import check_source
+from core.ingress import check_source, decode_rejection_record
 from core.object_store import OutcomeUnknown
 from full_peer.node import FullPeer
-from core.repository_applier import RejectionReceipt, RepositoryApplier
+from core.repository_applier import (
+    RejectionReceipt,
+    RepositoryApplier,
+)
 from core.store import FsStore
 
-from .provider_fakes import FakeR2Bucket, FakeS3Bucket
+from .provider_fakes import provider_store
 from .util import closed_subset
 
 
@@ -227,24 +231,6 @@ def test_deferred_rejection_replay_dispatches_its_typed_receipt(tmp_path):
     assert store.get(source) is None
 
 
-def _provider_store(kind, directory):
-    if kind == "fs":
-        return FsStore(str(directory))
-    if kind == "s3":
-        bucket = FakeS3Bucket()
-        return S3Store(
-            S3Config(
-                "receipt-bucket",
-                "tenant",
-                read_total_max_attempts=1,
-            ),
-            client=bucket.client("applier"),
-        )
-    if kind == "r2":
-        return R2BindingStore(FakeR2Bucket(), "tenant")
-    raise AssertionError(kind)
-
-
 def _concurrently(call, actors):
     with ThreadPoolExecutor(max_workers=len(actors)) as pool:
         return tuple(pool.map(lambda actor: run(call(actor)), actors))
@@ -298,7 +284,7 @@ def test_identical_success_is_one_reserved_generation_and_one_delete(
         kind, tmp_path):
     workspace, raw, _ = _message_pile(
         tmp_path / f"source-{kind}", f"same success {kind}", 10)
-    store = _provider_store(kind, tmp_path / f"recipient-{kind}")
+    store = provider_store(kind, tmp_path / f"recipient-{kind}")
     first = RepositoryApplier(workspace, store)
     second = RepositoryApplier(workspace, store)
 
@@ -340,7 +326,7 @@ def test_identical_rejection_is_one_reserved_generation_and_one_delete(
     workspace, _, _ = _message_pile(
         tmp_path / f"source-reject-{kind}", f"reject {kind}", 10)
     raw = b"{}"
-    store = _provider_store(kind, tmp_path / f"rejected-{kind}")
+    store = provider_store(kind, tmp_path / f"rejected-{kind}")
     first = RepositoryApplier(workspace, store)
     second = RepositoryApplier(workspace, store)
     sources = _concurrently(
@@ -358,6 +344,25 @@ def test_identical_rejection_is_one_reserved_generation_and_one_delete(
     terminal = run(cold.apply(source))
     assert terminal.status == "rejected"
     assert terminal.retired is True
+    binding = check_source(source, raw)
+    metadata = run(cold.store.list_page(
+        "failed/meta/", None, 8)).keys
+    assert len(metadata) == 1
+    record = run(cold.store.get_bounded(metadata[0], 4 * 1024))
+    decode_rejection_record(
+        record,
+        workspace=workspace,
+        source=source,
+        payload=h(raw),
+        generation=binding.generation,
+    )
+    spend = run(cold.store.get_bounded(
+        "applier/spent/" + binding.generation, 4 * 1024))
+    assert json.loads(spend) == {
+        "kind": "internal-generation-spend-v1",
+        "outcome": "rejected",
+        "proof": h(record),
+    }
 
     run(cold.store.put_if_absent(source, raw))
     recreated = run(RepositoryApplier(workspace, store).apply(source))
@@ -371,7 +376,7 @@ def test_generation_and_spend_evidence_cannot_be_erased_or_replaced(
         kind, tmp_path):
     workspace, raw, _ = _message_pile(
         tmp_path / f"source-tombstone-{kind}", f"tombstone {kind}", 10)
-    store = _provider_store(
+    store = provider_store(
         kind, tmp_path / f"recipient-tombstone-{kind}")
     applier = RepositoryApplier(workspace, store)
     source = run(applier.stage("member", raw))

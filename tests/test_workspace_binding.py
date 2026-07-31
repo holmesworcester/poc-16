@@ -108,8 +108,11 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
     assert store.get("root") is None
     assert store.get(source) is None
     assert store.get("failed/pile/" + h(hostile)) == hostile
-    assert json.loads(result.rejection.record)["error"] \
-        == "InvalidPile: mixed workspace pile"
+    rejection = json.loads(result.rejection.record)
+    assert (
+        rejection["classification"],
+        rejection["diagnostic"],
+    ) == ("InvalidPile", "mixed workspace pile")
 
 
 def test_foreign_pile_and_legacy_pile_have_one_typed_rejection_door(
@@ -190,8 +193,11 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
 
     assert result.status == "rejected"
     assert result.retired is True
-    assert json.loads(result.rejection.record)["error"] \
-        == "InvalidPile: pile workspace"
+    rejection = json.loads(result.rejection.record)
+    assert (
+        rejection["classification"],
+        rejection["diagnostic"],
+    ) == ("InvalidPile", "pile workspace")
     assert store.get("root") == root
     assert node.fact_of(second, foreign.fid) is None
 

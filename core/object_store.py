@@ -54,10 +54,26 @@ def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key == "root" or key.startswith("root/") \
         or key == "obj" or key.startswith("obj/") \
+        or key == "failed/pile" or key.startswith("failed/pile/") \
+        or key == "failed/meta" or key.startswith("failed/meta/") \
         or key == "applier/generation" \
         or key.startswith("applier/generation/") \
         or key == "applier/spent" \
         or key.startswith("applier/spent/")
+
+
+def validate_create(key, value):
+    """Validate one conditional-create address before provider mutation."""
+    key = validate_key(key)
+    if not isinstance(value, bytes):
+        raise TypeError("object value must be bytes")
+    if key == "root" or key.startswith("root/"):
+        raise ValueError("root requires compare-and-swap")
+    for prefix in ("obj/", "failed/pile/", "failed/meta/"):
+        if key == prefix[:-1] or (
+                key.startswith(prefix) and key[len(prefix):] != h(value)):
+            raise ValueError("immutable object address")
+    return key
 
 
 @dataclass(frozen=True)

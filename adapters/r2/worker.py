@@ -14,6 +14,7 @@ from core.object_store import (
     Versioned,
     VersionToken,
     authoritative_key,
+    validate_create,
     validate_key,
 )
 
@@ -207,10 +208,7 @@ class R2BindingStore:
             raise OutcomeUnknown(f"R2 returned no mutation result for {key}")
 
     async def put_if_absent(self, key, value):
-        if key == "root" or key.startswith("root/"):
-            raise ValueError("root requires compare-and-swap")
-        if key == "obj" or key.startswith("obj/") and key[4:] != h(value):
-            raise ValueError("immutable object address")
+        key = validate_create(key, value)
         result = await self._put(
             key, value, onlyIf=_if_none_match())
         return CREATED if result is not None else EXISTS

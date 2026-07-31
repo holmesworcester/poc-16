@@ -573,8 +573,11 @@ def test_embedded_object_member_is_rejected_without_establishing_bytes(
     assert store.get("obj/" + oid) is None
     assert store.get("root") is None
     assert store.get("failed/pile/" + h(hostile)) == hostile
-    assert json.loads(result.rejection.record)["error"] \
-        == "InvalidPile: pile shape"
+    rejection = json.loads(result.rejection.record)
+    assert (
+        rejection["classification"],
+        rejection["diagnostic"],
+    ) == ("InvalidPile", "pile shape")
 
 
 def test_repository_reader_is_pinned_and_has_no_store_authority(tmp_path):

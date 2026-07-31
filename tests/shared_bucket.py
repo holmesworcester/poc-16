@@ -20,6 +20,7 @@ from core.object_store import (
     Versioned,
     VersionToken,
     authoritative_key,
+    validate_create,
     validate_key,
 )
 from core.limits import PAGE_BATCH, PayloadTooLarge
@@ -229,14 +230,7 @@ class ScriptedBucket:
         self._gate(actor, "put", key, "after")
 
     def _put_if_absent(self, actor, key, value):
-        key = validate_key(key)
-        if not isinstance(value, bytes):
-            raise TypeError("object value must be bytes")
-        if key == "root" or key.startswith("root/"):
-            raise ValueError("root requires compare-and-swap")
-        if key == "obj" or (
-                key.startswith("obj/") and key[4:] != h(value)):
-            raise ValueError("immutable object address")
+        key = validate_create(key, value)
         self._gate(actor, "put_if_absent", key, "before")
         with self._lock:
             before = self._current_token(key)
