@@ -1,8 +1,8 @@
 """Two small AWS Lambda adapters around shared notification code.
 
 The scheduled scanner owns only an operational cursor and SQS publication.
-The SQS consumer is read-only over repository/state objects and maps the
-shared worker's typed result to Lambda's partial-batch response.  Neither
+The SQS consumer is read-only over repository objects and may CAS only the
+operational notification cursor after the shared worker finishes. Neither
 function is a repository publication hook or an alternate fact processor.
 """
 import asyncio
@@ -19,7 +19,12 @@ from core.fact import canon
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from notifications.carrier import CarrierDelivery
-from notifications.discovery import NotificationDiscovery
+from notifications.discovery import (
+    BOOTSTRAP_BACKFILL,
+    BOOTSTRAP_CURRENT,
+    NotificationDiscovery,
+    NotificationState,
+)
 from notifications.worker import (
     RETRY,
     TERMINAL,
@@ -29,6 +34,8 @@ from notifications.worker import (
 )
 
 from .config import (
+    BOOTSTRAP_RESULT_SCHEMA,
+    BOOTSTRAP_SCHEMA,
     DIRECT_SMOKE_RESULT_SCHEMA,
     DIRECT_SMOKE_SCHEMA,
     SCAN_RESULT_SCHEMA,
@@ -143,9 +150,8 @@ def _scanner_dependencies():
     return _scanner_cache
 
 
-async def scan_once(*, repository=None, state=None, workspace=None,
-                    carrier=None, owner=None):
-    """Advance at most one shared bounded discovery page."""
+def _discovery(*, repository=None, state=None, workspace=None,
+               carrier=None, owner=None):
     if any(value is None for value in (repository, state, workspace, carrier)):
         configured = _scanner_dependencies()
         repository = configured[0] if repository is None else repository
@@ -153,9 +159,24 @@ async def scan_once(*, repository=None, state=None, workspace=None,
         workspace = configured[2] if workspace is None else workspace
         carrier = configured[3] if carrier is None else carrier
     owner = _notification_owner() if owner is None else owner
-    return await NotificationDiscovery(
+    return NotificationDiscovery(
         repository, state, workspace, carrier,
-        owner=owner).run_once()
+        owner=owner)
+
+
+async def scan_once(**dependencies):
+    """Advance at most one shared bounded discovery page."""
+    return await _discovery(**dependencies).run_once()
+
+
+async def bootstrap_once(mode, **dependencies):
+    """Explicitly initialize absent discovery state in one selected mode."""
+    discovery = _discovery(**dependencies)
+    if mode == BOOTSTRAP_CURRENT:
+        return await discovery.bootstrap_current()
+    if mode == BOOTSTRAP_BACKFILL:
+        return await discovery.bootstrap_backfill()
+    raise ValueError("notification bootstrap mode")
 
 
 def _scan_event(event, workspace):
@@ -166,14 +187,29 @@ def _scan_event(event, workspace):
         "schema": SCAN_WAKE_SCHEMA,
         "workspace": workspace,
     }
-    if not scheduled and not wake:
-        raise ValueError("notification scan invocation")
+    if scheduled or wake:
+        return None
+    if isinstance(event, dict) \
+            and set(event) == {"mode", "schema", "workspace"} \
+            and event.get("schema") == BOOTSTRAP_SCHEMA \
+            and event.get("workspace") == workspace \
+            and event.get("mode") in {
+                BOOTSTRAP_CURRENT, BOOTSTRAP_BACKFILL}:
+        return event["mode"]
+    raise ValueError("notification scanner invocation")
 
 
 def scanner_handler(event, _context):
-    """Handle one schedule or explicit non-authoritative wake."""
+    """Handle a schedule/wake or one explicit bootstrap operation."""
     workspace = _workspace()
-    _scan_event(event, workspace)
+    mode = _scan_event(event, workspace)
+    if mode is not None:
+        cursor = asyncio.run(bootstrap_once(mode, workspace=workspace))
+        return {
+            "mode": cursor.bootstrap,
+            "schema": BOOTSTRAP_RESULT_SCHEMA,
+            "status": "initialized",
+        }
     result = asyncio.run(scan_once(workspace=workspace))
     return {"schema": SCAN_RESULT_SCHEMA, "status": result.status}
 
@@ -232,11 +268,13 @@ def _delivery_dependencies():
             "TINYP2P_NOTIFICATION_CANONICAL_PREFIX",
             state=False,
         )
-        state = _store(
+        state_store = _store(
             "TINYP2P_NOTIFICATION_STATE_BUCKET",
             "TINYP2P_NOTIFICATION_STATE_PREFIX",
-            state=False,
+            state=True,
         )
+        state = NotificationState(
+            state_store, workspace, _notification_owner())
         secret, provider = _push_provider()
 
         def current_root(requested):
@@ -341,6 +379,7 @@ __all__ = (
     "deliver_batch",
     "delivery_handler",
     "direct_smoke",
+    "bootstrap_once",
     "scan_once",
     "scanner_handler",
 )

@@ -195,6 +195,12 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"
+              - Sid: CompleteNotificationCursor
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/root"
               - Sid: ReadExactNotificationSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -216,9 +222,12 @@ Resources:
                 - !Ref AWS::NoValue
               - !If
                 - HasStateKmsKey
-                - Sid: DecryptNotificationState
+                - Sid: CompleteEncryptedNotificationCursor
                   Effect: Allow
-                  Action: kms:Decrypt
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
                   Resource: !Ref NotificationStateKmsKeyArn
                 - !Ref AWS::NoValue
               - !If
@@ -284,6 +293,7 @@ Resources:
       ReservedConcurrentExecutions: !Ref DeliveryReservedConcurrency
       Environment:
         Variables:
+          TINYP2P_NOTIFICATION_DEPLOYMENT_ID: !Ref DeploymentId
           TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
           TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
           TINYP2P_NOTIFICATION_CANONICAL_PREFIX: !Ref CanonicalPrefix

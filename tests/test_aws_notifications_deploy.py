@@ -12,6 +12,8 @@ import pytest
 from core.crypto import h, load_sk
 from deploy.aws_notifications import manage
 from deploy.aws_notifications.config import (
+    BOOTSTRAP_RESULT_SCHEMA,
+    BOOTSTRAP_SCHEMA,
     DEPLOYMENT_ID_TAG,
     DEPLOYMENT_MARKER,
     DEPLOYMENT_TAG,
@@ -19,6 +21,8 @@ from deploy.aws_notifications.config import (
     DIRECT_SMOKE_SCHEMA,
     DLQ_RETENTION_SECONDS,
     QUEUE_RETENTION_SECONDS,
+    SCAN_RESULT_SCHEMA,
+    SCAN_WAKE_SCHEMA,
 )
 from deploy.aws_notifications.secret import push_node_id
 from notifications.hints import NotificationHint, encode_hint
@@ -27,6 +31,8 @@ from notifications.hints import NotificationHint, encode_hint
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "deploy" / "aws_notifications"
 WORKSPACE = "a" * 64
+HINT_OWNER = "c" * 64
+GENERATION = "e" * 64
 ACCOUNT = "123456789012"
 SECRET_ARN = (
     f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:"
@@ -217,7 +223,7 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "sqs:ReceiveMessage" not in scanner
     assert "secretsmanager:GetSecretValue" not in scanner
     assert "s3:GetObject" in delivery
-    assert "s3:PutObject" not in delivery
+    assert delivery.count("s3:PutObject") == 1
     assert "sqs:SendMessage" not in delivery
     assert "secretsmanager:GetSecretValue" in delivery
     assert "kms:EncryptionContext:SecretARN" in delivery
@@ -229,7 +235,14 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
         assert forbidden not in template
     historical = delivery.split("ReadHistoricalNotificationRoot", 1)[1]
     assert "${NotificationStatePrefix}/obj/*" in historical
+    completion = historical.split("CompleteNotificationCursor", 1)[1].split(
+        "ReadExactNotificationSecret", 1)[0]
+    historical = historical.split("CompleteNotificationCursor", 1)[0]
+    assert "s3:PutObject" not in historical
     assert "${NotificationStatePrefix}/root" not in historical
+    assert "s3:PutObject" in completion
+    assert "${NotificationStatePrefix}/root" in completion
+    assert "${NotificationStatePrefix}/obj/*" not in completion
 
 
 def test_requirements_are_hash_locked_for_lambda_and_firebase():
@@ -362,6 +375,14 @@ def test_explicit_disable_retains_queues_and_functions(monkeypatch):
         assert "Condition:" not in resource
 
 
+def test_create_cannot_skip_explicit_bootstrap(monkeypatch):
+    candidate = args(enable=True)
+    monkeypatch.setattr(manage, "_stack_or_none", lambda _args: None)
+
+    with pytest.raises(RuntimeError, match="bootstrap explicitly"):
+        manage._stack_for_deploy(candidate)
+
+
 def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
         monkeypatch):
     candidate = args()
@@ -390,6 +411,53 @@ def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
     assert f"PushNodeId={PUSH_NODE}" in command
     assert checks == ["lifecycle", "build"]
     assert outputs["NotificationQueueUrl"] == QUEUE_URL
+
+
+def test_explicit_enable_checks_initialized_scanner_before_build(monkeypatch):
+    candidate = args(create=False, update=True, enable=True)
+    incumbent = manage._outputs(stack(candidate, enabled=False))
+    final = stack(candidate, enabled=True)
+    effects = []
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", True, False, incumbent))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
+    monkeypatch.setattr(manage, "_verify_state_lifecycle", lambda _args: None)
+    monkeypatch.setattr(
+        manage, "_check_initialized", lambda _args, _outputs: effects.append(
+            "initialized"))
+    monkeypatch.setattr(manage, "build", lambda _args: effects.append("build"))
+    monkeypatch.setattr(manage, "_owned_stack", lambda _args: final)
+    monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
+    monkeypatch.setattr(manage, "_run", lambda *_args, **_kwargs:
+                        SimpleNamespace(stdout=""))
+
+    manage.deploy(candidate)
+
+    assert effects == ["initialized", "build"]
+
+
+def test_enable_preflight_is_one_normal_wake_and_fails_closed(monkeypatch):
+    candidate = args()
+    outputs = manage._outputs(stack(candidate, enabled=False))
+    calls = []
+    monkeypatch.setattr(manage, "_invoke", lambda _args, function, payload: (
+        calls.append((function, payload)) or {
+            "schema": SCAN_RESULT_SCHEMA,
+            "status": "idle",
+        }))
+
+    assert manage._check_initialized(candidate, outputs) is None
+    assert calls == [(
+        outputs["NotificationScannerFunctionArn"],
+        {"schema": SCAN_WAKE_SCHEMA, "workspace": WORKSPACE},
+    )]
+
+    monkeypatch.setattr(
+        manage, "_invoke", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("uninitialized")))
+    with pytest.raises(RuntimeError, match="bootstrap.*before enabling"):
+        manage._check_initialized(candidate, outputs)
 
 
 @pytest.mark.parametrize(("changes", "push", "field"), (
@@ -489,11 +557,52 @@ def test_disabled_carrier_can_be_redriven_before_restart(monkeypatch):
     assert command[command.index("--destination-arn") + 1] == QUEUE_ARN
 
 
+@pytest.mark.parametrize("mode", ("current", "backfill"))
+def test_bootstrap_is_explicit_and_uses_the_disabled_scanner(
+        monkeypatch, mode):
+    candidate = args(bootstrap_mode=mode)
+    outputs = manage._outputs(stack(candidate, enabled=False))
+    calls = []
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args: stack(
+            candidate, enabled=False))
+    monkeypatch.setattr(manage, "_invoke", lambda _args, function, payload: (
+        calls.append((function, payload)) or {
+            "mode": mode,
+            "schema": BOOTSTRAP_RESULT_SCHEMA,
+            "status": "initialized",
+        }))
+
+    result = manage.bootstrap(candidate)
+
+    assert result["mode"] == mode
+    assert calls == [(
+        outputs["NotificationScannerFunctionArn"],
+        {
+            "mode": mode,
+            "schema": BOOTSTRAP_SCHEMA,
+            "workspace": WORKSPACE,
+        },
+    )]
+
+
+def test_bootstrap_refuses_an_enabled_deployment(monkeypatch):
+    candidate = args(bootstrap_mode="current")
+    monkeypatch.setattr(
+        manage, "_owned_stack", lambda _args: stack(candidate, enabled=True))
+    monkeypatch.setattr(manage, "_invoke", lambda *_args, **_kwargs:
+                        pytest.fail("enabled bootstrap invoked Lambda"))
+
+    with pytest.raises(RuntimeError, match="disable.*before bootstrap"):
+        manage.bootstrap(candidate)
+
+
 def test_direct_smoke_is_independent_of_production_and_proves_acceptance(
         tmp_path, monkeypatch):
     candidate = args(hint_file=str(tmp_path / "hint.json"))
     raw = encode_hint(NotificationHint(
-        WORKSPACE, h(b"event root"), (h(b"event"),)))
+        WORKSPACE, HINT_OWNER, GENERATION,
+        h(b"event root"), (h(b"event"),)))
     Path(candidate.hint_file).write_bytes(raw)
     calls = []
     monkeypatch.setattr(
@@ -527,7 +636,8 @@ def test_direct_smoke_rejects_no_recipient_retry_and_terminal_outcomes(
         tmp_path, monkeypatch, counts):
     candidate = args(hint_file=str(tmp_path / "hint.json"))
     Path(candidate.hint_file).write_bytes(encode_hint(NotificationHint(
-        WORKSPACE, h(b"root"), (h(b"event"),))))
+        WORKSPACE, HINT_OWNER, GENERATION,
+        h(b"root"), (h(b"event"),))))
     monkeypatch.setattr(
         manage, "_owned_stack", lambda _args: stack(
             candidate, enabled=False, smoke=True))

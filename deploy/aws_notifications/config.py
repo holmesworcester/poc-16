@@ -5,6 +5,8 @@ import re
 DEPLOYMENT_MARKER = "poc16-aws-notifications-v1"
 DEPLOYMENT_TAG = "poc16:deployment"
 DEPLOYMENT_ID_TAG = "poc16:deployment-id"
+BOOTSTRAP_SCHEMA = "poc16-notification-bootstrap-v1"
+BOOTSTRAP_RESULT_SCHEMA = "poc16-notification-bootstrap-result-v1"
 SCAN_WAKE_SCHEMA = "poc16-notification-scan-wake-v1"
 SCAN_RESULT_SCHEMA = "poc16-notification-scan-result-v1"
 DIRECT_SMOKE_SCHEMA = "poc16-notification-direct-smoke-v1"

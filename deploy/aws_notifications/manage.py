@@ -17,6 +17,8 @@ from notifications.hints import decode_hint
 
 from .config import (
     ALARM_ACTION_ARN_RE,
+    BOOTSTRAP_RESULT_SCHEMA,
+    BOOTSTRAP_SCHEMA,
     DEPLOYMENT_ID_RE,
     DEPLOYMENT_ID_TAG,
     DEPLOYMENT_MARKER,
@@ -28,6 +30,8 @@ from .config import (
     MAX_RECEIVE_COUNT,
     OWNER_RE,
     QUEUE_RETENTION_SECONDS,
+    SCAN_RESULT_SCHEMA,
+    SCAN_WAKE_SCHEMA,
     SECRET_ARN_RE,
     SECRET_VERSION_RE,
 )
@@ -432,6 +436,9 @@ def _stack_for_deploy(args):
     if args.create:
         if incumbent is not None:
             raise RuntimeError("create requires an absent stack name")
+        if args.enable is True:
+            raise RuntimeError(
+                "create disabled, bootstrap explicitly, then enable")
         return (
             args.stack_name,
             bool(args.enable),
@@ -491,6 +498,8 @@ def deploy(args):
     if incumbent is not None:
         _check_binding(incumbent, binding)
     _verify_state_lifecycle(args)
+    if args.enable is True:
+        _check_initialized(args, incumbent)
     build(args)
     _run([
         "sam", "deploy",
@@ -568,7 +577,7 @@ def redrive(args):
 
 
 def _invoke(args, function, payload):
-    with tempfile.TemporaryDirectory(prefix="poc16-notification-smoke-") \
+    with tempfile.TemporaryDirectory(prefix="poc16-notification-invoke-") \
             as directory:
         source = Path(directory) / "request.json"
         target = Path(directory) / "response.json"
@@ -589,10 +598,56 @@ def _invoke(args, function, payload):
             metadata = json.loads(result.stdout)
             response = json.loads(target.read_bytes())
         except (OSError, TypeError, json.JSONDecodeError) as error:
-            raise RuntimeError("malformed Lambda smoke response") from error
+            raise RuntimeError("malformed Lambda invocation response") \
+                from error
     if metadata.get("StatusCode") != 200 \
             or "FunctionError" in metadata:
-        raise RuntimeError("Lambda smoke invocation failed")
+        raise RuntimeError("Lambda invocation failed")
+    return response
+
+
+def _check_initialized(args, outputs):
+    if not isinstance(outputs, dict):
+        raise RuntimeError("bootstrap notification state before enabling")
+    try:
+        response = _invoke(
+            args,
+            outputs["NotificationScannerFunctionArn"],
+            {
+                "schema": SCAN_WAKE_SCHEMA,
+                "workspace": outputs["WorkspaceId"],
+            },
+        )
+    except (KeyError, RuntimeError):
+        raise RuntimeError(
+            "bootstrap notification state before enabling") from None
+    if not isinstance(response, dict) or set(response) != {
+            "schema", "status"} \
+            or response.get("schema") != SCAN_RESULT_SCHEMA \
+            or response.get("status") not in {
+                "advanced", "idle", "published", "raced", "republished"}:
+        raise RuntimeError("notification initialization check failed")
+
+
+def bootstrap(args):
+    """Initialize absent notification state while production is disabled."""
+    outputs = _outputs(_owned_stack(args))
+    if outputs.get("Enabled") != "false":
+        raise RuntimeError("disable notification production before bootstrap")
+    response = _invoke(
+        args,
+        outputs["NotificationScannerFunctionArn"],
+        {
+            "mode": args.bootstrap_mode,
+            "schema": BOOTSTRAP_SCHEMA,
+            "workspace": outputs["WorkspaceId"],
+        },
+    )
+    if response != {
+            "mode": args.bootstrap_mode,
+            "schema": BOOTSTRAP_RESULT_SCHEMA,
+            "status": "initialized"}:
+        raise RuntimeError("notification bootstrap was not confirmed")
     return response
 
 
@@ -684,6 +739,16 @@ def parser():
     redrive_command = commands.add_parser("redrive")
     _identity_arguments(redrive_command)
     redrive_command.add_argument("--max-per-second", type=int, default=10)
+    bootstrap_command = commands.add_parser("bootstrap")
+    _identity_arguments(bootstrap_command)
+    bootstrap_mode = bootstrap_command.add_mutually_exclusive_group(
+        required=True)
+    bootstrap_mode.add_argument(
+        "--current", dest="bootstrap_mode", action="store_const",
+        const="current")
+    bootstrap_mode.add_argument(
+        "--backfill", dest="bootstrap_mode", action="store_const",
+        const="backfill")
     smoke_command = commands.add_parser("direct-smoke")
     _identity_arguments(smoke_command)
     smoke_command.add_argument("--hint-file", required=True)
@@ -708,6 +773,8 @@ def main(argv=None):
         remove(args)
     elif args.command == "redrive":
         print(redrive(args))
+    elif args.command == "bootstrap":
+        print(json.dumps(bootstrap(args), sort_keys=True))
     else:
         print(json.dumps(direct_smoke(args), sort_keys=True))
     return 0

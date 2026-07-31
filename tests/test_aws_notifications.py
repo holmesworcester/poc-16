@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import sys
 import traceback
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import facts
 import pytest
@@ -23,11 +23,12 @@ from notifications.delivery import (
     PushUnregistered,
     seal_target,
 )
-from notifications.hints import (
-    NotificationHint,
-    decode_hint,
-    encode_hint,
+from notifications.discovery import (
+    CursorNotInitialized,
+    NotificationDiscovery,
+    NotificationState,
 )
+from notifications.hints import decode_hint
 from notifications.worker import NotificationWorker
 from adapters.aws import SqsCarrier
 from deploy.aws_notifications import app
@@ -69,6 +70,32 @@ def test_scanner_state_store_is_separate_conditional_s3_namespace(
     assert state.prefix == "notifications/workspace"
     assert state.conditional_write_403_is_absent is True
     assert captured == [canonical, state]
+
+
+def test_delivery_composes_shared_notification_state_for_cursor_completion(
+        tmp_path, monkeypatch):
+    workspace = "a" * 64
+    canonical = FsStore(str(tmp_path / "canonical"))
+    operational = FsStore(str(tmp_path / "operational"))
+    push_secret, _push_node = keypair()
+    stores = {
+        "TINYP2P_NOTIFICATION_CANONICAL_BUCKET": canonical,
+        "TINYP2P_NOTIFICATION_STATE_BUCKET": operational,
+    }
+    monkeypatch.setattr(app, "_delivery_cache", None)
+    monkeypatch.setattr(app, "_workspace", lambda: workspace)
+    monkeypatch.setattr(app, "_notification_owner", lambda: OWNER)
+    monkeypatch.setattr(
+        app, "_store", lambda bucket, _prefix, **_kwargs: stores[bucket])
+    monkeypatch.setattr(
+        app, "_push_provider", lambda: (push_secret, Push([])))
+
+    configured = app._delivery_dependencies()
+
+    assert configured[0] == workspace
+    assert isinstance(configured[1], NotificationState)
+    assert configured[1].owner == OWNER
+    assert configured[1].store.store is operational
 
 
 def test_cursor_owner_binds_the_complete_semantic_deployment(monkeypatch):
@@ -358,11 +385,16 @@ def _world(tmp_path, *, invalid_endpoint=False):
         ts=2,
     )
     preference.set_global(node, workspace, preference.ALL, ts=3)
+    state_store = FsStore(str(tmp_path / "notification-state"))
+    carrier = QueueCarrier([])
+    discovery = NotificationDiscovery(
+        node.store(workspace), state_store, workspace, carrier,
+        owner=OWNER, generation_factory=lambda: "e" * 64)
+    asyncio.run(discovery.bootstrap_current())
     event = message.post(node, workspace, "general", "hello", ts=4)
-    root = node.reader(workspace).root_bytes
-    state = FsStore(str(tmp_path / "notification-state"))
-    state.put_if_absent("obj/" + h(root), root)
-    raw = encode_hint(NotificationHint(workspace, h(root), (event,)))
+    assert asyncio.run(discovery.run_once()).status == "published"
+    raw, = carrier.bodies
+    state = NotificationState(state_store, workspace, OWNER)
     return node, workspace, push_secret, event, state, raw
 
 
@@ -386,22 +418,6 @@ def _record(body, message_id="work", attempt=1):
     }
 
 
-async def _drain(repository, state, workspace, carrier, maximum=100):
-    results = []
-    for _ in range(maximum):
-        result = await app.scan_once(
-            repository=repository,
-            state=state,
-            workspace=workspace,
-            carrier=carrier,
-            owner=OWNER,
-        )
-        results.append(result)
-        if result.status == "idle":
-            return results
-    raise AssertionError("AWS notification scanner did not become idle")
-
-
 def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
     node = FullPeer(str(tmp_path / "scanner-node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
@@ -409,16 +425,24 @@ def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
     state = FsStore(str(tmp_path / "scanner-state"))
     queue = Queue()
     carrier = SqsCarrier(queue, URL, ARN)
-    asyncio.run(_drain(node.store(workspace), state, workspace, carrier))
-    queue.bodies.clear()
+    asyncio.run(app.bootstrap_once(
+        "current", repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
 
     first = message.post(node, workspace, "general", "one", ts=10)
-    # Its wake is dropped. A second publication and the next schedule are the
-    # only liveness event the scanner receives.
     second = message.post(node, workspace, "general", "two", ts=11)
-    asyncio.run(_drain(node.store(workspace), state, workspace, carrier))
+    published = asyncio.run(app.scan_once(
+        repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
+    first_body, = queue.bodies
+    queue.bodies.clear()  # The accepted wake is dropped after cursor CAS.
+    repeated = asyncio.run(app.scan_once(
+        repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=carrier, owner=OWNER))
 
-    hints = [decode_hint(body) for body in queue.bodies]
+    assert (published.status, repeated.status) == ("published", "republished")
+    assert queue.bodies == [first_body]
+    hints = [decode_hint(first_body)]
     assert {fid for hint in hints for fid in hint.facts} == {first, second}
     assert len({hint.root_oid for hint in hints}) == 1
 
@@ -429,8 +453,9 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
     state = FsStore(str(tmp_path / "race-state"))
-    asyncio.run(_drain(
-        node.store(workspace), state, workspace, QueueCarrier([])))
+    asyncio.run(app.bootstrap_once(
+        "current", repository=node.store(workspace), state=state,
+        workspace=workspace, carrier=QueueCarrier([]), owner=OWNER))
     event = message.post(node, workspace, "general", "race", ts=10)
 
     # Pin the target without progressing, then let both invocations read the
@@ -461,11 +486,58 @@ def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
 
     results = asyncio.run(race())
 
-    assert sorted(result.status for result in results) \
-        == ["published", "raced"]
+    assert [result.status for result in results] \
+        == ["republished", "republished"]
     assert len(carrier.bodies) == 2
     assert carrier.bodies[0] == carrier.bodies[1]
     assert decode_hint(carrier.bodies[0]).facts == (event,)
+
+
+def test_scanner_requires_explicit_bootstrap_before_first_fair_run(tmp_path):
+    node = FullPeer(str(tmp_path / "bootstrap-node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    state = FsStore(str(tmp_path / "bootstrap-state"))
+    carrier = QueueCarrier([])
+    dependencies = {
+        "repository": node.store(workspace),
+        "state": state,
+        "workspace": workspace,
+        "carrier": carrier,
+        "owner": OWNER,
+    }
+
+    with pytest.raises(CursorNotInitialized):
+        asyncio.run(app.scan_once(**dependencies))
+    cursor = asyncio.run(app.bootstrap_once("current", **dependencies))
+
+    assert cursor.bootstrap == "current"
+    assert asyncio.run(app.scan_once(**dependencies)).status == "idle"
+
+
+def test_scanner_handler_accepts_only_explicit_bootstrap_event(
+        monkeypatch):
+    workspace = "a" * 64
+    calls = []
+
+    async def initialize(mode, **dependencies):
+        calls.append((mode, dependencies))
+        return SimpleNamespace(bootstrap=mode)
+
+    monkeypatch.setenv("TINYP2P_NOTIFICATION_WORKSPACE_ID", workspace)
+    monkeypatch.setattr(app, "bootstrap_once", initialize)
+
+    response = app.scanner_handler({
+        "mode": "backfill",
+        "schema": "poc16-notification-bootstrap-v1",
+        "workspace": workspace,
+    }, None)
+
+    assert response == {
+        "mode": "backfill",
+        "schema": "poc16-notification-bootstrap-result-v1",
+        "status": "initialized",
+    }
+    assert calls == [("backfill", {"workspace": workspace})]
 
 
 @dataclass
@@ -638,16 +710,23 @@ def test_unregistered_fid_is_terminal_but_missing_event_root_retries(
     worker = _worker(node, secret, provider)
     sqs = {"Records": [_record(raw)]}
 
-    terminal = asyncio.run(app.deliver_batch(
-        sqs, state=state, worker=worker,
-        workspace=workspace, queue_arn=ARN))
+    class MissingRoot:
+        def __init__(self, backing):
+            self.owner = backing.owner
+            self.pending = backing.pending
+            self.complete = backing.complete
+
+        async def get_bounded(self, _key, _maximum):
+            return None
+
     missing = asyncio.run(app.deliver_batch(
-        sqs,
-        state=FsStore(str(tmp_path / "missing-state")),
-        worker=worker,
+        sqs, state=MissingRoot(state), worker=worker,
         workspace=workspace,
         queue_arn=ARN,
     ))
+    terminal = asyncio.run(app.deliver_batch(
+        sqs, state=state, worker=worker,
+        workspace=workspace, queue_arn=ARN))
 
     assert terminal == {"batchItemFailures": []}
     assert missing == {
