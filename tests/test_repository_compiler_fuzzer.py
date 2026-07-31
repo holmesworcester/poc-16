@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import facts
 from core import indexes
 from core.repository_snapshot import extend_snapshot
 from tests import repository_compiler_fuzzer as fuzzer
@@ -61,6 +62,8 @@ def test_seed_replays_and_covers_single_batch_duplicate_and_noop():
         "action-before-target",
         "target-after-action",
         "target-action-batch",
+        "multi-scope-file",
+        "multi-scope-chunk",
         "competing-action-late",
         "competing-action-earlier",
         "duplicate-existing",
@@ -68,6 +71,27 @@ def test_seed_replays_and_covers_single_batch_duplicate_and_noop():
         "removal-late",
         "removal-earlier",
     } <= {step.name for step in first.steps}
+
+
+def test_differential_oracle_rejects_a_dropped_suppression_scope(
+        monkeypatch):
+    corpus = fuzzer.build_corpus()
+    plan = fuzzer.build_plan(corpus, fuzzer.FIXED_SEEDS[0])
+    current_scopes = facts.current_scopes
+
+    def broken(anchor, base_root, incoming, fetch):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                facts,
+                "current_scopes",
+                lambda fact: frozenset(sorted(current_scopes(fact))[:1]),
+            )
+            return extend_snapshot(anchor, base_root, incoming, fetch)
+
+    with pytest.raises(AssertionError) as caught:
+        fuzzer.run_plan(corpus, plan, broken)
+    assert any(
+        "multi-scope-chunk" in note for note in caught.value.__notes__)
 
 
 def test_failure_shrinks_to_one_fact_and_reports_seed_and_prefix():

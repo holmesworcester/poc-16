@@ -95,6 +95,20 @@ def build_corpus():
             facts.content.message.message(
                 workspace, public, "f3", name, 20 + ordinal, public),
         )
+    file_root = h(b"poc16-f3-file-root")
+    descriptor = signed(
+        "multi-scope-file",
+        facts.content.file.file(
+            workspace, public, "f3", "multi-scope.bin",
+            1, file_root, 1, 40, public),
+    )
+    chunk = signed(
+        "multi-scope-chunk",
+        facts.content.chunk.chunk(
+            workspace, public, "f3", file_root, 0, 1,
+            h(b"poc16-f3-chunk-object"), 41, descriptor.fid, public),
+    )
+    assert len(facts.fact_scopes(chunk)) == 2
 
     actions = {}
     for name, target, mode, timestamp in (
@@ -166,6 +180,8 @@ def build_plan(corpus, seed):
             "target-action-batch",
             group["target-batch"] + group["action-batch"],
         ),
+        Step("multi-scope-file", group["multi-scope-file"]),
+        Step("multi-scope-chunk", group["multi-scope-chunk"]),
         Step("competing-target", group["target-competing"]),
         Step("competing-action-late", group["competing-late"]),
         Step("competing-action-earlier", group["competing-early"]),
