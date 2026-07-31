@@ -15,6 +15,15 @@ Parameters:
   SoftwareDigest:
     Type: String
     AllowedPattern: "^[0-9a-f]{64}$"
+  ScannerCodeSha256:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]{43}=$'
+  DeliveryCodeSha256:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]{43}=$'
+  DeliveryDomainId:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{64}$"
   WorkspaceId:
     Type: String
     AllowedPattern: "^[0-9a-f]{64}$"
@@ -267,6 +276,7 @@ Resources:
       Environment:
         Variables:
           TINYP2P_NOTIFICATION_AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          TINYP2P_NOTIFICATION_AWS_PARTITION: !Ref AWS::Partition
           TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
           TINYP2P_NOTIFICATION_DEPLOYMENT_ID: !Ref DeploymentId
           TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
@@ -274,9 +284,7 @@ Resources:
           TINYP2P_NOTIFICATION_STATE_BUCKET: !Ref NotificationStateBucketName
           TINYP2P_NOTIFICATION_STATE_PREFIX: !Ref NotificationStatePrefix
           TINYP2P_NOTIFICATION_EXPECTED_BUCKET_OWNER: !Ref ExpectedBucketOwner
-          TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
-          TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
-          TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
+          TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID: !Ref DeliveryDomainId
           TINYP2P_NOTIFICATION_QUEUE_ARN: !GetAtt NotificationQueue.Arn
           TINYP2P_NOTIFICATION_QUEUE_URL: !Ref NotificationQueue
           TINYP2P_NOTIFICATION_SOFTWARE_DIGEST: !Ref SoftwareDigest
@@ -297,6 +305,7 @@ Resources:
       ReservedConcurrentExecutions: !Ref DeliveryReservedConcurrency
       Environment:
         Variables:
+          TINYP2P_NOTIFICATION_AWS_PARTITION: !Ref AWS::Partition
           TINYP2P_NOTIFICATION_DEPLOYMENT_ID: !Ref DeploymentId
           TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
           TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
@@ -308,6 +317,7 @@ Resources:
           TINYP2P_NOTIFICATION_SECRET_ARN: !Ref NotificationSecretArn
           TINYP2P_NOTIFICATION_SECRET_VERSION_ID: !Ref NotificationSecretVersionId
           TINYP2P_NOTIFICATION_PUSH_NODE_ID: !Ref PushNodeId
+          TINYP2P_NOTIFICATION_DELIVERY_DOMAIN_ID: !Ref DeliveryDomainId
           TINYP2P_NOTIFICATION_SOFTWARE_DIGEST: !Ref SoftwareDigest
 
   NotificationScannerVersion:
@@ -315,14 +325,16 @@ Resources:
     Properties:
       Description: !Ref SoftwareDigest
       FunctionName: !Ref NotificationScannerFunction
+      CodeSha256: !Ref ScannerCodeSha256
       RuntimePolicy:
         UpdateRuntimeOn: FunctionUpdate
 
   NotificationDeliveryVersion:
     Type: AWS::Lambda::Version
     Properties:
-      Description: !Ref SoftwareDigest
+      Description: !Sub "${SoftwareDigest}:${NotificationSecretVersionId}"
       FunctionName: !Ref NotificationDeliveryFunction
+      CodeSha256: !Ref DeliveryCodeSha256
       RuntimePolicy:
         UpdateRuntimeOn: FunctionUpdate
 
@@ -409,12 +421,22 @@ Resources:
         - !Ref AWS::NoValue
 
 Outputs:
+  AwsPartition:
+    Value: !Ref AWS::Partition
+  StackAccountId:
+    Value: !Ref AWS::AccountId
   DeploymentMarker:
     Value: poc16-aws-notifications-v1
   DeploymentId:
     Value: !Ref DeploymentId
   SoftwareDigest:
     Value: !Ref SoftwareDigest
+  ScannerCodeSha256:
+    Value: !Ref ScannerCodeSha256
+  DeliveryCodeSha256:
+    Value: !Ref DeliveryCodeSha256
+  DeliveryDomainId:
+    Value: !Ref DeliveryDomainId
   Enabled:
     Value: !Ref Enabled
   WorkspaceId:
@@ -453,6 +475,26 @@ Outputs:
     Value: !Ref NotificationDeadLetterQueue
   NotificationDeadLetterQueueArn:
     Value: !GetAtt NotificationDeadLetterQueue.Arn
+  NotificationDeliveryMappingUuid:
+    Value: !Ref NotificationDeliveryMapping
+  NotificationScanScheduleName:
+    Value: !Ref NotificationScanSchedule
+  NotificationScanScheduleExpression:
+    Value: !Ref ScheduleExpression
+  NotificationScannerReservedConcurrency:
+    Value: !Ref ScannerReservedConcurrency
+  NotificationDeliveryReservedConcurrency:
+    Value: !Ref DeliveryReservedConcurrency
+  NotificationMaxReceiveCount:
+    Value: !Ref MaxReceiveCount
+  NotificationLogRetentionDays:
+    Value: !Ref LogRetentionDays
+  NotificationAlarmActionArn:
+    Value: !Ref AlarmActionArn
+  NotificationScannerRoleArn:
+    Value: !GetAtt NotificationScannerRole.Arn
+  NotificationDeliveryRoleArn:
+    Value: !GetAtt NotificationDeliveryRole.Arn
   NotificationScannerVersionArn:
     Value: !Ref NotificationScannerVersion
   NotificationDeliveryVersionArn:

@@ -29,7 +29,10 @@ def decode_secret(value):
                 "application", "credential", "environment"} \
                 or not all(isinstance(row[name], str) and row[name]
                            for name in ("application", "environment")) \
-                or not isinstance(row["credential"], dict):
+                or not isinstance(row["credential"], dict) \
+                or not isinstance(
+                    row["credential"].get("project_id"), str) \
+                or not row["credential"]["project_id"]:
             raise RuntimeError("notification Firebase application")
         key = row["application"], row["environment"]
         if key in seen:
