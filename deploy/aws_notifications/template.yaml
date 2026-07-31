@@ -253,6 +253,7 @@ Resources:
         Variables:
           TINYP2P_NOTIFICATION_AWS_ACCOUNT_ID: !Ref AWS::AccountId
           TINYP2P_NOTIFICATION_WORKSPACE_ID: !Ref WorkspaceId
+          TINYP2P_NOTIFICATION_DEPLOYMENT_ID: !Ref DeploymentId
           TINYP2P_NOTIFICATION_CANONICAL_BUCKET: !Ref CanonicalBucketName
           TINYP2P_NOTIFICATION_CANONICAL_PREFIX: !Ref CanonicalPrefix
           TINYP2P_NOTIFICATION_STATE_BUCKET: !Ref NotificationStateBucketName

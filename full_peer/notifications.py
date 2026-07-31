@@ -13,6 +13,7 @@ import time
 
 from adapters.gcp.firebase import FirebaseAdminFcm
 from core.crypto import h, load_sk
+from core.fact import canon
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from core.store import FsStore
@@ -122,6 +123,11 @@ class FullPeerNotifications:
         self.node = node
         self.directory = directory
         self.secret, self.push_node = _secret(push_node_secret)
+        self.owner = h(canon([
+            "full-peer-notification-owner-v1",
+            node.pk,
+            self.push_node,
+        ]))
         self.provider = provider
         self.cadence = float(cadence)
         self._stores = {}
@@ -177,7 +183,8 @@ class FullPeerNotifications:
                 delivery, workspace, state, worker)
 
         return NotificationDiscovery(
-            repository, state, workspace, DirectCarrier(handle))
+            repository, state, workspace, DirectCarrier(handle),
+            owner=self.owner)
 
     async def _run_once(self):
         out = []

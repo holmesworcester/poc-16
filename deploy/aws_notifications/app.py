@@ -13,7 +13,8 @@ import time
 from adapters.aws import SqsCarrier, consume_sqs_batch, queue_binding
 from adapters.gcp.firebase import FirebaseAdminFcm
 from adapters.s3 import S3Config, S3Store
-from core.crypto import load_sk
+from core.crypto import h, load_sk
+from core.fact import canon
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from notifications.discovery import NotificationDiscovery
@@ -49,6 +50,14 @@ def _workspace():
     if not valid_fid(value):
         raise RuntimeError("invalid notification workspace")
     return value
+
+
+def _notification_owner():
+    return h(canon([
+        "aws-notification-owner-v1",
+        _required("TINYP2P_NOTIFICATION_DEPLOYMENT_ID"),
+        _workspace(),
+    ]))
 
 
 def _owner():
@@ -121,7 +130,7 @@ def _scanner_dependencies():
 
 
 async def scan_once(*, repository=None, state=None, workspace=None,
-                    carrier=None):
+                    carrier=None, owner=None):
     """Advance at most one shared bounded discovery page."""
     if any(value is None for value in (repository, state, workspace, carrier)):
         configured = _scanner_dependencies()
@@ -129,8 +138,10 @@ async def scan_once(*, repository=None, state=None, workspace=None,
         state = configured[1] if state is None else state
         workspace = configured[2] if workspace is None else workspace
         carrier = configured[3] if carrier is None else carrier
+    owner = _notification_owner() if owner is None else owner
     return await NotificationDiscovery(
-        repository, state, workspace, carrier).run_once()
+        repository, state, workspace, carrier,
+        owner=owner).run_once()
 
 
 def _scan_event(event, workspace):
