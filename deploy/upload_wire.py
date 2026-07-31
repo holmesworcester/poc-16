@@ -18,9 +18,9 @@ from core.limits import (
 from deploy.upload_session import (
     MAX_RANGE_PROOF_BYTES,
     MAX_SESSION_OBJECTS,
-    TOKEN_BYTES,
     UploadLeaf,
     UploadManifest,
+    valid_cursor,
     valid_leaf,
     valid_manifest,
 )
@@ -162,8 +162,7 @@ def _decode_manifest(value):
 
 
 def _cursor(value):
-    if not isinstance(value, str) or len(value) != TOKEN_BYTES \
-            or not value.isascii():
+    if not valid_cursor(value):
         _invalid("upload cursor")
     return value
 

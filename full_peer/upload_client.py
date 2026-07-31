@@ -7,11 +7,17 @@ from urllib.parse import unquote, urlsplit
 from core.limits import PAGE_BATCH
 from core.staged_intent import SESSION_HEX_BYTES, staging_key
 import deploy.upload_wire as wire
+from deploy.upload_session import (
+    MAX_SESSION_CLOCK_SKEW_MS,
+    MAX_SESSION_TTL_MS,
+    UploadLeaf,
+    UploadManifest,
+    valid_cursor,
+)
 from full_peer.upload_journal import (
     UploadProgress,
     UploadSource,
 )
-from deploy.upload_session import UploadLeaf, UploadManifest
 
 
 DEFAULT_SESSION_RESTARTS = 3
@@ -140,12 +146,14 @@ class UploadClient:
         proof = proof_factory() if callable(proof_factory) else proof_factory
         result = self.broker.open(
             proof, self.source.vector.manifest, self.source.pile)
+        now = self._now()
         if not isinstance(proof, bytes) \
                 or not isinstance(result, wire.OpenedUpload) \
                 or not _hex(result.session, SESSION_HEX_BYTES) \
-                or not isinstance(result.cursor, str) or not result.cursor \
+                or not valid_cursor(result.cursor) \
                 or type(result.expires_at_ms) is not int \
-                or result.expires_at_ms <= self._now():
+                or not now < result.expires_at_ms \
+                <= now + MAX_SESSION_TTL_MS + MAX_SESSION_CLOCK_SKEW_MS:
             raise UploadProtocolError("invalid OPEN response")
         issued_until = (
             None if previous is not None
@@ -236,7 +244,7 @@ class UploadClient:
         expected = end if advancing else progress.cursor_index
         if result.next_index != expected \
                 or result.expires_at_ms != progress.expires_at_ms \
-                or not isinstance(result.cursor, str) or not result.cursor \
+                or not valid_cursor(result.cursor) \
                 or not advancing and result.cursor != progress.cursor \
                 or not isinstance(result.objects, tuple) \
                 or len(result.objects) != len(leaves):

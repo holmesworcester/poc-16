@@ -25,10 +25,12 @@ from core.limits import (
 from core.shape import valid_fid
 from core.staged_intent import MEMBER_HEX_BYTES, SESSION_HEX_BYTES
 from deploy.upload_session import (
+    MAX_SESSION_CLOCK_SKEW_MS,
     MAX_SESSION_OBJECTS,
     UploadLeaf,
     UploadManifest,
     UploadVector,
+    valid_cursor,
 )
 
 
@@ -105,8 +107,11 @@ def _new(path, raw):
 
 def _replace(path, raw):
     directory = os.path.dirname(path)
-    fd, temporary = tempfile.mkstemp(
-        prefix="." + os.path.basename(path), dir=directory)
+    temporary = os.path.join(
+        directory, "." + os.path.basename(path) + ".next")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC \
+        | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as out:
             out.write(raw)
@@ -400,8 +405,7 @@ class UploadSource:
         if not isinstance(progress, UploadProgress) \
                 or progress.source_id != self.source_id \
                 or not _hex(progress.session, SESSION_HEX_BYTES) \
-                or not isinstance(progress.cursor, str) \
-                or not progress.cursor \
+                or not valid_cursor(progress.cursor) \
                 or type(progress.cursor_index) is not int \
                 or type(progress.delivered_index) is not int \
                 or not 0 <= progress.delivered_index \
@@ -515,10 +519,9 @@ class UploadSource:
             state = "abandoned"
             collect_after = abandoned["collect_after_ms"]
         elif progress is not None and progress.expires_at_ms <= now_ms:
-            state, collect_after = "expired", progress.issued_until_ms
+            state, collect_after = "expired", None
         else:
-            state, collect_after = "active", (
-                progress.issued_until_ms if progress is not None else 0)
+            state, collect_after = "active", None
         return UploadStatus(
             self.source_id, self.workspace, self.member, state,
             len(self.vector.leaves),
@@ -545,11 +548,14 @@ class UploadSource:
             if current.state == "abandoned":
                 return current
             progress = self.progress()
-            issued_until = (
-                progress.issued_until_ms
-                if progress is not None else now_ms)
-            collect_after = None if issued_until is None \
-                else max(now_ms, issued_until)
+            if progress is None:
+                collect_after = now_ms
+            elif progress.issued_until_ms is None:
+                collect_after = None
+            else:
+                collect_after = max(
+                    now_ms,
+                    progress.issued_until_ms + MAX_SESSION_CLOCK_SKEW_MS)
             _new(self.abandoned_path, canon({
                 "abandoned_at_ms": now_ms,
                 "collect_after_ms": collect_after,

@@ -64,6 +64,12 @@ class InvalidUploadSession(ValueError):
     """Untrusted session metadata, proof, or cursor is not admissible."""
 
 
+def valid_cursor(token):
+    """Whether an opaque cursor has the protocol's exact bounded wire shape."""
+    return isinstance(token, str) and len(token) == TOKEN_BYTES \
+        and token.isascii()
+
+
 @dataclass(frozen=True)
 class UploadLeaf:
     """The only client-supplied per-object metadata."""
@@ -473,10 +479,7 @@ class SessionTokenCodec:
         return encoded
 
     def decode(self, token, trusted_now):
-        if not isinstance(token, str) \
-                or len(token) != TOKEN_BYTES \
-                or not token.isascii() \
-                or not _uint(trusted_now, _U64_MAX):
+        if not valid_cursor(token) or not _uint(trusted_now, _U64_MAX):
             raise InvalidUploadSession("upload cursor")
         try:
             raw = base64.b64decode(

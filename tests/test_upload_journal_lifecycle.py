@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import multiprocessing
+import os
 from pathlib import Path
 import threading
 
@@ -9,8 +10,15 @@ import pytest
 
 import facts
 from core.fact import canon
+from deploy.upload_session import (
+    MAX_SESSION_CLOCK_SKEW_MS,
+    MAX_SESSION_TTL_MS,
+)
 from full_peer.node import FullPeer
-from full_peer.upload_client import UploadRetryable
+from full_peer.upload_client import (
+    UploadProtocolError,
+    UploadRetryable,
+)
 from full_peer.upload_journal import (
     UploadJournalError,
     UploadSource,
@@ -36,6 +44,12 @@ def _hold_upload_writer(path, ready, release):
         ready.set()
         if not release.wait(10):
             raise RuntimeError("upload writer test timed out")
+
+
+def _crash_before_session_replace(path, progress):
+    source = UploadSource.load(path)
+    journal.os.replace = lambda old, new: os._exit(23)
+    source.save(progress)
 
 
 def test_killed_upload_is_discoverable_after_restart_and_paginates(tmp_path):
@@ -138,6 +152,63 @@ def test_writer_fence_is_cross_process(tmp_path):
     assert process.exitcode == 0
 
 
+@pytest.mark.parametrize("phase", ("open", "issue"))
+def test_hostile_cursor_never_reaches_the_bounded_journal(tmp_path, phase):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path, objects=(b"one",))
+    oversized = "x" * (journal.MAX_SESSION_DOCUMENT_BYTES + 1)
+
+    class Hostile:
+        provider_origin = broker.provider_origin
+        finalize = broker.finalize
+
+        def open(self, *args):
+            result = broker.open(*args)
+            return replace(result, cursor=oversized) \
+                if phase == "open" else result
+
+        def issue(self, *args):
+            result = broker.issue(*args)
+            return replace(result, cursor=oversized) \
+                if phase == "issue" else result
+
+    with pytest.raises(UploadProtocolError):
+        UploadClient(
+            source, Hostile(), FakeProvider(), clock).run(proof)
+    progress = source.progress()
+    if phase == "open":
+        assert progress is None
+    else:
+        assert progress.cursor_index == progress.delivered_index == 0
+    if Path(source.session_path).exists():
+        assert Path(source.session_path).stat().st_size \
+            <= journal.MAX_SESSION_DOCUMENT_BYTES
+
+
+def test_open_rejects_expiry_beyond_protocol_ttl_and_skew(tmp_path):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path)
+
+    class FarFuture:
+        provider_origin = broker.provider_origin
+        issue = broker.issue
+        finalize = broker.finalize
+
+        def open(self, *args):
+            return replace(
+                broker.open(*args),
+                expires_at_ms=clock() + MAX_SESSION_TTL_MS
+                + MAX_SESSION_CLOCK_SKEW_MS + 1,
+            )
+
+    with pytest.raises(UploadProtocolError, match="OPEN"):
+        UploadClient(
+            source, FarFuture(), FakeProvider(), clock).run(proof)
+    assert source.progress() is None
+
+
 def test_abandonment_retains_every_issued_session_expiry(tmp_path):
     (
         _, _, _, clock, nonces, _, broker, source, proof,
@@ -162,8 +233,13 @@ def test_abandonment_retains_every_issued_session_expiry(tmp_path):
 
     status = source.abandon(clock())
     assert status.state == "abandoned"
-    assert status.collect_after_ms == progress.issued_until_ms
+    assert status.collect_after_ms == (
+        progress.issued_until_ms + MAX_SESSION_CLOCK_SKEW_MS)
     assert not status.collectible
+    assert not source.status(progress.issued_until_ms).collectible
+    assert source.status(
+        progress.issued_until_ms
+        + MAX_SESSION_CLOCK_SKEW_MS).collectible
     with pytest.raises(UploadJournalError, match="not collectible"):
         UploadSource.collect(
             Path(source.path).parent, source.workspace,
@@ -222,7 +298,8 @@ def test_collection_refuses_partial_delivery_and_recovers_after_crash(
             source.source_id, clock())
 
     source.abandon(clock())
-    clock.value = source.progress().issued_until_ms
+    clock.value = (
+        source.progress().issued_until_ms + MAX_SESSION_CLOCK_SKEW_MS)
     real_rmtree, failed = journal.shutil.rmtree, False
 
     def crash_during_delete(path):
@@ -363,3 +440,37 @@ def test_journal_replace_is_crash_safe_and_cannot_move_cursor_backward(
     with pytest.raises(UploadJournalError, match="rollback"):
         UploadSource.load(source.path).save(stale)
     assert source.progress() == retained
+
+
+def test_repeated_process_death_reuses_one_session_temporary(tmp_path):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path, objects=(b"a", b"b"))
+    with pytest.raises(Crash):
+        UploadClient(
+            source, broker,
+            FakeProvider(lambda bucket, key, raw: "crash-before"),
+            clock,
+        ).run(proof)
+    retained = source.progress()
+    advanced = replace(retained, delivered_index=1)
+    context = multiprocessing.get_context("spawn")
+
+    for _ in range(3):
+        process = context.Process(
+            target=_crash_before_session_replace,
+            args=(source.path, advanced),
+        )
+        process.start()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        assert process.exitcode == 23
+        assert source.progress() == retained
+        assert [path.name for path in Path(source.path).glob(
+            ".session.json*")] == [".session.json.next"]
+
+    source.save(advanced)
+    assert source.progress() == advanced
+    assert not list(Path(source.path).glob(".session.json*"))
