@@ -145,8 +145,10 @@ class _FaultStore:
     """Lose selected write responses or crash before selected creates."""
 
     def __init__(
-            self, store, *, lose_create=(), lose_put=(), crash_create=()):
+            self, store, *, unknown_create=(), lose_create=(),
+            lose_put=(), crash_create=()):
         self.store = store
+        self.unknown_create = set(unknown_create)
         self.lose_create = set(lose_create)
         self.lose_put = set(lose_put)
         self.crash_create = tuple(crash_create)
@@ -165,6 +167,10 @@ class _FaultStore:
     def put_if_absent(self, key, value):
         if self._matched(key, self.crash_create):
             raise RuntimeError("simulated crash before create")
+        unknown = self._matched(key, self.unknown_create)
+        if unknown is not None:
+            self.unknown_create.remove(unknown)
+            raise OutcomeUnknown("simulated unknown before create")
         result = self.store.put_if_absent(key, value)
         lost = self._matched(key, self.lose_create)
         if lost is not None:
@@ -495,6 +501,12 @@ def test_operational_writes_reconcile_lost_responses_and_restart(
     asyncio.run(
         RepositoryApplier(workspace, faulty)._put_evidence(evidence)
     )
+    retried = RepositoryApplier(
+        workspace, store)._marker_receipt("done", key, raw)
+    asyncio.run(RepositoryApplier(
+        workspace,
+        _FaultStore(store, unknown_create=(retried.key,)),
+    )._put_evidence(retried))
     asyncio.run(
         RepositoryApplier(
             workspace, faulty,
@@ -502,6 +514,7 @@ def test_operational_writes_reconcile_lost_responses_and_restart(
     )
     restarted = RepositoryApplier(workspace, store)
     assert asyncio.run(restarted._has_evidence(evidence)) is True
+    assert asyncio.run(restarted._has_evidence(retried)) is True
     assert asyncio.run(
         restarted._load_discovery_cursor("staged")
     ) == "next-page"

@@ -255,6 +255,28 @@ def test_applier_owns_object_establishment_generations_and_retirement():
         assert callers == expected
 
 
+def test_only_cursor_savers_may_use_overwriteable_operational_hints():
+    applier = next(
+        item for item in parsed(Path("core/repository_applier.py")).body
+        if isinstance(item, ast.ClassDef)
+        and item.name == "RepositoryApplier")
+    callers = {
+        method.name
+        for method in applier.body
+        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "_put_hint"
+            for call in ast.walk(method)
+        )
+    }
+    assert callers == {
+        "_save_discovery_cursor",
+        "_save_staged_object_cursor",
+    }
+
+
 def test_pile_sender_is_the_only_production_encoder():
     callers = set()
     for path in source_paths():
