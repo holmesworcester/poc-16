@@ -25,10 +25,10 @@ _RETRYABLE = frozenset({
 })
 _INVALID_ENDPOINT = frozenset({
     "InvalidArgumentError",
-    "NotFoundError",
 })
 _RETRYABLE_CONFIGURATION = frozenset({
     "FailedPreconditionError",
+    "NotFoundError",
     "PermissionDeniedError",
     "SenderIdMismatchError",
     "ThirdPartyAuthError",

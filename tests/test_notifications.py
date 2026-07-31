@@ -302,6 +302,7 @@ def test_firebase_adapter_rejects_an_unconfigured_application_before_send():
     "name,expected",
     [
         ("UnregisteredError", PushUnregistered),
+        ("NotFoundError", PushRetryable),
         ("QuotaExceededError", PushRetryable),
         ("SenderIdMismatchError", PushRetryable),
         ("ThirdPartyAuthError", PushRetryable),

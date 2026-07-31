@@ -330,10 +330,11 @@ def _derive_from(hint, fetch, current_root, push_node):
                     current_view, user, push_node, budget):
                 body = endpoint.body
                 delivery_id = h(canon([
-                    "notification-delivery-v1",
+                    "notification-delivery-v2",
                     hint.workspace,
                     fid,
-                    endpoint.fid,
+                    user,
+                    body["installation"],
                     h(payload),
                 ]))
                 intent = NotificationIntent(

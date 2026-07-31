@@ -228,6 +228,34 @@ def test_crash_after_fcm_acceptance_replays_same_idempotency_boundary(
     assert provider.requests[0].payload == provider.requests[1].payload
 
 
+def test_retry_after_endpoint_rotation_uses_new_fid_with_same_delivery_id(
+        tmp_path):
+    node, workspace, secret, push_node, endpoint = _world(tmp_path)
+    event = _event(node, workspace)
+    hint = _hint(node, workspace, event)
+    provider = ScriptedPush([])
+    worker = _worker(node, secret, provider)
+
+    first = _process(worker, hint)
+    push_endpoint.replace(
+        node,
+        workspace,
+        endpoint,
+        push_node,
+        seal_target(push_node, "rotated-firebase-installation-id"),
+        ts=5,
+    )
+    second = _process(worker, hint)
+
+    assert first.action is second.action is ACK
+    assert [request.target for request in provider.requests] == [
+        "firebase-installation-id",
+        "rotated-firebase-installation-id",
+    ]
+    assert provider.requests[0].delivery_id \
+        == provider.requests[1].delivery_id
+
+
 def test_overlapping_workers_submit_the_same_delivery_and_collapse_id(
         tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
