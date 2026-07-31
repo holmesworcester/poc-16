@@ -231,6 +231,38 @@ def test_completed_collection_is_local_and_does_not_mutate_repository(
     assert node.store(workspace).get_bounded("root", 1024 * 1024) == before
 
 
+def test_collection_retry_keeps_a_recreated_same_id_source(
+        tmp_path, monkeypatch):
+    (
+        _, _, _, clock, _, _, broker, source, proof,
+    ) = world(tmp_path)
+    UploadClient(source, broker, FakeProvider(), clock).run(proof)
+    root, pile = Path(source.path).parent, Path(
+        source.path, "pile").read_bytes()
+    real_rmtree = journal.shutil.rmtree
+
+    def crash_delete(path):
+        if Path(path).name.startswith(".collecting-"):
+            raise Crash
+        return real_rmtree(path)
+
+    monkeypatch.setattr(journal.shutil, "rmtree", crash_delete)
+    with pytest.raises(Crash):
+        UploadSource.collect(
+            root, source.workspace, source.source_id, clock())
+    monkeypatch.setattr(journal.shutil, "rmtree", real_rmtree)
+
+    builder = journal.UploadSourceBuilder(
+        root, source.workspace, source.member)
+    recreated = builder.finish(pile)
+    assert recreated.source_id == source.source_id
+    with pytest.raises(UploadJournalError, match="not collectible"):
+        UploadSource.collect(
+            root, source.workspace, source.source_id, clock())
+    assert Path(recreated.path).is_dir()
+    assert not list(root.glob(".collecting-*"))
+
+
 def test_discovery_skips_a_source_collected_after_directory_snapshot(
         tmp_path, monkeypatch):
     (

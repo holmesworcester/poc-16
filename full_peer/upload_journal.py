@@ -559,11 +559,13 @@ class UploadSource:
             root, f".collecting-{workspace}-{source_id}")
         with _root_lock(root), _source_lock(
                 root, source_id, blocking=False):
-            if not os.path.isdir(target):
-                if not os.path.isdir(tombstone):
-                    raise UploadJournalError("upload source unavailable")
+            recovering = os.path.isdir(tombstone)
+            if recovering:
                 shutil.rmtree(tombstone)
                 _sync_dir(root)
+            if not os.path.isdir(target):
+                if not recovering:
+                    raise UploadJournalError("upload source unavailable")
                 return source_id
             source = cls.load(target)
             if source.workspace != workspace:
@@ -571,8 +573,6 @@ class UploadSource:
             status = source.status(now_ms)
             if not status.collectible:
                 raise UploadJournalError("upload source is not collectible")
-            if os.path.isdir(tombstone):
-                shutil.rmtree(tombstone)
             os.rename(target, tombstone)
             _sync_dir(root)
             try:
