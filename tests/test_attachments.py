@@ -6,13 +6,14 @@ import threading
 import pytest
 
 import facts
-import core.catalog as catalog_module
-import core.sync as sync_module
-from core import bao, shape
+import full_peer.sync as sync_module
+from core import fact_index, shape
+from full_peer import bao_native as bao
+from full_peer import sql_store
 from core.close import decode_pile, encode_pile
 from core.crypto import h
-from core.node import Node
-from core.walk import _fetch_blobs
+from full_peer.node import FullPeer
+from full_peer.walk import _fetch_blobs
 from facts.content import chunk, file as file_family
 
 from .util import (
@@ -25,8 +26,8 @@ from .util import (
 
 
 def close_node(node):
-    for index in node._idx.values():
-        index.close()
+    for projection in node._sql.values():
+        projection.db.close()
 
 
 def progress(node, workspace):
@@ -47,7 +48,7 @@ def push_all(node, workspace, peer):
 
 def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     path = tmp_path / "node"
-    node = Node(str(path))
+    node = FullPeer(str(path))
     workspace = facts.auth.workspace.create(node, "alice")
     data = random.Random(16).randbytes(bao.WIDTH * 2 + 17)
     fid = send_bytes(node, workspace, "three-slices.bin", data)
@@ -62,7 +63,7 @@ def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
     close_node(node)
     assert not (path / "app.db").exists()
     os.unlink(path / "ws" / f"{workspace}.idx.db")
-    rebuilt = Node(str(path))
+    rebuilt = FullPeer(str(path))
     output = tmp_path / "saved.bin"
     assert facts.content.file.save(rebuilt, workspace, fid, output)["bytes"] == len(data)
     assert output.read_bytes() == data
@@ -70,7 +71,7 @@ def test_round_trip_survives_rebuild_and_index_wipe(tmp_path):
 
 def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     fid = send_bytes(node, workspace, "upgrade.bin", b"upgrade", ts=2)
     store = node.store(workspace)
@@ -78,26 +79,25 @@ def test_stale_projection_refreshes_refs_without_repository_write(tmp_path):
 
     index = node.idx(workspace)
     index.execute(
-        "DELETE FROM fact_index WHERE kind=?", (catalog_module.REF_INDEX,))
+        "DELETE FROM fact_index WHERE kind=?", (fact_index.REF_INDEX,))
     index.execute(
-        "INSERT OR REPLACE INTO meta VALUES('index-version', ?)",
-        ("admission-catalog-v24",))
+        "DELETE FROM meta WHERE k='root'")
     index.commit()
     close_node(node)
 
-    refreshed = Node(str(directory))
+    refreshed = FullPeer(str(directory))
 
     assert refreshed.store(workspace).get("root") == root
     assert file_family.resolve(refreshed, workspace, fid)["complete"]
     assert refreshed.idx(workspace).execute(
         "SELECT COUNT(*) FROM fact_index WHERE kind=?",
-        (catalog_module.REF_INDEX,)).fetchone()[0] > 0
+        (fact_index.REF_INDEX,)).fetchone()[0] > 0
     assert not refreshed.reader(workspace).worker().authority_known(
-        catalog_module.REF_INDEX, "file", fid)
+        fact_index.REF_INDEX, "file", fid)
 
 
 def test_file_selector_compatibility_and_exact_suppression(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     first = send_bytes(node, workspace, "first.bin", b"first", ts=10)
     second = send_bytes(node, workspace, "second.bin", b"second", ts=20)
@@ -118,7 +118,7 @@ def test_file_selector_compatibility_and_exact_suppression(tmp_path):
 @pytest.mark.parametrize("operation", ("resolve", "bytes", "save"))
 def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
         tmp_path, monkeypatch, operation):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     wanted = random.Random(40).randbytes(bao.WIDTH + 17)
     unwanted = random.Random(41).randbytes(bao.WIDTH * 2 + 23)
@@ -142,9 +142,9 @@ def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
     unwanted_fids = {unwanted_fid, *chunk_fids[unwanted_fid]}
 
     decoded, verified_roots, synchronized = [], [], []
-    strict_decode = catalog_module.decode
+    strict_decode = sql_store.decode
     strict_verify = bao.verify
-    strict_sync = node._sync_index
+    strict_sync = node._sync_sql
 
     def observed_decode(raw):
         fact = strict_decode(raw)
@@ -159,9 +159,9 @@ def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
         synchronized.append(ws)
         return strict_sync(ws)
 
-    monkeypatch.setattr(catalog_module, "decode", observed_decode)
+    monkeypatch.setattr(sql_store, "decode", observed_decode)
     monkeypatch.setattr(bao, "verify", observed_verify)
-    monkeypatch.setattr(node, "_sync_index", observed_sync)
+    monkeypatch.setattr(node, "_sync_sql", observed_sync)
 
     if operation == "resolve":
         assert file_family.resolve(node, workspace, wanted_fid)["complete"]
@@ -183,7 +183,7 @@ def test_single_file_queries_touch_only_selected_descriptor_and_chunks(
 
 def test_file_read_pins_catalog_then_verifies_without_node_lock(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     payload = random.Random(42).randbytes(bao.WIDTH + 1)
     fid = send_bytes(node, workspace, "snapshot.bin", payload, ts=10)
@@ -237,7 +237,7 @@ def test_file_read_pins_catalog_then_verifies_without_node_lock(
 
 
 def test_file_payload_and_state_reads_use_the_bao_proof_bound(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     payload = b"bounded Bao proof"
     fid = send_bytes(
@@ -279,7 +279,7 @@ def test_file_payload_and_state_reads_use_the_bao_proof_bound(tmp_path):
 
 def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     store = node.store(workspace)
     old_root = store.get("root")
@@ -313,18 +313,18 @@ def test_failed_repository_commit_keeps_objects_and_retry_exposes_them(
 
 def test_committed_blob_is_visible_without_an_arrival_cache(tmp_path):
     path = tmp_path / "node"
-    node = Node(str(path))
+    node = FullPeer(str(path))
     workspace = facts.auth.workspace.create(node, "alice")
     send_bytes(node, workspace, "restart.bin", b"restart")
     assert progress(node, workspace)["complete"]
     assert not (path / "app.db").exists()
     close_node(node)
-    restarted = Node(str(path))
+    restarted = FullPeer(str(path))
     assert progress(restarted, workspace)["complete"]
 
 
 def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "separate-proof-path.bin",
@@ -368,7 +368,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
     }
     assert events[-1] == ("pile", capture.raw)
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
     for _, oid, raw in object_events:
         destination.receive_object(workspace, oid, raw)
@@ -388,7 +388,7 @@ def test_sync_piles_carry_facts_while_blob_proofs_use_object_reads(tmp_path):
 
 
 def test_blob_push_failure_precedes_the_fact_delivery(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "one-way.bin",
@@ -408,12 +408,12 @@ def test_blob_push_failure_precedes_the_fact_delivery(tmp_path):
 
 
 def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice")
     send_bytes(
         source, workspace, "retry.bin",
         random.Random(17).randbytes(bao.WIDTH * 2 + 1))
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
     deliver(
         destination, workspace,
@@ -455,7 +455,7 @@ def test_unchanged_root_retries_a_missing_proof(tmp_path, monkeypatch):
 
 
 def test_invalid_proof_never_counts_as_progress(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice")
     fid = send_bytes(source, workspace, "proof.bin", b"good")
     descriptor = source.fact_of(workspace, fid)
@@ -475,7 +475,7 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
     pile = decode_pile(
         closed_subset(source, workspace, [item.fid]), workspace)
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "copy", [])
     destination.receive_object(workspace, h(invalid), invalid)
     deliver(destination, workspace, encode_pile(pile))
@@ -484,7 +484,7 @@ def test_invalid_proof_never_counts_as_progress(tmp_path):
 
 
 def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     send_bytes(node, workspace, "gone.bin", b"gone")
     chunk_fid = node.by_type(workspace, chunk.TAG)[0].fid
@@ -503,7 +503,7 @@ def test_late_arrival_cannot_resurrect_a_retracted_chunk(tmp_path):
 
 def test_deleting_descriptor_retracts_chunks_and_stops_blob_demand(tmp_path):
     """SELF(file) and PARENT(file) resolve to one sid on every path."""
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     data = b"private-cascade-marker" * 40_000
     descriptor_fid = send_bytes(

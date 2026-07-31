@@ -26,7 +26,7 @@ from deploy.aws_upload_broker.signer import (
     S3UploadConfig,
     S3UploadSigner,
 )
-from deploy.gateway import AsyncFromSyncReader, Response
+from core.http import AsyncFromSyncReader, Response
 from deploy.upload_broker import UploadBroker
 from deploy.upload_broker_http import (
     UploadBrokerEndpoint,

@@ -13,23 +13,24 @@ import pytest
 
 import facts
 
-from core import daemon, peer_capability
+from core import http, http_stdlib, peer_capability
 from core import close as close_module
-from core import sync as sync_module
+from full_peer import sync as sync_module
 from core.close import decode_pile
 from core.crypto import h
+from core.grants import check_token, make_token
 from core.limits import MAX_ROOT_BYTES
-from core.node import Node, now_ms
-from core.sync import sync
-from core.walk import Peer, PushUnsupported
+from full_peer.node import FullPeer, now_ms
+from full_peer.sync import sync
+from full_peer.walk import Peer, PushUnsupported
 
 from .util import all_fids, closed_subset, deliver
 
 
 def replicas(tmp_path):
-    remote = Node(str(tmp_path / "remote"))
+    remote = FullPeer(str(tmp_path / "remote"))
     workspace = facts.auth.workspace.create(remote, "alice", ts=1)
-    local = Node(
+    local = FullPeer(
         str(tmp_path / "local"),
         initial_secret=remote.identity(workspace)[0])
     local.add_workspace(workspace, "local", [])
@@ -44,7 +45,7 @@ def replicas(tmp_path):
 
 def test_sender_batches_verified_closures_at_the_wire_limit(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     first = facts.content.message.post(
         source, workspace, "general", "first batch", ts=10)
@@ -68,7 +69,7 @@ def test_sender_batches_verified_closures_at_the_wire_limit(
     assert all(
         set(json.loads(raw)) == {"ws", "facts"}
         for raw in batches)
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", [])
     for raw in batches:
         destination.receive_pile(workspace, "peer", raw)
@@ -80,26 +81,25 @@ def test_sender_batches_verified_closures_at_the_wire_limit(
 def serving(node, profile, tamper_cap=None):
     observed = {"mints": 0, "puts": []}
 
-    class Edge(daemon.Handler):
-        def mint(self, request):
-            observed["mints"] += 1
-            return super().mint(request)
-
-        def _json(self, code, body):
-            if tamper_cap is not None and isinstance(body, dict) \
-                    and "grant" in body:
-                body = {**body, "cap": tamper_cap}
-            return super()._json(code, body)
+    class Edge(http_stdlib.StdlibPeerHandler):
+        def _send(self, response):
+            if self.path.startswith("/mint"):
+                observed["mints"] += 1
+                if tamper_cap is not None and response.status == 200:
+                    body = json.loads(response.body)
+                    body["cap"] = tamper_cap
+                    response = http.HttpGate._json(
+                        response.status, body, response.headers)
+            return super()._send(response)
 
         def do_PUT(self):
             observed["puts"].append(self.path)
             if self.sync_profile == peer_capability.READ_ONLY:
-                return self._send(405)
+                return self._send(http.Response(405))
             return super().do_PUT()
 
-    Edge.node = node
-    Edge.secret = b"peer-capability-test-secret"
-    Edge.syncer = None
+    Edge.peer = node
+    Edge.secret = b"p" * 32
     Edge.sync_profile = profile
     server = ThreadingHTTPServer(("127.0.0.1", 0), Edge)
     server.daemon_threads = True
@@ -253,7 +253,7 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert observed["mints"] == 1
 
         edge.sync_profile = peer_capability.READ_ONLY
-        edge.secret = b"rotated-peer-capability-secret"
+        edge.secret = b"r" * 32
         peer.root(response_limit=MAX_ROOT_BYTES)
         assert not peer.accepts_push
         assert observed["mints"] == 2
@@ -276,7 +276,7 @@ def test_remint_and_cold_cache_refresh_the_authenticated_profile(tmp_path):
         assert remote.fact_of(workspace, pending) is None
 
         edge.sync_profile = peer_capability.FULL
-        edge.secret = b"second-rotated-capability-secret"
+        edge.secret = b"s" * 32
         pulled, pushed = sync(local, workspace, url)
         assert pulled == 0
         assert pushed > 0
@@ -313,7 +313,7 @@ def test_full_peer_accepts_only_correctly_addressed_immutable_objects(
 def test_capability_is_hmac_bound_and_unknown_signed_versions_are_rejected():
     secret = b"capability-authentication-secret"
     workspace = "a" * 64
-    token = daemon.make_token(
+    token = make_token(
         secret, "member", workspace,
         capability=peer_capability.READ_ONLY)
     encoded, mac = token.split(".", 1)
@@ -323,7 +323,7 @@ def test_capability_is_hmac_bound_and_unknown_signed_versions_are_rejected():
     payload["cap"] = peer_capability.FULL
     changed = base64.urlsafe_b64encode(
         json.dumps(payload, sort_keys=True).encode()).decode()
-    assert daemon.check_token(
+    assert check_token(
         secret, f"Bearer {changed}.{mac}", workspace) is None
 
     payload["cap"] = "sync-v2/full"
@@ -331,7 +331,7 @@ def test_capability_is_hmac_bound_and_unknown_signed_versions_are_rejected():
     raw = json.dumps(payload, sort_keys=True).encode()
     signed = base64.urlsafe_b64encode(raw).decode() + "." + hmac.new(
         secret, raw, hashlib.sha256).hexdigest()
-    assert daemon.check_token(
+    assert check_token(
         secret, "Bearer " + signed, workspace) is None
 
 
@@ -342,7 +342,7 @@ def test_read_only_grant_is_rejected_at_the_daemon_push_door(tmp_path):
     with serving(
             remote, peer_capability.FULL) as (url, observed, edge):
         member = local.member_for(workspace)
-        token = daemon.make_token(
+        token = make_token(
             edge.secret, member, workspace,
             capability=peer_capability.READ_ONLY)
         request = urllib.request.Request(
@@ -365,7 +365,7 @@ def test_push_grant_cannot_write_another_producer_segment(tmp_path):
             remote, peer_capability.FULL) as (url, observed, edge):
         member = local.member_for(workspace)
         other = "0" * 16 if member != "0" * 16 else "f" * 16
-        token = daemon.make_token(
+        token = make_token(
             edge.secret, member, workspace,
             capability=peer_capability.FULL)
         request = urllib.request.Request(

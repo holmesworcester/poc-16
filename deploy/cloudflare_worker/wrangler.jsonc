@@ -50,7 +50,7 @@
       "../../core",
       "../../facts",
       "../../adapters/r2",
-      "../gateway.py",
+      "../../core/http.py",
       "crypto_compat.py",
       "entry.py",
       "runtime.py"

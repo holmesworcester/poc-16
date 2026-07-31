@@ -11,7 +11,7 @@ from core import indexes, merkle_map, snapshot
 from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from core.worker import WorkerView
 from facts.auth import request
 
@@ -27,7 +27,7 @@ def putter(store):
 
 
 def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "keeps another slot", ts=2)
     for ordinal in range(100):
@@ -56,7 +56,7 @@ def test_exact_fid_and_principal_reads_never_fetch_the_fact_manifest(tmp_path):
 
 def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
     """The deployed CF auth path remains usable when SQLite is unavailable."""
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = now_ms()
     pile = encode_pile(request.payload(
@@ -76,7 +76,7 @@ def test_worker_mint_uses_no_database(tmp_path, monkeypatch):
 @pytest.mark.parametrize("field", ("count", "depth"))
 def test_worker_mint_rejects_forged_outer_map_metadata(
         tmp_path, name, field):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = now_ms()
     pile = encode_pile(request.payload(
@@ -112,7 +112,7 @@ def test_worker_mint_rejects_forged_outer_map_metadata(
 
 def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "keeps another slot", ts=2)
     now = now_ms()
@@ -142,7 +142,7 @@ def test_missing_suppression_slot_fails_closed_instead_of_meaning_clear(
 
 def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)
@@ -166,7 +166,7 @@ def test_eviction_is_one_exact_principal_read_and_covers_old_requests(
 
 
 def test_fact_and_suppression_action_slots_change_under_one_root(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
     store = node.store(workspace)

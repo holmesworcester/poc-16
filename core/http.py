@@ -1,25 +1,32 @@
-"""Database-free protocol gateway shared by Lambda and Cloudflare Workers."""
+"""The one database-free HTTP peer-data gate.
+
+``HttpGate`` owns every route and authorization decision. Provider runtimes
+call it directly; :mod:`core.http_stdlib` binds the same gate to ordinary HTTP
+bytes for a full peer. Iroh may wrap those bytes later, but it must not
+acquire another route table.
+"""
 import base64
 from dataclasses import dataclass, field
 import json
 import re
 
-from core import peer_capability
-from core.crypto import h, seal_to
-from core.grants import check_token, make_token
-from core.limits import (
+from . import peer_capability
+from .crypto import h, seal_to
+from .grants import check_token, make_token
+from .limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_PAGE_REQUEST_BYTES,
+    MAX_PILE_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
     decode_json,
 )
-from core.repository_reader import RepositoryReader, RepositoryRootError
+from .repository_reader import RepositoryReader, RepositoryRootError
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
 INVITE_RE = re.compile(r"^[a-zA-Z0-9._~-]{1,256}$")
@@ -33,7 +40,7 @@ class Response:
 
 
 class AsyncFromSyncReader:
-    """Expose a blocking reader to the one async gateway used by Lambda."""
+    """Expose a blocking reader to the one async gate used by Lambda."""
 
     def __init__(self, reader):
         self.reader = reader
@@ -45,16 +52,18 @@ class AsyncFromSyncReader:
         return self.reader.has(key)
 
 
-class Gateway:
-    """One-workspace, read-only authorization and immutable-object service.
+class HttpGate:
+    """One-workspace peer authorization and immutable-object service.
 
-    The gateway is async because a Cloudflare R2 binding is async. Lambda wraps
+    The gate is async because a Cloudflare R2 binding is async. Lambda wraps
     its synchronous SDK adapter with :class:`AsyncFromSyncReader`, so both
     deployments execute this same route and authorization implementation.
+    Supplying a receiver enables writes through ``RepositoryApplier``;
+    omitting it yields the hosted read-only capability.
     """
 
     def __init__(
-            self, store, workspace, secret, now,
+            self, store, workspace, secret, now, receiver=None,
             *, sync_profile=peer_capability.READ_ONLY,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
             max_root_bytes=MAX_ROOT_BYTES,
@@ -72,8 +81,10 @@ class Gateway:
         if not callable(seal):
             raise ValueError("grant sealer")
         self.store, self.workspace = store, workspace
+        self.receiver = receiver
         self.secret, self.now = secret, now
-        if not peer_capability.known(sync_profile):
+        if sync_profile is not None \
+                and not peer_capability.known(sync_profile):
             raise ValueError("sync profile")
         bounded = (
             ("request bytes", max_request_bytes, MAX_MINT_REQUEST_BYTES),
@@ -90,7 +101,7 @@ class Gateway:
                     (max_mint_fetches, MAX_MINT_FETCHES),
                     (max_mint_fetch_bytes, MAX_MINT_FETCH_BYTES),
                 )):
-            raise ValueError("gateway limits")
+            raise ValueError("HTTP gate limits")
         self.sync_profile = sync_profile
         self.max_request_bytes = max_request_bytes
         self.max_root_bytes = max_root_bytes
@@ -126,12 +137,13 @@ class Gateway:
             value = value[0] if len(value) == 1 else None
         return value == self.workspace
 
-    def _member(self, headers, trusted_now):
+    def _member(self, headers, trusted_now, *, require_push=False):
         return check_token(
             self.secret,
             self._header(headers, "Authorization"),
             self.workspace,
             trusted_now=trusted_now,
+            require_push=require_push,
         )
 
     async def _get(self, key, max_bytes):
@@ -209,13 +221,15 @@ class Gateway:
             self.secret, public[:16], self.workspace, verb,
             capability=self.sync_profile,
             issued_at=trusted_now, ttl_ms=self.grant_ttl_ms)
-        return self._json(200, {
-            "cap": self.sync_profile,
+        response = {
             "etag": h(root),
             "grant": base64.b64encode(
                 self.seal(public, token.encode())).decode(),
             "root": base64.b64encode(root).decode(),
-        })
+        }
+        if self.sync_profile is not None:
+            response["cap"] = self.sync_profile
+        return self._json(200, response)
 
     @staticmethod
     def _decode_batch(body):
@@ -267,12 +281,35 @@ class Gateway:
             for prefix in ("/pile", "/poke", "/ctl")
         )
 
+    @staticmethod
+    def public_response(method, path):
+        """Return a workspace-independent peer response, if one exists."""
+        if method.upper() == "GET" and "/" + path.strip("/") == "/healthz":
+            return HttpGate._json(200, {"ok": True})
+        return None
+
+    @staticmethod
+    def request_limit(method, path):
+        """Maximum request bytes before any transport reads the body."""
+        method = method.upper()
+        path = "/" + path.strip("/")
+        if method == "PUT" and path.startswith("/page/"):
+            return MAX_OBJECT_BYTES
+        if method == "PUT" and path.startswith("/pile/"):
+            return MAX_PILE_BYTES
+        if method == "POST" and path == "/mint":
+            return MAX_MINT_REQUEST_BYTES
+        if method == "POST" and path == "/page":
+            return MAX_PAGE_REQUEST_BYTES
+        return 0
+
     async def handle(self, method, path, query=None, headers=None, body=b""):
         """Return one transport-neutral response; provider failures fail shut."""
         method, query, headers = method.upper(), query or {}, headers or {}
         path = "/" + path.strip("/")
-        if path == "/healthz" and method == "GET":
-            return self._json(200, {"ok": True})
+        public = self.public_response(method, path)
+        if public is not None:
+            return public
         if path == "/readyz" and method == "GET":
             try:
                 if await self._reader() is None:
@@ -303,7 +340,54 @@ class Gateway:
                     "Cache-Control": "no-store",
                     "Content-Type": "application/octet-stream",
                 })
-        if self._read_only_path(path):
+        if path.startswith("/ctl"):
+            return Response(405)
+        if path == "/poke" and method == "POST":
+            if self.receiver is None:
+                return Response(405)
+            if body:
+                return Response(400)
+            try:
+                await self.receiver.turn()
+            except Exception:
+                return Response(503)
+            return Response(204)
+        if method == "PUT" and path.startswith("/page/"):
+            if self.receiver is None:
+                return Response(405)
+            if not self._member(headers, trusted_now, require_push=True):
+                return Response(401)
+            oid = path.removeprefix("/page/")
+            if not OID_RE.fullmatch(oid):
+                return Response(404)
+            if not isinstance(body, bytes) or len(body) > MAX_OBJECT_BYTES \
+                    or h(body) != oid:
+                return Response(400)
+            try:
+                await self.receiver.admit_object(oid, body)
+            except Exception:
+                return Response(400)
+            return Response(204)
+        if method == "PUT" and path.startswith("/pile/"):
+            if self.receiver is None:
+                return Response(405)
+            member = self._member(
+                headers, trusted_now, require_push=True)
+            if not member:
+                return Response(401)
+            parts = path.strip("/").split("/")
+            if len(parts) != 3 or parts[:2] != ["pile", member] \
+                    or not OID_RE.fullmatch(parts[2]):
+                return Response(403)
+            if not isinstance(body, bytes) or len(body) > MAX_PILE_BYTES \
+                    or h(body) != parts[2]:
+                return Response(400)
+            try:
+                await self.receiver.receive_pile(member, body)
+            except Exception:
+                return Response(400)
+            return Response(204)
+        if self.receiver is None and self._read_only_path(path):
             return Response(405)
         if not self._member(headers, trusted_now):
             return Response(401)

@@ -7,7 +7,7 @@ import pytest
 from core.crypto import h
 from core.fact import canon
 from core.ingress import RejectionReceipt, check_source
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
 
@@ -19,7 +19,7 @@ def run(awaitable):
 
 
 def _message_pile(directory, text, ts):
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     fid = facts.content.message.post(node, workspace, "general", text, ts=ts)
     return workspace, closed_subset(node, workspace, [fid]), fid
@@ -97,7 +97,7 @@ def test_forged_rejection_receipt_cannot_authorize_retirement(tmp_path):
 
 def test_typed_permanent_rejection_records_evidence_before_retirement(
         tmp_path):
-    source_node = Node(str(tmp_path / "source"))
+    source_node = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source_node, "alice", ts=1)
     raw = b"{}"
     store = FsStore(str(tmp_path / "recipient"))
@@ -116,7 +116,7 @@ def test_typed_permanent_rejection_records_evidence_before_retirement(
 
 
 def test_bounded_cursor_wrap_eventually_sees_insertion_behind_it(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     middle_fid = facts.content.message.post(
         source, workspace, "general", "middle", ts=10)
@@ -148,7 +148,7 @@ def test_bounded_cursor_wrap_eventually_sees_insertion_behind_it(tmp_path):
     assert store.get(early) is None
     assert store.get(middle) is None
     assert store.get(late) is None
-    reader = Node(str(tmp_path / "reader"))
+    reader = FullPeer(str(tmp_path / "reader"))
     reader.add_workspace(workspace, "copy", peers=[])
     reader._stores[workspace] = store
     reader.rebuild(workspace)

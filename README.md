@@ -5,27 +5,25 @@ algorithm across a full peer, AWS Lambda, and a Cloudflare Worker. A hosted
 recipient needs an object store but no database. SQLite exists only as a
 disposable full-client query and authorship accelerator.
 
-The implementation is deliberately strict about authority:
+The implementation is deliberately strict about authority and direction:
 
-- `PileSender` is the only close/encode/delivery capability. It may use the
-  client projection.
 - `RepositoryApplier` is the only fact-pile-to-root capability. It is
   database-free and owns immutable establishment, the root CAS, rejection
   evidence, and retirement of its own internal pile generations.
 - `RepositoryReader` is a pinned, database-free, side-effect-free read
   capability.
+- `HttpGate` is the one peer route and authorization capability over those
+  database-free repository capabilities.
+- `PileSender` is the only close/encode/delivery capability. It may use the
+  full peer's disposable SQL projection and local identities.
+- `FullPeer` composes all of the above for a stateful local peer; its receiving
+  side still invokes `RepositoryApplier`.
 
-There are two actor compositions:
-
-| actor | capabilities |
-| --- | --- |
-| hosted repository | `RepositoryApplier` + `RepositoryReader` |
-| full P2P node | `PileSender` + the same `RepositoryApplier` + the same `RepositoryReader` |
-
-There is no second receiving path in the full node. A hosted deployment may
-put its Reader-facing broker and Applier in separate least-privilege processes
-or stacks. That is a physical security boundary inside the hosted repository,
-not a third repository actor or state machine.
+A hosted peer needs `RepositoryApplier`, `RepositoryReader`, and `HttpGate`.
+A full peer adds `PileSender`, local identity, scheduling, control, attachment
+I/O, and disposable SQL. There is no second receiving path. A provider may
+place its read/signing broker and Applier in separate least-privilege
+processes or stacks without creating another repository state machine.
 
 ## Read the code in this order
 
@@ -34,9 +32,12 @@ not a third repository actor or state machine.
 3. `core/repository_snapshot.py`: the pure validated-fact-set compiler.
 4. `core/repository_applier.py`: storage effects and the sole root CAS.
 5. `core/repository_reader.py`, `core/worker.py`: pinned authenticated reads.
-6. `core/pile_sender.py`: client authorship and closure.
-7. `core/node.py`: the full-node composition, not a policy owner.
-8. `deploy/` and `adapters/`: provider translation and packaging only.
+6. `core/http.py`, `core/http_stdlib.py`: the shared peer gate, then its
+   standard-library HTTP server/byte adapter.
+7. `full_peer/pile_sender.py`: stateful-client authorship and closure.
+8. `full_peer/node.py`: `FullPeer`, the composition root, not a policy owner.
+9. `full_peer/sql_store.py`: the sole SQL boundary.
+10. `deploy/` and `adapters/`: provider adaptation and packaging only.
 
 [DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
 semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
@@ -58,25 +59,25 @@ python3 -m pip install ./native/bao_py
 Start a local node:
 
 ```sh
-python3 -m core daemon ./state --port 7100
+python3 -m full_peer daemon ./state --port 7100
 ```
 
 List family-owned commands:
 
 ```sh
-python3 -m core --commands
+python3 -m full_peer --commands
 ```
 
 The CLI passes a command path and raw arguments through one generic binder.
-Fact-family modules declare their own commands; `core/cli.py` does not grow a
-branch for every new family.
+Fact-family modules declare their own commands; `full_peer/cli.py` does not
+grow a branch for every new family.
 
 For example:
 
 ```sh
-python3 -m core auth.workspace.create ./alice
-python3 -m core content.message.post WORKSPACE_PREFIX general hello
-python3 -m core content.message.list WORKSPACE_PREFIX
+python3 -m full_peer auth.workspace.create ./alice
+python3 -m full_peer content.message.post WORKSPACE_PREFIX general hello
+python3 -m full_peer content.message.list WORKSPACE_PREFIX
 ```
 
 Use `--node URL` to target a non-default local daemon.
@@ -146,12 +147,12 @@ Absence is not `CLEAR`; a reader that needs an absent slot fails closed.
 This lets a Worker answer exact liveness or suppression questions without
 loading the fact set or rebuilding a database.
 
-Deletion is an ordinary fact. Its named needs prove the actor, its action
+Deletion is an ordinary fact. Its named needs prove the author, its action
 offer names the exact target selector, and the target family must permit that
 action. An admin may delete every directly deletable fact. An owner may
 delete facts owned by the same durable member principal, including facts
 written by any of that member's devices. These are ordinary family checks,
-not special cases in `Node`.
+not special cases in `FullPeer`.
 
 Removal does not retroactively revoke validated storage. Once removal has
 propagated, peers stop granting that principal new sharing authority. Facts
@@ -162,7 +163,8 @@ the pinned root's current suppression and authority maps.
 
 ## Client persistence
 
-The SQLite client projection is intentionally small:
+`full_peer/sql_store.py` is the sole SQLite boundary, and its projection is
+intentionally small:
 
 ```text
 facts(fid, blob)                  one current canonical serialization

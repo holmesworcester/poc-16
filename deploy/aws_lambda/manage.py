@@ -47,7 +47,6 @@ FILES = (
     "adapters/s3/__init__.py",
     "adapters/s3/store.py",
     "deploy/__init__.py",
-    "deploy/gateway.py",
     "deploy/aws_lambda/__init__.py",
     "deploy/aws_lambda/app.py",
     "deploy/aws_lambda/config.py",
@@ -395,13 +394,13 @@ def _smoke_endpoint(url, state, workspace):
     from core import snapshot
     from core.crypto import h
     from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
-    from core.node import Node, now_ms
-    from core.walk import Peer
+    from full_peer.node import FullPeer, now_ms
+    from full_peer.walk import Peer
 
     state = Path(state).resolve()
     if not state.is_dir():
         raise ValueError("smoke client state directory does not exist")
-    node = Node(str(state))
+    node = FullPeer(str(state))
     if workspace not in node.workspaces():
         raise ValueError("smoke workspace is not present in client state")
     peer = Peer(node, workspace, url)

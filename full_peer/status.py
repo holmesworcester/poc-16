@@ -1,6 +1,6 @@
 """Read-only local host status for the daemon control plane."""
-from .crypto import h
-from .limits import MAX_ROOT_BYTES
+from core.crypto import h
+from core.limits import MAX_ROOT_BYTES
 
 
 def describe(node):

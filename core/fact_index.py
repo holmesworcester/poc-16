@@ -4,8 +4,6 @@ This module is deliberately storage-free.  Both the disposable SQLite client
 projection and the authenticated repository compiler consume this exact
 function, so adding a fact family cannot create two indexing definitions.
 """
-import facts
-
 TYPE_INDEX = "fact.type"
 KEY_INDEX = "fact.key"
 REF_INDEX = "fact.ref"
@@ -22,6 +20,8 @@ INTERNAL_INDEXES = frozenset((
 
 def index_rows(fact):
     """Return every family-neutral lookup row contributed by ``fact``."""
+    import facts
+
     if any(name in INTERNAL_INDEXES for name, _, _ in fact.offers()):
         raise ValueError("reserved fact index kind")
     scopes = facts.current_scopes(fact)

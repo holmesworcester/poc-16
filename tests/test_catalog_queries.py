@@ -6,9 +6,10 @@ import pytest
 
 import facts
 
-from core import catalog
+from core import fact_index
 from core.fact import Fact, canon, decode, encode
-from core.node import Node
+from full_peer import sql_store
+from full_peer.node import FullPeer
 from core.repository_snapshot import action_bindings
 
 
@@ -45,10 +46,10 @@ def _expected_projection(node, workspace):
     rows = {
         row
         for fact in validated.facts.values()
-        for row in catalog.index_rows(fact)
+        for row in fact_index.index_rows(fact)
     }
     rows.update(
-        (catalog.ACTION_INDEX, sid, "", fid)
+        (fact_index.ACTION_INDEX, sid, "", fid)
         for sid, fid in action_bindings(validated.facts).items()
     )
     return facts_by_fid, rows
@@ -68,7 +69,7 @@ def _assert_exact_projection(node, workspace):
     assert _tables(db) == {"facts", "fact_index", "meta"}
     assert set(
         key for (key,) in db.execute("SELECT k FROM meta")
-    ) == {"index-version", "root", "root-bytes"}
+    ) == {"root"}
     for fid, raw in actual_facts.items():
         fact = decode(raw)
         assert fact.fid == fid
@@ -76,7 +77,7 @@ def _assert_exact_projection(node, workspace):
 
 
 def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     kept = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
@@ -103,7 +104,7 @@ def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
     assert db.execute(
         "SELECT src FROM fact_index "
         "WHERE kind=? AND src=?",
-        (catalog.ACTION_INDEX, action),
+        (fact_index.ACTION_INDEX, action),
     ).fetchone() == (action,)
     assert _tables(db).isdisjoint(OBSOLETE_TABLES)
     assert not (tmp_path / "node" / "app.db").exists()
@@ -111,7 +112,7 @@ def test_catalog_stores_one_blob_and_one_exact_combined_index(tmp_path):
 
 def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     keep = facts.content.message.post(node, workspace, "general", "keep", ts=2)
     remove = facts.content.message.post(node, workspace, "general", "remove", ts=3)
@@ -126,7 +127,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     assert [row["fid"] for row in expected["messages"]] == [keep]
     node.idx(workspace).close()
 
-    reopened = Node(str(directory))
+    reopened = FullPeer(str(directory))
 
     assert reopened.reader(workspace).root_bytes == root
     assert facts.auth.user.members(reopened, workspace) == expected["members"]
@@ -142,7 +143,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
 def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     message_fid = facts.content.message.post(
         node, workspace, "general", "survives cut", ts=2)
@@ -170,6 +171,7 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         CREATE TABLE supp(value TEXT);
         CREATE INDEX fact_keys ON fact_index(k0,src);
         CREATE INDEX fact_boundaries ON fact_index(k0,src);
+        PRAGMA user_version=0;
     """)
     local_only = Fact(
         "legacy",
@@ -189,13 +191,13 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         ),
     )
     db.execute(
-        "INSERT OR REPLACE INTO meta VALUES('index-version',?)",
+        "INSERT OR REPLACE INTO meta VALUES('obsolete',?)",
         ("admission-catalog-v27",),
     )
     db.commit()
     db.close()
 
-    reopened = Node(str(directory))
+    reopened = FullPeer(str(directory))
     upgraded = reopened.idx(workspace)
 
     assert reopened.reader(workspace).root_bytes == root
@@ -213,7 +215,7 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
 
 
 def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     message_fid = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
@@ -225,7 +227,7 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
         "DELETE FROM facts WHERE fid=?", (message_fid,))
     db.execute(
         "INSERT INTO fact_index VALUES(?,?,?,?)",
-        (catalog.TYPE_INDEX, "forged", "", workspace),
+        (fact_index.TYPE_INDEX, "forged", "", workspace),
     )
     db.commit()
 
@@ -240,7 +242,7 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
 def test_foreign_root_format_fails_closed_without_local_republish(
         tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "kept", ts=2)
     store = node.store(workspace)
@@ -251,14 +253,14 @@ def test_foreign_root_format_fails_closed_without_local_republish(
     node.idx(workspace).close()
 
     with pytest.raises(ValueError, match="root shape"):
-        Node(str(directory))
+        FullPeer(str(directory))
 
     assert store.get("root") == foreign
 
 
 def test_index_lookup_decodes_only_selected_fact_bodies(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     for timestamp in range(2, 7):
         facts.content.message.post(
@@ -270,15 +272,15 @@ def test_index_lookup_decodes_only_selected_fact_bodies(
         )
 
     decoded = []
-    strict_decode = catalog.decode
+    strict_decode = sql_store.decode
 
     def observed(raw):
         fact = strict_decode(raw)
         decoded.append(fact.fid)
         return fact
 
-    monkeypatch.setattr(catalog, "decode", observed)
-    selected = node.catalog(workspace).indexed(
+    monkeypatch.setattr(sql_store, "decode", observed)
+    selected = node.sql(workspace).indexed(
         "member", node.identity_id(workspace))
 
     assert [fact.fid for fact in selected] == [workspace]

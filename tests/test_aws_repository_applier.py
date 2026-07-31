@@ -8,10 +8,11 @@ import facts
 import pytest
 
 from adapters.s3 import S3Config, S3Store
-from core import bao, indexes, snapshot
+from core import indexes, snapshot
+from full_peer import bao_native as bao
 from core.close import decode_pile
 from core.crypto import h
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
 from core.staged_intent import staging_key
@@ -29,7 +30,7 @@ MEMBER = "b" * 16
 
 
 def _stage_file(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     send_bytes(
         source,
@@ -275,7 +276,7 @@ def test_sam_role_limits_ingress_missing_probe_to_detached_objects():
 
 def test_real_s3_adapters_keep_ingress_and_canonical_prefixes_disjoint(
         tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     facts.content.message.post(source, workspace, "general", "S3 adapter", ts=2)
     raw = closed_subset(
@@ -322,7 +323,7 @@ def test_real_s3_adapters_keep_ingress_and_canonical_prefixes_disjoint(
 
 
 def test_403_missing_root_probe_bootstraps_repository_genesis(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     raw = closed_subset(
         source, workspace,
@@ -355,7 +356,7 @@ def test_403_missing_root_probe_bootstraps_repository_genesis(tmp_path):
 
 def test_403_missing_validated_map_page_uses_exact_probe_not_access_denied(
         tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     raw = closed_subset(
         source, workspace,

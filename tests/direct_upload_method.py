@@ -1393,7 +1393,7 @@ INTEGRATION_SEAMS = (
         "proof_payload",
         "family-owned ephemeral authorization dispatch"),
     IntegrationSeam(
-        "core/pile_sender.py",
+        "full_peer/pile_sender.py",
         "PileSender",
         "built SQL-permitted exact-pile author"),
     IntegrationSeam(
@@ -1405,9 +1405,9 @@ INTEGRATION_SEAMS = (
         "RepositoryReader",
         "built DB-free pinned-root reader"),
     IntegrationSeam(
-        "core/daemon.py",
-        "Handler.do_PUT",
-        "full-P2P transport into the shared RepositoryApplier"),
+        "core/http_stdlib.py",
+        "StdlibPeerHandler.do_PUT",
+        "full-peer HTTP server/byte adapter into the shared HttpGate"),
     IntegrationSeam(
         "adapters/s3/store.py",
         "S3Store",

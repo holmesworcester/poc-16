@@ -13,7 +13,7 @@ from core.close import encode_pile
 from core.crypto import h
 from core.fact import canon
 from core.limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
-from core.node import Node
+from full_peer.node import FullPeer
 from deploy.upload_broker import (
     AuthorizedPut,
     MAX_FINALIZE_RESPONSE_BYTES,
@@ -151,7 +151,7 @@ def _leaf(raw):
 
 
 def world(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))

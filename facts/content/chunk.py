@@ -1,5 +1,4 @@
 """facts/content/chunk.py — the signed name of one self-proving Bao slice."""
-from core import bao
 from core.fact import Fact, Need
 from core.suppression import PARENT, selector_markers
 from .._policy import (
@@ -10,6 +9,7 @@ from .._policy import (
     author_selectors,
 )
 from ..auth import signature
+from .. import _bao as bao
 
 TAG = "chunk"
 POLICY = FamilyPolicy(

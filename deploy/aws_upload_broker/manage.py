@@ -65,7 +65,6 @@ FILES = (
     "adapters/s3/__init__.py",
     "adapters/s3/store.py",
     "deploy/__init__.py",
-    "deploy/gateway.py",
     "deploy/upload_broker.py",
     "deploy/upload_broker_http.py",
     "deploy/upload_keyring.py",

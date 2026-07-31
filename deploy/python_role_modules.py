@@ -3,12 +3,12 @@
 
 REPOSITORY_READER_CORE_MODULES = (
     "__init__.py",
-    "bao.py",
     "close.py",
     "crypto.py",
     "fact.py",
     "fact_index.py",
     "grants.py",
+    "http.py",
     "http_body.py",
     "indexes.py",
     "ingress.py",

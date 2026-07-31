@@ -9,9 +9,9 @@ import pytest
 from adapters import host
 import facts
 
-from core import cli, daemon
 from core.crypto import keypair
-from core.node import Node
+from full_peer import cli, daemon
+from full_peer.node import FullPeer
 from core.store import FsStore
 from tests.provider_fakes import FakeS3Bucket
 
@@ -51,7 +51,7 @@ def _injected_factory(document, bucket=None):
 
 def test_default_node_store_is_the_same_local_filesystem_layout(tmp_path):
     workspace = "a" * 64
-    node = Node(str(tmp_path))
+    node = FullPeer(str(tmp_path))
     store = node.store(workspace)
 
     assert isinstance(store, FsStore)
@@ -61,14 +61,14 @@ def test_default_node_store_is_the_same_local_filesystem_layout(tmp_path):
 def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
     factory, bucket, clients = _injected_factory(S3)
     secret, _ = keypair()
-    first = Node(
+    first = FullPeer(
         str(tmp_path / "first"), initial_secret=secret,
         store_factory=factory)
     workspace = facts.auth.workspace.create(first, "shared", ts=1)
     fid = facts.content.message.post(
         first, workspace, "general", "provider-backed", ts=2)
 
-    second = Node(
+    second = FullPeer(
         str(tmp_path / "second"), initial_secret=secret,
         store_factory=factory)
     second.add_workspace(workspace, "shared", peers=[])
@@ -83,7 +83,7 @@ def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
 
 def test_full_workspace_ids_create_disjoint_bucket_namespaces(tmp_path):
     factory, bucket, _ = _injected_factory(S3)
-    node = Node(str(tmp_path), store_factory=factory)
+    node = FullPeer(str(tmp_path), store_factory=factory)
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     assert first != second
@@ -226,7 +226,7 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     factory, _, _ = _injected_factory(S3)
     secret, _ = keypair()
     state = tmp_path / "state"
-    bootstrap = Node(
+    bootstrap = FullPeer(
         str(state), initial_secret=secret, store_factory=factory)
     workspace = facts.auth.workspace.create(bootstrap, "daemon", ts=1)
     config_path = tmp_path / "store.json"
@@ -234,25 +234,25 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     seen = {}
 
     monkeypatch.setattr(host, "load_store_factory", lambda path: factory)
-    monkeypatch.setattr(daemon.Syncer, "start", lambda self: None)
+    def serve(
+            directory, port, host_name, cadence, url, *,
+            control_port, store_factory):
+        seen["arguments"] = (
+            directory, port, host_name, cadence, url, control_port)
+        seen["peer"] = FullPeer(
+            directory, initial_secret=secret,
+            store_factory=store_factory)
 
-    class Server:
-        def __init__(self, address, handler):
-            seen["address"], seen["handler"] = address, handler
-
-        def serve_forever(self):
-            seen["served"] = True
-
-    monkeypatch.setattr(daemon, "ThreadingHTTPServer", Server)
+    monkeypatch.setattr(daemon, "serve", serve)
     assert cli.main([
         "daemon", str(state), "--port", "0",
         "--store-config", str(config_path),
     ]) is None
 
-    selected = daemon.Handler.node
+    selected = seen["peer"]
     assert selected.store(workspace).get("root") \
         == bootstrap.store(workspace).get("root")
-    assert seen["served"]
+    assert seen["arguments"][1:3] == (0, "127.0.0.1")
 
 
 def test_daemon_help_documents_reproducible_s3_r2_config(capsys):
@@ -279,10 +279,9 @@ def guarded(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
 
-from core import daemon
-daemon.Syncer.start = lambda self: None
-daemon.ThreadingHTTPServer.serve_forever = lambda self: None
-daemon.serve(tempfile.mkdtemp(), 0)
+from full_peer.node import FullPeer
+node = FullPeer(tempfile.mkdtemp())
+node.store("0" * 64)
 """
     result = subprocess.run(
         [sys.executable, "-c", script], cwd=ROOT,

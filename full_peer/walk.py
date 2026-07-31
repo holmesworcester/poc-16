@@ -6,10 +6,10 @@ import urllib.request
 
 import facts as families
 
-from . import peer_capability
-from .crypto import h, unseal
-from .http_body import read_bounded
-from .limits import (
+from core import peer_capability
+from core.crypto import h, unseal
+from core.http_body import read_bounded
+from core.limits import (
     MAX_CONTROL_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
@@ -181,7 +181,7 @@ def _fetch_blobs(node, ws, peer):
     st = node.store(ws)
     with node.lock:
         pending = []
-        for fid in node.catalog(ws).fact_ids():
+        for fid in node.sql(ws).fact_ids():
             fact = node.fact_of(ws, fid)
             if node.suppressed(ws, fact):
                 continue

@@ -1,5 +1,6 @@
 """Black-box and exact-tree contracts for RepositoryReader minting."""
 import base64
+import asyncio
 import inspect
 import json
 import random
@@ -9,11 +10,11 @@ from nacl.exceptions import CryptoError
 
 import facts
 
-from core import daemon, snapshot
+from core import http, snapshot
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from core.repository_reader import RepositoryReader
 from facts.auth import request
 from facts.auth.device import bind
@@ -24,12 +25,13 @@ from .util import (
     closed_subset,
     inject_device_claim,
     invoke_mint,
+    invoke_mint_value,
 )
 
 
 @pytest.fixture
 def world(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     now = now_ms()
     workspace = facts.auth.workspace.create(node, "alice", ts=now - 1)
     proof_facts = request.payload(
@@ -60,7 +62,7 @@ def authorize(node, workspace, pile, now, root=None, fetch=None):
 def conflict_world(path, seed):
     """A random-depth device chain plus a different explicit affiliation."""
     rng = random.Random(seed)
-    node = Node(str(path))
+    node = FullPeer(str(path))
     workspace = facts.auth.workspace.create(node, "root", ts=1)
     founder_secret, founder = node.identity(workspace)
     bind(node, workspace, "root-primary")
@@ -107,14 +109,15 @@ def conflict_world(path, seed):
 
 def test_mint_rejects_malformed_requests(world):
     node, workspace, _, _, pile = world
-    handler, _ = invoke_mint(node, workspace, pile)
     for body in (
             None, [], {}, {"ws": []}, {"ws": workspace},
             {"ws": workspace, "pile": []}):
-        assert handler.mint(body) == (400, None)
-    handler._q = lambda: (["mint"], {"ws": workspace})
-    handler._body = lambda *_: b"{"
-    assert handler.do_POST() == (400, None)
+        assert invoke_mint_value(
+            node, workspace, body)[1] == (400, None)
+    gate, _ = invoke_mint(node, workspace, pile)
+    response = asyncio.run(gate.handle(
+        "POST", "/mint", {"ws": workspace}, {}, b"{"))
+    assert response.status == 400
 
 
 def test_mint_accepts_exactly_one_ephemeral_request(world):
@@ -129,10 +132,10 @@ def test_mint_accepts_exactly_one_ephemeral_request(world):
         node, workspace, encode_pile(combine(facts, second)), now) is None
 
 
-def test_daemon_mint_fails_closed_at_aggregate_fetch_budget(
+def test_http_mint_fails_closed_at_aggregate_fetch_budget(
         world, monkeypatch):
     node, workspace, _, _, pile = world
-    monkeypatch.setattr(daemon, "MINT_MAX_FETCHES", 0)
+    monkeypatch.setattr(http, "MAX_MINT_FETCHES", 0)
     handler, (code, body) = invoke_mint(node, workspace, pile)
 
     assert code == 403
@@ -156,7 +159,7 @@ def test_family_owns_expiry_tag_and_verb(world):
     assert authorize(node, workspace, expired, now) is None
     assert authorize(node, workspace, wrong_verb, now) is None
     assert authorize(node, workspace, wrong_tag, now) is None
-    assert ".body" not in inspect.getsource(daemon.Handler.mint)
+    assert ".body" not in inspect.getsource(http.HttpGate._mint)
 
 
 def test_grant_is_sealed_to_requester(world):
@@ -165,7 +168,7 @@ def test_grant_is_sealed_to_requester(world):
     token = unseal(
         node.sk, base64.b64decode(body["grant"])).decode()
     assert code == 200
-    assert daemon.check_token(
+    assert http.check_token(
         handler.secret, "Bearer " + token, workspace) == node.pk[:16]
     other, _ = keypair()
     with pytest.raises(CryptoError):
@@ -183,7 +186,7 @@ def test_mint_is_read_only_and_does_not_touch_sqlite(world):
     code, _ = invoke_mint(node, workspace, pile)[1]
     assert code == 200
 
-    reopened = Node(node.dir)
+    reopened = FullPeer(node.dir)
     after = (
         reopened.store(workspace).list(""),
         tuple(reopened.idx(workspace).iterdump()),
@@ -200,7 +203,7 @@ def test_missing_composite_trees_fail_closed(world):
 
 
 def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob")
@@ -219,7 +222,7 @@ def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     assert authorize(node, workspace, pile, now) is None
     assert authorize(node, workspace, pile, now, root=forged) is None
     store._replace("root", forged)
-    assert invoke_mint(node, workspace, pile)[1][0] == 403
+    assert invoke_mint(node, workspace, pile)[1][0] == 503
     with pytest.raises(ValueError, match="root shape"):
         node.rebuild(workspace)
     assert store.get("root") == forged
@@ -277,7 +280,7 @@ def test_worker_keeps_explicit_authority_stable_across_later_providers(
 
 def test_gate_checks_current_uploader_not_historical_closure_authors(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)

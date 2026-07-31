@@ -6,7 +6,7 @@ The endpoint owns the exact paths, canonical documents, and safe error map.
 It never receives provider bodies or returns exception text.
 """
 from core.limits import PayloadTooLarge
-from deploy.gateway import Response
+from core.http import Response
 from deploy.upload_broker import (
     UploadBroker,
     UploadUnavailable,

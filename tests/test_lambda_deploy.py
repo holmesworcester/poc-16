@@ -18,7 +18,7 @@ from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
 from core.limits import MAX_MINT_REQUEST_BYTES
-from core.node import Node
+from full_peer.node import FullPeer
 from deploy.aws_lambda import app
 from deploy.aws_lambda.config import (
     BUCKET_PATTERN,
@@ -40,7 +40,7 @@ from deploy.aws_lambda.config import (
     validate_sdk_budget,
 )
 from deploy.aws_lambda.s3_bucket_policy import policy
-from deploy.gateway import AsyncFromSyncReader, Gateway, Response
+from core.http import AsyncFromSyncReader, HttpGate, Response
 from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request
 
@@ -100,12 +100,12 @@ def deployment_args(**changes):
 
 
 def world(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
-    app._gateway_cache = Gateway(
+    app._gateway_cache = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: now)
     return node, workspace, now, pile
@@ -157,7 +157,7 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
 
 
 def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
@@ -165,7 +165,7 @@ def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
         request.payload(node, first, "sync", now + 60_000, now),
         workspace=first,
     )
-    app._gateway_cache = Gateway(
+    app._gateway_cache = HttpGate(
         AsyncFromSyncReader(node.store(second)),
         second, b"s" * 32, lambda: now)
     request_body = json.dumps({

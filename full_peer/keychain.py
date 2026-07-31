@@ -1,4 +1,4 @@
-"""Node-local plural signing identities, above and outside workspaces.
+"""Full-peer-local plural signing identities, above and outside workspaces.
 
 The keychain is deliberately not a fact family and never enters sync. Keys are
 equal peers in a flat device set; a workspace binding selects which local key
@@ -7,7 +7,7 @@ authors that workspace's facts.
 import json
 import os
 
-from .crypto import keypair, load_sk
+from core.crypto import keypair, load_sk
 
 
 class Keychain:

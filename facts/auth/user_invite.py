@@ -54,7 +54,7 @@ DURABLE = True
 # COMMANDS
 def make(node, workspace):
     """Publish a closed invite blob without adding the invitation to the set."""
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     seed = os.urandom(32)
     invite_sk, invite_pk = keypair()

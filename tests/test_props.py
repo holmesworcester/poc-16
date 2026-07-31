@@ -28,9 +28,9 @@ from core.close import decode_pile
 from core.crypto import keypair, load_sk
 from core.fact import Fact, canon
 from core.kernel import drain, offer_src
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from core.object_store import OutcomeUnknown
-from core.pile_sender import PileSender
+from full_peer.pile_sender import PileSender
 from core.repository_applier import (
     RepositoryAnchorPending,
     RepositoryApplier,
@@ -109,14 +109,14 @@ def message_pile(node, workspace, text, ts):
 
 
 def close_indexes(node):
-    for index in node._idx.values():
-        index.close()
+    for projection in node._sql.values():
+        projection.db.close()
 
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     """Alice's node with members, mixed authors, a blob, and suppression."""
-    monkeypatch.setattr("core.node.now_ms", lambda: 2_000_000)
+    monkeypatch.setattr("full_peer.node.now_ms", lambda: 2_000_000)
     identities = iter(range(2, 10))
 
     def deterministic_keypair():
@@ -124,7 +124,7 @@ def world(tmp_path, monkeypatch):
         return secret, secret.verify_key.encode().hex()
 
     monkeypatch.setattr(test_util, "keypair", deterministic_keypair)
-    node = Node(
+    node = FullPeer(
         str(tmp_path / "alice"),
         initial_secret=load_sk(f"{1:064x}"),
     )
@@ -220,7 +220,7 @@ def test_history_independence_across_order_and_turn_batching(
 
 
 def test_sender_authors_but_only_applier_advances_root(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     sender = node.sender(workspace)
     applier = node.applier(workspace)
@@ -246,7 +246,7 @@ def test_sender_authors_but_only_applier_advances_root(tmp_path):
 
 def test_cold_applier_and_reader_are_database_free(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     facts.content.message.post(source, workspace, "general", "database-free", ts=10)
     raw = closed_subset(
@@ -267,7 +267,7 @@ def test_cold_applier_and_reader_are_database_free(
 
 
 def test_repository_reader_remains_pinned_during_later_apply(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     pinned = node.reader(workspace)
     item, raw = message_pile(node, workspace, "later root", ts=10)
@@ -297,7 +297,7 @@ def test_restart_rebuilds_presentation_from_reader_without_changing_root(
 
     close_indexes(node)
     os.unlink(index_path)
-    reopened = Node(node.dir)
+    reopened = FullPeer(node.dir)
 
     assert reopened.reader(workspace).root_bytes == expected_root
     assert [row["text"] for row in facts.content.message.messages(
@@ -339,7 +339,7 @@ def test_reader_rejects_forged_root_metadata_without_building_a_root(world):
 
 
 def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "blocked by corrupt base", ts=10)
@@ -359,7 +359,7 @@ def test_applier_retains_exact_work_when_base_root_is_corrupt(tmp_path):
 
 
 def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     target = message(
         workspace, author.pk, "general", "detached", ts=10)
@@ -391,7 +391,7 @@ def test_applier_cannot_mint_a_root_without_the_workspace_anchor(tmp_path):
 
 def test_pre_cas_crash_retains_work_and_cold_retry_applies(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "survives pre-CAS", ts=10)
@@ -422,7 +422,7 @@ def test_pre_cas_crash_retains_work_and_cold_retry_applies(
 
 def test_ambiguous_cas_is_confirmed_before_exact_retirement(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "confirmed CAS", ts=10)
@@ -446,7 +446,7 @@ def test_ambiguous_cas_is_confirmed_before_exact_retirement(
 
 def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "after-CAS replay", ts=10)
@@ -461,7 +461,7 @@ def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
     assert node.reader(workspace).validated().fact(item.fid) == item
 
     close_indexes(node)
-    reopened = Node(str(directory))
+    reopened = FullPeer(str(directory))
     report = run(reopened.applier(workspace).turn())
 
     assert len(report) == 1
@@ -476,7 +476,7 @@ def test_post_cas_crash_replays_as_noop_after_process_restart(tmp_path):
 
 def test_failed_turn_keeps_old_root_and_retries_same_generation(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = message_pile(
         node, workspace, "turn retry", ts=10)
@@ -506,7 +506,7 @@ def test_failed_turn_keeps_old_root_and_retries_same_generation(
 
 def test_concurrent_appliers_rebase_without_retiring_the_cas_loser(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     bootstrap_raw = closed_subset(
         author, workspace, all_fids(author, workspace))
@@ -575,7 +575,7 @@ def test_suppression_is_authenticated_and_reader_pinned(tmp_path):
 
 
 def test_suppression_converges_in_both_pile_orders(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     base = closed_subset(
         source, workspace, all_fids(source, workspace))
@@ -636,7 +636,7 @@ def test_straggler_replay_converges_byte_for_byte(tmp_path, world):
 
 def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     """PileSender follows the real member-authority spine."""
-    node = Node(str(tmp_path / "chain"))
+    node = FullPeer(str(tmp_path / "chain"))
     workspace = facts.auth.workspace.create(node, "alice")
     ts = now_ms()
     bob_secret, bob, bob_fact = add_member(
@@ -673,7 +673,7 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
 
 
 def test_rejoining_key_cannot_shadow_its_invite_into_a_cycle(tmp_path):
-    node = Node(str(tmp_path / "shadow"))
+    node = FullPeer(str(tmp_path / "shadow"))
     workspace = facts.auth.workspace.create(node, "alice")
     bob_secret, bob_public, original = add_member(
         node, workspace, "bob")

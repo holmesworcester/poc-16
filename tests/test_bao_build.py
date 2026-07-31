@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core import bao
+from full_peer import bao_native as bao
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = "python3 -m pip install ./native/bao_py"
@@ -22,7 +22,7 @@ class BlockBao(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockBao())
 import facts
-from core import bao
+from full_peer import bao_native as bao
 assert bao.geometry(0) == 0
 assert bao.span(1, bao.WIDTH + 7) == (bao.WIDTH, 7)
 try:

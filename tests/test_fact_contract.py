@@ -120,10 +120,10 @@ def test_core_fact_module_has_no_family_authors():
 
 def test_core_judge_and_engine_do_not_name_family_policy():
     for name in (
-            "catalog.py", "fact.py", "indexes.py", "kernel.py",
+            "fact.py", "fact_index.py", "indexes.py", "kernel.py",
             "repository_applier.py", "repository_reader.py",
-            "repository_snapshot.py", "snapshot.py", "node.py",
-            "suppression_state.py", "worker.py"):
+            "repository_snapshot.py", "snapshot.py", "validated_set.py",
+            "worker.py"):
         source = (ROOT / "core" / name).read_text()
         for vocabulary in (
                 '"admin"', '"device_key"', '"member"', '"removed"',
@@ -133,7 +133,7 @@ def test_core_judge_and_engine_do_not_name_family_policy():
 
 def test_cli_and_daemon_have_no_application_command_inventory():
     for name in ("cli.py", "daemon.py"):
-        source = (ROOT / "core" / name).read_text()
+        source = (ROOT / "full_peer" / name).read_text()
         assert all(path not in source for path in facts.COMMANDS), name
 
 

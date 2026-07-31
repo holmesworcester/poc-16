@@ -7,7 +7,7 @@ import facts
 from core import indexes
 from core.crypto import keypair
 from core.fact import Fact
-from core.node import Node
+from full_peer.node import FullPeer
 from core.suppression import (
     PARENT,
     SELF,
@@ -181,7 +181,7 @@ def test_new_principal_namespace_needs_no_core_change(monkeypatch):
 def test_runtime_policy_rejects_missing_and_extra_selectors(
         tmp_path, monkeypatch, atoms):
     """The registry check remains load-bearing if shape validation is lax."""
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     secret, public = node.identity(workspace)
     malformed = Fact(
@@ -204,7 +204,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
 
 def test_runtime_policy_rejects_a_forged_nonparent(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     descriptor_fid = send_bytes(
         node, workspace, "one.bin", b"ancestor", ts=10)
@@ -234,7 +234,7 @@ def test_runtime_policy_rejects_a_forged_nonparent(
 
 
 def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     alice_secret, alice = node.identity(workspace)
 
@@ -277,7 +277,7 @@ def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
 
 
 def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "Bob", ts=10)

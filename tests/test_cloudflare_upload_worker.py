@@ -13,7 +13,7 @@ import pytest
 from core.close import encode_pile
 from core.crypto import h
 from core.limits import PayloadTooLarge
-from core.node import Node
+from full_peer.node import FullPeer
 from deploy.cloudflare_upload.boundary import Deployment
 from deploy.cloudflare_upload.reader import (
     R2CanonicalReader,
@@ -223,7 +223,7 @@ class WorkerOpener:
 
 
 def world(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request_fact.payload(
         node, workspace, "upload", NOW + 60_000, NOW))

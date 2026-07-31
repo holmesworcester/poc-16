@@ -13,14 +13,14 @@ import pytest
 
 from core.close import encode_pile
 from core.crypto import h
-from core.node import Node
+from full_peer.node import FullPeer
 from deploy.aws_upload_broker import app
 from deploy.aws_upload_broker.config import (
     SDK_CONNECT_TIMEOUT_SECONDS,
     SDK_READ_TIMEOUT_SECONDS,
     SDK_TOTAL_ATTEMPTS,
 )
-from deploy.gateway import Response
+from core.http import Response
 from deploy.upload_broker import (
     AuthorizedPut,
     UploadBroker,
@@ -146,7 +146,7 @@ def function_event(
 
 
 def world(tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     proof = encode_pile(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))

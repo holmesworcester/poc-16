@@ -14,10 +14,10 @@ from dataclasses import dataclass
 
 import facts
 
-from .crypto import h
-from .limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
-from .repository_reader import RepositoryReader
-from .store import RemoteStore
+from core.crypto import h
+from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES
+from core.repository_reader import RepositoryReader
+from core.store import RemoteStore
 from .walk import Peer, _fetch_blobs
 
 

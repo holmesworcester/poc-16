@@ -31,13 +31,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import facts
 
 from core import snapshot
-from core import sync as sync_module
+from full_peer import sync as sync_module
 from core.close import close
 from facts.auth.signature import signature
 from facts.content.message import message
 from core.kernel import kernel, offer_src, resolve_deps
 from core.limits import MAX_CLOSURE_FACTS
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from core.repository_reader import RepositoryReader
 
 from tests.util import add_member, all_fids
@@ -105,7 +105,7 @@ def bulk_author(
 
 def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16):
     rng = random.Random(seed)
-    n = Node(node_dir)
+    n = FullPeer(node_dir)
     t0 = perf()
     ws = facts.auth.workspace.create(n, "alice")
     base_ts = now_ms()
@@ -181,7 +181,7 @@ def ingest(node, ws, units, workers=WORKERS, batch=BATCH):
 # ---- the catchup benchmark ---------------------------------------------------
 
 def catchup(seed, ws, fresh_dir):
-    fresh = Node(fresh_dir)
+    fresh = FullPeer(fresh_dir)
     fresh.add_workspace(ws, "benchmark-catchup", peers=[])
     src = seed.store(ws)
     root, ohs = snapshot_objs(src)
@@ -256,7 +256,7 @@ def reconcile(A, B, ws):
 
 def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
          shape=None, seed=16):
-    A = Node(os.path.join(base_dir, "A"))
+    A = FullPeer(os.path.join(base_dir, "A"))
     ws = facts.auth.workspace.create(A, "alice")
     base_ts = now_ms()
     window = years * 365 * 24 * 3600 * 1000
@@ -274,7 +274,7 @@ def bidi(total_facts, base_dir, n_members=MEMBERS, years=YEARS, *,
         }
     membership = all_fids(A, ws)
 
-    B = Node(os.path.join(base_dir, "B"))
+    B = FullPeer(os.path.join(base_dir, "B"))
     copy_facts(B, ws, A, membership)
 
     per_side = max(1, (total_facts - len(membership)) // 4)  # msgs per side

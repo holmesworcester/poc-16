@@ -97,7 +97,7 @@ DURABLE = True
 def remove(node, workspace, target, ts=None):
     """Choose OWNER when principals match, otherwise require ADMIN."""
     import facts
-    from core.node import now_ms
+    from full_peer.node import now_ms
     from .._commands import member_source
 
     with node.lock:

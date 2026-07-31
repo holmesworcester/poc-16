@@ -19,7 +19,6 @@ BUILD = HERE / ".aws-sam"
 MARKER = "poc16-aws-repository-applier-v1"
 CORE_MODULES = (
     "__init__.py",
-    "bao.py",
     "close.py",
     "crypto.py",
     "fact.py",
@@ -106,11 +105,10 @@ def verify_stage(directory):
         raise RuntimeError(f"applier stage omitted {sorted(missing)}")
     forbidden = {
         "core/admission.py",
-        "core/catalog.py",
-        "core/client_projection.py",
-        "core/daemon.py",
-        "core/node.py",
-        "core/pile_sender.py",
+        "full_peer/sql_store.py",
+        "full_peer/daemon.py",
+        "full_peer/node.py",
+        "full_peer/pile_sender.py",
         "core/publication.py",
         "core/runtime.py",
     } & paths

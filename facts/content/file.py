@@ -2,7 +2,6 @@
 import os
 import tempfile
 
-from core import bao
 from core.fact_index import REF_INDEX, TYPE_INDEX
 from core.crypto import h
 from core.fact import Fact, Need
@@ -15,6 +14,7 @@ from .._policy import (
 )
 from .._commands import member_source, upload_builder, upload_source
 from ..auth import signature
+from .. import _bao as bao
 from . import chunk as chunkfam
 
 TAG = "file_bao"
@@ -95,7 +95,8 @@ DURABLE = True
 # COMMANDS
 def _prepare(node, workspace, channel, path, name, ts, put_object):
     """Author one file/chunk fact set; choose its detached object sink."""
-    from core.node import now_ms
+    from full_peer import bao_native
+    from full_peer.node import now_ms
 
     timestamp = now_ms() if ts is None else ts
     source = os.path.abspath(os.fspath(path))
@@ -114,11 +115,11 @@ def _prepare(node, workspace, channel, path, name, ts, put_object):
         raise ValueError("publishing identity is not a workspace member")
     with tempfile.TemporaryDirectory(prefix="tinyp2p-bao-") as scratch:
         outboard = os.path.join(scratch, "outboard")
-        root = bao.prepare(source, outboard)
+        root = bao_native.prepare(source, outboard)
         count, cids = bao.geometry(size), []
         for index in range(count):
-            blob = bao.proof(source, outboard, index, size)
-            payload = bao.verify(blob, root, index, size)
+            blob = bao_native.proof(source, outboard, index, size)
+            payload = bao_native.verify(blob, root, index, size)
             if len(payload) != bao.span(index, size)[1]:
                 raise RuntimeError("Bao returned a short slice")
             cid = h(blob)
@@ -228,6 +229,8 @@ def save(node, workspace, selector, out_path):
 # QUERIES
 def _state(store, descriptor, chunks):
     """Verify only one descriptor's selected Bao slices."""
+    from full_peer import bao_native
+
     body, cids = descriptor.body, {}
     for fact in chunks:
         child = fact.body
@@ -242,7 +245,7 @@ def _state(store, descriptor, chunks):
                 "obj/" + child["cid"], bao.MAX_PROOF_BYTES)
             if raw is None or h(raw) != child["cid"]:
                 continue
-            bao.verify(raw, body["root"], child["i"], body["size"])
+            bao_native.verify(raw, body["root"], child["i"], body["size"])
         except Exception:
             continue
         cids.setdefault(child["i"], child["cid"])
@@ -265,10 +268,10 @@ def _state(store, descriptor, chunks):
 
 
 def _states(node, workspace, selector=None):
-    """Pin one catalog snapshot, then verify its immutable bytes unlocked."""
+    """Pin one SQL snapshot, then verify its immutable bytes unlocked."""
     with node.lock:
-        node._sync_index(workspace)
-        admitted = node.catalog(workspace)
+        node._sync_sql(workspace)
+        admitted = node.sql(workspace)
         def select(kind, k0=None, k1=None, **filters):
             return tuple(
                 fact for fact in admitted.indexed(
@@ -319,9 +322,11 @@ def _resolve_state(node, workspace, selector):
 
 
 def _payloads(node, workspace, record, cids):
+    from full_peer import bao_native
+
     store = node.store(workspace)
     return (
-        bao.verify(
+        bao_native.verify(
             store.get_bounded(
                 "obj/" + cids[index], bao.MAX_PROOF_BYTES),
             record["root"], index, record["size"])

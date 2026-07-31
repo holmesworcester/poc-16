@@ -1,4 +1,5 @@
 """The process CLI and daemon are transports for family-owned commands."""
+import asyncio
 import io
 import json
 from types import SimpleNamespace
@@ -7,9 +8,10 @@ import urllib.error
 import pytest
 
 import facts
-from core import cli, daemon
+from core import http
 from core.limits import PayloadTooLarge
-from core.node import Node
+from full_peer import cli, daemon
+from full_peer.node import FullPeer
 
 
 EXPECTED = {
@@ -75,7 +77,7 @@ def test_registry_rejects_duplicates_bad_paths_and_noncallables():
 
 def test_one_binder_serves_new_commands_prefixes_and_integer_time(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path))
+    node = FullPeer(str(tmp_path))
     workspace = facts.invoke_command(
         node, "auth.workspace.create", ["alice"])
     fid = facts.invoke_command(
@@ -108,7 +110,7 @@ def test_workspace_prefix_must_be_unique():
 
 
 def _handler(node):
-    handler = object.__new__(daemon.Handler)
+    handler = object.__new__(daemon.ControlHandler)
     handler.node = node
     handler.syncer = SimpleNamespace(kicks=0)
     handler.syncer.kick = lambda: setattr(
@@ -119,15 +121,13 @@ def _handler(node):
 
 
 def _request(handler, path, argv):
-    return handler.ctl_post(
-        ["ctl", "command"],
-        json.dumps({"path": path, "argv": argv}).encode(),
-    )
+    return handler.dispatch(
+        json.dumps({"path": path, "argv": argv}).encode())
 
 
 def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
         tmp_path, monkeypatch):
-    handler = _handler(Node(str(tmp_path)))
+    handler = _handler(FullPeer(str(tmp_path)))
 
     code, workspace = _request(
         handler, "auth.workspace.create", ["alice"])
@@ -152,16 +152,16 @@ def test_generic_control_dispatch_maps_failures_and_kicks_only_success(
     assert handler.syncer.kicks == 1
 
 
-def test_core_status_is_local_control_not_a_fact_family_command(tmp_path):
-    node = Node(str(tmp_path))
+def test_peer_status_is_local_control_not_a_fact_family_command(tmp_path):
+    node = FullPeer(str(tmp_path))
     handler = _handler(node)
 
-    assert _request(handler, "core.status", []) == (200, {
+    assert _request(handler, "peer.status", []) == (200, {
         "pk": node.pk,
         "member": node.member,
         "workspaces": {},
     })
-    assert "core.status" not in facts.COMMANDS
+    assert "peer.status" not in facts.COMMANDS
     assert handler.syncer.kicks == 0
 
 
@@ -284,7 +284,7 @@ def test_command_discovery_is_sorted_and_needs_no_daemon(capsys):
     assert cli.main(["--commands"]) == 0
     paths = capsys.readouterr().out.splitlines()
     assert paths == sorted(paths)
-    assert set(paths) == EXPECTED | set(daemon.CORE_COMMANDS)
+    assert set(paths) == EXPECTED | set(daemon.LOCAL_COMMANDS)
 
 
 def test_help_is_local_and_does_not_become_a_command(monkeypatch, capsys):
@@ -293,3 +293,35 @@ def test_help_is_local_and_does_not_become_a_command(monkeypatch, capsys):
         lambda *args: pytest.fail("help reached the daemon"))
     assert cli.main(["--help"]) == 0
     assert "scope.family.verb" in capsys.readouterr().out
+
+
+def test_peer_gate_cannot_serve_local_control(tmp_path):
+    node = FullPeer(str(tmp_path))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(node.store(workspace)),
+        workspace,
+        b"c" * 32,
+        lambda: 100,
+        receiver=object(),
+    )
+
+    response = asyncio.run(gate.handle(
+        "POST", "/ctl/command", {"ws": workspace}, {}, b"{}"))
+
+    assert response.status == 405
+
+
+def test_control_server_refuses_non_loopback_before_binding(
+        tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path))
+    syncer = SimpleNamespace()
+    monkeypatch.setattr(
+        daemon,
+        "ThreadingHTTPServer",
+        lambda *_args: pytest.fail("non-loopback control address was bound"),
+    )
+
+    with pytest.raises(
+            ValueError, match="control listener must use a loopback IP"):
+        daemon._control_server(node, syncer, "0.0.0.0", 0)

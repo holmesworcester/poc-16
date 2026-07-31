@@ -4,12 +4,12 @@ import facts
 
 from core import indexes
 from core.fact_index import TYPE_INDEX
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_snapshot import compile_snapshot
 
 
 def test_type_postings_include_suppressed_validated_facts(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     live = facts.content.message.post(
         node, workspace, "general", "live", ts=2)
@@ -28,7 +28,7 @@ def test_type_postings_include_suppressed_validated_facts(tmp_path):
 
 
 def test_fact_residence_is_only_an_object_id(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     view = node.reader(workspace)
     row = view.worker()._reader(indexes.FACT).get(
@@ -40,7 +40,7 @@ def test_fact_residence_is_only_an_object_id(tmp_path):
 
 
 def test_authority_rows_contain_no_proof_rank(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     public = node.identity_id(workspace)
     view = node.reader(workspace).worker()
@@ -52,7 +52,7 @@ def test_authority_rows_contain_no_proof_rank(tmp_path):
 
 
 def test_compile_is_history_independent_over_same_validated_set(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(
         node, workspace, "general", "one", ts=2)
@@ -69,7 +69,7 @@ def test_compile_is_history_independent_over_same_validated_set(tmp_path):
 
 
 def test_current_scopes_are_one_mechanical_definition(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     fact = node.fact_of(workspace, workspace)
 

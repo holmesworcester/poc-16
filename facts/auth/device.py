@@ -53,7 +53,7 @@ DURABLE = True
 
 # COMMANDS — build a fact, admit it, stop.
 def bind(node, workspace, label):
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     secret, public = node.identity(workspace)
     if offer_source(

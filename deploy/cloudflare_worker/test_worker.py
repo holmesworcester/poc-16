@@ -21,7 +21,7 @@ from core.crypto import (
     seal_to as native_seal,
     unseal as native_unseal,
 )
-from core.node import Node
+from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request as request_fact
@@ -110,7 +110,7 @@ def run(awaitable):
 
 
 def worker_world(tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request_fact.payload(
@@ -478,7 +478,7 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     assert not (staged / "adapters" / "r2" / "s3.py").exists()
     assert not (staged / "adapters" / "s3").exists()
     subprocess.run(
-        [sys.executable, "-c", "import deploy.gateway"],
+        [sys.executable, "-c", "import core.http"],
         cwd=staged,
         env={**os.environ, "PYTHONPATH": str(staged)},
         check=True,

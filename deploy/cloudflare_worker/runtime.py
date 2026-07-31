@@ -1,4 +1,4 @@
-"""Cloudflare request and binding translation around the shared Gateway."""
+"""Cloudflare request and binding translation around the shared HttpGate."""
 import base64
 from dataclasses import dataclass
 import re
@@ -18,7 +18,7 @@ from core.limits import (
     PAGE_BATCH,
 )
 from core.shape import valid_fid
-from deploy.gateway import Gateway, Response
+from core.http import HttpGate, Response
 
 if __package__:
     from .crypto_compat import seal_to, unseal
@@ -137,7 +137,7 @@ class Settings:
 
 
 class ReadOnlyStore:
-    """Narrow an R2 ObjectStore binding to the Gateway's read capability."""
+    """Narrow an R2 ObjectStore binding to the HttpGate's read capability."""
 
     __slots__ = ("_store",)
 
@@ -157,7 +157,7 @@ def now_ms():
 
 def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
-    return Gateway(
+    return HttpGate(
         ReadOnlyStore(settings.bucket, settings.prefix),
         settings.workspace,
         settings.secret,
@@ -269,7 +269,7 @@ def _secured(response):
 
 
 async def handle(request, env):
-    """Translate one Workers SDK request into the shared Gateway contract."""
+    """Translate one Workers SDK request into the shared HttpGate contract."""
     try:
         _crypto_self_test()
         settings = Settings.from_env(env)

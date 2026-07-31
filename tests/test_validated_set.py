@@ -7,7 +7,7 @@ import facts
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import encode
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
 from core.validated_set import reconstruct
@@ -25,7 +25,7 @@ def apply(applier, member, raw):
 
 
 def test_unclosed_pile_is_rejected_atomically(tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     message = facts.content.message.message(
         workspace, author.identity(workspace)[1], "general", "orphan", 2)
@@ -40,7 +40,7 @@ def test_unclosed_pile_is_rejected_atomically(tmp_path):
 
 
 def test_valid_prefix_of_invalid_pile_publishes_nothing(tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     store = FsStore(str(tmp_path / "recipient"))
     applier = RepositoryApplier(workspace, store)
@@ -93,7 +93,7 @@ def test_successful_closed_pile_publishes_every_durable_fact(tmp_path):
 
 
 def test_suppression_changes_visibility_not_validated_residence(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(
         node, workspace, "general", "keep the validated bytes", ts=2)
@@ -111,9 +111,9 @@ def test_suppression_changes_visibility_not_validated_residence(tmp_path):
 
 
 def test_fact_delta_has_no_proof_root_dimension(tmp_path):
-    from core.sync import _delta
+    from full_peer.sync import _delta
 
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     base_root = source.reader(workspace).root_bytes
     item = facts.content.message.post(
@@ -141,7 +141,7 @@ def test_fact_delta_has_no_proof_root_dimension(tmp_path):
 
 
 def test_reconstruction_rejects_forged_fact_bytes(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     root = node.reader(workspace).root_bytes
     store = node.store(workspace)
@@ -162,7 +162,7 @@ def test_reconstruction_rejects_forged_fact_bytes(tmp_path):
 
 
 def test_fact_oid_is_canonical_bytes_not_an_admission_witness(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     view = node.reader(workspace).validated()
     fact = view.fact(workspace)

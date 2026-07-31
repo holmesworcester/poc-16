@@ -9,15 +9,17 @@ from pathlib import Path
 import pytest
 
 import facts
-from core import catalog, daemon
+from core import http
 from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon, encode
+from core.grants import make_token
 from core.ingress import InvalidPile
 from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
+from full_peer import sql_store
 from facts.auth import request
 from facts.auth import user as user_family
 from facts.auth.signature import signature
@@ -26,7 +28,7 @@ from facts.content.message import message
 
 
 def two_workspaces(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     assert node.identity_id(first) == node.identity_id(second)
@@ -130,27 +132,36 @@ def test_uploader_token_workspace_and_pile_path_must_match(tmp_path):
     secret = b"g" * 32
     member = node.member_for(first)
     raw = b"closed pile bytes"
-    handler = object.__new__(daemon.Handler)
-    handler.node = node
-    handler.secret = secret
-    sent = []
-    handler._send = lambda code, *_args, **_kwargs: sent.append(code) or code
-    handler._body = lambda _limit: pytest.fail(
-        "workspace/path rejection read the body")
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(node.store(second)),
+        second,
+        secret,
+        lambda: 100,
+        receiver=object(),
+    )
 
-    first_token = daemon.make_token(secret, member, first)
-    handler.headers = {"Authorization": "Bearer " + first_token}
-    handler._q = lambda: (
-        ["pile", member, h(raw)], {"ws": second})
-    assert handler.do_PUT() == 401
+    first_token = make_token(
+        secret, member, first, issued_at=0, ttl_ms=1_000)
+    response = run(gate.handle(
+        "PUT",
+        f"/pile/{member}/{h(raw)}",
+        {"ws": second},
+        {"Authorization": "Bearer " + first_token},
+        raw,
+    ))
+    assert response.status == 401
 
     second_member = node.member_for(second)
-    second_token = daemon.make_token(secret, second_member, second)
-    handler.headers = {"Authorization": "Bearer " + second_token}
-    handler._q = lambda: (
-        ["pile", "not-the-uploader", h(raw)], {"ws": second})
-    assert handler.do_PUT() is None
-    assert sent[-1] == 403
+    second_token = make_token(
+        secret, second_member, second, issued_at=0, ttl_ms=1_000)
+    response = run(gate.handle(
+        "PUT",
+        f"/pile/not-the-uploader/{h(raw)}",
+        {"ws": second},
+        {"Authorization": "Bearer " + second_token},
+        raw,
+    ))
+    assert response.status == 403
 
 
 def test_database_free_reader_applier_and_projection_enforce_same_anchor(
@@ -191,7 +202,7 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
     )
     index.commit()
     with pytest.raises(ValueError, match="fact projection integrity"):
-        node.catalog(second).fact(ws_less_ordinary.fid)
+        node.sql(second).fact(ws_less_ordinary.fid)
 
     node.rebuild(second)
     assert node.fact_of(second, ws_less_ordinary.fid) is None
@@ -201,7 +212,7 @@ def test_database_free_reader_applier_and_projection_enforce_same_anchor(
 @pytest.mark.parametrize("case", ("foreign-inner-pile", "incomplete-proof"))
 def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
         tmp_path, monkeypatch, case):
-    node = Node(str(tmp_path / "joiner"))
+    node = FullPeer(str(tmp_path / "joiner"))
     before = json.dumps(node.keyring, sort_keys=True)
     expected = "0" * 64
     foreign = "f" * 64
@@ -249,7 +260,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
 @pytest.mark.parametrize("declared", [True, False])
 def test_invite_redemption_bounds_and_closes_untrusted_http_body(
         tmp_path, monkeypatch, declared):
-    node = Node(str(tmp_path / "joiner"))
+    node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = base64.urlsafe_b64encode(canon({
         "u": "https://invite.invalid",
@@ -288,7 +299,7 @@ def test_invite_redemption_bounds_and_closes_untrusted_http_body(
 
 def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "joiner"))
+    node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = base64.urlsafe_b64encode(canon({
         "u": "https://invite.invalid",
@@ -327,7 +338,7 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
 
 
 def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "workspace", ts=1)
     root = node.store(workspace).get("root")
     foreign = Fact(
@@ -339,26 +350,28 @@ def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
     )
 
     with pytest.raises(ValueError, match="fact projection integrity"):
-        node.catalog(workspace).fact(foreign.fid)
+        node.sql(workspace).fact(foreign.fid)
 
     index.execute(
         "DELETE FROM meta WHERE k='root'",
     )
     index.commit()
     index.close()
-    node._idx.clear()
+    node._sql.clear()
 
-    reopened = Node(node.dir)
+    reopened = FullPeer(node.dir)
     assert reopened.fact_of(workspace, foreign.fid) is None
     assert reopened.store(workspace).get("root") == root
 
 
-def test_legacy_projection_upgrade_discards_ws_less_ordinary_row():
+def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):
     workspace = "0" * 64
-    db = sqlite3.connect(":memory:")
+    path = tmp_path / "legacy.db"
+    db = sqlite3.connect(path)
     db.executescript("""
         CREATE TABLE facts(
             fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
+        PRAGMA user_version=0;
     """)
     ordinary = Fact("sample", 1, [], {"legacy": True}, None)
     db.execute(
@@ -371,8 +384,10 @@ def test_legacy_projection_upgrade_discards_ws_less_ordinary_row():
         ),
     )
     db.commit()
+    db.close()
 
-    catalog.upgrade_schema(db, workspace)
+    projection = sql_store.SqlStore.open(str(path), workspace)
+    db = projection.db
 
     assert {
         row[1] for row in db.execute("PRAGMA table_info(facts)")

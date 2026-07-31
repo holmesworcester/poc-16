@@ -7,7 +7,6 @@ from bench.seed_chain import build_seed
 from bench.bench_sync import bidi, bulk_author, catchup, check_leaves
 import facts
 
-from core import catalog
 from core.close import close, decode_pile
 from core.kernel import drain, resolve_deps
 from core.limits import MAX_CLOSURE_FACTS
@@ -153,7 +152,7 @@ def test_reader_rebuilds_a_deleted_projection_without_root_write(
     index.execute("DELETE FROM facts")
     index.commit()
 
-    assert not node.catalog(workspace).fact_ids()
+    assert not node.sql(workspace).fact_ids()
 
     node.rebuild(workspace)
 
@@ -161,7 +160,7 @@ def test_reader_rebuilds_a_deleted_projection_without_root_write(
     assert index.execute(
         "SELECT COUNT(*) FROM facts",
     ).fetchone()[0] == membership_facts
-    assert node.catalog(workspace).fact_ids() == set(
+    assert node.sql(workspace).fact_ids() == set(
         node.reader(workspace).validated().fact_ids())
     assert not {
         kind for (kind,) in index.execute(

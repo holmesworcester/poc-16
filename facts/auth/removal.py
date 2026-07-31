@@ -46,7 +46,7 @@ DURABLE = True
 
 # COMMANDS
 def evict(node, workspace, target):
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     target_pk = member_key(node, workspace, target)
     ts = now_ms()

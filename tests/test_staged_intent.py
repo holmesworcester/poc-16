@@ -7,14 +7,14 @@ import pytest
 
 import facts
 
-from core import bao
+from full_peer import bao_native as bao
 from core import repository_applier as applier_module
 from core import staged_intent as staged_intent_module
 from core.close import decode_pile, encode_pile
 from core.crypto import h
 from core.fact import Fact, canon
 from core.ingress import InvalidStagedIntent, PermanentIngressRejection
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.object_store import STALE
 from core.staged_intent import (
@@ -37,7 +37,7 @@ MEMBER = "d" * 16
 
 @pytest.fixture
 def staged_file(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     send_bytes(
         node,

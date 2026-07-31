@@ -7,11 +7,11 @@ import facts
 
 from core import snapshot
 from core.fact import canon
-from core.node import Node
+from full_peer.node import FullPeer
 
 
 def test_root_atomically_names_the_four_current_bounded_maps(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "indexed", ts=10)
 
@@ -40,7 +40,7 @@ def test_root_atomically_names_the_four_current_bounded_maps(tmp_path):
 )
 def test_unknown_or_empty_root_fails_closed_without_republication(
         tmp_path, replacement):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     store = node.store(workspace)
     store._replace("root", replacement)
@@ -53,7 +53,7 @@ def test_unknown_or_empty_root_fails_closed_without_republication(
 
 def test_projection_rebuild_is_side_effect_free_and_republish_is_forbidden(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(node, workspace, "general", "stable", ts=10)
     store = node.store(workspace)
@@ -73,7 +73,7 @@ def test_projection_rebuild_is_side_effect_free_and_republish_is_forbidden(
 def test_legacy_sql_authority_tables_are_discarded_not_migrated(
         tmp_path):
     directory = str(tmp_path / "node")
-    node = Node(directory)
+    node = FullPeer(directory)
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     root = node.store(workspace).get("root")
     db = node.idx(workspace)
@@ -90,7 +90,7 @@ def test_legacy_sql_authority_tables_are_discarded_not_migrated(
     db.commit()
     db.close()
 
-    reopened = Node(directory)
+    reopened = FullPeer(directory)
     names = {
         name for (name,) in reopened.idx(workspace).execute(
             "SELECT name FROM sqlite_master WHERE type='table'")

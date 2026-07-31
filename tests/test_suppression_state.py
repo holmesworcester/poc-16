@@ -5,12 +5,12 @@ import os
 import pytest
 
 import facts
-from core import catalog, suppression_state
+from core import fact_index
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from core.kernel import offer_src, resolve_deps
-from core.node import Node
-from core import sync as sync_module
+from full_peer.node import FullPeer
+from full_peer import sync as sync_module
 from facts.auth.removal import removal
 from facts.auth.signature import signature
 from facts.content.message import message
@@ -31,7 +31,7 @@ def _action_rows(node, workspace):
     actions = node.idx(workspace).execute(
         "SELECT k0, src FROM fact_index "
         "WHERE kind=? ORDER BY k0",
-        (catalog.ACTION_INDEX,),
+        (fact_index.ACTION_INDEX,),
     ).fetchall()
     return list(actions)
 
@@ -63,7 +63,7 @@ def _author_eviction(node, workspace, target, ts):
 
 
 def test_composite_root_has_no_legacy_removal_object(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
     action_fid = facts.content.delete.remove(node, workspace, target, ts=20)
@@ -80,7 +80,7 @@ def test_composite_root_has_no_legacy_removal_object(tmp_path):
 
 def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     directory = tmp_path / "node"
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
     facts.content.delete.remove(node, workspace, target, ts=20)
@@ -90,7 +90,7 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     node.idx(workspace).close()
     os.unlink(directory / "ws" / f"{workspace}.idx.db")
 
-    rebuilt = Node(str(directory))
+    rebuilt = FullPeer(str(directory))
     assert _action_rows(rebuilt, workspace) == expected_actions
     assert rebuilt.store(workspace).get("root") == expected_root
     assert target not in visible_fids(rebuilt, workspace)
@@ -98,7 +98,7 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
 
 def test_historical_fact_survives_but_removed_member_cannot_author_now(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     provider = member_src(node, workspace, bob)
@@ -131,7 +131,7 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
 
 def test_historical_admin_action_survives_but_removed_admin_cannot_author(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     _, carol, _ = add_member(node, workspace, "carol", ts=20)
@@ -157,8 +157,8 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
     node.turn(workspace)
     assert node.fact_of(workspace, item.fid) == item
     assert node.fact_of(workspace, item.fid) == item
-    assert suppression_state.active(
-        node.idx(workspace), facts.principal_sid("member", carol))
+    assert node.suppression_active(
+        workspace, facts.principal_sid("member", carol))
 
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
@@ -167,7 +167,7 @@ def test_historical_admin_action_survives_but_removed_admin_cannot_author(
 
 
 def test_terminal_member_action_covers_a_future_provider(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_identity = add_member(node, workspace, "bob", ts=10)[:2]
     bob_secret, bob = bob_identity
@@ -182,15 +182,14 @@ def test_terminal_member_action_covers_a_future_provider(tmp_path):
         "WHERE kind='member' AND k0=? ORDER BY src",
         (bob,)).fetchall()
     assert len(providers) == 2
-    assert suppression_state.active(
-        node.idx(workspace),
-        facts.principal_sid("member", bob))
+    assert node.suppression_active(
+        workspace, facts.principal_sid("member", bob))
 
 
 def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
         tmp_path):
     """A prior-sorting removal cannot rewrite historical fact admission."""
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
     base = closed_subset(source, workspace, all_fids(source, workspace))
@@ -205,7 +204,7 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
     for name, order in (
             ("fact-first", (message_pile, action_pile)),
             ("action-first", (action_pile, message_pile))):
-        peer = Node(str(tmp_path / name))
+        peer = FullPeer(str(tmp_path / name))
         peer.add_workspace(workspace, "alice", peers=[])
         deliver(peer, workspace, base)
         peer.turn(workspace)
@@ -221,8 +220,8 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
         and peer.fact_of(workspace, posted.fid) == posted
         and [row["fid"] for row in facts.content.message.messages(
             peer, workspace)] == [posted.fid]
-        and suppression_state.active(
-            peer.idx(workspace), facts.principal_sid("member", bob))
+        and peer.suppression_active(
+            workspace, facts.principal_sid("member", bob))
         for peer in peers
     )
     assert peers[0].store(workspace).get("root") \
@@ -231,7 +230,7 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
 
 
 def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bob_secret, bob, _ = add_member(source, workspace, "bob", ts=10)
     base = closed_subset(source, workspace, all_fids(source, workspace))
@@ -275,7 +274,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     for name, order in (
             ("early-first", (first_pile, later_pile)),
             ("late-first", (later_pile, first_pile))):
-        peer = Node(str(tmp_path / name))
+        peer = FullPeer(str(tmp_path / name))
         peer.add_workspace(workspace, "alice", peers=[])
         deliver(peer, workspace, base)
         peer.turn(workspace)
@@ -285,7 +284,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
         sid = facts.principal_sid("member", bob)
         assert peer.idx(workspace).execute(
             "SELECT src FROM fact_index WHERE kind=? AND k0=?",
-            (catalog.ACTION_INDEX, sid),
+            (fact_index.ACTION_INDEX, sid),
         ).fetchone() \
             == (first.fid,)
         assert peer.fact_of(workspace, posted.fid) == posted
@@ -295,14 +294,14 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
 
 
 def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder = source.identity(workspace)
     _, bob, _ = add_member(source, workspace, "bob", ts=10)
     common = closed_subset(source, workspace, all_fids(source, workspace))
     first = _author_eviction(source, workspace, bob, 20)
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.keychain.add_identity(founder_secret)
     destination.add_workspace(
         workspace, "alice", peers=[], identity=founder)
@@ -328,13 +327,13 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
     sid = facts.principal_sid("member", bob)
     assert destination.idx(workspace).execute(
         "SELECT src FROM fact_index WHERE kind=? AND k0=?",
-        (catalog.ACTION_INDEX, sid),
+        (fact_index.ACTION_INDEX, sid),
     ).fetchone() \
         == (first.fid,)
 
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
@@ -354,18 +353,18 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
     node.bind_identity(workspace, child)
     with pytest.raises(ValueError, match="not a workspace admin"):
         facts.auth.removal.evict(node, workspace, carol)
-    assert not suppression_state.active(
-        node.idx(workspace), facts.principal_sid("member", carol))
+    assert not node.suppression_active(
+        workspace, facts.principal_sid("member", carol))
 
 
 def test_fact_sync_carries_actions_and_their_projection(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     target = facts.content.message.post(source, workspace, "general", "doomed", ts=10)
     before = closed_subset(source, workspace, all_fids(source, workspace))
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", peers=[])
     deliver(destination, workspace, before)
     destination.turn(workspace)
@@ -406,7 +405,7 @@ def test_fact_sync_carries_actions_and_their_projection(
 
 def test_one_poisoned_fact_lands_honest_state_without_caching(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     poisoned_target = facts.content.message.post(
         source, workspace, "general", "poison witness", ts=10)
@@ -414,7 +413,7 @@ def test_one_poisoned_fact_lands_honest_state_without_caching(
         source, workspace, "general", "honest witness", ts=11)
     before = closed_subset(source, workspace, all_fids(source, workspace))
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "alice", peers=[])
     deliver(destination, workspace, before)
     destination.turn(workspace)
@@ -455,16 +454,13 @@ def test_one_poisoned_fact_lands_honest_state_without_caching(
             ValueError, match="unresolved validated-fact difference"):
         sync_module.sync(destination, workspace, url)
 
-    assert suppression_state.active(
-        destination.idx(workspace), honest_sid)
-    assert not suppression_state.active(
-        destination.idx(workspace), poisoned_sid)
+    assert destination.suppression_active(workspace, honest_sid)
+    assert not destination.suppression_active(workspace, poisoned_sid)
     assert honest_target not in visible_fids(destination, workspace)
     assert poisoned_target in visible_fids(destination, workspace)
     assert (workspace, url) not in destination.sync_cache
 
     PoisonedPeer.poisoned = False
     assert sync_module.sync(destination, workspace, url) == (1, 0)
-    assert suppression_state.active(
-        destination.idx(workspace), poisoned_sid)
+    assert destination.suppression_active(workspace, poisoned_sid)
     assert destination.store(workspace).get("root") == store.get("root")

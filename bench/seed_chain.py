@@ -31,7 +31,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from core.kernel import offer_src
-from core.node import Node
+from full_peer.node import FullPeer
 
 SHAPES = ("star", "wide", "random", "chain")
 
@@ -194,7 +194,7 @@ def build_seed(node_dir, total_facts, n_members=MEMBERS, years=YEARS, seed=16,
     content_rng = random.Random(seed)
     keys = _SeededKeys(seed)
     root_secret, _ = keys.next()
-    node = Node(node_dir, initial_secret=root_secret)
+    node = FullPeer(node_dir, initial_secret=root_secret)
     started = time.perf_counter()
     workspace = facts.auth.workspace.create(node, "alice", ts=keys.timestamp())
     root_ts = node.fact_of(workspace, workspace).ts

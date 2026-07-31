@@ -88,8 +88,9 @@ def stage():
             REPOSITORY / "adapters" / "r2" / name,
             pending / "adapters" / "r2" / name,
         )
-    for name in ("__init__.py", "gateway.py"):
-        _copy(REPOSITORY / "deploy" / name, pending / "deploy" / name)
+    _copy(
+        REPOSITORY / "deploy" / "__init__.py",
+        pending / "deploy" / "__init__.py")
     if WORKER.exists():
         shutil.rmtree(WORKER)
     pending.rename(WORKER)
@@ -203,15 +204,15 @@ def _verify_bundle(directory):
         "core/worker.py",
         "facts/auth/request.py",
         "adapters/r2/worker.py",
-        "deploy/gateway.py",
+        "core/http.py",
     }
     missing = required - paths
     if missing:
         raise RuntimeError(f"dry-run omitted modules: {sorted(missing)}")
     forbidden = {
         "core/store.py",
-        "core/node.py",
-        "core/daemon.py",
+        "full_peer/node.py",
+        "full_peer/daemon.py",
         "core/runtime.py",
         "adapters/r2/s3.py",
         "adapters/s3/store.py",

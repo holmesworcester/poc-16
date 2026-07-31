@@ -1,4 +1,5 @@
 """Object-store concurrency contracts."""
+import asyncio
 import base64
 import fcntl
 import io
@@ -10,8 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pytest
 
-from core import daemon
-from core import walk
+from core import http
 from core.crypto import h
 from core.object_store import (
     ABSENT,
@@ -29,7 +29,8 @@ from core.limits import (
     PayloadTooLarge,
 )
 from core.store import FsStore, RemoteStore
-from core.walk import Peer as WalkPeer
+from full_peer import walk
+from full_peer.walk import Peer as WalkPeer
 
 
 def test_fs_puts_use_distinct_atomic_temp_files(tmp_path, monkeypatch):
@@ -410,32 +411,33 @@ def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
                 raise PayloadTooLarge("fake object")
             return value
 
-    class Node:
-        def store(self, ws):
-            return Store()
-
-    handler = object.__new__(daemon.Handler)
-    handler.node = Node()
-    handler._q = lambda: (["page"], {"ws": "workspace"})
-    handler._known = lambda ws: True
-    handler._member = lambda ws: "member"
-    handler._body = lambda *_: json.dumps(
+    secret = b"b" * 32
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(Store()),
+        "workspace",
+        secret,
+        lambda: 100,
+    )
+    query = {"ws": "workspace"}
+    body = json.dumps(
         [first_oid, missing_oid, third_oid]).encode()
-    handler._json = lambda code, body, **kwargs: (code, body)
-    handler._send = lambda code: code
+    assert asyncio.run(gate.handle(
+        "POST", "/page", query, {}, body)).status == 401
+    token = http.make_token(
+        secret, "member", "workspace", issued_at=0, ttl_ms=1_000)
+    headers = {"Authorization": "Bearer " + token}
+    assert asyncio.run(gate.handle(
+        "POST", "/page", query, headers,
+        json.dumps([first_oid] * 257).encode(),
+    )).status == 413
 
-    handler._member = lambda ws: None
-    assert handler.do_POST() == 401
-    handler._member = lambda ws: "member"
-    handler._body = lambda *_: json.dumps([first_oid] * 257).encode()
-    assert handler.do_POST() == 413
-    handler._body = lambda *_: json.dumps(
-        [first_oid, missing_oid, third_oid]).encode()
-
-    assert handler.do_POST() == (200, [
+    response = asyncio.run(gate.handle(
+        "POST", "/page", query, headers, body))
+    assert response.status == 200
+    assert json.loads(response.body) == [
         base64.b64encode(first).decode(), None,
         base64.b64encode(third).decode(),
-    ])
+    ]
 
 
 def test_page_batch_route_stops_before_256_valid_objects_exceed_bytes(
@@ -458,19 +460,23 @@ def test_page_batch_route_stops_before_256_valid_objects_exceed_bytes(
 
     store = Store()
 
-    class Node:
-        def store(self, ws):
-            return store
+    secret = b"b" * 32
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(store),
+        "workspace",
+        secret,
+        lambda: 100,
+        max_batch_bytes=64,
+    )
+    token = http.make_token(
+        secret, "member", "workspace", issued_at=0, ttl_ms=1_000)
+    response = asyncio.run(gate.handle(
+        "POST",
+        "/page",
+        {"ws": "workspace"},
+        {"Authorization": "Bearer " + token},
+        json.dumps(list(objects)).encode(),
+    ))
 
-    handler = object.__new__(daemon.Handler)
-    handler.node = Node()
-    handler._q = lambda: (["page"], {"ws": "workspace"})
-    handler._known = lambda ws: True
-    handler._member = lambda ws: "member"
-    handler._body = lambda *_: json.dumps(list(objects)).encode()
-    handler._json = lambda code, body, **kwargs: (code, body)
-    handler._send = lambda code, *args, **kwargs: code
-    monkeypatch.setattr(daemon, "MAX_PAGE_BATCH_BYTES", 64)
-
-    assert handler.do_POST() == 413
+    assert response.status == 413
     assert store.reads < len(objects)

@@ -6,7 +6,7 @@ import facts
 from core.close import decode_pile, encode_pile
 from core.crypto import keypair
 from core.kernel import offer_src, resolve_deps
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import grant
 from facts.auth.request import payload as request_payload
@@ -23,7 +23,7 @@ from .util import (
 
 
 def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
@@ -39,9 +39,9 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
     assert {fact.t for fact in dependencies} \
         == {"signature", "workspace", "device"}
     assert granted.ts == node.fact_of(workspace, workspace).ts
-    facts_after_first = len(node.catalog(workspace).fact_ids())
+    facts_after_first = len(node.sql(workspace).fact_ids())
     assert grant(node, workspace, user, laptop, "laptop") == first
-    assert len(node.catalog(workspace).fact_ids()) == facts_after_first
+    assert len(node.sql(workspace).fact_ids()) == facts_after_first
     with pytest.raises(ValueError, match="already enrolled"):
         grant(node, workspace, user, laptop, "duplicate")
 
@@ -62,7 +62,7 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
 
 
 def test_direct_grant_retry_after_restart_is_the_same_fact(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
@@ -70,16 +70,16 @@ def test_direct_grant_retry_after_restart_is_the_same_fact(tmp_path):
     node.keychain.add_identity(laptop_secret)
 
     first = grant(node, workspace, user, laptop, "laptop")
-    fact_count = len(node.catalog(workspace).fact_ids())
+    fact_count = len(node.sql(workspace).fact_ids())
     node.idx(workspace).close()
 
-    reopened = Node(node.dir)
+    reopened = FullPeer(node.dir)
     assert grant(reopened, workspace, user, laptop, "laptop") == first
-    assert len(reopened.catalog(workspace).fact_ids()) == fact_count
+    assert len(reopened.sql(workspace).fact_ids()) == fact_count
 
 
 def test_duplicate_provider_does_not_change_an_idempotent_grant(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder_secret, founder = node.identity(workspace)
     bind(node, workspace, "phone")
@@ -103,14 +103,14 @@ def test_duplicate_provider_does_not_change_an_idempotent_grant(tmp_path):
         },
     )
 
-    before = node.catalog(workspace).fact_ids()
+    before = node.sql(workspace).fact_ids()
     assert grant(node, workspace, founder, laptop, "laptop") == first
-    assert node.catalog(workspace).fact_ids() == before
+    assert node.sql(workspace).fact_ids() == before
     assert node.fact_of(workspace, alternate.fid) == alternate
 
 
 def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     user = node.pk
@@ -131,7 +131,7 @@ def test_any_device_set_peer_can_grant_the_next_sibling(tmp_path):
 
 
 def test_device_commands_reject_existing_members_and_bindings(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     bind(node, workspace, "phone")
     with pytest.raises(ValueError, match="already in a device set"):
@@ -153,7 +153,7 @@ def _two_principals(node, workspace):
 
 
 def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder_secret, founder, bob_secret, bob = _two_principals(
         node, workspace)
@@ -192,7 +192,7 @@ def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
 
 
 def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder, bob_secret, bob = _two_principals(
         source, workspace)
@@ -226,7 +226,7 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
     for name, order in (
             ("bob-first", (bob_chain, alice_pile)),
             ("alice-first", (alice_pile, bob_chain))):
-        peer = Node(str(tmp_path / name))
+        peer = FullPeer(str(tmp_path / name))
         deliver(peer, workspace, common)
         peer.turn(workspace)
         for pile in order:
@@ -253,7 +253,7 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
 
 def test_later_provider_cannot_change_stored_owner_or_delete_authority(
         tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     founder_secret, founder, bob_secret, bob = _two_principals(
         source, workspace)
@@ -280,7 +280,7 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
     for name, order in (
             ("delete-first", (bob_pile, alice_pile)),
             ("conflict-first", (alice_pile, bob_pile))):
-        peer = Node(str(tmp_path / name))
+        peer = FullPeer(str(tmp_path / name))
         deliver(peer, workspace, common)
         peer.turn(workspace)
         for pile in order:
@@ -308,7 +308,7 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
 
 
 def test_removed_owner_disables_child_mint_and_delegated_admin(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)

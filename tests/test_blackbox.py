@@ -13,7 +13,7 @@ import time
 import urllib.error
 
 import pytest
-from core.cli import ctl
+from full_peer.cli import ctl
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,23 +36,33 @@ def _free_ports(names):
             sock.close()
 
 
-PORTS = _free_ports(("alice", "bob", "carol"))
+PORTS = _free_ports(tuple(
+    f"{who}-{kind}"
+    for who in ("alice", "bob", "carol")
+    for kind in ("data", "control")
+))
 
 
-def url(who):
-    return f"http://127.0.0.1:{PORTS[who]}"
+def peer_url(who):
+    return f"http://127.0.0.1:{PORTS[who + '-data']}"
+
+
+def control_url(who):
+    return f"http://127.0.0.1:{PORTS[who + '-control']}"
 
 
 def command(who, path, *argv):
     """The one node-local control envelope used by CLI and tests alike."""
-    return ctl(url(who), path, [str(value) for value in argv])
+    return ctl(control_url(who), path, [str(value) for value in argv])
 
 
 def spawn(tmp, who):
     log = open(tmp / f"{who}.log", "w")
     p = subprocess.Popen(
-        [sys.executable, "-m", "core", "daemon", str(tmp / who),
-         "--port", str(PORTS[who]), "--cadence", "0.3"],
+        [sys.executable, "-m", "full_peer", "daemon", str(tmp / who),
+         "--port", str(PORTS[who + "-data"]),
+         "--control-port", str(PORTS[who + "-control"]),
+         "--url", peer_url(who), "--cadence", "0.3"],
         cwd=REPO, stdout=log, stderr=log,
         env={**os.environ, "TINYP2P_GRANT_TTL": "2000", "TINYP2P_DEBUG": "1"})
     wait_until(lambda: alive(who), 10, f"{who} daemon up")
@@ -61,7 +71,7 @@ def spawn(tmp, who):
 
 def alive(who):
     try:
-        command(who, "core.status")
+        command(who, "peer.status")
         return True
     except Exception:
         return False
@@ -80,7 +90,7 @@ def wait_until(pred, timeout, what):
 
 
 def root_of(who, ws):
-    return command(who, "core.status")["workspaces"][ws]["root"]
+    return command(who, "peer.status")["workspaces"][ws]["root"]
 
 
 def texts(who, ws):
@@ -98,14 +108,14 @@ def converged(ws, *whos):
 def test_alice_bob_carol(tmp_path):
     procs = {}
     try:
-        for who in PORTS:
+        for who in ("alice", "bob", "carol"):
             procs[who] = spawn(tmp_path, who)
 
         # -- malformed control requests fail closed without phantom state -----
         with pytest.raises(urllib.error.HTTPError) as unknown:
-            command("alice", "core.rebuild", "missing")
+            command("alice", "peer.rebuild", "missing")
         assert unknown.value.code == 404
-        assert command("alice", "core.status")["workspaces"] == {}
+        assert command("alice", "peer.status")["workspaces"] == {}
 
         # -- create + invite + join ------------------------------------------
         ws = command("alice", "auth.workspace.create", "alice")
@@ -125,7 +135,7 @@ def test_alice_bob_carol(tmp_path):
         command(
             "carol", "content.message.post", ws, "general", "hi from carol")
         wait_until(lambda: converged(ws, "alice", "bob", "carol"), 30, "3-way convergence")
-        for who in PORTS:
+        for who in ("alice", "bob", "carol"):
             assert set(texts(who, ws)) == {"welcome", "hi from bob", "hi from carol"}
             assert {
                 member["name"]
@@ -164,16 +174,16 @@ def test_alice_bob_carol(tmp_path):
 
         # -- real deletion route + CLI: owner and admin, message and file ----
         removed = subprocess.run(
-            [sys.executable, "-m", "core", "--node", url("alice"),
+            [sys.executable, "-m", "full_peer", "--node", control_url("alice"),
              "content.delete.remove", ws[:12], welcome],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert removed.returncode == 0, removed.stderr
         refused = subprocess.run(
-            [sys.executable, "-m", "core", "--node", url("alice"),
+            [sys.executable, "-m", "full_peer", "--node", control_url("alice"),
              "content.delete.remove", ws[:12], "0" * 64],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert refused.returncode == 1
-        assert "core: 400:" in refused.stderr
+        assert "full_peer: 400:" in refused.stderr
         assert "Traceback" not in refused.stderr
         command("alice", "content.delete.remove", ws, bob_message)
         command("bob", "content.delete.remove", ws, fid2)
@@ -190,8 +200,10 @@ def test_alice_bob_carol(tmp_path):
                 and fid not in files and fid2 not in files
 
         wait_until(
-            lambda: all(deletions_visible(who) for who in PORTS)
-            and converged(ws, *PORTS),
+            lambda: all(
+                deletions_visible(who)
+                for who in ("alice", "bob", "carol"))
+            and converged(ws, "alice", "bob", "carol"),
             45, "message and attachment deletions converge")
         with pytest.raises(urllib.error.HTTPError) as gone:
             command(
@@ -219,7 +231,7 @@ def test_alice_bob_carol(tmp_path):
             lambda: any(
                 "HTTP Error 403" in failure["error"]
                 or "not a workspace member" in failure["error"]
-                for failure in command("carol", "core.status")[
+                for failure in command("carol", "peer.status")[
                     "workspaces"][ws]["sync_failures"]),
             10, "carol's sync authorization is refused")
         # ctl is a trusted node-local surface, not the remote auth boundary:
@@ -257,7 +269,7 @@ def test_alice_bob_carol(tmp_path):
 
         # -- the actual CLI binary, end to end -------------------------------
         out = subprocess.run(
-            [sys.executable, "-m", "core", "--node", url("alice"),
+            [sys.executable, "-m", "full_peer", "--node", control_url("alice"),
              "content.message.list", ws[:12]],
             cwd=REPO, capture_output=True, text=True, timeout=30)
         assert out.returncode == 0 and "post restart" in out.stdout

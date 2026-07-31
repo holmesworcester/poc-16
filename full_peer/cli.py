@@ -8,14 +8,14 @@ import sys
 import urllib.error
 import urllib.request
 
-from .http_body import read_bounded
-from .limits import MAX_CONTROL_BYTES
+from core.http_body import read_bounded
+from core.limits import MAX_CONTROL_BYTES
 
-DEFAULT_NODE = "http://127.0.0.1:7100"
+DEFAULT_NODE = "http://127.0.0.1:7101"
 USAGE = (
-    "usage: core [--node URL] <scope.family.verb> [args...]\n"
-    "       core daemon <dir> [--port PORT] [--store-config PATH]\n"
-    "       core --commands"
+    "usage: full_peer [--node URL] <scope.family.verb> [args...]\n"
+    "       full_peer daemon <dir> [--port PORT] [--control-port PORT]\n"
+    "       full_peer --commands"
 )
 STORE_HELP = """\
 Cloud object stores use a strict JSON file passed with --store-config.
@@ -48,13 +48,14 @@ def ctl(node_url, path, argv):
 
 def _serve(argv):
     parser = argparse.ArgumentParser(
-        prog="core daemon",
+        prog="full_peer daemon",
         description="Run one local client node and its HTTP responder.",
         epilog=STORE_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("dir")
     parser.add_argument("--port", type=int, default=7100)
+    parser.add_argument("--control-port", type=int, default=7101)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cadence", type=float, default=1.0)
     parser.add_argument("--url")
@@ -69,13 +70,13 @@ def _serve(argv):
     from .daemon import serve
     return serve(
         args.dir, args.port, args.host, args.cadence, args.url,
-        store_factory=store_factory)
+        control_port=args.control_port, store_factory=store_factory)
 
 
 def _commands():
-    from .daemon import CORE_COMMANDS
+    from .daemon import LOCAL_COMMANDS
     from facts import COMMANDS
-    return tuple(sorted((*CORE_COMMANDS, *COMMANDS)))
+    return tuple(sorted((*LOCAL_COMMANDS, *COMMANDS)))
 
 
 def main(argv=None):
@@ -114,7 +115,7 @@ def main(argv=None):
             detail = error.reason
         finally:
             error.close()
-        print(f"core: {error.code}: {detail}", file=sys.stderr)
+        print(f"full_peer: {error.code}: {detail}", file=sys.stderr)
         return 1
     if isinstance(out, str):
         print(out)

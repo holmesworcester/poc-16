@@ -14,7 +14,7 @@ from core.close import decode_pile, encode_pile
 from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.ingress import KernelRejected
-from core.node import Node
+from full_peer.node import FullPeer
 from core.limits import MAX_PILE_BYTES, MAX_ROOT_BYTES, PayloadTooLarge
 from core.repository_applier import RepositoryApplier, SyncStoreAdapter
 from core.repository_reader import RepositoryReader
@@ -216,7 +216,7 @@ def test_crash_after_cas_replays_as_token_checked_noop_and_retires(
 
 def test_concurrent_cold_appliers_rebase_retained_loser(
         tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     base_pile = closed_subset(
         source, workspace, all_fids(source, workspace))
@@ -261,7 +261,7 @@ def test_concurrent_cold_appliers_rebase_retained_loser(
 
 
 def test_proposal_for_one_pile_cannot_commit_or_retire_another(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     first_fid = facts.content.message.post(
         source, workspace, "general", "first", ts=10)
@@ -306,7 +306,7 @@ def test_proposal_is_an_ephemeral_capability_of_its_minting_applier(
 
 def test_permanent_rejection_preserves_exact_evidence_before_delete(
         tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     store = FsStore(str(tmp_path / "hosted"))
     malformed = b"{}"
@@ -327,7 +327,7 @@ def test_permanent_rejection_preserves_exact_evidence_before_delete(
 
 def test_removal_of_a_never_member_is_rejected_before_root_mutation(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     secret, public = author.identity(workspace)
     _, never_member = keypair()
@@ -356,7 +356,7 @@ def test_removal_of_a_never_member_is_rejected_before_root_mutation(
 
 def test_family_program_failure_retains_source_without_rejection_evidence(
         tmp_path, monkeypatch):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     facts.content.message.post(
         author, workspace, "general", "valid before failure", ts=10)
@@ -384,7 +384,7 @@ def test_family_program_failure_retains_source_without_rejection_evidence(
 
 def test_crypto_program_failure_retains_source_without_rejection_evidence(
         tmp_path, monkeypatch):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     raw = closed_subset(
         author, workspace, all_fids(author, workspace))
@@ -411,7 +411,7 @@ def test_crypto_program_failure_retains_source_without_rejection_evidence(
 )
 def test_noncanonical_pile_retires_exact_source_then_healthy_work_applies(
         tmp_path, attack):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     good = closed_subset(
         author, workspace, all_fids(author, workspace))
@@ -455,7 +455,7 @@ def test_noncanonical_pile_retires_exact_source_then_healthy_work_applies(
 
 def test_apply_does_not_readjudicate_previously_validated_facts(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     facts.content.message.post(
         node, workspace, "general", "retained fact", ts=10)
@@ -488,7 +488,7 @@ def test_apply_does_not_readjudicate_previously_validated_facts(
 
 def test_malformed_pile_is_rejected_before_root_or_validated_set_reads(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     store = FsStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
@@ -512,7 +512,7 @@ def test_malformed_pile_is_rejected_before_root_or_validated_set_reads(
 def test_embedded_object_member_is_rejected_without_establishing_bytes(
         tmp_path):
     """An ordinary pile cannot bypass detached immutable-object ingress."""
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     ordinary = closed_subset(
         source, workspace, all_fids(source, workspace))

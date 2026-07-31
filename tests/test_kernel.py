@@ -20,7 +20,7 @@ from core.kernel import (
     drain,
     validate,
 )
-from core.node import now_ms
+from full_peer.node import now_ms
 from facts._policy import FamilyPolicy
 
 

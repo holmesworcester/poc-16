@@ -548,7 +548,7 @@ def test_current_integration_seams_name_built_repository_roles():
     assert integration_inventory(root) == INTEGRATION_SEAMS
     by_symbol = {seam.symbol: seam.path for seam in INTEGRATION_SEAMS}
     assert by_symbol["UploadBroker"] == "deploy/upload_broker.py"
-    assert by_symbol["PileSender"] == "core/pile_sender.py"
+    assert by_symbol["PileSender"] == "full_peer/pile_sender.py"
     assert by_symbol["RepositoryApplier"] == \
         "core/repository_applier.py"
     assert by_symbol["RepositoryReader"] == \

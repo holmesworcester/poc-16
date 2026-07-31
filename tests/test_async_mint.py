@@ -8,7 +8,7 @@ import facts
 
 from core import merkle_map
 from core.close import decode_pile, encode_pile
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 from core.repository_reader import RepositoryReader
 from facts.auth import request
 
@@ -38,7 +38,7 @@ def run_async(workspace, pile, root, fetch, now, *,
 
 @pytest.fixture
 def snapshots(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
@@ -265,7 +265,7 @@ def test_unique_fetch_and_aggregate_byte_budgets_are_hard(snapshots):
 
 
 def test_async_driver_never_repins_root_during_an_await(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)

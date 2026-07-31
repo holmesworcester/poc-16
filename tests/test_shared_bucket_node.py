@@ -7,10 +7,11 @@ import pytest
 
 import facts
 
-from core import bao, indexes
+from core import indexes
+from full_peer import bao_native as bao
 from core.close import close
 from core.crypto import h, keypair
-from core.node import Node
+from full_peer.node import FullPeer
 from core.object_store import Applied, OutcomeUnknown
 from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
@@ -109,7 +110,7 @@ def _commit_facts(workspace, commit):
 
 def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     first, first_raw = _message_pile(
         author, workspace, "alice", 10)
@@ -154,7 +155,7 @@ def test_concurrent_cold_appliers_retain_and_rebase_the_cas_loser(
 
 
 def test_opaque_token_is_not_root_content_identity(tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     item, raw = _message_pile(
         author, workspace, "opaque CAS", 10)
@@ -179,7 +180,7 @@ def test_opaque_token_is_not_root_content_identity(tmp_path):
 @pytest.mark.parametrize("applied_before_loss", (False, True))
 def test_applier_reconciles_unknown_root_cas(
         tmp_path, monkeypatch, applied_before_loss):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     item, raw = _message_pile(
         node, workspace, "survives ambiguity", 10)
@@ -220,7 +221,7 @@ def test_applier_reconciles_unknown_root_cas(
 
 def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     first, first_raw = _message_pile(
         author, workspace, "ambiguous", 10)
@@ -266,7 +267,7 @@ def test_unknown_cas_followed_by_a_later_root_keeps_the_exact_pile(
 
 def test_database_free_reader_stays_pinned_during_later_eviction(
         tmp_path, monkeypatch):
-    writer = Node(str(tmp_path / "writer"))
+    writer = FullPeer(str(tmp_path / "writer"))
     workspace = facts.auth.workspace.create(writer, "alice", ts=1)
     founder = writer.identity_id(workspace)
     bob_secret, bob, _ = add_member(
@@ -312,7 +313,7 @@ def test_database_free_reader_stays_pinned_during_later_eviction(
 
 def test_later_authority_changes_never_remove_validated_facts(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "root", ts=1)
     root_secret, root = author.identity(workspace)
     q_secret, q, _ = add_member(
@@ -431,7 +432,7 @@ def test_later_authority_changes_never_remove_validated_facts(
 
 def test_concurrent_appliers_preserve_suppression_winner_and_serial_union(
         tmp_path):
-    author = Node(str(tmp_path / "author"))
+    author = FullPeer(str(tmp_path / "author"))
     workspace = facts.auth.workspace.create(author, "alice", ts=1)
     target_fid = facts.content.message.post(
         author, workspace, "general", "target", ts=10)

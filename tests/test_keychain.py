@@ -5,13 +5,13 @@ import facts
 import pytest
 
 from core.crypto import keypair
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 
 from .util import add_member
 
 
 def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     default_secret, default_id = node.keychain.default()
     other_id = node.keychain.add_identity()
     other_secret, other_public = node.keychain.identity(other_id)
@@ -31,7 +31,7 @@ def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
     assert node.idx(workspace).execute(
         "SELECT COUNT(*) FROM facts").fetchone()[0] == fact_count
 
-    reopened = Node(node.dir)
+    reopened = FullPeer(node.dir)
     assert reopened.identity_id(workspace) == other_id
     assert set(reopened.keyring["keys"]) == {default_id, other_id}
     with pytest.raises(KeyError, match="unknown identity"):
@@ -51,7 +51,7 @@ def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
         },
     }))
 
-    node = Node(str(directory))
+    node = FullPeer(str(directory))
 
     assert node.pk == public
     assert node.identity_id(workspace) == public
@@ -71,7 +71,7 @@ def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
 
 
 def test_commands_author_with_the_workspace_bound_identity(tmp_path):
-    node = Node(str(tmp_path / "bound"))
+    node = FullPeer(str(tmp_path / "bound"))
     workspace = facts.auth.workspace.create(node, "alice")
     invite_ts = now_ms() + 1
     member_secret, member_public, _ = add_member(
@@ -88,7 +88,7 @@ def test_commands_author_with_the_workspace_bound_identity(tmp_path):
 
 
 def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
-    node = Node(str(tmp_path / "rebind"))
+    node = FullPeer(str(tmp_path / "rebind"))
     workspace = facts.auth.workspace.create(node, "alice")
     other_workspace = "f" * 64
     replacement = node.keychain.add_identity()
@@ -105,7 +105,7 @@ def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
 
 
 def test_publish_keeps_the_identity_that_signed_during_a_rebind(tmp_path):
-    node = Node(str(tmp_path / "race"))
+    node = FullPeer(str(tmp_path / "race"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     carol_secret, carol, _ = add_member(node, workspace, "carol", ts=20)

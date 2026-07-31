@@ -21,7 +21,7 @@ from deploy.aws_lambda.config import (
     SDK_TOTAL_ATTEMPTS,
     validate_sdk_budget,
 )
-from deploy.gateway import AsyncFromSyncReader, Gateway, Response
+from core.http import AsyncFromSyncReader, HttpGate, Response
 
 _gateway_cache = None
 _logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ def _store():
         read_total_max_attempts=attempts,
         probe_access_denied_missing=True,
     )
-    # Gateway receives only the narrowed reader wrapper. The execution role
+    # HttpGate receives only the narrowed reader wrapper. The execution role
     # has no S3 mutation action even though S3Store also implements publishing.
     return AsyncFromSyncReader(S3Store(config))
 
@@ -122,7 +122,7 @@ def _store():
 def _gateway():
     global _gateway_cache
     if _gateway_cache is None:
-        _gateway_cache = Gateway(
+        _gateway_cache = HttpGate(
             _store(),
             _required("TINYP2P_WORKSPACE_ID"),
             _secret(),

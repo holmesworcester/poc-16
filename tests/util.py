@@ -8,7 +8,7 @@ import tempfile
 
 import facts
 
-from core import daemon
+from core import http, peer_capability
 from core.close import close, encode_pile
 from core.crypto import h, keypair
 from facts.auth.device_invite import device_invite
@@ -17,16 +17,29 @@ from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import offer_src, resolve_deps
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
+
+
+def invoke_mint_value(node, workspace, value):
+    gate = http.HttpGate(
+        http.AsyncFromSyncReader(node.store(workspace)),
+        workspace,
+        b"mint-test-secret" * 2,
+        now_ms,
+        sync_profile=peer_capability.FULL,
+        max_mint_fetches=http.MAX_MINT_FETCHES,
+        max_mint_fetch_bytes=http.MAX_MINT_FETCH_BYTES,
+    )
+    response = asyncio.run(gate.handle(
+        "POST", "/mint", {"ws": workspace}, {},
+        json.dumps(value).encode(),
+    ))
+    body = json.loads(response.body) if response.body else None
+    return gate, (response.status, body)
 
 
 def invoke_mint(node, workspace, pile):
-    handler = object.__new__(daemon.Handler)
-    handler.node, handler.secret = node, b"mint-test-secret"
-    handler._known = lambda candidate: candidate == workspace
-    handler._send = lambda code, *args, **kwargs: (code, None)
-    handler._json = lambda code, body: (code, body)
-    return handler, handler.mint({
+    return invoke_mint_value(node, workspace, {
         "ws": workspace,
         "pile": base64.b64encode(pile).decode(),
     })
@@ -35,7 +48,7 @@ def invoke_mint(node, workspace, pile):
 def suppression_world(path, initial_secret=None):
     """A valid set with targets and PRODUCTION deletions
     (facts/content/delete.py via facts.content.delete.remove), authored in one fixed order."""
-    node = Node(str(path), initial_secret=initial_secret)
+    node = FullPeer(str(path), initial_secret=initial_secret)
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     targets = [
         facts.content.message.post(
@@ -78,7 +91,7 @@ def replay_random(source, workspace, destination, seed):
 def query_state(node, workspace=None):
     """Canonical public query state over the single fact catalog."""
     if workspace is None:
-        known = node.workspaces() or list(node._idx)
+        known = node.workspaces() or list(node._sql)
         if len(known) != 1:
             raise ValueError("query_state needs one workspace")
         workspace = known[0]
@@ -104,7 +117,7 @@ def visible_fids(node, workspace):
     with node.lock:
         return {
             fid
-            for fid in node.catalog(workspace).fact_ids()
+            for fid in node.sql(workspace).fact_ids()
             if not node.suppressed(workspace, node.fact_of(workspace, fid))
         }
 
@@ -197,7 +210,7 @@ def all_fids(n, ws):
     with n.lock:
         facts = [
             n.fact_of(ws, fid)
-            for fid in n.catalog(ws).fact_ids()
+            for fid in n.sql(ws).fact_ids()
         ]
     return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
 

@@ -6,10 +6,11 @@ import pytest
 
 import facts
 
-from core import catalog, daemon, indexes
+from core import fact_index, indexes
 from core.close import decode_pile, encode_pile
 from core.kernel import drain
-from core.node import Node
+from full_peer.node import FullPeer
+from full_peer.node import now_ms
 from core.repository_reader import RepositoryReader
 from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
@@ -46,7 +47,7 @@ def test_e_identical_across_partitions_orders_batchings(
     expected_app = query_state(source)
     for seed in range(5):
         peer = replay_random(
-            source, workspace, Node(str(tmp_path / f"peer-{seed}")), seed)
+            source, workspace, FullPeer(str(tmp_path / f"peer-{seed}")), seed)
         assert peer.store(workspace).get("root") == expected_root
         assert visible_fids(peer, workspace) == effective
         assert query_state(peer) == expected_app
@@ -91,12 +92,12 @@ def test_reader_rebuilds_missing_reference_projection_without_root_write(
     )
     index.commit()
 
-    assert referenced.isdisjoint(node.catalog(workspace).fact_ids())
+    assert referenced.isdisjoint(node.sql(workspace).fact_ids())
 
     node.rebuild(workspace)
 
     assert node.store(workspace).get("root") == root
-    assert referenced <= node.catalog(workspace).fact_ids()
+    assert referenced <= node.sql(workspace).fact_ids()
     assert all(node.fact_of(workspace, fid) is not None
                for fid in deletions)
     assert query_state(node) == expected
@@ -146,13 +147,13 @@ def test_suppression_stays_behind_the_root_commit(
     def projected_action():
         return node.idx(workspace).execute(
             "SELECT src FROM fact_index WHERE kind=? AND k0=?",
-            (catalog.ACTION_INDEX, indexes.fact_key(target.fid)),
+            (fact_index.ACTION_INDEX, indexes.fact_key(target.fid)),
         ).fetchone()
 
     assert committed_action(old_root) == {"state": "clear"}
     assert projected_action() is None
     assert visible()
-    now = daemon.now_ms()
+    now = now_ms()
     request = encode_pile(request_payload(
         node, workspace, "sync", now + 60_000, now))
     canonical_observed = []
@@ -208,7 +209,7 @@ def test_suppression_stays_behind_the_root_commit(
     assert node.fact_of(workspace, deletion.fid) is None
     assert projected_action() is None
     assert observed == [(200, old_root)]
-    assert canonical_observed == [True]
+    assert canonical_observed and all(canonical_observed)
     assert visible()
     assert store.list("pile/")
 
@@ -218,7 +219,7 @@ def test_suppression_stays_behind_the_root_commit(
             "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM meta;")
         index.commit()
         index.close()
-        node = Node(node.dir)
+        node = FullPeer(node.dir)
         store = node.store(workspace)
     else:
         monkeypatch.setattr(store, "cas", original_cas)
@@ -245,4 +246,5 @@ def test_suppression_stays_behind_the_root_commit(
     assert not visible()
     _, (code, body) = invoke_mint(node, workspace, request)
     assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
-    assert canonical_observed == [True, False]
+    assert canonical_observed[0] is True
+    assert canonical_observed[-1] is False

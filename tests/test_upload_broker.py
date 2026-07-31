@@ -11,9 +11,9 @@ import pytest
 from core.close import encode_pile
 from core.crypto import h
 from core.limits import MAX_OBJECT_BYTES, MAX_PILE_BYTES, PAGE_BATCH
-from core.node import Node
+from full_peer.node import FullPeer
 from core.staged_intent import staging_key
-from deploy.gateway import AsyncFromSyncReader, Gateway
+from core.http import AsyncFromSyncReader, HttpGate
 from deploy.upload_broker import (
     AuthorizedPut,
     MAX_CAPABILITY_DOCUMENT_BYTES,
@@ -108,7 +108,7 @@ def world(
         tmp_path, *, session_policy=None, signer=None, clock=None,
         nonce=lambda count: SESSION if count == 16 else b""):
     clock = clock or Clock()
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     public = node.identity_id(workspace)
     proof = encode_pile(request.payload(
@@ -748,7 +748,7 @@ def test_upload_purpose_is_accepted_only_by_upload_broker(tmp_path):
     (
         node, workspace, _, upload_proof, _, signer, _, broker,
     ) = world(tmp_path)
-    gateway = Gateway(
+    gateway = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: NOW)
     sync_proof = encode_pile(request.payload(
@@ -792,7 +792,7 @@ def test_broker_distinguishes_provider_failure_from_bad_proof(tmp_path):
     with pytest.raises(UploadUnavailable, match="root unavailable"):
         asyncio.run(broker.open(proof, vector.manifest, pile()))
 
-    foreign = Node(str(tmp_path / "foreign"))
+    foreign = FullPeer(str(tmp_path / "foreign"))
     foreign_workspace = facts.auth.workspace.create(foreign, "mallory", ts=1)
     foreign_root = foreign.store(foreign_workspace).get("root")
 

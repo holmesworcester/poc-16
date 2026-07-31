@@ -65,8 +65,8 @@ DURABLE = True
 def accept(node, link, name):
     """Redeem a self-contained invite, then push the authored join."""
     from core.kernel import drain
-    from core.node import now_ms
-    from core.sync import sync
+    from full_peer.node import now_ms
+    from full_peer.sync import sync
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
     url, workspace = link_data["u"], link_data["ws"]
@@ -110,8 +110,6 @@ def accept(node, link, name):
 # QUERIES
 def members(node, workspace):
     """Assemble the roster from current ``member`` and ``admin`` offers."""
-    from core import suppression_state
-
     with node.lock:
         candidates = {}
         role_order = {"admin": 0, "member": 1, "device": 2}
@@ -152,8 +150,8 @@ def members(node, workspace):
                 "pk": public,
                 "name": name,
                 "role": "admin" if public in admins else role,
-                "evicted": suppression_state.active(
-                    node.idx(workspace), scoped_id("member", owner)),
+                "evicted": node.suppression_active(
+                    workspace, scoped_id("member", owner)),
             }
             for public, (_, name, role, owner) in candidates.items()
         ]

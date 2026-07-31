@@ -8,7 +8,7 @@ from facts.auth.signature import signature
 from facts.content.file import file
 from facts.content.message import message
 from core.kernel import offer_src
-from core.node import Node
+from full_peer.node import FullPeer
 from core.suppression import (
     SELF,
     action,
@@ -75,7 +75,7 @@ def test_suppression_marker_survives_the_wire_codec():
           "enc": "clear-v1"}, WS),
 ])
 def test_post_cutover_markerless_content_is_rejected(fact, tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     secret, public = node.identity(workspace)
     member = offer_src(node.idx(workspace), "member", public)

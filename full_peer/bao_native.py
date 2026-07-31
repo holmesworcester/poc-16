@@ -6,18 +6,16 @@ Only attachment I/O crosses this seam and loads ``tinyp2p_bao``.
 import importlib
 from functools import lru_cache
 
-WIDTH = 256 * 1024
-MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
-MAX_SLICES = MAX_FILE_BYTES // WIDTH
-BAO_CHUNK_BYTES = 1024
-_DEPTH = (
-    (MAX_FILE_BYTES + BAO_CHUNK_BYTES - 1) // BAO_CHUNK_BYTES - 1
-).bit_length()
-MAX_PROOF_BYTES = (
-    (WIDTH + BAO_CHUNK_BYTES - 1) // BAO_CHUNK_BYTES + 1
-) * BAO_CHUNK_BYTES + (
-    WIDTH // BAO_CHUNK_BYTES + 2 * _DEPTH
-) * 64 + 8
+from facts._bao import (
+    BAO_CHUNK_BYTES,
+    MAX_FILE_BYTES,
+    MAX_PROOF_BYTES,
+    MAX_SLICES,
+    WIDTH,
+    geometry,
+    span,
+)
+
 BUILD_COMMAND = "python3 -m pip install ./native/bao_py"
 
 
@@ -32,19 +30,6 @@ def _native():
             "Bao attachments require the vendored Rust extension; "
             f"from the project root run: {BUILD_COMMAND}"
         ) from error
-
-
-def geometry(size, width=WIDTH):
-    """Slice count: ceil(size/width), and zero for an empty file."""
-    return 0 if size == 0 else (size + width - 1) // width
-
-
-def span(index, size, width=WIDTH):
-    """Return this slice's unpadded ``(start, count)``."""
-    if index < 0 or index >= geometry(size, width):
-        raise ValueError("slice index outside the descriptor")
-    start = index * width
-    return start, min(width, size - start)
 
 
 def prepare(src_path, outboard_path):

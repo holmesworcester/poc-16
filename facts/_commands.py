@@ -101,7 +101,7 @@ def upload_builder(node, workspace):
 def upload_source(
         node, workspace, source, broker_url, provider_origin):
     """Run the one provider-neutral direct uploader with a fresh auth proof."""
-    from core.node import now_ms
+    from full_peer.node import now_ms
     from deploy.upload_client_http import run_http
     import facts
 

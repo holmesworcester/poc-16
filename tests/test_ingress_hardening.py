@@ -8,8 +8,8 @@ import pytest
 import facts
 
 from core import (
-    close, daemon, fact, merkle_map, object_store,
-    repository_applier as repository_applier_module, snapshot, status,
+    close, fact, http_stdlib, merkle_map, object_store,
+    repository_applier as repository_applier_module, snapshot,
 )
 from core.crypto import h
 from core.fact import Fact, canon
@@ -19,7 +19,8 @@ from core.limits import (
     MAX_ATOM_VALUE_BYTES,
     PayloadTooLarge,
 )
-from core.node import Node
+from full_peer.node import FullPeer
+from full_peer import status
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from facts.content import message as message_family
@@ -105,11 +106,11 @@ def test_generic_atom_grammar_enforces_exact_text_and_fid_bounds():
 
 
 def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
 
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "source", [])
     good = closed_subset(source, workspace, [survivor])
     bad = poisoned_timestamp_pile(workspace)
@@ -127,7 +128,7 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
     assert destination.store(workspace).get(
         "failed/pile/" + h(bad)) == bad
 
-    restarted = Node(str(tmp_path / "destination"))
+    restarted = FullPeer(str(tmp_path / "destination"))
     assert restarted.fact_of(workspace, survivor) is not None
     assert restarted.store(workspace).list("pile/") == []
     assert status.describe(restarted)["workspaces"][workspace][
@@ -135,11 +136,11 @@ def test_poisoned_pile_is_quarantined_and_unrelated_pile_continues(tmp_path):
 
 
 def queued_messages(tmp_path):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     first = facts.content.message.post(source, workspace, "general", "first", ts=2)
     second = facts.content.message.post(source, workspace, "general", "second", ts=3)
-    destination = Node(str(tmp_path / "destination"))
+    destination = FullPeer(str(tmp_path / "destination"))
     destination.add_workspace(workspace, "source", [])
     first_raw = closed_subset(source, workspace, [first])
     second_raw = closed_subset(source, workspace, [second])
@@ -265,9 +266,9 @@ def test_failed_root_commit_is_isolated_from_the_next_pile_and_retries(
     assert failures[0]["source"] == first_key
     assert failures[0]["error"] == expected_error
 
-    for index in node._idx.values():
-        index.close()
-    reopened = Node(node.dir)
+    for projection in node._sql.values():
+        projection.db.close()
+    reopened = FullPeer(node.dir)
     reopened.turn(workspace)
 
     assert reopened.fact_of(workspace, first_fid) is not None
@@ -344,10 +345,10 @@ def test_failed_root_read_is_isolated_from_the_next_pile(
 )
 def test_rejection_retirement_requires_exact_durable_evidence(
         tmp_path, monkeypatch, boundary, source_survives, payload_exact):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
-    node = Node(str(tmp_path / "destination"))
+    node = FullPeer(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     bad = poisoned_timestamp_pile(workspace)
     good = closed_subset(source, workspace, [survivor])
@@ -405,10 +406,10 @@ def test_rejection_retirement_requires_exact_durable_evidence(
 
 def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     survivor = facts.content.message.post(source, workspace, "general", "survives", ts=2)
-    node = Node(str(tmp_path / "destination"))
+    node = FullPeer(str(tmp_path / "destination"))
     node.add_workspace(workspace, "source", [])
     rejected = close.encode_pile([
         Fact(
@@ -441,7 +442,7 @@ def test_decoded_kernel_rejection_is_the_only_other_quarantine_verdict(
 
 def test_failure_status_follows_short_native_pages_without_whole_list(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "node", ts=1)
     inner = node.store(workspace)
     expected = []
@@ -484,9 +485,9 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
         tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     factory = lambda workspace: FsStore(str(shared / workspace))
-    first = Node(str(tmp_path / "first"), store_factory=factory)
+    first = FullPeer(str(tmp_path / "first"), store_factory=factory)
     workspace = facts.auth.workspace.create(first, "shared", ts=1)
-    second = Node(str(tmp_path / "second"), store_factory=factory)
+    second = FullPeer(str(tmp_path / "second"), store_factory=factory)
     second.add_workspace(workspace, "shared", [])
     second.rebuild(workspace)
     bad = poisoned_timestamp_pile(workspace)
@@ -540,7 +541,7 @@ def test_two_workers_share_immutable_rejection_evidence_without_clobber(
 
 
 def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "node", ts=1)
     peer = "https://peer.invalid"
 
@@ -557,7 +558,7 @@ def test_sync_failure_and_recovery_are_exposed_in_status(tmp_path):
 
 
 def test_legacy_removal_field_is_rejected_instead_of_partly_decoded(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "node", ts=1)
     store = node.store(workspace)
     root = json.loads(store.get("root"))
@@ -627,22 +628,24 @@ def test_pile_encoder_and_object_admission_enforce_the_reader_bounds(
             workspace, NeverWritten()).admit_object(h(raw), raw))
 
 
-def test_daemon_body_rejects_claimed_oversize_without_reading():
+def test_peer_adapter_rejects_claimed_oversize_without_reading(
+        monkeypatch):
     class NeverRead:
         def read(self, _count):
             raise AssertionError("oversized body was read")
 
-    handler = object.__new__(daemon.Handler)
+    handler = object.__new__(http_stdlib.StdlibPeerHandler)
     handler.headers = {"Content-Length": "9"}
     handler.rfile = NeverRead()
+    monkeypatch.setattr(http_stdlib, "MAX_MINT_REQUEST_BYTES", 8)
 
     with pytest.raises(PayloadTooLarge):
-        handler._body(8)
+        handler._body("POST", "/unknown")
 
 
 def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
         tmp_path, monkeypatch):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     raw = close.encode_pile((), workspace=workspace)
     source = node.stage_received_pile(
@@ -682,7 +685,7 @@ def test_repeated_retirement_failures_keep_one_exact_receipt_slot(
 
 def test_distinct_failed_applies_retain_only_store_bound_pile_bytes(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     bootstrap = closed_subset(
         source, workspace, all_fids(source, workspace))
@@ -698,7 +701,7 @@ def test_distinct_failed_applies_retain_only_store_bound_pile_bytes(
     ]
     assert len(set(raws)) == 8
 
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     node.add_workspace(workspace, "alice", peers=[])
     deliver(node, workspace, bootstrap)
     node.turn(workspace)

@@ -1,0 +1,148 @@
+"""Standard-library HTTP server/byte adapter for :class:`core.http.HttpGate`.
+
+This host-only adapter contains no route decisions.  It normalizes ordinary
+HTTP request bytes, selects one workspace, and delegates every authorization
+and repository operation to the database-free gate.
+"""
+import asyncio
+from http.server import BaseHTTPRequestHandler
+import time
+from urllib.parse import parse_qs, urlparse
+
+from . import peer_capability
+from .http import HttpGate, Response
+from .limits import MAX_MINT_REQUEST_BYTES, PayloadTooLarge
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+class _SyncStore:
+    def __init__(self, store):
+        self.store = store
+
+    async def get_bounded(self, key, max_bytes):
+        return self.store.get_bounded(key, max_bytes)
+
+    async def has(self, key):
+        return self.store.has(key)
+
+
+class _SyncReceiver:
+    def __init__(self, peer, workspace):
+        self.peer = peer
+        self.workspace = workspace
+
+    async def admit_object(self, oid, raw):
+        return self.peer.receive_object(self.workspace, oid, raw)
+
+    async def receive_pile(self, member, raw):
+        return self.peer.receive_pile(self.workspace, member, raw)
+
+    async def turn(self):
+        return self.peer.turn(self.workspace)
+
+
+class StdlibPeerHandler(BaseHTTPRequestHandler):
+    """Translate ordinary HTTP bytes; ``HttpGate`` still owns the routes."""
+
+    peer = secret = None
+    sync_profile = peer_capability.FULL
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args):
+        pass
+
+    def _request(self):
+        parsed = urlparse(self.path)
+        query = {
+            key: values[0]
+            for key, values in parse_qs(parsed.query).items()
+            if len(values) == 1
+        }
+        return parsed.path, query
+
+    def _body(self, method, path):
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("unsupported transfer encoding")
+        claimed = self.headers.get("Content-Length")
+        try:
+            length = 0 if claimed is None else int(claimed)
+        except (TypeError, ValueError) as error:
+            raise ValueError("content length") from error
+        if length < 0:
+            raise ValueError("content length")
+        limit = HttpGate.request_limit(method, path)
+        if not limit and method in {"POST", "PUT"}:
+            limit = MAX_MINT_REQUEST_BYTES
+        if length > limit:
+            raise PayloadTooLarge("request body too large")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("short request body")
+        return body
+
+    def _send(self, response):
+        self.send_response(response.status)
+        headers = dict(response.headers)
+        headers.setdefault("Content-Type", "application/json")
+        headers["Content-Length"] = str(len(response.body))
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(response.body)
+
+    def _dispatch(self, method):
+        path, query = self._request()
+        try:
+            body = self._body(method, path)
+        except PayloadTooLarge:
+            return self._send(Response(413))
+        except ValueError:
+            return self._send(Response(400))
+        workspace = query.get("ws", "")
+        public = HttpGate.public_response(method, path)
+        if public is not None:
+            return self._send(public)
+        if not self.peer.has_workspace(workspace):
+            return self._send(Response(404))
+        gate = HttpGate(
+            _SyncStore(self.peer.store(workspace)),
+            workspace,
+            self.secret,
+            now_ms,
+            _SyncReceiver(self.peer, workspace),
+            sync_profile=self.sync_profile,
+        )
+        try:
+            response = asyncio.run(gate.handle(
+                method, path, query, dict(self.headers), body))
+        except Exception:
+            response = Response(503)
+        return self._send(response)
+
+    def do_GET(self):
+        return self._dispatch("GET")
+
+    def do_POST(self):
+        return self._dispatch("POST")
+
+    def do_PUT(self):
+        return self._dispatch("PUT")
+
+
+def handler_for(peer, secret, sync_profile=peer_capability.FULL):
+    """Bind one ordinary HTTP server without mutable global authority."""
+    return type(
+        "BoundPeerHandler",
+        (StdlibPeerHandler,),
+        {
+            "peer": peer,
+            "secret": secret,
+            "sync_profile": sync_profile,
+        },
+    )
+
+
+__all__ = ("StdlibPeerHandler", "handler_for")

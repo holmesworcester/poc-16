@@ -519,24 +519,24 @@ os._exit(72)
 
 def test_real_process_exit_after_root_cas_before_applier_retirement_recovers(
         tmp_path):
-    from core.node import Node
+    from full_peer.node import FullPeer
 
     node_dir = tmp_path / "node"
-    node = Node(str(node_dir))
+    node = FullPeer(str(node_dir))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     old_root = node.store(workspace).get("root")
-    for index in node._idx.values():
-        index.close()
+    for projection in node._sql.values():
+        projection.db.close()
 
     script = r"""
 import os
 import sys
 import facts
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 
 directory, workspace = sys.argv[1:]
-node = Node(directory)
+node = FullPeer(directory)
 
 async def die_before_retirement(*args, **kwargs):
     os._exit(73)
@@ -548,7 +548,7 @@ raise AssertionError("applier did not reach retirement")
     completed = _run_python(script, node_dir, workspace)
     assert completed.returncode == 73
 
-    reopened = Node(str(node_dir))
+    reopened = FullPeer(str(node_dir))
     assert reopened.store(workspace).get("root") != old_root
     assert [entry["text"] for entry in facts.content.message.messages(
         reopened, workspace)] == ["process crash"]

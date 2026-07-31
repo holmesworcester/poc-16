@@ -60,7 +60,7 @@ DURABLE = True
 
 # COMMANDS
 def _author(node, workspace, channel, text, ts):
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     timestamp = now_ms() if ts is None else ts
     secret, public = node.identity(workspace)

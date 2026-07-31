@@ -50,7 +50,6 @@ REMOVE_ORDER = tuple(reversed(ROLE_ORDER))
 BROKER_CORE_MODULES = UPLOAD_BROKER_CORE_MODULES
 BROKER_DEPLOY_MODULES = (
     "__init__.py",
-    "gateway.py",
     "upload_broker.py",
     "upload_broker_http.py",
     "upload_keyring.py",
@@ -65,7 +64,6 @@ BROKER_PROVIDER_MODULES = (
 )
 APPLIER_CORE_MODULES = (
     "__init__.py",
-    "bao.py",
     "close.py",
     "crypto.py",
     "fact.py",
@@ -267,11 +265,10 @@ def _verify_applier_bundle(directory):
         raise RuntimeError(
             f"pywrangler omitted applier modules: {sorted(missing)}")
     forbidden = {
-        "core/catalog.py",
-        "core/node.py",
-        "core/client_projection.py",
+        "full_peer/sql_store.py",
+        "full_peer/node.py",
         "core/store.py",
-        "core/daemon.py",
+        "full_peer/daemon.py",
         "core/runtime.py",
         "core/admission.py",
         "core/publication.py",
@@ -307,8 +304,8 @@ def _verify_broker_bundle(directory):
         raise RuntimeError(
             f"pywrangler omitted broker modules: {sorted(missing)}")
     forbidden = {
-        "core/node.py",
-        "core/daemon.py",
+        "full_peer/node.py",
+        "full_peer/daemon.py",
         "core/runtime.py",
         "adapters/r2/worker.py",
         "adapters/r2/s3.py",

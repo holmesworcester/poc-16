@@ -1,10 +1,10 @@
 """SQL-permitted local authorship that emits one ordinary exact pile."""
 import facts
 
-from .close import close, encode_pile
-from .crypto import h
-from .kernel import drain, resolve_deps
-from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
+from core.close import close, encode_pile
+from core.crypto import h
+from core.kernel import drain, resolve_deps
+from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
 
 
 class PileSender:
@@ -94,7 +94,7 @@ class PileSender:
 
         Detached immutable objects go first.  Piles are encoded and bounded
         before the first network mutation, then delivered through the peer's
-        narrow transport interface.
+        narrow byte interface.
         """
         units = tuple(tuple(unit) for unit in closed_units)
         batches = self.pack_batches(units)

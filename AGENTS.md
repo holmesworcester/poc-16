@@ -14,21 +14,37 @@ git status --short
 
 ## Capabilities
 
-There are three capabilities and two actors:
+Authority flows from the database-free core into an optional stateful peer
+composition:
 
-- `PileSender` may use SQLite. It closes local intent, encodes ordinary piles,
-  and delivers them. It cannot publish a root or retire ingress.
 - `RepositoryApplier` is database-free. It validates one closed pile, unions
   every durable fact into the validated set, establishes immutable objects,
   compiles and compare-and-swaps `root`, records rejection evidence, and
   retires only its exact internal generation.
 - `RepositoryReader` is database-free and side-effect free. It answers from
   one pinned root through `WorkerView` and `ValidatedView`.
+- `HttpGate` is database-free and owns the one peer route and authorization
+  table over Applier and Reader.
+- `PileSender` may use SQLite. It closes local intent, encodes ordinary piles,
+  and delivers them. It cannot publish a root or retire ingress.
 
-A full peer combines all three capabilities. A hosted recipient combines
-Applier and Reader; its metadata broker is a Reader plus a provider signer,
-not another actor or validation door. Never add a second pile-to-root path,
-provider-specific compiler, SQL publication path, or authority membrane.
+A hosted peer uses Applier, Reader, and HttpGate. `FullPeer` adds PileSender,
+local identities, scheduling, local control, attachment I/O, and the
+disposable SQL projection. Its receiving side still invokes Applier. A
+metadata broker is a Reader plus a provider signer, not another validation
+door. Never add a second pile-to-root path, provider-specific compiler, SQL
+publication path, or authority membrane.
+
+Read implementation authority in this order:
+
+1. `core/fact.py` and `facts/` for fact bytes and family policy.
+2. `core/kernel.py` for closed-pile judgment.
+3. `core/repository_snapshot.py`, `core/repository_applier.py`, and
+   `core/repository_reader.py` for the database-free repository engine.
+4. `core/http.py` for peer routes and authorization.
+5. `full_peer/` for the stateful local composition; `sql_store.py` is its sole
+   SQL boundary.
+6. `adapters/` and `deploy/` for provider adaptation and packaging.
 
 ## The central theorem
 

@@ -20,21 +20,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import facts
 
-from core import bao
-from core.cli import ctl
-from core.node import Node
+from full_peer import bao_native as bao
+from full_peer.cli import ctl
+from full_peer.node import FullPeer
 from facts.content import file as file_family
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.environ.get(
     "BENCH_DIR", os.path.join(tempfile.gettempdir(), "poc-16-bench-files"))
-PORTS = {"alice": 17511, "bob": 17512}
+PORTS = {
+    "alice-data": 17511,
+    "bob-data": 17512,
+    "alice-control": 17513,
+    "bob-control": 17514,
+}
+PEERS = ("alice", "bob")
 DEFAULT_SIZES = (8, 64, 256)
 now = time.perf_counter
 
 
 def url(who):
-    return f"http://127.0.0.1:{PORTS[who]}"
+    return f"http://127.0.0.1:{PORTS[who + '-control']}"
 
 
 def source(path, size):
@@ -92,7 +98,7 @@ def bench_overhead(sizes):
 def bench_send(size):
     """Author and save through the real in-process command path."""
     with tempfile.TemporaryDirectory(dir=WORK) as scratch:
-        node = Node(os.path.join(scratch, "node"))
+        node = FullPeer(os.path.join(scratch, "node"))
         workspace = facts.auth.workspace.create(node, "alice")
         input_path = source(os.path.join(scratch, "input"), size)
         start = now()
@@ -122,8 +128,9 @@ def bench_send(size):
 def spawn(base, who):
     log = open(os.path.join(base, who + ".log"), "w")
     process = subprocess.Popen(
-        [sys.executable, "-m", "core", "daemon",
-         os.path.join(base, who), "--port", str(PORTS[who]),
+        [sys.executable, "-m", "full_peer", "daemon",
+         os.path.join(base, who), "--port", str(PORTS[who + "-data"]),
+         "--control-port", str(PORTS[who + "-control"]),
          "--cadence", "0.2"],
         cwd=REPO,
         stdout=log,
@@ -133,7 +140,7 @@ def spawn(base, who):
     log.close()
     for _ in range(300):
         try:
-            ctl(url(who), "core.status", [])
+            ctl(url(who), "peer.status", [])
             return process
         except Exception:
             time.sleep(0.1)
@@ -155,7 +162,7 @@ def bench_download(size, timeout=3600):
     with tempfile.TemporaryDirectory(dir=WORK) as scratch:
         processes = {}
         try:
-            for who in PORTS:
+            for who in PEERS:
                 processes[who] = spawn(scratch, who)
             workspace = ctl(
                 url("alice"), "auth.workspace.create", ["alice"])
@@ -164,7 +171,7 @@ def bench_download(size, timeout=3600):
             ctl(url("bob"), "auth.user.join", [invite, "bob"])
             input_path = source(os.path.join(scratch, "input"), size)
 
-            peak = {who: 0.0 for who in PORTS}
+            peak = {who: 0.0 for who in PEERS}
             finished = threading.Event()
 
             def sample():

@@ -58,7 +58,7 @@ DURABLE = True
 
 # COMMANDS — build a fact, admit it, stop.
 def grant(node, workspace, target):
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     target_pk = member_key(node, workspace, target)
     secret, public = node.identity(workspace)

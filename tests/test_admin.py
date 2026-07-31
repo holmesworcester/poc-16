@@ -2,16 +2,15 @@
 import pytest
 
 import facts
-from core import suppression_state
 from core.crypto import keypair
 from facts.auth.admin import admins
-from core.node import Node, now_ms
+from full_peer.node import FullPeer, now_ms
 
 from .util import add_member
 
 
 def test_only_an_admin_can_grant_and_grants_delegate(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     founder = node.pk
     ts = now_ms()
@@ -38,14 +37,13 @@ def test_only_an_admin_can_grant_and_grants_delegate(tmp_path):
     removal_fid = facts.auth.removal.evict(node, workspace, "bob")
     removal = node.fact_of(workspace, removal_fid)
     assert removal.body["pk"] == carol
-    assert suppression_state.active(
-        node.idx(workspace),
-        facts.principal_sid("member", bob))
+    assert node.suppression_active(
+        workspace, facts.principal_sid("member", bob))
 
 
 def test_admin_target_prefers_exact_key_and_rejects_ambiguous_names(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice")
     spoof_identity, victim_identity = sorted(
         (keypair(), keypair()), key=lambda identity: identity[1])
@@ -75,8 +73,8 @@ def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
         tmp_path, monkeypatch):
     ticks = iter(range(100, 200))
     monkeypatch.setattr(
-        "core.node.now_ms", lambda: next(ticks))
-    node = Node(str(tmp_path / "node"))
+        "full_peer.node.now_ms", lambda: next(ticks))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     founder = node.identity_id(workspace)
     bob_secret, bob, _ = add_member(
@@ -105,10 +103,8 @@ def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
 
     node.bind_identity(workspace, carol)
     facts.auth.removal.evict(node, workspace, dave)
-    assert suppression_state.active(
-        node.idx(workspace),
-        facts.principal_sid("member", dave),
-    )
+    assert node.suppression_active(
+        workspace, facts.principal_sid("member", dave))
 
     # The converse is equally important: Carol's own removal ends the
     # delegated authority even though Bob's historical grant remains.
@@ -119,7 +115,5 @@ def test_delegated_admin_liveness_follows_grantee_after_grantor_leaves(
     node.bind_identity(workspace, carol)
     with pytest.raises(ValueError, match="not a workspace admin"):
         facts.auth.removal.evict(node, workspace, erin)
-    assert not suppression_state.active(
-        node.idx(workspace),
-        facts.principal_sid("member", erin),
-    )
+    assert not node.suppression_active(
+        workspace, facts.principal_sid("member", erin))

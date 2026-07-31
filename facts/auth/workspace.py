@@ -50,7 +50,7 @@ DURABLE = True
 
 # COMMANDS — workspace bootstrap necessarily records its anchor in the keyring.
 def create(node, name, ts=None):
-    from core.node import now_ms
+    from full_peer.node import now_ms
 
     secret, public = node.identity()
     root = workspace(

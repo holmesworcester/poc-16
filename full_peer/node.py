@@ -7,26 +7,19 @@ immutable-object creation, root CAS, or retirement.
 import asyncio
 import json
 import os
-import sqlite3
 import threading
 import time
 
-from . import (
-    catalog,
-    client_projection,
-    suppression_state,
-)
-from .fact import Fact
-from .keychain import Keychain
-from .limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PAGE_BATCH
-from .pile_sender import PileSender
-from .repository_applier import RepositoryApplier
-from .repository_reader import RepositoryReader
-from .store import FsStore
+from core import fact_index
+from core.fact import Fact
+from core.limits import MAX_OBJECT_BYTES, MAX_ROOT_BYTES, PAGE_BATCH
+from core.repository_applier import RepositoryApplier
+from core.repository_reader import RepositoryReader
+from core.store import FsStore
 
-IDX_SCHEMA = catalog.SCHEMA + """
-CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-"""
+from . import sql_store
+from .keychain import Keychain
+from .pile_sender import PileSender
 
 
 def now_ms():
@@ -34,7 +27,7 @@ def now_ms():
 
 
 def _run_applier(awaitable):
-    """Run the async provider-neutral engine from the synchronous full node."""
+    """Run the async provider-neutral engine from the synchronous full peer."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -56,7 +49,7 @@ def _run_applier(awaitable):
     return outcome["value"]
 
 
-class Node:
+class FullPeer:
     def __init__(self, dir, initial_secret=None, *, store_factory=None):
         self.dir = dir
         os.makedirs(dir, exist_ok=True)
@@ -67,21 +60,21 @@ class Node:
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.keyring = self.keychain.data
         self.sk, self.pk = self.keychain.default()
-        # app.db was a disposable projection cache. The canonical blob catalog
-        # plus generic index now answers family queries directly.
+        # app.db was a disposable projection cache. SqlStore now holds the
+        # canonical blobs and generic index needed by family queries.
         try:
             os.remove(os.path.join(dir, "app.db"))
         except FileNotFoundError:
             pass
-        self._stores, self._idx = {}, {}
+        self._stores, self._sql = {}, {}
         self._appliers, self._senders = {}, {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._sync_errors = {}
         self._ingress_attempt_errors = {}
         for ws in self.workspaces():  # a stale/wiped index is rebuilt from the store
-            self._sync_index(ws)
+            self._sync_sql(ws)
 
-    # ---- node-local state ----------------------------------------------------
+    # ---- full-peer-local state -----------------------------------------------
 
     def save_keyring(self):
         self.keychain.save()
@@ -102,6 +95,9 @@ class Node:
 
     def workspaces(self):
         return list(self.keyring["workspaces"])
+
+    def has_workspace(self, workspace):
+        return workspace in self.keyring["workspaces"]
 
     def applier(self, workspace):
         """Return the exact receiving engine shared with hosted recipients."""
@@ -240,46 +236,33 @@ class Node:
         return self._stores[ws]
 
     def idx(self, ws):
-        if ws not in self._idx:
-            os.makedirs(os.path.join(self.dir, "ws"), exist_ok=True)
-            con = sqlite3.connect(os.path.join(self.dir, "ws", ws + ".idx.db"),
-                                  check_same_thread=False)
-            con.executescript(IDX_SCHEMA)
-            catalog.upgrade_schema(con, ws)
-            self._idx[ws] = con
-        return self._idx[ws]
+        """Expose the raw connection only to SQL-backed authoring helpers."""
+        return self.sql(ws).db
 
-    def _sync_index(self, ws):
+    def sql(self, ws):
+        if ws not in self._sql:
+            self._sql[ws] = sql_store.SqlStore.open(
+                os.path.join(self.dir, "ws", ws + ".idx.db"), ws)
+        return self._sql[ws]
+
+    def _sync_sql(self, ws):
         """Refresh the disposable client projection without repository writes."""
         reader = self.reader(ws)
-        root_digest = None if reader is None else reader.etag
-        idx = self.idx(ws)
-        stamped = idx.execute(
-            "SELECT v FROM meta WHERE k='root'").fetchone()
-        version = idx.execute(
-            "SELECT v FROM meta WHERE k='index-version'").fetchone()
-        if stamped == (root_digest,) \
-                and version == (catalog.INDEX_VERSION,):
+        projection = self.sql(ws)
+        if projection.current_for(reader):
             return
-        client_projection.refresh(
-            idx,
-            reader,
-            workspace=ws,
-        )
+        projection.refresh(reader)
 
     def fact_of(self, ws, fid) -> Fact:
-        return self.catalog(ws).fact(fid)
-
-    def catalog(self, ws):
-        return catalog.Catalog(self.idx(ws), ws)
+        return self.sql(ws).fact(fid)
 
     def select(
             self, ws, kind, k0=None, k1=None, *,
             include_suppressed=False, **_options):
         """Select current facts through the one generic type/offer index."""
         with self.lock:
-            self._sync_index(ws)
-            rows = self.catalog(ws).indexed(kind, k0, k1)
+            self._sync_sql(ws)
+            rows = self.sql(ws).indexed(kind, k0, k1)
             if include_suppressed:
                 return rows
             return tuple(
@@ -288,7 +271,7 @@ class Node:
             )
 
     def by_type(self, ws, tag, **options):
-        return self.select(ws, catalog.TYPE_INDEX, tag, **options)
+        return self.select(ws, fact_index.TYPE_INDEX, tag, **options)
 
     def keys(self, ws):
         """Canonical validated keys for client-only query assembly."""
@@ -322,7 +305,7 @@ class Node:
                 fresh.extend(result.valids)
             if store.get_bounded("root", MAX_ROOT_BYTES) != before:
                 self._invalidate_sync_cache(ws)
-            self._sync_index(ws)
+            self._sync_sql(ws)
             return fresh
 
     # ---- authoring tail: close -> own pile -> turn ("kick") ------------------
@@ -355,14 +338,13 @@ class Node:
             raise ValueError(
                 "repository repair requires an exact RepositoryApplier pile")
         with self.lock:
-            client_projection.refresh(
-                self.idx(ws),
-                self.reader(ws),
-                workspace=ws,
-            )
+            self.sql(ws).refresh(self.reader(ws))
 
     # ---- exact suppression consult -------------------------------------------
 
     def suppressed(self, ws, fact):
         """The one local mask: explicit fact scopes intersect active actions."""
-        return suppression_state.suppresses(self.idx(ws), fact)
+        return self.sql(ws).suppresses(fact)
+
+    def suppression_active(self, ws, sid):
+        return self.sql(ws).active(sid)

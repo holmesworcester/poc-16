@@ -681,9 +681,9 @@ class RepositoryApplier:
 
     async def propose(self, raw):
         """Derive one proposal without mutating canonical repository state."""
-        # Reject untrusted bytes before they can force traversal of a large
-        # authenticated archive. Only a valid kernel judgment earns reads
-        # beyond the exact pile itself.
+        # Reject untrusted bytes before they can force traversal of the
+        # authenticated validated-fact tree. Only a valid kernel judgment
+        # earns reads beyond the exact pile itself.
         stream = decode_pile(raw, self.workspace)
         judgment = drain(tuple(stream), self.workspace)
         if not judgment.ok:

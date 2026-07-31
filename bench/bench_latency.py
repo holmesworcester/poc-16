@@ -1,7 +1,7 @@
 """Measure the two latency paths that must stay cheap after the tree cutover.
 
 Hot posts report total latency and immutable path-copy touches; calling the
-corpus-wide ``Node.keys`` reference path is a benchmark failure. Idle dials
+corpus-wide ``FullPeer.keys`` reference path is a benchmark failure. Idle dials
 report local engine cost after a 304; the first dial establishes blob
 completeness and every measured dial must do no fact/index/blob work.
 
@@ -23,7 +23,7 @@ from bench.bench_sync import build_seed
 import facts
 
 from core import snapshot
-from core import sync as sync_module
+from full_peer import sync as sync_module
 from core.crypto import h
 from core.limits import MAX_OBJECT_BYTES
 from core.object_store import CREATED

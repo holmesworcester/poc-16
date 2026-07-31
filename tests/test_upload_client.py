@@ -8,10 +8,10 @@ from urllib.parse import unquote, urlsplit
 import pytest
 
 import facts
-from core import bao
+from full_peer import bao_native as bao
 from core.close import encode_pile
 from core.crypto import h
-from core.node import Node
+from full_peer.node import FullPeer
 from core.staged_intent import (
     StagedObjectsPending,
     confirm_staged_object,
@@ -36,7 +36,7 @@ from deploy.upload_session import (
     SessionKey,
     UploadSessionPolicy,
 )
-from deploy.gateway import AsyncFromSyncReader
+from core.http import AsyncFromSyncReader
 from facts._commands import offer_source
 from facts.auth import request
 from facts.content import file as file_family
@@ -157,7 +157,7 @@ def UploadClient(source, broker, puts, now, **options):
 
 def world(tmp_path, provider="s3", objects=()):
     clock, nonces = Clock(), Nonces()
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     member = node.member_for(workspace)
     signer = Signer(provider, clock)

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import facts
 
 from core.crypto import h
-from core.node import Node
+from full_peer.node import FullPeer
 from core.repository_reader import RepositoryReader
 from core.staged_intent import staging_key
 from deploy.cloudflare_upload.worker.applier_runtime import drain
@@ -17,7 +17,7 @@ from .util import all_fids, closed_subset
 
 def test_scheduled_r2_actor_applies_and_reads_without_sql(
         tmp_path, monkeypatch):
-    source = Node(str(tmp_path / "source"))
+    source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     facts.content.message.post(source, workspace, "general", "through R2", ts=10)
     raw = closed_subset(

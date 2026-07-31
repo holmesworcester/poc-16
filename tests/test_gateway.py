@@ -12,18 +12,18 @@ from core.close import encode_pile
 from core.crypto import h, unseal
 from core.grants import check_token
 from core.limits import MAX_OBJECT_BYTES, PayloadTooLarge
-from core.node import Node
-from deploy.gateway import AsyncFromSyncReader, Gateway
+from full_peer.node import FullPeer
+from core.http import AsyncFromSyncReader, HttpGate
 from facts.auth import request
 
 
 def world(tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request.payload(
         node, workspace, "sync", now + 60_000, now))
-    gateway = Gateway(
+    gateway = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: now)
     return node, workspace, now, pile, gateway
@@ -43,7 +43,7 @@ def test_gateway_has_no_whole_object_read_fallback():
             raise AssertionError("whole-object fallback was used")
 
     store = WholeOnly()
-    gateway = Gateway(
+    gateway = HttpGate(
         store, "0" * 64, b"s" * 32, lambda: 0)
 
     response = call(gateway, "GET", "/readyz")
@@ -96,7 +96,7 @@ def test_gateway_mints_then_serves_one_pinned_snapshot(tmp_path):
 
 def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
         tmp_path):
-    node = Node(str(tmp_path / "node"))
+    node = FullPeer(str(tmp_path / "node"))
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
@@ -104,7 +104,7 @@ def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
         request.payload(node, first, "sync", now + 60_000, now),
         workspace=first,
     )
-    gateway = Gateway(
+    gateway = HttpGate(
         AsyncFromSyncReader(node.store(second)),
         second, b"s" * 32, lambda: now)
     body = json.dumps({
@@ -121,7 +121,7 @@ def test_gateway_rejects_a_misbound_or_malformed_repository_root(tmp_path):
     node, workspace, _, pile, healthy = world(tmp_path)
     _, _, token = mint(node, workspace, pile, healthy)
     headers = {"Authorization": "Bearer " + token}
-    foreign = Node(str(tmp_path / "foreign"))
+    foreign = FullPeer(str(tmp_path / "foreign"))
     foreign_workspace = facts.auth.workspace.create(foreign, "mallory", ts=1)
     foreign_root = foreign.store(foreign_workspace).get("root")
     request_body = json.dumps({
@@ -137,7 +137,7 @@ def test_gateway_rejects_a_misbound_or_malformed_repository_root(tmp_path):
             return self.root if key == "root" else None
 
     for bad_root in (foreign_root, b"{}"):
-        gateway = Gateway(
+        gateway = HttpGate(
             RootOnly(bad_root), workspace, b"s" * 32, lambda: 100)
 
         assert call(gateway, "GET", "/readyz").status == 503
@@ -171,7 +171,7 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
         base64.b64encode(second).decode(),
     ]
 
-    tiny = Gateway(
+    tiny = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: 100,
         max_batch_bytes=8)
@@ -184,11 +184,11 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
     exact_size = len(json.dumps(
         [base64.b64encode(first).decode(), None],
         sort_keys=True, separators=(",", ":")).encode())
-    exact = Gateway(
+    exact = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: 100,
         max_batch_bytes=exact_size)
-    below = Gateway(
+    below = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: 100,
         max_batch_bytes=exact_size - 1)
@@ -230,7 +230,7 @@ def test_gateway_mint_fails_closed_on_fetch_and_request_budgets(tmp_path):
         "pile": base64.b64encode(pile).decode(),
         "ws": workspace,
     }).encode()
-    no_fetches = Gateway(
+    no_fetches = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: 100,
         max_mint_fetches=0)
@@ -238,7 +238,7 @@ def test_gateway_mint_fails_closed_on_fetch_and_request_budgets(tmp_path):
         no_fetches,
         "POST", "/mint", {"ws": workspace}, {}, request_body
     ).status == 403
-    tiny_request = Gateway(
+    tiny_request = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: 100,
         max_request_bytes=1)
@@ -262,7 +262,7 @@ def test_gateway_reports_provider_failures_as_observable_503(
                 return node.store(workspace).get("root")
             raise OSError("injected provider failure")
 
-    gateway = Gateway(
+    gateway = HttpGate(
         FailingReader(), workspace, b"s" * 32, lambda: 100)
 
     assert call(
@@ -275,7 +275,7 @@ def test_gateway_reports_provider_failures_as_observable_503(
         raise ValueError("verifier stopped after provider failure")
 
     monkeypatch.setattr(
-        "deploy.gateway.RepositoryReader.mint_awaited",
+        "core.http.RepositoryReader.mint_awaited",
         raising_after_fetch)
     assert call(
         gateway, "POST", "/mint", {"ws": workspace}, {},
@@ -286,7 +286,7 @@ def test_gateway_reports_provider_failures_as_observable_503(
         raise ValueError("invalid proof")
 
     monkeypatch.setattr(
-        "deploy.gateway.RepositoryReader.mint_awaited",
+        "core.http.RepositoryReader.mint_awaited",
         invalid_without_fetch)
     assert call(
         gateway, "POST", "/mint", {"ws": workspace}, {},
@@ -305,7 +305,7 @@ def test_gateway_rejects_corrupt_content_addressed_reads(tmp_path):
                 return b"wrong"
             return node.store(workspace).get(key)
 
-    gateway = Gateway(
+    gateway = HttpGate(
         CorruptReader(), workspace, b"s" * 32, lambda: 100)
 
     assert call(
@@ -325,7 +325,7 @@ def test_gateway_pins_trusted_time_once_per_request(tmp_path):
         calls.append(100)
         return 100
 
-    gateway = Gateway(
+    gateway = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, now)
     response, _, _ = mint(node, workspace, pile, gateway)
@@ -337,8 +337,8 @@ def test_gateway_pins_trusted_time_once_per_request(tmp_path):
 def test_gateway_rejects_deployment_limits_above_protocol_ceiling(tmp_path):
     node, workspace, _, _, _ = world(tmp_path)
 
-    with pytest.raises(ValueError, match="gateway limits"):
-        Gateway(
+    with pytest.raises(ValueError, match="HTTP gate limits"):
+        HttpGate(
             AsyncFromSyncReader(node.store(workspace)),
             workspace, b"s" * 32, lambda: 100,
             max_object_bytes=MAX_OBJECT_BYTES + 1)
@@ -352,7 +352,7 @@ def test_gateway_translates_preallocation_read_limit_to_413(tmp_path):
         async def get_bounded(self, _key, _limit):
             raise PayloadTooLarge("provider body")
 
-    gateway = Gateway(
+    gateway = HttpGate(
         Oversized(), workspace, b"s" * 32, lambda: 100)
     headers = {"Authorization": "Bearer " + token}
 
@@ -383,7 +383,7 @@ def test_gateway_fetches_duplicate_batch_oids_once_and_preserves_order(
             calls.append((key, limit))
             return raw
 
-    gateway = Gateway(
+    gateway = HttpGate(
         Counting(), workspace, b"s" * 32, lambda: 100)
     response = call(
         gateway, "POST", "/page", {"ws": workspace},

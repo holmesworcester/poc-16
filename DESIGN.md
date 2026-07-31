@@ -3,9 +3,9 @@
 This document states the running architecture and its correctness boundary.
 Future work is called out explicitly.
 
-## 1. Authority and actors
+## 1. Authority and capability flow
 
-The repository has exactly three capabilities:
+The repository has three data capabilities plus one shared HTTP gate:
 
 ```text
 PileSender
@@ -16,26 +16,24 @@ RepositoryApplier
 
 RepositoryReader
     one pinned root -> authenticated, side-effect-free answers
+
+HttpGate
+    peer HTTP request -> authorized Applier or Reader operation
 ```
 
-They form two actor compositions:
-
-```text
-hosted repository = RepositoryApplier + RepositoryReader
-full P2P node      = PileSender + RepositoryApplier + RepositoryReader
-```
-
-`PileSender` may use local SQL and identity state. `RepositoryApplier` and
-`RepositoryReader` are database-free. A full peer's receiving side invokes
-the same Applier used by Lambda and Cloudflare Workers; there is no second
-pile-to-root algorithm.
+`RepositoryApplier` and `RepositoryReader` are the complete database-free
+repository engine. `HttpGate` applies the one peer route and authorization
+policy over those capabilities. A hosted peer can stop there. A full peer
+adds `PileSender`, local identity, scheduling, attachment I/O, local control,
+and disposable SQL. Its receiving side still invokes the same Applier used by
+Lambda and Cloudflare Workers; there is no second pile-to-root algorithm.
 
 Provider deployments may isolate a read/signing broker from the Applier.
-That is a least-privilege compartment boundary inside the hosted repository,
-not another repository actor. The broker can read a pinned canonical root and
-mint confined create-only ingress capabilities. It cannot mutate canonical
-state. The Applier can mutate canonical state and has no alternate fact
-validation policy.
+That is a least-privilege compartment boundary, not another repository
+algorithm. The broker can read a pinned canonical root and mint confined
+create-only ingress capabilities. It cannot mutate canonical state. The
+Applier can mutate canonical state and has no alternate fact validation
+policy.
 
 Each effect has one owner:
 
@@ -51,9 +49,11 @@ Each effect has one owner:
 | answer from a pinned root | `RepositoryReader` |
 | assemble local presentation | family queries over disposable SQL |
 
-`Node` is currently the full-peer composition root. It may schedule turns and
-translate results, but it is not a fact-policy, compiler, suppression, or CAS
-authority.
+`FullPeer` is the stateful composition root. `core/` does not import it,
+SQLite, keychains, local control, or attachment presentation. `FullPeer` may
+schedule turns and translate results, but it is not a fact-policy, compiler,
+suppression, or CAS authority. `full_peer/sql_store.py` is the sole SQL
+module, and deleting its database changes no repository answer.
 
 ## 2. Facts and closed piles
 
@@ -85,8 +85,10 @@ Core dispatches through the checked family registry and contains no tag switch.
 ### 2.1 The closed-pile boundary
 
 A pile is one canonical, workspace-bound, topologically ordered fact closure.
-Dependencies precede dependents. Pile bytes, fact count, dependency count, and
-transitive closure are bounded.
+Dependencies precede dependents. Pile bytes, each fact's dependency count, and
+per-fact transitive closure are bounded. An independent aggregate fact-count
+ceiling is future hardening; the current byte ceiling is the aggregate pile
+bound.
 
 The database-free kernel streams the pile into a temporary `MemoryContext`.
 For each fact it:
@@ -240,8 +242,8 @@ A direct deletion binds:
 - the immutable `owner` principal copied from the target.
 
 The target family must explicitly allow direct deletion. ADMIN is permitted
-for every directly deletable family. OWNER requires the actor to offer the
-complete `member(actor_key, target_owner)` address. Thus sibling devices share
+for every directly deletable family. OWNER requires the author to offer the
+complete `member(author_key, target_owner)` address. Thus sibling devices share
 ownership, while a later unrelated device claim cannot change it.
 
 Removal activates a typed member suppression ID. It affects current sharing

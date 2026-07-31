@@ -2,7 +2,7 @@
 
 Provider names, SDK loading, bucket layout, and credential-chain decisions
 belong here rather than in ``core``.  The returned callable is the generic
-``workspace id -> ObjectStore`` seam already accepted by ``Node``.
+``workspace id -> ObjectStore`` seam accepted by ``FullPeer``.
 """
 import importlib
 import json
