@@ -45,6 +45,7 @@ READER_CONFIG = PACKAGE / "wrangler.reader.generated.json"
 FCM_CONFIG = PACKAGE / "wrangler.fcm.generated.json"
 BUILD = PACKAGE / "build"
 VENDORED = PACKAGE / "python_modules"
+RELEASE = BUILD / "release"
 
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 IDENTITY_BINDING = "POC16_DEPLOYMENT_IDENTITY"
@@ -126,7 +127,35 @@ def stage():
             for source in (
                     REPOSITORY / "adapters" / "cloudflare").glob("*.py"):
                 _copy(source, root / "adapters" / "cloudflare" / source.name)
+
+    # This tree is the exact release subject used by the physical-device
+    # launch records.  Keep it independent of bytecode caches and generated
+    # configs so the digest is deterministic while still covering every
+    # deployed source, locked dependency, and runtime configuration template.
+    release = pending / "release"
     for role in ("reader", "scanner", "consumer"):
+        shutil.copytree(
+            pending / role, release / role,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(
+        VENDORED, release / "python_modules",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for source in (
+            PACKAGE / "fcm_bridge" / "core.mjs",
+            PACKAGE / "fcm_bridge" / "worker.js",
+            PACKAGE / "manage.py",
+            PACKAGE / "pylock.toml",
+            PACKAGE / "pyproject.toml",
+            PACKAGE / "uv.lock",
+            REPOSITORY / "deploy" / "cloudflare_python.py",
+            REPOSITORY / "deploy" / "python_role_modules.py",
+            *(
+                PACKAGE / name for name in (
+                    "wrangler.reader.jsonc", "wrangler.scanner.jsonc",
+                    "wrangler.consumer.jsonc", "wrangler.fcm.jsonc")),
+    ):
+        _copy(source, release / source.relative_to(REPOSITORY))
+    for role in ("reader", "scanner", "consumer", "release"):
         destination = BUILD / role
         if destination.exists():
             shutil.rmtree(destination)

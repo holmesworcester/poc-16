@@ -330,9 +330,11 @@ through `fid`. Generic `INVALID_ARGUMENT`, project/auth failures, quotas,
 timeouts, and malformed provider responses retry; only an exact typed FCM
 `UNREGISTERED` detail makes that FID terminal.
 
-The shared raw notification data ceiling is 1 KiB. Exact/one-over tests include
-Base64 expansion, the stable delivery ID, and JSON keys, keeping every locally
-accepted FCM data map below the provider's 4,096-byte limit.
+The 1 KiB ceiling applies only to the small derived FCM data map (stable IDs,
+channel, and event kind), not to workspace message facts, message text, files,
+or closed piles. Exact/one-over tests include Base64 expansion, the stable
+delivery ID, and JSON keys, keeping every locally accepted FCM data map below
+the provider's 4,096-byte limit.
 
 Notification-state root bytes do not contain historical FactTree pages or
 facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
@@ -360,6 +362,23 @@ python3 -m full_peer content.notification.set_channel WORKSPACE general none
 python3 -m full_peer content.notification.list WORKSPACE
 python3 -m full_peer auth.push_endpoint.list WORKSPACE
 ```
+
+An experimental FullPeer notification process must initialize every workspace
+explicitly after the daemon starts. `current` is the normal first launch and
+does not notify for existing history; `backfill` deliberately begins at the
+empty tree:
+
+```sh
+python3 -m full_peer --node http://127.0.0.1:7101 \
+  peer.notifications.bootstrap WORKSPACE current
+# Or, only when historical delivery is intentional:
+python3 -m full_peer --node http://127.0.0.1:7101 \
+  peer.notifications.bootstrap WORKSPACE backfill
+```
+
+Repeating the same mode is harmless. A conflicting mode, absent state during
+scanning, or a cursor owned by another deployment fails closed. The periodic
+scanner runs after bootstrap; `peer.notifications.wake` is only a latency hint.
 
 Endpoint registration still needs the mobile integration to obtain permission
 and a current Firebase Installation ID, seal that FID with
