@@ -216,7 +216,8 @@ def _endpoints(view, user, push_node, budget):
     return sorted(selected, key=lambda fact: fact.fid)
 
 
-def _trigger(fact):
+def trigger_for(fact):
+    """Return the family-owned trigger, if this fact can notify."""
     family = facts.family_for(fact.t)
     hook = None if family is None else getattr(
         family, "notification_trigger", None)
@@ -237,7 +238,7 @@ def derive(hint, fetch, *, push_node=None):
     budget, intents = _Budget(), {}
     for fid in hint.facts:
         fact = view.fact(fid)
-        trigger = _trigger(fact)
+        trigger = trigger_for(fact)
         if trigger is None or not view.fact_active(fid):
             continue
         for user in _users(view, trigger, budget):
@@ -334,4 +335,5 @@ __all__ = (
     "deliver",
     "derive",
     "seal_target",
+    "trigger_for",
 )
