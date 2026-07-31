@@ -304,6 +304,23 @@ have finite retention: fair scans recreate wakes from the durable pending
 cursor. The cursor and immutable notification-state objects remain deployment
 continuity and must not be silently discarded.
 
+The Cloudflare artifact under `deploy/cloudflare_notifications` divides that
+composition into four private Workers: a mutation-free canonical R2 reader, a
+FactTree scanner with notification-state R2 plus Queue-producer authority, a
+Queue consumer with only read services and the selected push-node secret, and
+a small FCM HTTP v1 bridge which alone holds the Firebase service account. The
+consumer has no R2 or Firebase credential; the FCM bridge has no repository
+binding or public route. It targets Firebase installation IDs through `fid`.
+Generic `INVALID_ARGUMENT`, project/auth failures, quotas, timeouts, and
+malformed provider responses retry; only an exact typed FCM `UNREGISTERED`
+detail makes that FID terminal.
+
+Notification-state root bytes do not contain historical FactTree pages or
+facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
+configurations and reject an enabled deletion rule overlapping either the
+notification-state prefix or its canonical workspace prefix. The tool never
+changes lifecycle configuration or deletes either bucket or Queue.
+
 The preference commands are available now:
 
 ```sh
@@ -328,6 +345,22 @@ coverage with:
 
 ```sh
 python3 -m pytest -q tests/test_notification*.py tests/test_*notifications*.py
+```
+
+For Cloudflare, set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
+`CF_WORKSPACE`, `CF_DEPLOYMENT_OWNER`, `CF_CANONICAL_BUCKET`,
+`CF_NOTIFICATION_STATE_BUCKET`, `CF_FIREBASE_APPLICATION`,
+`CF_FIREBASE_ENVIRONMENT`, the selected push-node seed, and
+`FIREBASE_SERVICE_ACCOUNT_JSON`. The control token needs Worker and Queue
+permissions plus Workers R2 Storage Write, which Cloudflare currently requires
+even to read bucket lifecycle rules. First creation is explicit:
+
+```sh
+export CF_CREATE=1
+python3 -m deploy.cloudflare_notifications.manage provision
+python3 -m deploy.cloudflare_notifications.manage build
+python3 -m deploy.cloudflare_notifications.manage deploy
+python3 -m deploy.cloudflare_notifications.manage verify
 ```
 
 ## Facts, suppression, and deletion

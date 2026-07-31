@@ -27,3 +27,11 @@ deploy/cloudflare_upload/.wrangler/
 deploy/cloudflare_upload/build/
 deploy/cloudflare_upload/generated/
 deploy/cloudflare_upload/python_modules/
+deploy/cloudflare_notifications/.dev.vars*
+deploy/cloudflare_notifications/.env*
+deploy/cloudflare_notifications/.venv/
+deploy/cloudflare_notifications/.venv-workers/
+deploy/cloudflare_notifications/.wrangler/
+deploy/cloudflare_notifications/build/
+deploy/cloudflare_notifications/python_modules/
+deploy/cloudflare_notifications/wrangler.*.generated.json

@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "poc16-notification-consumer-placeholder",
+  "main": "build/consumer/entry.py",
+  "base_dir": "build/consumer",
+  "compatibility_date": "2026-07-31",
+  "compatibility_flags": ["python_workers"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "services": [
+    {"binding": "CANONICAL_READER", "service": "replace-canonical-reader"},
+    {"binding": "NOTIFICATION_STATE_READER", "service": "replace-notification-scanner"},
+    {"binding": "FCM_BOUNDARY", "service": "replace-fcm-boundary"}
+  ],
+  "queues": {"consumers": []},
+  "vars": {
+    "POC16_DEPLOYMENT_OWNER": "replace-with-deployment-owner",
+    "POC16_DEPLOYMENT_ROLE": "notification-consumer",
+    "NOTIFICATIONS_ENABLED": "0",
+    "WORKSPACE": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "secrets": {"required": ["PUSH_NODE_SECRET"]},
+  "python_modules": {"excludes": ["**/*.pyc", "**/__pycache__"]},
+  "build": {
+    "command": "python manage.py stage",
+    "cwd": ".",
+    "watch_dir": ["../../core", "../../facts", "../../notifications", "../../adapters", "."]
+  },
+  "observability": {"enabled": true, "head_sampling_rate": 0.01}
+}
