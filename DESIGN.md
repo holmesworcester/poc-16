@@ -45,7 +45,6 @@ Each effect has one owner:
 | establish immutable repository objects | `RepositoryApplier` |
 | compile authenticated maps | `repository_snapshot` |
 | compare-and-swap `root` | `RepositoryApplier` |
-| retire an internal pile generation | `RepositoryApplier` |
 | answer from a pinned root | `RepositoryReader` |
 | assemble local presentation | family queries over disposable SQL |
 
@@ -62,21 +61,13 @@ attachment I/O, and direct-upload journal/runtime. `facts/` imports neither
 without moving their semantic decisions into the host composition.
 
 The direct-upload client is stateful-peer state:
-`full_peer/upload_journal.py` owns crash-safe source/progress persistence,
-`full_peer/upload_client.py` owns the bounded resumable transition, and
-`full_peer/upload_client_http.py` owns its outbound HTTP effects. Provider
-brokers, signers, and deployment packaging remain under `deploy/`; only the
-shared `upload_session.py` and `upload_wire.py` values cross that boundary.
-Each content-addressed source has one cross-process writer for the complete
-resume transition. Session replacement retains the maximum expiry of every
-issued capability, progress only advances, and lifecycle discovery is a
-bounded manifest page. Active, expired, abandoned, and completed describe
-local delivery only. Collection atomically hides one exact source before
-deleting it and is allowed only after pile-last delivery was durably recorded,
-or explicit abandonment and the retained capability-expiry bound; none of
-these records is repository, root-CAS, or read authority.
-Legacy v1 progress may resume, but its erased session history makes abandoned
-collection permanently ineligible unless delivery later completes.
+`full_peer/upload_journal.py` retains one exact pile and its current lease,
+`full_peer/upload_client.py` owns the small `OPEN -> PUT -> FINALIZE` retry
+transition, and `full_peer/upload_client_http.py` owns its outbound HTTP
+effects. Provider brokers, signers, private Applier invocation, and deployment
+packaging remain under `deploy/`. Local progress is delivery state only and
+may be discarded when the user abandons it; an in-flight request can create at
+most one immutable staging object and cannot mutate canonical state.
 
 ### 1.1 Iroh is connection only
 
@@ -166,7 +157,7 @@ The clear envelope contains only generic protocol atoms:
 
 Every fact type is a module under `facts/`. A family owns construction, exact
 shape validation, declared `Need`s, durability, suppression and direct-action
-policy, liveness guards, commands, queries, and detached blob references.
+policy, liveness guards, commands, queries, and inline authenticated payloads.
 Core dispatches through the checked family registry and contains no tag switch.
 Registry compilation rejects malformed or ambiguous selector, action,
 liveness, and typed-suppression declarations before a family can be admitted.
@@ -178,11 +169,11 @@ Dependencies precede dependents. Pile bytes, aggregate fact count, each fact's
 dependency count, and per-fact transitive closure are independently bounded.
 The count is checked lexically before generation reservation, then rechecked
 by the exact decoder and kernel. Each canonical fact and public invite envelope
-also fits the smallest hosted Reader's single-object response ceiling. Detached
-Bao objects use their separate direct-upload and completion path.
-Authenticated-root traversal reads only `MAX_REPOSITORY_OBJECT_BYTES`; the
-larger generic object ceiling is reserved for detached ingress and exact
-collision/retirement work.
+also fits the smallest hosted Reader's single-object response ceiling. A Bao
+file descriptor and every verified Bao slice are ordinary facts. A slice
+carries its payload and range proof inline, names the exact descriptor, and
+may arrive in a different closed pile. Authenticated-root traversal reads only
+bounded ordinary fact and map objects; there is no detached completion store.
 
 The database-free kernel streams the pile into a temporary `MemoryContext`.
 For each fact it:
@@ -359,57 +350,38 @@ resident.
 
 ## 5. RepositoryApplier transition
 
-For one exact logical delivery the Applier:
+For one caller-named create-only source key the Applier:
 
-1. creates or recovers its stable create-only generation reservation;
-2. bounded-decodes the marker and pile;
-3. validates the entire pile before reading a potentially large root;
+1. bounded-reads exactly that pile, with no LIST or discovery step;
+2. verifies the workspace, uploader, session, path, digest, and canonical pile;
+3. validates the entire closed pile before publication;
 4. pins `root` bytes and the provider's opaque CAS token;
 5. point-checks incoming residences against the pinned FactTree;
 6. path-copies each newly validated fact and affected suppression route through
    the three authenticated maps;
-7. conditionally establishes immutable objects with collision checks;
-8. performs one CAS on `root`;
-9. records durable rejection evidence, or returns a process-local applied
-   receipt bound to the committed root;
-10. create-only spends that exact outcome and issues DELETE only when the
-    spend is definitely fresh.
+7. conditionally establishes immutable facts and map pages with collision
+   checks;
+8. performs one CAS on `root` and reconciles an unknown result;
+9. returns `applied`, `noop`, `rejected`, or `retryable`.
 
 The pure full compiler remains the repair and test oracle. Normal publication
 path-copies affected authenticated routes and must produce its byte-identical
 root without enumerating unrelated validated facts.
 
-A CAS loser keeps its work and retries from the newer root. An unknown CAS
-result is reconciled by reading root. A crash after CAS but before a spend
-re-proposes against the committed root and receives a process-local no-op
-receipt. An ambiguous spend never grants DELETE; the source may remain as
-bounded, already-discharged garbage, but every restart observes terminal state.
-No LIST result, notification, SQL row, cursor, path segment, provider ETag, or
-process-local lock authorizes root mutation or deletion.
+A CAS loser retries from the newer root. If that root already contains every
+durable fact from the exact pile, the result is `noop`; otherwise the same
+bounded transition proposes the missing union. A crash after CAS is therefore
+recovered by the sender repeating `FINALIZE`. The exact immutable ingress pile
+remains available until a provider retention policy collects it.
 
-Piles carry facts, not delivery events. The generation reservation is the
-stable digest of workspace, member, exact payload, and—when present—the
-direct-upload marker. Thus byte-identical redelivery is one logical generation
-rather than an indistinguishable ABA instance. Reservation and spend records
-are never deleted. A valid receipt binds workspace, source, payload,
-reservation, exact outcome, and the applicable base/result-root or rejection
-evidence. Permanent rejection evidence is bounded, content-addressed, and binds
-the exact workspace, source, generation, payload, and verdict. The sole running
-delete path requires its exact read-backs and a definitely created outcome
-spend; `EXISTS` and outcome-unknown both deny deletion. This remains correct
-when provider ETags repeat for byte-identical values.
-
-HTTP receipt acknowledges once the exact generation is durably staged, even
-when its first apply attempt fails transiently. The retained generation is the
-database-free retry record and a later poke or scheduled turn retries it.
-`FullPeer` may additionally show failures observed by its own local scheduler;
-that process-local diagnostic is not repository state and is not required of a
-hosted recipient.
+`RepositoryApplier` has no ingress DELETE, queue, scheduled drain, completion
+cursor, durable receipt, internal pile copy, or SQL state. No notification,
+LIST result, cursor, path segment, provider ETag, process-local lock, or broker
+observation authorizes root mutation. The closed-pile kernel and root CAS do.
 
 Concurrent workers may observe slightly delayed roots. They may duplicate
 bounded immutable work. They cannot overwrite immutable objects with different
-bytes, clobber a newer root, retire another generation, skip detached-object
-completion, or corrupt a Merkle tree.
+bytes, clobber a newer root, delete ingress, or corrupt a Merkle tree.
 
 ## 6. RepositoryReader and sync
 
@@ -458,59 +430,35 @@ projection codec change, not a second validation path.
 
 Ordinary clients upload directly to isolated object-store ingress:
 
-1. ask a read-only broker for exact short-lived create-only capabilities;
-2. PUT detached objects first;
-3. PUT one exact closed pile marker last;
-4. optionally send a wake hint.
+1. `OPEN` presents current upload authority plus one pile digest and size;
+2. the broker returns one fixed-expiry cursor and one exact create-only PUT;
+3. the client PUTs that pile directly to S3 or R2;
+4. the client calls broker `FINALIZE` with the cursor;
+5. the broker invokes the hosted Applier over a provider-private binding with
+   the exact key and digest.
 
-The Applier fetches the marker itself, verifies workspace/member/session/path
-bindings, uses that marker as the stable identity of a durably reserved
-internal generation, and runs the same pile transition as P2P receipt. It
-never deletes client-writable ingress. F10 spends and retires only the
-internal generation.
+`OPEN` is the only current-liveness read. Its authenticated cursor fixes the
+workspace, uploader path component, provider, session, pile digest, size,
+issue time, and expiry. `FINALIZE` cannot change those values or extend the
+lease. A removal committed before `OPEN` denies a new lease; a removal after
+`OPEN` leaves only that already-confined pile usable until expiry. The
+provider PUT expires no later than the same lease.
 
-Acknowledgement creates an availability obligation for the exact client
-object. No receipt, F10 spend, Worker teardown, or unproved age heuristic may
-retire it. AWS confines the broker parent to conditional `PutObject` and
-requires an exact no-lifecycle audit of its externally owned ingress bucket.
-Later S3 bucket-configuration mutation is outside broker-parent compromise;
-that authority is deploy-only and absent from both Lambda roles. R2's S3
-parent necessarily has broader verbs, so a provider bucket lock retains the
-complete ingress prefix indefinitely; the lock applies to existing and future
-objects and takes precedence over lifecycle. Deployment verifies that exact
-lock before either Worker is installed and removal leaves it in place. The
-lock API replaces the complete rule document without CAS. R2 REST
-configuration authority is account-scoped. Its deploy-only control token is
-not a Worker secret, and
-`exclusive-dedicated` is an operator invariant: one deployment process is the
-sole designated lock writer for the dedicated ingress bucket. Concurrent
-same-owner installers write the same document; a racing account administrator
-or compromised control token is outside the broker-parent boundary. A future
-collector must first prove a separate, exact abandoned-session lifecycle and
-cannot impersonate F10.
+The broker is a pinned `RepositoryReader`, an exact PUT signer, and a narrow
+private invocation client. It cannot read ingress bytes or mutate canonical
+objects and has no validation or compiler. Lambda invocation permission or a
+Cloudflare service binding lets it request work, not choose the result: the
+database-free Applier independently reads the exact key, rehashes and decodes
+the pile, runs the kernel, and owns the sole root CAS.
 
-Notifications and paginated LIST are discovery hints only. Scheduled bounded
-rescans are the progress path. Missing attachments do not block fact
-validation; detached completion uses immutable page receipts and a
-non-authoritative cursor.
-
-The broker grants one fixed-expiry resumable authorization lease. `OPEN`
-alone reads a pinned `RepositoryReader` snapshot and proves current upload
-authority. Its authenticated cursor fixes workspace, uploader path component,
-provider, finite source commitment, progress, quotas, issue time, and expiry.
-`ISSUE` and `FINALIZE` perform no later liveness lookup: they accept only an
-unmodified cursor, a monotonic committed prefix, remaining quota, and trusted
-time strictly before that expiry. A removal committed before `OPEN` denies the
-lease; one committed after `OPEN` cannot revoke already-issued provider
-requests and therefore takes effect for this path no later than the lease
-expiry. Each provider request has its own immutable deadline no later than the
-same expiry. Restart, retry, key-ring rotation, notification delay, and a
-changed default TTL cannot extend an existing lease.
-
-This cursor is ingress authority only. It cannot address canonical objects,
-`root`, or an Applier internal generation, and the broker never turns its
-pinned observation into admission state. `RepositoryApplier` independently
-verifies staged bytes and the closed pile before the sole root CAS.
+There is no `ISSUE`, object vector, detached upload, queue, notification,
+cron, LIST drain, or server-side retry record. A large file is a descriptor
+fact followed by as many independent Bao slice-fact piles as the sender needs.
+The sender retries `FINALIZE` after retryable or lost results and opens a new
+lease if the old one expires. An upload is complete only after `applied` or
+`noop`, so a time-based staging lifecycle may remove abandoned or old sources
+without violating repository correctness; a sender whose unpublished source
+expired simply uploads a new exact session.
 
 ## 9. Object-store contract
 
@@ -520,18 +468,17 @@ The database-free engine requires:
 - conditional create for immutable values;
 - one linearizable conditional replace register named `root`;
 - durable values after acknowledged writes;
-- opaque CAS tokens kept separate from root content hashes;
-- bounded paginated LIST only where discovery is required.
+- opaque CAS tokens kept separate from root content hashes.
 
 S3 and R2 conditional writes provide the root register. ETags are opaque
 version tokens, not content hashes. The filesystem adapter is a stronger local
 implementation of the same interface.
 
 Fault tests should explore everything the contract permits: CAS races, unknown
-outcomes, stale cache layers, short/paginated LIST, repeated notifications,
-opaque tokens, delayed visibility outside the canonical store contract, and
-crash points. A small live-provider conformance suite verifies each adapter;
-the seeded adversarial fake provides reproducible correctness coverage.
+outcomes, stale cache layers, opaque tokens, delayed visibility outside the
+canonical store contract, and crash points. A small live-provider conformance
+suite verifies each adapter; the seeded adversarial fake provides reproducible
+correctness coverage.
 
 ## 10. Core invariants
 
@@ -545,6 +492,7 @@ The implementation and tests enforce:
 - one pure repository compiler and one root CAS owner;
 - one receiving path for full peers, Lambda, and Workers;
 - database-free hosted authorization and application;
-- stable generation reservation plus one outcome-bound retirement spend;
+- exact sender-triggered application with no LIST, queue, or ingress DELETE;
+- independently admissible ordinary Bao slice facts;
 - opaque-token CAS and immutable collision checks;
 - byte-identical convergence across arrival orders and concurrent workers.

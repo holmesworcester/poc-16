@@ -8,8 +8,8 @@ disposable full-client query and authorship accelerator.
 The implementation is deliberately strict about authority and direction:
 
 - `RepositoryApplier` is the only fact-pile-to-root capability. It is
-  database-free and owns immutable establishment, the root CAS, rejection
-  evidence, and retirement of its own internal pile generations.
+  database-free and owns closed-pile validation, immutable establishment, and
+  the root CAS. It never deletes ingress.
 - `RepositoryReader` is a pinned, database-free, side-effect-free read
   capability.
 - `HttpGate` is the one peer route and authorization capability over those
@@ -199,24 +199,21 @@ An authored unit follows one path:
 ```text
 facts command
     -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
-    -> RepositoryApplier reserves one stable internal generation
+    -> RepositoryApplier reads one exact create-only source key
     -> kernel judges the exact closed pile
     -> pure compiler path-copies FactTree, SuppTree, and FactOrder
     -> immutable objects are conditionally established
     -> one CAS advances root
-    -> one exact outcome-bound spend grants its sole retirement DELETE
+    -> applied, noop, rejected, or retryable result
     -> RepositoryReader pins the resulting root
 ```
 
-Generation identity is the durable create-only reservation, not the source
-path or a provider ETag. Byte-identical delivery by the same member is the
-same logical work and recovers the same reservation. Root-CAS losers keep that
-work and retry from the newer root. A lost CAS response is reconciled by
-reading the root. Retirement first creates one exact outcome-bound spend
-record; only a definitely fresh spend may issue DELETE. An ambiguous spend
-therefore fails safe by retaining already-discharged source bytes, and no
-restart or stale receipt may issue a second DELETE. One bad pile cannot wedge
-later pile generations.
+The exact key and digest identify one delivery attempt; they do not grant
+admission. Root-CAS losers retry from the newer root, and a lost CAS response
+is reconciled by reading the root. Repeating an already-applied pile returns
+an idempotent result. The source remains immutable staging for provider
+retention, so concurrent workers have no destructive ingress action to race.
+One bad pile cannot wedge a later exact request.
 
 ## Facts, suppression, and deletion
 
@@ -306,78 +303,52 @@ serialized form, not preserve an obsolete original encoding.
 
 ## Direct object-store upload
 
-Peers do not proxy file bytes through Lambda or a Worker. A broker reads a
-pinned repository root to authorize an upload and returns exact, short-lived,
-create-only PUT capabilities. The client uploads:
+Peers do not proxy pile bytes through Lambda or a Worker. The entire hosted
+upload protocol is:
 
-1. detached objects to an isolated ingress bucket;
-2. one exact fact pile marker last.
+```text
+OPEN(proof, pile digest, pile size)
+    -> exact fixed-expiry create-only PUT plus cursor
+client PUTs the pile directly to S3/R2
+FINALIZE(cursor)
+    -> broker privately invokes Applier(exact key, digest)
+    -> applied | noop | rejected | retryable
+```
 
-The stateful client owns this side of the protocol:
-`full_peer/upload_journal.py` durably spools immutable source bytes and one
-atomic progress record, `full_peer/upload_client.py` advances only persisted
-OPEN/ISSUE/FINALIZE authority, and `full_peer/upload_client_http.py` performs
-bounded broker POSTs and exact streaming PUTs. Provider brokers and deployment
-adapters remain under `deploy/`; only `upload_session.py` and `upload_wire.py`
-are shared by both sides.
+There is no `ISSUE`, detached-object vector, upload group, Queue/SQS message,
+bucket notification, cron, or LIST drain. A file descriptor and each Bao
+slice are ordinary facts; the slice contains its payload and range proof and
+can be sent in its own closed pile. Large uploads are therefore just repeated
+instances of the same small protocol.
 
-`content.file.uploads` pages the retained local sources and reports `active`,
-`expired`, `abandoned`, or `completed`. These are delivery states, never
-publication verdicts. One cross-process writer owns a source for an entire
-resume; atomic journal updates cannot move its authenticated cursor or
-delivered prefix backward. `content.file.abandon_upload` durably stops retries,
-but collection waits until every locally observed capability expiry.
-`content.file.collect_upload` then removes only that exact abandoned source, or
-an exact source whose pile-last delivery step was durably journaled. It never
-reads or mutates repository state. A legacy v1 journal can still resume, but
-abandoned collection fails closed because v1 did not retain replaced-session
-expiry history.
+The stateful client retains one exact pile and, while useful, its current
+lease. `full_peer/upload_journal.py` owns that local crash state,
+`full_peer/upload_client.py` owns `OPEN -> PUT -> FINALIZE`, and
+`full_peer/upload_client_http.py` owns the HTTP effects. If a response is lost,
+the client repeats `FINALIZE`; if a lease expires, it opens a new exact session.
+Local active, abandoned, and completed states never grant repository
+authority, and abandoning local state is safe because an outstanding request
+can write only one isolated immutable staging key.
 
-The marker is the durable work item. Notifications and LIST results are
-discovery hints; scheduled bounded rescans are the progress path, and only an
-exact bounded marker read can establish work.
+`OPEN` reads one pinned repository root and checks current upload authority.
+The cursor fixes workspace, uploader, provider, session, pile digest, size,
+issue time, and expiry. `FINALIZE` changes none of those and does not reread
+liveness. Removal before a new `OPEN` denies it; removal afterward leaves only
+that already-confined pile usable until its fixed expiry.
 
-`RepositoryApplier` then:
+The broker has read-only canonical access, an exact ingress PUT signer, and a
+narrow provider-private invocation of the Applier. It never receives pile
+bytes and cannot mutate canonical storage directly. The Applier bounded-reads
+the exact key, checks its workspace/session/member/digest binding, decodes the
+whole closed pile, invokes the ordinary kernel, and owns the only root CAS.
+The member path component identifies the authenticated uploader, not every
+fact author in a legitimate relayed closure.
 
-1. fetches and validates the exact marker;
-2. checks the exact key/session/member/digest binding and that every ordinary
-   fact names the configured workspace (the workspace-genesis fact is the
-   sole ws-less exception);
-3. copies it behind the marker's one durably reserved internal generation;
-4. commits facts through the ordinary pile path;
-5. spends and retires only that internal generation;
-6. promotes referenced attachments in bounded round-robin pages.
-
-The Applier never deletes the client marker or detached ingress objects.
-F10 retires only the marker's separately reserved internal generation. Until
-an exact abandoned-session collection rule is proved, provider policy retains
-the complete client-writable namespace: the AWS broker role is conditional
-PUT-only and deployment admits only a no-lifecycle bucket, while Cloudflare
-uses an indefinite R2 bucket lock over the ingress prefix. Missing attachments
-do not block valid fact admission; immutable page receipts and a
-non-authoritative cursor let concurrent Workers duplicate bounded work without
-skipping completion or corrupting the tree.
-
-The marker's member component names the broker-authenticated upload session,
-not the author of every fact in a relayed closure. Per-fact signatures and
-family needs remain the authority proof.
-
-The broker is a `RepositoryReader` plus a provider signer. It has read-only
-canonical credentials and exposes only exact create-only ingress PUT grants;
-it has no repository mutation route. The Applier alone can mutate the
-canonical bucket.
-
-Upload authorization has one explicit staleness bound. `OPEN` reads one
-pinned repository root and checks the uploader's current authority. A
-successful `OPEN` exchanges that observation for one bearer lease whose fixed
-expiry is the key-ring session TTL after the broker's trusted time. `ISSUE`
-and `FINALIZE` verify the authenticated cursor, monotonic prefix, quotas, and
-that same deadline; they do not reread liveness and cannot extend the lease.
-Thus removal before a new `OPEN` denies it, while removal after `OPEN` leaves
-only the already-confined session usable until expiry. Every exact provider
-PUT expires no later than the session. Neither the cursor nor a successful PUT
-is repository admission: the Applier still validates the pile and owns the
-only root CAS.
+`RepositoryApplier` never deletes ingress. A configured S3/R2 lifecycle may
+eventually collect old staging because the client reports success only after
+`applied` or `noop`; if an unpublished staging key expires, the sender simply
+opens and uploads a new exact session. Retention is storage hygiene, not a
+server-side work queue or a correctness precondition.
 
 ## Object-store contract
 
@@ -388,16 +359,15 @@ adapters:
   materialization;
 - create-only immutable writes with collision verification;
 - one linearizable conditional replace of `root`;
-- an opaque version token returned with the exact root bytes;
-- bounded, paginated LIST for discovery only.
+- an opaque version token returned with the exact root bytes.
 
-`get_bounded` and `list_page` are mandatory store operations, not compatibility
-wrappers around whole-object GET or whole-result LIST.
+`get_bounded` is mandatory and cannot be a compatibility wrapper around an
+unbounded whole-object GET. The receive algorithm does not require LIST.
 
 The opaque provider version token is not the root content hash. Readers use
 the content hash as snapshot identity; Appliers use the opaque token only as
 the compare capability for CAS. Correctness never depends on ETag being
-MD5-like, on LIST ordering beyond the adapter contract, or on a database.
+MD5-like, bucket enumeration, or a database.
 
 The filesystem adapter is a stronger local implementation of the same
 contract. S3 uses conditional requests through `adapters/s3`; the Cloudflare
