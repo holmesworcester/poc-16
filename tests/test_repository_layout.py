@@ -344,13 +344,23 @@ def test_one_explicit_fact_context_serves_core_and_full_peer_authoring():
         ]
 
 
-def test_one_semantic_root_cas_and_one_root_compiler():
+def test_one_repository_root_cas_and_one_root_compiler():
     semantic = []
     for path, call in calls_named("cas"):
         if call.args and isinstance(call.args[0], ast.Constant) \
                 and call.args[0].value == "root":
-            semantic.append(path)
-    assert semantic == [Path("core/repository_applier.py")]
+            semantic.append((path, call))
+    assert [path for path, _call in semantic] == [
+        Path("core/repository_applier.py"),
+        Path("notifications/discovery.py"),
+        Path("notifications/discovery.py"),
+    ]
+    for _path, call in semantic[1:]:
+        owner = call.func.value
+        assert isinstance(owner, ast.Attribute) \
+            and isinstance(owner.value, ast.Name) \
+            and owner.value.id == "self" \
+            and owner.attr == "cursor_store"
 
     encode_root = []
     for path in source_paths():
