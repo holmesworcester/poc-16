@@ -81,6 +81,8 @@ Every fact type is a module under `facts/`. A family owns construction, exact
 shape validation, declared `Need`s, durability, suppression and direct-action
 policy, liveness guards, commands, queries, and detached blob references.
 Core dispatches through the checked family registry and contains no tag switch.
+Registry compilation rejects malformed or ambiguous selector, action,
+liveness, and typed-suppression declarations before a family can be admitted.
 
 ### 2.1 The closed-pile boundary
 
@@ -210,8 +212,11 @@ ACTIVE(action_fid)
 exact liveness check which needs a missing slot fails closed.
 
 Selectors may name SELF, a parent, an ancestor path, several IDs, or none.
-The descendant carries ancestor IDs because dependencies precede it. A later
-deleter never enumerates descendants.
+PARENT pins its one direct dependency. ANCESTOR traverses only exact named
+refs at every hop; the registry distinguishes that promise and admission
+checks the actual ref chain. The descendant can therefore carry the final
+ancestor ID without storing selected Need providers or historical admission
+edges. A later deleter never enumerates descendants.
 
 SuppTree supports exact fact deletion, member removal, device/owner liveness,
 and bounded Worker authorization reads without a database or fact-set scan.

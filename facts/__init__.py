@@ -12,27 +12,8 @@ from ._policy import validate_fact_policy, validate_family_policy
 MODULES = auth.MODULES + content.MODULES
 
 
-def compile_families(modules):
-    """Validate and freeze the one behavior+policy dispatch inventory."""
-    modules = tuple(modules)
-    families = {module.TAG: module for module in modules}
-    if len(families) != len(modules):
-        raise ValueError("duplicate fact tag")
-    if any(not hasattr(module, "POLICY") for module in modules):
-        raise ValueError("every fact family must own its policy")
-    for module in modules:
-        validate_family_policy(module.POLICY)
-    if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
-        raise ValueError("exactly one genesis family required")
-    return families
-
-
-FAMILIES = compile_families(MODULES)
-MAX_AUTHORITY_SCOPES = 64
-
-
 def _principal_namespaces(modules):
-    """Map authority offer names to their one declared suppression namespace."""
+    """Map each globally resolved principal offer to one namespace."""
     out = {}
     for module in modules:
         for declaration in module.POLICY.principal_offers:
@@ -43,6 +24,26 @@ def _principal_namespaces(modules):
                     f"principal offer namespace conflict: "
                     f"{declaration.name!r}")
     return out
+
+
+def compile_families(modules):
+    """Validate and freeze the one behavior+policy dispatch inventory."""
+    modules = tuple(modules)
+    families = {module.TAG: module for module in modules}
+    if len(families) != len(modules):
+        raise ValueError("duplicate fact tag")
+    if any(not hasattr(module, "POLICY") for module in modules):
+        raise ValueError("every fact family must own its policy")
+    for module in modules:
+        validate_family_policy(module.POLICY)
+    _principal_namespaces(modules)
+    if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
+        raise ValueError("exactly one genesis family required")
+    return families
+
+
+FAMILIES = compile_families(MODULES)
+MAX_AUTHORITY_SCOPES = 64
 
 
 PRINCIPAL_NAMESPACES = _principal_namespaces(MODULES)
@@ -140,11 +141,11 @@ def is_genesis(tag):
 
 
 def _offer_sids(fact, declarations):
-    by_name = {row.name: row.namespace for row in declarations}
     return {
-        scoped_id(by_name[name], a0)
+        scoped_id(row.namespace, a0)
+        for row in declarations
         for name, a0, _ in fact.offers()
-        if name in by_name
+        if name == row.name
     }
 
 
@@ -199,11 +200,8 @@ def current_scopes(fact):
 def explicit_provider(fact, role):
     """Return a provider fid explicitly named by a suppression path.
 
-    Parent and ancestor selectors are semantic envelope atoms.  When their
-    final path role matches a Need role, that exact provider matters and the
-    kernel must check it instead of choosing another offer at the same
-    address.  Families without such an atom deliberately accept any valid
-    provider of the address.
+    A parent selector may pin a direct Need. Ancestor paths traverse immutable
+    refs only, so they never select an interchangeable provider here.
     """
     from core.suppression import selector_markers
 
@@ -211,8 +209,8 @@ def explicit_provider(fact, role):
         marker[3]
         for marker in selector_markers(fact)
         if len(marker) == 4
-        and marker[1] in {"parent", "ancestor"}
-        and marker[2].split("/")[-1] == role
+        and marker[1] == "parent"
+        and marker[2] == role
     }
     if len(matches) > 1:
         raise ValueError(f"ambiguous explicit provider for {role!r}")

@@ -35,7 +35,6 @@ class MemoryContext:
         self.anchor = anchor
         self.facts = {}
         self.depths = {}
-        self.edges = {}
         self.closures = {}
 
     def has_fact(self, fid):
@@ -54,9 +53,6 @@ class MemoryContext:
             (a0, a1) for offer, a0, a1 in (fact.offers() if fact else ())
             if offer == name
         )
-
-    def edge_source(self, source, role):
-        return self.edges.get((source, role))
 
     def provider(self, name, a0, a1=None, source=None):
         return self.resolve_offer(name, a0, a1, source)
@@ -98,8 +94,6 @@ class MemoryContext:
         self.facts[fact.fid], self.depths[fact.fid] = fact, depth
         closure = self.closure(tuple(edge.fid for edge in edges))
         self.closures[fact.fid] = frozenset((fact.fid,)) | closure
-        self.edges.update(
-            ((fact.fid, edge.role), edge.fid) for edge in edges)
 
 
 def offer_src(db, name, a0, a1=None, source=None):

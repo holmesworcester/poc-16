@@ -111,9 +111,10 @@ must not import concrete family modules or switch on their tags.
 Needs use complete offer addresses. A fact may also name an exact provider in
 its envelope when identity matters. Do not infer durable ownership from a
 current winning provider. Suppression selectors are explicit: SELF, named
-parent or ancestor paths, several selectors, or none. A family with none
-cannot be directly suppressed, although its declared current authority scopes
-may still make it unusable as a provider.
+parent or ancestor paths, several selectors, or none. PARENT pins one direct
+dependency; every ANCESTOR hop must be an immutable named ref. A family with
+none cannot be directly suppressed, although its declared current authority
+scopes may still make it unusable as a provider.
 
 ## Object-store and concurrency rules
 

@@ -120,16 +120,19 @@ def test_registry_rejects_direct_delete_authority_gaps(policy, error):
 
 
 @pytest.mark.parametrize(
-    "suppression",
+    ("suppression", "error"),
     (
-        _policy.NEVER,
-        (_policy.Parent("member"),),
-        (_policy.SelectorRule(SELF, ("malformed",)),),
-        (_policy.Self(), _policy.Self()),
+        (_policy.NEVER, "exactly one Self"),
+        ((_policy.Parent("member"),), "exactly one Self"),
+        (
+            (_policy.SelectorRule(SELF, ("malformed",)),),
+            "suppression selector",
+        ),
+        ((_policy.Self(), _policy.Self()), "duplicate suppression"),
     ),
 )
 def test_registry_rejects_direct_delete_without_one_self_selector(
-        suppression):
+        suppression, error):
     family = SimpleNamespace(
         TAG="undeclared_delete_target",
         POLICY=_policy.FamilyPolicy(
@@ -139,7 +142,7 @@ def test_registry_rejects_direct_delete_without_one_self_selector(
         ),
     )
 
-    with pytest.raises(ValueError, match="exactly one Self"):
+    with pytest.raises(ValueError, match=error):
         facts.compile_families((family,))
 
 

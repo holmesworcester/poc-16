@@ -133,7 +133,10 @@ rewrite ownership.
 A suppressible family serializes the exact IDs that may suppress each fact.
 Selectors can name SELF, a parent, a grandparent/ancestor path, or several
 such IDs. A family with no suppression policy serializes no suppression key
-and its facts cannot be directly suppressed. That is a visibility rule:
+and its facts cannot be directly suppressed. Parent selectors pin one direct
+dependency. Ancestor paths are chains of immutable named refs, so adding an
+interchangeable provider cannot rewire a stored fact's suppression IDs.
+That is a visibility rule:
 separately, a family may declare current principal/authority scopes whose
 suppression makes the fact unusable as an authority provider without removing
 the fact from validated storage.
