@@ -16,6 +16,9 @@ Parameters:
     MinLength: 3
     MaxLength: 64
     AllowedPattern: "^[a-z0-9][a-z0-9-]{2,63}$"
+  SoftwareDigest:
+    Type: String
+    AllowedPattern: "^[0-9a-f]{64}$"
   WorkspaceId:
     Type: String
     AllowedPattern: "^[0-9a-f]{64}$"
@@ -393,6 +396,8 @@ Outputs:
     Value: poc16-aws-notifications-v1
   DeploymentId:
     Value: !Ref DeploymentId
+  SoftwareDigest:
+    Value: !Ref SoftwareDigest
   Enabled:
     Value: !Ref Enabled
   DirectSmokeEnabled:

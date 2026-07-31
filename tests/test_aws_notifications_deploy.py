@@ -10,6 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 from core.crypto import h, load_sk
+from core.fact import canon
+from deploy.notification_launch import (
+    MAX_LAUNCH_RECORD_BYTES,
+    launch_record as encode_launch_record,
+)
 from deploy.aws_notifications import manage
 from deploy.aws_notifications.config import (
     BOOTSTRAP_RESULT_SCHEMA,
@@ -41,6 +46,7 @@ SECRET_ARN = (
 SECRET_VERSION = "a" * 32
 SECRET_SEED = "11" * 32
 PUSH_NODE = push_node_id(load_sk(SECRET_SEED))
+SOFTWARE_DIGEST = "f" * 64
 QUEUE_ARN = f"arn:aws:sqs:us-west-2:{ACCOUNT}:poc16-notifications"
 QUEUE_URL = (
     f"https://sqs.us-west-2.amazonaws.com/{ACCOUNT}/poc16-notifications"
@@ -61,6 +67,8 @@ def args(**changes):
         "direct_smoke": None,
         "enable": None,
         "expected_owner": ACCOUNT,
+        "ios_launch_record": None,
+        "android_launch_record": None,
         "max_per_second": 10,
         "max_receive_count": 5,
         "notification_secret_arn": SECRET_ARN,
@@ -89,7 +97,8 @@ def _output_rows(values):
     ]
 
 
-def stack(candidate=None, *, enabled=True, smoke=False, push_node=PUSH_NODE):
+def stack(candidate=None, *, enabled=True, smoke=False, push_node=PUSH_NODE,
+          software_digest=SOFTWARE_DIGEST):
     candidate = args() if candidate is None else candidate
     outputs = {
         "CanonicalBucketName": candidate.canonical_bucket,
@@ -122,6 +131,7 @@ def stack(candidate=None, *, enabled=True, smoke=False, push_node=PUSH_NODE):
         "NotificationStatePrefix": candidate.state_prefix,
         "PushNodeId": push_node,
         "RepositoryKmsKeyArn": candidate.repository_kms_key_arn or "",
+        "SoftwareDigest": software_digest,
         "WorkspaceId": candidate.workspace,
     }
     return {
@@ -136,6 +146,45 @@ def stack(candidate=None, *, enabled=True, smoke=False, push_node=PUSH_NODE):
             {"Key": DEPLOYMENT_ID_TAG, "Value": candidate.deployment_id},
         ],
     }
+
+
+def launch_binding(candidate, *, stack_id=None, push_node=PUSH_NODE,
+                   software_digest=SOFTWARE_DIGEST):
+    return {
+        "canonical_bucket": candidate.canonical_bucket,
+        "canonical_prefix": candidate.canonical_prefix,
+        "deployment_id": candidate.deployment_id,
+        "expected_bucket_owner": candidate.expected_owner,
+        "notification_secret_arn": candidate.notification_secret_arn,
+        "notification_secret_version_id": (
+            candidate.notification_secret_version_id),
+        "notification_state_bucket": candidate.state_bucket,
+        "notification_state_prefix": candidate.state_prefix,
+        "provider": "aws",
+        "push_node_id": push_node,
+        "software_digest": software_digest,
+        "stack_id": stack(candidate)["StackId"] if stack_id is None
+        else stack_id,
+        "workspace": candidate.workspace,
+    }
+
+
+def launch_record(candidate, platform, *, stack_id=None,
+                  push_node=PUSH_NODE, software_digest=SOFTWARE_DIGEST):
+    return encode_launch_record(platform, launch_binding(
+        candidate,
+        stack_id=stack_id,
+        push_node=push_node,
+        software_digest=software_digest,
+    ))
+
+
+def write_launch_records(directory, candidate, *, stack_id=None):
+    for platform in ("ios", "android"):
+        path = directory / f"{platform}.json"
+        path.write_bytes(launch_record(
+            candidate, platform, stack_id=stack_id))
+        setattr(candidate, f"{platform}_launch_record", str(path))
 
 
 def _secret_response(*, version=SECRET_VERSION, arn=SECRET_ARN,
@@ -161,6 +210,7 @@ def test_stage_is_importable_and_contains_only_shared_read_side(tmp_path):
             "adapters/gcp/firebase.py",
             "adapters/s3/store.py",
             "core/repository_reader.py",
+            "deploy/notification_launch.py",
             "deploy/aws_notifications/app.py",
             "deploy/aws_notifications/secret.py",
             "facts/auth/push_endpoint.py",
@@ -212,6 +262,7 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
     assert "TINYP2P_NOTIFICATION_SECRET_VERSION_ID" in template
     assert "TINYP2P_NOTIFICATION_PUSH_NODE_ID" in template
     assert "TINYP2P_NOTIFICATION_DIRECT_SMOKE_ENABLED" in template
+    assert "SoftwareDigest" in template
     assert "Handler: deploy.aws_notifications.app.scanner_handler" in template
     assert "Handler: deploy.aws_notifications.app.delivery_handler" in template
     assert "FunctionResponseTypes:\n        - ReportBatchItemFailures" in template
@@ -383,6 +434,77 @@ def test_create_cannot_skip_explicit_bootstrap(monkeypatch):
         manage._stack_for_deploy(candidate)
 
 
+def test_launch_gate_requires_exact_ios_and_android_records(tmp_path):
+    candidate = args(create=False, update=True, enable=True)
+    target = stack(candidate)["StackId"]
+    write_launch_records(tmp_path, candidate, stack_id=target)
+
+    assert manage._check_launch_gate(
+        candidate, target, manage._binding(candidate, PUSH_NODE),
+        SOFTWARE_DIGEST) is None
+
+    candidate.android_launch_record = None
+    with pytest.raises(RuntimeError, match="android.*required"):
+        manage._check_launch_gate(
+            candidate, target, manage._binding(candidate, PUSH_NODE),
+            SOFTWARE_DIGEST)
+
+
+@pytest.mark.parametrize(("field", "value"), (
+    ("deployment_id", "another-deployment"),
+    ("notification_secret_version_id", "b" * 32),
+    ("platform", "android"),
+    ("push_node_id", "b" * 64),
+    ("result", "accepted"),
+    ("schema", "poc16-mobile-notification-launch-v0"),
+    ("stack_id", "another-stack"),
+    ("software_digest", "b" * 64),
+    ("workspace", "b" * 64),
+    ("unexpected", "field"),
+))
+def test_launch_gate_rejects_stale_or_inexact_evidence(
+        tmp_path, field, value):
+    candidate = args(create=False, update=True, enable=True)
+    target = stack(candidate)["StackId"]
+    write_launch_records(tmp_path, candidate, stack_id=target)
+    document = json.loads(launch_record(
+        candidate, "ios", stack_id=target))
+    if field in {"platform", "result", "schema"}:
+        document[field] = value
+    else:
+        document["binding"][field] = value
+    Path(candidate.ios_launch_record).write_bytes(canon(document))
+
+    with pytest.raises(RuntimeError, match="invalid ios"):
+        manage._check_launch_gate(
+            candidate, target, manage._binding(candidate, PUSH_NODE),
+            SOFTWARE_DIGEST)
+
+
+@pytest.mark.parametrize("raw", (
+    b"{}\n",
+    b"x" * (MAX_LAUNCH_RECORD_BYTES + 1),
+    b"",
+))
+def test_launch_gate_rejects_noncanonical_or_unbounded_records(
+        tmp_path, raw):
+    candidate = args(create=False, update=True, enable=True)
+    target = stack(candidate)["StackId"]
+    write_launch_records(tmp_path, candidate, stack_id=target)
+    Path(candidate.ios_launch_record).write_bytes(raw)
+
+    with pytest.raises(RuntimeError, match="invalid ios"):
+        manage._check_launch_gate(
+            candidate, target, manage._binding(candidate, PUSH_NODE),
+            SOFTWARE_DIGEST)
+
+
+def test_launch_records_cannot_be_supplied_without_explicit_enable(tmp_path):
+    candidate = args(ios_launch_record=str(tmp_path / "ios.json"))
+    with pytest.raises(ValueError, match="require explicit --enable"):
+        manage._validated(candidate)
+
+
 def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
         monkeypatch):
     candidate = args()
@@ -396,7 +518,10 @@ def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
     monkeypatch.setattr(
         manage, "_verify_state_lifecycle", lambda _args: checks.append(
             "lifecycle"))
-    monkeypatch.setattr(manage, "build", lambda _args: checks.append("build"))
+    monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(
+        manage, "build", lambda _args, **_kwargs: checks.append("build"))
     monkeypatch.setattr(manage, "_owned_stack", lambda _args: final)
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
     monkeypatch.setattr(manage, "_run", lambda command, **_kwargs: (
@@ -409,12 +534,15 @@ def test_create_is_fully_disabled_by_default_and_checks_real_bindings(
     assert "DirectSmokeEnabled=false" in command
     assert f"NotificationSecretVersionId={SECRET_VERSION}" in command
     assert f"PushNodeId={PUSH_NODE}" in command
+    assert f"SoftwareDigest={SOFTWARE_DIGEST}" in command
     assert checks == ["lifecycle", "build"]
     assert outputs["NotificationQueueUrl"] == QUEUE_URL
 
 
-def test_explicit_enable_checks_initialized_scanner_before_build(monkeypatch):
+def test_explicit_enable_checks_launches_and_initialized_scanner_before_build(
+        tmp_path, monkeypatch):
     candidate = args(create=False, update=True, enable=True)
+    write_launch_records(tmp_path, candidate, stack_id="stack")
     incumbent = manage._outputs(stack(candidate, enabled=False))
     final = stack(candidate, enabled=True)
     effects = []
@@ -424,9 +552,12 @@ def test_explicit_enable_checks_initialized_scanner_before_build(monkeypatch):
     monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
     monkeypatch.setattr(manage, "_verify_state_lifecycle", lambda _args: None)
     monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(
         manage, "_check_initialized", lambda _args, _outputs: effects.append(
             "initialized"))
-    monkeypatch.setattr(manage, "build", lambda _args: effects.append("build"))
+    monkeypatch.setattr(
+        manage, "build", lambda _args, **_kwargs: effects.append("build"))
     monkeypatch.setattr(manage, "_owned_stack", lambda _args: final)
     monkeypatch.setattr(manage, "_caller_account", lambda _args: ACCOUNT)
     monkeypatch.setattr(manage, "_run", lambda *_args, **_kwargs:
@@ -435,6 +566,67 @@ def test_explicit_enable_checks_initialized_scanner_before_build(monkeypatch):
     manage.deploy(candidate)
 
     assert effects == ["initialized", "build"]
+
+
+def test_enable_with_missing_launch_evidence_stops_before_build(
+        tmp_path, monkeypatch):
+    candidate = args(create=False, update=True, enable=True)
+    ios = tmp_path / "ios.json"
+    ios.write_bytes(launch_record(candidate, "ios", stack_id="stack"))
+    candidate.ios_launch_record = str(ios)
+    incumbent = manage._outputs(stack(candidate, enabled=False))
+    effects = []
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", True, False, incumbent))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
+    monkeypatch.setattr(
+        manage, "_verify_state_lifecycle",
+        lambda _args: effects.append("lifecycle"))
+    monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(
+        manage, "_check_initialized",
+        lambda *_args: effects.append("initialized"))
+    monkeypatch.setattr(
+        manage, "build", lambda _args, **_kwargs: effects.append("build"))
+
+    with pytest.raises(RuntimeError, match="android.*required"):
+        manage.deploy(candidate)
+    assert effects == ["lifecycle"]
+
+
+def test_enabled_update_rejects_untested_software_before_build(monkeypatch):
+    candidate = args(create=False, update=True)
+    incumbent = manage._outputs(stack(
+        candidate, enabled=True, software_digest="e" * 64))
+    effects = []
+    monkeypatch.setattr(
+        manage, "_stack_for_deploy",
+        lambda _args: ("stack", True, False, incumbent))
+    monkeypatch.setattr(manage, "_secret_binding", lambda _args: PUSH_NODE)
+    monkeypatch.setattr(
+        manage, "_verify_state_lifecycle",
+        lambda _args: effects.append("lifecycle"))
+    monkeypatch.setattr(
+        manage, "_prepare_software", lambda: SOFTWARE_DIGEST)
+    monkeypatch.setattr(
+        manage, "build", lambda *_args, **_kwargs: effects.append("build"))
+
+    with pytest.raises(RuntimeError, match="disable.*changing software"):
+        manage.deploy(candidate)
+    assert effects == ["lifecycle"]
+
+
+def test_build_refuses_prepared_input_change(monkeypatch):
+    calls = []
+    monkeypatch.setattr(manage, "_software_digest", lambda: "b" * 64)
+    monkeypatch.setattr(
+        manage, "_run", lambda command, **_kwargs: calls.append(command))
+
+    with pytest.raises(RuntimeError, match="inputs changed"):
+        manage.build(expected_digest="a" * 64)
+    assert calls == []
 
 
 def test_enable_preflight_is_one_normal_wake_and_fails_closed(monkeypatch):
@@ -668,4 +860,6 @@ def test_direct_smoke_and_production_defaults_are_separate():
     ])
     assert parsed.enable is None
     assert parsed.direct_smoke is None
+    assert parsed.ios_launch_record is None
+    assert parsed.android_launch_record is None
     assert manage.parser().parse_args(["build"]).command == "build"

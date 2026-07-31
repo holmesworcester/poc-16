@@ -2,6 +2,7 @@
 """Build, deploy, inspect, redrive, and remove AWS notifications safely."""
 import argparse
 import base64
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ from adapters.aws import queue_binding
 from adapters.s3 import S3Config
 from core.object_store import validate_store_prefix
 from core.shape import valid_fid
+from deploy.notification_launch import require_mobile_launches, tree_digest
 from notifications.hints import decode_hint
 
 from .config import (
@@ -68,6 +70,7 @@ NOTIFICATION_CORE_MODULES = (
 )
 DEPLOY_FILES = (
     "deploy/__init__.py",
+    "deploy/notification_launch.py",
     "deploy/aws_notifications/__init__.py",
     "deploy/aws_notifications/app.py",
     "deploy/aws_notifications/config.py",
@@ -161,14 +164,33 @@ def _run(command, *, capture=False):
     )
 
 
-def build(_args=None):
+def _software_digest():
+    stage_hash = tree_digest(STAGE)
+    template_hash = hashlib.sha256(
+        (HERE / "template.yaml").read_bytes()).hexdigest()
+    return hashlib.sha256(json.dumps(
+        {"stage": stage_hash, "template": template_hash},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _prepare_software():
     stage()
+    return _software_digest()
+
+
+def build(_args=None, *, expected_digest=None):
+    digest = _prepare_software() if expected_digest is None \
+        else _software_digest()
+    if expected_digest is not None and digest != expected_digest:
+        raise RuntimeError("notification deploy inputs changed during build")
     _run([
         "sam", "build",
         "--template-file", str(HERE / "template.yaml"),
         "--build-dir", str(BUILD),
         "--use-container",
     ])
+    return digest
 
 
 def _provider_flags(args):
@@ -237,6 +259,13 @@ def _validated(args):
             or not args.schedule.startswith(("rate(", "cron(")) \
             or not args.schedule.endswith(")"):
         raise ValueError("notification schedule")
+    launch_records = (
+        getattr(args, "ios_launch_record", None),
+        getattr(args, "android_launch_record", None),
+    )
+    if args.enable is not True and any(
+            value is not None for value in launch_records):
+        raise ValueError("launch records require explicit --enable")
     return args
 
 
@@ -461,14 +490,15 @@ def _stack_for_deploy(args):
     return owned["StackId"], *switches, outputs
 
 
-def _parameters(args, enabled, direct_smoke, push_node):
+def _parameters(args, enabled, direct_smoke, push_node, software_digest):
     if type(enabled) is not bool or type(direct_smoke) is not bool \
-            or not valid_fid(push_node):
+            or not valid_fid(push_node) or not valid_fid(software_digest):
         raise TypeError("notification deployment state")
     return (
         f"Enabled={'true' if enabled else 'false'}",
         f"DirectSmokeEnabled={'true' if direct_smoke else 'false'}",
         f"DeploymentId={args.deployment_id}",
+        f"SoftwareDigest={software_digest}",
         f"WorkspaceId={args.workspace}",
         f"CanonicalBucketName={args.canonical_bucket}",
         f"CanonicalPrefix={args.canonical_prefix}",
@@ -489,6 +519,30 @@ def _parameters(args, enabled, direct_smoke, push_node):
     )
 
 
+def _check_launch_gate(args, stack_id, binding, software_digest):
+    """Require exact, deployment-bound evidence from both mobile platforms."""
+    expected = {
+        "canonical_bucket": binding["CanonicalBucketName"],
+        "canonical_prefix": binding["CanonicalPrefix"],
+        "deployment_id": args.deployment_id,
+        "expected_bucket_owner": binding["ExpectedBucketOwner"],
+        "notification_secret_arn": binding["NotificationSecretArn"],
+        "notification_secret_version_id": (
+            binding["NotificationSecretVersionId"]),
+        "notification_state_bucket": binding["NotificationStateBucketName"],
+        "notification_state_prefix": binding["NotificationStatePrefix"],
+        "provider": "aws",
+        "push_node_id": binding["PushNodeId"],
+        "software_digest": software_digest,
+        "stack_id": stack_id,
+        "workspace": binding["WorkspaceId"],
+    }
+    require_mobile_launches({
+        "ios": getattr(args, "ios_launch_record", None),
+        "android": getattr(args, "android_launch_record", None),
+    }, expected)
+
+
 def deploy(args):
     """Create disabled; updates preserve state without an explicit switch."""
     args = _validated(args)
@@ -498,9 +552,15 @@ def deploy(args):
     if incumbent is not None:
         _check_binding(incumbent, binding)
     _verify_state_lifecycle(args)
+    software_digest = _prepare_software()
+    if incumbent is not None and enabled \
+            and incumbent.get("SoftwareDigest") != software_digest:
+        raise RuntimeError(
+            "disable notification production before changing software")
     if args.enable is True:
+        _check_launch_gate(args, target, binding, software_digest)
         _check_initialized(args, incumbent)
-    build(args)
+    build(args, expected_digest=software_digest)
     _run([
         "sam", "deploy",
         "--template-file", str(BUILD / "template.yaml"),
@@ -509,7 +569,7 @@ def deploy(args):
         "--resolve-s3",
         "--no-fail-on-empty-changeset",
         "--parameter-overrides", *_parameters(
-            args, enabled, direct_smoke_enabled, push_node),
+            args, enabled, direct_smoke_enabled, push_node, software_digest),
         "--tags",
         f"{DEPLOYMENT_TAG}={DEPLOYMENT_MARKER}",
         f"{DEPLOYMENT_ID_TAG}={args.deployment_id}",
@@ -519,7 +579,8 @@ def deploy(args):
     _check_binding(outputs, binding)
     if outputs.get("Enabled") != ("true" if enabled else "false") \
             or outputs.get("DirectSmokeEnabled") \
-            != ("true" if direct_smoke_enabled else "false"):
+            != ("true" if direct_smoke_enabled else "false") \
+            or outputs.get("SoftwareDigest") != software_digest:
         raise RuntimeError("deployed notification outputs are incomplete")
     _checked_queues(args, outputs)
     return outputs
@@ -716,6 +777,8 @@ def parser():
     deploy_command.add_argument("--delivery-concurrency", type=int, default=10)
     deploy_command.add_argument(
         "--max-receive-count", type=int, default=MAX_RECEIVE_COUNT)
+    deploy_command.add_argument("--ios-launch-record")
+    deploy_command.add_argument("--android-launch-record")
     traffic = deploy_command.add_mutually_exclusive_group()
     traffic.add_argument(
         "--enable", dest="enable", action="store_const", const=True)
