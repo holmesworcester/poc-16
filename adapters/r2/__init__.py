@@ -1,8 +1,10 @@
 """Cloudflare R2 adapters."""
 
+from .reader import R2ReadBindingStore
 from .worker import R2BindingStore
 
-__all__ = ("R2BindingStore", "R2S3Config", "R2S3Store")
+__all__ = (
+    "R2BindingStore", "R2ReadBindingStore", "R2S3Config", "R2S3Store")
 
 
 def __getattr__(name):

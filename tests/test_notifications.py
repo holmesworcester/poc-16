@@ -1,5 +1,7 @@
 """Authenticated facts and stateless post-publication push delivery."""
 
+import json
+
 import pytest
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ from facts.content import message
 from facts.content import notification_preference as preference
 from full_peer.node import FullPeer
 from notifications.delivery import (
+    MAX_PAYLOAD_BYTES,
     PublicationHint,
     PushRequest,
     PushRetryable,
@@ -311,6 +314,28 @@ def test_firebase_adapter_uses_fid_and_both_platform_collapse_ids():
     assert not hasattr(built, "token")
     assert adapter.delivery_routes == (
         ("poc16.mobile", "production", "firebase-project"),)
+
+
+def test_largest_local_payload_fits_fcm_data_and_one_more_byte_is_invalid():
+    module = FakeMessaging()
+    adapter = FirebaseAdminFcm(
+        {("poc16.mobile", "production"): _firebase_app()},
+        messaging_module=module)
+    exact = PushRequest(
+        "poc16.mobile", "production", "apple", "target-token",
+        b"x" * MAX_PAYLOAD_BYTES, "d" * 64, 60_000, 60, "message")
+
+    adapter.send(exact)
+
+    built, _app = module.sent[0]
+    encoded_data = json.dumps(
+        built.data, separators=(",", ":"), sort_keys=True).encode()
+    assert len(encoded_data) < 4_096
+    with pytest.raises(ValueError, match="push request"):
+        PushRequest(
+            "poc16.mobile", "production", "apple", "target-token",
+            b"x" * (MAX_PAYLOAD_BYTES + 1), "d" * 64,
+            60_000, 60, "message")
 
 
 def test_firebase_adapter_rejects_an_unconfigured_application_before_send():

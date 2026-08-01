@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "poc16-notification-fcm-placeholder",
+  "main": "fcm_bridge/worker.js",
+  "compatibility_date": "2026-07-31",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "version_metadata": {"binding": "CF_VERSION_METADATA"},
+  "vars": {
+    "POC16_DEPLOYMENT_OWNER": "replace-with-deployment-owner",
+    "POC16_DEPLOYMENT_IDENTITY": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_SOFTWARE_DIGEST": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_RELEASE_ID": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_CLOUDFLARE_ACCOUNT_ID": "00000000000000000000000000000000",
+    "POC16_DEPLOYMENT_ROLE": "notification-fcm-boundary",
+    "NOTIFICATIONS_ENABLED": "0",
+    "NOTIFICATION_TEST_MODE": "0",
+    "FCM_APPLICATION": "replace.application",
+    "FCM_ENVIRONMENT": "replace-environment",
+    "FCM_PROJECT_ID": "replace-project"
+  },
+  "observability": {"enabled": true, "head_sampling_rate": 0.01}
+}

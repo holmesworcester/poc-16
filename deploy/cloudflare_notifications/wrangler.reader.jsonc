@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "poc16-notification-reader-placeholder",
+  "main": "build/reader/entry.py",
+  "base_dir": "build/reader",
+  "compatibility_date": "2026-07-31",
+  "compatibility_flags": ["python_workers"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [],
+  "r2_buckets": [
+    {
+      "binding": "CANONICAL",
+      "bucket_name": "replace-canonical",
+      "preview_bucket_name": "replace-canonical",
+      "remote": false
+    }
+  ],
+  "vars": {
+    "POC16_DEPLOYMENT_OWNER": "replace-with-deployment-owner",
+    "POC16_DEPLOYMENT_IDENTITY": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_SOFTWARE_DIGEST": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_RELEASE_ID": "0000000000000000000000000000000000000000000000000000000000000000",
+    "POC16_CLOUDFLARE_ACCOUNT_ID": "00000000000000000000000000000000",
+    "POC16_DEPLOYMENT_ROLE": "notification-canonical-reader",
+    "NOTIFICATIONS_ENABLED": "0",
+    "NOTIFICATION_TEST_MODE": "0",
+    "WORKSPACE": "0000000000000000000000000000000000000000000000000000000000000000",
+    "CANONICAL_PREFIX": "workspaces/0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "python_modules": {"excludes": ["**/*.pyc", "**/__pycache__"]},
+  "build": {
+    "command": "python manage.py stage",
+    "cwd": ".",
+    "watch_dir": ["../../core", "../../adapters/r2", "."]
+  },
+  "observability": {"enabled": true, "head_sampling_rate": 0.01}
+}
