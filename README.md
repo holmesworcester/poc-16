@@ -431,6 +431,13 @@ coverage with:
 python3 -m pytest -q tests/test_notification*.py tests/test_*notifications*.py
 ```
 
+Cloudflare notification deployment requires Python 3.13 or newer, `uv`, and
+Node.js with `npx`. Run `uv sync --group dev` in
+`deploy/cloudflare_notifications` once; the lock selects
+workers-py/pywrangler 1.16.0, while the control tool invokes the pinned
+`wrangler@4.118.0` through `npx --yes` (which therefore needs that package in
+its cache or registry access).
+
 For Cloudflare, set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
 `CF_WORKSPACE`, `CF_DEPLOYMENT_OWNER`, `CF_CANONICAL_BUCKET`,
 `CF_NOTIFICATION_STATE_BUCKET`, `CF_FIREBASE_APPLICATION`,
@@ -440,7 +447,7 @@ For Cloudflare, set `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`,
 same exact project in `CF_FIREBASE_TEST_PROJECT_ID`; the service-account JSON
 must carry that bound project ID. The control token needs Worker and Queue
 permissions plus Workers R2 Storage Write, which Cloudflare currently requires
-even to read bucket lifecycle rules. First creation is explicit:
+even to read bucket lifecycle rules.
 
 Every staging command holds one fail-fast lock for this worktree from config
 generation through the last provider call. Wrangler and its `stage-locked`
@@ -448,7 +455,7 @@ build descendant inherit that ownership, so another process cannot mix fixed
 config, bundle, secret, or manifest paths; an orphan provider child keeps the
 lock until it exits, while a crashed process with no child releases it without
 trusting or deleting the stale lock file. Use another worktree for a concurrent
-release.
+release. First creation is explicit:
 
 ```sh
 export CF_CREATE=1
