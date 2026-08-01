@@ -437,11 +437,15 @@ outbox or pending-item database.
 Bootstrap is an explicit cursor transition. `current` starts after the present
 FactTree; `backfill` starts at the empty tree. An absent cursor during normal
 scanning is an operational fault, not an instruction to choose one. Workspace,
-immutable deployment owner, bootstrap mode, and a fresh bootstrap generation
-are persisted so state loss or deployment rebinding fails closed. The
-generation is included in pending bytes: a worker paused before state loss
-cannot complete byte-identical work recreated after recovery under newer
-current authority.
+stable semantic delivery owner, bootstrap mode, and a fresh bootstrap
+generation are persisted so state loss or authority rebinding fails closed.
+The owner binds repository and state namespaces plus a delivery-domain ID over
+the push-node key and sorted application/environment/Firebase-project routes.
+It deliberately excludes Queue/SQS identity, credentials, and deployed code
+versions, so equivalent carrier failover, credential rotation, and software
+rollout are not cursor migrations. The generation is included in pending
+bytes: a worker paused before state loss cannot complete byte-identical work
+recreated after recovery under newer current authority.
 
 The carrier is an opaque wake carrier only. On delivery,
 `NotificationWorker` resolves and hash-verifies the historical event root,
@@ -464,9 +468,11 @@ delivery Lambda. Cloudflare uses segregated Workers, R2 notification state,
 and Cloudflare Queues. FullPeer may compose the same scanner and worker with a
 filesystem state store and an in-process wake. These deployments are outside
 core and remain disabled until real iOS and Android launch tests pass. Queue
-and DLQ retention are finite operational headroom; notification cursor,
-pending body, and historical root state must be non-expiring because they are
-the durable eventual-delivery record.
+and DLQ retention are finite operational headroom. The notification cursor,
+pending body, copied historical root, and every immutable canonical FactTree
+page and fact reachable from a retained root must remain non-expiring and
+synchronously readable; asynchronous archive restore is outside the
+at-least-once contract.
 
 ## 6. RepositoryReader and sync
 
