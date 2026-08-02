@@ -1,8 +1,29 @@
 # POC-16 engineer guide
 
-Read `README.md` for operation and `DESIGN.md` for protocol and trust
-boundaries. Those files and this guide are the repository's only Markdown
+Read `README.md` for current operation and `DESIGN.md` for the accepted target
+protocol and trust boundaries. `poc-16-iq2` tracks the transition from the
+running workspace-wide content root to per-device writer logs and a shared
+head directory; `poc-16-iq2.9` is the one-way cutover gate. Do not deepen the
+predecessor's global-root assumptions or claim that target behavior is already
+deployed. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
+
+The target `AuthorityGate` is actor-neutral: hosted and full peers run the same
+implementation. Every semantic evaluation starts from exactly one canonical
+closed pile. Pull evaluates a complete writer-tree leaf and may retain its
+durable facts; push evaluates the same wire value only to check conditions in
+fresh in-memory or temporary SQLite, then discards the pile judgment and every
+derived row. A pushed pile never enters recipient fact space. Local persistent
+SQL, Python fact objects, provider identity, and Iroh identity may not shortcut
+this boundary. Provider storage bindings, process scheduling, and optional
+content consumption are the only hosted/full-peer composition differences;
+pile bytes, evaluator, gate, temporary schema, family queries, and typed result
+must remain identical.
+
+Target writer trees reuse the canonical bounded persistent Merkle-map style.
+Each logical leaf names exactly one independently closed pile, and range or
+diff pagination stops only between leaves. A cold receiver must validate every
+returned leaf without an adjacent leaf or prior cache state.
 
 Start a work session with:
 
@@ -12,7 +33,13 @@ bd ready
 git status --short
 ```
 
-## Capabilities
+## Current transition capabilities
+
+The predecessor below still pushes ordinary piles into recipient storage. That
+behavior is not target push semantics and must disappear at `poc-16-iq2.9`:
+writers publish closed-pile leaves to their own trees, consumers pull them, and
+only discarded condition evaluations are pushed. Do not preserve the current
+PileSender-to-Applier route as a second target publication algorithm.
 
 Authority flows from the database-free core into an optional stateful peer
 composition:
@@ -140,11 +167,17 @@ scopes may still make it unusable as a provider.
 
 ## Object-store and concurrency rules
 
-The storage contract is immutable content-addressed objects plus one
-linearizable opaque-token CAS register named `root`. Exact untrusted reads use
-bounded APIs. Discovery uses bounded pagination. Never rely on ETags being
-content hashes, unconditional replacement, whole-GET/whole-LIST fallbacks, or
-LIST for safety.
+The running predecessor uses immutable content-addressed objects plus one
+linearizable opaque-token CAS register named `root`. The accepted target keeps
+immutable objects but replaces ordinary content publication with one stable
+CAS head per device and bounded strong LIST of the workspace head prefix; only
+the small authority/removal projection remains shared. In both designs, exact
+untrusted reads are bounded and provider ETags are opaque. LIST discovers
+candidate heads in the target but never grants membership, authorship,
+liveness, or fact validity. Every peer mirrors only missing content-addressed
+head/tree objects. The target `AuthorityGate` evaluates one pushed closed pile
+to prove requester and recipient membership, device join, and non-removal; it
+discards that state and does not validate the advertised content tree.
 
 One exact create-only ingress key and its digest identify one delivery attempt.
 It is staging, not a server-side queue or repository authority. Provider

@@ -1,5 +1,12 @@
 # tiny p2p, POC-16
 
+> **Architecture transition:** [`DESIGN.md`](DESIGN.md) now specifies the
+> accepted per-device writer-log and shared head-directory target tracked by
+> `poc-16-iq2`. The running code and operational instructions below still
+> describe the predecessor workspace-wide content root until
+> `poc-16-iq2.9` completes its one-way cutover. Do not read target-design
+> statements as current deployment claims.
+
 POC-16 is a fact-DAG repository with one storage format and one receiving
 algorithm across a full peer, AWS Lambda, and a Cloudflare Worker. A hosted
 recipient needs an object store but no database. SQLite exists only as a
@@ -50,8 +57,10 @@ processes or stacks without creating another repository state machine.
     authenticated notification state, durable post-publication discovery,
     current-authority derivation, and provider delivery.
 
-[DESIGN.md](DESIGN.md) gives the data model, invariants, and failure
-semantics. [AGENTS.md](AGENTS.md) contains repository ratchets.
+[DESIGN.md](DESIGN.md) gives the accepted target data model, invariants,
+failure semantics, and migration boundary. [AGENTS.md](AGENTS.md) contains
+repository ratchets. This README remains the running-operation authority until
+the target cutover closes.
 
 ## Local use
 
