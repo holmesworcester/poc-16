@@ -25,12 +25,14 @@ membership and administration rather than by every message or file.
 The design must provide:
 
 - the same fact bytes, closed-pile judgment, and suppression rules everywhere;
-- cloud gates and readers with no persistent database or durable projection;
+- one closed pile as the input to every semantic evaluation, whether pushed or
+  pulled;
+- hosted gates and readers with no persistent database or durable projection;
 - direct object-store upload of large immutable data;
 - independently writable device logs, with no cross-device content CAS;
 - deterministic convergence from mixed but individually valid log views;
-- one implementation of validation and reconciliation shared by hosted and
-  full peers;
+- maximal isomorphism between hosted and full peers: one pile codec, evaluator,
+  authority gate, mirror, consumer, and condition-query implementation;
 - bounded operations under Lambda and Cloudflare Worker limits;
 - no destructive action in the publication path.
 
@@ -45,20 +47,23 @@ It is a bounded way to discover signed candidate heads.
 
 ## 2. Authority and data flow
 
-There are five logical capabilities:
+There are six logical capabilities:
 
 ```text
 LogWriter
     local intent -> bounded closed piles -> immutable per-device Merkle log
 
-CloudGate
-    membership + non-removal proof -> writer-confined head-slot CAS
+ClosedPileEvaluator
+    canonical closed-pile bytes -> bounded kernel/family judgment
+
+AuthorityGate
+    pushed pile judgment -> ephemeral conditions -> exact bounded action
 
 RepositoryMirror
     listed head pointers -> missing content-addressed writer-tree objects
 
 FactConsumer
-    mirrored closed piles -> ordinary kernel -> local validated union
+    pulled pile judgment -> local validated union
 
 HttpGate
     peer HTTP request -> authorized object, head, authority, or mirror operation
@@ -68,27 +73,37 @@ HttpGate
 authorship and presentation. It uploads immutable objects directly to its
 registered store. It does not need a cloud process to rebuild its tree.
 
-`CloudGate` has no persistent database. For one request it projects the supplied
-authority facts and removal paths into a fresh in-memory or temporary SQLite
-transaction and asks the ordinary fact queries whether the requester and the
-recipient node are currently eligible. Its only configured protocol identity
-input is the recipient node's root public key. A successful requester proof
-binds the exact proposed head OID. The gate confines the update to that device's
-stable slot and performs its CAS. It trusts the writer to maintain the writer
-tree: it does not validate the head, log shape, content piles, sequence,
-predecessor, or closure, and it never compiles a workspace content root.
+`ClosedPileEvaluator` is the one semantic input door. Hosted and full peers
+invoke the same canonical decoder, bounded kernel, and family dispatch for
+every pushed or pulled pile. No actor may accept loose facts, caller-projected
+rows, or a claimed validation result.
 
-`RepositoryMirror` is database-free and runs on every peer, including the
-cloud peer. It lists directory slots, learns their head OIDs, and mirrors only
+`AuthorityGate` runs unchanged in a hosted peer, a full peer, or an in-process
+local call. For one pushed closed pile it evaluates that pile, projects its
+valid judgment and authenticated removal paths into a fresh in-memory or
+temporary SQLite transaction, and asks ordinary fact queries whether the
+requester and recipient node satisfy the requested conditions. Its only
+configured protocol-identity input is the recipient node's root public key. A
+successful request binds the exact proposed head OID. The gate may then perform
+only that exact bounded operation, such as replacing the requester's device
+slot or returning a confined removal path. It discards the pile judgment and
+SQL state and never admits the pushed facts to the recipient's content state.
+It trusts the writer to maintain the writer tree: it does not validate the
+head, log shape, content piles, sequence, predecessor, or closure, and it never
+compiles a workspace content root.
+
+`RepositoryMirror` is database-free and runs on every peer, including hosted
+peers. It lists directory slots, learns their head OIDs, and mirrors only
 content-addressed head and writer-tree objects absent from its local store. It
 may enforce byte, request, hash, and storage-integrity bounds while copying;
 that is not semantic fact or log admission.
 
 `FactConsumer` runs wherever mirrored content is used as workspace state. It
-validates every new closed pile through the ordinary kernel before projecting
-facts. A full peer always consumes this way and may project the validated union
-into disposable SQLite. A cloud peer that only mirrors, gates, and serves data
-does not consume the content and therefore does not validate it.
+pulls complete closed-pile leaves and invokes the same `ClosedPileEvaluator`
+before joining their durable facts to the local validated union. A full peer
+always consumes this way and may project the validated union into disposable
+SQLite. A hosted peer that only mirrors, gates, and serves data does not consume
+the content and therefore does not validate it.
 
 `HttpGate` owns the common HTTP operations and grant checks. AWS Lambda,
 Cloudflare Workers, a plain HTTP peer, and a peer reached through Iroh invoke
@@ -114,12 +129,59 @@ durability, immutable refs and offers, suppression selectors and actions,
 liveness scopes, commands, and query assembly. Core dispatches through the
 checked family registry and contains no fact-type switch.
 
-### 3.1 A log stores independently valid wire units
+### 3.1 One evaluator, two retention modes
 
-A writer log is an authenticated ordered map from a writer-local publication
-sequence to an immutable closed-pile object or a verified slice of a pile pack.
-Every pile is independently bounded, topologically ordered, and workspace
-bound. Dependencies precede dependents.
+At the semantic protocol boundary, nodes communicate only canonical closed
+piles. They never send or accept a loose fact list, selected dependency edges,
+SQL rows, a materialized view, or a claim that some predicate already passed.
+Heads, Merkle pages, pack indexes, and authenticated removal paths are bounded
+retrieval or index evidence; they cannot introduce fact state except through a
+successful closed-pile judgment.
+
+The same evaluator has exactly two uses:
+
+```text
+pull closed pile
+    -> canonical decode + bounded kernel/family judgment
+    -> join durable facts to the receiver's validated fact space
+
+push closed pile
+    -> the same canonical decode + bounded kernel/family judgment
+    -> project only that judgment into fresh temporary state
+    -> check the exact requested conditions
+    -> discard the judgment, facts, and temporary state
+```
+
+Pull is replication. Push is not. A pushed pile may authorize only the exact
+operation bound by its request fact, such as a writer-confined head CAS, grant,
+or self-confined removal-path response. It never enters a recipient log or
+validated fact space and can never become a second publication route.
+
+This distinction is about retention, not validation. Hosted peers, full peers,
+plain HTTP, HTTP over Iroh, and local in-process calls all feed identical
+canonical bytes to `ClosedPileEvaluator`. An in-process caller may not bypass
+the codec with Python objects or consult the full peer's existing SQL rows.
+
+### 3.2 A writer tree stores independently closed leaves
+
+A writer log is physically the same canonical, history-independent, bounded
+persistent Merkle-map style used by the other authenticated trees. It is an
+ordered map from a fixed writer-local publication key to an immutable closed-
+pile OID. This reuses one page codec, branch geometry, path-copy update, range
+walk, and two-root diff; there is no bespoke append-log tree engine.
+
+Each logical leaf is exactly one independently bounded, topologically ordered,
+workspace-bound closed pile. Physical Merkle pages may batch several leaf
+descriptors, and an object-store pack may co-locate several pile bodies, but
+neither packing layer changes the logical leaf or permits a range to cut
+through a pile. The union referenced by a physical leaf page is therefore also
+closed. Dependencies precede dependents inside every logical leaf.
+
+A half-open key range or Merkle diff therefore returns zero or more complete
+closed-pile leaves. A cold receiver can evaluate every returned leaf alone:
+closure may not depend on a neighboring leaf, an earlier range, or receiver
+cache state. When the same dependency is needed by several leaves, its
+canonical fact bytes are repeated and meet idempotently after validation.
 
 The intended split is:
 
@@ -133,24 +195,26 @@ That is expected. Duplicate canonical `fid` values meet idempotently. The log
 writer is not presumed to be the author of every fact in a relayed closure;
 ordinary fact signatures and family policy retain that distinction.
 
-For each incoming pile the kernel:
+For every pushed or pulled pile the shared evaluator:
 
 1. proves canonical identity and workspace binding;
 2. resolves exact refs and family-declared Needs from the supplied closure;
 3. invokes family shape and policy checks;
 4. enforces fact, dependency, depth, byte, and closure bounds;
-5. admits every durable fact only if the entire pile succeeds.
+5. returns a valid judgment only if the entire pile succeeds.
 
-An already validated resident may make replay cheaper, but correctness and
-cold reconstruction cannot require it: every published log unit carries the
-closure a fresh receiver needs. Local-only authority anchors are confined to
-the separate authority gate and never silently complete an ordinary content
-pile.
+An already validated resident may make pull deduplication cheaper after
+judgment, but correctness and cold reconstruction cannot require it: every
+published log leaf and every pushed proof pile carries the fact closure a fresh
+receiver needs. The recipient root public key and verifier-pinned authenticated
+roots are explicit verification context; neither they nor local SQL may
+silently complete a `Need` absent from the pile.
 
 The selected dependency edges are ephemeral judgment values. They are not
-stored as proof DAGs, ranks, winners, or admission witnesses. An invalid pile
-admits nothing from that pile; because later log entries are independently
-closed, it need not poison an unrelated later pile.
+stored as proof DAGs, ranks, winners, or admission witnesses. An invalid pull
+leaf admits nothing from that leaf, and an invalid push authorizes nothing.
+Because every later leaf is independently closed, one invalid leaf cannot
+poison an unrelated later leaf or range.
 
 Once a peer validates a fact, its local validated set is monotone:
 
@@ -175,8 +239,8 @@ A writer update proceeds in this order:
    registered store;
 3. construct the new cumulative writer-log root;
 4. construct and sign one immutable successor head record;
-5. prove current membership and non-removal to `CloudGate`, binding that proof
-   to the proposed head OID;
+5. push one closed authority pile to `AuthorityGate`, binding its signed request
+   fact to the proposed head OID;
 6. conditionally replace only this device's stable head slot.
 
 The log root is content addressed. It is not the provider ETag, and no code may
@@ -188,6 +252,12 @@ preceding immutable head record, making rollback and forks visible. A provider
 directory cannot force a user-controlled bucket to retain data forever; cloud
 storage availability is therefore distinct from fact validity. Replication to
 other peers supplies independent durability.
+
+When a consumer accepts a successor head, it verifies that the new tree is a
+monotone extension of the predecessor: every old logical key still names the
+same pile OID, every added key follows the fixed writer-local order, and no leaf
+was changed or removed. The range diff supplies exactly the new complete
+closed-pile leaves. `AuthorityGate` deliberately does not perform this check.
 
 Writers may pack many small pile or Bao-slice objects into one immutable object
 with a compact range index. A pack index is only a locator. Each extracted pile,
@@ -225,11 +295,11 @@ The stable slot makes listing compact: one entry per enrolled device rather
 than one entry per update. Its body is content hashed independently; its
 provider version token is used only to conditionally replace that exact slot.
 
-`CloudGate` accepts an exact slot update only when:
+`AuthorityGate` accepts an exact slot update only when:
 
-- the submitted proof authenticates the workspace device as a member and not
-  removed at the authority root the gate itself pins;
-- the proof binds the exact proposed head OID;
+- the submitted closed pile authenticates the workspace device as a member and
+  not removed at the authority root the gate itself pins;
+- the pile's signed request fact binds the exact proposed head OID;
 - the deterministic slot belongs to that same workspace device;
 - the request and slot body fit fixed mechanical bounds;
 - the per-device conditional replace succeeds.
@@ -239,9 +309,9 @@ root it used beside the head OID. It does not fetch or interpret the head or
 writer tree, verify its signature or predecessor, or establish that its objects
 exist. Those are writer responsibility until another peer consumes the log.
 
-A consuming peer, not the cloud gate, verifies the head object's content hash,
+A consuming peer, not `AuthorityGate`, verifies the head object's content hash,
 device signature, workspace, owner, store binding, sequence, predecessor chain,
-and named log root before validating every closed pile it has not already
+and named log root before evaluating every closed-pile leaf it has not already
 validated.
 
 An unknown CAS result is reconciled by rereading the stable slot. An exact
@@ -263,7 +333,7 @@ concurrent updates for one device contend on one slot.
 If users keep content in physically separate buckets, the provider-operated
 directory bucket holds only these small slot records. Each writer head points
 through a registered store binding to the user's content bucket. Every peer,
-including the cloud peer, mirrors the per-writer trees it learns through this
+including each hosted peer, mirrors the per-writer trees it learns through this
 directory; no peer combines them beneath another content root.
 
 ### 6.1 LIST discovers candidates; it grants nothing
@@ -280,11 +350,11 @@ A workspace mirror turn is:
 3. compare each listed opaque slot token with the locally observed token;
 4. conditionally read only a new or changed tiny slot to learn its head OID;
 5. if that immutable head OID is already local, perform no head fetch;
-6. otherwise mirror the missing content-addressed head, Merkle pages, and pile
-   objects from that writer tree;
-7. stop there on a cloud peer;
-8. on a consuming peer, validate the head and every previously unvalidated
-   closed pile, then union its durable facts.
+6. otherwise mirror the missing content-addressed head, Merkle pages, and
+   complete logical pile leaves from that writer tree;
+7. stop there on a non-consuming hosted peer;
+8. on a consuming peer, evaluate the head and every previously unvalidated
+   closed-pile leaf through the shared consumer, then union its durable facts.
 
 A head learned through P2P and already present locally is not fetched again
 merely because this provider directory slot was first observed later. The
@@ -301,10 +371,10 @@ We do not assume that a multi-page LIST plus subsequent GETs is one global
 snapshot. A head can advance during pagination. A conditional GET either pins
 the exact listed version or fails and causes that one key to be reconsidered.
 
-Mixing head versions cannot create a torn object or authorize a fact. The cloud
-peer merely mirrors opaque content-addressed objects. A consuming peer admits
-only piles it has independently validated, so a mixed observation can only
-delay valid additions. Periodic full scans plus fair retry converge.
+Mixing head versions cannot create a torn object or authorize a fact. A
+non-consuming peer merely mirrors opaque content-addressed objects. A consumer
+admits only piles it has independently validated, so a mixed observation can
+only delay valid additions. Periodic full scans plus fair retry converge.
 
 Initial discovery costs roughly one LIST request per 1,000 device writers plus
 one small slot read per writer. A warm peer still lists the directory but reads
@@ -320,26 +390,31 @@ facts projected into a small authenticated authority/removal root.
 
 ### 7.1 One request-local proof transaction
 
-An authorization request carries a bounded set of canonical facts and exact
-authenticated removal paths. The verifier creates a fresh SQLite database in
-memory or provider-local temporary storage, decodes those facts through the
-ordinary family serializers, projects them with the ordinary fact handlers,
-queries the projected state inside that isolated authorization transaction,
-and discards the database.
+An authorization request pushes exactly one bounded canonical closed pile. The
+pile contains the signed request fact, every authority fact and dependency
+needed to judge it, and the exact bounded removal-path evidence named by those
+facts. There is no parallel fact-array, SQL-row, bearer-claim, or precomputed
+verdict argument.
 
-Before projection, core mechanically verifies canonical fact identities,
-signatures, workspace bindings, and each removal path against the authority
-root currently pinned by the recipient. SQLite therefore receives authenticated
-proof inputs rather than caller-invented `CLEAR` rows. This proof verification
-is the cloud's authority job; it still never traverses the advertised content
-log.
+`AuthorityGate` first invokes the ordinary `ClosedPileEvaluator`. Core verifies
+canonical fact identities, signatures, workspace bindings, and each named
+removal path against the authority root currently pinned by the recipient. The
+gate then creates a fresh SQLite database in memory or provider-local temporary
+storage, projects only the valid pile judgment through ordinary family
+handlers, queries the projected state inside that isolated authorization
+transaction, and discards the database and judgment.
+
+SQLite therefore receives authenticated facts from one valid closed pile
+rather than caller-invented `CLEAR` rows. This authority-proof evaluation is
+the gate's job; it still never traverses the advertised content log. A rejected
+pile authorizes no condition query or external effect.
 
 No prior request rows, persistent SQL, provider account, API token, cache, or
 ambient Iroh identity enter the verdict. The only locally configured protocol
 identity supplied to the transaction is the recipient node's root public key.
 The workspace, requester, owner, requester device, operation, object or head
-OID, and proof root are all bound by the submitted canonical facts and signed
-request.
+OID, and proof root are all bound by the pile's signed request fact and its
+closed dependencies.
 
 For ordinary publication or content access the resulting state must prove:
 
@@ -361,24 +436,26 @@ target verifier even if the first single-node implementation lands them as a
 separate follow-up. A deployment cannot claim multi-node readiness without
 them.
 
-This transaction validates authority proof facts only. It does not open or
-validate the writer's advertised head, Merkle tree, content piles, or facts.
-The cloud mirror trusts each writer to maintain those objects; every consuming
-peer validates them before use.
+This pushed evaluation checks authority conditions only. Its facts and derived
+rows are always thrown away after the exact answer or bounded action. It does
+not open or validate the writer's advertised head, Merkle tree, content piles,
+or facts. A hosted mirror trusts each writer to maintain those objects; every
+consuming peer validates pulled pile leaves before use.
 
 ### 7.2 Self-confined removal-path recovery
 
 A client cannot prove current non-removal without a path from the current
 removal root, but a removed client must still be able to learn that it was
-removed. A second, strictly weaker operation therefore asks only:
+removed. A second, strictly weaker pushed closed pile therefore asks only:
 
 ```text
 was this signed requester device once admitted under this workspace member?
 ```
 
-If so, the service may return the current authenticated removal paths for that
-same member and requester device. It does not return another member's path, a
-workspace-wide removal dump, a content-read grant, a head-write grant, or any
+If so, the service may return the current authenticated removal-path objects
+for that same member and requester device. The client encloses that evidence in
+its next closed proof pile. The service does not return another member's path,
+a workspace-wide removal dump, a content-read grant, a head-write grant, or any
 other authority. Historical membership is therefore a discovery capability
 for the caller's own current status, not continuing workspace access.
 
@@ -389,17 +466,19 @@ fail.
 
 ### 7.3 Cached proof retry
 
-Clients retain their last successful authority fact bundle and removal paths.
-They submit that proof directly on later operations. The gate pins the current
-authority/removal root and accepts the cached proof while it is current and all
-required member and device states remain clear.
+Clients retain the last successful canonical closed proof pile, including its
+removal-path evidence. They push those exact bytes again on later operations.
+The gate pins the current authority/removal root and accepts the cached pile
+while its evidence is current and all required member and device states remain
+clear.
 
 If the proof is stale or lacks a current path, the gate returns a typed
 `proof_refresh_required` result without performing the requested operation.
-The client invokes the historical-membership endpoint, replaces only its own
-removal paths, and retries. If the refreshed paths show removal or self-leave,
-the retry receives a permanent authority denial. No proactive proof push,
-polling queue, or persisted gate session is required.
+The client invokes the historical-membership endpoint, rebuilds one closed
+proof pile with only its refreshed removal paths, and retries. If the refreshed
+paths show removal or self-leave, the retry receives a permanent authority
+denial. No proactive proof distribution, polling queue, or persisted gate
+session is required.
 
 This intentionally favors the simplest correct cache rule: an older removal
 root may be rejected even when an unrelated member changed. A more selective
@@ -454,36 +533,43 @@ which peer relayed a closure cannot change the result.
 A consuming stateful peer projects the combined validated union and generic
 indexes into SQLite for queries. A consuming database-free peer can point-query
 authenticated per-writer indexes or validate streamed pile deltas without
-creating a hidden database. The cloud peer mirrors the same writer trees but
-does not run this content projection; its gate needs only the separate
-authority/removal proof.
+creating a hidden database. A non-consuming hosted peer mirrors the same writer
+trees but does not run this content projection; its gate needs only the separate
+pushed closed authority pile.
 
 ## 9. Sync and range behavior
 
 The unit of workspace discovery is a device head. The unit of incremental sync
-is the Merkle difference between two roots of that device's log. The unit of
-semantic admission remains one closed pile.
+is the Merkle difference between two roots of that device's tree. The unit of
+transfer and semantic judgment is one complete closed-pile leaf.
 
 ```text
 LIST workspace head slots
     -> unchanged slot token: no slot read
     -> changed slot token: read head oid
     -> known head oid: no immutable fetch
-    -> unknown head oid: mirror missing head/tree/pile objects
-    -> cloud peer stops
-    -> consuming peer validates every new closed pile
+    -> unknown head oid: range-diff and mirror missing pages/full pile leaves
+    -> non-consuming peer stops
+    -> consuming peer evaluates every new closed-pile leaf
     -> durable facts join that peer's local validated set
 ```
 
 The first sync visits all registered writer slots. Later sync cost is the fixed
-directory scan plus unknown head OIDs and missing log ranges, not the entire
+directory scan plus unknown head OIDs and missing tree ranges, not the entire
 workspace fact corpus. Every peer retains mirrored head OIDs and Merkle objects
 in its ordinary object store. A full peer may retain traversal frontiers outside
 SQL so deleting the presentation database does not destroy sync correctness.
 
+Range pagination stops only between logical pile leaves. Every page is thus a
+bounded sequence of independently closed evaluations; no receiver must widen a
+range, chase a dependency into an adjacent leaf, or retain the preceding page
+to make the next page valid. Tree fingerprints and OIDs prune identical ranges;
+they never stand in for evaluating the returned pile bytes.
+
 Facts with large payloads, Bao slices, key wraps, and history-key material may
 be co-packed for S3/R2. P2P peers may transfer the same individual verified
-objects. Both paths expose identical canonical facts and proofs to the kernel.
+objects. Both paths recover identical canonical closed-pile bytes for the same
+logical leaves and feed them to the same evaluator.
 
 ## 10. Object-store contract
 
@@ -506,10 +592,11 @@ applied, noop, stale/retryable, permanent rejection, and unknown-result
 reconciliation.
 
 Bulk objects are uploaded directly under writer-confined grants. The small
-head-slot operation passes through `CloudGate`; the gate validates only the
-ephemeral requester/recipient membership and non-removal proof bound to the
-exact head OID, confines the slot, and performs CAS. It is not a content
-validator, proxy, or tree builder.
+head-slot operation passes through `AuthorityGate`; the gate evaluates one
+pushed closed pile, checks only the ephemeral requester/recipient membership
+and non-removal conditions bound to the exact head OID, confines the slot, and
+performs CAS. It is not a content validator, proxy, or tree builder, and the
+pushed pile never enters repository state.
 
 ## 11. Concurrency and failures
 
@@ -526,12 +613,12 @@ For two requests targeting the same device head:
 4. readers see either complete head, never partial bytes.
 
 A crash before head CAS leaves unreachable immutable objects. A crash after an
-ambiguous CAS is reconciled by exact reread. The cloud may publish a malformed
-head from a currently authorized writer because it deliberately trusts writers
-to maintain their trees. Bounded mirroring and per-device isolation ensure that
-such a tree can make only that writer's content unusable; a consuming peer
-rejects it, and it cannot wedge another slot, delete another writer's data, or
-corrupt the authority root.
+ambiguous CAS is reconciled by exact reread. `AuthorityGate` may publish a
+malformed head from a currently authorized writer because it deliberately
+trusts writers to maintain their trees. Bounded mirroring and per-device
+isolation ensure that such a tree can make only that writer's content unusable;
+a consuming peer rejects it, and it cannot wedge another slot, delete another
+writer's data, or corrupt the authority root.
 
 The concurrency proof and deterministic tests must cover:
 
@@ -567,8 +654,9 @@ mechanism is part of the initial correctness boundary.
 
 ## 13. FullPeer, SQL, HTTP, and Iroh
 
-Every peer composes the same core directory and mirroring behavior. `FullPeer`
-adds content consumption and local state:
+Every peer composes the same `ClosedPileEvaluator`, `AuthorityGate`, directory
+mirror, object codecs, and condition queries. `FullPeer` enables content
+consumption and adds local state:
 
 - device keys and registered store bindings;
 - log construction and resumable object upload;
@@ -578,13 +666,30 @@ adds content consumption and local state:
 - attachment presentation and local control;
 - Iroh connection lifecycle.
 
-It must not implement a second head codec, directory mirror, pile validator,
-authority rule, or Merkle reconciliation algorithm. The cloud peer and full
-peer store and exchange the same head and tree objects; the difference is only
-that FullPeer consumes mirrored piles through the kernel and projects them for
-the client. Deleting SQLite changes no writer log, head, authority root, or
+It must not implement a second head codec, directory mirror, pile evaluator,
+authority gate, condition query, or Merkle reconciliation algorithm. A hosted
+peer and full peer store and exchange the same head, tree, and closed-pile
+objects. A hosted deployment may choose not to enable `FactConsumer`; that is
+the absence of a capability, not an alternate content-validation path.
+Deleting FullPeer SQLite changes no writer tree, head, authority root, or
 validated answer. Rebuild hydrates each fact into the form current for its
 surrounding context before storing the current serialized SQL form.
+
+### 13.1 Hosted and local turns are isomorphic
+
+| Turn | Hosted peer | Full peer | Shared authority |
+|---|---|---|---|
+| pushed condition check | canonical pile bytes enter `AuthorityGate` | the same bytes enter the same gate, even in process | `ClosedPileEvaluator` + fresh proof SQLite + family queries |
+| pulled content | mirror full pile leaves; optionally stop | mirror the same leaves, then consume | `RepositoryMirror` + `ClosedPileEvaluator` + `FactConsumer` |
+| pushed state afterward | none | none | pushed facts and rows are discarded |
+| pulled state afterward | retained only if consumer is enabled | validated fact union plus rebuildable client projection | the same consumer judgment |
+
+Provider bindings, process scheduling, and local presentation are effects at
+the outside edge. They may change how canonical pile bytes arrive or where
+immutable objects live, never the evaluated value, family handlers, SQL schema,
+condition query, or typed result. Tests must run the same fixtures through an
+in-process full peer, plain HTTP, HTTP over Iroh, packaged Lambda, and workerd
+and require byte-identical judgments and typed decisions.
 
 Iroh remains connection-only:
 
@@ -599,7 +704,7 @@ workspace, bucket, head, or fact authority.
 
 Notification delivery remains durable operational work outside fact
 publication. The scanner is a content consumer: it validates triggering piles
-and never relies on the cloud mirror having done so. It no longer advances one
+and never relies on `RepositoryMirror` having done so. It no longer advances one
 workspace `FactTree` cursor. It retains per-writer acknowledged head OIDs,
 lists the directory, and performs bounded diffs only for unknown writer heads.
 
@@ -628,16 +733,18 @@ The following assumptions do not survive:
 - one workspace-wide mutable content `root`;
 - a cloud `RepositoryApplier` rebuilding the shared workspace tree for every
   pile;
+- pushing ordinary content into a recipient's durable fact space; target push
+  is a discarded condition evaluation, while ordinary replication is pull;
 - one global `FactTree` cursor for sync or notifications;
 - cross-device root-CAS contention and its orphan-amplification work;
 - a deployment configured around one canonical content snapshot per workspace.
 
 The migration order is:
 
-1. freeze canonical writer-head, log, and directory fixtures;
-2. implement writer-local log construction and the authority projection;
+1. freeze canonical writer-head, closed-leaf tree, and directory fixtures;
+2. implement writer-local tree construction and the shared `AuthorityGate`;
 3. implement persistence-free multi-head mirroring, content consumption, and
-   request-local authority verification;
+   pushed closed-pile authority evaluation;
 4. implement FS, S3, and R2 directory adapters;
 5. move FullPeer and notifications to the shared multi-head core;
 6. run deterministic and live provider concurrency tests;
@@ -650,33 +757,42 @@ must end with only the writer-log/head path. `poc-16-iq2.9` is the cutover gate.
 
 ## 16. Core invariants
 
-1. Every semantic admission uses the same closed-pile kernel.
-2. Every peer mirrors the same independently rooted per-writer trees through
+1. Every semantic evaluation begins with exactly one canonical closed pile and
+   uses the same `ClosedPileEvaluator` and family handlers.
+2. A valid pulled pile may join durable facts to a consumer's validated space;
+   a pushed pile and every row derived from it are always discarded after
+   checking the exact bound conditions.
+3. Hosted and full peers use the same `AuthorityGate`, temporary SQL schema,
+   condition queries, mirror, and consumer; local SQL is never an authority
+   shortcut.
+4. Every logical writer-tree leaf is independently closed, and no range or
+   page boundary splits a pile or requires neighboring receiver state.
+5. Every peer mirrors the same independently rooted per-writer trees through
    the same core object protocol.
-3. Every ordinary content update mutates at most one device head slot.
-4. Different device writers share no mutable content key.
-5. Immutable objects exist before a writer advertises a head that names them.
-6. A provider version token is opaque and never a content hash.
-7. LIST output is candidate discovery, never authority.
-8. The cloud gate projects only request-local proof facts and proves requester
-   and recipient membership, device join, and non-removal bound to the exact
-   operation; it does not validate writer content.
-9. Every consuming peer validates head, tree, and closed-pile semantics before
+6. Every ordinary content update mutates at most one device head slot.
+7. Different device writers share no mutable content key.
+8. Immutable objects exist before a writer advertises a head that names them.
+9. A provider version token is opaque and never a content hash.
+10. LIST output is candidate discovery, never authority.
+11. `AuthorityGate` evaluates only one request-local closed pile and proves
+   requester and recipient membership, device join, and non-removal bound to
+   the exact operation; it does not validate writer content.
+12. Every consuming peer validates head, tree, and closed-pile semantics before
    using mirrored content as state.
-10. Mixed head observations may delay facts but cannot fabricate or invalidate
+13. Mixed head observations may delay facts but cannot fabricate or invalidate
     them.
-11. Removal governs current publication and access without rewriting validated
+14. Removal governs current publication and access without rewriting validated
     history.
-12. Request-local SQLite is discarded after one proof transaction; persistent
+15. Request-local SQLite is discarded after one proof transaction; persistent
     SQLite, caches, cursors, hints, queues, and Iroh identities are
     non-authoritative.
-13. Provider adapters add no semantic branch.
-14. FullPeer reuses the complete core mirror and consume paths.
-15. Every optional recency hint is repairable by a complete stable-head scan.
-16. No core publication path deletes ingress, heads, logs, or canonical
+16. Provider adapters add no semantic branch.
+17. FullPeer reuses the complete core gate, mirror, and consume paths.
+18. Every optional recency hint is repairable by a complete stable-head scan.
+19. No core publication path deletes ingress, heads, logs, or canonical
     objects.
-17. Historical membership exposes only the caller's own current removal paths
+20. Historical membership exposes only the caller's own current removal paths
     and never grants content or publication access.
-18. One device root secret plus invite-derived facts is the complete protocol
+21. One device root secret plus invite-derived facts is the complete protocol
     identity bootstrap for a node.
-19. After cutover, no workspace-global mutable content root remains.
+22. After cutover, no workspace-global mutable content root remains.

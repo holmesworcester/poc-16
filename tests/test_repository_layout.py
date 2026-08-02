@@ -112,6 +112,22 @@ def test_writer_log_target_is_not_claimed_as_running_before_cutover():
         in documents["AGENTS.md"]
 
 
+def test_target_has_one_closed_pile_evaluation_boundary():
+    design = (ROOT / "DESIGN.md").read_text()
+    guide = (ROOT / "AGENTS.md").read_text()
+    flat_design = re.sub(r"\s+", " ", design)
+
+    assert "CloudGate" not in design + guide
+    assert "ClosedPileEvaluator" in design
+    assert "AuthorityGate" in design and "AuthorityGate" in guide
+    assert "Pull is replication. Push is not." in design
+    assert "A pushed pile never enters" in design + guide
+    assert "Hosted and local turns are isomorphic" in design
+    assert "Every logical writer-tree leaf is independently closed" \
+        in flat_design
+    assert "no range or page boundary splits a pile" in flat_design
+
+
 def test_retired_authority_implementations_cannot_return():
     for relative in (
             "core/admission.py",

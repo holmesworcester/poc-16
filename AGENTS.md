@@ -8,11 +8,22 @@ predecessor's global-root assumptions or claim that target behavior is already
 deployed. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
-The target cloud verifier may use one fresh in-memory or temporary SQLite
-transaction to project a submitted authority proof. That database is discarded
-after the request and never receives content logs. This is compatible with the
-no-persistent-database boundary: the cloud mirrors writer trees opaquely, while
-only consuming peers kernel-validate their closed piles.
+The target `AuthorityGate` is actor-neutral: hosted and full peers run the same
+implementation. Every semantic evaluation starts from exactly one canonical
+closed pile. Pull evaluates a complete writer-tree leaf and may retain its
+durable facts; push evaluates the same wire value only to check conditions in
+fresh in-memory or temporary SQLite, then discards the pile judgment and every
+derived row. A pushed pile never enters recipient fact space. Local persistent
+SQL, Python fact objects, provider identity, and Iroh identity may not shortcut
+this boundary. Provider storage bindings, process scheduling, and optional
+content consumption are the only hosted/full-peer composition differences;
+pile bytes, evaluator, gate, temporary schema, family queries, and typed result
+must remain identical.
+
+Target writer trees reuse the canonical bounded persistent Merkle-map style.
+Each logical leaf names exactly one independently closed pile, and range or
+diff pagination stops only between leaves. A cold receiver must validate every
+returned leaf without an adjacent leaf or prior cache state.
 
 Start a work session with:
 
@@ -23,6 +34,12 @@ git status --short
 ```
 
 ## Current transition capabilities
+
+The predecessor below still pushes ordinary piles into recipient storage. That
+behavior is not target push semantics and must disappear at `poc-16-iq2.9`:
+writers publish closed-pile leaves to their own trees, consumers pull them, and
+only discarded condition evaluations are pushed. Do not preserve the current
+PileSender-to-Applier route as a second target publication algorithm.
 
 Authority flows from the database-free core into an optional stateful peer
 composition:
@@ -158,9 +175,9 @@ the small authority/removal projection remains shared. In both designs, exact
 untrusted reads are bounded and provider ETags are opaque. LIST discovers
 candidate heads in the target but never grants membership, authorship,
 liveness, or fact validity. Every peer mirrors only missing content-addressed
-head/tree objects. The target cloud gate projects request-local facts to prove
-requester and recipient membership, device join, and non-removal; it does not
-validate the advertised content tree.
+head/tree objects. The target `AuthorityGate` evaluates one pushed closed pile
+to prove requester and recipient membership, device join, and non-removal; it
+discards that state and does not validate the advertised content tree.
 
 One exact create-only ingress key and its digest identify one delivery attempt.
 It is staging, not a server-side queue or repository authority. Provider
