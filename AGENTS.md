@@ -1,7 +1,11 @@
 # POC-16 engineer guide
 
-Read `README.md` for operation and `DESIGN.md` for protocol and trust
-boundaries. Those files and this guide are the repository's only Markdown
+Read `README.md` for current operation and `DESIGN.md` for the accepted target
+protocol and trust boundaries. `poc-16-iq2` tracks the transition from the
+running workspace-wide content root to per-device writer logs and a shared
+head directory; `poc-16-iq2.9` is the one-way cutover gate. Do not deepen the
+predecessor's global-root assumptions or claim that target behavior is already
+deployed. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
 Start a work session with:
@@ -12,7 +16,7 @@ bd ready
 git status --short
 ```
 
-## Capabilities
+## Current transition capabilities
 
 Authority flows from the database-free core into an optional stateful peer
 composition:
@@ -140,11 +144,14 @@ scopes may still make it unusable as a provider.
 
 ## Object-store and concurrency rules
 
-The storage contract is immutable content-addressed objects plus one
-linearizable opaque-token CAS register named `root`. Exact untrusted reads use
-bounded APIs. Discovery uses bounded pagination. Never rely on ETags being
-content hashes, unconditional replacement, whole-GET/whole-LIST fallbacks, or
-LIST for safety.
+The running predecessor uses immutable content-addressed objects plus one
+linearizable opaque-token CAS register named `root`. The accepted target keeps
+immutable objects but replaces ordinary content publication with one stable
+CAS head per device and bounded strong LIST of the workspace head prefix; only
+the small authority/removal projection remains shared. In both designs, exact
+untrusted reads are bounded and provider ETags are opaque. LIST discovers
+candidate heads in the target but never grants membership, authorship,
+liveness, or fact validity.
 
 One exact create-only ingress key and its digest identify one delivery attempt.
 It is staging, not a server-side queue or repository authority. Provider

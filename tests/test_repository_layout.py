@@ -97,6 +97,21 @@ def test_root_document_links_resolve_locally():
                 f"{name} links missing {target}")
 
 
+def test_writer_log_target_is_not_claimed_as_running_before_cutover():
+    documents = {
+        name: re.sub(r"\s+", " ", (ROOT / name).read_text().replace(">", ""))
+        for name in ROOT_DOCS
+    }
+    assert all("poc-16-iq2" in text for text in documents.values())
+    assert "accepted target architecture" in documents["DESIGN.md"]
+    assert "Current `main` still implements the predecessor" \
+        in documents["DESIGN.md"]
+    assert "running code and operational instructions below still describe" \
+        in documents["README.md"]
+    assert "Do not deepen the predecessor's global-root assumptions" \
+        in documents["AGENTS.md"]
+
+
 def test_retired_authority_implementations_cannot_return():
     for relative in (
             "core/admission.py",
