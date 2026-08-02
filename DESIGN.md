@@ -25,7 +25,7 @@ membership and administration rather than by every message or file.
 The design must provide:
 
 - the same fact bytes, closed-pile judgment, and suppression rules everywhere;
-- database-free cloud gates and readers;
+- cloud gates and readers with no persistent database or durable projection;
 - direct object-store upload of large immutable data;
 - independently writable device logs, with no cross-device content CAS;
 - deterministic convergence from mixed but individually valid log views;
@@ -45,36 +45,50 @@ It is a bounded way to discover signed candidate heads.
 
 ## 2. Authority and data flow
 
-There are four logical capabilities:
+There are five logical capabilities:
 
 ```text
 LogWriter
     local intent -> bounded closed piles -> immutable per-device Merkle log
 
-HeadGate
-    signed next head + pinned authority -> one per-device head CAS
+CloudGate
+    membership + non-removal proof -> writer-confined head-slot CAS
 
-WorkspaceReader
-    pinned authority + listed heads -> verified log deltas -> validated union
+RepositoryMirror
+    listed head pointers -> missing content-addressed writer-tree objects
+
+FactConsumer
+    mirrored closed piles -> ordinary kernel -> local validated union
 
 HttpGate
-    peer HTTP request -> authorized object, head, authority, or reader operation
+    peer HTTP request -> authorized object, head, authority, or mirror operation
 ```
 
 `LogWriter` normally lives in a stateful full peer and may use SQLite for local
 authorship and presentation. It uploads immutable objects directly to its
 registered store. It does not need a cloud process to rebuild its tree.
 
-`HeadGate` is database-free. It receives only a small canonical head proposal,
-checks the writer and its current authority, establishes the immutable head
-record, and conditionally replaces that writer's stable directory slot. It
-does not ingest file bytes, enumerate the workspace fact set, or compile a
-workspace content root.
+`CloudGate` has no persistent database. For one request it projects the supplied
+authority facts and removal paths into a fresh in-memory or temporary SQLite
+transaction and asks the ordinary fact queries whether the requester and the
+recipient node are currently eligible. Its only configured protocol identity
+input is the recipient node's root public key. A successful requester proof
+binds the exact proposed head OID. The gate confines the update to that device's
+stable slot and performs its CAS. It trusts the writer to maintain the writer
+tree: it does not validate the head, log shape, content piles, sequence,
+predecessor, or closure, and it never compiles a workspace content root.
 
-`WorkspaceReader` is database-free. It pins authority, lists candidate head
-slots, verifies their exact bodies, and consumes changed writer logs through
-the ordinary closed-pile kernel. A full peer may project the resulting union
-into disposable SQLite, but SQL never changes an authenticated answer.
+`RepositoryMirror` is database-free and runs on every peer, including the
+cloud peer. It lists directory slots, learns their head OIDs, and mirrors only
+content-addressed head and writer-tree objects absent from its local store. It
+may enforce byte, request, hash, and storage-integrity bounds while copying;
+that is not semantic fact or log admission.
+
+`FactConsumer` runs wherever mirrored content is used as workspace state. It
+validates every new closed pile through the ordinary kernel before projecting
+facts. A full peer always consumes this way and may project the validated union
+into disposable SQLite. A cloud peer that only mirrors, gates, and serves data
+does not consume the content and therefore does not validate it.
 
 `HttpGate` owns the common HTTP operations and grant checks. AWS Lambda,
 Cloudflare Workers, a plain HTTP peer, and a peer reached through Iroh invoke
@@ -161,7 +175,9 @@ A writer update proceeds in this order:
    registered store;
 3. construct the new cumulative writer-log root;
 4. construct and sign one immutable successor head record;
-5. ask `HeadGate` to replace only this device's stable head slot.
+5. prove current membership and non-removal to `CloudGate`, binding that proof
+   to the proposed head OID;
+6. conditionally replace only this device's stable head slot.
 
 The log root is content addressed. It is not the provider ETag, and no code may
 derive one from the other. Writer-log pages and pile objects are immutable and
@@ -191,7 +207,6 @@ writer-local sequence
 previous immutable head oid, or genesis
 current writer-log root oid
 registered store-binding fid
-authority root used for publication
 device signature
 ```
 
@@ -199,40 +214,39 @@ The exact codec and bounds belong to `poc-16-iq2.1`. These semantic fields are
 not provider metadata. In particular, a head contains a registered store
 binding, never an arbitrary URL supplied to a cloud fetcher.
 
-The directory uses two forms:
+The directory and writer store use two forms:
 
 ```text
-head-objects/<head-oid>          immutable canonical head record
-heads/<workspace>/<device-fid>  mutable stable slot containing that record
+head-objects/<head-oid>          immutable writer-supplied head record
+heads/<workspace>/<device-fid>  mutable {head_oid, accepted_authority_root}
 ```
 
 The stable slot makes listing compact: one entry per enrolled device rather
 than one entry per update. Its body is content hashed independently; its
 provider version token is used only to conditionally replace that exact slot.
 
-`HeadGate` accepts a successor only when:
+`CloudGate` accepts an exact slot update only when:
 
-- the key, signed workspace, device, owner, and registered store agree;
-- the proposer proves the device's publication authority at one pinned
-  authority root;
-- the predecessor and sequence match the current stable head;
-- the immutable head record and named log root are present under their exact
-  registered bindings;
-- all bytes and traversals fit protocol bounds;
+- the submitted proof authenticates the workspace device as a member and not
+  removed at the authority root the gate itself pins;
+- the proof binds the exact proposed head OID;
+- the deterministic slot belongs to that same workspace device;
+- the request and slot body fit fixed mechanical bounds;
 - the per-device conditional replace succeeds.
 
-The gate itself reads and pins the provider's current authority root; the
-caller cannot select an older root. The accepted head records that exact root
-for audit and race semantics.
+The caller cannot select an older authority root. The gate records the exact
+root it used beside the head OID. It does not fetch or interpret the head or
+writer tree, verify its signature or predecessor, or establish that its objects
+exist. Those are writer responsibility until another peer consumes the log.
 
-The gate may exact-probe the named root but does not enumerate or semantically
-revalidate the complete user log. Consumers still validate closed piles before
-using them.
+A consuming peer, not the cloud gate, verifies the head object's content hash,
+device signature, workspace, owner, store binding, sequence, predecessor chain,
+and named log root before validating every closed pile it has not already
+validated.
 
 An unknown CAS result is reconciled by rereading the stable slot. An exact
-candidate match is success. A newer signed successor makes repeating the old
-request harmless; otherwise the writer repins and retries. No path deletes a
-head, log object, pile, or ingress object.
+head-OID match is success; otherwise the writer repins and retries. No path
+deletes a head, log object, pile, or ingress object.
 
 ## 6. The shared workspace directory
 
@@ -247,9 +261,10 @@ Alice and Bob never compare against the same token. Only duplicate or genuinely
 concurrent updates for one device contend on one slot.
 
 If users keep content in physically separate buckets, the provider-operated
-directory bucket holds only these small head records. Each verified head points
-through a registered store binding to the user's content bucket. This permits
-one workspace LIST without proxying content through the directory service.
+directory bucket holds only these small slot records. Each writer head points
+through a registered store binding to the user's content bucket. Every peer,
+including the cloud peer, mirrors the per-writer trees it learns through this
+directory; no peer combines them beneath another content root.
 
 ### 6.1 LIST discovers candidates; it grants nothing
 
@@ -257,16 +272,24 @@ S3 and R2 supply strongly consistent prefix listing. The portable contract is
 bounded cursor pagination returning at most 1,000 entries per page, ordered by
 key. The implementation must also tolerate a valid short page.
 
-A workspace observation is:
+A workspace mirror turn is:
 
-1. pin one authority/removal root;
-2. list every page under the exact workspace head prefix;
-3. reject malformed keys and filter candidates through the authenticated
-   device-writer registry;
-4. compare each listed opaque version token with the local cached token;
-5. conditionally fetch and verify every new or changed exact head;
-6. Merkle-diff the corresponding writer log from the last accepted head;
-7. validate discovered closed piles and union their durable facts.
+1. list every page under the exact workspace head prefix;
+2. reject malformed keys and filter candidates through the known device-writer
+   registry;
+3. compare each listed opaque slot token with the locally observed token;
+4. conditionally read only a new or changed tiny slot to learn its head OID;
+5. if that immutable head OID is already local, perform no head fetch;
+6. otherwise mirror the missing content-addressed head, Merkle pages, and pile
+   objects from that writer tree;
+7. stop there on a cloud peer;
+8. on a consuming peer, validate the head and every previously unvalidated
+   closed pile, then union its durable facts.
+
+A head learned through P2P and already present locally is not fetched again
+merely because this provider directory slot was first observed later. The
+provider token optimizes the tiny mutable slot read; content OIDs determine
+whether any immutable head or tree object is missing.
 
 LIST output is never accepted as membership, authorship, liveness, workspace
 binding, or fact validity. A forged extra object is ignored. An absent object
@@ -278,35 +301,126 @@ We do not assume that a multi-page LIST plus subsequent GETs is one global
 snapshot. A head can advance during pagination. A conditional GET either pins
 the exact listed version or fails and causes that one key to be reconsidered.
 
-Because every accepted writer root contains independently valid closed piles,
-mixing head versions cannot create a torn Merkle tree or authorize a fact. It
-can only delay observing some valid additions. Periodic full scans plus fair
-retry converge.
+Mixing head versions cannot create a torn object or authorize a fact. The cloud
+peer merely mirrors opaque content-addressed objects. A consuming peer admits
+only piles it has independently validated, so a mixed observation can only
+delay valid additions. Periodic full scans plus fair retry converge.
 
 Initial discovery costs roughly one LIST request per 1,000 device writers plus
-one small head read per writer. A warm reader still lists the directory but
-fetches bodies and diffs only for changed version tokens. This is measured
-before introducing any second index.
+one small slot read per writer. A warm peer still lists the directory but reads
+only changed slots and mirrors only head/tree objects it does not already have.
+This is measured before introducing any second index.
 
-## 7. Workspace authority and removal
+## 7. Ephemeral authority verification and removal refresh
 
-Ordinary content logs do not update a shared workspace state. Membership,
+Ordinary content logs do not update shared workspace authority. Membership,
 device enrollment, delegated administration, registered store bindings,
-infrastructure membership, leave, and removal are projected separately into a
-small authenticated authority/removal root.
+infrastructure-node join, leave, self-removal, and administrative removal are
+facts projected into a small authenticated authority/removal root.
 
-This projection uses the same canonical facts, closed-pile kernel, and explicit
-suppression semantics as every peer. A cloud validator may add only its local
-`invite_accepted` anchor and the authority/removal roots it has already
-authenticated. It does not acquire a parallel IAM or Iroh identity model.
+### 7.1 One request-local proof transaction
 
-The important checks are:
+An authorization request carries a bounded set of canonical facts and exact
+authenticated removal paths. The verifier creates a fresh SQLite database in
+memory or provider-local temporary storage, decodes those facts through the
+ordinary family serializers, projects them with the ordinary fact handlers,
+queries the projected state inside that isolated authorization transaction,
+and discards the database.
 
-- publishing a writer head requires current member and device liveness;
-- obtaining a content-read grant requires current member and device liveness;
-- proving historical membership is sufficient only to fetch the caller's
-  confined current removal proof, so a peer can determine whether it is still
-  eligible;
+Before projection, core mechanically verifies canonical fact identities,
+signatures, workspace bindings, and each removal path against the authority
+root currently pinned by the recipient. SQLite therefore receives authenticated
+proof inputs rather than caller-invented `CLEAR` rows. This proof verification
+is the cloud's authority job; it still never traverses the advertised content
+log.
+
+No prior request rows, persistent SQL, provider account, API token, cache, or
+ambient Iroh identity enter the verdict. The only locally configured protocol
+identity supplied to the transaction is the recipient node's root public key.
+The workspace, requester, owner, requester device, operation, object or head
+OID, and proof root are all bound by the submitted canonical facts and signed
+request.
+
+For ordinary publication or content access the resulting state must prove:
+
+1. the requester user was admitted as a workspace member;
+2. that member is not currently removed and has not left;
+3. the signing requester device joined under that member;
+4. that requester device is not removed and has not removed itself;
+5. the recipient node's configured root public key names an infrastructure
+   device that joined the required provider community, with an in-band binding
+   offering service to this workspace;
+6. that recipient device and its owning infrastructure member are not removed
+   and have not left either the community or that service binding;
+7. the exact requested operation and, for publication, proposed head OID are
+   bound to the requester device.
+
+The recipient-device checks prevent a removed or retired provider replica from
+continuing to mint grants in a multi-node deployment. They are part of the
+target verifier even if the first single-node implementation lands them as a
+separate follow-up. A deployment cannot claim multi-node readiness without
+them.
+
+This transaction validates authority proof facts only. It does not open or
+validate the writer's advertised head, Merkle tree, content piles, or facts.
+The cloud mirror trusts each writer to maintain those objects; every consuming
+peer validates them before use.
+
+### 7.2 Self-confined removal-path recovery
+
+A client cannot prove current non-removal without a path from the current
+removal root, but a removed client must still be able to learn that it was
+removed. A second, strictly weaker operation therefore asks only:
+
+```text
+was this signed requester device once admitted under this workspace member?
+```
+
+If so, the service may return the current authenticated removal paths for that
+same member and requester device. It does not return another member's path, a
+workspace-wide removal dump, a content-read grant, a head-write grant, or any
+other authority. Historical membership is therefore a discovery capability
+for the caller's own current status, not continuing workspace access.
+
+The historic-membership proof uses retained canonical membership and device
+join facts. Current removal and self-leave facts do not erase that history; they
+appear in the returned path and cause the stronger current-operation query to
+fail.
+
+### 7.3 Cached proof retry
+
+Clients retain their last successful authority fact bundle and removal paths.
+They submit that proof directly on later operations. The gate pins the current
+authority/removal root and accepts the cached proof while it is current and all
+required member and device states remain clear.
+
+If the proof is stale or lacks a current path, the gate returns a typed
+`proof_refresh_required` result without performing the requested operation.
+The client invokes the historical-membership endpoint, replaces only its own
+removal paths, and retries. If the refreshed paths show removal or self-leave,
+the retry receives a permanent authority denial. No proactive proof push,
+polling queue, or persisted gate session is required.
+
+This intentionally favors the simplest correct cache rule: an older removal
+root may be rejected even when an unrelated member changed. A more selective
+freshness proof is an optimization, not part of the initial protocol.
+
+### 7.4 One protocol identity per node
+
+A node needs one device root secret and invite links to join communities. Its
+root public key is named by the device or infrastructure membership facts, and
+all subsequent proofs, head updates, removal-path requests, and grants derive
+from that fact state. Provider credentials needed to call S3, R2, Lambda, or a
+Worker remain deployment effects; they are not additional protocol principals.
+
+Iroh endpoint keys remain connection material only. A separate HMAC user
+database, provider-admin identity, API-token membership system, or persisted
+cloud account table must not appear beside the fact proof universe.
+
+### 7.5 Removal and deletion semantics
+
+The important content rules remain:
+
 - an administrator may delete every fact family that declares itself directly
   deletable;
 - a user may delete facts owned by that user, including facts authored through
@@ -314,10 +428,11 @@ The important checks are:
 - the delete fact's ordinary Needs and offers must validate, and its offered
   suppression ID must exactly match a selector declared by the target fact.
 
-A head records the authority root under which it was accepted. If removal and
-publication race, a head validly accepted from the preceding authority view is
-historical workspace content. Removal governs later sharing, grants, and
-publication after propagation; it does not rewrite already accepted history.
+The directory slot records the authority root under which its head OID was
+accepted. If removal and publication race, a head accepted from the preceding
+authority view remains available for peers to validate as historical workspace
+content. Removal governs later sharing, grants, and publication after
+propagation; it does not rewrite already validated history.
 
 The authority root may still use one conditional register because its write
 rate follows uncommon control changes rather than all content. If measurements
@@ -336,11 +451,12 @@ residence meets by `fid`, and suppression actions meet by the existing
 deterministic family rule. Arrival order, directory order, page boundaries, and
 which peer relayed a closure cannot change the result.
 
-A stateful peer projects the combined validated union and generic indexes into
-SQLite for queries. A database-free reader can point-query authenticated
-per-writer indexes or validate streamed pile deltas without creating a hidden
-database. The cloud authority gate needs only the separate authority/removal
-projection; it does not scan arbitrary message logs to authenticate a request.
+A consuming stateful peer projects the combined validated union and generic
+indexes into SQLite for queries. A consuming database-free peer can point-query
+authenticated per-writer indexes or validate streamed pile deltas without
+creating a hidden database. The cloud peer mirrors the same writer trees but
+does not run this content projection; its gate needs only the separate
+authority/removal proof.
 
 ## 9. Sync and range behavior
 
@@ -349,20 +465,21 @@ is the Merkle difference between two roots of that device's log. The unit of
 semantic admission remains one closed pile.
 
 ```text
-LIST workspace heads
-    -> unchanged token: no work
-    -> changed token: verify head
-    -> diff old and new writer-log roots
-    -> range-fetch missing pile or pack slices
-    -> kernel validates each closed pile
-    -> durable facts join the local validated set
+LIST workspace head slots
+    -> unchanged slot token: no slot read
+    -> changed slot token: read head oid
+    -> known head oid: no immutable fetch
+    -> unknown head oid: mirror missing head/tree/pile objects
+    -> cloud peer stops
+    -> consuming peer validates every new closed pile
+    -> durable facts join that peer's local validated set
 ```
 
-The first sync visits all registered writer heads. Later sync cost is the fixed
-directory scan plus changed writers and changed log ranges, not the entire
-workspace fact corpus. A full peer may retain cached head OIDs and Merkle
-frontiers outside SQL so deleting the presentation database does not destroy
-sync correctness.
+The first sync visits all registered writer slots. Later sync cost is the fixed
+directory scan plus unknown head OIDs and missing log ranges, not the entire
+workspace fact corpus. Every peer retains mirrored head OIDs and Merkle objects
+in its ordinary object store. A full peer may retain traversal frontiers outside
+SQL so deleting the presentation database does not destroy sync correctness.
 
 Facts with large payloads, Bao slices, key wraps, and history-key material may
 be co-packed for S3/R2. P2P peers may transfer the same individual verified
@@ -389,9 +506,10 @@ applied, noop, stale/retryable, permanent rejection, and unknown-result
 reconciliation.
 
 Bulk objects are uploaded directly under writer-confined grants. The small
-head operation may pass through `HeadGate`; this is intentional because the
-gate checks signed semantic bindings and current authority. It is not a content
-proxy or tree builder.
+head-slot operation passes through `CloudGate`; the gate validates only the
+ephemeral requester/recipient membership and non-removal proof bound to the
+exact head OID, confines the slot, and performs CAS. It is not a content
+validator, proxy, or tree builder.
 
 ## 11. Concurrency and failures
 
@@ -408,9 +526,12 @@ For two requests targeting the same device head:
 4. readers see either complete head, never partial bytes.
 
 A crash before head CAS leaves unreachable immutable objects. A crash after an
-ambiguous CAS is reconciled by exact reread. A poisoned or malformed head can
-deny only its own acceptance; it cannot wedge another device's slot, delete
-another writer's data, or corrupt the authority root.
+ambiguous CAS is reconciled by exact reread. The cloud may publish a malformed
+head from a currently authorized writer because it deliberately trusts writers
+to maintain their trees. Bounded mirroring and per-device isolation ensure that
+such a tree can make only that writer's content unusable; a consuming peer
+rejects it, and it cannot wedge another slot, delete another writer's data, or
+corrupt the authority root.
 
 The concurrency proof and deterministic tests must cover:
 
@@ -446,7 +567,8 @@ mechanism is part of the initial correctness boundary.
 
 ## 13. FullPeer, SQL, HTTP, and Iroh
 
-`FullPeer` composes the same core behaviors with local state:
+Every peer composes the same core directory and mirroring behavior. `FullPeer`
+adds content consumption and local state:
 
 - device keys and registered store bindings;
 - log construction and resumable object upload;
@@ -456,11 +578,13 @@ mechanism is part of the initial correctness boundary.
 - attachment presentation and local control;
 - Iroh connection lifecycle.
 
-It must not implement a second head codec, pile validator, directory filter,
-authority rule, or Merkle reconciliation algorithm. Deleting SQLite changes no
-writer log, head, authority root, or validated answer. Rebuild hydrates each
-fact into the form current for its surrounding context before storing the
-current serialized SQL form.
+It must not implement a second head codec, directory mirror, pile validator,
+authority rule, or Merkle reconciliation algorithm. The cloud peer and full
+peer store and exchange the same head and tree objects; the difference is only
+that FullPeer consumes mirrored piles through the kernel and projects them for
+the client. Deleting SQLite changes no writer log, head, authority root, or
+validated answer. Rebuild hydrates each fact into the form current for its
+surrounding context before storing the current serialized SQL form.
 
 Iroh remains connection-only:
 
@@ -474,9 +598,10 @@ workspace, bucket, head, or fact authority.
 ## 14. Notifications
 
 Notification delivery remains durable operational work outside fact
-publication. The scanner no longer advances one workspace `FactTree` cursor.
-It retains per-writer acknowledged head OIDs, lists the directory, and performs
-bounded diffs only for changed writer logs.
+publication. The scanner is a content consumer: it validates triggering piles
+and never relies on the cloud mirror having done so. It no longer advances one
+workspace `FactTree` cursor. It retains per-writer acknowledged head OIDs,
+lists the directory, and performs bounded diffs only for unknown writer heads.
 
 A pending notification page pins the exact writer heads and triggering facts
 it represents. Delivery separately pins current authority, preferences, and
@@ -511,7 +636,8 @@ The migration order is:
 
 1. freeze canonical writer-head, log, and directory fixtures;
 2. implement writer-local log construction and the authority projection;
-3. implement database-free multi-head reading;
+3. implement persistence-free multi-head mirroring, content consumption, and
+   request-local authority verification;
 4. implement FS, S3, and R2 directory adapters;
 5. move FullPeer and notifications to the shared multi-head core;
 6. run deterministic and live provider concurrency tests;
@@ -525,22 +651,32 @@ must end with only the writer-log/head path. `poc-16-iq2.9` is the cutover gate.
 ## 16. Core invariants
 
 1. Every semantic admission uses the same closed-pile kernel.
-2. Every ordinary content update mutates at most one device head slot.
-3. Different device writers share no mutable content key.
-4. Immutable objects exist before any head references them.
-5. A provider version token is opaque and never a content hash.
-6. LIST output is candidate discovery, never authority.
-7. Every accepted head is signed, workspace-bound, writer-bound,
-   store-bound, predecessor-bound, and authorized at a pinned authority root.
-8. Mixed head observations may delay facts but cannot fabricate or invalidate
-   them.
-9. Removal governs current publication and access without rewriting validated
-   history.
-10. SQLite, caches, cursors, hints, queues, and Iroh identities are
+2. Every peer mirrors the same independently rooted per-writer trees through
+   the same core object protocol.
+3. Every ordinary content update mutates at most one device head slot.
+4. Different device writers share no mutable content key.
+5. Immutable objects exist before a writer advertises a head that names them.
+6. A provider version token is opaque and never a content hash.
+7. LIST output is candidate discovery, never authority.
+8. The cloud gate projects only request-local proof facts and proves requester
+   and recipient membership, device join, and non-removal bound to the exact
+   operation; it does not validate writer content.
+9. Every consuming peer validates head, tree, and closed-pile semantics before
+   using mirrored content as state.
+10. Mixed head observations may delay facts but cannot fabricate or invalidate
+    them.
+11. Removal governs current publication and access without rewriting validated
+    history.
+12. Request-local SQLite is discarded after one proof transaction; persistent
+    SQLite, caches, cursors, hints, queues, and Iroh identities are
     non-authoritative.
-11. Provider adapters add no semantic branch.
-12. FullPeer reuses the complete core receive and read path.
-13. Every optional recency hint is repairable by a complete stable-head scan.
-14. No core publication path deletes ingress, heads, logs, or canonical
+13. Provider adapters add no semantic branch.
+14. FullPeer reuses the complete core mirror and consume paths.
+15. Every optional recency hint is repairable by a complete stable-head scan.
+16. No core publication path deletes ingress, heads, logs, or canonical
     objects.
-15. After cutover, no workspace-global mutable content root remains.
+17. Historical membership exposes only the caller's own current removal paths
+    and never grants content or publication access.
+18. One device root secret plus invite-derived facts is the complete protocol
+    identity bootstrap for a node.
+19. After cutover, no workspace-global mutable content root remains.

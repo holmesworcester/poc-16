@@ -8,6 +8,12 @@ predecessor's global-root assumptions or claim that target behavior is already
 deployed. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
+The target cloud verifier may use one fresh in-memory or temporary SQLite
+transaction to project a submitted authority proof. That database is discarded
+after the request and never receives content logs. This is compatible with the
+no-persistent-database boundary: the cloud mirrors writer trees opaquely, while
+only consuming peers kernel-validate their closed piles.
+
 Start a work session with:
 
 ```sh
@@ -151,7 +157,10 @@ CAS head per device and bounded strong LIST of the workspace head prefix; only
 the small authority/removal projection remains shared. In both designs, exact
 untrusted reads are bounded and provider ETags are opaque. LIST discovers
 candidate heads in the target but never grants membership, authorship,
-liveness, or fact validity.
+liveness, or fact validity. Every peer mirrors only missing content-addressed
+head/tree objects. The target cloud gate projects request-local facts to prove
+requester and recipient membership, device join, and non-removal; it does not
+validate the advertised content tree.
 
 One exact create-only ingress key and its digest identify one delivery attempt.
 It is staging, not a server-side queue or repository authority. Provider
