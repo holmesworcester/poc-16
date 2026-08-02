@@ -22,18 +22,23 @@ must remain identical.
 
 Target writer trees reuse the canonical bounded persistent Merkle-map style.
 Each logical leaf names exactly one independently closed pile; range or diff
-pagination stops only between leaves. The device-signed writer head and Merkle
-inclusion path authenticate the leaf without a second per-pile signature. A
-cold receiver must validate that head, inclusion, and complete pile without an
-adjacent leaf or prior cache state.
+pagination stops only between leaves. Every pile is signed directly by its
+publishing writer device. The pile signature authenticates the portable pile;
+the device-signed writer head and Merkle inclusion path authenticate its place
+in that device's tree. A cold receiver must validate the pile signature, head,
+inclusion, and complete pile without an adjacent leaf or prior cache state.
 
 Cloud publication is owner-confined: a device may populate and advance only
 its own registered writer log, and hosted storage does not validate those
-content bytes. Full-peer gossip is sync-first-then-send: a peer may serve all
-writers' leaves it has consumed successfully, preserves every original signed
-head and writer identity, and never treats its prior judgment as a receiver's
-admission certificate. Do not add a combined P2P content log or allow one
-device to upload relayed content into another device's cloud writer log.
+content bytes. Full-peer replication is validate-first peer sync: a peer may
+serve all writers' piles it has consumed successfully, preserves every original
+pile signature, signed head, and writer identity, and never treats its prior
+judgment as a receiver's admission certificate. Do not add a combined P2P
+content log or allow one device to upload relayed content into another device's
+cloud writer log.
+P2P exchanges the per-device head directory and runs the common RBSR algorithm
+only for changed device roots. Add a combined peer inventory tree only after
+measurements show that this forest is inadequate.
 
 Start a work session with:
 
