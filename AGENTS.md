@@ -21,9 +21,19 @@ pile bytes, evaluator, gate, temporary schema, family queries, and typed result
 must remain identical.
 
 Target writer trees reuse the canonical bounded persistent Merkle-map style.
-Each logical leaf names exactly one independently closed pile, and range or
-diff pagination stops only between leaves. A cold receiver must validate every
-returned leaf without an adjacent leaf or prior cache state.
+Each logical leaf names exactly one independently closed pile; range or diff
+pagination stops only between leaves. The device-signed writer head and Merkle
+inclusion path authenticate the leaf without a second per-pile signature. A
+cold receiver must validate that head, inclusion, and complete pile without an
+adjacent leaf or prior cache state.
+
+Cloud publication is owner-confined: a device may populate and advance only
+its own registered writer log, and hosted storage does not validate those
+content bytes. Full-peer gossip is sync-first-then-send: a peer may serve all
+writers' leaves it has consumed successfully, preserves every original signed
+head and writer identity, and never treats its prior judgment as a receiver's
+admission certificate. Do not add a combined P2P content log or allow one
+device to upload relayed content into another device's cloud writer log.
 
 Start a work session with:
 

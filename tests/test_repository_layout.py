@@ -128,6 +128,24 @@ def test_target_has_one_closed_pile_evaluation_boundary():
     assert "no range or page boundary splits a pile" in flat_design
 
 
+def test_target_separates_owner_cloud_publication_from_validated_gossip():
+    design = (ROOT / "DESIGN.md").read_text()
+    guide = (ROOT / "AGENTS.md").read_text()
+    flat_design = re.sub(r"\s+", " ", design)
+    flat_guide = re.sub(r"\s+", " ", guide)
+
+    assert "signed writer head authenticates every pile leaf" in flat_design
+    assert "there is no second per-pile signature" in flat_design
+    assert "Cloud mutation is origin-confined" in design
+    assert "may not upload a relayed pile into that cloud writer log" \
+        in flat_design
+    assert "Sync first, then gossip" in design
+    assert "not one sync session per pile" in flat_design
+    assert "not a second combined content log" in flat_design
+    assert "Full-peer gossip is sync-first-then-send" in flat_guide
+    assert "Do not add a combined P2P content log" in flat_guide
+
+
 def test_retired_authority_implementations_cannot_return():
     for relative in (
             "core/admission.py",

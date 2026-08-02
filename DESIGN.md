@@ -20,6 +20,15 @@ Normal content publication therefore has no workspace-wide mutable key. The
 remaining shared state is a small authority/removal projection, changed by
 membership and administration rather than by every message or file.
 
+There are two deliberately different distribution rules. A hosted store is an
+owner-confined publication target: one device may upload and advertise only
+its own writer log, and the hosted data path may keep those content bytes
+opaque. A consuming full peer is a gossip participant: after it has verified
+and consumed a pile authenticated by its original writer's signed head and
+Merkle tree, it may relay those exact bytes and proofs for that writer.
+Relaying never turns the relay into the writer and never mutates the original
+writer's cloud log.
+
 ## 1. Goals and non-goals
 
 The design must provide:
@@ -30,6 +39,9 @@ The design must provide:
 - hosted gates and readers with no persistent database or durable projection;
 - direct object-store upload of large immutable data;
 - independently writable device logs, with no cross-device content CAS;
+- owner-confined cloud publication without hosted content validation;
+- origin-preserving P2P gossip of locally validated, writer-authenticated pile
+  leaves;
 - deterministic convergence from mixed but individually valid log views;
 - maximal isomorphism between hosted and full peers: one pile codec, evaluator,
   authority gate, mirror, consumer, and condition-query implementation;
@@ -71,7 +83,9 @@ HttpGate
 
 `LogWriter` normally lives in a stateful full peer and may use SQLite for local
 authorship and presentation. It uploads immutable objects directly to its
-registered store. It does not need a cloud process to rebuild its tree.
+registered store. A hosted grant confines it to that device's own registered
+writer store and stable slot; it cannot append to or advance another device's
+log. It does not need a cloud process to rebuild its tree.
 
 `ClosedPileEvaluator` is the one semantic input door. Hosted and full peers
 invoke the same canonical decoder, bounded kernel, and family dispatch for
@@ -96,14 +110,17 @@ compiles a workspace content root.
 peers. It lists directory slots, learns their head OIDs, and mirrors only
 content-addressed head and writer-tree objects absent from its local store. It
 may enforce byte, request, hash, and storage-integrity bounds while copying;
-that is not semantic fact or log admission.
+that is not semantic fact or log admission. An opaque hosted mirror may serve
+owner-confined objects without becoming a P2P gossip source for them.
 
 `FactConsumer` runs wherever mirrored content is used as workspace state. It
 pulls complete closed-pile leaves and invokes the same `ClosedPileEvaluator`
 before joining their durable facts to the local validated union. A full peer
 always consumes this way and may project the validated union into disposable
 SQLite. A hosted peer that only mirrors, gates, and serves data does not consume
-the content and therefore does not validate it.
+the content and therefore does not validate it. Successful consumption also
+makes the original writer-authenticated leaf eligible for P2P gossip. It does
+not authorize the consuming peer to rewrite that leaf or its signed head.
 
 `HttpGate` owns the common HTTP operations and grant checks. AWS Lambda,
 Cloudflare Workers, a plain HTTP peer, and a peer reached through Iroh invoke
@@ -162,7 +179,40 @@ plain HTTP, HTTP over Iroh, and local in-process calls all feed identical
 canonical bytes to `ClosedPileEvaluator`. An in-process caller may not bypass
 the codec with Python objects or consult the full peer's existing SQL rows.
 
-### 3.2 A writer tree stores independently closed leaves
+### 3.2 A signed writer head authenticates every pile leaf
+
+The device signature on a canonical writer head commits to that device's exact
+Merkle root. A verified Merkle path then binds one writer-local key to one
+closed-pile OID. Together, the signed head and inclusion path are the pile's
+writer authentication; there is no second per-pile signature, publication
+envelope, or relay signature.
+
+In protocol terms, "the pile is signed by its device owner" means exactly that
+its `(writer-local key, pile OID)` row has a valid inclusion path to that
+device's verified signed head. A loose pile body is never owner-authenticated.
+
+This authentication means only "this device published this exact closed pile
+at this position in its log." It does not claim that the device authored every
+fact inside the pile. A legitimate closure normally contains workspace,
+membership, key, or other dependency facts authored by other principals; the
+ordinary fact signatures and family policies still decide fact authorship and
+validity.
+
+A full peer gossips the original signed head, required Merkle objects or proof,
+and exact closed-pile bytes. It neither inserts the pile into its own writer log
+nor signs on behalf of the original writer. A pile presented without a valid
+head and inclusion path for its claimed writer is not sync input.
+
+The hosted content path is intentionally different at this boundary. A cloud
+store grants immutable upload and head-slot mutation only to the matching
+workspace device and may store the resulting head, pile, and Merkle objects
+without opening them or checking their signatures. `AuthorityGate` still
+validates the separate pushed authority pile that grants this writer-confined
+operation. Opaque treatment applies to writer content, not to the authority
+request. Malformed content can therefore make only its owner's log unusable;
+every consuming peer rejects it before admission or gossip.
+
+### 3.3 A writer tree stores independently closed leaves
 
 A writer log is physically the same canonical, history-independent, bounded
 persistent Merkle-map style used by the other authenticated trees. It is an
@@ -226,15 +276,32 @@ then f remains valid in every validated superset S'
 Remote log inclusion proves only authenticated publication by that log writer.
 It does not let an untrusted writer bypass the receiving kernel.
 
+### 3.4 Sync first, then gossip
+
+A full peer may advertise a remote writer's leaf as available gossip, or send
+its pile body as such, only after completing the ordinary pull path for that
+leaf: verify the writer-head signature and leaf inclusion, evaluate the
+complete closed pile, and join the valid facts to its local validated set. A
+receiver repeats those checks; the sender's prior judgment is never an
+admission certificate.
+
+The origin writer follows the same rule locally before first publication: it
+constructs and evaluates the closed pile, includes it in its tree, signs the
+new head, and then advances its own log. A non-consuming hosted mirror is the
+sole opaque storage case. It can return the owner's stored bytes under the
+normal grant gate, but it does not claim that those bytes are validated gossip.
+
 ## 4. Per-device writer logs
 
 Every enrolled device has its own logical writer ID and its own log. Separate
 devices of one user have separate logs so the normal case has one human process
-contending with nobody, including the user's other devices.
+contending with nobody, including the user's other devices. Only that device
+may add leaves to or advance that cloud writer log. Other full peers may gossip
+its accepted signed-head/tree/pile tuples without changing their origin.
 
 A writer update proceeds in this order:
 
-1. construct one or more bounded closed piles;
+1. construct and locally evaluate one or more bounded closed piles;
 2. establish fact, pile, pack, and Merkle objects immutably in the writer's
    registered store;
 3. construct the new cumulative writer-log root;
@@ -335,6 +402,14 @@ directory bucket holds only these small slot records. Each writer head points
 through a registered store binding to the user's content bucket. Every peer,
 including each hosted peer, mirrors the per-writer trees it learns through this
 directory; no peer combines them beneath another content root.
+
+Cloud mutation is origin-confined. The authenticated device may establish
+objects in its registered store and conditionally replace only
+`heads/<workspace>/<that-device>`. Another member may read granted objects but
+may not upload a relayed pile into that cloud writer log or advance its slot.
+The cloud therefore never has to decide whether arbitrary third-party content
+is a faithful relay. P2P gossip supplies cross-peer replication after consumer
+validation instead.
 
 ### 6.1 LIST discovers candidates; it grants nothing
 
@@ -528,7 +603,7 @@ refs declared by the fact; a deleter never enumerates descendants.
 Deletion and removal remain ordinary facts. Across writer logs, canonical fact
 residence meets by `fid`, and suppression actions meet by the existing
 deterministic family rule. Arrival order, directory order, page boundaries, and
-which peer relayed a closure cannot change the result.
+which peer gossiped a writer-authenticated closure cannot change the result.
 
 A consuming stateful peer projects the combined validated union and generic
 indexes into SQLite for queries. A consuming database-free peer can point-query
@@ -541,7 +616,8 @@ pushed closed authority pile.
 
 The unit of workspace discovery is a device head. The unit of incremental sync
 is the Merkle difference between two roots of that device's tree. The unit of
-transfer and semantic judgment is one complete closed-pile leaf.
+transfer and semantic judgment is one complete writer-authenticated closed-
+pile leaf.
 
 ```text
 LIST workspace head slots
@@ -559,6 +635,21 @@ directory scan plus unknown head OIDs and missing tree ranges, not the entire
 workspace fact corpus. Every peer retains mirrored head OIDs and Merkle objects
 in its ordinary object store. A full peer may retain traversal frontiers outside
 SQL so deleting the presentation database does not destroy sync correctness.
+
+P2P uses the same multi-head algorithm, not one sync session per pile and not a
+second combined content log. A full peer offers the verified signed writer
+heads it knows and marks only successfully consumed leaf bodies as available gossip.
+The receiver compares that inventory with its own, runs one Merkle diff for
+each changed writer tree, and may fetch many available complete pile leaves in
+one bounded range turn. It then verifies and evaluates each leaf independently.
+A derived Merkle inventory of known heads may later accelerate this comparison,
+but it is an untrusted discovery cache, never a publication root or validation
+certificate.
+
+Thus a full peer gossips all validated writers it knows, not merely its own
+writer log. The cloud path remains owner-push-only. Both paths deliver the same
+signed head, Merkle evidence, and closed-pile bytes to the same consumer; only
+discovery and eligibility to upload differ.
 
 Range pagination stops only between logical pile leaves. Every page is thus a
 bounded sequence of independently closed evaluations; no receiver must widen a
@@ -591,8 +682,12 @@ conditionals. Provider adapters must preserve the same typed outcomes:
 applied, noop, stale/retryable, permanent rejection, and unknown-result
 reconciliation.
 
-Bulk objects are uploaded directly under writer-confined grants. The small
-head-slot operation passes through `AuthorityGate`; the gate evaluates one
+Bulk objects are uploaded directly under writer-confined, owner-only grants.
+No grant permits one device to populate or advance another device's cloud log.
+The hosted data path mechanically enforces store, namespace, size, hash, and
+write-condition bounds but does not decode writer content, verify the head
+signature, walk Merkle inclusion, or verify fact signatures. The small head-
+slot operation passes through `AuthorityGate`; the gate evaluates one
 pushed closed pile, checks only the ephemeral requester/recipient membership
 and non-removal conditions bound to the exact head OID, confines the slot, and
 performs CAS. It is not a content validator, proxy, or tree builder, and the
@@ -619,6 +714,13 @@ trusts writers to maintain their trees. Bounded mirroring and per-device
 isolation ensure that such a tree can make only that writer's content unusable;
 a consuming peer rejects it, and it cannot wedge another slot, delete another
 writer's data, or corrupt the authority root.
+
+Because a cloud grant and slot request are confined to the authenticated
+device, an unrelated peer cannot race that writer's mutable key. Duplicate or
+concurrent updates to one slot come only from that writer's own processes. P2P
+gossip is immutable and cannot create a slot race: duplicate head, tree, and
+pile OIDs meet idempotently, while a forged or context-mismatched leaf is
+rejected by the consumer.
 
 The concurrency proof and deterministic tests must cover:
 
@@ -665,6 +767,12 @@ consumption and adds local state:
 - disposable combined SQLite projection;
 - attachment presentation and local control;
 - Iroh connection lifecycle.
+
+`FullPeer` may serve verified original signed heads and corresponding Merkle
+evidence for discovery. It serves a remote pile body as validated gossip only
+after consuming that leaf successfully. It does not wrap those piles in a
+combined log, attribute them to its own device, or expose opaque unconsumed
+mirror entries as validated gossip.
 
 It must not implement a second head codec, directory mirror, pile evaluator,
 authority gate, condition query, or Merkle reconciliation algorithm. A hosted
@@ -765,34 +873,41 @@ must end with only the writer-log/head path. `poc-16-iq2.9` is the cutover gate.
 3. Hosted and full peers use the same `AuthorityGate`, temporary SQL schema,
    condition queries, mirror, and consumer; local SQL is never an authority
    shortcut.
-4. Every logical writer-tree leaf is independently closed, and no range or
+4. Every accepted writer-tree leaf has a valid inclusion path to a canonical
+   head signed by that tree's writer device.
+5. Every logical writer-tree leaf is independently closed, and no range or
    page boundary splits a pile or requires neighboring receiver state.
-5. Every peer mirrors the same independently rooted per-writer trees through
-   the same core object protocol.
-6. Every ordinary content update mutates at most one device head slot.
-7. Different device writers share no mutable content key.
-8. Immutable objects exist before a writer advertises a head that names them.
-9. A provider version token is opaque and never a content hash.
-10. LIST output is candidate discovery, never authority.
-11. `AuthorityGate` evaluates only one request-local closed pile and proves
+6. Cloud publication grants let a device populate and advance only its own
+   writer log; hosted content storage need not validate those opaque bytes.
+7. A full peer gossips a remote leaf only after successful consumption,
+   preserves its original signed head and writer identity, and never treats the
+   sender's prior judgment as an admission certificate.
+8. Every peer mirrors the same independently rooted per-writer trees through
+   the same core object protocol; no combined P2P content log is authoritative.
+9. Every ordinary content update mutates at most one device head slot.
+10. Different device writers share no mutable content key.
+11. Immutable objects exist before a writer advertises a head that names them.
+12. A provider version token is opaque and never a content hash.
+13. LIST output is candidate discovery, never authority.
+14. `AuthorityGate` evaluates only one request-local closed pile and proves
    requester and recipient membership, device join, and non-removal bound to
    the exact operation; it does not validate writer content.
-12. Every consuming peer validates head, tree, and closed-pile semantics before
-   using mirrored content as state.
-13. Mixed head observations may delay facts but cannot fabricate or invalidate
+15. Every consuming peer validates head signature, tree inclusion, and closed-
+    pile semantics before using mirrored content as state.
+16. Mixed head observations may delay facts but cannot fabricate or invalidate
     them.
-14. Removal governs current publication and access without rewriting validated
+17. Removal governs current publication and access without rewriting validated
     history.
-15. Request-local SQLite is discarded after one proof transaction; persistent
+18. Request-local SQLite is discarded after one proof transaction; persistent
     SQLite, caches, cursors, hints, queues, and Iroh identities are
     non-authoritative.
-16. Provider adapters add no semantic branch.
-17. FullPeer reuses the complete core gate, mirror, and consume paths.
-18. Every optional recency hint is repairable by a complete stable-head scan.
-19. No core publication path deletes ingress, heads, logs, or canonical
+19. Provider adapters add no semantic branch.
+20. FullPeer reuses the complete core gate, mirror, and consume paths.
+21. Every optional recency hint is repairable by a complete stable-head scan.
+22. No core publication path deletes ingress, heads, logs, or canonical
     objects.
-20. Historical membership exposes only the caller's own current removal paths
+23. Historical membership exposes only the caller's own current removal paths
     and never grants content or publication access.
-21. One device root secret plus invite-derived facts is the complete protocol
+24. One device root secret plus invite-derived facts is the complete protocol
     identity bootstrap for a node.
-22. After cutover, no workspace-global mutable content root remains.
+25. After cutover, no workspace-global mutable content root remains.
