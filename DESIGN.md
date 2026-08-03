@@ -427,6 +427,18 @@ never touches layout, while a background or sender-side packer takes a bounded
 uncovered contiguous prefix, uploads one at-most-95-MiB pack, and CASes only its
 window page. Each pile is copied into established packing at most once.
 
+No immutable object layout can simultaneously provide one-GET unbounded cold
+history, write only the new bytes on append, and independently address every
+range: after the second append, at least one of those requirements must become
+a manifest traversal or a rewrite. The target is the simple Pareto point. With
+Merkle page fanout `B`, a normal append writes one new pile, `O(log_B n)`
+path-copy pages, and one writer-head CAS. For `H` packed bytes under pack cap
+`C` and `Q` occupied fixed windows, dense cold transfer approaches
+`Q + ceil(H/C)` layout/body GETs plus the bounded head/tree work. Sparse sync
+pays only the RBSR frontier, affected layout pages, and selected complete-pile
+ranges. These are transfer packs growing denser toward the past; the signed
+semantic piles themselves never grow or change.
+
 If cold request count later matters, a source may perform one final coalescing
 pass when a publication window closes, replacing its several small placements
 with the minimum number of at-most-95-MiB packs. That makes older windows dense
