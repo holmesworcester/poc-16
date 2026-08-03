@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from core import peer_capability
+from core import pack_access, peer_capability
 from core.crypto import h
 from core.fact import canon
 from core.grants import make_token
@@ -23,6 +23,7 @@ from core.pack_access import (
     PackOpen,
     ScopedRequest,
     confine_scoped_request,
+    copy_pack_get,
     decode_pack_open,
     decode_scoped_request,
     encode_pack_open,
@@ -264,6 +265,87 @@ def test_put_confinement_requires_whole_create_only_request():
         with pytest.raises(InvalidPackAccess):
             confine_scoped_request(
                 opened, replace(good, headers=headers), NOW)
+
+
+def test_whole_pack_get_streams_to_sink_and_verifies_hash_and_length():
+    body = b"one" + b"two" + b"three"
+    opened = PackOpen("GET", h(body), len(body))
+    written = []
+
+    class Chunks:
+        def __iter__(self):
+            yield b"one"
+            yield b"two"
+            yield b"three"
+
+        def read(self, *_args):
+            raise AssertionError("stream must not be read without a bound")
+
+    assert copy_pack_get(
+        opened,
+        200,
+        {"Content-Length": str(len(body))},
+        Chunks(),
+        written.append,
+    ) == len(body)
+    assert b"".join(written) == body
+
+    corrupt = []
+    with pytest.raises(InvalidPackAccess, match="integrity"):
+        copy_pack_get(
+            opened, 200, {"content-length": str(len(body))},
+            (body[:-1] + b"!",), corrupt.append)
+    # A caller must use a temporary sink: bad bytes are never publication.
+    assert b"".join(corrupt) == body[:-1] + b"!"
+
+
+def test_ranged_pack_get_requires_exact_206_metadata_and_stays_bounded():
+    opened = PackOpen("GET", OID, 100, 10, 4)
+    expected_headers = {
+        "Content-Length": "4",
+        "Content-Range": "bytes 10-13/100",
+    }
+    written = []
+    assert copy_pack_get(
+        opened, 206, expected_headers, (b"ab", b"cd"),
+        written.append) == 4
+    assert written == [b"ab", b"cd"]
+
+    cases = (
+        (200, expected_headers, (b"abcd",)),
+        (206, {**expected_headers, "Content-Length": "5"}, (b"abcd",)),
+        (206, {**expected_headers,
+               "Content-Range": "bytes 10-14/100"}, (b"abcd",)),
+        (206, {"Content-Length": "4"}, (b"abcd",)),
+        (206, expected_headers, (b"abc",)),
+        (206, expected_headers, (b"abcde",)),
+        (206, expected_headers, (b"", b"abcd")),
+        (206, expected_headers, ("abcd",)),
+    )
+    for status, headers, chunks in cases:
+        with pytest.raises(InvalidPackAccess):
+            copy_pack_get(opened, status, headers, chunks, lambda _part: None)
+
+
+def test_pack_get_rejects_duplicate_headers_and_excess_fragmentation(
+        monkeypatch):
+    body = b"abc"
+    opened = PackOpen("GET", h(body), len(body))
+
+    class DuplicateHeaders:
+        @staticmethod
+        def items():
+            return (("Content-Length", "3"), ("content-length", "3"))
+
+    with pytest.raises(InvalidPackAccess, match="headers"):
+        copy_pack_get(
+            opened, 200, DuplicateHeaders(), (body,), lambda _part: None)
+
+    monkeypatch.setattr(pack_access, "MAX_PACK_STREAM_CHUNKS", 2)
+    with pytest.raises(InvalidPackAccess, match="stream"):
+        copy_pack_get(
+            opened, 200, {"Content-Length": "3"},
+            (b"a", b"b", b"c"), lambda _part: None)
 
 
 def test_gate_uses_normal_grants_and_requires_push_only_for_put():

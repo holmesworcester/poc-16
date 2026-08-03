@@ -6,6 +6,7 @@ request needed to perform it.  :func:`confine_scoped_request` keeps issuer
 mistakes from widening method, object, range, create-only, or lifetime scope.
 """
 from dataclasses import dataclass
+import hashlib
 import re
 from urllib.parse import urlsplit
 
@@ -26,6 +27,7 @@ MAX_SCOPED_HEADERS = 32
 MAX_SCOPED_HEADER_NAME_BYTES = 128
 MAX_SCOPED_HEADER_VALUE_BYTES = 4 * 1024
 MAX_SCOPED_TTL_MS = 60_000
+MAX_PACK_STREAM_CHUNKS = 1_000_000
 MAX_SAFE_INTEGER = (1 << 53) - 1
 
 _METHODS = frozenset(("GET", "PUT"))
@@ -259,9 +261,76 @@ def confine_scoped_request(
     return scoped
 
 
+def _response_header(headers, name, *, required=True):
+    try:
+        values = tuple(
+            value for key, value in headers.items()
+            if isinstance(key, str) and key.lower() == name)
+    except (AttributeError, TypeError) as error:
+        raise InvalidPackAccess("pack response headers") from error
+    if len(values) > 1 or required and len(values) != 1 \
+            or any(not isinstance(value, str) for value in values):
+        raise InvalidPackAccess("pack response headers")
+    return values[0] if values else None
+
+
+def copy_pack_get(opened, status, headers, chunks, write):
+    """Verify and stream one exact ordinary-HTTP pack GET response.
+
+    Whole bodies are SHA-256 checked against the pack OID. A ranged response
+    cannot authenticate the enclosing pack, so its caller must additionally
+    verify the resulting complete pile against the OID selected by the signed
+    writer tree. Bytes may have reached a temporary sink before a late failure;
+    callers publish that sink only after this function returns successfully.
+    """
+    if not isinstance(opened, PackOpen) or opened.method != "GET" \
+            or type(status) is not int or not callable(write):
+        raise InvalidPackAccess("pack GET response")
+    ranged = opened.offset is not None
+    expected_bytes = opened.length if ranged else opened.pack_bytes
+    if status != (206 if ranged else 200) \
+            or _response_header(headers, "content-length") \
+            != str(expected_bytes):
+        raise InvalidPackAccess("pack GET response metadata")
+    content_range = _response_header(
+        headers, "content-range", required=ranged)
+    if ranged:
+        expected_range = (
+            f"bytes {opened.offset}-"
+            f"{opened.offset + opened.length - 1}/{opened.pack_bytes}"
+        )
+        if content_range != expected_range:
+            raise InvalidPackAccess("pack GET response range")
+    elif content_range is not None:
+        raise InvalidPackAccess("pack GET response range")
+
+    digest = None if ranged else hashlib.sha256()
+    total = 0
+    try:
+        iterator = iter(chunks)
+    except TypeError as error:
+        raise InvalidPackAccess("pack GET response stream") from error
+    for count, chunk in enumerate(iterator, 1):
+        if count > MAX_PACK_STREAM_CHUNKS \
+                or not isinstance(chunk, bytes) or not chunk:
+            raise InvalidPackAccess("pack GET response stream")
+        total += len(chunk)
+        if total > expected_bytes:
+            raise InvalidPackAccess("pack GET response length")
+        if digest is not None:
+            digest.update(chunk)
+        write(chunk)
+    if total != expected_bytes:
+        raise InvalidPackAccess("pack GET response length")
+    if digest is not None and digest.hexdigest() != opened.oid:
+        raise InvalidPackAccess("pack GET response integrity")
+    return total
+
+
 __all__ = (
     "MAX_PACK_BYTES",
     "MAX_PACK_OPEN_BYTES",
+    "MAX_PACK_STREAM_CHUNKS",
     "MAX_SCOPED_HEADERS",
     "MAX_SCOPED_REQUEST_BYTES",
     "MAX_SCOPED_TTL_MS",
@@ -269,6 +338,7 @@ __all__ = (
     "PackOpen",
     "ScopedRequest",
     "confine_scoped_request",
+    "copy_pack_get",
     "decode_pack_open",
     "decode_scoped_request",
     "encode_pack_open",
