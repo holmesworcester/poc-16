@@ -31,6 +31,7 @@ from deploy.aws_lambda.config import (
     MAX_LOG_RECORD_BYTES,
     MAX_QUERY_BYTES,
     MAX_QUERY_FIELDS,
+    MAX_READINESS_RESPONSE_BYTES,
     MAX_STORE_PREFIX_LENGTH,
     PREFIX_PATTERN,
     SDK_CLEANUP_MARGIN_SECONDS,
@@ -945,7 +946,7 @@ def test_readiness_is_bounded_and_requires_explicit_ok(monkeypatch):
 
         @staticmethod
         def read(amount):
-            assert amount == 4097
+            assert amount == MAX_READINESS_RESPONSE_BYTES + 1
             return b'{"ok":true}'
 
     def open_request(request, timeout):

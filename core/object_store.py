@@ -40,6 +40,7 @@ from .ingress import MAX_INGRESS_KEY_BYTES
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
+    WRITER_LAYOUT_WINDOW_PILES,
     PayloadTooLarge,
 )
 
@@ -121,7 +122,7 @@ def mutable_key(key):
         return False
     start = int(sequence)
     return 1 <= start <= (1 << 53) - 1 \
-        and (start - 1) % 16_384 == 0
+        and (start - 1) % WRITER_LAYOUT_WINDOW_PILES == 0
 
 
 def validate_create(key, value):

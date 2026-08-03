@@ -23,11 +23,14 @@ from core.limits import (
     MAX_ATOM_NAME_BYTES,
     MAX_ATOM_VALUE_BYTES,
     MAX_FACT_BYTES,
+    MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
+from core.object_store import async_store, ensure_object_async
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
+from core.writer_repository import FactConsumer
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content import message as message_family
 from full_peer import status
@@ -112,11 +115,10 @@ def test_shared_pile_limits_fit_smallest_hosted_memory_ceiling():
         limits.MAX_PILE_JSON_VALUES,
         limits.MAX_PILE_FACTS,
     )
-    assert limits.MAX_FACT_BYTES == 3 * limits.MIB
+    assert limits.MAX_FACT_BYTES == 4 * limits.MIB
     assert limits.MAX_PILE_FACTS == 256
-    assert limits.MAX_PILE_BYTES \
-        == limits.MAX_REPOSITORY_OBJECT_BYTES \
-        == 4 * limits.MIB
+    assert limits.MAX_PILE_BYTES == 5 * limits.MIB
+    assert limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_PILE_BYTES
     assert peak < limits.MIN_HOSTED_MEMORY_BYTES
     assert limits.MAX_APPLIER_SUBREQUESTS < limits.MAX_HOSTED_SUBREQUESTS
 
@@ -272,7 +274,7 @@ def test_pile_and_root_reject_size_before_parsing(monkeypatch):
             decoder(raw)
 
 
-def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):
+def test_exact_max_fact_round_trips_through_pile_residence_and_http(tmp_path):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "source", ts=1)
     secret, public = source.identity(workspace)
@@ -282,15 +284,21 @@ def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):
         workspace, public, "general", "x" * padding, 2)
     signed = facts.auth.signature.signature(secret, public, exact, 2)
     genesis = source.fact_of(workspace, workspace)
-    raw = close.encode_pile((genesis, signed, exact), workspace=workspace)
-    destination = FullPeer(str(tmp_path / "destination"))
-    destination.add_workspace(workspace, "destination", [])
-    destination.receive_pile(workspace, "0123456789abcdef" * 4, raw)
-    assert destination.fact_of(workspace, exact.fid) == exact
+    raw = close.encode_signed_pile(close.make_signed_pile(
+        secret, workspace, public, (genesis, signed, exact)))
+    assert MAX_FACT_BYTES < len(raw) <= MAX_PILE_BYTES
+
+    destination = FsStore(str(tmp_path / "destination"))
+    run(ensure_object_async(async_store(destination), h(raw), raw))
+    consumer = FactConsumer(workspace)
+    consumer.consume(raw, writer=public)
+    assert fact.decode(consumer.fact_bytes(exact.fid)) == exact
 
     secret_token = b"g" * 32
+    encoded = fact.encode(exact)
+    run(ensure_object_async(async_store(destination), h(encoded), encoded))
     gate = http.HttpGate(
-        http.AsyncFromSyncReader(destination.store(workspace)),
+        http.AsyncFromSyncReader(destination),
         workspace,
         secret_token,
         lambda: 100,
@@ -298,7 +306,6 @@ def test_exact_max_fact_round_trips_through_peer_and_http(tmp_path):
     )
     token = make_token(
         secret_token, "reader", workspace, issued_at=100)
-    encoded = fact.encode(exact)
     response = run(gate.handle(
         "GET", "/page/" + h(encoded), {"ws": workspace},
         {"Authorization": "Bearer " + token}))

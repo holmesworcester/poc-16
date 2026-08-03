@@ -11,7 +11,13 @@ import re
 from urllib.parse import urlsplit
 
 from .fact import canon
-from .limits import MAX_PILE_BYTES, MIB, PayloadTooLarge, decode_json
+from .limits import (
+    MAX_PILE_BYTES,
+    MAX_WRITER_PACK_BYTES,
+    PACK_STREAM_CHUNK_BYTES,
+    PayloadTooLarge,
+    decode_json,
+)
 from .shape import valid_fid
 
 
@@ -19,7 +25,7 @@ PACK_OPEN_FORMAT = "poc16-pack-open-v1"
 SCOPED_REQUEST_FORMAT = "poc16-scoped-request-v1"
 PACK_PREFIX = "pack"
 
-MAX_PACK_BYTES = 95 * MIB
+MAX_PACK_BYTES = MAX_WRITER_PACK_BYTES
 MAX_PACK_OPEN_BYTES = 1024
 MAX_SCOPED_REQUEST_BYTES = 16 * 1024
 MAX_SCOPED_URL_BYTES = 8 * 1024
@@ -330,6 +336,7 @@ def copy_pack_get(opened, status, headers, chunks, write):
 __all__ = (
     "MAX_PACK_BYTES",
     "MAX_PACK_OPEN_BYTES",
+    "PACK_STREAM_CHUNK_BYTES",
     "MAX_PACK_STREAM_CHUNKS",
     "MAX_SCOPED_HEADERS",
     "MAX_SCOPED_REQUEST_BYTES",

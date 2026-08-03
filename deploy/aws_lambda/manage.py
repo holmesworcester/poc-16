@@ -33,6 +33,7 @@ from deploy.aws_lambda.config import (  # noqa: E402
     DEPLOYMENT_MARKER,
     DEPLOYMENT_TAG,
     KMS_KEY_ARN_RE,
+    MAX_READINESS_RESPONSE_BYTES,
     MAX_STORE_PREFIX_LENGTH,
     WORKSPACE_RE,
 )
@@ -376,11 +377,11 @@ def _readiness(url):
         f"{url.rstrip('/')}/readyz", method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            raw = response.read(4097)
+            raw = response.read(MAX_READINESS_RESPONSE_BYTES + 1)
             status = response.status
     except (OSError, urllib.error.URLError) as error:
         raise RuntimeError("Lambda readiness request failed") from error
-    if status != 200 or len(raw) > 4096:
+    if status != 200 or len(raw) > MAX_READINESS_RESPONSE_BYTES:
         raise RuntimeError("Lambda readiness request failed")
     try:
         value = json.loads(raw)

@@ -9,8 +9,11 @@ from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
 from core.limits import (
+    MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
+    MAX_PAGE_BATCH_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
     PayloadTooLarge,
 )
 from deploy.aws_lambda.config import (
@@ -153,19 +156,19 @@ def _gateway():
             lambda: int(time.time() * 1000),
             pack_open=_pack_issuer(config).open,
             max_request_bytes=_positive(
-                "TINYP2P_MAX_REQUEST_BYTES", 512 * 1024),
+                "TINYP2P_MAX_REQUEST_BYTES", MAX_MINT_REQUEST_BYTES),
             max_root_bytes=_positive(
-                "TINYP2P_MAX_ROOT_BYTES", 1024 * 1024),
+                "TINYP2P_MAX_ROOT_BYTES", MAX_ROOT_BYTES),
             max_object_bytes=_positive(
                 "TINYP2P_MAX_OBJECT_BYTES", MAX_REPOSITORY_OBJECT_BYTES),
             max_batch_count=_positive(
                 "TINYP2P_MAX_BATCH_COUNT", 256),
             max_batch_bytes=_positive(
-                "TINYP2P_MAX_BATCH_BYTES", 4 * 1024 * 1024),
+                "TINYP2P_MAX_BATCH_BYTES", MAX_PAGE_BATCH_BYTES),
             max_mint_fetches=_positive(
                 "TINYP2P_MINT_MAX_FETCHES", 128),
             max_mint_fetch_bytes=_positive(
-                "TINYP2P_MINT_MAX_FETCH_BYTES", 4 * 1024 * 1024),
+                "TINYP2P_MINT_MAX_FETCH_BYTES", MAX_MINT_FETCH_BYTES),
             grant_ttl_ms=_positive(
                 "TINYP2P_GRANT_TTL", 60_000),
         )

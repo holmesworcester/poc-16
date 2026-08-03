@@ -9,6 +9,13 @@ import json
 
 MIB = 1024 * 1024
 
+# Writer-log physical layout and streaming bounds. Keep these provider-neutral
+# so codecs, stores, FullPeer, Lambda, R2, and benchmarks cannot drift by
+# repeating the same numeric ceiling.
+MAX_WRITER_PACK_BYTES = 95 * MIB
+WRITER_LAYOUT_WINDOW_PILES = 16_384
+PACK_STREAM_CHUNK_BYTES = 64 * 1024
+
 PAGE_BATCH = 256
 MAX_ROOT_BYTES = MIB
 MAX_CONTROL_BYTES = MIB
@@ -17,25 +24,25 @@ MAX_MINT_FETCHES = 128
 MAX_MINT_FETCH_BYTES = 4 * MIB
 MAX_PAGE_REQUEST_BYTES = 64 * 1024
 MAX_PAGE_BATCH_BYTES = 4 * MIB
-MAX_OBJECT_BYTES = MAX_PAGE_BATCH_BYTES
 # Shared authenticated-map geometry.
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
-# A maximum-size fact must still fit inside a signed pile with its ordinary
-# signature and authority closure. Keep one MiB of the four-MiB repository
-# object for that framing instead of advertising a fact that no peer can
-# publish through the sole semantic wire door.
-MAX_FACT_BYTES = 3 * MIB
+# A signed closed pile may be larger than any one fact because it carries the
+# fact's signature, dependencies, and canonical framing. Both are ordinary
+# repository objects; every residence and mirror path must accept the larger
+# named ceiling rather than silently substituting a batch/page limit.
+MAX_FACT_BYTES = 4 * MIB
+MAX_PILE_BYTES = 5 * MIB
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
-MAX_REPOSITORY_OBJECT_BYTES = MAX_OBJECT_BYTES
+MAX_REPOSITORY_OBJECT_BYTES = max(
+    MAX_FACT_BYTES, MAX_PILE_BYTES, MAX_MERKLE_PAGE_BYTES)
+MAX_OBJECT_BYTES = MAX_REPOSITORY_OBJECT_BYTES
 
-# One immutable closed pile. A signed pile is an ordinary repository object,
-# so its wire ceiling must be exactly the ceiling used by WriterLog and
-# RepositoryMirror rather than a second, unpublishable size class.
+# One immutable closed pile. These are protocol limits, not merely
+# implementation budgets: every receiving engine enforces the same boundary.
 MAX_CLOSURE_FACTS = 256
 MAX_PILE_FACTS = MAX_CLOSURE_FACTS
-MAX_PILE_BYTES = MAX_REPOSITORY_OBJECT_BYTES
 MAX_STORE_READ_BYTES = max(MAX_OBJECT_BYTES, MAX_PILE_BYTES)
 MAX_PILE_JSON_VALUES = 48 * MAX_PILE_FACTS + 16
 # device_invite is the current maximum: FactOrder + Fact residence + ten

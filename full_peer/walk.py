@@ -20,6 +20,7 @@ from core.limits import (
 from core.object_store import ABSENT, ListPage, Versioned, VersionToken
 from core.pack_access import (
     MAX_SCOPED_REQUEST_BYTES,
+    PACK_STREAM_CHUNK_BYTES,
     PackOpen,
     confine_scoped_request,
     copy_pack_get,
@@ -260,7 +261,7 @@ class Peer:
         with urllib.request.urlopen(request, timeout=60) as response:
             def chunks():
                 while True:
-                    chunk = response.read(64 * 1024)
+                    chunk = response.read(PACK_STREAM_CHUNK_BYTES)
                     if not chunk:
                         return
                     yield chunk

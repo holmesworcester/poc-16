@@ -13,7 +13,13 @@ from .close import decode_signed_pile
 from .crypto import h
 from .fact import canon
 from .ingress import InvalidPile
-from .limits import MAX_OBJECT_BYTES, MIB, PayloadTooLarge, decode_json
+from .limits import (
+    MAX_OBJECT_BYTES,
+    MAX_WRITER_PACK_BYTES,
+    WRITER_LAYOUT_WINDOW_PILES,
+    PayloadTooLarge,
+    decode_json,
+)
 from .object_store import (
     ABSENT,
     STALE,
@@ -28,9 +34,9 @@ from .writer_tree import MAX_WRITER_SEQUENCE, WRITER_SEQUENCE_DIGITS
 
 LAYOUT_FORMAT = "poc16-writer-layout-page-v1"
 LAYOUT_PREFIX = "layouts"
-WINDOW_PILES = 16_384
+WINDOW_PILES = WRITER_LAYOUT_WINDOW_PILES
 MAX_LAYOUT_PAGE_BYTES = MAX_OBJECT_BYTES
-MAX_LAYOUT_PACK_BYTES = 95 * MIB
+MAX_LAYOUT_PACK_BYTES = MAX_WRITER_PACK_BYTES
 
 
 class InvalidWriterLayout(ValueError):

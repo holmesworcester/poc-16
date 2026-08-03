@@ -23,6 +23,7 @@ from core.limits import PayloadTooLarge, decode_json
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
+    PACK_STREAM_CHUNK_BYTES,
     PackOpen,
     ScopedRequest,
     pack_key,
@@ -30,7 +31,7 @@ from core.pack_access import (
 from core.shape import valid_fid
 
 
-STREAM_CHUNK_BYTES = 64 * 1024
+STREAM_CHUNK_BYTES = PACK_STREAM_CHUNK_BYTES
 DEFAULT_TICKET_TTL_MS = 30_000
 MAX_TICKET_BYTES = 1024
 _TICKET_DOMAIN = b"poc16-full-peer-pack-ticket-v1\0"
