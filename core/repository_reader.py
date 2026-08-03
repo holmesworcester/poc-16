@@ -78,14 +78,16 @@ class RepositoryReader:
             pile_bytes, trusted_now, purpose=purpose)
 
     @classmethod
-    async def mint_awaited(
-            cls, workspace, root_bytes, fetch, pile_bytes, trusted_now, *,
-            max_unique_fetches, max_fetch_bytes, purpose="sync"):
-        """Adapt awaited object I/O without creating another read engine."""
+    async def answer_awaited(
+            cls, workspace, root_bytes, fetch, answer, *,
+            max_unique_fetches, max_fetch_bytes):
+        """Run one synchronous Reader answer over bounded awaited fetches."""
         if type(max_unique_fetches) is not int or max_unique_fetches < 0:
             raise ValueError("reader unique-fetch budget")
         if type(max_fetch_bytes) is not int or max_fetch_bytes < 0:
             raise ValueError("reader byte budget")
+        if not callable(fetch) or not callable(answer):
+            raise TypeError("awaited reader operation")
 
         cache = {}
         fetched_bytes = 0
@@ -98,8 +100,7 @@ class RepositoryReader:
         reader = cls(workspace, root_bytes, cached_fetch)
         while True:
             try:
-                return reader.mint(
-                    pile_bytes, trusted_now, purpose=purpose)
+                return answer(reader)
             except _ObjectMiss as miss:
                 oid = miss.oid
 
@@ -115,3 +116,18 @@ class RepositoryReader:
             if fetched_bytes > max_fetch_bytes:
                 return None
             cache[oid] = raw
+
+    @classmethod
+    async def mint_awaited(
+            cls, workspace, root_bytes, fetch, pile_bytes, trusted_now, *,
+            max_unique_fetches, max_fetch_bytes, purpose="sync"):
+        """Adapt awaited object I/O without creating another read engine."""
+        return await cls.answer_awaited(
+            workspace,
+            root_bytes,
+            fetch,
+            lambda reader: reader.mint(
+                pile_bytes, trusted_now, purpose=purpose),
+            max_unique_fetches=max_unique_fetches,
+            max_fetch_bytes=max_fetch_bytes,
+        )

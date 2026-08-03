@@ -50,11 +50,10 @@ DURABLE = False
 def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
     """Authorize this ephemeral closure using only bounded Worker reads.
 
-    ``view`` is the database-free CF capability: authenticated Fact and
-    Suppression tree point reads over one root.
+    ``view`` is the database-free capability: authenticated Fact and
+    Suppression tree point reads over one pinned authority root. The selected
+    provider must reside there; a self-contained proof cannot bootstrap it.
     """
-    import facts
-
     body = valid.fact.body
     if purpose not in PURPOSES or body["verb"] != purpose \
             or body["exp"] < trusted_now:
@@ -64,14 +63,11 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
     if provider is None or (
             "member", body["pk"], body["owner"]) not in provider.offers():
         return None
-    sid = facts.principal_sid("member", body["owner"])
-    if not view.fact_known(provider.fid):
-        # A never-seen address may bootstrap from its self-contained closure.
-        # A terminal pre-tombstone must fail closed.
-        if view.suppression_known(sid):
-            return None
-    elif view.fact(provider.fid) != provider \
-            or not view.fact_active(provider.fid):
+    try:
+        current = view.fact(provider.fid)
+    except ValueError:
+        return None
+    if current != provider or not view.fact_active(provider.fid):
         return None
     return body["pk"], body["verb"]
 

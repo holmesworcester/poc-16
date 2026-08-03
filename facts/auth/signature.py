@@ -4,7 +4,7 @@ from core.fact import Fact, workspace_of
 from .._policy import FamilyPolicy
 
 TAG = "signature"
-POLICY = FamilyPolicy()
+POLICY = FamilyPolicy(authority_resident=True)
 
 
 # SHAPE

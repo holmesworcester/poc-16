@@ -76,6 +76,7 @@ class SidOffer:
 
 @dataclass(frozen=True)
 class FamilyPolicy:
+    authority_resident: bool = False
     suppression: tuple[SelectorRule, ...] | None = NEVER
     direct_targets: tuple[DirectTarget, ...] = ()
     owner_field: str | None = None
@@ -93,6 +94,8 @@ def validate_family_policy(policy):
     """Fail closed on every generic declaration before family registration."""
     if not isinstance(policy, FamilyPolicy):
         raise ValueError("family policy type")
+    if type(policy.authority_resident) is not bool:
+        raise ValueError("authority residence must be bool")
 
     selectors = policy.suppression
     if selectors is not NEVER:

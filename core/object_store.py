@@ -6,10 +6,11 @@ The root-authoritative snapshot uses only two namespaces:
     A grow-only content-addressed map. Conditional creation may report either
     that the bytes were created or that identical bytes already existed.
 
-``root``
-    One linearizable value-CAS register. A version token is an opaque
-    comparison capability for the exact bytes returned by the same read; it is
-    not a content digest or a globally unique generation.
+``root``, ``authority``
+    Distinct linearizable value-CAS registers for content and shared control
+    state. A version token is an opaque comparison capability for the exact
+    bytes returned by the same read; it is not a content digest or a globally
+    unique generation.
 
 The same local store may retain exact ``ingress/v1/`` sources. Hosted uploads
 put that namespace in a separate provider compartment. It is retry input,
@@ -34,6 +35,9 @@ from .limits import (
 )
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
+CONTENT_ROOT_KEY = "root"
+AUTHORITY_ROOT_KEY = "authority"
+REPOSITORY_ROOT_KEYS = frozenset((CONTENT_ROOT_KEY, AUTHORITY_ROOT_KEY))
 
 # S3 and R2 both cap one complete object key at 1,024 bytes. A configured
 # prefix must leave room for every logical namespace the shared store may
@@ -77,7 +81,8 @@ def validate_store_prefix(prefix):
 
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
-    return key == "root" or key.startswith("root/") \
+    return key in REPOSITORY_ROOT_KEYS \
+        or key.startswith("root/") or key.startswith("authority/") \
         or key == "obj" or key.startswith("obj/")
 
 
@@ -86,8 +91,9 @@ def validate_create(key, value):
     key = validate_key(key)
     if not isinstance(value, bytes):
         raise TypeError("object value must be bytes")
-    if key == "root" or key.startswith("root/"):
-        raise ValueError("root requires compare-and-swap")
+    if key in REPOSITORY_ROOT_KEYS \
+            or key.startswith("root/") or key.startswith("authority/"):
+        raise ValueError("repository root requires compare-and-swap")
     for prefix in ("obj/",):
         if key == prefix[:-1] or (
                 key.startswith(prefix) and key[len(prefix):] != h(value)):

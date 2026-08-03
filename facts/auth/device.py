@@ -12,6 +12,7 @@ from ._display import display
 
 TAG = "device"
 POLICY = FamilyPolicy(
+    authority_resident=True,
     suppression=(Self(),),
     authority_liveness_guards=("member",),
     principal_offers=(SidOffer("device_key", "device"),),

@@ -11,6 +11,7 @@ from . import signature
 
 TAG = "admin"
 POLICY = FamilyPolicy(
+    authority_resident=True,
     # The grantor_admin Need is checked when the grant is admitted. The resulting
     # admin authority remains live only while the grantee remains a member.
     authority_liveness_guards=("grantee_member",),

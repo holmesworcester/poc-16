@@ -1,13 +1,13 @@
 """ObjectStore: the one S3-shaped trait every node stores through.
 
-Layout: root (the CAS'd composite snapshot), obj/<hash> (bounded map pages
-and fact/file blobs — immutable),
+Layout: root and authority (distinct CAS'd composite snapshots), obj/<hash>
+(bounded map pages and fact/file blobs — immutable),
 ingress/v1/workspaces/<ws>/piles/<session>/<uploader>/<hash> (exact ingress),
 and invite/<id> (public reads).
 
 The public mutation contract rejects unconditional root/object replacement
 and authoritative deletion. Objects and retained piles use atomic
-put-if-absent; root uses CAS.
+put-if-absent; repository roots use CAS.
 """
 import fcntl
 import heapq
@@ -24,6 +24,7 @@ from .object_store import (
     Versioned,
     VersionToken,
     ListPage,
+    REPOSITORY_ROOT_KEYS,
     authoritative_key,
     validate_create,
     validate_key,
@@ -77,7 +78,8 @@ class FsStore:
         because replacement is serialized by ``_root_lock``. Provider
         implementations return their own conditional-write token instead.
         """
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        limit = MAX_ROOT_BYTES \
+            if key in REPOSITORY_ROOT_KEYS else MAX_OBJECT_BYTES
         value = self.get_bounded(key, limit)
         return ABSENT if value is None else Versioned(
             value, VersionToken(h(value)))
@@ -143,8 +145,8 @@ class FsStore:
                 pass
 
     def cas(self, key, token, b):
-        if key != "root":
-            raise ValueError("only root is mutable by CAS")
+        if key not in REPOSITORY_ROOT_KEYS:
+            raise ValueError("key is not a repository CAS register")
         with open(self._root_lock, "a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             current = self.read_versioned(key)

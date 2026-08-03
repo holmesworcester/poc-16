@@ -36,6 +36,7 @@ from .object_store import (
     STALE,
     Applied,
     OutcomeUnknown,
+    REPOSITORY_ROOT_KEYS,
     SyncStoreAdapter,
     Versioned,
     async_store,
@@ -57,11 +58,22 @@ class ApplyResult:
 class RepositoryApplier:
     """One database-free receiving engine over an object-store CAS register."""
 
-    def __init__(self, workspace, store):
+    def __init__(
+            self, workspace, store, *, root_key="root",
+            evaluate=None, accept_fact=None):
         if not valid_fid(workspace):
             raise ValueError("repository workspace")
+        if root_key not in REPOSITORY_ROOT_KEYS:
+            raise ValueError("repository root key")
+        if evaluate is not None and not callable(evaluate):
+            raise TypeError("repository evaluator")
+        if accept_fact is not None and not callable(accept_fact):
+            raise TypeError("repository fact policy")
         self.workspace = workspace
         self.store = async_store(store)
+        self.root_key = root_key
+        self._evaluate = evaluate
+        self._accept_fact = accept_fact
 
     @staticmethod
     async def _get_bounded(store, key, maximum):
@@ -135,8 +147,8 @@ class RepositoryApplier:
 
     def _validated_facts(self, raw):
         """Return the durable subset of one database-free closed-pile turn."""
-        stream = decode_pile(raw, self.workspace)
-        judgment = drain(tuple(stream), self.workspace)
+        judgment = self._evaluate(raw) if self._evaluate is not None else \
+            drain(tuple(decode_pile(raw, self.workspace)), self.workspace)
         if not judgment.ok:
             if judgment.failure is not None:
                 raise judgment.failure
@@ -145,6 +157,9 @@ class RepositoryApplier:
         facts_by_fid, durable = {}, []
         for receipt in judgment.valids:
             family = facts.family_for(receipt.fact.t)
+            if self._accept_fact is not None \
+                    and not self._accept_fact(receipt.fact):
+                raise KernelRejected("fact is outside repository policy")
             if family is None or not family.DURABLE:
                 continue
             fid = receipt.fact.fid
@@ -179,7 +194,7 @@ class RepositoryApplier:
         except PermanentIngressRejection:
             return ApplyResult("rejected", None)
 
-        versioned = await self.store.read_versioned("root")
+        versioned = await self.store.read_versioned(self.root_key)
         if versioned is ABSENT:
             base_root, base_token = None, ABSENT
         elif isinstance(versioned, Versioned):
@@ -197,7 +212,7 @@ class RepositoryApplier:
         if compiled.root is None:
             return ApplyResult("noop", None, admitted)
         if compiled.root == base_root:
-            current = await self.store.read_versioned("root")
+            current = await self.store.read_versioned(self.root_key)
             if not isinstance(current, Versioned) \
                     or current.token != base_token \
                     or current.value != base_root:
@@ -206,9 +221,9 @@ class RepositoryApplier:
 
         try:
             result = await self.store.cas(
-                "root", base_token, compiled.root)
+                self.root_key, base_token, compiled.root)
         except OutcomeUnknown:
-            current = await self.store.read_versioned("root")
+            current = await self.store.read_versioned(self.root_key)
             if isinstance(current, Versioned) \
                     and current.value == compiled.root:
                 return ApplyResult("applied", compiled.root, admitted)

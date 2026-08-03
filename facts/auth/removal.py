@@ -5,7 +5,10 @@ from .._policy import FamilyPolicy, SidOffer
 from . import signature
 
 TAG = "evict"
-POLICY = FamilyPolicy(action_offers=(SidOffer("removed", "member"),))
+POLICY = FamilyPolicy(
+    authority_resident=True,
+    action_offers=(SidOffer("removed", "member"),),
+)
 
 
 # SHAPE
