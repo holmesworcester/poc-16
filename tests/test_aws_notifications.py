@@ -28,6 +28,7 @@ from notifications.discovery import (
     NotificationDiscovery,
     NotificationState,
 )
+from notifications.forest import current_repository
 from notifications.hints import decode_hint
 from notifications.worker import NotificationWorker
 from adapters.aws import SqsCarrier
@@ -446,6 +447,10 @@ class AwaitedStore:
         await asyncio.sleep(0)
         return self.store.get_bounded(key, maximum)
 
+    async def copy_pile_object(self, oid, maximum, write):
+        await asyncio.sleep(0)
+        return self.store.copy_pile_object(oid, maximum, write)
+
     async def read_versioned(self, key):
         await asyncio.sleep(0)
         return self.store.read_versioned(key)
@@ -457,6 +462,10 @@ class AwaitedStore:
     async def cas(self, key, token, value):
         await asyncio.sleep(0)
         return self.store.cas(key, token, value)
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        await asyncio.sleep(0)
+        return self.store.list_page(prefix, cursor, limit)
 
 
 class RejectCarrier:
@@ -509,9 +518,11 @@ def _world(tmp_path, *, invalid_endpoint=False):
 
 
 def _worker(node, secret, provider):
+    async def current(workspace):
+        return await current_repository(node.store(workspace), workspace)
+
     return NotificationWorker(
-        lambda workspace: node.reader(workspace).root_bytes,
-        lambda workspace, oid: node.store(workspace).get("obj/" + oid),
+        current,
         secret,
         provider,
         lambda: 10,
@@ -528,7 +539,7 @@ def _record(body, message_id="work", attempt=1):
     }
 
 
-def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
+def test_dropped_schedule_wake_is_repaired_from_writer_heads(tmp_path):
     node = FullPeer(str(tmp_path / "scanner-node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bind(node, workspace, "phone")
@@ -554,7 +565,7 @@ def test_dropped_schedule_wake_is_repaired_from_latest_facttree(tmp_path):
     assert queue.bodies == [first_body]
     hints = [decode_hint(first_body)]
     assert {fid for hint in hints for fid in hint.facts} == {first, second}
-    assert len({hint.root_oid for hint in hints}) == 1
+    assert len({hint.head for hint in hints}) == 1
 
 
 def test_concurrent_scanner_lambdas_duplicate_but_cursor_cas_advances_once(
@@ -697,13 +708,10 @@ def test_crash_after_fcm_acceptance_retries_with_same_delivery_id(tmp_path):
                 raise RuntimeError("crash after FCM acceptance")
             return result
 
-    worker = CrashOnce(
-        lambda selected: node.reader(selected).root_bytes,
-        lambda selected, oid: node.store(selected).get("obj/" + oid),
-        secret,
-        provider,
-        lambda: 10,
-    )
+    async def current(selected):
+        return await current_repository(node.store(selected), selected)
+
+    worker = CrashOnce(current, secret, provider, lambda: 10)
     event = {"Records": [_record(raw)]}
 
     first = asyncio.run(app.deliver_batch(
@@ -813,14 +821,14 @@ def test_invalid_endpoint_is_terminal_and_does_not_wedge_sqs(tmp_path):
     assert provider.requests == []
 
 
-def test_unregistered_fid_is_terminal_but_missing_event_root_retries(
+def test_unregistered_fid_is_terminal_but_missing_event_fact_retries(
         tmp_path):
     node, workspace, secret, _event, state, raw = _world(tmp_path)
     provider = Push([PushUnregistered("gone")])
     worker = _worker(node, secret, provider)
     sqs = {"Records": [_record(raw)]}
 
-    class MissingRoot:
+    class MissingEvent:
         def __init__(self, backing):
             self.owner = backing.owner
             self.pending = backing.pending
@@ -830,7 +838,7 @@ def test_unregistered_fid_is_terminal_but_missing_event_root_retries(
             return None
 
     missing = asyncio.run(app.deliver_batch(
-        sqs, state=MissingRoot(state), worker=worker,
+        sqs, state=MissingEvent(state), worker=worker,
         workspace=workspace,
         queue_arn=ARN,
     ))

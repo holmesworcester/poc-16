@@ -67,8 +67,16 @@ async def read_versioned(env, key, maximum=MAX_ROOT_BYTES):
     }
 
 
+async def list_page(env, prefix, cursor=None, limit=256):
+    page = await store(env).list_page(prefix, cursor, limit)
+    return {"cursor": page.cursor, "keys": list(page.keys)}
+
+
 def release_state(env):
     return release(env, "notification-canonical-reader")
 
 
-__all__ = ("Settings", "get_bounded", "read_versioned", "release_state")
+__all__ = (
+    "Settings", "get_bounded", "list_page", "read_versioned",
+    "release_state",
+)

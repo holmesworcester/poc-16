@@ -1,9 +1,9 @@
 """Optional FullPeer scheduling around the shared notification engine.
 
 The repository is the authority and the notification cursor is operational
-state.  This composition never consults SQLite, observes repository commits,
-or implements notification selection.  It periodically runs the exact shared
-FactTree discovery and worker used by hosted deployments.
+state. This composition never consults SQLite, observes repository commits,
+or implements notification selection. It periodically runs the exact shared
+writer-head discovery and worker used by hosted deployments.
 """
 import asyncio
 from dataclasses import dataclass
@@ -14,7 +14,6 @@ import time
 from adapters.gcp.firebase import FirebaseAdminFcm
 from core.crypto import h, load_sk
 from core.fact import canon
-from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from core.store import FsStore
 from notifications.carrier import (
@@ -26,6 +25,7 @@ from notifications.carrier import (
 )
 from notifications.discovery import NotificationDiscovery, NotificationState
 from notifications.delivery import delivery_domain_id
+from notifications.forest import current_repository
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 
 
@@ -154,23 +154,13 @@ class FullPeerNotifications:
             return self._stores[workspace]
 
     def _worker(self, workspace, repository):
-        def current_root(selected):
+        async def current(selected):
             if selected != workspace:
                 raise ValueError("notification workspace mismatch")
-            raw = repository.get_bounded("root", MAX_ROOT_BYTES)
-            if raw is None:
-                raise OSError("notification repository has no root")
-            return raw
-
-        def fetch(selected, oid):
-            if selected != workspace:
-                raise ValueError("notification workspace mismatch")
-            return repository.get_bounded(
-                "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
+            return await current_repository(repository, workspace)
 
         return NotificationWorker(
-            current_root,
-            fetch,
+            current,
             self.secret,
             self.provider,
             self.node.now_ms,
@@ -199,7 +189,7 @@ class FullPeerNotifications:
         else:
             raise ValueError("notification bootstrap mode")
         return {
-            "base": cursor.base,
+            "heads": cursor.heads["root"],
             "mode": cursor.bootstrap,
             "workspace": workspace,
         }

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import facts
 from adapters.gcp.firebase import FirebaseAdminFcm
 from core.crypto import h, keypair
+from core.fact import encode
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.auth.device_invite import grant
@@ -25,7 +26,7 @@ from notifications.delivery import (
     derive,
     seal_target,
 )
-from .util import compiled_repository
+from notifications.forest import CurrentView
 
 
 def _firebase_app(project="firebase-project"):
@@ -51,25 +52,21 @@ def _world(tmp_path, name="node"):
     return node, workspace, push_secret, push_node, endpoint
 
 
-def _snapshot(node, workspace):
-    return compiled_repository(node, workspace)
-
-
-def _fetch(node, workspace):
-    _root, objects = _snapshot(node, workspace)
-    return objects.get
+def _view(node, workspace):
+    return CurrentView(workspace, {
+        fid: encode(node.fact_of(workspace, fid))
+        for fid in node.sql(workspace).fact_ids()
+    })
 
 
 def _hint(node, workspace, *fids):
     return PublicationHint(
         workspace,
-        _snapshot(node, workspace)[0],
-        tuple(sorted(set(fids))),
+        tuple(
+            encode(node.fact_of(workspace, fid))
+            for fid in sorted(set(fids))
+        ),
     )
-
-
-def _root(node, workspace):
-    return _snapshot(node, workspace)[0]
 
 
 def _author_preference(node, workspace, scope, target, mode, ts):
@@ -234,12 +231,10 @@ def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
     channel = message.post(
         node, workspace, "quiet", "channel opt-in", ts=7)
 
-    assert derive(_hint(node, workspace, text),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
-    mention, = derive(_hint(node, workspace, explicit),
-                      _fetch(node, workspace), _root(node, workspace))
-    ordinary, = derive(_hint(node, workspace, channel),
-                       _fetch(node, workspace), _root(node, workspace))
+    current = _view(node, workspace)
+    assert derive(_hint(node, workspace, text), current) == ()
+    mention, = derive(_hint(node, workspace, explicit), current)
+    ordinary, = derive(_hint(node, workspace, channel), current)
     assert mention.endpoint == ordinary.endpoint == endpoint
     assert mention.kind == "mention"
     assert ordinary.kind == "message"
@@ -248,8 +243,8 @@ def test_matching_uses_explicit_mentions_and_channel_override(tmp_path):
 def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
     node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
     event = message.post(node, workspace, "general", "quiet", ts=3)
-    assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
+    assert derive(_hint(node, workspace, event), _view(
+        node, workspace)) == ()
 
     _author_preference(
         node, workspace, preference.CHANNEL, "general",
@@ -257,8 +252,8 @@ def test_absent_and_concurrent_inherited_preferences_fail_closed(tmp_path):
     _author_preference(
         node, workspace, preference.CHANNEL, "general",
         preference.INHERIT, 5)
-    assert derive(_hint(node, workspace, event),
-                  _fetch(node, workspace), _root(node, workspace)) == ()
+    assert derive(_hint(node, workspace, event), _view(
+        node, workspace)) == ()
 
 
 class _Message:

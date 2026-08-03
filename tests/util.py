@@ -199,8 +199,8 @@ def compiled_repository(node, workspace, objects=None):
     """Compile current projected facts into an explicit test-only snapshot.
 
     The writer-log FullPeer deliberately has no aggregate content root. Tests
-    for the still-root-shaped authority/notification readers construct that
-    pure value explicitly instead of reviving ``FullPeer.reader``.
+    for pure RepositoryReader queries construct that disposable value
+    explicitly instead of reviving ``FullPeer.reader``.
     """
     from core.repository_snapshot import compile_snapshot
 

@@ -3,9 +3,9 @@ import asyncio
 
 import facts
 
-from core import indexes
 from core.crypto import h, keypair
-from core.limits import MAX_ROOT_BYTES, PayloadTooLarge
+from core.limits import PayloadTooLarge
+from core.writer_head import decode_slot_at, head_slot_key
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.content import message
@@ -24,6 +24,7 @@ from notifications.discovery import (
     PENDING_NONCURRENT,
 )
 from notifications.hints import decode_hint
+from notifications.forest import current_repository
 from notifications.worker import NotificationWorker, handle_carrier_delivery
 from tests.notification_carrier import FaultCarrier
 
@@ -88,7 +89,7 @@ class PausingComplete(StateProxy):
         return await self.state.complete(*args)
 
 
-class RootFault(StateProxy):
+class EventFault(StateProxy):
     def __init__(self, state, value=None, error=None):
         super().__init__(state)
         self.value = value
@@ -142,20 +143,16 @@ def _world(tmp_path, provider=None):
     state = NotificationState(cursor_store, workspace, OWNER)
     provider = provider or AsyncPush()
 
-    async def current_root(selected):
+    async def current(selected):
         await asyncio.sleep(0)
-        return node.reader(selected).root_bytes
-
-    async def fetch(selected, oid):
-        await asyncio.sleep(0)
-        return node.store(selected).get("obj/" + oid)
+        return await current_repository(node.store(selected), selected)
 
     async def now_ms():
         await asyncio.sleep(0)
         return 10
 
     worker = NotificationWorker(
-        current_root, fetch, push_secret, provider, now_ms)
+        current, push_secret, provider, now_ms)
     return (
         node, workspace, event, body, reference, state, provider, worker)
 
@@ -288,7 +285,7 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
         new_body, = fresh_carrier.payloads
         old_reference, new_reference = map(
             decode_hint, (old_body, new_body))
-        assert old_reference.root_oid == new_reference.root_oid
+        assert old_reference.head == new_reference.head
         assert old_reference.facts == new_reference.facts
         assert old_reference.generation != new_reference.generation
         assert h(old_body) != h(new_body)
@@ -310,14 +307,14 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
     assert len(provider.requests) == 1
 
 
-def test_current_missing_corrupt_or_oversized_root_always_retries(tmp_path):
+def test_pending_event_missing_corrupt_or_oversized_always_retries(tmp_path):
     (_node, workspace, _event, body, _reference,
      state, provider, worker) = _world(tmp_path)
     faults = (
-        RootFault(state),
-        RootFault(state, b"substituted"),
-        RootFault(state, error=PayloadTooLarge("oversized")),
-        RootFault(state, error=OSError("temporarily down")),
+        EventFault(state),
+        EventFault(state, b"substituted"),
+        EventFault(state, error=PayloadTooLarge("oversized")),
+        EventFault(state, error=OSError("temporarily down")),
     )
     for fault in faults:
         carrier, accepted, result = asyncio.run(_deliver(
@@ -327,11 +324,13 @@ def test_current_missing_corrupt_or_oversized_root_always_retries(tmp_path):
     assert provider.requests == []
 
 
-def test_current_worker_invalid_hint_retries_without_completion(tmp_path):
+def test_malformed_current_writer_forest_retries_without_completion(tmp_path):
     (node, workspace, _event, body, _reference,
      state, provider, worker) = _world(tmp_path)
-    fact_page = node.reader(workspace).root.maps[indexes.FACT]["root"]
-    node.store(workspace)._delete("obj/" + fact_page)
+    device = node.identity_id(workspace)
+    key = head_slot_key(workspace, device)
+    slot = decode_slot_at(key, node.store(workspace).get(key))
+    node.store(workspace)._delete("obj/" + slot.head)
 
     carrier, accepted, result = asyncio.run(_deliver(
         body, workspace, state, worker))

@@ -46,6 +46,7 @@ class Settings:
             raise ValueError("canonical reader and notification state differ")
         if not callable(getattr(canonical, "get_bounded", None)) \
                 or not callable(getattr(canonical, "read_versioned", None)) \
+                or not callable(getattr(canonical, "list_page", None)) \
                 or not callable(getattr(canonical, "release", None)):
             raise ValueError("CANONICAL_READER binding")
         queue = getattr(env, "NOTIFICATION_QUEUE")

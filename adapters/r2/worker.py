@@ -13,12 +13,11 @@ from core.object_store import (
     CREATED,
     EXISTS,
     Applied,
+    MAX_PROVIDER_KEY_BYTES,
     OutcomeUnknown,
     RetryableStoreError,
     STALE,
     StoreError,
-    ListPage,
-    MAX_PROVIDER_KEY_BYTES,
     Versioned,
     VersionToken,
     authoritative_key,
@@ -28,6 +27,7 @@ from core.object_store import (
     validate_store_prefix,
 )
 from core.shape import valid_fid
+from .listing import list_page as _list_page
 
 
 def _if_none_match():
@@ -76,58 +76,6 @@ class R2BindingStore:
         if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
             raise ValueError("R2 object key exceeds 1024 bytes")
         return physical
-
-    def _list_prefix(self, prefix):
-        if not isinstance(prefix, str):
-            raise ValueError("bad list prefix")
-        trailing = prefix.endswith("/")
-        logical = prefix[:-1] if trailing else prefix
-        if logical:
-            validate_key(logical)
-        physical = f"{self.prefix}/" if self.prefix else ""
-        if logical:
-            physical += logical
-        if trailing:
-            physical += "/"
-        if len(physical.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
-            raise ValueError("R2 list prefix exceeds 1024 bytes")
-        return physical
-
-    def _logical(self, physical):
-        base = f"{self.prefix}/" if self.prefix else ""
-        try:
-            oversized = len(physical.encode("ascii")) > \
-                MAX_PROVIDER_KEY_BYTES
-        except UnicodeEncodeError as error:
-            raise StoreError("R2 returned an invalid logical key") from error
-        if oversized:
-            raise StoreError("R2 returned an invalid logical key")
-        if not physical.startswith(base):
-            raise StoreError("R2 returned a key outside the configured prefix")
-        logical = physical[len(base):]
-        try:
-            return validate_key(logical)
-        except (TypeError, ValueError) as error:
-            raise StoreError("R2 returned an invalid logical key") from error
-
-    @staticmethod
-    def _page_objects(values, limit):
-        """Consume at most one object beyond the native LIST page budget."""
-        try:
-            iterator = iter(values)
-        except TypeError as error:
-            raise StoreError("R2 LIST objects are not iterable") from error
-        objects = []
-        try:
-            for _ in range(limit + 1):
-                objects.append(next(iterator))
-        except StopIteration:
-            pass
-        except Exception as error:
-            raise StoreError("R2 LIST object iteration failed") from error
-        if len(objects) > limit:
-            raise StoreError("R2 LIST exceeded the requested page limit")
-        return tuple(objects)
 
     @staticmethod
     async def _bytes(obj):
@@ -305,44 +253,8 @@ class R2BindingStore:
         return STALE if result is None else Applied(self._token(result))
 
     async def list_page(self, prefix, cursor=None, limit=1000):
-        """Issue exactly one bounded native R2 LIST request."""
-        if type(limit) is not int or not 0 < limit <= 1000:
-            raise ValueError("R2 list page limit")
-        if cursor is not None and (
-                not isinstance(cursor, str) or not cursor):
-            raise ValueError("R2 list cursor")
-        physical = self._list_prefix(prefix)
-        try:
-            options = {"prefix": physical, "limit": limit}
-            if cursor is not None:
-                options["cursor"] = cursor
-            page = await self.bucket.list(**options)
-            objects = self._page_objects(page.objects, limit)
-            truncated = page.truncated
-            next_cursor = page.cursor
-        except StoreError:
-            raise
-        except Exception as error:
-            raise StoreError(
-                f"R2 list failed for {prefix}") from error
-        keys = set()
-        for obj in objects:
-            key = getattr(obj, "key", None)
-            if not isinstance(key, str):
-                raise StoreError("R2 LIST returned a non-string key")
-            if not key.startswith(physical):
-                raise StoreError(
-                    "R2 LIST returned an out-of-prefix key")
-            keys.add(self._logical(key))
-        keys = tuple(sorted(keys))
-        if not isinstance(truncated, bool):
-            raise StoreError("R2 LIST returned invalid truncation")
-        if not truncated:
-            return ListPage(keys, None)
-        if not isinstance(next_cursor, str) \
-                or not next_cursor or next_cursor == cursor:
-            raise StoreError("R2 LIST returned a repeated cursor")
-        return ListPage(keys, next_cursor)
+        return await _list_page(
+            self.bucket, self.prefix, prefix, cursor, limit)
 
     async def list(self, prefix):
         """Administrative full traversal; receiving code uses ``list_page``."""

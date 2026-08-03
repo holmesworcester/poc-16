@@ -10,8 +10,22 @@ from .carrier import MAX_CARRIER_BYTES
 from .delivery import PublicationHint
 
 
-FORMAT = "notification-hint-v2"
+FORMAT = "notification-writer-hint-v1"
 MAX_HINT_BYTES = MAX_CARRIER_BYTES
+# Each event carries two 64-hex identities plus JSON framing.  Keep a simple
+# protocol constant comfortably below the carrier byte ceiling rather than
+# discovering that ceiling after a cursor has already selected a page.
+MAX_HINT_EVENTS = min(MAX_PILE_FACTS, 512)
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class EventRef:
+    fid: str
+    oid: str
+
+    def __post_init__(self):
+        if not valid_fid(self.fid) or not valid_fid(self.oid):
+            raise ValueError("notification event reference")
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,29 +33,38 @@ class NotificationHint:
     workspace: str
     owner: str
     generation: str
-    root_oid: str
-    facts: tuple[str, ...]
+    device: str
+    base_head: str | None
+    head: str
+    events: tuple[EventRef, ...]
 
     def __post_init__(self):
-        if not valid_fid(self.workspace) or not valid_fid(self.owner) \
-                or not valid_fid(self.generation) \
-                or not valid_fid(self.root_oid) \
-                or not isinstance(self.facts, tuple) \
-                or len(self.facts) > MAX_PILE_FACTS \
-                or tuple(sorted(set(self.facts))) != self.facts \
-                or not all(valid_fid(fid) for fid in self.facts):
+        if not all(valid_fid(value) for value in (
+                self.workspace, self.owner, self.generation,
+                self.device, self.head)) \
+                or self.base_head is not None \
+                and not valid_fid(self.base_head) \
+                or not isinstance(self.events, tuple) \
+                or not 1 <= len(self.events) <= MAX_HINT_EVENTS \
+                or tuple(sorted(set(self.events))) != self.events:
             raise ValueError("notification hint")
+
+    @property
+    def facts(self):
+        return tuple(event.fid for event in self.events)
 
 
 def _body(hint):
     if not isinstance(hint, NotificationHint):
         raise TypeError("notification hint")
     return {
-        "facts": list(hint.facts),
+        "base_head": hint.base_head,
+        "device": hint.device,
+        "events": [[event.fid, event.oid] for event in hint.events],
         "format": FORMAT,
         "generation": hint.generation,
+        "head": hint.head,
         "owner": hint.owner,
-        "root_oid": hint.root_oid,
         "workspace": hint.workspace,
     }
 
@@ -56,30 +79,40 @@ def encode_hint(hint):
 def decode_hint(raw):
     value = decode_json(raw, MAX_HINT_BYTES, "notification hint")
     if not isinstance(value, dict) or set(value) != {
-            "facts", "format", "generation", "owner", "root_oid",
-            "workspace"} \
+            "base_head", "device", "events", "format", "generation",
+            "head", "owner", "workspace"} \
             or value.get("format") != FORMAT \
-            or not isinstance(value.get("facts"), list):
+            or not isinstance(value.get("events"), list):
         raise ValueError("notification hint shape")
-    hint = NotificationHint(
-        value.get("workspace"), value.get("owner"),
-        value.get("generation"), value.get("root_oid"),
-        tuple(value["facts"]))
+    try:
+        events = tuple(EventRef(*row) for row in value["events"])
+        hint = NotificationHint(
+            value.get("workspace"), value.get("owner"),
+            value.get("generation"), value.get("device"),
+            value.get("base_head"), value.get("head"), events)
+    except (TypeError, ValueError) as error:
+        raise ValueError("notification hint shape") from error
     if encode_hint(hint) != raw:
         raise ValueError("notification hint identity")
     return hint
 
 
-def materialize_hint(hint, root):
-    """Bind carrier work to hash-verified root bytes from cursor storage."""
-    if not isinstance(hint, NotificationHint) \
-            or not isinstance(root, bytes) or h(root) != hint.root_oid:
-        raise ValueError("notification hint root")
-    return PublicationHint(hint.workspace, root, hint.facts)
+def materialize_hint(hint, raw_events):
+    """Bind scanner-validated event references to hash-verified fact bytes."""
+    if not isinstance(hint, NotificationHint):
+        raise ValueError("notification hint")
+    raw_events = tuple(raw_events)
+    if len(raw_events) != len(hint.events) or any(
+            not isinstance(raw, bytes) or h(raw) != event.oid
+            for event, raw in zip(hint.events, raw_events)):
+        raise ValueError("notification hint events")
+    return PublicationHint(hint.workspace, raw_events)
 
 
 __all__ = (
+    "EventRef",
     "MAX_HINT_BYTES",
+    "MAX_HINT_EVENTS",
     "NotificationHint",
     "decode_hint",
     "encode_hint",

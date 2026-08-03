@@ -226,16 +226,16 @@ exact-ingress/global-root flow documented later and is removed by
 ## Mobile notifications
 
 Mobile notification delivery is durable operational work outside repository
-publication. A successful root CAS never invokes a notification callback and
-never waits for a queue or provider:
+publication. A successful writer-slot CAS never invokes a notification
+callback and never waits for a queue or provider:
 
 ```text
 mobile installation -> sealed push_endpoint fact
 user setting         -> notification_preference fact
 new message          -> family-owned notification trigger
-scheduled scanner    -> authenticated FactTree diff -> durable pending cursor
-disposable wake      -> historical event proof + current authority join -> FCM
-typed completion     -> pending-cursor CAS -> next FactTree page
+scheduled scanner    -> validated writer-head diff -> durable pending cursor
+disposable wake      -> pinned event bytes + current writer-forest join -> FCM
+typed completion     -> pending-cursor CAS -> next writer-head page
 ```
 
 An endpoint belongs to one workspace user and mobile installation. It carries
@@ -252,27 +252,35 @@ restrictively, so a concurrent mute wins. With no global preference the default
 is `none`.
 
 `NotificationDiscovery` has a separate operational object store and CAS
-cursor. On each bounded turn it pins one repository target root, diffs only
-the authenticated `fact.type` postings in `FactTree` from its acknowledged
-base, and selects families with a `notification_trigger` hook. It does not
-read fact blobs, `FactOrder`, SQLite, ingress, or `RepositoryApplier`.
+cursor. It lists the per-device head directory, pins one exact signed head,
+and uses the shared `RepositoryMirror` and `FactConsumer` to validate its new
+closed piles from that writer's acknowledged head. It then selects facts whose
+family declares a `notification_trigger` hook. The cursor keeps authenticated
+maps of acknowledged head OID by writer, already-emitted trigger FID, and exact
+rejected head OID by writer. Repeated closure dependencies therefore do not
+repeat notifications, and one malformed writer head is quarantined without
+being acknowledged or blocking other writers. Discovery does not consult
+SQLite, ingress, `RepositoryApplier`, or a workspace-wide content root.
 
-Bootstrap is explicit: normal launch initializes at the current repository
-root, while a deliberate backfill starts at the empty tree. Scanning with an
-absent cursor fails loudly. Each successful bootstrap creates a fresh random
-generation so an old paused worker cannot complete identical work after state
-loss and rebootstrap.
+Bootstrap is explicit: normal launch validates all current writer heads and
+marks their existing triggers seen, while a deliberate backfill starts with
+empty acknowledged/seen maps. Scanning with an absent cursor fails loudly.
+Each successful bootstrap creates a fresh random generation so an old paused
+worker cannot complete identical work after state loss and rebootstrap.
 
 One canonical body contains only workspace, immutable deployment owner,
-bootstrap generation, target-root object ID, and sorted trigger FIDs. Before
-publishing, the scanner preserves the exact target root and body in
-notification state and CASes one pending body OID with its exact successor.
-There is at most one pending page per workspace. Queue, SQS, and local
-deliveries are disposable wakes: every fair scheduled turn republishes the
-byte-identical pending body until the worker records completion. A lost wake,
-finite queue retention, ambiguous publish response, process crash, or scanner
-race can duplicate work but cannot make discovery forget it. A zero-trigger
-page advances directly.
+bootstrap generation, writer device, acknowledged/base head, pinned target
+head, and sorted `(fid, fact-object OID)` trigger references. Before
+publishing, the scanner copies those exact event bytes and the hint into
+notification state, then CASes one pending body OID with its exact seen-map
+successor. Writer validation itself is discarded until that cursor CAS, so a
+crash after validation cannot make a retry skip unacknowledged work. There is
+at most one pending page per workspace. Queue, SQS, and local deliveries are
+disposable wakes: every fair scheduled turn republishes the byte-identical
+pending body until the worker records completion. A lost wake, finite queue
+retention, ambiguous publish response, process crash, or scanner race can
+duplicate work but cannot make discovery forget it. A zero-trigger validated
+head advances directly.
 
 The worker advances the pending cursor only after typed FCM acceptance or an
 explicit current-authority or terminal outcome. A concurrent or stale delivery
@@ -285,16 +293,19 @@ to skip history or flood it again. Preserve notification state across updates
 and rollback; state loss is an explicit recovery event, never implicit
 reinitialization.
 
-`NotificationWorker` resolves and hash-checks the historical event root from
-notification state, authenticates every named event there, then separately
-pins the current repository root. Its bounded authenticated join follows:
+`NotificationWorker` hash-checks the scanner-preserved event bytes from
+notification state, then reconstructs a discarded current query snapshot by
+mirroring every current writer head through the same `FactConsumer`. Its
+bounded authenticated join follows:
 
 1. route key to candidate user preferences;
 2. user and cell key to current preference values;
 3. user key to all current endpoint facts.
 
 It validates every posting and current suppression, membership/device
-liveness, endpoint cell, and push-node binding through `RepositoryReader`.
+liveness, endpoint cell, and push-node binding through a small in-memory index
+built directly from that validated forest. No aggregate repository root is
+compiled even temporarily.
 Message facts carry canonical mention IDs; display text is never parsed. A
 delayed retry therefore honors a later mute, removal, endpoint rotation, or
 event suppression instead of replaying historical authority.
@@ -302,7 +313,7 @@ event suppression instead of replaying historical authority.
 The handler invokes the worker only when the delivered body's SHA-256 equals
 the cursor's sole pending OID. Noncurrent wakes are acknowledged; the scanner
 will republish any work that later becomes current. For current work, missing
-or corrupt historical data retries instead of clearing the cursor. Only after
+or corrupt pending event data retries instead of clearing the cursor. Only after
 FCM accepts every selected request, current authority selects no delivery, or
 an explicit unregistered FID or locally malformed sealed endpoint is terminal
 does the handler CAS to the stored successor. CAS ambiguity is resolved by
@@ -324,7 +335,7 @@ be silently discarded.
 
 The Cloudflare artifact under `deploy/cloudflare_notifications` divides that
 composition into four private Workers: a mutation-free canonical R2 reader, a
-FactTree scanner with notification-state R2 plus Queue-producer authority, a
+writer-head scanner with notification-state R2 plus Queue-producer authority, a
 Queue consumer with canonical reads, the scanner's narrow
 `get_bounded/pending/complete` service, and the selected push-node secret, and a
 small FCM HTTP v1 bridge which alone holds the Firebase service account. The
@@ -341,8 +352,9 @@ or closed piles. Exact/one-over tests include Base64 expansion, the stable
 delivery ID, and JSON keys, keeping every locally accepted FCM data map below
 the provider's 4,096-byte limit.
 
-Notification-state root bytes do not contain historical FactTree pages or
-facts. Cloudflare `deploy` and `verify` therefore read both R2 lifecycle
+Notification-state root bytes do not contain pinned writer trees or their
+closed piles; only pending event bytes are copied there. Cloudflare `deploy`
+and `verify` therefore read both R2 lifecycle
 configurations and reject an enabled deletion rule overlapping either the
 notification-state prefix or its canonical workspace prefix. R2 Standard and
 Infrequent Access storage remain synchronously readable, so that lifecycle
@@ -377,7 +389,7 @@ and complete custom-domain result page, so a public or additional invocation
 surface cannot hide behind otherwise correct release markers.
 
 Changing a semantic identity binding is a drain/migration, not an in-place
-update; the owner marker alone cannot authorize it. The FactTree cursor uses
+update; the owner marker alone cannot authorize it. The writer-head cursor uses
 that same identity as its owner. Equivalent scanners may therefore race or
 fail over through replacement Queues while sharing the durable pending cursor,
 but a different repository, state namespace, push node, Firebase route, or
@@ -618,11 +630,12 @@ Removal does not retroactively revoke validated storage. Once removal has
 propagated, peers stop granting that principal new sharing authority. Facts
 accepted by a peer that had not yet learned the removal remain legitimate
 workspace facts. The pile supplies the one-time validation closure.
-Authenticated residence after root CAS is the durable admission certificate;
-no selected dependency path is retained afterward. A remote proof names its exact provider;
-the hosted Reader authenticates that FactTree residence and its current
-SuppTree scopes. Stateful commands assemble interchangeable candidates from
-their disposable SQL projection.
+Authenticated residence after writer-slot acceptance is the durable admission
+certificate; no selected dependency path is retained afterward. A remote
+proof names its exact provider; the hosted consumer validates the signed
+writer tree and closed pile, then applies current suppression scopes. Stateful
+commands assemble interchangeable candidates from their disposable SQL
+projection.
 
 ## Client persistence
 

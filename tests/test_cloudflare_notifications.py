@@ -22,7 +22,6 @@ from adapters.cloudflare.queue import (
 from adapters.r2.reader import R2ReadBindingStore
 from core.crypto import h, keypair, load_sk
 from core.limits import PayloadTooLarge
-from core.repository_reader import RepositoryReader
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.content import delete, message
@@ -132,6 +131,20 @@ class R2Bucket:
 
     async def delete(self, key):
         raise AssertionError("notification deployment may not delete R2")
+
+    async def list(self, **options):
+        await asyncio.sleep(0)
+        prefix = options.get("prefix", "")
+        limit = options.get("limit", 1000)
+        start = int(options.get("cursor", "0"))
+        keys = sorted(key for key in self.data if key.startswith(prefix))
+        selected = keys[start:start + limit]
+        end = start + len(selected)
+        return SimpleNamespace(
+            objects=[SimpleNamespace(key=key) for key in selected],
+            truncated=end < len(keys),
+            cursor=str(end) if end < len(keys) else None,
+        )
 
 
 class Queue:
@@ -356,7 +369,7 @@ def _world(tmp_path):
 def _copy_repository(node, workspace, bucket, prefix):
     store = node.store(workspace)
     for key in store.list(""):
-        if key == "root" or key.startswith("obj/"):
+        if key.startswith(("heads/", "obj/")):
             bucket.seed(f"{prefix}/{key}", store.get(key))
 
 
@@ -378,6 +391,9 @@ class CanonicalReadService:
 
     async def read_versioned(self, key, maximum):
         return await reader.read_versioned(self.env, key, maximum)
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return await reader.list_page(self.env, prefix, cursor, limit)
 
     async def release(self):
         return reader.release_state(self.env)
@@ -538,17 +554,14 @@ def test_replacement_queue_republishes_and_completes_one_durable_cursor(
     assert run(state_service.pending(h(exact.encode()))) == PENDING_NONCURRENT
 
 
-def test_missing_historical_fact_after_pending_cursor_retries_without_send(
+def test_missing_pending_event_fact_retries_without_send(
         tmp_path):
-    (node, workspace, secret, event, canonical, _state, queue,
+    (_node, workspace, secret, _event, _canonical, state, queue,
      canonical_reader, state_service) = _published_world(tmp_path)
-    local = node.store(workspace)
-    fact_oid = RepositoryReader(
-        workspace, local.get("root"),
-        lambda oid: local.get("obj/" + oid)).validated().fact_oid(event)
-    key = f"workspaces/{workspace}/obj/{fact_oid}"
-    canonical.data.pop(key)
-    canonical.etags.pop(key)
+    reference = decode_hint(queue.bodies[0].encode())
+    key = f"notifications/v1/{workspace}/obj/{reference.events[0].oid}"
+    state.data.pop(key)
+    state.etags.pop(key)
     fcm = FcmService()
     body, = queue.bodies
     item = QueueMessage(body, "missing-historical-fact")
@@ -684,7 +697,7 @@ def test_delayed_cloudflare_work_uses_current_mute_or_suppression(
     assert fcm.documents == []
 
 
-def test_dropped_schedule_wake_only_delays_the_next_facttree_diff(tmp_path):
+def test_dropped_schedule_wake_only_delays_the_next_writer_diff(tmp_path):
     node, workspace, _secret = _world(tmp_path)
     canonical, state, queue = R2Bucket(), R2Bucket(), Queue()
     _copy_repository(
@@ -789,7 +802,7 @@ def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
         old_hint, new_hint = map(
             lambda body: decode_hint(body.encode()),
             (old_body, new_body))
-        assert old_hint.root_oid == new_hint.root_oid
+        assert old_hint.head == new_hint.head
         assert old_hint.facts == new_hint.facts
         assert old_hint.generation != new_hint.generation
         assert h(old_body.encode()) != h(new_body.encode())
@@ -1361,7 +1374,39 @@ def test_binding_inventory_segregates_effects_and_has_no_applier():
         {"binding": "FCM_BOUNDARY", "service": "poc16-fcm-boundary"},
     ]
     assert "repository_applier.py" not in manage.CORE_MODULES
+    assert "writer_repository.py" in manage.WRITER_CONSUMER_CORE_MODULES
+    assert "writer_repository.py" not in manage.CORE_MODULES
     assert "full_peer" not in scanner.__file__
+
+
+def test_staged_writer_consumer_core_stays_out_of_reader_role(
+        tmp_path, monkeypatch):
+    build = tmp_path / "build"
+    vendored = tmp_path / "python_modules"
+    vendored.mkdir()
+    monkeypatch.setattr(manage, "BUILD", build)
+    monkeypatch.setattr(manage, "VENDORED", vendored)
+    monkeypatch.setattr(manage, "patch_pynacl", lambda _path: None)
+
+    manage.stage()
+
+    assert not (build / "reader/core/writer_repository.py").exists()
+    for role in ("scanner", "consumer"):
+        assert (build / role / "core/writer_repository.py").is_file()
+        assert (build / role / "notifications/forest.py").is_file()
+    for forbidden in (
+            "repository_applier.py", "repository_reader.py",
+            "repository_snapshot.py"):
+        assert not any(build.rglob(forbidden))
+    for role in ("reader", "scanner", "consumer"):
+        subprocess.run(
+            [sys.executable, "-c", f"import {role}"],
+            cwd=build / role,
+            env={**os.environ, "PYTHONPATH": str(build / role)},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_generated_builds_lock_the_exact_prepared_software():

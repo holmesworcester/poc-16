@@ -140,8 +140,15 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
                   - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/heads/${WorkspaceId}/*"
+              - Sid: ListCanonicalWriterHeads
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub "${CanonicalPrefix}/heads/${WorkspaceId}/*"
               - Sid: OwnNotificationCursor
                 Effect: Allow
                 Action:
@@ -197,9 +204,16 @@ Resources:
                 Effect: Allow
                 Action: s3:GetObject
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/root"
                   - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/obj/*"
-              - Sid: ReadHistoricalNotificationRoot
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}/${CanonicalPrefix}/heads/${WorkspaceId}/*"
+              - Sid: ListCanonicalWriterHeads
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${CanonicalBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub "${CanonicalPrefix}/heads/${WorkspaceId}/*"
+              - Sid: ReadPendingNotificationFacts
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"

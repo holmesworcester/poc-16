@@ -16,10 +16,10 @@ from adapters.gcp.firebase import FirebaseAdminFcm
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
 from core.fact import canon
-from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
 from core.shape import valid_fid
 from notifications.carrier import CarrierDelivery
 from notifications.delivery import delivery_domain_id
+from notifications.forest import current_repository
 from notifications.discovery import (
     BOOTSTRAP_BACKFILL,
     BOOTSTRAP_CURRENT,
@@ -294,23 +294,13 @@ def _delivery_dependencies():
             state_store, workspace, _notification_owner())
         secret, provider = _push_provider()
 
-        def current_root(requested):
+        async def current(requested):
             if requested != workspace:
                 raise ValueError("notification workspace")
-            raw = canonical.get_bounded("root", MAX_ROOT_BYTES)
-            if raw is None:
-                raise OSError("notification repository has no root")
-            return raw
-
-        def fetch(requested, oid):
-            if requested != workspace:
-                raise ValueError("notification workspace")
-            return canonical.get_bounded(
-                "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
+            return await current_repository(canonical, workspace)
 
         worker = NotificationWorker(
-            current_root,
-            fetch,
+            current,
             secret,
             provider,
             lambda: int(time.time() * 1000),
@@ -321,7 +311,7 @@ def _delivery_dependencies():
 
 async def deliver_batch(event, *, state=None, worker=None, workspace=None,
                         queue_arn=None):
-    """Decode hints, bind historical roots, and consume one SQS batch."""
+    """Decode writer hints, rebuild current authority, and consume a batch."""
     if any(value is None for value in (state, worker, workspace, queue_arn)):
         configured = _delivery_dependencies()
         state = configured[1] if state is None else state

@@ -950,7 +950,7 @@ def test_http_and_worker_boundaries_never_whole_materialize_bodies():
 
 def test_provider_list_adapters_validate_native_page_shape_before_use():
     s3 = (ROOT / "adapters/s3/store.py").read_text()
-    r2 = (ROOT / "adapters/r2/worker.py").read_text()
+    r2 = (ROOT / "adapters/r2/listing.py").read_text()
 
     assert 'len(contents) > args["MaxKeys"]' in s3
     assert "_page_objects(page.objects, limit)" in r2
@@ -1235,7 +1235,7 @@ print(json.dumps(sorted(sys.modules)))
         "core.repository_reader"]
 
 
-def test_notification_scanner_does_not_import_applier_authority():
+def test_notification_engine_has_no_applier_or_aggregate_root_reader():
     script = """
 import json
 import sys
@@ -1246,7 +1246,11 @@ print(json.dumps(sorted(sys.modules)))
         [sys.executable, "-c", script],
         cwd=ROOT, check=True, capture_output=True, text=True)
     loaded = set(json.loads(result.stdout))
-    assert "core.repository_applier" not in loaded
+    assert loaded.isdisjoint({
+        "core.repository_applier",
+        "core.repository_reader",
+        "core.repository_snapshot",
+    })
 
 
 def test_full_peer_notifications_only_compose_the_shared_engine():

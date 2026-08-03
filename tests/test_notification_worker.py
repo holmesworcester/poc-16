@@ -8,7 +8,7 @@ import facts
 import pytest
 
 from core.crypto import h, keypair
-from core.fetch_budget import FetchBudgetExceeded
+from core.fact import encode
 from facts.auth import push_endpoint
 from facts.auth.device import bind
 from facts.auth.signature import signature
@@ -20,8 +20,6 @@ from notifications.delivery import (
     PushAccepted,
     PushRetryable,
     PushUnregistered,
-    derive,
-    derive_awaited,
     seal_target,
 )
 from notifications.worker import (
@@ -32,9 +30,9 @@ from notifications.worker import (
     WorkerResult,
     carrier_disposition,
 )
+from notifications.forest import CurrentRepository, CurrentView
 from notifications.carrier import ACK as CARRIER_ACK
 from notifications.carrier import RETRY as CARRIER_RETRY
-from .util import compiled_repository
 
 
 @dataclass
@@ -72,32 +70,23 @@ def _world(tmp_path, *, sealed_target=None):
     return node, workspace, push_secret, push_node, endpoint
 
 
-def _hint(node, workspace, event, root=None):
+def _hint(node, workspace, event):
     return PublicationHint(
-        workspace,
-        root or _snapshot(node, workspace),
-        (event,),
-    )
+        workspace, (encode(node.fact_of(workspace, event)),))
 
 
-def _snapshot(node, workspace):
-    objects = getattr(node, "_notification_test_objects", None)
-    if objects is None:
-        objects = {}
-        node._notification_test_objects = objects
-    return compiled_repository(node, workspace, objects)[0]
+def _current(node, workspace):
+    projection = node.sql(workspace)
+    return CurrentRepository(workspace, CurrentView(workspace, {
+        fid: projection.fact_bytes(fid)
+        for fid in projection.fact_ids()
+    }))
 
 
-def _fetch(node, workspace, oid):
-    _snapshot(node, workspace)
-    return node._notification_test_objects.get(oid)
-
-
-def _worker(node, secret, provider, now=10, *, current_root=None):
+def _worker(node, secret, provider, now=10, *, current_repository=None):
     return NotificationWorker(
-        current_root or (
-            lambda workspace: _snapshot(node, workspace)),
-        lambda workspace, oid: _fetch(node, workspace, oid),
+        current_repository or (
+            lambda workspace: _current(node, workspace)),
         secret,
         provider,
         lambda: now,
@@ -142,21 +131,16 @@ def test_transient_fcm_failure_retries_until_acceptance(tmp_path):
         == provider.requests[1].delivery_id
 
 
-def test_async_root_fetch_clock_and_provider_use_the_same_worker(tmp_path):
+def test_async_repository_clock_and_provider_use_the_same_worker(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     event = _event(node, workspace)
     hint = _hint(node, workspace, event)
     calls = []
 
-    async def current_root(selected):
+    async def current_repository(selected):
         await asyncio.sleep(0)
-        calls.append(("root", selected))
-        return _snapshot(node, selected)
-
-    async def fetch(selected, oid):
-        await asyncio.sleep(0)
-        calls.append(("fetch", selected, oid))
-        return _fetch(node, selected, oid)
+        calls.append(("repository", selected))
+        return _current(node, selected)
 
     async def now_ms():
         await asyncio.sleep(0)
@@ -175,16 +159,15 @@ def test_async_root_fetch_clock_and_provider_use_the_same_worker(tmp_path):
 
     provider = AsyncPush()
     worker = NotificationWorker(
-        current_root, fetch, secret, provider, now_ms)
+        current_repository, secret, provider, now_ms)
 
     result = _process(worker, hint)
 
     assert result.action is ACK
     assert result.deliveries[0].message_id == "async-accepted"
     assert len(provider.requests) == 1
-    assert calls[0] == ("root", workspace)
+    assert calls[0] == ("repository", workspace)
     assert ("clock",) in calls
-    assert any(call[0] == "fetch" for call in calls)
     assert calls[-1][0] == "push"
 
 
@@ -275,7 +258,7 @@ def test_overlapping_workers_submit_the_same_delivery_and_collapse_id(
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     event = _event(node, workspace)
     hint = _hint(node, workspace, event)
-    root = _snapshot(node, workspace)
+    current = _current(node, workspace)
 
     class OverlappingPush:
         def __init__(self):
@@ -296,7 +279,7 @@ def test_overlapping_workers_submit_the_same_delivery_and_collapse_id(
             node,
             secret,
             provider,
-            current_root=lambda _workspace: root,
+            current_repository=lambda _workspace: current,
         )
         for _ in range(2)
     ]
@@ -370,16 +353,13 @@ def test_unregistered_fid_is_typed_terminal_delivery(tmp_path):
     assert [row.status for row in result.deliveries] == ["unregistered"]
 
 
-def test_substituted_event_root_is_terminal_without_provider_call(tmp_path):
+def test_non_publication_hint_is_terminal_without_provider_call(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
-    preference.set_global(node, workspace, preference.ALL, ts=3)
-    before_event = _snapshot(node, workspace)
-    event = message.post(node, workspace, "general", "later", ts=4)
     provider = ScriptedPush([])
 
     result = _process(
         _worker(node, secret, provider),
-        _hint(node, workspace, event, before_event),
+        object(),
     )
 
     assert result.action is TERMINAL
@@ -387,10 +367,10 @@ def test_substituted_event_root_is_terminal_without_provider_call(tmp_path):
     assert provider.requests == []
 
 
-def test_current_root_behind_event_retries_without_provider_call(tmp_path):
+def test_current_repository_behind_event_retries_without_provider_call(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     preference.set_global(node, workspace, preference.ALL, ts=3)
-    before_event = _snapshot(node, workspace)
+    before_event = _current(node, workspace)
     event = message.post(node, workspace, "general", "later", ts=4)
     hint = _hint(node, workspace, event)
     provider = ScriptedPush([])
@@ -400,7 +380,7 @@ def test_current_root_behind_event_retries_without_provider_call(tmp_path):
             node,
             secret,
             provider,
-            current_root=lambda _workspace: before_event,
+            current_repository=lambda _workspace: before_event,
         ),
         hint,
     )
@@ -466,56 +446,11 @@ def test_ttl_is_fresh_for_acceptance_attempt_not_event_age(tmp_path):
     assert request.ttl_seconds == 7 * 24 * 60 * 60
 
 
-def test_derivation_enforces_unique_object_fetch_budget(tmp_path):
+def test_current_delivery_view_has_no_aggregate_root_or_fetch_api(tmp_path):
     node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
     event = _event(node, workspace)
-    hint = _hint(node, workspace, event)
+    current = _current(node, workspace)
 
-    with pytest.raises(FetchBudgetExceeded):
-        derive(
-            hint,
-            lambda oid: _fetch(node, workspace, oid),
-            _snapshot(node, workspace),
-            max_fetches=0,
-        )
-
-
-def test_async_fetch_limit_stops_before_one_over_provider_call(tmp_path):
-    node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
-    event = _event(node, workspace)
-    hint = _hint(node, workspace, event)
-    root = _snapshot(node, workspace)
-
-    async def run(limit):
-        calls = []
-
-        async def fetch(oid):
-            calls.append(oid)
-            return _fetch(node, workspace, oid)
-
-        result = await derive_awaited(
-            hint, fetch, root, max_fetches=limit)
-        return result, calls
-
-    baseline, baseline_calls = asyncio.run(run(32_768))
-    needed = len(baseline_calls)
-    assert needed > 1
-
-    exact, exact_calls = asyncio.run(run(needed))
-    assert exact == baseline
-    assert len(exact_calls) == needed
-
-    one_over_calls = []
-
-    async def one_over_fetch(oid):
-        one_over_calls.append(oid)
-        return _fetch(node, workspace, oid)
-
-    with pytest.raises(FetchBudgetExceeded):
-        asyncio.run(derive_awaited(
-            hint,
-            one_over_fetch,
-            root,
-            max_fetches=needed - 1,
-        ))
-    assert len(one_over_calls) == needed - 1
+    assert current.view.fact_known(event)
+    assert not hasattr(current, "root")
+    assert not hasattr(current, "fetch")
