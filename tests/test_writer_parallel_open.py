@@ -5,9 +5,21 @@ consumer commit remain one serialized acceptance stream.
 """
 import asyncio
 from dataclasses import dataclass
+import json
+import threading
+
+import pytest
 
 from core.crypto import h, keypair
-from core.object_store import ABSENT, Applied, Versioned, VersionToken
+from core.grants import make_token
+from core.http import AsyncFromSyncReader, HttpGate
+from core.object_store import (
+    ABSENT,
+    Applied,
+    ListPage,
+    Versioned,
+    VersionToken,
+)
 from core.store import FsStore
 from core.writer_head import (
     HeadSlot,
@@ -181,6 +193,129 @@ class TopReadWave(AsyncStoreProxy):
         if self.failure is not None:
             raise self.failure
         return self.snapshots[key]
+
+
+class OversizedDirectoryPage(AsyncStoreProxy):
+    async def list_page(self, prefix, cursor=None, limit=256):
+        page = await super().list_page(prefix, cursor, limit + 1)
+        return ListPage(page.keys, page.cursor)
+
+
+class BlockingSyncHeadStore:
+    """Fail unless a blocking store's complete head page overlaps."""
+
+    def __init__(self, backing, expected):
+        self.backing = backing
+        self.expected = expected
+        self.active = self.maximum = 0
+        self.released = self.broken = False
+        self.condition = threading.Condition()
+
+    def list_page(self, prefix, cursor=None, limit=256):
+        return self.backing.list_page(prefix, cursor, limit)
+
+    def get_bounded(self, key, maximum):
+        with self.condition:
+            if self.broken:
+                raise RuntimeError("synchronous writer heads were serialized")
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            if self.active == self.expected:
+                self.released = True
+                self.condition.notify_all()
+            elif not self.condition.wait_for(
+                    lambda: self.released or self.broken, timeout=1):
+                self.broken = True
+                self.condition.notify_all()
+                raise RuntimeError(
+                    "synchronous writer heads were serialized")
+        try:
+            return self.backing.get_bounded(key, maximum)
+        finally:
+            with self.condition:
+                self.active -= 1
+
+
+def test_http_gate_parallelizes_blocking_fs_or_s3_head_reads(tmp_path):
+    async def scenario():
+        forest = await make_forest(tmp_path / "source", count=3)
+        blocking = BlockingSyncHeadStore(forest.source, expected=3)
+        secret = b"parallel-sync-adapter-secret-0001"
+        gate = HttpGate(
+            AsyncFromSyncReader(blocking),
+            forest.workspace,
+            secret,
+            lambda: 1_000,
+        )
+        bearer = make_token(
+            secret, forest.devices[0], forest.workspace,
+            issued_at=1_000, ttl_ms=1_000,
+        )
+
+        response = await gate.handle(
+            "GET",
+            "/heads",
+            {"ws": forest.workspace, "limit": "3"},
+            {"Authorization": "Bearer " + bearer},
+        )
+
+        assert response.status == 200
+        assert len(json.loads(response.body)["heads"]) == 3
+        assert blocking.maximum == 3
+
+    run(scenario())
+
+
+def test_source_cannot_expand_the_parallel_top_read_bound(tmp_path):
+    async def scenario():
+        forest = await make_forest(tmp_path / "source", count=2)
+        mirror = RepositoryMirror(
+            forest.workspace,
+            FsStore(str(tmp_path / "local")),
+            forest.resolve,
+            FactConsumer(forest.workspace),
+        )
+        with pytest.raises(ValueError, match="directory page overflow"):
+            await mirror.sync_from(
+                OversizedDirectoryPage(forest.source), page_limit=1)
+
+    run(scenario())
+
+
+class OneMalformedTop(AsyncStoreProxy):
+    def __init__(self, backing, malformed):
+        super().__init__(backing)
+        self.malformed = malformed
+
+    async def read_versioned(self, key):
+        if key == self.malformed:
+            raise ValueError("malformed writer slot")
+        await asyncio.sleep(0)
+        return await super().read_versioned(key)
+
+
+def test_one_malformed_top_does_not_wedge_its_directory_page(tmp_path):
+    async def scenario():
+        forest = await make_forest(tmp_path / "source", count=3)
+        bad = head_slot_key(forest.workspace, forest.devices[1])
+        local = FsStore(str(tmp_path / "local"))
+        result = await RepositoryMirror(
+            forest.workspace,
+            local,
+            forest.resolve,
+            FactConsumer(forest.workspace),
+        ).sync_from(OneMalformedTop(forest.source, bad), page_limit=3)
+
+        assert result.listed == 3
+        assert result.changed == result.piles == 2
+        assert result.errors == ((bad, "malformed writer slot"),)
+        assert local.get(bad) is None
+        assert sum(
+            local.get(head_slot_key(forest.workspace, device)) is not None
+            for device in forest.devices
+        ) == 2
+
+    run(scenario())
 
 
 class SerialLocalStore(AsyncStoreProxy):

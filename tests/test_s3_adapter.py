@@ -610,7 +610,7 @@ def test_authoritative_guards_fail_before_any_sdk_request():
         store.put_if_absent("root", raw)
     with pytest.raises(ValueError, match="address"):
         store.put_if_absent("obj/" + "0" * 64, raw)
-    with pytest.raises(ValueError, match="only root"):
+    with pytest.raises(ValueError, match="CAS register"):
         store.cas("obj/" + h(raw), ABSENT, raw)
     with pytest.raises(TypeError, match="version token"):
         store.cas("root", "not-a-token", raw)

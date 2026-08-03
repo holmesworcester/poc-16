@@ -1418,3 +1418,36 @@ async def update_awaited(
         return done.value
     finally:
         program.close()
+
+
+def reachable_staged_pages(root, seed, staged):
+    """Return staged map pages reachable from ``root``.
+
+    Incremental updates deliberately emit after each logical change to keep
+    their live decoder state bounded.  A client preparing a batched remote
+    publication may collect those writes first and upload only pages reachable
+    from the final root.  Traversal stops at children absent from ``staged``;
+    those are immutable pages already established by an earlier head.
+
+    Values stored in leaves are opaque and are not followed.  In particular,
+    a writer tree's signed-pile OIDs remain separate logical objects.
+    """
+    _validate_seed(seed)
+    if not isinstance(root, str) or root and not valid_fid(root) \
+            or not isinstance(staged, dict) \
+            or any(not valid_fid(oid) or not isinstance(raw, bytes)
+                   for oid, raw in staged.items()):
+        raise ValueError("staged merkle pages")
+    if not root:
+        return frozenset()
+    reachable, stack = set(), [root]
+    while stack:
+        oid = stack.pop()
+        if oid in reachable or oid not in staged:
+            continue
+        page, _summary = _decode(staged[oid], oid, seed)
+        reachable.add(oid)
+        if page["kind"] == "branch":
+            stack.extend(
+                _summary_row(row).oid for row in page["children"])
+    return frozenset(reachable)

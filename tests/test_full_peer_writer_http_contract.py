@@ -17,12 +17,15 @@ from urllib.parse import urlencode, urlsplit
 
 import facts
 
-from core.crypto import keypair
+from core.crypto import h, keypair
 from core.grants import make_token
 from core.http_stdlib import handler_for
+from core.store import RemoteStore
 from core.writer_head import decode_slot_at, head_slot_key
+from core.writer_repository import RepositoryMirror
 from full_peer.node import FullPeer
 from full_peer.sync import sync
+from full_peer.walk import Peer
 from tests.util import add_member
 
 
@@ -161,8 +164,11 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
         )
         assert status == 200
         first = json.loads(raw)
-        assert set(first) == {"cursor", "keys"}
-        assert first["keys"] == [expected_keys[0]]
+        assert set(first) == {"cursor", "heads"}
+        assert [entry[0] for entry in first["heads"]] == [expected_keys[0]]
+        bundled = base64.b64decode(first["heads"][0][1], validate=True)
+        assert bundled == alice.store(workspace).get(expected_keys[0])
+        assert first["heads"][0][2] == h(bundled)
         assert isinstance(first["cursor"], str) and first["cursor"]
 
         status, raw, _ = _http(
@@ -176,10 +182,9 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
             headers=source_auth,
         )
         assert status == 200
-        assert json.loads(raw) == {
-            "cursor": None,
-            "keys": [expected_keys[1]],
-        }
+        second = json.loads(raw)
+        assert second["cursor"] is None
+        assert [entry[0] for entry in second["heads"]] == [expected_keys[1]]
 
         selected_key = head_slot_key(workspace, alice.identity_id(workspace))
         selected_slot = alice.store(workspace).get(selected_key)
@@ -252,9 +257,44 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
         )
         assert status == 204
 
-    assert carol.store(workspace).get(selected_key) == selected_slot
+        # A stale reverse-sync cache may later offer an older complete slot.
+        # The receiver must distinguish that from an exact duplicate instead
+        # of acknowledging bytes it did not leave installed.
+        facts.content.message.post(
+            alice, workspace, "general", "newer alice", ts=41)
+        newer_slot = alice.store(workspace).get(selected_key)
+        assert newer_slot != selected_slot
+        for key in alice.store(workspace).list("obj"):
+            oid = key.removeprefix("obj/")
+            status, _, _ = _http(
+                target_url,
+                "PUT",
+                f"/obj/{oid}?ws={workspace}",
+                body=alice.store(workspace).get(key),
+                headers=target_auth,
+            )
+            assert status in {201, 204}
+        status, _, _ = _http(
+            target_url,
+            "PUT",
+            f"/mirror/{alice.identity_id(workspace)}?ws={workspace}",
+            body=newer_slot,
+            headers=target_auth,
+        )
+        assert status == 201
+        status, _, _ = _http(
+            target_url,
+            "PUT",
+            f"/mirror/{alice.identity_id(workspace)}?ws={workspace}",
+            body=selected_slot,
+            headers=target_auth,
+        )
+        assert status == 409
+
+    assert carol.store(workspace).get(selected_key) == newer_slot
     assert carol.sql(workspace).projected_head(
-        alice.identity_id(workspace)) == head_oid
+        alice.identity_id(workspace)) == decode_slot_at(
+            selected_key, newer_slot).head
     assert "from alice" in _messages(carol, workspace)
 
 
@@ -310,3 +350,81 @@ def test_full_peer_sync_relays_both_ways_is_noop_and_rebuilds_sql(tmp_path):
     reopened = FullPeer(carol.dir)
     assert reopened.sql(workspace).fact_ids() == expected_facts
     assert _messages(reopened, workspace) == expected_messages
+
+
+def test_bundled_head_page_isolates_one_oversized_slot(tmp_path):
+    """One corrupt top cannot turn bounded discovery into a page-wide wedge."""
+    workspace, alice, bob, carol = _forest_fixture(tmp_path)
+    _run(alice.mirror(workspace).sync_from(bob.store(workspace)))
+    bad_key = head_slot_key(workspace, alice.identity_id(workspace))
+    alice.store(workspace)._replace(bad_key, b"x" * 1_025)
+
+    with _serve(alice) as (url, secret):
+        remote = Peer(carol, workspace, url)
+        remote.cache.update({
+            "sync_profile": "sync-v1/full",
+            "token": make_token(
+                secret,
+                carol.member,
+                workspace,
+                issued_at=int(time.time() * 1000),
+                ttl_ms=60_000,
+            ),
+        })
+        result = _run(carol.mirror(workspace).sync_from(
+            RemoteStore(remote)))
+
+    assert result.listed == 2
+    assert result.changed == 1
+    assert result.piles == 2
+    assert result.errors == ((bad_key, "listed writer slot disappeared"),)
+    good_key = head_slot_key(workspace, bob.identity_id(workspace))
+    assert carol.store(workspace).get(good_key) \
+        == alice.store(workspace).get(good_key)
+
+
+def test_reverse_noop_reuses_the_directory_tops_from_the_pull(tmp_path):
+    """Two-way sync does not probe every unchanged remote head twice."""
+    workspace, alice, bob, carol = _forest_fixture(tmp_path)
+    _run(alice.mirror(workspace).sync_from(bob.store(workspace)))
+
+    with _serve(alice) as (url, secret):
+        # First establish Carol's original writer tree at the remote peer.
+        sync(carol, workspace, url)
+
+        class CountingPeer(Peer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.requests = 0
+
+            def _http(self, *args, **kwargs):
+                self.requests += 1
+                return super()._http(*args, **kwargs)
+
+        peer = CountingPeer(carol, workspace, url)
+        peer.cache.update({
+            "sync_profile": "sync-v1/full",
+            "token": make_token(
+                secret,
+                carol.member,
+                workspace,
+                issued_at=int(time.time() * 1000),
+                ttl_ms=60_000,
+            ),
+        })
+        remote = RemoteStore(peer)
+        pulled = _run(carol.mirror(workspace).sync_from(remote))
+        assert pulled.errors == ()
+        assert peer.requests > 0
+
+        peer.requests = 0
+        pushed = _run(RepositoryMirror(
+            workspace,
+            remote,
+            carol.writer_binding,
+            None,
+        ).sync_from(carol.store(workspace)))
+
+    assert pushed.errors == ()
+    assert pushed.changed == pushed.piles == pushed.facts == 0
+    assert peer.requests == 0

@@ -1,0 +1,834 @@
+"""Per-device writer publication and shared forest reconciliation.
+
+The cloud composition uses :class:`OpaqueHeadGate` and never constructs or
+validates writer content. A consuming peer uses :class:`RepositoryMirror` with
+one :class:`FactConsumer`. Both store the same immutable objects and stable
+per-device slots through the same object-store contract.
+"""
+import asyncio
+from dataclasses import dataclass
+import inspect
+
+import facts
+
+from .close import (
+    ClosedPileEvaluator,
+    encode_signed_pile,
+    make_signed_pile,
+    signed_pile_oid,
+)
+from .crypto import h
+from .fact import canon, encode
+from .limits import (
+    MAX_REPOSITORY_OBJECT_BYTES,
+    PAGE_BATCH,
+)
+from .object_store import (
+    ABSENT,
+    STALE,
+    Applied,
+    OutcomeUnknown,
+    Versioned,
+    VersionToken,
+    async_store,
+    ensure_object_async,
+)
+from .shape import valid_fid
+from .writer_head import (
+    HeadSlot,
+    WriterBinding,
+    decode_head,
+    decode_slot,
+    decode_slot_at,
+    encode_head,
+    encode_slot,
+    head_oid,
+    head_slot_key,
+    head_slot_prefix,
+    make_head,
+    parse_head_slot_key,
+    require_bound_head,
+    validate_advance,
+)
+from .writer_tree import (
+    EMPTY_TREE,
+    append_piles_awaited,
+    reachable_staged_pages,
+    validate_extension_awaited,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedUpdate:
+    """Immutable objects for one final tree root and one signed head."""
+
+    workspace: str
+    device: str
+    base_head: str | None
+    piles: tuple
+    head: object
+    objects: tuple[tuple[str, bytes], ...]
+
+    @property
+    def head_oid(self):
+        return head_oid(self.head)
+
+
+@dataclass(frozen=True, slots=True)
+class HeadGrant:
+    """Typed result of one discarded authority-pile evaluation."""
+
+    workspace: str
+    device: str
+    base_head: str | None
+    head: str
+    authority_root: str
+
+    def __post_init__(self):
+        if not all(valid_fid(value) for value in (
+                self.workspace, self.device,
+                self.head, self.authority_root)) \
+                or self.base_head is not None \
+                and not valid_fid(self.base_head):
+            raise ValueError("head grant")
+
+
+@dataclass(frozen=True, slots=True)
+class SlotResult:
+    status: str
+    slot: HeadSlot
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorResult:
+    listed: int
+    changed: int
+    piles: int
+    facts: int
+    errors: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedBatch:
+    """One fully judged candidate suffix, still free of residence effects."""
+
+    piles: tuple[str, ...]
+    facts: tuple[tuple[str, bytes], ...]
+
+    def __post_init__(self):
+        if any(not valid_fid(oid) for oid in self.piles) \
+                or any(not valid_fid(fid) or not isinstance(raw, bytes)
+                       for fid, raw in self.facts):
+            raise ValueError("validated consumer batch")
+
+
+async def _maybe_await(value):
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
+    if not valid_fid(oid):
+        raise ValueError("repository object oid")
+    raw = await store.get_bounded("obj/" + oid, maximum)
+    if not isinstance(raw, bytes) or len(raw) > maximum or h(raw) != oid:
+        raise ValueError("repository object integrity")
+    return raw
+
+
+async def _objects(store, oids, maximum=MAX_REPOSITORY_OBJECT_BYTES):
+    """Fetch a pile set through an optional bounded batch capability."""
+    oids = tuple(oids)
+    get_many = getattr(store, "get_many", None)
+    if not callable(get_many):
+        return tuple([
+            await _object(store, oid, maximum) for oid in oids
+        ])
+    values = await _maybe_await(get_many(
+        tuple("obj/" + oid for oid in oids)))
+    if not isinstance(values, (tuple, list)) or len(values) != len(oids):
+        raise ValueError("repository object batch")
+    out = []
+    for oid, raw in zip(oids, values):
+        if not isinstance(raw, bytes) or len(raw) > maximum \
+                or h(raw) != oid:
+            raise ValueError("repository object integrity")
+        out.append(raw)
+    return tuple(out)
+
+
+class WriterLog:
+    """Build signed piles and one final path-copied device-tree update.
+
+    This is writer-side work. Hosted storage never invokes it: a cloud writer
+    prepares locally, uploads :attr:`PreparedUpdate.objects`, then submits only
+    an authority pile and proposed head OID to :class:`OpaqueHeadGate`.
+    """
+
+    def __init__(
+            self, workspace, device, owner, store_binding, secret, store):
+        if not all(valid_fid(value) for value in (
+                workspace, device, owner, store_binding)):
+            raise ValueError("writer log binding")
+        self.workspace = workspace
+        self.device = device
+        self.owner = owner
+        self.store_binding = store_binding
+        self.secret = secret
+        self.store = async_store(store)
+        self.binding = WriterBinding(
+            workspace, device, owner, store_binding)
+        self.evaluator = ClosedPileEvaluator(workspace)
+
+    async def _base(self):
+        key = head_slot_key(self.workspace, self.device)
+        versioned = await self.store.read_versioned(key)
+        if versioned is ABSENT:
+            return None, EMPTY_TREE
+        if not isinstance(versioned, Versioned):
+            raise TypeError("writer slot read")
+        slot = decode_slot_at(key, versioned.value)
+        raw = await _object(self.store, slot.head)
+        head = require_bound_head(decode_head(raw), self.binding)
+        if head_oid(raw) != slot.head:
+            raise ValueError("writer head slot integrity")
+        return head, head.tree
+
+    async def prepare(self, closures):
+        """Validate and batch one or more closures under one final head."""
+        closures = tuple(tuple(closure) for closure in closures)
+        if not closures:
+            raise ValueError("writer update needs a closed pile")
+        base_head, base_tree = await self._base()
+        pending = {}
+        signed = []
+        for closure in closures:
+            pile = make_signed_pile(
+                self.secret,
+                self.workspace,
+                self.device,
+                closure,
+            )
+            raw = encode_signed_pile(pile)
+            self.evaluator.evaluate(raw, writer=self.device)
+            oid = signed_pile_oid(raw)
+            pending[oid] = raw
+            signed.append(pile)
+
+        async def fetch(oid):
+            if oid in pending:
+                return pending[oid]
+            return await _object(self.store, oid)
+
+        async def emit(raw):
+            oid = h(raw)
+            pending.setdefault(oid, raw)
+            return oid
+
+        pile_oids = tuple(signed_pile_oid(pile) for pile in signed)
+        tree = await append_piles_awaited(
+            base_tree,
+            self.workspace,
+            self.device,
+            pile_oids,
+            fetch,
+            emit,
+        )
+        # The generic bounded updater yields every intermediate path-copy
+        # page.  A writer can batch locally and establish only the pages its
+        # final signed head can reach, avoiding immediate cloud orphans.
+        keep = set(pile_oids) | set(reachable_staged_pages(
+            tree, self.workspace, self.device, pending))
+        pending = {
+            oid: raw for oid, raw in pending.items()
+            if oid in keep
+        }
+        head = make_head(
+            self.secret,
+            self.workspace,
+            self.device,
+            self.owner,
+            tree.count,
+            tree,
+            self.store_binding,
+        )
+        raw_head = encode_head(head)
+        pending[head_oid(raw_head)] = raw_head
+        return PreparedUpdate(
+            self.workspace,
+            self.device,
+            None if base_head is None else head_oid(base_head),
+            tuple(signed),
+            head,
+            tuple(pending.items()),
+        )
+
+    async def establish(self, prepared, store=None):
+        """Upload all immutables before any slot can advertise the head."""
+        if not isinstance(prepared, PreparedUpdate) \
+                or prepared.workspace != self.workspace \
+                or prepared.device != self.device:
+            raise ValueError("prepared writer update")
+        target = self.store if store is None else async_store(store)
+        for oid, raw in prepared.objects:
+            await ensure_object_async(target, oid, raw)
+        return prepared.head_oid
+
+
+class AuthorityGate:
+    """Evaluate and discard one signed proof pile for an exact head OID.
+
+    The fact family owns the membership/device requirements and exact request
+    binding. ``authority_root`` is verifier-pinned current authority state;
+    it is recorded in the slot but never selected by the requester.
+    """
+
+    def __init__(self, workspace, authority_root, now):
+        if not valid_fid(workspace) or not callable(now) \
+                or not (valid_fid(authority_root)
+                        or callable(authority_root)):
+            raise ValueError("authority gate")
+        self.workspace = workspace
+        self.authority_root = authority_root
+        self.now = now
+        self.evaluator = ClosedPileEvaluator(workspace)
+
+    async def authorize(self, proof_raw, proposed_head):
+        evaluated = self.evaluator.evaluate(proof_raw)
+        decision = facts.authorize_writer_head(
+            evaluated.judgment,
+            evaluated.pile.writer,
+            proposed_head,
+            self.now(),
+        )
+        if decision is None:
+            raise ValueError("writer head authority denied")
+        device, _owner, base_head = decision
+        authority_root = await _maybe_await(
+            self.authority_root()
+            if callable(self.authority_root)
+            else self.authority_root)
+        return HeadGrant(
+            self.workspace, device, base_head,
+            proposed_head, authority_root)
+
+    def authorize_access(self, proof_raw, view, *, purpose):
+        """Judge and discard one ordinary access proof pile.
+
+        ``view`` is the verifier's current authority projection.  It may be a
+        database-free authenticated Worker view or a full peer's rebuildable
+        projection, but the signed wire bytes and family query are identical.
+        """
+        evaluated = self.evaluator.evaluate(proof_raw)
+        return facts.authorize_access(
+            evaluated.judgment,
+            evaluated.pile.facts,
+            view,
+            self.now(),
+            purpose=purpose,
+        )
+
+
+class OpaqueHeadGate:
+    """Authorize one exact owner slot and CAS it without reading content."""
+
+    def __init__(self, store, authorize):
+        if not callable(authorize):
+            raise TypeError("head authority gate")
+        self.store = async_store(store)
+        self.authorize = authorize
+
+    async def advance(self, proof_raw, proposed_head):
+        if not valid_fid(proposed_head):
+            raise ValueError("proposed writer head")
+        grant = await _maybe_await(self.authorize(proof_raw, proposed_head))
+        if not isinstance(grant, HeadGrant) or grant.head != proposed_head:
+            raise ValueError("authority decision did not bind proposed head")
+        key = head_slot_key(grant.workspace, grant.device)
+        slot = HeadSlot(
+            grant.workspace,
+            grant.device,
+            grant.head,
+            grant.authority_root,
+        )
+        raw = encode_slot(slot)
+        opened = await self.store.read_versioned(key)
+        if opened is ABSENT:
+            if grant.base_head is not None:
+                return SlotResult("retryable", slot)
+            token = ABSENT
+        elif isinstance(opened, Versioned):
+            if opened.value == raw:
+                return SlotResult("noop", slot)
+            current = decode_slot_at(key, opened.value)
+            if current.head != grant.base_head:
+                return SlotResult("retryable", slot)
+            token = opened.token
+        else:
+            raise TypeError("writer slot read")
+        try:
+            result = await self.store.cas(key, token, raw)
+        except OutcomeUnknown:
+            current = await self.store.read_versioned(key)
+            if isinstance(current, Versioned) and current.value == raw:
+                return SlotResult("applied", slot)
+            return SlotResult("retryable", slot)
+        if result is STALE:
+            return SlotResult("retryable", slot)
+        if not isinstance(result, Applied):
+            raise TypeError("writer slot CAS")
+        return SlotResult("applied", slot)
+
+
+class FactConsumer:
+    """Shared closed-pile evaluator over a replaceable monotone state sink."""
+
+    def __init__(self, workspace, state=None):
+        self.workspace = workspace
+        self.evaluator = ClosedPileEvaluator(workspace)
+        if state is not None and not all(
+                callable(getattr(state, method, None))
+                for method in (
+                    "commit", "fact_bytes", "fact_ids",
+                    "projected_head")):
+            raise TypeError("fact consumer state")
+        self.state = state
+        self._facts = {} if state is None else None
+        self._piles = set() if state is None else None
+        self._heads = {} if state is None else None
+
+    def prepare_batch(self, values, *, owner=None):
+        """Validate a candidate suffix without making any of it resident.
+
+        A writer head is accepted as one unit.  If its fifth new pile is bad,
+        the first four must not leak into the consumer merely because they
+        happened to be visited first.
+        """
+        staged_facts = {}
+        staged_piles = set()
+        batch_facts, batch_piles = {}, []
+        for raw, writer in values:
+            oid = h(raw)
+            if oid in staged_piles or self.state is None \
+                    and oid in self._piles:
+                continue
+            evaluated = self.evaluator.evaluate(raw, writer=writer)
+            if owner is not None:
+                member = ("member", writer, owner)
+                device = ("device_key", writer, owner)
+                offers = {
+                    offer
+                    for valid in evaluated.judgment.valids
+                    for offer in valid.fact.offers()
+                }
+                if member not in offers or (
+                        writer != owner and device not in offers):
+                    raise ValueError("writer is not proved by its closure")
+            for valid in evaluated.judgment.valids:
+                family = facts.family_for(valid.fact.t)
+                if family is None or not family.DURABLE:
+                    continue
+                fid, body = valid.fact.fid, encode(valid.fact)
+                incumbent = staged_facts.get(fid)
+                if incumbent is None:
+                    incumbent = self.fact_bytes(fid)
+                if incumbent is not None and incumbent != body:
+                    raise ValueError("validated fact identity conflict")
+                if incumbent is None:
+                    staged_facts[fid] = body
+                    batch_facts[fid] = body
+            staged_piles.add(oid)
+            batch_piles.append(oid)
+        return ValidatedBatch(
+            tuple(batch_piles), tuple(sorted(batch_facts.items())))
+
+    def commit(self, batch, *, device, head):
+        """Atomically join one accepted head's already-validated suffix."""
+        if not isinstance(batch, ValidatedBatch) \
+                or not valid_fid(device) or not valid_fid(head):
+            raise ValueError("consumer commit")
+        if self.state is not None:
+            return self.state.commit(
+                batch, device=device, head=head)
+        staged_facts = dict(self._facts)
+        additions = []
+        for fid, body in batch.facts:
+            incumbent = staged_facts.get(fid)
+            if incumbent is not None and incumbent != body:
+                raise ValueError("validated fact identity conflict")
+            if incumbent is None:
+                staged_facts[fid] = body
+                additions.append(fid)
+        self._facts = staged_facts
+        self._piles = self._piles | set(batch.piles)
+        self._heads = {**self._heads, device: head}
+        return tuple(additions)
+
+    def consume_batch(self, values, *, device=None, head=None):
+        """Convenience for a caller that already owns the commit boundary."""
+        values = tuple(values)
+        if device is None:
+            writers = {writer for _raw, writer in values}
+            if len(writers) != 1:
+                raise ValueError("consumer writer")
+            device = next(iter(writers))
+        if head is None:
+            head = h(canon([
+                "poc16-standalone-consumer-batch-v1",
+                tuple(h(raw) for raw, _writer in values),
+            ]))
+        return self.commit(
+            self.prepare_batch(values), device=device, head=head)
+
+    def consume(self, raw, *, writer):
+        return self.consume_batch(((raw, writer),))
+
+    def projected_head(self, device):
+        return self._heads.get(device) if self.state is None \
+            else self.state.projected_head(device)
+
+    def fact_ids(self):
+        return tuple(sorted(self._facts)) if self.state is None \
+            else tuple(sorted(self.state.fact_ids()))
+
+    def fact_bytes(self, fid):
+        return self._facts.get(fid) if self.state is None \
+            else self.state.fact_bytes(fid)
+
+    def has_pile(self, oid):
+        return self.state is None and oid in self._piles
+
+
+class RepositoryMirror:
+    """Mirror and optionally consume every changed device tree with RBSR."""
+
+    def __init__(self, workspace, store, binding_for, consumer):
+        consumer_ok = consumer is None or (
+            getattr(consumer, "workspace", None) == workspace
+            and all(callable(getattr(consumer, method, None))
+                    for method in (
+                        "prepare_batch", "commit", "projected_head"))
+        )
+        if not valid_fid(workspace) or not callable(binding_for) \
+                or not consumer_ok:
+            raise ValueError("repository mirror")
+        self.workspace = workspace
+        self.store = async_store(store)
+        self.binding_for = binding_for
+        self.consumer = consumer
+
+    async def _binding(self, workspace, device, authority_root, head):
+        # ``candidate`` is an optional bootstrap input, not a fourth
+        # positional slot.  A resolver commonly closes over a defaulted
+        # fourth argument; treating that as the candidate silently replaces
+        # its captured binding and rejects an otherwise valid writer.
+        try:
+            parameters = inspect.signature(self.binding_for).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_candidate = "candidate" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        value = self.binding_for(
+            workspace,
+            device,
+            authority_root,
+            **({"candidate": head} if accepts_candidate else {}),
+        )
+        return await _maybe_await(value)
+
+    async def _local_head(self, key, binding, opened=None):
+        if opened is None:
+            opened = await self.store.read_versioned(key)
+        if opened is ABSENT:
+            return opened, None
+        if not isinstance(opened, Versioned):
+            raise TypeError("writer slot read")
+        slot = decode_slot_at(key, opened.value)
+        raw = await _object(self.store, slot.head)
+        return opened, require_bound_head(decode_head(raw), binding)
+
+    async def _sync_slot(self, source, key, opened=None):
+        workspace, device = parse_head_slot_key(key)
+        if workspace != self.workspace:
+            raise ValueError("writer slot workspace")
+        opened = await source.read_versioned(key) \
+            if opened is None else opened
+        if not isinstance(opened, Versioned):
+            raise ValueError("listed writer slot disappeared")
+        slot = decode_slot_at(key, opened.value)
+        local_opened = await self.store.read_versioned(key)
+        if isinstance(local_opened, Versioned) \
+                and local_opened.value == opened.value:
+            if self.consumer is None \
+                    or self.consumer.projected_head(device) == slot.head:
+                return 0, 0, False
+            piles, facts = await self._replay_slot(key, local_opened)
+            return piles, facts, False
+        source_cache = {}
+
+        async def source_fetch(oid):
+            raw = source_cache.get(oid)
+            if raw is None:
+                raw = await _object(source, oid)
+                source_cache[oid] = raw
+            await ensure_object_async(self.store, oid, raw)
+            return raw
+
+        async def local_fetch(oid):
+            return await _object(self.store, oid)
+
+        candidate_raw = await source_fetch(slot.head)
+        decoded_candidate = decode_head(candidate_raw)
+        binding = await self._binding(
+            workspace, device, slot.authority_root, decoded_candidate)
+        if not isinstance(binding, WriterBinding):
+            raise ValueError("unknown writer binding")
+        candidate = require_bound_head(decoded_candidate, binding)
+        if head_oid(candidate_raw) != slot.head:
+            raise ValueError("writer head slot integrity")
+        local_slot, accepted = await self._local_head(
+            key, binding, local_opened)
+        if accepted is not None:
+            # Directory views need not be simultaneous.  Seeing an older
+            # signed head from a lagging peer is ordinary two-way sync, not a
+            # request to roll the local slot back; leave it unchanged so the
+            # reverse pass can advertise the newer accepted head.
+            if candidate.sequence < accepted.sequence:
+                return 0, 0, False
+            delta = validate_advance(accepted, candidate, binding)
+            if delta == 0:
+                return 0, 0, False
+            accepted_tree = accepted.tree
+        else:
+            accepted_tree = EMPTY_TREE
+
+        additions = await validate_extension_awaited(
+            accepted_tree,
+            candidate.tree,
+            workspace,
+            device,
+            source_fetch,
+            local_fetch,
+        )
+        pile_oids = tuple(pile_oid for _leaf, pile_oid in additions)
+        # Do not publish a candidate pile into the local object store before
+        # the complete candidate suffix passes semantic judgment.  A peer may
+        # batch these immutable reads; each returned body is still checked by
+        # OID and then evaluated as its own complete signed pile.
+        pile_values = tuple(zip(
+            pile_oids,
+            await _objects(source, pile_oids),
+        ))
+        batch = None if self.consumer is None \
+            else self.consumer.prepare_batch(
+                ((raw, device) for _oid, raw in pile_values),
+                owner=candidate.owner,
+            )
+        for pile_oid, raw in pile_values:
+            await ensure_object_async(self.store, pile_oid, raw)
+
+        token = ABSENT if local_slot is ABSENT else local_slot.token
+        result = await self.store.cas(key, token, opened.value)
+        if result is STALE:
+            raise ValueError("concurrent local writer-slot update")
+        if not isinstance(result, Applied):
+            raise TypeError("writer slot CAS")
+        fact_count = 0 if self.consumer is None else len(
+            self.consumer.commit(
+                batch, device=device, head=slot.head))
+        return len(additions), fact_count, True
+
+    async def _replay_slot(self, key, opened=None):
+        """Repair a projection checkpoint from one durable accepted slot."""
+        if self.consumer is None:
+            return 0, 0
+        workspace, device = parse_head_slot_key(key)
+        if workspace != self.workspace:
+            raise ValueError("writer slot workspace")
+        opened = await self.store.read_versioned(key) \
+            if opened is None else opened
+        if not isinstance(opened, Versioned):
+            raise ValueError("accepted writer slot disappeared")
+        slot = decode_slot_at(key, opened.value)
+        candidate_raw = await _object(self.store, slot.head)
+        decoded_candidate = decode_head(candidate_raw)
+        binding = await self._binding(
+            workspace, device, slot.authority_root, decoded_candidate)
+        if not isinstance(binding, WriterBinding):
+            raise ValueError("unknown writer binding")
+        candidate = require_bound_head(decoded_candidate, binding)
+        if head_oid(candidate_raw) != slot.head:
+            raise ValueError("writer head slot integrity")
+
+        previous_oid = self.consumer.projected_head(device)
+        if previous_oid is None:
+            accepted_tree = EMPTY_TREE
+        else:
+            previous_raw = await _object(self.store, previous_oid)
+            previous = require_bound_head(
+                decode_head(previous_raw), binding)
+            validate_advance(previous, candidate, binding)
+            accepted_tree = previous.tree
+
+        async def fetch(oid):
+            return await _object(self.store, oid)
+
+        additions = await validate_extension_awaited(
+            accepted_tree,
+            candidate.tree,
+            workspace,
+            device,
+            fetch,
+            fetch,
+        )
+        pile_values = []
+        for _leaf, pile_oid in additions:
+            pile_values.append((
+                pile_oid, await _object(self.store, pile_oid)))
+        batch = self.consumer.prepare_batch(
+            ((raw, device) for _oid, raw in pile_values),
+            owner=candidate.owner,
+        )
+        facts = self.consumer.commit(
+            batch, device=device, head=slot.head)
+        return len(additions), len(facts)
+
+    async def replay_local(self, *, page_limit=256):
+        """Replay every projection checkpoint lagging its accepted slot."""
+        if self.consumer is None:
+            return MirrorResult(0, 0, 0, 0, ())
+        prefix = head_slot_prefix(self.workspace)
+        cursor = None
+        listed = changed = piles = fact_count = 0
+        errors = []
+        while True:
+            page = await self.store.list_page(prefix, cursor, page_limit)
+            listed += len(page.keys)
+            for key in page.keys:
+                try:
+                    workspace, device = parse_head_slot_key(key)
+                    opened = await self.store.read_versioned(key)
+                    if not isinstance(opened, Versioned):
+                        raise ValueError("accepted writer slot disappeared")
+                    slot = decode_slot_at(key, opened.value)
+                    if self.consumer.projected_head(device) == slot.head:
+                        continue
+                    got_piles, got_facts = await self._replay_slot(
+                        key, opened)
+                    piles += got_piles
+                    fact_count += got_facts
+                    changed += 1
+                except ValueError as error:
+                    errors.append((key, str(error)))
+            if page.cursor is None:
+                break
+            cursor = page.cursor
+        return MirrorResult(
+            listed, changed, piles, fact_count, tuple(errors))
+
+    async def accept_slot(self, raw):
+        """Validate one staged P2P candidate through the normal mirror path.
+
+        Immutable objects already arrived through create-only PUTs.  This
+        transient source substitutes only the proposed slot bytes; all object
+        reads and the final accepted-slot CAS still use this mirror's store.
+        """
+        slot = decode_slot(raw)
+        key = head_slot_key(slot.workspace, slot.device)
+        target = self.store
+
+        class CandidateSource:
+            async def get_bounded(self, candidate_key, maximum):
+                return await target.get_bounded(candidate_key, maximum)
+
+            async def read_versioned(self, candidate_key):
+                if candidate_key == key:
+                    return Versioned(raw, VersionToken(h(raw)))
+                return await target.read_versioned(candidate_key)
+
+            async def put_if_absent(self, candidate_key, value):
+                return await target.put_if_absent(candidate_key, value)
+
+            async def cas(self, candidate_key, token, value):
+                return await target.cas(candidate_key, token, value)
+
+            async def list_page(self, prefix, cursor=None, limit=256):
+                return await target.list_page(prefix, cursor, limit)
+
+        piles, fact_count, changed = await self._sync_slot(
+            CandidateSource(), key)
+        return MirrorResult(
+            1, int(changed), piles, fact_count, ())
+
+    @staticmethod
+    async def _open_slots(source, keys):
+        """Open one bounded directory page as a single read phase.
+
+        Sources may collapse the phase into one provider/HTTP batch.  The
+        fallback starts every independent slot read before processing any
+        writer, so network latency is one bounded wave rather than one RTT
+        per workspace member.  Applying and projecting the returned slots
+        remains deliberately serialized below.
+        """
+        keys = tuple(keys)
+        read_many = getattr(source, "read_many_versioned", None)
+        if callable(read_many):
+            opened = await _maybe_await(read_many(keys))
+        else:
+            opened = await asyncio.gather(*(
+                source.read_versioned(key) for key in keys),
+                return_exceptions=True)
+        if not isinstance(opened, (tuple, list)) \
+                or len(opened) != len(keys):
+            raise ValueError("writer slot batch")
+        return tuple(opened)
+
+    async def sync_from(self, source_store, *, page_limit=256):
+        if type(page_limit) is not int \
+                or not 0 < page_limit <= PAGE_BATCH:
+            raise ValueError("writer directory page limit")
+        source = async_store(source_store)
+        prefix = head_slot_prefix(self.workspace)
+        cursor = None
+        listed = changed = piles = fact_count = 0
+        errors = []
+        while True:
+            page = await source.list_page(prefix, cursor, page_limit)
+            if len(page.keys) > page_limit:
+                raise ValueError("writer directory page overflow")
+            listed += len(page.keys)
+            # Head discovery is one bounded read wave.  Do not run complete
+            # `_sync_slot` calls concurrently: the optional projection sink
+            # is one transactionally ordered local state machine.
+            opened_page = await self._open_slots(source, page.keys)
+            for key, opened in zip(page.keys, opened_page):
+                try:
+                    if isinstance(opened, BaseException):
+                        raise opened
+                    got_piles, got_facts, did_change = await self._sync_slot(
+                        source, key, opened)
+                    piles += got_piles
+                    fact_count += got_facts
+                    changed += int(did_change)
+                except ValueError as error:
+                    errors.append((key, str(error)))
+            if page.cursor is None:
+                break
+            cursor = page.cursor
+        return MirrorResult(
+            listed, changed, piles, fact_count, tuple(errors))
+
+
+__all__ = (
+    "AuthorityGate",
+    "FactConsumer",
+    "HeadGrant",
+    "MirrorResult",
+    "OpaqueHeadGate",
+    "PreparedUpdate",
+    "RepositoryMirror",
+    "SlotResult",
+    "ValidatedBatch",
+    "WriterLog",
+)

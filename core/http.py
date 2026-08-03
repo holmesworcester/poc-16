@@ -6,7 +6,9 @@ bytes for a full peer. Iroh may wrap those bytes later, but it must not
 acquire another route table.
 """
 import base64
+import asyncio
 from dataclasses import dataclass, field
+import inspect
 import json
 import re
 
@@ -30,7 +32,22 @@ from .limits import (
     decode_json,
 )
 from .repository_reader import RepositoryReader, RepositoryRootError
-from .object_store import MAX_INVITE_ID_BYTES
+from .object_store import (
+    ABSENT,
+    CREATED,
+    EXISTS,
+    Applied,
+    MAX_INVITE_ID_BYTES,
+    STALE,
+    Versioned,
+    ensure_object_async,
+)
+from .writer_head import (
+    MAX_HEAD_SLOT_BYTES,
+    decode_slot,
+    head_slot_key,
+    head_slot_prefix,
+)
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
 INVITE_RE = re.compile(
@@ -45,13 +62,28 @@ class Response:
 
 
 class AsyncFromSyncReader:
-    """Expose a blocking reader to the one async gate used by Lambda."""
+    """Expose one blocking ObjectStore to the shared awaited HTTP gate."""
 
     def __init__(self, reader):
         self.reader = reader
 
     async def get_bounded(self, key, max_bytes):
-        return self.reader.get_bounded(key, max_bytes)
+        return await asyncio.to_thread(
+            self.reader.get_bounded, key, max_bytes)
+
+    async def read_versioned(self, key):
+        return await asyncio.to_thread(self.reader.read_versioned, key)
+
+    async def put_if_absent(self, key, value):
+        return await asyncio.to_thread(
+            self.reader.put_if_absent, key, value)
+
+    async def cas(self, key, token, value):
+        return await asyncio.to_thread(self.reader.cas, key, token, value)
+
+    async def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        return await asyncio.to_thread(
+            self.reader.list_page, prefix, cursor, limit)
 
 
 class HttpGate:
@@ -67,6 +99,8 @@ class HttpGate:
     def __init__(
             self, store, workspace, secret, now, receiver=None,
             *, sync_profile=peer_capability.READ_ONLY,
+            mirror=None,
+            mint_authorize=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
             max_root_bytes=MAX_ROOT_BYTES,
             max_object_bytes=MAX_OBJECT_BYTES,
@@ -84,6 +118,8 @@ class HttpGate:
             raise ValueError("grant sealer")
         self.store, self.workspace = store, workspace
         self.receiver = receiver
+        self.mirror = mirror
+        self.mint_authorize = mint_authorize
         self.secret, self.now = secret, now
         if sync_profile is not None \
                 and not peer_capability.known(sync_profile):
@@ -185,6 +221,31 @@ class HttpGate:
             pile = self._decode_mint(body, self.workspace)
         except (TypeError, ValueError, json.JSONDecodeError):
             return Response(400)
+        if self.mint_authorize is not None:
+            try:
+                if inspect.iscoroutinefunction(self.mint_authorize):
+                    grant = await self.mint_authorize(pile, "sync")
+                else:
+                    grant = await asyncio.to_thread(
+                        self.mint_authorize, pile, "sync")
+                    if inspect.isawaitable(grant):
+                        grant = await grant
+            except Exception:
+                return Response(403)
+            if grant is None:
+                return Response(403)
+            public, verb = grant
+            token = make_token(
+                self.secret, public, self.workspace, verb,
+                capability=self.sync_profile,
+                issued_at=trusted_now, ttl_ms=self.grant_ttl_ms)
+            response = {
+                "grant": base64.b64encode(
+                    self.seal(public, token.encode())).decode(),
+            }
+            if self.sync_profile is not None:
+                response["cap"] = self.sync_profile
+            return self._json(200, response)
         try:
             root = await self._root()
             if not root:
@@ -278,6 +339,145 @@ class HttpGate:
             return Response(503)
         return self._json(200, values)
 
+    async def _heads(self, query):
+        """Return one bounded page of atomically opened writer slots.
+
+        The page is not a workspace snapshot and does not pretend to be one:
+        each independent slot may have linearized at a different instant.
+        Returning the small tops with their directory page removes one
+        network round per writer while preserving per-writer CAS authority.
+        The returned digest authenticates this HTTP response value; it is not
+        the provider's opaque CAS token and cannot mutate the source slot.
+        """
+        cursor = query.get("cursor") or None
+        try:
+            limit = int(query.get("limit", PAGE_BATCH))
+        except (TypeError, ValueError):
+            return Response(400)
+        if not 0 < limit <= PAGE_BATCH:
+            return Response(400)
+        try:
+            page = await self.store.list_page(
+                head_slot_prefix(self.workspace), cursor, limit)
+            opened = await asyncio.gather(*(
+                self.store.get_bounded(key, MAX_HEAD_SLOT_BYTES)
+                for key in page.keys), return_exceptions=True)
+        except Exception:
+            return Response(503)
+        if not isinstance(opened, (tuple, list)) \
+                or len(opened) != len(page.keys):
+            return Response(503)
+        normalized = []
+        for value in opened:
+            if isinstance(value, ValueError) or value is None:
+                normalized.append(None)
+            elif isinstance(value, BaseException) \
+                    or not isinstance(value, bytes) \
+                    or len(value) > MAX_HEAD_SLOT_BYTES:
+                return Response(503)
+            else:
+                normalized.append(value)
+        return self._json(200, {
+            "cursor": page.cursor,
+            "heads": [
+                [key, None, None]
+                if value is None else [
+                    key, base64.b64encode(value).decode(), h(value)]
+                for key, value in zip(page.keys, normalized)
+            ],
+        })
+
+    async def _head(self, device, headers):
+        try:
+            key = head_slot_key(self.workspace, device)
+            opened = await self.store.read_versioned(key)
+        except ValueError:
+            return Response(404)
+        except Exception:
+            return Response(503)
+        if opened is ABSENT:
+            return Response(404)
+        if not isinstance(opened, Versioned):
+            return Response(503)
+        etag = opened.token.value
+        if self._header(headers, "If-None-Match") == etag:
+            return Response(304)
+        return Response(200, opened.value, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream",
+            "ETag": etag,
+        })
+
+    async def _object(self, oid):
+        if not OID_RE.fullmatch(oid):
+            return Response(404)
+        try:
+            raw = await self._get(
+                "obj/" + oid, self.max_object_bytes)
+        except PayloadTooLarge:
+            return Response(413)
+        except Exception:
+            return Response(503)
+        if raw is None:
+            return Response(404)
+        if h(raw) != oid:
+            return Response(503)
+        return Response(200, raw, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream",
+        })
+
+    async def _put_object(self, oid, body):
+        if not OID_RE.fullmatch(oid) or not isinstance(body, bytes) \
+                or len(body) > self.max_object_bytes or h(body) != oid:
+            return Response(400)
+        try:
+            result = await ensure_object_async(self.store, oid, body)
+        except PayloadTooLarge:
+            return Response(413)
+        except ValueError:
+            return Response(409)
+        except Exception:
+            return Response(503)
+        if result is CREATED:
+            return Response(201)
+        if result is EXISTS:
+            return Response(204)
+        return Response(503)
+
+    async def _accept_mirror(self, device, body):
+        if self.mirror is None:
+            return Response(405)
+        try:
+            slot = decode_slot(
+                body, workspace=self.workspace, device=device)
+            result = self.mirror.accept_slot(body)
+            if inspect.isawaitable(result):
+                result = await result
+        except ValueError as error:
+            return Response(
+                409 if "concurrent" in str(error) else 400)
+        except Exception:
+            return Response(503)
+        if result.errors:
+            return Response(400)
+        # A cached directory observation may be stale by the time a reverse
+        # sync reaches this receiver.  ``changed == 0`` can mean either exact
+        # no-op or "receiver is already newer"; only the exact installed slot
+        # is CAS success for the caller's proposed value.
+        try:
+            current = await self.store.get_bounded(
+                head_slot_key(slot.workspace, slot.device),
+                MAX_HEAD_SLOT_BYTES,
+            )
+        except Exception:
+            return Response(503)
+        if current != body:
+            return Response(409)
+        return Response(204 if not result.changed else 201, headers={
+            "ETag": h(current),
+        })
+
     @staticmethod
     def _read_only_path(path):
         return any(
@@ -303,6 +503,12 @@ class HttpGate:
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/page":
             return MAX_PAGE_REQUEST_BYTES
+        if method == "POST" and path == "/obj":
+            return MAX_PAGE_REQUEST_BYTES
+        if method == "PUT" and path.startswith("/obj/"):
+            return MAX_OBJECT_BYTES
+        if method == "PUT" and path.startswith("/mirror/"):
+            return MAX_HEAD_SLOT_BYTES
         return 0
 
     async def handle(self, method, path, query=None, headers=None, body=b""):
@@ -314,7 +520,10 @@ class HttpGate:
             return public
         if path == "/readyz" and method == "GET":
             try:
-                if await self._reader() is None:
+                if self.mirror is not None or self.mint_authorize is not None:
+                    await self.store.list_page(
+                        head_slot_prefix(self.workspace), None, 1)
+                elif await self._reader() is None:
                     raise ValueError("root readiness")
             except Exception:
                 return self._json(503, {"ok": False})
@@ -344,6 +553,17 @@ class HttpGate:
                 })
         if path.startswith("/ctl"):
             return Response(405)
+        if method == "PUT" and (
+                path.startswith("/obj/")
+                or path.startswith("/mirror/")):
+            if not self._member(
+                    headers, trusted_now, require_push=True):
+                return Response(401)
+            if path.startswith("/obj/"):
+                return await self._put_object(
+                    path.removeprefix("/obj/"), body)
+            device = path.removeprefix("/mirror/")
+            return await self._accept_mirror(device, body)
         if method == "PUT" and path.startswith("/pile/"):
             if self.receiver is None:
                 return Response(405)
@@ -374,6 +594,15 @@ class HttpGate:
             return Response(405)
         if not self._member(headers, trusted_now):
             return Response(401)
+        if path == "/heads" and method == "GET":
+            return await self._heads(query)
+        if path.startswith("/head/") and method == "GET":
+            return await self._head(
+                path.removeprefix("/head/"), headers)
+        if path == "/obj" and method == "POST":
+            return await self._batch(body)
+        if path.startswith("/obj/") and method == "GET":
+            return await self._object(path.removeprefix("/obj/"))
         if path == "/root" and method == "GET":
             try:
                 reader = await self._reader()

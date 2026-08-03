@@ -1,0 +1,345 @@
+"""Black-box per-device repository behavior in normal and cloud modes."""
+import asyncio
+
+import pytest
+
+from core.close import (
+    encode_signed_pile,
+    make_signed_pile,
+    signed_pile_oid,
+)
+from core.crypto import h, keypair
+from core.object_store import ABSENT
+from core.store import FsStore
+from core.writer_head import (
+    HeadSlot,
+    WriterBinding,
+    decode_slot_at,
+    encode_head,
+    encode_slot,
+    head_oid,
+    head_slot_key,
+    make_head,
+)
+from core.writer_repository import (
+    AuthorityGate,
+    FactConsumer,
+    HeadGrant,
+    OpaqueHeadGate,
+    RepositoryMirror,
+    WriterLog,
+)
+from core.writer_tree import EMPTY_TREE, append_piles
+from facts.auth.device import device as device_fact
+from facts.auth.head_request import head_request
+from facts.auth.signature import signature as signature_fact
+from facts.auth.workspace import workspace as workspace_fact
+from facts.content.message import message as message_fact
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
+
+
+def world():
+    secret, public = keypair()
+    root = workspace_fact(secret, public, "alice", 1)
+    device = device_fact(root.fid, public, "laptop", 2)
+    device_signature = signature_fact(secret, public, device, 2)
+    return secret, public, root, device_signature, device
+
+
+def proof_for(
+        secret, public, root, device_signature, device, proposed_head,
+        base_head=None):
+    request = head_request(
+        root.fid, public, public, base_head,
+        proposed_head, 1_000, 3)
+    request_signature = signature_fact(
+        secret, public, request, 3)
+    return encode_signed_pile(make_signed_pile(
+        secret,
+        root.fid,
+        public,
+        (root, device_signature, device, request_signature, request),
+    ))
+
+
+def binding_for(workspace, public, store_binding):
+    def resolve(candidate_workspace, device, _authority_root):
+        assert candidate_workspace == workspace
+        if device != public:
+            return None
+        return WriterBinding(
+            workspace, public, public, store_binding)
+    return resolve
+
+
+def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        store_binding = h(b"writer-store")
+        authority_root = h(b"current-authority")
+        writer_store = FsStore(str(tmp_path / "writer"))
+        cloud_store = FsStore(str(tmp_path / "cloud"))
+        normal_store = FsStore(str(tmp_path / "normal-receiver"))
+        cloud_receiver_store = FsStore(str(tmp_path / "cloud-receiver"))
+
+        writer = WriterLog(
+            root.fid,
+            public,
+            public,
+            store_binding,
+            secret,
+            writer_store,
+        )
+        prepared = await writer.prepare(((
+            root, device_signature, device),))
+        await writer.establish(prepared)
+
+        proof = proof_for(
+            secret, public, root, device_signature,
+            device, prepared.head_oid)
+        authority = AuthorityGate(
+            root.fid, authority_root, lambda: 10)
+        writer_gate = OpaqueHeadGate(
+            writer_store, authority.authorize)
+        cloud_gate = OpaqueHeadGate(
+            cloud_store, authority.authorize)
+
+        assert (await writer_gate.advance(
+            proof, prepared.head_oid)).status == "applied"
+        await writer.establish(prepared, cloud_store)
+        assert (await cloud_gate.advance(
+            proof, prepared.head_oid)).status == "applied"
+
+        normal_consumer = FactConsumer(root.fid)
+        cloud_consumer = FactConsumer(root.fid)
+        resolve = binding_for(root.fid, public, store_binding)
+        normal = RepositoryMirror(
+            root.fid, normal_store, resolve, normal_consumer)
+        via_cloud = RepositoryMirror(
+            root.fid, cloud_receiver_store, resolve, cloud_consumer)
+
+        normal_result = await normal.sync_from(writer_store)
+        cloud_result = await via_cloud.sync_from(cloud_store)
+
+        assert normal_result.errors == cloud_result.errors == ()
+        assert normal_result.changed == cloud_result.changed == 1
+        assert normal_result.piles == cloud_result.piles == 1
+        assert normal_consumer.fact_ids() == cloud_consumer.fact_ids()
+        assert set(normal_consumer.fact_ids()) == {
+            root.fid, device_signature.fid, device.fid}
+        assert normal_store.get(
+            f"heads/{root.fid}/{public}") == cloud_receiver_store.get(
+                f"heads/{root.fid}/{public}")
+
+        # Equal directories are a no-op and fetch no pile for semantic work.
+        again = await via_cloud.sync_from(cloud_store)
+        assert again.changed == again.piles == again.facts == 0
+
+    run(scenario())
+
+
+def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
+    async def scenario():
+        alice = world()
+        bob = world()
+        # Both devices publish into one workspace for this storage-level race;
+        # binding/auth fixtures deliberately keep semantic identities separate.
+        workspace = alice[2].fid
+        store = FsStore(str(tmp_path / "cloud"))
+        authority_root = h(b"authority")
+        proposals = []
+        for ordinal, values in enumerate((alice, bob), 1):
+            _secret, public, _root, _sig, _device = values
+            proposals.append((
+                public, h(f"head-{ordinal}".encode())))
+
+        async def authorize(proof, head):
+            device = proof.decode()
+            return HeadGrant(
+                workspace, device, None, head, authority_root)
+
+        gate = OpaqueHeadGate(store, authorize)
+        outcomes = await asyncio.gather(*(
+            gate.advance(device.encode(), head)
+            for device, head in proposals
+        ))
+        assert [outcome.status for outcome in outcomes] == [
+            "applied", "applied"]
+        assert len(store.list(f"heads/{workspace}")) == 2
+
+    run(scenario())
+
+
+def test_cloud_can_store_bad_owner_content_but_consumer_rejects_it(tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        authority_root = h(b"authority")
+        cloud = FsStore(str(tmp_path / "cloud"))
+        receiver = FsStore(str(tmp_path / "receiver"))
+        forged_head = h(b"missing opaque head")
+        proof = proof_for(
+            secret, public, root, device_signature, device, forged_head)
+        authority = AuthorityGate(
+            root.fid, authority_root, lambda: 10)
+
+        # The cloud validates only the authority pile and exact slot binding;
+        # it never opens the advertised content object.
+        result = await OpaqueHeadGate(
+            cloud, authority.authorize).advance(proof, forged_head)
+        assert result.status == "applied"
+
+        consumer = FactConsumer(root.fid)
+        mirror = RepositoryMirror(
+            root.fid,
+            receiver,
+            binding_for(root.fid, public, h(b"store")),
+            consumer,
+        )
+        synced = await mirror.sync_from(cloud)
+        assert synced.changed == synced.piles == synced.facts == 0
+        assert synced.errors == ((
+            f"heads/{root.fid}/{public}",
+            "repository object integrity",
+        ),)
+        assert consumer.fact_ids() == ()
+
+    run(scenario())
+
+
+def test_invalid_closed_pile_never_reaches_a_writer_tree(tmp_path):
+    async def scenario():
+        secret, public, root, _device_signature, _device = world()
+        writer = WriterLog(
+            root.fid, public, public, h(b"store"), secret,
+            FsStore(str(tmp_path / "writer")))
+        dangling = message_fact(
+            root.fid, public, "general", "no member closure", 9)
+        try:
+            await writer.prepare(((dangling,),))
+        except Exception as error:
+            assert "closed pile rejected" in str(error)
+        else:
+            raise AssertionError("nonclosed writer pile was accepted")
+
+    run(scenario())
+
+
+def test_bad_late_pile_admits_nothing_from_the_candidate_head(tmp_path):
+    """A multi-pile candidate is one semantic acceptance transaction."""
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        source = FsStore(str(tmp_path / "hostile-source"))
+        receiver = FsStore(str(tmp_path / "receiver"))
+        store_binding = h(b"store")
+        good = make_signed_pile(
+            secret, root.fid, public,
+            (root, device_signature, device))
+        dangling = message_fact(
+            root.fid, public, "general", "missing member", 9)
+        bad = make_signed_pile(
+            secret, root.fid, public, (dangling,))
+        raw_piles = tuple(map(encode_signed_pile, (good, bad)))
+        objects = {
+            signed_pile_oid(raw): raw for raw in raw_piles
+        }
+
+        def emit(raw):
+            oid = h(raw)
+            objects[oid] = raw
+            return oid
+
+        tree = append_piles(
+            EMPTY_TREE, root.fid, public,
+            tuple(signed_pile_oid(raw) for raw in raw_piles),
+            objects.get, emit)
+        candidate = make_head(
+            secret, root.fid, public, public,
+            tree.count, tree, store_binding)
+        candidate_raw = encode_head(candidate)
+        candidate_oid = head_oid(candidate_raw)
+        objects[candidate_oid] = candidate_raw
+        for oid, raw in objects.items():
+            source.put_if_absent("obj/" + oid, raw)
+        key = head_slot_key(root.fid, public)
+        source.cas(key, ABSENT, encode_slot(HeadSlot(
+            root.fid, public, candidate_oid, h(b"authority"))))
+
+        consumer = FactConsumer(root.fid)
+        result = await RepositoryMirror(
+            root.fid,
+            receiver,
+            binding_for(root.fid, public, store_binding),
+            consumer,
+        ).sync_from(source)
+
+        assert result.changed == result.piles == result.facts == 0
+        assert result.errors and "closed pile rejected" in result.errors[0][1]
+        assert consumer.fact_ids() == ()
+        assert receiver.get(key) is None
+        assert receiver.get("obj/" + signed_pile_oid(raw_piles[0])) is None
+
+    run(scenario())
+
+
+def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
+    class FailOnceConsumer(FactConsumer):
+        def __init__(self, workspace):
+            super().__init__(workspace)
+            self.fail = True
+
+        def commit(self, batch, *, device, head):
+            if self.fail:
+                self.fail = False
+                raise OSError("simulated projection crash")
+            return super().commit(batch, device=device, head=head)
+
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        source = FsStore(str(tmp_path / "source"))
+        receiver = FsStore(str(tmp_path / "receiver"))
+        binding = h(b"store")
+        log = WriterLog(
+            root.fid, public, public, binding, secret, source)
+        update = await log.prepare(((
+            root, device_signature, device),))
+        await log.establish(update)
+        gate = OpaqueHeadGate(
+            source,
+            AuthorityGate(
+                root.fid, h(b"authority"), lambda: 10).authorize,
+        )
+        await gate.advance(
+            proof_for(
+                secret, public, root, device_signature,
+                device, update.head_oid),
+            update.head_oid,
+        )
+
+        consumer = FailOnceConsumer(root.fid)
+        mirror = RepositoryMirror(
+            root.fid,
+            receiver,
+            binding_for(root.fid, public, binding),
+            consumer,
+        )
+        with pytest.raises(OSError, match="projection crash"):
+            await mirror.sync_from(source)
+
+        key = head_slot_key(root.fid, public)
+        assert decode_slot_at(key, receiver.get(key)).head == update.head_oid
+        assert consumer.projected_head(public) is None
+        assert consumer.fact_ids() == ()
+
+        repaired = await mirror.sync_from(source)
+        assert repaired.errors == ()
+        assert repaired.changed == 0
+        assert repaired.piles == 1
+        assert consumer.projected_head(public) == update.head_oid
+        assert set(consumer.fact_ids()) == {
+            root.fid, device_signature.fid, device.fid}
+
+    run(scenario())

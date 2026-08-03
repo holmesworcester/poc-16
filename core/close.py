@@ -8,10 +8,12 @@ close() emits the closure walk's own completion order: news in key order,
 deps first, emit on completion, dedup by fid — deps-first by construction,
 deterministic, and the walk that gathers the closure IS the serializer.
 """
+from dataclasses import dataclass
 from itertools import islice
 
-from .fact import bound_to, canon, encode, from_json, workspace_of
-from .ingress import InvalidPile
+from .crypto import h, sign, verify
+from .fact import Fact, bound_to, canon, encode, from_json, workspace_of
+from .ingress import InvalidPile, KernelRejected
 from .limits import (
     MIN_HOSTED_MEMORY_BYTES,
     InvalidEncoding,
@@ -23,6 +25,11 @@ from .limits import (
     decode_json,
 )
 from .shape import valid_fid
+
+
+SIGNED_PILE_FORMAT = "poc16-signed-pile-v1"
+SIGNED_PILE_SIGNATURE_DOMAIN = "poc16-signed-pile-signature-v1"
+SIGNATURE_HEX_CHARS = 128
 
 
 def check_pile_bounds(raw):
@@ -260,3 +267,171 @@ def decode_pile(b: bytes, workspace):
         raise InvalidPile(str(error)) from error
     except InvalidEncoding as error:
         raise InvalidPile(str(error) or "pile encoding") from error
+
+
+def _signature(value):
+    return isinstance(value, str) \
+        and len(value) == SIGNATURE_HEX_CHARS \
+        and all(character in "0123456789abcdef" for character in value)
+
+
+def _signed_document(workspace, writer, facts):
+    if not valid_fid(workspace) or not valid_fid(writer) \
+            or not isinstance(facts, tuple) \
+            or len(facts) > MAX_PILE_FACTS \
+            or not all(isinstance(fact, Fact) for fact in facts) \
+            or not all(bound_to(fact, workspace) for fact in facts):
+        raise ValueError("signed pile")
+    for fact in facts:
+        encode(fact)
+    return {
+        "facts": [fact.to_json() for fact in facts],
+        "format": SIGNED_PILE_FORMAT,
+        "workspace": workspace,
+        "writer": writer,
+    }
+
+
+def signed_pile_message(workspace, writer, facts):
+    """Return the domain-separated digest signed by the writer device."""
+    return h(canon([
+        SIGNED_PILE_SIGNATURE_DOMAIN,
+        _signed_document(workspace, writer, facts),
+    ]))
+
+
+@dataclass(frozen=True, slots=True)
+class SignedPile:
+    """One portable, independently closed publication unit.
+
+    ``writer`` is the publishing device's root Ed25519 public key. Individual
+    facts retain their own authorship signatures; this outer signature says
+    only that the device published this exact ordered closure.
+    """
+
+    workspace: str
+    writer: str
+    facts: tuple[Fact, ...]
+    signature: str
+
+    def __post_init__(self):
+        _signed_document(self.workspace, self.writer, self.facts)
+        if not _signature(self.signature) or not verify(
+                self.writer,
+                signed_pile_message(
+                    self.workspace, self.writer, self.facts),
+                self.signature):
+            raise ValueError("signed pile signature")
+
+
+def make_signed_pile(secret, workspace, writer, facts):
+    """Sign one exact bounded closure with its publishing device key."""
+    facts = tuple(islice(facts, MAX_PILE_FACTS + 1))
+    if len(facts) > MAX_PILE_FACTS:
+        raise PayloadTooLarge("pile has too many facts")
+    message = signed_pile_message(workspace, writer, facts)
+    return SignedPile(workspace, writer, facts, sign(secret, message))
+
+
+def signed_pile_document(pile):
+    if not isinstance(pile, SignedPile):
+        raise TypeError("signed pile")
+    return {
+        **_signed_document(pile.workspace, pile.writer, pile.facts),
+        "signature": pile.signature,
+    }
+
+
+def encode_signed_pile(pile):
+    """Encode the one signed-pile format used by push and pull."""
+    try:
+        raw = canon(signed_pile_document(pile))
+        check_pile_bounds(raw)
+        return raw
+    except PayloadTooLarge:
+        raise
+    except (RecursionError, TypeError, UnicodeError, ValueError) as error:
+        raise InvalidPile("signed pile encoding") from error
+
+
+def decode_signed_pile(raw, workspace=None, writer=None):
+    """Decode and verify one canonical signed closed-pile value."""
+    try:
+        check_pile_bounds(raw)
+        value = decode_json(raw, MAX_PILE_BYTES, "signed pile")
+        if not isinstance(value, dict) or set(value) != {
+                "facts", "format", "signature", "workspace", "writer"} \
+                or value.get("format") != SIGNED_PILE_FORMAT \
+                or not isinstance(value.get("facts"), list) \
+                or len(value["facts"]) > MAX_PILE_FACTS:
+            raise InvalidEncoding("signed pile shape")
+        pile = SignedPile(
+            value["workspace"],
+            value["writer"],
+            tuple(from_json(item) for item in value["facts"]),
+            value["signature"],
+        )
+        if workspace is not None and pile.workspace != workspace \
+                or writer is not None and pile.writer != writer \
+                or encode_signed_pile(pile) != raw:
+            raise InvalidEncoding("signed pile binding")
+        return pile
+    except PayloadTooLarge as error:
+        raise InvalidPile(str(error)) from error
+    except (InvalidEncoding, KeyError, RecursionError, TypeError,
+            UnicodeError, ValueError) as error:
+        raise InvalidPile(str(error) or "signed pile encoding") from error
+
+
+def signed_pile_oid(value):
+    raw = encode_signed_pile(value) if isinstance(value, SignedPile) else value
+    decode_signed_pile(raw)
+    return h(raw)
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluatedPile:
+    """A signed pile plus the kernel judgment over those exact bytes."""
+
+    pile: SignedPile
+    judgment: object
+
+
+class ClosedPileEvaluator:
+    """The shared signed-pile semantic door for push and pull."""
+
+    def __init__(self, workspace):
+        if not valid_fid(workspace):
+            raise ValueError("pile evaluator workspace")
+        self.workspace = workspace
+
+    def evaluate(self, raw, *, writer=None):
+        from .kernel import drain
+
+        pile = decode_signed_pile(
+            raw, workspace=self.workspace, writer=writer)
+        judgment = drain(pile.facts, self.workspace)
+        if not judgment.ok:
+            if judgment.failure is not None:
+                raise judgment.failure
+            raise KernelRejected("closed pile rejected")
+        return EvaluatedPile(pile, judgment)
+
+
+__all__ = (
+    "ClosedPileEvaluator",
+    "EvaluatedPile",
+    "SIGNED_PILE_FORMAT",
+    "SIGNED_PILE_SIGNATURE_DOMAIN",
+    "SignedPile",
+    "check_pile_bounds",
+    "close",
+    "decode_pile",
+    "decode_signed_pile",
+    "encode_pile",
+    "encode_signed_pile",
+    "make_signed_pile",
+    "signed_pile_document",
+    "signed_pile_message",
+    "signed_pile_oid",
+)

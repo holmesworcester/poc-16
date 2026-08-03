@@ -3,7 +3,7 @@ import base64
 import json
 import urllib.request
 
-from core.close import decode_pile
+from core.close import decode_signed_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
 from core.fact import Fact, Need, workspace_of
 from core.http_body import read_bounded
@@ -97,8 +97,8 @@ def accept(node, link, name):
         if not isinstance(blob, dict) or set(blob) != {"pile", "isk", "ws"} \
                 or blob.get("ws") != workspace:
             raise ValueError("invite workspace")
-        bootstrap = decode_pile(
-            base64.b64decode(blob["pile"], validate=True), workspace)
+        bootstrap = decode_signed_pile(
+            base64.b64decode(blob["pile"], validate=True), workspace).facts
         judgment = drain(bootstrap, workspace)
         invitations = [
             valid.fact for valid in judgment.valids
@@ -115,11 +115,10 @@ def accept(node, link, name):
             workspace, name, peers=[peer],
             identity=node.keychain.default_id())
         retained = True
-        # The bootstrap is already closed/topological; PileSender owns the one
-        # outbound wire encoding before the shared receiving boundary.
-        pile = node.sender(workspace).pack(bootstrap + [sig, member])
-        node.receive_pile(
-            workspace, node.member_for(workspace), pile)
+        # The bootstrap is already closed and topological.  The local writer
+        # publishes that exact closure as one signed writer-tree leaf; network
+        # reconciliation subsequently exchanges the same portable leaf.
+        node.publish_closed(workspace, (tuple(bootstrap) + (sig, member),))
         return workspace
     finally:
         if not retained:

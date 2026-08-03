@@ -9,6 +9,7 @@ The public mutation contract rejects unconditional root/object replacement
 and authoritative deletion. Objects and retained piles use atomic
 put-if-absent; repository roots use CAS.
 """
+import asyncio
 import fcntl
 import heapq
 import os
@@ -26,6 +27,7 @@ from .object_store import (
     ListPage,
     REPOSITORY_ROOT_KEYS,
     authoritative_key,
+    mutable_key,
     validate_create,
     validate_key,
 )
@@ -36,6 +38,7 @@ from .limits import (
     PAGE_BATCH,
     PayloadTooLarge,
 )
+from .writer_head import parse_head_slot_key
 
 
 class FsStore:
@@ -145,8 +148,8 @@ class FsStore:
                 pass
 
     def cas(self, key, token, b):
-        if key not in REPOSITORY_ROOT_KEYS:
-            raise ValueError("key is not a repository CAS register")
+        if not mutable_key(key):
+            raise ValueError("key is not a CAS register")
         with open(self._root_lock, "a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             current = self.read_versioned(key)
@@ -216,42 +219,98 @@ class FsStore:
 
 
 class RemoteStore:
-    """Read-only ObjectStore over a walk.Peer, so a remote store is fetched
-    through the same interface the local fetch(oid) driver wraps."""
+    """Ordinary HTTP peer exposed as the same bounded ObjectStore contract.
+
+    Immutable PUTs stage hash-addressed objects.  A head CAS is translated to
+    the peer's mirror-finalize operation, where the receiving
+    :class:`RepositoryMirror` repeats validation and owns the actual local
+    compare-and-swap.
+    """
 
     def __init__(self, peer):
         self.peer = peer
 
-    def get(self, key):
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
-        return self.get_bounded(key, limit)
-
-    def get_bounded(self, key, max_bytes):
+    async def get_bounded(self, key, max_bytes):
         if type(max_bytes) is not int \
                 or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
             raise ValueError("remote read byte limit")
-        if key == "root":
-            got = self.peer.root(response_limit=max_bytes)
-            return got[0] if got is not None else None
+        if key.startswith("heads/"):
+            _workspace, device = parse_head_slot_key(key)
+            got = await asyncio.to_thread(self.peer.head, device)
+            return None if got is None else got[0]
         if key.startswith("obj/"):
-            return self.peer.obj(key[4:], response_limit=max_bytes)
+            return await asyncio.to_thread(
+                self.peer.obj, key[4:], response_limit=max_bytes)
         return None
 
-    def get_many(self, keys):
+    async def read_versioned(self, key):
+        if key.startswith("heads/"):
+            observed_head = getattr(self.peer, "observed_head", None)
+            if callable(observed_head):
+                known, opened = observed_head(key)
+                if known:
+                    return opened
+            _workspace, device = parse_head_slot_key(key)
+            try:
+                got = await asyncio.to_thread(self.peer.head, device)
+            except Exception as error:
+                if getattr(error, "code", None) == 404:
+                    return ABSENT
+                raise
+            return ABSENT if got is None else Versioned(*got)
+        value = await self.get_bounded(key, MAX_OBJECT_BYTES)
+        return ABSENT if value is None else Versioned(
+            value, VersionToken(h(value)))
+
+    async def read_many_versioned(self, keys):
+        """Use the slots bundled with the latest bounded directory page."""
+        keys = tuple(keys)
+        if all(key.startswith("heads/") for key in keys):
+            return self.peer.opened_heads(keys)
+        return tuple([
+            await self.read_versioned(key) for key in keys
+        ])
+
+    async def get_many(self, keys):
         """Fetch object keys in bounded batches; preserve order and misses."""
         keys = tuple(keys)
         if not all(key.startswith("obj/") for key in keys):
-            return tuple(self.get(key) for key in keys)
-        if not hasattr(self.peer, "objs"):
-            return tuple(self.get(key) for key in keys)
+            return tuple([
+                await self.get_bounded(key, MAX_OBJECT_BYTES)
+                for key in keys
+            ])
         out = []
         for start in range(0, len(keys), PAGE_BATCH):
-            out.extend(self.peer.objs(
-                [key[4:] for key in keys[start:start + PAGE_BATCH]]))
+            out.extend(await asyncio.to_thread(
+                self.peer.objs,
+                [key[4:] for key in keys[start:start + PAGE_BATCH]],
+            ))
         return tuple(out)
 
-    def has(self, key):
-        return self.get(key) is not None
+    async def put_if_absent(self, key, value):
+        key = validate_create(key, value)
+        if not key.startswith("obj/"):
+            raise ValueError("remote create is immutable-only")
+        status = await asyncio.to_thread(
+            self.peer.put_obj, key[4:], value)
+        if status == 201:
+            return CREATED
+        if status == 204:
+            return EXISTS
+        raise ValueError("remote immutable create")
 
-    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
-        raise TypeError("remote stores do not expose LIST")
+    async def cas(self, key, token, value):
+        if not mutable_key(key) or key == "root":
+            raise ValueError("remote CAS is writer-slot-only")
+        _workspace, device = parse_head_slot_key(key)
+        applied, returned = await asyncio.to_thread(
+            self.peer.accept_slot, device, value)
+        if not applied:
+            return STALE
+        return Applied(returned or VersionToken(h(value)))
+
+    async def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        if not prefix.startswith("heads/"):
+            raise TypeError("remote LIST is writer-directory-only")
+        return await asyncio.to_thread(
+            self.peer.heads, cursor, limit)

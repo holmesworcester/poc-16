@@ -20,6 +20,7 @@ from core.object_store import (
     Versioned,
     VersionToken,
     authoritative_key,
+    mutable_key,
     validate_create,
     validate_key,
     validate_store_prefix,
@@ -226,8 +227,8 @@ class R2BindingStore:
         return CREATED if result is not None else EXISTS
 
     async def cas(self, key, token, value):
-        if key != "root":
-            raise ValueError("only root is mutable by CAS")
+        if not mutable_key(key):
+            raise ValueError("key is not a CAS register")
         if token is ABSENT:
             condition = _if_none_match()
         elif isinstance(token, VersionToken):

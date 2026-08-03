@@ -134,6 +134,46 @@ def family_for(tag):
     return FAMILIES.get(tag)
 
 
+def authorize_writer_head(judgment, writer, proposed_head, trusted_now):
+    """Dispatch one ephemeral exact-head decision through its fact family."""
+    decisions = []
+    for valid in judgment.valids:
+        family = family_for(valid.fact.t)
+        authorize = getattr(family, "authorize_head", None)
+        if callable(authorize):
+            decision = authorize(
+                valid, writer, proposed_head, trusted_now)
+            if decision is not None:
+                decisions.append(decision)
+    return decisions[0] if len(decisions) == 1 else None
+
+
+def authorize_access(judgment, stream, view, trusted_now, *, purpose):
+    """Dispatch one ephemeral access request from a signed pile judgment.
+
+    The caller supplies a verifier-pinned current-authority view.  The pile
+    supplies its complete historical membership closure, while the view
+    decides whether the exact selected provider is still current and clear.
+    """
+    candidates = []
+    for valid in judgment.valids:
+        family = family_for(valid.fact.t)
+        if family is None or family.DURABLE:
+            continue
+        authorize = getattr(family, "authorize", None)
+        if callable(authorize):
+            decision = authorize(
+                view,
+                valid,
+                stream,
+                trusted_now,
+                purpose=purpose,
+            )
+            if decision is not None:
+                candidates.append(decision)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def is_genesis(tag):
     """Whether ``tag`` owns the registry's sole ws-less fact shape."""
     family = family_for(tag)

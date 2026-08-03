@@ -1,10 +1,9 @@
-"""The full peer's disposable SQLite fact projection.
+"""Disposable full-peer fact/index projection with per-writer checkpoints.
 
-This module is the sole SQL boundary.  It stores canonical validated fact
-bytes, one generic mechanical index, and a pinned-root cache stamp.  It is
-never an input to closed-pile validation, repository compilation, root CAS,
-or hosted reads; deleting it only makes the full peer rebuild local query
-state from :class:`core.repository_reader.RepositoryReader`.
+Core validates complete signed piles and owns accepted writer slots.  This
+sole SQL boundary atomically joins the resulting canonical facts and advances
+one projection checkpoint.  Deleting the file loses no protocol state: core
+replays each accepted writer tree from its durable slot.
 """
 
 import os
@@ -12,16 +11,19 @@ import sqlite3
 
 import facts
 
-from core.crypto import h
-from core.fact import bound_to, decode, encode
-from core.fact_index import ACTION_INDEX, TYPE_INDEX, index_rows
-from core.repository_snapshot import action_bindings
+from core.fact import bound_to, decode
+from core.fact_index import (
+    ACTION_INDEX,
+    SCOPE_INDEX,
+    TYPE_INDEX,
+    index_rows,
+)
 from core.shape import valid_fid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 CREATE TABLE IF NOT EXISTS facts(
     fid TEXT PRIMARY KEY,
     blob BLOB NOT NULL);
@@ -33,16 +35,16 @@ CREATE TABLE IF NOT EXISTS fact_index(
     PRIMARY KEY(kind, k0, k1, src));
 CREATE INDEX IF NOT EXISTS fact_index_by_src
     ON fact_index(src, kind, k0, k1);
-CREATE TABLE IF NOT EXISTS meta(
-    k TEXT PRIMARY KEY,
-    v BLOB);
+CREATE TABLE IF NOT EXISTS projected_heads(
+    device TEXT PRIMARY KEY,
+    head_oid TEXT NOT NULL);
 """
 
 
 _COLUMNS = {
     "facts": ("fid", "blob"),
     "fact_index": ("kind", "k0", "k1", "src"),
-    "meta": ("k", "v"),
+    "projected_heads": ("device", "head_oid"),
 }
 
 
@@ -131,6 +133,11 @@ class SqlStore:
 
     fact_of = fact
 
+    def fact_bytes(self, fid):
+        row = self.db.execute(
+            "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
+        return None if row is None else bytes(row[0])
+
     def offers_from(self, source, name):
         return self.db.execute(
             "SELECT k0, k1 FROM fact_index WHERE src=? AND kind=? "
@@ -200,49 +207,104 @@ class SqlStore:
     def suppresses(self, fact):
         return any(self.active(sid) for sid in facts.current_scopes(fact))
 
-    def current_for(self, reader):
-        root_digest = None if reader is None else reader.etag
-        stamped = self.db.execute(
-            "SELECT v FROM meta WHERE k='root'").fetchone()
-        return stamped == (root_digest,)
+    # The access gate consumes this small Worker-like capability.  It keeps
+    # family authorization independent of SQL while letting a full peer use
+    # the same query as a database-free authenticated authority view.
+    def fact_known(self, fid):
+        return self.fact_bytes(fid) is not None
 
-    def refresh(self, reader):
-        """Replace all rows from one pinned authenticated repository."""
-        if reader is None:
-            validated, root_bytes = None, None
-        elif reader.workspace != self.anchor:
-            raise ValueError("projection workspace")
-        else:
-            validated = reader.all_facts()
-            root_bytes = reader.root_bytes
-        self.db.execute("BEGIN")
+    def fact_active(self, fid):
+        fact = self.fact(fid)
+        return fact is not None and not self.suppresses(fact)
+
+    def suppression_known(self, sid):
+        return self.db.execute(
+            "SELECT 1 FROM fact_index WHERE "
+            "(kind=? OR kind=?) AND k0=? LIMIT 1",
+            (SCOPE_INDEX, ACTION_INDEX, sid),
+        ).fetchone() is not None
+
+    def principal_active(self, namespace, public_key):
+        return not self.active(facts.principal_sid(
+            namespace, public_key))
+
+    def projected_head(self, device):
+        if not valid_fid(device):
+            raise ValueError("projection device")
+        row = self.db.execute(
+            "SELECT head_oid FROM projected_heads WHERE device=?",
+            (device,),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def commit(self, batch, *, device, head):
+        """Atomically join one core-validated suffix and its checkpoint."""
+        from core.writer_repository import ValidatedBatch
+
+        if not isinstance(batch, ValidatedBatch) \
+                or not valid_fid(device) or not valid_fid(head):
+            raise ValueError("projection commit")
+        additions, candidates = [], {}
+        self.db.execute("BEGIN IMMEDIATE")
         try:
-            for table in ("fact_index", "facts"):
-                self.db.execute(f"DELETE FROM {table}")
-            if validated is not None:
-                for fid in sorted(validated.facts):
-                    fact = validated.facts[fid]
+            for fid, raw in batch.facts:
+                fact = self._fact((raw,), fid)
+                family = facts.family_for(fact.t)
+                if family is None or not family.DURABLE:
+                    raise ValueError("projection durable fact")
+                incumbent = self.fact_bytes(fid)
+                if incumbent is not None and incumbent != raw:
+                    raise ValueError("fact projection conflict")
+                if incumbent is None:
                     self.db.execute(
                         "INSERT INTO facts VALUES(?,?)",
-                        (fid, encode(fact)),
+                        (fid, raw),
                     )
                     self.db.executemany(
                         "INSERT INTO fact_index VALUES(?,?,?,?)",
                         index_rows(fact),
                     )
-                self.db.executemany(
-                    "INSERT INTO fact_index VALUES(?,?,?,?)",
-                    (
-                        (ACTION_INDEX, sid, "", fid)
-                        for sid, fid in sorted(
-                            action_bindings(validated.facts).items())
-                    ),
+                    additions.append(fid)
+                    for sid in facts.action_sids(fact):
+                        candidate = (fact.key, fact.fid)
+                        candidates[sid] = min(
+                            candidates.get(sid, candidate), candidate)
+
+            for sid, candidate in sorted(candidates.items()):
+                row = self.db.execute(
+                    "SELECT src FROM fact_index "
+                    "WHERE kind=? AND k0=? AND k1=''",
+                    (ACTION_INDEX, sid),
+                ).fetchone()
+                if row is not None:
+                    incumbent = self.fact(row[0])
+                    candidate = min(
+                        candidate, (incumbent.key, incumbent.fid))
+                self.db.execute(
+                    "DELETE FROM fact_index "
+                    "WHERE kind=? AND k0=? AND k1=''",
+                    (ACTION_INDEX, sid),
                 )
-            self.db.execute("DELETE FROM meta")
+                self.db.execute(
+                    "INSERT INTO fact_index VALUES(?,?,?,?)",
+                    (ACTION_INDEX, sid, "", candidate[1]),
+                )
             self.db.execute(
-                "INSERT OR REPLACE INTO meta VALUES('root',?)",
-                (h(root_bytes) if root_bytes is not None else None,),
+                "INSERT OR REPLACE INTO projected_heads VALUES(?,?)",
+                (device, head),
             )
+            self.db.commit()
+            return tuple(additions)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def reset(self):
+        """Discard only rebuildable projection rows."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ("projected_heads", "fact_index", "facts"):
+                self.db.execute(f"DELETE FROM {table}")
             self.db.commit()
         except Exception:
             self.db.rollback()

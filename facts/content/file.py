@@ -86,9 +86,10 @@ def _stable(stat):
 def _author(node, workspace, channel, path, name, ts, emit):
     """Prove one stable source and emit descriptor-first closed piles.
 
-    Every call to ``emit(raw, fid)`` receives one independently valid ordinary
-    pile: first the signed descriptor closure, then exactly one unsigned slice
-    plus that same closure. No detached completion channel exists.
+    Every call to ``emit(closure, fid)`` receives one independently valid
+    closure: first the signed descriptor, then exactly one Bao slice plus that
+    descriptor closure.  The caller chooses local writer publication or a
+    direct-upload encoding; there is still only one signed-pile wire format.
     """
     native = node.attachment_io()
     timestamp = node.now_ms() if ts is None else ts
@@ -119,13 +120,13 @@ def _author(node, workspace, channel, path, name, ts, emit):
             [signed, descriptor],
             {signed.fid: [], descriptor.fid: [signed.fid, member]},
         )
-        emit(sender.pack(descriptor_closed), descriptor.fid)
+        emit(tuple(descriptor_closed), descriptor.fid)
 
         for index in range(bao.geometry(size)):
             proof = native.proof(source, outboard, index, size)
             item = slices.file_slice(
                 workspace, descriptor.fid, index, proof, timestamp)
-            emit(sender.pack((*descriptor_closed, item)), item.fid)
+            emit((*descriptor_closed, item), item.fid)
 
         if _stable(os.stat(source)) != _stable(initial):
             raise ValueError("file changed while it was being proved")
@@ -133,9 +134,9 @@ def _author(node, workspace, channel, path, name, ts, emit):
 
 
 def send(node, workspace, channel, path, name=None, ts=None):
-    """Publish the descriptor and each inline range through the one Applier."""
-    def receive(raw, expected):
-        node.receive_pile(workspace, node.member_for(workspace), raw)
+    """Publish the descriptor and each inline range as writer-tree leaves."""
+    def receive(closed, expected):
+        node.publish_closed(workspace, (closed,))
         if node.fact_of(workspace, expected) is None:
             raise ValueError(f"authored fact was not admitted: {expected}")
 
@@ -149,8 +150,9 @@ def upload(
     """Upload and collect each pile before authoring the next Bao slice."""
     count = 0
 
-    def deliver(raw, _expected):
+    def deliver(closed, _expected):
         nonlocal count
+        raw = node.sender(workspace).pack(closed)
         source = node.create_upload(workspace, raw)
         result = direct_upload(
             node, workspace, source, broker_url, provider_origin)
@@ -213,7 +215,7 @@ def _record(descriptor, have):
 def _states(node, workspace, selector=None):
     """Pin only the selected descriptor's proof facts; lists count indexes."""
     with node.lock:
-        node._sync_sql(workspace)
+        node._ensure_projection(workspace)
         admitted = node.sql(workspace)
 
         def select(kind, k0=None, k1=None, **filters):

@@ -223,7 +223,7 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
             "root/child", "/outside", "../outside"):
         with pytest.raises(ValueError, match="key"):
             first.put(key, b"clobber")
-    with pytest.raises(ValueError, match="only root"):
+    with pytest.raises(ValueError, match="CAS register"):
         first.cas("obj/" + h(b"x"), ABSENT, b"x")
     with pytest.raises(ValueError, match="conditional"):
         first.put("root", b"clobber")

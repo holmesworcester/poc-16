@@ -1,0 +1,167 @@
+"""Canonical signed-pile, writer-head, and per-device tree contract."""
+import json
+
+import pytest
+
+from core.close import (
+    ClosedPileEvaluator,
+    decode_signed_pile,
+    encode_signed_pile,
+    make_signed_pile,
+    signed_pile_oid,
+)
+from core.crypto import h, keypair
+from core.fact import canon
+from core.ingress import InvalidPile, KernelRejected
+from core.writer_head import (
+    HeadSlot,
+    InvalidWriterHead,
+    WriterBinding,
+    decode_head,
+    decode_slot_at,
+    encode_head,
+    encode_slot,
+    head_oid,
+    head_slot_key,
+    make_head,
+    require_bound_head,
+    validate_advance,
+)
+from core.writer_tree import (
+    EMPTY_TREE,
+    append_piles,
+    build_tree,
+    leaf_row,
+    validate_extension,
+)
+from facts.auth.workspace import workspace as workspace_fact
+from facts.auth.signature import signature as signature_fact
+from facts.content.message import message as message_fact
+
+
+def emit_into(objects):
+    def emit(raw):
+        oid = h(raw)
+        objects.setdefault(oid, raw)
+        return oid
+    return emit
+
+
+def signed_workspace_pile(name="alice"):
+    secret, public = keypair()
+    root = workspace_fact(secret, public, name, 1)
+    pile = make_signed_pile(
+        secret, root.fid, public, (root,))
+    return secret, public, root, pile, encode_signed_pile(pile)
+
+
+def test_signed_pile_is_the_same_canonical_push_and_pull_value():
+    _secret, public, root, pile, raw = signed_workspace_pile()
+
+    assert decode_signed_pile(
+        raw, workspace=root.fid, writer=public) == pile
+    evaluated = ClosedPileEvaluator(root.fid).evaluate(raw, writer=public)
+    assert evaluated.pile == pile
+    assert tuple(valid.fact.fid for valid in evaluated.judgment.valids) == (
+        root.fid,)
+    assert signed_pile_oid(raw) == h(raw)
+
+
+@pytest.mark.parametrize("change", ("signature", "writer", "workspace"))
+def test_signed_pile_rejects_forged_outer_bindings(change):
+    _secret, _public, _root, _pile, raw = signed_workspace_pile()
+    value = json.loads(raw)
+    value[change] = "0" * len(value[change])
+
+    with pytest.raises(InvalidPile):
+        decode_signed_pile(canon(value))
+
+
+def test_signed_pile_rejects_noncanonical_and_nonclosed_content():
+    secret, public, root, _pile, raw = signed_workspace_pile()
+    with pytest.raises(InvalidPile):
+        decode_signed_pile(raw + b" ")
+
+    # The outer signature can authenticate publication but cannot make a fact
+    # whose semantic dependencies are absent into a valid closure.
+    dangling = message_fact(
+        root.fid, public, "general", "missing authority", 2)
+    nonclosed = encode_signed_pile(make_signed_pile(
+        secret, root.fid, public, (dangling,)))
+    with pytest.raises(KernelRejected, match="closed pile rejected"):
+        ClosedPileEvaluator(root.fid).evaluate(nonclosed)
+
+
+def test_writer_head_and_slot_round_trip_without_predecessor_chain():
+    secret, public, root, pile, _raw = signed_workspace_pile()
+    objects = {}
+    tree = append_piles(
+        EMPTY_TREE,
+        root.fid,
+        public,
+        (signed_pile_oid(pile),),
+        objects.get,
+        emit_into(objects),
+    )
+    store = h(b"registered-store")
+    head = make_head(
+        secret, root.fid, public, public, tree.count, tree, store)
+    raw = encode_head(head)
+
+    assert decode_head(raw) == head
+    assert b"previous" not in raw
+    binding = WriterBinding(root.fid, public, public, store)
+    assert require_bound_head(head, binding) == head
+
+    slot = HeadSlot(
+        root.fid, public, head_oid(head), h(b"authority-root"))
+    key = head_slot_key(root.fid, public)
+    assert decode_slot_at(key, encode_slot(slot)) == slot
+
+
+def test_head_and_tree_advance_compare_directly_to_last_accepted_root():
+    secret, public, root, first_pile, _raw = signed_workspace_pile()
+    objects = {}
+    emit = emit_into(objects)
+    first = append_piles(
+        EMPTY_TREE, root.fid, public,
+        (signed_pile_oid(first_pile),), objects.get, emit)
+    second_fact = signature_fact(secret, public, root, 2)
+    second_pile = make_signed_pile(
+        secret, root.fid, public, (root, second_fact))
+    second_oid = signed_pile_oid(second_pile)
+    second = append_piles(
+        first, root.fid, public, (second_oid,), objects.get, emit)
+    store = h(b"store")
+    binding = WriterBinding(root.fid, public, public, store)
+    first_head = make_head(
+        secret, root.fid, public, public, first.count, first, store)
+    second_head = make_head(
+        secret, root.fid, public, public, second.count, second, store)
+
+    assert validate_advance(first_head, second_head, binding) == 1
+    assert validate_extension(
+        first, second, root.fid, public, objects.get) == (
+            leaf_row(2, second_oid),)
+    assert validate_advance(second_head, second_head, binding) == 0
+
+    with pytest.raises(InvalidWriterHead, match="rollback"):
+        validate_advance(second_head, first_head, binding)
+
+    rewritten = build_tree(
+        root.fid,
+        public,
+        (
+            leaf_row(1, h(b"rewritten")),
+            leaf_row(2, second_oid),
+        ),
+        emit,
+    )
+    hostile = make_head(
+        secret, root.fid, public, public,
+        rewritten.count, rewritten, store)
+    with pytest.raises(InvalidWriterHead, match="fork"):
+        validate_advance(second_head, hostile, binding)
+    with pytest.raises(ValueError, match="rewrote accepted row"):
+        validate_extension(
+            first, rewritten, root.fid, public, objects.get)

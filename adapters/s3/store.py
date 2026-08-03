@@ -33,6 +33,7 @@ from core.object_store import (
     KEY_RE,
     MAX_PROVIDER_KEY_BYTES,
     authoritative_key,
+    mutable_key,
     validate_create,
     validate_key,
     validate_store_prefix,
@@ -578,8 +579,8 @@ class S3Store:
         return CREATED
 
     def cas(self, key, token, value):
-        if validate_key(key) != "root":
-            raise ValueError("only root is mutable by CAS")
+        if not mutable_key(key):
+            raise ValueError("key is not a CAS register")
         if token is not ABSENT and not isinstance(token, VersionToken):
             raise TypeError("CAS requires an absent marker or version token")
         args = self._put_args(key, value)
@@ -594,9 +595,9 @@ class S3Store:
             if status == 412 or (
                     token is not ABSENT and _is_missing_key(error)):
                 return STALE
-            _raise_mutation_error("conditional root PutObject", error)
+            _raise_mutation_error("conditional PutObject", error)
         etag = self._response_etag(
-            response, "conditional root PutObject", mutation=True)
+            response, "conditional PutObject", mutation=True)
         return Applied(VersionToken(etag))
 
     def _list_args(self, prefix, limit):

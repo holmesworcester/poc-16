@@ -1,7 +1,7 @@
-"""SQL-permitted local authorship that emits one ordinary exact pile."""
+"""SQL-permitted local authorship of canonical signed closed piles."""
 import facts
 
-from core.close import close, encode_pile
+from core.close import close, encode_signed_pile, make_signed_pile
 from core.kernel import drain, resolve_deps
 
 
@@ -16,7 +16,7 @@ class PileSender:
         """Close local intent using the disposable SQL projection."""
         node, workspace = self.node, self.workspace
         with node.lock:
-            node._sync_sql(workspace)
+            node._ensure_projection(workspace)
             context = node.sql(workspace)
             newmap = {fact.fid: fact for fact in news}
 
@@ -31,8 +31,10 @@ class PileSender:
             return tuple(close(news, deps_of, fact_of))
 
     def pack(self, closed):
-        """Encode one already-closed outbound unit in the ordinary wire codec."""
-        return encode_pile(closed, workspace=self.workspace)
+        """Sign and encode one already-closed portable unit."""
+        secret, writer = self.node.identity(self.workspace)
+        return encode_signed_pile(make_signed_pile(
+            secret, self.workspace, writer, tuple(closed)))
 
     def pack_batches(self, closed_units):
         """Encode each independent closure as its own ordinary pile."""
@@ -47,24 +49,15 @@ class PileSender:
             batches.append(self.pack(unit))
         return tuple(batches)
 
-    def deliver(self, peer, closed_units):
-        """Deliver fact-only verified closures through one capability."""
-        units = tuple(tuple(unit) for unit in closed_units)
-        batches = self.pack_batches(units)
-        for raw in batches:
-            peer.put_pile(raw)
-        return len(batches)
-
     def pile(self, news, deps_new):
         """Close and encode local intent without receiving it."""
         return self.pack(self.close(news, deps_new))
 
     def send(self, news, deps_new):
-        """Deliver local intent through the recipient RepositoryApplier."""
+        """Publish local intent through this device's one writer log."""
         node, workspace = self.node, self.workspace
-        raw = self.pile(news, deps_new)
-        fresh = node.receive_pile(
-            workspace, node.member_for(workspace), raw)
+        closed = self.close(news, deps_new)
+        fresh = node.publish_closed(workspace, (closed,))
         missing = [
             fact.fid for fact in news
             if facts.family_for(fact.t).DURABLE

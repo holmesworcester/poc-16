@@ -453,9 +453,10 @@ A workspace mirror turn is:
 1. list every page under the exact workspace head prefix;
 2. reject malformed keys and filter candidates through the known device-writer
    registry;
-3. compare each listed opaque slot token with the locally observed token;
-4. conditionally read only a new or changed tiny slot to learn its head OID;
-5. if that immutable head OID is already local, perform no head fetch;
+3. open all independent tiny slots in that bounded page as one parallel or
+   bundled read phase, never as one sequential RTT per writer;
+4. compare each opened head OID with that writer's locally accepted head OID;
+5. if the immutable head OID is already local, perform no tree or pile fetch;
 6. otherwise mirror the missing content-addressed head, Merkle pages, and
    complete directly signed logical pile leaves from that writer tree;
 7. stop there on a non-consuming hosted peer;
@@ -464,9 +465,12 @@ A workspace mirror turn is:
    its durable facts.
 
 A head learned through P2P and already present locally is not fetched again
-merely because this provider directory slot was first observed later. The
-provider token optimizes the tiny mutable slot read; content OIDs determine
-whether any immutable head or tree object is missing.
+merely because this provider directory slot was first observed later. An
+adapter may compare a cached, source-specific opaque slot token before opening
+the slot body. An HTTP peer may instead bundle the bounded page's small slot
+bodies with the directory response. These are equivalent read optimizations,
+not repository state: in both cases the portable comparison is the individual
+signed head OID. There is no hash, manifest, or CAS register over all heads.
 
 LIST output is never accepted as membership, authorship, liveness, workspace
 binding, or fact validity. A forged extra object is ignored. An absent object
@@ -474,19 +478,22 @@ means only that no content was observed for that writer.
 
 ### 6.2 A directory observation is intentionally not transactional
 
-We do not assume that a multi-page LIST plus subsequent GETs is one global
-snapshot. A head can advance during pagination. A conditional GET either pins
-the exact listed version or fails and causes that one key to be reconsidered.
+We do not assume that a multi-page LIST plus its parallel or bundled slot reads
+is one global snapshot. Each slot read linearizes independently, and a head can
+advance during pagination. The mirror may consume the complete old or new slot;
+a later complete scan catches an update that linearized after its read.
 
 Mixing head versions cannot create a torn object or authorize a fact. A
 non-consuming peer merely mirrors opaque content-addressed objects. A consumer
 admits only piles it has independently validated, so a mixed observation can
 only delay valid additions. Periodic full scans plus fair retry converge.
 
-Initial discovery costs roughly one LIST request per 1,000 device writers plus
-one small slot read per writer. A warm peer still lists the directory but reads
-only changed slots and mirrors only head/tree objects it does not already have.
-This is measured before introducing any second index.
+Initial discovery costs one bounded head-page round per page when HTTP bundles
+the tops, or one LIST round followed by one parallel slot-read round for a
+direct provider adapter. It must never cost one sequential RTT per writer. A
+warm peer still scans the directory but mirrors only head/tree objects whose
+individual head OIDs changed. This is measured before introducing any second
+index.
 
 ## 7. Ephemeral authority verification and removal refresh
 
@@ -652,9 +659,8 @@ transfer and semantic judgment is one complete writer-device-signed closed-
 pile leaf.
 
 ```text
-LIST workspace head slots
-    -> unchanged slot token: no slot read
-    -> changed slot token: read head oid
+LIST/open one bounded page of independent workspace head slots
+    -> compare every writer's remote head oid with its local head oid
     -> known head oid: no immutable fetch
     -> unknown head oid: RBSR and mirror missing pages/full signed-pile leaves
     -> non-consuming peer stops
@@ -676,6 +682,14 @@ ranges, and exchange the missing complete signed-pile leaves. Running the diff
 in both directions reconciles arbitrary overlap rather than assuming either
 peer has a prefix of the other. Each receiver verifies and evaluates every
 missing pile independently before serving it in a later sync.
+
+One two-way turn reuses the remote per-writer slots opened during its pull when
+deciding what to offer back. It does not probe every unchanged remote slot a
+second time. This observation is only a disposable optimization: `/mirror`
+reopens the receiver's current slot and acknowledges success only when the
+proposed exact bytes are installed. A receiver advance after the directory
+scan therefore produces an exact no-op, a stale/retry result, or validation
+against the newer head—never an overwrite authorized by the cache.
 
 This per-device RBSR forest is the initial and only required P2P index. Measure
 directory exchange and per-changed-device turns before adding a combined peer

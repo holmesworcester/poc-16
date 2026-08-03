@@ -46,6 +46,17 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+class _SerializedMirror:
+    """Put a stateful peer's one projection behind its existing lock."""
+
+    def __init__(self, lock, mirror):
+        self.lock, self.mirror = lock, mirror
+
+    async def accept_slot(self, raw):
+        with self.lock:
+            return await self.mirror.accept_slot(raw)
+
+
 class StdlibPeerHandler(BaseHTTPRequestHandler):
     """Translate ordinary HTTP bytes; ``HttpGate`` still owns the routes."""
 
@@ -115,12 +126,16 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             workspace,
             self.secret,
             now_ms,
-            self.peer.applier(workspace),
+            mirror=_SerializedMirror(
+                self.peer.lock, self.peer.mirror(workspace)),
+            mint_authorize=lambda pile, purpose: self.peer.authorize_access(
+                workspace, pile, purpose),
             sync_profile=self.sync_profile,
             grant_ttl_ms=self.gate_options.grant_ttl_ms,
             max_mint_fetches=self.gate_options.max_mint_fetches,
             max_mint_fetch_bytes=self.gate_options.max_mint_fetch_bytes,
         )
+
         try:
             response = asyncio.run(gate.handle(
                 method, path, query, dict(self.headers), body))

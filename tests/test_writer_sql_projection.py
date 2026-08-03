@@ -1,0 +1,95 @@
+"""Full-peer SQL is a disposable sink behind the core writer consumer."""
+import asyncio
+
+from core.close import encode_signed_pile, make_signed_pile
+from core.crypto import h, keypair
+from core.store import FsStore
+from core.writer_head import WriterBinding
+from core.writer_repository import (
+    AuthorityGate,
+    FactConsumer,
+    OpaqueHeadGate,
+    RepositoryMirror,
+    WriterLog,
+)
+from facts.auth.device import device as device_fact
+from facts.auth.head_request import head_request
+from facts.auth.signature import signature as signature_fact
+from facts.auth.workspace import workspace as workspace_fact
+from full_peer.sql_store import SqlStore
+
+
+def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
+    async def scenario():
+        secret, public = keypair()
+        root = workspace_fact(secret, public, "alice", 1)
+        device = device_fact(root.fid, public, "laptop", 2)
+        device_signature = signature_fact(secret, public, device, 2)
+        binding = h(b"store")
+        authority_root = h(b"authority")
+        source = FsStore(str(tmp_path / "source"))
+        local = FsStore(str(tmp_path / "local"))
+        database = str(tmp_path / "projection.db")
+
+        log = WriterLog(
+            root.fid, public, public, binding, secret, source)
+        update = await log.prepare(((
+            root, device_signature, device),))
+        await log.establish(update)
+        request = head_request(
+            root.fid, public, public, None,
+            update.head_oid, 1_000, 3)
+        request_signature = signature_fact(
+            secret, public, request, 3)
+        proof = encode_signed_pile(make_signed_pile(
+            secret,
+            root.fid,
+            public,
+            (root, device_signature, device,
+             request_signature, request),
+        ))
+        gate = AuthorityGate(
+            root.fid, authority_root, lambda: 10)
+        assert (await OpaqueHeadGate(
+            source, gate.authorize).advance(
+                proof, update.head_oid)).status == "applied"
+
+        def binding_for(workspace, writer, selected_authority):
+            if (workspace, writer, selected_authority) != (
+                    root.fid, public, authority_root):
+                return None
+            return WriterBinding(
+                root.fid, public, public, binding)
+
+        projection = SqlStore.open(database, root.fid)
+        consumer = FactConsumer(root.fid, projection)
+        mirror = RepositoryMirror(
+            root.fid, local, binding_for, consumer)
+        first = await mirror.sync_from(source)
+        assert first.errors == ()
+        assert projection.projected_head(public) == update.head_oid
+        assert projection.fact(root.fid) == root
+        projection.db.close()
+
+        # An ordinary restart preserves the transactional projection stamp.
+        projection = SqlStore.open(database, root.fid)
+        restarted = RepositoryMirror(
+            root.fid, local, binding_for,
+            FactConsumer(root.fid, projection),
+        )
+        unchanged = await restarted.sync_from(source)
+        assert unchanged.changed == unchanged.piles == unchanged.facts == 0
+
+        # Deleting/reinitializing SQL changes no accepted protocol state. The
+        # same core mirror replays the locally accepted tree from an empty
+        # per-writer checkpoint; it does not ask the remote for old piles.
+        projection.reset()
+        rebuilt = await restarted.sync_from(source)
+        assert rebuilt.errors == ()
+        assert rebuilt.changed == 0
+        assert rebuilt.piles == 1
+        assert projection.projected_head(public) == update.head_oid
+        assert projection.fact(root.fid) == root
+        projection.db.close()
+
+    asyncio.run(scenario())

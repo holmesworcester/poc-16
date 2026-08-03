@@ -48,6 +48,7 @@ MAX_INVITE_ID_BYTES = 256
 MAX_LOGICAL_KEY_BYTES = max(
     len("root"),
     len("obj/") + 64,
+    len("heads/") + 64 + 1 + 64,
     len("invite/") + MAX_INVITE_ID_BYTES,
     MAX_INGRESS_KEY_BYTES,
 )
@@ -83,7 +84,18 @@ def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key in REPOSITORY_ROOT_KEYS \
         or key.startswith("root/") or key.startswith("authority/") \
-        or key == "obj" or key.startswith("obj/")
+        or key == "obj" or key.startswith("obj/") \
+        or key == "heads" or key.startswith("heads/")
+
+
+def mutable_key(key):
+    """Whether ``key`` is one exact protocol CAS register."""
+    key = validate_key(key)
+    if key in REPOSITORY_ROOT_KEYS:
+        return True
+    parts = key.split("/")
+    return len(parts) == 3 and parts[0] == "heads" \
+        and all(re.fullmatch(r"[0-9a-f]{64}", part) for part in parts[1:])
 
 
 def validate_create(key, value):
@@ -91,12 +103,14 @@ def validate_create(key, value):
     key = validate_key(key)
     if not isinstance(value, bytes):
         raise TypeError("object value must be bytes")
-    if key in REPOSITORY_ROOT_KEYS \
-            or key.startswith("root/") or key.startswith("authority/"):
-        raise ValueError("repository root requires compare-and-swap")
+    if mutable_key(key) \
+            or key == "authority" or key.startswith("authority/") \
+            or key == "heads" or key.startswith("heads/"):
+        raise ValueError("mutable authority requires compare-and-swap")
     for prefix in ("obj/",):
-        if key == prefix[:-1] or (
-                key.startswith(prefix) and key[len(prefix):] != h(value)):
+        if key == prefix[:-1] or key.startswith(prefix) and (
+                len(key) != len(prefix) + 64
+                or key[len(prefix):] != h(value)):
             raise ValueError("immutable object address")
     return key
 
@@ -204,6 +218,10 @@ class ObjectStore(Protocol):
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
 
+    def list_page(
+            self, prefix: str, cursor: str | None = None,
+            limit: int = 256) -> ListPage: ...
+
 class AsyncObjectStore(Protocol):
     """Awaited equivalent of the exact object-store contract."""
 
@@ -218,6 +236,10 @@ class AsyncObjectStore(Protocol):
     async def cas(
             self, key: str, token: VersionToken | Absent,
             value: bytes) -> Applied | Stale: ...
+
+    async def list_page(
+            self, prefix: str, cursor: str | None = None,
+            limit: int = 256) -> ListPage: ...
 
 
 class SyncStoreAdapter:
@@ -241,6 +263,9 @@ class SyncStoreAdapter:
 
     async def cas(self, key, token, value):
         return self.store.cas(key, token, value)
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return self.store.list_page(prefix, cursor, limit)
 
     def namespace_id(self):
         return store_namespace(self.store)
