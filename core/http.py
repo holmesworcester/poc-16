@@ -41,6 +41,7 @@ from .object_store import (
     STALE,
     Versioned,
     ensure_object_async,
+    mutable_key,
 )
 from .pack_access import (
     MAX_PACK_OPEN_BYTES,
@@ -471,6 +472,28 @@ class HttpGate:
             "Content-Type": "application/octet-stream",
         })
 
+    async def _layout(self, device, encoded_start):
+        """Return one bounded source-local locator page, never a pack body."""
+        try:
+            key = (
+                f"layouts/{self.workspace}/{device}/{encoded_start}"
+            )
+            if not mutable_key(key):
+                raise ValueError
+            raw = await self._get(key, MAX_OBJECT_BYTES)
+        except ValueError:
+            return Response(404)
+        except PayloadTooLarge:
+            return Response(413)
+        except Exception:
+            return Response(503)
+        if raw is None:
+            return Response(404)
+        return Response(200, raw, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/octet-stream",
+        })
+
     async def _put_object(self, oid, body):
         if not OID_RE.fullmatch(oid) or not isinstance(body, bytes) \
                 or len(body) > self.max_object_bytes or h(body) != oid:
@@ -649,6 +672,11 @@ class HttpGate:
         if path.startswith("/head/") and method == "GET":
             return await self._head(
                 path.removeprefix("/head/"), headers)
+        if path.startswith("/layout/") and method == "GET":
+            parts = path.strip("/").split("/")
+            if len(parts) != 3:
+                return Response(404)
+            return await self._layout(parts[1], parts[2])
         if path == "/obj" and method == "POST":
             return await self._batch(body)
         if path.startswith("/obj/") and method == "GET":

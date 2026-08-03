@@ -293,6 +293,37 @@ class RemoteStore:
             ))
         return tuple(out)
 
+    async def fetch_writer_piles(self, workspace, device, rows):
+        """Use this HTTP source's optional layout without changing authority.
+
+        ``RepositoryMirror`` has already authenticated and selected ``rows``
+        from the signed writer tree.  Layout pages and pack requests merely
+        locate those OIDs; the shared fetcher falls back to ``/obj`` for every
+        absent or invalid hint.
+        """
+        from .writer_fetch import fetch_layout_piles
+
+        async def read_layout(key, maximum):
+            return await asyncio.to_thread(
+                self.peer.layout, key, response_limit=maximum)
+
+        async def copy_pack(opened, write):
+            return await asyncio.to_thread(
+                self.peer.copy_pack, opened, write)
+
+        async def read_loose(oids, _maximum):
+            return await self.get_many(
+                tuple("obj/" + oid for oid in oids))
+
+        return await fetch_layout_piles(
+            workspace,
+            device,
+            rows,
+            read_layout=read_layout,
+            copy_pack=copy_pack,
+            read_loose=read_loose,
+        )
+
     async def put_if_absent(self, key, value):
         key = validate_create(key, value)
         if not key.startswith("obj/"):

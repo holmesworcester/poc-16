@@ -156,6 +156,32 @@ async def _objects(store, oids, maximum=MAX_REPOSITORY_OBJECT_BYTES):
     return tuple(out)
 
 
+async def _writer_piles(source, workspace, device, rows):
+    """Fetch tree-selected rows through one optional source optimizer.
+
+    The capability receives only the exact rows proved by ``WriterTree``.
+    Results are independently OID-checked here, so a physical layout cannot
+    substitute, add, or reorder logical history.  Sources without the
+    capability retain the ordinary loose-object batch path.
+    """
+    rows = tuple(rows)
+    fetch = getattr(source, "fetch_writer_piles", None)
+    values = NotImplemented if not callable(fetch) else await _maybe_await(
+        fetch(workspace, device, rows))
+    if values is NotImplemented:
+        values = await _objects(source, (oid for _key, oid in rows))
+    if not isinstance(values, (tuple, list)) or len(values) != len(rows):
+        raise ValueError("repository pile fetch")
+    checked = []
+    for (_key, oid), raw in zip(rows, values):
+        if not isinstance(raw, bytes) \
+                or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
+                or h(raw) != oid:
+            raise ValueError("repository object integrity")
+        checked.append(raw)
+    return tuple(checked)
+
+
 class WriterLog:
     """Build signed piles and one final path-copied device-tree update.
 
@@ -618,7 +644,8 @@ class RepositoryMirror:
         # OID and then evaluated as its own complete signed pile.
         pile_values = tuple(zip(
             pile_oids,
-            await _objects(source, pile_oids),
+            await _writer_piles(
+                source, workspace, device, additions),
         ))
         batch = None if self.consumer is None \
             else self.consumer.prepare_batch(

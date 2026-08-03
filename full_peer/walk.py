@@ -18,10 +18,22 @@ from core.limits import (
     decode_json,
 )
 from core.object_store import ABSENT, ListPage, Versioned, VersionToken
+from core.pack_access import (
+    MAX_SCOPED_REQUEST_BYTES,
+    PackOpen,
+    confine_scoped_request,
+    copy_pack_get,
+    decode_scoped_request,
+    encode_pack_open,
+)
 from core.writer_head import (
     MAX_HEAD_SLOT_BYTES,
     head_slot_key,
     head_slot_prefix,
+)
+from core.writer_layout import (
+    MAX_LAYOUT_PAGE_BYTES,
+    parse_layout_page_key,
 )
 from .node import now_ms
 
@@ -212,6 +224,54 @@ class Peer:
         _, b, _ = self._http(
             "GET", f"/obj/{oh}", response_limit=response_limit)
         return b
+
+    def layout(self, key, *, response_limit=MAX_LAYOUT_PAGE_BYTES):
+        """Open one directly addressed, bounded source-local layout page."""
+        workspace, device, start = parse_layout_page_key(key)
+        if workspace != self.ws \
+                or type(response_limit) is not int \
+                or not 0 < response_limit <= MAX_LAYOUT_PAGE_BYTES:
+            raise ValueError("peer writer layout")
+        try:
+            _, body, _ = self._http(
+                "GET", f"/layout/{device}/{start:016d}",
+                response_limit=response_limit)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise
+        return body
+
+    def copy_pack(self, opened, write):
+        """Open, then verify and stream one exact ordinary-HTTP pack GET."""
+        if not isinstance(opened, PackOpen) or opened.method != "GET" \
+                or not callable(write):
+            raise ValueError("peer pack GET")
+        _, raw, _ = self._http(
+            "POST", "/pack/open", data=encode_pack_open(opened),
+            response_limit=MAX_SCOPED_REQUEST_BYTES)
+        scoped = confine_scoped_request(
+            opened, decode_scoped_request(raw), now_ms())
+        request = urllib.request.Request(
+            scoped.url,
+            method="GET",
+            headers=dict(scoped.headers),
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            def chunks():
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        return
+                    yield chunk
+
+            return copy_pack_get(
+                opened,
+                response.status,
+                response.headers,
+                chunks(),
+                write,
+            )
 
     def objs(self, oids):
         """Fetch an ordered object batch, splitting a provider-sized 413."""
