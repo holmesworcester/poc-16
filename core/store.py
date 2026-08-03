@@ -1,9 +1,15 @@
-"""ObjectStore: the one S3-shaped trait every node stores through.
+"""Bounded ObjectStore for authenticated metadata and semantic objects.
 
 Layout: root and authority (distinct CAS'd composite snapshots), obj/<hash>
 (bounded map pages and fact/file blobs — immutable),
+heads/<workspace>/<device> and layouts/<workspace>/<device>/<window>
+(independent CAS registers),
 ingress/v1/workspaces/<ws>/piles/<session>/<uploader>/<hash> (exact ingress),
 and invite/<id> (public reads).
+
+Large immutable pack/<hash> bodies use a separate streaming data plane.  The
+namespace rules here still protect them from unconditional replacement or
+deletion when the same backing directory or bucket is used.
 
 The public mutation contract rejects unconditional root/object replacement
 and authoritative deletion. Objects and retained piles use atomic

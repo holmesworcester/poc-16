@@ -758,6 +758,14 @@ The unit of transfer may be a whole physical pack or an exact range within one.
 The unit of semantic judgment remains one complete writer-device-signed closed
 pile.
 
+Here, an RBSR "range" is a range of writer-local publication sequences, not a
+claim about semantic timestamps inside the facts. A late or deliberately
+backdated fact appends at the current end of its writer log. It therefore never
+reopens an older physical layout window. A peer may fetch the newest
+publication ranges first for progressive operation because every selected leaf
+is independently closed; semantic time queries remain ordinary fact-index
+queries after validation.
+
 ```text
 LIST/open one bounded page of independent workspace head slots
     -> compare every writer's remote head oid with its local head oid

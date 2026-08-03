@@ -12,6 +12,15 @@ The root-authoritative snapshot uses only two namespaces:
     bytes returned by the same read; it is not a content digest or a globally
     unique generation.
 
+``heads/<workspace>/<device>``, ``layouts/<workspace>/<device>/<window>``
+    Independent linearizable CAS registers. Heads are signed logical history;
+    layout pages are untrusted source-local transfer hints.
+
+``pack/<sha256>``
+    Immutable large transfer objects. Their keys share this namespace and
+    mutation policy, but their bodies use the separate streaming data plane
+    rather than the bounded semantic-object methods in this trait.
+
 The same local store may retain exact ``ingress/v1/`` sources. Hosted uploads
 put that namespace in a separate provider compartment. It is retry input,
 never a repository answer or part of ``RepositoryReader``.
@@ -85,7 +94,9 @@ def authoritative_key(key):
     return key in REPOSITORY_ROOT_KEYS \
         or key.startswith("root/") or key.startswith("authority/") \
         or key == "obj" or key.startswith("obj/") \
-        or key == "heads" or key.startswith("heads/")
+        or key == "heads" or key.startswith("heads/") \
+        or key == "layouts" or key.startswith("layouts/") \
+        or key == "pack" or key.startswith("pack/")
 
 
 def mutable_key(key):
@@ -94,8 +105,23 @@ def mutable_key(key):
     if key in REPOSITORY_ROOT_KEYS:
         return True
     parts = key.split("/")
-    return len(parts) == 3 and parts[0] == "heads" \
-        and all(re.fullmatch(r"[0-9a-f]{64}", part) for part in parts[1:])
+    if len(parts) == 3 and parts[0] == "heads":
+        return all(
+            re.fullmatch(r"[0-9a-f]{64}", part) for part in parts[1:])
+    if len(parts) != 4 or parts[0] != "layouts" \
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", part)
+                for part in parts[1:3]):
+        return False
+    # Keep the low-level store independent of the layout codec while still
+    # accepting only its canonical fixed-window address arithmetic.
+    sequence = parts[3]
+    if len(sequence) != 16 or not sequence.isascii() \
+            or not sequence.isdigit():
+        return False
+    start = int(sequence)
+    return 1 <= start <= (1 << 53) - 1 \
+        and (start - 1) % 16_384 == 0
 
 
 def validate_create(key, value):
@@ -107,7 +133,7 @@ def validate_create(key, value):
             or key == "authority" or key.startswith("authority/") \
             or key == "heads" or key.startswith("heads/"):
         raise ValueError("mutable authority requires compare-and-swap")
-    for prefix in ("obj/",):
+    for prefix in ("obj/", "pack/"):
         if key == prefix[:-1] or key.startswith(prefix) and (
                 len(key) != len(prefix) + 64
                 or key[len(prefix):] != h(value)):

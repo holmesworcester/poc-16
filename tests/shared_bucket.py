@@ -20,6 +20,7 @@ from core.object_store import (
     Versioned,
     VersionToken,
     authoritative_key,
+    mutable_key,
     validate_create,
     validate_key,
 )
@@ -251,8 +252,8 @@ class ScriptedBucket:
         key = validate_key(key)
         if not isinstance(value, bytes):
             raise TypeError("object value must be bytes")
-        if key != "root":
-            raise ValueError("only root is mutable by CAS")
+        if not mutable_key(key):
+            raise ValueError("key is not a CAS register")
         if expected is not ABSENT and not isinstance(expected, VersionToken):
             raise TypeError("version token")
         self._gate(actor, "cas", key, "before")
@@ -270,7 +271,7 @@ class ScriptedBucket:
             event = self._record(
                 actor, "cas", key, value, expected,
                 before, result, after)
-            if isinstance(result, Applied):
+            if isinstance(result, Applied) and key == "root":
                 objects = tuple(sorted(
                     (name[4:], raw)
                     for name, raw in self._data.items()
@@ -426,8 +427,7 @@ class ScriptedBucket:
                 else:
                     assert page.cursor is None
             elif event.op == "delete":
-                assert event.key != "root" \
-                    and not event.key.startswith("obj/")
+                assert not authoritative_key(event.key)
                 assert event.result is (event.key in data)
                 data.pop(event.key, None)
                 tokens.pop(event.key, None)

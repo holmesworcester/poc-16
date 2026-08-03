@@ -4,7 +4,15 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from core.crypto import h
-from core.object_store import CREATED, EXISTS, Applied, STALE
+from core.object_store import (
+    ABSENT,
+    CREATED,
+    EXISTS,
+    Applied,
+    STALE,
+    mutable_key,
+)
+from core.writer_layout import layout_page_key
 
 from .shared_bucket import InjectedCrash, ScriptedBucket
 
@@ -90,10 +98,33 @@ def test_crash_boundaries_preserve_completed_atomic_operations_only():
 def test_authoritative_keys_reject_unconditional_or_bad_address_writes():
     bucket = ScriptedBucket()
     writer = bucket.handle("writer")
+    workspace, device = h(b"workspace"), h(b"device")
+    layout = layout_page_key(workspace, device, 1)
 
     with pytest.raises(ValueError, match="conditional"):
         writer.put("root", b"clobber")
     with pytest.raises(ValueError, match="conditional"):
         writer.put("obj/" + "0" * 64, b"clobber")
+    with pytest.raises(ValueError, match="conditional"):
+        writer.put(layout, b"clobber")
+    with pytest.raises(ValueError, match="conditional"):
+        writer.put("pack/" + "0" * 64, b"clobber")
     with pytest.raises(ValueError, match="address"):
         writer.put_if_absent("obj/" + "0" * 64, b"wrong hash")
+    with pytest.raises(ValueError, match="address"):
+        writer.put_if_absent("pack/" + "0" * 64, b"wrong hash")
+
+    assert mutable_key(layout)
+    assert isinstance(writer.cas(layout, ABSENT, b"page"), Applied)
+    assert writer.cas(layout, ABSENT, b"lost race") is STALE
+    assert writer.get(layout) == b"page"
+
+
+@pytest.mark.parametrize("key", (
+    "layouts/" + "0" * 64 + "/" + "1" * 64 + "/0000000000000000",
+    "layouts/" + "0" * 64 + "/" + "1" * 64 + "/0000000000000002",
+    "layouts/" + "0" * 64 + "/" + "1" * 64 + "/1",
+    "layouts/" + "0" * 63 + "/" + "1" * 64 + "/0000000000000001",
+))
+def test_only_canonical_fixed_window_layout_keys_are_cas_registers(key):
+    assert not mutable_key(key)
