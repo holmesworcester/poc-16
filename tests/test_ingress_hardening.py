@@ -112,9 +112,11 @@ def test_shared_pile_limits_fit_smallest_hosted_memory_ceiling():
         limits.MAX_PILE_JSON_VALUES,
         limits.MAX_PILE_FACTS,
     )
-    assert limits.MAX_FACT_BYTES == 4 * limits.MIB
+    assert limits.MAX_FACT_BYTES == 3 * limits.MIB
     assert limits.MAX_PILE_FACTS == 256
-    assert limits.MAX_PILE_BYTES == 5 * limits.MIB
+    assert limits.MAX_PILE_BYTES \
+        == limits.MAX_REPOSITORY_OBJECT_BYTES \
+        == 4 * limits.MIB
     assert peak < limits.MIN_HOSTED_MEMORY_BYTES
     assert limits.MAX_APPLIER_SUBREQUESTS < limits.MAX_HOSTED_SUBREQUESTS
 

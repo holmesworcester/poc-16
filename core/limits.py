@@ -22,19 +22,20 @@ MAX_OBJECT_BYTES = MAX_PAGE_BATCH_BYTES
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
-# Every database-free hosted Reader must be able to return canonical facts and
-# public invite envelopes admitted by the shared engine. Inline Bao proofs
-# are ordinary fact bodies under the same bound.
-MAX_FACT_BYTES = MAX_PAGE_BATCH_BYTES
+# A maximum-size fact must still fit inside a signed pile with its ordinary
+# signature and authority closure. Keep one MiB of the four-MiB repository
+# object for that framing instead of advertising a fact that no peer can
+# publish through the sole semantic wire door.
+MAX_FACT_BYTES = 3 * MIB
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
-MAX_REPOSITORY_OBJECT_BYTES = max(
-    MAX_FACT_BYTES, MAX_MERKLE_PAGE_BYTES)
+MAX_REPOSITORY_OBJECT_BYTES = MAX_OBJECT_BYTES
 
-# One immutable closed pile. These are protocol limits, not merely
-# implementation budgets: every receiving engine enforces the same boundary.
+# One immutable closed pile. A signed pile is an ordinary repository object,
+# so its wire ceiling must be exactly the ceiling used by WriterLog and
+# RepositoryMirror rather than a second, unpublishable size class.
 MAX_CLOSURE_FACTS = 256
 MAX_PILE_FACTS = MAX_CLOSURE_FACTS
-MAX_PILE_BYTES = 5 * MIB
+MAX_PILE_BYTES = MAX_REPOSITORY_OBJECT_BYTES
 MAX_STORE_READ_BYTES = max(MAX_OBJECT_BYTES, MAX_PILE_BYTES)
 MAX_PILE_JSON_VALUES = 48 * MAX_PILE_FACTS + 16
 # device_invite is the current maximum: FactOrder + Fact residence + ten

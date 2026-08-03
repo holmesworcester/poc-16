@@ -409,7 +409,7 @@ at provider object HTTP; FullPeer points it at a same-origin streaming route,
 which Iroh may carry unchanged. The client performs the returned ordinary HTTP
 request in every composition.
 
-Neither `ObjectStore.get_bounded`, the four/five-MiB semantic-object limits,
+Neither `ObjectStore.get_bounded`, the common four-MiB semantic-object limit,
 `HttpGate.Response`, Lambda response bodies, nor Worker buffered-body helpers
 may be widened to 95 MiB. Whole GETs stream to a sink and verify declared size
 and pack hash before acceptance. Exact range GETs are bounded by one signed

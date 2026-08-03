@@ -256,8 +256,8 @@ def writer_shape(inventory, target_bytes, *, force_seal_tail=False):
         if pile.size > MAX_PILE_BYTES:
             raise ValueError("pile exceeds protocol limit")
         if pile.size > target_bytes:
-            # A protocol-valid 4--5 MiB pile remains indivisible under the
-            # nominal 4 MiB target. The physical body ceiling is 95 MiB.
+            # A caller may benchmark a target below the shared semantic-
+            # object ceiling. A complete pile remains indivisible.
             seal()
             sealed.append(_pack((pile,)))
             continue
