@@ -3,6 +3,9 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import hmac
+import json
+import subprocess
+import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -16,11 +19,9 @@ from core.pack_access import (
     PackOpen,
     confine_scoped_request,
 )
-from deploy.cloudflare_pack import (
-    R2PackIssuer,
-    R2PackPut,
-    R2PackTarget,
-)
+from deploy.cloudflare_pack.contract import R2PackTarget
+from deploy.cloudflare_pack.issuer import R2PackIssuer
+from deploy.cloudflare_pack.put import R2PackPut
 
 
 NOW = 1_800_000_000_000
@@ -354,3 +355,20 @@ def test_issuer_rejects_wrong_member_and_preserves_url_fragment_rule():
     scoped = issuer()(MEMBER, opened, NOW)
     parsed = urlsplit(scoped.url)
     assert parsed.fragment == ""
+
+
+def test_native_worker_import_does_not_load_sigv4_or_upload_broker():
+    script = """
+import json
+import sys
+import deploy.cloudflare_pack.put
+print(json.dumps(sorted(name for name in sys.modules if name.startswith(
+    (\"deploy.cloudflare_upload\", \"deploy.upload_broker\")))))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == []
