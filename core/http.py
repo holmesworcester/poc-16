@@ -24,12 +24,10 @@ from .limits import (
     MAX_PAGE_BATCH_BYTES,
     MAX_PAGE_REQUEST_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
-    MAX_ROOT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
     decode_json,
 )
-from .repository_reader import RepositoryReader, RepositoryRootError
 from .object_store import (
     ABSENT,
     CREATED,
@@ -115,12 +113,12 @@ class HttpGate:
             self, store, workspace, secret, now,
             *, sync_profile=peer_capability.READ_ONLY,
             mirror=None,
+            head_advance=None,
             mint_authorize=None,
             authority_publish=None,
             object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
-            max_root_bytes=MAX_ROOT_BYTES,
             max_object_bytes=MAX_OBJECT_BYTES,
             max_batch_count=PAGE_BATCH,
             max_batch_bytes=MAX_PAGE_BATCH_BYTES,
@@ -136,6 +134,9 @@ class HttpGate:
             raise ValueError("grant sealer")
         self.store, self.workspace = store, workspace
         self.mirror = mirror
+        if head_advance is not None and not callable(head_advance):
+            raise ValueError("head advancer")
+        self.head_advance = head_advance
         self.mint_authorize = mint_authorize
         if authority_publish is not None and not callable(authority_publish):
             raise ValueError("authority publisher")
@@ -151,7 +152,6 @@ class HttpGate:
             raise ValueError("sync profile")
         bounded = (
             ("request bytes", max_request_bytes, MAX_MINT_REQUEST_BYTES),
-            ("root bytes", max_root_bytes, MAX_ROOT_BYTES),
             ("object bytes", max_object_bytes, MAX_OBJECT_BYTES),
             ("batch count", max_batch_count, PAGE_BATCH),
             ("batch bytes", max_batch_bytes, MAX_PAGE_BATCH_BYTES),
@@ -169,7 +169,6 @@ class HttpGate:
             raise ValueError("HTTP gate cannot serve canonical facts")
         self.sync_profile = sync_profile
         self.max_request_bytes = max_request_bytes
-        self.max_root_bytes = max_root_bytes
         self.max_object_bytes = max_object_bytes
         self.max_batch_count = max_batch_count
         self.max_batch_bytes = max_batch_bytes
@@ -218,16 +217,6 @@ class HttpGate:
             raise PayloadTooLarge("object read exceeds byte limit")
         return value
 
-    async def _root(self):
-        return await self._get("root", self.max_root_bytes)
-
-    async def _reader(self):
-        """Open one root-only Reader for readiness or root presentation."""
-        root = await self._root()
-        return RepositoryReader(
-            self.workspace, root, lambda _oid: None,
-        ) if root else None
-
     @staticmethod
     def _decode_mint(body, workspace):
         request = decode_json(
@@ -270,54 +259,7 @@ class HttpGate:
             }
             response["cap"] = self.sync_profile
             return self._json(200, response)
-        try:
-            root = await self._root()
-            if not root:
-                return Response(503)
-        except Exception:
-            return Response(503)
-        fetch_error = None
-
-        async def fetch(oid):
-            nonlocal fetch_error
-            try:
-                return await self._get(
-                    "obj/" + oid, MAX_REPOSITORY_OBJECT_BYTES)
-            except Exception as error:
-                fetch_error = error
-                return None
-
-        try:
-            grant = await RepositoryReader.mint_awaited(
-                self.workspace,
-                root,
-                fetch,
-                pile,
-                trusted_now,
-                max_unique_fetches=self.max_mint_fetches,
-                max_fetch_bytes=self.max_mint_fetch_bytes,
-            )
-        except RepositoryRootError:
-            return Response(503)
-        except Exception:
-            return Response(503 if fetch_error is not None else 403)
-        if fetch_error is not None:
-            return Response(503)
-        if grant is None:
-            return Response(403)
-        public, verb = grant
-        token = make_token(
-            self.secret, public, self.workspace, verb,
-            capability=self.sync_profile,
-            issued_at=trusted_now, ttl_ms=self.grant_ttl_ms)
-        response = {
-            "etag": h(root),
-            "grant": base64.b64encode(
-                self.seal(public, token.encode())).decode(),
-            "root": base64.b64encode(root).decode(),
-        }
-        response["cap"] = self.sync_profile
-        return self._json(200, response)
+        return Response(503)
 
     async def _publish_authority(self, body):
         """Apply one public signed authority closure; semantic checks grant it."""
@@ -344,6 +286,35 @@ class HttpGate:
             return Response(409)
         if status == "rejected":
             return Response(403)
+        return Response(503)
+
+    async def _advance_head(self, proposed_head, body):
+        """Evaluate one owner proof, then CAS only its bound writer slot."""
+        if self.head_advance is None:
+            return Response(405)
+        if not OID_RE.fullmatch(proposed_head) \
+                or not isinstance(body, bytes) \
+                or len(body) > self.max_request_bytes:
+            return Response(400)
+        try:
+            if inspect.iscoroutinefunction(self.head_advance):
+                result = await self.head_advance(body, proposed_head)
+            else:
+                result = await _to_thread(
+                    self.head_advance, body, proposed_head)
+                if inspect.isawaitable(result):
+                    result = await result
+        except ValueError:
+            return Response(403)
+        except Exception:
+            return Response(503)
+        status = getattr(result, "status", None)
+        if status == "applied":
+            return Response(201)
+        if status == "noop":
+            return Response(204)
+        if status == "retryable":
+            return Response(409)
         return Response(503)
 
     @staticmethod
@@ -637,6 +608,8 @@ class HttpGate:
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/authority":
             return MAX_AUTHORITY_PILE_BYTES
+        if method == "POST" and path.startswith("/head/"):
+            return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES
         if method == "POST" and path == "/pack/open":
@@ -658,11 +631,8 @@ class HttpGate:
             return public
         if path == "/readyz" and method == "GET":
             try:
-                if self.mirror is not None or self.mint_authorize is not None:
-                    await self.store.list_page(
-                        head_slot_prefix(self.workspace), None, 1)
-                elif await self._reader() is None:
-                    raise ValueError("root readiness")
+                await self.store.list_page(
+                    head_slot_prefix(self.workspace), None, 1)
             except Exception:
                 return self._json(503, {"ok": False})
             return self._json(200, {"ok": True})
@@ -673,6 +643,9 @@ class HttpGate:
             return await self._mint(body, trusted_now)
         if path == "/authority" and method == "POST":
             return await self._publish_authority(body)
+        if path.startswith("/head/") and method == "POST":
+            return await self._advance_head(
+                path.removeprefix("/head/"), body)
         if path.startswith("/invite/") and method == "GET":
             invite = path.removeprefix("/invite/")
             if not INVITE_RE.fullmatch(invite):
@@ -728,19 +701,4 @@ class HttpGate:
             return await self._batch(body)
         if path.startswith("/obj/") and method == "GET":
             return await self._object(path.removeprefix("/obj/"))
-        if path == "/root" and method == "GET":
-            try:
-                reader = await self._reader()
-                root = reader.root_bytes if reader is not None else b""
-            except Exception:
-                return Response(503)
-            etag = reader.etag if reader is not None else h(root)
-            if self._header(headers, "If-None-Match") == etag:
-                return Response(304)
-            return Response(
-                200, root, {
-                    "Cache-Control": "no-store",
-                    "Content-Type": "application/octet-stream",
-                    "ETag": etag,
-                })
         return Response(404)

@@ -4,14 +4,18 @@ import base64
 import json
 
 from core.authority import AuthorityRepository
+from core.crypto import h
 from core.http import AsyncFromSyncReader, HttpGate
 from core.limits import MAX_AUTHORITY_PILE_BYTES
 from core.store import FsStore
+from core.writer_head import decode_slot_at, head_slot_key
+from core.writer_repository import OpaqueHeadGate
 from facts.auth.signature import signature
 from facts.content.message import message
 from tests.test_authority_repository import (
     access_proof,
     authority_world,
+    head_proof,
     signed,
 )
 
@@ -102,3 +106,56 @@ def test_authority_http_rejects_content_and_bounds_before_provider_work(
         b"x" * (MAX_AUTHORITY_PILE_BYTES + 1)))
     assert rejected.status == 413
     assert store.list("") == []
+
+
+def test_public_head_request_advances_only_the_proof_bound_writer_slot(
+        tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    repository = AuthorityRepository(world.root.fid, store)
+
+    async def authorize(proof, proposed):
+        return await repository.authorize_head(proof, proposed, 10)
+
+    gateway = HttpGate(
+        AsyncFromSyncReader(store),
+        world.root.fid,
+        b"authority-http-secret" * 2,
+        lambda: 10,
+        authority_publish=repository.publish,
+        head_advance=OpaqueHeadGate(store, authorize).advance,
+    )
+    authority = signed(
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    assert run(gateway.handle(
+        "POST", "/authority", {"ws": world.root.fid}, {}, authority,
+    )).status == 201
+
+    proposed = h(b"opaque writer head")
+    proof = head_proof(world, proposed)
+    route = "/head/" + proposed
+    assert run(gateway.handle(
+        "POST", route, {"ws": world.root.fid}, {}, proof,
+    )).status == 201
+    assert run(gateway.handle(
+        "POST", route, {"ws": world.root.fid}, {}, proof,
+    )).status == 204
+
+    key = head_slot_key(world.root.fid, world.member)
+    accepted_slot = store.get(key)
+    slot = decode_slot_at(key, accepted_slot)
+    assert slot.head == proposed
+    assert slot.authority_root == run(repository.pin()).root_oid
+
+    # The route parameter is part of the signed request judgment.  A caller
+    # cannot redirect the same proof into another writer head or slot.
+    redirected = h(b"redirected writer head")
+    assert run(gateway.handle(
+        "POST", "/head/" + redirected,
+        {"ws": world.root.fid}, {}, proof,
+    )).status == 403
+    assert store.get(key) == accepted_slot

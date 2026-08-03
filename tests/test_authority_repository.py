@@ -243,6 +243,16 @@ def test_removal_before_head_pin_denies_but_an_inflight_old_pin_linearizes(
     assert run(repository.authorize_head(proof, proposed, 10)) is None
     assert run(repository.writer_binding(
         world.member, world.member)) is None
+    assert run(repository.writer_binding_at(
+        old_pin.root_oid,
+        world.member,
+        world.member,
+    )) == WriterBinding(
+        world.root.fid,
+        world.member,
+        world.member,
+        writer_store_binding(world.root.fid, world.member),
+    )
     old_grant = run(old_pin.authorize_head(proof, proposed, 10))
     assert old_grant.authority_root == old_pin.root_oid
     assert old_grant.head == proposed

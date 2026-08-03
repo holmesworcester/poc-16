@@ -34,7 +34,7 @@ from deploy.cloudflare_sigv4 import (  # noqa: E402
     credential,
 )
 from deploy.python_role_modules import (  # noqa: E402
-    REPOSITORY_READER_CORE_MODULES,
+    HOSTED_GATE_CORE_MODULES,
 )
 from core.object_store import validate_store_prefix  # noqa: E402
 from core.pack_access import MAX_SCOPED_TTL_MS  # noqa: E402
@@ -58,7 +58,7 @@ EDGE_SECRET_BYTES = 32
 DEFAULT_PACK_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
 _ABSENT = object()
 
-CORE_MODULES = REPOSITORY_READER_CORE_MODULES
+CORE_MODULES = HOSTED_GATE_CORE_MODULES
 SECRET_NAMES = (
     "GRANT_SECRET",
     "PACK_TICKET_SECRET",

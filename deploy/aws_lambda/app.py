@@ -8,12 +8,12 @@ import time
 from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
+from core.authority import AuthorityRepository
 from core.limits import (
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
-    MAX_ROOT_BYTES,
     PayloadTooLarge,
 )
 from deploy.aws_lambda.config import (
@@ -34,6 +34,7 @@ from deploy.aws_lambda.pack_issuer import (
     S3PackIssuer,
 )
 from core.http import AsyncFromSyncReader, HttpGate, Response
+from core.writer_repository import OpaqueHeadGate
 
 _gateway_cache = None
 _logger = logging.getLogger(__name__)
@@ -150,17 +151,32 @@ def _gateway():
     if _gateway_cache is None:
         config = _s3_config()
         issuer = _pack_issuer(config)
+        store = _store(config)
+        workspace = _required("TINYP2P_WORKSPACE_ID")
+        clock = lambda: int(time.time() * 1000)
+        authority = AuthorityRepository(workspace, store)
+
+        async def authorize_head(proof, proposed):
+            return await authority.authorize_head(
+                proof, proposed, clock())
+
+        async def authorize_access(proof, purpose):
+            return await authority.authorize_access(
+                proof, clock(), purpose=purpose)
+
         _gateway_cache = HttpGate(
-            _store(config),
-            _required("TINYP2P_WORKSPACE_ID"),
+            store,
+            workspace,
             _secret(),
-            lambda: int(time.time() * 1000),
+            clock,
+            authority_publish=authority.publish,
+            head_advance=OpaqueHeadGate(
+                store, authorize_head).advance,
+            mint_authorize=authorize_access,
             object_open=issuer.open_object,
             pack_open=issuer.open_pack,
             max_request_bytes=_positive(
                 "TINYP2P_MAX_REQUEST_BYTES", MAX_MINT_REQUEST_BYTES),
-            max_root_bytes=_positive(
-                "TINYP2P_MAX_ROOT_BYTES", MAX_ROOT_BYTES),
             max_object_bytes=_positive(
                 "TINYP2P_MAX_OBJECT_BYTES", MAX_REPOSITORY_OBJECT_BYTES),
             max_batch_count=_positive(

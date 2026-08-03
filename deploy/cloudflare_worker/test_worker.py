@@ -17,7 +17,6 @@ import facts
 
 from core import limits, peer_capability
 from core.object_store import MAX_STORE_PREFIX_BYTES
-from tests.util import signed_pile_bytes
 from core.crypto import (
     h,
     load_sk,
@@ -37,16 +36,23 @@ from core.pack_access import (
 )
 from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
-from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
+from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from facts.auth import request as request_fact
+from tests.test_authority_repository import (
+    authority_world,
+    head_proof,
+    signed,
+)
 
 TEST_PACK_TTL_SECONDS = 30
 
 
 class R2Object:
-    def __init__(self, value):
+    def __init__(self, value, *, key="", etag=None):
         self.value = value
         self.size = len(value)
+        self.key = key
+        self.etag = etag or "opaque-" + h(value)
 
     async def arrayBuffer(self):
         return self.value
@@ -55,19 +61,59 @@ class R2Object:
 class Bucket:
     def __init__(self, data):
         self.data = dict(data)
+        self.etags = {
+            key: f"opaque-{index}"
+            for index, key in enumerate(sorted(self.data), 1)
+        }
+        self.generation = len(self.etags)
         self.calls = []
+
+    def _etag(self, key):
+        if key not in self.etags:
+            self.generation += 1
+            self.etags[key] = f"opaque-{self.generation}"
+        return self.etags[key]
 
     async def get(self, key):
         self.calls.append(("get", key))
         value = self.data.get(key)
-        return None if value is None else R2Object(value)
+        return None if value is None else R2Object(
+            value, key=key, etag=self._etag(key))
 
     async def head(self, key):
         self.calls.append(("head", key))
-        return None if key not in self.data else R2Object(b"")
+        return None if key not in self.data else R2Object(
+            b"", key=key, etag=self._etag(key))
 
-    async def put(self, *args, **kwargs):
-        raise AssertionError("read-only Worker attempted R2 put")
+    async def put(self, key, value, **options):
+        self.calls.append(("put", key))
+        condition = options.get("onlyIf")
+        if isinstance(condition, dict) \
+                and condition.get("If-None-Match") == "*" \
+                and key in self.data:
+            return None
+        if isinstance(condition, dict) and "etagMatches" in condition \
+                and self.etags.get(key) != condition["etagMatches"]:
+            return None
+        value = bytes(value)
+        self.generation += 1
+        self.data[key] = value
+        self.etags[key] = f"opaque-{self.generation}"
+        return R2Object(
+            b"", key=key, etag=self.etags[key])
+
+    async def list(self, prefix, limit, cursor=None):
+        self.calls.append(("list", prefix))
+        keys = sorted(key for key in self.data if key.startswith(prefix))
+        start = int(cursor or 0)
+        stop = min(len(keys), start + limit)
+        return SimpleNamespace(
+            objects=[R2Object(
+                b"", key=key, etag=self.etags[key])
+                for key in keys[start:stop]],
+            truncated=stop < len(keys),
+            cursor=str(stop) if stop < len(keys) else None,
+        )
 
     async def delete(self, *args, **kwargs):
         raise AssertionError("read-only Worker attempted R2 delete")
@@ -177,19 +223,8 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
-def worker_world(tmp_path, monkeypatch):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    now = 100
-    pile = signed_pile_bytes(request_fact.payload(
-        node, workspace, "sync", now + runtime.MAX_GRANT_TTL_MS, now))
-    prefix = f"workspaces/{workspace}"
-    store = node.store(workspace)
-    bucket = Bucket({
-        f"{prefix}/{key}": store.get(key)
-        for key in store.list("")
-    })
-    environment = SimpleNamespace(
+def worker_environment(bucket, workspace, prefix):
+    return SimpleNamespace(
         BUCKET=bucket,
         WORKSPACE=workspace,
         STORE_PREFIX=prefix,
@@ -206,11 +241,61 @@ def worker_world(tmp_path, monkeypatch):
         R2_SECRET_ACCESS_KEY="worker-secret-key",
         **runtime._BUDGETS,
     )
+
+
+def worker_world(tmp_path, monkeypatch):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    now = 100
+    pile = node.sender(workspace).pack(request_fact.payload(
+        node, workspace, "sync", now + runtime.MAX_GRANT_TTL_MS, now))
+    prefix = f"workspaces/{workspace}"
+    store = node.store(workspace)
+    bucket = Bucket({
+        f"{prefix}/{key}": store.get(key)
+        for key in store.list("")
+    })
+    environment = worker_environment(bucket, workspace, prefix)
     monkeypatch.setattr(runtime, "now_ms", lambda: now)
     return node, workspace, pile, bucket, environment
 
 
-def test_runtime_mints_and_reads_through_only_the_direct_r2_binding(
+def test_runtime_bootstraps_authority_then_advances_one_owner_head():
+    world = authority_world()
+    prefix = f"workspaces/{world.root.fid}"
+    bucket = Bucket({})
+    environment = worker_environment(bucket, world.root.fid, prefix)
+    authority = signed(
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    published = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/authority?ws={world.root.fid}",
+        authority,
+    ), environment, clock=lambda: 10))
+    assert published.status == 201
+
+    proposed = h(b"cloudflare opaque writer head")
+    advanced = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{proposed}?ws={world.root.fid}",
+        head_proof(world, proposed),
+    ), environment, clock=lambda: 10))
+    assert advanced.status == 201
+    slot_key = f"{prefix}/heads/{world.root.fid}/{world.member}"
+    assert bucket.data[slot_key]
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{h(b'wrong')}?ws={world.root.fid}",
+        head_proof(world, proposed),
+    ), environment, clock=lambda: 10)).status == 403
+    assert len([key for key in bucket.data if "/heads/" in key]) == 1
+
+
+def test_runtime_mints_and_reads_the_writer_directory_from_r2(
         tmp_path, monkeypatch):
     node, workspace, pile, bucket, environment = worker_world(
         tmp_path, monkeypatch)
@@ -231,15 +316,18 @@ def test_runtime_mints_and_reads_through_only_the_direct_r2_binding(
         node.identity(workspace)[0],
         base64.b64decode(value["grant"]),
     ).decode()
-    root = run(runtime.handle(Request(
-        "GET", f"https://worker.example/root?ws={workspace}",
+    heads = run(runtime.handle(Request(
+        "GET", f"https://worker.example/heads?ws={workspace}",
         headers={"Authorization": "Bearer " + token},
     ), environment))
-    assert root.status == 200
-    assert root.body == node.store(workspace).get("root")
-    assert root.headers["Cache-Control"] == "no-store"
-    assert root.headers["X-Content-Type-Options"] == "nosniff"
-    assert {call[0] for call in bucket.calls} <= {"get", "head"}
+    assert heads.status == 200
+    directory = json.loads(heads.body)
+    assert len(directory["heads"]) == 1
+    assert directory["heads"][0][0].endswith(
+        "/" + node.identity_id(workspace))
+    assert heads.headers["Cache-Control"] == "no-store"
+    assert heads.headers["X-Content-Type-Options"] == "nosniff"
+    assert {call[0] for call in bucket.calls} <= {"get", "list"}
 
 
 def test_deployed_entry_issues_direct_object_and_pack_requests(
@@ -729,7 +817,7 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
         manage.REPOSITORY / "core" / "repository_reader.py").read_bytes()
     assert {
         path.name for path in (staged / "core").glob("*.py")
-    } == set(REPOSITORY_READER_CORE_MODULES)
+    } == set(HOSTED_GATE_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").read_bytes() == (
         manage.REPOSITORY / "facts" / "auth" / "request.py").read_bytes()
     assert (staged / "adapters" / "r2" / "worker.py").read_bytes() == (
@@ -746,8 +834,6 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     assert not (staged / "core" / "store.py").exists()
     assert not (staged / "core" / "node.py").exists()
     assert not (staged / "core" / "mint.py").exists()
-    assert not (staged / "core" / "repository_applier.py").exists()
-    assert not (staged / "core" / "writer_repository.py").exists()
     assert not (staged / "adapters" / "r2" / "s3.py").exists()
     assert not (staged / "adapters" / "s3").exists()
     assert not (staged / "deploy" / "aws_lambda").exists()

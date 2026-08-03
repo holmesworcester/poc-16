@@ -47,8 +47,14 @@ from core.object_store import (
     MAX_LOGICAL_KEY_BYTES,
     MAX_PROVIDER_KEY_BYTES,
 )
-from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
+from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from facts.auth import request
+from core.store import FsStore
+from tests.test_authority_repository import (
+    authority_world,
+    head_proof,
+    signed,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LAMBDA = ROOT / "deploy" / "aws_lambda"
@@ -129,6 +135,44 @@ def mint(node, workspace, pile):
         node.identity(workspace)[0],
         base64.b64decode(body["grant"])).decode()
     return status, body, token
+
+
+def test_lambda_bootstraps_authority_then_advances_one_owner_head(
+        tmp_path, monkeypatch):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    config = S3Config("test-bucket", "tenant")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
+    monkeypatch.setattr(
+        app, "_store", lambda _config: AsyncFromSyncReader(store))
+    monkeypatch.setattr(
+        app, "_pack_issuer", lambda _config: SimpleNamespace(
+            open_pack=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
+    monkeypatch.setattr(app, "_secret", lambda: b"s" * 32)
+    monkeypatch.setattr(app.time, "time", lambda: 0.010)
+    monkeypatch.setenv("TINYP2P_WORKSPACE_ID", world.root.fid)
+    app._gateway_cache = None
+
+    authority = signed(
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    assert response(app.handler(event(
+        "POST", "/authority", world.root.fid, authority), None))[0] == 201
+
+    proposed = h(b"lambda opaque writer head")
+    proof = head_proof(world, proposed)
+    assert response(app.handler(event(
+        "POST", "/head/" + proposed,
+        world.root.fid, proof), None))[0] == 201
+    assert store.get(f"heads/{world.root.fid}/{world.member}") is not None
+    assert response(app.handler(event(
+        "POST", "/head/" + h(b"wrong"),
+        world.root.fid, proof), None))[0] == 403
 
 
 def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
@@ -390,7 +434,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     assert (staged / "core" / "repository_reader.py").is_file()
     assert {
         path.name for path in (staged / "core").glob("*.py")
-    } == set(REPOSITORY_READER_CORE_MODULES)
+    } == set(HOSTED_GATE_CORE_MODULES)
     assert (staged / "facts" / "auth" / "request.py").is_file()
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
@@ -407,7 +451,6 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
             "mint.py",
             "node.py",
             "pile_sender.py",
-            "repository_applier.py",
             "store.py",
             "suppression_state.py"):
         assert not (staged / "core" / forbidden).exists()

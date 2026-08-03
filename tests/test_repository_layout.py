@@ -1145,6 +1145,7 @@ def test_protocol_front_doors_route_semantic_reads_through_one_reader():
 
 def test_deployed_reader_core_allowlists_equal_their_import_closures():
     from deploy.python_role_modules import (
+        HOSTED_GATE_CORE_MODULES,
         REPOSITORY_READER_CORE_MODULES,
         UPLOAD_BROKER_CORE_MODULES,
     )
@@ -1178,7 +1179,11 @@ print(json.dumps(sorted(
 
     for imports, modules in (
                 (
-                    ("core.http",),
+                    ("deploy.aws_lambda.app",),
+                    HOSTED_GATE_CORE_MODULES,
+                ),
+                (
+                    ("core.http", "core.repository_reader"),
                     REPOSITORY_READER_CORE_MODULES,
                 ),
                 (
@@ -1334,6 +1339,7 @@ def test_one_core_http_gate_owns_peer_routes_and_control_is_separate():
     }
     assert {
         "/ctl",
+        "/authority",
         "/head/",
         "/heads",
         "/invite/",
@@ -1345,9 +1351,9 @@ def test_one_core_http_gate_owns_peer_routes_and_control_is_separate():
         "/obj/open",
         "/pack/open",
         "/readyz",
-        "/root",
     } <= route_literals
-    assert {"/page", "/page/", "/pile/"}.isdisjoint(route_literals)
+    assert {"/page", "/page/", "/pile/", "/root"}.isdisjoint(
+        route_literals)
 
     adapter_literals = {
         value.value

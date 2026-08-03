@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from adapters.r2.worker import R2BindingStore
 from core import peer_capability
+from core.authority import AuthorityRepository
 from core.crypto import load_sk, sign, verify
 from core.limits import (
     MAX_MINT_FETCHES as CORE_MAX_MINT_FETCHES,
@@ -14,12 +15,12 @@ from core.limits import (
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES as CORE_MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
-    MAX_ROOT_BYTES as CORE_MAX_ROOT_BYTES,
     PAGE_BATCH,
 )
 from core.shape import valid_fid
 from core.http import HttpGate, Response
 from core.object_store import validate_store_prefix
+from core.writer_repository import OpaqueHeadGate
 from deploy.cloudflare_pack.contract import (
     PACK_TICKET_SECRET_BYTES,
     R2PackTarget,
@@ -33,7 +34,6 @@ else:
     from crypto_compat import seal_to, unseal
 
 MAX_REQUEST_BYTES = min(512 * 1024, MAX_MINT_REQUEST_BYTES)
-MAX_ROOT_BYTES = min(64 * 1024, CORE_MAX_ROOT_BYTES)
 MAX_OBJECT_BYTES = CORE_MAX_OBJECT_BYTES
 MAX_BATCH_COUNT = min(48, PAGE_BATCH)
 MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
@@ -47,7 +47,6 @@ EDGE_SECRET_BYTES = 32
 
 _BUDGETS = {
     "MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
-    "MAX_ROOT_BYTES": MAX_ROOT_BYTES,
     "MAX_OBJECT_BYTES": MAX_OBJECT_BYTES,
     "MAX_BATCH_COUNT": MAX_BATCH_COUNT,
     "MAX_BATCH_BYTES": MAX_BATCH_BYTES,
@@ -131,7 +130,6 @@ class Settings:
     r2_secret_access_key: str = field(repr=False)
     pack_ticket_secret: bytes = field(repr=False)
     max_request_bytes: int
-    max_root_bytes: int
     max_object_bytes: int
     max_batch_count: int
     max_batch_bytes: int
@@ -202,18 +200,6 @@ class Settings:
         )
 
 
-class ReadOnlyStore:
-    """Narrow an R2 ObjectStore binding to the HttpGate's read capability."""
-
-    __slots__ = ("_store",)
-
-    def __init__(self, bucket, prefix):
-        self._store = R2BindingStore(bucket, prefix)
-
-    async def get_bounded(self, key, max_bytes):
-        return await self._store.get_bounded(key, max_bytes)
-
-
 def now_ms():
     return time_ns() // 1_000_000
 
@@ -221,16 +207,29 @@ def now_ms():
 def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
     issuer = settings.issue_packs(clock)
+    store = R2BindingStore(settings.bucket, settings.prefix)
+    authority = AuthorityRepository(settings.workspace, store)
+
+    async def authorize_head(proof, proposed):
+        return await authority.authorize_head(
+            proof, proposed, clock())
+
+    async def authorize_access(proof, purpose):
+        return await authority.authorize_access(
+            proof, clock(), purpose=purpose)
+
     return HttpGate(
-        ReadOnlyStore(settings.bucket, settings.prefix),
+        store,
         settings.workspace,
         settings.secret,
         clock,
+        authority_publish=authority.publish,
+        head_advance=OpaqueHeadGate(store, authorize_head).advance,
+        mint_authorize=authorize_access,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,
         sync_profile=peer_capability.READ_ONLY,
         max_request_bytes=settings.max_request_bytes,
-        max_root_bytes=settings.max_root_bytes,
         max_object_bytes=settings.max_object_bytes,
         max_batch_count=settings.max_batch_count,
         max_batch_bytes=settings.max_batch_bytes,

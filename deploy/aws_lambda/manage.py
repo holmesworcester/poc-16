@@ -38,7 +38,7 @@ from deploy.aws_lambda.config import (  # noqa: E402
     WORKSPACE_RE,
 )
 from deploy.python_role_modules import (  # noqa: E402
-    REPOSITORY_READER_CORE_MODULES,
+    HOSTED_GATE_CORE_MODULES,
 )
 STAGE = HERE / "stage"
 BUILD = HERE / ".aws-sam"
@@ -99,7 +99,7 @@ def stage(destination=STAGE):
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
-    for name in REPOSITORY_READER_CORE_MODULES:
+    for name in HOSTED_GATE_CORE_MODULES:
         target = destination / "core" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / "core" / name, target)
