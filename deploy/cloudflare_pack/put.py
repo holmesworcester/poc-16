@@ -1,10 +1,16 @@
-"""Native R2 PUT route that never brings pack bytes into Python memory."""
+"""Native R2 PUT route that never buffers immutable object or pack bytes."""
 from dataclasses import dataclass
 import hmac
 import time
 from urllib.parse import parse_qsl, urlsplit
 
-from core.pack_access import MAX_PACK_BYTES, MAX_SCOPED_TTL_MS
+from core.limits import MAX_DIRECT_OBJECT_BYTES
+from core.pack_access import (
+    MAX_PACK_BYTES,
+    MAX_SCOPED_TTL_MS,
+    object_key,
+    pack_key,
+)
 from core.shape import valid_fid
 
 from .contract import (
@@ -65,7 +71,7 @@ class R2PackResponse:
     body: bytes = b""
 
 
-class R2PackPut:
+class R2ImmutablePut:
     """Validate one exact ticket, then give R2 the untouched body stream."""
 
     def __init__(
@@ -99,12 +105,12 @@ class R2PackPut:
         if parsed.scheme != expected_origin.scheme \
                 or parsed.netloc != expected_origin.netloc \
                 or parsed.username is not None or parsed.password is not None \
-                or parsed.fragment or not parsed.path.startswith("/pack/") \
-                or parsed.path.count("/") != 2:
+                or parsed.fragment or parsed.path.count("/") != 2:
             return None, self._response(403)
-        oid = parsed.path[len("/pack/"):]
-        if not valid_fid(oid):
+        prefix, oid = parsed.path.strip("/").split("/", 1)
+        if prefix not in {"obj", "pack"} or not valid_fid(oid):
             return None, self._response(403)
+        logical_key = object_key(oid) if prefix == "obj" else pack_key(oid)
         try:
             pairs = parse_qsl(
                 parsed.query,
@@ -115,29 +121,34 @@ class R2PackPut:
             if tuple(name for name, _ in pairs) != TICKET_FIELDS:
                 raise ValueError("ticket fields")
             values = dict(pairs)
-            pack_bytes = int(values["pack_bytes"])
+            body_bytes = int(values["body_bytes"])
             expires_at_ms = int(values["expires_at_ms"])
-            if str(pack_bytes) != values["pack_bytes"] \
+            if str(body_bytes) != values["body_bytes"] \
                     or str(expires_at_ms) != values["expires_at_ms"]:
                 raise ValueError("noncanonical ticket integer")
         except (KeyError, TypeError, ValueError):
             return None, self._response(403)
         expected_query = ticket_query(
-            self._ticket_secret, oid, pack_bytes, expires_at_ms)
+            self._ticket_secret, logical_key, body_bytes, expires_at_ms)
         if parsed.query != expected_query or not hmac.compare_digest(
                 values["signature"],
                 ticket_signature(
-                    self._ticket_secret, oid, pack_bytes, expires_at_ms)):
+                    self._ticket_secret,
+                    logical_key,
+                    body_bytes,
+                    expires_at_ms)):
             return None, self._response(403)
         now = self._clock()
         if type(now) is not int or now < 0:
             return None, self._response(503)
         if not now < expires_at_ms <= now + MAX_SCOPED_TTL_MS:
             return None, self._response(403)
-        if not 1 <= pack_bytes <= MAX_PACK_BYTES:
+        maximum = MAX_DIRECT_OBJECT_BYTES \
+            if prefix == "obj" else MAX_PACK_BYTES
+        if not 1 <= body_bytes <= maximum:
             return None, self._response(413)
         headers = getattr(request, "headers", None)
-        if _header(headers, "content-length") != str(pack_bytes) \
+        if _header(headers, "content-length") != str(body_bytes) \
                 or _header(headers, "if-none-match") != "*" \
                 or _header(headers, "range") is not None \
                 or _header(headers, "content-range") is not None:
@@ -145,16 +156,16 @@ class R2PackPut:
         body = getattr(request, "body", None)
         if body is None:
             return None, self._response(400)
-        return (oid, body), None
+        return (logical_key, oid, body), None
 
     async def handle(self, request):
         opened, failure = self._opened(request)
         if failure is not None:
             return failure
-        oid, body = opened
+        logical_key, oid, body = opened
         try:
             result = await self.bucket.put(
-                self.target.physical_key(oid),
+                self.target.physical_logical_key(logical_key),
                 body,
                 onlyIf=_if_none_match(),
                 sha256=oid,

@@ -18,8 +18,11 @@ from core.limits import MAX_DIRECT_OBJECT_BYTES
 from core.pack_access import (
     MAX_SCOPED_REQUEST_BYTES,
     MAX_SCOPED_TTL_MS,
+    InvalidPackAccess,
     ObjectOpen,
     PackOpen,
+    confine_object_request,
+    copy_object_get,
     decode_scoped_request,
     encode_object_open,
     encode_pack_open,
@@ -295,7 +298,7 @@ def test_issuer_maps_whole_range_and_create_to_exact_s3_requests():
 
 def test_object_issuer_maps_one_bounded_open_to_exact_s3_get():
     store, signer = issuer()
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    opened = ObjectOpen("GET", OID, MAX_DIRECT_OBJECT_BYTES)
     scoped = signer.open_object(MEMBER, opened, NOW)
     exact_key = f"{PREFIX}/obj/{OID}"
 
@@ -323,6 +326,51 @@ def test_object_issuer_maps_one_bounded_open_to_exact_s3_get():
         },
         BODY,
     )
+
+
+def test_object_create_is_exact_hashed_and_collision_requires_readback():
+    store, signer = issuer()
+    opened = ObjectOpen("PUT", OID, len(BODY))
+    scoped = signer.open_object(MEMBER, opened, NOW)
+    exact_key = f"{PREFIX}/obj/{OID}"
+
+    assert confine_object_request(opened, scoped, NOW) is scoped
+    assert store.calls == [(
+        "put_object",
+        {
+            "Bucket": BUCKET,
+            "ChecksumSHA256": base64.b64encode(
+                hashlib.sha256(BODY).digest()).decode(),
+            "ContentLength": len(BODY),
+            "ContentType": PACK_CONTENT_TYPE,
+            "ExpectedBucketOwner": OWNER,
+            "IfNoneMatch": "*",
+            "Key": exact_key,
+        },
+        DEFAULT_PACK_TTL_SECONDS - SIGV4_CLOCK_MARGIN_SECONDS,
+        "PUT",
+    )]
+    assert store.execute(scoped, BODY)[0] == 200
+    assert store.execute(scoped, BODY)[0] == 412
+
+    # S3's 412 says only "occupied".  The common direct GET is what makes an
+    # identical incumbent a no-op instead of blindly trusting the collision.
+    get = ObjectOpen("GET", OID, len(BODY))
+    get_scoped = signer.open_object(MEMBER, get, NOW)
+    status, headers, chunks = store.execute(get_scoped)
+    assert copy_object_get(
+        get, status, headers, (chunks,), lambda _chunk: None) == len(BODY)
+
+    occupied, second = issuer()
+    occupied.data[exact_key] = b"!" * len(BODY)
+    conflict = second.open_object(MEMBER, opened, NOW)
+    assert occupied.execute(conflict, BODY)[0] == 412
+    check = second.open_object(MEMBER, get, NOW)
+    status, headers, chunks = occupied.execute(check)
+    with pytest.raises(InvalidPackAccess, match="integrity"):
+        copy_object_get(
+            get, status, headers, (chunks,), lambda _chunk: None)
+    assert occupied.data[exact_key] == b"!" * len(BODY)
 
 
 def test_fake_s3_returns_exact_whole_and_single_range_shapes():
@@ -411,7 +459,7 @@ def test_fake_s3_rejects_every_signed_authority_mutation():
 
 def test_fake_s3_rejects_every_object_get_authority_mutation():
     store, signer = issuer()
-    opened = ObjectOpen(OID, len(BODY))
+    opened = ObjectOpen("GET", OID, len(BODY))
     scoped = signer.open_object(MEMBER, opened, NOW)
     headers = dict(scoped.headers)
     cases = (
@@ -456,7 +504,8 @@ def test_object_issuer_rejects_a_presigner_that_omits_owner_binding():
 
     weak, signer = issuer(Weak())
     with pytest.raises(RuntimeError, match="sign every constraint"):
-        signer.open_object(MEMBER, ObjectOpen(OID, len(BODY)), NOW)
+        signer.open_object(
+            MEMBER, ObjectOpen("GET", OID, len(BODY)), NOW)
     assert len(weak.calls) == 1
 
 
@@ -464,7 +513,9 @@ def test_sigv4_second_boundary_stays_inside_gate_ttl():
     _store, signer = issuer()
     trusted_now = NOW - 1
     scoped = signer.open_object(
-        MEMBER, ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES), trusted_now)
+        MEMBER,
+        ObjectOpen("GET", OID, MAX_DIRECT_OBJECT_BYTES),
+        trusted_now)
 
     assert trusted_now < scoped.expires_at_ms \
         <= trusted_now + MAX_SCOPED_TTL_MS
@@ -550,9 +601,9 @@ def test_lambda_object_open_returns_metadata_without_buffering_s3_body():
     app._gateway_cache = gate
     token = make_token(
         secret, MEMBER, WORKSPACE,
-        capability=peer_capability.READ_ONLY,
+        capability=peer_capability.FULL,
         issued_at=NOW, ttl_ms=MAX_SCOPED_TTL_MS)
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    opened = ObjectOpen("PUT", OID, MAX_DIRECT_OBJECT_BYTES)
 
     class UnbufferableBody:
         def __bytes__(self):  # pragma: no cover - failure is the assertion
@@ -575,6 +626,9 @@ def test_lambda_object_open_returns_metadata_without_buffering_s3_body():
     raw = base64.b64decode(result["body"])
     scoped = decode_scoped_request(raw)
     assert issued == [scoped]
+    assert scoped.method == "PUT"
+    assert dict(scoped.headers)["content-length"] \
+        == str(MAX_DIRECT_OBJECT_BYTES)
     assert len(store.calls) == 1
     assert len(raw) <= MAX_SCOPED_REQUEST_BYTES
     assert BODY not in raw

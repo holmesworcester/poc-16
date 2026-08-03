@@ -120,13 +120,18 @@ Resources:
                   StringEquals:
                     s3:authType: REST-QUERY-STRING
                     s3:signatureversion: AWS4-HMAC-SHA256
-              - Sid: CreateImmutablePacksByScopedRequest
+              - Sid: CreateImmutableObjectsByScopedRequest
                 Effect: Allow
                 Action: s3:PutObject
-                Resource: !Sub
-                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
-                  - Bucket: !Ref BucketName
-                    Prefix: !Ref StorePrefix
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
                 Condition:
                   Null:
                     s3:if-none-match: "false"

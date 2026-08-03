@@ -201,9 +201,11 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
         event("GET", "/obj/" + h(raw), workspace, headers=headers), None))
     assert (status, fetched) == (200, raw)
 
+    # Immutable creation is issued through /obj/open; the buffered mutation
+    # route is deliberately absent even when a grant is read-only.
     assert response(app.handler(
         event("PUT", "/obj/" + h(b"x"), workspace, b"x",
-              headers=headers), None))[0] == 401
+              headers=headers), None))[0] == 404
 
 
 def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
@@ -472,7 +474,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     )
 
 
-def test_lambda_template_is_bounded_and_pack_writes_are_exactly_scoped():
+def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     template = (LAMBDA / "template.yaml").read_text()
     requirements = (LAMBDA / "requirements.txt").read_text()
 
@@ -490,6 +492,7 @@ def test_lambda_template_is_bounded_and_pack_writes_are_exactly_scoped():
     assert '${StorePrefix}/root' in template
     assert '${StorePrefix}/obj/*' in template
     assert '${StorePrefix}/invite/*' in template
+    assert template.count('${Prefix}/obj/*') == 2
     assert template.count('${Prefix}/pack/*') == 2
     assert "s3:authType: REST-QUERY-STRING" in template
     assert "s3:signatureversion: AWS4-HMAC-SHA256" in template

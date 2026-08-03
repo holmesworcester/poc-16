@@ -2,7 +2,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+from core import peer_capability
 from core.writer_head import decode_slot_at, head_slot_key
+from full_peer.walk import Peer
 from tests.test_full_peer_writer_http_contract import (
     _bearer,
     _forest_fixture,
@@ -17,16 +19,16 @@ def test_concurrent_writer_finalization_serializes_one_sql_projection(tmp_path):
 
     with _serve(receiver) as (url, secret):
         headers = _bearer(secret, alice.member, workspace)
+        client = Peer(alice, workspace, url)
+        client.cache.update({
+            "sync_profile": peer_capability.FULL,
+            "token": headers["Authorization"].removeprefix("Bearer "),
+        })
         for source in (alice, bob):
             for key in source.store(workspace).list("obj"):
                 oid = key.removeprefix("obj/")
-                status, _, _ = _http(
-                    url,
-                    "PUT",
-                    f"/obj/{oid}?ws={workspace}",
-                    body=source.store(workspace).get(key),
-                    headers=headers,
-                )
+                status = client.put_obj(
+                    oid, source.store(workspace).get(key))
                 assert status in {201, 204}
 
         projection = receiver.sql(workspace)

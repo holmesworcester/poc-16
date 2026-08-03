@@ -71,8 +71,9 @@ def test_one_pile_publish_cold_sync_and_noop_have_small_exact_costs(tmp_path):
         published = cloud.snapshot()
         assert published.object_puts == len(update.objects) == 3
         assert published.slot_gets == published.slot_cas == 1
-        assert published.object_gets == published.lists == 0
-        assert published.requests == 5
+        assert published.object_gets == 1  # head existence, no body bytes
+        assert published.lists == 0
+        assert published.requests == 6
 
         cloud.clear()
         consumer = FactConsumer(root.fid)
@@ -134,7 +135,8 @@ def test_hundred_piles_use_one_head_cas_and_only_final_tree_pages(tmp_path):
         assert set(objects) == pile_oids | reachable | {update.head_oid}
         assert cost.object_puts == 100 + tree_pages + 1
         assert cost.slot_gets == cost.slot_cas == 1
-        assert cost.requests == 100 + tree_pages + 3
+        assert cost.object_gets == 1  # head existence, no body bytes
+        assert cost.requests == 100 + tree_pages + 4
         # A batch emits only the pages reachable from its final root. It does
         # not upload one intermediate path-copy tree per pile.
         assert tree_pages < 2 * len(closures)
@@ -201,8 +203,9 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         assert len(update.objects) == 3  # pile + final tree page + head
         assert publish.object_puts == 3
         assert publish.slot_gets == publish.slot_cas == 1
-        assert publish.object_gets == publish.lists == 0
-        assert publish.requests == 5
+        assert publish.object_gets == 1  # head existence, no body bytes
+        assert publish.lists == 0
+        assert publish.requests == 6
 
         cloud.clear()
         result = await mirror.sync_from(cloud)

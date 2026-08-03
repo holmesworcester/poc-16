@@ -3,6 +3,8 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 
+import pytest
+
 from adapters.r2 import R2BindingStore
 from adapters.s3 import S3Config, S3Store
 from bench.writer_cloud_cost import CostVector, CountingStore
@@ -105,6 +107,23 @@ async def exercise(kind, tmp_path, values):
         cloud,
     )
     prepared = await writer.prepare(closures)
+    proof = authority_proof(
+        secret, public, root, device_signature, device,
+        prepared.head_oid)
+    authority = AuthorityGate(
+        root.fid, authority_root, lambda: 10)
+
+    cloud.clear()
+    physical_start = len(bucket.history)
+    with pytest.raises(ValueError, match="head object is missing"):
+        await OpaqueHeadGate(
+            cloud, authority.authorize).advance(
+                proof, prepared.head_oid)
+    assert cloud.snapshot() == CostVector(object_gets=1)
+    assert f"{PREFIX}/{slot_key}" not in bucket.data
+    assert physical_operations(kind, bucket, physical_start) == (
+        ("head", "obj/" + prepared.head_oid),
+    )
 
     cloud.clear()
     physical_start = len(bucket.history)
@@ -134,14 +153,16 @@ async def exercise(kind, tmp_path, values):
     slot_raw = encode_slot(advanced.slot)
     assert advanced.status == "applied"
     assert cloud.snapshot() == CostVector(
+        object_gets=1,
         slot_gets=1,
         slot_cas=1,
         write_bytes=len(slot_raw),
     )
     gate_operations = physical_operations(kind, bucket, physical_start)
-    assert not any(
-        operation == "get" and key.startswith("obj/")
-        for operation, key in gate_operations)
+    assert [(operation, key) for operation, key in gate_operations
+            if key.startswith("obj/")] == [
+        ("head", "obj/" + prepared.head_oid),
+    ]
     assert [key for operation, key in gate_operations
             if operation == "put"] == [slot_key]
 

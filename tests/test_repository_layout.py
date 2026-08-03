@@ -447,7 +447,6 @@ def test_applier_owns_object_establishment_and_exact_source_identity():
 
     for function, expected in (
             ("ensure_object_async", {
-                "core/http.py",
                 "core/repository_applier.py",
                 "core/writer_repository.py",
                 "notifications/discovery.py",
@@ -1354,6 +1353,21 @@ def test_one_core_http_gate_owns_peer_routes_and_control_is_separate():
     } <= route_literals
     assert {"/page", "/page/", "/pile/", "/root"}.isdisjoint(
         route_literals)
+    assert "_put_object" not in {
+        item.name for item in gate.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    # Object creation has one metadata OPEN plus direct streaming data plane;
+    # no small-body PUT fallback may reappear in the buffered core gate.
+    request_limit = next(
+        item for item in gate.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and item.name == "request_limit")
+    assert "MAX_OBJECT_BYTES" not in {
+        node.id for node in ast.walk(request_limit)
+        if isinstance(node, ast.Name)
+    }
 
     adapter_literals = {
         value.value

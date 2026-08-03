@@ -30,13 +30,8 @@ from .limits import (
 )
 from .object_store import (
     ABSENT,
-    CREATED,
-    EXISTS,
-    Applied,
     MAX_INVITE_ID_BYTES,
-    STALE,
     Versioned,
-    ensure_object_async,
     mutable_key,
 )
 from .pack_access import (
@@ -395,7 +390,7 @@ class HttpGate:
         })
 
     async def _open_object(self, body, headers, trusted_now):
-        """Authorize one direct bounded object GET; bytes bypass this gate."""
+        """Authorize one direct object GET/PUT; bytes bypass this gate."""
         if self.object_open is None:
             return Response(405)
         if not isinstance(body, bytes) or len(body) > min(
@@ -407,7 +402,8 @@ class HttpGate:
             return Response(413)
         except ValueError:
             return Response(400)
-        member = self._member(headers, trusted_now)
+        member = self._member(
+            headers, trusted_now, require_push=opened.method == "PUT")
         if not member:
             return Response(401)
         try:
@@ -541,24 +537,6 @@ class HttpGate:
             "Content-Type": "application/octet-stream",
         })
 
-    async def _put_object(self, oid, body):
-        if not OID_RE.fullmatch(oid) or not isinstance(body, bytes) \
-                or len(body) > self.max_object_bytes or h(body) != oid:
-            return Response(400)
-        try:
-            result = await ensure_object_async(self.store, oid, body)
-        except PayloadTooLarge:
-            return Response(413)
-        except ValueError:
-            return Response(409)
-        except Exception:
-            return Response(503)
-        if result is CREATED:
-            return Response(201)
-        if result is EXISTS:
-            return Response(204)
-        return Response(503)
-
     async def _accept_mirror(self, device, body):
         if self.mirror is None:
             return Response(405)
@@ -616,8 +594,6 @@ class HttpGate:
             return MAX_PACK_OPEN_BYTES
         if method == "POST" and path == "/obj/open":
             return MAX_OBJECT_OPEN_BYTES
-        if method == "PUT" and path.startswith("/obj/"):
-            return MAX_OBJECT_BYTES
         if method == "PUT" and path.startswith("/mirror/"):
             return MAX_HEAD_SLOT_BYTES
         return 0
@@ -674,15 +650,10 @@ class HttpGate:
             return await self._open_object(body, headers, trusted_now)
         if path.startswith("/ctl"):
             return Response(405)
-        if method == "PUT" and (
-                path.startswith("/obj/")
-                or path.startswith("/mirror/")):
+        if method == "PUT" and path.startswith("/mirror/"):
             if not self._member(
                     headers, trusted_now, require_push=True):
                 return Response(401)
-            if path.startswith("/obj/"):
-                return await self._put_object(
-                    path.removeprefix("/obj/"), body)
             device = path.removeprefix("/mirror/")
             return await self._accept_mirror(device, body)
         if not self._member(headers, trusted_now):

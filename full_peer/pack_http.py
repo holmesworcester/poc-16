@@ -36,8 +36,8 @@ STREAM_CHUNK_BYTES = DIRECT_STREAM_CHUNK_BYTES
 DEFAULT_TICKET_TTL_MS = 30_000
 MAX_TICKET_BYTES = 1024
 _TICKET_DOMAIN = b"poc16-full-peer-pack-ticket-v1\0"
-_OBJECT_TICKET_DOMAIN = b"poc16-full-peer-object-ticket-v1\0"
-_TEMP_PREFIX = ".pack-upload-"
+_OBJECT_TICKET_DOMAIN = b"poc16-full-peer-object-ticket-v2\0"
+_TEMP_PREFIX = ".immutable-upload-"
 _TEMP_SUFFIX = ".tmp"
 
 
@@ -151,17 +151,19 @@ class FullPeerPackService:
             ticket.workspace,
             ticket.member,
             ticket.expires_at_ms,
+            ticket.opened.method,
             ticket.opened.oid,
-            ticket.opened.max_bytes,
+            ticket.opened.object_bytes,
         ], _OBJECT_TICKET_DOMAIN)
 
     def _decode_object_ticket(self, token):
         try:
             value = self._decode_payload(token, _OBJECT_TICKET_DOMAIN)
-            if len(value) != 5:
+            if len(value) != 6:
                 raise ValueError
             return _Ticket(
-                value[0], value[1], ObjectOpen(value[3], value[4]), value[2])
+                value[0], value[1],
+                ObjectOpen(value[3], value[4], value[5]), value[2])
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("object ticket") from error
 
@@ -207,7 +209,7 @@ class FullPeerPackService:
 
     def issue_object(
             self, workspace, member, opened, trusted_now, origin):
-        """Issue one read-only content-addressed object operation."""
+        """Issue one whole content-addressed object operation."""
         if not self.peer.has_workspace(workspace) \
                 or not valid_fid(member) \
                 or not isinstance(opened, ObjectOpen) \
@@ -218,11 +220,15 @@ class FullPeerPackService:
         expires = trusted_now + self.ttl_ms
         token = self._encode_object_ticket(_Ticket(
             workspace, member, opened, expires))
+        headers = () if opened.method == "GET" else (
+            ("content-length", str(opened.object_bytes)),
+            ("if-none-match", "*"),
+        )
         return ScopedRequest(
-            "GET",
+            opened.method,
             f"{origin}/{object_key(opened.oid)}?"
             f"{urlencode({'ticket': token})}",
-            (),
+            headers,
             expires,
         )
 
@@ -237,7 +243,8 @@ class FullPeerPackService:
     def _resolve_object(self, token, method, oid, trusted_now):
         ticket = self._decode_object_ticket(token)
         if ticket.expires_at_ms <= trusted_now \
-                or method != "GET" or ticket.opened.oid != oid:
+                or ticket.opened.method != method \
+                or ticket.opened.oid != oid:
             raise ValueError("object ticket scope")
         return ticket
 
@@ -284,9 +291,9 @@ class FullPeerPackService:
         finally:
             source.close()
 
-    def _matches(self, path, opened):
+    def _matches(self, path, expected_bytes, expected_oid):
         try:
-            if os.stat(path).st_size != opened.pack_bytes:
+            if os.stat(path).st_size != expected_bytes:
                 return False
             digest = hashlib.sha256()
             with self.read_opener(path, "rb") as source:
@@ -297,27 +304,27 @@ class FullPeerPackService:
                     if len(chunk) > STREAM_CHUNK_BYTES:
                         raise ValueError("pack reader exceeded chunk bound")
                     digest.update(chunk)
-            return digest.hexdigest() == opened.oid
+            return digest.hexdigest() == expected_oid
         except FileNotFoundError:
             return False
 
-    def _put(self, handler, ticket):
-        opened = ticket.opened
+    def _put_stream(
+            self, handler, final, expected_bytes, expected_oid):
         if handler.headers.get("Transfer-Encoding") \
                 or handler.headers.get("Range") is not None \
                 or handler.headers.get("If-None-Match") != "*" \
                 or handler.headers.get("Content-Length") \
-                != str(opened.pack_bytes):
+                != str(expected_bytes):
             return self._error(handler, 403)
         handler.close_connection = True
-        directory = self._directory(ticket.workspace)
-        final = self._path(ticket.workspace, opened.oid)
+        directory = os.path.dirname(final)
+        os.makedirs(directory, exist_ok=True)
         fd, temporary = tempfile.mkstemp(
             dir=directory, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
         status = 503
         try:
             digest = hashlib.sha256()
-            remaining = opened.pack_bytes
+            remaining = expected_bytes
             with os.fdopen(fd, "wb") as target:
                 while remaining:
                     chunk = handler.rfile.read(
@@ -333,7 +340,7 @@ class FullPeerPackService:
                 target.flush()
                 os.fsync(target.fileno())
             if remaining == 0:
-                if digest.hexdigest() != opened.oid:
+                if digest.hexdigest() != expected_oid:
                     status = 400
                 else:
                     try:
@@ -341,7 +348,7 @@ class FullPeerPackService:
                         status = 201
                     except FileExistsError:
                         status = 204 if self._matches(
-                            final, opened) else 409
+                            final, expected_bytes, expected_oid) else 409
         except (OSError, ValueError):
             status = 503
         finally:
@@ -350,6 +357,24 @@ class FullPeerPackService:
             except FileNotFoundError:
                 pass
         return self._finish(handler, status)
+
+    def _put(self, handler, ticket):
+        opened = ticket.opened
+        return self._put_stream(
+            handler,
+            self._path(ticket.workspace, opened.oid),
+            opened.pack_bytes,
+            opened.oid,
+        )
+
+    def _put_object(self, handler, ticket):
+        opened = ticket.opened
+        return self._put_stream(
+            handler,
+            self._object_path(ticket.workspace, opened.oid),
+            opened.object_bytes,
+            opened.oid,
+        )
 
     def _get(self, handler, ticket):
         opened = ticket.opened
@@ -391,7 +416,7 @@ class FullPeerPackService:
         path = self._object_path(ticket.workspace, opened.oid)
         try:
             size = os.stat(path).st_size
-            if size > opened.max_bytes:
+            if size > opened.object_bytes:
                 return self._error(handler, 413)
             source = self.read_opener(path, "rb")
         except FileNotFoundError:
@@ -437,7 +462,11 @@ class FullPeerPackService:
                 query["ticket"], method, parts[1], self.clock())
         except (TypeError, ValueError):
             return self._error(handler, 403)
-        return self._get_object(handler, ticket)
+        if method == "PUT":
+            return self._put_object(handler, ticket)
+        if method == "GET":
+            return self._get_object(handler, ticket)
+        return self._error(handler, 405)
 
 
 class _PackHandlerMixin:

@@ -26,7 +26,7 @@ from deploy.cloudflare_pack.contract import (
     R2PackTarget,
 )
 from deploy.cloudflare_pack.issuer import R2PackIssuer
-from deploy.cloudflare_pack.put import R2PackPut
+from deploy.cloudflare_pack.put import R2ImmutablePut
 
 if __package__:
     from .crypto_compat import seal_to, unseal
@@ -169,7 +169,7 @@ class Settings:
             ticket_secret,
             clock=lambda: 0,
         )
-        R2PackPut(target, bucket, ticket_secret, clock=lambda: 0)
+        R2ImmutablePut(target, bucket, ticket_secret, clock=lambda: 0)
         return cls(
             bucket,
             workspace,
@@ -191,8 +191,8 @@ class Settings:
             clock=clock,
         )
 
-    def put_packs(self, clock):
-        return R2PackPut(
+    def put_immutables(self, clock):
+        return R2ImmutablePut(
             self.pack_target,
             self.bucket,
             self.pack_ticket_secret,
@@ -345,9 +345,9 @@ async def handle(request, env, *, clock=None):
         url = urlsplit(str(request.url))
     except (AttributeError, TypeError, ValueError, UnicodeError):
         return _secured(Response(400))
-    if method == "PUT" and url.path.startswith("/pack/"):
+    if method == "PUT" and url.path.startswith(("/obj/", "/pack/")):
         try:
-            result = await settings.put_packs(
+            result = await settings.put_immutables(
                 now_ms if clock is None else clock).handle(request)
             return _secured(Response(
                 result.status, result.body, dict(result.headers)))

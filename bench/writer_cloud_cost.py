@@ -89,6 +89,11 @@ class CountingStore:
 
         return await self.store.copy_pile_object(oid, max_bytes, counted)
 
+    async def has(self, key):
+        value = await self.store.has(key)
+        self._counts[f"{_kind(key)}_gets"] += 1
+        return value
+
     async def read_versioned(self, key):
         value = await self.store.read_versioned(key)
         self._read(key, value)

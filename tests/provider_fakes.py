@@ -120,6 +120,7 @@ class FakeS3Client:
     def head_object(self, **request):
         key = request["Key"]
         with self.bucket.lock:
+            self.bucket._record(self.actor, "head", key, None)
             if key not in self.bucket.data:
                 raise ProviderError(404, "NotFound")
             return {"ETag": self.bucket.tokens[key]}

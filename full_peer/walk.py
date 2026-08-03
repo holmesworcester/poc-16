@@ -1,5 +1,8 @@
 """HTTP peer and pile-transfer helpers for the sync dial."""
 import base64
+import hashlib
+import http.client
+import io
 import json
 import urllib.error
 import urllib.parse
@@ -20,7 +23,13 @@ from core.limits import (
     DIRECT_STREAM_CHUNK_BYTES,
     decode_json,
 )
-from core.object_store import ABSENT, ListPage, Versioned, VersionToken
+from core.object_store import (
+    ABSENT,
+    ListPage,
+    OutcomeUnknown,
+    Versioned,
+    VersionToken,
+)
 from core.pack_access import (
     MAX_SCOPED_REQUEST_BYTES,
     ObjectOpen,
@@ -253,7 +262,7 @@ class Peer:
             write(raw)
             return len(raw)
 
-        opened = ObjectOpen(oh, response_limit)
+        opened = ObjectOpen("GET", oh, response_limit)
         _, raw, _ = self._http(
             "POST", "/obj/open",
             data=encode_object_open(opened),
@@ -363,13 +372,60 @@ class Peer:
             raise ValueError("page batch encoding") from error
 
     def put_obj(self, oid, raw):
-        if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+        if not isinstance(raw, bytes) \
+                or not 0 < len(raw) <= MAX_DIRECT_OBJECT_BYTES \
                 or h(raw) != oid:
             raise ValueError("peer immutable object")
-        status, _, _ = self._http(
-            "PUT", f"/obj/{oid}", data=raw, require_push=True,
-            response_limit=MAX_CONTROL_BYTES)
-        return status
+        opened = ObjectOpen("PUT", oid, len(raw))
+        _, encoded, _ = self._http(
+            "POST", "/obj/open", data=encode_object_open(opened),
+            require_push=True, response_limit=MAX_SCOPED_REQUEST_BYTES)
+        scoped = confine_object_request(
+            opened, decode_scoped_request(encoded), now_ms())
+        parsed = urllib.parse.urlsplit(scoped.url)
+        connection_type = http.client.HTTPSConnection \
+            if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(
+            parsed.hostname, parsed.port, timeout=60)
+        path = parsed.path + (
+            "?" + parsed.query if parsed.query else "")
+        try:
+            connection.request(
+                "PUT",
+                path,
+                body=io.BytesIO(raw),
+                headers=dict(scoped.headers),
+            )
+            response = connection.getresponse()
+            response_body = response.read(MAX_CONTROL_BYTES + 1)
+            status = response.status
+        except (OSError, http.client.HTTPException) as error:
+            raise OutcomeUnknown(
+                "direct immutable PUT outcome unknown") from error
+        finally:
+            connection.close()
+        if len(response_body) > MAX_CONTROL_BYTES:
+            raise ValueError("direct immutable PUT response too large")
+        if status in {200, 201}:
+            return 201
+        if status == 204:
+            return 204
+        if status in {409, 412}:
+            digest = hashlib.sha256()
+            try:
+                copied = self.copy_obj(
+                    oid, response_limit=len(raw), write=digest.update)
+            except Exception as error:
+                raise ValueError("remote immutable create conflict") \
+                    from error
+            if copied == len(raw) and digest.hexdigest() == oid:
+                return 204
+            raise ValueError("remote immutable create conflict")
+        if status in {408, 425, 429} or status >= 500:
+            raise OutcomeUnknown(
+                f"direct immutable PUT returned HTTP {status}")
+        raise ValueError(
+            f"direct immutable PUT returned HTTP {status}")
 
     def accept_slot(self, device, raw):
         if not isinstance(raw, bytes) or len(raw) > MAX_HEAD_SLOT_BYTES:

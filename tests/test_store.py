@@ -269,6 +269,24 @@ def test_remote_store_adapts_current_object_and_writer_head_reads():
         asyncio.run(store.read_many_versioned(("obj/" + h(page),)))
 
 
+def test_remote_store_object_existence_maps_http_missing_to_false():
+    body = b"present"
+
+    class Peer:
+        @staticmethod
+        def obj(oid, *, response_limit):
+            if oid == h(body):
+                return body
+            raise urllib.error.HTTPError(
+                "https://peer/obj", 404, "missing", {}, io.BytesIO())
+
+    store = RemoteStore(Peer())
+    assert asyncio.run(store.has("obj/" + h(body)))
+    assert not asyncio.run(store.has("obj/" + h(b"missing")))
+    with pytest.raises(TypeError, match="object-only"):
+        asyncio.run(store.has("root"))
+
+
 def test_remote_store_batches_object_gets_in_bounded_order():
     keys = [f"obj/{ordinal:064x}" for ordinal in range(513)]
 

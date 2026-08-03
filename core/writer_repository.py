@@ -410,6 +410,8 @@ class OpaqueHeadGate:
         grant = await _maybe_await(self.authorize(proof_raw, proposed_head))
         if not isinstance(grant, HeadGrant) or grant.head != proposed_head:
             raise ValueError("authority decision did not bind proposed head")
+        if not await self.store.has("obj/" + proposed_head):
+            raise ValueError("proposed writer head object is missing")
         key = head_slot_key(grant.workspace, grant.device)
         slot = HeadSlot(
             grant.workspace,

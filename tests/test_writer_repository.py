@@ -156,8 +156,11 @@ def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
         proposals = []
         for ordinal, values in enumerate((alice, bob), 1):
             _secret, public, _root, _sig, _device = values
+            raw_head = f"head-{ordinal}".encode()
+            head = h(raw_head)
+            store.put_if_absent("obj/" + head, raw_head)
             proposals.append((
-                public, h(f"head-{ordinal}".encode())))
+                public, head))
 
         async def authorize(proof, head):
             device = proof.decode()
@@ -176,7 +179,7 @@ def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
     run(scenario())
 
 
-def test_cloud_can_store_bad_owner_content_but_consumer_rejects_it(tmp_path):
+def test_cloud_requires_the_opaque_head_object_then_trusts_its_bytes(tmp_path):
     async def scenario():
         secret, public, root, device_signature, device = world()
         authority_root = h(b"authority")
@@ -185,8 +188,19 @@ def test_cloud_can_store_bad_owner_content_but_consumer_rejects_it(tmp_path):
         forged_head = h(b"missing opaque head")
         proof = proof_for(
             secret, public, root, device_signature, device, forged_head)
-        # The cloud validates only the authority pile and exact slot binding;
-        # it never opens the advertised content object.
+        # The mechanical gate rejects head-before-object ordering without
+        # opening or decoding writer-controlled bytes.
+        with pytest.raises(ValueError, match="head object is missing"):
+            await OpaqueHeadGate(
+                cloud,
+                mechanical_head_authorizer(
+                    root.fid, authority_root, 10)).advance(
+                        proof, forged_head)
+        assert cloud.get(f"heads/{root.fid}/{public}") is None
+
+        # Existence is not content admission: an opaque malformed head is
+        # accepted by the cloud and rejected only by a consuming peer.
+        cloud.put_if_absent("obj/" + forged_head, b"missing opaque head")
         result = await OpaqueHeadGate(
             cloud,
             mechanical_head_authorizer(
@@ -202,10 +216,8 @@ def test_cloud_can_store_bad_owner_content_but_consumer_rejects_it(tmp_path):
         )
         synced = await mirror.sync_from(cloud)
         assert synced.changed == synced.piles == synced.facts == 0
-        assert synced.errors == ((
-            f"heads/{root.fid}/{public}",
-            "repository object integrity",
-        ),)
+        assert len(synced.errors) == 1
+        assert synced.errors[0][0] == f"heads/{root.fid}/{public}"
         assert consumer.fact_ids() == ()
 
     run(scenario())

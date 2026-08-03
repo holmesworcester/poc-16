@@ -20,13 +20,15 @@ from core.pack_access import (
     PackOpen,
     confine_object_request,
     confine_scoped_request,
+    object_key,
+    pack_key,
 )
 from deploy.cloudflare_pack.contract import (
     PACK_TICKET_SECRET_BYTES,
     R2PackTarget,
 )
 from deploy.cloudflare_pack.issuer import R2PackIssuer
-from deploy.cloudflare_pack.put import R2PackPut
+from deploy.cloudflare_pack.put import R2ImmutablePut
 
 
 NOW = 1_800_000_000_000
@@ -37,7 +39,7 @@ ACCESS = "a" * 32
 SECRET = "b" * 64
 TICKET_SECRET = b"t" * PACK_TICKET_SECRET_BYTES
 PREFIX = "repositories/" + h(b"workspace")
-TICKET_DOMAIN = b"poc16-r2-pack-put-v1\0"
+TICKET_DOMAIN = b"poc16-r2-immutable-put-v1\0"
 
 
 def target(**changes):
@@ -62,19 +64,24 @@ def issuer(candidate=None, *, clock=None):
     )
 
 
-def _ticket_url(oid, pack_bytes, expires_at_ms):
+def _direct_ticket_url(logical_key, body_bytes, expires_at_ms):
     message = TICKET_DOMAIN + b"\0".join((
-        oid.encode("ascii"),
-        str(pack_bytes).encode("ascii"),
+        logical_key.encode("ascii"),
+        str(body_bytes).encode("ascii"),
         str(expires_at_ms).encode("ascii"),
     ))
     signature = hmac.new(
         TICKET_SECRET, message, hashlib.sha256).hexdigest()
     return (
-        f"{target().put_endpoint}/pack/{oid}"
-        f"?expires_at_ms={expires_at_ms}&pack_bytes={pack_bytes}"
+        f"{target().put_endpoint}/{logical_key}"
+        f"?body_bytes={body_bytes}&expires_at_ms={expires_at_ms}"
         f"&signature={signature}"
     )
+
+
+def _ticket_url(oid, pack_bytes, expires_at_ms):
+    return _direct_ticket_url(
+        pack_key(oid), pack_bytes, expires_at_ms)
 
 
 class ProviderFailure(Exception):
@@ -183,7 +190,7 @@ def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
 
 
 def test_object_get_is_one_exact_bounded_direct_r2_request():
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    opened = ObjectOpen("GET", OID, MAX_DIRECT_OBJECT_BYTES)
 
     scoped = issuer().open_object(MEMBER, opened, NOW)
 
@@ -197,7 +204,7 @@ def test_object_get_is_one_exact_bounded_direct_r2_request():
 
 
 def test_object_issuer_fails_closed_on_identity_type_time_and_deadline():
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    opened = ObjectOpen("GET", OID, MAX_DIRECT_OBJECT_BYTES)
     issued = issuer()
 
     for member, candidate, trusted_now in (
@@ -220,7 +227,7 @@ def test_exact_put_boundaries_stream_one_body_identity_to_native_r2(pack_bytes):
     assert confine_scoped_request(opened, scoped, NOW) is scoped
     body = SentinelStream(pack_bytes)
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     response = run(route, request_for(scoped, body))
@@ -240,6 +247,46 @@ def test_exact_put_boundaries_stream_one_body_identity_to_native_r2(pack_bytes):
         f"{PREFIX}/pack/{OID}": (pack_bytes, OID)}
 
 
+@pytest.mark.parametrize("object_bytes", (1, MAX_DIRECT_OBJECT_BYTES))
+def test_exact_object_put_boundaries_use_the_same_native_r2_route(
+        object_bytes):
+    opened = ObjectOpen("PUT", OID, object_bytes)
+    scoped = issuer().open_object(MEMBER, opened, NOW)
+    assert confine_object_request(opened, scoped, NOW) is scoped
+    body = SentinelStream(object_bytes)
+    bucket = FakeR2()
+    route = R2ImmutablePut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    response = run(route, request_for(scoped, body))
+
+    assert response.status == 201
+    assert bucket.calls == [(
+        f"{PREFIX}/obj/{OID}",
+        body,
+        {"onlyIf": {"If-None-Match": "*"}, "sha256": OID},
+    )]
+    assert bucket.objects == {
+        f"{PREFIX}/obj/{OID}": (object_bytes, OID)}
+
+
+def test_one_over_object_put_is_rejected_before_r2_sees_the_stream():
+    oversized = MAX_DIRECT_OBJECT_BYTES + 1
+    request = FakeRequest(
+        "PUT",
+        _direct_ticket_url(
+            object_key(OID), oversized, NOW + 30_000),
+        {"content-length": str(oversized), "if-none-match": "*"},
+        SentinelStream(oversized),
+    )
+    bucket = FakeR2()
+    route = R2ImmutablePut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    assert run(route, request).status == 413
+    assert bucket.calls == []
+
+
 def test_one_over_is_rejected_before_r2_sees_the_stream():
     oversized = MAX_PACK_BYTES + 1
     request = FakeRequest(
@@ -249,7 +296,7 @@ def test_one_over_is_rejected_before_r2_sees_the_stream():
         SentinelStream(oversized),
     )
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     assert run(route, request).status == 413
@@ -264,7 +311,7 @@ def test_create_collision_does_not_consume_or_replace_existing_pack():
     bucket.objects[f"{PREFIX}/pack/{OID}"] = existing
     body = SentinelStream(7, failure=AssertionError(
         "conditional failure must precede stream consumption"))
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     assert run(route, request_for(scoped, body)).status == 412
@@ -282,7 +329,7 @@ def test_checksum_interruption_and_provider_errors_never_create_a_pack(
         body, expected):
     scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     assert run(route, request_for(scoped, body)).status == expected
@@ -296,7 +343,7 @@ def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
     body = SentinelStream(7)
     bucket = FakeR2()
 
-    expired = R2PackPut(
+    expired = R2ImmutablePut(
         target(), bucket, TICKET_SECRET,
         clock=lambda: scoped.expires_at_ms,
     )
@@ -308,7 +355,7 @@ def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
         {"content-length": "7", "if-none-match": "*"},
         body,
     )
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
     assert run(route, too_long).status == 403
     assert bucket.calls == []
@@ -316,17 +363,18 @@ def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
 
 @pytest.mark.parametrize("mutate", (
     lambda url: url + "&extra=1",
-    lambda url: url.replace("expires_at_ms=", "pack_bytes=7&expires_at_ms="),
-    lambda url: url.replace("pack_bytes=7", "pack_bytes=8"),
+    lambda url: url.replace("expires_at_ms=", "body_bytes=7&expires_at_ms="),
+    lambda url: url.replace("body_bytes=7", "body_bytes=8"),
     lambda url: url.replace("signature=", "signature=0"),
     lambda url: url.replace(f"/pack/{OID}", f"/pack/{OTHER}"),
+    lambda url: url.replace(f"/pack/{OID}", f"/obj/{OID}"),
     lambda url: url.replace(
         "https://packs.example.com", "https://other.example.com"),
 ))
 def test_ticket_cannot_widen_key_size_origin_or_query(mutate):
     scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
     request = request_for(scoped, SentinelStream(7), url=mutate(scoped.url))
 
@@ -345,7 +393,7 @@ def test_ticket_cannot_widen_key_size_origin_or_query(mutate):
 def test_native_route_rejects_every_header_widening(headers):
     scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     request = request_for(scoped, SentinelStream(7), headers=headers)
@@ -356,13 +404,13 @@ def test_native_route_rejects_every_header_widening(headers):
 def test_native_route_rejects_wrong_method_missing_body_and_bad_clock():
     scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
-    route = R2PackPut(
+    route = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
 
     assert run(route, request_for(
         scoped, SentinelStream(7), method="GET")).status == 405
     assert run(route, request_for(scoped, None)).status == 400
-    bad_clock = R2PackPut(
+    bad_clock = R2ImmutablePut(
         target(), bucket, TICKET_SECRET, clock=lambda: True)
     assert run(bad_clock, request_for(scoped, SentinelStream(7))).status == 503
     assert bucket.calls == []

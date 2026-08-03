@@ -19,7 +19,9 @@ import facts
 
 from core import peer_capability
 from core.crypto import h, keypair
+from core.fact import canon
 from core.grants import make_token
+from core.limits import MAX_FACT_BYTES, MAX_OBJECT_BYTES
 from core.store import RemoteStore
 from core.writer_head import decode_slot_at, head_slot_key
 from core.writer_repository import RepositoryMirror
@@ -161,6 +163,7 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
         target_url, target_secret = stack.enter_context(_serve(carol))
         source_auth = _bearer(source_secret, carol.member, workspace)
         target_auth = _bearer(target_secret, alice.member, workspace)
+        target_client = Peer(alice, workspace, target_url)
 
         status, raw, _ = _http(
             source_url,
@@ -238,14 +241,17 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
         # or committing the SQL projection checkpoint.
         for key in alice.store(workspace).list("obj"):
             oid = key.removeprefix("obj/")
-            status, _, _ = _http(
-                target_url,
-                "PUT",
-                f"/obj/{oid}?ws={workspace}",
-                body=alice.store(workspace).get(key),
-                headers=target_auth,
-            )
+            status = target_client.put_obj(
+                oid, alice.store(workspace).get(key))
             assert status in {201, 204}
+        status, _, _ = _http(
+            target_url,
+            "PUT",
+            f"/obj/{h(b'old buffered route')}?ws={workspace}",
+            body=b"old buffered route",
+            headers=target_auth,
+        )
+        assert status == 404
         status, _, _ = _http(
             target_url,
             "PUT",
@@ -272,13 +278,8 @@ def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
         assert newer_slot != selected_slot
         for key in alice.store(workspace).list("obj"):
             oid = key.removeprefix("obj/")
-            status, _, _ = _http(
-                target_url,
-                "PUT",
-                f"/obj/{oid}?ws={workspace}",
-                body=alice.store(workspace).get(key),
-                headers=target_auth,
-            )
+            status = target_client.put_obj(
+                oid, alice.store(workspace).get(key))
             assert status in {201, 204}
         status, _, _ = _http(
             target_url,
@@ -356,6 +357,39 @@ def test_full_peer_sync_relays_both_ways_is_noop_and_rebuilds_sql(tmp_path):
     reopened = FullPeer(carol.dir)
     assert reopened.sql(workspace).fact_ids() == expected_facts
     assert _messages(reopened, workspace) == expected_messages
+
+
+def test_reverse_sync_direct_puts_a_valid_over_buffer_pile(tmp_path):
+    """The reverse half uses ObjectOpen PUT, never the removed small route."""
+    workspace, alice, _bob, carol = _forest_fixture(tmp_path)
+    probe = facts.content.message.message(
+        workspace,
+        alice.identity_id(workspace),
+        "general",
+        "",
+        50,
+    )
+    padding = MAX_FACT_BYTES - len(canon(probe.to_json()))
+    facts.content.message.post(
+        alice, workspace, "general", "x" * padding, ts=50)
+    large = [
+        (key, alice.store(workspace).get(key))
+        for key in alice.store(workspace).list("obj")
+        if len(alice.store(workspace).get(key)) > MAX_OBJECT_BYTES
+    ]
+    assert len(large) == 1
+
+    with _serve(carol) as (carol_url, _secret):
+        # Alice is the dialer, so its local writer is transferred in the
+        # reverse half after the ordinary remote-head scan.
+        sync(alice, workspace, carol_url)
+
+    key, raw = large[0]
+    assert carol.store(workspace).get(key) == raw
+    assert any(
+        len(row["text"]) == padding
+        for row in facts.content.message.messages(carol, workspace)
+    )
 
 
 def test_bundled_head_page_isolates_one_oversized_slot(tmp_path):

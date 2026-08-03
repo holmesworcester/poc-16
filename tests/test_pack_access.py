@@ -105,39 +105,45 @@ def scoped_for(opened, *, expires_at_ms=NOW + 10_000):
 
 
 def object_scoped(opened, *, expires_at_ms=NOW + 10_000):
+    headers = () if opened.method == "GET" else (
+        ("content-length", str(opened.object_bytes)),
+        ("if-none-match", "*"),
+    )
     return ScopedRequest(
-        "GET",
+        opened.method,
         f"https://bucket.example/prefix/{object_key(opened.oid)}?signature=x",
-        (),
+        headers,
         expires_at_ms,
     )
 
 
-def test_object_open_codec_has_one_named_repository_bound():
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+def test_object_open_codec_has_one_method_and_named_repository_bound():
+    opened = ObjectOpen("PUT", OID, MAX_DIRECT_OBJECT_BYTES)
     raw = encode_object_open(opened)
 
     assert object_key(OID) == "obj/" + OID
     assert decode_object_open(raw) == opened
     assert json.loads(raw) == {
-        "format": "poc16-object-open-v1",
-        "max_bytes": MAX_DIRECT_OBJECT_BYTES,
+        "format": "poc16-object-open-v2",
+        "method": "PUT",
+        "object_bytes": MAX_DIRECT_OBJECT_BYTES,
         "oid": OID,
     }
-    for oid, maximum in (
-            (OID.upper(), MAX_DIRECT_OBJECT_BYTES),
-            (OID, 0),
-            (OID, MAX_DIRECT_OBJECT_BYTES + 1),
-            (OID, True)):
+    for method, oid, maximum in (
+            ("POST", OID, MAX_DIRECT_OBJECT_BYTES),
+            ("GET", OID.upper(), MAX_DIRECT_OBJECT_BYTES),
+            ("GET", OID, 0),
+            ("GET", OID, MAX_DIRECT_OBJECT_BYTES + 1),
+            ("GET", OID, True)):
         with pytest.raises(InvalidPackAccess):
-            ObjectOpen(oid, maximum)
+            ObjectOpen(method, oid, maximum)
     with pytest.raises(PayloadTooLarge):
         decode_object_open(b" " * (MAX_OBJECT_OPEN_BYTES + 1))
 
 
-def test_object_request_and_stream_are_read_only_bounded_and_hashed():
+def test_object_get_request_and_stream_are_bounded_and_hashed():
     body = b"content-addressed object"
-    opened = ObjectOpen(h(body), len(body))
+    opened = ObjectOpen("GET", h(body), len(body))
     scoped = object_scoped(opened)
     assert confine_object_request(opened, scoped, NOW) is scoped
 
@@ -179,6 +185,22 @@ def test_object_request_and_stream_are_read_only_bounded_and_hashed():
                 opened, status, headers, chunks, lambda _part: None)
 
 
+def test_object_put_confinement_requires_exact_create_only_headers():
+    opened = ObjectOpen("PUT", OID, 100)
+    scoped = object_scoped(opened)
+    assert confine_object_request(opened, scoped, NOW) is scoped
+
+    for headers in (
+            (("content-length", "99"), ("if-none-match", "*")),
+            (("content-length", "100"),),
+            (("content-length", "100"), ("if-none-match", "present")),
+            (("content-length", "100"), ("if-none-match", "*"),
+             ("range", "bytes=0-99"))):
+        with pytest.raises(InvalidPackAccess):
+            confine_object_request(
+                opened, replace(scoped, headers=headers), NOW)
+
+
 def gate(issuer, **limits):
     return HttpGate(
         object(), WORKSPACE, SECRET, lambda: NOW,
@@ -191,8 +213,9 @@ def object_gate(issuer, **limits):
         object_open=issuer, **limits)
 
 
-def test_gate_opens_objects_for_read_grants_without_buffering_body():
-    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+def test_gate_requires_push_only_for_object_put_and_never_buffers_body():
+    get = ObjectOpen("GET", OID, MAX_DIRECT_OBJECT_BYTES)
+    put = ObjectOpen("PUT", OID, MAX_DIRECT_OBJECT_BYTES)
     calls = []
 
     def issuer(member, request, trusted_now):
@@ -200,18 +223,27 @@ def test_gate_opens_objects_for_read_grants_without_buffering_body():
         return object_scoped(request)
 
     service = object_gate(issuer)
-    body = encode_object_open(opened)
-    response = call_object(service, body=body, headers=bearer(
+    get_body = encode_object_open(get)
+    put_body = encode_object_open(put)
+    response = call_object(service, body=get_body, headers=bearer(
         peer_capability.READ_ONLY))
     assert response.status == 200
-    assert decode_scoped_request(response.body) == object_scoped(opened)
-    assert calls == [(MEMBER, opened, NOW)]
-    assert call_object(service, body=body).status == 401
+    assert decode_scoped_request(response.body) == object_scoped(get)
+    assert calls == [(MEMBER, get, NOW)]
+    assert call_object(
+        service, body=put_body,
+        headers=bearer(peer_capability.READ_ONLY)).status == 401
+    put_response = call_object(
+        service, body=put_body, headers=bearer(peer_capability.FULL))
+    assert put_response.status == 200
+    assert decode_scoped_request(put_response.body) == object_scoped(put)
+    assert calls[-1] == (MEMBER, put, NOW)
+    assert call_object(service, body=get_body).status == 401
     assert call_object(
         service, method="GET", headers=bearer(
             peer_capability.READ_ONLY)).status == 405
     assert call_object(
-        object_gate(None), body=body,
+        object_gate(None), body=get_body,
         headers=bearer(peer_capability.READ_ONLY)).status == 405
     assert HttpGate.request_limit("POST", "/obj/open") \
         == MAX_OBJECT_OPEN_BYTES

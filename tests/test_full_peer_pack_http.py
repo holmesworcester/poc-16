@@ -1,12 +1,14 @@
 """Real-socket tests for FullPeer's ordinary streaming pack data plane."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import asyncio
 import http.client
 import io
 import os
 import socket
 import threading
-from http.server import ThreadingHTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 import facts
@@ -15,25 +17,32 @@ import pytest
 from core import peer_capability
 from core.crypto import h
 from core.grants import make_token
+from core.limits import MAX_DIRECT_OBJECT_BYTES, MAX_OBJECT_BYTES
 from core.pack_access import (
     MAX_PACK_BYTES,
     InvalidPackAccess,
     ObjectOpen,
     PackOpen,
+    ScopedRequest,
     copy_object_get,
     copy_pack_get,
     decode_scoped_request,
     encode_object_open,
     encode_pack_open,
+    encode_scoped_request,
     object_key,
     pack_key,
 )
+from core.object_store import EXISTS
+from core.store import RemoteStore
+from core.writer_repository import ensure_pile_async
 from full_peer.node import FullPeer
 from full_peer.pack_http import (
     STREAM_CHUNK_BYTES,
     FullPeerPackService,
     handler_for,
 )
+from full_peer.walk import Peer
 
 
 NOW = 1_800_000_000_000
@@ -118,7 +127,9 @@ def open_object(url, peer, workspace, clock, opened):
         f"/obj/open?ws={workspace}",
         body=encode_object_open(opened),
         headers=bearer(
-            peer, workspace, clock, peer_capability.READ_ONLY),
+            peer, workspace, clock,
+            peer_capability.READ_ONLY
+            if opened.method == "GET" else peer_capability.FULL),
     )
     assert status == 200
     return decode_scoped_request(raw)
@@ -212,6 +223,16 @@ def temp_paths(peer, workspace):
     ) if os.path.isdir(directory) else ()
 
 
+def object_temp_paths(peer, workspace):
+    directory = os.path.dirname(
+        object_path(peer, workspace, "0" * 64))
+    return tuple(
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if name.endswith(".tmp")
+    ) if os.path.isdir(directory) else ()
+
+
 def test_real_http_streams_whole_put_get_and_exact_206_range(tmp_path):
     body = (b"complete signed pile bytes\0" * 10_000) \
         + b"final boundary"
@@ -261,7 +282,7 @@ def test_real_http_streams_tree_selected_object_outside_gate_buffer(tmp_path):
             return original(key, maximum)
 
         store.get_bounded = guarded
-        opened = ObjectOpen(oid, len(body))
+        opened = ObjectOpen("GET", oid, len(body))
         scoped = open_object(url, peer, workspace, clock, opened)
         status, recovered, headers = copy_object(scoped, opened)
 
@@ -272,13 +293,59 @@ def test_real_http_streams_tree_selected_object_outside_gate_buffer(tmp_path):
         assert scoped.method == "GET" and scoped.headers == ()
 
 
+def test_real_http_direct_object_put_is_create_only_and_hash_checked(tmp_path):
+    body = b"one directly established closed pile\0" * 20_000
+    oid = h(body)
+    corrupt_oid = h(b"different logical object")
+    collision_body = b"correct occupied object" * 20_000
+    collision_oid = h(collision_body)
+    with serving(tmp_path) as (url, peer, workspace, clock, _packs):
+        opened = ObjectOpen("PUT", oid, len(body))
+        first = open_object(url, peer, workspace, clock, opened)
+        second = open_object(url, peer, workspace, clock, opened)
+
+        assert perform(first, body=io.BytesIO(body))[0] == 201
+        assert perform(second, body=io.BytesIO(body))[0] == 204
+        with open(object_path(peer, workspace, oid), "rb") as source:
+            assert source.read() == body
+
+        wrong_hash = open_object(
+            url, peer, workspace, clock,
+            ObjectOpen("PUT", corrupt_oid, len(body)))
+        assert perform(wrong_hash, body=io.BytesIO(body))[0] == 400
+        assert not os.path.exists(object_path(
+            peer, workspace, corrupt_oid))
+
+        corrupt_path = object_path(peer, workspace, collision_oid)
+        os.makedirs(os.path.dirname(corrupt_path), exist_ok=True)
+        with open(corrupt_path, "wb") as target:
+            target.write(b"x" * len(collision_body))
+        collision = open_object(
+            url, peer, workspace, clock,
+            ObjectOpen("PUT", collision_oid, len(collision_body)))
+        assert perform(
+            collision, body=io.BytesIO(collision_body))[0] == 409
+        with open(corrupt_path, "rb") as source:
+            assert source.read() == b"x" * len(collision_body)
+        assert object_temp_paths(peer, workspace) == ()
+
+        # The former buffered mutation is gone, including for small bodies.
+        assert request(
+            url,
+            "PUT",
+            f"/{object_key(h(b'old route'))}?ws={workspace}",
+            body=b"old route",
+            headers=bearer(peer, workspace, clock),
+        )[0] == 404
+
+
 def test_object_ticket_cannot_widen_key_method_size_or_lifetime(tmp_path):
     body = b"bounded direct object"
     oid = h(body)
     with serving(tmp_path, ttl_ms=50) \
             as (url, peer, workspace, clock, _packs):
         peer.store(workspace).put_if_absent(object_key(oid), body)
-        opened = ObjectOpen(oid, len(body))
+        opened = ObjectOpen("GET", oid, len(body))
         scoped = open_object(url, peer, workspace, clock, opened)
         parsed = urlsplit(scoped.url)
         path = parsed.path + "?" + parsed.query
@@ -292,11 +359,48 @@ def test_object_ticket_cannot_widen_key_method_size_or_lifetime(tmp_path):
 
         smaller = open_object(
             url, peer, workspace, clock,
-            ObjectOpen(oid, len(body) - 1))
+            ObjectOpen("GET", oid, len(body) - 1))
         assert perform(smaller)[0] == 413
 
         clock.value += 50
         assert perform(scoped)[0] == 403
+
+
+def test_object_put_ticket_requires_push_exact_length_and_fresh_scope(tmp_path):
+    body = b"exact object PUT ticket"
+    oid = h(body)
+    with serving(tmp_path, ttl_ms=50) \
+            as (url, peer, workspace, clock, _packs):
+        opened = ObjectOpen("PUT", oid, len(body))
+        status, _, _ = request(
+            url,
+            "POST",
+            f"/obj/open?ws={workspace}",
+            body=encode_object_open(opened),
+            headers=bearer(
+                peer, workspace, clock, peer_capability.READ_ONLY),
+        )
+        assert status == 401
+
+        scoped = open_object(url, peer, workspace, clock, opened)
+        assert perform(
+            scoped,
+            body=body,
+            headers={"content-length": str(len(body) - 1)},
+        )[0] == 403
+        parsed = urlsplit(scoped.url)
+        widened = parsed.path.replace(oid, h(b"another object")) \
+            + "?" + parsed.query
+        assert request(
+            f"{parsed.scheme}://{parsed.netloc}",
+            "PUT",
+            widened,
+            body=body,
+            headers=dict(scoped.headers),
+        )[0] == 403
+        clock.value += 50
+        assert perform(scoped, body=body)[0] == 403
+        assert not os.path.exists(object_path(peer, workspace, oid))
 
 
 def test_opening_the_95_mib_ceiling_allocates_only_control_metadata(tmp_path):
@@ -314,8 +418,12 @@ def test_opening_the_95_mib_ceiling_allocates_only_control_metadata(tmp_path):
 
         direct = open_object(
             url, peer, workspace, clock,
-            ObjectOpen(oid, MAX_PACK_BYTES))
-        assert direct.method == "GET" and direct.headers == ()
+            ObjectOpen("PUT", oid, MAX_DIRECT_OBJECT_BYTES))
+        assert direct.method == "PUT"
+        assert dict(direct.headers) == {
+            "content-length": str(MAX_DIRECT_OBJECT_BYTES),
+            "if-none-match": "*",
+        }
         assert len(direct.url) < 512
         assert not os.path.exists(object_path(peer, workspace, oid))
 
@@ -463,6 +571,123 @@ def test_interrupted_put_removes_same_directory_temporary_file(tmp_path):
 
         assert temp_paths(peer, workspace) == ()
         assert not os.path.exists(pack_path(peer, workspace, oid))
+
+
+def test_interrupted_object_put_removes_same_directory_temporary_file(
+        tmp_path):
+    size = 4 * STREAM_CHUNK_BYTES
+    oid = h(b"object body that will never be sent")
+    with serving(tmp_path) as (url, peer, workspace, clock, _packs):
+        scoped = open_object(
+            url, peer, workspace, clock,
+            ObjectOpen("PUT", oid, size))
+        parsed = urlsplit(scoped.url)
+        sock = socket.create_connection(
+            (parsed.hostname, parsed.port), timeout=5)
+        request_head = (
+            f"PUT {parsed.path}?{parsed.query} HTTP/1.1\r\n"
+            f"Host: {parsed.netloc}\r\n"
+            f"Content-Length: {size}\r\n"
+            "If-None-Match: *\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(request_head + b"partial")
+        sock.shutdown(socket.SHUT_WR)
+        while sock.recv(4096):
+            pass
+        sock.close()
+
+        assert object_temp_paths(peer, workspace) == ()
+        assert not os.path.exists(object_path(peer, workspace, oid))
+
+
+def test_lost_object_put_ack_reconciles_through_exact_direct_get(tmp_path):
+    body = b"x" * (MAX_OBJECT_BYTES + 1)
+    oid = h(body)
+    with serving(tmp_path) as (url, peer, workspace, clock, service):
+        clock.value = time.time_ns() // 1_000_000
+        finish = service._finish
+        lost = True
+
+        def lose_first_created(handler, status, *, length=0, headers=()):
+            nonlocal lost
+            if lost and status == 201:
+                lost = False
+                handler.close_connection = True
+                handler.connection.shutdown(socket.SHUT_RDWR)
+                handler.connection.close()
+                return None
+            return finish(
+                handler, status, length=length, headers=headers)
+
+        service._finish = lose_first_created
+        client = Peer(peer, workspace, url)
+        client.cache.update({
+            "sync_profile": peer_capability.FULL,
+            "token": make_token(
+                SECRET,
+                peer.member_for(workspace),
+                workspace,
+                capability=peer_capability.FULL,
+                issued_at=clock(),
+                ttl_ms=60_000,
+            ),
+        })
+        remote = RemoteStore(client)
+        result = asyncio.run(ensure_pile_async(remote, oid, body))
+
+        assert result is EXISTS
+        assert not lost
+        with open(object_path(peer, workspace, oid), "rb") as source:
+            assert source.read() == body
+
+
+def test_direct_object_put_never_follows_provider_redirect():
+    paths = []
+
+    class Redirect(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_PUT(self):
+            paths.append(self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(307)
+            self.send_header("Content-Length", "0")
+            self.send_header("Location", "/redirected")
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = b"must not be redirected"
+        oid = h(body)
+        host, port = server.server_address[:2]
+        expires = int(time.time() * 1000) + 10_000
+        scoped = ScopedRequest(
+            "PUT",
+            f"http://{host}:{port}/{object_key(oid)}?ticket=exact",
+            (
+                ("content-length", str(len(body))),
+                ("if-none-match", "*"),
+            ),
+            expires,
+        )
+        peer = object.__new__(Peer)
+        peer._http = lambda *_args, **_kwargs: (
+            200, encode_scoped_request(scoped), {})
+
+        with pytest.raises(ValueError, match="HTTP 307"):
+            peer.put_obj(oid, body)
+        assert paths == [f"/{object_key(oid)}?ticket=exact"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
 
 
 def test_independent_service_never_collects_another_upload_temp(tmp_path):

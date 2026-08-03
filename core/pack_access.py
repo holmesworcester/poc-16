@@ -22,7 +22,7 @@ from .limits import (
 from .shape import valid_fid
 
 
-OBJECT_OPEN_FORMAT = "poc16-object-open-v1"
+OBJECT_OPEN_FORMAT = "poc16-object-open-v2"
 PACK_OPEN_FORMAT = "poc16-pack-open-v1"
 SCOPED_REQUEST_FORMAT = "poc16-scoped-request-v1"
 OBJECT_PREFIX = "obj"
@@ -62,14 +62,21 @@ def _bounded_ascii(value, maximum, *, allow_empty=False, allow_space=True):
 
 @dataclass(frozen=True, slots=True)
 class ObjectOpen:
-    """One content-addressed object GET with an explicit receiver ceiling."""
+    """One whole content-addressed object operation.
 
+    ``object_bytes`` is the receiver ceiling for GET and the exact request
+    length for create-only PUT.  Both operations address the same immutable
+    object; the method changes authority and transfer direction, not format.
+    """
+
+    method: str
     oid: str
-    max_bytes: int
+    object_bytes: int
 
     def __post_init__(self):
-        if not valid_fid(self.oid) or type(self.max_bytes) is not int \
-                or not 1 <= self.max_bytes <= MAX_DIRECT_OBJECT_BYTES:
+        if self.method not in _METHODS or not valid_fid(self.oid) \
+                or type(self.object_bytes) is not int \
+                or not 1 <= self.object_bytes <= MAX_DIRECT_OBJECT_BYTES:
             raise InvalidPackAccess("object OPEN")
 
 
@@ -161,7 +168,8 @@ def object_open_document(value):
         raise InvalidPackAccess("object OPEN")
     return {
         "format": OBJECT_OPEN_FORMAT,
-        "max_bytes": value.max_bytes,
+        "method": value.method,
+        "object_bytes": value.object_bytes,
         "oid": value.oid,
     }
 
@@ -228,10 +236,11 @@ def decode_object_open(raw):
     value = _decode(raw, MAX_OBJECT_OPEN_BYTES, "object OPEN")
     try:
         if not isinstance(value, dict) or set(value) != {
-                "format", "max_bytes", "oid"} \
+                "format", "method", "object_bytes", "oid"} \
                 or value.get("format") != OBJECT_OPEN_FORMAT:
             raise ValueError("object OPEN shape")
-        result = ObjectOpen(value["oid"], value["max_bytes"])
+        result = ObjectOpen(
+            value["method"], value["oid"], value["object_bytes"])
         if object_open_document(result) != value:
             raise ValueError("object OPEN shape")
         return result
@@ -325,12 +334,12 @@ def confine_scoped_request(
 
 def confine_object_request(
         opened, scoped, trusted_now, *, max_ttl_ms=MAX_SCOPED_TTL_MS):
-    """Confine an issuer result to one read-only content-addressed object."""
+    """Confine an issuer result to one whole content-addressed object."""
     if not isinstance(opened, ObjectOpen) \
             or not isinstance(scoped, ScopedRequest) \
             or type(trusted_now) is not int \
             or type(max_ttl_ms) is not int or max_ttl_ms <= 0 \
-            or scoped.method != "GET" \
+            or scoped.method != opened.method \
             or not trusted_now < scoped.expires_at_ms \
             <= trusted_now + max_ttl_ms:
         raise InvalidPackAccess("scoped object request binding")
@@ -338,9 +347,14 @@ def confine_object_request(
         path = urlsplit(scoped.url).path
     except ValueError as error:
         raise InvalidPackAccess("scoped object request binding") from error
+    headers = dict(scoped.headers)
     if not path.endswith("/" + object_key(opened.oid)) \
-            or "range" in dict(scoped.headers):
+            or "range" in headers or "content-range" in headers:
         raise InvalidPackAccess("scoped object request key")
+    if opened.method == "PUT" and (
+            headers.get("content-length") != str(opened.object_bytes)
+            or headers.get("if-none-match") != "*"):
+        raise InvalidPackAccess("scoped object create-only PUT")
     return scoped
 
 
@@ -421,7 +435,8 @@ def copy_pack_get(opened, status, headers, chunks, write):
 
 def copy_object_get(opened, status, headers, chunks, write):
     """Verify and stream one bounded, content-addressed ordinary HTTP GET."""
-    if not isinstance(opened, ObjectOpen) or type(status) is not int \
+    if not isinstance(opened, ObjectOpen) or opened.method != "GET" \
+            or type(status) is not int \
             or not callable(write) or status != 200:
         raise InvalidPackAccess("object GET response")
     raw_length = _response_header(headers, "content-length")
@@ -431,7 +446,7 @@ def copy_object_get(opened, status, headers, chunks, write):
         expected_bytes = int(raw_length)
     except (TypeError, ValueError) as error:
         raise InvalidPackAccess("object GET response metadata") from error
-    if expected_bytes < 0 or expected_bytes > opened.max_bytes \
+    if expected_bytes < 0 or expected_bytes > opened.object_bytes \
             or str(expected_bytes) != raw_length:
         raise InvalidPackAccess("object GET response metadata")
 

@@ -324,6 +324,20 @@ class RemoteStore:
             write=write,
         )
 
+    async def has(self, key):
+        if not key.startswith("obj/"):
+            raise TypeError("remote existence probe is object-only")
+        try:
+            return await self.get_bounded(key, MAX_OBJECT_BYTES) is not None
+        except PayloadTooLarge:
+            # Signed heads and tree pages are always buffered objects.  A
+            # large value at their claimed address is not an established top.
+            return False
+        except Exception as error:
+            if getattr(error, "code", None) == 404:
+                return False
+            raise
+
     async def fetch_writer_piles(self, workspace, device, rows):
         """Use this HTTP source's optional layout without changing authority.
 

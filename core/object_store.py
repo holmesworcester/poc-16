@@ -241,6 +241,8 @@ class ObjectStore(Protocol):
     def copy_pile_object(
             self, oid: str, max_bytes: int, write) -> int | None: ...
 
+    def has(self, key: str) -> bool: ...
+
     def read_versioned(self, key: str) -> Versioned | Absent: ...
 
     def put_if_absent(
@@ -262,6 +264,8 @@ class AsyncObjectStore(Protocol):
 
     async def copy_pile_object(
             self, oid: str, max_bytes: int, write) -> int | None: ...
+
+    async def has(self, key: str) -> bool: ...
 
     async def read_versioned(self, key: str) -> Versioned | Absent: ...
 
@@ -292,6 +296,9 @@ class SyncStoreAdapter:
 
     async def copy_pile_object(self, oid, max_bytes, write):
         return self.store.copy_pile_object(oid, max_bytes, write)
+
+    async def has(self, key):
+        return self.store.has(key)
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)

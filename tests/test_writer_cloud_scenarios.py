@@ -277,6 +277,7 @@ async def publish(kind, tmp_path, root, specs, label):
 
     expected = CostVector(
         slot_gets=len(specs),
+        object_gets=len(specs),
         object_puts=3 * len(specs),
         slot_cas=len(specs),
         write_bytes=immutable_bytes + sum(map(len, slot_bytes.values())),
@@ -386,6 +387,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
     changed_publication = run.cloud.snapshot()
     assert changed_publication == CostVector(
         slot_gets=1,
+        object_gets=1,
         object_puts=3,
         slot_cas=1,
         read_bytes=len(old_slot_bytes),
@@ -393,6 +395,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
     )
     assert provider_counts(kind, run.bucket, history) == {
         "get": 1,
+        "head": 1,
         "put": 4,
     }
 
@@ -441,6 +444,9 @@ class ReadBarrierStore:
 
     async def get_bounded(self, key, maximum):
         return await self.store.get_bounded(key, maximum)
+
+    async def has(self, key):
+        return await self.store.has(key)
 
     async def read_versioned(self, key):
         value = await self.store.read_versioned(key)
@@ -512,11 +518,12 @@ async def race_scenario(kind, tmp_path, root, specs):
     candidate_slots = tuple(encode_slot(outcome.slot) for outcome in outcomes)
     assert contention == CostVector(
         slot_gets=2,
+        object_gets=2,
         slot_cas=2,
         read_bytes=2 * len(initial_slot),
         write_bytes=sum(map(len, candidate_slots)),
     )
-    assert contention.object_gets == 0
+    assert contention.read_bytes == 2 * len(initial_slot)
 
     winner = statuses.index("applied")
     loser = 1 - winner
@@ -554,7 +561,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     rebase = run.cloud.snapshot()
     assert rebase == CostVector(
         slot_gets=1,
-        object_gets=1,
+        object_gets=2,
         object_puts=3,
         slot_cas=1,
         read_bytes=len(old_slot) + loser_pile_bytes,

@@ -23,9 +23,9 @@ from core.crypto import h, unseal
 from core.limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
-    MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
 )
+from core.pack_access import MAX_OBJECT_OPEN_BYTES
 from core.repository_reader import RepositoryReader
 from facts.auth import request
 from full_peer import walk as walk_module
@@ -602,12 +602,27 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
 
         token, _ = mint(
             direct, workspace, pile, identity_secret)
-        oversized = (
+        retired_put = (
             f"PUT /obj/{h(b'never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
-            f"Content-Length: {MAX_OBJECT_BYTES + 1}\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        retired_results = [
+            raw_call(target, retired_put) for target in paths
+        ]
+        assert retired_results[1:] == \
+            retired_results[:1] * (len(retired_results) - 1)
+        assert retired_results[0][0] == 404
+
+        oversized = (
+            "POST /obj/open?"
+            f"ws={workspace} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            f"Content-Length: {MAX_OBJECT_OPEN_BYTES + 1}\r\n"
             "Connection: close\r\n\r\n"
         ).encode()
         oversized_results = [
@@ -620,7 +635,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, _ = mint(
             through_iroh[0], workspace, pile, identity_secret)
         malformed = (
-            f"PUT /obj/{h(b'malformed never lands')}?"
+            "POST /obj/open?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"

@@ -425,8 +425,10 @@ helpers may be widened to 95 MiB. Whole GETs stream to a sink and verify
 declared size and object or pack hash before acceptance. Exact range GETs are
 bounded by one signed pile, require exact HTTP range/length metadata, and
 verify the tree-selected pile OID, workspace/device signature, and ordinary
-closed-pile judgment. PUTs are immutable/create-only, and the layout page is
-CASed only after the pack is established.
+closed-pile judgment. Object and pack PUTs are immutable/create-only and use
+the same small OPEN-to-ordinary-HTTP split at every size; there is no buffered
+`PUT /obj/<oid>` fallback. A writer head or layout page is CASed only after
+every object it advertises is established.
 
 This is an unavoidable storage tradeoff rather than a protocol ambiguity. One
 ever-growing object minimizes cold GET count but rewrites the writer's entire

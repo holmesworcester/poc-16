@@ -353,8 +353,8 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
     headers = {"Authorization": "Bearer " + token}
     object_oid = h(b"virtual maximum ordinary object")
     opened_object = ObjectOpen(
-        object_oid, limits.MAX_DIRECT_OBJECT_BYTES)
-    assert opened_object.max_bytes > runtime.MAX_OBJECT_BYTES
+        "GET", object_oid, limits.MAX_DIRECT_OBJECT_BYTES)
+    assert opened_object.object_bytes > runtime.MAX_OBJECT_BYTES
     unauthorized = run(service.fetch(Request(
         "POST",
         f"https://worker.example/obj/open?ws={workspace}",
@@ -435,6 +435,29 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
         {"onlyIf": {"If-None-Match": "*"}, "sha256": oid},
     )]
 
+    object_put = ObjectOpen(
+        "PUT", object_oid, limits.MAX_DIRECT_OBJECT_BYTES)
+    object_request = runtime.Settings.from_env(environment).issue_packs(
+        lambda: 100).open_object(
+            h(b"upload broker member"), object_put, 100)
+    object_body = SentinelPackBody()
+    direct_object = Request(
+        "PUT",
+        object_request.url,
+        headers=dict(object_request.headers),
+        stream=object_body,
+    )
+    object_stored = run(service.fetch(direct_object))
+
+    assert object_stored.status == 201
+    assert direct_object.body is object_body \
+        and direct_object.bytes_calls == 0
+    assert pack_bucket.pack_puts[-1] == (
+        f"{environment.STORE_PREFIX}/obj/{object_oid}",
+        object_body,
+        {"onlyIf": {"If-None-Match": "*"}, "sha256": object_oid},
+    )
+
 
 def test_deployed_entry_confines_a_widened_object_issuer(
         tmp_path, monkeypatch):
@@ -443,7 +466,7 @@ def test_deployed_entry_confines_a_widened_object_issuer(
     pack_bucket = PackBucket(bucket.data)
     environment.BUCKET = pack_bucket
     opened = ObjectOpen(
-        h(b"confined object"), limits.MAX_DIRECT_OBJECT_BYTES)
+        "GET", h(b"confined object"), limits.MAX_DIRECT_OBJECT_BYTES)
     token = make_token(
         b"s" * runtime.EDGE_SECRET_BYTES,
         h(b"object reader"),
@@ -843,8 +866,9 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
             sys.executable,
             "-c",
             "from deploy.cloudflare_pack.issuer import R2PackIssuer; "
-            "import deploy.cloudflare_pack.put; "
-            "assert callable(R2PackIssuer.open_object)",
+            "from deploy.cloudflare_pack.put import R2ImmutablePut; "
+            "assert callable(R2PackIssuer.open_object); "
+            "assert callable(R2ImmutablePut.handle)",
         ],
         cwd=staged,
         env={**os.environ, "PYTHONPATH": str(staged)},

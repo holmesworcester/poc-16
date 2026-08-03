@@ -131,9 +131,9 @@ def _checksum(oid):
 
 def _headers(opened, config):
     values = {}
-    if isinstance(opened, PackOpen) and opened.method == "PUT":
+    if _method(opened) == "PUT":
         values.update({
-            "content-length": str(opened.pack_bytes),
+            "content-length": str(_body_bytes(opened)),
             "content-type": PACK_CONTENT_TYPE,
             "if-none-match": "*",
             "x-amz-checksum-sha256": _checksum(opened.oid),
@@ -171,7 +171,7 @@ def _params(opened, binding, headers):
         return params
     params.update({
         "ChecksumSHA256": values["x-amz-checksum-sha256"],
-        "ContentLength": opened.pack_bytes,
+        "ContentLength": _body_bytes(opened),
         "ContentType": PACK_CONTENT_TYPE,
         "IfNoneMatch": "*",
     })
@@ -192,7 +192,15 @@ def _expected_target(endpoint, bucket, key):
 
 
 def _method(opened):
-    return "GET" if isinstance(opened, ObjectOpen) else opened.method
+    return opened.method
+
+
+def _body_bytes(opened):
+    if isinstance(opened, ObjectOpen):
+        return opened.object_bytes
+    if isinstance(opened, PackOpen):
+        return opened.pack_bytes
+    raise TypeError("AWS S3 direct request")
 
 
 def _inspect(url, opened, binding, client, headers, trusted_now):
@@ -299,7 +307,7 @@ class S3PackIssuer:
         return self._open(member, opened, trusted_now)
 
     def open_object(self, member, opened, trusted_now):
-        """Issue one read-only ``ObjectOpen`` for direct S3 transfer."""
+        """Issue one whole ``ObjectOpen`` for direct S3 transfer."""
         if not isinstance(opened, ObjectOpen):
             raise ValueError("authorized S3 object request")
         return self._open(member, opened, trusted_now)
