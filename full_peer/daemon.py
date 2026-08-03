@@ -18,7 +18,7 @@ import facts
 
 from core.limits import MAX_CONTROL_BYTES, PayloadTooLarge, decode_json
 from core.http_stdlib import HttpGateOptions
-from core.http_stdlib import handler_for as peer_handler_for
+from .pack_http import handler_for as peer_handler_for
 
 from . import status
 from .iroh_forwarders import IrohForwarders
