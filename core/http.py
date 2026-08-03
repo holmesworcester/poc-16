@@ -42,6 +42,12 @@ from .object_store import (
     Versioned,
     ensure_object_async,
 )
+from .pack_access import (
+    MAX_PACK_OPEN_BYTES,
+    confine_scoped_request,
+    decode_pack_open,
+    encode_scoped_request,
+)
 from .writer_head import (
     MAX_HEAD_SLOT_BYTES,
     decode_slot,
@@ -101,6 +107,7 @@ class HttpGate:
             *, sync_profile=peer_capability.READ_ONLY,
             mirror=None,
             mint_authorize=None,
+            pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
             max_root_bytes=MAX_ROOT_BYTES,
             max_object_bytes=MAX_OBJECT_BYTES,
@@ -120,6 +127,9 @@ class HttpGate:
         self.receiver = receiver
         self.mirror = mirror
         self.mint_authorize = mint_authorize
+        if pack_open is not None and not callable(pack_open):
+            raise ValueError("pack OPEN issuer")
+        self.pack_open = pack_open
         self.secret, self.now = secret, now
         if sync_profile is not None \
                 and not peer_capability.known(sync_profile):
@@ -339,6 +349,40 @@ class HttpGate:
             return Response(503)
         return self._json(200, values)
 
+    async def _open_pack(self, body, headers, trusted_now):
+        """Authorize one bounded pack request; body bytes bypass this gate."""
+        if self.pack_open is None:
+            return Response(405)
+        if not isinstance(body, bytes) or len(body) > min(
+                self.max_request_bytes, MAX_PACK_OPEN_BYTES):
+            return Response(413)
+        try:
+            opened = decode_pack_open(body)
+        except PayloadTooLarge:
+            return Response(413)
+        except ValueError:
+            return Response(400)
+        member = self._member(
+            headers, trusted_now, require_push=opened.method == "PUT")
+        if not member:
+            return Response(401)
+        try:
+            if inspect.iscoroutinefunction(self.pack_open):
+                scoped = await self.pack_open(member, opened, trusted_now)
+            else:
+                scoped = await asyncio.to_thread(
+                    self.pack_open, member, opened, trusted_now)
+                if inspect.isawaitable(scoped):
+                    scoped = await scoped
+            scoped = confine_scoped_request(opened, scoped, trusted_now)
+            response = encode_scoped_request(scoped)
+        except Exception:
+            return Response(503)
+        return Response(200, response, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        })
+
     async def _heads(self, query):
         """Return one bounded page of atomically opened writer slots.
 
@@ -505,6 +549,8 @@ class HttpGate:
             return MAX_PAGE_REQUEST_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES
+        if method == "POST" and path == "/pack/open":
+            return MAX_PACK_OPEN_BYTES
         if method == "PUT" and path.startswith("/obj/"):
             return MAX_OBJECT_BYTES
         if method == "PUT" and path.startswith("/mirror/"):
@@ -551,6 +597,10 @@ class HttpGate:
                     "Cache-Control": "no-store",
                     "Content-Type": "application/octet-stream",
                 })
+        if path == "/pack/open":
+            if method != "POST":
+                return Response(405)
+            return await self._open_pack(body, headers, trusted_now)
         if path.startswith("/ctl"):
             return Response(405)
         if method == "PUT" and (
