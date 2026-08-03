@@ -3,7 +3,7 @@ import time
 
 from core.pack_access import PackOpen, ScopedRequest, pack_key
 from core.shape import valid_fid
-from deploy.cloudflare_upload.signer import R2SigV4
+from deploy.cloudflare_sigv4 import R2SigV4
 
 from .contract import R2PackTarget, ticket_query, ticket_secret
 

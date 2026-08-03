@@ -50,6 +50,7 @@ REMOVE_ORDER = tuple(reversed(ROLE_ORDER))
 BROKER_CORE_MODULES = UPLOAD_BROKER_CORE_MODULES
 BROKER_DEPLOY_MODULES = (
     "__init__.py",
+    "cloudflare_sigv4.py",
     "repository_apply_wire.py",
     "upload_broker.py",
     "upload_broker_http.py",
@@ -303,6 +304,7 @@ def _verify_broker_bundle(directory):
         "deploy/upload_broker.py",
         "deploy/upload_broker_http.py",
         "deploy/upload_keyring.py",
+        "deploy/cloudflare_sigv4.py",
         "deploy/cloudflare_upload/reader.py",
         "deploy/cloudflare_upload/signer.py",
     }

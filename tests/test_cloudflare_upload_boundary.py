@@ -477,6 +477,7 @@ def test_build_dry_runs_both_exact_generated_worker_configs(
                 "deploy/upload_broker.py",
                 "deploy/upload_broker_http.py",
                 "deploy/upload_keyring.py",
+                "deploy/cloudflare_sigv4.py",
                 "deploy/cloudflare_upload/reader.py",
                 "deploy/cloudflare_upload/signer.py",
                 "python_modules/nacl/_sodium.fake.so"):
@@ -528,6 +529,7 @@ def test_stage_broker_is_db_free_and_uses_shared_reader_sources(
             "facts/auth/request.py",
             "deploy/upload_broker.py",
             "deploy/upload_broker_http.py",
+            "deploy/cloudflare_sigv4.py",
             "deploy/cloudflare_upload/reader.py",
             "deploy/cloudflare_upload/signer.py"):
         assert (staged / relative).is_file()

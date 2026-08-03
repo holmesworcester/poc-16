@@ -1,19 +1,21 @@
 """Cloudflare Worker boundary, package, and deployment-command tests."""
 import asyncio
 import base64
+import importlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 import pytest
 
 import facts
 
-from core import limits
+from core import limits, peer_capability
 from core.object_store import MAX_STORE_PREFIX_BYTES
 from core.close import encode_pile
 from core.crypto import (
@@ -22,10 +24,20 @@ from core.crypto import (
     seal_to as native_seal,
     unseal as native_unseal,
 )
+from core.grants import make_token
+from core.pack_access import (
+    MAX_PACK_BYTES,
+    MAX_SCOPED_TTL_MS,
+    PackOpen,
+    decode_scoped_request,
+    encode_pack_open,
+)
 from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import REPOSITORY_READER_CORE_MODULES
 from facts.auth import request as request_fact
+
+TEST_PACK_TTL_SECONDS = 30
 
 
 class R2Object:
@@ -106,6 +118,54 @@ class Stream:
         return self.reader
 
 
+class SentinelPackBody:
+    """A virtual maximum-size body that Python must never inspect."""
+
+    async def arrayBuffer(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack PUT called arrayBuffer")
+
+    def getReader(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack PUT entered bounded body reader")
+
+    def __iter__(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack PUT iterated request body")
+
+    def __bytes__(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack PUT copied request body")
+
+
+class PackBucket(Bucket):
+    def __init__(self, data):
+        super().__init__(data)
+        self.pack_puts = []
+
+    async def put(self, key, value, **options):
+        self.pack_puts.append((key, value, options))
+        return SimpleNamespace(key=key)
+
+
+def deployed_entry(monkeypatch, environment):
+    workers = ModuleType("workers")
+
+    class WorkerEntrypoint:
+        pass
+
+    class WorkerResponse:
+        def __init__(self, body, *, status, headers):
+            self.body = body
+            self.status = status
+            self.headers = dict(headers)
+
+    workers.WorkerEntrypoint = WorkerEntrypoint
+    workers.Response = WorkerResponse
+    monkeypatch.setitem(sys.modules, "workers", workers)
+    sys.modules.pop("deploy.cloudflare_worker.entry", None)
+    entry = importlib.import_module("deploy.cloudflare_worker.entry")
+    service = entry.Default()
+    service.env = environment
+    return service
+
+
 def run(awaitable):
     return asyncio.run(awaitable)
 
@@ -115,7 +175,7 @@ def worker_world(tmp_path, monkeypatch):
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
     pile = encode_pile(request_fact.payload(
-        node, workspace, "sync", now + 60_000, now))
+        node, workspace, "sync", now + runtime.MAX_GRANT_TTL_MS, now))
     prefix = f"workspaces/{workspace}"
     store = node.store(workspace)
     bucket = Bucket({
@@ -126,7 +186,17 @@ def worker_world(tmp_path, monkeypatch):
         BUCKET=bucket,
         WORKSPACE=workspace,
         STORE_PREFIX=prefix,
-        GRANT_SECRET=base64.b64encode(b"s" * 32).decode(),
+        GRANT_SECRET=base64.b64encode(
+            b"s" * runtime.EDGE_SECRET_BYTES).decode(),
+        R2_ENDPOINT=(
+            "https://" + "c" * 32 + ".r2.cloudflarestorage.com"),
+        PACK_BUCKET="poc16-packs",
+        PACK_PUT_ENDPOINT="https://worker.example",
+        PACK_TTL_SECONDS=TEST_PACK_TTL_SECONDS,
+        PACK_TICKET_SECRET=base64.b64encode(
+            b"p" * runtime.EDGE_SECRET_BYTES).decode(),
+        R2_ACCESS_KEY_ID="worker-access-key",
+        R2_SECRET_ACCESS_KEY="worker-secret-key",
         **runtime._BUDGETS,
     )
     monkeypatch.setattr(runtime, "now_ms", lambda: now)
@@ -163,6 +233,117 @@ def test_runtime_mints_and_reads_through_only_the_direct_r2_binding(
     assert root.headers["Cache-Control"] == "no-store"
     assert root.headers["X-Content-Type-Options"] == "nosniff"
     assert {call[0] for call in bucket.calls} <= {"get", "head"}
+
+
+def test_deployed_entry_issues_exact_gets_and_streams_native_pack_put(
+        tmp_path, monkeypatch):
+    _, workspace, _, bucket, environment = worker_world(
+        tmp_path, monkeypatch)
+    pack_bucket = PackBucket(bucket.data)
+    environment.BUCKET = pack_bucket
+    service = deployed_entry(monkeypatch, environment)
+    # This is exactly the capability advertised by this gateway's /mint.
+    # It can open reads, but it deliberately cannot authorize pack creation.
+    assert runtime.gateway(runtime.Settings.from_env(
+        environment)).sync_profile == peer_capability.READ_ONLY
+    member = h(b"pack reader")
+    token = make_token(
+        b"s" * runtime.EDGE_SECRET_BYTES,
+        member,
+        workspace,
+        capability=peer_capability.READ_ONLY,
+        issued_at=100,
+        ttl_ms=runtime.MAX_GRANT_TTL_MS,
+    )
+    headers = {"Authorization": "Bearer " + token}
+    oid = h(b"virtual maximum pack")
+    whole = PackOpen("GET", oid, MAX_PACK_BYTES)
+    ranged = PackOpen("GET", oid, MAX_PACK_BYTES, 17, 31)
+    put = PackOpen("PUT", oid, MAX_PACK_BYTES)
+
+    issued = []
+    for opened in (whole, ranged):
+        response = run(service.fetch(Request(
+            "POST",
+            f"https://worker.example/pack/open?ws={workspace}",
+            encode_pack_open(opened),
+            headers,
+        )))
+        assert response.status == 200
+        issued.append(decode_scoped_request(response.body))
+
+    denied = run(service.fetch(Request(
+        "POST",
+        f"https://worker.example/pack/open?ws={workspace}",
+        encode_pack_open(put),
+        headers,
+    )))
+    assert denied.status == 401
+
+    whole_request, range_request = issued
+    assert whole_request.method == "GET" and whole_request.headers == ()
+    assert range_request.method == "GET"
+    assert range_request.headers == (("range", "bytes=17-47"),)
+    assert urlsplit(whole_request.url).path == (
+        f"/poc16-packs/{environment.STORE_PREFIX}/pack/{oid}")
+    assert urlsplit(range_request.url).path == urlsplit(
+        whole_request.url).path
+    # Pack creation authority belongs to the upload-purpose front door. This
+    # read-only gateway deliberately cannot mint a push-capable grant.
+    put_request = runtime.Settings.from_env(environment).issue_packs(
+        lambda: 100)(h(b"upload broker member"), put, 100)
+    assert put_request.method == "PUT"
+    assert urlsplit(put_request.url).path == f"/pack/{oid}"
+
+    sentinel = SentinelPackBody()
+    direct = Request(
+        "PUT",
+        put_request.url,
+        headers=dict(put_request.headers),
+        stream=sentinel,
+    )
+    stored = run(service.fetch(direct))
+
+    assert stored.status == 201
+    assert direct.body is sentinel and direct.bytes_calls == 0
+    assert pack_bucket.pack_puts == [(
+        f"{environment.STORE_PREFIX}/pack/{oid}",
+        sentinel,
+        {"onlyIf": {"If-None-Match": "*"}, "sha256": oid},
+    )]
+
+
+@pytest.mark.parametrize(("name", "value"), (
+    ("PACK_TICKET_SECRET", "not-base64"),
+    ("R2_ACCESS_KEY_ID", "short"),
+    ("R2_SECRET_ACCESS_KEY", "short"),
+    ("R2_ENDPOINT", "http://r2.example"),
+    ("PACK_BUCKET", "Bad_Bucket"),
+    ("PACK_PUT_ENDPOINT", "http://worker.example"),
+    ("PACK_TTL_SECONDS", MAX_SCOPED_TTL_MS // 1000 + 1),
+    ("BUCKET", None),
+))
+def test_pack_bindings_fail_readiness_and_requests_shut(
+        tmp_path, monkeypatch, name, value):
+    _, _, _, bucket, environment = worker_world(tmp_path, monkeypatch)
+    setattr(environment, name, value)
+
+    response = run(runtime.handle(Request(
+        "GET", "https://worker.example/healthz"), environment))
+
+    assert response.status == 500
+    assert bucket.calls == []
+
+
+def test_missing_pack_secret_fails_readiness_shut(tmp_path, monkeypatch):
+    _, _, _, bucket, environment = worker_world(tmp_path, monkeypatch)
+    del environment.PACK_TICKET_SECRET
+
+    response = run(runtime.handle(Request(
+        "GET", "https://worker.example/healthz"), environment))
+
+    assert response.status == 500
+    assert bucket.calls == []
 
 
 def test_runtime_fails_closed_for_scope_config_and_malformed_content_length(
@@ -432,7 +613,8 @@ import sys
 import deploy.cloudflare_worker.runtime
 print(json.dumps(sorted(set(sys.modules) & {
     "fcntl", "sqlite3", "threading", "multiprocessing",
-    "adapters.s3", "adapters.r2.s3"
+    "adapters.s3", "adapters.r2.s3",
+    "deploy.upload_broker", "deploy.cloudflare_upload.signer"
 })))
 """
     result = subprocess.run(
@@ -472,14 +654,30 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
         manage.REPOSITORY / "facts" / "auth" / "request.py").read_bytes()
     assert (staged / "adapters" / "r2" / "worker.py").read_bytes() == (
         manage.REPOSITORY / "adapters" / "r2" / "worker.py").read_bytes()
+    assert (staged / "adapters" / "r2" / "reader.py").read_bytes() == (
+        manage.REPOSITORY / "adapters" / "r2" / "reader.py").read_bytes()
+    for relative in (
+            "deploy/cloudflare_sigv4.py",
+            "deploy/cloudflare_pack/contract.py",
+            "deploy/cloudflare_pack/issuer.py",
+            "deploy/cloudflare_pack/put.py"):
+        assert (staged / relative).read_bytes() == (
+            manage.REPOSITORY / relative).read_bytes()
     assert not (staged / "core" / "store.py").exists()
     assert not (staged / "core" / "node.py").exists()
     assert not (staged / "core" / "mint.py").exists()
     assert not (staged / "core" / "repository_applier.py").exists()
+    assert not (staged / "core" / "writer_repository.py").exists()
     assert not (staged / "adapters" / "r2" / "s3.py").exists()
     assert not (staged / "adapters" / "s3").exists()
+    assert not (staged / "deploy" / "aws_lambda").exists()
+    assert not (staged / "full_peer").exists()
     subprocess.run(
-        [sys.executable, "-c", "import core.http"],
+        [
+            sys.executable,
+            "-c",
+            "import deploy.cloudflare_pack.issuer, deploy.cloudflare_pack.put",
+        ],
         cwd=staged,
         env={**os.environ, "PYTHONPATH": str(staged)},
         check=True,
@@ -497,6 +695,9 @@ def test_generated_config_is_single_workspace_least_privilege():
         "CF_WORKSPACE": "a" * 64,
         "CF_R2_BUCKET": "production",
         "CF_R2_PREVIEW_BUCKET": "preview",
+        "CF_R2_ENDPOINT": (
+            "https://" + "b" * 32 + ".r2.cloudflarestorage.com"),
+        "CF_PACK_PUT_ENDPOINT": "https://gateway.example.com",
         "CF_WORKER_NAME": "gateway",
         "CF_DEPLOYMENT_OWNER": "production-primary",
         "CF_ROUTE": "gateway.example.com/*",
@@ -519,9 +720,36 @@ def test_generated_config_is_single_workspace_least_privilege():
     }]
     assert config["vars"]["WORKSPACE"] == "a" * 64
     assert config["vars"]["STORE_PREFIX"] == f"workspaces/{'a' * 64}"
+    assert config["vars"]["R2_ENDPOINT"] == environment["CF_R2_ENDPOINT"]
+    assert config["vars"]["PACK_BUCKET"] == "production"
+    assert config["vars"]["PACK_PUT_ENDPOINT"] \
+        == "https://gateway.example.com"
+    assert config["vars"]["PACK_TTL_SECONDS"] \
+        == manage.DEFAULT_PACK_TTL_SECONDS
     assert config["vars"][manage.OWNER_BINDING] == "production-primary"
-    assert config["secrets"]["required"] == ["GRANT_SECRET"]
-    assert "GRANT_SECRET" not in config["vars"]
+    assert config["secrets"]["required"] == list(manage.SECRET_NAMES)
+    assert not set(manage.SECRET_NAMES) & set(config["vars"])
+
+
+def test_deploy_secrets_are_exact_and_validated_before_wrangler():
+    environment = {
+        "GRANT_SECRET": base64.b64encode(
+            b"g" * manage.EDGE_SECRET_BYTES).decode(),
+        "PACK_TICKET_SECRET": base64.b64encode(
+            b"p" * manage.EDGE_SECRET_BYTES).decode(),
+        "R2_ACCESS_KEY_ID": "pack-reader-access",
+        "R2_SECRET_ACCESS_KEY": "pack-reader-secret",
+    }
+
+    assert manage._secrets(environment) == environment
+    for name in manage.SECRET_NAMES:
+        malformed = dict(environment)
+        malformed[name] = "bad"
+        with pytest.raises(ValueError, match=name):
+            manage._secrets(malformed)
+    malformed = dict(environment, PACK_TICKET_SECRET=object())
+    with pytest.raises(ValueError, match="PACK_TICKET_SECRET"):
+        manage._secrets(malformed)
 
 
 def test_manage_and_runtime_share_exact_store_prefix_budget(
@@ -529,6 +757,9 @@ def test_manage_and_runtime_share_exact_store_prefix_budget(
     environment = {
         "CF_WORKSPACE": "a" * 64,
         "CF_R2_BUCKET": "production",
+        "CF_R2_ENDPOINT": (
+            "https://" + "b" * 32 + ".r2.cloudflarestorage.com"),
+        "CF_PACK_PUT_ENDPOINT": "https://gateway.example.com",
         "CF_DEPLOYMENT_OWNER": "production-primary",
         "CF_ROUTE": "gateway.example.com/*",
         "CF_STORE_PREFIX": "a" * MAX_STORE_PREFIX_BYTES,
@@ -551,6 +782,7 @@ def test_manage_and_runtime_share_exact_store_prefix_budget(
 def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     config = json.loads(manage.TEMPLATE.read_text())
 
+    assert runtime.EDGE_SECRET_BYTES == manage.EDGE_SECRET_BYTES
     assert {
         name: config["vars"][name]
         for name in runtime._BUDGETS
@@ -560,18 +792,21 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     # Bao slice payloads are inline ordinary facts. Authenticated repository
     # reads apply their narrower page/fact bound at the gate call site rather
     # than shrinking this shared object-response ceiling.
-    assert runtime.MAX_OBJECT_BYTES <= limits.MAX_OBJECT_BYTES
+    assert runtime.MAX_OBJECT_BYTES == limits.MAX_OBJECT_BYTES \
+        == limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_PILE_BYTES
+    assert limits.MAX_FACT_BYTES < runtime.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
-    assert runtime.MAX_BATCH_BYTES <= limits.MAX_PAGE_BATCH_BYTES
+    assert runtime.MAX_BATCH_BYTES == limits.MAX_PAGE_BATCH_BYTES
     assert runtime.MAX_MINT_FETCHES <= limits.MAX_MINT_FETCHES
     assert runtime.MAX_MINT_FETCH_BYTES <= limits.MAX_MINT_FETCH_BYTES
-    assert runtime.MAX_OBJECT_BYTES == runtime.MAX_BATCH_BYTES \
-        == 4 * 1024 * 1024
 
 
 @pytest.mark.parametrize("field,value", [
     ("CF_WORKSPACE", "not-a-workspace"),
     ("CF_R2_BUCKET", ""),
+    ("CF_R2_ENDPOINT", "http://r2.example"),
+    ("CF_PACK_PUT_ENDPOINT", "http://gateway.example.com"),
+    ("CF_PACK_TTL_SECONDS", str(MAX_SCOPED_TTL_MS // 1000 + 1)),
     ("CF_ROUTE", ""),
     ("CF_STORE_PREFIX", "../escape"),
     ("CF_DEPLOYMENT_OWNER", "short"),
@@ -581,6 +816,9 @@ def test_generated_config_rejects_ambiguous_deployment_input(field, value):
     environment = {
         "CF_WORKSPACE": "a" * 64,
         "CF_R2_BUCKET": "production",
+        "CF_R2_ENDPOINT": (
+            "https://" + "b" * 32 + ".r2.cloudflarestorage.com"),
+        "CF_PACK_PUT_ENDPOINT": "https://gateway.example.com",
         "CF_DEPLOYMENT_OWNER": "production-primary",
         "CF_ROUTE": "gateway.example.com/*",
         field: value,
@@ -695,7 +933,7 @@ def test_deploy_and_remove_subprocesses_have_control_plane_deadlines(
     )
 
     config = deployment_config()
-    manage._deploy(config, "secret")
+    manage._deploy(config, {"secret": "value"})
     manage._delete(config)
 
     assert [options["timeout"] for _, options in calls] == [
@@ -748,7 +986,8 @@ def test_deploy_verifies_exact_owner_after_wrangle_upload(monkeypatch):
     observed = iter(("production-primary", "production-primary"))
     calls = []
     monkeypatch.setattr(manage, "generated_config", lambda: config)
-    monkeypatch.setattr(manage, "_secret", lambda environment: "secret")
+    monkeypatch.setattr(
+        manage, "_secrets", lambda environment: {"secret": "value"})
     monkeypatch.setattr(
         manage,
         "_worker_settings",
@@ -762,7 +1001,7 @@ def test_deploy_verifies_exact_owner_after_wrangle_upload(monkeypatch):
 
     manage.deploy()
 
-    assert calls == [(config, "secret")]
+    assert calls == [(config, {"secret": "value"})]
 
 
 def test_deploy_reports_post_upload_owner_mismatch(monkeypatch):
@@ -770,7 +1009,8 @@ def test_deploy_reports_post_upload_owner_mismatch(monkeypatch):
     observed = iter(("production-primary", "someone-else"))
     uploads = []
     monkeypatch.setattr(manage, "generated_config", lambda: config)
-    monkeypatch.setattr(manage, "_secret", lambda environment: "secret")
+    monkeypatch.setattr(
+        manage, "_secrets", lambda environment: {"secret": "value"})
     monkeypatch.setattr(
         manage,
         "_worker_settings",
@@ -830,8 +1070,16 @@ def smoke_environment(tmp_path, monkeypatch):
         "CF_SMOKE_MINT_FILE": str(mint),
         "CF_WORKSPACE": "a" * 64,
         "CF_R2_BUCKET": "production",
+        "CF_R2_ENDPOINT": (
+            "https://" + "b" * 32 + ".r2.cloudflarestorage.com"),
+        "CF_PACK_PUT_ENDPOINT": "https://gateway.example.com",
         "CF_DEPLOYMENT_OWNER": "smoke-owner",
-        "GRANT_SECRET": base64.b64encode(b"s" * 32).decode(),
+        "GRANT_SECRET": base64.b64encode(
+            b"s" * manage.EDGE_SECRET_BYTES).decode(),
+        "PACK_TICKET_SECRET": base64.b64encode(
+            b"p" * manage.EDGE_SECRET_BYTES).decode(),
+        "R2_ACCESS_KEY_ID": "smoke-access-key",
+        "R2_SECRET_ACCESS_KEY": "smoke-secret-key",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)

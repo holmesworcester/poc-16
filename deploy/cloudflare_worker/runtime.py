@@ -1,6 +1,6 @@
 """Cloudflare request and binding translation around the shared HttpGate."""
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from time import time_ns
 from urllib.parse import parse_qs, urlsplit
@@ -20,6 +20,9 @@ from core.limits import (
 from core.shape import valid_fid
 from core.http import HttpGate, Response
 from core.object_store import validate_store_prefix
+from deploy.cloudflare_pack.contract import R2PackTarget
+from deploy.cloudflare_pack.issuer import R2PackIssuer
+from deploy.cloudflare_pack.put import R2PackPut
 
 if __package__:
     from .crypto_compat import seal_to, unseal
@@ -37,6 +40,7 @@ MAX_MINT_FETCH_BYTES = min(
 MAX_QUERY_BYTES = 4 * 1024
 MAX_QUERY_FIELDS = 8
 MAX_GRANT_TTL_MS = 60_000
+EDGE_SECRET_BYTES = 32
 
 _BUDGETS = {
     "MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
@@ -61,7 +65,7 @@ def _crypto_self_test():
     global _CRYPTO_READY
     if _CRYPTO_READY:
         return
-    secret = load_sk("42" * 32)
+    secret = load_sk("42" * EDGE_SECRET_BYTES)
     public = secret.verify_key.encode().hex()
     message = "poc-16-cloudflare-python-compatibility"
     signature = sign(secret, message)
@@ -95,12 +99,34 @@ def _budget(env, name):
     return value
 
 
+def _integer(env, name):
+    value = _text(env, name)
+    if not value.isascii() or not value.isdecimal() \
+            or str(int(value)) != value:
+        raise ValueError(f"{name} binding")
+    return int(value)
+
+
+def _secret32(env, name):
+    try:
+        secret = base64.b64decode(_text(env, name), validate=True)
+    except (ValueError, TypeError) as error:
+        raise ValueError(f"{name} binding") from error
+    if len(secret) != EDGE_SECRET_BYTES:
+        raise ValueError(f"{name} binding")
+    return secret
+
+
 @dataclass(frozen=True)
 class Settings:
     bucket: object
     workspace: str
     prefix: str
-    secret: bytes
+    secret: bytes = field(repr=False)
+    pack_target: R2PackTarget
+    r2_access_key_id: str = field(repr=False)
+    r2_secret_access_key: str = field(repr=False)
+    pack_ticket_secret: bytes = field(repr=False)
     max_request_bytes: int
     max_root_bytes: int
     max_object_bytes: int
@@ -122,19 +148,53 @@ class Settings:
             validate_store_prefix(prefix)
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("STORE_PREFIX binding") from error
-        try:
-            secret = base64.b64decode(
-                _text(env, "GRANT_SECRET"), validate=True)
-        except (ValueError, TypeError) as error:
-            raise ValueError("GRANT_SECRET binding") from error
-        if len(secret) != 32:
-            raise ValueError("GRANT_SECRET binding")
+        bucket = getattr(env, "BUCKET")
+        secret = _secret32(env, "GRANT_SECRET")
+        ticket_secret = _secret32(env, "PACK_TICKET_SECRET")
+        target = R2PackTarget(
+            _text(env, "R2_ENDPOINT"),
+            _text(env, "PACK_BUCKET"),
+            prefix,
+            _text(env, "PACK_PUT_ENDPOINT"),
+            _integer(env, "PACK_TTL_SECONDS"),
+        )
+        access_key_id = _text(env, "R2_ACCESS_KEY_ID")
+        secret_access_key = _text(env, "R2_SECRET_ACCESS_KEY")
+        R2PackIssuer(
+            target,
+            access_key_id,
+            secret_access_key,
+            ticket_secret,
+            clock=lambda: 0,
+        )
+        R2PackPut(target, bucket, ticket_secret, clock=lambda: 0)
         return cls(
-            getattr(env, "BUCKET"),
+            bucket,
             workspace,
             prefix,
             secret,
+            target,
+            access_key_id,
+            secret_access_key,
+            ticket_secret,
             *(_budget(env, name) for name in _BUDGETS),
+        )
+
+    def issue_packs(self, clock):
+        return R2PackIssuer(
+            self.pack_target,
+            self.r2_access_key_id,
+            self.r2_secret_access_key,
+            self.pack_ticket_secret,
+            clock=clock,
+        )
+
+    def put_packs(self, clock):
+        return R2PackPut(
+            self.pack_target,
+            self.bucket,
+            self.pack_ticket_secret,
+            clock=clock,
         )
 
 
@@ -161,6 +221,7 @@ def gateway(settings, clock=None):
         settings.workspace,
         settings.secret,
         clock,
+        pack_open=settings.issue_packs(clock),
         sync_profile=peer_capability.READ_ONLY,
         max_request_bytes=settings.max_request_bytes,
         max_root_bytes=settings.max_root_bytes,
@@ -267,7 +328,7 @@ def _secured(response):
     )
 
 
-async def handle(request, env):
+async def handle(request, env, *, clock=None):
     """Translate one Workers SDK request into the shared HttpGate contract."""
     try:
         _crypto_self_test()
@@ -276,6 +337,18 @@ async def handle(request, env):
         return _secured(Response(500))
     try:
         method = _method(request)
+        url = urlsplit(str(request.url))
+    except (AttributeError, TypeError, ValueError, UnicodeError):
+        return _secured(Response(400))
+    if method == "PUT" and url.path.startswith("/pack/"):
+        try:
+            result = await settings.put_packs(
+                now_ms if clock is None else clock).handle(request)
+            return _secured(Response(
+                result.status, result.body, dict(result.headers)))
+        except Exception:
+            return _secured(Response(500))
+    try:
         headers = _headers(request)
         length = _content_length(headers)
     except Exception:
@@ -297,12 +370,11 @@ async def handle(request, env):
             settings.max_query_bytes,
             settings.max_query_fields,
         )
-        url = urlsplit(str(request.url))
     except OverflowError:
         return _secured(Response(414))
     except (TypeError, ValueError, UnicodeError):
         return _secured(Response(400))
-    result = await gateway(settings).handle(
+    result = await gateway(settings, clock).handle(
         method,
         url.path,
         query,

@@ -23,10 +23,18 @@ if str(REPOSITORY) not in sys.path:
 from deploy.cloudflare_python import (  # noqa: E402
     patch_pynacl as patch_vendored_pynacl,
 )
+from deploy.cloudflare_pack.contract import R2PackTarget  # noqa: E402
+from deploy.cloudflare_sigv4 import (  # noqa: E402
+    ACCESS_KEY_PATTERN,
+    MAX_ACCESS_KEY_ID_CHARS,
+    MAX_SECRET_ACCESS_KEY_CHARS,
+    credential,
+)
 from deploy.python_role_modules import (  # noqa: E402
     REPOSITORY_READER_CORE_MODULES,
 )
 from core.object_store import validate_store_prefix  # noqa: E402
+from core.pack_access import MAX_SCOPED_TTL_MS  # noqa: E402
 
 BUILD = PACKAGE / "build"
 WORKER = BUILD / "worker"
@@ -43,9 +51,17 @@ OWNER = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 API_RESPONSE_BYTES = 64 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
+EDGE_SECRET_BYTES = 32
+DEFAULT_PACK_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
 _ABSENT = object()
 
 CORE_MODULES = REPOSITORY_READER_CORE_MODULES
+SECRET_NAMES = (
+    "GRANT_SECRET",
+    "PACK_TICKET_SECRET",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+)
 
 
 def _copy(source, destination):
@@ -83,7 +99,7 @@ def stage():
     )
     for name in ("__init__.py",):
         _copy(REPOSITORY / "adapters" / name, pending / "adapters" / name)
-    for name in ("__init__.py", "worker.py"):
+    for name in ("__init__.py", "reader.py", "worker.py"):
         _copy(
             REPOSITORY / "adapters" / "r2" / name,
             pending / "adapters" / "r2" / name,
@@ -91,6 +107,14 @@ def stage():
     _copy(
         REPOSITORY / "deploy" / "__init__.py",
         pending / "deploy" / "__init__.py")
+    _copy(
+        REPOSITORY / "deploy" / "cloudflare_sigv4.py",
+        pending / "deploy" / "cloudflare_sigv4.py")
+    for name in ("__init__.py", "contract.py", "issuer.py", "put.py"):
+        _copy(
+            REPOSITORY / "deploy" / "cloudflare_pack" / name,
+            pending / "deploy" / "cloudflare_pack" / name,
+        )
     if WORKER.exists():
         shutil.rmtree(WORKER)
     pending.rename(WORKER)
@@ -123,15 +147,41 @@ def _pywrangler(*arguments, capture=False, env=None, timeout=None):
     )
 
 
-def _secret(environment):
-    value = environment.get("GRANT_SECRET", "").strip()
+def _base64_secret(environment, name):
+    value = environment.get(name, "")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be base64")
+    value = value.strip()
     try:
         raw = base64.b64decode(value, validate=True)
     except (ValueError, TypeError) as error:
-        raise ValueError("GRANT_SECRET must be base64") from error
-    if len(raw) != 32:
-        raise ValueError("GRANT_SECRET must encode exactly 32 bytes")
+        raise ValueError(f"{name} must be base64") from error
+    if len(raw) != EDGE_SECRET_BYTES:
+        raise ValueError(
+            f"{name} must encode exactly {EDGE_SECRET_BYTES} bytes")
     return value
+
+
+def _secrets(environment):
+    access = credential(
+        environment.get("R2_ACCESS_KEY_ID", ""),
+        "R2_ACCESS_KEY_ID is invalid",
+        MAX_ACCESS_KEY_ID_CHARS,
+    )
+    if ACCESS_KEY_PATTERN.fullmatch(access) is None:
+        raise ValueError("R2_ACCESS_KEY_ID is invalid")
+    secret = credential(
+        environment.get("R2_SECRET_ACCESS_KEY", ""),
+        "R2_SECRET_ACCESS_KEY is invalid",
+        MAX_SECRET_ACCESS_KEY_CHARS,
+    )
+    return {
+        "GRANT_SECRET": _base64_secret(environment, "GRANT_SECRET"),
+        "PACK_TICKET_SECRET": _base64_secret(
+            environment, "PACK_TICKET_SECRET"),
+        "R2_ACCESS_KEY_ID": access,
+        "R2_SECRET_ACCESS_KEY": secret,
+    }
 
 
 def _store_prefix(value):
@@ -157,6 +207,18 @@ def generated_config(environment=os.environ, *, smoke=False):
             "CF_DEPLOYMENT_OWNER must be 8-128 identifier characters")
     prefix = _store_prefix(environment.get(
         "CF_STORE_PREFIX", f"workspaces/{workspace}").strip("/"))
+    try:
+        ttl = int(environment.get(
+            "CF_PACK_TTL_SECONDS", str(DEFAULT_PACK_TTL_SECONDS)))
+    except (TypeError, ValueError) as error:
+        raise ValueError("CF_PACK_TTL_SECONDS is invalid") from error
+    target = R2PackTarget(
+        environment.get("CF_R2_ENDPOINT"),
+        bucket,
+        prefix,
+        environment.get("CF_PACK_PUT_ENDPOINT"),
+        ttl,
+    )
     config["name"] = environment.get(
         "CF_WORKER_NAME", "poc-16-readonly-gateway")
     if not WORKER_NAME.fullmatch(config["name"]):
@@ -168,6 +230,10 @@ def generated_config(environment=os.environ, *, smoke=False):
     })
     config["vars"]["WORKSPACE"] = workspace
     config["vars"]["STORE_PREFIX"] = prefix
+    config["vars"]["R2_ENDPOINT"] = target.endpoint
+    config["vars"]["PACK_BUCKET"] = target.bucket
+    config["vars"]["PACK_PUT_ENDPOINT"] = target.put_endpoint
+    config["vars"]["PACK_TTL_SECONDS"] = target.ttl_seconds
     config["vars"][OWNER_BINDING] = owner
     if smoke:
         config["name"] = f"poc16-smoke-{os.urandom(16).hex()}"
@@ -204,7 +270,12 @@ def _verify_bundle(directory):
         "core/worker.py",
         "facts/auth/request.py",
         "adapters/r2/worker.py",
+        "adapters/r2/reader.py",
         "core/http.py",
+        "deploy/cloudflare_sigv4.py",
+        "deploy/cloudflare_pack/contract.py",
+        "deploy/cloudflare_pack/issuer.py",
+        "deploy/cloudflare_pack/put.py",
     }
     missing = required - paths
     if missing:
@@ -214,8 +285,12 @@ def _verify_bundle(directory):
         "full_peer/node.py",
         "full_peer/daemon.py",
         "core/runtime.py",
+        "core/writer_repository.py",
         "adapters/r2/s3.py",
         "adapters/s3/store.py",
+        "deploy/aws_lambda/app.py",
+        "deploy/cloudflare_upload/signer.py",
+        "deploy/upload_broker.py",
     } & paths
     if forbidden:
         raise RuntimeError(f"dry-run included host modules: {sorted(forbidden)}")
@@ -242,7 +317,12 @@ def workerd_test():
         port = listener.getsockname()[1]
     environment = {
         **os.environ,
-        "GRANT_SECRET": base64.b64encode(bytes(32)).decode(),
+        "GRANT_SECRET": base64.b64encode(
+            bytes(EDGE_SECRET_BYTES)).decode(),
+        "PACK_TICKET_SECRET": base64.b64encode(
+            b"p" * EDGE_SECRET_BYTES).decode(),
+        "R2_ACCESS_KEY_ID": "workerd-access",
+        "R2_SECRET_ACCESS_KEY": "workerd-secret",
     }
     with tempfile.NamedTemporaryFile(
             mode="w+", prefix="poc16-workerd-", suffix=".log") as log:
@@ -295,23 +375,23 @@ def test():
 
 
 def dev(extra):
-    _secret(os.environ)
+    _secrets(os.environ)
     _pywrangler("dev", *extra, env=os.environ)
 
 
 def _deploy(
-        config, secret, *, capture=False,
+        config, secret_values, *, capture=False,
         timeout=CONTROL_TIMEOUT_SECONDS):
     _write_config(config)
     with tempfile.NamedTemporaryFile(
-            mode="w", prefix="poc16-secrets-", suffix=".json") as secrets:
-        json.dump({"GRANT_SECRET": secret}, secrets)
-        secrets.flush()
+            mode="w", prefix="poc16-secrets-", suffix=".json") as pending:
+        json.dump(secret_values, pending)
+        pending.flush()
         return _pywrangler(
             "deploy",
             "--strict",
             "--config", str(GENERATED),
-            "--secrets-file", secrets.name,
+            "--secrets-file", pending.name,
             capture=capture,
             env=os.environ,
             timeout=timeout,
@@ -424,12 +504,13 @@ def _delete(
 
 
 def deploy():
+    secrets = _secrets(os.environ)
     config = generated_config()
     _preflight_deploy(
         config,
         allow_create=os.environ.get("CF_CREATE") == "1",
     )
-    _deploy(config, _secret(os.environ))
+    _deploy(config, secrets)
     _require_owned(config)
 
 
@@ -447,6 +528,7 @@ def smoke():
     if not request_path:
         raise ValueError("CF_SMOKE_MINT_FILE is required")
     request_body = Path(request_path).read_bytes()
+    secrets = _secrets(os.environ)
     config = generated_config(smoke=True)
     if _worker_settings(config) is not _ABSENT:
         raise RuntimeError("generated smoke Worker name already exists")
@@ -454,7 +536,7 @@ def smoke():
     primary = None
     try:
         attempted = True
-        result = _deploy(config, _secret(os.environ), capture=True)
+        result = _deploy(config, secrets, capture=True)
         _require_owned(config)
         print(result.stdout, end="")
         match = WORKERS_URL.search(result.stdout + result.stderr)
@@ -499,7 +581,7 @@ Commands:
   test      run host, clean dry-run, and local workerd tests
   build     create and inspect a clean pywrangler dry-run artifact
   dev       run the local Worker with its direct local R2 binding
-  deploy    deploy one configured workspace and encrypted grant secret
+  deploy    deploy one configured workspace with validated secrets
   remove    remove the configured production Worker
   smoke     opt-in live mint test using a unique, automatically removed Worker
   stage     internal custom-build hook used by Wrangler
