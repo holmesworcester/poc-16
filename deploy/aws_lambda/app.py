@@ -25,6 +25,11 @@ from deploy.aws_lambda.config import (
     SDK_TOTAL_ATTEMPTS,
     validate_sdk_budget,
 )
+from deploy.aws_lambda.pack_issuer import (
+    DEFAULT_PACK_TTL_SECONDS,
+    S3PackBinding,
+    S3PackIssuer,
+)
 from core.http import AsyncFromSyncReader, HttpGate, Response
 
 _gateway_cache = None
@@ -102,9 +107,9 @@ def _secret():
     return value
 
 
-def _store():
+def _s3_config():
     connect, read, attempts = _sdk_budget()
-    config = S3Config(
+    return S3Config(
         bucket=_required("TINYP2P_S3_BUCKET"),
         prefix=_required("TINYP2P_S3_PREFIX"),
         region_name=os.environ.get("AWS_REGION"),
@@ -118,19 +123,35 @@ def _store():
         read_total_max_attempts=attempts,
         probe_access_denied_missing=True,
     )
-    # HttpGate receives only the narrowed reader wrapper. The execution role
-    # has no S3 mutation action even though S3Store also implements publishing.
+
+
+def _store(config=None):
+    config = _s3_config() if config is None else config
+    if not isinstance(config, S3Config):
+        raise TypeError("Lambda S3 config")
+    # HttpGate receives only the narrowed reader wrapper. Pack creation is
+    # exposed separately as an exact presigned request, never as this store's
+    # general mutation methods.
     return AsyncFromSyncReader(S3Store(config))
+
+
+def _pack_issuer(config=None):
+    """Construct the metadata-only issuer; callers transfer bytes to S3."""
+    config = _s3_config() if config is None else config
+    ttl = _positive("TINYP2P_PACK_TTL_SECONDS", DEFAULT_PACK_TTL_SECONDS)
+    return S3PackIssuer(S3PackBinding(config, ttl))
 
 
 def _gateway():
     global _gateway_cache
     if _gateway_cache is None:
+        config = _s3_config()
         _gateway_cache = HttpGate(
-            _store(),
+            _store(config),
             _required("TINYP2P_WORKSPACE_ID"),
             _secret(),
             lambda: int(time.time() * 1000),
+            pack_open=_pack_issuer(config).open,
             max_request_bytes=_positive(
                 "TINYP2P_MAX_REQUEST_BYTES", 512 * 1024),
             max_root_bytes=_positive(

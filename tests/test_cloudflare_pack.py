@@ -1,0 +1,356 @@
+"""R2 pack data plane streams bytes and attenuates every operation exactly."""
+import asyncio
+from dataclasses import dataclass
+import hashlib
+import hmac
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from core.crypto import h
+from core.limits import MAX_PILE_BYTES
+from core.pack_access import (
+    MAX_PACK_BYTES,
+    MAX_SCOPED_TTL_MS,
+    PackOpen,
+    confine_scoped_request,
+)
+from deploy.cloudflare_pack import (
+    R2PackIssuer,
+    R2PackPut,
+    R2PackTarget,
+)
+
+
+NOW = 1_800_000_000_000
+MEMBER = h(b"member")
+OID = h(b"pack payload")
+OTHER = h(b"other pack")
+ACCESS = "a" * 32
+SECRET = "b" * 64
+TICKET_SECRET = b"t" * 32
+PREFIX = "repositories/" + h(b"workspace")
+TICKET_DOMAIN = b"poc16-r2-pack-put-v1\0"
+
+
+def target(**changes):
+    values = {
+        "endpoint": "https://" + "c" * 32 + ".r2.cloudflarestorage.com",
+        "bucket": "poc16-packs",
+        "prefix": PREFIX,
+        "put_endpoint": "https://packs.example.com",
+        "ttl_seconds": 30,
+    }
+    values.update(changes)
+    return R2PackTarget(**values)
+
+
+def issuer(candidate=None):
+    return R2PackIssuer(
+        target() if candidate is None else candidate,
+        ACCESS,
+        SECRET,
+        TICKET_SECRET,
+        clock=lambda: NOW,
+    )
+
+
+def _ticket_url(oid, pack_bytes, expires_at_ms):
+    message = TICKET_DOMAIN + b"\0".join((
+        oid.encode("ascii"),
+        str(pack_bytes).encode("ascii"),
+        str(expires_at_ms).encode("ascii"),
+    ))
+    signature = hmac.new(
+        TICKET_SECRET, message, hashlib.sha256).hexdigest()
+    return (
+        f"{target().put_endpoint}/pack/{oid}"
+        f"?expires_at_ms={expires_at_ms}&pack_bytes={pack_bytes}"
+        f"&signature={signature}"
+    )
+
+
+class ProviderFailure(Exception):
+    def __init__(self, status):
+        super().__init__(f"provider status {status}")
+        self.status = status
+
+
+class SentinelStream:
+    """Virtual body: tests can model 95 MiB without allocating or reading it."""
+
+    def __init__(self, size, digest=OID, failure=None):
+        self.size = size
+        self.digest = digest
+        self.failure = failure
+
+    async def arrayBuffer(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack route buffered request.body")
+
+    def getReader(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack route read request.body")
+
+    def __iter__(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack route iterated request.body")
+
+    def __bytes__(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack route copied request.body")
+
+
+@dataclass
+class FakeRequest:
+    method: str
+    url: str
+    headers: object
+    body: object
+
+    async def arrayBuffer(self):  # pragma: no cover - failure is the assertion
+        raise AssertionError("pack route buffered Request")
+
+
+class FakeR2:
+    """The native binding consumes the stream outside the Python route."""
+
+    def __init__(self):
+        self.objects = {}
+        self.calls = []
+
+    async def put(self, key, value, **options):
+        self.calls.append((key, value, options))
+        assert options["onlyIf"] == {"If-None-Match": "*"}
+        if key in self.objects:
+            return None
+        if value.failure is not None:
+            raise value.failure
+        if options["sha256"] != value.digest:
+            raise ProviderFailure(400)
+        self.objects[key] = (value.size, value.digest)
+        return SimpleNamespace(key=key)
+
+
+def request_for(scoped, body, **changes):
+    values = {
+        "method": scoped.method,
+        "url": scoped.url,
+        "headers": dict(scoped.headers),
+        "body": body,
+    }
+    values.update(changes)
+    return FakeRequest(**values)
+
+
+def run(route, request):
+    return asyncio.run(route.handle(request))
+
+
+def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
+    whole = PackOpen("GET", OID, MAX_PACK_BYTES)
+    ranged = PackOpen(
+        "GET",
+        OID,
+        MAX_PACK_BYTES,
+        MAX_PACK_BYTES - MAX_PILE_BYTES,
+        MAX_PILE_BYTES,
+    )
+    issued = issuer()
+
+    whole_request = issued(MEMBER, whole, NOW)
+    range_request = issued(MEMBER, ranged, NOW)
+
+    assert confine_scoped_request(whole, whole_request, NOW) is whole_request
+    assert confine_scoped_request(ranged, range_request, NOW) is range_request
+    expected_path = f"/poc16-packs/{PREFIX}/pack/{OID}"
+    assert urlsplit(whole_request.url).path == expected_path
+    assert urlsplit(range_request.url).path == expected_path
+    assert whole_request.headers == ()
+    assert range_request.headers == ((
+        "range",
+        f"bytes={MAX_PACK_BYTES - MAX_PILE_BYTES}-{MAX_PACK_BYTES - 1}",
+    ),)
+    assert parse_qs(urlsplit(whole_request.url).query)[
+        "X-Amz-SignedHeaders"] == ["host"]
+    assert parse_qs(urlsplit(range_request.url).query)[
+        "X-Amz-SignedHeaders"] == ["host;range"]
+    assert NOW < whole_request.expires_at_ms <= NOW + 30_000
+    assert NOW < range_request.expires_at_ms <= NOW + 30_000
+
+
+@pytest.mark.parametrize("pack_bytes", (1, MAX_PACK_BYTES))
+def test_exact_put_boundaries_stream_one_body_identity_to_native_r2(pack_bytes):
+    opened = PackOpen("PUT", OID, pack_bytes)
+    scoped = issuer()(MEMBER, opened, NOW)
+    assert confine_scoped_request(opened, scoped, NOW) is scoped
+    body = SentinelStream(pack_bytes)
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    response = run(route, request_for(scoped, body))
+
+    assert response.status == 201
+    assert response.body == b""
+    assert dict(response.headers) == {
+        "cache-control": "no-store",
+        "content-length": "0",
+    }
+    assert bucket.calls == [(
+        f"{PREFIX}/pack/{OID}",
+        body,
+        {"onlyIf": {"If-None-Match": "*"}, "sha256": OID},
+    )]
+    assert bucket.objects == {
+        f"{PREFIX}/pack/{OID}": (pack_bytes, OID)}
+
+
+def test_one_over_is_rejected_before_r2_sees_the_stream():
+    oversized = MAX_PACK_BYTES + 1
+    request = FakeRequest(
+        "PUT",
+        _ticket_url(OID, oversized, NOW + 30_000),
+        {"content-length": str(oversized), "if-none-match": "*"},
+        SentinelStream(oversized),
+    )
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    assert run(route, request).status == 413
+    assert bucket.calls == []
+    assert bucket.objects == {}
+
+
+def test_create_collision_does_not_consume_or_replace_existing_pack():
+    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    existing = (7, OID)
+    bucket = FakeR2()
+    bucket.objects[f"{PREFIX}/pack/{OID}"] = existing
+    body = SentinelStream(7, failure=AssertionError(
+        "conditional failure must precede stream consumption"))
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    assert run(route, request_for(scoped, body)).status == 412
+    assert bucket.objects[f"{PREFIX}/pack/{OID}"] is existing
+    assert bucket.calls[0][1] is body
+
+
+@pytest.mark.parametrize(("body", "expected"), (
+    (SentinelStream(7, OTHER), 400),
+    (SentinelStream(7, failure=RuntimeError("interrupted stream")), 503),
+    (SentinelStream(7, failure=ProviderFailure(422)), 400),
+    (SentinelStream(7, failure=ProviderFailure(412)), 412),
+))
+def test_checksum_interruption_and_provider_errors_never_create_a_pack(
+        body, expected):
+    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    assert run(route, request_for(scoped, body)).status == expected
+    assert bucket.objects == {}
+    assert bucket.calls[0][1] is body
+
+
+def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
+    opened = PackOpen("PUT", OID, 7)
+    scoped = issuer()(MEMBER, opened, NOW)
+    body = SentinelStream(7)
+    bucket = FakeR2()
+
+    expired = R2PackPut(
+        target(), bucket, TICKET_SECRET,
+        clock=lambda: scoped.expires_at_ms,
+    )
+    assert run(expired, request_for(scoped, body)).status == 403
+
+    too_long = FakeRequest(
+        "PUT",
+        _ticket_url(OID, 7, NOW + MAX_SCOPED_TTL_MS + 1),
+        {"content-length": "7", "if-none-match": "*"},
+        body,
+    )
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+    assert run(route, too_long).status == 403
+    assert bucket.calls == []
+
+
+@pytest.mark.parametrize("mutate", (
+    lambda url: url + "&extra=1",
+    lambda url: url.replace("expires_at_ms=", "pack_bytes=7&expires_at_ms="),
+    lambda url: url.replace("pack_bytes=7", "pack_bytes=8"),
+    lambda url: url.replace("signature=", "signature=0"),
+    lambda url: url.replace(f"/pack/{OID}", f"/pack/{OTHER}"),
+    lambda url: url.replace(
+        "https://packs.example.com", "https://other.example.com"),
+))
+def test_ticket_cannot_widen_key_size_origin_or_query(mutate):
+    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+    request = request_for(scoped, SentinelStream(7), url=mutate(scoped.url))
+
+    assert run(route, request).status == 403
+    assert bucket.calls == []
+
+
+@pytest.mark.parametrize("headers", (
+    {"content-length": "6", "if-none-match": "*"},
+    {"content-length": "07", "if-none-match": "*"},
+    {"content-length": "7"},
+    {"content-length": "7", "if-none-match": "anything"},
+    {"content-length": "7", "if-none-match": "*", "range": "bytes=0-6"},
+    {"content-length": "7", "if-none-match": "*", "content-range": "bytes 0-6/7"},
+))
+def test_native_route_rejects_every_header_widening(headers):
+    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    request = request_for(scoped, SentinelStream(7), headers=headers)
+    assert run(route, request).status == 400
+    assert bucket.calls == []
+
+
+def test_native_route_rejects_wrong_method_missing_body_and_bad_clock():
+    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    bucket = FakeR2()
+    route = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: NOW)
+
+    assert run(route, request_for(
+        scoped, SentinelStream(7), method="GET")).status == 405
+    assert run(route, request_for(scoped, None)).status == 400
+    bad_clock = R2PackPut(
+        target(), bucket, TICKET_SECRET, clock=lambda: True)
+    assert run(bad_clock, request_for(scoped, SentinelStream(7))).status == 503
+    assert bucket.calls == []
+
+
+@pytest.mark.parametrize("changes", (
+    {"endpoint": "http://example.com"},
+    {"put_endpoint": "https://packs.example.com/path"},
+    {"bucket": "Bad_Bucket"},
+    {"prefix": "/absolute"},
+    {"ttl_seconds": 0},
+    {"ttl_seconds": MAX_SCOPED_TTL_MS // 1000 + 1},
+))
+def test_target_rejects_ambiguous_or_wider_provider_scope(changes):
+    with pytest.raises(ValueError):
+        target(**changes)
+
+
+def test_issuer_rejects_wrong_member_and_preserves_url_fragment_rule():
+    opened = PackOpen("GET", OID, 7)
+    with pytest.raises(ValueError):
+        issuer()("not-a-member", opened, NOW)
+    with pytest.raises(ValueError):
+        R2PackIssuer(target(), ACCESS, SECRET, b"short", clock=lambda: NOW)
+
+    scoped = issuer()(MEMBER, opened, NOW)
+    parsed = urlsplit(scoped.url)
+    assert parsed.fragment == ""

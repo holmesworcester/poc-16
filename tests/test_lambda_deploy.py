@@ -309,6 +309,8 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
         tmp_path, monkeypatch):
     node, workspace, _, _ = world(tmp_path)
     calls = []
+    config = S3Config(
+        "test-bucket", "tenant", region_name="us-west-2")
 
     class Secrets:
         def get_secret_value(self, **request):
@@ -325,9 +327,13 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
     monkeypatch.setitem(sys.modules, "boto3", Boto)
     monkeypatch.setattr(
         app, "_botocore_config", lambda: "bounded-botocore")
+    monkeypatch.setattr(app, "_s3_config", lambda: config)
     monkeypatch.setattr(
         app, "_store",
-        lambda: AsyncFromSyncReader(node.store(workspace)))
+        lambda value: AsyncFromSyncReader(node.store(workspace)))
+    monkeypatch.setattr(
+        app, "_pack_issuer",
+        lambda value: SimpleNamespace(open=lambda *_args: None))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
     monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "stable-secret")
     app._gateway_cache = None
@@ -385,6 +391,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     assert (staged / "adapters" / "s3" / "store.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "app.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "config.py").is_file()
+    assert (staged / "deploy" / "aws_lambda" / "pack_issuer.py").is_file()
     assert (staged / "deploy" / "aws_lambda" / "sdk_smoke.py").is_file()
     assert (
         staged / "deploy" / "aws_lambda" / "s3_bucket_policy.py").is_file()
@@ -418,7 +425,7 @@ def test_lambda_stage_is_an_explicit_importable_allowlist(tmp_path):
     )
 
 
-def test_lambda_template_is_read_only_bounded_and_reproducible():
+def test_lambda_template_is_bounded_and_pack_writes_are_exactly_scoped():
     template = (LAMBDA / "template.yaml").read_text()
     requirements = (LAMBDA / "requirements.txt").read_text()
 
@@ -429,13 +436,19 @@ def test_lambda_template_is_read_only_bounded_and_reproducible():
     assert "CodeUri: stage/" in template
     assert "secretsmanager:GetSecretValue" in template
     assert "s3:GetObject" in template
-    assert "s3:PutObject" not in template
+    assert template.count("Action: s3:PutObject") == 1
     assert "s3:DeleteObject" not in template
     assert "Action: s3:ListBucket" in template
     assert "s3:prefix:" in template
     assert '${StorePrefix}/root' in template
     assert '${StorePrefix}/obj/*' in template
     assert '${StorePrefix}/invite/*' in template
+    assert template.count('${Prefix}/pack/*') == 2
+    assert "s3:authType: REST-QUERY-STRING" in template
+    assert "s3:signatureversion: AWS4-HMAC-SHA256" in template
+    assert 's3:if-none-match: "false"' in template
+    assert "s3:signatureAge: 60000" in template
+    assert 'TINYP2P_PACK_TTL_SECONDS: "60"' in template
     assert "MetricName: Url5xxCount" in template
     assert "MetricName: Errors" not in template
     assert "AlarmActions: !If" in template
@@ -555,6 +568,10 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
         for statement in document["Statement"])
     assert statements["RequireImmutableObjectCreate"]["Condition"] == {
         "Null": {"s3:if-none-match": "true"}}
+    assert statements["RequireImmutableObjectCreate"]["Resource"] == [
+        "arn:aws:s3:::workspace-bucket/tenant/obj/*",
+        "arn:aws:s3:::workspace-bucket/tenant/pack/*",
+    ]
     assert statements["RequireRootCompareAndSwap"]["Condition"] == {
         "Null": {
             "s3:if-match": "true",

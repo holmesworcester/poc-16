@@ -16,6 +16,7 @@ REPOSITORY_READER_CORE_MODULES = (
     "limits.py",
     "merkle_map.py",
     "object_store.py",
+    "pack_access.py",
     "peer_capability.py",
     "repository_reader.py",
     "repository_snapshot.py",
@@ -24,6 +25,8 @@ REPOSITORY_READER_CORE_MODULES = (
     "suppression.py",
     "validated_set.py",
     "worker.py",
+    "writer_head.py",
+    "writer_tree.py",
 )
 
 UPLOAD_BROKER_CORE_MODULES = (

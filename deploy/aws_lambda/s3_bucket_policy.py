@@ -53,6 +53,7 @@ def policy(
     bucket_arn = f"arn:{partition}:s3:::{bucket}"
     root = f"{bucket_arn}/{prefix}/root"
     objects = f"{bucket_arn}/{prefix}/obj/*"
+    packs = f"{bucket_arn}/{prefix}/pack/*"
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -92,7 +93,7 @@ def policy(
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": "s3:PutObject",
-                "Resource": objects,
+                "Resource": [objects, packs],
                 "Condition": {"Null": {"s3:if-none-match": "true"}},
             },
             {

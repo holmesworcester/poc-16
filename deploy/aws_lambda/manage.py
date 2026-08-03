@@ -50,6 +50,7 @@ FILES = (
     "deploy/aws_lambda/__init__.py",
     "deploy/aws_lambda/app.py",
     "deploy/aws_lambda/config.py",
+    "deploy/aws_lambda/pack_issuer.py",
     "deploy/aws_lambda/sdk_smoke.py",
     "deploy/aws_lambda/s3_bucket_policy.py",
 )
@@ -335,6 +336,7 @@ def bucket_policy(args):
 def test(_args):
     _run([
         "python3", "-m", "pytest", "-q",
+        "tests/test_aws_pack_issuer.py",
         "tests/test_lambda_deploy.py",
         "tests/test_gateway.py",
         "tests/test_s3_adapter.py",

@@ -107,6 +107,34 @@ Resources:
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
+              - Sid: ReadImmutablePacksByScopedRequest
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  NumericLessThanEquals:
+                    s3:signatureAge: 60000
+                  StringEquals:
+                    s3:authType: REST-QUERY-STRING
+                    s3:signatureversion: AWS4-HMAC-SHA256
+              - Sid: CreateImmutablePacksByScopedRequest
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+                  NumericLessThanEquals:
+                    s3:signatureAge: 60000
+                  StringEquals:
+                    s3:authType: REST-QUERY-STRING
+                    s3:signatureversion: AWS4-HMAC-SHA256
               - Sid: ReadGrantSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -116,6 +144,13 @@ Resources:
                 - Sid: DecryptWorkspaceObjects
                   Effect: Allow
                   Action: kms:Decrypt
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasKmsKey
+                - Sid: CreateEncryptedWriterPacks
+                  Effect: Allow
+                  Action: kms:GenerateDataKey
                   Resource: !Ref KmsKeyArn
                 - !Ref AWS::NoValue
               - Sid: WriteFunctionLogs
@@ -168,6 +203,7 @@ Resources:
           TINYP2P_MINT_MAX_FETCHES: "128"
           TINYP2P_MINT_MAX_FETCH_BYTES: "4194304"
           TINYP2P_GRANT_TTL: "60000"
+          TINYP2P_PACK_TTL_SECONDS: "60"
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
