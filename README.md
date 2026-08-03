@@ -1,11 +1,11 @@
 # tiny p2p, POC-16
 
-> **Architecture transition:** [`DESIGN.md`](DESIGN.md) now specifies the
-> accepted per-device writer-log and shared head-directory target tracked by
-> `poc-16-iq2`. The running code and operational instructions below still
-> describe the predecessor workspace-wide content root until
-> `poc-16-iq2.9` completes its one-way cutover. Do not read target-design
-> statements as current deployment claims.
+> **Architecture transition:** [`DESIGN.md`](DESIGN.md) specifies the accepted
+> per-device writer-log and shared head-directory target tracked by
+> `poc-16-iq2`. FullPeer authoring and sync already use that writer forest;
+> hosted mint, direct-upload, and notification instructions below still use
+> the predecessor workspace-wide content root until `poc-16-iq2.9` completes
+> its one-way cutover.
 
 POC-16 is a fact-DAG repository with one storage format and one receiving
 algorithm across a full peer, AWS Lambda, and a Cloudflare Worker. A hosted
@@ -14,23 +14,20 @@ disposable full-client query and authorship accelerator.
 
 The implementation is deliberately strict about authority and direction:
 
-- `RepositoryApplier` is the only fact-pile-to-root capability. It is
-  database-free and owns closed-pile validation, immutable establishment, and
-  the root CAS. It never deletes ingress.
-- `RepositoryReader` is a pinned, database-free, side-effect-free read
-  capability.
-- `HttpGate` is the one peer route and authorization capability over those
-  database-free repository capabilities.
-- `PileSender` is the only close/encode/delivery capability. It may use the
-  full peer's disposable SQL projection and local identities.
-- `FullPeer` composes all of the above for a stateful local peer; its receiving
-  side still invokes `RepositoryApplier`.
+- `WriterLog` signs independently closed pile leaves and appends them to one
+  device tree; `OpaqueHeadGate` advances only that device's slot.
+- `RepositoryMirror` authenticates heads, inclusions, and complete piles;
+  `FactConsumer` admits their durable facts to an optional local projection.
+- `PileSender` is the full peer's SQL-permitted close/sign boundary. Its normal
+  send path publishes through `WriterLog`, not `RepositoryApplier`.
+- `FullPeer` composes that writer core with identity, scheduling, attachment
+  I/O, and disposable SQL.
+- `RepositoryApplier`, `RepositoryReader`, and global-root `HttpGate` routes
+  remain in hosted predecessor paths until the one-way cutover deletes them.
 
-A hosted peer needs `RepositoryApplier`, `RepositoryReader`, and `HttpGate`.
-A full peer adds `PileSender`, local identity, scheduling, control, attachment
-I/O, and disposable SQL. There is no second receiving path. A provider may
-place its read/signing broker and Applier in separate least-privilege
-processes or stacks without creating another repository state machine.
+Hosted and full peers will share the writer core. During this split transition,
+the provider direct-upload and notification sections describe the remaining
+global-root services; they are not a second target receiving design.
 
 ## Read the code in this order
 
@@ -207,26 +204,24 @@ daemon configuration cannot mix plain remote URLs with Iroh peer records.
 
 ## Repository flow
 
-An authored unit follows one path:
+An ordinary FullPeer-authored unit follows this running path:
 
 ```text
 facts command
-    -> PileSender closes dependencies and encodes one fact-only {ws,facts} pile
-    -> RepositoryApplier reads one exact create-only source key
-    -> kernel judges the exact closed pile
-    -> pure compiler path-copies FactTree, SuppTree, and FactOrder
-    -> immutable objects are conditionally established
-    -> one CAS advances root
-    -> applied, noop, rejected, or retryable result
-    -> RepositoryReader pins the resulting root
+    -> PileSender closes dependencies and signs one canonical pile
+    -> WriterLog verifies the exact closure and appends one Merkle leaf
+    -> immutable pile, tree pages, and signed head are established
+    -> a discarded authority pile authorizes one device-slot CAS
+    -> RepositoryMirror and FactConsumer repeat validation
+    -> disposable SQL projects the accepted durable facts
 ```
 
-The exact key and digest identify one delivery attempt; they do not grant
-admission. Root-CAS losers retry from the newer root, and a lost CAS response
-is reconciled by reading the root. Repeating an already-applied pile returns
-an idempotent result. The source remains immutable staging for provider
-retention, so concurrent workers have no destructive ingress action to race.
-One bad pile cannot wedge a later exact request.
+Each writer has one CAS slot, so different writers commute. Same-writer losers
+rebase on the newer signed head, and lost responses are reconciled by rereading
+that slot. P2P sync lists slots, runs RBSR only for changed roots, and transfers
+complete closed leaves. Hosted direct upload still follows the predecessor
+exact-ingress/global-root flow documented later and is removed by
+`poc-16-iq2.9`.
 
 ## Mobile notifications
 
@@ -1043,11 +1038,10 @@ python3 -m deploy.aws_notifications.manage remove \
 
 ## Current performance status
 
-The honest `PileSender -> RepositoryApplier -> RepositoryReader` benchmark
-path uses incremental snapshot extension. Each exact pile updates affected
-Fact, Order, and Suppression routes and establishes immutable pages
-immediately; it does not rebuild a client database or replay the full fact
-corpus on every commit.
+The current P2P benchmark measures `WriterLog -> RepositoryMirror ->
+FactConsumer`: listed heads, changed-tree RBSR, exact pile transfer, and full
+receiver validation. It does not count the hosted predecessor root compiler
+as part of writer-forest throughput.
 
 No 50k/200k fact-rate or file-throughput number is asserted here until the
 benchmark is rerun. The corresponding bead requires facts/s at both sizes and

@@ -106,7 +106,9 @@ def test_writer_log_target_is_not_claimed_as_running_before_cutover():
     assert "accepted target architecture" in documents["DESIGN.md"]
     assert "Current `main` still implements the predecessor" \
         in documents["DESIGN.md"]
-    assert "running code and operational instructions below still describe" \
+    assert "FullPeer authoring and sync already use that writer forest" \
+        in documents["README.md"]
+    assert "hosted mint, direct-upload, and notification instructions below" \
         in documents["README.md"]
     assert "Do not deepen the predecessor's global-root assumptions" \
         in documents["AGENTS.md"]

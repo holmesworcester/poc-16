@@ -62,33 +62,34 @@ git status --short
 
 ## Current transition capabilities
 
-The predecessor below still pushes ordinary piles into recipient storage. That
-behavior is not target push semantics and must disappear at `poc-16-iq2.9`:
-writers publish closed-pile leaves to their own trees, consumers pull them, and
-only discarded condition evaluations are pushed. Do not preserve the current
-PileSender-to-Applier route as a second target publication algorithm.
+FullPeer authoring and sync already use per-device writer trees. Hosted direct
+upload, minting, and notification discovery still use the predecessor global
+content root and must disappear at `poc-16-iq2.9`: writers publish closed-pile
+leaves to their own trees, consumers pull them, and only discarded condition
+evaluations are pushed. Do not preserve hosted pile-to-Applier delivery as a
+second target publication algorithm.
 
 Authority flows from the database-free core into an optional stateful peer
 composition:
 
-- `RepositoryApplier` is database-free. It validates one closed pile, unions
-  every durable fact into the validated set, establishes immutable objects,
-  compiles and compare-and-swaps `root`, and returns one bounded exact result.
-  It never deletes ingress.
-- `RepositoryReader` is database-free and side-effect free. It answers from
-  one pinned root through `WorkerView` and `ValidatedView`.
-- `HttpGate` is database-free and owns the one peer route and authorization
-  table over Applier and Reader.
-- `PileSender` may use SQLite. It closes local intent, encodes ordinary piles,
-  uploads each exact pile, and directly asks the recipient to apply that key.
-  It cannot publish a root or delete ingress.
+- `WriterLog` signs closed piles and builds one device's tree; `OpaqueHeadGate`
+  performs the sole mechanical CAS of that device's slot.
+- `RepositoryMirror` verifies heads, inclusions, and complete pile closures.
+  `FactConsumer` is its optional validated-fact sink.
+- `PileSender` may use SQLite to close local intent. Its normal `send` path
+  publishes through the local device's `WriterLog`; it does not invoke
+  `RepositoryApplier`.
+- `RepositoryApplier`, `RepositoryReader`, and their global `root` remain only
+  in hosted predecessor and small authority-repository paths pending
+  `poc-16-iq2.9`.
+- `HttpGate` temporarily exposes both the writer-forest routes and those
+  predecessor hosted routes. The latter must be deleted, not generalized.
 
-A hosted peer uses Applier, Reader, and HttpGate. `FullPeer` adds PileSender,
-local identities, scheduling, local control, attachment I/O, and the
-disposable SQL projection. Its receiving side still invokes Applier. A
-metadata broker is a Reader plus a provider signer, not another validation
-door. Never add a second pile-to-root path, provider-specific compiler, SQL
-publication path, or authority membrane.
+`FullPeer` composes WriterLog, RepositoryMirror, FactConsumer, PileSender,
+local identities, scheduling, local control, attachment I/O, and disposable
+SQL. Hosted deployments have not completed that cutover. Never add a second
+writer-tree path, provider-specific compiler, SQL publication path, or
+authority membrane.
 
 Read implementation authority in this order:
 
@@ -219,10 +220,13 @@ delete ingress, mint from unobserved state, or corrupt a Merkle tree.
 
 ## Change rules
 
-- Inbound piles enter through `RepositoryApplier`.
-- Outbound piles enter through `PileSender`.
-- Sync compares `fid -> object_oid`, assembles fresh closures from immutable
-  refs and Needs, and receives them through the ordinary Applier.
+- FullPeer-authored piles enter its device's `WriterLog` through `PileSender`.
+- Pulled piles enter through `RepositoryMirror` and `FactConsumer`; every
+  receiver repeats signed-pile and closure validation.
+- Hosted predecessor uploads still enter `RepositoryApplier` until
+  `poc-16-iq2.9` replaces and deletes that path.
+- Sync compares per-device heads, runs RBSR only for changed writer trees, and
+  transfers their independently closed pile leaves.
 - Provider adapters translate storage, events, budgets, and deployment
   configuration only.
 - Iroh carries opaque HTTP bytes only. Endpoint identity, tickets, ALPN,

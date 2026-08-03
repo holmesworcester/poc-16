@@ -6,7 +6,7 @@ from core.kernel import drain, resolve_deps
 
 
 class PileSender:
-    """Close local intent and deliver it to a recipient's shared Applier."""
+    """Close local intent and publish it through this device's writer log."""
 
     def __init__(self, node, workspace):
         self.node = node
