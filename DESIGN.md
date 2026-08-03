@@ -401,6 +401,23 @@ one page are sorted, nonoverlapping, wholly inside that window, and may leave
 holes. A hole means "fetch the normal pile object," not deletion. Pack bodies
 never cross writer or layout-window boundaries.
 
+Large pack bytes use a control/data split. The common gate handles one small,
+authenticated `PackOpen` value bound to method, pack OID, declared bytes, and
+an optional exact range. It returns a short-lived `ScopedRequest` containing an
+ordinary HTTP URL and required headers. S3 and R2 normally point that request
+at provider object HTTP; FullPeer points it at a same-origin streaming route,
+which Iroh may carry unchanged. The client performs the returned ordinary HTTP
+request in every composition.
+
+Neither `ObjectStore.get_bounded`, the four/five-MiB semantic-object limits,
+`HttpGate.Response`, Lambda response bodies, nor Worker buffered-body helpers
+may be widened to 95 MiB. Whole GETs stream to a sink and verify declared size
+and pack hash before acceptance. Exact range GETs are bounded by one signed
+pile, require exact HTTP range/length metadata, and verify the tree-selected
+pile OID, workspace/device signature, and ordinary closed-pile judgment. PUTs
+are immutable/create-only, and the layout page is CASed only after the pack is
+established.
+
 This is an unavoidable storage tradeoff rather than a protocol ambiguity. One
 ever-growing object minimizes cold GET count but rewrites the writer's entire
 history on each append. One immutable object per pile writes each byte once but

@@ -27,9 +27,12 @@ fixed-window layout pages may map contiguous leaf ranges to immutable concat
 packs, but they are locators rather than log authority. Every pile is signed
 directly by its publishing writer device. The pile signature authenticates the
 portable pile; the device-signed writer head and Merkle inclusion path
-authenticate its place
-in that device's tree. A cold receiver must validate the pile signature, head,
-inclusion, and complete pile without an adjacent leaf or prior cache state.
+authenticate its place in that device's tree. A cold receiver must validate
+the pile signature, head, inclusion, and complete pile without an adjacent leaf
+or prior cache state.
+Large pack bodies must not widen `ObjectStore.get_bounded`, semantic-object
+limits, or buffered `HttpGate` responses. The common gate may mint one bounded
+exact HTTP request; S3/R2 transfer directly and FullPeer streams the same route.
 
 Cloud publication is owner-confined: a device may populate and advance only
 its own registered writer log, and hosted storage does not validate those
