@@ -26,11 +26,40 @@ from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import resolve_deps
-from core.writer_repository import FactConsumer
+from core.writer_repository import FactConsumer, HeadGrant
 from full_peer.node import FullPeer, now_ms
 
 
 _FIXTURE_SIGNER = load_sk("01" * 32)
+
+
+def mechanical_head_authorizer(workspace, authority_root, trusted_now=0):
+    """Test-only semantic bypass for exercising the mechanical head CAS.
+
+    Authority behavior is covered through ``AuthorityRepository`` tests. Lower
+    writer-tree/store tests need only a typed grant that preserves the exact
+    request's device, base, and proposed head without retaining the retired
+    production AuthorityGate.
+    """
+    async def authorize(raw, proposed_head):
+        pile = decode_signed_pile(raw, workspace=workspace)
+        requests = [fact for fact in pile.facts if fact.t == "head_request"]
+        if len(requests) != 1:
+            return None
+        request = requests[0]
+        body = request.body
+        if pile.writer != body.get("device") \
+                or body.get("head") != proposed_head \
+                or body.get("exp", -1) < trusted_now:
+            return None
+        return HeadGrant(
+            workspace,
+            body["device"],
+            body.get("base_head") or None,
+            proposed_head,
+            authority_root,
+        )
+    return authorize
 
 
 def signed_pile_bytes(facts, *, workspace=None, secret=None):

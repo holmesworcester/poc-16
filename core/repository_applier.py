@@ -124,6 +124,17 @@ class RepositoryApplier:
         source = await self._stage(member, raw)
         return await self.apply_exact(self.store, source, h(raw))
 
+    async def apply_pile(self, raw):
+        """Apply one exact in-hand pile without manufacturing ingress state."""
+        if not isinstance(raw, bytes) or len(raw) > MAX_BUFFERED_PILE_BYTES:
+            return ApplyResult("rejected", None)
+        try:
+            check_pile_bounds(raw)
+            facts_by_fid, admitted = self._validated_facts(raw)
+        except (InvalidEncoding, PayloadTooLarge, PermanentIngressRejection):
+            return ApplyResult("rejected", None)
+        return await self._apply_validated(facts_by_fid, admitted)
+
     async def _extend_snapshot(self, root_bytes, facts_by_fid):
         """Compile through one awaited page path and immediate immutables."""
         async def fetch(oid):
@@ -193,7 +204,10 @@ class RepositoryApplier:
             facts_by_fid, admitted = self._validated_facts(raw)
         except PermanentIngressRejection:
             return ApplyResult("rejected", None)
+        return await self._apply_validated(facts_by_fid, admitted)
 
+    async def _apply_validated(self, facts_by_fid, admitted):
+        """Join one already-judged durable set through the sole root CAS."""
         versioned = await self.store.read_versioned(self.root_key)
         if versioned is ABSENT:
             base_root, base_token = None, ABSENT
@@ -218,6 +232,14 @@ class RepositoryApplier:
                     or current.value != base_root:
                 return ApplyResult("retryable", base_root, admitted)
             return ApplyResult("noop", compiled.root, admitted)
+
+        # A directory slot records the content hash of the exact authority
+        # view used to authorize it.  Preserve root bytes under that address
+        # before advertising them through the mutable register, just as the
+        # compiler preserves every page the root names.  Provider version
+        # tokens remain separate opaque CAS capabilities.
+        await ensure_object_async(
+            self.store, h(compiled.root), compiled.root)
 
         try:
             result = await self.store.cas(

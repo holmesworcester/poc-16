@@ -24,13 +24,13 @@ from core.writer_head import (
     make_head,
 )
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     HeadGrant,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from core.writer_tree import EMPTY_TREE, append_piles
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
@@ -103,12 +103,12 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
         proof = proof_for(
             secret, public, root, device_signature,
             device, prepared.head_oid)
-        authority = AuthorityGate(
-            root.fid, authority_root, lambda: 10)
         writer_gate = OpaqueHeadGate(
-            writer_store, authority.authorize)
+            writer_store,
+            mechanical_head_authorizer(root.fid, authority_root, 10))
         cloud_gate = OpaqueHeadGate(
-            cloud_store, authority.authorize)
+            cloud_store,
+            mechanical_head_authorizer(root.fid, authority_root, 10))
 
         assert (await writer_gate.advance(
             proof, prepared.head_oid)).status == "applied"
@@ -185,13 +185,12 @@ def test_cloud_can_store_bad_owner_content_but_consumer_rejects_it(tmp_path):
         forged_head = h(b"missing opaque head")
         proof = proof_for(
             secret, public, root, device_signature, device, forged_head)
-        authority = AuthorityGate(
-            root.fid, authority_root, lambda: 10)
-
         # The cloud validates only the authority pile and exact slot binding;
         # it never opens the advertised content object.
         result = await OpaqueHeadGate(
-            cloud, authority.authorize).advance(proof, forged_head)
+            cloud,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10)).advance(proof, forged_head)
         assert result.status == "applied"
 
         consumer = FactConsumer(root.fid)
@@ -322,8 +321,8 @@ def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
         await log.establish(update)
         gate = OpaqueHeadGate(
             source,
-            AuthorityGate(
-                root.fid, h(b"authority"), lambda: 10).authorize,
+            mechanical_head_authorizer(
+                root.fid, h(b"authority"), 10),
         )
         await gate.advance(
             proof_for(

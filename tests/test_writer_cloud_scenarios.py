@@ -13,12 +13,12 @@ from core.crypto import h, keypair
 from core.store import FsStore
 from core.writer_head import WriterBinding, encode_slot
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
 from facts.auth.head_request import head_request
@@ -95,7 +95,7 @@ class CloudRun:
     bucket: object
     cloud: CountingStore
     root: object
-    authority: AuthorityGate
+    authorize: object
     devices: tuple[DeviceRuntime, ...]
     bindings: dict
     slot_bytes: dict
@@ -239,8 +239,8 @@ def added_message(root, spec, text, timestamp):
 async def publish(kind, tmp_path, root, specs, label):
     bucket, raw_store = provider(kind)
     cloud = CountingStore(raw_store)
-    authority = AuthorityGate(
-        root.fid, AUTHORITY_ROOT, lambda: 8_500_000)
+    authorize = mechanical_head_authorizer(
+        root.fid, AUTHORITY_ROOT, 8_500_000)
     runtimes = []
     bindings = {spec.public: spec.binding for spec in specs}
     slot_bytes = {}
@@ -261,12 +261,12 @@ async def publish(kind, tmp_path, root, specs, label):
         request = proof(root, spec, prepared.head_oid, None)
         await writer.establish(prepared)
         local_result = await OpaqueHeadGate(
-            local, authority.authorize).advance(
+            local, authorize).advance(
                 request, prepared.head_oid)
         assert local_result.status == "applied"
         await writer.establish(prepared, cloud)
         cloud_result = await OpaqueHeadGate(
-            cloud, authority.authorize).advance(
+            cloud, authorize).advance(
                 request, prepared.head_oid)
         assert cloud_result.status == "applied"
         slot_bytes[spec.public] = encode_slot(cloud_result.slot)
@@ -287,7 +287,7 @@ async def publish(kind, tmp_path, root, specs, label):
         bucket,
         cloud,
         root,
-        authority,
+        authorize,
         tuple(runtimes),
         bindings,
         slot_bytes,
@@ -367,7 +367,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
         root, changed.spec, update.head_oid, update.base_head)
     await changed.writer.establish(update)
     local_result = await OpaqueHeadGate(
-        changed.local, run.authority.authorize).advance(
+        changed.local, run.authorize).advance(
             request, update.head_oid)
     assert local_result.status == "applied"
 
@@ -378,7 +378,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
     history = len(run.bucket.history)
     await changed.writer.establish(update, run.cloud)
     cloud_result = await OpaqueHeadGate(
-        run.cloud, run.authority.authorize).advance(
+        run.cloud, run.authorize).advance(
             request, update.head_oid)
     assert cloud_result.status == "applied"
     new_slot_bytes = encode_slot(cloud_result.slot)
@@ -501,7 +501,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     run.cloud.clear()
     outcomes = await asyncio.gather(*(
         OpaqueHeadGate(
-            barrier_store, run.authority.authorize).advance(
+            barrier_store, run.authorize).advance(
                 request, candidate.head_oid)
         for request, candidate in zip(requests, candidates)
     ))
@@ -521,7 +521,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     winner = statuses.index("applied")
     loser = 1 - winner
     winner_result = await OpaqueHeadGate(
-        runtime.local, run.authority.authorize).advance(
+        runtime.local, run.authorize).advance(
             requests[winner], candidates[winner].head_oid)
     assert winner_result.status == "applied"
     run.slot_bytes[spec.public] = encode_slot(outcomes[winner].slot)
@@ -536,7 +536,7 @@ async def race_scenario(kind, tmp_path, root, specs):
         root, spec, rebased.head_oid, rebased.base_head)
     await runtime.writer.establish(rebased)
     local_rebase = await OpaqueHeadGate(
-        runtime.local, run.authority.authorize).advance(
+        runtime.local, run.authorize).advance(
             rebased_request, rebased.head_oid)
     assert local_rebase.status == "applied"
 
@@ -547,7 +547,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     run.cloud.clear()
     await runtime.writer.establish(rebased, run.cloud)
     cloud_rebase = await OpaqueHeadGate(
-        run.cloud, run.authority.authorize).advance(
+        run.cloud, run.authorize).advance(
             rebased_request, rebased.head_oid)
     assert cloud_rebase.status == "applied"
     final_slot = encode_slot(cloud_rebase.slot)

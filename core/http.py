@@ -16,6 +16,7 @@ from .crypto import h, seal_to
 from .grants import check_token, make_token
 from .limits import (
     MAX_INVITE_BYTES,
+    MAX_AUTHORITY_PILE_BYTES,
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
@@ -115,6 +116,7 @@ class HttpGate:
             *, sync_profile=peer_capability.READ_ONLY,
             mirror=None,
             mint_authorize=None,
+            authority_publish=None,
             object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
@@ -135,6 +137,9 @@ class HttpGate:
         self.store, self.workspace = store, workspace
         self.mirror = mirror
         self.mint_authorize = mint_authorize
+        if authority_publish is not None and not callable(authority_publish):
+            raise ValueError("authority publisher")
+        self.authority_publish = authority_publish
         if object_open is not None and not callable(object_open):
             raise ValueError("object OPEN issuer")
         if pack_open is not None and not callable(pack_open):
@@ -313,6 +318,33 @@ class HttpGate:
         }
         response["cap"] = self.sync_profile
         return self._json(200, response)
+
+    async def _publish_authority(self, body):
+        """Apply one public signed authority closure; semantic checks grant it."""
+        if self.authority_publish is None:
+            return Response(405)
+        if not isinstance(body, bytes) \
+                or len(body) > MAX_AUTHORITY_PILE_BYTES:
+            return Response(413)
+        try:
+            if inspect.iscoroutinefunction(self.authority_publish):
+                result = await self.authority_publish(body)
+            else:
+                result = await _to_thread(self.authority_publish, body)
+                if inspect.isawaitable(result):
+                    result = await result
+        except Exception:
+            return Response(503)
+        status = getattr(result, "status", None)
+        if status == "applied":
+            return Response(201)
+        if status == "noop":
+            return Response(204)
+        if status == "retryable":
+            return Response(409)
+        if status == "rejected":
+            return Response(403)
+        return Response(503)
 
     @staticmethod
     def _decode_batch(body):
@@ -603,6 +635,8 @@ class HttpGate:
         path = "/" + path.strip("/")
         if method == "POST" and path == "/mint":
             return MAX_MINT_REQUEST_BYTES
+        if method == "POST" and path == "/authority":
+            return MAX_AUTHORITY_PILE_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES
         if method == "POST" and path == "/pack/open":
@@ -637,6 +671,8 @@ class HttpGate:
         trusted_now = self.now()
         if path == "/mint" and method == "POST":
             return await self._mint(body, trusted_now)
+        if path == "/authority" and method == "POST":
+            return await self._publish_authority(body)
         if path.startswith("/invite/") and method == "GET":
             invite = path.removeprefix("/invite/")
             if not INVITE_RE.fullmatch(invite):

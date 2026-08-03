@@ -43,12 +43,12 @@ from core.writer_layout import (
     window_start,
 )
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from core.writer_tree import EMPTY_TREE, append_piles, leaf_key
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
@@ -110,8 +110,8 @@ async def published(store, count=3, *, large=False):
     await writer.establish(update)
     result = await OpaqueHeadGate(
         store,
-        AuthorityGate(
-            root.fid, h(b"authority"), lambda: 10).authorize,
+        mechanical_head_authorizer(
+            root.fid, h(b"authority"), 10),
     ).advance(
         authority_proof(
             secret, public, root, device_signature,
@@ -297,8 +297,8 @@ def test_warm_sparse_difference_uses_one_exact_pile_range(tmp_path):
             update.head_oid, update.base_head)
         advanced = await OpaqueHeadGate(
             backing,
-            AuthorityGate(
-                root.fid, h(b"authority"), lambda: 10).authorize,
+            mechanical_head_authorizer(
+                root.fid, h(b"authority"), 10),
         ).advance(proof, update.head_oid)
         assert advanced.status == "applied"
         all_raws = raws + tuple(
@@ -555,6 +555,13 @@ class _ReadPeer:
 
     def authorize_access(self, *_args):
         raise AssertionError("pre-minted HTTP test must not evaluate mint")
+
+    def authority(self, _workspace):
+        class Authority:
+            async def publish(self, _raw):
+                raise AssertionError(
+                    "pre-minted read test must not publish authority")
+        return Authority()
 
 
 class _DialNode:

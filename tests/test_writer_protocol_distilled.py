@@ -17,12 +17,12 @@ from core.writer_head import (
     head_slot_prefix,
 )
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
 from facts.auth.head_request import head_request
@@ -128,8 +128,8 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
             root.fid, writer, writer, store_binding, secret, source)
         gate = OpaqueHeadGate(
             source,
-            AuthorityGate(
-                root.fid, authority_root, lambda: 10).authorize,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10),
         )
 
         initial = await log.prepare((authority,))
@@ -248,8 +248,8 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
             root.fid, writer, writer, store_binding, secret, source)
         gate = OpaqueHeadGate(
             source,
-            AuthorityGate(
-                root.fid, authority_root, lambda: 10).authorize,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10),
         )
         consumer = FactConsumer(root.fid)
         mirror = RepositoryMirror(
@@ -392,8 +392,8 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
                 await log.establish(update, cloud)
                 gate = OpaqueHeadGate(
                     cloud,
-                    AuthorityGate(
-                        root.fid, authority_root, lambda: 10).authorize,
+                    mechanical_head_authorizer(
+                        root.fid, authority_root, 10),
                 )
                 result = await gate.advance(
                     authority_proof(

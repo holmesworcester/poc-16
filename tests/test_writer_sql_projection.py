@@ -10,12 +10,12 @@ from core.fact import encode
 from core.store import FsStore
 from core.writer_head import WriterBinding
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
 from facts.auth.signature import signature as signature_fact
@@ -75,10 +75,10 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
             (root, device_signature, device,
              request_signature, request),
         ))
-        gate = AuthorityGate(
-            root.fid, authority_root, lambda: 10)
         assert (await OpaqueHeadGate(
-            source, gate.authorize).advance(
+            source,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10)).advance(
                 proof, update.head_oid)).status == "applied"
 
         def binding_for(

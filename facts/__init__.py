@@ -134,15 +134,16 @@ def family_for(tag):
     return FAMILIES.get(tag)
 
 
-def authorize_writer_head(judgment, writer, proposed_head, trusted_now):
-    """Dispatch one ephemeral exact-head decision through its fact family."""
+def authorize_writer_head(
+        judgment, stream, view, writer, proposed_head, trusted_now):
+    """Dispatch one pinned-current exact-head decision through its family."""
     decisions = []
     for valid in judgment.valids:
         family = family_for(valid.fact.t)
         authorize = getattr(family, "authorize_head", None)
         if callable(authorize):
             decision = authorize(
-                valid, writer, proposed_head, trusted_now)
+                view, valid, stream, writer, proposed_head, trusted_now)
             if decision is not None:
                 decisions.append(decision)
     return decisions[0] if len(decisions) == 1 else None

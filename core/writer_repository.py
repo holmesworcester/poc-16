@@ -21,7 +21,6 @@ from .close import (
 from .crypto import h
 from .fact import canon, encode
 from .limits import (
-    MAX_AUTHORITY_PILE_BYTES,
     MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
@@ -55,6 +54,7 @@ from .writer_head import (
     parse_head_slot_key,
     require_bound_head,
     validate_advance,
+    writer_store_binding,
 )
 from .writer_tree import (
     EMPTY_TREE,
@@ -395,63 +395,6 @@ class WriterLog:
         return prepared.head_oid
 
 
-class AuthorityGate:
-    """Evaluate and discard one signed proof pile for an exact head OID.
-
-    The fact family owns the membership/device requirements and exact request
-    binding. ``authority_root`` is verifier-pinned current authority state;
-    it is recorded in the slot but never selected by the requester.
-    """
-
-    def __init__(self, workspace, authority_root, now):
-        if not valid_fid(workspace) or not callable(now) \
-                or not (valid_fid(authority_root)
-                        or callable(authority_root)):
-            raise ValueError("authority gate")
-        self.workspace = workspace
-        self.authority_root = authority_root
-        self.now = now
-        self.evaluator = ClosedPileEvaluator(
-            workspace, max_bytes=MAX_AUTHORITY_PILE_BYTES)
-
-    async def authorize(self, proof_raw, proposed_head):
-        evaluated = self.evaluator.evaluate(proof_raw)
-        decision = facts.authorize_writer_head(
-            evaluated.judgment,
-            evaluated.pile.writer,
-            proposed_head,
-            self.now(),
-        )
-        if decision is None:
-            raise ValueError("writer head authority denied")
-        device, _owner, base_head = decision
-        authority_root = await _maybe_await(
-            self.authority_root()
-            if callable(self.authority_root)
-            else self.authority_root)
-        return HeadGrant(
-            self.workspace, device, base_head,
-            proposed_head, authority_root)
-
-    def authorize_access(self, proof_raw, view, *, purpose):
-        """Judge and discard one ordinary access proof pile.
-
-        ``view`` is the verifier's current authority projection.  It may be a
-        database-free authenticated Worker view or a full peer's rebuildable
-        projection, but the signed wire bytes and family query are identical.
-        """
-        evaluated = self.evaluator.evaluate(proof_raw)
-        decision = facts.authorize_access(
-            evaluated.judgment,
-            evaluated.pile.facts,
-            view,
-            self.now(),
-            purpose=purpose,
-        )
-        return decision if decision == (
-            evaluated.pile.writer, purpose) else None
-
-
 class OpaqueHeadGate:
     """Authorize one exact owner slot and CAS it without reading content."""
 
@@ -616,7 +559,9 @@ class FactConsumer:
 class RepositoryMirror:
     """Mirror and optionally consume every changed device tree with RBSR."""
 
-    def __init__(self, workspace, store, binding_for, consumer):
+    def __init__(
+            self, workspace, store, binding_for, consumer,
+            *, current_binding_for=None, authority_publish=None):
         consumer_ok = consumer is None or (
             getattr(consumer, "workspace", None) == workspace
             and all(callable(getattr(consumer, method, None))
@@ -624,15 +569,30 @@ class RepositoryMirror:
                         "prepare_batch", "commit", "projected_head"))
         )
         if not valid_fid(workspace) or not callable(binding_for) \
-                or not consumer_ok:
+                or not consumer_ok \
+                or authority_publish is not None \
+                and (consumer is None or not callable(authority_publish)) \
+                or current_binding_for is not None \
+                and not callable(current_binding_for):
             raise ValueError("repository mirror")
         self.workspace = workspace
         self.store = async_store(store)
         self.binding_for = binding_for
+        self.current_binding_for = current_binding_for or binding_for
         self.consumer = consumer
+        self.authority_publish = authority_publish
 
-    async def _binding(self, workspace, device, authority_root, head):
-        value = self.binding_for(
+    async def _publish_authority(self, pile_values):
+        """Offer already-validated original piles to the authority repository."""
+        if self.authority_publish is None:
+            return
+        for _oid, raw in pile_values:
+            await _maybe_await(self.authority_publish(raw))
+
+    async def _binding(
+            self, workspace, device, authority_root, head, *, current=False):
+        resolver = self.current_binding_for if current else self.binding_for
+        value = resolver(
             workspace, device, authority_root, head)
         return await _maybe_await(value)
 
@@ -680,7 +640,20 @@ class RepositoryMirror:
         candidate_raw = await source_fetch(slot.head)
         decoded_candidate = decode_head(candidate_raw)
         binding = await self._binding(
-            workspace, device, slot.authority_root, decoded_candidate)
+            workspace, device, slot.authority_root, decoded_candidate,
+            current=True)
+        bootstrapping = binding is None
+        if bootstrapping:
+            # A newly joined writer's first independently closed pile is also
+            # its portable authority publication.  Verify the untrusted head's
+            # own signature and deterministic store address first; semantic
+            # membership is still required below before the slot can commit.
+            binding = WriterBinding(
+                workspace,
+                device,
+                decoded_candidate.owner,
+                writer_store_binding(workspace, device),
+            )
         if not isinstance(binding, WriterBinding):
             raise ValueError("unknown writer binding")
         candidate = require_bound_head(decoded_candidate, binding)
@@ -688,6 +661,8 @@ class RepositoryMirror:
             raise ValueError("writer head slot integrity")
         local_slot, accepted = await self._local_head(
             key, binding, local_opened)
+        if bootstrapping and accepted is not None:
+            raise ValueError("unknown accepted writer binding")
         if accepted is not None:
             # Directory views need not be simultaneous.  Seeing an older
             # signed head from a lagging peer is ordinary two-way sync, not a
@@ -725,6 +700,13 @@ class RepositoryMirror:
                 ((raw, device) for _oid, raw in pile_values),
                 owner=candidate.owner,
             )
+        await self._publish_authority(pile_values)
+        if bootstrapping:
+            current_binding = await self._binding(
+                workspace, device, slot.authority_root, decoded_candidate,
+                current=True)
+            if current_binding != binding:
+                raise ValueError("unknown writer binding")
         for pile_oid, raw in pile_values:
             await ensure_pile_async(self.store, pile_oid, raw)
 
@@ -790,6 +772,7 @@ class RepositoryMirror:
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
         )
+        await self._publish_authority(pile_values)
         facts = self.consumer.commit(
             batch, device=device, head=slot.head)
         return len(additions), len(facts)
@@ -924,7 +907,6 @@ class RepositoryMirror:
 
 
 __all__ = (
-    "AuthorityGate",
     "FactConsumer",
     "HeadGrant",
     "MirrorResult",

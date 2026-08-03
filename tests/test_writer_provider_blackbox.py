@@ -11,12 +11,12 @@ from core.crypto import h, keypair
 from core.store import FsStore
 from core.writer_head import WriterBinding, encode_slot, head_slot_key
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
 from facts.auth.signature import signature as signature_fact
@@ -124,12 +124,13 @@ async def exercise(kind, tmp_path, values):
     proof = authority_proof(
         secret, public, root, device_signature, device,
         prepared.head_oid)
-    authority = AuthorityGate(
-        root.fid, authority_root, lambda: 10)
     cloud.clear()
     physical_start = len(bucket.history)
     advanced = await OpaqueHeadGate(
-        cloud, authority.authorize).advance(proof, prepared.head_oid)
+        cloud,
+        mechanical_head_authorizer(
+            root.fid, authority_root, 10)).advance(
+                proof, prepared.head_oid)
     slot_raw = encode_slot(advanced.slot)
     assert advanced.status == "applied"
     assert cloud.snapshot() == CostVector(

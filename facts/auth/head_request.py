@@ -69,8 +69,8 @@ DURABLE = False
 
 
 # QUERIES — the gate asks the family to interpret one kernel-minted receipt.
-def authorize_head(valid, writer, proposed_head, trusted_now):
-    """Return the device/owner pair only for the fact's exact live request."""
+def authorize_head(view, valid, stream, writer, proposed_head, trusted_now):
+    """Authorize the exact request against pinned current authority state."""
     body = valid.fact.body
     if valid.fact.t != TAG or writer != body["device"] \
             or proposed_head != body["head"] \
@@ -79,9 +79,26 @@ def authorize_head(valid, writer, proposed_head, trusted_now):
     expected = {"author", "member"}
     if body["device"] != body["owner"]:
         expected.add("device")
-    edges = {edge.role for edge in valid.edges}
-    if edges != expected:
+    edges = {edge.role: edge.fid for edge in valid.edges}
+    if set(edges) != expected:
         return None
+    supplied = {fact.fid: fact for fact in stream}
+    required = {
+        "member": ("member", body["device"], body["owner"]),
+    }
+    if body["device"] != body["owner"]:
+        required["device"] = (
+            "device_key", body["device"], body["owner"])
+    for role, offer in required.items():
+        provider = supplied.get(edges[role])
+        if provider is None or offer not in provider.offers():
+            return None
+        try:
+            current = view.fact_of(provider.fid)
+        except ValueError:
+            return None
+        if current != provider or not view.fact_active(provider.fid):
+            return None
     return (
         body["device"],
         body["owner"],

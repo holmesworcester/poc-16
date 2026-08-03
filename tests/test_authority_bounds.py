@@ -160,8 +160,7 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
     def publish_authority():
         raw = closed_subset(
             node, workspace_id, all_fids(node, workspace_id))
-        result = asyncio.run(publisher.receive_pile(
-            node.identity_id(workspace_id), raw))
+        result = asyncio.run(publisher.publish(raw))
         assert result.status in {"applied", "noop"}
 
     def assert_current_identity_mints(public):

@@ -12,6 +12,7 @@ from core.crypto import h, unseal
 from core.http_body import read_bounded
 from core.limits import (
     MAX_CONTROL_BYTES,
+    MAX_AUTHORITY_PILE_BYTES,
     MAX_DIRECT_OBJECT_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
@@ -131,6 +132,17 @@ class Peer:
             "token": token,
             "sync_profile": peer_capability.negotiate(token, o),
         })
+
+    def publish_authority(self, raw):
+        """Submit one signed authority closure before ordinary mint is possible."""
+        if not isinstance(raw, bytes) or len(raw) > MAX_AUTHORITY_PILE_BYTES:
+            raise ValueError("authority pile")
+        status, _, _ = self._http(
+            "POST", "/authority", raw, auth=False,
+            response_limit=MAX_CONTROL_BYTES)
+        if status not in {201, 204}:
+            raise ValueError("authority publication")
+        return status
 
     def heads(self, cursor=None, limit=256):
         query = {"limit": limit}

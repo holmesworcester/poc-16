@@ -7,12 +7,12 @@ from core.fact import decode
 from core.store import FsStore
 from core.writer_head import WriterBinding
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
 from facts.auth.head_request import head_request
@@ -59,7 +59,8 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         bob_store = FsStore(str(tmp_path / "bob"))
         carol_store = FsStore(str(tmp_path / "carol"))
         authority_root = h(b"current-authority")
-        gate = AuthorityGate(root.fid, authority_root, lambda: 10)
+        authorize = mechanical_head_authorizer(
+            root.fid, authority_root, 10)
         bindings = {
             alice: WriterBinding(
                 root.fid, alice, alice, h(b"alice-store")),
@@ -84,7 +85,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         alice_update = await alice_log.prepare(((*authority,
             alice_message_sig, alice_message),))
         await alice_log.establish(alice_update)
-        await OpaqueHeadGate(alice_store, gate.authorize).advance(
+        await OpaqueHeadGate(alice_store, authorize).advance(
             authority_proof(
                 alice_secret, alice, alice, root,
                 (root, primary_sig, primary),
@@ -113,7 +114,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         bob_update = await bob_log.prepare(((*authority,
             bob_message_sig, bob_message),))
         await bob_log.establish(bob_update)
-        await OpaqueHeadGate(bob_store, gate.authorize).advance(
+        await OpaqueHeadGate(bob_store, authorize).advance(
             authority_proof(
                 bob_secret, bob, alice, root, authority,
                 bob_update.head_oid, 31),
@@ -143,7 +144,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         late_update = await alice_log.prepare((
             (root, late_sig, late),))
         await alice_log.establish(late_update)
-        await OpaqueHeadGate(alice_store, gate.authorize).advance(
+        await OpaqueHeadGate(alice_store, authorize).advance(
             authority_proof(
                 alice_secret, alice, alice, root,
                 (root, primary_sig, primary),
@@ -184,9 +185,9 @@ def test_workspace_directory_prefixes_do_not_cross(tmp_path):
             request = authority_proof(
                 secret, public, public, root,
                 (root, device_sig, device), update.head_oid, 20)
-            gate = AuthorityGate(
-                root.fid, h(f"auth-{ordinal}".encode()), lambda: 10)
-            await OpaqueHeadGate(shared, gate.authorize).advance(
+            authorize = mechanical_head_authorizer(
+                root.fid, h(f"auth-{ordinal}".encode()), 10)
+            await OpaqueHeadGate(shared, authorize).advance(
                 request, update.head_oid)
             consumer = FactConsumer(root.fid)
             receiver = RepositoryMirror(

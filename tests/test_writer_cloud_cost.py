@@ -7,12 +7,12 @@ from core.crypto import h, keypair
 from core.store import FsStore
 from core.writer_head import WriterBinding
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
 )
+from tests.util import mechanical_head_authorizer
 from core.writer_tree import reachable_staged_pages
 from facts.auth.device import device as device_fact
 from facts.auth.head_request import head_request
@@ -60,13 +60,13 @@ def test_one_pile_publish_cold_sync_and_noop_have_small_exact_costs(tmp_path):
         update = await writer.prepare(((
             root, device_signature, device),))
         await writer.establish(update)
-        authority = AuthorityGate(
-            root.fid, authority_root, lambda: 10)
-        await OpaqueHeadGate(author, authority.authorize).advance(
+        authorize = mechanical_head_authorizer(
+            root.fid, authority_root, 10)
+        await OpaqueHeadGate(author, authorize).advance(
             proof(values, update.head_oid), update.head_oid)
 
         await writer.establish(update, cloud)
-        await OpaqueHeadGate(cloud, authority.authorize).advance(
+        await OpaqueHeadGate(cloud, authorize).advance(
             proof(values, update.head_oid), update.head_oid)
         published = cloud.snapshot()
         assert published.object_puts == len(update.objects) == 3
@@ -117,9 +117,9 @@ def test_hundred_piles_use_one_head_cas_and_only_final_tree_pages(tmp_path):
         await writer.establish(update, cloud)
 
         authority_root = h(b"authority")
-        authority = AuthorityGate(
-            root.fid, authority_root, lambda: 10)
-        await OpaqueHeadGate(cloud, authority.authorize).advance(
+        authorize = mechanical_head_authorizer(
+            root.fid, authority_root, 10)
+        await OpaqueHeadGate(cloud, authorize).advance(
             proof(values, update.head_oid), update.head_oid)
         cost = cloud.snapshot()
         tree_pages = len(update.objects) - 100 - 1
@@ -152,7 +152,8 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         author = FsStore(str(tmp_path / "author"))
         cloud = CountingStore(FsStore(str(tmp_path / "cloud")))
         receiver = FsStore(str(tmp_path / "receiver"))
-        authority = AuthorityGate(root.fid, authority_root, lambda: 10)
+        authorize = mechanical_head_authorizer(
+            root.fid, authority_root, 10)
         log = WriterLog(
             root.fid, public, public, binding, secret, author)
 
@@ -160,12 +161,12 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
             root, device_signature, device),))
         await log.establish(initial, author)
         assert (await OpaqueHeadGate(
-            author, authority.authorize).advance(
+            author, authorize).advance(
                 proof(values, initial.head_oid),
                 initial.head_oid)).status == "applied"
         await log.establish(initial, cloud)
         assert (await OpaqueHeadGate(
-            cloud, authority.authorize).advance(
+            cloud, authorize).advance(
                 proof(values, initial.head_oid),
                 initial.head_oid)).status == "applied"
 
@@ -186,14 +187,14 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
             (root, device_signature, device, item_signature, item),))
         await log.establish(update, author)
         assert (await OpaqueHeadGate(
-            author, authority.authorize).advance(
+            author, authorize).advance(
                 proof(values, update.head_oid, update.base_head),
                 update.head_oid)).status == "applied"
 
         cloud.clear()
         await log.establish(update, cloud)
         assert (await OpaqueHeadGate(
-            cloud, authority.authorize).advance(
+            cloud, authorize).advance(
                 proof(values, update.head_oid, update.base_head),
                 update.head_oid)).status == "applied"
         publish = cloud.snapshot()

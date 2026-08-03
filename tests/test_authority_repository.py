@@ -11,7 +11,8 @@ from core.crypto import h, keypair
 from core.object_store import AUTHORITY_ROOT_KEY, Versioned, VersionToken
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
-from core.writer_repository import AuthorityGate
+from core.writer_head import WriterBinding, writer_store_binding
+from core.writer_repository import HeadGrant
 from facts.auth.removal import removal
 from facts.auth.request import request
 from facts.auth.head_request import head_request
@@ -90,9 +91,29 @@ def access_proof(world, *, exp=1_000):
     )
 
 
+def head_proof(world, proposed_head, *, base_head=None, exp=1_000):
+    item = head_request(
+        world.root.fid,
+        world.member,
+        world.member,
+        base_head,
+        proposed_head,
+        exp,
+        4,
+    )
+    item_signature = signature(
+        world.member_secret, world.member, item, 4)
+    return signed(
+        world.member_secret,
+        world.member,
+        world.root,
+        (*world.membership, item_signature, item),
+    )
+
+
 def publish(repository, secret, public, root, closure):
-    return run(repository.receive_pile(
-        public, signed(secret, public, root, closure)))
+    return run(repository.publish(
+        signed(secret, public, root, closure)))
 
 
 def test_never_resident_denied_then_publication_grants_without_sql(
@@ -144,6 +165,87 @@ def test_never_resident_denied_then_publication_grants_without_sql(
     assert pin.root_bytes == joined.root
     assert pin.root_oid == h(joined.root)
     assert isinstance(pin.version, VersionToken)
+    assert store.get("obj/" + pin.root_oid) == pin.root_bytes
+
+
+def test_head_grant_and_writer_binding_use_exact_current_authority_pin(
+        tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    repository = AuthorityRepository(world.root.fid, store)
+    proposed = h(b"proposed writer head")
+    proof = head_proof(world, proposed)
+
+    publish(
+        repository,
+        world.founder_secret,
+        world.founder,
+        world.root,
+        (world.root,),
+    )
+    assert run(repository.authorize_head(proof, proposed, 10)) is None
+    assert run(repository.writer_binding(
+        world.member, world.member)) is None
+
+    accepted = publish(
+        repository,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    pin = run(repository.pin())
+    assert accepted.root == pin.root_bytes
+    assert run(repository.authorize_head(proof, proposed, 10)) == HeadGrant(
+        world.root.fid,
+        world.member,
+        None,
+        proposed,
+        pin.root_oid,
+    )
+    assert run(repository.writer_binding(
+        world.member, world.member)) == WriterBinding(
+            world.root.fid,
+            world.member,
+            world.member,
+            writer_store_binding(world.root.fid, world.member),
+        )
+
+
+def test_removal_before_head_pin_denies_but_an_inflight_old_pin_linearizes(
+        tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    repository = AuthorityRepository(world.root.fid, store)
+    publish(
+        repository,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    old_pin = run(repository.pin())
+    proposed = h(b"head racing removal")
+    proof = head_proof(world, proposed)
+
+    evicted = removal(
+        world.root.fid, world.founder, world.member, 5)
+    evicted_signature = signature(
+        world.founder_secret, world.founder, evicted, 5)
+    publish(
+        repository,
+        world.founder_secret,
+        world.founder,
+        world.root,
+        (*world.membership, evicted_signature, evicted),
+    )
+
+    assert run(repository.authorize_head(proof, proposed, 10)) is None
+    assert run(repository.writer_binding(
+        world.member, world.member)) is None
+    old_grant = run(old_pin.authorize_head(proof, proposed, 10))
+    assert old_grant.authority_root == old_pin.root_oid
+    assert old_grant.head == proposed
 
 
 def test_current_removal_denies_an_old_valid_access_proof(tmp_path):
@@ -237,14 +339,7 @@ def test_access_proof_rejects_a_second_non_authorizing_ephemeral_fact(
 
     assert run(repository.authorize_access(ambiguous, 10)) is None
     pin = run(repository.pin())
-    view = RepositoryReader(
-        world.root.fid,
-        pin.root_bytes,
-        lambda oid: store.get("obj/" + oid),
-    ).worker()
-    assert AuthorityGate(
-        world.root.fid, pin.root_oid, lambda: 10,
-    ).authorize_access(ambiguous, view, purpose="sync") is None
+    assert run(pin.authorize_access(ambiguous, 10)) is None
 
 
 def test_content_family_rejects_the_whole_authority_publication(tmp_path):
@@ -441,15 +536,12 @@ def test_authority_authorization_pins_once_across_concurrent_removal(
             world.root.fid, world.founder, world.member, 5)
         evicted_signature = signature(
             world.founder_secret, world.founder, evicted, 5)
-        result = await publisher.receive_pile(
+        result = await publisher.publish(signed(
+            world.founder_secret,
             world.founder,
-            signed(
-                world.founder_secret,
-                world.founder,
-                world.root,
-                (*world.membership, evicted_signature, evicted),
-            ),
-        )
+            world.root,
+            (*world.membership, evicted_signature, evicted),
+        ))
         assert result.status == "applied"
         paused.release.set()
         return await decision, paused

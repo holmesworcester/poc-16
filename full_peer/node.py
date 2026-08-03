@@ -8,13 +8,12 @@ import time
 import facts
 
 from core import fact_index
-from core.close import encode_signed_pile, make_signed_pile
-from core.crypto import h
+from core.close import decode_signed_pile, encode_signed_pile, make_signed_pile
 from core.fact import Fact
+from core.authority import AuthorityRepository, authority_resident
 from core.store import FsStore
 from core.writer_head import WriterBinding, writer_store_binding
 from core.writer_repository import (
-    AuthorityGate,
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
@@ -59,7 +58,7 @@ class FullPeer:
         self.sk, self.pk = self.keychain.default()
         self._stores, self._sql, self._senders = {}, {}, {}
         self._consumers, self._mirrors, self._writers = {}, {}, {}
-        self._own_bindings = {}
+        self._authorities = {}
         self.sync_cache = {}  # (ws, peer_url) -> walk state
         self._iroh_peer_urls = {}  # (ws, endpoint) -> disposable loopback URL
         self._sync_errors = {}
@@ -120,8 +119,52 @@ class FullPeer:
                     self.store(workspace),
                     self.writer_binding,
                     self.consumer(workspace),
+                    current_binding_for=self.current_writer_binding,
+                    authority_publish=self._consume_authority,
                 )
             return self._mirrors[workspace]
+
+    def authority(self, workspace):
+        """Return the shared database-free authority repository."""
+        with self.lock:
+            if workspace not in self._authorities:
+                self._authorities[workspace] = AuthorityRepository(
+                    workspace, self.store(workspace))
+            return self._authorities[workspace]
+
+    async def _consume_authority(self, raw):
+        """Join one authority-only signed pile; ignore ordinary content piles."""
+        try:
+            pile = decode_signed_pile(raw)
+            if not pile.facts or any(
+                    facts.family_for(fact.t) is None
+                    or facts.family_for(fact.t).DURABLE
+                    and not authority_resident(fact)
+                    for fact in pile.facts):
+                return None
+        except Exception:
+            return None
+        repository = self.authority(pile.workspace)
+        for _ in range(8):
+            result = await repository.publish(raw)
+            if result.status in {"applied", "noop"}:
+                return result
+            if result.status != "retryable":
+                raise ValueError("authority publication rejected")
+        raise RuntimeError("authority publication contention")
+
+    def _announce_authority(self, workspace, raws):
+        """Push bootstrap authority to configured peers before mint/sync."""
+        from .walk import Peer
+
+        for peer in tuple(self.keyring["workspaces"][workspace]["peers"]):
+            url = self.resolve_peer(workspace, peer)
+            try:
+                sender = Peer(self, workspace, url)
+                for raw in raws:
+                    sender.publish_authority(raw)
+            finally:
+                self.release_peer(workspace, peer)
 
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
@@ -416,42 +459,18 @@ class FullPeer:
     def ingest_new(self, ws, news, deps_new, *, owner=None):
         return self.sender(ws).send(news, deps_new, owner=owner)
 
-    def writer_binding(
+    async def writer_binding(
+            self, workspace, device, authority_root, candidate):
+        """Resolve one already-accepted head at its recorded authority pin."""
+        owner = None if candidate is None else candidate.owner
+        return await self.authority(workspace).writer_binding_at(
+            authority_root, device, owner)
+
+    async def current_writer_binding(
             self, workspace, device, _authority_root, candidate):
-        """Resolve a device owner from own state or current fact projection."""
-        with self.lock:
-            own = self._own_bindings.get((workspace, device))
-            if own is not None:
-                return own
-            if candidate is not None:
-                binding = WriterBinding(
-                    workspace, device, candidate.owner,
-                    writer_store_binding(workspace, device))
-                if device == self.identity_id(workspace):
-                    self._own_bindings[(workspace, device)] = binding
-                return binding
-            owners = {
-                owner
-                for provider in self.sql(workspace).indexed(
-                    "member", device)
-                if not self.sql(workspace).suppresses(provider)
-                for name, key, owner in provider.offers()
-                if name == "member" and key == device and owner
-            }
-            if len(owners) != 1:
-                return None
-            owner = next(iter(owners))
-            if owner != device and not any(
-                    name == "device_key"
-                    and key == device and offered_owner == owner
-                    and not self.sql(workspace).suppresses(provider)
-                    for provider in self.sql(workspace).indexed(
-                        "device_key", device, owner)
-                    for name, key, offered_owner in provider.offers()):
-                return None
-            return WriterBinding(
-                workspace, device, owner,
-                writer_store_binding(workspace, device))
+        """Resolve an incoming head only through current authenticated state."""
+        owner = None if candidate is None else candidate.owner
+        return await self.authority(workspace).writer_binding(device, owner)
 
     def _writer(self, workspace, owner):
         secret, device = self.identity(workspace)
@@ -460,7 +479,6 @@ class FullPeer:
             binding = WriterBinding(
                 workspace, device, owner,
                 writer_store_binding(workspace, device))
-            self._own_bindings[(workspace, device)] = binding
             self._writers[key] = WriterLog(
                 workspace, device, owner, binding.store,
                 secret, self.store(workspace))
@@ -539,7 +557,8 @@ class FullPeer:
             return []
         with self.lock:
             secret, device = self.identity(workspace)
-            binding = self.writer_binding(workspace, device, None, None)
+            binding = _run_core(
+                self.authority(workspace).writer_binding(device))
             if owner is not None:
                 if binding is not None and binding.owner != owner:
                     raise ValueError("publishing identity owner mismatch")
@@ -579,19 +598,38 @@ class FullPeer:
                 device,
                 authority,
             ))
-            gate = AuthorityGate(
-                workspace,
-                h(("poc16-authority:" + workspace).encode()),
-                # One authored command observes one host timestamp.  The
-                # local composition must not consume another clock tick just
-                # because the same closed pile crosses the authority gate.
-                lambda: timestamp,
+            authority_repository = self.authority(workspace)
+            publications = tuple(
+                encode_signed_pile(pile)
+                for closure, pile in zip(closures, update.piles)
+                if all(
+                    authority_resident(fact)
+                    for fact in closure
+                    if facts.family_for(fact.t).DURABLE
+                )
             )
+
+            async def publish_authority():
+                for raw in publications:
+                    await self._consume_authority(raw)
+
+            async def authorize(raw, proposed):
+                return await authority_repository.authorize_head(
+                    raw, proposed, timestamp)
+
+            grant = _run_core(authorize(proof, update.head_oid))
+            published_first = grant is None and bool(publications)
+            if published_first:
+                _run_core(publish_authority())
             outcome = _run_core(OpaqueHeadGate(
-                self.store(workspace), gate.authorize).advance(
+                self.store(workspace), authorize).advance(
                     proof, update.head_oid))
             if outcome.status not in {"applied", "noop"}:
                 raise RuntimeError("writer head advance requires rebase")
+            if not published_first:
+                _run_core(publish_authority())
+            if publications:
+                self._announce_authority(workspace, publications)
             replay = _run_core(self.mirror(workspace).replay_local())
             if replay.errors:
                 raise ValueError(
@@ -602,16 +640,11 @@ class FullPeer:
     def authorize_access(self, workspace, proof_raw, purpose):
         """Run one signed access proof through the shared discarded gate."""
         with self.lock:
-            self._ensure_projection(workspace)
-            return AuthorityGate(
-                workspace,
-                h(("poc16-authority:" + workspace).encode()),
-                now_ms,
-            ).authorize_access(
+            return _run_core(self.authority(workspace).authorize_access(
                 proof_raw,
-                self.sql(workspace),
+                now_ms(),
                 purpose=purpose,
-            )
+            ))
 
     # ---- rebuild: the store's own units through the same kernel --------------
 
