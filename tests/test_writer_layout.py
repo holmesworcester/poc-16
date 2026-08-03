@@ -1,4 +1,6 @@
 """Source-local pack pages locate, but never authorize, writer history."""
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 
@@ -13,6 +15,8 @@ from core.crypto import h, keypair
 from core.fact import canon
 from core.ingress import KernelRejected
 from core.limits import PayloadTooLarge
+from core.object_store import OutcomeUnknown
+from core.store import FsStore
 from core.writer_layout import (
     MAX_LAYOUT_PACK_BYTES,
     MAX_LAYOUT_PAGE_BYTES,
@@ -28,6 +32,7 @@ from core.writer_layout import (
     layout_page_key,
     parse_layout_page_key,
     placement_for,
+    publish_placements,
     verify_pile_slice,
     verify_whole_pack,
     window_end,
@@ -37,6 +42,7 @@ from core.writer_tree import MAX_WRITER_SEQUENCE
 from facts.auth.signature import signature as signature_fact
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content.message import message as message_fact
+from tests.shared_bucket import ScriptedBucket
 
 
 def signed_piles():
@@ -254,6 +260,67 @@ def test_add_rebase_fills_only_holes_and_is_idempotent():
     with pytest.raises(InvalidWriterLayout, match="overlap"):
         add_placements(
             updated, (fake_pack(WINDOW_PILES + 1, 1, b"foreign"),))
+
+
+def test_concurrent_layout_publishers_rebase_disjoint_holes_without_clobber():
+    workspace, device = h(b"workspace"), h(b"device")
+    key = layout_page_key(workspace, device, 1)
+    bucket = ScriptedBucket()
+    alice, bob = bucket.handle("alice"), bucket.handle("bob")
+    paused = bucket.pause("alice", "cas", key, when="before")
+    first, later = fake_pack(1, 2, b"first"), fake_pack(5, 2, b"later")
+
+    def publish(store, placement):
+        return asyncio.run(publish_placements(
+            store, workspace, device, 1, (placement,)))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delayed = pool.submit(publish, alice, first)
+        paused.wait()
+        winner = pool.submit(publish, bob, later)
+        assert winner.result().placements == (later,)
+        paused.release.set()
+        assert delayed.result().placements == (first, later)
+
+    page = decode_layout_page_at(key, alice.get(key))
+    assert page.placements == (first, later)
+    assert bucket.assert_valid_history()
+
+    before = alice.get(key)
+    with pytest.raises(InvalidWriterLayout, match="overlap"):
+        publish(alice, fake_pack(2, 2, b"conflict"))
+    assert alice.get(key) == before
+
+
+def test_unknown_layout_cas_outcome_is_resolved_by_exact_reread(tmp_path):
+    workspace, device = h(b"workspace"), h(b"device")
+    store = FsStore(str(tmp_path / "store"))
+    placement = fake_pack(1, 2, b"pack")
+
+    class UnknownAfterCommit:
+        def __init__(self):
+            self.raised = False
+
+        def get_bounded(self, key, maximum):
+            return store.get_bounded(key, maximum)
+
+        def read_versioned(self, key):
+            return store.read_versioned(key)
+
+        def cas(self, key, token, raw):
+            result = store.cas(key, token, raw)
+            if not self.raised:
+                self.raised = True
+                raise OutcomeUnknown("lost successful response")
+            return result
+
+    published = asyncio.run(publish_placements(
+        UnknownAfterCommit(), workspace, device, 1, (placement,)))
+    assert published.placements == (placement,)
+    assert decode_layout_page_at(
+        layout_page_key(workspace, device, 1),
+        store.get(layout_page_key(workspace, device, 1)),
+    ) == published
 
 
 def test_pack_build_never_crosses_a_window_boundary():

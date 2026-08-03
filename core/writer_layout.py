@@ -14,6 +14,14 @@ from .crypto import h
 from .fact import canon
 from .ingress import InvalidPile
 from .limits import MAX_OBJECT_BYTES, MIB, PayloadTooLarge, decode_json
+from .object_store import (
+    ABSENT,
+    STALE,
+    Applied,
+    OutcomeUnknown,
+    Versioned,
+    async_store,
+)
 from .shape import valid_fid
 from .writer_tree import MAX_WRITER_SEQUENCE, WRITER_SEQUENCE_DIGITS
 
@@ -258,6 +266,50 @@ def add_placements(page, additions):
         tuple(sorted(current, key=lambda item: item.first)))
 
 
+async def publish_placements(
+        store, workspace, device, start, additions, *, attempts=8):
+    """CAS one or more established packs into their source-local page.
+
+    Independent packers may fill disjoint holes concurrently. A stale CAS is
+    rebased over the page that won. An exact placement is idempotent; an
+    overlap with different physical coverage is explicit and never clobbered.
+    Pack bodies must already exist before this function is called.
+    """
+    key = layout_page_key(workspace, device, start)
+    additions = tuple(additions)
+    if type(attempts) is not int or not 1 <= attempts <= 32:
+        raise ValueError("writer layout attempts")
+    target = async_store(store)
+    unknown = None
+    for _ in range(attempts):
+        try:
+            opened = await target.read_versioned(key)
+        except PayloadTooLarge:
+            raise
+        if opened is ABSENT:
+            token = ABSENT
+            current = LayoutPage(workspace, device, start, ())
+        elif isinstance(opened, Versioned):
+            token = opened.token
+            current = decode_layout_page_at(key, opened.value)
+        else:
+            raise TypeError("writer layout page read")
+        updated = add_placements(current, additions)
+        if updated == current:
+            return current
+        raw = encode_layout_page(updated)
+        try:
+            result = await target.cas(key, token, raw)
+        except OutcomeUnknown as error:
+            unknown = error
+            continue
+        if isinstance(result, Applied):
+            return updated
+        if result is not STALE:
+            raise TypeError("writer layout page CAS")
+    raise InvalidWriterLayout("writer layout contention") from unknown
+
+
 def _bounded_piles(raw_piles):
     try:
         raws = tuple(islice(raw_piles, WINDOW_PILES + 1))
@@ -366,6 +418,7 @@ __all__ = (
     "page_document",
     "parse_layout_page_key",
     "placement_for",
+    "publish_placements",
     "verify_pile_slice",
     "verify_whole_pack",
     "window_end",
