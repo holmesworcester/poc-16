@@ -1,4 +1,4 @@
-"""R2 pack data plane streams bytes and attenuates every operation exactly."""
+"""R2 object capabilities attenuate operations and keep bytes on R2."""
 import asyncio
 from dataclasses import dataclass
 import hashlib
@@ -12,14 +12,19 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from core.crypto import h
-from core.limits import MAX_PILE_BYTES
+from core.limits import MAX_DIRECT_OBJECT_BYTES, MAX_PILE_BYTES
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
+    ObjectOpen,
     PackOpen,
+    confine_object_request,
     confine_scoped_request,
 )
-from deploy.cloudflare_pack.contract import R2PackTarget
+from deploy.cloudflare_pack.contract import (
+    PACK_TICKET_SECRET_BYTES,
+    R2PackTarget,
+)
 from deploy.cloudflare_pack.issuer import R2PackIssuer
 from deploy.cloudflare_pack.put import R2PackPut
 
@@ -30,7 +35,7 @@ OID = h(b"pack payload")
 OTHER = h(b"other pack")
 ACCESS = "a" * 32
 SECRET = "b" * 64
-TICKET_SECRET = b"t" * 32
+TICKET_SECRET = b"t" * PACK_TICKET_SECRET_BYTES
 PREFIX = "repositories/" + h(b"workspace")
 TICKET_DOMAIN = b"poc16-r2-pack-put-v1\0"
 
@@ -47,13 +52,13 @@ def target(**changes):
     return R2PackTarget(**values)
 
 
-def issuer(candidate=None):
+def issuer(candidate=None, *, clock=None):
     return R2PackIssuer(
         target() if candidate is None else candidate,
         ACCESS,
         SECRET,
         TICKET_SECRET,
-        clock=lambda: NOW,
+        clock=(lambda: NOW) if clock is None else clock,
     )
 
 
@@ -175,6 +180,37 @@ def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
         "X-Amz-SignedHeaders"] == ["host;range"]
     assert NOW < whole_request.expires_at_ms <= NOW + 30_000
     assert NOW < range_request.expires_at_ms <= NOW + 30_000
+
+
+def test_object_get_is_one_exact_bounded_direct_r2_request():
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+
+    scoped = issuer().open_object(MEMBER, opened, NOW)
+
+    assert confine_object_request(opened, scoped, NOW) is scoped
+    assert scoped.method == "GET"
+    assert scoped.headers == ()
+    assert urlsplit(scoped.url).path == f"/poc16-packs/{PREFIX}/obj/{OID}"
+    assert parse_qs(urlsplit(scoped.url).query)[
+        "X-Amz-SignedHeaders"] == ["host"]
+    assert scoped.expires_at_ms == NOW + target().ttl_seconds * 1000
+
+
+def test_object_issuer_fails_closed_on_identity_type_time_and_deadline():
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    issued = issuer()
+
+    for member, candidate, trusted_now in (
+            ("not-a-member", opened, NOW),
+            (MEMBER, PackOpen("GET", OID, MAX_PACK_BYTES), NOW),
+            (MEMBER, opened, True)):
+        with pytest.raises(ValueError):
+            issued.open_object(member, candidate, trusted_now)
+
+    deadline = NOW + target().ttl_seconds * 1000
+    late = issuer(clock=lambda: deadline)
+    with pytest.raises(RuntimeError, match="deadline"):
+        late.open_object(MEMBER, opened, NOW)
 
 
 @pytest.mark.parametrize("pack_bytes", (1, MAX_PACK_BYTES))

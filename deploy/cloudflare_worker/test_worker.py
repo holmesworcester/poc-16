@@ -9,7 +9,7 @@ import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -28,8 +28,11 @@ from core.grants import make_token
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
+    ObjectOpen,
     PackOpen,
+    ScopedRequest,
     decode_scoped_request,
+    encode_object_open,
     encode_pack_open,
 )
 from full_peer.node import FullPeer
@@ -143,6 +146,10 @@ class PackBucket(Bucket):
         self.pack_puts.append((key, value, options))
         return SimpleNamespace(key=key)
 
+    async def get(self, key):  # pragma: no cover - failure is the assertion
+        raise AssertionError(
+            f"direct capability route read R2 object body {key}")
+
 
 def deployed_entry(monkeypatch, environment):
     workers = ModuleType("workers")
@@ -194,7 +201,7 @@ def worker_world(tmp_path, monkeypatch):
         PACK_PUT_ENDPOINT="https://worker.example",
         PACK_TTL_SECONDS=TEST_PACK_TTL_SECONDS,
         PACK_TICKET_SECRET=base64.b64encode(
-            b"p" * runtime.EDGE_SECRET_BYTES).decode(),
+            b"p" * runtime.PACK_TICKET_SECRET_BYTES).decode(),
         R2_ACCESS_KEY_ID="worker-access-key",
         R2_SECRET_ACCESS_KEY="worker-secret-key",
         **runtime._BUDGETS,
@@ -235,7 +242,7 @@ def test_runtime_mints_and_reads_through_only_the_direct_r2_binding(
     assert {call[0] for call in bucket.calls} <= {"get", "head"}
 
 
-def test_deployed_entry_issues_exact_gets_and_streams_native_pack_put(
+def test_deployed_entry_issues_direct_object_and_pack_requests(
         tmp_path, monkeypatch):
     _, workspace, _, bucket, environment = worker_world(
         tmp_path, monkeypatch)
@@ -256,6 +263,34 @@ def test_deployed_entry_issues_exact_gets_and_streams_native_pack_put(
         ttl_ms=runtime.MAX_GRANT_TTL_MS,
     )
     headers = {"Authorization": "Bearer " + token}
+    object_oid = h(b"virtual maximum ordinary object")
+    opened_object = ObjectOpen(
+        object_oid, limits.MAX_DIRECT_OBJECT_BYTES)
+    assert opened_object.max_bytes > runtime.MAX_OBJECT_BYTES
+    unauthorized = run(service.fetch(Request(
+        "POST",
+        f"https://worker.example/obj/open?ws={workspace}",
+        encode_object_open(opened_object),
+    )))
+    object_response = run(service.fetch(Request(
+        "POST",
+        f"https://worker.example/obj/open?ws={workspace}",
+        encode_object_open(opened_object),
+        headers,
+    )))
+
+    assert unauthorized.status == 401
+    assert object_response.status == 200
+    object_request = decode_scoped_request(object_response.body)
+    assert object_request.method == "GET" and object_request.headers == ()
+    assert urlsplit(object_request.url).path == (
+        f"/poc16-packs/{environment.STORE_PREFIX}/obj/{object_oid}")
+    assert parse_qs(urlsplit(object_request.url).query)[
+        "X-Amz-SignedHeaders"] == ["host"]
+    assert object_request.expires_at_ms \
+        == TEST_PACK_TTL_SECONDS * 1000
+    assert pack_bucket.calls == []
+
     oid = h(b"virtual maximum pack")
     whole = PackOpen("GET", oid, MAX_PACK_BYTES)
     ranged = PackOpen("GET", oid, MAX_PACK_BYTES, 17, 31)
@@ -311,6 +346,53 @@ def test_deployed_entry_issues_exact_gets_and_streams_native_pack_put(
         sentinel,
         {"onlyIf": {"If-None-Match": "*"}, "sha256": oid},
     )]
+
+
+def test_deployed_entry_confines_a_widened_object_issuer(
+        tmp_path, monkeypatch):
+    _, workspace, _, bucket, environment = worker_world(
+        tmp_path, monkeypatch)
+    pack_bucket = PackBucket(bucket.data)
+    environment.BUCKET = pack_bucket
+    opened = ObjectOpen(
+        h(b"confined object"), limits.MAX_DIRECT_OBJECT_BYTES)
+    token = make_token(
+        b"s" * runtime.EDGE_SECRET_BYTES,
+        h(b"object reader"),
+        workspace,
+        capability=peer_capability.READ_ONLY,
+        issued_at=100,
+        ttl_ms=runtime.MAX_GRANT_TTL_MS,
+    )
+
+    class WidenedIssuer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, member, request, trusted_now):
+            raise AssertionError("pack issuer unexpectedly called")
+
+        open = __call__
+
+        def open_object(self, member, request, trusted_now):
+            return ScopedRequest(
+                "GET",
+                "https://example.com/obj/" + h(b"wrong object"),
+                (),
+                trusted_now + TEST_PACK_TTL_SECONDS * 1000,
+            )
+
+    monkeypatch.setattr(runtime, "R2PackIssuer", WidenedIssuer)
+    service = deployed_entry(monkeypatch, environment)
+    response = run(service.fetch(Request(
+        "POST",
+        f"https://worker.example/obj/open?ws={workspace}",
+        encode_object_open(opened),
+        {"Authorization": "Bearer " + token},
+    )))
+
+    assert response.status == 503
+    assert pack_bucket.calls == []
 
 
 @pytest.mark.parametrize(("name", "value"), (
@@ -676,7 +758,9 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
         [
             sys.executable,
             "-c",
-            "import deploy.cloudflare_pack.issuer, deploy.cloudflare_pack.put",
+            "from deploy.cloudflare_pack.issuer import R2PackIssuer; "
+            "import deploy.cloudflare_pack.put; "
+            "assert callable(R2PackIssuer.open_object)",
         ],
         cwd=staged,
         env={**os.environ, "PYTHONPATH": str(staged)},
@@ -736,7 +820,7 @@ def test_deploy_secrets_are_exact_and_validated_before_wrangler():
         "GRANT_SECRET": base64.b64encode(
             b"g" * manage.EDGE_SECRET_BYTES).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
-            b"p" * manage.EDGE_SECRET_BYTES).decode(),
+            b"p" * manage.PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "pack-reader-access",
         "R2_SECRET_ACCESS_KEY": "pack-reader-secret",
     }
@@ -783,6 +867,8 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     config = json.loads(manage.TEMPLATE.read_text())
 
     assert runtime.EDGE_SECRET_BYTES == manage.EDGE_SECRET_BYTES
+    assert runtime.PACK_TICKET_SECRET_BYTES \
+        == manage.PACK_TICKET_SECRET_BYTES
     assert {
         name: config["vars"][name]
         for name in runtime._BUDGETS
@@ -793,8 +879,9 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     # reads apply their narrower page/fact bound at the gate call site rather
     # than shrinking this shared object-response ceiling.
     assert runtime.MAX_OBJECT_BYTES == limits.MAX_OBJECT_BYTES \
-        == limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_PILE_BYTES
-    assert limits.MAX_FACT_BYTES < runtime.MAX_OBJECT_BYTES
+        == limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_FACT_BYTES
+    assert limits.MAX_DIRECT_OBJECT_BYTES == limits.MAX_PILE_BYTES \
+        > runtime.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES == limits.MAX_PAGE_BATCH_BYTES
     assert runtime.MAX_MINT_FETCHES <= limits.MAX_MINT_FETCHES
@@ -1077,7 +1164,7 @@ def smoke_environment(tmp_path, monkeypatch):
         "GRANT_SECRET": base64.b64encode(
             b"s" * manage.EDGE_SECRET_BYTES).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
-            b"p" * manage.EDGE_SECRET_BYTES).decode(),
+            b"p" * manage.PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "smoke-access-key",
         "R2_SECRET_ACCESS_KEY": "smoke-secret-key",
     }

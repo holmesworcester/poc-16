@@ -23,7 +23,10 @@ if str(REPOSITORY) not in sys.path:
 from deploy.cloudflare_python import (  # noqa: E402
     patch_pynacl as patch_vendored_pynacl,
 )
-from deploy.cloudflare_pack.contract import R2PackTarget  # noqa: E402
+from deploy.cloudflare_pack.contract import (  # noqa: E402
+    PACK_TICKET_SECRET_BYTES,
+    R2PackTarget,
+)
 from deploy.cloudflare_sigv4 import (  # noqa: E402
     ACCESS_KEY_PATTERN,
     MAX_ACCESS_KEY_ID_CHARS,
@@ -147,7 +150,7 @@ def _pywrangler(*arguments, capture=False, env=None, timeout=None):
     )
 
 
-def _base64_secret(environment, name):
+def _base64_secret(environment, name, expected_bytes):
     value = environment.get(name, "")
     if not isinstance(value, str):
         raise ValueError(f"{name} must be base64")
@@ -156,9 +159,9 @@ def _base64_secret(environment, name):
         raw = base64.b64decode(value, validate=True)
     except (ValueError, TypeError) as error:
         raise ValueError(f"{name} must be base64") from error
-    if len(raw) != EDGE_SECRET_BYTES:
+    if len(raw) != expected_bytes:
         raise ValueError(
-            f"{name} must encode exactly {EDGE_SECRET_BYTES} bytes")
+            f"{name} must encode exactly {expected_bytes} bytes")
     return value
 
 
@@ -176,9 +179,10 @@ def _secrets(environment):
         MAX_SECRET_ACCESS_KEY_CHARS,
     )
     return {
-        "GRANT_SECRET": _base64_secret(environment, "GRANT_SECRET"),
+        "GRANT_SECRET": _base64_secret(
+            environment, "GRANT_SECRET", EDGE_SECRET_BYTES),
         "PACK_TICKET_SECRET": _base64_secret(
-            environment, "PACK_TICKET_SECRET"),
+            environment, "PACK_TICKET_SECRET", PACK_TICKET_SECRET_BYTES),
         "R2_ACCESS_KEY_ID": access,
         "R2_SECRET_ACCESS_KEY": secret,
     }
@@ -320,7 +324,7 @@ def workerd_test():
         "GRANT_SECRET": base64.b64encode(
             bytes(EDGE_SECRET_BYTES)).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
-            b"p" * EDGE_SECRET_BYTES).decode(),
+            b"p" * PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "workerd-access",
         "R2_SECRET_ACCESS_KEY": "workerd-secret",
     }

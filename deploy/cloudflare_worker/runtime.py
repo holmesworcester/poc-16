@@ -20,7 +20,10 @@ from core.limits import (
 from core.shape import valid_fid
 from core.http import HttpGate, Response
 from core.object_store import validate_store_prefix
-from deploy.cloudflare_pack.contract import R2PackTarget
+from deploy.cloudflare_pack.contract import (
+    PACK_TICKET_SECRET_BYTES,
+    R2PackTarget,
+)
 from deploy.cloudflare_pack.issuer import R2PackIssuer
 from deploy.cloudflare_pack.put import R2PackPut
 
@@ -107,12 +110,12 @@ def _integer(env, name):
     return int(value)
 
 
-def _secret32(env, name):
+def _secret(env, name, expected_bytes):
     try:
         secret = base64.b64decode(_text(env, name), validate=True)
     except (ValueError, TypeError) as error:
         raise ValueError(f"{name} binding") from error
-    if len(secret) != EDGE_SECRET_BYTES:
+    if len(secret) != expected_bytes:
         raise ValueError(f"{name} binding")
     return secret
 
@@ -149,8 +152,9 @@ class Settings:
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("STORE_PREFIX binding") from error
         bucket = getattr(env, "BUCKET")
-        secret = _secret32(env, "GRANT_SECRET")
-        ticket_secret = _secret32(env, "PACK_TICKET_SECRET")
+        secret = _secret(env, "GRANT_SECRET", EDGE_SECRET_BYTES)
+        ticket_secret = _secret(
+            env, "PACK_TICKET_SECRET", PACK_TICKET_SECRET_BYTES)
         target = R2PackTarget(
             _text(env, "R2_ENDPOINT"),
             _text(env, "PACK_BUCKET"),
@@ -216,12 +220,14 @@ def now_ms():
 
 def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
+    issuer = settings.issue_packs(clock)
     return HttpGate(
         ReadOnlyStore(settings.bucket, settings.prefix),
         settings.workspace,
         settings.secret,
         clock,
-        pack_open=settings.issue_packs(clock),
+        object_open=issuer.open_object,
+        pack_open=issuer.open,
         sync_profile=peer_capability.READ_ONLY,
         max_request_bytes=settings.max_request_bytes,
         max_root_bytes=settings.max_root_bytes,

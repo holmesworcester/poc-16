@@ -1,7 +1,7 @@
-"""Exact short-lived R2 requests issued behind the shared grant gate."""
+"""Exact short-lived R2 object requests behind the shared grant gate."""
 import time
 
-from core.pack_access import PackOpen, ScopedRequest, pack_key
+from core.pack_access import ObjectOpen, PackOpen, ScopedRequest, pack_key
 from core.shape import valid_fid
 from deploy.cloudflare_sigv4 import R2SigV4
 
@@ -12,8 +12,26 @@ def _system_now_ms():
     return time.time_ns() // 1_000_000
 
 
+def _signed_get(target, signer, key, headers, trusted_now):
+    expires_at_ms = trusted_now + target.ttl_seconds * 1000
+    signed = signer.sign(
+        "GET",
+        target.bucket,
+        key,
+        headers,
+        target.ttl_seconds,
+        not_after_ms=expires_at_ms,
+    )
+    return ScopedRequest(
+        signed.method,
+        signed.url,
+        signed.headers,
+        signed.expires_at_ms,
+    )
+
+
 class R2PackIssuer:
-    """Issue one exact request for an authenticated ``PackOpen``."""
+    """Issue exact R2 object and pack requests after shared-gate auth."""
 
     def __init__(
             self, target, access_key_id, secret_access_key, put_ticket_secret,
@@ -31,11 +49,22 @@ class R2PackIssuer:
             clock=clock,
         )
 
-    def __call__(self, member, opened, trusted_now):
+    def open_object(self, member, opened, trusted_now):
+        if not valid_fid(member) or not isinstance(opened, ObjectOpen) \
+                or type(trusted_now) is not int or trusted_now < 0:
+            raise ValueError("R2 object request")
+        return _signed_get(
+            self.target,
+            self._sigv4,
+            self.target.physical_object_key(opened.oid),
+            {},
+            trusted_now,
+        )
+
+    def open(self, member, opened, trusted_now):
         if not valid_fid(member) or not isinstance(opened, PackOpen) \
                 or type(trusted_now) is not int or trusted_now < 0:
             raise ValueError("R2 pack request")
-        expires_at_ms = trusted_now + self.target.ttl_seconds * 1000
         if opened.method == "GET":
             headers = {}
             if opened.offset is not None:
@@ -43,20 +72,14 @@ class R2PackIssuer:
                     f"bytes={opened.offset}-"
                     f"{opened.offset + opened.length - 1}"
                 )
-            signed = self._sigv4.sign(
-                "GET",
-                self.target.bucket,
+            return _signed_get(
+                self.target,
+                self._sigv4,
                 self.target.physical_key(opened.oid),
                 headers,
-                self.target.ttl_seconds,
-                not_after_ms=expires_at_ms,
+                trusted_now,
             )
-            return ScopedRequest(
-                signed.method,
-                signed.url,
-                signed.headers,
-                signed.expires_at_ms,
-            )
+        expires_at_ms = trusted_now + self.target.ttl_seconds * 1000
         url = f"{self.target.put_endpoint}/{pack_key(opened.oid)}?" + (
             ticket_query(
                 self._ticket_secret,
@@ -74,3 +97,5 @@ class R2PackIssuer:
             ),
             expires_at_ms,
         )
+
+    __call__ = open

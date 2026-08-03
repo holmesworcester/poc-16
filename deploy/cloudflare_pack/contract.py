@@ -1,4 +1,4 @@
-"""Small shared configuration and ticket format for R2 pack access."""
+"""Shared R2 namespace and immutable pack-creation ticket format."""
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -9,16 +9,19 @@ from core.object_store import (
     MAX_PROVIDER_KEY_BYTES,
     validate_store_prefix,
 )
-from core.pack_access import MAX_SCOPED_TTL_MS, pack_key
+from core.pack_access import MAX_SCOPED_TTL_MS, object_key, pack_key
 
 
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 TICKET_FIELDS = ("expires_at_ms", "pack_bytes", "signature")
 _TICKET_DOMAIN = b"poc16-r2-pack-put-v1\0"
+PACK_TICKET_SECRET_BYTES = 32
+DEFAULT_SCOPED_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
 
 
 def ticket_secret(value):
-    if not isinstance(value, bytes) or len(value) != 32:
+    if not isinstance(value, bytes) \
+            or len(value) != PACK_TICKET_SECRET_BYTES:
         raise ValueError("R2 pack ticket secret")
     return value
 
@@ -54,13 +57,13 @@ def _base_url(value, label):
 
 @dataclass(frozen=True, slots=True)
 class R2PackTarget:
-    """Non-secret R2 namespace and public native-PUT endpoint."""
+    """Non-secret R2 object namespace and public native-PUT endpoint."""
 
     endpoint: str
     bucket: str
     prefix: str
     put_endpoint: str
-    ttl_seconds: int = 60
+    ttl_seconds: int = DEFAULT_SCOPED_TTL_SECONDS
 
     def __post_init__(self):
         object.__setattr__(self, "endpoint", _base_url(
@@ -80,9 +83,16 @@ class R2PackTarget:
             raise ValueError("R2 pack capability lifetime")
         self.physical_key("0" * 64)
 
-    def physical_key(self, oid):
-        logical = pack_key(oid)
+    def _physical_key(self, logical):
         result = f"{self.prefix}/{logical}" if self.prefix else logical
         if len(result.encode("ascii")) > MAX_PROVIDER_KEY_BYTES:
-            raise ValueError("R2 pack key exceeds 1024 bytes")
+            raise ValueError(
+                "R2 key exceeds "
+                f"{MAX_PROVIDER_KEY_BYTES} provider bytes")
         return result
+
+    def physical_key(self, oid):
+        return self._physical_key(pack_key(oid))
+
+    def physical_object_key(self, oid):
+        return self._physical_key(object_key(oid))
