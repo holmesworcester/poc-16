@@ -10,21 +10,24 @@ authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
 The target `AuthorityGate` is actor-neutral: hosted and full peers run the same
 implementation. Every semantic evaluation starts from exactly one canonical
-closed pile. Pull evaluates a complete writer-tree leaf and may retain its
-durable facts; push evaluates the same wire value only to check conditions in
-fresh in-memory or temporary SQLite, then discards the pile judgment and every
-derived row. A pushed pile never enters recipient fact space. Local persistent
-SQL, Python fact objects, provider identity, and Iroh identity may not shortcut
-this boundary. Provider storage bindings, process scheduling, and optional
-content consumption are the only hosted/full-peer composition differences;
-pile bytes, evaluator, gate, temporary schema, family queries, and typed result
-must remain identical.
+closed pile. Pull recovers a complete signed pile from a loose pile object or a
+sealed-pack range and may retain its durable facts; push evaluates the same wire
+value only to check conditions in fresh in-memory or temporary SQLite, then
+discards the pile judgment and every derived row. A pushed pile never enters
+recipient fact space. Local persistent SQL, Python fact objects, provider
+identity, and Iroh identity may not shortcut this boundary. Provider storage
+bindings, process scheduling, packing, and optional content consumption are the
+only hosted/full-peer composition differences; pile bytes, evaluator, gate,
+temporary schema, family queries, and typed result must remain identical.
 
 Target writer trees reuse the canonical bounded persistent Merkle-map style.
 Each logical leaf names exactly one independently closed pile; range or diff
-pagination stops only between leaves. Every pile is signed directly by its
-publishing writer device. The pile signature authenticates the portable pile;
-the device-signed writer head and Merkle inclusion path authenticate its place
+pagination stops only between leaves. Separately replaceable, source-local
+fixed-window layout pages may map contiguous leaf ranges to immutable concat
+packs, but they are locators rather than log authority. Every pile is signed
+directly by its publishing writer device. The pile signature authenticates the
+portable pile; the device-signed writer head and Merkle inclusion path
+authenticate its place
 in that device's tree. A cold receiver must validate the pile signature, head,
 inclusion, and complete pile without an adjacent leaf or prior cache state.
 

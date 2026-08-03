@@ -323,42 +323,122 @@ A writer update proceeds in this order:
 
 1. construct and device-sign one or more bounded closed piles;
 2. locally evaluate those exact signed bytes;
-3. establish fact, pile, pack, and Merkle objects immutably in the writer's
-   registered store;
-4. construct the new cumulative writer-log root;
-5. construct and sign one immutable head record;
+3. append those pile OIDs to the cumulative logical Merkle tree;
+4. establish the signed piles and reachable Merkle objects immutably in the
+   writer's registered store;
+5. construct and sign one immutable head record over the cumulative logical
+   tree;
 6. push one closed authority pile to `AuthorityGate`, binding its signed request
    fact to the proposed head OID;
 7. conditionally replace only this device's stable head slot.
+
+Before or after that semantic publication, the source may independently pack
+contiguous complete piles and CAS only the directly addressed layout page for
+that fixed publication window. The immutable pack must exist before the page
+names it. A lagging or absent page leaves the newly published pile available by
+its normal OID; layout failure never rolls back or invalidates the writer head.
 
 The log root is content addressed. It is not the provider ETag, and no code may
 derive one from the other. Writer-log pages and pile objects are immutable and
 must exist before the head can become visible.
 
-The honest writer maintains a cumulative log. A head carries a strictly
-increasing writer-local sequence and the current cumulative root, but does not
-link a permanent chain of historical head versions. A peer compares a candidate
-directly with its last accepted head and tree: a lower sequence is rollback, an
-equal sequence with another root is a fork, and a higher sequence must be a
-monotone tree extension. A fresh peer validates the current signed head and all
-selected pile leaves. Historical head records and superseded path-copy pages
-are not protocol history and need not be retained after no active sync or local
-checkpoint pins them.
+The honest writer maintains one cumulative sequence of closed-pile identities,
+ordered by publication rather than by a fact's semantic timestamp. The
+cumulative Merkle tree is the authority for that sequence. A head carries that
+tree and a writer-local sequence exactly equal to its logical leaf count. It
+does not link a permanent chain of historical heads. A peer proves that a
+candidate tree is an exact append-only extension of its last accepted tree. A
+lower sequence is rollback, an equal sequence with different bytes is a fork,
+and a higher sequence may never remove, reorder, or replace an accepted leaf.
+Repacking does not create a writer head because it changes no logical fact.
+
+A fresh peer validates the current signed head, selected tree paths, and every
+selected signed closed pile. Historical head records and superseded path-copy
+pages are not protocol history and need not be retained after no active sync or
+local checkpoint pins them.
 
 A provider directory cannot force a user-controlled bucket to retain data
 forever; cloud storage availability is therefore distinct from fact validity.
 Replication to other peers supplies independent durability.
 
-When a consumer accepts a successor head, it verifies that the new tree is a
-monotone extension of the predecessor: every old logical key still names the
-same pile OID, every added key follows the fixed writer-local order, and no leaf
-was changed or removed. The range diff supplies exactly the new complete
-closed-pile leaves. `AuthorityGate` deliberately does not perform this check.
+When a consumer accepts a successor head, the two-tree RBSR difference supplies
+exactly the newly published closed-pile leaves. `AuthorityGate` deliberately
+does not perform this check.
 
-Writers may pack many small pile or Bao-slice objects into one immutable object
-with a compact range index. A pack index is only a locator. Each extracted pile,
-fact, payload hash, and Bao proof is checked normally. Packing changes request
-economics, not authority or closure.
+Logical history and physical transfer shape are separate:
+
+```text
+logical writer tree
+    publication sequence -> signed closed-pile OID
+
+source-local optional physical layout
+    fixed publication window -> bounded flat layout page
+
+layout page
+    nonoverlapping interval -> pack OID + byte lengths for complete piles
+```
+
+A pack body is a concatenation of complete signed pile bytes. Its locator is
+only a hint for finding those bytes: every extracted pile, fact, payload hash,
+and Bao proof is checked normally. Repacking a logical interval must not change
+any writer-tree leaf. Recent piles remain loose until a source seals a fixed
+pack.
+
+The layout is local to the serving store, not a writer-head field and not an
+origin signature. A cloud bucket and several relaying full peers may advertise
+different packs for the same authenticated pile OIDs. This is safe because a
+receiver first selects the expected sequence/OID from the signed logical tree,
+then treats the locator as an untrusted fetch hint. A bad or stale locator can
+cause only a bounded miss. It cannot add, omit, reorder, or validate a logical
+publication. Missing layout falls back to the pile's ordinary immutable object
+or another source.
+
+Layout pages cover fixed writer-local publication windows and are addressed by
+arithmetic from a sequence number; the initial bound is 16,384 publications per
+page, subject to an exact four-MiB codec ratchet. There is no layout root, LIST
+scan, predecessor search, global manifest, or second Merkle tree. Placements in
+one page are sorted, nonoverlapping, wholly inside that window, and may leave
+holes. A hole means "fetch the normal pile object," not deletion. Pack bodies
+never cross writer or layout-window boundaries.
+
+This is an unavoidable storage tradeoff rather than a protocol ambiguity. One
+ever-growing object minimizes cold GET count but rewrites the writer's entire
+history on each append. One immutable object per pile writes each byte once but
+makes cold catch-up request-bound. The initial policy therefore uses fixed
+immutable packs plus one asynchronously packed loose suffix: ordinary append
+never touches layout, while a background or sender-side packer takes a bounded
+uncovered contiguous prefix, uploads one at-most-95-MiB pack, and CASes only its
+window page. Each pile is copied into established packing at most once.
+
+If cold request count later matters, a source may perform one final coalescing
+pass when a publication window closes, replacing its several small placements
+with the minimum number of at-most-95-MiB packs. That makes older windows dense
+and leaves only the current window fragmented, matching the useful part of
+"larger packs toward the past" without an unbounded merge ladder. It costs at
+most one additional copy of that closed window and changes only its local
+layout page; it is an optimization, not required protocol state.
+
+Geometric recent runs can reduce a live suffix from linear to logarithmic GETs,
+but copy each pile at every merge level, make some appends rewrite a large run,
+and create more CAS/GC states. They are not part of the initial protocol. Add
+them only if corrected measurements show the bounded loose suffix dominates
+latency; doing so would change source-local packing policy, not the logical log.
+
+Cold catch-up derives the finite layout-page keys from the signed head count,
+opens those pages in parallel, fetches whole packs for their dense placements,
+and fetches uncovered holes loosely. From the ordered slices it may hash each
+pile, rebuild the canonical logical tree locally, and accept that shortcut only
+when root, count, and depth exactly equal the signed head. It need not download
+every remote Merkle page merely to learn the same rows. An incomplete or
+inconsistent layout falls back to the ordinary authenticated tree walk.
+
+RBSR or a resumed/selective sync starts with the signed tree, identifies
+missing logical leaf ranges, and then reads only the corresponding complete-
+pile slices. It must not reconstruct a cold full history with one range request
+per pile. Semantic timestamps do not control placement: a backdated message
+still appends at the next publication sequence, and a semantic deletion is
+another appended fact. No packing policy therefore assumes that users never
+write "into the past."
 
 ## 5. Canonical writer heads
 
@@ -369,8 +449,8 @@ format version
 workspace fid
 device-writer fid
 durable owner principal
-writer-local sequence
-current writer-log root oid
+writer-local sequence equal to logical leaf count
+cumulative logical writer-tree root oid
 registered store-binding fid
 device signature
 ```
@@ -457,11 +537,13 @@ A workspace mirror turn is:
    bundled read phase, never as one sequential RTT per writer;
 4. compare each opened head OID with that writer's locally accepted head OID;
 5. if the immutable head OID is already local, perform no tree or pile fetch;
-6. otherwise mirror the missing content-addressed head, Merkle pages, and
-   complete directly signed logical pile leaves from that writer tree;
+6. otherwise mirror the missing content-addressed head and logical writer-tree
+   pages, then open only the source-local layout pages needed by the tree
+   difference;
 7. stop there on a non-consuming hosted peer;
-8. on a consuming peer, verify and evaluate the head and every previously
-   unvalidated signed closed-pile leaf through the shared consumer, then union
+8. on a consuming peer, recover every previously unvalidated complete signed
+   pile from a loose object, whole pack, or exact pack range, evaluate it
+   through the shared consumer, and union
    its durable facts.
 
 A head learned through P2P and already present locally is not fetched again
@@ -654,17 +736,20 @@ pushed closed authority pile.
 ## 9. Sync and range behavior
 
 The unit of workspace discovery is a device head. The unit of incremental sync
-is the Merkle difference between two roots of that device's tree. The unit of
-transfer and semantic judgment is one complete writer-device-signed closed-
-pile leaf.
+is the Merkle difference between two roots of that device's logical pile tree.
+The unit of transfer may be a whole physical pack or an exact range within one.
+The unit of semantic judgment remains one complete writer-device-signed closed
+pile.
 
 ```text
 LIST/open one bounded page of independent workspace head slots
     -> compare every writer's remote head oid with its local head oid
     -> known head oid: no immutable fetch
-    -> unknown head oid: RBSR and mirror missing pages/full signed-pile leaves
+    -> unknown head oid: RBSR missing logical closed-pile leaves
+    -> use the current layout to fetch whole packs for dense missing history
+       or exact closed-pile ranges for sparse/resumed history
     -> non-consuming peer stops
-    -> consuming peer verifies and evaluates every new signed-pile leaf
+    -> consuming peer verifies and evaluates every new signed closed pile
     -> durable facts join that peer's local validated set
 ```
 
@@ -677,11 +762,11 @@ SQL so deleting the presentation database does not destroy sync correctness.
 P2P uses the same forest and range-based set reconciliation (RBSR), not one sync
 session per pile and not a second combined content log. Peers first exchange
 their per-device head directories. For each device root that differs, they
-compare range fingerprints, prune equal subtrees, descend only differing
-ranges, and exchange the missing complete signed-pile leaves. Running the diff
-in both directions reconciles arbitrary overlap rather than assuming either
-peer has a prefix of the other. Each receiver verifies and evaluates every
-missing pile independently before serving it in a later sync.
+compare logical pile-tree range fingerprints, prune equal subtrees, and descend
+only differing leaf ranges. Running the diff in both directions reconciles
+arbitrary overlap rather than assuming either peer has a prefix of the other.
+Each receiver verifies and evaluates every missing pile independently before
+serving it in a later sync.
 
 One two-way turn reuses the remote per-writer slots opened during its pull when
 deciding what to offer back. It does not probe every unchanged remote slot a
@@ -704,11 +789,12 @@ protocol. The cloud path remains owner-push-only. Both paths deliver the same
 directly signed pile, signed head, and Merkle evidence to the same consumer;
 only discovery and eligibility to upload differ.
 
-Range pagination stops only between logical pile leaves. Every page is thus a
-bounded sequence of independently closed evaluations; no receiver must widen a
-range, chase a dependency into an adjacent leaf, or retain the preceding page
-to make the next page valid. Tree fingerprints and OIDs prune identical ranges;
-they never stand in for evaluating the returned pile bytes.
+Logical tree rows and pack locators index only complete pile boundaries. Range
+pagination and pack byte ranges therefore stop between independently closed
+evaluations; no receiver must chase a dependency into an adjacent slice or
+retain a preceding slice to validate the next one. Tree fingerprints, expected
+pile OIDs, and layout pages prune or locate identical ranges; they never stand
+in for evaluating the returned pile bytes.
 
 Facts with large payloads, Bao slices, key wraps, and history-key material may
 be co-packed for S3/R2. P2P peers may transfer the same individual verified
