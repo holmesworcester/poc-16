@@ -14,14 +14,21 @@ from core import peer_capability
 from core.crypto import h
 from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
+from core.limits import MAX_DIRECT_OBJECT_BYTES
 from core.pack_access import (
+    MAX_SCOPED_REQUEST_BYTES,
+    MAX_SCOPED_TTL_MS,
+    ObjectOpen,
     PackOpen,
     decode_scoped_request,
+    encode_object_open,
     encode_pack_open,
 )
 from deploy.aws_lambda import app
 from deploy.aws_lambda.pack_issuer import (
+    DEFAULT_PACK_TTL_SECONDS,
     PACK_CONTENT_TYPE,
+    SIGV4_CLOCK_MARGIN_SECONDS,
     S3PackBinding,
     S3PackIssuer,
 )
@@ -280,8 +287,42 @@ def test_issuer_maps_whole_range_and_create_to_exact_s3_requests():
             hashlib.sha256(BODY).digest()).decode(),
         "x-amz-expected-bucket-owner": OWNER,
     }
-    assert all(item.expires_at_ms == NOW + 60_000
+    expected_expiry = NOW + 1000 * (
+        DEFAULT_PACK_TTL_SECONDS - SIGV4_CLOCK_MARGIN_SECONDS)
+    assert all(item.expires_at_ms == expected_expiry
                for item in (whole, ranged, create))
+
+
+def test_object_issuer_maps_one_bounded_open_to_exact_s3_get():
+    store, signer = issuer()
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    scoped = signer.open_object(MEMBER, opened, NOW)
+    exact_key = f"{PREFIX}/obj/{OID}"
+
+    assert store.calls == [(
+        "get_object",
+        {
+            "Bucket": BUCKET,
+            "ExpectedBucketOwner": OWNER,
+            "Key": exact_key,
+        },
+        DEFAULT_PACK_TTL_SECONDS - SIGV4_CLOCK_MARGIN_SECONDS,
+        "GET",
+    )]
+    assert scoped.method == "GET"
+    assert scoped.expires_at_ms == NOW + 1000 * (
+        DEFAULT_PACK_TTL_SECONDS - SIGV4_CLOCK_MARGIN_SECONDS)
+    assert dict(scoped.headers) == {
+        "x-amz-expected-bucket-owner": OWNER}
+    store.data[exact_key] = BODY
+    assert store.execute(scoped) == (
+        200,
+        {
+            "accept-ranges": "bytes",
+            "content-length": str(len(BODY)),
+        },
+        BODY,
+    )
 
 
 def test_fake_s3_returns_exact_whole_and_single_range_shapes():
@@ -368,6 +409,29 @@ def test_fake_s3_rejects_every_signed_authority_mutation():
     assert store.data == {}
 
 
+def test_fake_s3_rejects_every_object_get_authority_mutation():
+    store, signer = issuer()
+    opened = ObjectOpen(OID, len(BODY))
+    scoped = signer.open_object(MEMBER, opened, NOW)
+    headers = dict(scoped.headers)
+    cases = (
+        ("PUT", scoped.url, headers),
+        ("GET", scoped.url.replace(BUCKET, "foreign-bucket"), headers),
+        ("GET", scoped.url.replace(PREFIX, "foreign/workspace"), headers),
+        ("GET", scoped.url.replace(OID, h(b"other")), headers),
+        ("GET", _query_mutation(
+            scoped.url, "X-Amz-Expires",
+            str(DEFAULT_PACK_TTL_SECONDS + 1)), headers),
+        ("GET", scoped.url, {
+            **headers, "x-amz-expected-bucket-owner": "0" * 12}),
+    )
+    for method, url, mutated_headers in cases:
+        assert store.execute(
+            scoped, method=method, url=url,
+            headers=mutated_headers)[0] == 403
+    assert store.data == {}
+
+
 def test_issuer_rejects_presigner_scope_widening_before_return():
     class Weak(DeterministicS3):
         def generate_presigned_url(self, *args, **kwargs):
@@ -381,6 +445,29 @@ def test_issuer_rejects_presigner_scope_widening_before_return():
         signer.open(
             MEMBER, PackOpen("GET", OID, len(BODY), 1, 2), NOW)
     assert len(weak.calls) == 1
+
+
+def test_object_issuer_rejects_a_presigner_that_omits_owner_binding():
+    class Weak(DeterministicS3):
+        def generate_presigned_url(self, *args, **kwargs):
+            valid = super().generate_presigned_url(*args, **kwargs)
+            return valid.replace(
+                "host%3Bx-amz-expected-bucket-owner", "host")
+
+    weak, signer = issuer(Weak())
+    with pytest.raises(RuntimeError, match="sign every constraint"):
+        signer.open_object(MEMBER, ObjectOpen(OID, len(BODY)), NOW)
+    assert len(weak.calls) == 1
+
+
+def test_sigv4_second_boundary_stays_inside_gate_ttl():
+    _store, signer = issuer()
+    trusted_now = NOW - 1
+    scoped = signer.open_object(
+        MEMBER, ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES), trusted_now)
+
+    assert trusted_now < scoped.expires_at_ms \
+        <= trusted_now + MAX_SCOPED_TTL_MS
 
 
 def test_issuer_preserves_declared_kms_headers_in_the_signature():
@@ -410,6 +497,7 @@ def test_binding_rejects_non_aws_or_unbounded_configuration():
             (S3Config(**{**base, "region_name": None}), 60),
             (S3Config(**{**base,
                        "endpoint_url": "https://r2.example"}), 60),
+            (S3Config(**base), SIGV4_CLOCK_MARGIN_SECONDS),
             (S3Config(**base), 61)):
         with pytest.raises(ValueError, match="pack binding"):
             S3PackBinding(config, ttl)
@@ -446,6 +534,53 @@ def test_lambda_pack_open_returns_only_bounded_scoped_metadata(monkeypatch):
     assert store.data == {}
 
 
+def test_lambda_object_open_returns_metadata_without_buffering_s3_body():
+    store, signer = issuer()
+    secret = b"s" * 32
+    issued = []
+
+    def open_object(*args):
+        scoped = signer.open_object(*args)
+        issued.append(scoped)
+        return scoped
+
+    gate = HttpGate(
+        object(), WORKSPACE, secret, lambda: NOW,
+        object_open=open_object)
+    app._gateway_cache = gate
+    token = make_token(
+        secret, MEMBER, WORKSPACE,
+        capability=peer_capability.READ_ONLY,
+        issued_at=NOW, ttl_ms=MAX_SCOPED_TTL_MS)
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+
+    class UnbufferableBody:
+        def __bytes__(self):  # pragma: no cover - failure is the assertion
+            raise AssertionError("Lambda buffered the S3 object body")
+
+    physical_key = f"{PREFIX}/obj/{OID}"
+    sentinel = UnbufferableBody()
+    store.data[physical_key] = sentinel
+    result = app.handler({
+        "version": "2.0",
+        "rawPath": "/obj/open",
+        "rawQueryString": f"ws={WORKSPACE}",
+        "headers": {"authorization": "Bearer " + token},
+        "requestContext": {"http": {"method": "POST"}},
+        "body": base64.b64encode(encode_object_open(opened)).decode(),
+        "isBase64Encoded": True,
+    }, None)
+
+    assert result["statusCode"] == 200
+    raw = base64.b64decode(result["body"])
+    scoped = decode_scoped_request(raw)
+    assert issued == [scoped]
+    assert len(store.calls) == 1
+    assert len(raw) <= MAX_SCOPED_REQUEST_BYTES
+    assert BODY not in raw
+    assert store.data[physical_key] is sentinel
+
+
 def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
         monkeypatch):
     config = S3Config(
@@ -455,6 +590,9 @@ def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
 
     class PackIssuer:
         def open(self, *_args):
+            pass
+
+        def open_object(self, *_args):
             pass
 
     pack_issuer = PackIssuer()
@@ -468,5 +606,6 @@ def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
 
     gate = app._gateway()
     assert issued == [config]
+    assert gate.object_open == pack_issuer.open_object
     assert gate.pack_open == pack_issuer.open
     assert app._gateway_cache is gate

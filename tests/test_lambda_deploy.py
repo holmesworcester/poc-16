@@ -334,7 +334,10 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
         lambda value: AsyncFromSyncReader(node.store(workspace)))
     monkeypatch.setattr(
         app, "_pack_issuer",
-        lambda value: SimpleNamespace(open=lambda *_args: None))
+        lambda value: SimpleNamespace(
+            open=lambda *_args: None,
+            open_object=lambda *_args: None,
+        ))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)
     monkeypatch.setenv("TINYP2P_GRANT_SECRET_ARN", "stable-secret")
     app._gateway_cache = None

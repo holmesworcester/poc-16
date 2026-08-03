@@ -1,7 +1,7 @@
-"""Exact AWS S3 capabilities for immutable writer-pack HTTP requests.
+"""Exact AWS S3 capabilities for immutable direct-object HTTP requests.
 
-This module signs metadata only.  Pack bodies travel between the caller and
-S3, never through Lambda or :class:`core.http.HttpGate`.
+This module signs metadata only. Object and pack bodies travel between the
+caller and S3, never through Lambda or :class:`core.http.HttpGate`.
 """
 from dataclasses import dataclass
 import base64
@@ -12,8 +12,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from adapters.s3 import S3Config
 from core.pack_access import (
     MAX_SCOPED_TTL_MS,
+    ObjectOpen,
     PackOpen,
     ScopedRequest,
+    object_key,
     pack_key,
 )
 from core.shape import valid_fid
@@ -21,6 +23,9 @@ from core.shape import valid_fid
 
 PACK_CONTENT_TYPE = "application/octet-stream"
 DEFAULT_PACK_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
+# SigV4 records whole seconds after HttpGate captured millisecond trusted time.
+# Reserve one second so crossing that boundary cannot widen or reject the URL.
+SIGV4_CLOCK_MARGIN_SECONDS = 1
 
 _AWS_HOST = re.compile(
     r"^(?:s3(?:[.-][a-z0-9-]+)*\.)?amazonaws\.com(?:\.cn)?$")
@@ -42,7 +47,7 @@ _SIGNATURE = re.compile(r"^[0-9a-f]{64}$")
 
 @dataclass(frozen=True, slots=True)
 class S3PackBinding:
-    """The one deployed S3 namespace and bearer lifetime an issuer may use."""
+    """The deployed S3 namespace and bearer lifetime an issuer may use."""
 
     config: S3Config
     ttl_seconds: int = DEFAULT_PACK_TTL_SECONDS
@@ -53,12 +58,18 @@ class S3PackBinding:
                 or self.config.region_name is None \
                 or self.config.endpoint_url is not None \
                 or type(self.ttl_seconds) is not int \
-                or not 1 <= self.ttl_seconds \
+                or not SIGV4_CLOCK_MARGIN_SECONDS < self.ttl_seconds \
                 <= DEFAULT_PACK_TTL_SECONDS:
             raise ValueError("AWS S3 pack binding")
 
-    def physical_key(self, oid):
-        return f"{self.config.prefix}/{pack_key(oid)}"
+    def physical_key(self, opened):
+        if isinstance(opened, ObjectOpen):
+            logical = object_key(opened.oid)
+        elif isinstance(opened, PackOpen):
+            logical = pack_key(opened.oid)
+        else:
+            raise TypeError("AWS S3 direct request")
+        return f"{self.config.prefix}/{logical}"
 
 
 def _new_client(binding):
@@ -120,7 +131,7 @@ def _checksum(oid):
 
 def _headers(opened, config):
     values = {}
-    if opened.method == "PUT":
+    if isinstance(opened, PackOpen) and opened.method == "PUT":
         values.update({
             "content-length": str(opened.pack_bytes),
             "content-type": PACK_CONTENT_TYPE,
@@ -136,7 +147,7 @@ def _headers(opened, config):
         if config.bucket_key_enabled is not None:
             values["x-amz-server-side-encryption-bucket-key-enabled"] = (
                 str(config.bucket_key_enabled).lower())
-    elif opened.offset is not None:
+    elif isinstance(opened, PackOpen) and opened.offset is not None:
         values["range"] = (
             f"bytes={opened.offset}-{opened.offset + opened.length - 1}")
     if config.expected_bucket_owner is not None:
@@ -150,12 +161,12 @@ def _params(opened, binding, headers):
     values = dict(headers)
     params = {
         "Bucket": config.bucket,
-        "Key": binding.physical_key(opened.oid),
+        "Key": binding.physical_key(opened),
     }
     if config.expected_bucket_owner is not None:
         params["ExpectedBucketOwner"] = config.expected_bucket_owner
-    if opened.method == "GET":
-        if opened.offset is not None:
+    if _method(opened) == "GET":
+        if isinstance(opened, PackOpen) and opened.offset is not None:
             params["Range"] = values["range"]
         return params
     params.update({
@@ -180,6 +191,10 @@ def _expected_target(endpoint, bucket, key):
     }
 
 
+def _method(opened):
+    return "GET" if isinstance(opened, ObjectOpen) else opened.method
+
+
 def _inspect(url, opened, binding, client, headers, trusted_now):
     config = binding.config
     try:
@@ -193,23 +208,25 @@ def _inspect(url, opened, binding, client, headers, trusted_now):
             or parsed.password is not None or parsed.port is not None \
             or parsed.fragment or target not in _expected_target(
                 _endpoint_host(client), config.bucket,
-                binding.physical_key(opened.oid)):
+                binding.physical_key(opened)):
         raise RuntimeError("S3 pack presigner target")
     if set(query) - _REQUIRED_QUERY - _OPTIONAL_QUERY \
             or _REQUIRED_QUERY - set(query) \
             or any(len(values) != 1 for values in query.values()):
         raise RuntimeError("S3 pack presigner query shape")
+    request_ttl = (
+        binding.ttl_seconds - SIGV4_CLOCK_MARGIN_SECONDS)
     if _one(query, "X-Amz-Algorithm") != "AWS4-HMAC-SHA256" \
             or _one(query, "X-Amz-Expires") \
-            != str(binding.ttl_seconds) \
+            != str(request_ttl) \
             or _SIGNATURE.fullmatch(
                 _one(query, "X-Amz-Signature")) is None:
         raise RuntimeError("S3 pack presigner query authority")
     if "x-id" in query and _one(query, "x-id") != (
-            "GetObject" if opened.method == "GET" else "PutObject"):
+            "GetObject" if _method(opened) == "GET" else "PutObject"):
         raise RuntimeError("S3 pack presigner operation")
     if "x-amz-checksum-mode" in query and (
-            opened.method != "GET"
+            _method(opened) != "GET"
             or _one(query, "x-amz-checksum-mode") != "ENABLED"):
         raise RuntimeError("S3 pack presigner checksum mode")
 
@@ -231,16 +248,16 @@ def _inspect(url, opened, binding, client, headers, trusted_now):
     except (TypeError, ValueError) as error:
         raise RuntimeError("S3 pack presigner timestamp") from error
     expires_at_ms = (
-        int(issued.timestamp()) + binding.ttl_seconds) * 1000
+        int(issued.timestamp()) + request_ttl) * 1000
     if type(trusted_now) is not int or not trusted_now < expires_at_ms \
             <= trusted_now + binding.ttl_seconds * 1000:
         raise RuntimeError("S3 pack presigner clock")
     return ScopedRequest(
-        opened.method, url, headers, expires_at_ms)
+        _method(opened), url, headers, expires_at_ms)
 
 
 class S3PackIssuer:
-    """Issue one exact, short-lived S3 request after ``HttpGate`` auth."""
+    """Issue exact short-lived object and pack requests after gate auth."""
 
     def __init__(self, binding, client=None):
         if not isinstance(binding, S3PackBinding):
@@ -252,29 +269,46 @@ class S3PackIssuer:
             raise ValueError("S3 pack presigner client")
         _endpoint_host(self.client)
 
-    def open(self, member, opened, trusted_now):
-        if not valid_fid(member) or not isinstance(opened, PackOpen) \
+    def _open(self, member, opened, trusted_now):
+        if not valid_fid(member) \
+                or not isinstance(opened, (ObjectOpen, PackOpen)) \
                 or type(trusted_now) is not int:
-            raise ValueError("authorized S3 pack request")
+            raise ValueError("authorized S3 direct request")
         headers = _headers(opened, self.binding.config)
-        operation = "get_object" if opened.method == "GET" else "put_object"
+        method = _method(opened)
+        operation = "get_object" if method == "GET" else "put_object"
         try:
             url = self.client.generate_presigned_url(
                 operation,
                 Params=_params(opened, self.binding, headers),
-                ExpiresIn=self.binding.ttl_seconds,
-                HttpMethod=opened.method,
+                ExpiresIn=(
+                    self.binding.ttl_seconds
+                    - SIGV4_CLOCK_MARGIN_SECONDS),
+                HttpMethod=method,
             )
         except Exception as error:
-            raise RuntimeError("S3 pack presigning failed") from error
+            raise RuntimeError("S3 direct presigning failed") from error
         return _inspect(
             url, opened, self.binding, self.client,
             headers, trusted_now)
+
+    def open(self, member, opened, trusted_now):
+        """Issue one ``PackOpen`` for backward-compatible gate wiring."""
+        if not isinstance(opened, PackOpen):
+            raise ValueError("authorized S3 pack request")
+        return self._open(member, opened, trusted_now)
+
+    def open_object(self, member, opened, trusted_now):
+        """Issue one read-only ``ObjectOpen`` for direct S3 transfer."""
+        if not isinstance(opened, ObjectOpen):
+            raise ValueError("authorized S3 object request")
+        return self._open(member, opened, trusted_now)
 
 
 __all__ = (
     "DEFAULT_PACK_TTL_SECONDS",
     "PACK_CONTENT_TYPE",
+    "SIGV4_CLOCK_MARGIN_SECONDS",
     "S3PackBinding",
     "S3PackIssuer",
 )

@@ -132,14 +132,14 @@ def _store(config=None):
     config = _s3_config() if config is None else config
     if not isinstance(config, S3Config):
         raise TypeError("Lambda S3 config")
-    # HttpGate receives only the narrowed reader wrapper. Pack creation is
-    # exposed separately as an exact presigned request, never as this store's
-    # general mutation methods.
+    # HttpGate receives only the narrowed reader wrapper. Direct object reads
+    # and pack transfer are exposed separately as exact presigned requests,
+    # never as this store's general mutation methods.
     return AsyncFromSyncReader(S3Store(config))
 
 
 def _pack_issuer(config=None):
-    """Construct the metadata-only issuer; callers transfer bytes to S3."""
+    """Construct one metadata-only issuer; callers transfer bytes to S3."""
     config = _s3_config() if config is None else config
     ttl = _positive("TINYP2P_PACK_TTL_SECONDS", DEFAULT_PACK_TTL_SECONDS)
     return S3PackIssuer(S3PackBinding(config, ttl))
@@ -149,12 +149,14 @@ def _gateway():
     global _gateway_cache
     if _gateway_cache is None:
         config = _s3_config()
+        issuer = _pack_issuer(config)
         _gateway_cache = HttpGate(
             _store(config),
             _required("TINYP2P_WORKSPACE_ID"),
             _secret(),
             lambda: int(time.time() * 1000),
-            pack_open=_pack_issuer(config).open,
+            object_open=issuer.open_object,
+            pack_open=issuer.open,
             max_request_bytes=_positive(
                 "TINYP2P_MAX_REQUEST_BYTES", MAX_MINT_REQUEST_BYTES),
             max_root_bytes=_positive(
