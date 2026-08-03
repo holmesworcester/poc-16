@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import os
 import tempfile
-import threading
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -68,8 +67,6 @@ class FullPeerPackService:
         self.clock = clock
         self.ttl_ms = ttl_ms
         self.read_opener = read_opener
-        self._lock = threading.Lock()
-        self._prepared_directories = set()
 
     def _directory(self, workspace):
         store = self.peer.store(workspace)
@@ -77,17 +74,7 @@ class FullPeerPackService:
         if not isinstance(root, str) or not root:
             raise ValueError("FullPeer pack streaming needs filesystem storage")
         directory = os.path.join(root, "pack")
-        with self._lock:
-            if directory not in self._prepared_directories:
-                os.makedirs(directory, exist_ok=True)
-                for name in os.listdir(directory):
-                    if name.startswith(_TEMP_PREFIX) \
-                            and name.endswith(_TEMP_SUFFIX):
-                        try:
-                            os.remove(os.path.join(directory, name))
-                        except FileNotFoundError:
-                            pass
-                self._prepared_directories.add(directory)
+        os.makedirs(directory, exist_ok=True)
         return directory
 
     def _path(self, workspace, oid):

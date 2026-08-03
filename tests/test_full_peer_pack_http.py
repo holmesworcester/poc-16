@@ -6,7 +6,6 @@ import io
 import os
 import socket
 import threading
-import time
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -349,13 +348,34 @@ def test_interrupted_put_removes_same_directory_temporary_file(tmp_path):
         ).encode()
         sock.sendall(request_head + b"partial")
         sock.shutdown(socket.SHUT_WR)
+        while sock.recv(4096):
+            pass
         sock.close()
 
-        deadline = time.time() + 5
-        while time.time() < deadline and temp_paths(peer, workspace):
-            time.sleep(.01)
         assert temp_paths(peer, workspace) == ()
         assert not os.path.exists(pack_path(peer, workspace, oid))
+
+
+def test_independent_service_never_collects_another_upload_temp(tmp_path):
+    with serving(tmp_path) as (url, peer, workspace, clock, _packs):
+        directory = os.path.dirname(
+            pack_path(peer, workspace, "0" * 64))
+        os.makedirs(directory, exist_ok=True)
+        foreign = os.path.join(directory, ".pack-upload-other.tmp")
+        with open(foreign, "wb") as target:
+            target.write(b"active in another process")
+
+        independent = FullPeerPackService(peer, SECRET, clock=clock)
+        independent.issue(
+            workspace,
+            peer.member_for(workspace),
+            PackOpen("GET", h(b"future pack"), 1),
+            clock(),
+            url,
+        )
+
+        with open(foreign, "rb") as source:
+            assert source.read() == b"active in another process"
 
 
 def test_stream_reader_never_uses_an_unbounded_or_oversized_read(tmp_path):
