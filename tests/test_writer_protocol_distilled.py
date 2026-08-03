@@ -41,13 +41,19 @@ class ReadTracingFsStore(FsStore):
     def __init__(self, root):
         super().__init__(root)
         self.bounded_reads = []
+        self.pile_reads = []
 
     def get_bounded(self, key, max_bytes):
         self.bounded_reads.append(key)
         return super().get_bounded(key, max_bytes)
 
+    def copy_pile_object(self, oid, max_bytes, write):
+        self.pile_reads.append("obj/" + oid)
+        return super().copy_pile_object(oid, max_bytes, write)
+
     def clear_reads(self):
         self.bounded_reads.clear()
+        self.pile_reads.clear()
 
 
 def primary_authority(name="alice"):
@@ -92,7 +98,8 @@ def authority_proof(
 
 
 def resolver(bindings, authority_root):
-    def resolve(workspace, device, candidate_authority_root):
+    def resolve(
+            workspace, device, candidate_authority_root, _candidate):
         binding = bindings.get(device)
         if candidate_authority_root != authority_root \
                 or binding is None \
@@ -303,8 +310,8 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
         assert message_texts(consumer) == {"warm append"}
         # RBSR may fetch the new head and changed Merkle pages, but semantic
         # consumption fetches exactly the new indivisible closed pile.
-        assert source.bounded_reads.count(f"obj/{new_pile_oid}") == 1
-        assert f"obj/{initial_pile_oid}" not in source.bounded_reads
+        assert source.pile_reads.count(f"obj/{new_pile_oid}") == 1
+        assert f"obj/{initial_pile_oid}" not in source.pile_reads
 
         raw = source.get(f"obj/{new_pile_oid}")
         fetched = decode_signed_pile(

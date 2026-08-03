@@ -288,8 +288,6 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
     generated = tmp_path / "generated"
     monkeypatch.setattr(manage, "GENERATED", generated)
     generated.mkdir()
-    obsolete = generated / "ingress-lifecycle.json"
-    obsolete.write_text('{"rules":[{"delete":"acknowledged ingress"}]}')
     monkeypatch.setattr(
         manage, "stage_broker", lambda: tmp_path / "broker")
     monkeypatch.setattr(
@@ -348,7 +346,6 @@ def test_one_command_deploy_remove_mutates_only_exact_compute_roles(
         if call[0] == "uv" and call[3] == "deploy"
     )
     assert json.loads(paths["broker"].read_text())["r2_buckets"] == []
-    assert not obsolete.exists()
     assert "ingress-lock" not in paths
     assert secret_documents == [{
         "CANONICAL_READ_ACCESS_KEY_ID": "reader-id",

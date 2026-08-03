@@ -20,11 +20,12 @@ from core.object_store import (
     Applied,
     OutcomeUnknown,
     STALE,
+    Versioned,
     VersionToken,
+    async_store,
     ensure_object_async,
     verified_object,
 )
-from core.repository_applier import async_store
 from core.limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -237,36 +238,35 @@ def test_fs_root_cas_lock_is_shared_by_independent_handles(tmp_path):
         first.delete("obj/" + h(b"x"))
 
 
-def test_remote_store_adapts_peer_gets_without_exposing_list():
-    root, page = b"root", b"page"
+def test_remote_store_adapts_current_object_and_writer_head_reads():
+    page, slot = b"page", b"slot"
     calls = []
+    device = "1" * 64
 
     class Peer:
-        def root(self, *, response_limit):
-            calls.append(("root", response_limit))
-            return root, h(root)
-
         def obj(self, oid, *, response_limit):
             calls.append((oid, response_limit))
             return page if oid == h(page) else None
 
+        def head(self, candidate):
+            calls.append(("head", candidate))
+            return slot, VersionToken("opaque-slot")
+
     store = RemoteStore(Peer())
 
-    assert store.get("root") == root
-    assert store.get("obj/" + h(page)) == page
-    assert store.get_bounded("root", len(root)) == root
-    assert store.get_bounded("obj/" + h(page), len(page)) == page
-    assert store.has("obj/" + h(page))
+    assert asyncio.run(store.get_bounded(
+        "obj/" + h(page), len(page))) == page
+    assert asyncio.run(store.read_versioned(
+        f"heads/{WORKSPACE}/{device}")) == Versioned(
+            slot, VersionToken("opaque-slot"))
     assert calls == [
-        ("root", MAX_ROOT_BYTES),
-        (h(page), MAX_OBJECT_BYTES),
-        ("root", len(root)),
         (h(page), len(page)),
-        (h(page), MAX_OBJECT_BYTES),
+        ("head", device),
     ]
-    assert not hasattr(store, "read_versioned")
-    with pytest.raises(TypeError, match="LIST"):
-        store.list_page("obj/", None, 1)
+    with pytest.raises(TypeError, match="writer-head-only"):
+        asyncio.run(store.read_versioned("obj/" + h(page)))
+    with pytest.raises(TypeError, match="writer-head-only"):
+        asyncio.run(store.read_many_versioned(("obj/" + h(page),)))
 
 
 def test_remote_store_batches_object_gets_in_bounded_order():
@@ -281,9 +281,13 @@ def test_remote_store_batches_object_gets_in_bounded_order():
             return tuple(oid.encode() for oid in oids)
 
     peer = Peer()
-    assert RemoteStore(peer).get_many(keys) == tuple(
+    assert asyncio.run(RemoteStore(peer).get_many(keys)) == tuple(
         key[4:].encode() for key in keys)
     assert list(map(len, peer.calls)) == [256, 256, 1]
+    with pytest.raises(TypeError, match="object-only"):
+        asyncio.run(RemoteStore(peer).get_many((
+            f"heads/{WORKSPACE}/{'1' * 64}",
+        )))
 
 
 def test_peer_decodes_one_ordered_page_batch():
@@ -304,7 +308,7 @@ def test_peer_decodes_one_ordered_page_batch():
     oids = ("a" * 64, "b" * 64, "c" * 64)
 
     assert peer.objs(oids) == expected
-    assert calls == [("POST", "/page", list(oids))]
+    assert calls == [("POST", "/obj", list(oids))]
 
 
 def test_peer_adaptively_splits_413_batches_without_losing_order_or_misses():
@@ -322,7 +326,7 @@ def test_peer_adaptively_splits_413_batches_without_losing_order_or_misses():
         calls.append(requested)
         if len(requested) > 2:
             raise urllib.error.HTTPError(
-                "https://peer/page", 413, "too large", {}, io.BytesIO())
+                "https://peer/obj", 413, "too large", {}, io.BytesIO())
         return 200, json.dumps([
             base64.b64encode(held[oid]).decode() if oid in held else None
             for oid in requested
@@ -345,17 +349,42 @@ def test_peer_falls_back_to_single_get_when_one_object_cannot_fit_a_batch():
         calls.append((method, path, _kwargs.get("response_limit")))
         if method == "POST":
             raise urllib.error.HTTPError(
-                "https://peer/page", 413, "too large", {}, io.BytesIO())
-        assert (method, path) == ("GET", f"/page/{oid}")
+                "https://peer/obj", 413, "too large", {}, io.BytesIO())
+        assert (method, path) == ("GET", f"/obj/{oid}")
         return 200, raw, {}
 
     peer._http = http
 
     assert peer.objs((oid,)) == (raw,)
     assert calls == [
-        ("POST", "/page", walk.MAX_PAGE_BATCH_BYTES),
-        ("GET", f"/page/{oid}", walk.MAX_OBJECT_BYTES),
+        ("POST", "/obj", walk.MAX_PAGE_BATCH_BYTES),
+        ("GET", f"/obj/{oid}", walk.MAX_OBJECT_BYTES),
     ]
+
+
+def test_peer_never_buffers_a_large_object_when_direct_open_is_unsupported():
+    peer = object.__new__(WalkPeer)
+    raw = b"ordinary buffered object"
+    oid = h(raw)
+    calls = []
+
+    def http(method, path, *_args, **kwargs):
+        calls.append((method, path, kwargs.get("response_limit")))
+        if method == "POST":
+            raise urllib.error.HTTPError(
+                "https://peer/obj/open", 405, "unsupported", {}, io.BytesIO())
+        return 200, raw, {}
+
+    peer._http = http
+    with pytest.raises(urllib.error.HTTPError) as rejected:
+        peer.obj(oid, response_limit=MAX_OBJECT_BYTES + 1)
+    assert rejected.value.code == 405
+    assert calls == [("POST", "/obj/open", walk.MAX_SCOPED_REQUEST_BYTES)]
+
+    # Ordinary semantic objects have their own bounded route. This is a hard
+    # protocol split, not a probe followed by a legacy large-body fallback.
+    assert peer.obj(oid, response_limit=MAX_OBJECT_BYTES) == raw
+    assert calls[-1] == ("GET", f"/obj/{oid}", MAX_OBJECT_BYTES)
 
 
 def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
@@ -384,9 +413,7 @@ def test_peer_caps_an_untrusted_response_while_streaming(monkeypatch):
             "GET", "/public", auth=False, response_limit=8)
 
 
-@pytest.mark.parametrize("key", ("root", "obj/" + "a" * 64))
-def test_remote_bounded_read_drives_the_peer_stream_limit(
-        monkeypatch, key):
+def test_remote_bounded_read_drives_the_peer_stream_limit(monkeypatch):
     class Response:
         status = 200
         headers = {}
@@ -410,16 +437,18 @@ def test_remote_bounded_read_drives_the_peer_stream_limit(
     peer.cache = {"token": "already-minted"}
 
     with pytest.raises(ValueError, match="response too large"):
-        RemoteStore(peer).get_bounded(key, 8)
+        asyncio.run(RemoteStore(peer).get_bounded("obj/" + "a" * 64, 8))
 
 
-def test_peer_reads_snapshot_etag_case_insensitively():
+def test_peer_reads_writer_head_etag_case_insensitively():
     peer = object.__new__(WalkPeer)
+    peer.ws = WORKSPACE
+    peer._observed_heads = {}
     peer._http = lambda *_args, **_kwargs: (
-        200, b"root", {"etag": "opaque"})
+        200, b"slot", {"etag": "opaque"})
 
-    assert peer.root(
-        response_limit=MAX_ROOT_BYTES) == (b"root", "opaque")
+    assert peer.head("1" * 64) == (
+        b"slot", VersionToken("opaque"))
 
 
 def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
@@ -445,17 +474,17 @@ def test_page_batch_route_is_authenticated_ordered_and_preserves_misses():
     body = json.dumps(
         [first_oid, missing_oid, third_oid]).encode()
     assert asyncio.run(gate.handle(
-        "POST", "/page", query, {}, body)).status == 401
+        "POST", "/obj", query, {}, body)).status == 401
     token = http.make_token(
         secret, "member", "workspace", issued_at=0, ttl_ms=1_000)
     headers = {"Authorization": "Bearer " + token}
     assert asyncio.run(gate.handle(
-        "POST", "/page", query, headers,
+        "POST", "/obj", query, headers,
         json.dumps([first_oid] * 257).encode(),
     )).status == 413
 
     response = asyncio.run(gate.handle(
-        "POST", "/page", query, headers, body))
+        "POST", "/obj", query, headers, body))
     assert response.status == 200
     assert json.loads(response.body) == [
         base64.b64encode(first).decode(), None,
@@ -495,7 +524,7 @@ def test_page_batch_route_stops_before_256_valid_objects_exceed_bytes(
         secret, "member", "workspace", issued_at=0, ttl_ms=1_000)
     response = asyncio.run(gate.handle(
         "POST",
-        "/page",
+        "/obj",
         {"ws": "workspace"},
         {"Authorization": "Bearer " + token},
         json.dumps(list(objects)).encode(),

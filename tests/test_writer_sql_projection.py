@@ -1,8 +1,12 @@
 """Full-peer SQL is a disposable sink behind the core writer consumer."""
 import asyncio
 
+import facts
+import pytest
+
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
+from core.fact import encode
 from core.store import FsStore
 from core.writer_head import WriterBinding
 from core.writer_repository import (
@@ -17,6 +21,29 @@ from facts.auth.head_request import head_request
 from facts.auth.signature import signature as signature_fact
 from facts.auth.workspace import workspace as workspace_fact
 from full_peer.sql_store import SqlStore
+
+
+def test_sql_fact_reads_reject_foreign_and_corrupt_rows(tmp_path):
+    first_secret, first_public = keypair()
+    first = workspace_fact(first_secret, first_public, "first", 1)
+    second_secret, second_public = keypair()
+    second = workspace_fact(second_secret, second_public, "second", 1)
+    projection = SqlStore.open(str(tmp_path / "projection.db"), first.fid)
+
+    projection.db.execute(
+        "INSERT INTO facts(fid, blob) VALUES(?, ?)",
+        (second.fid, encode(second)),
+    )
+    projection.db.execute(
+        "INSERT INTO facts(fid, blob) VALUES(?, ?)",
+        (first.fid, b"not canonical fact bytes"),
+    )
+    projection.db.commit()
+
+    with pytest.raises(ValueError, match="integrity"):
+        projection.fact_of(second.fid)
+    with pytest.raises(ValueError):
+        projection.fact_of(first.fid)
 
 
 def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
@@ -54,7 +81,8 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
             source, gate.authorize).advance(
                 proof, update.head_oid)).status == "applied"
 
-        def binding_for(workspace, writer, selected_authority):
+        def binding_for(
+                workspace, writer, selected_authority, _candidate):
             if (workspace, writer, selected_authority) != (
                     root.fid, public, authority_root):
                 return None
@@ -68,7 +96,7 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         first = await mirror.sync_from(source)
         assert first.errors == ()
         assert projection.projected_head(public) == update.head_oid
-        assert projection.fact(root.fid) == root
+        assert projection.fact_of(root.fid) == root
         projection.db.close()
 
         # An ordinary restart preserves the transactional projection stamp.
@@ -89,7 +117,32 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         assert rebuilt.changed == 0
         assert rebuilt.piles == 1
         assert projection.projected_head(public) == update.head_oid
-        assert projection.fact(root.fid) == root
+        assert projection.fact_of(root.fid) == root
         projection.db.close()
 
     asyncio.run(scenario())
+
+
+def test_full_peer_projection_rebuild_never_republishes_writer_state(
+        tmp_path):
+    from full_peer.node import FullPeer
+
+    node = FullPeer(str(tmp_path / "peer"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    message = facts.content.message.post(
+        node, workspace, "general", "stable", ts=2)
+    store = node.store(workspace)
+    before = {
+        key: store.get(key)
+        for key in store.list("")
+    }
+
+    node.rebuild(workspace)
+
+    assert node.fact_of(workspace, message).fid == message
+    assert {
+        key: store.get(key)
+        for key in store.list("")
+    } == before
+    with pytest.raises(ValueError, match="never rebuilt"):
+        node.rebuild(workspace, republish=True)

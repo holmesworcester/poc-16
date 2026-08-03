@@ -296,7 +296,7 @@ async def publish(kind, tmp_path, root, specs, label):
 
 
 def mirror_for(run, receiver, consumer):
-    def binding_for(workspace, device, authority_root):
+    def binding_for(workspace, device, authority_root, _candidate):
         assert workspace == run.root.fid
         assert authority_root == AUTHORITY_ROOT
         return run.bindings.get(device)

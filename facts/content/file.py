@@ -284,7 +284,7 @@ def _resolve_state(node, workspace, selector):
 def _payloads(node, workspace, record, descriptor, by_index):
     for index in range(record["total"]):
         with node.lock:
-            item = node.sql(workspace).fact(by_index[index])
+            item = node.sql(workspace).fact_of(by_index[index])
         if item is None:
             raise ValueError("file slice disappeared from validated storage")
         yield slices.payload(item, descriptor)

@@ -9,6 +9,8 @@ from core.close import (
     signed_pile_oid,
 )
 from core.crypto import h, keypair
+from core.fact import canon
+from core.limits import MAX_FACT_BYTES, MAX_REPOSITORY_OBJECT_BYTES
 from core.object_store import ABSENT
 from core.store import FsStore
 from core.writer_head import (
@@ -66,7 +68,7 @@ def proof_for(
 
 
 def binding_for(workspace, public, store_binding):
-    def resolve(candidate_workspace, device, _authority_root):
+    def resolve(candidate_workspace, device, _authority_root, _candidate):
         assert candidate_workspace == workspace
         if device != public:
             return None
@@ -304,8 +306,19 @@ def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
         binding = h(b"store")
         log = WriterLog(
             root.fid, public, public, binding, secret, source)
+        probe = message_fact(
+            root.fid, public, "general", "", 3)
+        padding = MAX_FACT_BYTES - len(canon(probe.to_json()))
+        message = message_fact(
+            root.fid, public, "general", "x" * padding, 3)
+        message_signature = signature_fact(
+            secret, public, message, 3)
         update = await log.prepare(((
-            root, device_signature, device),))
+            root, device_signature, device,
+            message_signature, message),))
+        assert len(encode_signed_pile(update.piles[0])) \
+            > MAX_REPOSITORY_OBJECT_BYTES
+        await log.establish(update)
         await log.establish(update)
         gate = OpaqueHeadGate(
             source,
@@ -340,6 +353,7 @@ def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
         assert repaired.piles == 1
         assert consumer.projected_head(public) == update.head_oid
         assert set(consumer.fact_ids()) == {
-            root.fid, device_signature.fid, device.fid}
+            root.fid, device_signature.fid, device.fid,
+            message_signature.fid, message.fid}
 
     run(scenario())

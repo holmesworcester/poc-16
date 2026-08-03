@@ -79,7 +79,7 @@ def test_one_pile_publish_cold_sync_and_noop_have_small_exact_costs(tmp_path):
         mirror = RepositoryMirror(
             root.fid,
             receiver,
-            lambda workspace, device_key, _root: WriterBinding(
+            lambda workspace, device_key, _root, _candidate: WriterBinding(
                 workspace, device_key, public, store_binding),
             consumer,
         )
@@ -173,7 +173,7 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         mirror = RepositoryMirror(
             root.fid,
             receiver,
-            lambda workspace, device_key, _root: WriterBinding(
+            lambda workspace, device_key, _root, _candidate: WriterBinding(
                 workspace, device_key, public, binding),
             consumer,
         )

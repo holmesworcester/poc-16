@@ -9,12 +9,26 @@ import json
 
 MIB = 1024 * 1024
 
+# A writer pile is a useful closed bundle, not merely one fact plus framing.
+# One maximum pile must fit as a one-pile physical pack; smaller piles may be
+# concatenated into that same ceiling.  Hosted peers transfer either value
+# directly rather than buffering it through their metadata worker.
+MAX_FACT_BYTES = 4 * MIB
+MAX_PILE_BYTES = 95 * MIB
+MAX_WRITER_PACK_BYTES = MAX_PILE_BYTES
+
+# Discarded authority proofs and the remaining buffered pile door use the same
+# deliberately small budget. Content pull is the only path that needs the full
+# writer-pile ceiling, and it must use the direct data plane.
+MAX_BUFFERED_PILE_BYTES = 5 * MIB
+MAX_AUTHORITY_PILE_BYTES = MAX_BUFFERED_PILE_BYTES
+
 # Writer-log physical layout and streaming bounds. Keep these provider-neutral
 # so codecs, stores, FullPeer, Lambda, R2, and benchmarks cannot drift by
 # repeating the same numeric ceiling.
-MAX_WRITER_PACK_BYTES = 95 * MIB
 WRITER_LAYOUT_WINDOW_PILES = 16_384
-PACK_STREAM_CHUNK_BYTES = 64 * 1024
+DIRECT_STREAM_CHUNK_BYTES = 64 * 1024
+MAX_DIRECT_STREAM_FRAGMENTS = 4_096
 
 PAGE_BATCH = 256
 MAX_ROOT_BYTES = MIB
@@ -28,22 +42,22 @@ MAX_PAGE_BATCH_BYTES = 4 * MIB
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
-# A signed closed pile may be larger than any one fact because it carries the
-# fact's signature, dependencies, and canonical framing. Both are ordinary
-# repository objects; every residence and mirror path must accept the larger
-# named ceiling rather than silently substituting a batch/page limit.
-MAX_FACT_BYTES = 4 * MIB
-MAX_PILE_BYTES = 5 * MIB
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
+# Facts and authenticated-map pages use the ordinary buffered object path.
+# Large signed piles share the ``obj/`` address space but require the direct
+# streaming data plane and therefore must not widen this semantic-object bound.
 MAX_REPOSITORY_OBJECT_BYTES = max(
-    MAX_FACT_BYTES, MAX_PILE_BYTES, MAX_MERKLE_PAGE_BYTES)
+    MAX_FACT_BYTES, MAX_MERKLE_PAGE_BYTES)
 MAX_OBJECT_BYTES = MAX_REPOSITORY_OBJECT_BYTES
+MAX_DIRECT_OBJECT_BYTES = max(
+    MAX_REPOSITORY_OBJECT_BYTES, MAX_PILE_BYTES)
 
 # One immutable closed pile. These are protocol limits, not merely
 # implementation budgets: every receiving engine enforces the same boundary.
 MAX_CLOSURE_FACTS = 256
 MAX_PILE_FACTS = MAX_CLOSURE_FACTS
-MAX_STORE_READ_BYTES = max(MAX_OBJECT_BYTES, MAX_PILE_BYTES)
+MAX_STORE_READ_BYTES = max(
+    MAX_REPOSITORY_OBJECT_BYTES, MAX_BUFFERED_PILE_BYTES)
 MAX_PILE_JSON_VALUES = 48 * MAX_PILE_FACTS + 16
 # device_invite is the current maximum: FactOrder + Fact residence + ten
 # mechanical postings + five current suppression slots.

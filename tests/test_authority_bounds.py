@@ -7,12 +7,16 @@ import pytest
 
 import facts
 from core import peer_capability
-from core.close import encode_pile
+from .util import signed_pile_bytes
+from core.authority import AuthorityRepository
 from core.crypto import keypair
 from core.fact import Fact
 from core.http import HttpGate
 from core.kernel import drain
 from core.limits import MAX_REPOSITORY_OBJECT_BYTES
+from core.repository_applier import RepositoryApplier
+from core.repository_reader import RepositoryReader
+from core.store import FsStore
 from deploy.cloudflare_worker import runtime as cloudflare
 from facts.auth._display import MAX_DISPLAY_BYTES
 from facts.auth.device import device
@@ -23,7 +27,7 @@ from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
 from full_peer.node import FullPeer, now_ms
 
-from .util import add_member
+from .util import add_member, all_fids, closed_subset
 
 
 def _rebody(item, **changes):
@@ -118,23 +122,31 @@ def test_repository_applier_rejects_a_signed_oversized_founder_name(
     root = workspace(founder_secret, founder, exact, 1)
     hostile = _rebody(root, name=oversized)
 
-    rejected = FullPeer(str(tmp_path / "rejected"))
-    rejected.add_workspace(hostile.fid, "hostile", peers=[])
-    rejected.receive_pile(
-        hostile.fid,
-        "feed" * 16,
-        encode_pile((hostile,), workspace=hostile.fid),
-    )
-    assert rejected.store(hostile.fid).get("root") is None
+    rejected_store = FsStore(str(tmp_path / "rejected"))
+    rejected = asyncio.run(RepositoryApplier(
+        hostile.fid, rejected_store).receive_pile(
+            founder,
+            signed_pile_bytes(
+                (hostile,), workspace=hostile.fid,
+                secret=founder_secret),
+        ))
+    assert rejected.status == "rejected"
+    assert rejected_store.get("root") is None
 
-    accepted = FullPeer(str(tmp_path / "accepted"))
-    accepted.add_workspace(root.fid, "healthy", peers=[])
-    accepted.receive_pile(
+    accepted_store = FsStore(str(tmp_path / "accepted"))
+    accepted = asyncio.run(RepositoryApplier(
+        root.fid, accepted_store).receive_pile(
+            founder,
+            signed_pile_bytes(
+                (root,), workspace=root.fid,
+                secret=founder_secret),
+        ))
+    reader = RepositoryReader(
         root.fid,
-        "feed" * 16,
-        encode_pile((root,), workspace=root.fid),
+        accepted.root,
+        lambda oid: accepted_store.get("obj/" + oid),
     )
-    assert accepted.reader(root.fid) is not None
+    assert reader.validated().fact(root.fid) == root
 
 
 def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
@@ -142,28 +154,26 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
     oversized = label + "b"
     node = FullPeer(str(tmp_path / "node"))
     workspace_id = facts.auth.workspace.create(node, label, ts=1)
-    store = node.store(workspace_id)
+    authority_store = FsStore(str(tmp_path / "authority"))
+    publisher = AuthorityRepository(workspace_id, authority_store)
 
-    class CountingReader:
-        def __init__(self, reads):
-            self.reads = reads
-
-        async def get_bounded(self, key, maximum):
-            raw = store.get_bounded(key, maximum)
-            if self.reads is not None \
-                    and key.startswith("obj/") and raw is not None:
-                self.reads.append((key, len(raw), maximum))
-            return raw
+    def publish_authority():
+        raw = closed_subset(
+            node, workspace_id, all_fids(node, workspace_id))
+        result = asyncio.run(publisher.receive_pile(
+            node.identity_id(workspace_id), raw))
+        assert result.status in {"applied", "noop"}
 
     def assert_current_identity_mints(public):
         now = now_ms()
-        pile = encode_pile(facts.auth.request.payload(
-            node,
-            workspace_id,
-            "sync",
-            now + cloudflare.MAX_GRANT_TTL_MS,
-            now,
-        ))
+        pile = node.sender(workspace_id).pack(
+            facts.auth.request.payload(
+                node,
+                workspace_id,
+                "sync",
+                now + cloudflare.MAX_GRANT_TTL_MS,
+                now,
+            ))
         body = json.dumps(
             {
                 "pile": base64.b64encode(pile).decode(),
@@ -173,25 +183,41 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
             separators=(",", ":"),
         ).encode()
         assert len(body) <= cloudflare.MAX_REQUEST_BYTES
-        assert node.reader(workspace_id).mint(pile, now) \
+        assert node.authorize_access(workspace_id, pile, "sync") \
             == (public, "sync")
-
-        hosted = HttpGate(
-            CountingReader(None),
-            workspace_id,
-            b"s" * 32,
-            lambda: now,
-        )
-        hosted_response = asyncio.run(hosted.handle(
-            "POST", "/mint", {"ws": workspace_id}, {}, body))
+        publish_authority()
 
         object_reads = []
+
+        class CountingAuthorityStore:
+            async def read_versioned(self, key):
+                return authority_store.read_versioned(key)
+
+            async def get_bounded(self, key, maximum):
+                raw = authority_store.get_bounded(key, maximum)
+                if key.startswith("obj/") and raw is not None:
+                    object_reads.append((key, len(raw), maximum))
+                return raw
+
+        repository = AuthorityRepository(
+            workspace_id, CountingAuthorityStore())
+
+        async def authorize(proof, purpose):
+            return await repository.authorize_access(
+                proof,
+                now,
+                purpose=purpose,
+                max_unique_fetches=cloudflare.MAX_MINT_FETCHES,
+                max_fetch_bytes=cloudflare.MAX_MINT_FETCH_BYTES,
+            )
+
         edge = HttpGate(
-            CountingReader(object_reads),
+            CountingAuthorityStore(),
             workspace_id,
             b"s" * 32,
             lambda: now,
             sync_profile=peer_capability.READ_ONLY,
+            mint_authorize=authorize,
             max_request_bytes=cloudflare.MAX_REQUEST_BYTES,
             max_root_bytes=cloudflare.MAX_ROOT_BYTES,
             max_object_bytes=cloudflare.MAX_OBJECT_BYTES,
@@ -204,14 +230,10 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
         edge_response = asyncio.run(edge.handle(
             "POST", "/mint", {"ws": workspace_id}, {}, body))
 
-        assert hosted_response.status == edge_response.status == 200
-        hosted_answer = json.loads(hosted_response.body)
+        assert edge_response.status == 200
         edge_answer = json.loads(edge_response.body)
-        assert {
-            key: hosted_answer[key] for key in ("cap", "etag", "root")
-        } == {
-            key: edge_answer[key] for key in ("cap", "etag", "root")
-        }
+        assert set(edge_answer) == {"cap", "grant"}
+        assert edge_answer["cap"] == peer_capability.READ_ONLY
         assert object_reads
         assert len(object_reads) <= cloudflare.MAX_MINT_FETCHES
         assert sum(size for _, size, _ in object_reads) \
@@ -236,12 +258,12 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
     assert node.select(workspace_id, "admin", member)
     assert_current_identity_mints(member)
 
-    before = store.get("root")
+    before = node.sql(workspace_id).fact_ids()
     with pytest.raises(ValueError, match="display"):
         facts.auth.device.bind(node, workspace_id, oversized)
-    assert store.get("root") == before
+    assert node.sql(workspace_id).fact_ids() == before
     facts.auth.device.bind(node, workspace_id, label)
-    assert store.get("root") != before
+    assert node.sql(workspace_id).fact_ids() != before
 
     sibling_secret, sibling = keypair()
     node.keychain.add_identity(sibling_secret)

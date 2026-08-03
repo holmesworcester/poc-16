@@ -33,13 +33,13 @@ def test_required_writer_scales_ratchet_bundled_head_costs():
     expected = {
         100: (
             (100, 0, 0, 1, 1, 0, 67_825),
-            (100, 2, 1, 4, 4, 68, 74_487),
-            (101, 4, 1, 4, 4, 68, 75_059),
+            (100, 2, 1, 4, 4, 0, 73_052),
+            (101, 4, 1, 4, 4, 0, 73_626),
         ),
         1_000: (
             (1_000, 0, 0, 4, 4, 0, 678_499),
-            (1_000, 2, 1, 7, 7, 68, 685_169),
-            (1_001, 4, 1, 7, 7, 68, 685_737),
+            (1_000, 2, 1, 7, 7, 0, 683_731),
+            (1_001, 4, 1, 7, 7, 0, 684_305),
         ),
     }
     for writers, results in measured.items():
@@ -105,9 +105,9 @@ def test_small_directory_change_and_new_writer_accounting():
 
         assert noop.request_breakdown == (("heads", 2),)
         assert changed.request_breakdown == (
-            ("heads", 2), ("object", 2), ("pile-batch", 1))
+            ("heads", 2), ("object", 2), ("pile", 1))
         assert new_writer.request_breakdown == (
-            ("heads", 3), ("object", 2), ("pile-batch", 1))
+            ("heads", 3), ("object", 2), ("pile", 1))
 
         for result in (noop, changed, new_writer):
             assert result.measured_wall_seconds > 0
@@ -132,7 +132,7 @@ def test_small_directory_change_and_new_writer_accounting():
         changed.response_bytes,
         new_writer.request_bytes,
         new_writer.response_bytes,
-    ) == (0, 2_895, 68, 9_549, 68, 10_279)
+    ) == (0, 2_895, 0, 8_117, 0, 8_848)
 
 
 def test_exact_durable_fact_catchup_accounting():
@@ -144,15 +144,15 @@ def test_exact_durable_fact_catchup_accounting():
         result.piles,
         result.requests,
         result.parallel_request_waves,
-    ) == (4, 100, 45, 14, 14)
+    ) == (4, 100, 45, 55, 55)
     assert (
         result.request_bytes,
         result.response_bytes,
-    ) == (3_060, 245_303)
+    ) == (0, 186_365)
     assert result.messages_per_pile == 1
     assert result.scenario == "large-catchup-normal"
     assert result.request_breakdown == (
-        ("heads", 2), ("object", 8), ("pile-batch", 4))
+        ("heads", 2), ("object", 8), ("pile", 45))
     assert result.measured_facts_per_second > 0
 
 

@@ -80,6 +80,15 @@ class CountingStore:
         self._read(key, value)
         return value
 
+    async def copy_pile_object(self, oid, max_bytes, write):
+        self._counts["object_gets"] += 1
+
+        def counted(chunk):
+            self._counts["read_bytes"] += len(chunk)
+            write(chunk)
+
+        return await self.store.copy_pile_object(oid, max_bytes, counted)
+
     async def read_versioned(self, key):
         value = await self.store.read_versioned(key)
         self._read(key, value)

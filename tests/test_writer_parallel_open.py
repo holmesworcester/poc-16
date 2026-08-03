@@ -50,7 +50,7 @@ class Forest:
     slots: dict
     authority: str
 
-    def resolve(self, workspace, device, _authority):
+    def resolve(self, workspace, device, _authority, _candidate):
         if workspace != self.workspace:
             return None
         return self.bindings.get(device)
@@ -139,6 +139,9 @@ class AsyncStoreProxy:
 
     async def get_bounded(self, key, maximum):
         return self.backing.get_bounded(key, maximum)
+
+    async def copy_pile_object(self, oid, maximum, write):
+        return self.backing.copy_pile_object(oid, maximum, write)
 
     async def read_versioned(self, key):
         return self.backing.read_versioned(key)

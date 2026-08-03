@@ -9,8 +9,10 @@ import pytest
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
 from core.object_store import ensure_object_async
-from core.repository_applier import RepositoryApplier, async_store
+from core.object_store import async_store
+from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
+from core.repository_snapshot import compile_snapshot
 from core.ingress import ingress_key
 from core.store import FsStore
 from deploy.aws_repository_applier import app, manage
@@ -77,7 +79,14 @@ def test_exact_lambda_event_is_database_free_reader_visible_and_retained(
         canonical.get("root"),
         lambda oid: canonical.get("obj/" + oid),
     )
-    assert reader.root_bytes == source.reader(workspace).root_bytes
+    expected = compile_snapshot(
+        workspace,
+        {
+            fid: source.fact_of(workspace, fid)
+            for fid in source.sql(workspace).fact_ids()
+        },
+    )
+    assert reader.root_bytes == expected.root
 
 
 def test_exact_private_invocation_replays_as_noop(tmp_path):

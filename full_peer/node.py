@@ -57,12 +57,6 @@ class FullPeer:
         self._kr_path = os.path.join(dir, "keyring.json")
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.sk, self.pk = self.keychain.default()
-        # app.db was a disposable projection cache. SqlStore now holds the
-        # canonical blobs and generic index needed by family queries.
-        try:
-            os.remove(os.path.join(dir, "app.db"))
-        except FileNotFoundError:
-            pass
         self._stores, self._sql, self._senders = {}, {}, {}
         self._consumers, self._mirrors, self._writers = {}, {}, {}
         self._own_bindings = {}
@@ -386,7 +380,7 @@ class FullPeer:
     def fact_of(self, ws, fid) -> Fact:
         with self.lock:
             self._ensure_projection(ws)
-            return self.sql(ws).fact(fid)
+            return self.sql(ws).fact_of(fid)
 
     def select(
             self, ws, kind, k0=None, k1=None, *,
@@ -419,24 +413,11 @@ class FullPeer:
 
     # ---- authoring tail: close -> signed writer leaf -> accepted slot --------
 
-    def ingest_new(self, ws, news, deps_new):
-        return self.sender(ws).send(news, deps_new)
-
-    @staticmethod
-    def _owner_in(closures, writer):
-        owners = {
-            owner
-            for closure in closures
-            for fact in closure
-            for name, key, owner in fact.offers()
-            if name == "member" and key == writer and owner
-        }
-        if len(owners) != 1:
-            raise ValueError("writer closure has no unique durable owner")
-        return next(iter(owners))
+    def ingest_new(self, ws, news, deps_new, *, owner=None):
+        return self.sender(ws).send(news, deps_new, owner=owner)
 
     def writer_binding(
-            self, workspace, device, _authority_root, candidate=None):
+            self, workspace, device, _authority_root, candidate):
         """Resolve a device owner from own state or current fact projection."""
         with self.lock:
             own = self._own_bindings.get((workspace, device))
@@ -551,14 +532,31 @@ class FullPeer:
             raise ValueError("head authority closure")
         return tuple(out)
 
-    def publish_closed(self, workspace, closures):
+    def publish_closed(self, workspace, closures, *, owner=None):
         """Publish and consume one batch through the same core as a pull."""
         closures = tuple(tuple(closure) for closure in closures)
         if not closures:
             return []
         with self.lock:
             secret, device = self.identity(workspace)
-            owner = self._owner_in(closures, device)
+            binding = self.writer_binding(workspace, device, None, None)
+            if owner is not None:
+                if binding is not None and binding.owner != owner:
+                    raise ValueError("publishing identity owner mismatch")
+            elif binding is not None:
+                owner = binding.owner
+            else:
+                bootstrap_owners = {
+                    owner
+                    for closure in closures
+                    for fact in closure
+                    for name, key, owner in fact.offers()
+                    if name == "member" and key == device and owner == device
+                }
+                if bootstrap_owners != {device} \
+                        or self.sql(workspace).fact_ids():
+                    raise ValueError("writer has no current durable owner")
+                owner = device
             before = self.sql(workspace).fact_ids()
             writer = self._writer(workspace, owner)
             update = _run_core(writer.prepare(closures))

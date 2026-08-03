@@ -1,9 +1,9 @@
-"""Bounded control metadata for immutable pack HTTP transfer.
+"""Bounded control metadata for direct immutable-object HTTP transfer.
 
-Pack bodies never pass through these codecs.  A caller names one exact pack
-operation and a provider-specific issuer returns only the ordinary HTTP
-request needed to perform it.  :func:`confine_scoped_request` keeps issuer
-mistakes from widening method, object, range, create-only, or lifetime scope.
+Object and pack bodies never pass through these codecs. A caller names one
+bounded content-addressed operation and a provider-specific issuer returns
+only the ordinary HTTP request needed to perform it. Confinement keeps issuer
+mistakes from widening namespace, method, object, range, or lifetime scope.
 """
 from dataclasses import dataclass
 import hashlib
@@ -12,20 +12,24 @@ from urllib.parse import urlsplit
 
 from .fact import canon
 from .limits import (
+    MAX_DIRECT_OBJECT_BYTES,
     MAX_PILE_BYTES,
     MAX_WRITER_PACK_BYTES,
-    PACK_STREAM_CHUNK_BYTES,
+    DIRECT_STREAM_CHUNK_BYTES,
     PayloadTooLarge,
     decode_json,
 )
 from .shape import valid_fid
 
 
+OBJECT_OPEN_FORMAT = "poc16-object-open-v1"
 PACK_OPEN_FORMAT = "poc16-pack-open-v1"
 SCOPED_REQUEST_FORMAT = "poc16-scoped-request-v1"
+OBJECT_PREFIX = "obj"
 PACK_PREFIX = "pack"
 
 MAX_PACK_BYTES = MAX_WRITER_PACK_BYTES
+MAX_OBJECT_OPEN_BYTES = 512
 MAX_PACK_OPEN_BYTES = 1024
 MAX_SCOPED_REQUEST_BYTES = 16 * 1024
 MAX_SCOPED_URL_BYTES = 8 * 1024
@@ -33,7 +37,10 @@ MAX_SCOPED_HEADERS = 32
 MAX_SCOPED_HEADER_NAME_BYTES = 128
 MAX_SCOPED_HEADER_VALUE_BYTES = 4 * 1024
 MAX_SCOPED_TTL_MS = 60_000
-MAX_PACK_STREAM_CHUNKS = 1_000_000
+MAX_DIRECT_STREAM_CHUNKS = 4 * (
+    (MAX_DIRECT_OBJECT_BYTES + DIRECT_STREAM_CHUNK_BYTES - 1)
+    // DIRECT_STREAM_CHUNK_BYTES
+)
 MAX_SAFE_INTEGER = (1 << 53) - 1
 
 _METHODS = frozenset(("GET", "PUT"))
@@ -41,7 +48,7 @@ _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]+$")
 
 
 class InvalidPackAccess(ValueError):
-    """Pack control bytes or an issued request exceed their exact scope."""
+    """Direct-object control or response bytes exceed their exact scope."""
 
 
 def _bounded_ascii(value, maximum, *, allow_empty=False, allow_space=True):
@@ -51,6 +58,19 @@ def _bounded_ascii(value, maximum, *, allow_empty=False, allow_space=True):
         and all(
             (32 if allow_space else 33) <= ord(character) < 127
             for character in value)
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectOpen:
+    """One content-addressed object GET with an explicit receiver ceiling."""
+
+    oid: str
+    max_bytes: int
+
+    def __post_init__(self):
+        if not valid_fid(self.oid) or type(self.max_bytes) is not int \
+                or not 1 <= self.max_bytes <= MAX_DIRECT_OBJECT_BYTES:
+            raise InvalidPackAccess("object OPEN")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +150,22 @@ def pack_key(oid):
     return f"{PACK_PREFIX}/{oid}"
 
 
+def object_key(oid):
+    if not valid_fid(oid):
+        raise InvalidPackAccess("object OID")
+    return f"{OBJECT_PREFIX}/{oid}"
+
+
+def object_open_document(value):
+    if not isinstance(value, ObjectOpen):
+        raise InvalidPackAccess("object OPEN")
+    return {
+        "format": OBJECT_OPEN_FORMAT,
+        "max_bytes": value.max_bytes,
+        "oid": value.oid,
+    }
+
+
 def pack_open_document(value):
     if not isinstance(value, PackOpen):
         raise InvalidPackAccess("pack OPEN")
@@ -181,6 +217,26 @@ def _decode(raw, maximum, label):
 def encode_pack_open(value):
     return _encode(
         pack_open_document(value), MAX_PACK_OPEN_BYTES, "pack OPEN")
+
+
+def encode_object_open(value):
+    return _encode(
+        object_open_document(value), MAX_OBJECT_OPEN_BYTES, "object OPEN")
+
+
+def decode_object_open(raw):
+    value = _decode(raw, MAX_OBJECT_OPEN_BYTES, "object OPEN")
+    try:
+        if not isinstance(value, dict) or set(value) != {
+                "format", "max_bytes", "oid"} \
+                or value.get("format") != OBJECT_OPEN_FORMAT:
+            raise ValueError("object OPEN shape")
+        result = ObjectOpen(value["oid"], value["max_bytes"])
+        if object_open_document(result) != value:
+            raise ValueError("object OPEN shape")
+        return result
+    except (KeyError, TypeError, ValueError) as error:
+        raise InvalidPackAccess("object OPEN") from error
 
 
 def decode_pack_open(raw):
@@ -267,6 +323,27 @@ def confine_scoped_request(
     return scoped
 
 
+def confine_object_request(
+        opened, scoped, trusted_now, *, max_ttl_ms=MAX_SCOPED_TTL_MS):
+    """Confine an issuer result to one read-only content-addressed object."""
+    if not isinstance(opened, ObjectOpen) \
+            or not isinstance(scoped, ScopedRequest) \
+            or type(trusted_now) is not int \
+            or type(max_ttl_ms) is not int or max_ttl_ms <= 0 \
+            or scoped.method != "GET" \
+            or not trusted_now < scoped.expires_at_ms \
+            <= trusted_now + max_ttl_ms:
+        raise InvalidPackAccess("scoped object request binding")
+    try:
+        path = urlsplit(scoped.url).path
+    except ValueError as error:
+        raise InvalidPackAccess("scoped object request binding") from error
+    if not path.endswith("/" + object_key(opened.oid)) \
+            or "range" in dict(scoped.headers):
+        raise InvalidPackAccess("scoped object request key")
+    return scoped
+
+
 def _response_header(headers, name, *, required=True):
     try:
         values = tuple(
@@ -278,6 +355,30 @@ def _response_header(headers, name, *, required=True):
             or any(not isinstance(value, str) for value in values):
         raise InvalidPackAccess("pack response headers")
     return values[0] if values else None
+
+
+def _copy_stream(chunks, write, expected_bytes, expected_oid=None):
+    digest = None if expected_oid is None else hashlib.sha256()
+    total = 0
+    try:
+        iterator = iter(chunks)
+    except TypeError as error:
+        raise InvalidPackAccess("object response stream") from error
+    for count, chunk in enumerate(iterator, 1):
+        if count > MAX_DIRECT_STREAM_CHUNKS \
+                or not isinstance(chunk, bytes) or not chunk:
+            raise InvalidPackAccess("object response stream")
+        total += len(chunk)
+        if total > expected_bytes:
+            raise InvalidPackAccess("object response length")
+        if digest is not None:
+            digest.update(chunk)
+        write(chunk)
+    if total != expected_bytes:
+        raise InvalidPackAccess("object response length")
+    if digest is not None and digest.hexdigest() != expected_oid:
+        raise InvalidPackAccess("object response integrity")
+    return total
 
 
 def copy_pack_get(opened, status, headers, chunks, write):
@@ -310,46 +411,59 @@ def copy_pack_get(opened, status, headers, chunks, write):
     elif content_range is not None:
         raise InvalidPackAccess("pack GET response range")
 
-    digest = None if ranged else hashlib.sha256()
-    total = 0
+    return _copy_stream(
+        chunks,
+        write,
+        expected_bytes,
+        None if ranged else opened.oid,
+    )
+
+
+def copy_object_get(opened, status, headers, chunks, write):
+    """Verify and stream one bounded, content-addressed ordinary HTTP GET."""
+    if not isinstance(opened, ObjectOpen) or type(status) is not int \
+            or not callable(write) or status != 200:
+        raise InvalidPackAccess("object GET response")
+    raw_length = _response_header(headers, "content-length")
+    if _response_header(headers, "content-range", required=False) is not None:
+        raise InvalidPackAccess("object GET response range")
     try:
-        iterator = iter(chunks)
-    except TypeError as error:
-        raise InvalidPackAccess("pack GET response stream") from error
-    for count, chunk in enumerate(iterator, 1):
-        if count > MAX_PACK_STREAM_CHUNKS \
-                or not isinstance(chunk, bytes) or not chunk:
-            raise InvalidPackAccess("pack GET response stream")
-        total += len(chunk)
-        if total > expected_bytes:
-            raise InvalidPackAccess("pack GET response length")
-        if digest is not None:
-            digest.update(chunk)
-        write(chunk)
-    if total != expected_bytes:
-        raise InvalidPackAccess("pack GET response length")
-    if digest is not None and digest.hexdigest() != opened.oid:
-        raise InvalidPackAccess("pack GET response integrity")
-    return total
+        expected_bytes = int(raw_length)
+    except (TypeError, ValueError) as error:
+        raise InvalidPackAccess("object GET response metadata") from error
+    if expected_bytes < 0 or expected_bytes > opened.max_bytes \
+            or str(expected_bytes) != raw_length:
+        raise InvalidPackAccess("object GET response metadata")
+
+    return _copy_stream(
+        chunks, write, expected_bytes, opened.oid)
 
 
 __all__ = (
     "MAX_PACK_BYTES",
+    "MAX_OBJECT_OPEN_BYTES",
     "MAX_PACK_OPEN_BYTES",
-    "PACK_STREAM_CHUNK_BYTES",
-    "MAX_PACK_STREAM_CHUNKS",
+    "DIRECT_STREAM_CHUNK_BYTES",
+    "MAX_DIRECT_STREAM_CHUNKS",
     "MAX_SCOPED_HEADERS",
     "MAX_SCOPED_REQUEST_BYTES",
     "MAX_SCOPED_TTL_MS",
     "InvalidPackAccess",
+    "ObjectOpen",
     "PackOpen",
     "ScopedRequest",
+    "confine_object_request",
     "confine_scoped_request",
+    "copy_object_get",
     "copy_pack_get",
+    "decode_object_open",
     "decode_pack_open",
     "decode_scoped_request",
+    "encode_object_open",
     "encode_pack_open",
     "encode_scoped_request",
+    "object_key",
+    "object_open_document",
     "pack_key",
     "pack_open_document",
     "scoped_request_document",

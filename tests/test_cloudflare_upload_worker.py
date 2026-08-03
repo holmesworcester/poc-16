@@ -9,7 +9,7 @@ from urllib.parse import unquote, urlsplit
 import facts
 import pytest
 
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h
 from core.limits import PayloadTooLarge
 from core.object_store import ABSENT, Applied
@@ -237,7 +237,7 @@ def world(tmp_path, *, clock=None):
     clock = clock or Clock()
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    proof = encode_pile(request_fact.payload(
+    proof = signed_pile_bytes(request_fact.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
     backing = node.store(workspace)
     candidate = deployment(workspace)

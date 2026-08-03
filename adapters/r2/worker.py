@@ -1,6 +1,8 @@
 """Cloudflare Worker R2-binding implementation of AsyncObjectStore."""
 from core.crypto import h
 from core.limits import (
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_DIRECT_STREAM_FRAGMENTS,
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     MAX_STORE_READ_BYTES,
@@ -25,6 +27,7 @@ from core.object_store import (
     validate_key,
     validate_store_prefix,
 )
+from core.shape import valid_fid
 
 
 def _if_none_match():
@@ -149,6 +152,52 @@ class R2BindingStore:
             raise StoreError("R2 response size mismatch")
         return value
 
+    @staticmethod
+    def _chunk_bytes(value):
+        if hasattr(value, "to_bytes"):
+            value = value.to_bytes()
+        elif hasattr(value, "to_py"):
+            value = value.to_py()
+        try:
+            return bytes(value)
+        except (TypeError, ValueError) as error:
+            raise StoreError("R2 response stream chunk is not bytes") \
+                from error
+
+    @classmethod
+    async def _copy_body(cls, obj, max_bytes, write):
+        size = getattr(obj, "size", None)
+        if type(size) is not int or size < 0:
+            raise StoreError("R2 response has invalid size")
+        if size > max_bytes:
+            raise PayloadTooLarge("R2 response exceeds byte limit")
+        stream = getattr(obj, "body", None)
+        if stream is None or not callable(getattr(stream, "getReader", None)):
+            raise StoreError("R2 response has no readable stream")
+        reader = stream.getReader()
+        total = 0
+        try:
+            for _ in range(MAX_DIRECT_STREAM_FRAGMENTS):
+                result = await reader.read()
+                if not isinstance(getattr(result, "done", None), bool):
+                    raise StoreError("R2 response stream result")
+                if result.done:
+                    if total != size:
+                        raise StoreError("R2 response size mismatch")
+                    return total
+                chunk = cls._chunk_bytes(getattr(result, "value", None))
+                total += len(chunk)
+                if total > size:
+                    raise StoreError("R2 response size mismatch")
+                if total > max_bytes:
+                    raise PayloadTooLarge("R2 response exceeds byte limit")
+                write(chunk)
+            raise StoreError("R2 response exceeded fragment budget")
+        finally:
+            release = getattr(reader, "releaseLock", None)
+            if callable(release):
+                release()
+
     async def get(self, key):
         limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
         return await self.get_bounded(key, limit)
@@ -167,6 +216,22 @@ class R2BindingStore:
             raise
         except Exception as error:
             raise StoreError(f"R2 read failed for {key}") from error
+
+    async def copy_pile_object(self, oid, max_bytes, write):
+        """Stream one large signed pile without allocating an ArrayBuffer."""
+        if not valid_fid(oid) or type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_DIRECT_OBJECT_BYTES \
+                or not callable(write):
+            raise ValueError("R2 pile copy")
+        try:
+            obj = await self.bucket.get(self._key("obj/" + oid))
+            if obj is None:
+                return None
+            return await self._copy_body(obj, max_bytes, write)
+        except (PayloadTooLarge, StoreError):
+            raise
+        except Exception as error:
+            raise StoreError("R2 pile read failed") from error
 
     async def read_versioned(self, key):
         try:
@@ -280,7 +345,7 @@ class R2BindingStore:
         return ListPage(keys, next_cursor)
 
     async def list(self, prefix):
-        """Compatibility/admin helper; receiving code uses ``list_page``."""
+        """Administrative full traversal; receiving code uses ``list_page``."""
         cursor, out = None, set()
         for _ in range(self.max_list_pages):
             page = await self.list_page(prefix, cursor, 1000)

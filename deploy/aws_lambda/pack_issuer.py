@@ -292,8 +292,8 @@ class S3PackIssuer:
             url, opened, self.binding, self.client,
             headers, trusted_now)
 
-    def open(self, member, opened, trusted_now):
-        """Issue one ``PackOpen`` for backward-compatible gate wiring."""
+    def open_pack(self, member, opened, trusted_now):
+        """Issue one exact ``PackOpen`` request."""
         if not isinstance(opened, PackOpen):
             raise ValueError("authorized S3 pack request")
         return self._open(member, opened, trusted_now)

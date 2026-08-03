@@ -19,6 +19,9 @@ from core.object_store import (
     STALE,
     StoreError,
 )
+from core.repository_applier import RepositoryApplier
+from core.store import FsStore
+from full_peer.node import FullPeer
 from tests.adversarial_bucket import (
     AdversarialBucket,
     AsyncLaggedReader,
@@ -28,7 +31,7 @@ from tests.adversarial_bucket import (
 )
 from tests.provider_conformance import ConformanceRun, exercise_sync_store
 from tests.provider_fakes import FakeR2Bucket
-from tests.util import apply_planted
+from tests.util import all_fids, closed_subset
 
 pytestmark = pytest.mark.unit
 
@@ -518,58 +521,54 @@ os._exit(72)
             b"replacement" if when == "after" else b"base")
 
 
-def test_real_process_exit_after_root_cas_replays_retained_exact_source(
+def test_real_process_exit_after_root_cas_replays_retained_signed_source(
         tmp_path):
-    from full_peer.node import FullPeer
-
-    node_dir = tmp_path / "node"
-    node = FullPeer(str(node_dir))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    old_root = node.store(workspace).get("root")
-    for projection in node._sql.values():
-        projection.db.close()
+    source = FullPeer(str(tmp_path / "source"))
+    workspace = facts.auth.workspace.create(source, "alice", ts=1)
+    raw = closed_subset(source, workspace, all_fids(source, workspace))
+    pile_path = tmp_path / "pile.bin"
+    pile_path.write_bytes(raw)
+    store_dir = tmp_path / "repository"
 
     script = r"""
+import asyncio
 import os
 import sys
-import facts
 from core.object_store import Applied
+from core.repository_applier import RepositoryApplier
 from core.store import FsStore
-from full_peer.node import FullPeer
 
-directory, workspace = sys.argv[1:]
-node = FullPeer(directory)
+directory, workspace, pile_path = sys.argv[1:]
+store = FsStore(directory)
 original_cas = FsStore.cas
 
-def commit_then_die(store, key, token, value):
-    result = original_cas(store, key, token, value)
+def commit_then_die(self, key, token, value):
+    result = original_cas(self, key, token, value)
     if key == "root" and isinstance(result, Applied):
         os._exit(73)
     return result
 
 FsStore.cas = commit_then_die
-facts.content.message.post(node, workspace, "general", "process crash", ts=2)
+raw = open(pile_path, "rb").read()
+asyncio.run(RepositoryApplier(workspace, store).receive_pile(
+    "f" * 64, raw))
 raise AssertionError("applier did not reach root CAS")
 """
-    completed = _run_python(script, node_dir, workspace)
+    completed = _run_python(
+        script, store_dir, workspace, pile_path)
     assert completed.returncode == 73
 
-    reopened = FullPeer(str(node_dir))
-    assert reopened.store(workspace).get("root") != old_root
-    assert [entry["text"] for entry in facts.content.message.messages(
-        reopened, workspace)] == ["process crash"]
-    retained = reopened.store(workspace).list("ingress/")
-    assert len(retained) >= 2
-    committed_root = reopened.store(workspace).get("root")
+    store = FsStore(str(store_dir))
+    committed_root = store.get("root")
+    retained = store.list("ingress/")
+    assert isinstance(committed_root, bytes)
+    assert len(retained) == 1
 
-    results = [
-        asyncio.run(apply_planted(reopened.applier(workspace), source))
-        for source in retained
-    ]
-
-    assert {result.status for result in results} == {"noop"}
-    assert reopened.store(workspace).get("root") == committed_root
-    assert reopened.store(workspace).list("ingress/") == retained
+    replay = asyncio.run(RepositoryApplier(
+        workspace, store).apply_exact(store, retained[0], h(raw)))
+    assert replay.status == "noop"
+    assert store.get("root") == committed_root
+    assert store.get(retained[0]) == raw
 
 
 def test_real_process_probe_terminates_a_hung_child():

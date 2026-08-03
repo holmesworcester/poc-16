@@ -1,9 +1,9 @@
-"""FullPeer's streaming implementation of the ordinary pack HTTP data plane.
+"""FullPeer's streaming implementation of immutable-object HTTP transfer.
 
-The shared :class:`core.http.HttpGate` still authenticates ``/pack/open`` and
-confines the returned metadata.  This host-only module owns short-lived exact
-tickets and streams ``pack/`` files; no pack body enters a core ``Response`` or
-``ObjectStore.get_bounded``.
+The shared :class:`core.http.HttpGate` authenticates ``/obj/open`` and
+``/pack/open`` and confines the returned metadata. This host-only module owns
+short-lived exact tickets and streams ``obj/`` or ``pack/`` files; no large
+body enters a core ``Response`` or ``ObjectStore.get_bounded``.
 """
 import asyncio
 import base64
@@ -19,22 +19,24 @@ from core import peer_capability
 from core.fact import canon
 from core.http import AsyncFromSyncReader, HttpGate, Response
 from core.http_stdlib import handler_for as core_handler_for
-from core.limits import PayloadTooLarge, decode_json
+from core.limits import DIRECT_STREAM_CHUNK_BYTES, PayloadTooLarge, decode_json
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
-    PACK_STREAM_CHUNK_BYTES,
+    ObjectOpen,
     PackOpen,
     ScopedRequest,
+    object_key,
     pack_key,
 )
 from core.shape import valid_fid
 
 
-STREAM_CHUNK_BYTES = PACK_STREAM_CHUNK_BYTES
+STREAM_CHUNK_BYTES = DIRECT_STREAM_CHUNK_BYTES
 DEFAULT_TICKET_TTL_MS = 30_000
 MAX_TICKET_BYTES = 1024
 _TICKET_DOMAIN = b"poc16-full-peer-pack-ticket-v1\0"
+_OBJECT_TICKET_DOMAIN = b"poc16-full-peer-object-ticket-v1\0"
 _TEMP_PREFIX = ".pack-upload-"
 _TEMP_SUFFIX = ".tmp"
 
@@ -47,12 +49,12 @@ def now_ms():
 class _Ticket:
     workspace: str
     member: str
-    opened: PackOpen
+    opened: ObjectOpen | PackOpen
     expires_at_ms: int
 
 
 class FullPeerPackService:
-    """Issue exact tickets and stream immutable packs from local disk."""
+    """Issue exact tickets and stream immutable objects from local disk."""
 
     def __init__(
             self, peer, ticket_secret, *, clock=now_ms,
@@ -62,43 +64,41 @@ class FullPeerPackService:
                 or not callable(clock) or not callable(read_opener) \
                 or type(ttl_ms) is not int \
                 or not 0 < ttl_ms <= MAX_SCOPED_TTL_MS:
-            raise ValueError("FullPeer pack service options")
+            raise ValueError("FullPeer object service options")
         self.peer = peer
         self.ticket_secret = ticket_secret
         self.clock = clock
         self.ttl_ms = ttl_ms
         self.read_opener = read_opener
 
-    def _directory(self, workspace):
+    def _root(self, workspace):
         store = self.peer.store(workspace)
         root = getattr(store, "root", None)
         if not isinstance(root, str) or not root:
-            raise ValueError("FullPeer pack streaming needs filesystem storage")
-        directory = os.path.join(root, "pack")
+            raise ValueError("FullPeer streaming needs filesystem storage")
+        return root
+
+    def _directory(self, workspace):
+        directory = os.path.join(self._root(workspace), "pack")
         os.makedirs(directory, exist_ok=True)
         return directory
 
     def _path(self, workspace, oid):
         return os.path.join(self._directory(workspace), pack_key(oid)[5:])
 
-    def _encode_ticket(self, ticket):
-        payload = canon([
-            ticket.workspace,
-            ticket.member,
-            ticket.expires_at_ms,
-            ticket.opened.method,
-            ticket.opened.oid,
-            ticket.opened.pack_bytes,
-            ticket.opened.offset,
-            ticket.opened.length,
-        ])
+    def _object_path(self, workspace, oid):
+        return os.path.join(
+            self._root(workspace), *object_key(oid).split("/"))
+
+    def _encode_payload(self, value, domain):
+        payload = canon(value)
         encoded = base64.urlsafe_b64encode(payload).rstrip(b"=")
         mac = hmac.new(
-            self.ticket_secret, _TICKET_DOMAIN + payload,
+            self.ticket_secret, domain + payload,
             hashlib.sha256).hexdigest()
         return encoded.decode("ascii") + "." + mac
 
-    def _decode_ticket(self, token):
+    def _decode_payload(self, token, domain):
         try:
             if not isinstance(token, str) \
                     or len(token) > 2 * MAX_TICKET_BYTES:
@@ -108,14 +108,35 @@ class FullPeerPackService:
             payload = base64.b64decode(
                 padded, altchars=b"-_", validate=True)
             expected = hmac.new(
-                self.ticket_secret, _TICKET_DOMAIN + payload,
+                self.ticket_secret, domain + payload,
                 hashlib.sha256).hexdigest()
             value = decode_json(payload, MAX_TICKET_BYTES, "pack ticket")
             if not hmac.compare_digest(expected, mac) \
                     or base64.urlsafe_b64encode(payload).rstrip(
                         b"=").decode("ascii") != encoded \
                     or canon(value) != payload \
-                    or not isinstance(value, list) or len(value) != 8:
+                    or not isinstance(value, list):
+                raise ValueError
+            return value
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError("stream ticket") from error
+
+    def _encode_ticket(self, ticket):
+        return self._encode_payload([
+            ticket.workspace,
+            ticket.member,
+            ticket.expires_at_ms,
+            ticket.opened.method,
+            ticket.opened.oid,
+            ticket.opened.pack_bytes,
+            ticket.opened.offset,
+            ticket.opened.length,
+        ], _TICKET_DOMAIN)
+
+    def _decode_ticket(self, token):
+        try:
+            value = self._decode_payload(token, _TICKET_DOMAIN)
+            if len(value) != 8:
                 raise ValueError
             return _Ticket(
                 value[0], value[1],
@@ -125,19 +146,43 @@ class FullPeerPackService:
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("pack ticket") from error
 
+    def _encode_object_ticket(self, ticket):
+        return self._encode_payload([
+            ticket.workspace,
+            ticket.member,
+            ticket.expires_at_ms,
+            ticket.opened.oid,
+            ticket.opened.max_bytes,
+        ], _OBJECT_TICKET_DOMAIN)
+
+    def _decode_object_ticket(self, token):
+        try:
+            value = self._decode_payload(token, _OBJECT_TICKET_DOMAIN)
+            if len(value) != 5:
+                raise ValueError
+            return _Ticket(
+                value[0], value[1], ObjectOpen(value[3], value[4]), value[2])
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError("object ticket") from error
+
+    @staticmethod
+    def _validated_origin(origin):
+        parsed = urlsplit(origin)
+        if parsed.scheme != "http" or not parsed.netloc \
+                or parsed.path or parsed.query or parsed.fragment \
+                or parsed.username is not None or parsed.password is not None:
+            raise ValueError("FullPeer pack origin")
+        return origin
+
     def issue(self, workspace, member, opened, trusted_now, origin):
-        """Issuer callback consumed directly by ``HttpGate``."""
+        """Issue one exact pack operation after the common gate authorizes."""
         if not self.peer.has_workspace(workspace) \
                 or not valid_fid(member) \
                 or not isinstance(opened, PackOpen) \
                 or type(trusted_now) is not int:
             raise ValueError("FullPeer pack ticket binding")
         self._directory(workspace)
-        parsed = urlsplit(origin)
-        if parsed.scheme != "http" or not parsed.netloc \
-                or parsed.path or parsed.query or parsed.fragment \
-                or parsed.username is not None or parsed.password is not None:
-            raise ValueError("FullPeer pack origin")
+        origin = self._validated_origin(origin)
         expires = trusted_now + self.ttl_ms
         token = self._encode_ticket(_Ticket(
             workspace, member, opened, expires))
@@ -160,12 +205,40 @@ class FullPeerPackService:
             expires,
         )
 
+    def issue_object(
+            self, workspace, member, opened, trusted_now, origin):
+        """Issue one read-only content-addressed object operation."""
+        if not self.peer.has_workspace(workspace) \
+                or not valid_fid(member) \
+                or not isinstance(opened, ObjectOpen) \
+                or type(trusted_now) is not int:
+            raise ValueError("FullPeer object ticket binding")
+        self._object_path(workspace, opened.oid)
+        origin = self._validated_origin(origin)
+        expires = trusted_now + self.ttl_ms
+        token = self._encode_object_ticket(_Ticket(
+            workspace, member, opened, expires))
+        return ScopedRequest(
+            "GET",
+            f"{origin}/{object_key(opened.oid)}?"
+            f"{urlencode({'ticket': token})}",
+            (),
+            expires,
+        )
+
     def _resolve(self, token, method, oid, trusted_now):
         ticket = self._decode_ticket(token)
         if ticket.expires_at_ms <= trusted_now \
                 or ticket.opened.method != method \
                 or ticket.opened.oid != oid:
             raise ValueError("pack ticket scope")
+        return ticket
+
+    def _resolve_object(self, token, method, oid, trusted_now):
+        ticket = self._decode_object_ticket(token)
+        if ticket.expires_at_ms <= trusted_now \
+                or method != "GET" or ticket.opened.oid != oid:
+            raise ValueError("object ticket scope")
         return ticket
 
     @staticmethod
@@ -192,6 +265,24 @@ class FullPeerPackService:
                 handler, status, length=length, headers=headers)
         except (BrokenPipeError, ConnectionResetError, OSError):
             handler.close_connection = True
+
+    def _stream(self, handler, source, status, offset, length, headers):
+        try:
+            source.seek(offset)
+            self._send(handler, status, length=length, headers=headers)
+            remaining = length
+            while remaining:
+                maximum = min(STREAM_CHUNK_BYTES, remaining)
+                chunk = source.read(maximum)
+                if not chunk or len(chunk) > maximum:
+                    handler.close_connection = True
+                    return
+                handler.wfile.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            handler.close_connection = True
+        finally:
+            source.close()
 
     def _matches(self, path, opened):
         try:
@@ -289,22 +380,32 @@ class FullPeerPackService:
                 "Content-Range",
                 f"bytes {offset}-{offset + length - 1}/{opened.pack_bytes}",
             ))
+        return self._stream(
+            handler, source, status, offset, length, headers)
+
+    def _get_object(self, handler, ticket):
+        opened = ticket.opened
+        if handler.headers.get("Range") is not None \
+                or handler.headers.get("Transfer-Encoding"):
+            return self._error(handler, 403)
+        path = self._object_path(ticket.workspace, opened.oid)
         try:
-            source.seek(offset)
-            self._send(handler, status, length=length, headers=headers)
-            remaining = length
-            while remaining:
-                maximum = min(STREAM_CHUNK_BYTES, remaining)
-                chunk = source.read(maximum)
-                if not chunk or len(chunk) > maximum:
-                    handler.close_connection = True
-                    return
-                handler.wfile.write(chunk)
-                remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
-            handler.close_connection = True
-        finally:
-            source.close()
+            size = os.stat(path).st_size
+            if size > opened.max_bytes:
+                return self._error(handler, 413)
+            source = self.read_opener(path, "rb")
+        except FileNotFoundError:
+            return self._error(handler, 404)
+        except OSError:
+            return self._error(handler, 503)
+        return self._stream(
+            handler,
+            source,
+            200,
+            0,
+            size,
+            (("Content-Type", "application/octet-stream"),),
+        )
 
     def dispatch(self, handler, method, path, query):
         parts = path.strip("/").split("/")
@@ -324,9 +425,23 @@ class FullPeerPackService:
             return self._get(handler, ticket)
         return self._error(handler, 405)
 
+    def dispatch_object(self, handler, method, path, query):
+        parts = path.strip("/").split("/")
+        if len(parts) != 2 or parts[0] != "obj" \
+                or not valid_fid(parts[1]):
+            return self._error(handler, 404)
+        if set(query) != {"ticket"}:
+            return self._error(handler, 403)
+        try:
+            ticket = self._resolve_object(
+                query["ticket"], method, parts[1], self.clock())
+        except (TypeError, ValueError):
+            return self._error(handler, 403)
+        return self._get_object(handler, ticket)
+
 
 class _PackHandlerMixin:
-    """Add the FullPeer data plane without duplicating ordinary gate routes."""
+    """Add streaming bytes without duplicating ordinary gate routes."""
 
     pack_service = None
 
@@ -338,7 +453,7 @@ class _PackHandlerMixin:
             raise ValueError("HTTP Host")
         return "http://" + host
 
-    def _open_pack(self, method, path, query):
+    def _open(self, method, path, query):
         try:
             body = self._body(method, path)
         except PayloadTooLarge:
@@ -356,6 +471,9 @@ class _PackHandlerMixin:
                 self.secret,
                 self.pack_service.clock,
                 sync_profile=self.sync_profile,
+                object_open=lambda member, opened, trusted_now:
+                    self.pack_service.issue_object(
+                        workspace, member, opened, trusted_now, origin),
                 pack_open=lambda member, opened, trusted_now:
                     self.pack_service.issue(
                         workspace, member, opened, trusted_now, origin),
@@ -368,8 +486,11 @@ class _PackHandlerMixin:
 
     def _dispatch(self, method):
         path, query = self._request()
-        if path == "/pack/open":
-            return self._open_pack(method, path, query)
+        if path in {"/obj/open", "/pack/open"}:
+            return self._open(method, path, query)
+        if path.startswith("/obj/") and "ticket" in query:
+            return self.pack_service.dispatch_object(
+                self, method, path, query)
         if path.startswith("/pack/"):
             return self.pack_service.dispatch(
                 self, method, path, query)

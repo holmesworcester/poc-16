@@ -3,8 +3,10 @@
 The root-authoritative snapshot uses only two namespaces:
 
 ``obj/<sha256>``
-    A grow-only content-addressed map. Conditional creation may report either
-    that the bytes were created or that identical bytes already existed.
+    A grow-only content-addressed map of facts, Merkle pages, signed writer
+    piles, and heads. Conditional creation may report either that the bytes
+    were created or that identical bytes already existed. Large signed piles
+    use the direct streaming HTTP path rather than buffered semantic reads.
 
 ``root``, ``authority``
     Distinct linearizable value-CAS registers for content and shared control
@@ -236,6 +238,9 @@ class ObjectStore(Protocol):
     def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
 
+    def copy_pile_object(
+            self, oid: str, max_bytes: int, write) -> int | None: ...
+
     def read_versioned(self, key: str) -> Versioned | Absent: ...
 
     def put_if_absent(
@@ -254,6 +259,9 @@ class AsyncObjectStore(Protocol):
 
     async def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...
+
+    async def copy_pile_object(
+            self, oid: str, max_bytes: int, write) -> int | None: ...
 
     async def read_versioned(self, key: str) -> Versioned | Absent: ...
 
@@ -281,6 +289,9 @@ class SyncStoreAdapter:
                 not isinstance(value, bytes) or len(value) > max_bytes):
             raise PayloadTooLarge("object-store read exceeds byte limit")
         return value
+
+    async def copy_pile_object(self, oid, max_bytes, write):
+        return self.store.copy_pile_object(oid, max_bytes, write)
 
     async def read_versioned(self, key):
         return self.store.read_versioned(key)
@@ -338,8 +349,9 @@ def verified_object(
 
 
 async def ensure_object_async(store, oid, raw):
-    """Establish one immutable object before a root may reference it."""
-    if not isinstance(raw, bytes) or len(raw) > MAX_OBJECT_BYTES \
+    """Establish one immutable buffered semantic object."""
+    if not isinstance(raw, bytes) \
+            or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
             or not isinstance(oid, str) or h(raw) != oid:
         raise ValueError("immutable object address")
     key = "obj/" + oid

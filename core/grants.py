@@ -24,10 +24,9 @@ def make_token(
         "v": verb,
         "ws": workspace,
     }
-    if capability is not None:
-        if not peer_capability.known(capability):
-            raise ValueError("unknown peer capability")
-        claims["cap"] = capability
+    if not peer_capability.known(capability):
+        raise ValueError("unknown peer capability")
+    claims["cap"] = capability
     payload = json.dumps(claims, sort_keys=True)
     mac = hmac.new(
         secret, payload.encode(), hashlib.sha256).hexdigest()
@@ -49,7 +48,7 @@ def check_token(
             return None
         grant = json.loads(payload)
         capability = grant.get("cap")
-        if "cap" in grant and not peer_capability.known(capability):
+        if not peer_capability.known(capability):
             return None
         if require_push and not peer_capability.allows_push(capability):
             return None

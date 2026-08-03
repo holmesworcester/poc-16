@@ -29,10 +29,12 @@ from core.limits import (
 )
 from core.object_store import async_store, ensure_object_async
 from core.repository_applier import RepositoryApplier
+from core.repository_reader import RepositoryReader
 from core.store import FsStore
-from core.writer_repository import FactConsumer
+from core.writer_repository import FactConsumer, ensure_pile_async
 from facts.auth.workspace import workspace as workspace_fact
 from facts.content import message as message_family
+from .util import signed_pile_bytes, signed_pile_facts
 from full_peer import status
 from full_peer.node import FullPeer
 
@@ -50,18 +52,24 @@ def run(awaitable):
 
 def test_pile_codec_requires_one_canonical_json_spelling():
     workspace = "0" * 64
-    canonical = close.encode_pile((), workspace=workspace)
-    assert close.decode_pile(canonical, workspace) == []
-    aliases = (
-        b'{ "facts": [], "ws": "' + workspace.encode() + b'" }',
-        b'{"ws":"' + workspace.encode() + b'","facts":[]}',
-        b'{"facts":[],"ws":"' + workspace.encode()
-        + b'","ws":"' + workspace.encode() + b'"}',
-        b'{"facts":[],"ws":NaN}',
+    canonical = signed_pile_bytes((), workspace=workspace)
+    assert signed_pile_facts(canonical, workspace) == []
+    document = json.loads(canonical)
+    noncanonical = (
+        b" " + canonical,
+        json.dumps(
+            dict(reversed(tuple(document.items()))),
+            separators=(",", ":"),
+        ).encode(),
+        canonical[:-1] + b',"ws":"' + workspace.encode() + b'"}',
+        json.dumps(
+            {**document, "ws": float("nan")},
+            separators=(",", ":"),
+        ).encode(),
     )
-    for raw in aliases:
+    for raw in noncanonical:
         with pytest.raises(InvalidPile):
-            close.decode_pile(raw, workspace)
+            signed_pile_facts(raw, workspace)
 
 
 def test_fact_count_is_bounded_before_store_or_kernel_work(
@@ -77,7 +85,7 @@ def test_fact_count_is_bounded_before_store_or_kernel_work(
         "ws": workspace,
     })
     with pytest.raises(InvalidPile, match="too many facts"):
-        close.decode_pile(over, workspace)
+        signed_pile_facts(over, workspace)
     assert isinstance(kernel.drain(items, workspace).failure, PayloadTooLarge)
 
     class NeverMutated:
@@ -93,7 +101,7 @@ def test_json_value_budget_precedes_staging_and_healthy_pile_recovers(
         tmp_path, monkeypatch):
     secret, public = keypair()
     root = workspace_fact(secret, public, "memory-bound", 1)
-    healthy = close.encode_pile((root,), workspace=root.fid)
+    healthy = signed_pile_bytes((root,), workspace=root.fid)
     exact = canon({"facts": [], "junk": list(range(16)), "ws": root.fid})
     over = canon({"facts": [], "junk": list(range(17)), "ws": root.fid})
     monkeypatch.setattr(
@@ -109,18 +117,23 @@ def test_json_value_budget_precedes_staging_and_healthy_pile_recovers(
     assert store.get("root") is not None
 
 
-def test_shared_pile_limits_fit_smallest_hosted_memory_ceiling():
+def test_discarded_authority_piles_fit_smallest_hosted_memory_ceiling():
     peak = limits.applier_peak_bound(
-        limits.MAX_PILE_BYTES,
+        limits.MAX_AUTHORITY_PILE_BYTES,
         limits.MAX_PILE_JSON_VALUES,
         limits.MAX_PILE_FACTS,
     )
     assert limits.MAX_FACT_BYTES == 4 * limits.MIB
     assert limits.MAX_PILE_FACTS == 256
-    assert limits.MAX_PILE_BYTES == 5 * limits.MIB
-    assert limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_PILE_BYTES
+    assert limits.MAX_AUTHORITY_PILE_BYTES == 5 * limits.MIB
+    assert limits.MAX_PILE_BYTES == limits.MAX_WRITER_PACK_BYTES \
+        == 95 * limits.MIB
+    assert limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_FACT_BYTES
+    assert limits.MAX_DIRECT_OBJECT_BYTES == limits.MAX_PILE_BYTES
     assert peak < limits.MIN_HOSTED_MEMORY_BYTES
     assert limits.MAX_APPLIER_SUBREQUESTS < limits.MAX_HOSTED_SUBREQUESTS
+    with pytest.raises(InvalidPile, match="pile too large"):
+        close.ClosedPileEvaluator("0" * 64, max_bytes=3).evaluate(b"xxxx")
 
 
 def test_generic_atom_grammar_enforces_text_and_fid_bounds():
@@ -133,8 +146,8 @@ def test_generic_atom_grammar_enforces_text_and_fid_bounds():
             "v" * MAX_ATOM_VALUE_BYTES,
         ]],
         {}, workspace)
-    raw = close.encode_pile((valid,), workspace=workspace)
-    assert close.decode_pile(raw, workspace) == [valid]
+    raw = signed_pile_bytes((valid,), workspace=workspace)
+    assert signed_pile_facts(raw, workspace) == [valid]
     for atom in (
             ["ref", "", fid],
             ["ref", "role", "not-a-fid"],
@@ -143,8 +156,8 @@ def test_generic_atom_grammar_enforces_text_and_fid_bounds():
             ["offer", "name", "v" * (MAX_ATOM_VALUE_BYTES + 1)]):
         poison = Fact("unknown", 1, [atom], {}, workspace)
         with pytest.raises(InvalidPile):
-            close.decode_pile(
-                close.encode_pile((poison,), workspace=workspace),
+            signed_pile_facts(
+                signed_pile_bytes((poison,), workspace=workspace),
                 workspace,
             )
 
@@ -162,7 +175,13 @@ def test_rejected_exact_pile_does_not_block_independent_pile(tmp_path):
     assert run(apply_planted(applier, good)).status == "applied"
     assert store.get(bad) == b"{}"
     assert store.get(good) == healthy
-    assert store.get("root") == source.store(workspace).get("root")
+    reader = RepositoryReader(
+        workspace,
+        store.get("root"),
+        lambda oid: store.get("obj/" + oid),
+    )
+    assert set(reader.validated().fact_ids()) \
+        == set(all_fids(source, workspace))
 
 
 def test_program_failure_retains_source_and_independent_work_progresses(
@@ -243,7 +262,7 @@ def test_legacy_removal_field_is_rejected():
 
 
 @pytest.mark.parametrize("decoder", (
-    close.decode_pile,
+    signed_pile_facts,
     snapshot.decode_root,
     fact.decode,
 ))
@@ -251,7 +270,7 @@ def test_json_codec_doors_translate_recursion_to_value_error(decoder):
     nested = b"[" * 5_000 + b"0" + b"]" * 5_000
     with pytest.raises(ValueError):
         decoder(nested, "0" * 64) \
-            if decoder is close.decode_pile else decoder(nested)
+            if decoder is signed_pile_facts else decoder(nested)
 
 
 def test_merkle_page_recursion_is_a_value_error():
@@ -264,7 +283,7 @@ def test_pile_and_root_reject_size_before_parsing(monkeypatch):
     workspace = "0" * 64
     cases = (
         (close, "MAX_PILE_BYTES",
-         lambda raw: close.decode_pile(raw, workspace),
+         lambda raw: signed_pile_facts(raw, workspace),
          canon({"ws": workspace, "facts": []})),
         (snapshot, "MAX_ROOT_BYTES", snapshot.decode_root, b'{"stamp":"x"}'),
     )
@@ -289,7 +308,7 @@ def test_exact_max_fact_round_trips_through_pile_residence_and_http(tmp_path):
     assert MAX_FACT_BYTES < len(raw) <= MAX_PILE_BYTES
 
     destination = FsStore(str(tmp_path / "destination"))
-    run(ensure_object_async(async_store(destination), h(raw), raw))
+    run(ensure_pile_async(async_store(destination), h(raw), raw))
     consumer = FactConsumer(workspace)
     consumer.consume(raw, writer=public)
     assert fact.decode(consumer.fact_bytes(exact.fid)) == exact
@@ -307,7 +326,7 @@ def test_exact_max_fact_round_trips_through_pile_residence_and_http(tmp_path):
     token = make_token(
         secret_token, "reader", workspace, issued_at=100)
     response = run(gate.handle(
-        "GET", "/page/" + h(encoded), {"ws": workspace},
+        "GET", "/obj/" + h(encoded), {"ws": workspace},
         {"Authorization": "Bearer " + token}))
     assert response.status == 200
     assert response.body == encoded

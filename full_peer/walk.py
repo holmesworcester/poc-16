@@ -12,19 +12,24 @@ from core.crypto import h, unseal
 from core.http_body import read_bounded
 from core.limits import (
     MAX_CONTROL_BYTES,
+    MAX_DIRECT_OBJECT_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
+    DIRECT_STREAM_CHUNK_BYTES,
     decode_json,
 )
 from core.object_store import ABSENT, ListPage, Versioned, VersionToken
 from core.pack_access import (
     MAX_SCOPED_REQUEST_BYTES,
-    PACK_STREAM_CHUNK_BYTES,
+    ObjectOpen,
     PackOpen,
+    confine_object_request,
     confine_scoped_request,
+    copy_object_get,
     copy_pack_get,
     decode_scoped_request,
+    encode_object_open,
     encode_pack_open,
 )
 from core.writer_head import (
@@ -59,8 +64,8 @@ class Peer:
 
     @property
     def accepts_push(self):
-        return "sync_profile" not in self.cache or peer_capability.allows_push(
-            self.cache["sync_profile"])
+        return peer_capability.allows_push(
+            self.cache.get("sync_profile"))
 
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
@@ -219,12 +224,50 @@ class Peer:
         return opened.value, opened.token
 
     def obj(self, oh, *, response_limit):
+        value = bytearray()
+        copied = self.copy_obj(
+            oh, response_limit=response_limit, write=value.extend)
+        return None if copied is None else bytes(value)
+
+    def copy_obj(self, oh, *, response_limit, write):
+        """Copy one object through its size-appropriate HTTP data plane."""
         if type(response_limit) is not int \
-                or not 0 < response_limit <= MAX_OBJECT_BYTES:
+                or not 0 < response_limit <= MAX_DIRECT_OBJECT_BYTES \
+                or not callable(write):
             raise ValueError("peer object response limit")
-        _, b, _ = self._http(
-            "GET", f"/obj/{oh}", response_limit=response_limit)
-        return b
+        if response_limit <= MAX_OBJECT_BYTES:
+            _, raw, _ = self._http(
+                "GET", f"/obj/{oh}", response_limit=response_limit)
+            write(raw)
+            return len(raw)
+
+        opened = ObjectOpen(oh, response_limit)
+        _, raw, _ = self._http(
+            "POST", "/obj/open",
+            data=encode_object_open(opened),
+            response_limit=MAX_SCOPED_REQUEST_BYTES)
+        scoped = confine_object_request(
+            opened, decode_scoped_request(raw), now_ms())
+        request = urllib.request.Request(
+            scoped.url,
+            method="GET",
+            headers=dict(scoped.headers),
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            def chunks():
+                while True:
+                    chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        return
+                    yield chunk
+
+            return copy_object_get(
+                opened,
+                response.status,
+                response.headers,
+                chunks(),
+                write,
+            )
 
     def layout(self, key, *, response_limit=MAX_LAYOUT_PAGE_BYTES):
         """Open one directly addressed, bounded source-local layout page."""
@@ -261,7 +304,7 @@ class Peer:
         with urllib.request.urlopen(request, timeout=60) as response:
             def chunks():
                 while True:
-                    chunk = response.read(PACK_STREAM_CHUNK_BYTES)
+                    chunk = response.read(DIRECT_STREAM_CHUNK_BYTES)
                     if not chunk:
                         return
                     yield chunk

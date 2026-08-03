@@ -18,10 +18,14 @@ from core.grants import make_token
 from core.pack_access import (
     MAX_PACK_BYTES,
     InvalidPackAccess,
+    ObjectOpen,
     PackOpen,
+    copy_object_get,
     copy_pack_get,
     decode_scoped_request,
+    encode_object_open,
     encode_pack_open,
+    object_key,
     pack_key,
 )
 from full_peer.node import FullPeer
@@ -107,6 +111,19 @@ def open_pack(url, peer, workspace, clock, opened, *, capability=None):
     return decode_scoped_request(raw)
 
 
+def open_object(url, peer, workspace, clock, opened):
+    status, raw, _headers = request(
+        url,
+        "POST",
+        f"/obj/open?ws={workspace}",
+        body=encode_object_open(opened),
+        headers=bearer(
+            peer, workspace, clock, peer_capability.READ_ONLY),
+    )
+    assert status == 200
+    return decode_scoped_request(raw)
+
+
 def perform(scoped, *, body=None, headers=None):
     parsed = urlsplit(scoped.url)
     supplied = dict(scoped.headers)
@@ -149,8 +166,41 @@ def copy_get(scoped, opened):
         connection.close()
 
 
+def copy_object(scoped, opened):
+    """Use the common object verifier over the FullPeer streaming route."""
+    parsed = urlsplit(scoped.url)
+    connection = http.client.HTTPConnection(
+        parsed.hostname, parsed.port, timeout=5)
+    try:
+        connection.request(
+            "GET",
+            parsed.path + ("?" + parsed.query if parsed.query else ""),
+            headers=dict(scoped.headers),
+        )
+        response = connection.getresponse()
+        sink = io.BytesIO()
+
+        def chunks():
+            while True:
+                chunk = response.read(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    return
+                yield chunk
+
+        copy_object_get(
+            opened, response.status, dict(response.headers),
+            chunks(), sink.write)
+        return response.status, sink.getvalue(), dict(response.headers)
+    finally:
+        connection.close()
+
+
 def pack_path(peer, workspace, oid):
     return os.path.join(peer.store(workspace).root, pack_key(oid))
+
+
+def object_path(peer, workspace, oid):
+    return os.path.join(peer.store(workspace).root, object_key(oid))
 
 
 def temp_paths(peer, workspace):
@@ -197,6 +247,58 @@ def test_real_http_streams_whole_put_get_and_exact_206_range(tmp_path):
             f"bytes {offset}-{offset + length - 1}/{len(body)}")
 
 
+def test_real_http_streams_tree_selected_object_outside_gate_buffer(tmp_path):
+    body = b"one independently closed pile\0" * 20_000
+    oid = h(body)
+    with serving(tmp_path) as (url, peer, workspace, clock, _packs):
+        store = peer.store(workspace)
+        assert store.put_if_absent(object_key(oid), body).value == "created"
+        original = store.get_bounded
+
+        def guarded(key, maximum):
+            if key == object_key(oid):
+                raise AssertionError("large object entered buffered gate read")
+            return original(key, maximum)
+
+        store.get_bounded = guarded
+        opened = ObjectOpen(oid, len(body))
+        scoped = open_object(url, peer, workspace, clock, opened)
+        status, recovered, headers = copy_object(scoped, opened)
+
+        assert status == 200
+        assert recovered == body
+        assert headers["Content-Length"] == str(len(body))
+        assert urlsplit(scoped.url).path == "/" + object_key(oid)
+        assert scoped.method == "GET" and scoped.headers == ()
+
+
+def test_object_ticket_cannot_widen_key_method_size_or_lifetime(tmp_path):
+    body = b"bounded direct object"
+    oid = h(body)
+    with serving(tmp_path, ttl_ms=50) \
+            as (url, peer, workspace, clock, _packs):
+        peer.store(workspace).put_if_absent(object_key(oid), body)
+        opened = ObjectOpen(oid, len(body))
+        scoped = open_object(url, peer, workspace, clock, opened)
+        parsed = urlsplit(scoped.url)
+        path = parsed.path + "?" + parsed.query
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
+        assert request(base, "PUT", path, body=b"")[0] == 403
+        assert request(
+            base, "GET", path.replace(oid, h(b"wrong")))[0] == 403
+        assert request(
+            base, "GET", path, headers={"Range": "bytes=0-1"})[0] == 403
+
+        smaller = open_object(
+            url, peer, workspace, clock,
+            ObjectOpen(oid, len(body) - 1))
+        assert perform(smaller)[0] == 413
+
+        clock.value += 50
+        assert perform(scoped)[0] == 403
+
+
 def test_opening_the_95_mib_ceiling_allocates_only_control_metadata(tmp_path):
     oid = h(b"not allocated")
     with serving(tmp_path) as (url, peer, workspace, clock, _packs):
@@ -209,6 +311,13 @@ def test_opening_the_95_mib_ceiling_allocates_only_control_metadata(tmp_path):
         assert len(scoped.url) < 512
         assert not os.path.exists(pack_path(peer, workspace, oid))
         assert temp_paths(peer, workspace) == ()
+
+        direct = open_object(
+            url, peer, workspace, clock,
+            ObjectOpen(oid, MAX_PACK_BYTES))
+        assert direct.method == "GET" and direct.headers == ()
+        assert len(direct.url) < 512
+        assert not os.path.exists(object_path(peer, workspace, oid))
 
 
 def test_wrong_hash_length_and_corrupt_collision_never_establish(tmp_path):

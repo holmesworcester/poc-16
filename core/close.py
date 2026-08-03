@@ -1,7 +1,7 @@
-"""close(): the canonical-topo serializer, and the wire ingress unit codec.
+"""Closure ordering and the sole device-signed pile wire codec.
 
-Ingress, request, invite, and sync-push piles use the same ordered fact-list
-codec. Published fact bodies have one canonical content-addressed residence;
+Requests, authority checks, writer leaves, and peer sync use the same signed
+ordered fact-list codec. Published fact bodies have one canonical residence;
 FactOrder stores only key-to-object references and deliberately does not
 introduce a second body or pile codec.
 close() emits the closure walk's own completion order: news in key order,
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from itertools import islice
 
 from .crypto import h, sign, verify
-from .fact import Fact, bound_to, canon, encode, from_json, workspace_of
+from .fact import Fact, bound_to, canon, encode, from_json
 from .ingress import InvalidPile, KernelRejected
 from .limits import (
     MIN_HOSTED_MEMORY_BYTES,
@@ -206,69 +206,6 @@ def close(news, deps_of, fact_of):
     return out
 
 
-def encode_pile(facts, *, workspace=None) -> bytes:
-    """Encode one workspace-bound closed unit.
-
-    ``workspace`` is inferred from non-empty fact bytes when omitted. Empty
-    diagnostic/corruption fixtures must name it explicitly.
-    """
-    facts = tuple(islice(facts, MAX_PILE_FACTS + 1))
-    if len(facts) > MAX_PILE_FACTS:
-        raise PayloadTooLarge("pile has too many facts")
-    if workspace is None:
-        if not facts:
-            raise ValueError("pile workspace")
-        workspace = workspace_of(facts[0])
-    if not valid_fid(workspace):
-        raise ValueError("pile workspace")
-    if not all(bound_to(fact, workspace) for fact in facts):
-        raise ValueError("mixed workspace pile")
-    for fact in facts:
-        encode(fact)
-    raw = canon({
-        "ws": workspace,
-        "facts": [f.to_json() for f in facts],
-    })
-    check_pile_bounds(raw)
-    return raw
-
-
-def decode_pile(b: bytes, workspace):
-    """Hash-verify everything at the door — cheapest checks first.
-
-    Total over arbitrary JSON: foreign bytes leave here as ``InvalidPile`` or
-    ``PayloadTooLarge``. Unexpected exception types remain program failures
-    and must never become destructive quarantine verdicts.
-    """
-    try:
-        check_pile_bounds(b)
-        if not valid_fid(workspace):
-            raise InvalidEncoding("pile workspace")
-        o = decode_json(b, MAX_PILE_BYTES, "pile")
-        if not isinstance(o, dict) \
-                or set(o) != {"ws", "facts"} \
-                or not valid_fid(o.get("ws")) \
-                or not isinstance(o.get("facts"), list):
-            raise InvalidEncoding("pile shape")
-        if len(o["facts"]) > MAX_PILE_FACTS:
-            raise PayloadTooLarge("pile has too many facts")
-        pile_workspace = o["ws"]
-        facts = [
-            from_json(fo) for fo in o["facts"]
-        ]  # raises on integrity mismatch
-        if pile_workspace != workspace:
-            raise InvalidEncoding("pile workspace")
-        if not all(bound_to(fact, pile_workspace) for fact in facts):
-            raise InvalidEncoding("mixed workspace pile")
-        if encode_pile(facts, workspace=pile_workspace) != b:
-            raise InvalidEncoding("pile is not canonical")
-        return facts
-    except PayloadTooLarge as error:
-        raise InvalidPile(str(error)) from error
-    except InvalidEncoding as error:
-        raise InvalidPile(str(error) or "pile encoding") from error
-
-
 def _signature(value):
     return isinstance(value, str) \
         and len(value) == SIGNATURE_HEX_CHARS \
@@ -400,14 +337,19 @@ class EvaluatedPile:
 class ClosedPileEvaluator:
     """The shared signed-pile semantic door for push and pull."""
 
-    def __init__(self, workspace):
-        if not valid_fid(workspace):
-            raise ValueError("pile evaluator workspace")
+    def __init__(self, workspace, *, max_bytes=MAX_PILE_BYTES):
+        if not valid_fid(workspace) \
+                or type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_PILE_BYTES:
+            raise ValueError("pile evaluator options")
         self.workspace = workspace
+        self.max_bytes = max_bytes
 
     def evaluate(self, raw, *, writer=None):
         from .kernel import drain
 
+        if not isinstance(raw, bytes) or len(raw) > self.max_bytes:
+            raise InvalidPile("pile too large")
         pile = decode_signed_pile(
             raw, workspace=self.workspace, writer=writer)
         judgment = drain(pile.facts, self.workspace)
@@ -426,9 +368,7 @@ __all__ = (
     "SignedPile",
     "check_pile_bounds",
     "close",
-    "decode_pile",
     "decode_signed_pile",
-    "encode_pile",
     "encode_signed_pile",
     "make_signed_pile",
     "signed_pile_document",

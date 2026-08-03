@@ -21,7 +21,7 @@ class PileSender:
             newmap = {fact.fid: fact for fact in news}
 
             def fact_of(fid):
-                return newmap.get(fid) or context.fact(fid)
+                return newmap.get(fid) or context.fact_of(fid)
 
             def deps_of(fid):
                 if fid in deps_new:
@@ -53,11 +53,11 @@ class PileSender:
         """Close and encode local intent without receiving it."""
         return self.pack(self.close(news, deps_new))
 
-    def send(self, news, deps_new):
+    def send(self, news, deps_new, *, owner=None):
         """Publish local intent through this device's one writer log."""
         node, workspace = self.node, self.workspace
         closed = self.close(news, deps_new)
-        fresh = node.publish_closed(workspace, (closed,))
+        fresh = node.publish_closed(workspace, (closed,), owner=owner)
         missing = [
             fact.fid for fact in news
             if facts.family_for(fact.t).DURABLE

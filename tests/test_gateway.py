@@ -8,7 +8,7 @@ import pytest
 import facts
 
 from core import peer_capability
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h, unseal
 from core.grants import check_token
 from core.limits import (
@@ -27,7 +27,7 @@ def world(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         node, workspace, "sync", now + 60_000, now))
     gateway = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
@@ -106,7 +106,7 @@ def test_gateway_rejects_a_valid_request_pile_from_another_workspace(
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
-    foreign = encode_pile(
+    foreign = signed_pile_bytes(
         request.payload(node, first, "sync", now + 60_000, now),
         workspace=first,
     )
@@ -167,11 +167,11 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
 
     assert call(
         gateway,
-        "POST", "/page", {"ws": workspace}, {}, request_body
+        "POST", "/obj", {"ws": workspace}, {}, request_body
     ).status == 401
     response = call(
         gateway,
-        "POST", "/page", {"ws": workspace}, headers, request_body)
+        "POST", "/obj", {"ws": workspace}, headers, request_body)
     assert json.loads(response.body) == [
         base64.b64encode(first).decode(), None,
         base64.b64encode(second).decode(),
@@ -183,7 +183,7 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
         max_batch_bytes=8)
     assert call(
         tiny,
-        "POST", "/page", {"ws": workspace}, headers, request_body
+        "POST", "/obj", {"ws": workspace}, headers, request_body
     ).status == 413
 
     one_body = json.dumps([h(first), "0" * 64]).encode()
@@ -199,10 +199,10 @@ def test_gateway_authenticates_ordered_batches_and_bounds_bytes(tmp_path):
         workspace, b"s" * 32, lambda: 100,
         max_batch_bytes=exact_size - 1)
     assert call(
-        exact, "POST", "/page", {"ws": workspace}, headers, one_body
+        exact, "POST", "/obj", {"ws": workspace}, headers, one_body
     ).status == 200
     assert call(
-        below, "POST", "/page", {"ws": workspace}, headers, one_body
+        below, "POST", "/obj", {"ws": workspace}, headers, one_body
     ).status == 413
 
 
@@ -223,7 +223,7 @@ def test_gateway_is_read_only_and_workspace_scoped(tmp_path):
     assert call(
         gateway,
         "PUT", "/pile/member/id", {"ws": workspace}, headers
-    ).status == 405
+    ).status == 404
     assert call(
         gateway,
         "POST", "/poke", {"ws": workspace}, headers
@@ -316,10 +316,10 @@ def test_gateway_rejects_corrupt_content_addressed_reads(tmp_path):
         CorruptReader(), workspace, b"s" * 32, lambda: 100)
 
     assert call(
-        gateway, "GET", f"/page/{oid}",
+        gateway, "GET", f"/obj/{oid}",
         {"ws": workspace}, headers).status == 503
     assert call(
-        gateway, "POST", "/page",
+        gateway, "POST", "/obj",
         {"ws": workspace}, headers,
         json.dumps([oid]).encode()).status == 503
     assert reads == [
@@ -434,10 +434,10 @@ def test_gateway_translates_preallocation_read_limit_to_413(tmp_path):
     headers = {"Authorization": "Bearer " + token}
 
     assert call(
-        gateway, "GET", "/page/" + "0" * 64,
+        gateway, "GET", "/obj/" + "0" * 64,
         {"ws": workspace}, headers).status == 413
     assert call(
-        gateway, "POST", "/page", {"ws": workspace}, headers,
+        gateway, "POST", "/obj", {"ws": workspace}, headers,
         json.dumps(["0" * 64]).encode()).status == 413
     assert call(
         gateway, "GET", "/invite/example",
@@ -463,7 +463,7 @@ def test_gateway_fetches_duplicate_batch_oids_once_and_preserves_order(
     gateway = HttpGate(
         Counting(), workspace, b"s" * 32, lambda: 100)
     response = call(
-        gateway, "POST", "/page", {"ws": workspace},
+        gateway, "POST", "/obj", {"ws": workspace},
         {"Authorization": "Bearer " + token},
         json.dumps([oid] * 256).encode())
 

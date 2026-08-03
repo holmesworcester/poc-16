@@ -3,8 +3,8 @@
 The benchmark calls :meth:`RepositoryMirror.sync_from`, not a private helper.
 Its source implements the same wire behavior as ``RemoteStore``: one bounded
 ``/heads`` response contains both directory keys and their opened slots, exact
-objects use ``GET /obj/<oid>``, and pile bodies use bounded ``POST /obj``
-batches (including the real 413 split behavior).
+objects use buffered ``GET /obj/<oid>``, and pile bodies use the required
+bounded streaming object read.
 
 Wall and CPU times are measured with an in-memory object store and no injected
 network delay. Network time is then modeled as measured wall time plus one RTT
@@ -33,7 +33,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.crypto import h, load_sk
+from core.close import EvaluatedPile, decode_signed_pile
+from core.kernel import Judgment, Valid
 from core.limits import (
+    MAX_PILE_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_STORE_READ_BYTES,
     PAGE_BATCH,
@@ -105,6 +108,17 @@ class MemoryStore:
         return ABSENT if value is None else Versioned(
             value, VersionToken(self.tokens[key]))
 
+    async def copy_pile_object(self, oid, maximum, write):
+        if type(maximum) is not int or not 0 < maximum <= MAX_PILE_BYTES:
+            raise ValueError("memory-store pile bound")
+        value = self.data.get("obj/" + oid)
+        if value is not None and len(value) > maximum:
+            raise PayloadTooLarge("memory-store pile")
+        if value is None:
+            return None
+        write(value)
+        return len(value)
+
     async def put_if_absent(self, key, value):
         validate_create(key, value)
         incumbent = self.data.get(key)
@@ -161,8 +175,12 @@ class ReceiverValidatedFixture:
     """Skip only unmeasured sender preflight for large valid fixtures."""
 
     @staticmethod
-    def evaluate(*_args, **_kwargs):
-        return None
+    def evaluate(raw, *, writer=None):
+        pile = decode_signed_pile(raw, writer=writer)
+        return EvaluatedPile(
+            pile,
+            Judgment(True, tuple(Valid(fact, ()) for fact in pile.facts)),
+        )
 
 
 @dataclass(slots=True)
@@ -177,7 +195,7 @@ class Forest:
     object_owner: dict
 
     def binding_for(
-            self, workspace, device, authority_root, *, candidate=None):
+            self, workspace, device, authority_root, candidate):
         del candidate
         if workspace != self.root.fid or authority_root != AUTHORITY_ROOT:
             return None
@@ -458,6 +476,21 @@ class TraceRemoteStore:
             response_bytes=0 if value is None else len(value),
         )
         return value
+
+    async def copy_pile_object(self, oid, maximum, write):
+        if type(maximum) is not int or not 0 < maximum <= MAX_PILE_BYTES:
+            raise ValueError("trace remote pile bound")
+        value = self.forest.source.data.get("obj/" + oid)
+        if value is not None and len(value) > maximum:
+            raise PayloadTooLarge("trace remote pile")
+        device = self.forest.object_owner[oid]
+        await self._record(
+            "pile", device,
+            response_bytes=0 if value is None else len(value))
+        if value is None:
+            return None
+        write(value)
+        return len(value)
 
     async def read_versioned(self, key):
         workspace, device = parse_head_slot_key(key)

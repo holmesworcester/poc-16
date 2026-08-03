@@ -46,10 +46,10 @@ def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
             "b" * 64, "bad", peers=[], identity="not-a-key")
 
 
-def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
-    directory = tmp_path / "legacy"
+def test_retired_keyring_schema_is_rejected_instead_of_migrated(tmp_path):
+    directory = tmp_path / "retired"
     directory.mkdir()
-    secret, public = keypair()
+    secret, _public = keypair()
     workspace = "a" * 64
     (directory / "keyring.json").write_text(json.dumps({
         "sk": secret.encode().hex(),
@@ -58,23 +58,10 @@ def test_legacy_single_keyring_migrates_without_changing_identity(tmp_path):
         },
     }))
 
-    node = FullPeer(str(directory))
-
-    assert node.pk == public
-    assert node.identity_id(workspace) == public
-    assert node.keyring == {
-        "keys": {public: secret.encode().hex()},
-        "workspaces": {
-            workspace: {
-                "name": "old",
-                "peers": ["http://peer"],
-                "identity": public,
-            },
-        },
-    }
-    persisted = json.loads((directory / "keyring.json").read_text())
-    assert "sk" not in persisted
-    assert persisted == node.keyring
+    with pytest.raises(ValueError, match="keyring schema"):
+        FullPeer(str(directory))
+    assert json.loads((directory / "keyring.json").read_text())["sk"] \
+        == secret.encode().hex()
 
 
 def test_iroh_peer_reachability_is_bounded_canonical_and_durable(tmp_path):
@@ -250,7 +237,7 @@ def test_rebinding_a_workspace_invalidates_its_cached_peer_grants(tmp_path):
     assert node.sync_cache[(other_workspace, "http://peer-b")] is unrelated
 
 
-def test_publish_keeps_the_identity_that_signed_during_a_rebind(tmp_path):
+def test_publish_fails_closed_if_workspace_identity_changes_mid_command(tmp_path):
     node = FullPeer(str(tmp_path / "race"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
@@ -271,9 +258,21 @@ def test_publish_keeps_the_identity_that_signed_during_a_rebind(tmp_path):
         return captured
 
     node.identity = identity
-    fid = facts.content.message.post(node, workspace, "general", "captured signer", ts=30)
+    before = tuple(facts.content.message.messages(node, workspace))
+    store = node.store(workspace)
+    before_heads = {
+        key: store.get(key)
+        for key in store.list(f"heads/{workspace}/")
+    }
+    with pytest.raises(
+            ValueError, match="publishing identity owner mismatch"):
+        facts.content.message.post(
+            node, workspace, "general", "captured signer", ts=30)
 
-    assert calls >= 2  # ingest names its pile with the newly bound identity
+    assert calls >= 2
     assert node.identity_id(workspace) == carol
-    assert node.fact_of(workspace, fid).body["pk"] == bob
-    assert facts.content.message.messages(node, workspace)[-1]["text"] == "captured signer"
+    assert tuple(facts.content.message.messages(node, workspace)) == before
+    assert {
+        key: store.get(key)
+        for key in store.list(f"heads/{workspace}/")
+    } == before_heads

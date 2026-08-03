@@ -64,7 +64,7 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
             "member", body["pk"], body["owner"]) not in provider.offers():
         return None
     try:
-        current = view.fact(provider.fid)
+        current = view.fact_of(provider.fid)
     except ValueError:
         return None
     if current != provider or not view.fact_active(provider.fid):

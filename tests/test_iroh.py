@@ -18,12 +18,12 @@ from urllib.parse import urlparse
 import pytest
 
 import facts
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h, unseal
 from core.limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
-    MAX_PILE_BYTES,
+    MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
 )
 from core.repository_reader import RepositoryReader
@@ -343,7 +343,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
     identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         bootstrap, workspace, "sync", issued + 300_000, issued))
     bootstrap.sql(workspace).db.close()
 
@@ -473,7 +473,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     member = bootstrap.member_for(workspace)
     identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         bootstrap, workspace, "sync", issued + 300_000, issued))
     published = repository_bytes(state, workspace)
     object_key, raw = next(
@@ -531,11 +531,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             through_iroh[0], workspace, pile, identity_secret)
         assert capability == "sync-v1/full"
         baseline = repository_bytes(state, workspace)
-        # Canonical pages are read-only HTTP resources. The Applier is their
-        # sole writer; peers can mutate repository state only with piles.
+        # An unknown route cannot mutate repository state through either
+        # direct TCP or Iroh's opaque byte forwarding.
         assert parity(
             "PUT",
-            f"/page/{oid}?ws={workspace}",
+            f"/retired/{oid}?ws={workspace}",
             body=raw,
             token=token,
         )[0] == 404
@@ -545,14 +545,14 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             through_iroh[1], workspace, pile, identity_secret)
         assert parity(
             "GET",
-            f"/page/{oid}?ws={workspace}",
+            f"/obj/{oid}?ws={workspace}",
             token=token,
         )[:2] == (200, raw)
 
         time.sleep(2.2)
         assert parity(
             "GET",
-            f"/page/{oid}?ws={workspace}",
+            f"/obj/{oid}?ws={workspace}",
             token=token,
         )[0] == 401
         assert repository_bytes(state, workspace) == baseline
@@ -577,15 +577,6 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             "/root?ws=" + "0" * 64,
             token=token,
         )[0] == 404
-
-        token, _ = mint(
-            through_iroh[1], workspace, pile, identity_secret)
-        assert parity(
-            "PUT",
-            f"/pile/not-{member}/{h(b'pile')}?ws={workspace}",
-            body=b"pile",
-            token=token,
-        )[0] == 403
 
         for method, path in (
                 ("POST", f"/root?ws={workspace}"),
@@ -612,11 +603,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, _ = mint(
             direct, workspace, pile, identity_secret)
         oversized = (
-            f"PUT /pile/{member}/{h(b'never lands')}?"
+            f"PUT /obj/{h(b'never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
-            f"Content-Length: {MAX_PILE_BYTES + 1}\r\n"
+            f"Content-Length: {MAX_OBJECT_BYTES + 1}\r\n"
             "Connection: close\r\n\r\n"
         ).encode()
         oversized_results = [
@@ -629,7 +620,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         token, _ = mint(
             through_iroh[0], workspace, pile, identity_secret)
         malformed = (
-            f"PUT /pile/{member}/{h(b'malformed never lands')}?"
+            f"PUT /obj/{h(b'malformed never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
             "Host: localhost\r\n"
             f"Authorization: Bearer {token}\r\n"
@@ -770,16 +761,18 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
         )
 
         def converged():
-            roots = {
-                workspace_row(alice_ready, workspace)["root"],
-                workspace_row(bob_ready, workspace)["root"],
+            forests = {
+                workspace_row(alice_ready, workspace)[
+                    "forest_fingerprint"],
+                workspace_row(bob_ready, workspace)[
+                    "forest_fingerprint"],
             }
             fids = {
                 row["fid"]
                 for row in control_command(
                     bob_ready, "content.message.list", workspace)
             }
-            return len(roots) == 1 and None not in roots \
+            return len(forests) == 1 \
                 and {alice_message, bob_message}.issubset(fids)
 
         wait_until(
@@ -1212,7 +1205,7 @@ def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
     issued = now_ms()
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         bootstrap, workspace, "sync", issued + 300_000, issued))
     store = bootstrap.store(workspace)
     root = store.get("root")

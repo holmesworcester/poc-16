@@ -9,18 +9,47 @@ import tempfile
 import facts
 
 from core import http, peer_capability
-from core.close import close, encode_pile
-from core.crypto import h, keypair
+from core.close import (
+    close,
+    decode_signed_pile,
+    encode_signed_pile,
+    make_signed_pile,
+)
+from core.crypto import h, keypair, load_sk
+from core.fact import workspace_of
 from core.ingress import ingress_key, parse_ingress_key
 from core.object_store import CREATED, EXISTS
-from core.repository_applier import async_store
+from core.object_store import async_store
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import resolve_deps
+from core.writer_repository import FactConsumer
 from full_peer.node import FullPeer, now_ms
+
+
+_FIXTURE_SIGNER = load_sk("01" * 32)
+
+
+def signed_pile_bytes(facts, *, workspace=None, secret=None):
+    """Encode one real signed wire pile for protocol-independent fixtures."""
+    facts = tuple(facts)
+    if workspace is None:
+        if not facts:
+            raise ValueError("pile workspace")
+        workspace = workspace_of(facts[0])
+    secret = _FIXTURE_SIGNER if secret is None else secret
+    writer = secret.verify_key.encode().hex()
+    return encode_signed_pile(make_signed_pile(
+        secret, workspace, writer, facts))
+
+
+def signed_pile_facts(raw, workspace=None, writer=None):
+    """Decode the sole signed wire format and return its ordered facts."""
+    return list(decode_signed_pile(
+        raw, workspace=workspace, writer=writer).facts)
 
 
 def invoke_mint_value(node, workspace, value):
@@ -96,26 +125,20 @@ def suppression_world(path, initial_secret=None):
 
 
 def replay_random(source, workspace, destination, seed):
-    """Deliver the same valid set under a random partition/order/batching."""
+    """Consume the same valid set under a random partition and order."""
     rng = random.Random(seed)
     shuffled = all_fids(source, workspace)
     rng.shuffle(shuffled)
-    position = batch = 0
-    pending = []
+    position = 0
     while position < len(shuffled):
-        for pile in range(rng.randint(1, 3)):
+        for _pile in range(rng.randint(1, 3)):
             take = rng.randint(1, 5)
             chunk = shuffled[position:position + take]
             position += take
             if chunk:
-                pending.append(deliver(
+                deliver(
                     destination, workspace,
-                    closed_subset(source, workspace, chunk),
-                    member=h(
-                        f"seed{seed}batch{batch}pile{pile}".encode())))
-        for exact_source in pending:
-            destination.turn(workspace, exact_source)
-        batch += 1
+                    closed_subset(source, workspace, chunk))
     return destination
 
 
@@ -141,6 +164,26 @@ def query_state(node, workspace=None):
         )
         for name, query in queries
     )
+
+
+def compiled_repository(node, workspace, objects=None):
+    """Compile current projected facts into an explicit test-only snapshot.
+
+    The writer-log FullPeer deliberately has no aggregate content root. Tests
+    for the still-root-shaped authority/notification readers construct that
+    pure value explicitly instead of reviving ``FullPeer.reader``.
+    """
+    from core.repository_snapshot import compile_snapshot
+
+    with node.lock:
+        projection = node.sql(workspace)
+        compiled = compile_snapshot(workspace, {
+            fid: projection.fact_of(fid)
+            for fid in projection.fact_ids()
+        })
+    target = {} if objects is None else objects
+    target.update(compiled.objects)
+    return compiled.root, target
 
 
 def visible_fids(node, workspace):
@@ -230,15 +273,14 @@ def closed_subset(n, ws, fids):
                       lambda fid: resolve_deps(
                           n.fact_of(ws, fid), context) or [],
                       lambda fid: n.fact_of(ws, fid))
-    return encode_pile(facts, workspace=ws)
+    return signed_pile_bytes(facts, workspace=ws)
 
 
-def deliver(dst, ws, pile_bytes, member="feed" * 16):
-    """Deliver and apply one exact pile; there is no discovery turn."""
-    digest = h(pile_bytes)
-    source = ingress_key(ws, digest[:32], member, digest)
-    dst.receive_pile(ws, member, pile_bytes)
-    return source
+def deliver(dst, ws, pile_bytes):
+    """Consume one already-authenticated signed pile through common core."""
+    pile = decode_signed_pile(pile_bytes, workspace=ws)
+    return FactConsumer(ws, dst.sql(ws)).consume(
+        pile_bytes, writer=pile.writer)
 
 
 def all_fids(n, ws):

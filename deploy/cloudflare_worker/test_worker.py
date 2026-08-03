@@ -17,7 +17,7 @@ import facts
 
 from core import limits, peer_capability
 from core.object_store import MAX_STORE_PREFIX_BYTES
-from core.close import encode_pile
+from tests.util import signed_pile_bytes
 from core.crypto import (
     h,
     load_sk,
@@ -181,7 +181,7 @@ def worker_world(tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = encode_pile(request_fact.payload(
+    pile = signed_pile_bytes(request_fact.payload(
         node, workspace, "sync", now + runtime.MAX_GRANT_TTL_MS, now))
     prefix = f"workspaces/{workspace}"
     store = node.store(workspace)
@@ -326,7 +326,7 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
     # Pack creation authority belongs to the upload-purpose front door. This
     # read-only gateway deliberately cannot mint a push-capable grant.
     put_request = runtime.Settings.from_env(environment).issue_packs(
-        lambda: 100)(h(b"upload broker member"), put, 100)
+        lambda: 100).open_pack(h(b"upload broker member"), put, 100)
     assert put_request.method == "PUT"
     assert urlsplit(put_request.url).path == f"/pack/{oid}"
 
@@ -369,10 +369,8 @@ def test_deployed_entry_confines_a_widened_object_issuer(
         def __init__(self, *args, **kwargs):
             pass
 
-        def __call__(self, member, request, trusted_now):
+        def open_pack(self, member, request, trusted_now):
             raise AssertionError("pack issuer unexpectedly called")
-
-        open = __call__
 
         def open_object(self, member, request, trusted_now):
             return ScopedRequest(
@@ -469,19 +467,19 @@ def test_runtime_bounds_and_authenticates_r2_object_reads(
     bucket.data[f"{prefix}/obj/{oid}"] = raw
 
     found = run(runtime.handle(Request(
-        "GET", f"https://worker.example/page/{oid}?ws={workspace}",
+        "GET", f"https://worker.example/obj/{oid}?ws={workspace}",
         headers=headers,
     ), environment))
     missing = run(runtime.handle(Request(
-        "GET", f"https://worker.example/page/{'0' * 64}?ws={workspace}",
+        "GET", f"https://worker.example/obj/{'0' * 64}?ws={workspace}",
         headers=headers,
     ), environment))
     bucket.data[f"{prefix}/obj/{oid}"] = b"corrupt"
     corrupt = run(runtime.handle(Request(
-        "GET", f"https://worker.example/page/{oid}?ws={workspace}",
+        "GET", f"https://worker.example/obj/{oid}?ws={workspace}",
         headers=headers,
     ), environment))
-    read_only = run(runtime.handle(Request(
+    retired = run(runtime.handle(Request(
         "PUT", f"https://worker.example/pile/member/id?ws={workspace}",
         headers=headers,
     ), environment))
@@ -489,7 +487,7 @@ def test_runtime_bounds_and_authenticates_r2_object_reads(
     assert found.status == 200 and found.body == raw
     assert missing.status == 404
     assert corrupt.status == 503
-    assert read_only.status == 405
+    assert retired.status == 404
     assert not hasattr(runtime.ReadOnlyStore(bucket, prefix), "put")
 
 
@@ -546,11 +544,11 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
             "GET", f"https://worker.example/invite/code?ws={workspace}",
         ), environment)),
         run(runtime.handle(Request(
-            "GET", f"https://worker.example/page/{oid}?ws={workspace}",
+            "GET", f"https://worker.example/obj/{oid}?ws={workspace}",
             headers=headers,
         ), environment)),
         run(runtime.handle(Request(
-            "POST", f"https://worker.example/page?ws={workspace}",
+            "POST", f"https://worker.example/obj?ws={workspace}",
             json.dumps([oid]).encode(), headers,
         ), environment)),
     ]

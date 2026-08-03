@@ -13,6 +13,8 @@ import re
 
 from core.crypto import h
 from core.limits import (
+    DIRECT_STREAM_CHUNK_BYTES,
+    MAX_DIRECT_OBJECT_BYTES,
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     MAX_STORE_READ_BYTES,
@@ -38,6 +40,7 @@ from core.object_store import (
     validate_key,
     validate_store_prefix,
 )
+from core.shape import valid_fid
 
 
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -405,10 +408,12 @@ class S3Store:
         return etag
 
     @staticmethod
-    def _response_body(
-            response, operation, max_bytes, max_body_read_calls):
+    def _copy_response_body(
+            response, operation, max_bytes, max_body_read_calls, write,
+            *, direct=False):
+        maximum = MAX_DIRECT_OBJECT_BYTES if direct else MAX_STORE_READ_BYTES
         if type(max_bytes) is not int \
-                or not 0 < max_bytes <= MAX_STORE_READ_BYTES:
+                or not 0 < max_bytes <= maximum or not callable(write):
             raise ValueError("S3 read byte limit")
         _positive_int(
             max_body_read_calls, "max_body_read_calls",
@@ -426,7 +431,7 @@ class S3Store:
                 raise PayloadTooLarge(
                     f"S3 {operation} response exceeds byte limit")
             ceiling = declared if declared is not None else max_bytes
-            value = bytearray()
+            total = 0
             read_calls = 0
             while True:
                 # Botocore's StreamingBody normally fills ``amount``. Treat
@@ -435,7 +440,9 @@ class S3Store:
                 if read_calls >= max_body_read_calls:
                     raise StoreError(
                         f"S3 {operation} response exceeded fragment budget")
-                amount = ceiling - len(value) + 1
+                amount = ceiling - total + 1
+                if direct:
+                    amount = min(amount, DIRECT_STREAM_CHUNK_BYTES)
                 chunk = body.read(amount)
                 read_calls += 1
                 if not isinstance(chunk, bytes):
@@ -446,17 +453,17 @@ class S3Store:
                         f"S3 {operation} response exceeded read request")
                 if not chunk:
                     break
-                value.extend(chunk)
-                if declared is not None and len(value) > declared:
+                total += len(chunk)
+                if declared is not None and total > declared:
                     raise StoreError(
                         f"S3 {operation} response ContentLength mismatch")
-                if len(value) > max_bytes:
+                if total > max_bytes:
                     raise PayloadTooLarge(
                         f"S3 {operation} response exceeds byte limit")
-            if declared is not None and len(value) != declared:
+                write(chunk)
+            if declared is not None and total != declared:
                 raise StoreError(
                     f"S3 {operation} response ContentLength mismatch")
-            value = bytes(value)
         except (PayloadTooLarge, StoreError):
             raise
         except Exception as error:
@@ -471,7 +478,16 @@ class S3Store:
                     # bytes that were returned. Do not let cleanup obscure a
                     # classified read failure.
                     pass
-        return value
+        return total
+
+    @classmethod
+    def _response_body(
+            cls, response, operation, max_bytes, max_body_read_calls):
+        value = bytearray()
+        cls._copy_response_body(
+            response, operation, max_bytes, max_body_read_calls,
+            value.extend)
+        return bytes(value)
 
     def _get_response(self, key, operation):
         try:
@@ -533,6 +549,19 @@ class S3Store:
         return None if response is None else self._response_body(
             response, "GetObject", max_bytes,
             self.config.max_body_read_calls)
+
+    def copy_pile_object(self, oid, max_bytes, write):
+        """Stream one large signed pile without using the buffered read door."""
+        if not valid_fid(oid) or type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_DIRECT_OBJECT_BYTES \
+                or not callable(write):
+            raise ValueError("S3 pile copy")
+        response = self._get_response("obj/" + oid, "GetObject pile")
+        if response is None:
+            return None
+        return self._copy_response_body(
+            response, "GetObject pile", max_bytes,
+            self.config.max_body_read_calls, write, direct=True)
 
     def read_versioned(self, key):
         response = self._get_response(key, "GetObject")
@@ -673,7 +702,7 @@ class S3Store:
         return ListPage(tuple(sorted(out)), continuation)
 
     def list(self, prefix):
-        """Compatibility/admin helper; receiving code uses ``list_page``."""
+        """Administrative full traversal; receiving code uses ``list_page``."""
         out = set()
         continuation = None
         seen_tokens = set()

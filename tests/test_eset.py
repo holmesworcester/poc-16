@@ -1,18 +1,12 @@
 """E = V minus S stays independent of delivery history."""
-import base64
-import threading
 
 import pytest
 
 import facts
 
-from core import fact_index, indexes
-from core.close import decode_pile, encode_pile
+from .util import signed_pile_facts
 from core.kernel import drain
 from full_peer.node import FullPeer
-from full_peer.node import now_ms
-from core.repository_reader import RepositoryReader
-from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 from facts.content.delete import delete
 from facts._policy import OWNER
@@ -20,7 +14,6 @@ from facts._policy import OWNER
 from .util import (
     all_fids,
     closed_subset,
-    invoke_mint,
     member_src,
     query_state,
     replay_random,
@@ -41,14 +34,13 @@ def test_e_identical_across_partitions_orders_batchings(
         for fid in all_fids(source, workspace)
         for _, target in source.fact_of(workspace, fid).refs()
     }
-    assert referenced <= set(
-        source.reader(workspace).validated().fact_ids())
-    expected_root = source.store(workspace).get("root")
+    assert referenced <= source.sql(workspace).fact_ids()
+    expected_facts = set(all_fids(source, workspace))
     expected_app = query_state(source)
     for seed in range(5):
         peer = replay_random(
             source, workspace, FullPeer(str(tmp_path / f"peer-{seed}")), seed)
-        assert peer.store(workspace).get("root") == expected_root
+        assert set(all_fids(peer, workspace)) == expected_facts
         assert visible_fids(peer, workspace) == effective
         assert query_state(peer) == expected_app
 
@@ -65,7 +57,7 @@ def test_suppression_facts_not_suppressible(tmp_path):
     recursive = delete(workspace, public, first.key, OWNER, 200)
     sig = signature(secret, public, recursive, 200)
 
-    with pytest.raises(ValueError, match="were not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(workspace, [sig, recursive], {
             recursive.fid: [
                 first.fid, sig.fid, member_src(node, workspace, public)],
@@ -108,9 +100,9 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
     source, workspace, targets, deletions = suppression_world(
         tmp_path / "source")
     target = targets[1]
-    alone = decode_pile(
+    alone = signed_pile_facts(
         closed_subset(source, workspace, [target]), workspace)
-    with_deletion = decode_pile(closed_subset(
+    with_deletion = signed_pile_facts(closed_subset(
         source, workspace, [deletions[0]]), workspace)
 
     alone_result = drain(alone, workspace)
@@ -119,138 +111,3 @@ def test_verdicts_never_read_s(tmp_path, monkeypatch):
     assert target in {valid.fact.fid for valid in alone_result.valids}
     assert target in {valid.fact.fid for valid in deletion_result.valids}
     assert target not in visible_fids(source, workspace)
-
-
-@pytest.mark.parametrize("restart", (False, True))
-def test_suppression_stays_behind_the_root_commit(
-        tmp_path, monkeypatch, restart):
-    """Root and action projection advance atomically across a failed CAS."""
-    node, workspace, _, _ = suppression_world(tmp_path / "node")
-    target_fid = facts.content.message.post(
-        node, workspace, "unpublished", "target", ts=300)
-    target = node.fact_of(workspace, target_fid)
-    deletion = delete(  # the fid facts.content.delete.remove(ts=301) authors below
-        workspace, node.identity_id(workspace), target.key, OWNER, 301)
-    store = node.store(workspace)
-    old_root = store.get("root")
-
-    def visible():
-        return target.fid in visible_fids(node, workspace)
-
-    def committed_action(raw):
-        return RepositoryReader(
-            workspace,
-            raw,
-            lambda oid: store.get("obj/" + oid),
-        ).worker().suppression(indexes.fact_key(target.fid))
-
-    def projected_action():
-        return node.idx(workspace).execute(
-            "SELECT src FROM fact_index WHERE kind=? AND k0=?",
-            (fact_index.ACTION_INDEX, indexes.fact_key(target.fid)),
-        ).fetchone()
-
-    assert committed_action(old_root) == {"state": "clear"}
-    assert projected_action() is None
-    assert visible()
-    now = now_ms()
-    request = encode_pile(request_payload(
-        node, workspace, "sync", now + 60_000, now))
-    canonical_observed = []
-    old_view = node.reader(workspace).worker()
-    original_mint = type(old_view).mint
-
-    def observe_canonical(view, pile, trusted_now, *, purpose="sync"):
-        canonical_observed.append(view.etag == old_view.etag)
-        return original_mint(
-            view, pile, trusted_now, purpose=purpose)
-
-    monkeypatch.setattr(type(old_view), "mint", observe_canonical)
-
-    release_reader = threading.Event()
-    reader_waiting = threading.Event()
-    observed = []
-
-    def read_like_mint():
-        release_reader.wait()
-        reader_waiting.set()
-        _, (code, body) = invoke_mint(node, workspace, request)
-        observed.append((
-            code,
-            base64.b64decode(body["root"]) if body else None,
-        ))
-
-    reader = threading.Thread(target=read_like_mint, daemon=True)
-    reader.start()
-    candidate = []
-    original_cas = store.cas
-
-    def fail_before_root_commit(key, etag, raw):
-        candidate.append(raw)
-        assert key == "root"
-        assert store.get("root") == old_root
-        # SQL is only a projection of the committed root, so it cannot expose
-        # the candidate action while the root CAS is still pending.
-        assert projected_action() is None
-        release_reader.set()
-        assert reader_waiting.wait(timeout=5)
-        raise RuntimeError("suppression root CAS failed")
-
-    monkeypatch.setattr(store, "cas", fail_before_root_commit)
-    with pytest.raises(ValueError, match="not admitted"):
-        facts.content.delete.remove(node, workspace, target.fid, ts=301)
-    reader.join(timeout=5)
-
-    assert not reader.is_alive()
-    assert len(candidate) == 1
-    assert committed_action(candidate[0]) == {
-        "state": "active", "action": deletion.fid}
-    assert store.get("root") == old_root
-    assert node.fact_of(workspace, deletion.fid) is None
-    assert projected_action() is None
-    assert observed == [(200, old_root)]
-    assert canonical_observed and all(canonical_observed)
-    assert visible()
-    assert store.list("ingress/")
-    failed_source = next(
-        source for source in store.list("ingress/")
-        if store.get(source) is not None
-        and deletion.fid in {
-            fact.fid for fact in decode_pile(store.get(source), workspace)
-        })
-
-    if restart:
-        index = node.idx(workspace)
-        index.executescript(
-            "DELETE FROM facts; DELETE FROM fact_index; DELETE FROM meta;")
-        index.commit()
-        index.close()
-        node = FullPeer(node.dir)
-        store = node.store(workspace)
-    else:
-        monkeypatch.setattr(store, "cas", original_cas)
-
-    assert node.fact_of(workspace, deletion.fid) is None
-    assert store.get("root") == old_root
-    assert visible()
-    retry_cas = store.cas
-    retried = []
-
-    def observe_retry(key, etag, raw):
-        retried.append(raw)
-        return retry_cas(key, etag, raw)
-
-    monkeypatch.setattr(store, "cas", observe_retry)
-
-    node.turn(workspace, failed_source)
-    assert retried == candidate
-    assert store.get("root") == candidate[0]
-    assert node.fact_of(workspace, deletion.fid) == deletion
-    assert projected_action() == (deletion.fid,)
-    assert committed_action(store.get("root")) == {
-        "state": "active", "action": deletion.fid}
-    assert not visible()
-    _, (code, body) = invoke_mint(node, workspace, request)
-    assert (code, base64.b64decode(body["root"])) == (200, candidate[0])
-    assert canonical_observed[0] is True
-    assert canonical_observed[-1] is False

@@ -71,7 +71,8 @@ def grant(node, workspace, user, device_pk, label):
     """Idempotently fill one ``(workspace, admitting key, device)`` cell."""
     with node.lock:
         secret, public = node.identity(workspace)
-        member = offer_source(node, workspace, "member", public)
+        member = offer_source(
+            node, workspace, "member", public, user)
         device_source = offer_source(
             node, workspace, "device_key", public, user)
         if member is None or device_source is None:
@@ -97,7 +98,7 @@ def grant(node, workspace, user, device_pk, label):
             item.fid: [signed.fid, member, device_source],
             signed.fid: [],
         }
-        node.ingest_new(workspace, [signed, item], deps)
+        node.ingest_new(workspace, [signed, item], deps, owner=user)
         return item.fid
 
 

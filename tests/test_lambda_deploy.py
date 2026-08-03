@@ -14,7 +14,7 @@ import facts
 import pytest
 
 from adapters.s3 import S3Config
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h, unseal
 from core.grants import check_token
 from core.limits import MAX_MINT_REQUEST_BYTES
@@ -109,7 +109,7 @@ def world(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         node, workspace, "sync", now + 60_000, now))
     app._gateway_cache = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
@@ -154,12 +154,12 @@ def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
     raw = b"served through the function URL"
     node.store(workspace).put_if_absent("obj/" + h(raw), raw)
     status, _, fetched = response(app.handler(
-        event("GET", "/page/" + h(raw), workspace, headers=headers), None))
+        event("GET", "/obj/" + h(raw), workspace, headers=headers), None))
     assert (status, fetched) == (200, raw)
 
     assert response(app.handler(
-        event("PUT", "/pile/member/fid", workspace, b"x",
-              headers=headers), None))[0] == 405
+        event("PUT", "/obj/" + h(b"x"), workspace, b"x",
+              headers=headers), None))[0] == 401
 
 
 def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
@@ -167,7 +167,7 @@ def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
     first = facts.auth.workspace.create(node, "first", ts=1)
     second = facts.auth.workspace.create(node, "second", ts=2)
     now = 100
-    pile = encode_pile(
+    pile = signed_pile_bytes(
         request.payload(node, first, "sync", now + 60_000, now),
         workspace=first,
     )
@@ -257,7 +257,7 @@ def test_lambda_logs_handled_5xx_without_request_secrets(
 
     app._gateway_cache = Failure()
     request_event = event(
-        "GET", "/page/" + "0" * 64, workspace,
+        "GET", "/obj/" + "0" * 64, workspace,
         headers={"authorization": "Bearer top-secret-token"})
     context = SimpleNamespace(aws_request_id="request-123")
 
@@ -271,7 +271,7 @@ def test_lambda_logs_handled_5xx_without_request_secrets(
         "event": "poc16_gateway_failure",
         "kind": "gateway_response",
         "method": "GET",
-        "path": "/page/" + "0" * 64,
+        "path": "/obj/" + "0" * 64,
         "request_id": "request-123",
         "status": 503,
     }
@@ -335,7 +335,7 @@ def test_lambda_cold_sandboxes_load_one_stable_external_secret(
     monkeypatch.setattr(
         app, "_pack_issuer",
         lambda value: SimpleNamespace(
-            open=lambda *_args: None,
+            open_pack=lambda *_args: None,
             open_object=lambda *_args: None,
         ))
     monkeypatch.setenv("TINYP2P_WORKSPACE_ID", workspace)

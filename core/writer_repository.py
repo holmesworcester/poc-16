@@ -7,6 +7,7 @@ per-device slots through the same object-store contract.
 """
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import inspect
 
 import facts
@@ -20,11 +21,16 @@ from .close import (
 from .crypto import h
 from .fact import canon, encode
 from .limits import (
+    MAX_AUTHORITY_PILE_BYTES,
+    MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
+    PayloadTooLarge,
 )
 from .object_store import (
     ABSENT,
+    CREATED,
+    EXISTS,
     STALE,
     Applied,
     OutcomeUnknown,
@@ -66,6 +72,7 @@ class PreparedUpdate:
     device: str
     base_head: str | None
     piles: tuple
+    pile_oids: tuple[str, ...]
     head: object
     objects: tuple[tuple[str, bytes], ...]
 
@@ -135,9 +142,73 @@ async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
     return raw
 
 
+async def _copy_pile_object(store, oid, write):
+    """Copy one pile through the required streaming data plane."""
+    if not valid_fid(oid) or not callable(write):
+        raise ValueError("repository pile copy")
+    copied = await _maybe_await(
+        store.copy_pile_object(oid, MAX_PILE_BYTES, write))
+    if copied is None:
+        return None
+    if type(copied) is not int or not 0 <= copied <= MAX_PILE_BYTES:
+        raise ValueError("repository pile copy result")
+    return copied
+
+
+async def _pile_object(store, oid):
+    value = bytearray()
+    copied = await _copy_pile_object(store, oid, value.extend)
+    raw = None if copied is None else bytes(value)
+    if raw is None or copied != len(raw) or h(raw) != oid:
+        raise ValueError("repository pile integrity")
+    return raw
+
+
+async def _same_pile_object(store, oid, expected_bytes):
+    digest = hashlib.sha256()
+    copied = await _copy_pile_object(store, oid, digest.update)
+    return copied == expected_bytes and digest.hexdigest() == oid
+
+
+async def ensure_pile_async(store, oid, raw):
+    """Establish one large immutable pile and verify every collision."""
+    if not isinstance(raw, bytes) or len(raw) > MAX_PILE_BYTES \
+            or not valid_fid(oid) or h(raw) != oid:
+        raise ValueError("immutable pile address")
+    store = async_store(store)
+    unknown = None
+    for _ in range(2):
+        try:
+            result = await store.put_if_absent("obj/" + oid, raw)
+        except OutcomeUnknown as error:
+            unknown = error
+            continue
+        if result is CREATED:
+            return CREATED
+        if result is not EXISTS:
+            raise TypeError("conditional-create result")
+        try:
+            matches = await _same_pile_object(store, oid, len(raw))
+        except PayloadTooLarge as error:
+            raise ValueError("immutable pile conflict") from error
+        if not matches:
+            raise ValueError("immutable pile conflict")
+        return EXISTS
+    try:
+        if await _same_pile_object(store, oid, len(raw)):
+            return EXISTS
+    except PayloadTooLarge:
+        pass
+    raise unknown or OSError("immutable pile was not preserved")
+
+
 async def _objects(store, oids, maximum=MAX_REPOSITORY_OBJECT_BYTES):
     """Fetch a pile set through an optional bounded batch capability."""
     oids = tuple(oids)
+    if maximum > MAX_REPOSITORY_OBJECT_BYTES:
+        return tuple([
+            await _pile_object(store, oid) for oid in oids
+        ])
     get_many = getattr(store, "get_many", None)
     if not callable(get_many):
         return tuple([
@@ -147,13 +218,16 @@ async def _objects(store, oids, maximum=MAX_REPOSITORY_OBJECT_BYTES):
         tuple("obj/" + oid for oid in oids)))
     if not isinstance(values, (tuple, list)) or len(values) != len(oids):
         raise ValueError("repository object batch")
-    out = []
-    for oid, raw in zip(oids, values):
-        if not isinstance(raw, bytes) or len(raw) > maximum \
-                or h(raw) != oid:
-            raise ValueError("repository object integrity")
-        out.append(raw)
-    return tuple(out)
+    return tuple(
+        _checked_object(oid, raw, maximum)
+        for oid, raw in zip(oids, values)
+    )
+
+
+def _checked_object(oid, raw, maximum):
+    if not isinstance(raw, bytes) or len(raw) > maximum or h(raw) != oid:
+        raise ValueError("repository object integrity")
+    return raw
 
 
 async def _writer_piles(source, workspace, device, rows):
@@ -169,17 +243,31 @@ async def _writer_piles(source, workspace, device, rows):
     values = NotImplemented if not callable(fetch) else await _maybe_await(
         fetch(workspace, device, rows))
     if values is NotImplemented:
-        values = await _objects(source, (oid for _key, oid in rows))
+        values = await _objects(
+            source, (oid for _key, oid in rows), MAX_PILE_BYTES)
     if not isinstance(values, (tuple, list)) or len(values) != len(rows):
         raise ValueError("repository pile fetch")
     checked = []
     for (_key, oid), raw in zip(rows, values):
         if not isinstance(raw, bytes) \
-                or len(raw) > MAX_REPOSITORY_OBJECT_BYTES \
+                or len(raw) > MAX_PILE_BYTES \
                 or h(raw) != oid:
             raise ValueError("repository object integrity")
         checked.append(raw)
     return tuple(checked)
+
+
+def _require_writer_proof(evaluated, writer, owner):
+    """Require one pile to carry the exact member/device writer binding."""
+    offers = {
+        offer
+        for valid in evaluated.judgment.valids
+        for offer in valid.fact.offers()
+    }
+    if ("member", writer, owner) not in offers or (
+            writer != owner
+            and ("device_key", writer, owner) not in offers):
+        raise ValueError("writer is not proved by its closure")
 
 
 class WriterLog:
@@ -235,7 +323,9 @@ class WriterLog:
                 closure,
             )
             raw = encode_signed_pile(pile)
-            self.evaluator.evaluate(raw, writer=self.device)
+            evaluated = self.evaluator.evaluate(raw, writer=self.device)
+            _require_writer_proof(
+                evaluated, self.device, self.owner)
             oid = signed_pile_oid(raw)
             pending[oid] = raw
             signed.append(pile)
@@ -284,6 +374,7 @@ class WriterLog:
             self.device,
             None if base_head is None else head_oid(base_head),
             tuple(signed),
+            pile_oids,
             head,
             tuple(pending.items()),
         )
@@ -295,8 +386,12 @@ class WriterLog:
                 or prepared.device != self.device:
             raise ValueError("prepared writer update")
         target = self.store if store is None else async_store(store)
+        pile_oids = set(prepared.pile_oids)
         for oid, raw in prepared.objects:
-            await ensure_object_async(target, oid, raw)
+            if oid in pile_oids:
+                await ensure_pile_async(target, oid, raw)
+            else:
+                await ensure_object_async(target, oid, raw)
         return prepared.head_oid
 
 
@@ -316,7 +411,8 @@ class AuthorityGate:
         self.workspace = workspace
         self.authority_root = authority_root
         self.now = now
-        self.evaluator = ClosedPileEvaluator(workspace)
+        self.evaluator = ClosedPileEvaluator(
+            workspace, max_bytes=MAX_AUTHORITY_PILE_BYTES)
 
     async def authorize(self, proof_raw, proposed_head):
         evaluated = self.evaluator.evaluate(proof_raw)
@@ -345,13 +441,15 @@ class AuthorityGate:
         projection, but the signed wire bytes and family query are identical.
         """
         evaluated = self.evaluator.evaluate(proof_raw)
-        return facts.authorize_access(
+        decision = facts.authorize_access(
             evaluated.judgment,
             evaluated.pile.facts,
             view,
             self.now(),
             purpose=purpose,
         )
+        return decision if decision == (
+            evaluated.pile.writer, purpose) else None
 
 
 class OpaqueHeadGate:
@@ -439,16 +537,7 @@ class FactConsumer:
                 continue
             evaluated = self.evaluator.evaluate(raw, writer=writer)
             if owner is not None:
-                member = ("member", writer, owner)
-                device = ("device_key", writer, owner)
-                offers = {
-                    offer
-                    for valid in evaluated.judgment.valids
-                    for offer in valid.fact.offers()
-                }
-                if member not in offers or (
-                        writer != owner and device not in offers):
-                    raise ValueError("writer is not proved by its closure")
+                _require_writer_proof(evaluated, writer, owner)
             for valid in evaluated.judgment.valids:
                 family = facts.family_for(valid.fact.t)
                 if family is None or not family.DURABLE:
@@ -543,24 +632,8 @@ class RepositoryMirror:
         self.consumer = consumer
 
     async def _binding(self, workspace, device, authority_root, head):
-        # ``candidate`` is an optional bootstrap input, not a fourth
-        # positional slot.  A resolver commonly closes over a defaulted
-        # fourth argument; treating that as the candidate silently replaces
-        # its captured binding and rejects an otherwise valid writer.
-        try:
-            parameters = inspect.signature(self.binding_for).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-        accepts_candidate = "candidate" in parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
         value = self.binding_for(
-            workspace,
-            device,
-            authority_root,
-            **({"candidate": head} if accepts_candidate else {}),
-        )
+            workspace, device, authority_root, head)
         return await _maybe_await(value)
 
     async def _local_head(self, key, binding, opened=None):
@@ -653,7 +726,7 @@ class RepositoryMirror:
                 owner=candidate.owner,
             )
         for pile_oid, raw in pile_values:
-            await ensure_object_async(self.store, pile_oid, raw)
+            await ensure_pile_async(self.store, pile_oid, raw)
 
         token = ABSENT if local_slot is ABSENT else local_slot.token
         result = await self.store.cas(key, token, opened.value)
@@ -712,7 +785,7 @@ class RepositoryMirror:
         pile_values = []
         for _leaf, pile_oid in additions:
             pile_values.append((
-                pile_oid, await _object(self.store, pile_oid)))
+                pile_oid, await _pile_object(self.store, pile_oid)))
         batch = self.consumer.prepare_batch(
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
@@ -768,6 +841,9 @@ class RepositoryMirror:
         class CandidateSource:
             async def get_bounded(self, candidate_key, maximum):
                 return await target.get_bounded(candidate_key, maximum)
+
+            async def copy_pile_object(self, oid, maximum, write):
+                return await target.copy_pile_object(oid, maximum, write)
 
             async def read_versioned(self, candidate_key):
                 if candidate_key == key:

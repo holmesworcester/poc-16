@@ -11,7 +11,7 @@ from nacl.exceptions import CryptoError
 import facts
 
 from core import http, snapshot
-from core.close import decode_pile, encode_pile
+from .util import signed_pile_facts, signed_pile_bytes
 from core.crypto import h, keypair, unseal
 from core.fact import Fact, canon
 from full_peer.node import FullPeer, now_ms
@@ -36,7 +36,7 @@ def world(tmp_path):
     workspace = facts.auth.workspace.create(node, "alice", ts=now - 1)
     proof_facts = request.payload(
         node, workspace, "sync", now + 60_000, now)
-    return node, workspace, now, proof_facts, encode_pile(proof_facts)
+    return node, workspace, now, proof_facts, signed_pile_bytes(proof_facts)
 
 
 def combine(*streams):
@@ -93,7 +93,7 @@ def conflict_world(path, seed):
 
     node.bind_identity(workspace, child)
     now = base + 3
-    stale = encode_pile(request.payload(
+    stale = signed_pile_bytes(request.payload(
         node, workspace, "sync", now + 600_000, now))
     stale_root = node.store(workspace).get("root")
 
@@ -102,7 +102,7 @@ def conflict_world(path, seed):
         node, workspace, founder_secret, founder, founder, target,
         f"conflict-{rng.randrange(1_000)}", base + 4)
     assert node.fact_of(workspace, child_claim.fid) == child_claim
-    fresh = encode_pile(request.payload(
+    fresh = signed_pile_bytes(request.payload(
         node, workspace, "sync", now + 600_000, now))
     return node, workspace, now, founder, stale_root, stale, fresh
 
@@ -127,9 +127,9 @@ def test_mint_accepts_exactly_one_ephemeral_request(world):
     assert authorize(node, workspace, pile, now) == (node.pk, "sync")
     assert authorize(
         node, workspace,
-        encode_pile([node.fact_of(workspace, workspace)]), now) is None
+        signed_pile_bytes([node.fact_of(workspace, workspace)]), now) is None
     assert authorize(
-        node, workspace, encode_pile(combine(facts, second)), now) is None
+        node, workspace, signed_pile_bytes(combine(facts, second)), now) is None
 
 
 def test_http_mint_fails_closed_at_aggregate_fetch_budget(
@@ -144,16 +144,16 @@ def test_http_mint_fails_closed_at_aggregate_fetch_budget(
 
 def test_family_owns_expiry_tag_and_verb(world):
     node, workspace, now, _, _ = world
-    expired = encode_pile(request.payload(
+    expired = signed_pile_bytes(request.payload(
         node, workspace, "sync", now - 1, now))
-    wrong_verb = encode_pile(request.payload(
+    wrong_verb = signed_pile_bytes(request.payload(
         node, workspace, "write", now + 60_000, now))
     wrong = Fact(
         "not-a-request", now, [],
         {"pk": node.pk, "verb": "sync", "exp": now + 60_000},
         workspace)
     wrong_sig = signature(node.sk, node.pk, wrong, now)
-    wrong_tag = encode_pile([
+    wrong_tag = signed_pile_bytes([
         node.fact_of(workspace, workspace), wrong_sig, wrong])
 
     assert authorize(node, workspace, expired, now) is None
@@ -210,7 +210,7 @@ def test_obsolete_root_metadata_cannot_override_an_eviction_action(tmp_path):
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
     now = now_ms()
-    pile = encode_pile(request.payload(
+    pile = signed_pile_bytes(request.payload(
         node, workspace, "sync", now + 60_000, now))
     node.bind_identity(workspace, founder)
     facts.auth.removal.evict(node, workspace, bob)
@@ -288,7 +288,7 @@ def test_gate_checks_current_uploader_not_historical_closure_authors(
     node.bind_identity(workspace, bob)
     bob_message = facts.content.message.post(
         node, workspace, "general", "historical but now inactive", ts=20)
-    bob_closure = decode_pile(
+    bob_closure = signed_pile_facts(
         closed_subset(node, workspace, {bob_message}), workspace)
     now = now_ms()
     bob_request = request.payload(
@@ -299,10 +299,10 @@ def test_gate_checks_current_uploader_not_historical_closure_authors(
     good = request.payload(
         node, workspace, "sync", now + 60_000, now)
     assert authorize(
-        node, workspace, encode_pile(good), now) == (node.pk, "sync")
+        node, workspace, signed_pile_bytes(good), now) == (node.pk, "sync")
     assert authorize(
-        node, workspace, encode_pile(bob_request), now) is None
+        node, workspace, signed_pile_bytes(bob_request), now) is None
     assert authorize(
         node, workspace,
-        encode_pile(combine(bob_closure, good)), now) \
+        signed_pile_bytes(combine(bob_closure, good)), now) \
         == (founder, "sync")

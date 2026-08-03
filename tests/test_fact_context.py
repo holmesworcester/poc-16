@@ -3,7 +3,7 @@
 import facts
 
 from core import indexes
-from core.close import decode_pile
+from .util import signed_pile_facts
 from core.crypto import keypair
 from core.fact import Fact, encode
 from core.fact_index import index_rows
@@ -118,13 +118,25 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     facts.auth.removal.evict(node, workspace, member)
     ephemeral = facts.auth.request.payload(
         node, workspace, "sync", timestamp + 10_000, timestamp + 6)
+    head = facts.auth.head_request.head_request(
+        workspace,
+        node.pk,
+        node.pk,
+        None,
+        "2" * 64,
+        timestamp + 10_000,
+        timestamp + 7,
+    )
+    head_signature = facts.auth.signature.signature(
+        node.sk, node.pk, head, timestamp + 7)
 
-    durable = decode_pile(
+    durable = signed_pile_facts(
         closed_subset(node, workspace, all_fids(node, workspace)),
         workspace,
     )
     corpus, seen = list(durable), {fact.fid for fact in durable}
     corpus.extend(fact for fact in ephemeral if fact.fid not in seen)
+    corpus.extend((head_signature, head))
     assert {fact.t for fact in corpus} == set(facts.FAMILIES)
     routes = {
         fact.t: (
@@ -145,6 +157,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "device_invite": (0, 3, 5, 0, 17),
         "evict": (0, 1, 0, 1, 6),
         "file_bao": (0, 1, 1, 0, 7),
+        "head_request": (0, 0, 0, 0, 4),
         "msg": (0, 0, 1, 0, 6),
         "notification_preference": (0, 2, 1, 0, 8),
         "push_endpoint": (0, 1, 3, 0, 11),

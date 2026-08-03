@@ -161,8 +161,8 @@ def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
     )
     issued = issuer()
 
-    whole_request = issued(MEMBER, whole, NOW)
-    range_request = issued(MEMBER, ranged, NOW)
+    whole_request = issued.open_pack(MEMBER, whole, NOW)
+    range_request = issued.open_pack(MEMBER, ranged, NOW)
 
     assert confine_scoped_request(whole, whole_request, NOW) is whole_request
     assert confine_scoped_request(ranged, range_request, NOW) is range_request
@@ -216,7 +216,7 @@ def test_object_issuer_fails_closed_on_identity_type_time_and_deadline():
 @pytest.mark.parametrize("pack_bytes", (1, MAX_PACK_BYTES))
 def test_exact_put_boundaries_stream_one_body_identity_to_native_r2(pack_bytes):
     opened = PackOpen("PUT", OID, pack_bytes)
-    scoped = issuer()(MEMBER, opened, NOW)
+    scoped = issuer().open_pack(MEMBER, opened, NOW)
     assert confine_scoped_request(opened, scoped, NOW) is scoped
     body = SentinelStream(pack_bytes)
     bucket = FakeR2()
@@ -258,7 +258,7 @@ def test_one_over_is_rejected_before_r2_sees_the_stream():
 
 
 def test_create_collision_does_not_consume_or_replace_existing_pack():
-    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     existing = (7, OID)
     bucket = FakeR2()
     bucket.objects[f"{PREFIX}/pack/{OID}"] = existing
@@ -280,7 +280,7 @@ def test_create_collision_does_not_consume_or_replace_existing_pack():
 ))
 def test_checksum_interruption_and_provider_errors_never_create_a_pack(
         body, expected):
-    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
     route = R2PackPut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
@@ -292,7 +292,7 @@ def test_checksum_interruption_and_provider_errors_never_create_a_pack(
 
 def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
     opened = PackOpen("PUT", OID, 7)
-    scoped = issuer()(MEMBER, opened, NOW)
+    scoped = issuer().open_pack(MEMBER, opened, NOW)
     body = SentinelStream(7)
     bucket = FakeR2()
 
@@ -324,7 +324,7 @@ def test_ticket_expiry_and_excess_lifetime_fail_before_body_or_r2():
         "https://packs.example.com", "https://other.example.com"),
 ))
 def test_ticket_cannot_widen_key_size_origin_or_query(mutate):
-    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
     route = R2PackPut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
@@ -343,7 +343,7 @@ def test_ticket_cannot_widen_key_size_origin_or_query(mutate):
     {"content-length": "7", "if-none-match": "*", "content-range": "bytes 0-6/7"},
 ))
 def test_native_route_rejects_every_header_widening(headers):
-    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
     route = R2PackPut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
@@ -354,7 +354,7 @@ def test_native_route_rejects_every_header_widening(headers):
 
 
 def test_native_route_rejects_wrong_method_missing_body_and_bad_clock():
-    scoped = issuer()(MEMBER, PackOpen("PUT", OID, 7), NOW)
+    scoped = issuer().open_pack(MEMBER, PackOpen("PUT", OID, 7), NOW)
     bucket = FakeR2()
     route = R2PackPut(
         target(), bucket, TICKET_SECRET, clock=lambda: NOW)
@@ -384,11 +384,11 @@ def test_target_rejects_ambiguous_or_wider_provider_scope(changes):
 def test_issuer_rejects_wrong_member_and_preserves_url_fragment_rule():
     opened = PackOpen("GET", OID, 7)
     with pytest.raises(ValueError):
-        issuer()("not-a-member", opened, NOW)
+        issuer().open_pack("not-a-member", opened, NOW)
     with pytest.raises(ValueError):
         R2PackIssuer(target(), ACCESS, SECRET, b"short", clock=lambda: NOW)
 
-    scoped = issuer()(MEMBER, opened, NOW)
+    scoped = issuer().open_pack(MEMBER, opened, NOW)
     parsed = urlsplit(scoped.url)
     assert parsed.fragment == ""
 

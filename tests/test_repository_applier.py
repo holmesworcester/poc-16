@@ -8,16 +8,19 @@ import pytest
 
 from core import crypto
 from core.crypto import h
+from core.fact import canon
 from core.ingress import InvalidPile, ingress_key
 from core.limits import (
-    MAX_PILE_BYTES,
+    MAX_BUFFERED_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PayloadTooLarge,
 )
 from core.object_store import Applied, OutcomeUnknown
-from core.repository_applier import RepositoryApplier, SyncStoreAdapter
+from core.object_store import SyncStoreAdapter
+from core.repository_applier import RepositoryApplier
 from core.repository_reader import RepositoryReader
+from core.repository_snapshot import compile_snapshot
 from core.store import FsStore
 from core.validated_set import reconstruct
 from full_peer.node import FullPeer
@@ -27,6 +30,16 @@ from .util import all_fids, closed_subset, plant_exact, suppression_world
 
 def run(awaitable):
     return asyncio.run(awaitable)
+
+
+def compiled_root(node, workspace):
+    return compile_snapshot(
+        workspace,
+        {
+            fid: node.fact_of(workspace, fid)
+            for fid in node.sql(workspace).fact_ids()
+        },
+    ).root
 
 
 def test_receive_rejects_bad_type_and_one_over_before_mutation(tmp_path):
@@ -45,7 +58,7 @@ def test_receive_rejects_bad_type_and_one_over_before_mutation(tmp_path):
         run(applier.receive_pile("a" * 64, "not bytes"))
     with pytest.raises(InvalidPile, match="pile too large"):
         run(applier.receive_pile(
-            "a" * 64, b"x" * (MAX_PILE_BYTES + 1)))
+            "a" * 64, b"x" * (MAX_BUFFERED_PILE_BYTES + 1)))
     assert store.mutations == []
 
 
@@ -56,7 +69,7 @@ def test_adapter_requires_no_unbounded_read_list_or_delete():
 
     adapter = SyncStoreAdapter(ExactOnly())
     assert not any(
-        hasattr(adapter, name) for name in ("get", "list", "list_page", "delete")
+        hasattr(adapter, name) for name in ("get", "list", "delete")
     )
     assert run(adapter.get_bounded("exact", 1)) is None
 
@@ -92,9 +105,9 @@ def test_exact_async_store_applies_without_sql_list_or_delete(
     key = run(plant_exact(store, workspace, "f" * 64, raw))
     result = run(applier.apply_exact(store, key, h(raw)))
     assert result.status == "applied"
-    assert store.inner.get_bounded(key, MAX_PILE_BYTES) == raw
+    assert store.inner.get_bounded(key, MAX_BUFFERED_PILE_BYTES) == raw
     assert store.inner.get_bounded("root", MAX_ROOT_BYTES) == \
-        source.reader(workspace).root_bytes
+        compiled_root(source, workspace)
 
 
 def test_apply_exact_needs_caller_key_and_digest(tmp_path):
@@ -132,7 +145,7 @@ def test_missing_and_oversize_exact_sources_are_typed_without_mutation(
     missing = run(applier.apply_exact(ingress, missing_key, "b" * 64))
     assert missing.status == "retryable"
 
-    raw = b"x" * (MAX_PILE_BYTES + 1)
+    raw = b"x" * (MAX_BUFFERED_PILE_BYTES + 1)
     oversize_key = ingress_key(
         workspace, "e" * 32, "f" * 64, h(raw))
     ingress.put_if_absent(oversize_key, raw)
@@ -156,10 +169,10 @@ def test_whole_pile_rejection_precedes_repository_reads(tmp_path):
     assert store.list("obj/") == []
 
 
-def test_cold_applier_reproduces_full_peer_root(tmp_path):
+def test_cold_applier_reproduces_the_canonical_validated_set_root(tmp_path):
     source, workspace, _, _ = suppression_world(tmp_path / "source")
     raw = closed_subset(source, workspace, all_fids(source, workspace))
-    expected = source.store(workspace).get("root")
+    expected = compiled_root(source, workspace)
     store = FsStore(str(tmp_path / "hosted"))
     applier = RepositoryApplier(workspace, store)
     key = run(plant_exact(store, workspace, "f" * 64, raw))
@@ -232,6 +245,26 @@ def test_lost_cas_response_replays_from_retained_source(tmp_path):
     assert store.get(key) == raw
 
 
+def test_unknown_root_format_fails_closed_without_republication(tmp_path):
+    source, workspace, _, _ = suppression_world(tmp_path / "source")
+    bootstrap = closed_subset(
+        source, workspace, all_fids(source, workspace))
+    next_fid = facts.content.message.post(
+        source, workspace, "general", "next", ts=100)
+    update = closed_subset(source, workspace, (next_fid,))
+    store = FsStore(str(tmp_path / "hosted"))
+    applier = RepositoryApplier(workspace, store)
+    assert run(applier.receive_pile("a" * 64, bootstrap)).status \
+        == "applied"
+    foreign = canon({"stamp": "unknown-root-format"})
+    store._replace("root", foreign)
+
+    with pytest.raises(ValueError):
+        run(applier.receive_pile("b" * 64, update))
+
+    assert store.get("root") == foreign
+
+
 def test_concurrent_cold_apply_exact_reconciles_lost_winner_and_rebases_loser(
         tmp_path):
     source = FullPeer(str(tmp_path / "source"))
@@ -243,7 +276,7 @@ def test_concurrent_cold_apply_exact_reconciles_lost_winner_and_rebases_loser(
     second_fid = facts.content.message.post(
         source, workspace, "general", "second", ts=11)
     second_raw = closed_subset(source, workspace, (second_fid,))
-    expected = source.store(workspace).get("root")
+    expected = compiled_root(source, workspace)
 
     class Interleaved:
         def __init__(self, path):
@@ -370,8 +403,10 @@ def test_program_failure_retains_source_and_does_not_mutate_root(
 
 def test_repository_reader_is_pinned_and_has_no_store_authority(tmp_path):
     source, workspace, _, _ = suppression_world(tmp_path / "source")
-    store = source.store(workspace)
-    root = store.get("root")
+    raw = closed_subset(source, workspace, all_fids(source, workspace))
+    store = FsStore(str(tmp_path / "repository"))
+    root = run(RepositoryApplier(
+        workspace, store).receive_pile("a" * 64, raw)).root
     reader = RepositoryReader(
         workspace, root, lambda oid: store.get("obj/" + oid))
     assert reader.validated().fact(workspace).fid == workspace

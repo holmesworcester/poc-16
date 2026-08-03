@@ -13,7 +13,12 @@ import pytest
 
 from adapters.s3 import S3Config, S3Store
 from core.crypto import h
-from core.limits import PayloadTooLarge
+from core.limits import (
+    DIRECT_STREAM_CHUNK_BYTES,
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_OBJECT_BYTES,
+    PayloadTooLarge,
+)
 from core.object_store import (
     ABSENT,
     CREATED,
@@ -25,9 +30,9 @@ from core.object_store import (
     StoreError,
     Versioned,
     VersionToken,
+    async_store,
     ensure_object_async,
 )
-from core.repository_applier import async_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -388,6 +393,62 @@ def test_bounded_get_checks_length_and_never_uses_an_unbounded_read():
         store.get_bounded("obj/" + "2" * 64, 4)
     assert declared_oversized.amounts == []
     assert declared_oversized.closes == 1
+
+
+def test_direct_pile_copy_streams_the_exact_protocol_maximum():
+    class VirtualBody:
+        def __init__(self, size):
+            self.remaining = size
+            self.amounts = []
+            self.closed = False
+
+        def read(self, amount):
+            self.amounts.append(amount)
+            if not self.remaining:
+                return b""
+            take = min(amount, self.remaining)
+            self.remaining -= take
+            return b"x" * take
+
+        def close(self):
+            self.closed = True
+
+    body = VirtualBody(MAX_DIRECT_OBJECT_BYTES)
+    store = S3Store(config(), client=ScriptedClient(get_object=[{
+        "Body": body,
+        "ContentLength": MAX_DIRECT_OBJECT_BYTES,
+    }]))
+    copied = []
+    total = store.copy_pile_object(
+        h(b"virtual maximum pile"), MAX_DIRECT_OBJECT_BYTES,
+        lambda chunk: copied.append(len(chunk)))
+
+    assert total == MAX_DIRECT_OBJECT_BYTES == sum(copied)
+    assert max(copied) == DIRECT_STREAM_CHUNK_BYTES
+    assert body.amounts[-1] == 1
+    assert body.closed
+
+
+def test_direct_pile_copy_rejects_one_over_before_read_and_short_body():
+    oversized = Body(b"must not be read")
+    short = Body(b"abc")
+    store = S3Store(config(), client=ScriptedClient(get_object=[
+        {"Body": oversized, "ContentLength": MAX_OBJECT_BYTES + 1},
+        {"Body": short, "ContentLength": 4},
+        ServiceError(404, "NoSuchKey"),
+    ]))
+
+    with pytest.raises(PayloadTooLarge, match="byte limit"):
+        store.copy_pile_object(
+            h(b"oversized pile"), MAX_OBJECT_BYTES, lambda _chunk: None)
+    assert oversized.reads == 0
+    assert oversized.closes == 1
+    with pytest.raises(StoreError, match="ContentLength mismatch"):
+        store.copy_pile_object(
+            h(b"short pile"), MAX_OBJECT_BYTES, lambda _chunk: None)
+    assert short.closes == 1
+    assert store.copy_pile_object(
+        h(b"missing pile"), MAX_OBJECT_BYTES, lambda _chunk: None) is None
 
 
 @pytest.mark.parametrize(

@@ -84,8 +84,11 @@ def test_two_independent_nodes_share_one_injected_provider_store(tmp_path):
     assert second.fact_of(workspace, fid).body["text"] == "provider-backed"
     assert facts.content.message.messages(second, workspace) == facts.content.message.messages(first, workspace)
     assert len(clients) >= 2
-    physical = f"tenant/integration/workspace/{workspace}/root"
-    assert physical in bucket.data
+    physical = f"tenant/integration/workspace/{workspace}/"
+    assert f"{physical}root" not in bucket.data
+    assert any(
+        key.startswith(f"{physical}heads/{workspace}/")
+        for key in bucket.data)
 
 
 def test_full_workspace_ids_create_disjoint_bucket_namespaces(tmp_path):
@@ -102,7 +105,10 @@ def test_full_workspace_ids_create_disjoint_bucket_namespaces(tmp_path):
     }
     keys_by_workspace = {}
     for workspace, prefix in prefixes.items():
-        assert f"{prefix}root" in bucket.data
+        assert f"{prefix}root" not in bucket.data
+        assert any(
+            key.startswith(f"{prefix}heads/{workspace}/")
+            for key in bucket.data)
         keys_by_workspace[workspace] = {
             key for key in bucket.data if key.startswith(prefix)}
         assert keys_by_workspace[workspace]

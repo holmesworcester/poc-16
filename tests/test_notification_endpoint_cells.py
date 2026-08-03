@@ -61,7 +61,7 @@ def test_replacement_suppresses_every_observed_installation_sibling(tmp_path):
         ts=4,
     )
 
-    view = node.reader(workspace).worker()
+    view = node.sql(workspace)
     assert not view.fact_active(first)
     assert not view.fact_active(sibling.fid)
     assert view.fact_active(replacement)

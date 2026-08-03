@@ -3,7 +3,8 @@
 import pytest
 
 import facts
-from core.close import decode_pile, encode_pile
+from .util import signed_pile_facts, signed_pile_bytes
+from core import fact_index
 from core.crypto import keypair
 from core.kernel import resolve_deps
 from full_peer.node import FullPeer, now_ms
@@ -160,9 +161,12 @@ def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
     sibling_secret, sibling = keypair()
     node.keychain.add_identity(sibling_secret)
 
+    # Each authored pile belongs to the device whose writer log signs it.
+    node.bind_identity(workspace, founder)
     alice_claim = inject_device_claim(
         node, workspace, founder_secret, founder, founder, sibling,
         "alice-sibling", 100)
+    node.bind_identity(workspace, bob)
     bob_claim = inject_device_claim(
         node, workspace, bob_secret, bob, bob, sibling,
         "bob-sibling", 101)
@@ -210,6 +214,7 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
     bob_chain = closed_subset(
         source, workspace, (bob_claim.fid, child_claim.fid))
 
+    source.bind_identity(workspace, founder)
     alice_claim = inject_device_claim(
         source, workspace, founder_secret, founder, founder, target,
         "alice-target", 102)
@@ -217,8 +222,8 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
 
     # Independent closed units remain independent wire piles.
     assert len(source.sender(workspace).pack_batches((
-        decode_pile(bob_chain, workspace),
-        decode_pile(alice_pile, workspace),
+        signed_pile_facts(bob_chain, workspace),
+        signed_pile_facts(alice_pile, workspace),
     ))) == 2
 
     peers = []
@@ -267,6 +272,7 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
     bob_pile = closed_subset(
         source, workspace, (bob_claim.fid, posted, deletion))
 
+    source.bind_identity(workspace, founder)
     alice_claim = inject_device_claim(
         source, workspace, founder_secret, founder, founder, target,
         "alice-target", 130)
@@ -292,13 +298,13 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
             "mode": facts._policy.OWNER,
         }
         assert peer.fact_of(workspace, alice_claim.fid) == alice_claim
-        assert peer.reader(workspace).worker().suppression(
-            "fact:" + posted
-        ) == {"state": "active", "action": deletion}
+        sid = "fact:" + posted
+        assert peer.suppression_active(workspace, sid)
+        assert peer.idx(workspace).execute(
+            "SELECT src FROM fact_index WHERE kind=? AND k0=?",
+            (fact_index.ACTION_INDEX, sid),
+        ).fetchone() == (deletion,)
         assert facts.content.message.messages(peer, workspace) == []
-    assert source.store(workspace).get("root") \
-        == peers[0].store(workspace).get("root") \
-        == peers[1].store(workspace).get("root")
 
 
 def test_removed_owner_disables_child_mint_and_delegated_admin(tmp_path):
@@ -316,14 +322,14 @@ def test_removed_owner_disables_child_mint_and_delegated_admin(tmp_path):
     grant(node, workspace, bob, child, "bob-child")
     node.bind_identity(workspace, child)
     now = now_ms()
-    request = encode_pile(request_payload(
+    request = signed_pile_bytes(request_payload(
         node, workspace, "sync", now + 60_000, now))
 
     node.bind_identity(workspace, founder)
     facts.auth.admin.grant(node, workspace, child)
     facts.auth.removal.evict(node, workspace, bob)
 
-    assert node.reader(workspace).mint(request, now) is None
+    assert node.authorize_access(workspace, request, "sync") is None
     child_row = next(
         row for row in facts.auth.user.members(node, workspace)
         if row["pk"] == child)

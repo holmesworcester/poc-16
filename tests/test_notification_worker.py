@@ -34,6 +34,7 @@ from notifications.worker import (
 )
 from notifications.carrier import ACK as CARRIER_ACK
 from notifications.carrier import RETRY as CARRIER_RETRY
+from .util import compiled_repository
 
 
 @dataclass
@@ -74,16 +75,29 @@ def _world(tmp_path, *, sealed_target=None):
 def _hint(node, workspace, event, root=None):
     return PublicationHint(
         workspace,
-        root or node.reader(workspace).root_bytes,
+        root or _snapshot(node, workspace),
         (event,),
     )
+
+
+def _snapshot(node, workspace):
+    objects = getattr(node, "_notification_test_objects", None)
+    if objects is None:
+        objects = {}
+        node._notification_test_objects = objects
+    return compiled_repository(node, workspace, objects)[0]
+
+
+def _fetch(node, workspace, oid):
+    _snapshot(node, workspace)
+    return node._notification_test_objects.get(oid)
 
 
 def _worker(node, secret, provider, now=10, *, current_root=None):
     return NotificationWorker(
         current_root or (
-            lambda workspace: node.reader(workspace).root_bytes),
-        lambda workspace, oid: node.store(workspace).get("obj/" + oid),
+            lambda workspace: _snapshot(node, workspace)),
+        lambda workspace, oid: _fetch(node, workspace, oid),
         secret,
         provider,
         lambda: now,
@@ -137,12 +151,12 @@ def test_async_root_fetch_clock_and_provider_use_the_same_worker(tmp_path):
     async def current_root(selected):
         await asyncio.sleep(0)
         calls.append(("root", selected))
-        return node.reader(selected).root_bytes
+        return _snapshot(node, selected)
 
     async def fetch(selected, oid):
         await asyncio.sleep(0)
         calls.append(("fetch", selected, oid))
-        return node.store(selected).get("obj/" + oid)
+        return _fetch(node, selected, oid)
 
     async def now_ms():
         await asyncio.sleep(0)
@@ -261,7 +275,7 @@ def test_overlapping_workers_submit_the_same_delivery_and_collapse_id(
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     event = _event(node, workspace)
     hint = _hint(node, workspace, event)
-    root = node.reader(workspace).root_bytes
+    root = _snapshot(node, workspace)
 
     class OverlappingPush:
         def __init__(self):
@@ -359,7 +373,7 @@ def test_unregistered_fid_is_typed_terminal_delivery(tmp_path):
 def test_substituted_event_root_is_terminal_without_provider_call(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     preference.set_global(node, workspace, preference.ALL, ts=3)
-    before_event = node.reader(workspace).root_bytes
+    before_event = _snapshot(node, workspace)
     event = message.post(node, workspace, "general", "later", ts=4)
     provider = ScriptedPush([])
 
@@ -376,7 +390,7 @@ def test_substituted_event_root_is_terminal_without_provider_call(tmp_path):
 def test_current_root_behind_event_retries_without_provider_call(tmp_path):
     node, workspace, secret, _push_node, _endpoint = _world(tmp_path)
     preference.set_global(node, workspace, preference.ALL, ts=3)
-    before_event = node.reader(workspace).root_bytes
+    before_event = _snapshot(node, workspace)
     event = message.post(node, workspace, "general", "later", ts=4)
     hint = _hint(node, workspace, event)
     provider = ScriptedPush([])
@@ -460,8 +474,8 @@ def test_derivation_enforces_unique_object_fetch_budget(tmp_path):
     with pytest.raises(FetchBudgetExceeded):
         derive(
             hint,
-            lambda oid: node.store(workspace).get("obj/" + oid),
-            node.reader(workspace).root_bytes,
+            lambda oid: _fetch(node, workspace, oid),
+            _snapshot(node, workspace),
             max_fetches=0,
         )
 
@@ -470,14 +484,14 @@ def test_async_fetch_limit_stops_before_one_over_provider_call(tmp_path):
     node, workspace, _secret, _push_node, _endpoint = _world(tmp_path)
     event = _event(node, workspace)
     hint = _hint(node, workspace, event)
-    root = node.reader(workspace).root_bytes
+    root = _snapshot(node, workspace)
 
     async def run(limit):
         calls = []
 
         async def fetch(oid):
             calls.append(oid)
-            return node.store(workspace).get("obj/" + oid)
+            return _fetch(node, workspace, oid)
 
         result = await derive_awaited(
             hint, fetch, root, max_fetches=limit)
@@ -495,7 +509,7 @@ def test_async_fetch_limit_stops_before_one_over_provider_call(tmp_path):
 
     async def one_over_fetch(oid):
         one_over_calls.append(oid)
-        return node.store(workspace).get("obj/" + oid)
+        return _fetch(node, workspace, oid)
 
     with pytest.raises(FetchBudgetExceeded):
         asyncio.run(derive_awaited(

@@ -147,7 +147,8 @@ async def exercise(kind, tmp_path, values):
     receiver = FsStore(str(tmp_path / f"{kind}-receiver"))
     consumer = FactConsumer(root.fid)
 
-    def binding_for(workspace, candidate_device, candidate_authority):
+    def binding_for(
+            workspace, candidate_device, candidate_authority, _candidate):
         assert candidate_authority == authority_root
         if (workspace, candidate_device) != (root.fid, public):
             return None

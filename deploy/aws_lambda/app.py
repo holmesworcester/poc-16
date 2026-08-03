@@ -156,7 +156,7 @@ def _gateway():
             _secret(),
             lambda: int(time.time() * 1000),
             object_open=issuer.open_object,
-            pack_open=issuer.open,
+            pack_open=issuer.open_pack,
             max_request_bytes=_positive(
                 "TINYP2P_MAX_REQUEST_BYTES", MAX_MINT_REQUEST_BYTES),
             max_root_bytes=_positive(

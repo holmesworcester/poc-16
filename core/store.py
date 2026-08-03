@@ -1,14 +1,15 @@
 """Bounded ObjectStore for authenticated metadata and semantic objects.
 
 Layout: root and authority (distinct CAS'd composite snapshots), obj/<hash>
-(bounded map pages and fact/file blobs — immutable),
+(map pages, fact blobs, heads, and independently closed writer piles —
+immutable),
 heads/<workspace>/<device> and layouts/<workspace>/<device>/<window>
 (independent CAS registers),
 ingress/v1/workspaces/<ws>/piles/<session>/<uploader>/<hash> (exact ingress),
 and invite/<id> (public reads).
 
-Large immutable pack/<hash> bodies use a separate streaming data plane.  The
-namespace rules here still protect them from unconditional replacement or
+Large signed-pile and pack/<hash> bodies use the direct streaming data plane.
+The namespace rules here still protect them from unconditional replacement or
 deletion when the same backing directory or bucket is used.
 
 The public mutation contract rejects unconditional root/object replacement
@@ -38,6 +39,8 @@ from .object_store import (
     validate_key,
 )
 from .limits import (
+    DIRECT_STREAM_CHUNK_BYTES,
+    MAX_DIRECT_OBJECT_BYTES,
     MAX_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     MAX_STORE_READ_BYTES,
@@ -45,6 +48,7 @@ from .limits import (
     PayloadTooLarge,
 )
 from .writer_head import parse_head_slot_key
+from .shape import valid_fid
 
 
 class FsStore:
@@ -79,6 +83,31 @@ class FsStore:
         if len(value) > max_bytes:
             raise PayloadTooLarge("filesystem read exceeds byte limit")
         return value
+
+    def copy_pile_object(self, oid, max_bytes, write):
+        """Copy one large writer pile without widening ``get_bounded``."""
+        if not valid_fid(oid) or type(max_bytes) is not int \
+                or not 0 < max_bytes <= MAX_DIRECT_OBJECT_BYTES \
+                or not callable(write):
+            raise ValueError("filesystem pile copy")
+        try:
+            source = open(self._p("obj/" + oid), "rb")
+        except FileNotFoundError:
+            return None
+        total = 0
+        with source:
+            while True:
+                chunk = source.read(min(
+                    DIRECT_STREAM_CHUNK_BYTES,
+                    max_bytes - total + 1,
+                ))
+                if not chunk:
+                    return total
+                total += len(chunk)
+                if total > max_bytes:
+                    raise PayloadTooLarge(
+                        "filesystem pile exceeds byte limit")
+                write(chunk)
 
     def read_versioned(self, key):
         """Read one atomic value/token pair.
@@ -250,41 +279,34 @@ class RemoteStore:
         return None
 
     async def read_versioned(self, key):
-        if key.startswith("heads/"):
-            observed_head = getattr(self.peer, "observed_head", None)
-            if callable(observed_head):
-                known, opened = observed_head(key)
-                if known:
-                    return opened
-            _workspace, device = parse_head_slot_key(key)
-            try:
-                got = await asyncio.to_thread(self.peer.head, device)
-            except Exception as error:
-                if getattr(error, "code", None) == 404:
-                    return ABSENT
-                raise
-            return ABSENT if got is None else Versioned(*got)
-        value = await self.get_bounded(key, MAX_OBJECT_BYTES)
-        return ABSENT if value is None else Versioned(
-            value, VersionToken(h(value)))
+        if not key.startswith("heads/"):
+            raise TypeError("remote versioned read is writer-head-only")
+        observed_head = getattr(self.peer, "observed_head", None)
+        if callable(observed_head):
+            known, opened = observed_head(key)
+            if known:
+                return opened
+        _workspace, device = parse_head_slot_key(key)
+        try:
+            got = await asyncio.to_thread(self.peer.head, device)
+        except Exception as error:
+            if getattr(error, "code", None) == 404:
+                return ABSENT
+            raise
+        return ABSENT if got is None else Versioned(*got)
 
     async def read_many_versioned(self, keys):
         """Use the slots bundled with the latest bounded directory page."""
         keys = tuple(keys)
-        if all(key.startswith("heads/") for key in keys):
-            return self.peer.opened_heads(keys)
-        return tuple([
-            await self.read_versioned(key) for key in keys
-        ])
+        if not all(key.startswith("heads/") for key in keys):
+            raise TypeError("remote versioned batch is writer-head-only")
+        return self.peer.opened_heads(keys)
 
     async def get_many(self, keys):
         """Fetch object keys in bounded batches; preserve order and misses."""
         keys = tuple(keys)
         if not all(key.startswith("obj/") for key in keys):
-            return tuple([
-                await self.get_bounded(key, MAX_OBJECT_BYTES)
-                for key in keys
-            ])
+            raise TypeError("remote object batch is object-only")
         out = []
         for start in range(0, len(keys), PAGE_BATCH):
             out.extend(await asyncio.to_thread(
@@ -292,6 +314,15 @@ class RemoteStore:
                 [key[4:] for key in keys[start:start + PAGE_BATCH]],
             ))
         return tuple(out)
+
+    async def copy_pile_object(self, oid, max_bytes, write):
+        """Copy one tree-selected pile through ObjectOpen."""
+        return await asyncio.to_thread(
+            self.peer.copy_obj,
+            oid,
+            response_limit=max_bytes,
+            write=write,
+        )
 
     async def fetch_writer_piles(self, workspace, device, rows):
         """Use this HTTP source's optional layout without changing authority.
@@ -311,9 +342,14 @@ class RemoteStore:
             return await asyncio.to_thread(
                 self.peer.copy_pack, opened, write)
 
-        async def read_loose(oids, _maximum):
-            return await self.get_many(
-                tuple("obj/" + oid for oid in oids))
+        async def read_loose(oids, maximum):
+            out = []
+            for oid in oids:
+                value = bytearray()
+                copied = await self.copy_pile_object(
+                    oid, maximum, value.extend)
+                out.append(None if copied is None else bytes(value))
+            return tuple(out)
 
         return await fetch_layout_piles(
             workspace,

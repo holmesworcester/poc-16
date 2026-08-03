@@ -13,7 +13,13 @@ from core.close import (
     signed_pile_oid,
 )
 from core.crypto import h, keypair
+from core.fact import canon
 from core.grants import make_token
+from core.limits import (
+    MAX_FACT_BYTES,
+    MAX_PILE_BYTES,
+    MAX_REPOSITORY_OBJECT_BYTES,
+)
 from core.object_store import ABSENT, Applied, Versioned
 from core.pack_access import PackOpen, copy_pack_get
 from core.store import FsStore, RemoteStore
@@ -76,7 +82,7 @@ def authority_proof(
     ))
 
 
-async def published(store, count=3):
+async def published(store, count=3, *, large=False):
     secret, public = keypair()
     root = workspace_fact(secret, public, "workspace", 1)
     device = device_fact(root.fid, public, "device", 2)
@@ -85,9 +91,14 @@ async def published(store, count=3):
         root.fid, public, public, h(b"writer-layout-store"))
     closures = [(root, device_signature, device)]
     for ordinal in range(1, count):
+        text = f"message {ordinal}"
+        if large and ordinal == count - 1:
+            probe = message_fact(
+                root.fid, public, "general", "", 10 + ordinal)
+            text = "x" * (
+                MAX_FACT_BYTES - len(canon(probe.to_json())))
         message = message_fact(
-            root.fid, public, "general", f"message {ordinal}",
-            10 + ordinal)
+            root.fid, public, "general", text, 10 + ordinal)
         signed = signature_fact(
             secret, public, message, 10 + ordinal)
         closures.append((
@@ -113,7 +124,7 @@ async def published(store, count=3):
 
 
 def resolver(binding):
-    def resolve(workspace, device, _authority_root):
+    def resolve(workspace, device, _authority_root, _candidate):
         return binding if (
             workspace, device) == (
                 binding.workspace, binding.device) else None
@@ -201,9 +212,13 @@ class LayoutSource:
 
         async def read_loose(oids, maximum):
             self.loose_batches.append(tuple(oids))
-            return tuple(
-                self.backing.get_bounded("obj/" + oid, maximum)
-                for oid in oids)
+            out = []
+            for oid in oids:
+                value = bytearray()
+                copied = self.backing.copy_pile_object(
+                    oid, maximum, value.extend)
+                out.append(None if copied is None else bytes(value))
+            return tuple(out)
 
         return await fetch_layout_piles(
             workspace,
@@ -632,4 +647,46 @@ def test_real_http_remote_store_streams_pack_not_gate_response(tmp_path):
     assert pack_requests == [
         PackOpen("GET", placement.pack_oid, placement.pack_bytes)]
     assert loose_batches == []
+    assert consumer.fact_ids()
+
+
+def test_real_http_loose_piles_use_the_same_direct_object_stream(tmp_path):
+    async def prepare():
+        backing = FsStore(str(tmp_path / "source"))
+        fixture = await published(backing, 2, large=True)
+        return backing, fixture
+
+    backing, fixture = run(prepare())
+    _secret, public, root, _sig, _device, binding, _update, raws = fixture
+    assert any(len(raw) > MAX_REPOSITORY_OBJECT_BYTES for raw in raws)
+    token = make_token(
+        SECRET,
+        h(b"loose-layout-reader"),
+        root.fid,
+        capability=peer_capability.READ_ONLY,
+        issued_at=1,
+        ttl_ms=(1 << 52),
+    )
+    with serving(_ReadPeer(root.fid, backing, binding)) as url:
+        peer = Peer(_DialNode(token), root.fid, url)
+        limits = []
+        original = peer.copy_obj
+
+        def counted(oid, *, response_limit, write):
+            limits.append(response_limit)
+            return original(
+                oid, response_limit=response_limit, write=write)
+
+        peer.copy_obj = counted
+        consumer = FactConsumer(root.fid)
+        result = run(RepositoryMirror(
+            root.fid,
+            FsStore(str(tmp_path / "receiver")),
+            resolver(binding),
+            consumer,
+        ).sync_from(RemoteStore(peer)))
+
+    assert result.errors == ()
+    assert result.changed == 1 and result.piles == len(raws)
+    assert limits.count(MAX_PILE_BYTES) == len(raws)
     assert consumer.fact_ids()

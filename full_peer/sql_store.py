@@ -73,7 +73,7 @@ def _index_filter(kind, k0, k1, source_type, source_prefix=None):
     return " AND ".join(clauses), args
 
 
-def _compatible(db):
+def _current_schema(db):
     return db.execute("PRAGMA user_version").fetchone()[0] \
         == SCHEMA_VERSION and _tables(db) == set(_COLUMNS) and all(
             tuple(
@@ -100,7 +100,7 @@ class SqlStore:
             os.makedirs(directory, exist_ok=True)
         db = sqlite3.connect(path, check_same_thread=False)
         tables = _tables(db)
-        if tables and not _compatible(db):
+        if tables and not _current_schema(db):
             db.close()
             for exact in (path, path + "-wal", path + "-shm"):
                 try:
@@ -126,12 +126,10 @@ class SqlStore:
             raise ValueError("fact projection integrity")
         return fact
 
-    def fact(self, fid):
+    def fact_of(self, fid):
         row = self.db.execute(
             "SELECT blob FROM facts WHERE fid=?", (fid,)).fetchone()
         return self._fact(row, fid)
-
-    fact_of = fact
 
     def fact_bytes(self, fid):
         row = self.db.execute(
@@ -214,7 +212,7 @@ class SqlStore:
         return self.fact_bytes(fid) is not None
 
     def fact_active(self, fid):
-        fact = self.fact(fid)
+        fact = self.fact_of(fid)
         return fact is not None and not self.suppresses(fact)
 
     def suppression_known(self, sid):
@@ -277,7 +275,7 @@ class SqlStore:
                     (ACTION_INDEX, sid),
                 ).fetchone()
                 if row is not None:
-                    incumbent = self.fact(row[0])
+                    incumbent = self.fact_of(row[0])
                     candidate = min(
                         candidate, (incumbent.key, incumbent.fid))
                 self.db.execute(

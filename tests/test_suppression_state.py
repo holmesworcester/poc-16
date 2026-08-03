@@ -1,16 +1,16 @@
 """Running contracts for indexed suppression actions and ingress screening."""
-import json
+import asyncio
 import os
 
 import pytest
 
 import facts
 from core import fact_index
-from core.close import close, encode_pile
-from core.crypto import h, keypair, load_sk
+from core.close import close
+from .util import signed_pile_bytes
+from core.crypto import keypair, load_sk
 from core.kernel import resolve_deps
 from full_peer.node import FullPeer
-from full_peer import sync as sync_module
 from facts.auth.removal import removal
 from facts.auth.signature import signature
 from facts.content.message import message
@@ -39,7 +39,7 @@ def _action_rows(node, workspace):
 def _signed_pile(node, workspace, fact, signed, deps):
     incoming = {fact.fid: fact, signed.fid: signed}
     fact_of = lambda fid: incoming.get(fid) or node.fact_of(workspace, fid)
-    return encode_pile(close(
+    return signed_pile_bytes(close(
         [signed, fact],
         lambda fid: deps[fid] if fid in deps else (
             resolve_deps(fact_of(fid), node.sql(workspace)) or ()),
@@ -77,21 +77,6 @@ def _ordered_action_world(path):
         member_identity=(member_secret, member),
     )
     return node, workspace, member_secret, member
-
-
-def test_composite_root_has_no_legacy_removal_object(tmp_path):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
-    action_fid = facts.content.delete.remove(node, workspace, target, ts=20)
-
-    root = json.loads(node.store(workspace).get("root"))
-    assert set(root) == {
-        "anchor", "layout_seed", "maps", "stamp"}
-    assert set(root["maps"]) == {"fact", "fact_order", "supp"}
-    assert "removals" not in root
-    assert _action_rows(node, workspace)[0][:2] == (
-        f"fact:{target}", action_fid)
 
 
 def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
@@ -132,8 +117,6 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
     assert node.fact_of(workspace, item.fid) == item
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [item.fid]
-    assert node.store(workspace).list("ingress/")
-    assert node.ingress_failures(workspace) == []
 
     root = node.store(workspace).get("root")
     node.keychain.add_identity(bob_secret)
@@ -311,18 +294,30 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
     destination.add_workspace(
         workspace, "alice", peers=[], identity=founder)
     deliver(destination, workspace, common)
-    later = _author_eviction(destination, workspace, bob, 41)
+    later = removal(workspace, founder, bob, 41)
+    later_signature = signature(founder_secret, founder, later, 41)
+    deliver(destination, workspace, _signed_pile(
+        destination,
+        workspace,
+        later,
+        later_signature,
+        {
+            later_signature.fid: (),
+            later.fid: (
+                later_signature.fid,
+                destination.sql(workspace).resolve_offer("admin", founder),
+                destination.sql(workspace).resolve_offer("member", bob),
+            ),
+        },
+    ))
     assert later.key > first.key
     assert later.fid < first.fid  # the obsolete tuple-order shortcut
 
-    store = source.store(workspace)
-    root = store.get("root")
-    fetch = lambda oid: store.get("obj/" + oid)
-    pulled, pushed, pending = sync_module.reconcile_facts(
-        destination, workspace, None, root, fetch, deliver=False,
-    )
+    result = asyncio.run(destination.mirror(workspace).sync_from(
+        source.store(workspace)))
 
-    assert (pulled, pushed, pending) == (1, 0, True)
+    assert result.errors == ()
+    assert result.changed >= 1
     sid = facts.principal_sid("member", bob)
     assert destination.idx(workspace).execute(
         "SELECT src FROM fact_index WHERE kind=? AND k0=?",
@@ -356,8 +351,7 @@ def test_child_device_admin_inherits_user_liveness(tmp_path):
         workspace, facts.principal_sid("member", carol))
 
 
-def test_fact_sync_carries_actions_and_their_projection(
-        tmp_path, monkeypatch):
+def test_fact_sync_carries_actions_and_their_projection(tmp_path):
     source = FullPeer(str(tmp_path / "source"))
     workspace = facts.auth.workspace.create(source, "alice", ts=1)
     target = facts.content.message.post(source, workspace, "general", "doomed", ts=10)
@@ -368,93 +362,10 @@ def test_fact_sync_carries_actions_and_their_projection(
     deliver(destination, workspace, before)
     action_fid = facts.content.delete.remove(source, workspace, target, ts=20)
 
-    class LocalPeer:
-        accepts_push = True
+    result = asyncio.run(destination.mirror(workspace).sync_from(
+        source.store(workspace)))
 
-        def __init__(self, node, ws, url):
-            self.node, self.ws = node, ws
-            self.cache = node.sync_cache.setdefault((ws, url), {})
-
-        def root(self, etag=None, **_options):
-            return (
-                source.store(self.ws).get("root"),
-                h(source.store(self.ws).get("root")),
-            )
-
-        def obj(self, oid, **_options):
-            return source.store(self.ws).get("obj/" + oid)
-
-        def objs(self, oids):
-            return tuple(self.obj(oid) for oid in oids)
-
-        def put_pile(self, raw):
-            source.receive_pile(self.ws, "a" * 64, raw)
-
-    monkeypatch.setattr(sync_module, "Peer", LocalPeer)
-    sync_module.sync(destination, workspace, "local")
-
+    assert result.errors == ()
     assert _action_rows(destination, workspace)[0][:2] == (
         f"fact:{target}", action_fid)
     assert target not in visible_fids(destination, workspace)
-
-
-def test_one_poisoned_fact_lands_honest_state_without_caching(
-        tmp_path, monkeypatch):
-    source = FullPeer(str(tmp_path / "source"))
-    workspace = facts.auth.workspace.create(source, "alice", ts=1)
-    poisoned_target = facts.content.message.post(
-        source, workspace, "general", "poison witness", ts=10)
-    honest_target = facts.content.message.post(
-        source, workspace, "general", "honest witness", ts=11)
-    before = closed_subset(source, workspace, all_fids(source, workspace))
-
-    destination = FullPeer(str(tmp_path / "destination"))
-    destination.add_workspace(workspace, "alice", peers=[])
-    deliver(destination, workspace, before)
-
-    facts.content.delete.remove(source, workspace, poisoned_target, ts=20)
-    facts.content.delete.remove(source, workspace, honest_target, ts=21)
-    rows = dict(_action_rows(source, workspace))
-    poisoned_sid = f"fact:{poisoned_target}"
-    honest_sid = f"fact:{honest_target}"
-    poisoned_oid = source.reader(workspace).validated().fact_oid(
-        rows[poisoned_sid])
-    store = source.store(workspace)
-
-    class PoisonedPeer:
-        accepts_push = False
-        poisoned = True
-
-        def __init__(self, node, ws, url):
-            self.ws = ws
-            self.cache = node.sync_cache.setdefault((ws, url), {})
-
-        def root(self, etag=None, **_options):
-            raw = store.get("root")
-            current = h(raw)
-            return None if etag == current else (raw, current)
-
-        def obj(self, oid, **_options):
-            return b"not the claimed object" \
-                if self.poisoned and oid == poisoned_oid \
-                else store.get("obj/" + oid)
-
-        def objs(self, oids):
-            return tuple(self.obj(oid) for oid in oids)
-
-    monkeypatch.setattr(sync_module, "Peer", PoisonedPeer)
-    url = "local://poisoned"
-    with pytest.raises(
-            ValueError, match="unresolved validated-fact difference"):
-        sync_module.sync(destination, workspace, url)
-
-    assert destination.suppression_active(workspace, honest_sid)
-    assert not destination.suppression_active(workspace, poisoned_sid)
-    assert honest_target not in visible_fids(destination, workspace)
-    assert poisoned_target in visible_fids(destination, workspace)
-    assert (workspace, url) not in destination.sync_cache
-
-    PoisonedPeer.poisoned = False
-    assert sync_module.sync(destination, workspace, url) == (1, 0)
-    assert destination.suppression_active(workspace, poisoned_sid)
-    assert destination.store(workspace).get("root") == store.get("root")

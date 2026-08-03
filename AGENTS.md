@@ -8,6 +8,11 @@ predecessor's global-root assumptions or claim that target behavior is already
 deployed. Those files and this guide are the repository's only Markdown
 authorities. Track unfinished work in beads, never in a Markdown TODO ledger.
 
+POC-16 has no backwards-compatibility surface. A cutover deletes predecessor
+wire, storage, route, and deployment formats instead of reading or migrating
+them. The only retained upgrade path is application fact-form replay into the
+disposable SQL projection described in `DESIGN.md`.
+
 The target `AuthorityGate` is actor-neutral: hosted and full peers run the same
 implementation. Every semantic evaluation starts from exactly one canonical
 closed pile. Pull recovers a complete signed pile from a loose pile object or a
@@ -30,9 +35,10 @@ portable pile; the device-signed writer head and Merkle inclusion path
 authenticate its place in that device's tree. A cold receiver must validate
 the pile signature, head, inclusion, and complete pile without an adjacent leaf
 or prior cache state.
-Large pack bodies must not widen `ObjectStore.get_bounded`, semantic-object
-limits, or buffered `HttpGate` responses. The common gate may mint one bounded
-exact HTTP request; S3/R2 transfer directly and FullPeer streams the same route.
+Large signed-pile and pack bodies must not widen `ObjectStore.get_bounded`,
+semantic-object limits, or buffered `HttpGate` responses. The common gate may
+mint one bounded exact HTTP request; S3/R2 transfer directly and FullPeer
+streams the same route.
 
 Cloud publication is owner-confined: a device may populate and advance only
 its own registered writer log, and hosted storage does not validate those

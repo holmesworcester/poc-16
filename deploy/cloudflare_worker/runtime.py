@@ -70,7 +70,7 @@ def _crypto_self_test():
         return
     secret = load_sk("42" * EDGE_SECRET_BYTES)
     public = secret.verify_key.encode().hex()
-    message = "poc-16-cloudflare-python-compatibility"
+    message = "poc-16-cloudflare-python-self-test"
     signature = sign(secret, message)
     if not verify(public, message, signature):
         raise RuntimeError("Cloudflare PyNaCl Ed25519 self-test")
@@ -227,7 +227,7 @@ def gateway(settings, clock=None):
         settings.secret,
         clock,
         object_open=issuer.open_object,
-        pack_open=issuer.open,
+        pack_open=issuer.open_pack,
         sync_profile=peer_capability.READ_ONLY,
         max_request_bytes=settings.max_request_bytes,
         max_root_bytes=settings.max_root_bytes,

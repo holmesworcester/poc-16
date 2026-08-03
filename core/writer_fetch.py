@@ -5,18 +5,19 @@ module may locate those exact piles in source-local concat packs, but a layout
 page never contributes a row or an OID.  Every failed hint falls back to the
 ordinary immutable pile object.
 
-Pack bytes travel through ``copy_pack`` and never through ``ObjectStore``.
-The callback is expected to perform :func:`core.pack_access.copy_pack_get`
-against the ordinary HTTP response while writing chunks into the supplied
-sink.  The sinks below avoid assembling a second contiguous whole-pack body;
-the current consumer still retains the complete candidate suffix until its
-all-or-nothing semantic commit.
+Pack bytes travel through ``copy_pack`` and large loose piles through the
+source's direct object reader; neither widens buffered semantic-object reads.
+The pack callback performs :func:`core.pack_access.copy_pack_get` against the
+ordinary HTTP response while writing chunks into the supplied sink. The sinks
+below avoid assembling a second contiguous whole-pack body; the current
+consumer still retains the complete candidate suffix until its all-or-nothing
+semantic commit.
 """
 from collections import defaultdict
 import inspect
 
 from .crypto import h
-from .limits import MAX_REPOSITORY_OBJECT_BYTES
+from .limits import MAX_PILE_BYTES
 from .pack_access import PackOpen
 from .shape import valid_fid
 from .writer_layout import (
@@ -104,7 +105,7 @@ def _rows(values, workspace, device):
 
 def _verified_loose(raw, oid):
     if not isinstance(raw, bytes) \
-            or len(raw) > MAX_REPOSITORY_OBJECT_BYTES or h(raw) != oid:
+            or len(raw) > MAX_PILE_BYTES or h(raw) != oid:
         raise ValueError("repository object integrity")
     return raw
 
@@ -221,7 +222,7 @@ async def fetch_layout_piles(
     if missing:
         loose = await _maybe_await(read_loose(
             tuple(oid for _sequence, oid in missing),
-            MAX_REPOSITORY_OBJECT_BYTES,
+            MAX_PILE_BYTES,
         ))
         if not isinstance(loose, (tuple, list)) \
                 or len(loose) != len(missing):

@@ -1,7 +1,6 @@
 """facts/auth/user.py — invite redemption and workspace membership."""
 import base64
 import json
-import urllib.request
 
 from core.close import decode_signed_pile
 from core.crypto import box_decrypt, kdf, load_sk, sign, verify
@@ -66,6 +65,13 @@ DURABLE = True
 
 
 # COMMANDS — accepting a workspace establishes its local keyring anchor.
+def _open_invite(url):
+    """Open the full-peer-only invite URL without polluting edge imports."""
+    import urllib.request
+
+    return urllib.request.urlopen(url, timeout=15)
+
+
 def accept(node, link, name):
     """Redeem a self-contained invite and commit the authored join locally."""
     from core.kernel import drain
@@ -73,21 +79,16 @@ def accept(node, link, name):
     link_data = json.loads(base64.urlsafe_b64decode(link))
     if not isinstance(link_data, dict):
         raise ValueError("invite link")
-    if set(link_data) == {"u", "ws", "s"}:
-        peer = link_data["u"]  # legacy URL-only envelope
-    elif set(link_data) == {"p", "ws", "s"}:
-        peer = link_data["p"]
-    else:
+    if set(link_data) != {"p", "ws", "s"}:
         raise ValueError("invite link")
+    peer = link_data["p"]
     workspace = link_data["ws"]
     seed = bytes.fromhex(link_data["s"])
     retained = False
     try:
         url = node.resolve_peer(workspace, peer)
-        response = urllib.request.urlopen(
-            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}",
-            timeout=15,
-        )
+        response = _open_invite(
+            f"{url}/invite/{kdf(seed, 'id').hex()}?ws={workspace}")
         try:
             encrypted = read_bounded(
                 response, MAX_INVITE_BYTES, "invite response")

@@ -4,11 +4,8 @@ import sqlite3
 
 import facts
 
-from core import fact_index
-from core.fact import encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
-from facts.content.message import message
 
 
 def test_sql_projection_contains_no_admission_verdict_or_edges(tmp_path):
@@ -21,7 +18,7 @@ def test_sql_projection_contains_no_admission_verdict_or_edges(tmp_path):
             "SELECT DISTINCT kind FROM fact_index WHERE src=?", (fid,))
     }
 
-    assert node.sql(workspace).fact(fid).fid == fid
+    assert node.sql(workspace).fact_of(fid).fid == fid
     assert kinds == {"fact.key", "fact.scope", "fact.type"}
     assert not any(
         marker in kind
@@ -29,65 +26,12 @@ def test_sql_projection_contains_no_admission_verdict_or_edges(tmp_path):
         for marker in ("admission", "edge", "eligible", "proof", "rank"))
 
 
-def test_legacy_local_authority_rows_are_discarded_not_blessed(tmp_path):
-    directory = tmp_path / "node"
-    node = FullPeer(str(directory))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    root = node.reader(workspace).root_bytes
-    forged = message(
-        workspace,
-        node.identity_id(workspace),
-        "general",
-        "legacy local-only row",
-        2,
-    )
-    db = node.idx(workspace)
-    db.execute(
-        "INSERT INTO facts(fid, blob) VALUES(?,?)",
-        (forged.fid, encode(forged)),
-    )
-    db.executemany(
-        "INSERT INTO fact_index VALUES(?,?,?,?)",
-        fact_index.index_rows(forged),
-    )
-    db.executescript("""
-        CREATE TABLE admission_receipts(value TEXT);
-        CREATE TABLE proofs(value TEXT);
-        INSERT INTO admission_receipts VALUES('invented authority');
-        INSERT INTO proofs VALUES('invented rank');
-    """)
-    db.execute(
-        "INSERT OR REPLACE INTO meta(k, v) VALUES('obsolete', ?)",
-        ("obsolete-admission-projection",),
-    )
-    db.execute("PRAGMA user_version=0")
-    db.commit()
-    db.close()
-
-    reopened = FullPeer(str(directory))
-    upgraded = reopened.idx(workspace)
-
-    assert reopened.reader(workspace).root_bytes == root
-    assert forged.fid not in reopened.reader(
-        workspace).all_facts().facts
-    assert reopened.fact_of(workspace, forged.fid) is None
-    assert {
-        name for (name,) in upgraded.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    } == {"facts", "fact_index", "meta"}
-    assert upgraded.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE name IN ('admission_receipts','proofs')"
-    ).fetchone() is None
-
-
 def test_sql_store_is_read_only_over_a_disposable_projection(tmp_path):
     database = sqlite3.connect(tmp_path / "disposable.db")
     database.executescript(sql_store.SCHEMA)
     facade = sql_store.SqlStore(database, "0" * 64)
 
-    assert facade.fact("1" * 64) is None
+    assert facade.fact_of("1" * 64) is None
     assert not any(
         name in sql_store.SqlStore.__dict__
         for name in (

@@ -242,21 +242,11 @@ def test_join_commits_locally_then_kicks_the_only_network_reconciler(
     response = io.BytesIO(encrypted)
     response.headers = {"Content-Length": str(len(encrypted))}
     monkeypatch.setattr(
-        facts.auth.user.urllib.request,
-        "urlopen",
+        facts.auth.user,
+        "_open_invite",
         lambda *_args, **_kwargs: response,
     )
     joiner = FullPeer(str(tmp_path / "joiner"))
-
-    def duplicate_sync(*_args):
-        raise urllib.error.HTTPError(
-            "https://inviter.invalid/root", 503,
-            "stale root CAS", {}, None)
-
-    # This obsolete host capability reproduces the transient 503 which used
-    # to turn an already-committed join into control HTTP 500. A family command
-    # must leave publication to the successful control dispatch's one kick.
-    monkeypatch.setattr(joiner, "sync_peer", duplicate_sync, raising=False)
     handler = _handler(joiner)
 
     assert _request(
@@ -420,7 +410,6 @@ def test_peer_gate_cannot_serve_local_control(tmp_path):
         workspace,
         b"c" * 32,
         lambda: 100,
-        receiver=object(),
     )
 
     response = asyncio.run(gate.handle(

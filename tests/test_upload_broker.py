@@ -6,7 +6,7 @@ import json
 import facts
 import pytest
 
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h
 from core.http import AsyncFromSyncReader, HttpGate
 from core.limits import MAX_PILE_BYTES
@@ -97,7 +97,7 @@ def world(tmp_path, *, apply=None, signer=None, clock=None, lease=None):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     public = node.identity_id(workspace)
-    proof = encode_pile(request.payload(
+    proof = signed_pile_bytes(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
     signer = signer or RecordingSigner(clock)
     apply = apply or RecordingApplier()
@@ -201,7 +201,7 @@ def test_removal_is_observed_by_new_open_not_an_existing_fixed_lease(tmp_path):
     bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
-    proof = encode_pile(request.payload(
+    proof = signed_pile_bytes(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
     apply, signer = RecordingApplier(), RecordingSigner(clock)
     broker = UploadBroker(
@@ -284,7 +284,7 @@ def test_upload_purpose_is_broker_only(tmp_path):
     gateway = HttpGate(
         AsyncFromSyncReader(node.store(workspace)),
         workspace, b"s" * 32, lambda: NOW)
-    sync_proof = encode_pile(request.payload(
+    sync_proof = signed_pile_bytes(request.payload(
         node, workspace, "sync", NOW + 60_000, NOW))
 
     assert gateway_call(gateway, workspace, upload_proof).status == 403

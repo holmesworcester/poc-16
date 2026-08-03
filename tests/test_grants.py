@@ -1,6 +1,10 @@
 """Transport-independent bearer grant contracts."""
 import base64
+import hashlib
+import hmac
 import json
+
+import pytest
 
 from core import peer_capability
 from core.grants import check_token, make_token
@@ -54,3 +58,48 @@ def test_grant_rejects_wrong_scheme_mac_and_shape():
     assert check_token(
         secret, "Bearer " + forged, "w", trusted_now=2) is None
     assert check_token(secret, "Bearer broken", "w", trusted_now=2) is None
+
+
+def test_capability_is_required_hmac_bound_and_exactly_negotiated():
+    secret = b"capability-authentication-secret"
+    workspace = "a" * 64
+    token = make_token(
+        secret, "member", workspace,
+        capability=peer_capability.READ_ONLY,
+        issued_at=100,
+    )
+    encoded, mac = token.split(".", 1)
+    payload = json.loads(base64.urlsafe_b64decode(encoded))
+    assert payload["cap"] == peer_capability.READ_ONLY
+    assert peer_capability.negotiate(token, {
+        "cap": peer_capability.READ_ONLY,
+    }) == peer_capability.READ_ONLY
+
+    payload["cap"] = peer_capability.FULL
+    changed = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True).encode()).decode()
+    assert check_token(
+        secret, f"Bearer {changed}.{mac}", workspace,
+        trusted_now=101) is None
+
+    for invalid in (None, "sync-v2/full"):
+        with pytest.raises(ValueError, match="capability"):
+            make_token(
+                secret, "member", workspace,
+                capability=invalid, issued_at=100)
+
+    payload.pop("cap")
+    raw = json.dumps(payload, sort_keys=True).encode()
+    missing = base64.urlsafe_b64encode(raw).decode() + "." + hmac.new(
+        secret, raw, hashlib.sha256).hexdigest()
+    assert check_token(
+        secret, "Bearer " + missing, workspace,
+        trusted_now=101) is None
+    for advertised in ({}, {"cap": peer_capability.FULL}):
+        with pytest.raises(ValueError, match="negotiation"):
+            peer_capability.negotiate(missing, advertised)
+
+    with pytest.raises(ValueError, match="negotiation"):
+        peer_capability.negotiate(token, {
+            "cap": peer_capability.FULL,
+        })

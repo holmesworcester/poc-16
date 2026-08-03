@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import facts
 import pytest
 
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h, load_sk
 from core.limits import MAX_HOSTED_SUBREQUESTS
 from core.object_store import MAX_STORE_PREFIX_BYTES
@@ -178,7 +178,7 @@ def test_realistic_nonempty_turn_stays_below_configured_calls():
             root.fid, public, "general", f"hosted-{timestamp}", timestamp)
         stream.extend((signature(
             secret, public, item, timestamp), item))
-    raw = encode_pile(stream, workspace=root.fid)
+    raw = signed_pile_bytes(stream, workspace=root.fid)
     canonical, ingress = Bucket(), Bucket()
     key = ingress_key(
         root.fid, "c" * 32, "b" * 64, h(raw))

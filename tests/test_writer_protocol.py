@@ -67,6 +67,17 @@ def test_signed_pile_is_the_same_canonical_push_and_pull_value():
     assert signed_pile_oid(raw) == h(raw)
 
 
+def test_unsigned_predecessor_pile_has_no_decode_path():
+    _secret, _public, root, _pile, _raw = signed_workspace_pile()
+    predecessor = canon({
+        "facts": [root.to_json()],
+        "ws": root.fid,
+    })
+
+    with pytest.raises(InvalidPile, match="signed pile shape"):
+        ClosedPileEvaluator(root.fid).evaluate(predecessor)
+
+
 @pytest.mark.parametrize("change", ("signature", "writer", "workspace"))
 def test_signed_pile_rejects_forged_outer_bindings(change):
     _secret, _public, _root, _pile, raw = signed_workspace_pile()

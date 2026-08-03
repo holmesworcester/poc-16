@@ -10,8 +10,13 @@ from core.crypto import h
 from core.fact import canon
 from core.grants import make_token
 from core.http import HttpGate
-from core.limits import MAX_PILE_BYTES, PayloadTooLarge
+from core.limits import (
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_PILE_BYTES,
+    PayloadTooLarge,
+)
 from core.pack_access import (
+    MAX_OBJECT_OPEN_BYTES,
     MAX_PACK_BYTES,
     MAX_PACK_OPEN_BYTES,
     MAX_SCOPED_HEADER_VALUE_BYTES,
@@ -20,14 +25,20 @@ from core.pack_access import (
     MAX_SCOPED_TTL_MS,
     MAX_SCOPED_URL_BYTES,
     InvalidPackAccess,
+    ObjectOpen,
     PackOpen,
     ScopedRequest,
+    confine_object_request,
     confine_scoped_request,
+    copy_object_get,
     copy_pack_get,
+    decode_object_open,
     decode_pack_open,
     decode_scoped_request,
+    encode_object_open,
     encode_pack_open,
     encode_scoped_request,
+    object_key,
     pack_key,
 )
 from core.writer_layout import MAX_LAYOUT_PACK_BYTES
@@ -61,6 +72,17 @@ def call(gate, method="POST", body=b"", headers=None, workspace=WORKSPACE):
     ))
 
 
+def call_object(
+        gate, method="POST", body=b"", headers=None, workspace=WORKSPACE):
+    return asyncio.run(gate.handle(
+        method,
+        "/obj/open",
+        {"ws": workspace},
+        headers or {},
+        body,
+    ))
+
+
 def scoped_for(opened, *, expires_at_ms=NOW + 10_000):
     if opened.method == "PUT":
         headers = (
@@ -82,10 +104,122 @@ def scoped_for(opened, *, expires_at_ms=NOW + 10_000):
     )
 
 
+def object_scoped(opened, *, expires_at_ms=NOW + 10_000):
+    return ScopedRequest(
+        "GET",
+        f"https://bucket.example/prefix/{object_key(opened.oid)}?signature=x",
+        (),
+        expires_at_ms,
+    )
+
+
+def test_object_open_codec_has_one_named_repository_bound():
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    raw = encode_object_open(opened)
+
+    assert object_key(OID) == "obj/" + OID
+    assert decode_object_open(raw) == opened
+    assert json.loads(raw) == {
+        "format": "poc16-object-open-v1",
+        "max_bytes": MAX_DIRECT_OBJECT_BYTES,
+        "oid": OID,
+    }
+    for oid, maximum in (
+            (OID.upper(), MAX_DIRECT_OBJECT_BYTES),
+            (OID, 0),
+            (OID, MAX_DIRECT_OBJECT_BYTES + 1),
+            (OID, True)):
+        with pytest.raises(InvalidPackAccess):
+            ObjectOpen(oid, maximum)
+    with pytest.raises(PayloadTooLarge):
+        decode_object_open(b" " * (MAX_OBJECT_OPEN_BYTES + 1))
+
+
+def test_object_request_and_stream_are_read_only_bounded_and_hashed():
+    body = b"content-addressed object"
+    opened = ObjectOpen(h(body), len(body))
+    scoped = object_scoped(opened)
+    assert confine_object_request(opened, scoped, NOW) is scoped
+
+    written = []
+    assert copy_object_get(
+        opened,
+        200,
+        {"Content-Length": str(len(body))},
+        (body[:5], body[5:]),
+        written.append,
+    ) == len(body)
+    assert b"".join(written) == body
+
+    bad_scopes = (
+        replace(scoped, method="PUT"),
+        replace(scoped, url=(
+            "https://bucket.example/prefix/obj/" + h(b"wrong"))),
+        replace(scoped, headers=(("range", "bytes=0-1"),)),
+        replace(scoped, expires_at_ms=NOW),
+    )
+    for candidate in bad_scopes:
+        with pytest.raises(InvalidPackAccess):
+            confine_object_request(opened, candidate, NOW)
+
+    bad_responses = (
+        (206, {"Content-Length": str(len(body))}, (body,)),
+        (200, {"Content-Length": str(len(body) + 1)}, (body,)),
+        (200, {"Content-Length": "01"}, (b"x",)),
+        (200, {
+            "Content-Length": str(len(body)),
+            "Content-Range": f"bytes 0-{len(body) - 1}/{len(body)}",
+        }, (body,)),
+        (200, {"Content-Length": str(len(body))}, (body[:-1],)),
+        (200, {"Content-Length": str(len(body))}, (body[:-1] + b"!",)),
+    )
+    for status, headers, chunks in bad_responses:
+        with pytest.raises(InvalidPackAccess):
+            copy_object_get(
+                opened, status, headers, chunks, lambda _part: None)
+
+
 def gate(issuer, **limits):
     return HttpGate(
         object(), WORKSPACE, SECRET, lambda: NOW,
         pack_open=issuer, **limits)
+
+
+def object_gate(issuer, **limits):
+    return HttpGate(
+        object(), WORKSPACE, SECRET, lambda: NOW,
+        object_open=issuer, **limits)
+
+
+def test_gate_opens_objects_for_read_grants_without_buffering_body():
+    opened = ObjectOpen(OID, MAX_DIRECT_OBJECT_BYTES)
+    calls = []
+
+    def issuer(member, request, trusted_now):
+        calls.append((member, request, trusted_now))
+        return object_scoped(request)
+
+    service = object_gate(issuer)
+    body = encode_object_open(opened)
+    response = call_object(service, body=body, headers=bearer(
+        peer_capability.READ_ONLY))
+    assert response.status == 200
+    assert decode_scoped_request(response.body) == object_scoped(opened)
+    assert calls == [(MEMBER, opened, NOW)]
+    assert call_object(service, body=body).status == 401
+    assert call_object(
+        service, method="GET", headers=bearer(
+            peer_capability.READ_ONLY)).status == 405
+    assert call_object(
+        object_gate(None), body=body,
+        headers=bearer(peer_capability.READ_ONLY)).status == 405
+    assert HttpGate.request_limit("POST", "/obj/open") \
+        == MAX_OBJECT_OPEN_BYTES
+    assert call_object(
+        service,
+        body=b" " * (MAX_OBJECT_OPEN_BYTES + 1),
+        headers=bearer(peer_capability.READ_ONLY),
+    ).status == 413
 
 
 def test_pack_open_codec_has_one_portable_exact_bound():
@@ -341,7 +475,7 @@ def test_pack_get_rejects_duplicate_headers_and_excess_fragmentation(
         copy_pack_get(
             opened, 200, DuplicateHeaders(), (body,), lambda _part: None)
 
-    monkeypatch.setattr(pack_access, "MAX_PACK_STREAM_CHUNKS", 2)
+    monkeypatch.setattr(pack_access, "MAX_DIRECT_STREAM_CHUNKS", 2)
     with pytest.raises(InvalidPackAccess, match="stream"):
         copy_pack_get(
             opened, 200, {"Content-Length": "3"},

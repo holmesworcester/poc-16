@@ -188,9 +188,6 @@ def stage_applier():
 def render(deployment):
     """Write non-secret Worker configs and provider-policy inputs."""
     boundary = generated_boundary(deployment)
-    obsolete = GENERATED / "ingress-lifecycle.json"
-    if obsolete.exists() or obsolete.is_symlink():
-        obsolete.unlink()
     paths = {}
     for role in ROLE_ORDER:
         path = GENERATED / role / "wrangler.json"

@@ -67,7 +67,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
                 root.fid, bob, alice, h(b"bob-store")),
         }
 
-        def binding_for(workspace, device, _authority_root):
+        def binding_for(workspace, device, _authority_root, _candidate):
             binding = bindings.get(device)
             return binding if binding is not None \
                 and binding.workspace == workspace else None
@@ -192,7 +192,7 @@ def test_workspace_directory_prefixes_do_not_cross(tmp_path):
             receiver = RepositoryMirror(
                 root.fid,
                 FsStore(str(tmp_path / f"receiver-{ordinal}")),
-                lambda workspace, device_key, _authority,
+                lambda workspace, device_key, _authority, _candidate,
                 wanted=binding: wanted if (
                     workspace, device_key) == (
                         wanted.workspace, wanted.device) else None,

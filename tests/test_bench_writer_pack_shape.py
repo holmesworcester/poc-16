@@ -39,7 +39,8 @@ def test_pack_defaults_share_the_running_layout_bounds():
     assert DEFAULT_TARGETS_MIB == (4, 16, 64, 100)
     assert MAX_PILES_PER_PACK == 256
     assert MAX_PACK_BYTES == 95 * MIB
-    assert MAX_PILE_BYTES == MAX_REPOSITORY_OBJECT_BYTES == 5 * MIB
+    assert MAX_PILE_BYTES == MAX_PACK_BYTES
+    assert MAX_REPOSITORY_OBJECT_BYTES == 4 * MIB
     assert WINDOW_PILES == 16_384
     assert FETCH_CONCURRENCIES == (32, 64)
 
@@ -201,7 +202,7 @@ def test_protocol_oversize_pile_is_rejected_and_target_is_clamped():
 
     many = inventory(20, MAX_PILE_BYTES)
     shape = writer_shape(many, 100 * MIB, force_seal_tail=True)
-    assert tuple(len(pack.piles) for pack in shape.sealed) == (19, 1)
+    assert tuple(len(pack.piles) for pack in shape.sealed) == (1,) * 20
     assert all(pack.body_bytes <= MAX_PACK_BYTES for pack in shape.sealed)
     assert report((many,), 100, durable_facts=20).effective_target_mib == 95
 

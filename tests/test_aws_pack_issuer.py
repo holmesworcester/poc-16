@@ -249,10 +249,10 @@ def issuer(store=None, **config):
 
 def test_issuer_maps_whole_range_and_create_to_exact_s3_requests():
     store, signer = issuer()
-    whole = signer.open(MEMBER, PackOpen("GET", OID, len(BODY)), NOW)
-    ranged = signer.open(
+    whole = signer.open_pack(MEMBER, PackOpen("GET", OID, len(BODY)), NOW)
+    ranged = signer.open_pack(
         MEMBER, PackOpen("GET", OID, len(BODY), 4, 9), NOW)
-    create = signer.open(MEMBER, PackOpen("PUT", OID, len(BODY)), NOW)
+    create = signer.open_pack(MEMBER, PackOpen("PUT", OID, len(BODY)), NOW)
 
     assert [call[0] for call in store.calls] == [
         "get_object", "get_object", "put_object"]
@@ -330,13 +330,13 @@ def test_fake_s3_returns_exact_whole_and_single_range_shapes():
     key = f"{PREFIX}/pack/{OID}"
     store.data[key] = BODY
 
-    whole = signer.open(MEMBER, PackOpen("GET", OID, len(BODY)), NOW)
+    whole = signer.open_pack(MEMBER, PackOpen("GET", OID, len(BODY)), NOW)
     status, headers, body = store.execute(whole)
     assert (status, body) == (200, BODY)
     assert headers == {
         "accept-ranges": "bytes", "content-length": str(len(BODY))}
 
-    ranged = signer.open(
+    ranged = signer.open_pack(
         MEMBER, PackOpen("GET", OID, len(BODY), 5, 7), NOW)
     status, headers, body = store.execute(ranged)
     assert (status, body) == (206, BODY[5:12])
@@ -350,7 +350,7 @@ def test_fake_s3_returns_exact_whole_and_single_range_shapes():
 def test_signed_create_is_provider_hashed_create_only_and_never_clobbers():
     store, signer = issuer()
     opened = PackOpen("PUT", OID, len(BODY))
-    scoped = signer.open(MEMBER, opened, NOW)
+    scoped = signer.open_pack(MEMBER, opened, NOW)
     key = f"{PREFIX}/pack/{OID}"
 
     assert store.execute(scoped, BODY)[0] == 200
@@ -361,7 +361,7 @@ def test_signed_create_is_provider_hashed_create_only_and_never_clobbers():
     occupied, second = issuer()
     occupied.data[key] = b"incumbent"
     assert occupied.execute(
-        second.open(MEMBER, opened, NOW), BODY)[0] == 412
+        second.open_pack(MEMBER, opened, NOW), BODY)[0] == 412
     assert occupied.data[key] == b"incumbent"
 
 
@@ -377,9 +377,9 @@ def _query_mutation(url, name, value):
 
 def test_fake_s3_rejects_every_signed_authority_mutation():
     store, signer = issuer()
-    get = signer.open(
+    get = signer.open_pack(
         MEMBER, PackOpen("GET", OID, len(BODY), 2, 8), NOW)
-    put = signer.open(MEMBER, PackOpen("PUT", OID, len(BODY)), NOW)
+    put = signer.open_pack(MEMBER, PackOpen("PUT", OID, len(BODY)), NOW)
     get_headers, put_headers = dict(get.headers), dict(put.headers)
     cases = (
         (get, "PUT", get.url, get_headers, b""),
@@ -442,7 +442,7 @@ def test_issuer_rejects_presigner_scope_widening_before_return():
 
     weak, signer = issuer(Weak())
     with pytest.raises(RuntimeError, match="sign every constraint"):
-        signer.open(
+        signer.open_pack(
             MEMBER, PackOpen("GET", OID, len(BODY), 1, 2), NOW)
     assert len(weak.calls) == 1
 
@@ -477,7 +477,7 @@ def test_issuer_preserves_declared_kms_headers_in_the_signature():
         sse_kms_key_id=key,
         bucket_key_enabled=True,
     )
-    scoped = signer.open(
+    scoped = signer.open_pack(
         MEMBER, PackOpen("PUT", OID, len(BODY)), NOW)
     params = store.calls[0][1]
     assert params["ServerSideEncryption"] == "aws:kms"
@@ -508,7 +508,7 @@ def test_lambda_pack_open_returns_only_bounded_scoped_metadata(monkeypatch):
     secret = b"s" * 32
     gate = HttpGate(
         object(), WORKSPACE, secret, lambda: NOW,
-        pack_open=signer.open)
+        pack_open=signer.open_pack)
     app._gateway_cache = gate
     token = make_token(
         secret, MEMBER, WORKSPACE,
@@ -528,7 +528,7 @@ def test_lambda_pack_open_returns_only_bounded_scoped_metadata(monkeypatch):
     assert result["statusCode"] == 200
     raw = base64.b64decode(result["body"])
     scoped = decode_scoped_request(raw)
-    assert scoped == signer.open(MEMBER, opened, NOW)
+    assert scoped == signer.open_pack(MEMBER, opened, NOW)
     assert len(raw) < 16 * 1024
     assert BODY not in raw
     assert store.data == {}
@@ -589,7 +589,7 @@ def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
     issued = []
 
     class PackIssuer:
-        def open(self, *_args):
+        def open_pack(self, *_args):
             pass
 
         def open_object(self, *_args):
@@ -607,5 +607,5 @@ def test_lambda_gateway_composes_one_store_namespace_with_pack_issuer(
     gate = app._gateway()
     assert issued == [config]
     assert gate.object_open == pack_issuer.open_object
-    assert gate.pack_open == pack_issuer.open
+    assert gate.pack_open == pack_issuer.open_pack
     assert app._gateway_cache is gate

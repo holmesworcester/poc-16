@@ -41,29 +41,15 @@ def authority_resident(fact):
 
 def _access_decision(view, evaluated, trusted_now, purpose):
     """Dispatch exactly one ephemeral family request against ``view``."""
-    ephemeral = []
-    for valid in evaluated.judgment.valids:
-        family = facts.family_for(valid.fact.t)
-        if family is not None and not family.DURABLE:
-            ephemeral.append((family, valid))
-    if len(ephemeral) != 1:
-        return None
-
-    family, valid = ephemeral[0]
-    authorize = getattr(family, "authorize", None)
-    if not callable(authorize):
-        return None
-    decision = authorize(
-        view,
-        valid,
+    decision = facts.authorize_access(
+        evaluated.judgment,
         evaluated.pile.facts,
+        view,
         trusted_now,
         purpose=purpose,
     )
-    if not isinstance(decision, tuple) or len(decision) != 2 \
-            or decision != (evaluated.pile.writer, purpose):
-        return None
-    return decision
+    return decision if decision == (
+        evaluated.pile.writer, purpose) else None
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,7 +13,10 @@ from .util import add_member, suppression_world
 
 
 def _facts(node, workspace):
-    return dict(node.reader(workspace).all_facts().facts)
+    return {
+        fid: node.fact_of(workspace, fid)
+        for fid in node.sql(workspace).fact_ids()
+    }
 
 
 def test_ordinary_insert_reads_and_writes_only_changed_paths(tmp_path):
@@ -40,8 +43,7 @@ def test_ordinary_insert_reads_and_writes_only_changed_paths(tmp_path):
         lambda oid: fetched.append(oid) or objects.get(oid))
     full = compile_snapshot(workspace, after)
 
-    assert incremental.root == full.root \
-        == node.store(workspace).get("root")
+    assert incremental.root == full.root
     assert len(incremental.objects) < len(full.objects)
     assert not set(fetched) & {
         h(encode(fact)) for fact in before.values()
@@ -87,6 +89,8 @@ def test_member_removal_does_not_visit_incident_provider_facts(tmp_path):
         h(encode(fact)) for fact in before.values()
     }
     assert len(set(fetched)) < len(before)
+
+
 def test_incremental_action_checks_suppression_named_fact_evidence(tmp_path):
     source, workspace, _, deletions = suppression_world(tmp_path / "source")
     complete = _facts(source, workspace)

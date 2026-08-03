@@ -1,16 +1,15 @@
 """The one disposable SQL projection and combined generic index."""
-import json
+import asyncio
 import sqlite3
-
-import pytest
 
 import facts
 
 from core import fact_index
-from core.fact import Fact, canon, decode, encode
+from core.fact import Fact, decode, encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
 from core.repository_snapshot import action_bindings
+from core.writer_repository import FactConsumer, RepositoryMirror
 
 
 OBSOLETE_TABLES = {
@@ -24,6 +23,7 @@ OBSOLETE_TABLES = {
     "proofs",
     "staged",
     "supp",
+    "meta",
 }
 
 
@@ -36,23 +36,40 @@ def _tables(db):
 
 
 def _expected_projection(node, workspace):
-    """Derive exact local rows from one authenticated validated set."""
-    reader = node.reader(workspace)
-    validated = reader.all_facts()
+    """Replay accepted writer trees into an independent in-memory consumer."""
+    consumer = FactConsumer(workspace)
+    result = asyncio.run(RepositoryMirror(
+        workspace,
+        node.store(workspace),
+        node.writer_binding,
+        consumer,
+    ).replay_local())
+    assert result.errors == ()
     facts_by_fid = {
-        fid: encode(fact)
-        for fid, fact in validated.facts.items()
+        fid: consumer.fact_bytes(fid)
+        for fid in consumer.fact_ids()
+    }
+    decoded = {
+        fid: decode(raw) for fid, raw in facts_by_fid.items()
     }
     rows = {
         row
-        for fact in validated.facts.values()
+        for fact in decoded.values()
         for row in fact_index.index_rows(fact)
     }
     rows.update(
         (fact_index.ACTION_INDEX, sid, "", fid)
-        for sid, fid in action_bindings(validated.facts).items()
+        for sid, fid in action_bindings(decoded).items()
     )
     return facts_by_fid, rows
+
+
+def _durable_heads(node, workspace):
+    store = node.store(workspace)
+    return {
+        key: store.get(key)
+        for key in store.list(f"heads/{workspace}/")
+    }
 
 
 def _assert_exact_projection(node, workspace):
@@ -66,10 +83,7 @@ def _assert_exact_projection(node, workspace):
 
     assert actual_facts == expected_facts
     assert actual_rows == expected_rows
-    assert _tables(db) == {"facts", "fact_index", "meta"}
-    assert set(
-        key for (key,) in db.execute("SELECT k FROM meta")
-    ) == {"root"}
+    assert _tables(db) == {"facts", "fact_index", "projected_heads"}
     for fid, raw in actual_facts.items():
         fact = decode(raw)
         assert fact.fid == fid
@@ -117,7 +131,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     keep = facts.content.message.post(node, workspace, "general", "keep", ts=2)
     remove = facts.content.message.post(node, workspace, "general", "remove", ts=3)
     facts.content.delete.remove(node, workspace, remove, ts=4)
-    root = node.reader(workspace).root_bytes
+    heads = _durable_heads(node, workspace)
     expected = {
         "members": facts.auth.user.members(node, workspace),
         "messages": facts.content.message.messages(node, workspace),
@@ -129,7 +143,7 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
 
     reopened = FullPeer(str(directory))
 
-    assert reopened.reader(workspace).root_bytes == root
+    assert _durable_heads(reopened, workspace) == heads
     assert facts.auth.user.members(reopened, workspace) == expected["members"]
     assert facts.content.message.messages(reopened, workspace) == expected["messages"]
     assert dict(reopened.idx(workspace).execute(
@@ -140,14 +154,14 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     assert not (directory / "app.db").exists()
 
 
-def test_legacy_authority_schema_is_discarded_then_root_refreshed(
+def test_outdated_projection_schema_is_discarded_then_writer_trees_replayed(
         tmp_path):
     directory = tmp_path / "node"
     node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     message_fid = facts.content.message.post(
         node, workspace, "general", "survives cut", ts=2)
-    root = node.reader(workspace).root_bytes
+    heads = _durable_heads(node, workspace)
     path = directory / "ws" / f"{workspace}.idx.db"
     node.idx(workspace).close()
 
@@ -155,6 +169,7 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
     db.executescript("""
         DROP TABLE facts;
         DROP TABLE fact_index;
+        DROP TABLE projected_heads;
         CREATE TABLE facts(
             fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
         CREATE TABLE fact_index(
@@ -169,12 +184,13 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
         CREATE TABLE proofs(value TEXT);
         CREATE TABLE staged(value TEXT);
         CREATE TABLE supp(value TEXT);
+        CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
         CREATE INDEX fact_keys ON fact_index(k0,src);
         CREATE INDEX fact_boundaries ON fact_index(k0,src);
         PRAGMA user_version=0;
     """)
     local_only = Fact(
-        "legacy",
+        "obsolete_local",
         3,
         [],
         {"value": "must be discarded"},
@@ -186,13 +202,13 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
             local_only.fid,
             local_only.ts,
             local_only.t,
-            json.dumps(local_only.to_json()),
+                encode(local_only).decode(),
             1,
         ),
     )
     db.execute(
         "INSERT OR REPLACE INTO meta VALUES('obsolete',?)",
-        ("legacy-projection-v27",),
+        ("discard-this-projection",),
     )
     db.commit()
     db.close()
@@ -200,11 +216,12 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
     reopened = FullPeer(str(directory))
     upgraded = reopened.idx(workspace)
 
-    assert reopened.reader(workspace).root_bytes == root
+    assert _durable_heads(reopened, workspace) == heads
     assert reopened.fact_of(workspace, message_fid) is not None
     assert reopened.fact_of(
         workspace, local_only.fid) is None
-    assert _tables(upgraded) == {"facts", "fact_index", "meta"}
+    assert _tables(upgraded) == {
+        "facts", "fact_index", "projected_heads"}
     assert _tables(upgraded).isdisjoint(OBSOLETE_TABLES)
     assert upgraded.execute(
         "SELECT 1 FROM sqlite_master "
@@ -214,12 +231,12 @@ def test_legacy_authority_schema_is_discarded_then_root_refreshed(
     _assert_exact_projection(reopened, workspace)
 
 
-def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
+def test_projection_rebuild_replaces_stale_missing_and_extra_rows(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     message_fid = facts.content.message.post(
         node, workspace, "general", "kept", ts=2)
-    root = node.reader(workspace).root_bytes
+    heads = _durable_heads(node, workspace)
     db = node.idx(workspace)
     db.execute(
         "DELETE FROM fact_index WHERE src=?", (message_fid,))
@@ -233,30 +250,10 @@ def test_root_refresh_replaces_stale_missing_and_extra_rows(tmp_path):
 
     node.rebuild(workspace)
 
-    assert node.reader(workspace).root_bytes == root
+    assert _durable_heads(node, workspace) == heads
     _assert_exact_projection(node, workspace)
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [message_fid]
-
-
-def test_foreign_root_format_fails_closed_without_local_republish(
-        tmp_path):
-    directory = tmp_path / "node"
-    node = FullPeer(str(directory))
-    workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    facts.content.message.post(node, workspace, "general", "kept", ts=2)
-    store = node.store(workspace)
-    value = json.loads(store.get("root"))
-    value["stamp"] = "obsolete-or-foreign-layout"
-    foreign = canon(value)
-    store._replace("root", foreign)
-    node.idx(workspace).close()
-
-    with pytest.raises(ValueError, match="root shape"):
-        FullPeer(str(directory))
-
-    assert store.get("root") == foreign
-
 
 def test_index_lookup_decodes_only_selected_fact_bodies(
         tmp_path, monkeypatch):

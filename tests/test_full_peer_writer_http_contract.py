@@ -17,13 +17,15 @@ from urllib.parse import urlencode, urlsplit
 
 import facts
 
+from core import peer_capability
 from core.crypto import h, keypair
 from core.grants import make_token
-from core.http_stdlib import handler_for
 from core.store import RemoteStore
 from core.writer_head import decode_slot_at, head_slot_key
 from core.writer_repository import RepositoryMirror
 from full_peer.node import FullPeer
+from full_peer.pack_http import handler_for
+from full_peer import sync as sync_module
 from full_peer.sync import sync
 from full_peer.walk import Peer
 from tests.util import add_member
@@ -34,10 +36,14 @@ def _run(awaitable):
 
 
 @contextmanager
-def _serve(peer, secret=b"writer-http-contract-secret-0001"):
+def _serve(
+        peer,
+        secret=b"writer-http-contract-secret-0001",
+        sync_profile=peer_capability.FULL):
     """Serve the production stdlib adapter on an OS-assigned loopback port."""
     server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), handler_for(peer, secret))
+        ("127.0.0.1", 0), handler_for(
+            peer, secret, sync_profile=sync_profile))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -428,3 +434,27 @@ def test_reverse_noop_reuses_the_directory_tops_from_the_pull(tmp_path):
     assert pushed.errors == ()
     assert pushed.changed == pushed.piles == pushed.facts == 0
     assert peer.requests == 0
+
+
+def test_read_only_peer_pulls_writer_forest_without_any_reverse_put(
+        tmp_path, monkeypatch):
+    workspace, alice, bob, _carol = _forest_fixture(tmp_path)
+    requests = []
+
+    class CountingPeer(Peer):
+        def _http(self, method, path, *args, **kwargs):
+            requests.append((method, path))
+            return super()._http(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(sync_module, "Peer", CountingPeer)
+    with _serve(alice, sync_profile=peer_capability.READ_ONLY) as (url, _):
+        pulled, pushed = sync_module.sync(bob, workspace, url)
+
+    assert pulled == 1
+    assert pushed == 0
+    assert "from alice" in _messages(bob, workspace)
+    assert "from bob" not in _messages(alice, workspace)
+    assert requests
+    assert not [request for request in requests if request[0] == "PUT"]
+    assert bob.sync_state(workspace, url)["sync_profile"] \
+        == peer_capability.READ_ONLY

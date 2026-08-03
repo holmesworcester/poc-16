@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import facts
 import pytest
 
-from core.close import encode_pile
+from .util import signed_pile_bytes
 from core.crypto import h
 from core.fact import canon
 from core.http import AsyncFromSyncReader
@@ -118,7 +118,7 @@ class EndpointOpener:
 def world(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    proof = encode_pile(request.payload(
+    proof = signed_pile_bytes(request.payload(
         node, workspace, "upload", NOW + 60_000, NOW))
     clock, signer, applier = Clock(), Signer(Clock()), Applier()
     signer.clock = clock

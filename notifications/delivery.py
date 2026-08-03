@@ -207,7 +207,7 @@ def _postings(view, kind, k0, k1, budget):
         page = view.postings(kind, k0, k1, after=after)
         budget.add(len(page.rows))
         for row in page.rows:
-            yield row, view.fact(row.fid)
+            yield row, view.fact_of(row.fid)
         if page.cursor is None:
             return
         if page.cursor == after:
@@ -320,7 +320,7 @@ def _derive_from(hint, fetch, current_root, push_node):
     budget, intents = _Budget(), {}
     for fid in hint.facts:
         try:
-            fact = event_view.fact(fid)
+            fact = event_view.fact_of(fid)
             trigger = trigger_for(fact)
             event_active = event_view.fact_active(fid)
         except (FetchBudgetExceeded, OSError):
@@ -333,7 +333,7 @@ def _derive_from(hint, fetch, current_root, push_node):
         if not current_view.fact_known(fid):
             raise CurrentRootBehind(
                 "current notification root has not observed event")
-        current_fact = current_view.fact(fid)
+        current_fact = current_view.fact_of(fid)
         if current_fact != fact:
             raise ValueError("notification event residence conflict")
         if not current_view.fact_active(fid):

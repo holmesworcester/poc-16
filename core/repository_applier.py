@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import facts
 
-from .close import check_pile_bounds, decode_pile
+from .close import ClosedPileEvaluator, check_pile_bounds
 from .crypto import h
 from .fact import encode
 from .ingress import (
@@ -22,10 +22,9 @@ from .ingress import (
     ingress_key,
     parse_ingress_key,
 )
-from .kernel import drain
 from .limits import (
     InvalidEncoding,
-    MAX_PILE_BYTES,
+    MAX_BUFFERED_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
@@ -37,7 +36,6 @@ from .object_store import (
     Applied,
     OutcomeUnknown,
     REPOSITORY_ROOT_KEYS,
-    SyncStoreAdapter,
     Versioned,
     async_store,
     ensure_object_async,
@@ -72,7 +70,8 @@ class RepositoryApplier:
         self.workspace = workspace
         self.store = async_store(store)
         self.root_key = root_key
-        self._evaluate = evaluate
+        self._evaluate = evaluate or (
+            lambda raw: ClosedPileEvaluator(workspace).evaluate(raw).judgment)
         self._accept_fact = accept_fact
 
     @staticmethod
@@ -106,6 +105,8 @@ class RepositoryApplier:
         """Store raw receiving bytes before they can influence publication."""
         if not isinstance(raw, bytes):
             raise TypeError("exact ingress bytes required")
+        if len(raw) > MAX_BUFFERED_PILE_BYTES:
+            raise InvalidPile("pile too large")
         if not valid_fid(member):
             raise ValueError("ingress member")
         try:
@@ -147,8 +148,7 @@ class RepositoryApplier:
 
     def _validated_facts(self, raw):
         """Return the durable subset of one database-free closed-pile turn."""
-        judgment = self._evaluate(raw) if self._evaluate is not None else \
-            drain(tuple(decode_pile(raw, self.workspace)), self.workspace)
+        judgment = self._evaluate(raw)
         if not judgment.ok:
             if judgment.failure is not None:
                 raise judgment.failure
@@ -181,7 +181,7 @@ class RepositoryApplier:
             raise ValueError("exact ingress address")
         try:
             raw = await self._get_bounded(
-                source_store, source, MAX_PILE_BYTES)
+                source_store, source, MAX_BUFFERED_PILE_BYTES)
         except PayloadTooLarge:
             return ApplyResult("rejected", None)
         if raw is None:
@@ -238,6 +238,4 @@ class RepositoryApplier:
 __all__ = (
     "ApplyResult",
     "RepositoryApplier",
-    "SyncStoreAdapter",
-    "async_store",
 )

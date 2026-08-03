@@ -24,7 +24,7 @@ import pytest
 import facts
 
 from core import snapshot
-from core.close import decode_pile
+from .util import signed_pile_facts
 from core.crypto import h, keypair, load_sk
 from core.fact import Fact, canon
 from core.kernel import drain
@@ -580,7 +580,7 @@ def test_add_member_builds_a_monotone_delegation_chain(tmp_path):
     assert bob_fact.fid in {fact.fid for fact in closure}
     assert bob_fact.ts < invitation.ts < carol.ts
 
-    stream = decode_pile(
+    stream = signed_pile_facts(
         fact_pile(node, workspace, carol.fid),
         workspace,
     )
@@ -764,7 +764,7 @@ def test_ephemeral_request_never_enters_validated_repository(world):
         workspace, node.pk, "sync", ts + 9_999, ts)
     signed = signature(node.sk, node.pk, ephemeral, ts)
     member = node.sql(workspace).resolve_offer("member", node.pk)
-    chain = decode_pile(
+    chain = signed_pile_facts(
         fact_pile(node, workspace, member),
         workspace,
     )

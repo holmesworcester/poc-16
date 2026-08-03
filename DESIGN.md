@@ -401,22 +401,32 @@ one page are sorted, nonoverlapping, wholly inside that window, and may leave
 holes. A hole means "fetch the normal pile object," not deletion. Pack bodies
 never cross writer or layout-window boundaries.
 
-Large pack bytes use a control/data split. The common gate handles one small,
-authenticated `PackOpen` value bound to method, pack OID, declared bytes, and
-an optional exact range. It returns a short-lived `ScopedRequest` containing an
-ordinary HTTP URL and required headers. S3 and R2 normally point that request
-at provider object HTTP; FullPeer points it at a same-origin streaming route,
-which Iroh may carry unchanged. The client performs the returned ordinary HTTP
-request in every composition.
+Large pile and pack bytes use a control/data split. A fact remains bounded at
+four MiB, but a useful signed closed pile may contain many large facts and is
+bounded at 95 MiB. A physical pack has that same ceiling, so a maximum pile is
+simply a one-pile pack while smaller piles may share one pack. Discarded
+membership/removal proofs retain their separate five-MiB evaluation budget.
 
-Neither `ObjectStore.get_bounded`, the named four-MiB fact/five-MiB pile limits,
-`HttpGate.Response`, Lambda response bodies, nor Worker buffered-body helpers
-may be widened to 95 MiB. Whole GETs stream to a sink and verify declared size
-and pack hash before acceptance. Exact range GETs are bounded by one signed
-pile, require exact HTTP range/length metadata, and verify the tree-selected
-pile OID, workspace/device signature, and ordinary closed-pile judgment. PUTs
-are immutable/create-only, and the layout page is CASed only after the pack is
-established.
+The common gate handles one small authenticated `ObjectOpen` or `PackOpen`
+value bound to the content-addressed OID, method, declared ceiling, and, for a
+pack, an optional exact range. It returns a short-lived `ScopedRequest`
+containing an ordinary HTTP URL and required headers. S3 and R2 normally point
+that request at provider object HTTP; FullPeer points it at a same-origin
+streaming route, which Iroh may carry unchanged. The client performs the
+returned ordinary HTTP request in every composition. A peer that does not
+implement `ObjectOpen` may still serve ordinary four-MiB fact and page reads,
+but it cannot serve writer piles. Pile reads require the direct route even
+when a particular pile happens to be small; there is no capability probe,
+old-protocol fallback, or large body in a buffered response.
+
+Neither `ObjectStore.get_bounded`, the named four-MiB fact and Merkle-object
+limit, `HttpGate.Response`, Lambda response bodies, nor Worker buffered-body
+helpers may be widened to 95 MiB. Whole GETs stream to a sink and verify
+declared size and object or pack hash before acceptance. Exact range GETs are
+bounded by one signed pile, require exact HTTP range/length metadata, and
+verify the tree-selected pile OID, workspace/device signature, and ordinary
+closed-pile judgment. PUTs are immutable/create-only, and the layout page is
+CASed only after the pack is established.
 
 This is an unavoidable storage tradeoff rather than a protocol ambiguity. One
 ever-growing object minimizes cold GET count but rewrites the writer's entire
@@ -998,7 +1008,7 @@ endpoints. SQS, Cloudflare Queue, or FullPeer wakes remain disposable. Only a
 typed terminal outcome or provider acceptance advances durable notification
 progress. The migration is tracked by `poc-16-iq2.8`.
 
-## 15. Transition from the current global root
+## 15. One-way cutover from the current global root
 
 Current `main` has valuable components that survive:
 
@@ -1023,7 +1033,7 @@ The following assumptions do not survive:
 - cross-device root-CAS contention and its orphan-amplification work;
 - a deployment configured around one canonical content snapshot per workspace.
 
-The migration order is:
+The cutover order is:
 
 1. freeze canonical signed-pile, writer-head, closed-leaf tree, and directory
    fixtures;
@@ -1036,9 +1046,13 @@ The migration order is:
 7. switch deployments once;
 8. delete the global content-root path and its compatibility code.
 
-There will not be two permanent publication algorithms. A one-time exporter or
-migration fixture may read the predecessor repository, but normal runtime code
-must end with only the writer-log/head path. `poc-16-iq2.9` is the cutover gate.
+There will not be two publication algorithms or a predecessor-format reader.
+This prototype makes one hard cut: old keyrings, pile envelopes, roots, HTTP
+routes, deployment documents, and local operational schemas are rejected or
+discarded, never migrated in running code. The sole upgrade mechanism retained
+is application fact-form replay: a disposable SQL projection is deleted and
+rebuilt by hydrating validated facts into the form current for their
+surrounding context. `poc-16-iq2.9` is the cutover gate.
 
 ## 16. Core invariants
 

@@ -2,9 +2,8 @@
 import facts
 
 from . import indexes, merkle_map
-from .close import decode_pile
+from .close import ClosedPileEvaluator
 from .crypto import h
-from .kernel import drain
 from .validated_set import ValidatedView
 
 MAX_PROOF_FACTS = 64
@@ -36,7 +35,7 @@ class WorkerView:
         row = self._reader(indexes.FACT).get(indexes.fact_key(fid))
         return row is not None and bool(indexes.checked_fact_oid(row))
 
-    def fact(self, fid):
+    def fact_of(self, fid):
         return self._validated.fact(fid)
 
     def postings(
@@ -49,7 +48,7 @@ class WorkerView:
 
     def fact_location(self, fid):
         """Canonical reconciliation key locating this fact's home range."""
-        return self.fact(fid).key
+        return self.fact_of(fid).key
 
     def suppression(self, sid):
         row = self._reader(indexes.SUPP).get(sid)
@@ -59,7 +58,7 @@ class WorkerView:
         return all(self.suppression(sid)["state"] == "clear" for sid in scopes)
 
     def fact_active(self, fid):
-        fact = self.fact(fid)
+        fact = self.fact_of(fid)
         return self.scopes_active(facts.current_scopes(fact))
 
     def principal_active(self, kind, public_key):
@@ -71,30 +70,25 @@ class WorkerView:
         return self._reader(indexes.SUPP).get(sid) is not None
 
     def mint(self, pile_bytes, trusted_now, *, purpose="sync"):
-        """Validate one bounded closure for the caller's exact purpose.
+        """Validate one signed closed pile for the caller's exact purpose.
 
         ``purpose`` is supplied by the trusted endpoint, never decoded from a
         bearer token or caller-owned JSON.  A family still has to accept that
         purpose and the submitted request fact must name the same value.
         """
         try:
-            stream = decode_pile(pile_bytes, self.anchor)
+            evaluated = ClosedPileEvaluator(self.anchor).evaluate(pile_bytes)
+            stream = evaluated.pile.facts
             if len(stream) > MAX_PROOF_FACTS:
                 return None
-            result = drain(stream, self.anchor)
-            if not result.ok:
-                return None
-            ephemeral = [
-                valid for valid in result.valids
-                if not facts.family_for(valid.fact.t).DURABLE
-            ]
-            if len(ephemeral) != 1:
-                return None
-            request = ephemeral[0]
-            family = facts.family_for(request.fact.t)
-            authorize = getattr(family, "authorize", None)
-            return authorize(
-                self, request, stream, trusted_now, purpose=purpose) \
-                if authorize is not None else None
+            decision = facts.authorize_access(
+                evaluated.judgment,
+                stream,
+                self,
+                trusted_now,
+                purpose=purpose,
+            )
+            return decision if decision == (
+                evaluated.pile.writer, purpose) else None
         except Exception:
             return None

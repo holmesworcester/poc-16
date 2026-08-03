@@ -163,7 +163,7 @@ its full-peer keyring, registers a supervised outbound forwarder, and gives
 only the resulting `http://127.0.0.1:...` URL to the existing sync HTTP
 client. On restart it registers durable peers before scheduling and recreates
 each disposable forwarder on its next bounded scheduler or sync turn. Iroh
-mode rejects legacy plain-HTTP peer records, so an Iroh-enabled daemon cannot
+mode rejects plain-HTTP peer records, so an Iroh-enabled daemon cannot
 silently dial around the wrapper.
 
 Tickets are reachability data and can change while the endpoint ID remains
@@ -201,9 +201,9 @@ HTTP seam whose bytes traverse Iroh to the accepting peer:
 ./full_peer/iroh/target/release/poc16-iroh forward --peer=TICKET
 ```
 
-`--url` remains rejected in Iroh mode. Plain-HTTP mode remains available for
-local deployments and compatibility, but one daemon configuration cannot mix
-plain remote URLs with Iroh peer records.
+`--url` remains rejected in Iroh mode. Direct HTTP remains an isolated local
+diagnostic and test seam for the same gate; peer deployments use Iroh and one
+daemon configuration cannot mix plain remote URLs with Iroh peer records.
 
 ## Repository flow
 

@@ -10,9 +10,9 @@ import pytest
 
 import facts
 from core import http
-from core.close import decode_pile, encode_pile
+from .util import signed_pile_facts, signed_pile_bytes
 from core.crypto import h, keypair
-from core.fact import Fact, canon, encode
+from core.fact import Fact, canon
 from core.grants import make_token
 from core.ingress import InvalidPile
 from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
@@ -20,7 +20,6 @@ from full_peer.node import FullPeer
 from core.repository_applier import RepositoryApplier
 from core.store import FsStore
 from full_peer import sql_store
-from facts.auth import request
 from facts.auth import user as user_family
 from facts.auth import user_invite as user_invite_family
 from .util import apply_planted, plant_for
@@ -73,20 +72,19 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
     foreign_sig = signature(
         node.identity(first)[0], public, foreign, foreign.ts)
     second_genesis = node.fact_of(second, second)
-    hostile = canon({
-        "ws": second,
-        "facts": [
-            second_genesis.to_json(),
-            foreign_sig.to_json(),
-            foreign.to_json(),
-        ],
-    })
+    hostile_value = json.loads(signed_pile_bytes(
+        [second_genesis], workspace=second))
+    hostile_value["facts"].extend((
+        foreign_sig.to_json(),
+        foreign.to_json(),
+    ))
+    hostile = canon(hostile_value)
 
-    with pytest.raises(ValueError, match="mixed workspace pile"):
-        encode_pile(
+    with pytest.raises(ValueError, match="signed pile"):
+        signed_pile_bytes(
             [second_genesis, foreign_sig, foreign], workspace=second)
-    with pytest.raises(InvalidPile, match="mixed workspace pile"):
-        decode_pile(hostile, second)
+    with pytest.raises(InvalidPile, match="signed pile"):
+        signed_pile_facts(hostile, second)
 
     family_calls = []
     real_family_for = facts.family_for
@@ -110,23 +108,18 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
     assert store.get(source) == hostile
 
 
-def test_foreign_pile_and_legacy_pile_have_one_typed_rejection_door(
-        tmp_path):
+def test_foreign_signed_pile_has_one_typed_rejection_door(tmp_path):
     node, first, second = two_workspaces(tmp_path)
     first_root = node.fact_of(first, first)
-    foreign = encode_pile([first_root], workspace=first)
+    foreign = signed_pile_bytes([first_root], workspace=first)
 
-    with pytest.raises(InvalidPile, match="pile workspace"):
-        decode_pile(foreign, second)
-    with pytest.raises(InvalidPile, match="pile shape"):
-        decode_pile(canon({"facts": [first_root.to_json()]}), first)
-    with pytest.raises(ValueError, match="pile workspace"):
-        encode_pile((), workspace="not-a-workspace")
-    with pytest.raises(InvalidPile, match="pile workspace"):
-        decode_pile(foreign, None)
+    with pytest.raises(InvalidPile, match="signed pile binding"):
+        signed_pile_facts(foreign, second)
+    with pytest.raises(ValueError, match="signed pile"):
+        signed_pile_bytes((), workspace="not-a-workspace")
 
 
-def test_uploader_token_workspace_and_pile_path_must_match(tmp_path):
+def test_retired_pile_route_has_no_receiver_even_with_a_valid_token(tmp_path):
     node, first, second = two_workspaces(tmp_path)
     secret = b"g" * 32
     member = node.member_for(first)
@@ -136,7 +129,6 @@ def test_uploader_token_workspace_and_pile_path_must_match(tmp_path):
         second,
         secret,
         lambda: 100,
-        receiver=object(),
     )
 
     first_token = make_token(
@@ -160,51 +152,7 @@ def test_uploader_token_workspace_and_pile_path_must_match(tmp_path):
         {"Authorization": "Bearer " + second_token},
         raw,
     ))
-    assert response.status == 403
-
-
-def test_database_free_reader_applier_and_projection_enforce_same_anchor(
-        tmp_path):
-    node, first, second = two_workspaces(tmp_path)
-    now = 100
-    first_pile = encode_pile(request.payload(
-        node, first, "sync", now + 60_000, now), workspace=first)
-    second_pile = encode_pile(request.payload(
-        node, second, "sync", now + 60_000, now), workspace=second)
-    store = node.store(second)
-    reader = node.reader(second)
-
-    assert reader.mint(first_pile, now) is None
-    assert reader.mint(second_pile, now) \
-        == (node.identity_id(second), "sync")
-
-    foreign = message(
-        first, node.identity_id(first), "general", "not second", 101)
-    foreign_pile = encode_pile([foreign], workspace=first)
-    root = store.get("root")
-    applier = node.applier(second)
-    source = run(plant_for(
-        applier, node.member_for(second), foreign_pile))
-    result = run(apply_planted(applier, source))
-
-    assert result.status == "rejected"
-    assert store.get(source) == foreign_pile
-    assert store.get("root") == root
-    assert node.fact_of(second, foreign.fid) is None
-
-    ws_less_ordinary = Fact("msg", 102, [], {}, None)
-    index = node.idx(second)
-    index.execute(
-        "INSERT INTO facts VALUES(?,?)",
-        (ws_less_ordinary.fid, encode(ws_less_ordinary)),
-    )
-    index.commit()
-    with pytest.raises(ValueError, match="fact projection integrity"):
-        node.sql(second).fact(ws_less_ordinary.fid)
-
-    node.rebuild(second)
-    assert node.fact_of(second, ws_less_ordinary.fid) is None
-    assert store.get("root") == root
+    assert response.status == 404
 
 
 @pytest.mark.parametrize("case", ("foreign-inner-pile", "incomplete-proof"))
@@ -219,14 +167,14 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
     inner_workspace = foreign if case == "foreign-inner-pile" else expected
     invitation = user_invite(
         inner_workspace, inviter, invite_public, 1)
-    pile = encode_pile([invitation], workspace=inner_workspace)
+    pile = signed_pile_bytes([invitation], workspace=inner_workspace)
     blob = canon({
         "pile": base64.b64encode(pile).decode(),
         "isk": invite_secret.encode().hex(),
         "ws": expected,
     })
     link = base64.urlsafe_b64encode(canon({
-        "u": "https://invite.invalid",
+        "p": "https://invite.invalid",
         "ws": expected,
         "s": "01" * 32,
     })).decode()
@@ -241,9 +189,7 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
         def close(self):
             pass
 
-    monkeypatch.setattr(
-        user_family.urllib.request, "urlopen",
-        lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(user_family, "_open_invite", lambda _url: Response())
     monkeypatch.setattr(
         user_family, "box_decrypt",
         lambda *_args, **_kwargs: blob)
@@ -261,7 +207,7 @@ def test_invite_redemption_bounds_and_closes_untrusted_http_body(
     node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = base64.urlsafe_b64encode(canon({
-        "u": "https://invite.invalid",
+        "p": "https://invite.invalid",
         "ws": workspace,
         "s": "01" * 32,
     })).decode()
@@ -284,9 +230,7 @@ def test_invite_redemption_bounds_and_closes_untrusted_http_body(
 
     response = Response()
     monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
-    monkeypatch.setattr(
-        user_family.urllib.request, "urlopen",
-        lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(user_family, "_open_invite", lambda _url: response)
 
     with pytest.raises(PayloadTooLarge, match="invite response"):
         user_family.accept(node, link, "new member")
@@ -300,7 +244,7 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
     node = FullPeer(str(tmp_path / "joiner"))
     workspace = "0" * 64
     link = base64.urlsafe_b64encode(canon({
-        "u": "https://invite.invalid",
+        "p": "https://invite.invalid",
         "ws": workspace,
         "s": "01" * 32,
     })).decode()
@@ -321,9 +265,7 @@ def test_exact_bound_invite_response_reaches_crypto_and_still_closes(
 
     response = Response()
     monkeypatch.setattr(user_family, "MAX_INVITE_BYTES", 8)
-    monkeypatch.setattr(
-        user_family.urllib.request, "urlopen",
-        lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(user_family, "_open_invite", lambda _url: response)
 
     def decrypt(_key, encrypted):
         assert encrypted == b"x" * 8
@@ -361,43 +303,16 @@ def test_invite_creation_checks_encrypted_size_before_store(
     assert store.list("invite/") == invite_keys
 
 
-def test_reopen_refresh_discards_foreign_projection_rows(tmp_path):
-    node = FullPeer(str(tmp_path / "node"))
-    workspace = facts.auth.workspace.create(node, "workspace", ts=1)
-    root = node.store(workspace).get("root")
-    foreign = Fact(
-        "sample", 2, [], {"foreign": True}, "f" * 64)
-    index = node.idx(workspace)
-    index.execute(
-        "INSERT INTO facts(fid, blob) VALUES(?,?)",
-        (foreign.fid, encode(foreign)),
-    )
-
-    with pytest.raises(ValueError, match="fact projection integrity"):
-        node.sql(workspace).fact(foreign.fid)
-
-    index.execute(
-        "DELETE FROM meta WHERE k='root'",
-    )
-    index.commit()
-    index.close()
-    node._sql.clear()
-
-    reopened = FullPeer(node.dir)
-    assert reopened.fact_of(workspace, foreign.fid) is None
-    assert reopened.store(workspace).get("root") == root
-
-
 def test_incompatible_projection_is_deleted_instead_of_migrated(tmp_path):
     workspace = "0" * 64
-    path = tmp_path / "legacy.db"
+    path = tmp_path / "obsolete.db"
     db = sqlite3.connect(path)
     db.executescript("""
         CREATE TABLE facts(
             fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
         PRAGMA user_version=0;
     """)
-    ordinary = Fact("sample", 1, [], {"legacy": True}, None)
+    ordinary = Fact("sample", 1, [], {"obsolete": True}, None)
     db.execute(
         "INSERT INTO facts VALUES(?,?,?,?,1)",
         (

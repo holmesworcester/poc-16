@@ -61,7 +61,7 @@ class R2PackIssuer:
             trusted_now,
         )
 
-    def open(self, member, opened, trusted_now):
+    def open_pack(self, member, opened, trusted_now):
         if not valid_fid(member) or not isinstance(opened, PackOpen) \
                 or type(trusted_now) is not int or trusted_now < 0:
             raise ValueError("R2 pack request")
@@ -97,5 +97,3 @@ class R2PackIssuer:
             ),
             expires_at_ms,
         )
-
-    __call__ = open

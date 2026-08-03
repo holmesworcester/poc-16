@@ -8,7 +8,9 @@ import pytest
 
 from core.crypto import h
 from core.limits import MAX_ROOT_BYTES
-from core.repository_applier import RepositoryApplier, async_store
+from core.object_store import async_store
+from core.repository_applier import RepositoryApplier
+from core.repository_snapshot import compile_snapshot
 from full_peer.node import FullPeer
 
 from .provider_fakes import provider_store
@@ -37,7 +39,13 @@ def _corpus(directory, count):
         workspace,
         bootstrap,
         tuple(work),
-        author.store(workspace).get_bounded("root", MAX_ROOT_BYTES),
+        compile_snapshot(
+            workspace,
+            {
+                fid: author.fact_of(workspace, fid)
+                for fid in author.sql(workspace).fact_ids()
+            },
+        ).root,
     )
 
 

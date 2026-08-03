@@ -6,7 +6,6 @@ bytes for a full peer. Iroh may wrap those bytes later, but it must not
 acquire another route table.
 """
 import base64
-import asyncio
 from dataclasses import dataclass, field
 import inspect
 import json
@@ -15,7 +14,6 @@ import re
 from . import peer_capability
 from .crypto import h, seal_to
 from .grants import check_token, make_token
-from .ingress import PermanentIngressRejection
 from .limits import (
     MAX_INVITE_BYTES,
     MAX_MINT_FETCHES,
@@ -24,7 +22,6 @@ from .limits import (
     MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_PAGE_REQUEST_BYTES,
-    MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     MAX_ROOT_BYTES,
     PAGE_BATCH,
@@ -44,8 +41,11 @@ from .object_store import (
     mutable_key,
 )
 from .pack_access import (
+    MAX_OBJECT_OPEN_BYTES,
     MAX_PACK_OPEN_BYTES,
+    confine_object_request,
     confine_scoped_request,
+    decode_object_open,
     decode_pack_open,
     encode_scoped_request,
 )
@@ -68,6 +68,13 @@ class Response:
     headers: dict = field(default_factory=dict)
 
 
+async def _to_thread(function, *args):
+    """Load host thread support only when a blocking adapter actually uses it."""
+    from asyncio import to_thread
+
+    return await to_thread(function, *args)
+
+
 class AsyncFromSyncReader:
     """Expose one blocking ObjectStore to the shared awaited HTTP gate."""
 
@@ -75,21 +82,21 @@ class AsyncFromSyncReader:
         self.reader = reader
 
     async def get_bounded(self, key, max_bytes):
-        return await asyncio.to_thread(
+        return await _to_thread(
             self.reader.get_bounded, key, max_bytes)
 
     async def read_versioned(self, key):
-        return await asyncio.to_thread(self.reader.read_versioned, key)
+        return await _to_thread(self.reader.read_versioned, key)
 
     async def put_if_absent(self, key, value):
-        return await asyncio.to_thread(
+        return await _to_thread(
             self.reader.put_if_absent, key, value)
 
     async def cas(self, key, token, value):
-        return await asyncio.to_thread(self.reader.cas, key, token, value)
+        return await _to_thread(self.reader.cas, key, token, value)
 
     async def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
-        return await asyncio.to_thread(
+        return await _to_thread(
             self.reader.list_page, prefix, cursor, limit)
 
 
@@ -99,15 +106,16 @@ class HttpGate:
     The gate is async because a Cloudflare R2 binding is async. Lambda wraps
     its synchronous SDK adapter with :class:`AsyncFromSyncReader`, so both
     deployments execute this same route and authorization implementation.
-    Supplying a receiver enables writes through ``RepositoryApplier``;
-    omitting it yields the hosted read-only capability.
+    Writer publication enters through the per-device object and mirror routes;
+    this gate does not expose the retired workspace-global pile applier.
     """
 
     def __init__(
-            self, store, workspace, secret, now, receiver=None,
+            self, store, workspace, secret, now,
             *, sync_profile=peer_capability.READ_ONLY,
             mirror=None,
             mint_authorize=None,
+            object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
             max_root_bytes=MAX_ROOT_BYTES,
@@ -125,15 +133,16 @@ class HttpGate:
         if not callable(seal):
             raise ValueError("grant sealer")
         self.store, self.workspace = store, workspace
-        self.receiver = receiver
         self.mirror = mirror
         self.mint_authorize = mint_authorize
+        if object_open is not None and not callable(object_open):
+            raise ValueError("object OPEN issuer")
         if pack_open is not None and not callable(pack_open):
             raise ValueError("pack OPEN issuer")
+        self.object_open = object_open
         self.pack_open = pack_open
         self.secret, self.now = secret, now
-        if sync_profile is not None \
-                and not peer_capability.known(sync_profile):
+        if not peer_capability.known(sync_profile):
             raise ValueError("sync profile")
         bounded = (
             ("request bytes", max_request_bytes, MAX_MINT_REQUEST_BYTES),
@@ -237,7 +246,7 @@ class HttpGate:
                 if inspect.iscoroutinefunction(self.mint_authorize):
                     grant = await self.mint_authorize(pile, "sync")
                 else:
-                    grant = await asyncio.to_thread(
+                    grant = await _to_thread(
                         self.mint_authorize, pile, "sync")
                     if inspect.isawaitable(grant):
                         grant = await grant
@@ -254,8 +263,7 @@ class HttpGate:
                 "grant": base64.b64encode(
                     self.seal(public, token.encode())).decode(),
             }
-            if self.sync_profile is not None:
-                response["cap"] = self.sync_profile
+            response["cap"] = self.sync_profile
             return self._json(200, response)
         try:
             root = await self._root()
@@ -303,8 +311,7 @@ class HttpGate:
                 self.seal(public, token.encode())).decode(),
             "root": base64.b64encode(root).decode(),
         }
-        if self.sync_profile is not None:
-            response["cap"] = self.sync_profile
+        response["cap"] = self.sync_profile
         return self._json(200, response)
 
     @staticmethod
@@ -371,11 +378,46 @@ class HttpGate:
             if inspect.iscoroutinefunction(self.pack_open):
                 scoped = await self.pack_open(member, opened, trusted_now)
             else:
-                scoped = await asyncio.to_thread(
+                scoped = await _to_thread(
                     self.pack_open, member, opened, trusted_now)
                 if inspect.isawaitable(scoped):
                     scoped = await scoped
             scoped = confine_scoped_request(opened, scoped, trusted_now)
+            response = encode_scoped_request(scoped)
+        except Exception:
+            return Response(503)
+        return Response(200, response, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        })
+
+    async def _open_object(self, body, headers, trusted_now):
+        """Authorize one direct bounded object GET; bytes bypass this gate."""
+        if self.object_open is None:
+            return Response(405)
+        if not isinstance(body, bytes) or len(body) > min(
+                self.max_request_bytes, MAX_OBJECT_OPEN_BYTES):
+            return Response(413)
+        try:
+            opened = decode_object_open(body)
+        except PayloadTooLarge:
+            return Response(413)
+        except ValueError:
+            return Response(400)
+        member = self._member(headers, trusted_now)
+        if not member:
+            return Response(401)
+        try:
+            if inspect.iscoroutinefunction(self.object_open):
+                scoped = await self.object_open(
+                    member, opened, trusted_now)
+            else:
+                scoped = await _to_thread(
+                    self.object_open, member, opened, trusted_now)
+                if inspect.isawaitable(scoped):
+                    scoped = await scoped
+            scoped = confine_object_request(
+                opened, scoped, trusted_now)
             response = encode_scoped_request(scoped)
         except Exception:
             return Response(503)
@@ -402,9 +444,11 @@ class HttpGate:
         if not 0 < limit <= PAGE_BATCH:
             return Response(400)
         try:
+            from asyncio import gather
+
             page = await self.store.list_page(
                 head_slot_prefix(self.workspace), cursor, limit)
-            opened = await asyncio.gather(*(
+            opened = await gather(*(
                 self.store.get_bounded(key, MAX_HEAD_SLOT_BYTES)
                 for key in page.keys), return_exceptions=True)
         except Exception:
@@ -546,13 +590,6 @@ class HttpGate:
         })
 
     @staticmethod
-    def _read_only_path(path):
-        return any(
-            path == prefix or path.startswith(prefix + "/")
-            for prefix in ("/pile", "/ctl")
-        )
-
-    @staticmethod
     def public_response(method, path):
         """Return a workspace-independent peer response, if one exists."""
         if method.upper() == "GET" and "/" + path.strip("/") == "/healthz":
@@ -564,16 +601,14 @@ class HttpGate:
         """Maximum request bytes before any transport reads the body."""
         method = method.upper()
         path = "/" + path.strip("/")
-        if method == "PUT" and path.startswith("/pile/"):
-            return MAX_PILE_BYTES
         if method == "POST" and path == "/mint":
             return MAX_MINT_REQUEST_BYTES
-        if method == "POST" and path == "/page":
-            return MAX_PAGE_REQUEST_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES
         if method == "POST" and path == "/pack/open":
             return MAX_PACK_OPEN_BYTES
+        if method == "POST" and path == "/obj/open":
+            return MAX_OBJECT_OPEN_BYTES
         if method == "PUT" and path.startswith("/obj/"):
             return MAX_OBJECT_BYTES
         if method == "PUT" and path.startswith("/mirror/"):
@@ -624,6 +659,10 @@ class HttpGate:
             if method != "POST":
                 return Response(405)
             return await self._open_pack(body, headers, trusted_now)
+        if path == "/obj/open":
+            if method != "POST":
+                return Response(405)
+            return await self._open_object(body, headers, trusted_now)
         if path.startswith("/ctl"):
             return Response(405)
         if method == "PUT" and (
@@ -637,34 +676,6 @@ class HttpGate:
                     path.removeprefix("/obj/"), body)
             device = path.removeprefix("/mirror/")
             return await self._accept_mirror(device, body)
-        if method == "PUT" and path.startswith("/pile/"):
-            if self.receiver is None:
-                return Response(405)
-            member = self._member(
-                headers, trusted_now, require_push=True)
-            if not member:
-                return Response(401)
-            parts = path.strip("/").split("/")
-            if len(parts) != 3 or parts[:2] != ["pile", member] \
-                    or not OID_RE.fullmatch(parts[2]):
-                return Response(403)
-            if not isinstance(body, bytes) or len(body) > MAX_PILE_BYTES \
-                    or h(body) != parts[2]:
-                return Response(400)
-            try:
-                result = await self.receiver.receive_pile(member, body)
-            except PermanentIngressRejection:
-                return Response(400)
-            except Exception:
-                return Response(503)
-            status = getattr(result, "status", None)
-            if status in {"applied", "noop"}:
-                return Response(204)
-            if status == "rejected":
-                return Response(400)
-            return Response(503)
-        if self.receiver is None and self._read_only_path(path):
-            return Response(405)
         if not self._member(headers, trusted_now):
             return Response(401)
         if path == "/heads" and method == "GET":
@@ -695,27 +706,5 @@ class HttpGate:
                     "Cache-Control": "no-store",
                     "Content-Type": "application/octet-stream",
                     "ETag": etag,
-                })
-        if path == "/page" and method == "POST":
-            return await self._batch(body)
-        if path.startswith("/page/") and method == "GET":
-            oid = path.removeprefix("/page/")
-            if not OID_RE.fullmatch(oid):
-                return Response(404)
-            try:
-                raw = await self._get(
-                    "obj/" + oid, self.max_object_bytes)
-            except PayloadTooLarge:
-                return Response(413)
-            except Exception:
-                return Response(503)
-            if raw is None:
-                return Response(404)
-            if h(raw) != oid:
-                return Response(503)
-            return Response(
-                200, raw, {
-                    "Cache-Control": "no-store",
-                    "Content-Type": "application/octet-stream",
                 })
         return Response(404)

@@ -5,14 +5,16 @@ from dataclasses import dataclass
 
 import pytest
 
-from core.authority import AuthorityRepository
+from core.authority import AuthorityPin, AuthorityRepository
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
 from core.object_store import AUTHORITY_ROOT_KEY, Versioned, VersionToken
 from core.repository_reader import RepositoryReader
 from core.store import FsStore
+from core.writer_repository import AuthorityGate
 from facts.auth.removal import removal
 from facts.auth.request import request
+from facts.auth.head_request import head_request
 from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
@@ -174,6 +176,77 @@ def test_current_removal_denies_an_old_valid_access_proof(tmp_path):
     assert run(repository.authorize_access(proof, 10)) is None
 
 
+def test_access_decision_must_name_the_outer_pile_signer(tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    repository = AuthorityRepository(world.root.fid, store)
+    publish(
+        repository,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    item = request(
+        world.root.fid, world.member, "sync", 1_000, 4)
+    item_signature = signature(
+        world.member_secret, world.member, item, 4)
+    mismatched = signed(
+        world.founder_secret,
+        world.founder,
+        world.root,
+        (*world.membership, item_signature, item),
+    )
+
+    assert run(repository.authorize_access(mismatched, 10)) is None
+
+
+def test_access_proof_rejects_a_second_non_authorizing_ephemeral_fact(
+        tmp_path):
+    world = authority_world()
+    repository = AuthorityRepository(
+        world.root.fid, FsStore(str(tmp_path / "repository")))
+    publish(
+        repository,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    item = request(
+        world.root.fid, world.member, "sync", 1_000, 4)
+    item_signature = signature(
+        world.member_secret, world.member, item, 4)
+    head = head_request(
+        world.root.fid,
+        world.member,
+        world.member,
+        None,
+        h(b"candidate head"),
+        1_000,
+        5,
+    )
+    head_signature = signature(
+        world.member_secret, world.member, head, 5)
+    ambiguous = signed(
+        world.member_secret,
+        world.member,
+        world.root,
+        (*world.membership, item_signature, item, head_signature, head),
+    )
+
+    assert run(repository.authorize_access(ambiguous, 10)) is None
+    pin = run(repository.pin())
+    view = RepositoryReader(
+        world.root.fid,
+        pin.root_bytes,
+        lambda oid: store.get("obj/" + oid),
+    ).worker()
+    assert AuthorityGate(
+        world.root.fid, pin.root_oid, lambda: 10,
+    ).authorize_access(ambiguous, view, purpose="sync") is None
+
+
 def test_content_family_rejects_the_whole_authority_publication(tmp_path):
     world = authority_world()
     store = FsStore(str(tmp_path / "repository"))
@@ -249,3 +322,140 @@ def test_authority_pin_does_not_treat_an_opaque_version_as_root_identity(
     assert pin.version == VersionToken("opaque-cas-token")
     assert pin.root_oid == h(result.root)
     assert pin.root_oid != pin.version.value
+
+
+def test_authority_pin_memoizes_reads_and_enforces_exact_budgets(tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    repository = AuthorityRepository(world.root.fid, store)
+    publish(
+        repository,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    proof = access_proof(world)
+    pinned = run(repository.pin())
+
+    class TracedStore:
+        def __init__(self, replacement_key=None, replacement=None):
+            self.calls = []
+            self.replacement_key = replacement_key
+            self.replacement = replacement
+
+        async def get_bounded(self, key, maximum):
+            self.calls.append(key)
+            if key == self.replacement_key:
+                return self.replacement
+            return store.get_bounded(key, maximum)
+
+    def traced_pin(source):
+        return AuthorityPin(
+            pinned.workspace,
+            pinned.root_bytes,
+            pinned.root_oid,
+            pinned.version,
+            source,
+        )
+
+    baseline = TracedStore()
+    decision = run(traced_pin(baseline).authorize_access(proof, 10))
+    assert decision == (world.member, "sync")
+    assert len(baseline.calls) == len(set(baseline.calls))
+    total = sum(len(store.get(key)) for key in baseline.calls)
+
+    exact = TracedStore()
+    assert run(traced_pin(exact).authorize_access(
+        proof,
+        10,
+        max_unique_fetches=len(baseline.calls),
+        max_fetch_bytes=total,
+    )) == decision
+    assert exact.calls == baseline.calls
+
+    one_short = TracedStore()
+    assert run(traced_pin(one_short).authorize_access(
+        proof,
+        10,
+        max_unique_fetches=len(baseline.calls) - 1,
+        max_fetch_bytes=total,
+    )) is None
+    assert one_short.calls == baseline.calls[:-1]
+
+    one_byte_short = TracedStore()
+    assert run(traced_pin(one_byte_short).authorize_access(
+        proof,
+        10,
+        max_unique_fetches=len(baseline.calls),
+        max_fetch_bytes=total - 1,
+    )) is None
+
+    target = baseline.calls[-1]
+    for replacement in (None, b"corrupt object"):
+        damaged = TracedStore(target, replacement)
+        assert run(traced_pin(damaged).authorize_access(proof, 10)) is None
+        assert damaged.calls.count(target) == 1
+        assert len(damaged.calls) == len(set(damaged.calls))
+
+
+def test_authority_authorization_pins_once_across_concurrent_removal(
+        tmp_path):
+    world = authority_world()
+    store = FsStore(str(tmp_path / "repository"))
+    publisher = AuthorityRepository(world.root.fid, store)
+    publish(
+        publisher,
+        world.member_secret,
+        world.member,
+        world.root,
+        world.membership,
+    )
+    proof = access_proof(world)
+
+    class PausedStore:
+        def __init__(self):
+            self.root_reads = 0
+            self.object_reads = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def read_versioned(self, key):
+            self.root_reads += 1
+            return store.read_versioned(key)
+
+        async def get_bounded(self, key, maximum):
+            self.object_reads += 1
+            if self.object_reads == 1:
+                self.started.set()
+                await self.release.wait()
+            return store.get_bounded(key, maximum)
+
+    async def scenario():
+        paused = PausedStore()
+        reader = AuthorityRepository(world.root.fid, paused)
+        decision = asyncio.create_task(reader.authorize_access(proof, 10))
+        await paused.started.wait()
+
+        evicted = removal(
+            world.root.fid, world.founder, world.member, 5)
+        evicted_signature = signature(
+            world.founder_secret, world.founder, evicted, 5)
+        result = await publisher.receive_pile(
+            world.founder,
+            signed(
+                world.founder_secret,
+                world.founder,
+                world.root,
+                (*world.membership, evicted_signature, evicted),
+            ),
+        )
+        assert result.status == "applied"
+        paused.release.set()
+        return await decision, paused
+
+    decision, paused = run(scenario())
+    assert decision == (world.member, "sync")
+    assert paused.root_reads == 1
+    assert paused.object_reads > 0
+    assert run(publisher.authorize_access(proof, 10)) is None

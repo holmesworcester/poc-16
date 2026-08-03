@@ -155,23 +155,22 @@ def authorize_access(judgment, stream, view, trusted_now, *, purpose):
     supplies its complete historical membership closure, while the view
     decides whether the exact selected provider is still current and clear.
     """
-    candidates = []
+    ephemeral = []
     for valid in judgment.valids:
         family = family_for(valid.fact.t)
-        if family is None or family.DURABLE:
-            continue
-        authorize = getattr(family, "authorize", None)
-        if callable(authorize):
-            decision = authorize(
-                view,
-                valid,
-                stream,
-                trusted_now,
-                purpose=purpose,
-            )
-            if decision is not None:
-                candidates.append(decision)
-    return candidates[0] if len(candidates) == 1 else None
+        if family is not None and not family.DURABLE:
+            ephemeral.append((family, valid))
+    if len(ephemeral) != 1:
+        return None
+    family, valid = ephemeral[0]
+    authorize = getattr(family, "authorize", None)
+    return authorize(
+        view,
+        valid,
+        stream,
+        trusted_now,
+        purpose=purpose,
+    ) if callable(authorize) else None
 
 
 def is_genesis(tag):

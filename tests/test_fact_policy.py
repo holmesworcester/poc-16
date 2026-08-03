@@ -196,7 +196,7 @@ def test_runtime_policy_rejects_missing_and_extra_selectors(
     signed = signature(secret, public, malformed, malformed.ts)
     monkeypatch.setattr(message_family, "validate", lambda fact, ctx: True)
 
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(
             workspace, [signed, malformed], {
                 signed.fid: [],
@@ -223,7 +223,7 @@ def test_runtime_policy_rejects_a_forged_nonparent(
         original.t, original.ts, atoms, dict(original.body), workspace)
     monkeypatch.setattr(slice_family, "validate", lambda fact, ctx: True)
 
-    with pytest.raises(ValueError, match="not admitted"):
+    with pytest.raises(ValueError, match="rejected"):
         node.ingest_new(
             workspace, [forged], {forged.fid: [descriptor_fid]})
     assert node.fact_of(workspace, forged.fid) is None
@@ -257,6 +257,7 @@ def test_sibling_device_owner_admin_and_foreign_member_modes(tmp_path):
 
     node.bind_identity(workspace, devices[0][1])
     second = facts.content.message.post(node, workspace, "general", "owned on phone 2", ts=32)
+    node.bind_identity(workspace, alice)
     charlie_secret, charlie, _ = add_member(
         node, workspace, "Charlie", ts=40,
         inviter=(alice_secret, alice))
@@ -332,9 +333,20 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
             "owner": bob,
             "pk": founder,
         }
-        assert node.reader(workspace).worker().suppression(
-            indexes.fact_key(target)
-        ) == {
-            "state": "active",
-            "action": action_fid,
-        }
+        assert node.sql(workspace).active(indexes.fact_key(target))
+
+
+def test_removed_writer_cannot_reuse_its_historical_bootstrap_closure(
+        tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    bob_secret, bob, membership = add_member(
+        node, workspace, "Bob", ts=10)
+    historical = node.sender(workspace).close((membership,), {})
+
+    facts.auth.removal.evict(node, workspace, bob)
+    node.keychain.add_identity(bob_secret)
+    node.bind_identity(workspace, bob)
+
+    with pytest.raises(ValueError, match="no current durable owner"):
+        node.publish_closed(workspace, (historical,))

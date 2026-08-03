@@ -82,7 +82,9 @@ def publish(node, workspace, fact, signature, role="member"):
             f"publishing identity is not a workspace {role}")
     deps = {fact.fid: [r for _, r in fact.refs()] + [signature.fid]
             + [src], signature.fid: []}
-    node.ingest_new(workspace, [signature, fact], deps)
+    node.ingest_new(
+        workspace, [signature, fact], deps,
+        owner=None if need is None else need.a1)
     return fact.fid
 
 

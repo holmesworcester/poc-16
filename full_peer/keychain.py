@@ -69,33 +69,40 @@ def is_iroh_peer(peer):
 class Keychain:
     def __init__(self, path, initial_secret=None):
         self.path = path
-        if os.path.exists(path):
+        existing = os.path.exists(path)
+        if existing:
             with open(path) as source:
                 raw = json.load(source)
         else:
             raw = {}
         self.data = None
-        self.commit(self._normalize(raw, initial_secret))
+        self.commit(self._normalize(
+            raw, initial_secret, initialize=not existing))
 
     @staticmethod
     def _public_key(seed_hex):
         return load_sk(seed_hex).verify_key.encode().hex()
 
-    def _normalize(self, raw, initial_secret=None):
+    def _normalize(self, raw, initial_secret=None, *, initialize=False):
         if not isinstance(raw, dict):
             raise ValueError("keyring must be a JSON object")
-        workspaces = raw.get("workspaces", {})
+        if initialize:
+            if raw:
+                raise ValueError("new keyring must start empty")
+            raw = {"keys": {}, "workspaces": {}}
+        elif set(raw) != {"keys", "workspaces"}:
+            raise ValueError("keyring schema")
+        workspaces = raw["workspaces"]
         if not isinstance(workspaces, dict):
             raise ValueError("keyring workspaces must be an object")
-        keys = raw.get("keys", {})
+        keys = raw["keys"]
         if not isinstance(keys, dict):
             raise ValueError("keyring keys must be an object")
         keys = dict(keys)
 
-        legacy_seed = raw.get("sk")
-        if legacy_seed is not None:
-            keys.setdefault(self._public_key(legacy_seed), legacy_seed)
         if not keys:
+            if not initialize:
+                raise ValueError("keyring needs an identity")
             secret = initial_secret
             if isinstance(secret, str):
                 secret = load_sk(secret)
@@ -112,15 +119,15 @@ class Keychain:
         normalized_workspaces = {}
         iroh_count = 0
         for workspace, entry in workspaces.items():
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or set(entry) != {
+                    "identity", "name", "peers"}:
                 raise ValueError(f"workspace {workspace!r} metadata must be an object")
             normalized = dict(entry)
-            normalized.setdefault("identity", default_id)
             if normalized["identity"] not in keys:
                 raise ValueError(
                     f"workspace {workspace!r} names an unknown identity")
             normalized["peers"] = normalize_peers(
-                normalized.get("peers", []))
+                normalized["peers"])
             iroh_count += sum(map(is_iroh_peer, normalized["peers"]))
             normalized_workspaces[workspace] = normalized
         if iroh_count > MAX_IROH_PEERS:
