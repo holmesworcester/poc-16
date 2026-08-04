@@ -6,7 +6,15 @@ Scope packages are deliberately just tables of contents.
 import inspect
 
 from . import auth, content
-from core.suppression import deathkey, is_deletion, scoped_id, suppkeys
+from core.limits import MAX_REMOVAL_UPDATES
+from core.shape import valid_fid
+from core.suppression import (
+    deathkey,
+    is_deletion,
+    scoped_id,
+    suppkeys,
+    suppression_slot,
+)
 from ._policy import validate_fact_policy, validate_family_policy
 
 MODULES = auth.MODULES + content.MODULES
@@ -243,6 +251,58 @@ def semantic_evaluation(judgment, stream):
     except KeyError as error:
         raise ValueError("semantic evaluation receipt") from error
     return receipts, current_stream
+
+
+def control_evaluation(judgment, stream):
+    """Require one evaluated pile to contain only declared control facts.
+
+    This is a classification of the same kernel judgment, not a second
+    validator. Generic signatures qualify only when their exact target in the
+    closure is itself family-declared control material.
+    """
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    current = tuple(valid.fact for valid in valids)
+    if len(current) != len(current_stream) or any(
+            (family := family_for(fact.t)) is None or not family.DURABLE
+            for fact in current):
+        raise ValueError("control pile contains non-durable fact")
+    selected = authority_projection(current_stream)
+    if tuple(fact.fid for fact in selected) != tuple(
+            fact.fid for fact in current):
+        raise ValueError("control pile contains ordinary content")
+    return current
+
+
+def removal_state_groups(judgment, stream):
+    """Derive tiny deterministic ACI updates, one state-affecting fact each."""
+    groups = []
+    for fact in control_evaluation(judgment, stream):
+        rows = {
+            sid: suppression_slot()
+            for sid in current_scopes(fact)
+        }
+        rows.update(
+            (sid, suppression_slot(fact.fid))
+            for sid in action_sids(fact)
+        )
+        if len(rows) > MAX_REMOVAL_UPDATES:
+            raise ValueError("fact exceeds removal-state route budget")
+        if rows:
+            groups.append(tuple(sorted(rows.items())))
+    return tuple(groups)
+
+
+def bootstrap_member(judgment, stream, writer):
+    """Select the one direct member fact naming a bootstrap pile's writer."""
+    if not valid_fid(writer):
+        raise ValueError("bootstrap writer")
+    providers = tuple(
+        fact for fact in control_evaluation(judgment, stream)
+        if ("member", writer, writer) in fact.offers()
+    )
+    if len(providers) != 1:
+        raise ValueError("bootstrap direct member")
+    return providers[0]
 
 
 def authorize_writer_head(
