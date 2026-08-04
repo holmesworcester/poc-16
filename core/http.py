@@ -44,6 +44,8 @@ from .pack_access import (
     decode_pack_open,
     encode_scoped_request,
 )
+from .removal_path import ProofRefreshRequired, RemovalDenied
+from .shape import valid_fid
 from .writer_head import (
     MAX_HEAD_SLOT_BYTES,
     decode_slot,
@@ -63,11 +65,11 @@ class Response:
     headers: dict = field(default_factory=dict)
 
 
-async def _to_thread(function, *args):
+async def _to_thread(function, *args, **kwargs):
     """Load host thread support only when a blocking adapter actually uses it."""
     from asyncio import to_thread
 
-    return await to_thread(function, *args)
+    return await to_thread(function, *args, **kwargs)
 
 
 class AsyncFromSyncReader:
@@ -114,7 +116,9 @@ class HttpGate:
             mirror=None,
             head_advance=None,
             mint_authorize=None,
-            authority_publish=None,
+            path_authorize=None,
+            removal_bootstrap=None,
+            removal_advance=None,
             object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
@@ -137,9 +141,19 @@ class HttpGate:
             raise ValueError("head advancer")
         self.head_advance = head_advance
         self.mint_authorize = mint_authorize
-        if authority_publish is not None and not callable(authority_publish):
-            raise ValueError("authority publisher")
-        self.authority_publish = authority_publish
+        callbacks = (
+            ("path authorizer", path_authorize),
+            ("removal bootstrap", removal_bootstrap),
+            ("removal advancer", removal_advance),
+        )
+        if any(value is not None and not callable(value)
+               for _label, value in callbacks):
+            raise ValueError(next(
+                label for label, value in callbacks
+                if value is not None and not callable(value)))
+        self.path_authorize = path_authorize
+        self.removal_bootstrap = removal_bootstrap
+        self.removal_advance = removal_advance
         if object_open is not None and not callable(object_open):
             raise ValueError("object OPEN issuer")
         if pack_open is not None and not callable(pack_open):
@@ -240,12 +254,21 @@ class HttpGate:
         if self.mint_authorize is not None:
             try:
                 if inspect.iscoroutinefunction(self.mint_authorize):
-                    grant = await self.mint_authorize(pile, "sync")
+                    grant = await self.mint_authorize(
+                        pile, trusted_now, purpose="sync")
                 else:
                     grant = await _to_thread(
-                        self.mint_authorize, pile, "sync")
+                        self.mint_authorize,
+                        pile,
+                        trusted_now,
+                        purpose="sync",
+                    )
                     if inspect.isawaitable(grant):
                         grant = await grant
+            except ProofRefreshRequired:
+                return self._json(409, {"error": "proof_refresh_required"})
+            except RemovalDenied:
+                return Response(403)
             except (PayloadTooLarge, StoreError):
                 return Response(503)
             except Exception:
@@ -265,22 +288,77 @@ class HttpGate:
             return self._json(200, response)
         return Response(503)
 
-    async def _publish_authority(self, body):
-        """Apply one public signed authority closure; semantic checks grant it."""
-        if self.authority_publish is None:
+    async def _removal_path(self, body, trusted_now):
+        """Evaluate historical membership and return only caller points."""
+        if self.path_authorize is None:
             return Response(405)
-        if not isinstance(body, bytes) \
-                or len(body) > MAX_AUTHORITY_PILE_BYTES:
+        if not isinstance(body, bytes) or len(body) > self.max_request_bytes:
             return Response(413)
         try:
-            if inspect.iscoroutinefunction(self.authority_publish):
-                result = await self.authority_publish(body)
+            pile = self._decode_mint(body, self.workspace)
+            if inspect.iscoroutinefunction(self.path_authorize):
+                result = await self.path_authorize(pile, trusted_now)
             else:
-                result = await _to_thread(self.authority_publish, body)
+                result = await _to_thread(
+                    self.path_authorize, pile, trusted_now)
                 if inspect.isawaitable(result):
                     result = await result
-        except Exception:
+        except (PayloadTooLarge, StoreError):
             return Response(503)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return Response(403)
+        if not isinstance(result, bytes) or len(result) > MAX_MINT_REQUEST_BYTES:
+            return Response(403 if result is None else 503)
+        return Response(200, result, {
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        })
+
+    async def _bootstrap_removal(self, body):
+        """Evaluate one original direct-member control closure, then discard."""
+        if self.removal_bootstrap is None:
+            return Response(405)
+        if not isinstance(body, bytes) or len(body) > MAX_AUTHORITY_PILE_BYTES:
+            return Response(413)
+        try:
+            if inspect.iscoroutinefunction(self.removal_bootstrap):
+                result = await self.removal_bootstrap(body)
+            else:
+                result = await _to_thread(self.removal_bootstrap, body)
+                if inspect.isawaitable(result):
+                    result = await result
+        except (PayloadTooLarge, StoreError):
+            return Response(503)
+        except Exception:
+            return Response(403)
+        return self._removal_result(result)
+
+    async def _advance_removal(self, device, encoded_sequence, body):
+        """Poke one already accepted writer leaf; caller supplies no state."""
+        if self.removal_advance is None:
+            return Response(405)
+        if body != b"" or not valid_fid(device) \
+                or not encoded_sequence.isdigit():
+            return Response(400)
+        try:
+            sequence = int(encoded_sequence)
+            if sequence <= 0 or str(sequence) != encoded_sequence:
+                return Response(400)
+            if inspect.iscoroutinefunction(self.removal_advance):
+                result = await self.removal_advance(device, sequence)
+            else:
+                result = await _to_thread(
+                    self.removal_advance, device, sequence)
+                if inspect.isawaitable(result):
+                    result = await result
+        except (PayloadTooLarge, StoreError):
+            return Response(503)
+        except Exception:
+            return Response(403)
+        return self._removal_result(result)
+
+    @staticmethod
+    def _removal_result(result):
         status = getattr(result, "status", None)
         if status == "applied":
             return Response(201)
@@ -292,7 +370,7 @@ class HttpGate:
             return Response(403)
         return Response(503)
 
-    async def _advance_head(self, proposed_head, body):
+    async def _advance_head(self, proposed_head, body, trusted_now):
         """Evaluate one owner proof, then CAS only its bound writer slot."""
         if self.head_advance is None:
             return Response(405)
@@ -302,12 +380,17 @@ class HttpGate:
             return Response(400)
         try:
             if inspect.iscoroutinefunction(self.head_advance):
-                result = await self.head_advance(body, proposed_head)
+                result = await self.head_advance(
+                    body, proposed_head, trusted_now)
             else:
                 result = await _to_thread(
-                    self.head_advance, body, proposed_head)
+                    self.head_advance, body, proposed_head, trusted_now)
                 if inspect.isawaitable(result):
                     result = await result
+        except ProofRefreshRequired:
+            return self._json(409, {"error": "proof_refresh_required"})
+        except RemovalDenied:
+            return Response(403)
         except (PayloadTooLarge, StoreError):
             return Response(503)
         except ValueError:
@@ -597,8 +680,12 @@ class HttpGate:
         path = "/" + path.strip("/")
         if method == "POST" and path == "/mint":
             return MAX_MINT_REQUEST_BYTES
-        if method == "POST" and path == "/authority":
+        if method == "POST" and path == "/removal/path":
+            return MAX_MINT_REQUEST_BYTES
+        if method == "POST" and path == "/removal/bootstrap":
             return MAX_AUTHORITY_PILE_BYTES
+        if method == "POST" and path.startswith("/removal/advance/"):
+            return 0
         if method == "POST" and path.startswith("/head/"):
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/obj":
@@ -630,11 +717,18 @@ class HttpGate:
         trusted_now = self.now()
         if path == "/mint" and method == "POST":
             return await self._mint(body, trusted_now)
-        if path == "/authority" and method == "POST":
-            return await self._publish_authority(body)
+        if path == "/removal/path" and method == "POST":
+            return await self._removal_path(body, trusted_now)
+        if path == "/removal/bootstrap" and method == "POST":
+            return await self._bootstrap_removal(body)
+        if path.startswith("/removal/advance/") and method == "POST":
+            parts = path.strip("/").split("/")
+            if len(parts) != 4:
+                return Response(404)
+            return await self._advance_removal(parts[2], parts[3], body)
         if path.startswith("/head/") and method == "POST":
             return await self._advance_head(
-                path.removeprefix("/head/"), body)
+                path.removeprefix("/head/"), body, trusted_now)
         if path.startswith("/invite/") and method == "GET":
             invite = path.removeprefix("/invite/")
             if not INVITE_RE.fullmatch(invite):

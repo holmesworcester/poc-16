@@ -88,7 +88,7 @@ async def accept_one(store, secret, writer, owner, root, closure):
     update = await log.prepare((closure,))
     await log.establish(update)
 
-    async def authorize(_proof, proposed_head):
+    async def authorize(_proof, proposed_head, _trusted_now):
         return HeadGrant(
             root.fid,
             writer,
@@ -98,7 +98,7 @@ async def accept_one(store, secret, writer, owner, root, closure):
         )
 
     advanced = await OpaqueHeadGate(store, authorize).advance(
-        b"discarded test proof", update.head_oid)
+        b"discarded test proof", update.head_oid, 10)
     assert advanced.status == "applied"
     return update
 

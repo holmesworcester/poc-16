@@ -86,18 +86,18 @@ class PreparedUpdate:
 
 @dataclass(frozen=True, slots=True)
 class HeadGrant:
-    """Typed result of one discarded authority-pile evaluation."""
+    """Typed result of one discarded current-removal evaluation."""
 
     workspace: str
     device: str
     base_head: str | None
     head: str
-    authority_root: str
+    removal_root: str
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
                 self.workspace, self.device,
-                self.head, self.authority_root)) \
+                self.head, self.removal_root)) \
                 or self.base_head is not None \
                 and not valid_fid(self.base_head):
             raise ValueError("head grant")
@@ -473,10 +473,13 @@ class OpaqueHeadGate:
         self.store = async_store(store)
         self.authorize = authorize
 
-    async def advance(self, proof_raw, proposed_head):
+    async def advance(self, proof_raw, proposed_head, trusted_now):
         if not valid_fid(proposed_head):
             raise ValueError("proposed writer head")
-        grant = await _maybe_await(self.authorize(proof_raw, proposed_head))
+        if type(trusted_now) is not int or trusted_now < 0:
+            raise ValueError("trusted head time")
+        grant = await _maybe_await(
+            self.authorize(proof_raw, proposed_head, trusted_now))
         if not isinstance(grant, HeadGrant) or grant.head != proposed_head:
             raise ValueError("authority decision did not bind proposed head")
         if not await self.store.has("obj/" + proposed_head):
@@ -486,7 +489,7 @@ class OpaqueHeadGate:
             grant.workspace,
             grant.device,
             grant.head,
-            grant.authority_root,
+            grant.removal_root,
         )
         raw = encode_slot(slot)
         opened = await self.store.read_versioned(key)
@@ -754,10 +757,10 @@ class RepositoryMirror:
         self.consumer = consumer
 
     async def _binding(
-            self, workspace, device, authority_root, head, *, current=False):
+            self, workspace, device, removal_root, head, *, current=False):
         resolver = self.current_binding_for if current else self.binding_for
         value = resolver(
-            workspace, device, authority_root, head)
+            workspace, device, removal_root, head)
         return await _maybe_await(value)
 
     async def _local_head(self, key, binding, opened=None):
@@ -804,7 +807,7 @@ class RepositoryMirror:
         candidate_raw = await source_fetch(slot.head)
         decoded_candidate = decode_head(candidate_raw)
         binding = await self._binding(
-            workspace, device, slot.authority_root, decoded_candidate,
+            workspace, device, slot.removal_root, decoded_candidate,
             current=True)
         bootstrapping = binding is None
         if bootstrapping:

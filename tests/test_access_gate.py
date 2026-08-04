@@ -87,7 +87,7 @@ def test_two_discarded_phases_mint_and_bind_head_without_mutating_state(tmp_path
         proposed,
         10,
     ))
-    assert (grant.workspace, grant.device, grant.head, grant.authority_root) == (
+    assert (grant.workspace, grant.device, grant.head, grant.removal_root) == (
         root.fid, member, proposed, initial)
     assert run(gate.state.pin()).root_oid == initial
 

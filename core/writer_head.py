@@ -93,12 +93,12 @@ class HeadSlot:
     workspace: str
     device: str
     head: str
-    authority_root: str
+    removal_root: str
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
                 self.workspace, self.device,
-                self.head, self.authority_root)):
+                self.head, self.removal_root)):
             raise ValueError("head slot")
 
 
@@ -283,10 +283,10 @@ def slot_document(slot):
     if not isinstance(slot, HeadSlot):
         raise TypeError("head slot")
     return {
-        "authority_root": slot.authority_root,
         "device": slot.device,
         "format": SLOT_FORMAT,
         "head": slot.head,
+        "removal_root": slot.removal_root,
         "workspace": slot.workspace,
     }
 
@@ -305,12 +305,12 @@ def decode_slot(raw, *, workspace=None, device=None):
     try:
         value = decode_json(raw, MAX_HEAD_SLOT_BYTES, "head slot")
         if not isinstance(value, dict) or set(value) != {
-                "authority_root", "device", "format", "head", "workspace"} \
+                "device", "format", "head", "removal_root", "workspace"} \
                 or value.get("format") != SLOT_FORMAT:
             raise ValueError
         slot = HeadSlot(
             value["workspace"], value["device"],
-            value["head"], value["authority_root"])
+            value["head"], value["removal_root"])
         if encode_slot(slot) != raw \
                 or workspace is not None and slot.workspace != workspace \
                 or device is not None and slot.device != device:
