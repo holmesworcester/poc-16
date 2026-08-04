@@ -8,7 +8,6 @@ from core import fact_index
 from core.fact import CurrentFact, Fact, current_fact, decode, encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
-from core.repository_snapshot import action_bindings
 from core.writer_repository import FactConsumer, RepositoryMirror
 from facts.auth.signature import signature
 from facts.content.message import legacy_message
@@ -37,6 +36,14 @@ def _tables(db):
     }
 
 
+def _action_bindings(facts_by_fid):
+    selected = {}
+    for fact in facts_by_fid.values():
+        for sid in facts.action_sids(fact):
+            selected[sid] = min(selected.get(sid, fact.fid), fact.fid)
+    return selected
+
+
 def _expected_projection(node, workspace):
     """Replay accepted writer trees into an independent in-memory consumer."""
     consumer = FactConsumer(workspace)
@@ -62,7 +69,7 @@ def _expected_projection(node, workspace):
     }
     rows.update(
         (fact_index.ACTION_INDEX, sid, "", fid)
-        for sid, fid in action_bindings(decoded).items()
+        for sid, fid in _action_bindings(decoded).items()
     )
     return {
         fid: sql_store._encode_current(decode(raw))

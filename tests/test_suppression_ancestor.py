@@ -6,9 +6,7 @@ import facts
 from core.crypto import keypair
 from core.fact import Fact, Need
 from core.kernel import drain
-from core.repository_snapshot import compile_snapshot
 from core.suppression import suppkeys
-from core.validated_set import ValidatedView
 from facts import _policy
 
 
@@ -64,7 +62,7 @@ def lower_fid(original, make):
 
 def test_immutable_ref_ancestor_survives_a_lower_equivalent_provider(
         monkeypatch):
-    """A stored leaf re-closes after the provider set grows."""
+    """The authored ancestor selector does not follow provider ordering."""
     policy = _policy.FamilyPolicy(
         suppression=(_policy.Ancestor("parent", "authority"),))
     grand_family = module(
@@ -139,21 +137,14 @@ def test_immutable_ref_ancestor_survives_a_lower_equivalent_provider(
     assert alternate.fid < parent.fid
     assert alternate.offers() == parent.offers()
     grown = (genesis, grandparent, parent, alternate, leaf)
-    assert drain(grown, workspace).ok
-
-    compiled = compile_snapshot(
-        workspace, {fact.fid: fact for fact in grown})
-    objects = dict(compiled.objects)
-    view = ValidatedView(compiled.root, objects.get)
-    closure = view.closure((leaf.fid,))
-
-    assert tuple(fact.fid for fact in closure) == (
-        grandparent.fid,
-        parent.fid,
-        leaf.fid,
-    )
-    assert alternate.fid not in {fact.fid for fact in closure}
-    assert drain(closure, workspace).ok
+    judgment = drain(grown, workspace)
+    assert judgment.ok
+    leaf_valid = next(
+        valid for valid in judgment.valids if valid.fact.fid == leaf.fid)
+    assert ("parent", parent.fid) in leaf_valid.edges
+    assert ("authority", grandparent.fid) in next(
+        valid for valid in judgment.valids
+        if valid.fact.fid == parent.fid).edges
     assert suppkeys(leaf) == {f"fact:{grandparent.fid}"}
 
 
@@ -207,18 +198,11 @@ def test_parent_selector_pins_an_exact_need_during_reconstruction(
     )
     grown = (genesis, original, alternate, leaf)
     assert alternate.fid < original.fid
-    assert drain(grown, genesis.fid).ok
-
-    compiled = compile_snapshot(
-        genesis.fid, {fact.fid: fact for fact in grown})
-    view = ValidatedView(compiled.root, dict(compiled.objects).get)
-    closure = view.closure((leaf.fid,))
-
-    assert tuple(fact.fid for fact in closure) == (
-        original.fid,
-        leaf.fid,
-    )
-    assert drain(closure, genesis.fid).ok
+    judgment = drain(grown, genesis.fid)
+    assert judgment.ok
+    leaf_valid = next(
+        valid for valid in judgment.valids if valid.fact.fid == leaf.fid)
+    assert leaf_valid.edges == (("parent", original.fid),)
 
 
 def test_ancestor_declaration_cannot_claim_an_interchangeable_need(
