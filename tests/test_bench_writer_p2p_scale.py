@@ -33,13 +33,13 @@ def test_required_writer_scales_ratchet_bundled_head_costs():
     expected = {
         100: (
             (100, 0, 0, 1, 1, 0, 67_825),
-            (100, 2, 1, 4, 4, 0, 73_052),
-            (101, 4, 1, 4, 4, 0, 73_626),
+            (100, 2, 1, 4, 4, 0, 72_980),
+            (101, 4, 1, 4, 4, 0, 73_554),
         ),
         1_000: (
             (1_000, 0, 0, 4, 4, 0, 678_499),
-            (1_000, 2, 1, 7, 7, 0, 683_731),
-            (1_001, 4, 1, 7, 7, 0, 684_305),
+            (1_000, 2, 1, 7, 7, 0, 683_659),
+            (1_001, 4, 1, 7, 7, 0, 684_233),
         ),
     }
     for writers, results in measured.items():
@@ -132,7 +132,7 @@ def test_small_directory_change_and_new_writer_accounting():
         changed.response_bytes,
         new_writer.request_bytes,
         new_writer.response_bytes,
-    ) == (0, 2_895, 0, 8_117, 0, 8_848)
+    ) == (0, 2_895, 0, 8_045, 0, 8_776)
 
 
 def test_exact_durable_fact_catchup_accounting():
@@ -148,7 +148,7 @@ def test_exact_durable_fact_catchup_accounting():
     assert (
         result.request_bytes,
         result.response_bytes,
-    ) == (0, 186_365)
+    ) == (0, 183_989)
     assert result.messages_per_pile == 1
     assert result.scenario == "large-catchup-normal"
     assert result.request_breakdown == (

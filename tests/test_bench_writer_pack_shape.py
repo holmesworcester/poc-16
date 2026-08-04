@@ -77,7 +77,7 @@ def test_real_signed_pile_distillation_counts_page_then_payloads():
         loose.pile_p95_bytes,
         loose.pile_max_bytes,
         loose.max_writer_bytes,
-    ) == (45, 176_261, 2_886, 4_277, 4_278, 4_278, 47_048)
+    ) == (45, 173_885, 2_886, 4_205, 4_206, 4_206, 46_256)
     assert (
         loose.sealed_packs,
         loose.tail_piles,
