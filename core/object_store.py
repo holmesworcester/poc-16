@@ -11,6 +11,11 @@ The protocol uses these namespaces:
 ``authority``
     The linearizable shared authority/removal projection.
 
+``removal``, ``removal-node/<sha256>``
+    One private suppression-root CAS cell and its immutable proof nodes.
+    These names are available only to the authority engine; they are never
+    mapped into generic object, pack, grant, or public LIST routes.
+
 ``cursor``
     A generic operational CAS cell used only by isolated subsystems such as
     notification delivery. It is never workspace fact authority.
@@ -44,9 +49,12 @@ from .limits import (
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
 AUTHORITY_ROOT_KEY = "authority"
+REMOVAL_ROOT_KEY = "removal"
+REMOVAL_NODE_PREFIX = "removal-node/"
 OPERATIONAL_CURSOR_KEY = "cursor"
 SINGLETON_CAS_KEYS = frozenset((
     AUTHORITY_ROOT_KEY,
+    REMOVAL_ROOT_KEY,
     OPERATIONAL_CURSOR_KEY,
 ))
 
@@ -59,6 +67,7 @@ MAX_INVITE_ID_BYTES = 256
 MAX_LOGICAL_KEY_BYTES = max(
     len(OPERATIONAL_CURSOR_KEY),
     len("obj/") + 64,
+    len(REMOVAL_NODE_PREFIX) + 64,
     len("heads/") + 64 + 1 + 64,
     len("invite/") + MAX_INVITE_ID_BYTES,
 )
@@ -94,6 +103,7 @@ def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key in SINGLETON_CAS_KEYS \
         or key.startswith("cursor/") or key.startswith("authority/") \
+        or key.startswith(REMOVAL_NODE_PREFIX) \
         or key == "obj" or key.startswith("obj/") \
         or key == "heads" or key.startswith("heads/") \
         or key == "layouts" or key.startswith("layouts/") \
@@ -134,7 +144,7 @@ def validate_create(key, value):
             or key == "authority" or key.startswith("authority/") \
             or key == "heads" or key.startswith("heads/"):
         raise ValueError("mutable authority requires compare-and-swap")
-    for prefix in ("obj/", "pack/"):
+    for prefix in ("obj/", "pack/", REMOVAL_NODE_PREFIX):
         if key == prefix[:-1] or key.startswith(prefix) and (
                 len(key) != len(prefix) + 64
                 or key[len(prefix):] != h(value)):

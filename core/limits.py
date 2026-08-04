@@ -42,6 +42,15 @@ MAX_PAGE_BATCH_BYTES = 4 * MIB
 MAX_MERKLE_PAGE_BYTES = 48 * 1024
 MAX_MERKLE_PAGE_DEPTH = 512
 
+# Private suppression/removal proof geometry. Logical keys are SHA-256
+# digests, so a compressed binary Patricia path has at most one branch for
+# each digest bit. Proofs carry only one target value and opaque sibling
+# commitments; they never carry a dense leaf or neighboring logical keys.
+MAX_REMOVAL_PROOF_STEPS = 256
+MAX_REMOVAL_NODE_BYTES = 1024
+MAX_REMOVAL_ROOT_BYTES = 1024
+MAX_REMOVAL_PROOF_BYTES = 32 * 1024
+
 MAX_INVITE_BYTES = MAX_PAGE_BATCH_BYTES
 # Facts and authenticated-map pages use the ordinary buffered object path.
 # Large signed piles share the ``obj/`` address space but require the direct
@@ -65,6 +74,8 @@ MAX_REGISTERED_FACT_ROUTES = 17
 MAX_REGISTERED_FACT_ROWS = 11
 MAX_REGISTERED_SUPPRESSION_ROUTES = 5
 MAX_RESOLVED_EDGES = 64
+MAX_REMOVAL_UPDATES = (
+    MAX_PILE_FACTS * MAX_REGISTERED_SUPPRESSION_ROUTES)
 
 # A 512-page adversarial path is accepted; a deeper canonical map is outside
 # the protocol even though a 384-byte key could theoretically select more
@@ -157,6 +168,8 @@ MAX_HOSTED_SUBREQUESTS = 10_000_000
 # atoms cannot escape as retryable program failures or unbounded index rows.
 MAX_ATOM_NAME_BYTES = 128
 MAX_ATOM_VALUE_BYTES = 384
+MAX_SUPPRESSION_ID_BYTES = (
+    MAX_ATOM_NAME_BYTES + 1 + MAX_ATOM_VALUE_BYTES)
 
 
 class PayloadTooLarge(ValueError):
