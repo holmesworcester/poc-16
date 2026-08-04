@@ -87,7 +87,6 @@ Resources:
                 Condition:
                   StringLike:
                     s3:prefix:
-                      - !Sub "${StorePrefix}/authority"
                       - !Sub "${StorePrefix}/removal"
                       - !Sub "${StorePrefix}/removal-node/*"
                       - !Sub "${StorePrefix}/obj/*"
@@ -95,18 +94,22 @@ Resources:
                       - !Sub "${StorePrefix}/heads/${WorkspaceId}/*"
                   NumericLessThanEquals:
                     s3:max-keys: !Ref HeadPageKeys
-              - Sid: ReadAuthorityAndWriterHeads
+              - Sid: ReadPrivateRemovalState
                 Effect: Allow
                 Action: s3:GetObject
                 Resource:
                   - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
-                  - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+              - Sid: ReadWriterHeads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/heads/${Workspace}/*"
                     - Bucket: !Ref BucketName
@@ -122,10 +125,6 @@ Resources:
                       Prefix: !Ref StorePrefix
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
               - Sid: ReadImmutablePacksByScopedRequest
@@ -149,10 +148,16 @@ Resources:
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+              - Sid: CreatePrivateRemovalNodes
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
                 Condition:
                   Null:
                     s3:if-none-match: "false"
@@ -171,14 +176,10 @@ Resources:
                   StringEquals:
                     s3:authType: REST-QUERY-STRING
                     s3:signatureversion: AWS4-HMAC-SHA256
-              - Sid: AdvanceAuthorityAndOwnerHeads
+              - Sid: AdvanceRemovalAndOwnerHeads
                 Effect: Allow
                 Action: s3:PutObject
                 Resource:
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
                     - Bucket: !Ref BucketName
@@ -252,8 +253,6 @@ Resources:
           TINYP2P_MAX_OBJECT_BYTES: "4194304"
           TINYP2P_MAX_BATCH_COUNT: "256"
           TINYP2P_MAX_BATCH_BYTES: "4194304"
-          TINYP2P_MINT_MAX_FETCHES: "128"
-          TINYP2P_MINT_MAX_FETCH_BYTES: "4194304"
           TINYP2P_GRANT_TTL: "60000"
           TINYP2P_PACK_TTL_SECONDS: "60"
       FunctionUrlConfig:

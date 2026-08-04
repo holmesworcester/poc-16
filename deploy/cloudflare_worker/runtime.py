@@ -7,11 +7,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from adapters.r2.worker import R2BindingStore
 from core import peer_capability
-from core.authority import AuthorityRepository
+from core.access import AccessGate
 from core.crypto import load_sk, sign, verify
 from core.limits import (
-    MAX_MINT_FETCHES as CORE_MAX_MINT_FETCHES,
-    MAX_MINT_FETCH_BYTES as CORE_MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES as CORE_MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
@@ -37,9 +35,6 @@ MAX_REQUEST_BYTES = min(512 * 1024, MAX_MINT_REQUEST_BYTES)
 MAX_OBJECT_BYTES = CORE_MAX_OBJECT_BYTES
 MAX_BATCH_COUNT = min(48, PAGE_BATCH)
 MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
-MAX_MINT_FETCHES = min(48, CORE_MAX_MINT_FETCHES)
-MAX_MINT_FETCH_BYTES = min(
-    MAX_MINT_FETCHES * 8 * 1024, CORE_MAX_MINT_FETCH_BYTES)
 MAX_QUERY_BYTES = 4 * 1024
 MAX_QUERY_FIELDS = 8
 MAX_GRANT_TTL_MS = 60_000
@@ -50,8 +45,6 @@ _BUDGETS = {
     "MAX_OBJECT_BYTES": MAX_OBJECT_BYTES,
     "MAX_BATCH_COUNT": MAX_BATCH_COUNT,
     "MAX_BATCH_BYTES": MAX_BATCH_BYTES,
-    "MAX_MINT_FETCHES": MAX_MINT_FETCHES,
-    "MAX_MINT_FETCH_BYTES": MAX_MINT_FETCH_BYTES,
     "MAX_QUERY_BYTES": MAX_QUERY_BYTES,
     "MAX_QUERY_FIELDS": MAX_QUERY_FIELDS,
     "GRANT_TTL_MS": MAX_GRANT_TTL_MS,
@@ -133,8 +126,6 @@ class Settings:
     max_object_bytes: int
     max_batch_count: int
     max_batch_bytes: int
-    max_mint_fetches: int
-    max_mint_fetch_bytes: int
     max_query_bytes: int
     max_query_fields: int
     grant_ttl_ms: int
@@ -208,28 +199,18 @@ def gateway(settings, clock=None):
     clock = now_ms if clock is None else clock
     issuer = settings.issue_packs(clock)
     store = R2BindingStore(settings.bucket, settings.prefix)
-    authority = AuthorityRepository(settings.workspace, store)
-
-    async def authorize_head(proof, proposed):
-        return await authority.authorize_head(
-            proof, proposed, clock(),
-            max_unique_fetches=settings.max_mint_fetches,
-            max_fetch_bytes=settings.max_mint_fetch_bytes)
-
-    async def authorize_access(proof, purpose):
-        return await authority.authorize_access(
-            proof, clock(), purpose=purpose,
-            max_unique_fetches=settings.max_mint_fetches,
-            max_fetch_bytes=settings.max_mint_fetch_bytes)
+    gate = AccessGate(settings.workspace, store)
 
     return HttpGate(
         store,
         settings.workspace,
         settings.secret,
         clock,
-        authority_publish=authority.publish,
-        head_advance=OpaqueHeadGate(store, authorize_head).advance,
-        mint_authorize=authorize_access,
+        head_advance=OpaqueHeadGate(store, gate.authorize_head).advance,
+        mint_authorize=gate.authorize_access,
+        path_authorize=gate.removal_path,
+        removal_bootstrap=gate.state.bootstrap,
+        removal_advance=gate.state.advance_leaf,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,
         sync_profile=peer_capability.OWNER,
@@ -237,8 +218,6 @@ def gateway(settings, clock=None):
         max_object_bytes=settings.max_object_bytes,
         max_batch_count=settings.max_batch_count,
         max_batch_bytes=settings.max_batch_bytes,
-        max_mint_fetches=settings.max_mint_fetches,
-        max_mint_fetch_bytes=settings.max_mint_fetch_bytes,
         grant_ttl_ms=settings.grant_ttl_ms,
         seal=seal_to,
     )

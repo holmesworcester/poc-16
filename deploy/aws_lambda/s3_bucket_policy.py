@@ -51,7 +51,6 @@ def policy(
         principal = "*"
         lifecycle_sid = "DenyLifecycleMutation"
     bucket_arn = f"arn:{partition}:s3:::{bucket}"
-    authority = f"{bucket_arn}/{prefix}/authority"
     removal = f"{bucket_arn}/{prefix}/removal"
     removal_nodes = f"{bucket_arn}/{prefix}/removal-node/*"
     heads = f"{bucket_arn}/{prefix}/heads/*"
@@ -66,7 +65,7 @@ def policy(
                 "Principal": principal,
                 "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
                 "Resource": [
-                    authority, removal, heads, objects, removal_nodes],
+                    removal, heads, objects, removal_nodes],
             },
             {
                 "Sid": "DenyAuthoritativeMetadataMutation",
@@ -84,7 +83,7 @@ def policy(
                     "s3:UpdateObjectEncryption",
                 ],
                 "Resource": [
-                    authority, removal, heads, objects, removal_nodes],
+                    removal, heads, objects, removal_nodes],
             },
             {
                 "Sid": lifecycle_sid,
@@ -106,7 +105,7 @@ def policy(
                 "Effect": "Deny",
                 "Principal": principal,
                 "Action": "s3:PutObject",
-                "Resource": [authority, removal, heads],
+                "Resource": [removal, heads],
                 "Condition": {
                     "Null": {
                         "s3:if-match": "true",

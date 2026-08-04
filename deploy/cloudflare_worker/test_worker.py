@@ -16,6 +16,7 @@ import pytest
 import facts
 
 from core import limits, peer_capability
+from core.access import AccessGate
 from core.object_store import MAX_STORE_PREFIX_BYTES
 from core.crypto import (
     h,
@@ -34,15 +35,20 @@ from core.pack_access import (
     encode_object_open,
     encode_pack_open,
 )
+from core.suppression_tree import decode_root
 from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
-from facts.auth import request as request_fact
-from tests.test_authority_repository import (
-    authority_world,
-    head_proof,
+from facts.auth.removal import removal
+from facts.auth.removal_path_request import removal_path_request
+from facts.auth.signature import signature
+from tests.test_access_gate import (
+    access_proof,
+    head_proof as current_head_proof,
+    path_proof,
     signed,
 )
+from tests.test_removal_state import accept_one, world as removal_world
 
 TEST_PACK_TTL_SECONDS = 30
 
@@ -53,6 +59,7 @@ class R2Object:
         self.size = len(value)
         self.key = key
         self.etag = etag or "opaque-" + h(value)
+        self.body = Stream([value])
 
     async def arrayBuffer(self):
         return self.value
@@ -247,8 +254,14 @@ def worker_world(tmp_path, monkeypatch):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = node.sender(workspace).pack(request_fact.payload(
-        node, workspace, "sync", now + runtime.MAX_GRANT_TTL_MS, now))
+    root = node.fact_of(workspace, workspace)
+    secret, member = node.identity(workspace)
+    gate = AccessGate(workspace, node.store(workspace))
+    assert run(gate.state.bootstrap(
+        signed(secret, member, root, (root,)))).status in {"applied", "noop"}
+    path = run(gate.removal_path(
+        path_proof(secret, member, root, (root,)), now))
+    pile = access_proof(secret, member, root, (root,), path)
     prefix = f"workspaces/{workspace}"
     store = node.store(workspace)
     bucket = Bucket({
@@ -260,41 +273,143 @@ def worker_world(tmp_path, monkeypatch):
     return node, workspace, pile, bucket, environment
 
 
-def test_runtime_bootstraps_authority_then_advances_one_owner_head():
-    world = authority_world()
-    prefix = f"workspaces/{world.root.fid}"
+def proof_body(workspace, pile):
+    return json.dumps({
+        "pile": base64.b64encode(pile).decode(),
+        "ws": workspace,
+    }).encode()
+
+
+def test_runtime_runs_confined_removal_gate_then_advances_one_owner_head():
+    value = removal_world()
+    prefix = f"workspaces/{value.root.fid}"
     bucket = Bucket({})
-    environment = worker_environment(bucket, world.root.fid, prefix)
-    authority = signed(
-        world.member_secret,
-        world.member,
-        world.root,
-        world.membership,
+    environment = worker_environment(bucket, value.root.fid, prefix)
+    bootstrap = signed(
+        value.member_secret,
+        value.member,
+        value.root,
+        value.membership,
     )
     published = run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/authority?ws={world.root.fid}",
-        authority,
+        f"https://worker.example/removal/bootstrap?ws={value.root.fid}",
+        bootstrap,
     ), environment, clock=lambda: 10))
     assert published.status == 201
+    historical = path_proof(
+        value.member_secret, value.member,
+        value.root, value.membership)
+    path_response = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/path?ws={value.root.fid}",
+        proof_body(value.root.fid, historical),
+    ), environment, clock=lambda: 10))
+    assert path_response.status == 200
+    path = path_response.body
+
+    current = access_proof(
+        value.member_secret, value.member,
+        value.root, value.membership, path)
+    minted = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={value.root.fid}",
+        proof_body(value.root.fid, current),
+    ), environment, clock=lambda: 10))
+    assert minted.status == 200
+    token = native_unseal(
+        value.member_secret,
+        base64.b64decode(json.loads(minted.body)["grant"]),
+    ).decode()
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/authority?ws={value.root.fid}",
+        bootstrap,
+        {"Authorization": "Bearer " + token},
+    ), environment, clock=lambda: 10)).status == 404
 
     proposed = h(b"cloudflare opaque writer head")
     bucket.data[f"{prefix}/obj/{proposed}"] = (
         b"cloudflare opaque writer head")
     advanced = run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/head/{proposed}?ws={world.root.fid}",
-        head_proof(world, proposed),
+        f"https://worker.example/head/{proposed}?ws={value.root.fid}",
+        current_head_proof(
+            value.member_secret, value.member,
+            value.root, value.membership, path, proposed),
     ), environment, clock=lambda: 10))
     assert advanced.status == 201
-    slot_key = f"{prefix}/heads/{world.root.fid}/{world.member}"
+    slot_key = f"{prefix}/heads/{value.root.fid}/{value.member}"
     assert bucket.data[slot_key]
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/head/{h(b'wrong')}?ws={world.root.fid}",
-        head_proof(world, proposed),
+        f"https://worker.example/head/{h(b'wrong')}?ws={value.root.fid}",
+        current_head_proof(
+            value.member_secret, value.member,
+            value.root, value.membership, path, proposed),
     ), environment, clock=lambda: 10)).status == 403
     assert len([key for key in bucket.data if "/heads/" in key]) == 1
+
+    private_node = decode_root(
+        bucket.data[f"{prefix}/removal"], value.root.fid).root
+    assert run(runtime.handle(Request(
+        "GET",
+        f"https://worker.example/obj/{private_node}?ws={value.root.fid}",
+        headers={"Authorization": "Bearer " + token},
+    ), environment, clock=lambda: 10)).status == 404
+
+    other = h(b"other member")
+    relabeled = removal_path_request(
+        value.root.fid, value.member, other, 1_000, 7)
+    relabeled_sig = signature(
+        value.member_secret, value.member, relabeled, 7)
+    forged = signed(
+        value.member_secret,
+        value.member,
+        value.root,
+        (*value.membership, relabeled_sig, relabeled),
+    )
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/path?ws={value.root.fid}",
+        proof_body(value.root.fid, forged),
+    ), environment, clock=lambda: 10)).status == 403
+
+    evicted = removal(
+        value.root.fid, value.founder, value.member, 8)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 8)
+    run(accept_one(
+        runtime.R2BindingStore(bucket, prefix),
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*value.membership, evicted_sig, evicted),
+    ))
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/advance/"
+        f"{value.founder}/1?ws={value.root.fid}",
+    ), environment, clock=lambda: 10)).status == 201
+    stale = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={value.root.fid}",
+        proof_body(value.root.fid, current),
+    ), environment, clock=lambda: 10))
+    assert stale.status == 409
+    assert json.loads(stale.body) == {"error": "proof_refresh_required"}
+    refreshed = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/path?ws={value.root.fid}",
+        proof_body(value.root.fid, historical),
+    ), environment, clock=lambda: 10))
+    assert refreshed.status == 200
+    denied = access_proof(
+        value.member_secret, value.member,
+        value.root, value.membership, refreshed.body)
+    assert run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={value.root.fid}",
+        proof_body(value.root.fid, denied),
+    ), environment, clock=lambda: 10)).status == 403
 
 
 def test_runtime_mints_and_reads_the_writer_directory_from_r2(
@@ -633,16 +748,16 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
             raise AssertionError("oversized R2 body was allocated")
 
     class OversizedBucket:
-        def __init__(self, healthy_authority=None):
-            self.healthy_authority = healthy_authority
+        def __init__(self, healthy_removal=None):
+            self.healthy_removal = healthy_removal
             self.objects = []
 
         async def get(self, key):
-            if self.healthy_authority is not None \
-                    and key.endswith("/authority"):
-                return R2Object(self.healthy_authority)
+            if self.healthy_removal is not None \
+                    and key.endswith("/removal"):
+                return R2Object(self.healthy_removal)
             limit = limits.MAX_ROOT_BYTES \
-                if key.endswith("/authority") \
+                if key.endswith("/removal") \
                 else runtime.MAX_OBJECT_BYTES
             obj = OversizedObject(limit + 1)
             self.objects.append(obj)
@@ -669,37 +784,24 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
     assert len(oversized.objects) == len(results)
     assert all(obj.array_calls == 0 for obj in oversized.objects)
 
+    oversized_root = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={workspace}",
+        mint_body,
+    ), environment))
+    assert oversized_root.status == 503
+    assert len(oversized.objects) == len(results) + 1
+    assert all(obj.array_calls == 0 for obj in oversized.objects)
+
     prefix = environment.STORE_PREFIX
-    selective = OversizedBucket(healthy.data[f"{prefix}/authority"])
+    selective = OversizedBucket(healthy.data[f"{prefix}/removal"])
     environment.BUCKET = selective
-    mint_oversize = run(runtime.handle(Request(
+    self_contained = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={workspace}",
         mint_body,
     ), environment))
 
-    assert mint_oversize.status == 503
-    assert selective.objects
-    assert all(obj.array_calls == 0 for obj in selective.objects)
-
-
-def test_runtime_applies_mint_fetch_byte_budget_at_the_binding(
-        tmp_path, monkeypatch):
-    _, workspace, pile, _, environment = worker_world(tmp_path, monkeypatch)
-    environment.MAX_MINT_FETCH_BYTES = 1
-    body = json.dumps({
-        "pile": base64.b64encode(pile).decode(),
-        "ws": workspace,
-    }).encode()
-
-    denied = run(runtime.handle(Request(
-        "POST", f"https://worker.example/mint?ws={workspace}", body),
-        environment))
-    malformed = run(runtime.handle(Request(
-        "POST", f"https://worker.example/mint?ws={workspace}", b"{"),
-        environment))
-
-    assert denied.status == 403
-    assert malformed.status == 400
+    assert self_contained.status == 200
+    assert selective.objects == []
 
 
 def test_runtime_streams_request_body_only_to_its_hard_limit(
@@ -837,8 +939,10 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     manage.stage()
 
     staged = build / "worker"
-    assert (staged / "core" / "repository_reader.py").read_bytes() == (
-        manage.REPOSITORY / "core" / "repository_reader.py").read_bytes()
+    assert (staged / "core" / "access.py").read_bytes() == (
+        manage.REPOSITORY / "core" / "access.py").read_bytes()
+    assert (staged / "core" / "removal_state.py").read_bytes() == (
+        manage.REPOSITORY / "core" / "removal_state.py").read_bytes()
     assert {
         path.name for path in (staged / "core").glob("*.py")
     } == set(HOSTED_GATE_CORE_MODULES)
@@ -858,6 +962,9 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
     assert not (staged / "core" / "store.py").exists()
     assert not (staged / "core" / "node.py").exists()
     assert not (staged / "core" / "mint.py").exists()
+    assert not (staged / "core" / "authority.py").exists()
+    assert not (staged / "core" / "repository_applier.py").exists()
+    assert not (staged / "core" / "repository_reader.py").exists()
     assert not (staged / "adapters" / "r2" / "s3.py").exists()
     assert not (staged / "adapters" / "s3").exists()
     assert not (staged / "deploy" / "aws_lambda").exists()
@@ -992,8 +1099,6 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         > runtime.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES == limits.MAX_PAGE_BATCH_BYTES
-    assert runtime.MAX_MINT_FETCHES <= limits.MAX_MINT_FETCHES
-    assert runtime.MAX_MINT_FETCH_BYTES <= limits.MAX_MINT_FETCH_BYTES
 
 
 @pytest.mark.parametrize("field,value", [

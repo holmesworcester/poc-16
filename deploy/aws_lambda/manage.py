@@ -339,7 +339,7 @@ def test(_args):
         "python3", "-m", "pytest", "-q",
         "tests/test_aws_pack_issuer.py",
         "tests/test_lambda_deploy.py",
-        "tests/test_authority_http.py",
+        "tests/test_removal_http.py",
         "tests/test_s3_adapter.py",
         "tests/test_writer_repository.py",
     ])

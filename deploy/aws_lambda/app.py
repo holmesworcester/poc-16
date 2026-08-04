@@ -9,9 +9,8 @@ from urllib.parse import parse_qs
 
 from adapters.s3 import S3Config, S3Store
 from core import peer_capability
-from core.authority import AuthorityRepository
+from core.access import AccessGate
 from core.limits import (
-    MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -134,9 +133,9 @@ def _store(config=None):
     config = _s3_config() if config is None else config
     if not isinstance(config, S3Config):
         raise TypeError("Lambda S3 config")
-    # HttpGate receives only the narrowed reader wrapper. Direct object reads
-    # and pack transfer are exposed separately as exact presigned requests,
-    # never as this store's general mutation methods.
+    # The gate receives one awaited bucket contract for private removal state
+    # and writer heads. Public object and pack bytes still bypass Lambda only
+    # through exact presigned requests, never a general mutation route.
     return AsyncFromSyncReader(S3Store(config))
 
 
@@ -155,33 +154,18 @@ def _gateway():
         store = _store(config)
         workspace = _required("TINYP2P_WORKSPACE_ID")
         clock = lambda: int(time.time() * 1000)
-        authority = AuthorityRepository(workspace, store)
-        mint_fetches = _positive(
-            "TINYP2P_MINT_MAX_FETCHES", 128)
-        mint_fetch_bytes = _positive(
-            "TINYP2P_MINT_MAX_FETCH_BYTES", MAX_MINT_FETCH_BYTES)
-
-        async def authorize_head(proof, proposed):
-            return await authority.authorize_head(
-                proof, proposed, clock(),
-                max_unique_fetches=mint_fetches,
-                max_fetch_bytes=mint_fetch_bytes)
-
-        async def authorize_access(proof, purpose):
-            return await authority.authorize_access(
-                proof, clock(), purpose=purpose,
-                max_unique_fetches=mint_fetches,
-                max_fetch_bytes=mint_fetch_bytes)
-
+        gate = AccessGate(workspace, store)
         _gateway_cache = HttpGate(
             store,
             workspace,
             _secret(),
             clock,
-            authority_publish=authority.publish,
             head_advance=OpaqueHeadGate(
-                store, authorize_head).advance,
-            mint_authorize=authorize_access,
+                store, gate.authorize_head).advance,
+            mint_authorize=gate.authorize_access,
+            path_authorize=gate.removal_path,
+            removal_bootstrap=gate.state.bootstrap,
+            removal_advance=gate.state.advance_leaf,
             object_open=issuer.open_object,
             pack_open=issuer.open_pack,
             sync_profile=peer_capability.OWNER,
@@ -193,8 +177,6 @@ def _gateway():
                 "TINYP2P_MAX_BATCH_COUNT", 256),
             max_batch_bytes=_positive(
                 "TINYP2P_MAX_BATCH_BYTES", MAX_PAGE_BATCH_BYTES),
-            max_mint_fetches=mint_fetches,
-            max_mint_fetch_bytes=mint_fetch_bytes,
             grant_ttl_ms=_positive(
                 "TINYP2P_GRANT_TTL", 60_000),
         )

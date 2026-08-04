@@ -269,10 +269,11 @@ def _verify_bundle(directory):
         "entry.py",
         "runtime.py",
         "crypto_compat.py",
-        "core/validated_set.py",
-        "core/repository_reader.py",
-        "core/authority.py",
-        "core/repository_applier.py",
+        "core/access.py",
+        "core/kernel.py",
+        "core/removal_path.py",
+        "core/removal_state.py",
+        "core/suppression_tree.py",
         "core/writer_repository.py",
         "core/worker.py",
         "facts/auth/request.py",
@@ -288,6 +289,9 @@ def _verify_bundle(directory):
     if missing:
         raise RuntimeError(f"dry-run omitted modules: {sorted(missing)}")
     forbidden = {
+        "core/authority.py",
+        "core/repository_reader.py",
+        "core/repository_applier.py",
         "core/store.py",
         "full_peer/node.py",
         "full_peer/daemon.py",
