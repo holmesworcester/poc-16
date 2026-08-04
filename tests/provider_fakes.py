@@ -72,6 +72,8 @@ class FakeS3Bucket:
         self.body_factory = None
         self.insert_after_page = None
         self.put_faults = []
+        self.multipart = {}
+        self.next_upload = 0
 
     def client(self, actor):
         return FakeS3Client(self, actor)
@@ -107,13 +109,22 @@ class FakeS3Client:
                 raise ProviderError(status, code)
             value = self.bucket.data[key]
             token = self.bucket.tokens[key]
+            if request.get("IfNoneMatch") == token:
+                raise ProviderError(304, "NotModified")
+            selected = value
+            byte_range = request.get("Range")
+            if byte_range is not None:
+                if not byte_range.startswith("bytes=-"):
+                    raise ProviderError(416, "InvalidRange")
+                selected = value[-int(byte_range.removeprefix("bytes=-")):]
             factory = self.bucket.body_factory
-            body = factory(value) if factory is not None else AtomicBody(value)
+            body = factory(selected) if factory is not None \
+                else AtomicBody(selected)
             self.bucket._record(
-                self.actor, "get", key, (value, token))
+                self.actor, "get", key, (selected, token))
             return {
                 "Body": body,
-                "ContentLength": len(value),
+                "ContentLength": len(selected),
                 "ETag": token,
             }
 
@@ -180,6 +191,61 @@ class FakeS3Client:
             self.bucket.data.pop(key, None)
             self.bucket.tokens.pop(key, None)
             self.bucket._record(self.actor, "delete", key, None)
+
+    def create_multipart_upload(self, **request):
+        key = request["Key"]
+        with self.bucket.lock:
+            self.bucket.next_upload += 1
+            upload = f"upload-{self.bucket.next_upload}"
+            self.bucket.multipart[upload] = [key, {}]
+            self.bucket._record(self.actor, "multipart-create", key, upload)
+            return {"UploadId": upload}
+
+    def upload_part_copy(self, **request):
+        with self.bucket.lock:
+            upload = self.bucket.multipart[request["UploadId"]]
+            source = request["CopySource"]["Key"]
+            value = self.bucket.data[source]
+            selected = value
+            byte_range = request.get("CopySourceRange")
+            if byte_range is not None:
+                start, stop = map(
+                    int, byte_range.removeprefix("bytes=").split("-"))
+                selected = value[start:stop + 1]
+            part = request["PartNumber"]
+            upload[1][part] = selected
+            etag = self.bucket._etag(selected)
+            self.bucket._record(
+                self.actor, "part-copy", upload[0], len(selected))
+            return {"CopyPartResult": {"ETag": etag}}
+
+    def upload_part(self, **request):
+        value = bytes(request["Body"])
+        with self.bucket.lock:
+            upload = self.bucket.multipart[request["UploadId"]]
+            part = request["PartNumber"]
+            upload[1][part] = value
+            etag = self.bucket._etag(value)
+            self.bucket._record(self.actor, "part-upload", upload[0], len(value))
+            return {"ETag": etag}
+
+    def complete_multipart_upload(self, **request):
+        with self.bucket.lock:
+            key, parts = self.bucket.multipart.pop(request["UploadId"])
+            declared = [item["PartNumber"]
+                        for item in request["MultipartUpload"]["Parts"]]
+            value = b"".join(parts[number] for number in declared)
+            token = self.bucket._etag(value)
+            self.bucket.data[key] = value
+            self.bucket.tokens[key] = token
+            self.bucket._record(self.actor, "multipart-complete", key, token)
+            return {"ETag": token}
+
+    def abort_multipart_upload(self, **request):
+        with self.bucket.lock:
+            upload = self.bucket.multipart.pop(request["UploadId"], None)
+            key = request["Key"] if upload is None else upload[0]
+            self.bucket._record(self.actor, "multipart-abort", key, None)
 
 
 @dataclass

@@ -79,6 +79,27 @@ def ingest(state, run: Run) -> None:
         state.treap = staged_treap
 
 
+def ingest_batch(state, runs) -> None:
+    """Atomically verify and file one adjacency-bound publication."""
+    runs = tuple(runs)
+    if not isinstance(state, PeerState) or not runs:
+        raise ValueError("writer run batch")
+    with state.lock:
+        staged = PeerState()
+        staged.logs = dict(state.logs)
+        staged.heads = dict(state.heads)
+        staged.forks = list(state.forks)
+        staged.session_cache = dict(state.session_cache)
+        staged.treap = state.treap
+        staged.coverage = getattr(state, "coverage", None)
+        for run in runs:
+            ingest(staged, run)
+        state.logs = staged.logs
+        state.heads = staged.heads
+        state.forks = staged.forks
+        state.treap = staged.treap
+
+
 def _rebuild(logs):
     treap = Treap()
     for log in logs.values():

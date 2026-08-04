@@ -1,10 +1,8 @@
 """Compact authenticated contiguous writer-sequence runs."""
-import base64
-import json
+import struct
 from dataclasses import dataclass
 
 from .fact import canonical, decode_slice
-from core.fact import canon
 
 from .log import Head, WriterLog, decode_head, encode_head, verify_head
 from .tree import _leaf, _node, inclusion
@@ -101,38 +99,62 @@ def carry(log: WriterLog, seq: int) -> Run:
     return prove_run(log, seq, seq + 1)
 
 
-RUN_FORMAT = "poc16-peer-run-v1"
+RUN_MAGIC = b"P16R2\x00"
 
 
 def encode_run(run):
     if not verify_run(run):
         raise ValueError("invalid writer run")
-    return canon({
-        "facts": base64.b64encode(run.facts).decode("ascii"),
-        "format": RUN_FORMAT,
-        "head": base64.b64encode(encode_head(run.head)).decode("ascii"),
-        "hi": run.hi,
-        "lo": run.lo,
-        "paths": [[item.hex() for item in path] for path in run.paths],
-        "writer": run.writer.hex(),
-    })
+    if run.lo >= 1 << 64 or run.hi >= 1 << 64 \
+            or len(run.facts) >= 1 << 32 or len(run.paths) >= 1 << 8:
+        raise ValueError("writer run bounds")
+    raw = bytearray(RUN_MAGIC)
+    raw.extend(run.writer)
+    raw.extend(struct.pack(">QQI", run.lo, run.hi, len(run.facts)))
+    raw.extend(run.facts)
+    head = encode_head(run.head)
+    raw.extend(struct.pack(">H", len(head)))
+    raw.extend(head)
+    raw.extend(struct.pack(">B", len(run.paths)))
+    for path in run.paths:
+        if len(path) >= 1 << 16:
+            raise ValueError("writer run path")
+        raw.extend(struct.pack(">H", len(path)))
+        for item in path:
+            raw.extend(item)
+    return bytes(raw)
 
 
 def decode_run(raw):
+    if not isinstance(raw, bytes) or not raw.startswith(RUN_MAGIC):
+        raise ValueError("writer run")
     try:
-        value = json.loads(raw)
-        if not isinstance(value, dict) or set(value) != {
-                "facts", "format", "head", "hi", "lo", "paths", "writer"} \
-                or value.get("format") != RUN_FORMAT:
+        cursor = len(RUN_MAGIC)
+
+        def take(size):
+            nonlocal cursor
+            if size < 0 or cursor + size > len(raw):
+                raise ValueError
+            value = raw[cursor:cursor + size]
+            cursor += size
+            return value
+
+        writer = take(32)
+        lo, hi, facts_size = struct.unpack(">QQI", take(20))
+        facts = take(facts_size)
+        head_size = struct.unpack(">H", take(2))[0]
+        head = decode_head(take(head_size))
+        path_count = struct.unpack(">B", take(1))[0]
+        paths = []
+        for _path in range(path_count):
+            count = struct.unpack(">H", take(2))[0]
+            paths.append(tuple(take(32) for _item in range(count)))
+        if cursor != len(raw):
             raise ValueError
         run = Run(
-            bytes.fromhex(value["writer"]), value["lo"], value["hi"],
-            base64.b64decode(value["facts"], validate=True),
-            decode_head(base64.b64decode(value["head"], validate=True)),
-            tuple(tuple(bytes.fromhex(item) for item in path)
-                  for path in value["paths"]),
+            writer, lo, hi, facts, head, tuple(paths),
         )
-    except (TypeError, ValueError, UnicodeError) as error:
+    except (TypeError, ValueError, UnicodeError, struct.error) as error:
         raise ValueError("writer run") from error
     if not verify_run(run) or encode_run(run) != raw:
         raise ValueError("writer run")

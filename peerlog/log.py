@@ -1,11 +1,11 @@
 """Dense own-writer streams and honest island copies for foreign writers."""
 from dataclasses import dataclass
+import struct
 
 from nacl import signing
 from nacl.exceptions import BadSignatureError
 
 from core.fact import canon
-from core.limits import decode_json
 
 from .fact import Fact, canonical, decode_slice, encode_slice, is_control
 
@@ -27,7 +27,8 @@ class Head:
 
     def __post_init__(self):
         if not valid_writer(self.writer) or type(self.seq) is not int \
-                or self.seq < -1 or not isinstance(self.root, bytes) \
+                or self.seq < -1 or self.seq >= 1 << 63 \
+                or not isinstance(self.root, bytes) \
                 or len(self.root) != 32 or not isinstance(self.control_root, bytes) \
                 or len(self.control_root) != 32 or not isinstance(self.sig, bytes) \
                 or len(self.sig) != 64:
@@ -56,29 +57,20 @@ def verify_head(head):
 def encode_head(head):
     if not isinstance(head, Head) or not verify_head(head):
         raise ValueError("writer head")
-    return canon({
-        "control_root": head.control_root.hex(),
-        "format": HEAD_DOMAIN,
-        "root": head.root.hex(),
-        "seq": head.seq,
-        "sig": head.sig.hex(),
-        "writer": head.writer.hex(),
-    })
+    return b"P16H2\x00" + head.writer + struct.pack(">q", head.seq) \
+        + head.root + head.control_root + head.sig
 
 
 def decode_head(raw):
-    value = decode_json(raw, 4096, "peer writer head")
-    if not isinstance(value, dict) or set(value) != {
-            "control_root", "format", "root", "seq", "sig", "writer"} \
-            or value.get("format") != HEAD_DOMAIN:
+    if not isinstance(raw, bytes) or len(raw) != 174 \
+            or not raw.startswith(b"P16H2\x00"):
         raise ValueError("peer writer head")
     try:
         head = Head(
-            bytes.fromhex(value["writer"]), value["seq"],
-            bytes.fromhex(value["root"]), bytes.fromhex(value["control_root"]),
-            bytes.fromhex(value["sig"]),
+            raw[6:38], struct.unpack(">q", raw[38:46])[0],
+            raw[46:78], raw[78:110], raw[110:174],
         )
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, struct.error) as error:
         raise ValueError("peer writer head") from error
     if not verify_head(head) or encode_head(head) != raw:
         raise ValueError("peer writer head")

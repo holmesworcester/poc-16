@@ -15,9 +15,9 @@ from nacl import signing
 from peerlog.coverage import Coverage, intersect
 from peerlog.fact import Fact, canonical, decode_slice, fid
 from peerlog.endpoint import PeerEndpoint
-from peerlog.ingest import PeerState, ingest, observe_head
+from peerlog.ingest import PeerState, ingest, ingest_batch, observe_head
 from peerlog.log import WriterLog
-from peerlog.proof import Run, prove_run, verify_run
+from peerlog.proof import Run, decode_run, prove_run, verify_run
 from peerlog.session import SessionCoordinator, mesh_sync
 from peerlog.treap import Treap, decode_root, snapshot
 from peerlog.walk import (
@@ -150,6 +150,26 @@ def test_range_accept_is_all_or_nothing():
         ingest(target, prove_run(fork, 4, 8))
     assert target.entries() == before
     assert target.logs[source.writer].coverage() == before_coverage
+
+
+def test_adjacency_batch_rejects_without_installing_valid_carry_prefix():
+    secret = signing.SigningKey.generate()
+    writer = bytes(secret.verify_key)
+    accepted = WriterLog(writer, secret)
+    forked = WriterLog(writer, secret)
+    accepted.append(Fact("msg", 10, (), b"accepted"))
+    forked.append(Fact("msg", 10, (), b"forked"))
+    carried = WriterLog.owned()
+    carried.append(Fact("member", 9, (), b"valid carry"))
+
+    state = PeerState()
+    ingest(state, prove_run(accepted, 0, 1))
+    before = state.entries()
+    with pytest.raises(ValueError, match="writer fork"):
+        ingest_batch(state, (
+            prove_run(carried, 0, 1), prove_run(forked, 0, 1)))
+    assert state.entries() == before
+    assert carried.writer not in state.logs
 
 
 def test_tampered_run_rejects_whole_run():
@@ -544,7 +564,28 @@ def test_three_peer_mesh_forwards_original_writer_proofs_to_convergence():
                for report in reports)
 
 
-@skeleton
 def test_peer_serves_passive_interface_identically():
     """A client's seq-diff recipe run against a peer's Store returns
     byte-identical results to the same recipe against the cloud store."""
+    from peerlog.cloud import CloudQueue, MemoryCloud
+    from peerlog.endpoint import run_key
+
+    workspace = hashlib.sha256(b"passive workspace").digest()
+    log = WriterLog.owned()
+    for seq in range(12):
+        log.append(Fact("msg", seq + 1, (), f"passive:{seq}".encode()))
+
+    state = PeerState()
+    state.add_owned(log)
+    peer = PeerEndpoint(state)
+    cloud = CloudQueue(MemoryCloud(), workspace)
+    cloud.publish(log, 0, 12)
+
+    peer_bytes = peer.get(run_key(log.writer, 0, 12))
+    cloud_bytes = cloud.read_run(log.writer, 0, 12)
+    assert peer_bytes == cloud_bytes
+
+    from_peer, from_cloud = PeerState(), PeerState()
+    ingest(from_peer, decode_run(peer_bytes))
+    ingest(from_cloud, decode_run(cloud_bytes))
+    assert from_peer.entries() == from_cloud.entries() == state.entries()

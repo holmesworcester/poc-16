@@ -23,6 +23,11 @@ import pytest
 from adapters.r2 import R2S3Config, R2S3Store
 from adapters.s3 import S3Config, S3Store
 from core.object_store import Applied, OutcomeUnknown
+from peerlog.cloud import MULTIPART_EDGE, CloudCache, CloudQueue
+from peerlog.cloud_s3 import S3Cloud
+from peerlog.fact import Fact
+from peerlog.ingest import PeerState
+from peerlog.log import WriterLog
 from tests.provider_conformance import (
     ConformanceRun,
     exercise_sync_store,
@@ -253,3 +258,33 @@ def test_live_r2_direct_api_conformance(live_r2_store):
     exercise_sync_store(live_r2_store, run, pace=pace)
     _prove_recovery_after_discarded_response(
         live_r2_store(), run, pace)
+
+
+@pytest.mark.live
+@pytest.mark.live_r2
+def test_live_r2_peerlog_rounds_and_five_mib_part_copy(live_r2_store):
+    """Phase-2 evidence; skipped unless direct R2 credentials are explicit."""
+    provider = S3Cloud(live_r2_store())
+    workspace = secrets.token_bytes(32)
+    cloud = CloudQueue(provider, workspace)
+    log = WriterLog.owned()
+    log.append(Fact("msg", 1, (), b"first"))
+    cloud.publish(log)
+    state, cache = PeerState(), CloudCache()
+    assert cloud.sync(state, cache).rounds == 2
+    assert cloud.sync(state, cache).rounds == 1
+
+    # Respect R2's documented same-key write pacing for the derived directory.
+    time.sleep(1.05)
+    log.append(Fact("msg", 2, (), b"delta"))
+    cloud.publish(log, 1, 2)
+    assert cloud.sync(state, cache).rounds == 2
+
+    edge = b"r" * MULTIPART_EDGE
+    provider.create("part-copy/source", edge)
+    upload = provider.begin_multipart("part-copy/destination")
+    provider.copy_part(upload, "part-copy/source", MULTIPART_EDGE)
+    provider.upload_part(upload, b"tail")
+    assert provider.get("part-copy/destination")[0] is None
+    provider.complete_multipart(upload)
+    assert provider.get("part-copy/destination")[0] == edge + b"tail"
