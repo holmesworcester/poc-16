@@ -2,8 +2,27 @@
 import asyncio
 import random
 
+import facts
+
+from core.crypto import h
+from core.limits import MAX_CONTROL_PILE_BYTES
+from core.object_store import Versioned
 from core.store import RemoteStore
-from core.writer_repository import OwnerPublisher, RepositoryMirror
+from core.writer_head import (
+    MAX_WRITER_HEAD_BYTES,
+    WriterBinding,
+    decode_head,
+    decode_slot_at,
+    head_slot_key,
+    require_bound_head,
+    writer_store_binding,
+)
+from core.writer_repository import (
+    OwnerPublisher,
+    RepositoryMirror,
+    open_accepted_pile,
+)
+from facts.auth._proof import historical_owner
 
 from .walk import Peer
 
@@ -25,6 +44,57 @@ async def _control_head_retry_pause(attempt):
         CONTROL_HEAD_RETRY_BASE_MS * (1 << min(attempt, 16)),
     )
     await asyncio.sleep(random.random() * ceiling / 1_000)
+
+
+def _local_publication_binding(node, workspace):
+    """Select live authorship or one exact accepted self-removal terminal.
+
+    Local SQL is authoritative for continued authorship.  Its only absence
+    exception is the current signed final head whose last accepted pile
+    activates this same device's removal cell.  Reconstructing that binding
+    from durable bytes lets a restarted sender deliver the terminal transition
+    without retaining ambient post-removal authority.
+    """
+    with node.lock:
+        binding = node.local_writer_binding(workspace)
+        if binding is not None:
+            return binding
+
+        _secret, device = node.identity(workspace)
+        store = node.store(workspace)
+        key = head_slot_key(workspace, device)
+        opened = store.read_versioned(key)
+        if not isinstance(opened, Versioned):
+            return None
+        slot = decode_slot_at(key, opened.value)
+        raw_head = store.get_bounded(
+            "obj/" + slot.head, MAX_WRITER_HEAD_BYTES)
+        if raw_head is None or h(raw_head) != slot.head:
+            raise ValueError("local publication head integrity")
+        head = decode_head(raw_head)
+        binding = WriterBinding(
+            workspace,
+            device,
+            historical_owner(node, workspace, device),
+            writer_store_binding(workspace, device),
+        )
+        require_bound_head(head, binding)
+        if head.sequence < 1:
+            return None
+        terminal = _run(open_accepted_pile(
+            store,
+            workspace,
+            device,
+            head.sequence,
+            max_bytes=MAX_CONTROL_PILE_BYTES,
+        ))
+        try:
+            plan = node.access_gate(workspace).state.plan_control(
+                (terminal,), device)
+        except ValueError:
+            return None
+        expected = facts.principal_sid("device", device)
+        return binding if plan.active_sids == (expected,) else None
 
 
 def sync(node, workspace, url):
@@ -60,9 +130,10 @@ def sync(node, workspace, url):
                     pushed.errors[0][1])
         pushed_count = pushed.piles
     elif peer.accepts_owner_publish:
-        binding = node.local_writer_binding(workspace)
+        binding = _local_publication_binding(node, workspace)
         if binding is None:
-            raise ValueError("local writer has no current authority binding")
+            raise ValueError(
+                "local writer has no current or terminal publication binding")
         device = binding.device
 
         async def make_proof(base, proposed):
