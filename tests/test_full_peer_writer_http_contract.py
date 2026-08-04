@@ -19,6 +19,7 @@ from urllib.parse import urlencode, urlsplit
 import facts
 import pytest
 
+from bench.writer_p2p_cost import measure_two_party_sync
 from core import peer_capability
 from core.access import AccessGate, ControlHeadRetry
 from core.crypto import h, keypair
@@ -490,6 +491,58 @@ def test_full_peer_sync_relays_both_ways_is_noop_and_rebuilds_sql(tmp_path):
     reopened = FullPeer(carol.dir)
     assert reopened.sql(workspace).fact_ids() == expected_facts
     assert _messages(reopened, workspace) == expected_messages
+
+
+def test_two_party_sync_performance_includes_messaging_and_catchup(tmp_path):
+    """Measure one real bidirectional sync, excluding only fixture/counting."""
+    workspace, alice, bob, _carol = _forest_fixture(tmp_path)
+    for ordinal in range(20):
+        facts.content.message.post(
+            alice,
+            workspace,
+            "general",
+            f"alice performance {ordinal}",
+            ts=100 + ordinal,
+        )
+        facts.content.message.post(
+            bob,
+            workspace,
+            "general",
+            f"bob performance {ordinal}",
+            ts=1_000 + ordinal,
+        )
+
+    alice_before = set(alice.sql(workspace).fact_ids())
+    bob_before = set(bob.sql(workspace).fact_ids())
+    with _serve(bob) as (bob_url, _secret):
+        result = measure_two_party_sync(
+            alice, bob, workspace, bob_url)
+
+    expected = alice_before | bob_before
+    assert set(alice.sql(workspace).fact_ids()) == expected
+    assert set(bob.sql(workspace).fact_ids()) == expected
+    assert result.local_facts == len(bob_before - alice_before)
+    assert result.remote_facts == len(alice_before - bob_before)
+    assert result.facts > 0
+    assert result.elapsed_seconds > 0
+    assert result.facts_per_second > 0
+    assert result.pulled_changed == 1
+    assert result.pushed_piles > 0
+    expected_messages = {
+        "from alice",
+        "from bob",
+        *(f"alice performance {ordinal}" for ordinal in range(20)),
+        *(f"bob performance {ordinal}" for ordinal in range(20)),
+    }
+    assert _messages(alice, workspace) == expected_messages
+    assert _messages(bob, workspace) == expected_messages
+    print(
+        "two-party sync: "
+        f"{result.facts} facts in {result.elapsed_seconds:.6f}s "
+        f"({result.facts_per_second:.1f} facts/s; "
+        f"local +{result.local_facts}, remote +{result.remote_facts}, "
+        f"pulled={result.pulled_changed}, pushed={result.pushed_piles} piles)"
+    )
 
 
 def test_reverse_sync_direct_puts_a_valid_over_buffer_pile(tmp_path):
