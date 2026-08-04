@@ -82,6 +82,10 @@ class AsyncFromSyncReader:
         return await _to_thread(
             self.reader.get_bounded, key, max_bytes)
 
+    async def copy_pile_object(self, oid, max_bytes, write):
+        return await _to_thread(
+            self.reader.copy_pile_object, oid, max_bytes, write)
+
     async def read_versioned(self, key):
         return await _to_thread(self.reader.read_versioned, key)
 
