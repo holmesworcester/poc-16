@@ -638,13 +638,27 @@ root, compares whole authority roots, or synchronizes an authority repository
 before content sync. The only bootstrap exchange is a self-confined read of the
 caller's path from the recipient's removal tree.
 
-Advancing the recipient's own removal tree is a separate local/control-plane
-responsibility. A pushed access proof can never advance it. A full peer may
-derive its tree from authority facts admitted through ordinary validated pull;
-a hosted gate may be configured from the workspace's authority service. The
-exact authority-source protocol is independent of mint and writer sync and
-must use the same fact semantics when specified; it must never recreate a
-caller-driven pre-sync phase.
+Advancing the recipient's own removal tree is a separate recipient-owned
+operation. A pushed access proof can never advance it. There are exactly two
+inputs, and hosted and full peers run the same database-free implementation:
+
+1. A fresh recipient may bootstrap a direct member from that member's original
+   device-signed, control-only closed pile. The pile must prove its outer writer
+   as `member(writer, writer)` and may introduce only CLEAR cells. It is
+   evaluated and discarded; no fact repository is created.
+2. Thereafter, a caller may only poke one `(writer device, sequence)` already
+   present in the recipient's accepted writer forest. The recipient opens that
+   exact authenticated leaf, evaluates its original signed control-only pile,
+   derives the family-declared CLEAR/ACTIVE cells, discards the facts, and
+   joins those cells into its private removal tree.
+
+The normal poke supplies no facts, root, or proposed state. It merely asks the
+recipient to inspect immutable data its own gate already accepted. Each
+state-affecting fact is one small ACI join; a stale CAS is retryable and replay
+finishes any prefix left by a crash. Ordinary content leaves are never opened
+by this control path. No SQL projection, LIST scan, re-closed authority pile,
+caller root, separate authority service, queue, or provider-specific
+coordinator participates.
 
 Every request is one bounded canonical closed pile signed by the requesting
 member device and evaluated by the ordinary `ClosedPileEvaluator`. The gate's
@@ -748,8 +762,9 @@ One strong proof is answered entirely against one immutable removal-root pin.
 A concurrent removal-tree update may make that answer immediately stale in
 wall-clock terms, but cannot tear it across roots. A later request pins the
 newer root. A writer slot records the removal-root OID that authorized its
-accepted head, which lets a consumer reconstruct that head's writer binding
-without reauthorizing historical content under a different current view.
+accepted head for audit and race diagnosis. The hash is not a fetch capability
+and is not used to reconstruct a historical authority repository; consumers
+validate signed heads, closed piles, and fact relationships normally.
 
 Removal governs later access and publication after observation; it does not
 rewrite already validated history. If removal and publication race, the head

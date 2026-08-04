@@ -77,6 +77,11 @@ MAX_RESOLVED_EDGES = 64
 # Recipient removal state advances once per state-affecting fact, never once
 # per whole pile. One fact cannot contribute more than this many slots.
 MAX_REMOVAL_UPDATES = MAX_REGISTERED_SUPPRESSION_ROUTES
+# A live request proves one direct-member provider and, for a secondary
+# device, one owner-signed device provider. Each may carry the full declared
+# suppression-route ceiling.
+MAX_REMOVAL_PATH_SCOPES = 2 * MAX_REGISTERED_SUPPRESSION_ROUTES
+MAX_REMOVAL_PATH_BYTES = MAX_MINT_REQUEST_BYTES
 
 # A 512-page adversarial path is accepted; a deeper canonical map is outside
 # the protocol even though a 384-byte key could theoretically select more
