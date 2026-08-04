@@ -43,6 +43,81 @@ def root_bytes(raws):
     return _levels(tuple(raws))[-1][0]
 
 
+class IncrementalTree:
+    """Append-only form of the exact running writer Merkle tree.
+
+    Complete real subtrees are retained once.  The one changing right edge is
+    combined with deterministic padding in logarithmic work, so signing every
+    owner append does not rehash the complete writer history.
+    """
+
+    def __init__(self):
+        self._count = 0
+        self._nodes = {}
+        self._pads = {}
+
+    def append(self, raw):
+        if not isinstance(raw, bytes):
+            raise ValueError("writer tree leaf")
+        index = self._count
+        self._nodes[(0, index)] = _leaf(index, raw)
+        self._count += 1
+        level = 0
+        while index & 1:
+            left = self._nodes[(level, index - 1)]
+            right = self._nodes[(level, index)]
+            index //= 2
+            level += 1
+            self._nodes[(level, index)] = _node(left, right)
+
+    def _padding(self, start, level):
+        key = (level, start >> level)
+        found = self._pads.get(key)
+        if found is not None:
+            return found
+        if level == 0:
+            found = _pad(start)
+        else:
+            half = 1 << (level - 1)
+            found = _node(
+                self._padding(start, level - 1),
+                self._padding(start + half, level - 1),
+            )
+        self._pads[key] = found
+        return found
+
+    def _interval(self, start, level):
+        stop = start + (1 << level)
+        if start >= self._count:
+            return self._padding(start, level)
+        if stop <= self._count:
+            return self._nodes[(level, start >> level)]
+        half = 1 << (level - 1)
+        return _node(
+            self._interval(start, level - 1),
+            self._interval(start + half, level - 1),
+        )
+
+    def root(self):
+        if not self._count:
+            return EMPTY
+        height = (self._count - 1).bit_length()
+        return self._interval(0, height)
+
+    def inclusion(self, seq):
+        if type(seq) is not int or not 0 <= seq < self._count:
+            raise ValueError("writer inclusion sequence")
+        height = (self._count - 1).bit_length()
+        path = []
+        for level in range(height):
+            sibling = ((seq >> level) ^ 1) << level
+            path.append(self._interval(sibling, level))
+        return tuple(path)
+
+    def __len__(self):
+        return self._count
+
+
 def _dense_raws(log):
     head = log.head()
     if head.seq < 0:
@@ -75,6 +150,9 @@ def pages(log) -> tuple[bytes, ...]:
 
 def inclusion(log, seq: int) -> tuple[bytes, ...]:
     """Sibling-hash path proving the fact at seq against root(log)."""
+    incremental = getattr(log, "_tree", None)
+    if incremental is not None and len(incremental) == len(log._facts):
+        return incremental.inclusion(seq)
     raws = _dense_raws(log)
     if type(seq) is not int or not 0 <= seq < len(raws):
         raise ValueError("writer inclusion sequence")

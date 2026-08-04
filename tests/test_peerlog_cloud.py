@@ -1,6 +1,7 @@
 """Phase-2 queue tests using the production peerlog codecs and ingest path."""
 import hashlib
 import threading
+import time
 
 import pytest
 
@@ -368,3 +369,37 @@ def test_same_workspace_writer_races_are_repaired_without_authority_loss():
     state = PeerState()
     queues[0].sync(state)
     assert set(state.entries()) == entries(logs[0]) | entries(logs[1])
+
+
+def test_cold_body_gets_really_overlap_under_the_named_wave_bound():
+    class DelayedCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.activity_lock = threading.Lock()
+            self.active = 0
+            self.maximum_active = 0
+
+        def get(self, key, *, if_none_match=None, suffix=None):
+            body_get = "/writers/" in key and suffix is None
+            if body_get:
+                with self.activity_lock:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                time.sleep(0.005)
+            try:
+                return super().get(
+                    key, if_none_match=if_none_match, suffix=suffix)
+            finally:
+                if body_get:
+                    with self.activity_lock:
+                        self.active -= 1
+
+    store = DelayedCloud()
+    cloud = CloudQueue(store, h("parallel body reads"))
+    for ordinal in range(70):
+        cloud.publish(owned(f"parallel-{ordinal}", 1), announce=False)
+    cloud.repair_directory()
+    report = cloud.sync(PeerState())
+    assert report.facts == report.object_gets == 70
+    assert report.rounds == 3  # directory + ceil(70 / 64) body waves
+    assert store.maximum_active >= 8

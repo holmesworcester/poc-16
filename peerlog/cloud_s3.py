@@ -8,6 +8,7 @@ one existing place.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 from .cloud import (
@@ -79,13 +80,16 @@ class S3Cloud:
             raise TypeError("configured S3-compatible store required")
         self.store = configured_store
         self.metrics = CloudMetrics()
+        self._metrics_lock = threading.Lock()
         self._uploads = {}
 
     def get(self, key, *, if_none_match=None, suffix=None):
-        self.metrics.gets += 1
+        with self._metrics_lock:
+            self.metrics.gets += 1
         request = self.store._read_args(key)
         if if_none_match is not None:
-            self.metrics.conditional_gets += 1
+            with self._metrics_lock:
+                self.metrics.conditional_gets += 1
             request["IfNoneMatch"] = if_none_match
         if suffix is not None:
             if type(suffix) is not int or suffix <= 0:
@@ -103,7 +107,8 @@ class S3Cloud:
         token = response.get("ETag")
         if not isinstance(token, str) or not token:
             raise ValueError("cloud provider ETag")
-        self.metrics.downloaded_bytes += len(value)
+        with self._metrics_lock:
+            self.metrics.downloaded_bytes += len(value)
         return value, token
 
     def read_versioned(self, key):

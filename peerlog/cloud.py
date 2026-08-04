@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -38,6 +40,7 @@ MICRO_TAIL = 32
 MULTIPART_EDGE = 5 * 1024 * 1024
 EPOCH_CAP = 64 * 1024 * 1024
 FOOTER_READ = 64 * 1024
+CLOUD_GET_CONCURRENCY = 64
 SEGMENT_MAGIC = b"P16Q1\x00"
 FOOTER_MAGIC = b"P16F"
 SLOT_FORMAT = "poc16-cloud-writer-slot-v1"
@@ -629,7 +632,13 @@ class CloudQueue:
                 raise ValueError("cloud writer sequence")
             run = prove_run(log, lo, hi)
             publication = Publication(run, carries, handoff_targets)
-            self._validate_publication(publication, self.visible_heads())
+            main_facts = decode_slice(run.facts, run.hi - run.lo)
+            needs_heads = any(
+                fact.refs and (
+                    is_control(fact) or fact.family in HANDOFF_FAMILIES)
+                for fact in main_facts)
+            self._validate_publication(
+                publication, self.visible_heads() if needs_heads else {})
             raw = _encode_segment((publication,), "micro")
             key = _micro_key(self.workspace, log.writer, lo, hi)
             self.store.create(key, raw)
@@ -671,8 +680,8 @@ class CloudQueue:
         """Deterministically rebuild the sole non-writer-owned object."""
         slot_keys = self.store.list(self.prefix + "slots/")
         slots = {}
-        for key in slot_keys:
-            found = self.store.read_versioned(key)
+        found_slots = self._parallel(slot_keys, self.store.read_versioned)
+        for key, found in zip(slot_keys, found_slots):
             if found.value is None:
                 continue
             slot = decode_slot(found.value)
@@ -705,6 +714,15 @@ class CloudQueue:
                 != hashlib.sha256(raw).hexdigest():
             raise ValueError("cloud segment address")
         return _decode_segment(raw)
+
+    def _parallel(self, items, operation):
+        items = tuple(items)
+        if len(items) < 2:
+            return tuple(operation(item) for item in items)
+        with ThreadPoolExecutor(
+                max_workers=min(CLOUD_GET_CONCURRENCY, len(items)),
+                thread_name_prefix="poc16-cloud-get") as executor:
+            return tuple(executor.map(operation, items))
 
     def _write_segment(self, publications, kind, weight):
         raw = _encode_segment(publications, kind)
@@ -837,6 +855,11 @@ class CloudQueue:
             raise ValueError("cloud sync state")
         if seq_window is not None and ts_window is not None:
             raise ValueError("one cloud sync window")
+        if seq_window is not None and (
+                not isinstance(seq_window, tuple) or len(seq_window) != 2
+                or any(type(item) is not int for item in seq_window)
+                or seq_window[0] < 0 or seq_window[1] <= seq_window[0]):
+            raise ValueError("cloud sequence window")
         if ts_window is not None and (
                 not isinstance(ts_window, tuple) or len(ts_window) != 2
                 or any(type(item) is not int for item in ts_window)
@@ -852,6 +875,12 @@ class CloudQueue:
                                    0, 0, (), tag)
         cache.directory_tag = tag
         selected = []
+        all_segments = tuple(
+            segment for slot in slots.values() for segment in slot.segments)
+        footers = {}
+        if ts_window is not None:
+            footers = dict(zip(
+                all_segments, self._parallel(all_segments, self.footer)))
         for writer, slot in slots.items():
             held = state.logs.get(writer)
             coverage = () if held is None else held.coverage()
@@ -862,7 +891,7 @@ class CloudQueue:
                     if hi <= window_lo or lo >= window_hi:
                         continue
                 if ts_window is not None:
-                    footer = self.footer(segment)
+                    footer = footers[segment]
                     if footer["ts_max"] < ts_window[0] \
                             or footer["ts_min"] >= ts_window[1]:
                         continue
@@ -870,8 +899,11 @@ class CloudQueue:
                     selected.append(segment)
         facts = carries = 0
         pending = set()
-        for segment in selected:
-            for publication in self._read_segment(segment):
+        segment_publications = self._parallel(selected, self._read_segment)
+        accepted_runs = []
+        accepted_main_facts = []
+        for publications in segment_publications:
+            for publication in publications:
                 self._validate_publication(
                     publication,
                     {writer: slot.hi for writer, slot in slots.items()},
@@ -879,20 +911,24 @@ class CloudQueue:
                 main_facts = decode_slice(
                     publication.main.facts,
                     publication.main.hi - publication.main.lo)
-                ingest_batch(state, (*publication.carries, publication.main))
+                accepted_runs.extend((*publication.carries, publication.main))
+                accepted_main_facts.append(main_facts)
                 for carried in publication.carries:
                     carries += carried.hi - carried.lo
                 facts += len(main_facts)
-                for fact in main_facts:
-                    for ref in fact.refs:
-                        target = state.logs.get(ref.writer)
-                        if target is None or ref.seq not in target._facts:
-                            pending.add(ref)
+        if accepted_runs:
+            ingest_batch(state, accepted_runs)
+        for main_facts in accepted_main_facts:
+            for fact in main_facts:
+                for ref in fact.refs:
+                    target = state.logs.get(ref.writer)
+                    if target is None or ref.seq not in target._facts:
+                        pending.add(ref)
         delta = self.store.metrics.delta(before)
-        # Directory then all immutable objects may be requested in parallel.
-        rounds = 1 + bool(ts_window is not None) + bool(selected)
-        footer_gets = sum(len(slot.segments) for slot in slots.values()) \
-            if ts_window is not None else 0
+        # Directory, bounded footer waves, then bounded immutable-body waves.
+        footer_gets = len(all_segments) if ts_window is not None else 0
+        rounds = 1 + math.ceil(footer_gets / CLOUD_GET_CONCURRENCY) \
+            + math.ceil(len(selected) / CLOUD_GET_CONCURRENCY)
         return CloudSyncReport(True, rounds, footer_gets + len(selected),
                                delta.downloaded_bytes, facts, carries,
                                tuple(sorted(pending,
@@ -923,7 +959,8 @@ def _covered(coverage, lo, hi):
 
 
 __all__ = (
-    "CloudCache", "CloudMetrics", "CloudObjectStore", "CloudQueue", "CloudSyncReport",
+    "CLOUD_GET_CONCURRENCY", "CloudCache", "CloudMetrics", "CloudObjectStore",
+    "CloudQueue", "CloudSyncReport",
     "EPOCH_CAP", "FOOTER_READ", "HANDOFF_FAMILIES", "HandoffTicket",
     "MICRO_TAIL", "MULTIPART_EDGE", "MaintenanceRequired", "MemoryCloud",
     "PartCopyUnavailable",

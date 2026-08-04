@@ -71,7 +71,7 @@ def ingest(state, run: Run) -> None:
 
         staged_logs = dict(state.logs)
         staged_logs[run.writer] = staged_log
-        staged_treap = _rebuild(staged_logs)
+        staged_treap = _advance_treap(state.treap, (staged_log,))
 
         state.logs[run.writer] = staged_log
         if incumbent_head is None or run.head.seq >= incumbent_head.seq:
@@ -84,25 +84,62 @@ def ingest_batch(state, runs) -> None:
     runs = tuple(runs)
     if not isinstance(state, PeerState) or not runs:
         raise ValueError("writer run batch")
+    decoded = []
+    for run in runs:
+        if not verify_run(run):
+            raise ValueError("invalid writer run")
+        decoded.append((run, decode_slice(run.facts, run.hi - run.lo)))
     with state.lock:
-        staged = PeerState()
-        staged.logs = dict(state.logs)
-        staged.heads = dict(state.heads)
-        staged.forks = list(state.forks)
-        staged.session_cache = dict(state.session_cache)
-        staged.treap = state.treap
-        staged.coverage = getattr(state, "coverage", None)
-        for run in runs:
-            ingest(staged, run)
-        state.logs = staged.logs
-        state.heads = staged.heads
-        state.forks = staged.forks
-        state.treap = staged.treap
+        staged_logs = dict(state.logs)
+        staged_heads = dict(state.heads)
+        changed = {}
+        for run, facts in decoded:
+            incumbent_head = staged_heads.get(run.writer)
+            evidence = _fork(incumbent_head, run.head) \
+                if incumbent_head else None
+            if evidence is not None:
+                raise ValueError("writer fork")
+
+            staged_log = changed.get(run.writer)
+            if staged_log is None:
+                incumbent_log = staged_logs.get(run.writer)
+                staged_log = WriterLog(run.writer)
+                if incumbent_log is not None:
+                    staged_log._facts = dict(incumbent_log._facts)
+                    staged_log._paths = dict(incumbent_log._paths)
+                    staged_log._head = incumbent_log._head
+                changed[run.writer] = staged_log
+                staged_logs[run.writer] = staged_log
+            staged_log._install(run.lo, facts, run.head)
+            staged_log._paths.update(leaf_paths(run))
+            if incumbent_head is None or run.head.seq >= incumbent_head.seq:
+                staged_heads[run.writer] = run.head
+
+        # Advance derived discovery state only for changed original writers.
+        # Replaying their histories is sufficient: accepted facts are monotone
+        # and late/exact classification can only become stricter when an older
+        # sequence island arrives.
+        staged_treap = _advance_treap(state.treap, changed.values())
+        state.logs = staged_logs
+        state.heads = staged_heads
+        state.treap = staged_treap
 
 
 def _rebuild(logs):
     treap = Treap()
     for log in logs.values():
+        high = None
+        for seq in sorted(log._facts):
+            fact = log.fact(seq)
+            late = high is not None and fact.ts + TS_QUARANTINE < high
+            treap.insert(fact.ts, fid(fact), exact=late)
+            high = fact.ts if high is None else max(high, fact.ts)
+    return treap
+
+
+def _advance_treap(current, logs):
+    treap = current.copy()
+    for log in logs:
         high = None
         for seq in sorted(log._facts):
             fact = log.fact(seq)

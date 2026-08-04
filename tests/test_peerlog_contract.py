@@ -12,6 +12,8 @@ import threading
 import pytest
 from nacl import signing
 
+import peerlog.ingest as ingest_module
+
 from peerlog.coverage import Coverage, intersect
 from peerlog.fact import Fact, canonical, decode_slice, fid
 from peerlog.endpoint import PeerEndpoint
@@ -20,6 +22,7 @@ from peerlog.log import WriterLog
 from peerlog.proof import Run, decode_run, prove_run, verify_run
 from peerlog.session import SessionCoordinator, mesh_sync
 from peerlog.treap import Treap, decode_root, snapshot
+from peerlog.tree import inclusion, root_bytes, verify_inclusion
 from peerlog.walk import (
     OBJECT_PREFIX,
     ROOT_KEY,
@@ -170,6 +173,49 @@ def test_adjacency_batch_rejects_without_installing_valid_carry_prefix():
             prove_run(carried, 0, 1), prove_run(forked, 0, 1)))
     assert state.entries() == before
     assert carried.writer not in state.logs
+
+
+def test_incremental_owner_tree_is_exact_at_growth_boundaries():
+    log = WriterLog.owned()
+    controls = []
+    checkpoints = {1, 2, 3, 4, 7, 8, 9, 255, 256, 257, 1024, 1025}
+    for seq in range(1025):
+        family = "member" if seq % 97 == 0 else "msg"
+        fact = Fact(family, seq + 1, (), bytes([seq % 251]) * 17)
+        log.append(fact)
+        if family == "member":
+            controls.append(canonical(fact))
+        if seq + 1 not in checkpoints:
+            continue
+        raws = tuple(log._raw(index) for index in range(seq + 1))
+        assert log.head().root == root_bytes(raws)
+        assert log.head().control_root == root_bytes(tuple(controls))
+        for target in {0, seq // 2, seq}:
+            path = inclusion(log, target)
+            assert verify_inclusion(
+                log.head(), target, log._raw(target), path)
+
+
+def test_adjacency_batch_advances_only_changed_writer_index(monkeypatch):
+    logs = []
+    for writer in range(12):
+        log = WriterLog.owned()
+        for seq in range(5):
+            log.append(Fact(
+                "msg", writer * 100 + seq + 1, (), bytes([writer]) * 8))
+        logs.append(log)
+    state = PeerState()
+    ingest_batch(state, tuple(prove_run(log, 0, 5) for log in logs))
+    assert len(state.treap) == 60
+    changed = logs[0]
+    changed.append(Fact("msg", 10_000, (), b"warm delta"))
+
+    def forbidden(_logs):  # pragma: no cover - failure-only assertion hook
+        raise AssertionError("warm batch rebuilt every unchanged writer")
+
+    monkeypatch.setattr(ingest_module, "_rebuild", forbidden)
+    ingest_batch(state, (prove_run(changed, 5, 6),))
+    assert len(state.treap) == 61
 
 
 def test_tampered_run_rejects_whole_run():

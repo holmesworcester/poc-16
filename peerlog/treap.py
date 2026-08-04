@@ -299,6 +299,13 @@ class Treap:
         if exact:
             self._exact.add(f)
 
+    def copy(self):
+        """Copy the rebuildable local index for a staged monotone advance."""
+        result = Treap()
+        result._by_fid = dict(self._by_fid)
+        result._exact = set(self._exact)
+        return result
+
     def fingerprint(self, lo: int, hi: int, coverage: Coverage) -> bytes:
         """Range fingerprint over (ts, fid) in [lo, hi).
 

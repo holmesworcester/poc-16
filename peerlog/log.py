@@ -8,6 +8,7 @@ from nacl.exceptions import BadSignatureError
 from core.fact import canon
 
 from .fact import Fact, canonical, decode_slice, encode_slice, is_control
+from .tree import IncrementalTree
 
 HEAD_DOMAIN = "poc16-peer-writer-head-v1"
 EMPTY_ROOT = __import__("hashlib").sha256(b"peerlog/seq/empty/v1").digest()
@@ -90,6 +91,8 @@ class WriterLog:
         self._facts = {}
         self._paths = {}
         self._head = None
+        self._tree = IncrementalTree() if secret is not None else None
+        self._control_tree = IncrementalTree() if secret is not None else None
 
     @classmethod
     def owned(cls, secret=None):
@@ -106,6 +109,10 @@ class WriterLog:
         if self._facts and set(self._facts) != set(range(seq)):
             raise ValueError("own writer log gap")
         self._facts[seq] = fact
+        raw = canonical(fact)
+        self._tree.append(raw)
+        if is_control(fact):
+            self._control_tree.append(raw)
         self._sign_head()
         return seq
 
@@ -144,13 +151,9 @@ class WriterLog:
             raise ValueError("writer sequence unavailable") from error
 
     def _sign_head(self):
-        from .tree import root_bytes
-        ordered = tuple(canonical(self._facts[seq]) for seq in range(len(self._facts)))
-        controls = tuple(canonical(self._facts[seq]) for seq in range(len(self._facts))
-                         if is_control(self._facts[seq]))
-        tree_root = root_bytes(ordered)
-        control_root = root_bytes(controls)
-        seq = len(ordered) - 1
+        tree_root = self._tree.root()
+        control_root = self._control_tree.root()
+        seq = len(self._facts) - 1
         message = _head_message(self.writer, seq, tree_root, control_root)
         self._head = Head(
             self.writer, seq, tree_root, control_root,
