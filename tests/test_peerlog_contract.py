@@ -33,9 +33,6 @@ from peerlog.walk import (
     sync,
 )
 
-skeleton = pytest.mark.skip(reason="phase-1 skeleton: contract named, body unwritten")
-
-
 class EndpointStore:
     """A responder-shaped GET/PUT endpoint with immutable object semantics."""
 
