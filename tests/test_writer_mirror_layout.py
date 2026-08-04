@@ -536,10 +536,9 @@ def test_packed_bad_later_pile_cannot_leak_earlier_valid_pile(tmp_path):
 
 
 class _ReadPeer:
-    def __init__(self, workspace, store, binding):
+    def __init__(self, workspace, store):
         self.workspace = workspace
         self._store = store
-        self._binding = binding
         self.lock = threading.RLock()
 
     def has_workspace(self, workspace):
@@ -549,21 +548,6 @@ class _ReadPeer:
         if not self.has_workspace(workspace):
             raise KeyError(workspace)
         return self._store
-
-    def mirror(self, workspace):
-        return RepositoryMirror(
-            workspace, self._store, resolver(self._binding), None)
-
-    def authorize_access(self, *_args):
-        raise AssertionError("pre-minted HTTP test must not evaluate mint")
-
-    def authority(self, _workspace):
-        class Authority:
-            async def publish(self, _raw):
-                raise AssertionError(
-                    "pre-minted read test must not publish authority")
-        return Authority()
-
 
 class _DialNode:
     def __init__(self, token):
@@ -618,7 +602,7 @@ def test_real_http_remote_store_streams_pack_not_gate_response(tmp_path):
         return bounded_get(key, maximum)
 
     backing.get_bounded = semantic_get
-    with serving(_ReadPeer(root.fid, backing, binding)) as url:
+    with serving(_ReadPeer(root.fid, backing)) as url:
         peer = _preminted_peer(_DialNode(token), root.fid, url)
         layout_requests, pack_requests, loose_batches = [], [], []
         original_layout = peer.layout
@@ -676,7 +660,7 @@ def test_real_http_loose_piles_use_the_same_direct_object_stream(tmp_path):
         issued_at=1,
         ttl_ms=(1 << 52),
     )
-    with serving(_ReadPeer(root.fid, backing, binding)) as url:
+    with serving(_ReadPeer(root.fid, backing)) as url:
         peer = _preminted_peer(_DialNode(token), root.fid, url)
         limits = []
         original = peer.copy_obj

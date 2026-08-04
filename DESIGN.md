@@ -627,14 +627,15 @@ warm peer still scans the directory but mirrors only head/tree objects whose
 individual head OIDs changed. This is measured before introducing any second
 index.
 
-## 7. Closed authority proofs and removal-path refresh
+## 7. Closed access proofs and removal-path refresh
 
 Each recipient owns and pins its current authenticated removal tree. That tree
 is verifier state, not state supplied by an access caller. A caller never
 publishes authority facts into the recipient, asks it to adopt the caller's
 root, compares whole authority roots, or synchronizes an authority repository
-before content sync. The only bootstrap exchange is a self-confined read of the
-caller's path from the recipient's removal tree.
+before content sync. The only bootstrap mutation is the direct-member
+CLEAR-only exception below; the only bootstrap read is a self-confined path
+from the recipient's removal tree.
 
 Advancing the recipient's own removal tree is a separate recipient-owned
 operation. A pushed access proof can never advance it. There are exactly two
@@ -652,6 +653,14 @@ inputs, and hosted and full peers run the same database-free implementation:
    those same immutable pile bytes, joins every family-declared CLEAR/ACTIVE
    cell first, and only then conditionally advances the bound writer slot.
 
+The two transport-neutral operations are exposed consistently as
+`POST /head/<proposed-head-oid>/permit` and
+`POST /head/<proposed-head-oid>/commit`. Both bodies use the same bounded
+binary frame: the first carries one current access-proof pile plus the ordered
+control-pile tuple, and the second carries the returned permit plus those exact
+same pile bytes. The frame adds only lengths; the signed pile OIDs and permit
+claims remain the authority.
+
 The permit is a stateless capability for one base, one proposed head, and one
 bounded set of content-addressed control piles. It is not a bearer grant for a
 namespace and has no expiry that could strand a writer after self-removal.
@@ -661,6 +670,17 @@ racing after issuance cannot revoke the already-linearized exact operation;
 stronger cross-key revocation would require a transaction spanning the private
 removal root and writer slot, which S3 and R2 do not provide.
 
+The caller retains the permit until it observes the exact slot outcome; the
+recipient deliberately stores no permit journal. Retryable removal-root
+contention, a provider 5xx, and an unknown transport outcome reuse those same
+bytes. A competing head is a terminal HTTP 412 and requires the writer to
+rebase; it is never retried as the same transition. A live FullPeer turn applies
+bounded exponential full jitter and never reissues authorization. Explicit
+caller cancellation or whole caller-process loss during that narrow interval
+is not silently repaired by recipient state in this prototype; whether a
+sender-owned pending record is worth its additional machinery is isolated in
+`poc-16-6j4.22.2`.
+
 Each state-affecting fact remains one small ACI join. A stale removal-root CAS
 is retryable, a crash may leave removal state ahead of the head, and exact
 permit replay finishes without a cursor or scan. The head can never become
@@ -669,12 +689,15 @@ by this control path. No SQL projection, LIST scan, re-closed authority pile,
 caller root, separate authority service, queue, or provider-specific
 coordinator participates.
 
-Every request is one bounded canonical closed pile signed by the requesting
-member device and evaluated by the ordinary `ClosedPileEvaluator`. The gate's
-only trusted context is the recipient's configured root public key, its local
-invite-acceptance/workspace anchor, and the exact removal root it pins. There is
-no parallel fact array, SQL row, bearer claim, caller-selected root, or claimed
-verdict.
+Every semantic evaluation consumes exactly one bounded canonical closed pile
+signed by its outer writer device and runs the ordinary
+`ClosedPileEvaluator`. Historical/current requests are requesting-device piles;
+each permitted control input is an original writer-device pile. A permit may
+bind several such independently evaluated piles, but it never turns them into
+one ambient fact set or claimed verdict. The gate's only trusted context is the
+recipient's configured root public key, its local invite-acceptance/workspace
+anchor, and the exact removal root it pins. There is no parallel fact array,
+SQL row, caller-selected root, or retained proof judgment.
 
 ### 7.1 Historical membership reveals only the caller's path
 
@@ -745,7 +768,8 @@ binds the base head and proposed head OID; `OpaqueHeadGate` may conditionally
 replace only that device's deterministic slot.
 
 Before a writer exposes a head containing new control piles, it obtains the
-exact head/control permit above and commits through that permit. Ordinary heads
+exact head/control permit at `POST /head/<oid>/permit` and commits it at
+`POST /head/<oid>/commit`. Ordinary heads
 without control retain the one-request current-proof slot CAS. There is no
 bearer-only removal update, accepted-leaf scan, replay cursor, or second
 control envelope. `POST /removal/bootstrap` remains the public, narrow

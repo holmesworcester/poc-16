@@ -848,6 +848,24 @@ class HttpGate:
             return MAX_HEAD_SLOT_BYTES
         return 0
 
+    @staticmethod
+    def requires_access_callbacks(method, path):
+        """Whether this route evaluates access/removal or advances a head."""
+        method = method.upper()
+        path = "/" + path.strip("/")
+        return method == "POST" and (
+            path in {
+                "/mint", "/removal/bootstrap", "/removal/path",
+            }
+            or path.startswith("/head/")
+        )
+
+    @staticmethod
+    def requires_mirror_callback(method, path):
+        """Whether this route consumes a validate-first peer mirror."""
+        return method.upper() == "PUT" \
+            and ("/" + path.strip("/")).startswith("/mirror/")
+
     async def handle(self, method, path, query=None, headers=None, body=b""):
         """Return one transport-neutral response; provider failures fail shut."""
         method, query, headers = method.upper(), query or {}, headers or {}

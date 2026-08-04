@@ -603,7 +603,7 @@ class OwnerPublisher:
     The target does not validate writer content.  This writer-side helper
     compares the two signed Merkle roots, establishes only the immutable
     candidate pages and closed piles needed by the suffix, establishes the
-    signed head last, and finally submits a discarded authority proof.  It
+    signed head last, and finally submits a discarded current-access proof. It
     never lists or mutates another writer's slot.
     """
 
@@ -962,7 +962,7 @@ class RepositoryMirror:
         bootstrapping = binding is None
         if bootstrapping:
             # A newly joined writer's first independently closed pile is also
-            # its portable authority publication.  Verify the untrusted head's
+            # its portable identity proof. Verify the untrusted head's
             # own signature and deterministic store address first; semantic
             # membership is still required below before the slot can commit.
             binding = WriterBinding(
@@ -1018,7 +1018,7 @@ class RepositoryMirror:
                 owner=candidate.owner,
             )
         if bootstrapping:
-            # No auxiliary authority publication may make an incoming head
+            # No auxiliary pre-sync may make an incoming head
             # valid.  The consumer just proved the exact member/device binding
             # from every independently closed pile in the candidate suffix.
             if self.consumer is None:

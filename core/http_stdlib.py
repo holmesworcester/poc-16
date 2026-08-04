@@ -110,30 +110,37 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             return self._send(public)
         if not self.peer.has_workspace(workspace):
             return self._send(Response(404))
-        access = self.peer.access_gate(workspace)
-        head_gate = self.peer.head_gate(workspace)
+        callbacks = {}
+        if HttpGate.requires_access_callbacks(method, path):
+            access = self.peer.access_gate(workspace)
+            head_gate = self.peer.head_gate(workspace)
 
-        async def commit_permit(permit, proposed, controls, secret):
-            grant = await access.authorize_permitted_head(
-                permit, proposed, controls, secret)
-            return await head_gate.advance_grant(grant, proposed)
+            async def commit_permit(permit, proposed, controls, secret):
+                grant = await access.authorize_permitted_head(
+                    permit, proposed, controls, secret)
+                return await head_gate.advance_grant(grant, proposed)
+
+            callbacks = {
+                "head_advance": head_gate.advance,
+                "head_permit_issue": access.issue_head_permit,
+                "head_permit_commit": commit_permit,
+                "mint_authorize": access.authorize_access,
+                "path_authorize": access.removal_path,
+                "removal_bootstrap": access.state.bootstrap,
+            }
 
         gate = HttpGate(
             AsyncFromSyncReader(self.peer.store(workspace)),
             workspace,
             self.secret,
             now_ms,
-            mirror=self.peer.mirror(workspace),
-            head_advance=head_gate.advance,
-            head_permit_issue=access.issue_head_permit,
-            head_permit_commit=commit_permit,
-            mint_authorize=access.authorize_access,
-            path_authorize=access.removal_path,
-            removal_bootstrap=access.state.bootstrap,
+            mirror=self.peer.mirror(workspace)
+            if HttpGate.requires_mirror_callback(method, path) else None,
             sync_profile=self.sync_profile,
             grant_ttl_ms=self.gate_options.grant_ttl_ms,
             max_mint_fetches=self.gate_options.max_mint_fetches,
             max_mint_fetch_bytes=self.gate_options.max_mint_fetch_bytes,
+            **callbacks,
         )
 
         try:

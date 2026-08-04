@@ -238,12 +238,12 @@ def test_http_has_one_route_table_and_only_private_removal_control():
     assert {
         "/ctl", "/head/", "/heads", "/invite/", "/layout/", "/mint",
         "/mirror/", "/obj", "/obj/", "/obj/open", "/pack/open",
-        "/readyz", "/removal/apply", "/removal/bootstrap",
+        "/readyz", "/removal/bootstrap",
         "/removal/path",
     } <= routes
     assert {
         "/authority", "/page", "/page/", "/pile/", "/removal/advance",
-        "/root",
+        "/removal/apply", "/root",
     }.isdisjoint(routes)
 
     # Adapters compose HttpGate; they do not grow a second peer route table.
@@ -262,10 +262,17 @@ def test_http_has_one_route_table_and_only_private_removal_control():
     ]
 
     source = (ROOT / "core/http.py").read_text()
-    assert source.index('path == "/removal/apply"') \
-        < source.index("require_object_put=True")
-    assert "removal_apply(body, writer=writer)" in source
-    assert "POST /authority" not in production_text()
+    assert 'parts[2] == "permit"' in source
+    assert 'parts[2] == "commit"' in source
+    assert "self.head_permit_issue(" in source
+    assert "self.head_permit_commit(" in source
+    assert "HttpGate.requires_access_callbacks(method, path)" in (
+        ROOT / "core/http_stdlib.py").read_text()
+    assert "HttpGate.requires_mirror_callback(method, path)" in (
+        ROOT / "core/http_stdlib.py").read_text()
+    production = production_text()
+    assert "/removal/apply" not in production
+    assert "POST /authority" not in production
 
 
 def test_removal_roots_and_nodes_are_not_generic_objects_or_grants():

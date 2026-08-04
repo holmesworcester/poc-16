@@ -613,7 +613,7 @@ separately, a family may declare current principal/authority scopes whose
 suppression makes the fact unusable as an authority provider without removing
 the fact from validated storage.
 
-`SuppTree` maps a known suppression ID to one of:
+`SuppressionTree` maps a known suppression ID to one of:
 
 - `CLEAR`: the ID exists and has no effective action at this root;
 - `ACTIVE(action_fid)`: the named immutable action is effective.
@@ -679,8 +679,8 @@ mint one current sync grant from a device-signed proof carrying the current remo
   -> POST /obj/open or /pack/open for an exact create-only PUT
   -> PUT missing pile/tree/head objects directly to S3 or R2
   -> ordinary head: POST /head/<proposed-head-oid> with an exact closed proof
-  -> control head: issue an exact base/head/control-pile permit while current
-  -> control head: commit the permit, joining removal before the head CAS
+  -> control head: POST /head/<oid>/permit with proof + exact control piles
+  -> control head: POST /head/<oid>/commit with permit + those same piles
   -> CAS heads/<workspace>/<device>
 ```
 
@@ -740,10 +740,14 @@ the shared `HttpGate` with the `owner` capability: it can read the recipient's
 removal tree and writer forest, create content-addressed objects/packs, and
 conditionally advance writer slots. A public `/removal/bootstrap` accepts only
 an original direct-member CLEAR closure. A control-bearing head first obtains
-a stateless permit bound to its current proof, exact base/head, and immutable
-control piles. Permit commit evaluates those control-only piles, joins their
-private removal cells, and only then attempts the head CAS. Ordinary content
-and malformed control piles are rejected, and exact retries are idempotent. A
+a stateless permit from `/head/<oid>/permit`, bound to its current proof, exact
+base/head, and immutable control piles. `/head/<oid>/commit` evaluates those
+same control-only piles, joins their private removal cells, and only then
+attempts the head CAS. The active sender retains one exact permit/body across
+retryable removal-root contention, 5xx, and lost-response retries with bounded
+full jitter. A competing-head HTTP 412 is terminal and requires rebase.
+Ordinary content and malformed control piles are rejected, and exact retries
+are idempotent. A
 closed head proof confines each slot update to its authenticated device. The
 Function URL adapter applies named request and aggregate control-pile bounds so
 base64 expansion and event metadata remain within Lambda's buffered invocation
@@ -767,7 +771,7 @@ python3 -m deploy.aws_lambda.manage deploy --create \
 ```
 
 Use `--update` only for the exact owned stack. `live-smoke` creates a unique
-temporary stack, exercises authority minting, reads, direct owner publication,
+temporary stack, exercises current-access minting, reads, owner publication,
 and denials against a supplied full-peer state, then removes compute again:
 
 ```sh
@@ -787,9 +791,10 @@ with the same `owner` capability. Small metadata operations use the native R2
 binding. Large GETs use scoped R2 S3/SigV4 URLs; large create-only PUTs use a
 short-lived HMAC ticket at a minimal streaming Worker route backed by the
 native R2 binding. Neither body enters the Python Worker heap. The owner
-gateway uses the same exact control-head permit to join private `removal` state
-before advancing its writer slot, but it has no generic authority publication
-route and no delete path. Control-pile count and aggregate bytes are bounded by
+gateway uses the same `/head/<oid>/permit` and `/head/<oid>/commit` control turn
+to join private `removal` state before advancing its writer slot, but it has no
+generic authority-publication route and no delete path. Control-pile count and
+aggregate bytes are bounded by
 named portable constants; ordinary metadata remains capped at 512 KiB.
 
 Set the non-secret deployment inputs:

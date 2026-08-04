@@ -28,7 +28,7 @@ local command
   -> PileSender closes dependencies
   -> WriterLog signs one independently closed pile leaf
   -> immutable pile/tree/head objects
-  -> authority proof binds one exact proposed head
+  -> current access proof binds one exact proposed head
   -> CAS heads/<workspace>/<device>
 
 peer pull
@@ -41,8 +41,8 @@ peer pull
 hosted owner publication
   -> direct create-only immutable object PUTs
   -> ordinary head: the same exact owner-head proof
-  -> control head: one exact preauthorized base/head/control permit
-  -> join private removal state before its bound head CAS
+  -> control head: POST /head/<oid>/permit with proof + exact controls
+  -> POST /head/<oid>/commit joins private removal state before its bound CAS
   -> CAS only the caller's writer slot
 ```
 
@@ -158,7 +158,7 @@ fact bytes must select it explicitly. Suppression selectors are explicit:
 SELF, one named parent, an immutable-ref ancestor path, several selectors, or
 none. A family offering no suppression key cannot be directly suppressed.
 
-`SuppTree` maps a known suppression ID to `CLEAR` or
+`SuppressionTree` maps a known suppression ID to `CLEAR` or
 `ACTIVE(action_fid)`. Absence is not clear. This lets a database-free node
 answer exact suppression and principal-liveness questions with authenticated
 point reads.
