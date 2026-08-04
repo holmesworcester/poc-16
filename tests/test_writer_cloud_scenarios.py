@@ -30,44 +30,45 @@ from tests.provider_fakes import FakeR2Bucket, FakeS3Bucket
 
 PAGE_SIZE = 10
 PREFIX = "tenant"
-AUTHORITY_ROOT = h(b"current authority root")
+REMOVAL_ROOT = h(b"current removal root")
+TRUSTED_NOW = 8_500_000
 
 # Canonical-byte ratchets for this fixed realistic fixture. These are storage
 # and transfer volumes, not a price sheet; provider rates remain external.
 SCALE_BYTES = {
     1: {
-        "publication": 4_072,
-        "cold": 4_072,
-        "noop": 351,
-        "changed_publication_read": 351,
-        "changed_publication_write": 4_165,
-        "one_changed": 4_165,
+        "publication": 4_070,
+        "cold": 4_070,
+        "noop": 349,
+        "changed_publication_read": 349,
+        "changed_publication_write": 4_163,
+        "one_changed": 4_163,
     },
     10: {
-        "publication": 52_586,
-        "cold": 52_586,
-        "noop": 3_510,
-        "changed_publication_read": 351,
-        "changed_publication_write": 5_485,
-        "one_changed": 8_644,
+        "publication": 51_189,
+        "cold": 51_189,
+        "noop": 3_490,
+        "changed_publication_read": 349,
+        "changed_publication_write": 5_330,
+        "one_changed": 8_471,
     },
     100: {
-        "publication": 537_960,
-        "cold": 537_960,
-        "noop": 35_100,
-        "changed_publication_read": 351,
-        "changed_publication_write": 5_487,
-        "one_changed": 40_236,
+        "publication": 522_613,
+        "cold": 522_613,
+        "noop": 34_900,
+        "changed_publication_read": 349,
+        "changed_publication_write": 5_332,
+        "one_changed": 39_883,
     },
 }
 
 RACE_BYTES = {
     "candidate_upload": 7_625,
-    "contention_read": 702,
-    "contention_write": 702,
-    "rebase_read": 3_225,
-    "rebase_write": 4_256,
-    "cold": 10_008,
+    "contention_read": 698,
+    "contention_write": 698,
+    "rebase_read": 3_223,
+    "rebase_write": 4_254,
+    "cold": 10_006,
 }
 
 
@@ -209,6 +210,7 @@ def proof(root, spec, proposed_head, base_head):
         base_head,
         proposed_head,
         9_000_000,
+        b"mechanical removal path",
         8_000_000,
     )
     request_signature = signature_fact(
@@ -239,7 +241,7 @@ async def publish(kind, tmp_path, root, specs, label):
     bucket, raw_store = provider(kind)
     cloud = CountingStore(raw_store)
     authorize = mechanical_head_authorizer(
-        root.fid, AUTHORITY_ROOT, 8_500_000)
+        root.fid, REMOVAL_ROOT)
     runtimes = []
     bindings = {spec.public: spec.binding for spec in specs}
     slot_bytes = {}
@@ -261,12 +263,12 @@ async def publish(kind, tmp_path, root, specs, label):
         await writer.establish(prepared)
         local_result = await OpaqueHeadGate(
             local, authorize).advance(
-                request, prepared.head_oid)
+                request, prepared.head_oid, TRUSTED_NOW)
         assert local_result.status == "applied"
         await writer.establish(prepared, cloud)
         cloud_result = await OpaqueHeadGate(
             cloud, authorize).advance(
-                request, prepared.head_oid)
+                request, prepared.head_oid, TRUSTED_NOW)
         assert cloud_result.status == "applied"
         slot_bytes[spec.public] = encode_slot(cloud_result.slot)
         immutable_bytes += sum(
@@ -296,9 +298,9 @@ async def publish(kind, tmp_path, root, specs, label):
 
 
 def mirror_for(run, receiver, consumer):
-    def binding_for(workspace, device, authority_root, _candidate):
+    def binding_for(workspace, device, removal_root, _candidate):
         assert workspace == run.root.fid
-        assert authority_root == AUTHORITY_ROOT
+        assert removal_root == REMOVAL_ROOT
         return run.bindings.get(device)
 
     return RepositoryMirror(
@@ -368,7 +370,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
     await changed.writer.establish(update)
     local_result = await OpaqueHeadGate(
         changed.local, run.authorize).advance(
-            request, update.head_oid)
+            request, update.head_oid, TRUSTED_NOW)
     assert local_result.status == "applied"
 
     old_slot_bytes = run.slot_bytes[changed.spec.public]
@@ -379,7 +381,7 @@ async def scale_scenario(kind, tmp_path, root, specs):
     await changed.writer.establish(update, run.cloud)
     cloud_result = await OpaqueHeadGate(
         run.cloud, run.authorize).advance(
-            request, update.head_oid)
+            request, update.head_oid, TRUSTED_NOW)
     assert cloud_result.status == "applied"
     new_slot_bytes = encode_slot(cloud_result.slot)
     run.slot_bytes[changed.spec.public] = new_slot_bytes
@@ -507,7 +509,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     outcomes = await asyncio.gather(*(
         OpaqueHeadGate(
             barrier_store, run.authorize).advance(
-                request, candidate.head_oid)
+                request, candidate.head_oid, TRUSTED_NOW)
         for request, candidate in zip(requests, candidates)
     ))
     statuses = [outcome.status for outcome in outcomes]
@@ -528,7 +530,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     loser = 1 - winner
     winner_result = await OpaqueHeadGate(
         runtime.local, run.authorize).advance(
-            requests[winner], candidates[winner].head_oid)
+            requests[winner], candidates[winner].head_oid, TRUSTED_NOW)
     assert winner_result.status == "applied"
     run.slot_bytes[spec.public] = encode_slot(outcomes[winner].slot)
     runtime.current = candidates[winner]
@@ -543,7 +545,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     await runtime.writer.establish(rebased)
     local_rebase = await OpaqueHeadGate(
         runtime.local, run.authorize).advance(
-            rebased_request, rebased.head_oid)
+            rebased_request, rebased.head_oid, TRUSTED_NOW)
     assert local_rebase.status == "applied"
 
     old_slot = run.slot_bytes[spec.public]
@@ -554,7 +556,7 @@ async def race_scenario(kind, tmp_path, root, specs):
     await runtime.writer.establish(rebased, run.cloud)
     cloud_rebase = await OpaqueHeadGate(
         run.cloud, run.authorize).advance(
-            rebased_request, rebased.head_oid)
+            rebased_request, rebased.head_oid, TRUSTED_NOW)
     assert cloud_rebase.status == "applied"
     final_slot = encode_slot(cloud_rebase.slot)
     rebase = run.cloud.snapshot()

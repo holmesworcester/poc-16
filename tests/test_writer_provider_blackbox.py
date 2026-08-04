@@ -40,7 +40,8 @@ class EndState:
 def authority_proof(
         secret, public, root, device_signature, device, proposed_head):
     request = head_request(
-        root.fid, public, public, None, proposed_head, 1_000, 4)
+        root.fid, public, public, None, proposed_head, 1_000,
+        b"mechanical removal path", 4)
     request_signature = signature_fact(secret, public, request, 4)
     return encode_signed_pile(make_signed_pile(
         secret,
@@ -88,7 +89,7 @@ async def exercise(kind, tmp_path, values):
     bucket, raw_store = provider(kind)
     cloud = CountingStore(raw_store)
     store_binding = h(b"provider writer binding")
-    authority_root = h(b"current authority root")
+    removal_root = h(b"current removal root")
     slot_key = head_slot_key(root.fid, public)
 
     message = message_fact(
@@ -116,8 +117,8 @@ async def exercise(kind, tmp_path, values):
         await OpaqueHeadGate(
             cloud,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10)).advance(
-                proof, prepared.head_oid)
+                root.fid, removal_root)).advance(
+                proof, prepared.head_oid, 10)
     assert cloud.snapshot() == CostVector(object_gets=1)
     assert f"{PREFIX}/{slot_key}" not in bucket.data
     assert physical_operations(kind, bucket, physical_start) == (
@@ -147,8 +148,8 @@ async def exercise(kind, tmp_path, values):
     advanced = await OpaqueHeadGate(
         cloud,
         mechanical_head_authorizer(
-            root.fid, authority_root, 10)).advance(
-                proof, prepared.head_oid)
+            root.fid, removal_root)).advance(
+                proof, prepared.head_oid, 10)
     slot_raw = encode_slot(advanced.slot)
     assert advanced.status == "applied"
     assert cloud.snapshot() == CostVector(
@@ -169,8 +170,8 @@ async def exercise(kind, tmp_path, values):
     consumer = FactConsumer(root.fid)
 
     def binding_for(
-            workspace, candidate_device, candidate_authority, _candidate):
-        assert candidate_authority == authority_root
+            workspace, candidate_device, candidate_removal, _candidate):
+        assert candidate_removal == removal_root
         if (workspace, candidate_device) != (root.fid, public):
             return None
         return WriterBinding(

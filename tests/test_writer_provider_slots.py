@@ -19,12 +19,12 @@ from tests.provider_fakes import FakeR2Bucket, FakeS3Bucket
 WORKSPACE = h(b"workspace")
 ALICE = h(b"alice-device")
 BOB = h(b"bob-device")
-AUTHORITY = h(b"authority")
+REMOVAL_ROOT = h(b"removal root")
 
 
 def slot(device, label):
     return encode_slot(HeadSlot(
-        WORKSPACE, device, h(label.encode()), AUTHORITY))
+        WORKSPACE, device, h(label.encode()), REMOVAL_ROOT))
 
 
 def exercise_sync(store):

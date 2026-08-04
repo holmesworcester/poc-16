@@ -77,7 +77,7 @@ DEFAULT_RTTS_MS = (25, 50, 75)
 LARGE_DURABLE_FACTS = 100_000
 NORMAL_MESSAGES_PER_PILE = 1
 OFFLINE_PACKED_MESSAGES_PER_PILE = 125
-AUTHORITY_ROOT = h(b"p2p benchmark authority")
+REMOVAL_ROOT = h(b"p2p benchmark removal root")
 
 
 def identity(label):
@@ -195,9 +195,9 @@ class Forest:
     object_owner: dict
 
     def binding_for(
-            self, workspace, device, authority_root, candidate):
+            self, workspace, device, removal_root, candidate):
         del candidate
-        if workspace != self.root.fid or authority_root != AUTHORITY_ROOT:
+        if workspace != self.root.fid or removal_root != REMOVAL_ROOT:
             return None
         return self.bindings.get(device)
 
@@ -323,7 +323,7 @@ async def publish_device(
         forest.root.fid,
         spec.public,
         prepared.head_oid,
-        AUTHORITY_ROOT,
+        REMOVAL_ROOT,
     ))
     applied = await forest.source.cas(key, token, slot)
     if not isinstance(applied, Applied):
@@ -364,7 +364,7 @@ async def append_message(forest, ordinal, label):
         forest.root.fid,
         runtime.spec.public,
         prepared.head_oid,
-        AUTHORITY_ROOT,
+        REMOVAL_ROOT,
     ))
     applied = await forest.source.cas(key, opened.token, slot)
     if not isinstance(applied, Applied):

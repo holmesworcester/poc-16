@@ -96,11 +96,11 @@ def _descriptor(value):
 class Scan:
     device: str
     head: str
-    authority_root: str
+    removal_root: str
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
-                self.device, self.head, self.authority_root)):
+                self.device, self.head, self.removal_root)):
             raise ValueError("notification scan")
 
 
@@ -182,9 +182,9 @@ def _descriptor_body(value):
 
 def _scan_body(value):
     return None if value is None else {
-        "authority_root": value.authority_root,
         "device": value.device,
         "head": value.head,
+        "removal_root": value.removal_root,
     }
 
 
@@ -225,7 +225,7 @@ def decode_cursor(raw):
     raw_pending = value.get("pending")
     if raw_scan is not None and (
             not isinstance(raw_scan, dict) or set(raw_scan) != {
-                "authority_root", "device", "head"}):
+                "device", "head", "removal_root"}):
         raise ValueError("notification scan shape")
     if raw_pending is not None and (
             not isinstance(raw_pending, dict) or set(raw_pending) != {
@@ -233,7 +233,7 @@ def decode_cursor(raw):
         raise ValueError("notification pending shape")
     scan = None if raw_scan is None else Scan(
         raw_scan.get("device"), raw_scan.get("head"),
-        raw_scan.get("authority_root"))
+        raw_scan.get("removal_root"))
     pending = None if raw_pending is None else Pending(
         raw_pending.get("oid"), raw_pending.get("heads"),
         raw_pending.get("seen"))
@@ -350,7 +350,7 @@ class _PinnedSource:
         self.source = source
         self.key = head_slot_key(workspace, scan.device)
         self.raw = encode_slot(HeadSlot(
-            workspace, scan.device, scan.head, scan.authority_root))
+            workspace, scan.device, scan.head, scan.removal_root))
 
     async def get_bounded(self, key, maximum):
         return await self.source.get_bounded(key, maximum)
@@ -386,7 +386,7 @@ class _ScanStore:
         self.key = head_slot_key(workspace, scan.device)
         if base is not None:
             self.values[self.key] = encode_slot(HeadSlot(
-                workspace, scan.device, base, scan.authority_root))
+                workspace, scan.device, base, scan.removal_root))
 
     async def get_bounded(self, key, maximum):
         raw = self.values.get(key)
@@ -659,7 +659,7 @@ class NotificationDiscovery:
                 if base == slot.head or rejected[slot.device] == slot.head:
                     continue
                 return Scan(
-                    slot.device, slot.head, slot.authority_root)
+                    slot.device, slot.head, slot.removal_root)
             if page.cursor is None:
                 return None
             after = page.cursor

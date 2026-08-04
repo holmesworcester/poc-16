@@ -577,7 +577,10 @@ def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():
         "a" * 64, "b" * 64, "c" * 64, BOOTSTRAP_BACKFILL,
         True, empty, empty, empty,
         Scan("d" * 64, "e" * 64, "f" * 64))
-    assert decode_cursor(encode_cursor(cursor)) == cursor
+    encoded_cursor = encode_cursor(cursor)
+    assert b'"removal_root"' in encoded_cursor
+    assert b'"authority_root"' not in encoded_cursor
+    assert decode_cursor(encoded_cursor) == cursor
     with pytest.raises(ValueError, match="cursor shape"):
         decode_cursor(canon({"format": "notification-cursor-v3"}))
 

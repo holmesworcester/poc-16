@@ -31,15 +31,14 @@ from full_peer.node import FullPeer, now_ms
 _FIXTURE_SIGNER = load_sk("01" * 32)
 
 
-def mechanical_head_authorizer(workspace, authority_root, trusted_now=0):
+def mechanical_head_authorizer(workspace, removal_root):
     """Test-only semantic bypass for exercising the mechanical head CAS.
 
-    Authority behavior is covered through ``AuthorityRepository`` tests. Lower
+    Removal-path behavior is covered through the real AccessGate tests. Lower
     writer-tree/store tests need only a typed grant that preserves the exact
-    request's device, base, and proposed head without retaining the retired
-    production AuthorityGate.
+    request's device, base, proposed head, and recipient root.
     """
-    async def authorize(raw, proposed_head):
+    async def authorize(raw, proposed_head, trusted_now):
         pile = decode_signed_pile(raw, workspace=workspace)
         requests = [fact for fact in pile.facts if fact.t == "head_request"]
         if len(requests) != 1:
@@ -55,7 +54,7 @@ def mechanical_head_authorizer(workspace, authority_root, trusted_now=0):
             body["device"],
             body.get("base_head") or None,
             proposed_head,
-            authority_root,
+            removal_root,
         )
     return authorize
 

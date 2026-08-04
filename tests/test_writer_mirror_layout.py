@@ -71,7 +71,7 @@ def authority_proof(
         base_head=None):
     request = head_request(
         root.fid, public, public, base_head,
-        proposed_head, 1_000, 100)
+        proposed_head, 1_000, b"mechanical removal path", 100)
     request_signature = signature_fact(
         secret, public, request, 100)
     return encode_signed_pile(make_signed_pile(
@@ -111,12 +111,13 @@ async def published(store, count=3, *, large=False):
     result = await OpaqueHeadGate(
         store,
         mechanical_head_authorizer(
-            root.fid, h(b"authority"), 10),
+            root.fid, h(b"removal root")),
     ).advance(
         authority_proof(
             secret, public, root, device_signature,
             device, update.head_oid),
         update.head_oid,
+        10,
     )
     assert result.status == "applied"
     raws = tuple(encode_signed_pile(pile) for pile in update.piles)
@@ -124,7 +125,7 @@ async def published(store, count=3, *, large=False):
 
 
 def resolver(binding):
-    def resolve(workspace, device, _authority_root, _candidate):
+    def resolve(workspace, device, _removal_root, _candidate):
         return binding if (
             workspace, device) == (
                 binding.workspace, binding.device) else None
@@ -298,8 +299,8 @@ def test_warm_sparse_difference_uses_one_exact_pile_range(tmp_path):
         advanced = await OpaqueHeadGate(
             backing,
             mechanical_head_authorizer(
-                root.fid, h(b"authority"), 10),
-        ).advance(proof, update.head_oid)
+                root.fid, h(b"removal root")),
+        ).advance(proof, update.head_oid, 10)
         assert advanced.status == "applied"
         all_raws = raws + tuple(
             encode_signed_pile(pile) for pile in update.piles)
@@ -512,7 +513,7 @@ def test_packed_bad_later_pile_cannot_leak_earlier_valid_pile(tmp_path):
             source_store.put_if_absent("obj/" + oid, raw)
         key = head_slot_key(root.fid, public)
         source_store.cas(key, ABSENT, encode_slot(HeadSlot(
-            root.fid, public, oid_head, h(b"authority"))))
+            root.fid, public, oid_head, h(b"removal root"))))
         placement, body = build_pack(root.fid, public, 1, raws)
         publish_page(source_store, root.fid, public, (placement,))
         source = LayoutSource(

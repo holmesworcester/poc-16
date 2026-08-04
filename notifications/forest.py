@@ -88,7 +88,7 @@ class MemoryStore:
         )
 
 
-def claimed_writer_binding(workspace, device, _authority_root, candidate):
+def claimed_writer_binding(workspace, device, _removal_root, candidate):
     """Bind a signed head to its claim; its piles must prove that claim.
 
     RepositoryMirror verifies the head signature and FactConsumer additionally

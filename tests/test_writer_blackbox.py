@@ -30,7 +30,7 @@ def authority_proof(
         base_head=None):
     request = head_request(
         root.fid, writer, owner, base_head,
-        proposed_head, 1_000_000, ts)
+        proposed_head, 1_000_000, b"mechanical removal path", ts)
     signed = signature_fact(secret, writer, request, ts)
     return encode_signed_pile(make_signed_pile(
         secret,
@@ -58,9 +58,9 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         alice_store = FsStore(str(tmp_path / "alice"))
         bob_store = FsStore(str(tmp_path / "bob"))
         carol_store = FsStore(str(tmp_path / "carol"))
-        authority_root = h(b"current-authority")
+        removal_root = h(b"current-removal-root")
         authorize = mechanical_head_authorizer(
-            root.fid, authority_root, 10)
+            root.fid, removal_root)
         bindings = {
             alice: WriterBinding(
                 root.fid, alice, alice, h(b"alice-store")),
@@ -68,7 +68,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
                 root.fid, bob, alice, h(b"bob-store")),
         }
 
-        def binding_for(workspace, device, _authority_root, _candidate):
+        def binding_for(workspace, device, _removal_root, _candidate):
             binding = bindings.get(device)
             return binding if binding is not None \
                 and binding.workspace == workspace else None
@@ -91,6 +91,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
                 (root, primary_sig, primary),
                 alice_update.head_oid, 20),
             alice_update.head_oid,
+            10,
         )
 
         # Bob consumes Alice before it can relay Alice onward.
@@ -119,6 +120,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
                 bob_secret, bob, alice, root, authority,
                 bob_update.head_oid, 31),
             bob_update.head_oid,
+            10,
         )
 
         # Carol connects only to Bob. Bob relays Alice's original accepted
@@ -150,6 +152,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
                 (root, primary_sig, primary),
                 late_update.head_oid, 41, late_update.base_head),
             late_update.head_oid,
+            10,
         )
         warm = await bob_mirror.sync_from(alice_store)
         assert warm.changed == warm.piles == 1
@@ -186,14 +189,14 @@ def test_workspace_directory_prefixes_do_not_cross(tmp_path):
                 secret, public, public, root,
                 (root, device_sig, device), update.head_oid, 20)
             authorize = mechanical_head_authorizer(
-                root.fid, h(f"auth-{ordinal}".encode()), 10)
+                root.fid, h(f"removal-{ordinal}".encode()))
             await OpaqueHeadGate(shared, authorize).advance(
-                request, update.head_oid)
+                request, update.head_oid, 10)
             consumer = FactConsumer(root.fid)
             receiver = RepositoryMirror(
                 root.fid,
                 FsStore(str(tmp_path / f"receiver-{ordinal}")),
-                lambda workspace, device_key, _authority, _candidate,
+                lambda workspace, device_key, _removal_root, _candidate,
                 wanted=binding: wanted if (
                     workspace, device_key) == (
                         wanted.workspace, wanted.device) else None,

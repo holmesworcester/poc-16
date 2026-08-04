@@ -48,16 +48,16 @@ class Forest:
     logs: dict
     bindings: dict
     slots: dict
-    authority: str
+    removal_root: str
 
-    def resolve(self, workspace, device, _authority, _candidate):
+    def resolve(self, workspace, device, _removal_root, _candidate):
         if workspace != self.workspace:
             return None
         return self.bindings.get(device)
 
 
 async def make_forest(path, count=3, published=None):
-    """Build independent device logs with one realistic shared authority."""
+    """Build independent device logs with one shared removal-root pin."""
     identities = tuple(keypair() for _ in range(count))
     founder_secret, founder = identities[0]
     root = workspace_fact(founder_secret, founder, "workspace", 1)
@@ -79,7 +79,7 @@ async def make_forest(path, count=3, published=None):
         ))
 
     source = FsStore(str(path))
-    authority = h(b"parallel-open-authority")
+    removal_root = h(b"parallel-open-removal-root")
     logs, bindings, slots = {}, {}, {}
     for ordinal, (secret, public) in enumerate(identities):
         store_binding = h(f"writer-store-{ordinal}".encode())
@@ -98,7 +98,7 @@ async def make_forest(path, count=3, published=None):
         logs[public] = log
         bindings[public] = binding
         slots[public] = encode_slot(HeadSlot(
-            root.fid, public, update.head_oid, authority))
+            root.fid, public, update.head_oid, removal_root))
 
     devices = tuple(sorted(logs))
     if published is None:
@@ -115,7 +115,7 @@ async def make_forest(path, count=3, published=None):
         logs,
         bindings,
         slots,
-        authority,
+        removal_root,
     )
 
 
@@ -126,7 +126,7 @@ async def staged_append(forest, device):
         forest.workspace,
         device,
         update.head_oid,
-        forest.authority,
+        forest.removal_root,
     ))
 
 

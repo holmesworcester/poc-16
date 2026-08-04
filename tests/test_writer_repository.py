@@ -12,7 +12,7 @@ from core.close import (
 from core.crypto import h, keypair
 from core.fact import canon
 from core.limits import (
-    MAX_AUTHORITY_PILE_BYTES,
+    MAX_CONTROL_PILE_BYTES,
     MAX_FACT_BYTES,
     MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -66,7 +66,7 @@ def proof_for(
         base_head=None):
     request = head_request(
         root.fid, public, public, base_head,
-        proposed_head, 1_000, 3)
+        proposed_head, 1_000, b"mechanical removal path", 3)
     request_signature = signature_fact(
         secret, public, request, 3)
     return encode_signed_pile(make_signed_pile(
@@ -78,7 +78,7 @@ def proof_for(
 
 
 def binding_for(workspace, public, store_binding):
-    def resolve(candidate_workspace, device, _authority_root, _candidate):
+    def resolve(candidate_workspace, device, _removal_root, _candidate):
         assert candidate_workspace == workspace
         if device != public:
             return None
@@ -105,13 +105,14 @@ async def _accepted_history(path, store_type=FsStore):
     await log.establish(update)
     gate = OpaqueHeadGate(
         store,
-        mechanical_head_authorizer(root.fid, h(b"authority"), 100),
+        mechanical_head_authorizer(root.fid, h(b"removal root")),
     )
     outcome = await gate.advance(
         proof_for(
             secret, public, root, device_signature,
             device, update.head_oid),
         update.head_oid,
+        100,
     )
     assert outcome.status == "applied"
     return store, secret, public, root, update
@@ -267,7 +268,7 @@ def test_open_accepted_pile_enforces_the_explicit_streaming_byte_bound(
             max_bytes=len(raw)) == raw
         assert await open_accepted_pile(
             store, root.fid, public, 1,
-            max_bytes=MAX_AUTHORITY_PILE_BYTES) == raw
+            max_bytes=MAX_CONTROL_PILE_BYTES) == raw
 
         with pytest.raises(PayloadTooLarge, match="exceeds byte limit"):
             await open_accepted_pile(
@@ -338,7 +339,7 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
     async def scenario():
         secret, public, root, device_signature, device = world()
         store_binding = h(b"writer-store")
-        authority_root = h(b"current-authority")
+        removal_root = h(b"current-removal-root")
         writer_store = FsStore(str(tmp_path / "writer"))
         cloud_store = FsStore(str(tmp_path / "cloud"))
         normal_store = FsStore(str(tmp_path / "normal-receiver"))
@@ -361,16 +362,16 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
             device, prepared.head_oid)
         writer_gate = OpaqueHeadGate(
             writer_store,
-            mechanical_head_authorizer(root.fid, authority_root, 10))
+            mechanical_head_authorizer(root.fid, removal_root))
         cloud_gate = OpaqueHeadGate(
             cloud_store,
-            mechanical_head_authorizer(root.fid, authority_root, 10))
+            mechanical_head_authorizer(root.fid, removal_root))
 
         assert (await writer_gate.advance(
-            proof, prepared.head_oid)).status == "applied"
+            proof, prepared.head_oid, 10)).status == "applied"
         await writer.establish(prepared, cloud_store)
         assert (await cloud_gate.advance(
-            proof, prepared.head_oid)).status == "applied"
+            proof, prepared.head_oid, 10)).status == "applied"
 
         normal_consumer = FactConsumer(root.fid)
         cloud_consumer = FactConsumer(root.fid)
@@ -404,7 +405,7 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
     async def scenario():
         secret, public, root, device_signature, device = world()
         store_binding = h(b"owner-publisher-store")
-        authority_root = h(b"owner-publisher-authority")
+        removal_root = h(b"owner-publisher-removal-root")
         local = FsStore(str(tmp_path / "local"))
         cloud = FsStore(str(tmp_path / "cloud"))
         receiver = FsStore(str(tmp_path / "receiver"))
@@ -415,16 +416,16 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         local_gate = OpaqueHeadGate(
             local,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10),
+                root.fid, removal_root),
         )
         cloud_gate = OpaqueHeadGate(
             cloud,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10),
+                root.fid, removal_root),
         )
 
         async def advance(proof, proposed):
-            return await cloud_gate.advance(proof, proposed)
+            return await cloud_gate.advance(proof, proposed, 10)
 
         def make_proof(base, proposed):
             return proof_for(
@@ -450,7 +451,7 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         first = await writer.prepare(((root, device_signature, device),))
         await writer.establish(first)
         assert (await local_gate.advance(
-            make_proof(None, first.head_oid), first.head_oid
+            make_proof(None, first.head_oid), first.head_oid, 10
         )).status == "applied"
         published = await publisher.publish()
         assert (published.status, published.piles) == ("applied", 1)
@@ -465,7 +466,7 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
                                         item_signature, item),))
         await writer.establish(second)
         assert (await local_gate.advance(
-            make_proof(first.head_oid, second.head_oid), second.head_oid
+            make_proof(first.head_oid, second.head_oid), second.head_oid, 10
         )).status == "applied"
         advanced = await publisher.publish()
         assert (advanced.status, advanced.piles) == ("applied", 1)
@@ -497,7 +498,7 @@ def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
         # binding/auth fixtures deliberately keep semantic identities separate.
         workspace = alice[2].fid
         store = FsStore(str(tmp_path / "cloud"))
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         proposals = []
         for ordinal, values in enumerate((alice, bob), 1):
             _secret, public, _root, _sig, _device = values
@@ -507,14 +508,14 @@ def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
             proposals.append((
                 public, head))
 
-        async def authorize(proof, head):
+        async def authorize(proof, head, _trusted_now):
             device = proof.decode()
             return HeadGrant(
-                workspace, device, None, head, authority_root)
+                workspace, device, None, head, removal_root)
 
         gate = OpaqueHeadGate(store, authorize)
         outcomes = await asyncio.gather(*(
-            gate.advance(device.encode(), head)
+            gate.advance(device.encode(), head, 10)
             for device, head in proposals
         ))
         assert [outcome.status for outcome in outcomes] == [
@@ -527,7 +528,7 @@ def test_two_device_roots_advance_without_a_shared_content_cas(tmp_path):
 def test_cloud_requires_the_opaque_head_object_then_trusts_its_bytes(tmp_path):
     async def scenario():
         secret, public, root, device_signature, device = world()
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         cloud = FsStore(str(tmp_path / "cloud"))
         receiver = FsStore(str(tmp_path / "receiver"))
         forged_head = h(b"missing opaque head")
@@ -539,8 +540,8 @@ def test_cloud_requires_the_opaque_head_object_then_trusts_its_bytes(tmp_path):
             await OpaqueHeadGate(
                 cloud,
                 mechanical_head_authorizer(
-                    root.fid, authority_root, 10)).advance(
-                        proof, forged_head)
+                    root.fid, removal_root)).advance(
+                        proof, forged_head, 10)
         assert cloud.get(f"heads/{root.fid}/{public}") is None
 
         # Existence is not content admission: an opaque malformed head is
@@ -549,7 +550,7 @@ def test_cloud_requires_the_opaque_head_object_then_trusts_its_bytes(tmp_path):
         result = await OpaqueHeadGate(
             cloud,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10)).advance(proof, forged_head)
+                root.fid, removal_root)).advance(proof, forged_head, 10)
         assert result.status == "applied"
 
         consumer = FactConsumer(root.fid)
@@ -679,13 +680,14 @@ def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
         gate = OpaqueHeadGate(
             source,
             mechanical_head_authorizer(
-                root.fid, h(b"authority"), 10),
+                root.fid, h(b"removal root")),
         )
         await gate.advance(
             proof_for(
                 secret, public, root, device_signature,
                 device, update.head_oid),
             update.head_oid,
+            10,
         )
 
         consumer = FailOnceConsumer(root.fid)

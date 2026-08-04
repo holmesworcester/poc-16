@@ -85,6 +85,7 @@ def authority_proof(
         base_head,
         proposed_head,
         1_000_000,
+        b"mechanical removal path",
         timestamp,
     )
     request_signature = signature_fact(
@@ -97,11 +98,11 @@ def authority_proof(
     ))
 
 
-def resolver(bindings, authority_root):
+def resolver(bindings, removal_root):
     def resolve(
-            workspace, device, candidate_authority_root, _candidate):
+            workspace, device, candidate_removal_root, _candidate):
         binding = bindings.get(device)
-        if candidate_authority_root != authority_root \
+        if candidate_removal_root != removal_root \
                 or binding is None \
                 or binding.workspace != workspace:
             return None
@@ -122,14 +123,14 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
     async def scenario():
         secret, writer, root, authority = primary_authority()
         store_binding = h(b"same-device-store")
-        authority_root = h(b"current-authority")
+        removal_root = h(b"current-removal-root")
         source = FsStore(str(tmp_path / "source"))
         log = WriterLog(
             root.fid, writer, writer, store_binding, secret, source)
         gate = OpaqueHeadGate(
             source,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10),
+                root.fid, removal_root),
         )
 
         initial = await log.prepare((authority,))
@@ -139,6 +140,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
                 secret, writer, writer, authority,
                 initial.head_oid, timestamp=101),
             initial.head_oid,
+            10,
         )
         assert initial_result.status == "applied"
 
@@ -170,6 +172,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
                     timestamp=210 + ordinal,
                 ),
                 candidate.head_oid,
+                10,
             )
             for ordinal, candidate in enumerate(candidates)
         ))
@@ -194,6 +197,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
                 timestamp=220,
             ),
             candidates[loser].head_oid,
+            10,
         )
         assert stale_again.status == "retryable"
         assert decode_slot_at(key, source.get(key)).head == winning_head
@@ -214,6 +218,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
                 timestamp=230,
             ),
             rebased.head_oid,
+            10,
         )
         assert applied.status == "applied"
 
@@ -224,7 +229,7 @@ def test_same_device_stale_base_race_has_one_winner_and_retryable_loser(
             resolver({
                 writer: WriterBinding(
                     root.fid, writer, writer, store_binding),
-            }, authority_root),
+            }, removal_root),
             consumer,
         )
         synced = await mirror.sync_from(source)
@@ -241,7 +246,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
     async def scenario():
         secret, writer, root, authority = primary_authority()
         store_binding = h(b"warm-writer-store")
-        authority_root = h(b"current-authority")
+        removal_root = h(b"current-removal-root")
         source = ReadTracingFsStore(str(tmp_path / "source"))
         receiver = FsStore(str(tmp_path / "receiver"))
         log = WriterLog(
@@ -249,7 +254,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
         gate = OpaqueHeadGate(
             source,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10),
+                root.fid, removal_root),
         )
         consumer = FactConsumer(root.fid)
         mirror = RepositoryMirror(
@@ -258,7 +263,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
             resolver({
                 writer: WriterBinding(
                     root.fid, writer, writer, store_binding),
-            }, authority_root),
+            }, removal_root),
             consumer,
         )
 
@@ -268,7 +273,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
             secret, writer, writer, authority,
             initial.head_oid, timestamp=101)
         assert (await gate.advance(
-            proof, initial.head_oid)).status == "applied"
+            proof, initial.head_oid, 10)).status == "applied"
         initial_pile_oid = signed_pile_oid(initial.piles[0])
 
         cold = await mirror.sync_from(source)
@@ -278,7 +283,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
 
         # The publisher and receiver both treat exact duplicates as no-ops.
         assert (await gate.advance(
-            proof, initial.head_oid)).status == "noop"
+            proof, initial.head_oid, 10)).status == "noop"
         source.clear_reads()
         duplicate = await mirror.sync_from(source)
         assert duplicate.changed == duplicate.piles == duplicate.facts == 0
@@ -300,6 +305,7 @@ def test_duplicate_sync_is_noop_and_warm_append_fetches_only_new_pile(
                 timestamp=201,
             ),
             update.head_oid,
+            10,
         )).status == "applied"
         new_pile_oid = signed_pile_oid(update.piles[0])
         source.clear_reads()
@@ -326,7 +332,7 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
         tmp_path):
     async def scenario():
         owner_secret, owner, root, primary = primary_authority()
-        authority_root = h(b"directory-authority")
+        removal_root = h(b"directory-removal-root")
         entries = []
 
         primary_binding = WriterBinding(
@@ -392,7 +398,7 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
                 gate = OpaqueHeadGate(
                     cloud,
                     mechanical_head_authorizer(
-                        root.fid, authority_root, 10),
+                        root.fid, removal_root),
                 )
                 result = await gate.advance(
                     authority_proof(
@@ -404,6 +410,7 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
                         timestamp=100 + proof_ordinal,
                     ),
                     update.head_oid,
+                    10,
                 )
                 assert result.status == "applied"
 
@@ -415,7 +422,7 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
             mirror = RepositoryMirror(
                 root.fid,
                 receiver_store,
-                resolver(bindings, authority_root),
+                resolver(bindings, removal_root),
                 consumer,
             )
             result = await mirror.sync_from(cloud, page_limit=1)

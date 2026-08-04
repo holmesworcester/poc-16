@@ -37,7 +37,7 @@ def proof(values, proposed_head, base_head=None):
     secret, public, root, device_signature, device = values
     request = head_request(
         root.fid, public, public, base_head,
-        proposed_head, 1_000_000, 3)
+        proposed_head, 1_000_000, b"mechanical removal path", 3)
     request_signature = signature_fact(secret, public, request, 3)
     return encode_signed_pile(make_signed_pile(
         secret, root.fid, public,
@@ -50,7 +50,7 @@ def test_one_pile_publish_cold_sync_and_noop_have_small_exact_costs(tmp_path):
         values = fixture()
         secret, public, root, device_signature, device = values
         store_binding = h(b"store")
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         author = FsStore(str(tmp_path / "author"))
         cloud_raw = FsStore(str(tmp_path / "cloud"))
         cloud = CountingStore(cloud_raw)
@@ -61,13 +61,13 @@ def test_one_pile_publish_cold_sync_and_noop_have_small_exact_costs(tmp_path):
             root, device_signature, device),))
         await writer.establish(update)
         authorize = mechanical_head_authorizer(
-            root.fid, authority_root, 10)
+            root.fid, removal_root)
         await OpaqueHeadGate(author, authorize).advance(
-            proof(values, update.head_oid), update.head_oid)
+            proof(values, update.head_oid), update.head_oid, 10)
 
         await writer.establish(update, cloud)
         await OpaqueHeadGate(cloud, authorize).advance(
-            proof(values, update.head_oid), update.head_oid)
+            proof(values, update.head_oid), update.head_oid, 10)
         published = cloud.snapshot()
         assert published.object_puts == len(update.objects) == 3
         assert published.slot_gets == published.slot_cas == 1
@@ -117,11 +117,11 @@ def test_hundred_piles_use_one_head_cas_and_only_final_tree_pages(tmp_path):
         update = await writer.prepare(closures)
         await writer.establish(update, cloud)
 
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         authorize = mechanical_head_authorizer(
-            root.fid, authority_root, 10)
+            root.fid, removal_root)
         await OpaqueHeadGate(cloud, authorize).advance(
-            proof(values, update.head_oid), update.head_oid)
+            proof(values, update.head_oid), update.head_oid, 10)
         cost = cloud.snapshot()
         tree_pages = len(update.objects) - 100 - 1
         objects = dict(update.objects)
@@ -150,12 +150,12 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         values = fixture()
         secret, public, root, device_signature, device = values
         binding = h(b"store")
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         author = FsStore(str(tmp_path / "author"))
         cloud = CountingStore(FsStore(str(tmp_path / "cloud")))
         receiver = FsStore(str(tmp_path / "receiver"))
         authorize = mechanical_head_authorizer(
-            root.fid, authority_root, 10)
+            root.fid, removal_root)
         log = WriterLog(
             root.fid, public, public, binding, secret, author)
 
@@ -165,12 +165,12 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         assert (await OpaqueHeadGate(
             author, authorize).advance(
                 proof(values, initial.head_oid),
-                initial.head_oid)).status == "applied"
+                initial.head_oid, 10)).status == "applied"
         await log.establish(initial, cloud)
         assert (await OpaqueHeadGate(
             cloud, authorize).advance(
                 proof(values, initial.head_oid),
-                initial.head_oid)).status == "applied"
+                initial.head_oid, 10)).status == "applied"
 
         consumer = FactConsumer(root.fid)
         mirror = RepositoryMirror(
@@ -191,14 +191,14 @@ def test_warm_one_pile_publish_and_mirror_cost_do_not_scale_with_history(
         assert (await OpaqueHeadGate(
             author, authorize).advance(
                 proof(values, update.head_oid, update.base_head),
-                update.head_oid)).status == "applied"
+                update.head_oid, 10)).status == "applied"
 
         cloud.clear()
         await log.establish(update, cloud)
         assert (await OpaqueHeadGate(
             cloud, authorize).advance(
                 proof(values, update.head_oid, update.base_head),
-                update.head_oid)).status == "applied"
+                update.head_oid, 10)).status == "applied"
         publish = cloud.snapshot()
         assert len(update.objects) == 3  # pile + final tree page + head
         assert publish.object_puts == 3

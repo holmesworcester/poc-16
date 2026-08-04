@@ -53,7 +53,7 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         device = device_fact(root.fid, public, "laptop", 2)
         device_signature = signature_fact(secret, public, device, 2)
         binding = writer_store_binding(root.fid, public)
-        authority_root = h(b"authority")
+        removal_root = h(b"removal root")
         source = FsStore(str(tmp_path / "source"))
         local = FsStore(str(tmp_path / "local"))
         database = str(tmp_path / "projection.db")
@@ -65,7 +65,7 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         await log.establish(update)
         request = head_request(
             root.fid, public, public, None,
-            update.head_oid, 1_000, 3)
+            update.head_oid, 1_000, b"mechanical removal path", 3)
         request_signature = signature_fact(
             secret, public, request, 3)
         proof = encode_signed_pile(make_signed_pile(
@@ -78,13 +78,13 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         assert (await OpaqueHeadGate(
             source,
             mechanical_head_authorizer(
-                root.fid, authority_root, 10)).advance(
-                proof, update.head_oid)).status == "applied"
+                root.fid, removal_root)).advance(
+                proof, update.head_oid, 10)).status == "applied"
 
         def binding_for(
-                workspace, writer, selected_authority, _candidate):
-            if (workspace, writer, selected_authority) != (
-                    root.fid, public, authority_root):
+                workspace, writer, selected_removal, _candidate):
+            if (workspace, writer, selected_removal) != (
+                    root.fid, public, removal_root):
                 return None
             return WriterBinding(
                 root.fid, public, public, binding)

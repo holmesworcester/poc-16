@@ -148,9 +148,12 @@ def test_writer_head_and_slot_round_trip_without_predecessor_chain():
     assert require_bound_head(head, binding) == head
 
     slot = HeadSlot(
-        root.fid, public, head_oid(head), h(b"authority-root"))
+        root.fid, public, head_oid(head), h(b"removal-root"))
     key = head_slot_key(root.fid, public)
-    assert decode_slot_at(key, encode_slot(slot)) == slot
+    raw_slot = encode_slot(slot)
+    assert b'"removal_root"' in raw_slot
+    assert b'"authority_root"' not in raw_slot
+    assert decode_slot_at(key, raw_slot) == slot
 
 
 def test_head_and_tree_advance_compare_directly_to_last_accepted_root():
