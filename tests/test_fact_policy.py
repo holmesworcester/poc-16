@@ -64,11 +64,11 @@ def test_one_registry_exhaustively_covers_the_router():
     assert {
         need.role for need in facts.auth.admin.needs(
             facts.auth.admin.admin(workspace, "grantor", "grantee", 1))
-    } == {"author", "grantor_admin", "grantee_member"}
+    } == {"author", "member", "grantor_admin", "grantee_member"}
     assert {
         need.role for need in facts.auth.removal.needs(
             facts.auth.removal.removal(workspace, "admin", "target", 1))
-    } == {"author", "admin", "target_member"}
+    } == {"author", "member", "admin", "target_member"}
     assert {
         need.role for need in facts.content.message.needs(
             facts.content.message.message(
@@ -329,6 +329,7 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
             node, workspace, target, ts=ts)
         action = node.fact_of(workspace, action_fid)
         assert action.body == {
+            "actor": founder,
             "mode": _policy.ADMIN,
             "owner": bob,
             "pk": founder,

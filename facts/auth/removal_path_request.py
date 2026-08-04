@@ -1,16 +1,17 @@
-"""Historical membership request for one self-confined removal path."""
+"""facts/auth/removal_path_request.py — historical path request."""
 
 from core.fact import Fact
 from core.shape import valid_fid
 from .._policy import FamilyPolicy
-from . import _access
+from . import _access, signature
+from ._proof import historical_owner, identity_closure
 
 
 TAG = "removal_path_request"
 POLICY = FamilyPolicy()
-DURABLE = False
 
 
+# SHAPE
 def removal_path_request(workspace, device, owner, exp, ts):
     return Fact(
         TAG, ts, [],
@@ -19,10 +20,12 @@ def removal_path_request(workspace, device, owner, exp, ts):
     )
 
 
+# NEEDS
 def needs(fact):
     return _access.needs(fact)
 
 
+# VALIDATE
 def validate(fact, _ctx):
     try:
         body = fact.body
@@ -37,6 +40,23 @@ def validate(fact, _ctx):
         return False
 
 
+# MODE
+DURABLE = False
+
+
+# COMMANDS
+def payload(node, workspace, exp, ts, *, owner=None, closures=()):
+    """Build the device-signed historical-membership proof closure."""
+    secret, device = node.identity(workspace)
+    owner = historical_owner(node, workspace, device) \
+        if owner is None else owner
+    item = removal_path_request(workspace, device, owner, exp, ts)
+    signed = signature.signature(secret, device, item, ts)
+    return identity_closure(
+        node, workspace, item, signed, closures=closures)
+
+
+# QUERIES
 def authorize_path(valid, stream, writer, trusted_now):
     if valid.fact.t != TAG or valid.fact.body["exp"] < trusted_now:
         return None

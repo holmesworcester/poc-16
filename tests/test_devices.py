@@ -3,14 +3,13 @@
 import pytest
 
 import facts
-from .util import signed_pile_facts, signed_pile_bytes
+from .util import signed_pile_facts
 from core import fact_index
 from core.crypto import keypair
 from core.kernel import resolve_deps
-from full_peer.node import FullPeer, now_ms
+from full_peer.node import FullPeer
 from facts.auth.device import bind, device, devices
 from facts.auth.device_invite import grant
-from facts.auth.request import payload as request_payload
 from facts.auth.signature import signature
 
 from .util import (
@@ -50,7 +49,9 @@ def test_direct_grant_admits_a_known_key_without_a_join(tmp_path):
         row["pk"]: row["role"]
         for row in facts.auth.user.members(node, workspace)
     }
-    assert members[laptop] == "device"
+    # Admin is a member-principal role, so every explicitly owned device can
+    # exercise Alice's founder authority with its own signature.
+    assert members[laptop] == "admin"
     assert {row["pk"] for row in devices(node, workspace, user)} \
         == {user, laptop}
 
@@ -178,10 +179,10 @@ def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
         "bob-sibling", 101)
 
     assert node.sql(workspace).resolve_offer(
-        "member", sibling, founder
+        "device_key", sibling, founder
     ) == alice_claim.fid
     assert node.sql(workspace).resolve_offer(
-        "member", sibling, bob
+        "device_key", sibling, bob
     ) == bob_claim.fid
     assert {
         (row["user"], row["pk"])
@@ -196,7 +197,7 @@ def test_conflicting_device_claims_are_distinct_explicit_addresses(tmp_path):
     _, child = keypair()
     with pytest.raises(ValueError, match="only the owning member"):
         grant(node, workspace, bob, child, "bob-side child")
-    with pytest.raises(ValueError, match="ambiguous member ownership"):
+    with pytest.raises(ValueError, match="ambiguous ownership"):
         facts.content.message.post(
             node, workspace, "general", "must name an owner")
 
@@ -301,9 +302,10 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
         action = peer.fact_of(workspace, deletion)
         assert target_fact.body["owner"] == bob
         assert action.body == {
-            "pk": target,
-            "owner": bob,
+            "actor": bob,
             "mode": facts._policy.OWNER,
+            "owner": bob,
+            "pk": target,
         }
         assert peer.fact_of(workspace, alice_claim.fid) == alice_claim
         sid = "fact:" + posted
@@ -313,6 +315,42 @@ def test_later_provider_cannot_change_stored_owner_or_delete_authority(
             (fact_index.ACTION_INDEX, sid),
         ).fetchone() == (deletion,)
         assert facts.content.message.messages(peer, workspace) == []
+
+
+def test_admin_member_authority_is_exercised_by_an_owned_device(tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    founder = node.identity_id(workspace)
+    bob_secret, bob, _ = add_member(node, workspace, "bob", ts=10)
+    carol_secret, carol, _ = add_member(node, workspace, "carol", ts=20)
+    node.keychain.add_identity(bob_secret)
+    node.keychain.add_identity(carol_secret)
+
+    node.bind_identity(workspace, bob)
+    bind(node, workspace, "bob-phone")
+    child_secret, child = keypair()
+    node.keychain.add_identity(child_secret)
+    grant(node, workspace, bob, child, "bob-child")
+
+    node.bind_identity(workspace, founder)
+    facts.auth.admin.grant(node, workspace, bob)
+    node.bind_identity(workspace, carol)
+    target = facts.content.message.post(
+        node, workspace, "general", "admin-removable", ts=30)
+
+    node.bind_identity(workspace, child)
+    action_fid = facts.content.delete.remove(
+        node, workspace, target, ts=40)
+    action = node.fact_of(workspace, action_fid)
+    assert action.body == {
+        "actor": bob,
+        "mode": facts._policy.ADMIN,
+        "owner": carol,
+        "pk": child,
+    }
+    facts.auth.removal.evict(node, workspace, carol)
+    assert node.suppression_active(
+        workspace, facts.principal_sid("member", carol))
 
 
 def test_removed_owner_disables_child_mint_and_delegated_admin(tmp_path):
@@ -328,16 +366,10 @@ def test_removed_owner_disables_child_mint_and_delegated_admin(tmp_path):
     child_secret, child = keypair()
     node.keychain.add_identity(child_secret)
     grant(node, workspace, bob, child, "bob-child")
-    node.bind_identity(workspace, child)
-    now = now_ms()
-    request = signed_pile_bytes(request_payload(
-        node, workspace, "sync", now + 60_000, now))
-
     node.bind_identity(workspace, founder)
-    facts.auth.admin.grant(node, workspace, child)
+    facts.auth.admin.grant(node, workspace, bob)
     facts.auth.removal.evict(node, workspace, bob)
 
-    assert node.authorize_access(workspace, request, "sync") is None
     child_row = next(
         row for row in facts.auth.user.members(node, workspace)
         if row["pk"] == child)

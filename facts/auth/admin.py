@@ -1,11 +1,13 @@
-"""facts/auth/admin.py — a delegable member elevation for eviction.
+"""facts/auth/admin.py — a delegable member-principal elevation.
 
 An existing admin may elevate an enrolled member, beginning with the founder
-admin embedded in the workspace root. This follows the poc-13 admin edge while
-making its authority recursively usable in poc-16's offers-and-needs kernel.
+admin embedded in the workspace root.  Authority belongs to the member, not
+one device: an owned device proves its member link and then consumes the same
+``admin(owner)`` offer.
 """
 from core.fact import Fact, Need
-from .._commands import member_key, member_source, offer_source
+from .._commands import member_key, member_source, offer_source, publish
+from .._identity import actor_needs
 from .._policy import FamilyPolicy
 from . import signature
 
@@ -19,25 +21,24 @@ POLICY = FamilyPolicy(
 
 
 # SHAPE
-def admin(workspace, pk, target_pk, ts, target_owner=None):
-    if pk == target_pk:
+def admin(workspace, pk, target, ts, actor=None):
+    actor = pk if actor is None else actor
+    if actor == target:
         raise ValueError("an admin grant must target another member")
-    target_owner = target_pk if target_owner is None else target_owner
     return Fact(
-        TAG, ts, [["offer", "admin", target_pk]],
-        {"pk": pk, "target": target_pk, "owner": target_owner}, workspace)
+        TAG, ts, [["offer", "admin", target]],
+        {"actor": actor, "pk": pk, "target": target}, workspace)
 
 
 # NEEDS
 def needs(f):
     body = f.body
     signer = body.get("pk", "")
+    actor = body.get("actor", "")
     target = body.get("target", "")
-    owner = body.get("owner", "")
-    return (
-        Need("author", "author", f.fid, signer),
-        Need("grantor_admin", "admin", signer),
-        Need("grantee_member", "member", target, owner),
+    return actor_needs(f, signer, actor) + (
+        Need("grantor_admin", "admin", actor),
+        Need("grantee_member", "member", target, target),
     )
 
 
@@ -45,10 +46,10 @@ def needs(f):
 def validate(f, ctx):
     try:
         body = f.body
-        return set(body) == {"pk", "target", "owner"} \
+        return set(body) == {"actor", "pk", "target"} \
             and all(isinstance(body[key], str) for key in body) \
             and f == admin(
-                f.ws, body["pk"], body["target"], f.ts, body["owner"])
+                f.ws, body["pk"], body["target"], f.ts, body["actor"])
     except (KeyError, IndexError, TypeError, ValueError):
         return False
 
@@ -61,24 +62,20 @@ DURABLE = True
 def grant(node, workspace, target):
     target_pk = member_key(node, workspace, target)
     secret, public = node.identity(workspace)
-    signer_admin = offer_source(node, workspace, "admin", public)
+    signer_member, actor = member_source(node, workspace, public)
     target_member, target_owner = member_source(
         node, workspace, target_pk)
+    signer_admin = offer_source(node, workspace, "admin", actor) \
+        if actor is not None else None
     if signer_admin is None:
         raise ValueError("local identity is not an admin")
     if target_member is None:
         raise ValueError("target is not a workspace member")
 
     ts = node.now_ms()
-    item = admin(
-        workspace, public, target_pk, ts, target_owner)
+    item = admin(workspace, public, target_owner, ts, actor)
     signed = signature.signature(secret, public, item, ts)
-    deps = {
-        item.fid: [signed.fid, signer_admin, target_member],
-        signed.fid: [],
-    }
-    node.ingest_new(workspace, [signed, item], deps)
-    return item.fid
+    return publish(node, workspace, item, signed)
 
 
 # QUERIES

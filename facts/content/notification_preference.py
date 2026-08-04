@@ -1,10 +1,11 @@
 """facts/content/notification_preference.py — shared user push settings."""
 from core.crypto import h
-from core.fact import Fact, Need, canon
+from core.fact import Fact, canon
 from core.limits import MAX_ATOM_VALUE_BYTES, valid_bounded_text
 from core.shape import valid_fid
 from .. import _policy
 from .._commands import member_source, offer_source
+from .._identity import actor_needs
 from .._policy import DELETE_SELF, FamilyPolicy, Self, author_selectors
 from ..auth import signature
 
@@ -110,11 +111,7 @@ def notification_preference(
 def needs(f):
     pk = f.body.get("pk", "")
     user = f.body.get("user", "")
-    return (
-        Need("author", "author", f.fid, pk),
-        Need("member", "member", pk, user),
-        Need("device", "device_key", pk, user),
-    )
+    return actor_needs(f, pk, user, require_device=True)
 
 
 # VALIDATE

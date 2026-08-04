@@ -9,6 +9,7 @@ from core.crypto import seal_to, unseal
 from core.fact import Fact, Need
 from core.shape import valid_fid
 from .._commands import member_source, offer_source
+from .._identity import actor_needs
 from .._policy import DELETE_SELF, FamilyPolicy, Self, author_selectors
 from . import signature
 
@@ -167,10 +168,7 @@ def needs(f):
     body = f.body
     pk = body.get("pk", "")
     owner = body.get("owner", "")
-    return (
-        Need("author", "author", f.fid, pk),
-        Need("member", "member", pk, owner),
-        Need("device", "device_key", pk, owner),
+    return (*actor_needs(f, pk, owner, require_device=True),
         # The complete address above proves ownership. This second view of the
         # same provider contributes device:<pk> to continuing liveness rather
         # than incorrectly treating the owning user as the installation.

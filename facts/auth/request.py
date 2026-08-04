@@ -5,17 +5,17 @@ import base64
 from core.fact import Fact
 from core.removal_path import verify_clear
 from core.shape import valid_fid
-from .._commands import offer_source
 from .._policy import FamilyPolicy
 from . import _access, signature
+from ._proof import historical_owner, identity_closure
 
 
 TAG = "req"
 POLICY = FamilyPolicy()
 PURPOSES = frozenset({"sync"})
-DURABLE = False
 
 
+# SHAPE
 def _encoded_path(raw):
     if not isinstance(raw, bytes):
         raise ValueError("removal path bytes")
@@ -36,10 +36,12 @@ def request(workspace, device, owner, verb, exp, removal_path, ts):
     )
 
 
+# NEEDS
 def needs(fact):
     return _access.needs(fact)
 
 
+# VALIDATE
 def validate(fact, _ctx):
     try:
         body = fact.body
@@ -56,6 +58,24 @@ def validate(fact, _ctx):
         return False
 
 
+# MODE
+DURABLE = False
+
+
+# COMMANDS
+def payload(node, workspace, verb, exp, ts, *, removal_path):
+    secret, device = node.identity(workspace)
+    owner = historical_owner(node, workspace, device)
+    item = request(
+        workspace, device, owner, verb, exp, removal_path, ts)
+    signed = signature.signature(secret, device, item, ts)
+    return identity_closure(node, workspace, item, signed)
+
+
+PROOF_COMMANDS = {purpose: payload for purpose in PURPOSES}
+
+
+# QUERIES
 def authorize(view, valid, stream, trusted_now, *, purpose="sync", writer=None):
     body = valid.fact.body
     if valid.fact.t != TAG or purpose not in PURPOSES \
@@ -67,27 +87,3 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync", writer=None):
     path = base64.b64decode(body["path"], validate=True)
     verify_clear(view, path, identity.scopes)
     return identity.device, body["verb"]
-
-
-def payload(node, workspace, verb, exp, ts, *, removal_path):
-    secret, device = node.identity(workspace)
-    binding = node.local_writer_binding(workspace)
-    if binding is None or binding.device != device:
-        raise ValueError("local identity is not a workspace member")
-    owner = binding.owner
-    member = offer_source(node, workspace, "member", owner, owner)
-    linked = None if device == owner else offer_source(
-        node, workspace, "device_key", device, owner)
-    if member is None or device != owner and linked is None:
-        raise ValueError("local identity relationship is incomplete")
-    item = request(
-        workspace, device, owner, verb, exp, removal_path, ts)
-    signed = signature.signature(secret, device, item, ts)
-    deps = [signed.fid, member]
-    if linked is not None:
-        deps.append(linked)
-    return node.sender(workspace).close(
-        [signed, item], {item.fid: deps, signed.fid: []})
-
-
-PROOF_COMMANDS = {purpose: payload for purpose in PURPOSES}

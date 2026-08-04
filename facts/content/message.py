@@ -1,5 +1,5 @@
 """facts/content/message.py — a member-signed channel message."""
-from core.fact import Fact, Need, current_fact
+from core.fact import Fact, current_fact
 from core.shape import valid_fid
 from .._notification import NotificationTrigger
 from .._policy import (
@@ -9,6 +9,7 @@ from .._policy import (
     author_selectors,
 )
 from .._commands import member_source, publish
+from .._identity import actor_needs
 from ..auth import signature
 
 TAG = "msg"
@@ -91,10 +92,7 @@ def reextract(source):
 def needs(f):
     pk = f.body.get("pk", "")
     owner = f.body.get("owner", "")
-    return (
-        Need("author", "author", f.fid, pk),
-        Need("member", "member", pk, owner),
-    )
+    return actor_needs(f, pk, owner)
 
 
 # VALIDATE

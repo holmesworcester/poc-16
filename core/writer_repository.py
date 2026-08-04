@@ -338,7 +338,7 @@ def _require_writer_proof(evaluated, writer, owner):
         for valid in valids
         for offer in valid.fact.offers()
     }
-    if ("member", writer, owner) not in offers or (
+    if ("member", owner, owner) not in offers or (
             writer != owner
             and ("device_key", writer, owner) not in offers):
         raise ValueError("writer is not proved by its closure")

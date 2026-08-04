@@ -6,14 +6,15 @@ from core.fact import Fact
 from core.removal_path import verify_clear
 from core.shape import valid_fid
 from .._policy import FamilyPolicy
-from . import _access
+from . import _access, signature
+from ._proof import identity_closure
 
 
 TAG = "head_request"
 POLICY = FamilyPolicy()
-DURABLE = False
 
 
+# SHAPE
 def head_request(
         workspace, device, owner, base_head, head, exp, removal_path, ts):
     if not isinstance(removal_path, bytes):
@@ -32,10 +33,12 @@ def head_request(
     )
 
 
+# NEEDS
 def needs(fact):
     return _access.needs(fact)
 
 
+# VALIDATE
 def validate(fact, _ctx):
     try:
         body = fact.body
@@ -54,6 +57,24 @@ def validate(fact, _ctx):
         return False
 
 
+# MODE
+DURABLE = False
+
+
+# COMMANDS
+def payload(
+        node, workspace, owner, base_head, head, exp, removal_path, ts,
+        *, closures=()):
+    """Build the device-signed current-path head proof closure."""
+    secret, device = node.identity(workspace)
+    item = head_request(
+        workspace, device, owner, base_head, head, exp, removal_path, ts)
+    signed = signature.signature(secret, device, item, ts)
+    return identity_closure(
+        node, workspace, item, signed, closures=closures)
+
+
+# QUERIES
 def authorize_head(view, valid, stream, writer, proposed_head, trusted_now):
     body = valid.fact.body
     if valid.fact.t != TAG or proposed_head != body["head"] \

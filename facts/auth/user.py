@@ -133,14 +133,19 @@ def accept(node, link, name):
 
 # QUERIES
 def members(node, workspace):
-    """Assemble the roster from current ``member`` and ``admin`` offers."""
+    """Assemble direct members and their explicitly owned devices."""
     with node.lock:
         candidates = {}
         role_order = {"admin": 0, "member": 1, "device": 2}
         # The roster is historical presentation: keep removed identities
         # visible and report their current liveness in ``evicted`` below.
-        for fact in node.select(
-                workspace, "member", include_suppressed=True):
+        providers = {
+            fact.fid: fact
+            for kind in ("member", "device_key")
+            for fact in node.select(
+                workspace, kind, include_suppressed=True)
+        }
+        for fact in providers.values():
             body = fact.body
             if fact.t == "workspace":
                 row = (
@@ -164,16 +169,16 @@ def members(node, workspace):
                 candidates[public] = (choice, name, role, owner)
 
         admins = {
-            public
+            owner
             for fact in node.select(workspace, "admin")
-            for name, public, _ in fact.offers()
+            for name, owner, _ in fact.offers()
             if name == "admin"
         }
         rows = [
             {
                 "pk": public,
                 "name": name,
-                "role": "admin" if public in admins else role,
+                "role": "admin" if owner in admins else role,
                 "evicted": node.suppression_active(
                     workspace, scoped_id("member", owner)),
             }

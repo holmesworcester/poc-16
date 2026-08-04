@@ -156,7 +156,11 @@ def test_post_kernel_dispatch_uses_current_form_and_source_identity(
         assert tuple(current_fact(fact) for fact in stream) == (current,)
         observed.append(label)
 
-    def authorize(_view, valid, stream, _trusted_now, *, purpose):
+    expected_writer = writer
+
+    def authorize(
+            _view, valid, stream, _trusted_now, *, purpose, writer=None):
+        assert writer == expected_writer
         check(valid, stream, "access")
         return writer, purpose
 
@@ -189,8 +193,8 @@ def test_post_kernel_dispatch_uses_current_form_and_source_identity(
     assert judgment.ok
     assert judgment.valids[0].fact is source
     assert facts.authorize_access(
-        judgment, (source,), object(), 8, purpose="sync") == (
-            writer, "sync")
+        judgment, (source,), object(), 8,
+        purpose="sync", writer=writer) == (writer, "sync")
     assert facts.authorize_writer_head(
         judgment, (source,), object(), writer, "2" * 64, 8) == (
             writer, writer, None)

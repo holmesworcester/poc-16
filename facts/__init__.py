@@ -244,7 +244,11 @@ def control_evaluation(judgment, stream):
             (family := family_for(fact.t)) is None or not family.DURABLE
             for fact in current):
         raise ValueError("control pile contains non-durable fact")
-    selected = control_projection(current_stream)
+    # Project from the retained source bytes. ``control_projection`` performs
+    # the one hydration itself and deliberately returns sources for storage.
+    # Passing ``current_stream`` here would attempt to hydrate CurrentFact a
+    # second time during an application-version replay.
+    selected = control_projection(stream)
     if tuple(fact.fid for fact in selected) != tuple(
             fact.fid for fact in current):
         raise ValueError("control pile contains ordinary content")

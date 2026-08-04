@@ -3,10 +3,11 @@ import os
 import tempfile
 
 from core.fact_index import REF_INDEX, TYPE_INDEX
-from core.fact import Fact, Need
+from core.fact import Fact
 from core.shape import valid_fid
 from .._policy import DELETE_SELF, FamilyPolicy, Self, author_selectors
 from .._commands import member_source
+from .._identity import actor_needs
 from ..auth import signature
 from .. import _bao as bao
 from . import file_slice as slices
@@ -41,10 +42,7 @@ def file(workspace, pk, channel, name, size, root, ts, owner=None):
 def needs(fact):
     pk = fact.body.get("pk", "")
     owner = fact.body.get("owner", "")
-    return (
-        Need("author", "author", fact.fid, pk),
-        Need("member", "member", pk, owner),
-    )
+    return actor_needs(fact, pk, owner)
 
 
 # VALIDATE

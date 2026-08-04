@@ -120,7 +120,7 @@ def test_path_reveals_exactly_one_hashed_sid_and_value():
 def test_build_update_retries_and_permutations_are_one_aci_join():
     workspace, _member, _device = ids("join")
     sid = principal_sid("member", h(b"joined member"))
-    actions = tuple(h(f"action {index}".encode()) for index in range(4))
+    actions = tuple(h(f"action {index}".encode()) for index in range(3))
     events = (
         (sid, suppression_slot()),
         *((sid, suppression_slot(action)) for action in actions),
@@ -131,7 +131,7 @@ def test_build_update_retries_and_permutations_are_one_aci_join():
     roots = set()
     from itertools import permutations
 
-    for order in permutations(events[:5]):
+    for order in permutations(events[:4]):
         built = tree._build(workspace, order)
         proof = proof_for(built.root, sid, object_map(built))
         assert tree.verify(built.root, workspace, sid, proof) == expected
@@ -145,7 +145,7 @@ def test_build_update_retries_and_permutations_are_one_aci_join():
             workspace, current.root, (event,), objects)
         objects.update(updated.nodes)
         current = updated
-    assert current.root == tree._build(workspace, events[:5]).root
+    assert current.root == tree._build(workspace, events[:4]).root
     assert tree.verify(
         current.root,
         workspace,
@@ -178,7 +178,7 @@ def test_slot_join_is_associative_commutative_idempotent_with_absence():
 
 
 def test_tiny_batch_exact_bound_prunes_nodes_and_one_over_stops_early():
-    assert MAX_REMOVAL_UPDATES == MAX_REGISTERED_SUPPRESSION_ROUTES == 5
+    assert MAX_REMOVAL_UPDATES == MAX_REGISTERED_SUPPRESSION_ROUTES == 4
     workspace, member, _device = ids("tiny batch")
     initial = (principal_sid("member", member), suppression_slot())
     additions = tuple(

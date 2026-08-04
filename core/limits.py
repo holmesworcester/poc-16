@@ -68,11 +68,11 @@ MAX_PILE_FACTS = MAX_CLOSURE_FACTS
 MAX_STORE_READ_BYTES = max(
     MAX_REPOSITORY_OBJECT_BYTES, MAX_BUFFERED_PILE_BYTES)
 MAX_PILE_JSON_VALUES = 48 * MAX_PILE_FACTS + 16
-# device_invite is the current maximum: FactOrder + Fact residence + ten
-# mechanical postings + five current suppression slots.
-MAX_REGISTERED_FACT_ROUTES = 17
-MAX_REGISTERED_FACT_ROWS = 11
-MAX_REGISTERED_SUPPRESSION_ROUTES = 5
+# device_invite is the current maximum: FactOrder + Fact residence + eight
+# mechanical postings + four current suppression slots.
+MAX_REGISTERED_FACT_ROUTES = 14
+MAX_REGISTERED_FACT_ROWS = 9
+MAX_REGISTERED_SUPPRESSION_ROUTES = 4
 MAX_RESOLVED_EDGES = 64
 # Recipient removal state advances once per state-affecting fact, never once
 # per whole pile. One fact cannot contribute more than this many slots.

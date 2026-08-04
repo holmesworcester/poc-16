@@ -271,13 +271,3 @@ def allows_direct_target(policy, action, selector, mode):
         and mode in row.modes
         for row in policy.direct_targets
     )
-
-
-def member_principal(ctx: FactContext, provider_fid, actor_key):
-    """Read the durable principal from one exact ``member(key, owner)`` offer."""
-    owners = {
-        owner
-        for key, owner in ctx.offers_from(provider_fid, "member")
-        if key == actor_key and owner
-    }
-    return next(iter(owners)) if len(owners) == 1 else None

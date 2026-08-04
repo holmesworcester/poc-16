@@ -5,7 +5,7 @@ from typing import NamedTuple
 import facts
 
 from core.limits import MAX_REMOVAL_PATH_SCOPES, PayloadTooLarge
-from core.fact import Need
+from .._identity import actor_needs
 
 
 class IdentityClaim(NamedTuple):
@@ -19,12 +19,7 @@ def needs(fact):
     body = fact.body
     device = body.get("device", "")
     owner = body.get("owner", "")
-    direct = (
-        Need("author", "author", fact.fid, device),
-        Need("member", "member", owner, owner),
-    )
-    return direct if device == owner else direct + (
-        Need("device", "device_key", device, owner),)
+    return actor_needs(fact, device, owner)
 
 
 def claim(valid, stream, writer):

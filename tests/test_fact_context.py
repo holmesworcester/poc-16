@@ -117,7 +117,10 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         node, workspace, message, ts=timestamp + 4)
     facts.auth.removal.evict(node, workspace, member)
     ephemeral = facts.auth.request.payload(
-        node, workspace, "sync", timestamp + 10_000, timestamp + 6)
+        node, workspace, "sync", timestamp + 10_000, timestamp + 6,
+        removal_path=b"[]")
+    historical = facts.auth.removal_path_request.payload(
+        node, workspace, timestamp + 10_000, timestamp + 6)
     head = facts.auth.head_request.head_request(
         workspace,
         node.pk,
@@ -125,6 +128,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         None,
         "2" * 64,
         timestamp + 10_000,
+        b"[]",
         timestamp + 7,
     )
     head_signature = facts.auth.signature.signature(
@@ -136,6 +140,8 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     )
     corpus, seen = list(durable), {fact.fid for fact in durable}
     corpus.extend(fact for fact in ephemeral if fact.fid not in seen)
+    seen.update(fact.fid for fact in corpus)
+    corpus.extend(fact for fact in historical if fact.fid not in seen)
     corpus.extend((head_signature, head))
     assert {fact.t for fact in corpus} == set(facts.FAMILIES)
     routes = {
@@ -154,13 +160,14 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "file_slice": (1, 1, 1, 0, 8),
         "delete": (1, 0, 0, 1, 6),
         "device": (0, 2, 3, 0, 12),
-        "device_invite": (0, 3, 5, 0, 17),
+        "device_invite": (0, 2, 4, 0, 14),
         "evict": (0, 1, 0, 1, 6),
         "file_bao": (0, 1, 1, 0, 7),
         "head_request": (0, 0, 0, 0, 4),
         "msg": (0, 0, 1, 0, 6),
         "notification_preference": (0, 2, 1, 0, 8),
         "push_endpoint": (0, 1, 3, 0, 11),
+        "removal_path_request": (0, 0, 0, 0, 4),
         "req": (0, 0, 0, 0, 4),
         "signature": (0, 1, 0, 0, 5),
         "user": (1, 1, 2, 0, 10),
