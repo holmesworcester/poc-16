@@ -18,6 +18,7 @@ from core.limits import (
 )
 from deploy.aws_lambda.config import (
     FUNCTION_TIMEOUT_SECONDS,
+    MAX_CONTROL_REQUEST_BYTES,
     MAX_LOG_METHOD_CHARS,
     MAX_LOG_PATH_CHARS,
     MAX_LOG_RECORD_BYTES,
@@ -56,6 +57,33 @@ def _positive(name, default):
     if value < 1:
         raise RuntimeError(f"invalid {name}")
     return value
+
+
+def _bounded_positive(name, default, ceiling):
+    value = _positive(name, default)
+    if value > ceiling:
+        raise RuntimeError(f"invalid {name}")
+    return value
+
+
+def _request_limit(method, path):
+    """Apply the exact route budget before decoding a Function URL body."""
+    path = "/" + path.strip("/")
+    protocol = HttpGate.request_limit(method, path)
+    if method.upper() == "POST" and path in {
+            "/removal/bootstrap", "/removal/apply"}:
+        provider = _bounded_positive(
+            "TINYP2P_MAX_CONTROL_BYTES",
+            MAX_CONTROL_REQUEST_BYTES,
+            MAX_CONTROL_REQUEST_BYTES,
+        )
+    else:
+        provider = _bounded_positive(
+            "TINYP2P_MAX_REQUEST_BYTES",
+            MAX_MINT_REQUEST_BYTES,
+            MAX_MINT_REQUEST_BYTES,
+        )
+    return min(protocol, provider) if protocol else provider
 
 
 def _sdk_budget():
@@ -165,12 +193,14 @@ def _gateway():
             mint_authorize=gate.authorize_access,
             path_authorize=gate.removal_path,
             removal_bootstrap=gate.state.bootstrap,
-            removal_advance=gate.state.advance_leaf,
+            removal_apply=gate.state.apply_control,
             object_open=issuer.open_object,
             pack_open=issuer.open_pack,
             sync_profile=peer_capability.OWNER,
-            max_request_bytes=_positive(
-                "TINYP2P_MAX_REQUEST_BYTES", MAX_MINT_REQUEST_BYTES),
+            max_request_bytes=_bounded_positive(
+                "TINYP2P_MAX_REQUEST_BYTES",
+                MAX_MINT_REQUEST_BYTES,
+                MAX_MINT_REQUEST_BYTES),
             max_object_bytes=_positive(
                 "TINYP2P_MAX_OBJECT_BYTES", MAX_REPOSITORY_OBJECT_BYTES),
             max_batch_count=_positive(
@@ -194,18 +224,19 @@ def _event(event):
     if not isinstance(method, str) or not isinstance(path, str) \
             or not isinstance(headers, dict):
         raise ValueError("Function URL request")
+    body_limit = _request_limit(method, path)
     encoded = event.get("body")
     if encoded is None:
         body = b""
     elif not isinstance(encoded, str):
         raise ValueError("Function URL body")
     elif event.get("isBase64Encoded") is True:
-        if len(encoded) > 4 * ((MAX_MINT_REQUEST_BYTES + 2) // 3):
+        if len(encoded) > 4 * ((body_limit + 2) // 3):
             raise PayloadTooLarge("Function URL body")
         body = base64.b64decode(encoded, validate=True)
     else:
         body = encoded.encode()
-    if len(body) > MAX_MINT_REQUEST_BYTES:
+    if len(body) > body_limit:
         raise PayloadTooLarge("Function URL body")
     raw_query = event.get("rawQueryString") or ""
     if not isinstance(raw_query, str):

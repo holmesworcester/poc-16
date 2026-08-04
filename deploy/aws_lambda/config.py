@@ -14,6 +14,12 @@ SDK_READ_TIMEOUT_SECONDS = 5
 SDK_TOTAL_ATTEMPTS = 1
 SDK_CLEANUP_MARGIN_SECONDS = 3
 
+# Function URL v2 places a base64 body inside Lambda's 6 MiB buffered
+# invocation envelope. Four raw MiB leaves room for that expansion and the
+# fixed event metadata; core deliberately permits providers to choose a lower
+# control-pile ceiling than its portable 5 MiB maximum.
+MAX_CONTROL_REQUEST_BYTES = 4 * 1024 * 1024
+
 MAX_QUERY_BYTES = 4096
 MAX_QUERY_FIELDS = 8
 MAX_READINESS_RESPONSE_BYTES = 4 * 1024

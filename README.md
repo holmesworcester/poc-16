@@ -682,6 +682,7 @@ then publishes:
 mint one current sync grant from a device-signed proof carrying the current removal path
   -> POST /obj/open or /pack/open for an exact create-only PUT
   -> PUT missing pile/tree/head objects directly to S3 or R2
+  -> POST /removal/apply for each exact new control pile, if any
   -> POST /head/<proposed-head-oid> with an exact closed head proof
   -> CAS heads/<workspace>/<device>
 ```
@@ -740,10 +741,15 @@ runtime uses the native R2 binding through `adapters/r2/worker.py`.
 AWS uses one externally owned S3 bucket and one Lambda stack. The Lambda runs
 the shared `HttpGate` with the `owner` capability: it can read the recipient's
 removal tree and writer forest, create content-addressed objects/packs, and
-conditionally advance writer slots. No access, mint, or sync request can
-advance the removal root; its separate authority source remains a control-plane
-responsibility. A closed head proof confines each slot update to its
-authenticated device. The template creates
+conditionally advance writer slots. A public `/removal/bootstrap` accepts only
+an original direct-member CLEAR closure. Thereafter an owner grant may submit
+an exact writer-signed control pile to `/removal/apply`; the Lambda commits its
+removal-state effects before it will accept the corresponding head. Ordinary
+content and malformed piles are rejected, and retries are idempotent. A closed
+head proof confines each slot update to its authenticated device. The Function
+URL adapter admits at most 4 MiB of raw control-pile bytes so base64 expansion
+and event metadata remain within Lambda's buffered invocation envelope; other
+metadata requests remain capped at 512 KiB. The template creates
 the grant secret, role, Function URL, logs, and alarm; it never creates or
 deletes the bucket.
 
@@ -783,8 +789,11 @@ with the same `owner` capability. Small metadata operations use the native R2
 binding. Large GETs use scoped R2 S3/SigV4 URLs; large create-only PUTs use a
 short-lived HMAC ticket at a minimal streaming Worker route backed by the
 native R2 binding. Neither body enters the Python Worker heap. The owner
-gateway can pin `removal` and advance writer slots but has no route that
-publishes caller-supplied authority state and no delete path.
+gateway can apply an authenticated exact control pile to private `removal`
+state before advancing its writer slot, but it has no generic authority
+publication route and no delete path. Its control routes stream and bound at
+the portable 5 MiB control-pile ceiling; ordinary metadata remains capped at
+512 KiB.
 
 Set the non-secret deployment inputs:
 

@@ -10,6 +10,7 @@ from core import peer_capability
 from core.access import AccessGate
 from core.crypto import load_sk, sign, verify
 from core.limits import (
+    MAX_CONTROL_PILE_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES as CORE_MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
@@ -32,6 +33,7 @@ else:
     from crypto_compat import seal_to, unseal
 
 MAX_REQUEST_BYTES = min(512 * 1024, MAX_MINT_REQUEST_BYTES)
+MAX_CONTROL_BYTES = MAX_CONTROL_PILE_BYTES
 MAX_OBJECT_BYTES = CORE_MAX_OBJECT_BYTES
 MAX_BATCH_COUNT = min(48, PAGE_BATCH)
 MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
@@ -42,6 +44,7 @@ EDGE_SECRET_BYTES = 32
 
 _BUDGETS = {
     "MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
+    "MAX_CONTROL_BYTES": MAX_CONTROL_BYTES,
     "MAX_OBJECT_BYTES": MAX_OBJECT_BYTES,
     "MAX_BATCH_COUNT": MAX_BATCH_COUNT,
     "MAX_BATCH_BYTES": MAX_BATCH_BYTES,
@@ -123,6 +126,7 @@ class Settings:
     r2_secret_access_key: str = field(repr=False)
     pack_ticket_secret: bytes = field(repr=False)
     max_request_bytes: int
+    max_control_bytes: int
     max_object_bytes: int
     max_batch_count: int
     max_batch_bytes: int
@@ -210,7 +214,7 @@ def gateway(settings, clock=None):
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
-        removal_advance=gate.state.advance_leaf,
+        removal_apply=gate.state.apply_control,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,
         sync_profile=peer_capability.OWNER,
@@ -304,6 +308,18 @@ async def _bounded_body(request, limit):
         reader.releaseLock()
 
 
+def _request_limit(settings, method, path):
+    """Return the provider-confined budget for one shared-gate route."""
+    path = "/" + path.strip("/")
+    protocol = HttpGate.request_limit(method, path)
+    control = method.upper() == "POST" and path in {
+        "/removal/bootstrap", "/removal/apply",
+    }
+    provider = settings.max_control_bytes \
+        if control else settings.max_request_bytes
+    return min(protocol, provider) if protocol else provider
+
+
 def _secured(response):
     return Response(
         response.status,
@@ -341,11 +357,12 @@ async def handle(request, env, *, clock=None):
         length = _content_length(headers)
     except Exception:
         return _secured(Response(400))
-    if length is not None and length > settings.max_request_bytes:
+    body_limit = _request_limit(settings, method, url.path)
+    if length is not None and length > body_limit:
         return _secured(Response(413))
     try:
         body = await _bounded_body(
-            request, settings.max_request_bytes) if method in {
+            request, body_limit) if method in {
             "POST", "PUT", "PATCH"} else b""
     except Exception:
         return _secured(Response(400))

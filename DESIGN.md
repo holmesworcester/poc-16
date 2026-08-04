@@ -735,6 +735,16 @@ closed pile before admitting facts. For a slot update, the request additionally
 binds the base head and proposed head OID; `OpaqueHeadGate` may conditionally
 replace only that device's deterministic slot.
 
+Before a hosted writer exposes a head containing a new control pile, it sends
+that exact original device-signed pile to authenticated `POST /removal/apply`.
+The recipient evaluates the supplied closed pile directly, accepts only
+family-declared control facts, joins its explicit removal-state changes, and
+discards the pile bytes. Only an applied or idempotent result permits the head
+CAS; a stale removal-root CAS is retryable and leaves the head untouched.
+There is no accepted-leaf scan, replay cursor, or second control envelope.
+`POST /removal/bootstrap` remains the public, narrow exception for introducing
+one original direct-member CLEAR closure before any grant can be minted.
+
 The gate never opens or semantically validates a proposed writer head, Merkle
 tree, content pile, or fact as part of minting. The hosted owner target trusts a
 writer to maintain its own opaque log; every consuming peer independently

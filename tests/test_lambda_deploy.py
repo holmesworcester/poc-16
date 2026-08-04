@@ -19,7 +19,11 @@ from core import peer_capability
 from core.access import AccessGate
 from core.crypto import h, unseal
 from core.grants import check_token
-from core.limits import MAX_MINT_REQUEST_BYTES, PAGE_BATCH
+from core.limits import (
+    MAX_CONTROL_PILE_BYTES,
+    MAX_MINT_REQUEST_BYTES,
+    PAGE_BATCH,
+)
 from full_peer.node import FullPeer
 from deploy.aws_lambda import app
 from deploy.aws_lambda.config import (
@@ -31,6 +35,7 @@ from deploy.aws_lambda.config import (
     MAX_LOG_METHOD_CHARS,
     MAX_LOG_PATH_CHARS,
     MAX_LOG_RECORD_BYTES,
+    MAX_CONTROL_REQUEST_BYTES,
     MAX_QUERY_BYTES,
     MAX_QUERY_FIELDS,
     MAX_READINESS_RESPONSE_BYTES,
@@ -48,6 +53,8 @@ from core.object_store import (
     MAX_INVITE_ID_BYTES,
     MAX_LOGICAL_KEY_BYTES,
     MAX_PROVIDER_KEY_BYTES,
+    REMOVAL_ROOT_KEY,
+    STALE,
 )
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from core.suppression_tree import decode_root
@@ -55,6 +62,7 @@ from core.writer_repository import OpaqueHeadGate
 from facts.auth.removal import removal
 from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
+from facts.content.message import message
 from core.store import FsStore
 from tests.test_access_gate import (
     access_proof,
@@ -62,7 +70,7 @@ from tests.test_access_gate import (
     path_proof,
     signed,
 )
-from tests.test_removal_state import accept_one, world as removal_world
+from tests.test_removal_state import world as removal_world
 
 ROOT = Path(__file__).resolve().parents[1]
 LAMBDA = ROOT / "deploy" / "aws_lambda"
@@ -152,9 +160,42 @@ def local_gateway(node, workspace, now):
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
-        removal_advance=gate.state.advance_leaf,
+        removal_apply=gate.state.apply_control,
         sync_profile=peer_capability.OWNER,
     )
+
+
+class StaleRemovalOnceStore(FsStore):
+    """Exercise one provider CAS loss without inventing another protocol."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.fail_removal_once = False
+        self.page_reads = []
+        self.calls = []
+
+    def get_bounded(self, key, maximum):
+        self.calls.append(("get", key))
+        return super().get_bounded(key, maximum)
+
+    def read_versioned(self, key):
+        self.calls.append(("read_versioned", key))
+        return super().read_versioned(key)
+
+    def put_if_absent(self, key, value):
+        self.calls.append(("put_if_absent", key))
+        return super().put_if_absent(key, value)
+
+    def cas(self, key, token, value):
+        self.calls.append(("cas", key))
+        if key == REMOVAL_ROOT_KEY and self.fail_removal_once:
+            self.fail_removal_once = False
+            return STALE
+        return super().cas(key, token, value)
+
+    def list_page(self, prefix, cursor=None, limit=PAGE_BATCH):
+        self.page_reads.append((prefix, cursor, limit))
+        return super().list_page(prefix, cursor, limit)
 
 
 def proof_body(workspace, pile):
@@ -174,10 +215,10 @@ def mint(node, workspace, pile):
     return status, body, token
 
 
-def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
+def test_lambda_applies_exact_control_before_another_owner_head(
         tmp_path, monkeypatch):
     value = removal_world()
-    store = FsStore(str(tmp_path / "repository"))
+    store = StaleRemovalOnceStore(str(tmp_path / "repository"))
     config = S3Config("test-bucket", "tenant")
     monkeypatch.setattr(app, "_s3_config", lambda: config)
     monkeypatch.setattr(
@@ -201,6 +242,15 @@ def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
     assert response(app.handler(event(
         "POST", "/removal/bootstrap",
         value.root.fid, bootstrap), None))[0] == 201
+    founder_bootstrap = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root,),
+    )
+    assert response(app.handler(event(
+        "POST", "/removal/bootstrap",
+        value.root.fid, founder_bootstrap), None))[0] == 204
 
     historical = path_proof(
         value.member_secret, value.member,
@@ -221,6 +271,25 @@ def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
         value.member_secret,
         base64.b64decode(json.loads(raw_mint)["grant"]),
     ).decode()
+    founder_history = path_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,))
+    founder_path = response(app.handler(event(
+        "POST", "/removal/path", value.root.fid,
+        proof_body(value.root.fid, founder_history)), None))
+    assert founder_path[0] == 200
+    founder_current = access_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), founder_path[2])
+    founder_mint = response(app.handler(event(
+        "POST", "/mint", value.root.fid,
+        proof_body(value.root.fid, founder_current)), None))
+    assert founder_mint[0] == 200
+    founder_token = unseal(
+        value.founder_secret,
+        base64.b64decode(json.loads(founder_mint[2])["grant"]),
+    ).decode()
+    founder_headers = {"Authorization": "Bearer " + founder_token}
     assert response(app.handler(event(
         "POST", "/authority", value.root.fid, bootstrap,
         headers={"Authorization": "Bearer " + token}), None))[0] == 404
@@ -239,6 +308,8 @@ def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
     assert response(app.handler(event(
         "POST", "/head/" + h(b"wrong"),
         value.root.fid, proof), None))[0] == 403
+    accepted_slot = store.get(
+        f"heads/{value.root.fid}/{value.member}")
 
     private_node = decode_root(
         store.get("removal"), value.root.fid).root
@@ -265,17 +336,66 @@ def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
         value.root.fid, value.founder, value.member, 8)
     evicted_sig = signature(
         value.founder_secret, value.founder, evicted, 8)
-    run(accept_one(
-        store,
+    control = signed(
         value.founder_secret,
-        value.founder,
         value.founder,
         value.root,
         (*value.membership, evicted_sig, evicted),
-    ))
+    )
+    ordinary = message(
+        value.root.fid, value.founder,
+        "general", "not removal control", 9)
+    ordinary_sig = signature(
+        value.founder_secret, value.founder, ordinary, 9)
+    ordinary_pile = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, ordinary_sig, ordinary),
+    )
+
+    removal_before = store.get(REMOVAL_ROOT_KEY)
     assert response(app.handler(event(
-        "POST", f"/removal/advance/{value.founder}/1",
-        value.root.fid), None))[0] == 201
+        "POST", "/removal/apply", value.root.fid, control), None))[0] == 401
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, b"not a pile",
+        headers=founder_headers), None))[0] == 403
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, ordinary_pile,
+        headers=founder_headers), None))[0] == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    store.calls.clear()
+    store.fail_removal_once = True
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, control,
+        headers=founder_headers), None))[0] == 409
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, control,
+        headers=founder_headers), None))[0] == 201
+    assert response(app.handler(event(
+        "POST", "/removal/apply", value.root.fid, control,
+        headers=founder_headers), None))[0] == 204
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") is None
+    assert store.page_reads == []
+    assert all(
+        key == REMOVAL_ROOT_KEY or key.startswith("removal-node/")
+        for _operation, key in store.calls)
+    assert not any("cursor" in key for key in store.list(""))
+
+    rejected_head = h(b"lambda head after member removal")
+    store.put_if_absent(
+        "obj/" + rejected_head, b"lambda head after member removal")
+    assert response(app.handler(event(
+        "POST", "/head/" + rejected_head, value.root.fid,
+        current_head_proof(
+            value.member_secret, value.member,
+            value.root, value.membership, path, rejected_head)), None))[0] \
+        == 409
+    assert store.get(
+        f"heads/{value.root.fid}/{value.member}") == accepted_slot
     stale = response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, current)), None))
@@ -291,6 +411,31 @@ def test_lambda_runs_confined_removal_gate_then_advances_one_owner_head(
     assert response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, denied)), None))[0] == 403
+
+
+def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
+    workspace = "a" * 64
+    calls = []
+
+    class Probe:
+        async def handle(self, *request):
+            calls.append(request)
+            return Response(200)
+
+    app._gateway_cache = Probe()
+    monkeypatch.setenv("TINYP2P_MAX_REQUEST_BYTES", "3")
+    monkeypatch.setenv("TINYP2P_MAX_CONTROL_BYTES", "5")
+
+    assert response(app.handler(event(
+        "POST", "/removal/apply", workspace, b"12345"), None))[0] == 200
+    assert calls[-1][-1] == b"12345"
+    assert response(app.handler(event(
+        "POST", "/removal/apply", workspace, b"123456"), None))[0] == 413
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"123"), None))[0] == 200
+    assert response(app.handler(event(
+        "POST", "/mint", workspace, b"1234"), None))[0] == 413
+    assert len(calls) == 2
 
 
 def test_lambda_mints_and_serves_writer_directory_objects(tmp_path):
@@ -656,6 +801,10 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert (
         f'TINYP2P_AWS_TOTAL_ATTEMPTS: '
         f'"{SDK_TOTAL_ATTEMPTS}"') in template
+    assert (
+        f'TINYP2P_MAX_CONTROL_BYTES: '
+        f'"{MAX_CONTROL_REQUEST_BYTES}"') in template
+    assert MAX_CONTROL_REQUEST_BYTES < MAX_CONTROL_PILE_BYTES
     assert f"AllowedPattern: '{BUCKET_PATTERN}'" in template
     assert f"AllowedPattern: '{PREFIX_PATTERN}'" in template
     assert f"MaxLength: {MAX_STORE_PREFIX_LENGTH}" in template

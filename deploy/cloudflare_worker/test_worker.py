@@ -42,13 +42,14 @@ from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from facts.auth.removal import removal
 from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
+from facts.content.message import message
 from tests.test_access_gate import (
     access_proof,
     head_proof as current_head_proof,
     path_proof,
     signed,
 )
-from tests.test_removal_state import accept_one, world as removal_world
+from tests.test_removal_state import world as removal_world
 
 TEST_PACK_TTL_SECONDS = 30
 
@@ -124,6 +125,24 @@ class Bucket:
 
     async def delete(self, *args, **kwargs):
         raise AssertionError("owner Worker attempted R2 delete")
+
+
+class StaleRemovalOnceBucket(Bucket):
+    """Return one real R2-shaped conditional-write conflict on demand."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.fail_removal_once = False
+
+    async def put(self, key, value, **options):
+        condition = options.get("onlyIf")
+        if self.fail_removal_once and key.endswith("/removal") \
+                and isinstance(condition, dict) \
+                and "etagMatches" in condition:
+            self.calls.append(("put", key))
+            self.fail_removal_once = False
+            return None
+        return await super().put(key, value, **options)
 
 
 class Request:
@@ -280,10 +299,10 @@ def proof_body(workspace, pile):
     }).encode()
 
 
-def test_runtime_runs_confined_removal_gate_then_advances_one_owner_head():
+def test_runtime_applies_exact_control_before_another_owner_head():
     value = removal_world()
     prefix = f"workspaces/{value.root.fid}"
-    bucket = Bucket({})
+    bucket = StaleRemovalOnceBucket({})
     environment = worker_environment(bucket, value.root.fid, prefix)
     bootstrap = signed(
         value.member_secret,
@@ -297,6 +316,17 @@ def test_runtime_runs_confined_removal_gate_then_advances_one_owner_head():
         bootstrap,
     ), environment, clock=lambda: 10))
     assert published.status == 201
+    founder_bootstrap = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root,),
+    )
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/bootstrap?ws={value.root.fid}",
+        founder_bootstrap,
+    ), environment, clock=lambda: 10)).status == 204
     historical = path_proof(
         value.member_secret, value.member,
         value.root, value.membership)
@@ -320,6 +350,28 @@ def test_runtime_runs_confined_removal_gate_then_advances_one_owner_head():
         value.member_secret,
         base64.b64decode(json.loads(minted.body)["grant"]),
     ).decode()
+    founder_history = path_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,))
+    founder_path = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/path?ws={value.root.fid}",
+        proof_body(value.root.fid, founder_history),
+    ), environment, clock=lambda: 10))
+    assert founder_path.status == 200
+    founder_current = access_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), founder_path.body)
+    founder_mint = run(runtime.handle(Request(
+        "POST", f"https://worker.example/mint?ws={value.root.fid}",
+        proof_body(value.root.fid, founder_current),
+    ), environment, clock=lambda: 10))
+    assert founder_mint.status == 200
+    founder_token = native_unseal(
+        value.founder_secret,
+        base64.b64decode(json.loads(founder_mint.body)["grant"]),
+    ).decode()
+    founder_headers = {"Authorization": "Bearer " + founder_token}
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/authority?ws={value.root.fid}",
@@ -378,19 +430,81 @@ def test_runtime_runs_confined_removal_gate_then_advances_one_owner_head():
         value.root.fid, value.founder, value.member, 8)
     evicted_sig = signature(
         value.founder_secret, value.founder, evicted, 8)
-    run(accept_one(
-        runtime.R2BindingStore(bucket, prefix),
+    control = signed(
         value.founder_secret,
-        value.founder,
         value.founder,
         value.root,
         (*value.membership, evicted_sig, evicted),
-    ))
+    )
+    ordinary = message(
+        value.root.fid, value.founder,
+        "general", "not removal control", 9)
+    ordinary_sig = signature(
+        value.founder_secret, value.founder, ordinary, 9)
+    ordinary_pile = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, ordinary_sig, ordinary),
+    )
+
+    removal_key = f"{prefix}/removal"
+    removal_before = bucket.data[removal_key]
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/advance/"
-        f"{value.founder}/1?ws={value.root.fid}",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        control,
+    ), environment, clock=lambda: 10)).status == 401
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        b"not a pile", founder_headers,
+    ), environment, clock=lambda: 10)).status == 403
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        ordinary_pile, founder_headers,
+    ), environment, clock=lambda: 10)).status == 403
+    assert bucket.data[removal_key] == removal_before
+
+    bucket.calls.clear()
+    bucket.fail_removal_once = True
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        control, founder_headers,
+    ), environment, clock=lambda: 10)).status == 409
+    assert bucket.data[removal_key] == removal_before
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        control, founder_headers,
     ), environment, clock=lambda: 10)).status == 201
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/removal/apply?ws={value.root.fid}",
+        control, founder_headers,
+    ), environment, clock=lambda: 10)).status == 204
+    assert not any(operation == "list" for operation, _key in bucket.calls)
+    assert not any(
+        "/heads/" in key or "/obj/" in key
+        for _operation, key in bucket.calls)
+    assert f"{prefix}/heads/{value.root.fid}/{value.founder}" \
+        not in bucket.data
+    assert not any("cursor" in key for key in bucket.data)
+
+    accepted_slot = bucket.data[slot_key]
+    rejected_head = h(b"cloudflare head after member removal")
+    bucket.data[f"{prefix}/obj/{rejected_head}"] = (
+        b"cloudflare head after member removal")
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{rejected_head}?ws={value.root.fid}",
+        current_head_proof(
+            value.member_secret, value.member,
+            value.root, value.membership, path, rejected_head),
+    ), environment, clock=lambda: 10)).status == 409
+    assert bucket.data[slot_key] == accepted_slot
     stale = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, current),
@@ -828,6 +942,34 @@ def test_runtime_streams_request_body_only_to_its_hard_limit(
     assert declared.bytes_calls == 0
 
 
+def test_runtime_applies_route_specific_exact_body_limits(
+        tmp_path, monkeypatch):
+    _, workspace, _, _, environment = worker_world(tmp_path, monkeypatch)
+    environment.MAX_REQUEST_BYTES = 3
+    environment.MAX_CONTROL_BYTES = 5
+    calls = []
+
+    class Probe:
+        async def handle(self, *request):
+            calls.append(request)
+            return runtime.Response(200)
+
+    monkeypatch.setattr(runtime, "gateway", lambda *_args, **_kwargs: Probe())
+    control = f"https://worker.example/removal/apply?ws={workspace}"
+    mint_url = f"https://worker.example/mint?ws={workspace}"
+
+    assert run(runtime.handle(Request(
+        "POST", control, b"12345"), environment)).status == 200
+    assert calls[-1][-1] == b"12345"
+    assert run(runtime.handle(Request(
+        "POST", control, b"123456"), environment)).status == 413
+    assert run(runtime.handle(Request(
+        "POST", mint_url, b"123"), environment)).status == 200
+    assert run(runtime.handle(Request(
+        "POST", mint_url, b"1234"), environment)).status == 413
+    assert len(calls) == 2
+
+
 def test_runtime_never_falls_back_to_whole_request_bytes():
     empty = Request("GET", "https://worker.example/healthz")
     assert run(runtime._bounded_body(empty, 8)) == b""
@@ -1090,6 +1232,7 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         for name in runtime._BUDGETS
     } == runtime._BUDGETS
     assert runtime.MAX_REQUEST_BYTES <= limits.MAX_MINT_REQUEST_BYTES
+    assert runtime.MAX_CONTROL_BYTES == limits.MAX_CONTROL_PILE_BYTES
     # Bao slice payloads are inline ordinary facts. Authenticated repository
     # reads apply their narrower page/fact bound at the gate call site rather
     # than shrinking this shared object-response ceiling.
