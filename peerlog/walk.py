@@ -1,11 +1,17 @@
-"""Two-sided closed-range RBSR over GET/PUT.
+"""One-sided closed-range RBSR over GET/PUT: driver and server.
 
-The b9af34f one-sided walk, symmetric between live peers: conditional
-GET of the counterparty's root, prune equal fingerprints, recurse into
-unequal ranges, pull missing facts as closed runs, push news the same
-way. Diff runs only inside the coverage intersection. A peer that only
-serves (never walks) is indistinguishable from the passive store —
-clients reuse the same recipes against either.
+The b9af34f walk between live peers. The DRIVER — the session
+initiator; simultaneous dials collapse to one session, lower endpoint
+id drives — walks the responder's served pages: conditional GET of the
+root, prune equal fingerprints, recurse unequal ranges, and read the
+symmetric difference off the leaf pages, which tells it both what it
+lacks (pull) and what the responder lacks (push). One session moves
+news both ways; the responder runs zero walk logic. It serves stable
+self-addressed treap pages (maintained incrementally at its own ingest
+time) and verifies pushed runs — indistinguishable from the passive
+store except that it maintains its own pages, which the passive cloud
+cannot (hence the cloud path is seq-diff). Diff runs only inside the
+coverage intersection.
 """
 from typing import Protocol
 
@@ -39,6 +45,7 @@ def push(remote: Store, runs: tuple[Run, ...]) -> None:
 
 
 def sync(local_state, remote: Store) -> dict:
-    """diff -> pull -> ingest -> push; returns a round/byte report the
-    bench harness consumes (bench/writer_p2p_cost.py)."""
+    """Driver side, one session: diff -> pull -> ingest -> push;
+    returns a round/byte report the bench harness consumes
+    (bench/writer_p2p_cost.py). The remote never walks."""
     raise NotImplementedError
