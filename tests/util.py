@@ -245,11 +245,10 @@ def member_src(n, ws, pk):
 
 
 def inject_device_claim(
-        node, workspace, secret, public, user, target, label, ts):
-    """Author a valid direct-device claim past command duplicate checks."""
-    item = device_invite(
-        workspace, public, user, target, label, ts)
-    signed = signature(secret, public, item, ts)
+        node, workspace, owner_secret, owner, target, label, ts):
+    """Author one owner-signed claim past command duplicate checks."""
+    item = device_invite(workspace, owner, target, label, ts)
+    signed = signature(owner_secret, owner, item, ts)
     node.ingest_new(
         workspace,
         [signed, item],
@@ -258,9 +257,9 @@ def inject_device_claim(
             item.fid: [
                 signed.fid,
                 node.sql(workspace).resolve_offer(
-                    "member", public, user),
+                    "member", owner, owner),
                 node.sql(workspace).resolve_offer(
-                    "device_key", public, user),
+                    "device_key", owner, owner),
             ],
         },
     )

@@ -44,20 +44,20 @@ SCALE_BYTES = {
         "one_changed": 4_165,
     },
     10: {
-        "publication": 53_234,
-        "cold": 53_234,
+        "publication": 52_586,
+        "cold": 52_586,
         "noop": 3_510,
         "changed_publication_read": 351,
-        "changed_publication_write": 5_557,
-        "one_changed": 8_716,
+        "changed_publication_write": 5_485,
+        "one_changed": 8_644,
     },
     100: {
-        "publication": 545_088,
-        "cold": 545_088,
+        "publication": 537_960,
+        "cold": 537_960,
         "noop": 35_100,
         "changed_publication_read": 351,
-        "changed_publication_write": 5_559,
-        "one_changed": 40_308,
+        "changed_publication_write": 5_487,
+        "one_changed": 40_236,
     },
 }
 
