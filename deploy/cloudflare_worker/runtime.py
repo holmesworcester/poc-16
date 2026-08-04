@@ -10,14 +10,13 @@ from core import peer_capability
 from core.access import AccessGate
 from core.crypto import load_sk, sign, verify
 from core.limits import (
-    MAX_CONTROL_PILE_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_OBJECT_BYTES as CORE_MAX_OBJECT_BYTES,
     MAX_PAGE_BATCH_BYTES,
     PAGE_BATCH,
 )
 from core.shape import valid_fid
-from core.http import HttpGate, Response
+from core.http import HttpGate, MAX_HEAD_CONTROL_REQUEST_BYTES, Response
 from core.object_store import validate_store_prefix
 from core.writer_repository import OpaqueHeadGate
 from deploy.cloudflare_pack.contract import (
@@ -33,7 +32,7 @@ else:
     from crypto_compat import seal_to, unseal
 
 MAX_REQUEST_BYTES = min(512 * 1024, MAX_MINT_REQUEST_BYTES)
-MAX_CONTROL_BYTES = MAX_CONTROL_PILE_BYTES
+MAX_CONTROL_BYTES = MAX_HEAD_CONTROL_REQUEST_BYTES
 MAX_OBJECT_BYTES = CORE_MAX_OBJECT_BYTES
 MAX_BATCH_COUNT = min(48, PAGE_BATCH)
 MAX_BATCH_BYTES = min(4 * 1024 * 1024, MAX_PAGE_BATCH_BYTES)
@@ -204,17 +203,24 @@ def gateway(settings, clock=None):
     issuer = settings.issue_packs(clock)
     store = R2BindingStore(settings.bucket, settings.prefix)
     gate = AccessGate(settings.workspace, store)
+    heads = OpaqueHeadGate(store, gate.authorize_head)
+
+    async def commit_permit(permit, proposed, controls, secret):
+        grant = await gate.authorize_permitted_head(
+            permit, proposed, controls, secret)
+        return await heads.advance_grant(grant, proposed)
 
     return HttpGate(
         store,
         settings.workspace,
         settings.secret,
         clock,
-        head_advance=OpaqueHeadGate(store, gate.authorize_head).advance,
+        head_advance=heads.advance,
+        head_permit_issue=gate.issue_head_permit,
+        head_permit_commit=commit_permit,
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
-        removal_apply=gate.state.apply_control,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,
         sync_profile=peer_capability.OWNER,
@@ -312,9 +318,7 @@ def _request_limit(settings, method, path):
     """Return the provider-confined budget for one shared-gate route."""
     path = "/" + path.strip("/")
     protocol = HttpGate.request_limit(method, path)
-    control = method.upper() == "POST" and path in {
-        "/removal/bootstrap", "/removal/apply",
-    }
+    control = protocol > MAX_MINT_REQUEST_BYTES
     provider = settings.max_control_bytes \
         if control else settings.max_request_bytes
     return min(protocol, provider) if protocol else provider

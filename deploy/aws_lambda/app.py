@@ -34,7 +34,12 @@ from deploy.aws_lambda.pack_issuer import (
     S3PackBinding,
     S3PackIssuer,
 )
-from core.http import AsyncFromSyncReader, HttpGate, Response
+from core.http import (
+    AsyncFromSyncReader,
+    HttpGate,
+    MAX_HEAD_CONTROL_REQUEST_BYTES,
+    Response,
+)
 from core.writer_repository import OpaqueHeadGate
 
 _gateway_cache = None
@@ -70,8 +75,7 @@ def _request_limit(method, path):
     """Apply the exact route budget before decoding a Function URL body."""
     path = "/" + path.strip("/")
     protocol = HttpGate.request_limit(method, path)
-    if method.upper() == "POST" and path in {
-            "/removal/bootstrap", "/removal/apply"}:
+    if protocol > MAX_MINT_REQUEST_BYTES:
         provider = _bounded_positive(
             "TINYP2P_MAX_CONTROL_BYTES",
             MAX_CONTROL_REQUEST_BYTES,
@@ -183,17 +187,24 @@ def _gateway():
         workspace = _required("TINYP2P_WORKSPACE_ID")
         clock = lambda: int(time.time() * 1000)
         gate = AccessGate(workspace, store)
+        heads = OpaqueHeadGate(store, gate.authorize_head)
+
+        async def commit_permit(permit, proposed, controls, secret):
+            grant = await gate.authorize_permitted_head(
+                permit, proposed, controls, secret)
+            return await heads.advance_grant(grant, proposed)
+
         _gateway_cache = HttpGate(
             store,
             workspace,
             _secret(),
             clock,
-            head_advance=OpaqueHeadGate(
-                store, gate.authorize_head).advance,
+            head_advance=heads.advance,
+            head_permit_issue=gate.issue_head_permit,
+            head_permit_commit=commit_permit,
             mint_authorize=gate.authorize_access,
             path_authorize=gate.removal_path,
             removal_bootstrap=gate.state.bootstrap,
-            removal_apply=gate.state.apply_control,
             object_open=issuer.open_object,
             pack_open=issuer.open_pack,
             sync_profile=peer_capability.OWNER,

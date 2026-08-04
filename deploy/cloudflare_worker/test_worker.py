@@ -25,6 +25,10 @@ from core.crypto import (
     unseal as native_unseal,
 )
 from core.grants import make_token
+from core.http import (
+    encode_head_commit_request,
+    encode_head_permit_request,
+)
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
@@ -299,16 +303,16 @@ def proof_body(workspace, pile):
     }).encode()
 
 
-def test_runtime_applies_exact_control_before_another_owner_head():
+def test_runtime_permit_commits_one_terminal_self_removal_head():
     value = removal_world()
     prefix = f"workspaces/{value.root.fid}"
     bucket = StaleRemovalOnceBucket({})
     environment = worker_environment(bucket, value.root.fid, prefix)
     bootstrap = signed(
-        value.member_secret,
-        value.member,
+        value.founder_secret,
+        value.founder,
         value.root,
-        value.membership,
+        (value.root,),
     )
     published = run(runtime.handle(Request(
         "POST",
@@ -316,20 +320,9 @@ def test_runtime_applies_exact_control_before_another_owner_head():
         bootstrap,
     ), environment, clock=lambda: 10))
     assert published.status == 201
-    founder_bootstrap = signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (value.root,),
-    )
-    assert run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/removal/bootstrap?ws={value.root.fid}",
-        founder_bootstrap,
-    ), environment, clock=lambda: 10)).status == 204
     historical = path_proof(
-        value.member_secret, value.member,
-        value.root, value.membership)
+        value.founder_secret, value.founder,
+        value.root, (value.root,))
     path_response = run(runtime.handle(Request(
         "POST",
         f"https://worker.example/removal/path?ws={value.root.fid}",
@@ -339,67 +332,36 @@ def test_runtime_applies_exact_control_before_another_owner_head():
     path = path_response.body
 
     current = access_proof(
-        value.member_secret, value.member,
-        value.root, value.membership, path)
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path)
     minted = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, current),
     ), environment, clock=lambda: 10))
     assert minted.status == 200
     token = native_unseal(
-        value.member_secret,
+        value.founder_secret,
         base64.b64decode(json.loads(minted.body)["grant"]),
     ).decode()
-    founder_history = path_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,))
-    founder_path = run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/removal/path?ws={value.root.fid}",
-        proof_body(value.root.fid, founder_history),
-    ), environment, clock=lambda: 10))
-    assert founder_path.status == 200
-    founder_current = access_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,), founder_path.body)
-    founder_mint = run(runtime.handle(Request(
-        "POST", f"https://worker.example/mint?ws={value.root.fid}",
-        proof_body(value.root.fid, founder_current),
-    ), environment, clock=lambda: 10))
-    assert founder_mint.status == 200
-    founder_token = native_unseal(
-        value.founder_secret,
-        base64.b64decode(json.loads(founder_mint.body)["grant"]),
-    ).decode()
-    founder_headers = {"Authorization": "Bearer " + founder_token}
+    headers = {"Authorization": "Bearer " + token}
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/authority?ws={value.root.fid}",
         bootstrap,
-        {"Authorization": "Bearer " + token},
+        headers,
     ), environment, clock=lambda: 10)).status == 404
 
-    proposed = h(b"cloudflare opaque writer head")
+    proposed = h(b"cloudflare terminal self-removal head")
     bucket.data[f"{prefix}/obj/{proposed}"] = (
-        b"cloudflare opaque writer head")
-    advanced = run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/head/{proposed}?ws={value.root.fid}",
-        current_head_proof(
-            value.member_secret, value.member,
-            value.root, value.membership, path, proposed),
-    ), environment, clock=lambda: 10))
-    assert advanced.status == 201
-    slot_key = f"{prefix}/heads/{value.root.fid}/{value.member}"
-    assert bucket.data[slot_key]
+        b"cloudflare terminal self-removal head")
+    proof = current_head_proof(
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path, proposed)
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/head/{h(b'wrong')}?ws={value.root.fid}",
-        current_head_proof(
-            value.member_secret, value.member,
-            value.root, value.membership, path, proposed),
+        proof,
     ), environment, clock=lambda: 10)).status == 403
-    assert len([key for key in bucket.data if "/heads/" in key]) == 1
 
     private_node = decode_root(
         bucket.data[f"{prefix}/removal"], value.root.fid).root
@@ -411,14 +373,14 @@ def test_runtime_applies_exact_control_before_another_owner_head():
 
     other = h(b"other member")
     relabeled = removal_path_request(
-        value.root.fid, value.member, other, 1_000, 7)
+        value.root.fid, value.founder, other, 1_000, 7)
     relabeled_sig = signature(
-        value.member_secret, value.member, relabeled, 7)
+        value.founder_secret, value.founder, relabeled, 7)
     forged = signed(
-        value.member_secret,
-        value.member,
+        value.founder_secret,
+        value.founder,
         value.root,
-        (*value.membership, relabeled_sig, relabeled),
+        (value.root, relabeled_sig, relabeled),
     )
     assert run(runtime.handle(Request(
         "POST",
@@ -427,14 +389,14 @@ def test_runtime_applies_exact_control_before_another_owner_head():
     ), environment, clock=lambda: 10)).status == 403
 
     evicted = removal(
-        value.root.fid, value.founder, value.member, 8)
+        value.root.fid, value.founder, value.founder, 8)
     evicted_sig = signature(
         value.founder_secret, value.founder, evicted, 8)
     control = signed(
         value.founder_secret,
         value.founder,
         value.root,
-        (*value.membership, evicted_sig, evicted),
+        (value.root, evicted_sig, evicted),
     )
     ordinary = message(
         value.root.fid, value.founder,
@@ -453,47 +415,76 @@ def test_runtime_applies_exact_control_before_another_owner_head():
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/removal/apply?ws={value.root.fid}",
-        control,
-    ), environment, clock=lambda: 10)).status == 401
+        control, headers,
+    ), environment, clock=lambda: 10)).status == 404
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/apply?ws={value.root.fid}",
-        b"not a pile", founder_headers,
+        f"https://worker.example/head/{proposed}/permit?ws="
+        f"{value.root.fid}",
+        b"not a control-head frame",
     ), environment, clock=lambda: 10)).status == 403
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/apply?ws={value.root.fid}",
-        ordinary_pile, founder_headers,
+        f"https://worker.example/head/{proposed}/permit?ws="
+        f"{value.root.fid}",
+        encode_head_permit_request(proof, (ordinary_pile,)),
     ), environment, clock=lambda: 10)).status == 403
     assert bucket.data[removal_key] == removal_before
 
     bucket.calls.clear()
+    permit_response = run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{proposed}/permit?ws="
+        f"{value.root.fid}",
+        encode_head_permit_request(proof, (control,)),
+    ), environment, clock=lambda: 10))
+    assert permit_response.status == 200
+    permit = permit_response.body
+    slot_key = f"{prefix}/heads/{value.root.fid}/{value.founder}"
+    assert slot_key not in bucket.data
+
+    tampered = bytearray(permit)
+    tampered[len(tampered) // 2] ^= 1
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{proposed}/commit?ws="
+        f"{value.root.fid}",
+        encode_head_commit_request(bytes(tampered), (control,)),
+    ), environment, clock=lambda: 10)).status == 403
+    assert bucket.data[removal_key] == removal_before
+
     bucket.fail_removal_once = True
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/apply?ws={value.root.fid}",
-        control, founder_headers,
+        f"https://worker.example/head/{proposed}/commit?ws="
+        f"{value.root.fid}",
+        encode_head_commit_request(permit, (control,)),
     ), environment, clock=lambda: 10)).status == 409
     assert bucket.data[removal_key] == removal_before
+    assert slot_key not in bucket.data
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/apply?ws={value.root.fid}",
-        control, founder_headers,
+        f"https://worker.example/head/{proposed}/commit?ws="
+        f"{value.root.fid}",
+        encode_head_commit_request(permit, (control,)),
     ), environment, clock=lambda: 10)).status == 201
+    accepted_slot = bucket.data[slot_key]
     assert run(runtime.handle(Request(
         "POST",
-        f"https://worker.example/removal/apply?ws={value.root.fid}",
-        control, founder_headers,
+        f"https://worker.example/head/{proposed}/commit?ws="
+        f"{value.root.fid}",
+        encode_head_commit_request(permit, (control,)),
     ), environment, clock=lambda: 10)).status == 204
+    assert bucket.data[slot_key] == accepted_slot
     assert not any(operation == "list" for operation, _key in bucket.calls)
-    assert not any(
-        "/heads/" in key or "/obj/" in key
+    assert all(
+        key == removal_key
+        or key.startswith(f"{prefix}/removal-node/")
+        or key == slot_key
+        or key == f"{prefix}/obj/{proposed}"
         for _operation, key in bucket.calls)
-    assert f"{prefix}/heads/{value.root.fid}/{value.founder}" \
-        not in bucket.data
     assert not any("cursor" in key for key in bucket.data)
 
-    accepted_slot = bucket.data[slot_key]
     rejected_head = h(b"cloudflare head after member removal")
     bucket.data[f"{prefix}/obj/{rejected_head}"] = (
         b"cloudflare head after member removal")
@@ -501,10 +492,18 @@ def test_runtime_applies_exact_control_before_another_owner_head():
         "POST",
         f"https://worker.example/head/{rejected_head}?ws={value.root.fid}",
         current_head_proof(
-            value.member_secret, value.member,
-            value.root, value.membership, path, rejected_head),
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head),
     ), environment, clock=lambda: 10)).status == 409
     assert bucket.data[slot_key] == accepted_slot
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{rejected_head}/permit?ws="
+        f"{value.root.fid}",
+        encode_head_permit_request(current_head_proof(
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head), (control,)),
+    ), environment, clock=lambda: 10)).status == 409
     stale = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, current),
@@ -518,8 +517,8 @@ def test_runtime_applies_exact_control_before_another_owner_head():
     ), environment, clock=lambda: 10))
     assert refreshed.status == 200
     denied = access_proof(
-        value.member_secret, value.member,
-        value.root, value.membership, refreshed.body)
+        value.founder_secret, value.founder,
+        value.root, (value.root,), refreshed.body)
     assert run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={value.root.fid}",
         proof_body(value.root.fid, denied),
@@ -955,7 +954,8 @@ def test_runtime_applies_route_specific_exact_body_limits(
             return runtime.Response(200)
 
     monkeypatch.setattr(runtime, "gateway", lambda *_args, **_kwargs: Probe())
-    control = f"https://worker.example/removal/apply?ws={workspace}"
+    control = (
+        f"https://worker.example/head/{'b' * 64}/commit?ws={workspace}")
     mint_url = f"https://worker.example/mint?ws={workspace}"
 
     assert run(runtime.handle(Request(
@@ -1232,7 +1232,8 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         for name in runtime._BUDGETS
     } == runtime._BUDGETS
     assert runtime.MAX_REQUEST_BYTES <= limits.MAX_MINT_REQUEST_BYTES
-    assert runtime.MAX_CONTROL_BYTES == limits.MAX_CONTROL_PILE_BYTES
+    assert runtime.MAX_CONTROL_BYTES \
+        == runtime.MAX_HEAD_CONTROL_REQUEST_BYTES
     # Bao slice payloads are inline ordinary facts. Authenticated repository
     # reads apply their narrower page/fact bound at the gate call site rather
     # than shrinking this shared object-response ceiling.

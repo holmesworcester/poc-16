@@ -30,6 +30,7 @@ _HTTP_REPOSITORY_CORE_MODULES = (
 HOSTED_GATE_CORE_MODULES = (
     *_HTTP_REPOSITORY_CORE_MODULES,
     "access.py",
+    "head_permit.py",
     "kernel.py",
     "removal_state.py",
     "writer_repository.py",

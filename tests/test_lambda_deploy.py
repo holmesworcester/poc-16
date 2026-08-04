@@ -20,7 +20,6 @@ from core.access import AccessGate
 from core.crypto import h, unseal
 from core.grants import check_token
 from core.limits import (
-    MAX_CONTROL_PILE_BYTES,
     MAX_MINT_REQUEST_BYTES,
     PAGE_BATCH,
 )
@@ -48,7 +47,14 @@ from deploy.aws_lambda.config import (
     validate_sdk_budget,
 )
 from deploy.aws_lambda.s3_bucket_policy import policy
-from core.http import AsyncFromSyncReader, HttpGate, Response
+from core.http import (
+    AsyncFromSyncReader,
+    HttpGate,
+    MAX_HEAD_CONTROL_REQUEST_BYTES,
+    encode_head_commit_request,
+    encode_head_permit_request,
+    Response,
+)
 from core.object_store import (
     MAX_INVITE_ID_BYTES,
     MAX_LOGICAL_KEY_BYTES,
@@ -150,17 +156,24 @@ def world(tmp_path):
 def local_gateway(node, workspace, now):
     store = AsyncFromSyncReader(node.store(workspace))
     gate = AccessGate(workspace, store)
+    heads = OpaqueHeadGate(store, gate.authorize_head)
+
+    async def commit_permit(permit, proposed, controls, secret):
+        grant = await gate.authorize_permitted_head(
+            permit, proposed, controls, secret)
+        return await heads.advance_grant(grant, proposed)
 
     return HttpGate(
         store,
         workspace,
         b"s" * 32,
         lambda: now,
-        head_advance=OpaqueHeadGate(store, gate.authorize_head).advance,
+        head_advance=heads.advance,
+        head_permit_issue=gate.issue_head_permit,
+        head_permit_commit=commit_permit,
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,
-        removal_apply=gate.state.apply_control,
         sync_profile=peer_capability.OWNER,
     )
 
@@ -215,7 +228,7 @@ def mint(node, workspace, pile):
     return status, body, token
 
 
-def test_lambda_applies_exact_control_before_another_owner_head(
+def test_lambda_permit_commits_one_terminal_self_removal_head(
         tmp_path, monkeypatch):
     value = removal_world()
     store = StaleRemovalOnceStore(str(tmp_path / "repository"))
@@ -234,15 +247,6 @@ def test_lambda_applies_exact_control_before_another_owner_head(
     app._gateway_cache = None
 
     bootstrap = signed(
-        value.member_secret,
-        value.member,
-        value.root,
-        value.membership,
-    )
-    assert response(app.handler(event(
-        "POST", "/removal/bootstrap",
-        value.root.fid, bootstrap), None))[0] == 201
-    founder_bootstrap = signed(
         value.founder_secret,
         value.founder,
         value.root,
@@ -250,66 +254,40 @@ def test_lambda_applies_exact_control_before_another_owner_head(
     )
     assert response(app.handler(event(
         "POST", "/removal/bootstrap",
-        value.root.fid, founder_bootstrap), None))[0] == 204
-
+        value.root.fid, bootstrap), None))[0] == 201
     historical = path_proof(
-        value.member_secret, value.member,
-        value.root, value.membership)
+        value.founder_secret, value.founder,
+        value.root, (value.root,))
     status, _, path = response(app.handler(event(
         "POST", "/removal/path", value.root.fid,
         proof_body(value.root.fid, historical)), None))
     assert status == 200
 
     current = access_proof(
-        value.member_secret, value.member,
-        value.root, value.membership, path)
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path)
     status, _, raw_mint = response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, current)), None))
     assert status == 200
     token = unseal(
-        value.member_secret,
+        value.founder_secret,
         base64.b64decode(json.loads(raw_mint)["grant"]),
     ).decode()
-    founder_history = path_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,))
-    founder_path = response(app.handler(event(
-        "POST", "/removal/path", value.root.fid,
-        proof_body(value.root.fid, founder_history)), None))
-    assert founder_path[0] == 200
-    founder_current = access_proof(
-        value.founder_secret, value.founder,
-        value.root, (value.root,), founder_path[2])
-    founder_mint = response(app.handler(event(
-        "POST", "/mint", value.root.fid,
-        proof_body(value.root.fid, founder_current)), None))
-    assert founder_mint[0] == 200
-    founder_token = unseal(
-        value.founder_secret,
-        base64.b64decode(json.loads(founder_mint[2])["grant"]),
-    ).decode()
-    founder_headers = {"Authorization": "Bearer " + founder_token}
+    headers = {"Authorization": "Bearer " + token}
     assert response(app.handler(event(
         "POST", "/authority", value.root.fid, bootstrap,
-        headers={"Authorization": "Bearer " + token}), None))[0] == 404
+        headers=headers), None))[0] == 404
 
-    proposed = h(b"lambda opaque writer head")
+    proposed = h(b"lambda terminal self-removal head")
     store.put_if_absent(
-        "obj/" + proposed, b"lambda opaque writer head")
+        "obj/" + proposed, b"lambda terminal self-removal head")
     proof = current_head_proof(
-        value.member_secret, value.member,
-        value.root, value.membership, path, proposed)
-    assert response(app.handler(event(
-        "POST", "/head/" + proposed,
-        value.root.fid, proof), None))[0] == 201
-    assert store.get(
-        f"heads/{value.root.fid}/{value.member}") is not None
+        value.founder_secret, value.founder,
+        value.root, (value.root,), path, proposed)
     assert response(app.handler(event(
         "POST", "/head/" + h(b"wrong"),
         value.root.fid, proof), None))[0] == 403
-    accepted_slot = store.get(
-        f"heads/{value.root.fid}/{value.member}")
 
     private_node = decode_root(
         store.get("removal"), value.root.fid).root
@@ -319,28 +297,28 @@ def test_lambda_applies_exact_control_before_another_owner_head(
 
     other = h(b"other member")
     relabeled = removal_path_request(
-        value.root.fid, value.member, other, 1_000, 7)
+        value.root.fid, value.founder, other, 1_000, 7)
     relabeled_sig = signature(
-        value.member_secret, value.member, relabeled, 7)
+        value.founder_secret, value.founder, relabeled, 7)
     forged = signed(
-        value.member_secret,
-        value.member,
+        value.founder_secret,
+        value.founder,
         value.root,
-        (*value.membership, relabeled_sig, relabeled),
+        (value.root, relabeled_sig, relabeled),
     )
     assert response(app.handler(event(
         "POST", "/removal/path", value.root.fid,
         proof_body(value.root.fid, forged)), None))[0] == 403
 
     evicted = removal(
-        value.root.fid, value.founder, value.member, 8)
+        value.root.fid, value.founder, value.founder, 8)
     evicted_sig = signature(
         value.founder_secret, value.founder, evicted, 8)
     control = signed(
         value.founder_secret,
         value.founder,
         value.root,
-        (*value.membership, evicted_sig, evicted),
+        (value.root, evicted_sig, evicted),
     )
     ordinary = message(
         value.root.fid, value.founder,
@@ -356,32 +334,55 @@ def test_lambda_applies_exact_control_before_another_owner_head(
 
     removal_before = store.get(REMOVAL_ROOT_KEY)
     assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, control), None))[0] == 401
+        "POST", "/removal/apply", value.root.fid, control,
+        headers=headers), None))[0] == 404
     assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, b"not a pile",
-        headers=founder_headers), None))[0] == 403
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        b"not a control-head frame"), None))[0] == 403
     assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, ordinary_pile,
-        headers=founder_headers), None))[0] == 403
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        encode_head_permit_request(
+            proof, (ordinary_pile,))), None))[0] == 403
     assert store.get(REMOVAL_ROOT_KEY) == removal_before
 
     store.calls.clear()
-    store.fail_removal_once = True
-    assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, control,
-        headers=founder_headers), None))[0] == 409
-    assert store.get(REMOVAL_ROOT_KEY) == removal_before
-    assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, control,
-        headers=founder_headers), None))[0] == 201
-    assert response(app.handler(event(
-        "POST", "/removal/apply", value.root.fid, control,
-        headers=founder_headers), None))[0] == 204
+    permit_response = response(app.handler(event(
+        "POST", f"/head/{proposed}/permit", value.root.fid,
+        encode_head_permit_request(proof, (control,))), None))
+    assert permit_response[0] == 200
+    permit = permit_response[2]
     assert store.get(
         f"heads/{value.root.fid}/{value.founder}") is None
+
+    tampered = bytearray(permit)
+    tampered[len(tampered) // 2] ^= 1
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(bytes(tampered), (control,))), None))[0] \
+        == 403
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+
+    store.fail_removal_once = True
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit, (control,))), None))[0] == 409
+    assert store.get(REMOVAL_ROOT_KEY) == removal_before
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") is None
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit, (control,))), None))[0] == 201
+    accepted_slot = store.get(
+        f"heads/{value.root.fid}/{value.founder}")
+    assert response(app.handler(event(
+        "POST", f"/head/{proposed}/commit", value.root.fid,
+        encode_head_commit_request(permit, (control,))), None))[0] == 204
+    assert store.get(
+        f"heads/{value.root.fid}/{value.founder}") == accepted_slot
     assert store.page_reads == []
     assert all(
         key == REMOVAL_ROOT_KEY or key.startswith("removal-node/")
+        or key == f"heads/{value.root.fid}/{value.founder}"
         for _operation, key in store.calls)
     assert not any("cursor" in key for key in store.list(""))
 
@@ -391,11 +392,17 @@ def test_lambda_applies_exact_control_before_another_owner_head(
     assert response(app.handler(event(
         "POST", "/head/" + rejected_head, value.root.fid,
         current_head_proof(
-            value.member_secret, value.member,
-            value.root, value.membership, path, rejected_head)), None))[0] \
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head)), None))[0] \
         == 409
     assert store.get(
-        f"heads/{value.root.fid}/{value.member}") == accepted_slot
+        f"heads/{value.root.fid}/{value.founder}") == accepted_slot
+    assert response(app.handler(event(
+        "POST", f"/head/{rejected_head}/permit", value.root.fid,
+        encode_head_permit_request(current_head_proof(
+            value.founder_secret, value.founder,
+            value.root, (value.root,), path, rejected_head),
+            (control,))), None))[0] == 409
     stale = response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, current)), None))
@@ -406,8 +413,8 @@ def test_lambda_applies_exact_control_before_another_owner_head(
         proof_body(value.root.fid, historical)), None))
     assert refreshed[0] == 200
     denied = access_proof(
-        value.member_secret, value.member,
-        value.root, value.membership, refreshed[2])
+        value.founder_secret, value.founder,
+        value.root, (value.root,), refreshed[2])
     assert response(app.handler(event(
         "POST", "/mint", value.root.fid,
         proof_body(value.root.fid, denied)), None))[0] == 403
@@ -425,12 +432,13 @@ def test_lambda_applies_route_specific_exact_body_limits(monkeypatch):
     app._gateway_cache = Probe()
     monkeypatch.setenv("TINYP2P_MAX_REQUEST_BYTES", "3")
     monkeypatch.setenv("TINYP2P_MAX_CONTROL_BYTES", "5")
+    route = "/head/" + "b" * 64 + "/commit"
 
     assert response(app.handler(event(
-        "POST", "/removal/apply", workspace, b"12345"), None))[0] == 200
+        "POST", route, workspace, b"12345"), None))[0] == 200
     assert calls[-1][-1] == b"12345"
     assert response(app.handler(event(
-        "POST", "/removal/apply", workspace, b"123456"), None))[0] == 413
+        "POST", route, workspace, b"123456"), None))[0] == 413
     assert response(app.handler(event(
         "POST", "/mint", workspace, b"123"), None))[0] == 200
     assert response(app.handler(event(
@@ -804,7 +812,7 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert (
         f'TINYP2P_MAX_CONTROL_BYTES: '
         f'"{MAX_CONTROL_REQUEST_BYTES}"') in template
-    assert MAX_CONTROL_REQUEST_BYTES < MAX_CONTROL_PILE_BYTES
+    assert MAX_CONTROL_REQUEST_BYTES < MAX_HEAD_CONTROL_REQUEST_BYTES
     assert f"AllowedPattern: '{BUCKET_PATTERN}'" in template
     assert f"AllowedPattern: '{PREFIX_PATTERN}'" in template
     assert f"MaxLength: {MAX_STORE_PREFIX_LENGTH}" in template
