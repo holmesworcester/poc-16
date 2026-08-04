@@ -4,8 +4,8 @@ from core.fact import canon
 from core.limits import PAGE_BATCH
 from core.object_store import Versioned
 from core.writer_head import (
+    decode_slot_at,
     head_slot_prefix,
-    visible_slot_at,
 )
 
 
@@ -21,7 +21,7 @@ def _writer_state(node, workspace):
             opened = store.read_versioned(key)
             if not isinstance(opened, Versioned):
                 raise ValueError("listed writer slot disappeared")
-            slot = visible_slot_at(key, opened.value)
+            slot = decode_slot_at(key, opened.value)
             if slot is None:
                 continue
             accepted.append((

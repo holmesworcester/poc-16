@@ -52,11 +52,11 @@ from .removal_path import ProofRefreshRequired, RemovalDenied
 from .shape import valid_fid
 from .writer_head import (
     MAX_HEAD_SLOT_BYTES,
+    decode_slot_at,
     decode_slot,
     encode_slot,
     head_slot_key,
     head_slot_prefix,
-    visible_slot_at,
 )
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -723,7 +723,7 @@ class HttpGate:
                 return Response(503)
             else:
                 try:
-                    slot = visible_slot_at(key, value)
+                    slot = decode_slot_at(key, value)
                     normalized.append(
                         None if slot is None else encode_slot(slot))
                 except ValueError:
@@ -753,7 +753,7 @@ class HttpGate:
         if not isinstance(opened, Versioned):
             return Response(503)
         try:
-            visible = visible_slot_at(key, opened.value)
+            visible = decode_slot_at(key, opened.value)
             if visible is None:
                 return Response(404)
             raw = encode_slot(visible)
@@ -835,7 +835,7 @@ class HttpGate:
             key = head_slot_key(slot.workspace, slot.device)
             current = await self.store.get_bounded(
                 key, MAX_HEAD_SLOT_BYTES)
-            visible = None if current is None else visible_slot_at(
+            visible = None if current is None else decode_slot_at(
                 key, current)
         except Exception:
             return Response(503)

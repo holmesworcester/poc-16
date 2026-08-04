@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from core.close import encode_signed_pile, make_signed_pile, signed_pile_oid
 from core.crypto import h, keypair
-from core.limits import MAX_MIRROR_CONTROL_ATTEMPTS
+from core.limits import MAX_CONTROL_APPLY_ATTEMPTS
 from core.object_store import ABSENT, REMOVAL_ROOT_KEY
 from core.removal_state import RecipientRemovalState
 from core.store import FsStore
@@ -14,10 +14,8 @@ from core.suppression import scoped_id, suppression_slot
 from core.suppression_tree import SuppressionTree
 from core.writer_head import (
     HeadSlot,
-    PendingHeadSlot,
     WriterBinding,
     decode_slot_at,
-    decode_slot_state_at,
     encode_head,
     encode_slot,
     head_oid,
@@ -470,12 +468,10 @@ def test_mirror_finishes_pending_head_before_newer_source_head(tmp_path):
     stalled = run(interrupted.sync_from(source))
 
     slot_key = head_slot_key(value.root.fid, value.founder)
-    pending = decode_slot_state_at(slot_key, target.get(slot_key))
-    assert isinstance(pending, PendingHeadSlot)
-    assert pending.head == first.head_oid
+    assert target.get(slot_key) is None
     assert stalled.changed == stalled.piles == stalled.facts == 0
     assert stalled.errors and "control application" in stalled.errors[0][1]
-    assert len(calls) == MAX_MIRROR_CONTROL_ATTEMPTS
+    assert len(calls) == MAX_CONTROL_APPLY_ATTEMPTS
 
     later = message(
         value.root.fid, value.founder, "general", "after H1", 5)
@@ -491,9 +487,9 @@ def test_mirror_finishes_pending_head_before_newer_source_head(tmp_path):
     ))
     assert second.base_head == first.head_oid
 
-    # Model a process restart: neither the interrupted consumer nor its
-    # control wrapper survives. The durable pending slot plus immutable local
-    # objects must be enough to complete H1 before considering source H2.
+    # Model a process restart: the failed turn left no admission slot. The
+    # immutable local objects plus the source's final slot are enough to replay
+    # the idempotent control plan before accepting H2.
     restarted_state = RecipientRemovalState(value.root.fid, target)
     restarted_consumer = FactConsumer(value.root.fid)
     caught_up = run(RepositoryMirror(
@@ -517,8 +513,8 @@ def test_mirror_finishes_pending_head_before_newer_source_head(tmp_path):
     )) == suppression_slot(evicted.fid)
 
 
-def test_local_replay_finishes_pending_head_without_source(tmp_path):
-    """Crash recovery uses copied bytes, not a source-retained old head."""
+def test_source_replay_finishes_apply_before_slot_crash(tmp_path):
+    """Crash recovery recomputes the plan from immutable source bytes."""
     value = world()
     source = FsStore(str(tmp_path / "source"))
     target = FsStore(str(tmp_path / "target"))
@@ -570,7 +566,7 @@ def test_local_replay_finishes_pending_head_without_source(tmp_path):
         exact_binding,
         restarted_consumer,
         control_state=restarted_state,
-    ).replay_local())
+    ).sync_from(source))
 
     slot_key = head_slot_key(value.root.fid, value.founder)
     assert recovered.errors == ()
@@ -585,9 +581,9 @@ def test_local_replay_finishes_pending_head_without_source(tmp_path):
     )) == suppression_slot(evicted.fid)
 
 
-def test_same_base_mirrors_reserve_before_effects_and_only_winner_projects(
+def test_same_base_mirrors_keep_fail_safe_loser_rows_and_one_projection(
         tmp_path):
-    """Two relays of a fork cannot publish both branches' removals."""
+    """Two relays expose one fork while both ACI removal plans survive."""
     value = world()
 
     invite_secret, invite_public = keypair()
@@ -697,7 +693,7 @@ def test_same_base_mirrors_reserve_before_effects_and_only_winner_projects(
     assert run(value_at(
         state,
         scoped_id("member", loser_member),
-    )) is None
+    )) == suppression_slot(loser.fid)
     assert consumer.projected_head(value.founder) == installed
     assert bucket.assert_valid_history()
 

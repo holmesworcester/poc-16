@@ -17,8 +17,8 @@ from .removal_state import checked_updates
 from .shape import valid_fid
 
 
-FORMAT = "poc16-control-head-permit-v2"
-MAC_DOMAIN = "poc16-control-head-permit-mac-v2"
+FORMAT = "poc16-control-head-permit-v3"
+MAC_DOMAIN = "poc16-control-head-permit-mac-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +31,6 @@ class ControlHeadPermit:
     head: str
     removal_root: str
     updates: tuple[tuple[str, dict], ...]
-    terminal_sids: tuple[str, ...]
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
@@ -42,15 +41,6 @@ class ControlHeadPermit:
                 or checked_updates(self.updates) != self.updates \
                 or not self.updates:
             raise ValueError("control head permit identity")
-        active = {
-            sid for sid, value in self.updates
-            if value.get("state") == "active"
-        }
-        if not isinstance(self.terminal_sids, tuple) \
-                or self.terminal_sids != tuple(
-                    sorted(set(self.terminal_sids))) \
-                or not set(self.terminal_sids) <= active:
-            raise ValueError("control head permit terminal ids")
 
 
 def _claims(permit):
@@ -61,7 +51,6 @@ def _claims(permit):
         "device": permit.device,
         "head": permit.head,
         "removal_root": permit.removal_root,
-        "terminal_sids": list(permit.terminal_sids),
         "updates": [
             [sid, value] for sid, value in permit.updates
         ],
@@ -118,9 +107,8 @@ def decode(raw, secret):
         raise ValueError("control head permit")
     claims = value["claims"]
     if set(claims) != {
-            "base_head", "device", "head", "terminal_sids", "updates",
+            "base_head", "device", "head", "updates",
             "removal_root", "workspace"} \
-            or not isinstance(claims["terminal_sids"], list) \
             or not isinstance(claims["updates"], list):
         raise ValueError("control head permit claims")
     try:
@@ -135,7 +123,6 @@ def decode(raw, secret):
             claims["head"],
             claims["removal_root"],
             checked_updates(updates),
-            tuple(claims["terminal_sids"]),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("control head permit claims") from error

@@ -9,7 +9,7 @@ from .head_permit import (
     decode as decode_permit,
     encode as encode_permit,
 )
-from .limits import MAX_MINT_REQUEST_BYTES
+from .limits import MAX_CONTROL_APPLY_ATTEMPTS, MAX_MINT_REQUEST_BYTES
 from .removal_path import build as build_path, encode as encode_path
 from .removal_state import RecipientRemovalState
 from .shape import valid_fid
@@ -131,7 +131,7 @@ class AccessGate:
             proof, proposed_head, trusted_now)
         if decision is None:
             return None
-        pin, device, owner, base_head, scopes = decision
+        pin, device, owner, base_head, _scopes = decision
         try:
             control_piles = tuple(control_piles)
         except TypeError:
@@ -151,8 +151,6 @@ class AccessGate:
         if supplied != declared:
             return None
         plan = self.state.plan_control(control_piles, device)
-        terminal = tuple(sorted(
-            set(scopes) & set(plan.active_sids)))
         return encode_permit(ControlHeadPermit(
             self.workspace,
             device,
@@ -160,24 +158,13 @@ class AccessGate:
             proposed_head,
             pin.root_oid,
             plan.updates,
-            terminal,
         ), secret)
-
-    @staticmethod
-    async def _states(pin, scopes):
-        states = {}
-        for sid in scopes:
-            proof = await pin.proof(sid)
-            if proof is None:
-                raise ValueError("control head caller state")
-            states[sid] = pin.verify(sid, proof).get("state")
-        return states
 
     async def commit_head_permit(
             self, head_gate, permit_raw, proposed_head, secret):
-        """Reserve, apply authenticated rows, then finalize one exact head."""
-        if not callable(getattr(head_gate, "reserve_control", None)) \
-                or not callable(getattr(head_gate, "finish_control", None)):
+        """Apply authenticated rows, then perform one exact writer-slot CAS."""
+        if not callable(getattr(head_gate, "control_replay", None)) \
+                or not callable(getattr(head_gate, "advance_control", None)):
             raise TypeError("control head gate")
         permit = decode_permit(permit_raw, secret)
         if permit.workspace != self.workspace or permit.head != proposed_head:
@@ -189,24 +176,31 @@ class AccessGate:
             permit.head,
             permit.removal_root,
         )
-        reservation = await head_gate.reserve_control(grant, h(permit_raw))
-        if getattr(reservation, "status", None) is not None:
-            return reservation
-
-        result = await self.state.apply_updates(permit.updates)
-        if result.status == "retryable":
-            raise ControlHeadRetry("control head removal CAS")
-        if result.status not in {"applied", "noop"}:
-            return None
+        permit_oid = h(permit_raw)
+        replay = await head_gate.control_replay(grant, permit_oid)
+        if replay is not None:
+            return replay
         pin = await self.state.pin()
         if pin is None:
             return None
-        if permit.terminal_sids:
-            states = await self._states(pin, permit.terminal_sids)
-            if any(states.get(sid) != "active"
-                   for sid in permit.terminal_sids):
-                return None
-        return await head_gate.finish_control(reservation, pin.root_oid)
+        recovering = pin.root_oid != permit.removal_root
+        if recovering and not await self.state.includes(
+                pin, permit.updates):
+            raise ControlHeadRetry("control head removal root is stale")
+
+        result = None
+        attempts = 1 if recovering else MAX_CONTROL_APPLY_ATTEMPTS
+        for _attempt in range(attempts):
+            result = await self.state.apply_updates(permit.updates)
+            if result.status != "retryable":
+                break
+        if result is None or result.status == "retryable":
+            raise ControlHeadRetry("control head removal CAS")
+        if result.status not in {"applied", "noop"} \
+                or not valid_fid(result.root_oid):
+            return None
+        return await head_gate.advance_control(
+            grant, permit_oid, result.root_oid)
 
 
 __all__ = ("AccessGate", "ControlHeadRetry")

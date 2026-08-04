@@ -95,26 +95,36 @@ MAX_REMOVAL_PATH_BYTES = MAX_MINT_REQUEST_BYTES
 # sink rows then ACI-join into one private-root CAS turn.
 MAX_HEAD_CONTROL_FACTS = MAX_PILE_FACTS
 MAX_HEAD_REMOVAL_UPDATES = MAX_REMOVAL_PATH_SCOPES
-# A consuming mirror may absorb one ordinary concurrent removal-root winner
-# in the active turn. Further contention leaves its exact slot reservation
-# durable for the next turn instead of multiplying provider work without a
-# bound inside one HTTP request.
-MAX_MIRROR_CONTROL_ATTEMPTS = 2
+# A control commit may absorb one concurrent removal-root winner after its
+# issue-time root was proved current. Further contention returns a bounded
+# retryable result to the caller instead of multiplying provider work.
+MAX_CONTROL_APPLY_ATTEMPTS = 2
+# One exact permit is retained only for a bounded active publication turn.
+MAX_OWNER_CONTROL_COMMIT_ATTEMPTS = 4
 
 # Worst-case object-store calls for one self-contained control permit commit.
 # A 256-bit Patricia walk reads at most D+1 nodes per update. Each reachable
 # path-copy node gets one conditional PUT and, only for an unknown outcome,
 # one exact reconciliation GET. The fixed terms cover root pin/CAS/reconcile,
-# the result pins, terminal point proofs, proposed-head existence, and the
-# pending/final writer-slot CAS pair with exact rereads.
+# the result pin, proposed-head existence, and the single writer-slot CAS with
+# an exact reread.
 _REMOVAL_DEPTH = MAX_REMOVAL_PROOF_STEPS
-MAX_HEAD_COMMIT_SUBREQUESTS = (
-    4
+_HEAD_APPLY_SUBREQUESTS = (
+    5
     + MAX_HEAD_REMOVAL_UPDATES * (
         (_REMOVAL_DEPTH + 1) + 2 * (_REMOVAL_DEPTH + 2))
-    + 2
-    + MAX_HEAD_REMOVAL_UPDATES * (_REMOVAL_DEPTH + 1)
-    + 6
+)
+_HEAD_RECOVERY_SUBREQUESTS = (
+    MAX_HEAD_REMOVAL_UPDATES * (_REMOVAL_DEPTH + 1)
+    + _HEAD_APPLY_SUBREQUESTS
+)
+MAX_HEAD_COMMIT_SUBREQUESTS = (
+    2
+    + max(
+        MAX_CONTROL_APPLY_ATTEMPTS * _HEAD_APPLY_SUBREQUESTS,
+        _HEAD_RECOVERY_SUBREQUESTS,
+    )
+    + 4
 )
 CLOUDFLARE_SUBREQUEST_LIMIT = 10_000
 if MAX_HEAD_COMMIT_SUBREQUESTS > CLOUDFLARE_SUBREQUEST_LIMIT:

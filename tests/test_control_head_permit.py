@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 import facts
-from core.access import AccessGate
+from core.access import AccessGate, ControlHeadRetry
 from core.close import (
     decode_signed_pile,
     encode_signed_pile,
@@ -18,18 +18,15 @@ from core.limits import (
     MAX_HEAD_REMOVAL_UPDATES,
     PayloadTooLarge,
 )
-from core.object_store import ABSENT
+from core.object_store import ABSENT, REMOVAL_ROOT_KEY
 from core.removal_path import ProofRefreshRequired, RemovalDenied
 from core.removal_state import ControlHeadPlan
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.writer_head import (
-    PendingHeadSlot,
     WriterBinding,
     decode_slot_at,
-    decode_slot_state_at,
     head_slot_key,
-    visible_slot_at,
     writer_store_binding,
 )
 from core.writer_repository import (
@@ -63,9 +60,16 @@ class OverlapCasStore:
         self.expected = []
         self.failure = None
         self.release = asyncio.Event()
+        self.selected_read = None
+        self.reads = []
+        self.read_failure = None
+        self.read_release = asyncio.Event()
 
     def overlap(self, key):
         self.selected = key
+
+    def overlap_reads(self, key):
+        self.selected_read = key
 
     async def get_bounded(self, key, maximum):
         return self.backing.get_bounded(key, maximum)
@@ -77,7 +81,18 @@ class OverlapCasStore:
         return self.backing.has(key)
 
     async def read_versioned(self, key):
-        return self.backing.read_versioned(key)
+        opened = self.backing.read_versioned(key)
+        if key == self.selected_read and not self.read_release.is_set():
+            self.reads.append(opened)
+            if len(self.reads) == 1:
+                asyncio.get_running_loop().call_soon(
+                    self._check_read_overlap)
+            elif len(self.reads) == 2:
+                self.read_release.set()
+            await self.read_release.wait()
+            if self.read_failure is not None:
+                raise self.read_failure
+        return opened
 
     async def put_if_absent(self, key, value):
         return self.backing.put_if_absent(key, value)
@@ -99,6 +114,12 @@ class OverlapCasStore:
             self.failure = AssertionError(
                 "same-base control commits serialized before slot CAS")
             self.release.set()
+
+    def _check_read_overlap(self):
+        if len(self.reads) != 2:
+            self.read_failure = AssertionError(
+                "same-root control commits serialized before freshness read")
+            self.read_release.set()
 
     async def list_page(self, prefix, cursor=None, limit=256):
         return self.backing.list_page(prefix, cursor, limit)
@@ -271,27 +292,17 @@ def test_signed_control_tree_requires_permit_and_exact_declared_piles(
     run(scenario())
 
 
-def test_exact_permit_resumes_a_reserved_removal_after_process_loss(tmp_path):
+def test_exact_permit_resumes_after_apply_before_slot_cas_process_loss(tmp_path):
     async def scenario():
         (_secret, founder, root, store, gate, head_gate,
          proposed, action, _control, raw) = await issued_terminal(
              tmp_path, "crash")
         permit = decode_permit(raw, PERMIT_SECRET)
         key = head_slot_key(root.fid, founder)
-        reservation = await head_gate.reserve_control(HeadGrant(
-            root.fid,
-            founder,
-            permit.base_head,
-            proposed,
-            permit.removal_root,
-        ), h(raw))
-        assert isinstance(
-            decode_slot_state_at(key, store.get(key)), PendingHeadSlot)
-        assert visible_slot_at(key, store.get(key)) is None
-
         # Model loss after the irreversible ACI join but before final CAS.
         assert (await gate.state.apply_updates(permit.updates)).status \
             == "applied"
+        assert store.read_versioned(key) is ABSENT
         joined_root = (await gate.state.pin()).root_oid
         assert (await value_at(
             gate, scoped_id("member", founder))) == suppression_slot(
@@ -312,7 +323,7 @@ def test_exact_permit_resumes_a_reserved_removal_after_process_loss(tmp_path):
             head_gate, raw, proposed, PERMIT_SECRET)
         assert replay.status == "noop"
         assert decode_slot_at(key, store.get(key)) == accepted
-        assert reservation.slot.permit == accepted.permit
+        assert h(raw) == accepted.permit
 
     run(scenario())
 
@@ -438,7 +449,7 @@ def test_generic_permit_joins_multiple_control_sinks_once(tmp_path):
     run(scenario())
 
 
-def test_concurrent_removal_after_issue_does_not_revoke_exact_permit(
+def test_commit_rejects_a_permit_whose_issue_root_is_no_longer_live(
         tmp_path):
     async def scenario():
         founder_secret, founder, root = founder_world()
@@ -475,24 +486,24 @@ def test_concurrent_removal_after_issue_does_not_revoke_exact_permit(
             scoped_id("member", founder),
             suppression_slot(concurrent_action),
         ),))).status == "applied"
-        result = await gate.commit_head_permit(
-            OpaqueHeadGate(store, gate.authorize_head),
-            permit,
-            proposed,
-            PERMIT_SECRET,
-        )
-        assert result.status == "applied"
+        with pytest.raises(ControlHeadRetry, match="root is stale"):
+            await gate.commit_head_permit(
+                OpaqueHeadGate(store, gate.authorize_head),
+                permit,
+                proposed,
+                PERMIT_SECRET,
+            )
         assert (await value_at(
             gate, scoped_id("member", founder))) == suppression_slot(
                 concurrent_action)
-        assert (await value_at(
-            gate, scoped_id("member", member))) == suppression_slot(
-                action.fid)
+        assert await value_at(gate, scoped_id("member", member)) is None
+        assert store.read_versioned(
+            head_slot_key(root.fid, founder)) is ABSENT
 
     run(scenario())
 
 
-def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
+def test_two_same_base_permits_apply_fail_safe_rows_then_one_head_wins(tmp_path):
     async def scenario():
         secret, founder, root = founder_world()
         members = tuple(
@@ -533,6 +544,7 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
 
         head_gate = OpaqueHeadGate(store, gate.authorize_head)
         key = head_slot_key(root.fid, founder)
+        store.overlap_reads(REMOVAL_ROOT_KEY)
         store.overlap(key)
         results = await asyncio.gather(*(
             gate.commit_head_permit(
@@ -543,15 +555,18 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
             == ["applied", "conflict"]
         assert len(store.expected) == 2
         assert store.expected[0] == store.expected[1] is ABSENT
+        assert len(store.reads) == 2
+        assert store.reads[0] == store.reads[1]
         winner = next(
             index for index, result in enumerate(results)
             if result.status == "applied")
-        loser = 1 - winner
         winner_sid = scoped_id("member", members[winner][1])
-        loser_sid = scoped_id("member", members[loser][1])
         assert await value_at(gate, winner_sid) == suppression_slot(
             actions[winner].fid)
-        assert await value_at(gate, loser_sid) is None
+        for index, (_secret, member, _closure) in enumerate(members):
+            assert await value_at(
+                gate, scoped_id("member", member)) == suppression_slot(
+                    actions[index].fid)
         slot = decode_slot_at(
             key,
             store.backing.get(key),
@@ -561,22 +576,30 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
     run(scenario())
 
 
-def test_pending_control_reservation_blocks_an_ordinary_same_base_head(
+def test_ordinary_same_base_can_win_after_control_effects_before_cas(
         tmp_path):
     async def scenario():
         (_secret, founder, root, store, gate, head_gate,
          proposed, _action, _control, raw) = await issued_terminal(
              tmp_path, "ordinary-race")
         permit = decode_permit(raw, PERMIT_SECRET)
-        reservation = await head_gate.reserve_control(HeadGrant(
-            root.fid, founder, None, proposed, permit.removal_root), h(raw))
         ordinary = establish_opaque_head(store, "ordinary loser")
-        lost = await head_gate.advance_grant(HeadGrant(
+        # Inject the competing ordinary CAS at the exact crash point between
+        # the control effect and its one final slot CAS.
+        assert (await gate.state.apply_updates(permit.updates)).status \
+            == "applied"
+        plain = await head_gate.advance_grant(HeadGrant(
             root.fid, founder, None, ordinary, permit.removal_root))
-        assert lost.status == "conflict"
-        assert isinstance(reservation.slot, PendingHeadSlot)
-        assert (await gate.commit_head_permit(
-            head_gate, raw, proposed, PERMIT_SECRET)).status == "applied"
+        control = await gate.commit_head_permit(
+            head_gate, raw, proposed, PERMIT_SECRET)
+        assert (plain.status, control.status) == ("applied", "conflict")
+        assert (await value_at(
+            gate, scoped_id("member", founder)))["state"] == "active"
+        accepted = decode_slot_at(
+            head_slot_key(root.fid, founder),
+            store.get(head_slot_key(root.fid, founder)),
+        )
+        assert accepted.head == ordinary
 
     run(scenario())
 

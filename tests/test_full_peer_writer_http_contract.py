@@ -762,7 +762,10 @@ def test_hosted_owner_same_base_loser_gets_412_and_stops_for_rebase(
         async def advance(self, proof, candidate, trusted_now):
             return await original.advance(proof, candidate, trusted_now)
 
-        async def reserve_control(self, grant, permit_oid):
+        async def control_replay(self, grant, permit_oid):
+            return await original.control_replay(grant, permit_oid)
+
+        async def advance_control(self, grant, permit_oid, removal_root):
             nonlocal winner_installed
             if not winner_installed:
                 winner_installed = True
@@ -776,10 +779,8 @@ def test_hosted_owner_same_base_loser_gets_412_and_stops_for_rebase(
                     grant.removal_root,
                 ))
                 assert competing.status == "applied"
-            return await original.reserve_control(grant, permit_oid)
-
-        async def finish_control(self, reservation, removal_root):
-            return await original.finish_control(reservation, removal_root)
+            return await original.advance_control(
+                grant, permit_oid, removal_root)
 
     monkeypatch.setattr(
         carol, "head_gate", lambda candidate: CompetingGate())
@@ -954,15 +955,15 @@ def test_local_publish_applies_exact_control_before_head_and_skips_content(
             return await original_head_gate.advance(
                 proof, proposed, trusted_now)
 
-        async def reserve_control(self, grant, permit_oid):
-            return await original_head_gate.reserve_control(
+        async def control_replay(self, grant, permit_oid):
+            return await original_head_gate.control_replay(
                 grant, permit_oid)
 
-        async def finish_control(self, reservation, removal_root):
-            proposed = reservation.slot.head
+        async def advance_control(self, grant, permit_oid, removal_root):
+            proposed = grant.head
             events.append(("head", alice.identity_id(workspace), proposed))
-            return await original_head_gate.finish_control(
-                reservation, removal_root)
+            return await original_head_gate.advance_control(
+                grant, permit_oid, removal_root)
 
     monkeypatch.setattr(access, "issue_head_permit", issue_permit)
     monkeypatch.setattr(access.state, "apply_updates", apply_updates)

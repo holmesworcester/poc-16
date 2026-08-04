@@ -185,6 +185,20 @@ class RecipientRemovalState:
             return await self._result("rejected")
         return await self._apply(updates, MAX_HEAD_REMOVAL_UPDATES)
 
+    async def includes(self, pin, updates):
+        """Return whether one pin already contains every permitted ACI row."""
+        if pin is None or getattr(pin, "workspace", None) != self.workspace:
+            return False
+        updates = checked_updates(updates)
+        for sid, expected in updates:
+            proof = await pin.proof(sid)
+            if proof is None:
+                return False
+            current = pin.verify(sid, proof)
+            if join_slots(current, expected) != current:
+                return False
+        return True
+
     async def bootstrap(self, raw_signed_pile):
         """Introduce one direct member from an original CLEAR-only closure."""
         try:

@@ -15,6 +15,7 @@ from core.fact import canon
 from core.limits import (
     MAX_CONTROL_PILE_BYTES,
     MAX_FACT_BYTES,
+    MAX_OWNER_CONTROL_COMMIT_ATTEMPTS,
     MAX_SEMANTIC_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
@@ -30,7 +31,7 @@ from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.writer_head import (
     HeadSlot,
-    PendingHeadSlot,
+    InvalidHeadSlot,
     WriterBinding,
     decode_slot_at,
     encode_head,
@@ -470,7 +471,7 @@ def test_accepting_mirror_composes_recipient_removal_state(tmp_path):
     run(scenario())
 
 
-def test_listed_but_invisible_pending_head_is_delayed_not_corrupt(tmp_path):
+def test_retired_pending_slot_shape_is_rejected(tmp_path):
     async def scenario():
         workspace = h(b"pending workspace")
         device = h(b"pending device")
@@ -481,16 +482,23 @@ def test_listed_but_invisible_pending_head_is_delayed_not_corrupt(tmp_path):
             lambda *_args: None,
             None,
         )
-        pending = PendingHeadSlot(
-            workspace, device, None,
-            h(b"pending proposed head"), h(b"pending permit"))
+        pending = canon({
+            "device": device,
+            "format": "poc16-writer-head-slot-v2",
+            "head": h(b"pending proposed head"),
+            "permit": h(b"pending permit"),
+            "previous": None,
+            "state": "pending",
+            "workspace": workspace,
+        })
         opened = Versioned(
-            encode_slot(pending), VersionToken("opaque-pending"))
-        assert await mirror._sync_slot(
-            store,
-            head_slot_key(workspace, device),
-            opened,
-        ) == (0, 0, False)
+            pending, VersionToken("opaque-pending"))
+        with pytest.raises(InvalidHeadSlot):
+            await mirror._sync_slot(
+                store,
+                head_slot_key(workspace, device),
+                opened,
+            )
 
     run(scenario())
 
@@ -813,6 +821,61 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
             (update.pile_oids[0], public),
             (update.pile_oids[0], public),
         ]
+
+    run(scenario())
+
+
+def test_owner_publisher_bounds_a_persistently_retryable_control_turn(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        store_binding = h(b"bounded-control-store")
+        removal_root = h(b"bounded-control-removal")
+        local = FsStore(str(tmp_path / "bounded-local"))
+        cloud = FsStore(str(tmp_path / "bounded-cloud"))
+        binding = WriterBinding(
+            root.fid, public, public, store_binding)
+        writer = WriterLog(
+            root.fid, public, public, store_binding, secret, local)
+        update = await writer.prepare(((root, device_signature, device),))
+        await writer.establish(update)
+        proof = proof_for(
+            secret, public, root, device_signature,
+            device, update.head_oid)
+        assert (await OpaqueHeadGate(
+            local,
+            mechanical_head_authorizer(root.fid, removal_root),
+        ).advance(proof, update.head_oid, 10)).status == "applied"
+
+        commits = []
+        pauses = []
+
+        async def commit(permit, proposed):
+            commits.append((permit, proposed))
+            return "retryable"
+
+        async def pause(attempt):
+            pauses.append(attempt)
+
+        published = await OwnerPublisher(
+            root.fid,
+            public,
+            binding,
+            local,
+            cloud,
+            lambda _base, _proposed: proof,
+            lambda *_args: b"one bounded exact permit",
+            commit,
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("control turn used ordinary authorization")),
+            pause,
+        ).publish()
+
+        assert published.status == "retryable"
+        assert len(commits) == MAX_OWNER_CONTROL_COMMIT_ATTEMPTS
+        assert all(item == commits[0] for item in commits)
+        assert pauses == list(range(MAX_OWNER_CONTROL_COMMIT_ATTEMPTS - 1))
+        assert cloud.get(head_slot_key(root.fid, public)) is None
 
     run(scenario())
 

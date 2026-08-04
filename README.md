@@ -24,17 +24,16 @@ The implementation is deliberately strict about authority and direction:
   second device-signed current-member proof carrying that path. Both judgments
   are discarded; neither synchronizes or mutates recipient authority state.
 - A control head is evaluated once at `/permit`. Its stable-secret HMAC permit
-  carries the bounded aggregate removal plan; `/commit` reserves an invisible
-  pending writer slot, applies that plan, and exposes the final slot afterward.
+  carries the bounded aggregate removal plan; `/commit` verifies its issue-time
+  root, applies that plan, and performs one CAS of the final writer slot.
 - Every writer head signs both its complete pile tree and an append-only
   control-only pile subsequence. The ordinary route requires an empty control
   delta; `/permit` accepts exactly the declared delta; a consuming peer
   independently recomputes and checks that control declaration from validated
-  piles. A consuming mirror reserves the local head before control effects,
-  retries removal-root contention only a named bounded number of times, and
-  can resume that pending head from already-copied local objects before it
-  reads a newer source head. It needs no cursor, retry journal, or retained old
-  source head.
+  piles. A consuming mirror applies control effects before its one final slot
+  CAS and retries removal-root contention only a named bounded number of times.
+  A crash can leave removal ahead; the next source sync idempotently reapplies
+  the plan. It needs no cursor, retry journal, or retained old source head.
 - Removal roots and proof nodes are private authenticated point-read state,
   never generic `obj/` or pack objects. A slot may record a root hash for audit,
   but only the self-confined path endpoint can read the private tree, and its
@@ -702,9 +701,8 @@ mint one current sync grant from a device-signed proof carrying the current remo
   -> ordinary head: POST /head/<proposed-head-oid> with an exact closed proof
   -> control head: POST /head/<oid>/permit with proof + exact control piles
   -> control head: POST /head/<oid>/commit with exactly the returned permit
-  -> reserve pending heads/<workspace>/<device>
   -> one aggregate removal-root CAS
-  -> finalize heads/<workspace>/<device>
+  -> one final CAS of heads/<workspace>/<device>
 ```
 
 `OwnerPublisher` compares the local and hosted signed writer trees, transfers
@@ -773,14 +771,14 @@ conditionally advance writer slots. A public `/removal/bootstrap` accepts only
 an original direct-member CLEAR closure. A control-bearing head first obtains
 a self-contained HMAC permit from `/head/<oid>/permit`. Issuance evaluates the
 current proof and original signed control piles exactly once and binds the
-workspace, device, exact base/head, issue-time removal root, canonical
-aggregate CLEAR/ACTIVE plan, and terminal suppression IDs. The commit body is
-only those authenticated permit bytes. `/head/<oid>/commit` reserves the exact
-writer slot as privately pending before one removal-root CAS, then finalizes
-the slot with the resulting root and permit hash. Generic readers see the
-previous final value while pending. The active sender retains one exact permit
-across retryable removal-root contention, 5xx, and lost-response retries with
-bounded full jitter. A competing-head HTTP 412 is terminal and requires rebase.
+workspace, device, exact base/head, issue-time removal root, and canonical
+aggregate CLEAR/ACTIVE plan. The commit body is only those authenticated permit
+bytes. `/head/<oid>/commit` verifies the issue-time root (or recognizes an exact
+already-applied crash replay), applies the plan, then performs one CAS of the
+final slot with the resulting root and permit hash. The active sender retains
+one exact permit across a named bounded number of retryable removal-root, 5xx,
+and lost-response attempts with full jitter. A competing-head HTTP 412 is
+terminal and requires rebase.
 Ordinary content and malformed control piles are rejected, and exact retries
 are idempotent. A
 closed head proof confines each slot update to its authenticated device. The
@@ -827,9 +825,9 @@ binding. Large GETs use scoped R2 S3/SigV4 URLs; large create-only PUTs use a
 short-lived HMAC ticket at a minimal streaming Worker route backed by the
 native R2 binding. Neither body enters the Python Worker heap. The owner
 gateway uses the same `/head/<oid>/permit` and `/head/<oid>/commit` control turn
-to evaluate control piles once, reserve a private pending writer slot, apply
-one authenticated aggregate plan to private `removal` state, and then finalize
-the visible slot. It has no generic authority-publication route and no delete
+to evaluate control piles once, apply one authenticated aggregate plan to
+private `removal` state, and then CAS the sole final slot shape. It has no
+generic authority-publication route and no delete
 path. Control-pile count and aggregate bytes are bounded by
 named portable constants; ordinary metadata remains capped at 512 KiB.
 

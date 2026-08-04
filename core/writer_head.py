@@ -107,27 +107,6 @@ class HeadSlot:
             raise ValueError("head slot")
 
 
-@dataclass(frozen=True, slots=True)
-class PendingHeadSlot:
-    """Private reservation whose previous final value remains observable."""
-
-    workspace: str
-    device: str
-    previous: HeadSlot | None
-    head: str
-    permit: str
-
-    def __post_init__(self):
-        if not all(valid_fid(value) for value in (
-                self.workspace, self.device, self.head, self.permit)) \
-                or self.previous is not None and (
-                    not isinstance(self.previous, HeadSlot)
-                    or (self.previous.workspace, self.previous.device) != (
-                        self.workspace, self.device)
-                    or self.previous.head == self.head):
-            raise ValueError("pending head slot")
-
-
 def _unsigned_document(
         workspace, device, owner, sequence, tree, control, store):
     return {
@@ -315,33 +294,17 @@ MAX_HEAD_SLOT_KEY_BYTES = len(head_slot_key(
 
 
 def slot_document(slot):
-    if isinstance(slot, HeadSlot):
-        return {
-            "device": slot.device,
-            "format": SLOT_FORMAT,
-            "head": slot.head,
-            "permit": "" if slot.permit is None else slot.permit,
-            "removal_root": slot.removal_root,
-            "state": "final",
-            "workspace": slot.workspace,
-        }
-    if isinstance(slot, PendingHeadSlot):
-        previous = None if slot.previous is None else {
-            "head": slot.previous.head,
-            "permit": "" if slot.previous.permit is None \
-                else slot.previous.permit,
-            "removal_root": slot.previous.removal_root,
-        }
-        return {
-            "device": slot.device,
-            "format": SLOT_FORMAT,
-            "head": slot.head,
-            "permit": slot.permit,
-            "previous": previous,
-            "state": "pending",
-            "workspace": slot.workspace,
-        }
-    raise TypeError("head slot")
+    if not isinstance(slot, HeadSlot):
+        raise TypeError("head slot")
+    return {
+        "device": slot.device,
+        "format": SLOT_FORMAT,
+        "head": slot.head,
+        "permit": "" if slot.permit is None else slot.permit,
+        "removal_root": slot.removal_root,
+        "state": "final",
+        "workspace": slot.workspace,
+    }
 
 
 def encode_slot(slot):
@@ -354,7 +317,7 @@ def encode_slot(slot):
     return raw
 
 
-def decode_slot_state(raw, *, workspace=None, device=None):
+def decode_slot(raw, *, workspace=None, device=None):
     try:
         value = decode_json(raw, MAX_HEAD_SLOT_BYTES, "head slot")
         if not isinstance(value, dict) or value.get("format") != SLOT_FORMAT:
@@ -366,22 +329,6 @@ def decode_slot_state(raw, *, workspace=None, device=None):
                 value["workspace"], value["device"],
                 value["head"], value["removal_root"],
                 value["permit"] or None)
-        elif value.get("state") == "pending" and set(value) == {
-                "device", "format", "head", "permit", "previous", "state",
-                "workspace"}:
-            previous = value["previous"]
-            if previous is not None and (
-                    not isinstance(previous, dict)
-                    or set(previous) != {
-                        "head", "permit", "removal_root"}):
-                raise ValueError
-            prior = None if previous is None else HeadSlot(
-                value["workspace"], value["device"],
-                previous["head"], previous["removal_root"],
-                previous["permit"] or None)
-            slot = PendingHeadSlot(
-                value["workspace"], value["device"], prior,
-                value["head"], value["permit"])
         else:
             raise ValueError
         if encode_slot(slot) != raw \
@@ -396,41 +343,15 @@ def decode_slot_state(raw, *, workspace=None, device=None):
         raise InvalidHeadSlot("head slot encoding") from error
 
 
-def decode_slot(raw, *, workspace=None, device=None):
-    """Decode one final slot; peer-proposed pending values are invalid."""
-    slot = decode_slot_state(raw, workspace=workspace, device=device)
-    if not isinstance(slot, HeadSlot):
-        raise InvalidHeadSlot("pending head slot is private")
-    return slot
-
-
-def visible_slot(raw, *, workspace=None, device=None):
-    """Project the last final slot without disclosing pending metadata."""
-    state = decode_slot_state(raw, workspace=workspace, device=device)
-    return state if isinstance(state, HeadSlot) else state.previous
-
-
 def decode_slot_at(key, raw):
     workspace, device = parse_head_slot_key(key)
     return decode_slot(raw, workspace=workspace, device=device)
-
-
-def decode_slot_state_at(key, raw):
-    workspace, device = parse_head_slot_key(key)
-    return decode_slot_state(raw, workspace=workspace, device=device)
-
-
-def visible_slot_at(key, raw):
-    workspace, device = parse_head_slot_key(key)
-    return visible_slot(raw, workspace=workspace, device=device)
-
 
 __all__ = (
     "HEAD_FORMAT",
     "HEAD_SIGNATURE_DOMAIN",
     "HEAD_SLOT_PREFIX",
     "HeadSlot",
-    "PendingHeadSlot",
     "InvalidHeadSlot",
     "InvalidWriterAddress",
     "InvalidWriterHead",
@@ -444,8 +365,6 @@ __all__ = (
     "decode_head",
     "decode_slot",
     "decode_slot_at",
-    "decode_slot_state",
-    "decode_slot_state_at",
     "encode_head",
     "encode_slot",
     "head_document",
@@ -460,7 +379,5 @@ __all__ = (
     "unsigned_head_document",
     "validate_advance",
     "verify_head",
-    "visible_slot",
-    "visible_slot_at",
     "writer_store_binding",
 )

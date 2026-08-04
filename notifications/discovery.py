@@ -41,10 +41,10 @@ from core.object_store import (
 from core.shape import valid_fid
 from core.writer_head import (
     HeadSlot,
+    decode_slot_at,
     encode_slot,
     head_slot_key,
     head_slot_prefix,
-    visible_slot_at,
 )
 from core.writer_repository import (
     FactConsumer,
@@ -662,7 +662,7 @@ class NotificationDiscovery:
                     raise value
                 if not isinstance(value, Versioned):
                     raise ValueError("listed writer slot disappeared")
-                slot = visible_slot_at(key, value.value)
+                slot = decode_slot_at(key, value.value)
                 if slot is None:
                     continue
                 devices.append(slot.device)

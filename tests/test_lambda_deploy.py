@@ -70,8 +70,6 @@ from core.object_store import (
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from core.suppression_tree import decode_root
 from core.writer_head import (
-    PendingHeadSlot,
-    decode_slot_state,
     writer_store_binding,
 )
 from core.writer_repository import OpaqueHeadGate, WriterLog
@@ -413,16 +411,8 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
     store.fail_removal_once = True
     assert response(app.handler(event(
         "POST", f"/head/{proposed}/commit", value.root.fid,
-        encode_head_commit_request(permit)), None))[0] == 409
-    assert store.get(REMOVAL_ROOT_KEY) == removal_before
-    pending = decode_slot_state(store.get(
-        f"heads/{value.root.fid}/{value.founder}"))
-    assert isinstance(pending, PendingHeadSlot)
-    assert (pending.workspace, pending.device, pending.head) == (
-        value.root.fid, value.founder, proposed)
-    assert response(app.handler(event(
-        "POST", f"/head/{proposed}/commit", value.root.fid,
         encode_head_commit_request(permit)), None))[0] == 201
+    assert store.get(REMOVAL_ROOT_KEY) != removal_before
     accepted_slot = store.get(
         f"heads/{value.root.fid}/{value.founder}")
     assert response(app.handler(event(

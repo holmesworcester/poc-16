@@ -1,8 +1,8 @@
-"""Structural ratchets for the v2 control-head transaction.
+"""Structural ratchets for the one-CAS control-head transaction.
 
 Behavioral suites exercise failures and provider outcomes.  These checks keep
 the authority flow itself small: evaluate once, authenticate the resulting
-plan, reserve one writer slot, apply one removal-root turn, then finalize.
+plan, apply one removal-root turn, then CAS one final writer slot.
 """
 
 import ast
@@ -57,9 +57,9 @@ def production_text():
     return "\n".join(sources)
 
 
-def test_control_permit_evaluates_once_then_reserves_applies_and_finalizes():
+def test_control_permit_evaluates_once_then_applies_and_cas_final_slot():
     permit = text("core/head_permit.py")
-    assert 'FORMAT = "poc16-control-head-permit-v2"' in permit
+    assert 'FORMAT = "poc16-control-head-permit-v3"' in permit
     claims = definition("core/head_permit.py", "_claims")
     returned = next(
         item.value for item in ast.walk(claims)
@@ -67,8 +67,8 @@ def test_control_permit_evaluates_once_then_reserves_applies_and_finalizes():
     assert {
         key.value for key in returned.keys if isinstance(key, ast.Constant)
     } == {
-        "base_head", "device", "head", "removal_root", "terminal_sids",
-        "updates", "workspace",
+        "base_head", "device", "head", "removal_root", "updates",
+        "workspace",
     }
     assert all(name not in permit for name in (
         "control_oids", "proof_oid", "effects_oid"))
@@ -91,10 +91,10 @@ def test_control_permit_evaluates_once_then_reserves_applies_and_finalizes():
         "core/access.py",
         definition("core/access.py", "commit_head_permit", "AccessGate"),
     )
-    reserve = commit.index("reserve_control(")
+    freshness = commit.index("pin = await self.state.pin()")
     apply = commit.index("apply_updates(")
-    finish = commit.index("finish_control(")
-    assert reserve < apply < finish
+    finish = commit.index("advance_control(")
+    assert freshness < apply < finish
     assert "plan_control(" not in commit
     assert "control_piles" not in commit
 
@@ -105,78 +105,41 @@ def test_control_permit_evaluates_once_then_reserves_applies_and_finalizes():
     assert removal_apply.count("self.tree.apply(") == 1
 
 
-def test_pending_writer_slot_is_private_and_projects_the_previous_final():
-    writer_head = text("core/writer_head.py")
-    pending = segment(
+def test_writer_slot_has_one_durable_shape_and_one_control_cas():
+    production = production_text()
+    assert "PendingHeadSlot" not in production
+    assert "reserve_control" not in production
+    assert "finish_control" not in production
+
+    slot_document = segment(
         "core/writer_head.py",
-        definition("core/writer_head.py", "PendingHeadSlot"),
+        definition("core/writer_head.py", "slot_document"),
     )
-    visible = segment(
-        "core/writer_head.py",
-        definition("core/writer_head.py", "visible_slot"),
-    )
-    assert "previous: HeadSlot | None" in pending
-    assert "head: str" in pending and "permit: str" in pending
-    assert "state.previous" in visible
-    assert "pending head slot is private" in writer_head
+    assert "HeadSlot" in slot_document
+    assert "pending" not in slot_document
 
-    repository = text("core/writer_repository.py")
-    reserve = segment(
+    advance = segment(
         "core/writer_repository.py",
         definition(
-            "core/writer_repository.py", "reserve_control", "OpaqueHeadGate"),
+            "core/writer_repository.py", "_advance_slot", "OpaqueHeadGate"),
     )
-    finish = segment(
-        "core/writer_repository.py",
-        definition(
-            "core/writer_repository.py", "finish_control", "OpaqueHeadGate"),
-    )
-    assert "PendingHeadSlot(" in reserve and ".store.cas(" in reserve
-    assert "HeadSlot(" in finish and ".store.cas(" in finish
-    assert repository.count("visible_slot_at(") >= 2
-    assert "visible_slot_at(" in text("core/http.py")
+    assert advance.count("self.store.cas(") == 1
 
 
-def test_mirror_pending_recovery_is_local_and_attempt_bounded():
-    finish = definition(
-        "core/writer_repository.py",
-        "_finish_reserved_control",
-        "RepositoryMirror",
-    )
-    assert not any(isinstance(node, ast.While) for node in ast.walk(finish))
-    loops = [node for node in ast.walk(finish) if isinstance(node, ast.For)]
-    assert len(loops) == 1
-    assert ast.unparse(loops[0].iter) \
-        == "range(MAX_MIRROR_CONTROL_ATTEMPTS)"
+def test_control_apply_and_owner_retry_loops_are_named_and_bounded():
+    sync_slot = definition(
+        "core/writer_repository.py", "_sync_slot", "RepositoryMirror")
+    loops = [node for node in ast.walk(sync_slot) if isinstance(node, ast.For)]
+    assert any(ast.unparse(node.iter) == "range(MAX_CONTROL_APPLY_ATTEMPTS)"
+               for node in loops)
 
-    pending = segment(
-        "core/writer_repository.py",
-        definition(
-            "core/writer_repository.py",
-            "_pending_transition",
-            "RepositoryMirror",
-        ),
-    )
-    assert "self.store" in pending
-    assert "source" not in pending
-    repair = segment(
-        "core/writer_repository.py",
-        definition(
-            "core/writer_repository.py",
-            "_repair_local_slot",
-            "RepositoryMirror",
-        ),
-    )
-    replay = segment(
-        "core/writer_repository.py",
-        definition(
-            "core/writer_repository.py",
-            "replay_local",
-            "RepositoryMirror",
-        ),
-    )
-    assert "_resume_pending(" in repair
-    assert "_repair_local_slot(" in replay
+    publish = definition(
+        "core/writer_repository.py", "publish", "OwnerPublisher")
+    assert not any(isinstance(node, ast.While) for node in ast.walk(publish))
+    loops = [node for node in ast.walk(publish) if isinstance(node, ast.For)]
+    assert any(ast.unparse(node.iter)
+               == "range(MAX_OWNER_CONTROL_COMMIT_ATTEMPTS)"
+               for node in loops)
 
 
 def test_signed_control_subsequence_cannot_bypass_the_fenced_route():
@@ -300,15 +263,15 @@ def test_retired_authority_publication_surface_stays_absent():
     assert "/removal/apply" not in routes
 
 
-def test_docs_state_the_v2_control_contract_and_cut_scope():
+def test_docs_state_the_one_cas_control_contract_and_cut_scope():
     design = text("DESIGN.md")
     readme = text("README.md")
     assert "Permit issuance is the only closed-pile evaluation in this turn." \
         in design
     assert "The commit body is exactly the returned bounded permit bytes" \
         in design
-    assert "private pending value" in design
-    assert "recipient-local audit, replay, and fencing metadata" in design
+    assert "one base-guarded CAS of the sole final slot shape" in design
+    assert "recipient-local audit and exact-replay metadata" in design
     assert "distinct from short-lived bearer-grant material" in design
     assert "append-only control-only pile subsequence" in design
     assert "independently recomputes" in readme

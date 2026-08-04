@@ -304,7 +304,9 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
     assert issued.status == 200
     target_sid = facts.principal_sid("device", target)
     terminal = decode_permit(issued.body, PERMIT_SECRET)
-    assert terminal.terminal_sids == (target_sid,)
+    assert any(
+        sid == target_sid and value["state"] == "active"
+        for sid, value in terminal.updates)
     assert run(http.handle(
         "POST",
         f"/head/{terminal_head}/commit",

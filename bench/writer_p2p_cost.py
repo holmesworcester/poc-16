@@ -8,8 +8,8 @@ from core.writer_head import (
     MAX_HEAD_SLOT_BYTES,
     MAX_WRITER_HEAD_BYTES,
     decode_head,
+    decode_slot_at,
     head_slot_prefix,
-    visible_slot_at,
 )
 from full_peer.sync import sync as full_sync
 from full_peer.walk import Peer
@@ -97,7 +97,7 @@ def _sync_snapshot(node, workspace):
     piles = 0
     for key in store.list(head_slot_prefix(workspace)):
         raw_slot = store.get_bounded(key, MAX_HEAD_SLOT_BYTES)
-        slot = visible_slot_at(key, raw_slot)
+        slot = decode_slot_at(key, raw_slot)
         if slot is None:
             continue
         raw_head = store.get_bounded(

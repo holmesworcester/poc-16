@@ -42,7 +42,6 @@ from core.pack_access import (
 from core.suppression_tree import decode_root
 from core.writer_head import (
     head_slot_key,
-    visible_slot_at,
     writer_store_binding,
 )
 from core.writer_repository import WriterLog
@@ -497,20 +496,8 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         f"https://worker.example/head/{proposed}/commit?ws="
         f"{value.root.fid}",
         encode_head_commit_request(permit),
-    ), environment, clock=lambda: 10)).status == 409
-    assert bucket.data[removal_key] == removal_before
-    # Commit reserves the exact slot before touching removal state, but the
-    # pending value is private and has no visible writer head.
-    assert visible_slot_at(
-        head_slot_key(value.root.fid, value.founder),
-        bucket.data[slot_key],
-    ) is None
-    assert run(runtime.handle(Request(
-        "POST",
-        f"https://worker.example/head/{proposed}/commit?ws="
-        f"{value.root.fid}",
-        encode_head_commit_request(permit),
     ), environment, clock=lambda: 10)).status == 201
+    assert bucket.data[removal_key] != removal_before
     accepted_slot = bucket.data[slot_key]
     assert run(runtime.handle(Request(
         "POST",

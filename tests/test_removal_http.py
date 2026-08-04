@@ -7,7 +7,6 @@ import json
 from core.access import AccessGate
 from core.crypto import h, keypair
 from core.grants import make_token
-from core.head_permit import decode as decode_permit
 from core.http import (
     MAX_HEAD_CONTROL_REQUEST_BYTES,
     AsyncFromSyncReader,
@@ -23,7 +22,7 @@ from core.writer_head import (
     head_slot_key,
     writer_store_binding,
 )
-from core.writer_repository import HeadGrant, OpaqueHeadGate, WriterLog
+from core.writer_repository import OpaqueHeadGate, WriterLog
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
@@ -264,7 +263,7 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
         b"x" * (MAX_HEAD_CONTROL_REQUEST_BYTES + 1))).status == 413
 
 
-def test_pending_control_head_is_not_visible_through_directory_routes(
+def test_permit_issue_creates_no_slot_before_control_commit(
         tmp_path):
     root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
@@ -293,16 +292,7 @@ def test_pending_control_head_is_not_visible_through_directory_routes(
         encode_head_permit_request(proof, (control,))))
     assert issued.status == 200
 
-    permit = decode_permit(issued.body, PERMIT_SECRET)
-    head_gate = OpaqueHeadGate(store, access.authorize_head)
-    reservation = run(head_gate.reserve_control(HeadGrant(
-        root.fid,
-        member,
-        permit.base_head,
-        proposed,
-        permit.removal_root,
-    ), h(issued.body)))
-    assert reservation.slot.head == proposed
+    assert store.get(head_slot_key(root.fid, member)) is None
 
     token = make_token(
         b"removal-http-secret" * 2,
@@ -319,8 +309,7 @@ def test_pending_control_head_is_not_visible_through_directory_routes(
         "GET", "/heads", {"ws": root.fid}, headers))
     assert directory.status == 200
     document = json.loads(directory.body)
-    assert document["heads"] == [[
-        head_slot_key(root.fid, member), None, None]]
+    assert document["heads"] == []
     assert proposed.encode() not in directory.body
     assert h(issued.body).encode() not in directory.body
 
