@@ -621,13 +621,40 @@ class CloudQueue:
         handoff_targets = tuple(handoff_targets)
         with self._lock:
             slot, token = self._slot_versioned(log.writer)
+            expected = 0 if slot is None else slot.hi
+            hi = log.head().seq + 1 if hi is None else hi
+            # Reconcile an exact retry after an applied slot CAS whose response
+            # was lost, or after an identical same-base publisher won first.
+            # The immutable micro bytes and signed head must both agree; a
+            # divergent same-writer proposal still fails closed as a collision.
+            if slot is not None and slot.segments and slot.hi == hi \
+                    and slot.head == encode_head(log.head()):
+                retry_lo = slot.segments[-1].lo if lo is None else lo
+                retry_run = prove_run(log, retry_lo, hi)
+                retry_publication = Publication(
+                    retry_run, carries, handoff_targets)
+                retry_raw = _encode_segment((retry_publication,), "micro")
+                retry_key = _micro_key(
+                    self.workspace, log.writer, retry_lo, hi)
+                retry_descriptor = Segment(
+                    retry_key, retry_lo, hi, len(retry_raw), 1, "micro")
+                incumbent, _tag = self.store.get(retry_key)
+                if retry_descriptor == slot.segments[-1] \
+                        and incumbent == retry_raw:
+                    if announce:
+                        self.repair_directory()
+                    return PublicationReceipt(
+                        retry_descriptor,
+                        tuple(HandoffTicket(
+                            self.workspace, log.writer, retry_lo, hi,
+                            retry_key, target)
+                            for target in handoff_targets),
+                    )
             if slot is not None and sum(
                     item.kind == "micro" for item in slot.segments) \
                     >= MICRO_TAIL:
                 raise MaintenanceRequired("cloud micro tail is ready to fold")
-            expected = 0 if slot is None else slot.hi
             lo = expected if lo is None else lo
-            hi = log.head().seq + 1 if hi is None else hi
             if lo != expected or hi <= lo:
                 raise ValueError("cloud writer sequence")
             run = prove_run(log, lo, hi)

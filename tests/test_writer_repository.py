@@ -19,11 +19,18 @@ from core.limits import (
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
-from core.object_store import ABSENT, STALE, OutcomeUnknown
+from core.object_store import (
+    ABSENT,
+    STALE,
+    OutcomeUnknown,
+    Versioned,
+    VersionToken,
+)
 from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.writer_head import (
     HeadSlot,
+    PendingHeadSlot,
     WriterBinding,
     decode_slot_at,
     encode_head,
@@ -474,10 +481,15 @@ def test_listed_but_invisible_pending_head_is_delayed_not_corrupt(tmp_path):
             lambda *_args: None,
             None,
         )
+        pending = PendingHeadSlot(
+            workspace, device, None,
+            h(b"pending proposed head"), h(b"pending permit"))
+        opened = Versioned(
+            encode_slot(pending), VersionToken("opaque-pending"))
         assert await mirror._sync_slot(
             store,
             head_slot_key(workspace, device),
-            ABSENT,
+            opened,
         ) == (0, 0, False)
 
     run(scenario())

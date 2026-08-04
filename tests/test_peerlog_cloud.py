@@ -4,6 +4,7 @@ import threading
 import time
 
 import pytest
+from nacl import signing
 
 from adapters.s3 import S3Config, S3Store
 from peerlog.cloud import (
@@ -403,3 +404,167 @@ def test_cold_body_gets_really_overlap_under_the_named_wave_bound():
     assert report.facts == report.object_gets == 70
     assert report.rounds == 3  # directory + ceil(70 / 64) body waves
     assert store.maximum_active >= 8
+
+
+def test_lost_slot_cas_response_retries_as_exact_idempotent_ack():
+    class LostResponseCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.lose = True
+
+        def cas(self, key, token, value):
+            result = super().cas(key, token, value)
+            if self.lose and "/slots/" in key and result:
+                self.lose = False
+                raise OSError("slot CAS response lost")
+            return result
+
+    store = LostResponseCloud()
+    cloud = CloudQueue(store, h("lost slot response"))
+    log = owned("lost response writer", 4)
+    with pytest.raises(OSError, match="response lost"):
+        cloud.publish(log, 0, 4)
+    before = store.metrics.copy()
+    receipt = cloud.publish(log, 0, 4)
+    delta = store.metrics.delta(before)
+    assert (receipt.segment.lo, receipt.segment.hi) == (0, 4)
+    assert delta.cas == 1  # directory repair only; writer slot was acknowledged
+    replica = PeerState()
+    assert cloud.sync(replica).facts == 4
+    assert set(replica.entries()) == entries(log)
+
+
+def test_same_base_identical_publishers_have_one_slot_winner_and_retry_ack():
+    class PausedSlotCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.pause_once = True
+
+        def cas(self, key, token, value):
+            if self.pause_once and "/slots/" in key:
+                self.pause_once = False
+                self.entered.set()
+                assert self.release.wait(3)
+            return super().cas(key, token, value)
+
+    store = PausedSlotCloud()
+    queues = (
+        CloudQueue(store, h("same writer interleave")),
+        CloudQueue(store, h("same writer interleave")),
+    )
+    log = owned("one writer", 3)
+    failures = []
+
+    def first():
+        try:
+            queues[0].publish(log, 0, 3, announce=False)
+        except Exception as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert store.entered.wait(3)
+    queues[1].publish(log, 0, 3, announce=False)
+    store.release.set()
+    thread.join(3)
+    assert len(failures) == 1
+    assert str(failures[0]) == "stale cloud writer slot"
+
+    # The loser rereads the exact signed head and immutable publication rather
+    # than issuing a second writer-slot CAS or reporting a false sequence gap.
+    before = store.metrics.copy()
+    queues[0].publish(log, 0, 3)
+    delta = store.metrics.delta(before)
+    assert delta.cas == 1  # derived directory only
+    state = PeerState()
+    assert queues[0].sync(state).facts == 3
+    assert set(state.entries()) == entries(log)
+
+
+def test_same_writer_divergent_same_sequence_fails_at_immutable_address():
+    class PausedSlotCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def cas(self, key, token, value):
+            if "/slots/" in key and not self.entered.is_set():
+                self.entered.set()
+                assert self.release.wait(3)
+            return super().cas(key, token, value)
+
+    secret = signing.SigningKey.generate()
+    first = WriterLog.owned(secret)
+    second = WriterLog.owned(signing.SigningKey(secret.encode()))
+    first.append(Fact("msg", 1, (), b"first fork"))
+    second.append(Fact("msg", 1, (), b"second fork"))
+    store = PausedSlotCloud()
+    workspace = h("divergent writer")
+    failures = []
+
+    def publish_first():
+        try:
+            CloudQueue(store, workspace).publish(first, announce=False)
+        except Exception as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    thread = threading.Thread(target=publish_first)
+    thread.start()
+    assert store.entered.wait(3)
+    with pytest.raises(ValueError, match="immutable object collision"):
+        CloudQueue(store, workspace).publish(second, announce=False)
+    store.release.set()
+    thread.join(3)
+    assert not failures and not thread.is_alive()
+
+
+def test_delayed_directory_snapshot_regresses_only_hint_until_fair_repair():
+    class DelayedFirstList(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.delay = True
+
+        def list(self, prefix):
+            result = super().list(prefix)
+            if self.delay:
+                self.delay = False
+                self.entered.set()
+                assert self.release.wait(3)
+            return result
+
+    store = DelayedFirstList()
+    queue = CloudQueue(store, h("delayed directory"))
+    first, second = owned("first listed", 2), owned("second listed", 2)
+    queue.publish(first, announce=False)
+    failures = []
+
+    def stale_repair():
+        try:
+            queue.repair_directory()
+        except Exception as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    thread = threading.Thread(target=stale_repair)
+    thread.start()
+    assert store.entered.wait(3)
+    queue.publish(second, announce=False)
+    queue.repair_directory()
+    assert set(queue.visible_heads()) == {first.writer, second.writer}
+    store.release.set()
+    thread.join(3)
+    assert not failures and not thread.is_alive()
+
+    # The stale repair may hide a newer writer from the derived directory, but
+    # cannot alter either owner slot. One fair deterministic LIST repair brings
+    # the hint back to the exact forest.
+    assert set(queue.visible_heads()) == {first.writer}
+    queue.repair_directory()
+    assert set(queue.visible_heads()) == {first.writer, second.writer}
+    state = PeerState()
+    assert queue.sync(state).facts == 4
+    assert set(state.entries()) == entries(first) | entries(second)
