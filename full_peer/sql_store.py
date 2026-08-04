@@ -309,4 +309,34 @@ class SqlStore:
             raise
 
 
-__all__ = ("SCHEMA", "SCHEMA_VERSION", "SqlStore")
+class LockedProjection:
+    """Serialize FactConsumer's synchronous SQL capability.
+
+    Repository mirroring awaits object-store reads between projection calls.
+    Lock only these four immediate calls so one FullPeer connection is never
+    entered concurrently and no lock is held across network I/O.
+    """
+
+    def __init__(self, projection, lock):
+        self.projection = projection
+        self.lock = lock
+
+    def fact_bytes(self, fid):
+        with self.lock:
+            return self.projection.fact_bytes(fid)
+
+    def fact_ids(self):
+        with self.lock:
+            return self.projection.fact_ids()
+
+    def projected_head(self, device):
+        with self.lock:
+            return self.projection.projected_head(device)
+
+    def commit(self, batch, *, device, head):
+        with self.lock:
+            return self.projection.commit(
+                batch, device=device, head=head)
+
+
+__all__ = ("LockedProjection", "SCHEMA", "SCHEMA_VERSION", "SqlStore")

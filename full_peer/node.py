@@ -107,7 +107,10 @@ class FullPeer:
         with self.lock:
             if workspace not in self._consumers:
                 self._consumers[workspace] = FactConsumer(
-                    workspace, self.sql(workspace))
+                    workspace,
+                    sql_store.LockedProjection(
+                        self.sql(workspace), self.lock),
+                )
             return self._consumers[workspace]
 
     def mirror(self, workspace):

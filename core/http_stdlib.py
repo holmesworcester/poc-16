@@ -46,17 +46,6 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-class _SerializedMirror:
-    """Put a stateful peer's one projection behind its existing lock."""
-
-    def __init__(self, lock, mirror):
-        self.lock, self.mirror = lock, mirror
-
-    async def accept_slot(self, raw):
-        with self.lock:
-            return await self.mirror.accept_slot(raw)
-
-
 class StdlibPeerHandler(BaseHTTPRequestHandler):
     """Translate ordinary HTTP bytes; ``HttpGate`` still owns the routes."""
 
@@ -126,8 +115,7 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             workspace,
             self.secret,
             now_ms,
-            mirror=_SerializedMirror(
-                self.peer.lock, self.peer.mirror(workspace)),
+            mirror=self.peer.mirror(workspace),
             mint_authorize=lambda pile, purpose: self.peer.authorize_access(
                 workspace, pile, purpose),
             authority_publish=self.peer.authority(workspace).publish,

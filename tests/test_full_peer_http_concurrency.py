@@ -1,9 +1,11 @@
 """Concurrency contract at the stateful peer's HTTP commit boundary."""
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
 from core import peer_capability
 from core.writer_head import decode_slot_at, head_slot_key
+from full_peer.status import describe
 from full_peer.walk import Peer
 from tests.test_full_peer_writer_http_contract import (
     _bearer,
@@ -82,3 +84,55 @@ def test_concurrent_writer_finalization_serializes_one_sql_projection(tmp_path):
         key = head_slot_key(workspace, device)
         slot = decode_slot_at(key, receiver.store(workspace).get(key))
         assert receiver.sql(workspace).projected_head(device) == slot.head
+
+
+def test_background_mirror_commit_excludes_status_sql_read(tmp_path):
+    """A live sync commit and control-plane read cannot share one connection."""
+    workspace, alice, _bob, receiver = _forest_fixture(tmp_path)
+    projection = receiver.sql(workspace)
+    commit = projection.commit
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    status_started = threading.Event()
+    status_entered_projection = threading.Event()
+    ensure_projection = receiver._ensure_projection
+
+    def blocked_commit(*args, **kwargs):
+        commit_entered.set()
+        if not release_commit.wait(5):
+            raise AssertionError("status race did not release projection")
+        return commit(*args, **kwargs)
+
+    def observed_projection(workspace):
+        status_entered_projection.set()
+        return ensure_projection(workspace)
+
+    def read_status():
+        status_started.set()
+        return describe(receiver)
+
+    projection.commit = blocked_commit
+    receiver._ensure_projection = observed_projection
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sync_future = pool.submit(
+            asyncio.run,
+            receiver.mirror(workspace).sync_from(
+                alice.store(workspace)),
+        )
+        try:
+            assert commit_entered.wait(5)
+            status_future = pool.submit(read_status)
+            assert status_started.wait(5)
+            # The mirror's synchronous projection adapter owns receiver.lock
+            # here, so status must wait instead of entering sqlite3.
+            assert not status_entered_projection.wait(0.1)
+        finally:
+            release_commit.set()
+
+        result = sync_future.result(10)
+        status = status_future.result(10)
+
+    assert result.errors == ()
+    assert result.changed == 1
+    assert status["workspaces"][workspace]["facts"] \
+        == len(projection.fact_ids())
