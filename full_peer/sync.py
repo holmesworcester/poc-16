@@ -1,5 +1,6 @@
 """Two-way FullPeer reconciliation through the shared writer-forest core."""
 import asyncio
+import random
 
 from core.store import RemoteStore
 from core.writer_repository import OwnerPublisher, RepositoryMirror
@@ -7,8 +8,23 @@ from core.writer_repository import OwnerPublisher, RepositoryMirror
 from .walk import Peer
 
 
+# FullPeer owns scheduling policy; provider-neutral core only retains the exact
+# permit/body and invokes the injected pause. Cancellation aborts that turn.
+CONTROL_HEAD_RETRY_BASE_MS = 10
+CONTROL_HEAD_RETRY_MAX_MS = 1_000
+
+
 def _run(awaitable):
     return asyncio.run(awaitable)
+
+
+async def _control_head_retry_pause(attempt):
+    """Apply bounded exponential full jitter in the active sender turn."""
+    ceiling = min(
+        CONTROL_HEAD_RETRY_MAX_MS,
+        CONTROL_HEAD_RETRY_BASE_MS * (1 << min(attempt, 16)),
+    )
+    await asyncio.sleep(random.random() * ceiling / 1_000)
 
 
 def sync(node, workspace, url):
@@ -72,6 +88,7 @@ def sync(node, workspace, url):
             peer.issue_head_permit,
             peer.commit_head_permit,
             peer.advance_head,
+            retry_pause=_control_head_retry_pause,
         )
         published = _run(publisher.publish())
         if published.status == "retryable":

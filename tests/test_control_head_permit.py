@@ -11,8 +11,18 @@ from core.removal_path import ProofRefreshRequired, RemovalDenied
 from core.removal_state import ControlHeadPlan, ControlPilePlan
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
-from core.writer_head import decode_slot_at, head_slot_key
-from core.writer_repository import OpaqueHeadGate
+from core.writer_head import (
+    WriterBinding,
+    decode_slot_at,
+    head_slot_key,
+    writer_store_binding,
+)
+from core.writer_repository import (
+    HeadGrant,
+    OpaqueHeadGate,
+    OwnerPublisher,
+    WriterLog,
+)
 from facts.auth.head_request import head_request
 from facts.auth.removal import removal
 from facts.auth.removal_path_request import removal_path_request
@@ -403,5 +413,101 @@ def test_two_preissued_terminal_heads_share_base_but_only_one_cas_wins(
             store.get(head_slot_key(root.fid, founder)),
         )
         assert slot.head == heads[0]
+
+    run(scenario())
+
+
+def test_owner_publisher_reuses_one_permit_after_terminal_commit_409(
+        tmp_path):
+    async def scenario():
+        secret, founder, root = founder_world()
+        local = FsStore(str(tmp_path / "terminal-publisher-local"))
+        remote = FsStore(str(tmp_path / "terminal-publisher-remote"))
+        binding = WriterBinding(
+            root.fid,
+            founder,
+            founder,
+            writer_store_binding(root.fid, founder),
+        )
+        writer = WriterLog(
+            root.fid,
+            founder,
+            founder,
+            binding.store,
+            secret,
+            local,
+        )
+        action, _raw = self_removal_pile(secret, founder, root)
+        action_signature = signature(secret, founder, action, action.ts)
+        update = await writer.prepare(((root, action_signature, action),))
+        await writer.establish(update)
+
+        async def local_authorize(_proof, proposed, _now):
+            return HeadGrant(
+                root.fid, founder, None, proposed, h(b"local removal"))
+
+        assert (await OpaqueHeadGate(
+            local, local_authorize).advance(
+                b"local", update.head_oid, 10)).status == "applied"
+
+        access = AccessGate(root.fid, remote)
+        assert (await access.state.bootstrap(signed(
+            secret, founder, root, (root,)))).status == "applied"
+        head_gate = OpaqueHeadGate(remote, access.authorize_head)
+        issues = []
+        commits = []
+
+        async def make_proof(base, proposed):
+            path = await access.removal_path(historical_proof(
+                secret, founder, root, (root,)), 10)
+            return exact_head_proof(
+                secret, founder, root, (root,), path, proposed, base)
+
+        async def issue(proof, proposed, controls):
+            permit = await access.issue_head_permit(
+                proof, proposed, controls, 10, PERMIT_SECRET)
+            issues.append(permit)
+            return permit
+
+        async def commit(permit, proposed, controls):
+            commits.append((permit, controls))
+            grant = await access.authorize_permitted_head(
+                permit, proposed, controls, PERMIT_SECRET)
+            assert (await value_at(
+                access, scoped_id("member", founder))) == suppression_slot(
+                    action.fid)
+            if len(commits) == 1:
+                # Model the typed HTTP 409/lost response after removal CAS.
+                # A fresh issuance is now impossible, so only the held exact
+                # permit can finish this terminal head.
+                return "retryable"
+            return await head_gate.advance_grant(grant, proposed)
+
+        async def ordinary_advance(_proof, _proposed):
+            raise AssertionError("control head used ordinary authorization")
+
+        published = await OwnerPublisher(
+            root.fid,
+            founder,
+            binding,
+            local,
+            remote,
+            make_proof,
+            issue,
+            commit,
+            ordinary_advance,
+            lambda _attempt: None,
+        ).publish()
+
+        assert published.status == "applied"
+        assert len(issues) == 1
+        assert len(commits) == 2
+        assert commits[0][0] is commits[1][0] is issues[0]
+        assert commits[0][1] is commits[1][1]
+        slot = decode_slot_at(
+            head_slot_key(root.fid, founder),
+            remote.get(head_slot_key(root.fid, founder)),
+        )
+        assert slot.head == update.head_oid
 
     run(scenario())

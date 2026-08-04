@@ -20,7 +20,7 @@ import facts
 import pytest
 
 from core import peer_capability
-from core.access import AccessGate
+from core.access import AccessGate, ControlHeadRetry
 from core.crypto import h, keypair
 from core.fact import canon
 from core.grants import make_token
@@ -618,6 +618,23 @@ def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
         tmp_path, monkeypatch):
     workspace, alice, _bob, carol = _forest_fixture(tmp_path)
     requests = []
+    access = carol.access_gate(workspace)
+    original_commit = access.authorize_permitted_head
+    commit_attempts = 0
+
+    async def retry_first_commit(permit, proposed, controls, secret):
+        nonlocal commit_attempts
+        commit_attempts += 1
+        grant = await original_commit(
+            permit, proposed, controls, secret)
+        if commit_attempts == 1:
+            # The removal turn completed, but its typed response says the
+            # exact outcome still needs reconciliation.
+            raise ControlHeadRetry("injected post-removal contention")
+        return grant
+
+    monkeypatch.setattr(
+        access, "authorize_permitted_head", retry_first_commit)
 
     class CountingPeer(Peer):
         def _http(self, method, path, *args, **kwargs):
@@ -635,6 +652,11 @@ def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
         ).head
         assert ("POST", f"/head/{proposed}/permit") in requests
         assert ("POST", f"/head/{proposed}/commit") in requests
+        assert requests.count(
+            ("POST", f"/head/{proposed}/permit")) == 1
+        assert requests.count(
+            ("POST", f"/head/{proposed}/commit")) == 2
+        assert commit_attempts == 2
         assert not [path for _method, path in requests
                     if path == "/removal/apply"]
 
@@ -647,6 +669,59 @@ def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
                 if path.endswith(("/permit", "/commit"))]
     assert any(method == "POST" and path.startswith("/head/")
                for method, path in requests)
+
+
+def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
+    peer = Peer(object(), h(b"workspace"), "http://peer.invalid")
+    proposed = h(b"proposed head")
+    permit = b"exact permit"
+    controls = (b"exact control pile",)
+    bodies = []
+
+    def unavailable_then_applied(
+            method, path, data=None, *_args, **_kwargs):
+        assert (method, path) == (
+            "POST", f"/head/{proposed}/commit")
+        bodies.append(data)
+        if len(bodies) == 1:
+            raise urllib.error.HTTPError(
+                "http://peer.invalid", 503, "outcome unknown", {}, None)
+        return 201, b"", {}
+
+    peer._http = unavailable_then_applied
+    assert peer.commit_head_permit(
+        permit, proposed, controls) == "retryable"
+    assert peer.commit_head_permit(
+        permit, proposed, controls) == "applied"
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+
+    bodies.clear()
+
+    def dropped_then_applied(
+            method, path, data=None, *_args, **_kwargs):
+        assert (method, path) == (
+            "POST", f"/head/{proposed}/commit")
+        bodies.append(data)
+        if len(bodies) == 1:
+            raise http.client.RemoteDisconnected(
+                "response lost after request")
+        return 201, b"", {}
+
+    peer._http = dropped_then_applied
+    assert peer.commit_head_permit(
+        permit, proposed, controls) == "retryable"
+    assert peer.commit_head_permit(
+        permit, proposed, controls) == "applied"
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+
+    def permanent_denial(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "http://peer.invalid", 403, "denied", {}, None)
+
+    peer._http = permanent_denial
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        peer.commit_head_permit(permit, proposed, controls)
+    assert denied.value.code == 403
 
 
 def test_each_sync_turn_mints_fresh_and_never_publishes_authority(

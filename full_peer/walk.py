@@ -288,9 +288,19 @@ class Peer:
                 response_limit=MAX_CONTROL_BYTES,
             )
         except urllib.error.HTTPError as error:
-            if error.code == 409:
+            if error.code == 409 or 500 <= error.code < 600:
                 return "retryable"
             raise
+        except (
+                urllib.error.URLError,
+                http.client.IncompleteRead,
+                http.client.RemoteDisconnected,
+                TimeoutError,
+                ConnectionError):
+            # The server may have completed either removal CAS, head CAS, or
+            # both before the response disappeared. The caller still holds
+            # the same exact permit/body, so replay is the sole safe action.
+            return "retryable"
         if status == 201:
             return "applied"
         if status == 204:

@@ -22,6 +22,9 @@ from .close import (
 from .crypto import h
 from .fact import canon, encode
 from .limits import (
+    MAX_HEAD_CONTROL_BYTES,
+    MAX_HEAD_CONTROL_PILES,
+    MAX_HEAD_PERMIT_BYTES,
     MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
@@ -136,6 +139,27 @@ class OwnerPublishResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingControlHead:
+    """Exact caller-held bytes retained until commit has a final outcome."""
+
+    permit: bytes
+    head: str
+    controls: tuple[bytes, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.permit, bytes) or not self.permit \
+                or len(self.permit) > MAX_HEAD_PERMIT_BYTES \
+                or not valid_fid(self.head) \
+                or not isinstance(self.controls, tuple) \
+                or not self.controls \
+                or len(self.controls) > MAX_HEAD_CONTROL_PILES \
+                or not all(isinstance(raw, bytes) and raw
+                           for raw in self.controls) \
+                or sum(map(len, self.controls)) > MAX_HEAD_CONTROL_BYTES:
+            raise ValueError("pending control head")
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedBatch:
     """One fully judged candidate suffix, still free of residence effects."""
 
@@ -155,6 +179,10 @@ class ValidatedBatch:
 
 async def _maybe_await(value):
     return await value if inspect.isawaitable(value) else value
+
+
+def _no_retry_pause(_attempt):
+    """Keep the provider-neutral core free of scheduler dependencies."""
 
 
 async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
@@ -548,7 +576,8 @@ class OwnerPublisher:
 
     def __init__(
             self, workspace, device, binding, source, target,
-            make_proof, issue_permit, commit_permit, advance):
+            make_proof, issue_permit, commit_permit, advance,
+            retry_pause=None):
         if not valid_fid(workspace) or not valid_fid(device) \
                 or not isinstance(binding, WriterBinding) \
                 or (binding.workspace, binding.device) != (
@@ -556,7 +585,8 @@ class OwnerPublisher:
                 or not callable(make_proof) \
                 or not callable(issue_permit) \
                 or not callable(commit_permit) \
-                or not callable(advance):
+                or not callable(advance) \
+                or (retry_pause is not None and not callable(retry_pause)):
             raise ValueError("owner publisher")
         self.workspace = workspace
         self.device = device
@@ -567,6 +597,7 @@ class OwnerPublisher:
         self.issue_permit = issue_permit
         self.commit_permit = commit_permit
         self.advance = advance
+        self.retry_pause = retry_pause or _no_retry_pause
         self.evaluator = ClosedPileEvaluator(workspace)
 
     async def publish(self):
@@ -655,8 +686,20 @@ class OwnerPublisher:
                 proof, local_slot.head, control_piles))
             if not isinstance(permit, bytes):
                 raise TypeError("owner control-head permit")
-            outcome = await _maybe_await(self.commit_permit(
-                permit, local_slot.head, control_piles))
+            pending = _PendingControlHead(
+                permit, local_slot.head, control_piles)
+            retry = 0
+            while True:
+                outcome = await _maybe_await(self.commit_permit(
+                    pending.permit, pending.head, pending.controls))
+                status = getattr(outcome, "status", outcome)
+                if status != "retryable":
+                    break
+                # Retain the exact capability and bytes in this active turn;
+                # bounded full jitter prevents a hot contention loop. Caller
+                # cancellation is the explicit process-local abort boundary.
+                await _maybe_await(self.retry_pause(retry))
+                retry += 1
         else:
             outcome = await _maybe_await(
                 self.advance(proof, local_slot.head))

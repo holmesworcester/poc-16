@@ -544,12 +544,11 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
         cloud_gate = OpaqueHeadGate(
             cloud, mechanical_head_authorizer(root.fid, removal_root))
         attempts = []
-        allow = False
 
         async def apply_control(raw, writer_id):
             attempts.append((signed_pile_oid(raw), writer_id))
             return type("Result", (), {
-                "status": "applied" if allow else "retryable",
+                "status": "applied" if len(attempts) > 1 else "retryable",
             })()
 
         async def advance(proof, proposed):
@@ -557,13 +556,21 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
 
         held_permit = b"held exact control-head permit"
         held_proof = None
+        issues = 0
+        commits = []
+        pauses = []
+
+        async def retry_pause(attempt):
+            pauses.append(attempt)
 
         async def issue_permit(proof, proposed, control_piles):
-            nonlocal held_proof
+            nonlocal held_proof, issues
+            issues += 1
             held_proof = proof, proposed, control_piles
             return held_permit
 
         async def commit_permit(permit, proposed, control_piles):
+            commits.append((permit, control_piles))
             assert permit == held_permit
             proof, expected_head, expected_piles = held_proof
             assert (proposed, control_piles) == (
@@ -586,16 +593,17 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
             issue_permit,
             commit_permit,
             advance,
+            retry_pause,
         )
-        first = await publisher.publish()
-        assert first.status == "retryable"
+        published = await publisher.publish()
+        assert published.status == "applied"
         key = head_slot_key(root.fid, public)
-        assert cloud.read_versioned(key) is ABSENT
-
-        allow = True
-        second = await publisher.publish()
-        assert second.status == "applied"
         assert decode_slot_at(key, cloud.get(key)).head == update.head_oid
+        assert issues == 1
+        assert len(commits) == 2
+        assert commits[0][0] is commits[1][0]
+        assert commits[0][1] is commits[1][1]
+        assert pauses == [0]
         assert attempts == [
             (update.pile_oids[0], public),
             (update.pile_oids[0], public),
