@@ -41,6 +41,8 @@ class ColdScale:
     received_bytes: int
     build_s: float
     sync_s: float
+    pipelined_facts_per_s: float
+    pipelined_bytes_per_s: float
     bandwidth_floor_s: float
     projected_network_s: float
     rtt_margin: float
@@ -67,6 +69,19 @@ class RangeScale:
     received_facts: int
     object_gets: int
     rounds: int
+
+
+@dataclass(frozen=True)
+class InteractiveScale:
+    history_facts: int
+    recent_facts: int
+    writers: int
+    object_gets: int
+    rounds: int
+    received_bytes: int
+    time_to_interactive_s: float
+    recent_facts_per_s: float
+    projected_network_s: float
 
 
 def _workspace(label):
@@ -108,7 +123,9 @@ def measure_cold(*, writers=50, facts=100_000, body_bytes=80):
     projected = floor + report.rounds * RTT_S
     return ColdScale(
         writers, facts, len(directory), report.object_gets, report.rounds,
-        report.received_bytes, build_s, sync_s, floor, projected,
+        report.received_bytes, build_s, sync_s,
+        facts / sync_s, report.received_bytes / sync_s,
+        floor, projected,
         0.0 if not floor else projected / floor - 1.0,
     )
 
@@ -166,10 +183,56 @@ def measure_range():
         len(log), lo, hi, report.facts, report.object_gets, report.rounds)
 
 
+def measure_interactive(*, history_facts, recent_facts=1_000,
+                        writers=1_000, body_bytes=24):
+    """Measure the recent-window demand pump over a larger cold history.
+
+    Each writer has one old immutable segment and one recent segment.  The
+    production sequence-window recipe must fetch and semantically ingest only
+    the latter, so this measures time to an interactive recent view instead of
+    disguising a full-history transfer as latency.
+    """
+    if type(history_facts) is not int or history_facts <= 0 \
+            or type(recent_facts) is not int or recent_facts <= 0 \
+            or type(writers) is not int or writers <= 0 \
+            or history_facts % writers or recent_facts % writers \
+            or recent_facts >= history_facts:
+        raise ValueError("interactive scale shape")
+    store = MemoryCloud()
+    queue = CloudQueue(
+        store, _workspace(
+            f"interactive/{history_facts}/{recent_facts}/{writers}"))
+    per_writer = history_facts // writers
+    recent_per_writer = recent_facts // writers
+    recent_lo = per_writer - recent_per_writer
+    for ordinal in range(writers):
+        log = _log(ordinal, per_writer, body_bytes)
+        queue.publish(log, 0, recent_lo, announce=False)
+        queue.publish(log, recent_lo, per_writer, announce=False)
+    queue.repair_directory()
+
+    state = PeerState()
+    started = time.perf_counter()
+    report = queue.sync(state, seq_window=(recent_lo, per_writer))
+    elapsed = time.perf_counter() - started
+    if len(state.treap) != recent_facts:
+        raise AssertionError("interactive scale convergence")
+    projected = report.received_bytes / BANDWIDTH_BYTES_S \
+        + report.rounds * RTT_S
+    return InteractiveScale(
+        history_facts, recent_facts, writers, report.object_gets,
+        report.rounds, report.received_bytes, elapsed,
+        recent_facts / elapsed, projected,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true",
                         help="run the 100k-fact authenticated cold profile")
+    parser.add_argument(
+        "--interactive-full", action="store_true",
+        help="measure a 1k-fact recent view over 10k/100k/1M histories")
     args = parser.parse_args()
     result = {
         "concurrency": CLOUD_GET_CONCURRENCY,
@@ -179,6 +242,11 @@ def main():
     }
     if args.full:
         result["cold_100k"] = asdict(measure_cold())
+    if args.interactive_full:
+        result["interactive"] = [
+            asdict(measure_interactive(history_facts=facts))
+            for facts in (10_000, 100_000, 1_000_000)
+        ]
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

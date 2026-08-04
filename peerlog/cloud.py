@@ -23,7 +23,7 @@ import hashlib
 import math
 import struct
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -751,6 +751,20 @@ class CloudQueue:
                 thread_name_prefix="poc16-cloud-get") as executor:
             return tuple(executor.map(operation, items))
 
+    def _parallel_completed(self, items, operation):
+        """Yield bounded GET results as they finish for ingest pipelining."""
+        items = tuple(items)
+        if len(items) < 2:
+            for item in items:
+                yield operation(item)
+            return
+        with ThreadPoolExecutor(
+                max_workers=min(CLOUD_GET_CONCURRENCY, len(items)),
+                thread_name_prefix="poc16-cloud-get") as executor:
+            futures = tuple(executor.submit(operation, item) for item in items)
+            for future in as_completed(futures):
+                yield future.result()
+
     def _write_segment(self, publications, kind, weight):
         raw = _encode_segment(publications, kind)
         writer = publications[0].main.writer
@@ -924,12 +938,15 @@ class CloudQueue:
                         continue
                 if not _covered(coverage, lo, hi):
                     selected.append(segment)
+        # The demand pump makes a partial view useful before old history:
+        # submit newest sequence ranges first while retaining per-publication
+        # atomic ingest and accepting out-of-order writer islands.
+        selected.sort(key=lambda segment: (segment.hi, segment.lo),
+                      reverse=True)
         facts = carries = 0
         pending = set()
-        segment_publications = self._parallel(selected, self._read_segment)
-        accepted_runs = []
-        accepted_main_facts = []
-        for publications in segment_publications:
+        for publications in self._parallel_completed(
+                selected, self._read_segment):
             for publication in publications:
                 self._validate_publication(
                     publication,
@@ -938,19 +955,23 @@ class CloudQueue:
                 main_facts = decode_slice(
                     publication.main.facts,
                     publication.main.hi - publication.main.lo)
-                accepted_runs.extend((*publication.carries, publication.main))
-                accepted_main_facts.append(main_facts)
+                # One adjacency-bound publication remains atomic, while later
+                # writer bodies continue downloading on the bounded executor.
+                ingest_batch(
+                    state, (*publication.carries, publication.main))
                 for carried in publication.carries:
                     carries += carried.hi - carried.lo
                 facts += len(main_facts)
-        if accepted_runs:
-            ingest_batch(state, accepted_runs)
-        for main_facts in accepted_main_facts:
-            for fact in main_facts:
-                for ref in fact.refs:
-                    target = state.logs.get(ref.writer)
-                    if target is None or ref.seq not in target._facts:
-                        pending.add(ref)
+                for fact in main_facts:
+                    for ref in fact.refs:
+                        target = state.logs.get(ref.writer)
+                        if target is None or ref.seq not in target._facts:
+                            pending.add(ref)
+        pending = {
+            ref for ref in pending
+            if state.logs.get(ref.writer) is None
+            or ref.seq not in state.logs[ref.writer]._facts
+        }
         delta = self.store.metrics.delta(before)
         # Directory, bounded footer waves, then bounded immutable-body waves.
         footer_gets = len(all_segments) if ts_window is not None else 0

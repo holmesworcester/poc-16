@@ -6,6 +6,7 @@ import time
 import pytest
 from nacl import signing
 
+import peerlog.cloud as cloud_module
 from adapters.s3 import S3Config, S3Store
 from peerlog.cloud import (
     MICRO_TAIL,
@@ -404,6 +405,47 @@ def test_cold_body_gets_really_overlap_under_the_named_wave_bound():
     assert report.facts == report.object_gets == 70
     assert report.rounds == 3  # directory + ceil(70 / 64) body waves
     assert store.maximum_active >= 8
+
+
+def test_completed_body_ingests_while_another_writer_get_is_in_flight(
+        monkeypatch):
+    class PipelinedCloud(MemoryCloud):
+        def __init__(self):
+            super().__init__()
+            self.blocked_key = None
+            self.blocked = threading.Event()
+            self.release = threading.Event()
+
+        def get(self, key, *, if_none_match=None, suffix=None):
+            if key == self.blocked_key and suffix is None:
+                self.blocked.set()
+                if not self.release.wait(2):
+                    raise AssertionError("ingest did not overlap body GET")
+            return super().get(
+                key, if_none_match=if_none_match, suffix=suffix)
+
+    store = PipelinedCloud()
+    cloud = CloudQueue(store, h("pipelined body ingest"))
+    for ordinal in range(2):
+        cloud.publish(owned(f"pipeline-{ordinal}", 8), announce=False)
+    cloud.repair_directory()
+    slots, _tag = cloud.poll()
+    keys = sorted(
+        segment.key for slot in slots.values() for segment in slot.segments)
+    store.blocked_key = keys[1]
+    original = cloud_module.ingest_batch
+    overlapped = []
+
+    def observe_ingest(state, runs):
+        assert store.blocked.wait(2)
+        overlapped.append(True)
+        store.release.set()
+        return original(state, runs)
+
+    monkeypatch.setattr(cloud_module, "ingest_batch", observe_ingest)
+    report = cloud.sync(PeerState())
+    assert report.facts == 16
+    assert overlapped
 
 
 def test_lost_slot_cas_response_retries_as_exact_idempotent_ack():
