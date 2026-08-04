@@ -40,6 +40,7 @@ from core.pack_access import (
     encode_pack_open,
 )
 from core.suppression_tree import decode_root
+from core.writer_head import head_slot_key, visible_slot_at
 from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
@@ -260,6 +261,8 @@ def worker_environment(bucket, workspace, prefix):
         STORE_PREFIX=prefix,
         GRANT_SECRET=base64.b64encode(
             b"s" * runtime.EDGE_SECRET_BYTES).decode(),
+        PERMIT_SECRET=base64.b64encode(
+            b"m" * runtime.PERMIT_SECRET_BYTES).decode(),
         R2_ENDPOINT=(
             "https://" + "c" * 32 + ".r2.cloudflarestorage.com"),
         PACK_BUCKET="poc16-packs",
@@ -440,6 +443,7 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
     ), environment, clock=lambda: 10))
     assert permit_response.status == 200
     permit = permit_response.body
+    assert encode_head_commit_request(permit) == permit
     slot_key = f"{prefix}/heads/{value.root.fid}/{value.founder}"
     assert slot_key not in bucket.data
 
@@ -449,31 +453,54 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         "POST",
         f"https://worker.example/head/{proposed}/commit?ws="
         f"{value.root.fid}",
-        encode_head_commit_request(bytes(tampered), (control,)),
+        encode_head_commit_request(bytes(tampered)),
     ), environment, clock=lambda: 10)).status == 403
     assert bucket.data[removal_key] == removal_before
+
+    # Grant rotation cannot invalidate a non-expiring exact control permit;
+    # changing the separate permit verifier key does fail closed.
+    environment.GRANT_SECRET = base64.b64encode(
+        b"g" * runtime.EDGE_SECRET_BYTES).decode()
+    wrong_permit_environment = SimpleNamespace(**{
+        **vars(environment),
+        "PERMIT_SECRET": base64.b64encode(
+            b"w" * runtime.PERMIT_SECRET_BYTES).decode(),
+    })
+    assert run(runtime.handle(Request(
+        "POST",
+        f"https://worker.example/head/{proposed}/commit?ws="
+        f"{value.root.fid}",
+        permit,
+    ), wrong_permit_environment, clock=lambda: 10)).status == 403
+    assert bucket.data[removal_key] == removal_before
+    assert slot_key not in bucket.data
 
     bucket.fail_removal_once = True
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/head/{proposed}/commit?ws="
         f"{value.root.fid}",
-        encode_head_commit_request(permit, (control,)),
+        encode_head_commit_request(permit),
     ), environment, clock=lambda: 10)).status == 409
     assert bucket.data[removal_key] == removal_before
-    assert slot_key not in bucket.data
+    # Commit reserves the exact slot before touching removal state, but the
+    # pending value is private and has no visible writer head.
+    assert visible_slot_at(
+        head_slot_key(value.root.fid, value.founder),
+        bucket.data[slot_key],
+    ) is None
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/head/{proposed}/commit?ws="
         f"{value.root.fid}",
-        encode_head_commit_request(permit, (control,)),
+        encode_head_commit_request(permit),
     ), environment, clock=lambda: 10)).status == 201
     accepted_slot = bucket.data[slot_key]
     assert run(runtime.handle(Request(
         "POST",
         f"https://worker.example/head/{proposed}/commit?ws="
         f"{value.root.fid}",
-        encode_head_commit_request(permit, (control,)),
+        encode_head_commit_request(permit),
     ), environment, clock=lambda: 10)).status == 204
     assert bucket.data[slot_key] == accepted_slot
     assert not any(operation == "list" for operation, _key in bucket.calls)
@@ -737,6 +764,7 @@ def test_deployed_entry_confines_a_widened_object_issuer(
 
 
 @pytest.mark.parametrize(("name", "value"), (
+    ("PERMIT_SECRET", "not-base64"),
     ("PACK_TICKET_SECRET", "not-base64"),
     ("R2_ACCESS_KEY_ID", "short"),
     ("R2_SECRET_ACCESS_KEY", "short"),
@@ -787,6 +815,34 @@ def test_runtime_fails_closed_for_scope_config_and_malformed_content_length(
     assert wrong.status == 404
     assert malformed.status == 400
     assert misconfigured.status == 500
+
+
+def test_runtime_keeps_grant_and_permit_secrets_stable_and_distinct(
+        tmp_path, monkeypatch):
+    _, _, _, bucket, environment = worker_world(tmp_path, monkeypatch)
+
+    first = runtime.Settings.from_env(environment)
+    second = runtime.Settings.from_env(environment)
+    assert first.grant_secret == second.grant_secret \
+        == b"s" * runtime.EDGE_SECRET_BYTES
+    assert first.permit_secret == second.permit_secret \
+        == b"m" * runtime.PERMIT_SECRET_BYTES
+    assert first.grant_secret != first.permit_secret
+
+    rotated_grant = SimpleNamespace(**{
+        **vars(environment),
+        "GRANT_SECRET": base64.b64encode(
+            b"g" * runtime.EDGE_SECRET_BYTES).decode(),
+    })
+    assert runtime.Settings.from_env(rotated_grant).permit_secret \
+        == first.permit_secret
+
+    reused = SimpleNamespace(**{
+        **vars(environment),
+        "PERMIT_SECRET": environment.GRANT_SECRET,
+    })
+    with pytest.raises(ValueError, match="must differ"):
+        runtime.Settings.from_env(reused)
 
 
 def test_runtime_bounds_and_authenticates_r2_object_reads(
@@ -954,20 +1010,27 @@ def test_runtime_applies_route_specific_exact_body_limits(
             return runtime.Response(200)
 
     monkeypatch.setattr(runtime, "gateway", lambda *_args, **_kwargs: Probe())
-    control = (
+    permit = (
+        f"https://worker.example/head/{'b' * 64}/permit?ws={workspace}")
+    commit = (
         f"https://worker.example/head/{'b' * 64}/commit?ws={workspace}")
     mint_url = f"https://worker.example/mint?ws={workspace}"
 
     assert run(runtime.handle(Request(
-        "POST", control, b"12345"), environment)).status == 200
+        "POST", permit, b"12345"), environment)).status == 200
     assert calls[-1][-1] == b"12345"
     assert run(runtime.handle(Request(
-        "POST", control, b"123456"), environment)).status == 413
+        "POST", permit, b"123456"), environment)).status == 413
+    assert run(runtime.handle(Request(
+        "POST", commit, b"123"), environment)).status == 200
+    assert calls[-1][-1] == b"123"
+    assert run(runtime.handle(Request(
+        "POST", commit, b"1234"), environment)).status == 413
     assert run(runtime.handle(Request(
         "POST", mint_url, b"123"), environment)).status == 200
     assert run(runtime.handle(Request(
         "POST", mint_url, b"1234"), environment)).status == 413
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_runtime_never_falls_back_to_whole_request_bytes():
@@ -1094,6 +1157,8 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
         manage.REPOSITORY / "adapters" / "r2" / "worker.py").read_bytes()
     assert (staged / "adapters" / "r2" / "reader.py").read_bytes() == (
         manage.REPOSITORY / "adapters" / "r2" / "reader.py").read_bytes()
+    assert (staged / "adapters" / "r2" / "listing.py").read_bytes() == (
+        manage.REPOSITORY / "adapters" / "r2" / "listing.py").read_bytes()
     for relative in (
             "deploy/cloudflare_sigv4.py",
             "deploy/cloudflare_pack/contract.py",
@@ -1117,8 +1182,10 @@ def test_stage_is_minimal_current_and_patches_pynacl(tmp_path, monkeypatch):
             "-c",
             "from deploy.cloudflare_pack.issuer import R2PackIssuer; "
             "from deploy.cloudflare_pack.put import R2ImmutablePut; "
+            "from runtime import Settings; "
             "assert callable(R2PackIssuer.open_object); "
-            "assert callable(R2ImmutablePut.handle)",
+            "assert callable(R2ImmutablePut.handle); "
+            "assert Settings.__name__ == 'Settings'",
         ],
         cwd=staged,
         env={**os.environ, "PYTHONPATH": str(staged)},
@@ -1177,6 +1244,8 @@ def test_deploy_secrets_are_exact_and_validated_before_wrangler():
     environment = {
         "GRANT_SECRET": base64.b64encode(
             b"g" * manage.EDGE_SECRET_BYTES).decode(),
+        "PERMIT_SECRET": base64.b64encode(
+            b"m" * manage.PERMIT_SECRET_BYTES).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
             b"p" * manage.PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "pack-reader-access",
@@ -1192,6 +1261,10 @@ def test_deploy_secrets_are_exact_and_validated_before_wrangler():
     malformed = dict(environment, PACK_TICKET_SECRET=object())
     with pytest.raises(ValueError, match="PACK_TICKET_SECRET"):
         manage._secrets(malformed)
+    same_key = dict(
+        environment, PERMIT_SECRET=environment["GRANT_SECRET"])
+    with pytest.raises(ValueError, match="must differ"):
+        manage._secrets(same_key)
 
 
 def test_manage_and_runtime_share_exact_store_prefix_budget(
@@ -1225,6 +1298,7 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     config = json.loads(manage.TEMPLATE.read_text())
 
     assert runtime.EDGE_SECRET_BYTES == manage.EDGE_SECRET_BYTES
+    assert runtime.PERMIT_SECRET_BYTES == manage.PERMIT_SECRET_BYTES
     assert runtime.PACK_TICKET_SECRET_BYTES \
         == manage.PACK_TICKET_SECRET_BYTES
     assert {
@@ -1243,6 +1317,10 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         > runtime.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES == limits.MAX_PAGE_BATCH_BYTES
+    assert config["limits"]["subrequests"] \
+        == limits.CLOUDFLARE_SUBREQUEST_LIMIT == 10_000
+    assert limits.MAX_HEAD_COMMIT_SUBREQUESTS \
+        <= config["limits"]["subrequests"]
 
 
 @pytest.mark.parametrize("field,value", [
@@ -1520,6 +1598,8 @@ def smoke_environment(tmp_path, monkeypatch):
         "CF_DEPLOYMENT_OWNER": "smoke-owner",
         "GRANT_SECRET": base64.b64encode(
             b"s" * manage.EDGE_SECRET_BYTES).decode(),
+        "PERMIT_SECRET": base64.b64encode(
+            b"m" * manage.PERMIT_SECRET_BYTES).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
             b"p" * manage.PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "smoke-access-key",

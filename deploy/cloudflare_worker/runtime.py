@@ -40,6 +40,7 @@ MAX_QUERY_BYTES = 4 * 1024
 MAX_QUERY_FIELDS = 8
 MAX_GRANT_TTL_MS = 60_000
 EDGE_SECRET_BYTES = 32
+PERMIT_SECRET_BYTES = 32
 
 _BUDGETS = {
     "MAX_REQUEST_BYTES": MAX_REQUEST_BYTES,
@@ -119,7 +120,8 @@ class Settings:
     bucket: object
     workspace: str
     prefix: str
-    secret: bytes = field(repr=False)
+    grant_secret: bytes = field(repr=False)
+    permit_secret: bytes = field(repr=False)
     pack_target: R2PackTarget
     r2_access_key_id: str = field(repr=False)
     r2_secret_access_key: str = field(repr=False)
@@ -144,7 +146,12 @@ class Settings:
         except (TypeError, ValueError, UnicodeError) as error:
             raise ValueError("STORE_PREFIX binding") from error
         bucket = getattr(env, "BUCKET")
-        secret = _secret(env, "GRANT_SECRET", EDGE_SECRET_BYTES)
+        grant_secret = _secret(env, "GRANT_SECRET", EDGE_SECRET_BYTES)
+        permit_secret = _secret(
+            env, "PERMIT_SECRET", PERMIT_SECRET_BYTES)
+        if permit_secret == grant_secret:
+            raise ValueError(
+                "PERMIT_SECRET binding must differ from GRANT_SECRET")
         ticket_secret = _secret(
             env, "PACK_TICKET_SECRET", PACK_TICKET_SECRET_BYTES)
         target = R2PackTarget(
@@ -164,16 +171,21 @@ class Settings:
             clock=lambda: 0,
         )
         R2ImmutablePut(target, bucket, ticket_secret, clock=lambda: 0)
+        budgets = {
+            name.lower(): _budget(env, name)
+            for name in _BUDGETS
+        }
         return cls(
-            bucket,
-            workspace,
-            prefix,
-            secret,
-            target,
-            access_key_id,
-            secret_access_key,
-            ticket_secret,
-            *(_budget(env, name) for name in _BUDGETS),
+            bucket=bucket,
+            workspace=workspace,
+            prefix=prefix,
+            grant_secret=grant_secret,
+            permit_secret=permit_secret,
+            pack_target=target,
+            r2_access_key_id=access_key_id,
+            r2_secret_access_key=secret_access_key,
+            pack_ticket_secret=ticket_secret,
+            **budgets,
         )
 
     def issue_packs(self, clock):
@@ -205,19 +217,19 @@ def gateway(settings, clock=None):
     gate = AccessGate(settings.workspace, store)
     heads = OpaqueHeadGate(store, gate.authorize_head)
 
-    async def commit_permit(permit, proposed, controls, secret):
-        grant = await gate.authorize_permitted_head(
-            permit, proposed, controls, secret)
-        return await heads.advance_grant(grant, proposed)
+    async def commit_permit(permit, proposed, secret):
+        return await gate.commit_head_permit(
+            heads, permit, proposed, secret)
 
     return HttpGate(
         store,
         settings.workspace,
-        settings.secret,
+        settings.grant_secret,
         clock,
         head_advance=heads.advance,
         head_permit_issue=gate.issue_head_permit,
         head_permit_commit=commit_permit,
+        permit_secret=settings.permit_secret,
         mint_authorize=gate.authorize_access,
         path_authorize=gate.removal_path,
         removal_bootstrap=gate.state.bootstrap,

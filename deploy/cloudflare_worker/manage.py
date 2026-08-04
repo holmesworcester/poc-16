@@ -55,12 +55,14 @@ OWNER_BINDING = "POC16_DEPLOYMENT_OWNER"
 API_RESPONSE_BYTES = 64 * 1024
 CONTROL_TIMEOUT_SECONDS = 120
 EDGE_SECRET_BYTES = 32
+PERMIT_SECRET_BYTES = 32
 DEFAULT_PACK_TTL_SECONDS = MAX_SCOPED_TTL_MS // 1000
 _ABSENT = object()
 
 CORE_MODULES = HOSTED_GATE_CORE_MODULES
 SECRET_NAMES = (
     "GRANT_SECRET",
+    "PERMIT_SECRET",
     "PACK_TICKET_SECRET",
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
@@ -102,7 +104,7 @@ def stage():
     )
     for name in ("__init__.py",):
         _copy(REPOSITORY / "adapters" / name, pending / "adapters" / name)
-    for name in ("__init__.py", "reader.py", "worker.py"):
+    for name in ("__init__.py", "listing.py", "reader.py", "worker.py"):
         _copy(
             REPOSITORY / "adapters" / "r2" / name,
             pending / "adapters" / "r2" / name,
@@ -178,9 +180,15 @@ def _secrets(environment):
         "R2_SECRET_ACCESS_KEY is invalid",
         MAX_SECRET_ACCESS_KEY_CHARS,
     )
+    grant_secret = _base64_secret(
+        environment, "GRANT_SECRET", EDGE_SECRET_BYTES)
+    permit_secret = _base64_secret(
+        environment, "PERMIT_SECRET", PERMIT_SECRET_BYTES)
+    if permit_secret == grant_secret:
+        raise ValueError("PERMIT_SECRET must differ from GRANT_SECRET")
     return {
-        "GRANT_SECRET": _base64_secret(
-            environment, "GRANT_SECRET", EDGE_SECRET_BYTES),
+        "GRANT_SECRET": grant_secret,
+        "PERMIT_SECRET": permit_secret,
         "PACK_TICKET_SECRET": _base64_secret(
             environment, "PACK_TICKET_SECRET", PACK_TICKET_SECRET_BYTES),
         "R2_ACCESS_KEY_ID": access,
@@ -276,6 +284,7 @@ def _verify_bundle(directory):
         "core/suppression_tree.py",
         "core/writer_repository.py",
         "facts/auth/request.py",
+        "adapters/r2/listing.py",
         "adapters/r2/worker.py",
         "adapters/r2/reader.py",
         "core/http.py",
@@ -326,6 +335,8 @@ def workerd_test():
         **os.environ,
         "GRANT_SECRET": base64.b64encode(
             bytes(EDGE_SECRET_BYTES)).decode(),
+        "PERMIT_SECRET": base64.b64encode(
+            b"m" * PERMIT_SECRET_BYTES).decode(),
         "PACK_TICKET_SECRET": base64.b64encode(
             b"p" * PACK_TICKET_SECRET_BYTES).decode(),
         "R2_ACCESS_KEY_ID": "workerd-access",
