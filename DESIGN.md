@@ -6,6 +6,10 @@ advancing device logs, and no predecessor-format content root or ingress path
 is accepted. Remaining measurement and live-deployment work is tracked in
 beads; it is not a compatibility switch.
 
+Section 7's two-phase removal-path bootstrap is the accepted security cut, not
+yet a claim about running code; implementation and removal of the predecessor
+authority-publication path are tracked by `poc-16-6j4.16`.
+
 The central decision is:
 
 ```text

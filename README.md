@@ -6,6 +6,11 @@ database-free authority, object, head, and HTTP core. A hosted owner target
 needs an object store but no database. SQLite exists only as a disposable
 full-client query and authorship accelerator.
 
+The writer-forest content path described here is running. The two-phase
+removal-path bootstrap in section 7 of `DESIGN.md` is the accepted security cut
+tracked by `poc-16-6j4.16`; authority/removal-path statements below describe
+that target until the bead closes.
+
 The implementation is deliberately strict about authority and direction:
 
 - `WriterLog` signs independently closed pile leaves and appends them to one
@@ -15,7 +20,8 @@ The implementation is deliberately strict about authority and direction:
   projection.
 - `PileSender` is the full peer's SQL-permitted close/sign boundary. Its normal
   send path publishes through `WriterLog`, not `RepositoryApplier`.
-- `AuthorityGate` first accepts a device-signed historical-member proof to
+- The target `AuthorityGate` first accepts a device-signed historical-member
+  proof to
   return only that member/device pair's current removal path, then accepts a
   second device-signed current-member proof carrying that path. Both judgments
   are discarded; neither synchronizes or mutates recipient authority state.
@@ -37,8 +43,9 @@ objects directly and may CAS only their own writer slot.
 3. `core/writer_tree.py`, `core/writer_head.py`, and
    `core/writer_repository.py`: per-device logs, owner publication, mirroring,
    and optional consumption.
-4. `core/authority.py` and `core/suppression.py`: self-confined removal-path
-   refresh and current-membership checks against the recipient's pinned root.
+4. `core/authority.py` and `core/suppression.py`: the authority implementation
+   being cut to self-confined removal-path refresh and current-membership checks
+   against the recipient's pinned root.
 5. `core/http.py`, `core/http_stdlib.py`: the shared peer gate, then its
    standard-library HTTP server/byte adapter.
 6. `full_peer/pile_sender.py`: stateful-client authorship and closure.
@@ -202,7 +209,9 @@ daemon configuration cannot mix plain remote URLs with Iroh peer records.
 
 ## Repository flow
 
-An ordinary FullPeer-authored unit follows this running path:
+An ordinary FullPeer-authored unit follows this running content path; the
+authority step names the accepted section 7 cut while `poc-16-6j4.16` remains
+open:
 
 ```text
 facts command
@@ -217,7 +226,7 @@ facts command
 Each writer has one CAS slot, so different writers commute. Same-writer losers
 rebase on the newer signed head, and lost responses are reconciled by rereading
 that slot. P2P sync lists slots, runs RBSR only for changed roots, and transfers
-complete closed leaves. Hosted owner publication establishes the same immutable
+complete closed leaves. The section 7 hosted cut establishes the same immutable
 objects directly, then advances only the local device's slot with the same
 closed proof against the recipient's current removal root.
 
@@ -665,8 +674,9 @@ There are no table migrations, version graphs, or generic old-protocol codecs.
 
 ## Hosted owner publication
 
-Peers do not proxy large immutable bodies through Lambda or a Worker. A
-stateful writer prepares the same objects it uses locally, then publishes:
+Peers do not proxy large immutable bodies through Lambda or a Worker. Under
+the section 7 cut, a stateful writer prepares the same objects it uses locally,
+then publishes:
 
 ```text
 mint one current sync grant from a device-signed proof carrying the current removal path
@@ -682,7 +692,7 @@ that binds the observed base and proposed head. A retry rereads the one slot;
 an exact repeat is a no-op, and a same-writer race requires rebase. Different
 writers never share a mutable content key.
 
-The hosted gate validates membership, member-signed device ownership,
+The section 7 hosted gate will validate membership, member-signed device ownership,
 non-removal, expiry, and the exact proposed head against its pinned removal
 root. It checks that
 the proposed head object exists, but deliberately does not parse or validate
