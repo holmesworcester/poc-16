@@ -1,24 +1,16 @@
 from bench.writer_p2p_cost import measure_two_party_sync
 
 
-class _Sql:
-    def __init__(self, node):
-        self.node = node
-
-    def fact_ids(self):
-        self.node.events.append(f"{self.node.name}:facts")
-        return set(self.node.facts)
-
-
 class _Node:
     def __init__(self, name, facts, events):
         self.name = name
         self.facts = set(facts)
         self.events = events
 
-    def sql(self, workspace):
+    def snapshot(self, workspace):
         assert workspace == "workspace"
-        return _Sql(self)
+        self.events.append(f"{self.name}:snapshot")
+        return set(self.facts), len(self.facts)
 
 
 def test_two_party_sync_timer_excludes_snapshots_and_result_counting():
@@ -46,19 +38,21 @@ def test_two_party_sync_timer_excludes_snapshots_and_result_counting():
         "http://remote",
         sync_turn=sync_turn,
         clock=clock,
+        snapshot=lambda node, workspace: node.snapshot(workspace),
     )
 
     assert events == [
-        "local:facts",
-        "remote:facts",
+        "local:snapshot",
+        "remote:snapshot",
         "clock",
         "sync",
         "clock",
-        "local:facts",
-        "remote:facts",
+        "local:snapshot",
+        "remote:snapshot",
     ]
     assert result.local_facts == result.remote_facts == 1
     assert result.facts == 2
+    assert result.pulled_piles == result.pushed_piles == 1
     assert result.elapsed_seconds == 2.5
     assert result.facts_per_second == 0.8
-    assert (result.pulled_changed, result.pushed_piles) == (1, 1)
+    assert result.pull_changed == 1

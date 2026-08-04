@@ -523,11 +523,16 @@ def test_two_party_sync_performance_includes_messaging_and_catchup(tmp_path):
     assert set(bob.sql(workspace).fact_ids()) == expected
     assert result.local_facts == len(bob_before - alice_before)
     assert result.remote_facts == len(alice_before - bob_before)
-    assert result.facts > 0
+    assert (
+        result.local_facts,
+        result.remote_facts,
+        result.facts,
+        result.pulled_piles,
+        result.pushed_piles,
+    ) == (42, 46, 88, 22, 24)
     assert result.elapsed_seconds > 0
     assert result.facts_per_second > 0
-    assert result.pulled_changed == 1
-    assert result.pushed_piles > 0
+    assert result.pull_changed == 1
     expected_messages = {
         "from alice",
         "from bob",
@@ -541,7 +546,8 @@ def test_two_party_sync_performance_includes_messaging_and_catchup(tmp_path):
         f"{result.facts} facts in {result.elapsed_seconds:.6f}s "
         f"({result.facts_per_second:.1f} facts/s; "
         f"local +{result.local_facts}, remote +{result.remote_facts}, "
-        f"pulled={result.pulled_changed}, pushed={result.pushed_piles} piles)"
+        f"pulled={result.pulled_piles}, pushed={result.pushed_piles} piles, "
+        f"pull_changed={result.pull_changed})"
     )
 
 

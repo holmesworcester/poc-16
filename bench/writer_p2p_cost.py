@@ -4,6 +4,13 @@ from dataclasses import dataclass
 import time
 
 from core.store import RemoteStore
+from core.writer_head import (
+    MAX_HEAD_SLOT_BYTES,
+    MAX_WRITER_HEAD_BYTES,
+    decode_head,
+    head_slot_prefix,
+    visible_slot_at,
+)
 from full_peer.sync import sync as full_sync
 from full_peer.walk import Peer
 
@@ -28,8 +35,9 @@ class TwoPartySyncVector:
 
     local_facts: int
     remote_facts: int
-    pulled_changed: int
+    pulled_piles: int
     pushed_piles: int
+    pull_changed: int
     elapsed_seconds: float
 
     @property
@@ -83,29 +91,50 @@ def measure_pull(node, workspace, url, token, *, rtt_ms=0):
     )
 
 
+def _sync_snapshot(node, workspace):
+    """Return durable fact IDs and accepted pile leaves for one FullPeer."""
+    store = node.store(workspace)
+    piles = 0
+    for key in store.list(head_slot_prefix(workspace)):
+        raw_slot = store.get_bounded(key, MAX_HEAD_SLOT_BYTES)
+        slot = visible_slot_at(key, raw_slot)
+        if slot is None:
+            continue
+        raw_head = store.get_bounded(
+            "obj/" + slot.head, MAX_WRITER_HEAD_BYTES)
+        piles += decode_head(raw_head).sequence
+    return set(node.sql(workspace).fact_ids()), piles
+
+
 def measure_two_party_sync(
         local, remote, workspace, url, *, sync_turn=full_sync,
-        clock=time.perf_counter):
+        clock=time.perf_counter, snapshot=_sync_snapshot):
     """Time one complete FullPeer sync and count facts admitted on both sides.
 
     Fixture work and the before/after durable-fact snapshots are deliberately
     outside the timer.  Elapsed time begins immediately before ``sync_turn``
     and ends immediately after it returns.
     """
-    local_before = set(local.sql(workspace).fact_ids())
-    remote_before = set(remote.sql(workspace).fact_ids())
+    local_facts_before, local_piles_before = snapshot(local, workspace)
+    remote_facts_before, remote_piles_before = snapshot(remote, workspace)
 
     started = clock()
-    pulled_changed, pushed_piles = sync_turn(local, workspace, url)
+    pull_changed, reported_pushed_piles = sync_turn(local, workspace, url)
     elapsed = clock() - started
 
-    local_after = set(local.sql(workspace).fact_ids())
-    remote_after = set(remote.sql(workspace).fact_ids())
+    local_facts_after, local_piles_after = snapshot(local, workspace)
+    remote_facts_after, remote_piles_after = snapshot(remote, workspace)
+    pulled_piles = local_piles_after - local_piles_before
+    pushed_piles = remote_piles_after - remote_piles_before
+    if pulled_piles < 0 or pushed_piles < 0 \
+            or pushed_piles != reported_pushed_piles:
+        raise AssertionError("two-party sync pile accounting")
     return TwoPartySyncVector(
-        len(local_after - local_before),
-        len(remote_after - remote_before),
-        pulled_changed,
+        len(local_facts_after - local_facts_before),
+        len(remote_facts_after - remote_facts_before),
+        pulled_piles,
         pushed_piles,
+        pull_changed,
         elapsed,
     )
 
