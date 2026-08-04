@@ -10,15 +10,24 @@ import random
 import threading
 
 import pytest
+from nacl import signing
 
 from peerlog.coverage import Coverage, intersect
+from peerlog.fact import Fact, canonical, decode_slice, fid
+from peerlog.endpoint import PeerEndpoint
+from peerlog.ingest import PeerState, ingest, observe_head
+from peerlog.log import WriterLog
+from peerlog.proof import Run, prove_run, verify_run
+from peerlog.session import SessionCoordinator, mesh_sync
 from peerlog.treap import Treap, decode_root, snapshot
 from peerlog.walk import (
     OBJECT_PREFIX,
     ROOT_KEY,
     diff,
     diff_entries,
+    diff_window,
     publish,
+    sync,
 )
 
 skeleton = pytest.mark.skip(reason="phase-1 skeleton: contract named, body unwritten")
@@ -64,17 +73,47 @@ def _tree(rows):
     return tree
 
 
-@skeleton
 def test_two_partial_peers_converge_to_coverage_union():
     """Arbitrary island/suffix states; after sync both hold the union
     of the coverage intersection, via GET/PUT only."""
+    left_log, right_log = WriterLog.owned(), WriterLog.owned()
+    for seq in range(10):
+        left_log.append(Fact("msg", seq * 2, (), f"left:{seq}".encode()))
+        right_log.append(Fact("msg", seq * 2 + 1, (), f"right:{seq}".encode()))
+    left_state, right_state = PeerState(), PeerState()
+    left_state.add_owned(left_log)
+    right_state.add_owned(right_log)
+    left = PeerEndpoint(left_state, Coverage(()), b"left")
+    right = PeerEndpoint(right_state, Coverage(()), b"right")
+
+    report = sync(left, right)
+    expected = set((left_state.treap.entries()))
+    assert expected == set(right_state.treap.entries())
+    assert len(expected) == 20
+    assert report["pulled_facts"] == report["pushed_facts"] == 10
+    assert all(key.startswith((ROOT_KEY, OBJECT_PREFIX, "peerlog/fact/", "peerlog/run/"))
+               for key in right.get_calls + right.put_calls)
 
 
-@skeleton
 def test_identical_sets_cost_one_conditional_get():
     """Equal coverage and equal sets: one conditional root GET, zero
     ranges recursed, zero bytes transferred. The conditional cache token
     belongs to the session wrapper, which is not implemented yet."""
+    log = WriterLog.owned()
+    for seq in range(100):
+        log.append(Fact("msg", seq, (), f"same:{seq}".encode()))
+    left_state = PeerState()
+    left_state.add_owned(log)
+    left = PeerEndpoint(left_state, endpoint_id=b"left")
+    right = PeerEndpoint(endpoint_id=b"right")
+    sync(right, left)
+    # First equality establishes the exact responder-root/local-set token.
+    sync(right, left)
+    left.get_calls.clear()
+    report = sync(right, left)
+    assert report["conditional_hit"]
+    assert left.get_calls == [ROOT_KEY]
+    assert report["diff_bytes"] == report["pulled_facts"] == 0
 
 
 def test_identical_sets_cost_one_root_get_and_no_page_reads():
@@ -89,15 +128,46 @@ def test_identical_sets_cost_one_root_get_and_no_page_reads():
     assert remote.get_calls == [ROOT_KEY]
 
 
-@skeleton
 def test_range_accept_is_all_or_nothing():
     """A run either ingests completely or leaves state untouched."""
+    source = WriterLog.owned()
+    for seq in range(8):
+        source.append(Fact("msg", seq, (), f"message:{seq}".encode()))
+    target = PeerState()
+    good = prove_run(source, 2, 7)
+    ingest(target, good)
+    before = target.entries()
+    before_coverage = target.logs[source.writer].coverage()
+
+    # A valid proof that overlaps an already accepted sequence with different
+    # bytes is equivocation. No later fact from the run may leak into state.
+    fork_secret = signing.SigningKey(source._secret.encode())
+    fork = WriterLog(source.writer, fork_secret)
+    for seq in range(8):
+        body = b"different" if seq == 4 else f"message:{seq}".encode()
+        fork.append(Fact("msg", seq, (), body))
+    with pytest.raises(ValueError, match="writer (fork|equivocation)"):
+        ingest(target, prove_run(fork, 4, 8))
+    assert target.entries() == before
+    assert target.logs[source.writer].coverage() == before_coverage
 
 
-@skeleton
 def test_tampered_run_rejects_whole_run():
     """One flipped byte anywhere in facts/paths/head fails verify_run
     and nothing from the run is filed."""
+    source = WriterLog.owned()
+    for seq in range(12):
+        source.append(Fact("msg", 100 + seq, (), bytes([seq]) * 40))
+    run = prove_run(source, 2, 10)
+    raw = bytearray(run.facts)
+    raw[len(raw) // 2] ^= 1
+    corrupt = Run(run.writer, run.lo, run.hi, bytes(raw), run.head, run.paths)
+    target = PeerState()
+    assert not verify_run(corrupt)
+    with pytest.raises(ValueError, match="invalid writer run"):
+        ingest(target, corrupt)
+    assert target.entries() == ()
+    assert target.logs == {}
 
 
 def test_walk_refuses_fingerprint_outside_coverage():
@@ -307,46 +377,171 @@ def test_publish_orders_objects_before_root_and_walk_rejects_tampering():
         diff_entries(Treap(), coverage, remote)
 
 
-@skeleton
 def test_fork_heads_collide_during_gossip():
     """Two signed heads for one writer disagreeing below the shared
     seq produce ForkEvidence at any peer that sees both."""
+    secret = signing.SigningKey.generate()
+    first = WriterLog.owned(secret)
+    second = WriterLog.owned(signing.SigningKey(secret.encode()))
+    first.append(Fact("msg", 1, (), b"one"))
+    second.append(Fact("msg", 1, (), b"two"))
+    state = PeerState()
+    assert observe_head(state, first.head()) is None
+    evidence = observe_head(state, second.head())
+    assert evidence.writer == first.writer
+    assert evidence.heads == (first.head(), second.head())
+    assert state.forks == [evidence]
 
 
-@skeleton
 def test_backdated_fact_lands_in_quarantine_band():
     """A fact with ts older than TS_QUARANTINE does not churn stable
     range fingerprints; it syncs through the late band."""
+    log = WriterLog.owned()
+    log.append(Fact("msg", 100_000_000, (), b"current"))
+    state = PeerState()
+    state.add_owned(log)
+    coverage = Coverage(((0, 200_000_000),))
+    stable = state.treap.fingerprint(0, 200_000_000, coverage)
+
+    log.append(Fact("msg", 1, (), b"late"))
+    state.add_owned(log)
+    assert state.treap.fingerprint(0, 200_000_000, coverage) == stable
+    assert state.treap.exact_members() == ((1, fid(log.fact(1))),)
+    source = PeerEndpoint(state, coverage)
+    target = PeerEndpoint(PeerState(), Coverage(()))
+    sync(target, source)
+    assert target.state.entries() == state.entries()
 
 
-@skeleton
 def test_run_proof_amortizes_over_contiguous_seqs():
     """Proof bytes per fact for a contiguous run are O(1) amortized
     versus ~0.7 KB for the degenerate single-fact carry."""
+    source = WriterLog.owned()
+    for seq in range(256):
+        source.append(Fact("msg", seq, (), b"x" * 256))
+    single = prove_run(source, 100, 101)
+    batch = prove_run(source, 64, 192)
+    assert verify_run(single)
+    assert verify_run(batch)
+    single_proof = sum(map(len, single.paths[0])) + len(single.head.sig)
+    batch_proof = sum(len(item) for path in batch.paths for item in path) \
+        + len(batch.head.sig)
+    assert batch_proof / 128 < single_proof / 8
+    assert decode_slice(batch.facts, 128)[0].body == b"x" * 256
+    assert fid(decode_slice(batch.facts, 128)[-1]) == fid(source.fact(191))
 
 
-@skeleton
 def test_diff_rounds_grow_logarithmically():
     """Measured over growing set sizes with a fixed small delta: round
     count grows ~log n (bench/writer_p2p_cost.py reports, no mocks)."""
+    gets = []
+    coverage = Coverage(((0, 100_000),))
+    for exponent in range(8, 14):
+        rows = tuple((ts, f"scale:{ts}") for ts in range(2 ** exponent))
+        remote = EndpointStore()
+        publish(_tree(rows), coverage, remote)
+        remote.get_calls.clear()
+        local = _tree(row for row in rows if row[0] != len(rows) // 2)
+        result = diff_entries(local, coverage, remote)
+        assert len(result.remote_only) == 1
+        gets.append(result.gets)
+        assert result.gets <= 3 * exponent
+    assert max(gets) <= 3 * 13
 
 
-@skeleton
 def test_recent_window_sync_rounds_bounded():
     """Syncing only a recent ts-window costs bounded rounds regardless
     of history size."""
+    gets = []
+    cut = 1_000_000
+    coverage = Coverage(((0, cut + 64),))
+    for history in (256, 1024, 4096):
+        old = tuple((ts, f"old:{history}:{ts}") for ts in range(history))
+        recent = tuple((cut + ts, f"recent:{ts}") for ts in range(32))
+        remote = EndpointStore()
+        publish(_tree((*old, *recent)), coverage, remote)
+        remote.get_calls.clear()
+        local = _tree((*old, *(row for row in recent if row[0] != cut + 15)))
+        result = diff_window(local, coverage, remote, cut, cut + 64)
+        assert result.remote_only == ((cut + 15, _fid("recent:15")),)
+        gets.append(result.gets)
+    assert len(set(gets)) == 1
 
 
-@skeleton
 def test_driver_learns_symmetric_difference_and_pushes():
     """One driver session moves news both ways: the responder ends up
     holding the driver's news without ever running walk logic."""
+    a_log, b_log = WriterLog.owned(), WriterLog.owned()
+    a_log.append(Fact("msg", 1, (), b"a"))
+    b_log.append(Fact("msg", 2, (), b"b"))
+    a_state, b_state = PeerState(), PeerState()
+    a_state.add_owned(a_log)
+    b_state.add_owned(b_log)
+    a, b = PeerEndpoint(a_state), PeerEndpoint(b_state)
+    report = sync(a, b)
+    assert report["pulled_facts"] == report["pushed_facts"] == 1
+    assert a.state.entries() == b.state.entries()
+    assert any(key.startswith("peerlog/run/") for key in b.put_calls)
 
 
-@skeleton
 def test_simultaneous_dials_collapse_to_single_driver():
     """Both peers dial at once: exactly one session survives and the
     lower endpoint id drives it; no duplicate transfer."""
+    left_log, right_log = WriterLog.owned(), WriterLog.owned()
+    left_log.append(Fact("msg", 1, (), b"left"))
+    right_log.append(Fact("msg", 2, (), b"right"))
+    left_state, right_state = PeerState(), PeerState()
+    left_state.add_owned(left_log)
+    right_state.add_owned(right_log)
+    left = PeerEndpoint(left_state, endpoint_id=b"a")
+    right = PeerEndpoint(right_state, endpoint_id=b"b")
+    coordinator = SessionCoordinator(collision_window=0.1)
+    barrier = threading.Barrier(2)
+    reports, errors = [], []
+
+    def dial(a, b):
+        try:
+            barrier.wait()
+            reports.append(coordinator.dial(a, b))
+        except Exception as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=dial, args=(left, right)),
+        threading.Thread(target=dial, args=(right, left)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+    assert not errors
+    assert len(reports) == 2
+    assert all(report["collapsed"] and report["driver"] == b"a" for report in reports)
+    assert left.state.entries() == right.state.entries()
+    assert sum(report["pulled_facts"] for report in reports) == 2
+
+
+def test_three_peer_mesh_forwards_original_writer_proofs_to_convergence():
+    peers = []
+    expected = set()
+    for player in range(3):
+        log = WriterLog.owned()
+        for seq in range(24):
+            fact = Fact("msg", player * 1000 + seq, (),
+                        f"player:{player}:{seq}".encode())
+            log.append(fact)
+            expected.add((fact.ts, fid(fact)))
+        state = PeerState()
+        state.add_owned(log)
+        peers.append(PeerEndpoint(state, endpoint_id=bytes([player])))
+
+    reports = mesh_sync(peers)
+    assert len(reports) == 3
+    assert all(set(peer.state.entries()) == expected for peer in peers)
+    # The last edge transfers third-party writer facts authenticated by their
+    # original heads; the forwarding peer never re-signs them.
+    assert any(report["pushed_facts"] + report["pulled_facts"] >= 24
+               for report in reports)
 
 
 @skeleton

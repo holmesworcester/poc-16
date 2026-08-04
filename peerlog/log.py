@@ -1,38 +1,187 @@
-"""One dense append-only canonical stream per writer.
-
-Density is the availability contract: a head at seq h promises every
-seq <= h exists, so slices have no holes and located refs below a
-stored head cannot fail to resolve. A local WriterLog may be a dense
-suffix (one's own log), or islands (a foreign writer hydrated by chase
-or RBSR); coverage() is the honest statement of which.
-"""
+"""Dense own-writer streams and honest island copies for foreign writers."""
 from dataclasses import dataclass
 
-from .fact import Fact
+from nacl import signing
+from nacl.exceptions import BadSignatureError
+
+from core.fact import canon
+from core.limits import decode_json
+
+from .fact import Fact, canonical, decode_slice, encode_slice, is_control
+
+HEAD_DOMAIN = "poc16-peer-writer-head-v1"
+EMPTY_ROOT = __import__("hashlib").sha256(b"peerlog/seq/empty/v1").digest()
+
+
+def valid_writer(value):
+    return isinstance(value, bytes) and len(value) == 32
 
 
 @dataclass(frozen=True)
 class Head:
     writer: bytes
     seq: int
-    root: bytes          # seq-tree root over the whole log (tree.py)
-    control_root: bytes  # control-subsequence tree root
+    root: bytes
+    control_root: bytes
     sig: bytes
+
+    def __post_init__(self):
+        if not valid_writer(self.writer) or type(self.seq) is not int \
+                or self.seq < -1 or not isinstance(self.root, bytes) \
+                or len(self.root) != 32 or not isinstance(self.control_root, bytes) \
+                or len(self.control_root) != 32 or not isinstance(self.sig, bytes) \
+                or len(self.sig) != 64:
+            raise ValueError("writer head")
+
+
+def _head_message(writer, seq, tree_root, control_root):
+    return canon([
+        HEAD_DOMAIN, writer.hex(), seq, tree_root.hex(), control_root.hex(),
+    ])
+
+
+def verify_head(head):
+    if not isinstance(head, Head):
+        return False
+    try:
+        signing.VerifyKey(head.writer).verify(
+            _head_message(head.writer, head.seq, head.root, head.control_root),
+            head.sig,
+        )
+        return True
+    except (BadSignatureError, TypeError, ValueError):
+        return False
+
+
+def encode_head(head):
+    if not isinstance(head, Head) or not verify_head(head):
+        raise ValueError("writer head")
+    return canon({
+        "control_root": head.control_root.hex(),
+        "format": HEAD_DOMAIN,
+        "root": head.root.hex(),
+        "seq": head.seq,
+        "sig": head.sig.hex(),
+        "writer": head.writer.hex(),
+    })
+
+
+def decode_head(raw):
+    value = decode_json(raw, 4096, "peer writer head")
+    if not isinstance(value, dict) or set(value) != {
+            "control_root", "format", "root", "seq", "sig", "writer"} \
+            or value.get("format") != HEAD_DOMAIN:
+        raise ValueError("peer writer head")
+    try:
+        head = Head(
+            bytes.fromhex(value["writer"]), value["seq"],
+            bytes.fromhex(value["root"]), bytes.fromhex(value["control_root"]),
+            bytes.fromhex(value["sig"]),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("peer writer head") from error
+    if not verify_head(head) or encode_head(head) != raw:
+        raise ValueError("peer writer head")
+    return head
 
 
 class WriterLog:
+    def __init__(self, writer: bytes, secret=None):
+        if secret is not None and not isinstance(secret, signing.SigningKey):
+            raise ValueError("writer secret")
+        if secret is not None and writer != bytes(secret.verify_key):
+            raise ValueError("writer secret binding")
+        if not valid_writer(writer):
+            raise ValueError("writer")
+        self.writer = writer
+        self._secret = secret
+        self._facts = {}
+        self._paths = {}
+        self._head = None
+
+    @classmethod
+    def owned(cls, secret=None):
+        secret = secret or signing.SigningKey.generate()
+        return cls(bytes(secret.verify_key), secret)
+
     def append(self, fact: Fact) -> int:
-        """Own-log only; returns the assigned seq."""
-        raise NotImplementedError
+        """Own-log only; returns the assigned zero-based seq."""
+        if self._secret is None:
+            raise ValueError("foreign writer log")
+        if not isinstance(fact, Fact):
+            raise ValueError("fact")
+        seq = len(self._facts)
+        if self._facts and set(self._facts) != set(range(seq)):
+            raise ValueError("own writer log gap")
+        self._facts[seq] = fact
+        self._sign_head()
+        return seq
 
     def slice(self, lo: int, hi: int) -> bytes:
         """Canonical bytes for seqs [lo, hi); raises on any gap."""
-        raise NotImplementedError
+        if type(lo) is not int or type(hi) is not int or lo < 0 or hi <= lo:
+            raise ValueError("writer slice")
+        try:
+            facts = tuple(self._facts[seq] for seq in range(lo, hi))
+        except KeyError as error:
+            raise ValueError("writer slice gap") from error
+        return encode_slice(facts)
 
     def coverage(self) -> tuple[tuple[int, int], ...]:
         """Contiguous (lo, hi) seq intervals held locally."""
-        raise NotImplementedError
+        intervals = []
+        for seq in sorted(self._facts):
+            if intervals and intervals[-1][1] == seq:
+                intervals[-1] = (intervals[-1][0], seq + 1)
+            else:
+                intervals.append((seq, seq + 1))
+        return tuple(intervals)
 
     def head(self) -> Head:
-        """Latest signed head observed (own log: latest published)."""
-        raise NotImplementedError
+        """Latest signed head observed (own log: latest appended)."""
+        if self._head is None:
+            if self._secret is None:
+                raise ValueError("writer head unavailable")
+            self._sign_head()
+        return self._head
+
+    def fact(self, seq):
+        try:
+            return self._facts[seq]
+        except KeyError as error:
+            raise ValueError("writer sequence unavailable") from error
+
+    def _sign_head(self):
+        from .tree import root_bytes
+        ordered = tuple(canonical(self._facts[seq]) for seq in range(len(self._facts)))
+        controls = tuple(canonical(self._facts[seq]) for seq in range(len(self._facts))
+                         if is_control(self._facts[seq]))
+        tree_root = root_bytes(ordered)
+        control_root = root_bytes(controls)
+        seq = len(ordered) - 1
+        message = _head_message(self.writer, seq, tree_root, control_root)
+        self._head = Head(
+            self.writer, seq, tree_root, control_root,
+            self._secret.sign(message).signature,
+        )
+
+    def _install(self, lo, facts, head):
+        """Install an already verified run without exposing partial mutation."""
+        if head.writer != self.writer:
+            raise ValueError("writer mismatch")
+        replacements = dict(self._facts)
+        for offset, fact in enumerate(facts):
+            seq = lo + offset
+            incumbent = replacements.get(seq)
+            if incumbent is not None and canonical(incumbent) != canonical(fact):
+                raise ValueError("writer equivocation")
+            replacements[seq] = fact
+        self._facts = replacements
+        if self._head is None or head.seq > self._head.seq:
+            self._head = head
+
+    def _raw(self, seq):
+        return canonical(self.fact(seq))
+
+    def __len__(self):
+        return len(self._facts)

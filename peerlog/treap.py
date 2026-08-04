@@ -25,6 +25,7 @@ EMPTY = hashlib.sha256(b"peerlog/treap/empty/v1").digest()
 NODE_FORMAT = "peerlog-treap-node-v1"
 EXACT_FORMAT = "peerlog-treap-exact-v1"
 ROOT_FORMAT = "peerlog-treap-root-v1"
+TIME_PAGE_SPAN = 1_000_000
 
 
 def _valid_ts(value):
@@ -158,14 +159,18 @@ def snapshot(tree, coverage):
         raise ValueError("treap snapshot")
     objects = {}
     covered = []
-    for lo, hi in coverage.ranges:
-        oid, pages = _page_tree(tree.members(lo, hi))
-        objects.update(pages)
-        covered.append([lo, hi, oid.hex()])
+    for range_lo, range_hi in coverage.ranges:
+        lo = range_lo
+        while lo < range_hi:
+            hi = min(range_hi, ((lo // TIME_PAGE_SPAN) + 1) * TIME_PAGE_SPAN)
+            oid, pages = _page_tree(tree.covered_members(lo, hi))
+            objects.update(pages)
+            covered.append([lo, hi, oid.hex()])
+            lo = hi
 
     island_rows = tuple(
         row for row in tree.entries()
-        if not _in_coverage(coverage, row[0])
+        if row[1] in tree._exact or not _in_coverage(coverage, row[0])
     )
     islands = []
     for offset in range(0, len(island_rows), PAGE_BATCH):
@@ -175,6 +180,7 @@ def snapshot(tree, coverage):
         islands.append(oid.hex())
     root = canon({
         "covered": covered,
+        "coverage": [list(item) for item in coverage.ranges],
         "format": ROOT_FORMAT,
         "islands": islands,
     })
@@ -186,21 +192,32 @@ def snapshot(tree, coverage):
 def decode_root(raw):
     value = decode_json(raw, MAX_ROOT_BYTES, "treap root")
     if not isinstance(value, dict) or set(value) != {
-            "covered", "format", "islands"} \
+            "covered", "coverage", "format", "islands"} \
             or value.get("format") != ROOT_FORMAT or canon(value) != raw \
             or not isinstance(value.get("covered"), list) \
+            or not isinstance(value.get("coverage"), list) \
             or not isinstance(value.get("islands"), list):
         raise ValueError("treap root")
-    ranges = []
+    try:
+        coverage = Coverage(tuple(tuple(item) for item in value["coverage"]))
+    except (TypeError, ValueError):
+        raise ValueError("treap root") from None
     covered = []
     for item in value["covered"]:
         if not isinstance(item, list) or len(item) != 3:
             raise ValueError("treap root")
         lo, hi, encoded = item
         oid = _decode_oid(encoded)
-        ranges.append((lo, hi))
         covered.append((lo, hi, oid))
-    coverage = Coverage(tuple(ranges))
+    expected = []
+    for range_lo, range_hi in coverage.ranges:
+        lo = range_lo
+        while lo < range_hi:
+            hi = min(range_hi, ((lo // TIME_PAGE_SPAN) + 1) * TIME_PAGE_SPAN)
+            expected.append((lo, hi))
+            lo = hi
+    if tuple((lo, hi) for lo, hi, _oid in covered) != tuple(expected):
+        raise ValueError("treap root")
     islands = tuple(_decode_oid(item) for item in value["islands"])
     if len(set(islands)) != len(islands):
         raise ValueError("treap root")
@@ -270,14 +287,17 @@ def _verify_object(raw, oid, label):
 class Treap:
     def __init__(self):
         self._by_fid = {}
+        self._exact = set()
 
-    def insert(self, ts: int, f: bytes) -> None:
+    def insert(self, ts: int, f: bytes, *, exact=False) -> None:
         if not _valid_ts(ts) or not _valid_fid_bytes(f):
             raise ValueError("treap fact")
         existing = self._by_fid.get(f)
         if existing is not None and existing != ts:
             raise ValueError("treap fid timestamp")
         self._by_fid[f] = ts
+        if exact:
+            self._exact.add(f)
 
     def fingerprint(self, lo: int, hi: int, coverage: Coverage) -> bytes:
         """Range fingerprint over (ts, fid) in [lo, hi).
@@ -288,7 +308,7 @@ class Treap:
         """
         if not allows(coverage, lo, hi):
             raise ValueError("uncovered fingerprint")
-        return _root_hash(self.members(lo, hi))
+        return _root_hash(self.covered_members(lo, hi))
 
     def split_points(self, lo: int, hi: int, k: int) -> tuple[int, ...]:
         """Deterministic member-quantile subdivision of [lo, hi)."""
@@ -321,6 +341,13 @@ class Treap:
     def entries(self) -> tuple[tuple[int, bytes], ...]:
         """The exact resident set, in reconciliation-key order."""
         return tuple(sorted((ts, fact_id) for fact_id, ts in self._by_fid.items()))
+
+    def covered_members(self, lo, hi):
+        return tuple(row for row in self.members(lo, hi) if row[1] not in self._exact)
+
+    def exact_members(self):
+        return tuple(sorted((self._by_fid[fact_id], fact_id)
+                            for fact_id in self._exact))
 
     def __len__(self):
         return len(self._by_fid)
