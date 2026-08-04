@@ -75,6 +75,18 @@ def test_recent_window_sync_rounds_bounded():
 
 
 @skeleton
+def test_driver_learns_symmetric_difference_and_pushes():
+    """One driver session moves news both ways: the responder ends up
+    holding the driver's news without ever running walk logic."""
+
+
+@skeleton
+def test_simultaneous_dials_collapse_to_single_driver():
+    """Both peers dial at once: exactly one session survives and the
+    lower endpoint id drives it; no duplicate transfer."""
+
+
+@skeleton
 def test_peer_serves_passive_interface_identically():
     """A client's seq-diff recipe run against a peer's Store returns
     byte-identical results to the same recipe against the cloud store."""
