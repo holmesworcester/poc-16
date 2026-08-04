@@ -120,6 +120,8 @@ def test_documents_describe_the_running_writer_forest_and_access_gate():
     assert "range-based set reconciliation (RBSR)" in design
     assert "not one sync session per pile" in design
     assert "Hosted and local turns are isomorphic" in design
+    assert "MAX_SEMANTIC_PILE_BYTES" in design
+    assert "MAX_DIRECT_OBJECT_BYTES" in design
 
     stale_claims = (
         "accepted target architecture",
@@ -225,6 +227,24 @@ def test_core_writer_engine_has_one_authority_flow():
     }
     assert {"mirror", "publish_closed"} <= node_methods
     assert {"turn", "receive_pile", "applier"}.isdisjoint(node_methods)
+
+
+def test_semantic_and_physical_byte_limits_cannot_collapse_again():
+    text = production_text()
+    assert "MAX_PILE_BYTES" not in text
+    for path in (
+            "core/store.py",
+            "full_peer/walk.py",
+            "adapters/s3/store.py",
+            "adapters/r2/worker.py"):
+        assert "MAX_DIRECT_OBJECT_BYTES" in (ROOT / path).read_text()
+    for path in (
+            "core/close.py",
+            "core/writer_fetch.py",
+            "core/writer_layout.py",
+            "core/writer_packer.py",
+            "core/writer_repository.py"):
+        assert "MAX_SEMANTIC_PILE_BYTES" in (ROOT / path).read_text()
 
 
 def test_http_has_one_route_table_and_only_private_removal_control():

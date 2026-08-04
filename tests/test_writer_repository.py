@@ -15,7 +15,7 @@ from core.fact import canon
 from core.limits import (
     MAX_CONTROL_PILE_BYTES,
     MAX_FACT_BYTES,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PayloadTooLarge,
 )
@@ -279,7 +279,7 @@ def test_open_accepted_pile_enforces_the_explicit_streaming_byte_bound(
         with pytest.raises(ValueError, match="byte limit"):
             await open_accepted_pile(
                 store, root.fid, public, 1,
-                max_bytes=MAX_PILE_BYTES + 1)
+                max_bytes=MAX_SEMANTIC_PILE_BYTES + 1)
 
     run(scenario())
 

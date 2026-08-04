@@ -12,7 +12,7 @@ from core.grants import make_token
 from core.http import HttpGate
 from core.limits import (
     MAX_DIRECT_OBJECT_BYTES,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     PayloadTooLarge,
 )
 from core.pack_access import (
@@ -262,7 +262,8 @@ def test_pack_open_codec_has_one_portable_exact_bound():
     whole_get = PackOpen("GET", OID, MAX_PACK_BYTES)
     ranged = PackOpen(
         "GET", OID, MAX_PACK_BYTES,
-        MAX_PACK_BYTES - MAX_PILE_BYTES, MAX_PILE_BYTES)
+        MAX_PACK_BYTES - MAX_SEMANTIC_PILE_BYTES,
+        MAX_SEMANTIC_PILE_BYTES)
     for opened in (whole_put, whole_get, ranged):
         raw = encode_pack_open(opened)
         assert decode_pack_open(raw) == opened
@@ -277,8 +278,9 @@ def test_pack_open_codec_has_one_portable_exact_bound():
 @pytest.mark.parametrize("arguments", (
     ("PUT", OID, MAX_PACK_BYTES + 1, None, None),
     ("PUT", OID, 1, 0, 1),
-    ("GET", OID, 1, 0, MAX_PILE_BYTES + 1),
-    ("GET", OID, MAX_PILE_BYTES, 1, MAX_PILE_BYTES),
+    ("GET", OID, 1, 0, MAX_SEMANTIC_PILE_BYTES + 1),
+    ("GET", OID, MAX_SEMANTIC_PILE_BYTES,
+     1, MAX_SEMANTIC_PILE_BYTES),
     ("GET", OID, 1, 0, 0),
     ("GET", OID, 1, 0, None),
     ("get", OID, 1, None, None),

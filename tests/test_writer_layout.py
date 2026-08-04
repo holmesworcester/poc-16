@@ -14,7 +14,7 @@ from core.close import (
 )
 from core.crypto import h, keypair
 from core.fact import canon
-from core.limits import PayloadTooLarge
+from core.limits import MAX_SEMANTIC_PILE_BYTES, PayloadTooLarge
 from core.object_store import OutcomeUnknown
 from core.store import FsStore
 from core.writer_layout import (
@@ -119,6 +119,25 @@ def test_page_round_trip_has_only_derived_ranges_and_allows_holes():
     empty = LayoutPage(workspace, device, 1, ())
     assert decode_layout_page(encode_layout_page(empty)) == empty
     assert placement_for(empty, 1) is None
+
+
+def test_layout_rejects_a_physical_pack_claiming_an_oversize_pile_slice():
+    workspace, device = h(b"workspace"), h(b"device")
+    raw = canon({
+        "device": device,
+        "format": "poc16-writer-layout-page-v1",
+        "packs": [[
+            1,
+            h(b"hostile physical pack"),
+            MAX_SEMANTIC_PILE_BYTES + 1,
+            [MAX_SEMANTIC_PILE_BYTES + 1],
+        ]],
+        "start": 1,
+        "workspace": workspace,
+    })
+
+    with pytest.raises(InvalidWriterLayout, match="layout encoding"):
+        decode_layout_page(raw)
 
 
 def test_real_signed_piles_build_verify_whole_and_verify_sparse_ranges():
@@ -337,15 +356,19 @@ def test_pack_build_never_crosses_a_window_boundary():
 
 
 def test_exact_and_one_over_portable_pack_bounds():
+    full, remainder = divmod(
+        MAX_LAYOUT_PACK_BYTES, MAX_SEMANTIC_PILE_BYTES)
+    lengths = (MAX_SEMANTIC_PILE_BYTES,) * full + (
+        (remainder,) if remainder else ())
     exact = PackPlacement(
-        1, h(b"exact pack"), MAX_LAYOUT_PACK_BYTES,
-        (MAX_LAYOUT_PACK_BYTES,))
-    assert exact.byte_range(1) == (0, MAX_LAYOUT_PACK_BYTES)
+        1, h(b"exact pack"), MAX_LAYOUT_PACK_BYTES, lengths)
+    assert exact.byte_range(exact.last) == (
+        MAX_LAYOUT_PACK_BYTES - lengths[-1], lengths[-1])
 
     with pytest.raises(ValueError, match="placement"):
         replace(exact, pack_bytes=MAX_LAYOUT_PACK_BYTES + 1)
     with pytest.raises(ValueError, match="placement"):
-        replace(exact, lengths=(MAX_LAYOUT_PACK_BYTES + 1,))
+        replace(exact, lengths=(MAX_SEMANTIC_PILE_BYTES + 1,))
     with pytest.raises(ValueError, match="placement"):
         replace(exact, lengths=(0,))
 
@@ -357,8 +380,8 @@ def test_exact_window_worst_case_fits_and_one_more_cannot_enter_page():
         PackPlacement(
             sequence,
             h(sequence.to_bytes(8, "big")),
-            MAX_LAYOUT_PACK_BYTES,
-            (MAX_LAYOUT_PACK_BYTES,),
+            MAX_SEMANTIC_PILE_BYTES,
+            (MAX_SEMANTIC_PILE_BYTES,),
         )
         for sequence in range(start, start + WINDOW_PILES)
     )

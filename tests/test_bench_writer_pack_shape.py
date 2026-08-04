@@ -14,7 +14,10 @@ from bench.bench_writer_pack_shape import (
     reports,
     writer_shape,
 )
-from core.limits import MAX_PILE_BYTES, MAX_REPOSITORY_OBJECT_BYTES
+from core.limits import (
+    MAX_REPOSITORY_OBJECT_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
+)
 from core.writer_layout import (
     WINDOW_PILES,
     LayoutPage,
@@ -39,7 +42,7 @@ def test_pack_defaults_share_the_running_layout_bounds():
     assert DEFAULT_TARGETS_MIB == (4, 16, 64, 100)
     assert MAX_PILES_PER_PACK == 256
     assert MAX_PACK_BYTES == 95 * MIB
-    assert MAX_PILE_BYTES == MAX_PACK_BYTES
+    assert MAX_SEMANTIC_PILE_BYTES < MAX_PACK_BYTES
     assert MAX_REPOSITORY_OBJECT_BYTES == 4 * MIB
     assert WINDOW_PILES == 16_384
     assert FETCH_CONCURRENCIES == (32, 64)
@@ -186,7 +189,7 @@ def test_valid_pile_above_nominal_target_becomes_one_pile_pack():
     maximum = WriterInventory(
         "a" * 64,
         "b" * 64,
-        (PileRef(1, "1" * 64, MAX_PILE_BYTES),),
+        (PileRef(1, "1" * 64, MAX_SEMANTIC_PILE_BYTES),),
     )
     assert len(writer_shape(maximum, 4 * MIB).sealed) == 1
 
@@ -195,14 +198,14 @@ def test_protocol_oversize_pile_is_rejected_and_target_is_clamped():
     oversize = WriterInventory(
         "a" * 64,
         "b" * 64,
-        (PileRef(1, "1" * 64, MAX_PILE_BYTES + 1),),
+        (PileRef(1, "1" * 64, MAX_SEMANTIC_PILE_BYTES + 1),),
     )
     with pytest.raises(ValueError, match="protocol limit"):
         writer_shape(oversize, 100 * MIB)
 
-    many = inventory(20, MAX_PILE_BYTES)
+    many = inventory(20, MAX_SEMANTIC_PILE_BYTES)
     shape = writer_shape(many, 100 * MIB, force_seal_tail=True)
-    assert tuple(len(pack.piles) for pack in shape.sealed) == (1,) * 20
+    assert tuple(len(pack.piles) for pack in shape.sealed) == (8, 8, 4)
     assert all(pack.body_bytes <= MAX_PACK_BYTES for pack in shape.sealed)
     assert report((many,), 100, durable_facts=20).effective_target_mib == 95
 

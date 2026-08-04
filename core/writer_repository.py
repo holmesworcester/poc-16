@@ -25,7 +25,7 @@ from .limits import (
     MAX_HEAD_CONTROL_PILES,
     MAX_HEAD_PERMIT_BYTES,
     MAX_MIRROR_CONTROL_ATTEMPTS,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
     PayloadTooLarge,
@@ -245,11 +245,11 @@ async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
 
 
 async def _copy_pile_object(
-        store, oid, write, maximum=MAX_PILE_BYTES):
+        store, oid, write, maximum=MAX_SEMANTIC_PILE_BYTES):
     """Copy one pile through the required streaming data plane."""
     if not valid_fid(oid) or not callable(write) \
             or type(maximum) is not int \
-            or not 0 < maximum <= MAX_PILE_BYTES:
+            or not 0 < maximum <= MAX_SEMANTIC_PILE_BYTES:
         raise ValueError("repository pile copy")
     copied = await _maybe_await(
         store.copy_pile_object(oid, maximum, write))
@@ -260,7 +260,7 @@ async def _copy_pile_object(
     return copied
 
 
-async def _pile_object(store, oid, maximum=MAX_PILE_BYTES):
+async def _pile_object(store, oid, maximum=MAX_SEMANTIC_PILE_BYTES):
     value = bytearray()
     copied = await _copy_pile_object(
         store, oid, value.extend, maximum)
@@ -311,9 +311,11 @@ async def control_extension(
 
 
 async def open_accepted_pile(
-        store, workspace, device, sequence, *, max_bytes=MAX_PILE_BYTES):
+        store, workspace, device, sequence,
+        *, max_bytes=MAX_SEMANTIC_PILE_BYTES):
     """Open one original pile through the recipient's current accepted head."""
-    if type(max_bytes) is not int or not 0 < max_bytes <= MAX_PILE_BYTES:
+    if type(max_bytes) is not int \
+            or not 0 < max_bytes <= MAX_SEMANTIC_PILE_BYTES:
         raise ValueError("accepted pile byte limit")
     leaf = leaf_key(sequence)
     store = async_store(store)
@@ -363,7 +365,8 @@ async def _same_pile_object(store, oid, expected_bytes):
 
 async def ensure_pile_async(store, oid, raw):
     """Establish one large immutable pile and verify every collision."""
-    if not isinstance(raw, bytes) or len(raw) > MAX_PILE_BYTES \
+    if not isinstance(raw, bytes) \
+            or len(raw) > MAX_SEMANTIC_PILE_BYTES \
             or not valid_fid(oid) or h(raw) != oid:
         raise ValueError("immutable pile address")
     store = async_store(store)
@@ -435,13 +438,14 @@ async def _writer_piles(source, workspace, device, rows):
         fetch(workspace, device, rows))
     if values is NotImplemented:
         values = await _objects(
-            source, (oid for _key, oid in rows), MAX_PILE_BYTES)
+            source, (oid for _key, oid in rows),
+            MAX_SEMANTIC_PILE_BYTES)
     if not isinstance(values, (tuple, list)) or len(values) != len(rows):
         raise ValueError("repository pile fetch")
     checked = []
     for (_key, oid), raw in zip(rows, values):
         if not isinstance(raw, bytes) \
-                or len(raw) > MAX_PILE_BYTES \
+                or len(raw) > MAX_SEMANTIC_PILE_BYTES \
                 or h(raw) != oid:
             raise ValueError("repository object integrity")
         checked.append(raw)

@@ -38,7 +38,7 @@ from core.crypto import h, load_sk
 from core.close import EvaluatedPile, decode_signed_pile
 from core.kernel import Judgment, Valid
 from core.limits import (
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_PAGE_BATCH_BYTES,
     MAX_STORE_READ_BYTES,
     PAGE_BATCH,
@@ -111,7 +111,8 @@ class MemoryStore:
             value, VersionToken(self.tokens[key]))
 
     async def copy_pile_object(self, oid, maximum, write):
-        if type(maximum) is not int or not 0 < maximum <= MAX_PILE_BYTES:
+        if type(maximum) is not int \
+                or not 0 < maximum <= MAX_SEMANTIC_PILE_BYTES:
             raise ValueError("memory-store pile bound")
         value = self.data.get("obj/" + oid)
         if value is not None and len(value) > maximum:
@@ -479,7 +480,8 @@ class TraceRemoteStore:
         return value
 
     async def copy_pile_object(self, oid, maximum, write):
-        if type(maximum) is not int or not 0 < maximum <= MAX_PILE_BYTES:
+        if type(maximum) is not int \
+                or not 0 < maximum <= MAX_SEMANTIC_PILE_BYTES:
             raise ValueError("trace remote pile bound")
         value = self.forest.source.data.get("obj/" + oid)
         if value is not None and len(value) > maximum:

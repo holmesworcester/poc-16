@@ -17,7 +17,7 @@ from collections import defaultdict
 import inspect
 
 from .crypto import h
-from .limits import MAX_PILE_BYTES
+from .limits import MAX_SEMANTIC_PILE_BYTES
 from .pack_access import PackOpen
 from .shape import valid_fid
 from .writer_layout import (
@@ -105,7 +105,7 @@ def _rows(values, workspace, device):
 
 def _verified_loose(raw, oid):
     if not isinstance(raw, bytes) \
-            or len(raw) > MAX_PILE_BYTES or h(raw) != oid:
+            or len(raw) > MAX_SEMANTIC_PILE_BYTES or h(raw) != oid:
         raise ValueError("repository object integrity")
     return raw
 
@@ -222,7 +222,7 @@ async def fetch_layout_piles(
     if missing:
         loose = await _maybe_await(read_loose(
             tuple(oid for _sequence, oid in missing),
-            MAX_PILE_BYTES,
+            MAX_SEMANTIC_PILE_BYTES,
         ))
         if not isinstance(loose, (tuple, list)) \
                 or len(loose) != len(missing):

@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from .fact import canon
 from .limits import (
     MAX_DIRECT_OBJECT_BYTES,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_WRITER_PACK_BYTES,
     DIRECT_STREAM_CHUNK_BYTES,
     PayloadTooLarge,
@@ -100,7 +100,7 @@ class PackOpen:
                     type(self.offset) is not int
                     or type(self.length) is not int
                     or self.offset < 0
-                    or not 1 <= self.length <= MAX_PILE_BYTES
+                    or not 1 <= self.length <= MAX_SEMANTIC_PILE_BYTES
                     or self.offset + self.length > self.pack_bytes
                 ):
             raise InvalidPackAccess("pack OPEN")

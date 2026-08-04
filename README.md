@@ -688,6 +688,13 @@ Peers do not proxy large immutable bodies through Lambda or a Worker. Under
 the section 7 cut, a stateful writer prepares the same objects it uses locally,
 then publishes:
 
+`MAX_SEMANTIC_PILE_BYTES` is 11,491,734 bytes (about 10.96 MiB), derived
+from the smallest hosted evaluator's 128,000,000-byte peak-memory envelope.
+The separate `MAX_DIRECT_OBJECT_BYTES` and writer-pack ceiling is 95 MiB.
+Filesystem, FullPeer, S3/Lambda, and R2/Worker direct paths may stream that
+physical maximum, but only independently bounded complete piles enter the
+semantic evaluator.
+
 ```text
 mint one current sync grant from a device-signed proof carrying the current removal path
   -> POST /obj/open or /pack/open for an exact create-only PUT

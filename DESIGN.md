@@ -434,10 +434,13 @@ holes. A hole means "fetch the normal pile object," not deletion. Pack bodies
 never cross writer or layout-window boundaries.
 
 Large pile and pack bytes use a control/data split. A fact remains bounded at
-four MiB, but a useful signed closed pile may contain many large facts and is
-bounded at 95 MiB. A physical pack has that same ceiling, so a maximum pile is
-simply a one-pile pack while smaller piles may share one pack. Discarded
-membership/removal proofs retain their separate five-MiB evaluation budget.
+four MiB. `MAX_SEMANTIC_PILE_BYTES` is 11,491,734 bytes (about 10.96 MiB),
+derived from the 128,000,000-byte hosted peak-memory model at the worst legal
+fact and JSON-value counts. `MAX_DIRECT_OBJECT_BYTES` and the physical pack
+ceiling remain 95 MiB, so several smaller complete piles may share one pack.
+The ability to stream or range-read a physical object does not make that whole
+object one evaluable pile. Discarded membership/removal proofs retain their
+separate five-MiB evaluation budget.
 
 The common gate handles one small authenticated `ObjectOpen` or `PackOpen`
 value bound to the content-addressed OID, method, declared ceiling, and, for a

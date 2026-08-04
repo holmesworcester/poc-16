@@ -17,7 +17,7 @@ from core.fact import canon
 from core.grants import make_token
 from core.limits import (
     MAX_FACT_BYTES,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
 )
 from core.object_store import ABSENT, Applied, Versioned
@@ -690,5 +690,5 @@ def test_real_http_loose_piles_use_the_same_direct_object_stream(tmp_path):
 
     assert result.errors == ()
     assert result.changed == 1 and result.piles == len(raws)
-    assert limits.count(MAX_PILE_BYTES) == len(raws)
+    assert limits.count(MAX_SEMANTIC_PILE_BYTES) == len(raws)
     assert consumer.fact_ids()

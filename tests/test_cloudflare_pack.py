@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from core.crypto import h
-from core.limits import MAX_DIRECT_OBJECT_BYTES, MAX_PILE_BYTES
+from core.limits import MAX_DIRECT_OBJECT_BYTES, MAX_SEMANTIC_PILE_BYTES
 from core.pack_access import (
     MAX_PACK_BYTES,
     MAX_SCOPED_TTL_MS,
@@ -163,8 +163,8 @@ def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
         "GET",
         OID,
         MAX_PACK_BYTES,
-        MAX_PACK_BYTES - MAX_PILE_BYTES,
-        MAX_PILE_BYTES,
+        MAX_PACK_BYTES - MAX_SEMANTIC_PILE_BYTES,
+        MAX_SEMANTIC_PILE_BYTES,
     )
     issued = issuer()
 
@@ -179,7 +179,8 @@ def test_whole_and_exact_range_gets_are_direct_presigned_r2_requests():
     assert whole_request.headers == ()
     assert range_request.headers == ((
         "range",
-        f"bytes={MAX_PACK_BYTES - MAX_PILE_BYTES}-{MAX_PACK_BYTES - 1}",
+        f"bytes={MAX_PACK_BYTES - MAX_SEMANTIC_PILE_BYTES}-"
+        f"{MAX_PACK_BYTES - 1}",
     ),)
     assert parse_qs(urlsplit(whole_request.url).query)[
         "X-Amz-SignedHeaders"] == ["host"]

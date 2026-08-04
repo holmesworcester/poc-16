@@ -14,6 +14,7 @@ from .crypto import h
 from .fact import canon
 from .limits import (
     MAX_OBJECT_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_WRITER_PACK_BYTES,
     WRITER_LAYOUT_WINDOW_PILES,
     PayloadTooLarge,
@@ -108,8 +109,10 @@ class PackPlacement:
                 or not 1 <= self.pack_bytes <= MAX_LAYOUT_PACK_BYTES \
                 or not isinstance(self.lengths, tuple) \
                 or not 1 <= len(self.lengths) <= WINDOW_PILES \
-                or any(type(length) is not int or length <= 0
-                       for length in self.lengths) \
+                or any(
+                    type(length) is not int
+                    or not 1 <= length <= MAX_SEMANTIC_PILE_BYTES
+                    for length in self.lengths) \
                 or self.first + len(self.lengths) - 1 > MAX_WRITER_SEQUENCE:
             raise ValueError("writer pack placement")
         offsets = []

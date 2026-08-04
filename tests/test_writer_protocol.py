@@ -15,7 +15,18 @@ from core.close import (
     signed_pile_oid,
 )
 from core.crypto import h, keypair, sign
-from core.fact import canon
+from core.fact import Fact, canon
+from core.limits import (
+    MAX_DIRECT_OBJECT_BYTES,
+    MAX_OBJECT_BYTES,
+    MAX_PILE_FACTS,
+    MAX_PILE_JSON_VALUES,
+    MAX_SEMANTIC_PILE_BYTES,
+    MAX_WRITER_PACK_BYTES,
+    MIN_HOSTED_MEMORY_BYTES,
+    evaluator_peak_bound,
+    evaluator_pile_byte_bound,
+)
 from core.writer_head import (
     HeadSlot,
     InvalidWriterHead,
@@ -58,6 +69,22 @@ def signed_workspace_pile(name="alice"):
     return secret, public, root, pile, encode_signed_pile(pile)
 
 
+def canonical_padding_pile(target_bytes, secret, public, workspace):
+    """Build an exact-size canonical pile without a protocol-sized fixture."""
+    def encoded(padding):
+        fact = Fact(
+            "test_padding", 1, [], {"padding": "x" * padding}, workspace)
+        return encode_signed_pile(make_signed_pile(
+            secret, workspace, public, (fact,)))
+
+    base = encoded(0)
+    if target_bytes < len(base):
+        raise ValueError("padding pile target")
+    raw = encoded(target_bytes - len(base))
+    assert len(raw) == target_bytes
+    return raw
+
+
 def test_signed_pile_is_the_same_canonical_push_and_pull_value():
     _secret, public, root, pile, raw = signed_workspace_pile()
 
@@ -68,6 +95,48 @@ def test_signed_pile_is_the_same_canonical_push_and_pull_value():
     assert tuple(valid.fact.fid for valid in evaluated.judgment.valids) == (
         root.fid,)
     assert signed_pile_oid(raw) == h(raw)
+
+
+def test_semantic_pile_ceiling_is_the_exact_hosted_memory_bound():
+    assert MAX_SEMANTIC_PILE_BYTES == evaluator_pile_byte_bound(
+        MIN_HOSTED_MEMORY_BYTES,
+        MAX_PILE_JSON_VALUES,
+        MAX_PILE_FACTS,
+    )
+    assert evaluator_peak_bound(
+        MAX_SEMANTIC_PILE_BYTES,
+        MAX_PILE_JSON_VALUES,
+        MAX_PILE_FACTS,
+    ) <= MIN_HOSTED_MEMORY_BYTES
+    assert evaluator_peak_bound(
+        MAX_SEMANTIC_PILE_BYTES + 1,
+        MAX_PILE_JSON_VALUES,
+        MAX_PILE_FACTS,
+    ) > MIN_HOSTED_MEMORY_BYTES
+    assert MAX_OBJECT_BYTES < MAX_SEMANTIC_PILE_BYTES \
+        < MAX_DIRECT_OBJECT_BYTES == MAX_WRITER_PACK_BYTES
+
+
+def test_canonical_pile_exact_bound_reaches_semantics_and_one_over_does_not(
+        monkeypatch):
+    from core import close as close_module
+
+    secret, public = keypair()
+    workspace = h(b"bounded canonical pile")
+    target = 4 * 1024
+    exact = canonical_padding_pile(target, secret, public, workspace)
+    one_over = canonical_padding_pile(
+        target + 1, secret, public, workspace)
+    monkeypatch.setattr(
+        close_module, "MAX_SEMANTIC_PILE_BYTES", target)
+    evaluator = ClosedPileEvaluator(workspace, max_bytes=target)
+
+    # The synthetic family is intentionally unknown: reaching kernel judgment
+    # proves exact-bound canonical bytes passed every byte/codec check.
+    with pytest.raises(KernelRejected, match="closed pile rejected"):
+        evaluator.evaluate(exact, writer=public)
+    with pytest.raises(InvalidPile, match="pile too large"):
+        evaluator.evaluate(one_over, writer=public)
 
 
 def test_unsigned_predecessor_pile_has_no_decode_path():

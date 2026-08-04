@@ -1331,8 +1331,8 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
     # than shrinking this shared object-response ceiling.
     assert runtime.MAX_OBJECT_BYTES == limits.MAX_OBJECT_BYTES \
         == limits.MAX_REPOSITORY_OBJECT_BYTES == limits.MAX_FACT_BYTES
-    assert limits.MAX_DIRECT_OBJECT_BYTES == limits.MAX_PILE_BYTES \
-        > runtime.MAX_OBJECT_BYTES
+    assert limits.MAX_DIRECT_OBJECT_BYTES == limits.MAX_WRITER_PACK_BYTES \
+        > limits.MAX_SEMANTIC_PILE_BYTES > runtime.MAX_OBJECT_BYTES
     assert runtime.MAX_BATCH_COUNT <= limits.PAGE_BATCH
     assert runtime.MAX_BATCH_BYTES == limits.MAX_PAGE_BATCH_BYTES
     assert config["limits"]["subrequests"] \

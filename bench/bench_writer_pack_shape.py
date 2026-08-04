@@ -44,7 +44,7 @@ from bench.bench_writer_p2p_scale import (
 )
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h
-from core.limits import MAX_PILE_BYTES, MIB
+from core.limits import MAX_SEMANTIC_PILE_BYTES, MIB
 from core.writer_layout import (
     MAX_LAYOUT_PACK_BYTES,
     WINDOW_PILES,
@@ -253,7 +253,7 @@ def writer_shape(inventory, target_bytes, *, force_seal_tail=False):
             pending, pending_bytes = [], 0
 
     for pile in inventory.piles:
-        if pile.size > MAX_PILE_BYTES:
+        if pile.size > MAX_SEMANTIC_PILE_BYTES:
             raise ValueError("pile exceeds protocol limit")
         if pile.size > target_bytes:
             # A caller may benchmark a target below the shared semantic-

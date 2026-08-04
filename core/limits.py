@@ -9,13 +9,12 @@ import json
 
 MIB = 1024 * 1024
 
-# A writer pile is a useful closed bundle, not merely one fact plus framing.
-# One maximum pile must fit as a one-pile physical pack; smaller piles may be
-# concatenated into that same ceiling.  Hosted peers transfer either value
-# directly rather than buffering it through their metadata worker.
+# Physical pack/object transfer is independent of semantic pile evaluation.
+# Packs may concatenate several complete piles up to this streamed ceiling;
+# none of the pack, direct-object, or provider paths may imply that one value
+# of this size can be decoded in a hosted evaluator turn.
 MAX_FACT_BYTES = 4 * MIB
-MAX_PILE_BYTES = 95 * MIB
-MAX_WRITER_PACK_BYTES = MAX_PILE_BYTES
+MAX_WRITER_PACK_BYTES = 95 * MIB
 
 # Discarded access proofs and the remaining buffered pile door use the same
 # deliberately small budget. Content pull is the only path that needs the full
@@ -66,7 +65,7 @@ MAX_REPOSITORY_OBJECT_BYTES = max(
     MAX_FACT_BYTES, MAX_MERKLE_PAGE_BYTES)
 MAX_OBJECT_BYTES = MAX_REPOSITORY_OBJECT_BYTES
 MAX_DIRECT_OBJECT_BYTES = max(
-    MAX_REPOSITORY_OBJECT_BYTES, MAX_PILE_BYTES)
+    MAX_REPOSITORY_OBJECT_BYTES, MAX_WRITER_PACK_BYTES)
 
 # One immutable closed pile. These are protocol limits, not merely
 # implementation budgets: every receiving engine enforces the same boundary.
@@ -158,6 +157,25 @@ def evaluator_peak_bound(pile_bytes, json_values, fact_count):
         + _FACT_DECODE_BYTES * fact_count
         + closure_bitset_bound(fact_count)
     )
+
+
+def evaluator_pile_byte_bound(memory_bytes, json_values, fact_count):
+    """Largest pile byte count admitted by one evaluator memory envelope."""
+    if type(memory_bytes) is not int or memory_bytes < 0:
+        raise ValueError("evaluator memory limit")
+    fixed = evaluator_peak_bound(0, json_values, fact_count)
+    return max(0, (memory_bytes - fixed) // _PILE_BUFFER_COPIES)
+
+
+# One immutable semantic pile. This is derived for the worst legal JSON and
+# fact counts, so the byte ceiling alone proves that every admitted canonical
+# pile fits the smallest hosted evaluator. It is intentionally smaller than
+# the physical streamed-object/pack ceiling above.
+MAX_SEMANTIC_PILE_BYTES = evaluator_pile_byte_bound(
+    MIN_HOSTED_MEMORY_BYTES,
+    MAX_PILE_JSON_VALUES,
+    MAX_PILE_FACTS,
+)
 
 # Clear-envelope names become authenticated index vocabulary; values may
 # become authenticated map keys. Bound both before family dispatch so malformed

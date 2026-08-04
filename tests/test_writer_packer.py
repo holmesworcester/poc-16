@@ -374,7 +374,7 @@ def test_loose_pile_read_enforces_exact_named_pile_bound(monkeypatch):
     exact, exact_sink, _store = packer_for(
         exact_bucket, "exact", root, device)
     monkeypatch.setattr(
-        writer_packer_module, "MAX_PILE_BYTES", len(raws[0]))
+        writer_packer_module, "MAX_SEMANTIC_PILE_BYTES", len(raws[0]))
     assert run(exact.pack(rows, now_ms=0, force=True)) is not None
     assert len(exact_sink.calls) == 1
 
@@ -382,7 +382,10 @@ def test_loose_pile_read_enforces_exact_named_pile_bound(monkeypatch):
     over, over_sink, over_store = packer_for(
         over_bucket, "over", root, device)
     monkeypatch.setattr(
-        writer_packer_module, "MAX_PILE_BYTES", len(raws[0]) - 1)
+        writer_packer_module,
+        "MAX_SEMANTIC_PILE_BYTES",
+        len(raws[0]) - 1,
+    )
     with pytest.raises(PayloadTooLarge, match="loose pile too large"):
         run(over.pack(rows, now_ms=0, force=True))
     assert over_sink.calls == []

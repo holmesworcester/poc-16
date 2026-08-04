@@ -16,7 +16,7 @@ from .fact import Fact, bound_to, canon, encode, from_json
 from .limits import (
     MIN_HOSTED_MEMORY_BYTES,
     InvalidEncoding,
-    MAX_PILE_BYTES,
+    MAX_SEMANTIC_PILE_BYTES,
     MAX_PILE_FACTS,
     MAX_PILE_JSON_VALUES,
     PayloadTooLarge,
@@ -50,7 +50,7 @@ def check_pile_bounds(raw):
     """
     if not isinstance(raw, bytes):
         raise InvalidEncoding("pile bytes")
-    if len(raw) > MAX_PILE_BYTES:
+    if len(raw) > MAX_SEMANTIC_PILE_BYTES:
         raise PayloadTooLarge("pile too large")
     values = _scan_json_values(raw)
     facts = _scan_root_facts(raw)
@@ -303,7 +303,7 @@ def decode_signed_pile(raw, workspace=None, writer=None):
     """Decode and verify one canonical signed closed-pile value."""
     try:
         check_pile_bounds(raw)
-        value = decode_json(raw, MAX_PILE_BYTES, "signed pile")
+        value = decode_json(raw, MAX_SEMANTIC_PILE_BYTES, "signed pile")
         if not isinstance(value, dict) or set(value) != {
                 "facts", "format", "signature", "workspace", "writer"} \
                 or value.get("format") != SIGNED_PILE_FORMAT \
@@ -345,10 +345,10 @@ class EvaluatedPile:
 class ClosedPileEvaluator:
     """The shared signed-pile semantic door for push and pull."""
 
-    def __init__(self, workspace, *, max_bytes=MAX_PILE_BYTES):
+    def __init__(self, workspace, *, max_bytes=MAX_SEMANTIC_PILE_BYTES):
         if not valid_fid(workspace) \
                 or type(max_bytes) is not int \
-                or not 0 < max_bytes <= MAX_PILE_BYTES:
+                or not 0 < max_bytes <= MAX_SEMANTIC_PILE_BYTES:
             raise ValueError("pile evaluator options")
         self.workspace = workspace
         self.max_bytes = max_bytes

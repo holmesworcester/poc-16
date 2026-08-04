@@ -16,7 +16,7 @@ import inspect
 from itertools import islice
 
 from .crypto import h
-from .limits import MAX_PILE_BYTES, PayloadTooLarge
+from .limits import MAX_SEMANTIC_PILE_BYTES, PayloadTooLarge
 from .object_store import ABSENT, CREATED, EXISTS, CreateResult, Versioned
 from .shape import valid_fid
 from .writer_layout import (
@@ -201,7 +201,7 @@ class WriterPacker:
             raw = await _maybe_await(self.read_loose(row.oid))
             if not isinstance(raw, bytes) or not raw:
                 raise InvalidWriterLayout("writer packer loose pile integrity")
-            if len(raw) > MAX_PILE_BYTES:
+            if len(raw) > MAX_SEMANTIC_PILE_BYTES:
                 raise PayloadTooLarge("writer packer loose pile too large")
             if h(raw) != row.oid:
                 raise InvalidWriterLayout("writer packer loose pile integrity")
