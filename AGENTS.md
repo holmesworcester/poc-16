@@ -40,11 +40,13 @@ peer pull
 
 hosted owner publication
   -> direct create-only immutable object PUTs
-  -> the same exact owner-head proof
+  -> ordinary head: the same exact owner-head proof
+  -> control head: one exact preauthorized base/head/control permit
+  -> join private removal state before its bound head CAS
   -> CAS only the caller's writer slot
 ```
 
-The logical `AuthorityGate` is actor-neutral. Hosted and full peers use the
+The logical `AccessGate` is actor-neutral. Hosted and full peers use the
 same pile codec, removal-path verifier, family queries, and `OpaqueHeadGate`.
 It has two device-signed, discarded proof turns. First, a historical-member
 proof containing the owning member's signature over the requesting device may
@@ -54,6 +56,15 @@ read, sync, or head action. Neither turn installs authority facts or asks the
 recipient to synchronize an authority repository. A head proof can authorize
 only the proposed head OID named in the request and never validates the
 advertised content tree.
+
+A control-bearing head is the one removal-state exception. While the ordinary
+current proof still succeeds, the gate issues a stateless permit bound to that
+writer, base, proposed head, and bounded set of original control-pile OIDs.
+Commit re-evaluates exactly those control-only piles, joins their mechanical
+CLEAR/ACTIVE cells first, then attempts the bound slot CAS. Never add a
+bearer-only removal update, accepted-leaf poke, scan, cursor, or cached repair
+state. Removal may be ahead after a crash; an accepted head may never be ahead
+of its removal effects.
 
 Removal state is private point-read state. Never store or serve its roots/pages
 through generic `obj/`, pack, direct-open, or public LIST paths. A writer slot's
@@ -82,9 +93,9 @@ sync session per pile without measurements that invalidate the forest.
 3. `core/writer_tree.py`, `core/writer_head.py`, and
    `core/writer_repository.py`: writer logs, owner publication, mirroring, and
    optional consumption.
-4. `core/authority.py` and `core/suppression.py`: the two discarded proof
-   purposes and bounded verification against the recipient's pinned removal
-   tree.
+4. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
+   `core/suppression_tree.py`: the two discarded proof purposes and bounded
+   verification against the recipient's private pinned removal tree.
 5. `core/http.py`: the one route and grant gate used by every runtime.
 6. `full_peer/pile_sender.py`, `full_peer/node.py`, and
    `full_peer/sql_store.py`: stateful authorship, composition, and the sole SQL

@@ -6,10 +6,9 @@ database-free authority, object, head, and HTTP core. A hosted owner target
 needs an object store but no database. SQLite exists only as a disposable
 full-client query and authorship accelerator.
 
-The writer-forest content path described here is running. The two-phase
-removal-path bootstrap in section 7 of `DESIGN.md` is the accepted security cut
-tracked by `poc-16-6j4.16`; authority/removal-path statements below describe
-that target until the bead closes.
+The writer forest and the two-phase self-confined removal-path gate described
+here are the running protocol. There is no predecessor authority repository or
+compatibility route behind them.
 
 The implementation is deliberately strict about authority and direction:
 
@@ -19,9 +18,8 @@ The implementation is deliberately strict about authority and direction:
   piles; `FactConsumer` admits their durable facts to an optional local
   projection.
 - `PileSender` is the full peer's SQL-permitted close/sign boundary. Its normal
-  send path publishes through `WriterLog`, not `RepositoryApplier`.
-- The target `AuthorityGate` first accepts a device-signed historical-member
-  proof to
+  send path publishes through `WriterLog`.
+- `AccessGate` first accepts a device-signed historical-member proof to
   return only that member/device pair's current removal path, then accepts a
   second device-signed current-member proof carrying that path. Both judgments
   are discarded; neither synchronizes or mutates recipient authority state.
@@ -43,9 +41,9 @@ objects directly and may CAS only their own writer slot.
 3. `core/writer_tree.py`, `core/writer_head.py`, and
    `core/writer_repository.py`: per-device logs, owner publication, mirroring,
    and optional consumption.
-4. `core/authority.py` and `core/suppression.py`: the authority implementation
-   being cut to self-confined removal-path refresh and current-membership checks
-   against the recipient's pinned root.
+4. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
+   `core/suppression_tree.py`: discarded access judgments and the recipient's
+   private authenticated removal state.
 5. `core/http.py`, `core/http_stdlib.py`: the shared peer gate, then its
    standard-library HTTP server/byte adapter.
 6. `full_peer/pile_sender.py`: stateful-client authorship and closure.
@@ -209,9 +207,7 @@ daemon configuration cannot mix plain remote URLs with Iroh peer records.
 
 ## Repository flow
 
-An ordinary FullPeer-authored unit follows this running content path; the
-authority step names the accepted section 7 cut while `poc-16-6j4.16` remains
-open:
+An ordinary FullPeer-authored unit follows this running content path:
 
 ```text
 facts command
@@ -267,7 +263,7 @@ maps of acknowledged head OID by writer, already-emitted trigger FID, and exact
 rejected head OID by writer. Repeated closure dependencies therefore do not
 repeat notifications, and one malformed writer head is quarantined without
 being acknowledged or blocking other writers. Discovery does not consult
-SQLite, ingress, `RepositoryApplier`, or a workspace-wide content root.
+SQLite, ingress, or a workspace-wide content root.
 
 Bootstrap is explicit: normal launch validates all current writer heads and
 marks their existing triggers seen, while a deliberate backfill starts with
@@ -682,8 +678,9 @@ then publishes:
 mint one current sync grant from a device-signed proof carrying the current removal path
   -> POST /obj/open or /pack/open for an exact create-only PUT
   -> PUT missing pile/tree/head objects directly to S3 or R2
-  -> POST /removal/apply for each exact new control pile, if any
-  -> POST /head/<proposed-head-oid> with an exact closed head proof
+  -> ordinary head: POST /head/<proposed-head-oid> with an exact closed proof
+  -> control head: issue an exact base/head/control-pile permit while current
+  -> control head: commit the permit, joining removal before the head CAS
   -> CAS heads/<workspace>/<device>
 ```
 
@@ -742,14 +739,15 @@ AWS uses one externally owned S3 bucket and one Lambda stack. The Lambda runs
 the shared `HttpGate` with the `owner` capability: it can read the recipient's
 removal tree and writer forest, create content-addressed objects/packs, and
 conditionally advance writer slots. A public `/removal/bootstrap` accepts only
-an original direct-member CLEAR closure. Thereafter an owner grant may submit
-an exact writer-signed control pile to `/removal/apply`; the Lambda commits its
-removal-state effects before it will accept the corresponding head. Ordinary
-content and malformed piles are rejected, and retries are idempotent. A closed
-head proof confines each slot update to its authenticated device. The Function
-URL adapter admits at most 4 MiB of raw control-pile bytes so base64 expansion
-and event metadata remain within Lambda's buffered invocation envelope; other
-metadata requests remain capped at 512 KiB. The template creates
+an original direct-member CLEAR closure. A control-bearing head first obtains
+a stateless permit bound to its current proof, exact base/head, and immutable
+control piles. Permit commit evaluates those control-only piles, joins their
+private removal cells, and only then attempts the head CAS. Ordinary content
+and malformed control piles are rejected, and exact retries are idempotent. A
+closed head proof confines each slot update to its authenticated device. The
+Function URL adapter applies named request and aggregate control-pile bounds so
+base64 expansion and event metadata remain within Lambda's buffered invocation
+envelope; other metadata requests remain capped at 512 KiB. The template creates
 the grant secret, role, Function URL, logs, and alarm; it never creates or
 deletes the bucket.
 
@@ -789,11 +787,10 @@ with the same `owner` capability. Small metadata operations use the native R2
 binding. Large GETs use scoped R2 S3/SigV4 URLs; large create-only PUTs use a
 short-lived HMAC ticket at a minimal streaming Worker route backed by the
 native R2 binding. Neither body enters the Python Worker heap. The owner
-gateway can apply an authenticated exact control pile to private `removal`
-state before advancing its writer slot, but it has no generic authority
-publication route and no delete path. Its control routes stream and bound at
-the portable 5 MiB control-pile ceiling; ordinary metadata remains capped at
-512 KiB.
+gateway uses the same exact control-head permit to join private `removal` state
+before advancing its writer slot, but it has no generic authority publication
+route and no delete path. Control-pile count and aggregate bytes are bounded by
+named portable constants; ordinary metadata remains capped at 512 KiB.
 
 Set the non-secret deployment inputs:
 

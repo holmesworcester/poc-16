@@ -6,10 +6,6 @@ advancing device logs, and no predecessor-format content root or ingress path
 is accepted. Remaining measurement and live-deployment work is tracked in
 beads; it is not a compatibility switch.
 
-Section 7's two-phase removal-path bootstrap is the accepted security cut, not
-yet a claim about running code; implementation and removal of the predecessor
-authority-publication path are tracked by `poc-16-6j4.16`.
-
 The central decision is:
 
 ```text
@@ -47,7 +43,7 @@ The design must provide:
 - origin-preserving P2P sync of locally validated, writer-device-signed piles;
 - deterministic convergence from mixed but individually valid log views;
 - maximal isomorphism between hosted and full peers: one pile codec, evaluator,
-  authority gate, mirror, consumer, and condition-query implementation;
+  access gate, mirror, consumer, and condition-query implementation;
 - bounded operations under Lambda and Cloudflare Worker limits;
 - no destructive action in the publication path.
 
@@ -71,7 +67,7 @@ LogWriter
 ClosedPileEvaluator
     canonical closed-pile bytes -> bounded kernel/family judgment
 
-AuthorityGate
+AccessGate
     historical-member proof -> caller-confined current removal path
     current-member proof + path -> exact bounded action
 
@@ -96,7 +92,7 @@ invoke the same canonical decoder, outer writer-device signature check, bounded
 kernel, and family dispatch for every pushed or pulled pile. No actor may accept
 loose facts, caller-projected rows, or a claimed validation result.
 
-`AuthorityGate` runs unchanged in a hosted peer, a full peer, or an in-process
+`AccessGate` runs unchanged in a hosted peer, a full peer, or an in-process
 local call. It has two device-signed closed-pile requests. A weak historical-
 membership request proves which member once joined, proves that member signed
 the requesting device's ownership link, and returns only that member/device
@@ -220,7 +216,7 @@ writer.
 The hosted content path is intentionally opaque. A cloud store grants immutable
 upload and head-slot mutation only to the matching workspace device and may
 store the resulting head, pile, and Merkle objects without opening them or
-checking their signatures. `AuthorityGate` still evaluates the separate signed
+checking their signatures. `AccessGate` still evaluates the separate signed
 proof pile that grants this writer-confined operation. Opaque treatment applies
 to stored writer content, not to the access request. Malformed
 content can therefore make only its owner's log unusable; every consuming peer
@@ -332,9 +328,11 @@ A writer update proceeds in this order:
    writer's registered store;
 5. construct and sign one immutable head record over the cumulative logical
    tree;
-6. push one device-signed proof pile to `AuthorityGate`, binding its request
-   fact to the proposed head OID;
-7. conditionally replace only this device's stable head slot.
+6. push one device-signed proof pile to `AccessGate`, binding its request
+   fact to the observed base and proposed head OID;
+7. for an ordinary head, conditionally replace only this device's stable slot;
+   for a control-bearing head, first issue its exact control permit and then
+   use that permit to join removal state before the same slot replacement.
 
 Before or after that semantic publication, the source may independently pack
 contiguous complete piles and CAS only the directly addressed layout page for
@@ -366,7 +364,7 @@ forever; cloud storage availability is therefore distinct from fact validity.
 Replication to other peers supplies independent durability.
 
 When a consumer accepts a successor head, the two-tree RBSR difference supplies
-exactly the newly published closed-pile leaves. `AuthorityGate` deliberately
+exactly the newly published closed-pile leaves. `AccessGate` deliberately
 does not perform this check.
 
 Logical history and physical transfer shape are separate:
@@ -521,7 +519,7 @@ The stable slot makes listing compact: one entry per enrolled device rather
 than one entry per update. Its body is content hashed independently; its
 provider version token is used only to conditionally replace that exact slot.
 
-`AuthorityGate` accepts an exact slot update only when:
+`AccessGate` accepts an exact slot update only when:
 
 - the submitted device-signed closed pile authenticates the workspace device
   as a member and not removed at the removal root the gate itself pins;
@@ -536,7 +534,7 @@ exist, but does not fetch or interpret it, walk the writer tree, verify content
 signatures, or prove closure. Those are writer responsibility until another
 peer consumes the log.
 
-A consuming peer, not `AuthorityGate`, verifies the head object's content hash,
+A consuming peer, not `AccessGate`, verifies the head object's content hash,
 device signature, workspace, owner, store binding, sequence, and named log root;
 compares it with the peer's last accepted head; verifies each selected pile's
 direct writer signature and Merkle inclusion; and then evaluates every pile it
@@ -646,16 +644,27 @@ inputs, and hosted and full peers run the same database-free implementation:
    device-signed, control-only closed pile. The pile must prove its outer writer
    as `member(writer, writer)` and may introduce only CLEAR cells. It is
    evaluated and discarded; no fact repository is created.
-2. Thereafter, a caller may only poke one `(writer device, sequence)` already
-   present in the recipient's accepted writer forest. The recipient opens that
-   exact authenticated leaf, evaluates its original signed control-only pile,
-   derives the family-declared CLEAR/ACTIVE cells, discards the facts, and
-   joins those cells into its private removal tree.
+2. A writer head that introduces control piles uses one exact two-step permit
+   turn. While the writer is still current, the ordinary strong head proof
+   binds its observed base and proposed head and the gate evaluates the bounded
+   set of original writer-signed control-only piles. The resulting
+   authenticated permit binds that complete operation. Commit re-evaluates
+   those same immutable pile bytes, joins every family-declared CLEAR/ACTIVE
+   cell first, and only then conditionally advances the bound writer slot.
 
-The normal poke supplies no facts, root, or proposed state. It merely asks the
-recipient to inspect immutable data its own gate already accepted. Each
-state-affecting fact is one small ACI join; a stale CAS is retryable and replay
-finishes any prefix left by a crash. Ordinary content leaves are never opened
+The permit is a stateless capability for one base, one proposed head, and one
+bounded set of content-addressed control piles. It is not a bearer grant for a
+namespace and has no expiry that could strand a writer after self-removal.
+Replaying it can only finish or observe that one exact slot transition. A
+writer removed before permit issuance fails the normal strong proof. Removal
+racing after issuance cannot revoke the already-linearized exact operation;
+stronger cross-key revocation would require a transaction spanning the private
+removal root and writer slot, which S3 and R2 do not provide.
+
+Each state-affecting fact remains one small ACI join. A stale removal-root CAS
+is retryable, a crash may leave removal state ahead of the head, and exact
+permit replay finishes without a cursor or scan. The head can never become
+visible before all its control deltas. Ordinary content piles are never opened
 by this control path. No SQL projection, LIST scan, re-closed authority pile,
 caller root, separate authority service, queue, or provider-specific
 coordinator participates.
@@ -714,7 +723,7 @@ signed by the requesting member device. It contains the request fact, the
 historical membership and member-signed device-ownership chain, and the exact
 removal-path evidence returned by the recipient.
 
-`AuthorityGate` pins the recipient's current removal root, invokes the same
+`AccessGate` pins the recipient's current removal root, invokes the same
 evaluator, verifies that the path belongs to the named member and device at
 that exact root, and runs the request family's ordinary bounded query over only
 that request-local judgment. The query must establish:
@@ -735,15 +744,13 @@ closed pile before admitting facts. For a slot update, the request additionally
 binds the base head and proposed head OID; `OpaqueHeadGate` may conditionally
 replace only that device's deterministic slot.
 
-Before a hosted writer exposes a head containing a new control pile, it sends
-that exact original device-signed pile to authenticated `POST /removal/apply`.
-The recipient evaluates the supplied closed pile directly, accepts only
-family-declared control facts, joins its explicit removal-state changes, and
-discards the pile bytes. Only an applied or idempotent result permits the head
-CAS; a stale removal-root CAS is retryable and leaves the head untouched.
-There is no accepted-leaf scan, replay cursor, or second control envelope.
-`POST /removal/bootstrap` remains the public, narrow exception for introducing
-one original direct-member CLEAR closure before any grant can be minted.
+Before a writer exposes a head containing new control piles, it obtains the
+exact head/control permit above and commits through that permit. Ordinary heads
+without control retain the one-request current-proof slot CAS. There is no
+bearer-only removal update, accepted-leaf scan, replay cursor, or second
+control envelope. `POST /removal/bootstrap` remains the public, narrow
+exception for introducing one original direct-member CLEAR closure before any
+grant can be minted.
 
 The gate never opens or semantically validates a proposed writer head, Merkle
 tree, content pile, or fact as part of minting. The hosted owner target trusts a
@@ -935,11 +942,13 @@ No grant permits one device to populate or advance another device's cloud log.
 The hosted data path mechanically enforces store, namespace, size, hash, and
 write-condition bounds but does not decode writer content, verify the head
 or pile signatures, walk Merkle inclusion, or verify fact signatures. The
-small head-slot operation passes through `AuthorityGate`; the gate evaluates one
-pushed closed pile, checks only the ephemeral requester/recipient membership
+small head-slot operation passes through `AccessGate`; the gate evaluates one
+pushed proof pile, checks only the ephemeral requester/recipient membership
 and non-removal conditions bound to the exact head OID, confines the slot, and
-performs CAS. It is not a content validator, proxy, or tree builder, and the
-pushed pile never enters repository state.
+performs CAS. For a control-bearing head, its exact permit additionally
+evaluates only the named original control-only piles and joins their private
+removal cells before that CAS. The gate is not an ordinary content validator,
+proxy, or tree builder, and no pushed pile enters repository fact state.
 
 ## 11. Concurrency and failures
 
@@ -956,7 +965,9 @@ For two requests targeting the same device head:
 4. readers see either complete head, never partial bytes.
 
 A crash before head CAS leaves unreachable immutable objects. A crash after an
-ambiguous CAS is reconciled by exact reread. `AuthorityGate` may accept a
+ambiguous CAS is reconciled by exact reread. A control permit may leave its ACI
+removal joins ahead after a crash, but exact replay completes the bound head;
+the reverse state can never occur. `AccessGate` may accept a
 malformed head from a currently authorized writer because it deliberately
 trusts writers to maintain their trees. Bounded mirroring and per-device
 isolation ensure that such a tree can make only that writer's content unusable;
@@ -977,6 +988,7 @@ The concurrency proof and deterministic tests must cover:
 - head creation and update at every pagination boundary;
 - short pages, opaque cursors, stale tokens, throttling, and lost responses;
 - removal-tree advancement racing publication and read grants;
+- terminal self-removal crashing before and after its removal and head CASes;
 - crashes at every external effect;
 - full-scan repair after every permitted delayed observation.
 
@@ -1004,8 +1016,8 @@ mechanism is part of the initial correctness boundary.
 
 ## 13. FullPeer, SQL, HTTP, and Iroh
 
-Every deployment composes the same `ClosedPileEvaluator`, authenticated
-repository reader, object codecs, `AuthorityGate`, `OpaqueHeadGate`, and HTTP
+Every deployment composes the same `ClosedPileEvaluator`, bounded authenticated
+object reads, object codecs, `AccessGate`, `OpaqueHeadGate`, and HTTP
 routes. `FullPeer` additionally enables directory mirroring and content
 consumption, and adds local state:
 
@@ -1041,9 +1053,9 @@ no table migrations, version graphs, or selected dependency histories.
 
 | Turn | Hosted peer | Full peer | Shared core |
 |---|---|---|---|
-| pushed condition check | canonical pile bytes enter `AuthorityGate` | the same bytes enter the same gate, even in process | `ClosedPileEvaluator` + pinned removal-path verifier + family query |
+| pushed condition check | canonical pile bytes enter `AccessGate` | the same bytes enter the same gate, even in process | `ClosedPileEvaluator` + pinned removal-path verifier + family query |
 | pulled content | mirror full pile leaves; optionally stop | mirror the same leaves, then consume | `RepositoryMirror` + `ClosedPileEvaluator` + `FactConsumer` |
-| pushed state afterward | none | none | pushed facts and rows are discarded |
+| pushed state afterward | no fact state; permitted control deltas may join private removal state | the same | proof/control facts are discarded |
 | pulled state afterward | retained only if consumer is enabled | validated fact union plus rebuildable client projection | the same consumer judgment |
 
 Provider bindings, process scheduling, and local presentation are effects at
@@ -1112,9 +1124,9 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 1. Every semantic evaluation begins with exactly one canonical device-signed
    closed pile and uses the same `ClosedPileEvaluator` and family handlers.
 2. A valid pulled pile may join durable facts to a consumer's validated space;
-   a pushed proof pile and every value derived from it are always discarded
-   after the exact bound check.
-3. Hosted and full peers use the same database-free `AuthorityGate`, removal-
+   pushed proof and control facts are discarded. Only a permitted control
+   pile's bounded CLEAR/ACTIVE delta may remain in private removal state.
+3. Hosted and full peers use the same database-free `AccessGate`, removal-
    path verifier, request-family queries, object contract, and HTTP routes;
    local SQL is never an authority shortcut.
 4. Every accepted writer-tree leaf contains a pile signed directly by that
@@ -1135,29 +1147,32 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 11. Immutable objects exist before a writer advertises a head that names them.
 12. A provider version token is opaque and never a content hash.
 13. LIST output is candidate discovery, never authority.
-14. `AuthorityGate` evaluates one device-signed request-local closed pile
+14. `AccessGate` evaluates one device-signed request-local closed pile
    against one recipient-pinned removal root and binds current member/device
    authority to the exact operation; it does not validate writer content.
-15. Every consuming peer validates pile signature, head signature, tree
+15. A control-bearing head is preauthorized while current and binds its exact
+   base, proposed head, and control pile OIDs. Commit joins removal state before
+   slot CAS; replay can leave removal ahead but never the head ahead.
+16. Every consuming peer validates pile signature, head signature, tree
     inclusion, and closed-pile semantics before using mirrored content as state.
-16. Mixed head observations may delay facts but cannot fabricate or invalidate
+17. Mixed head observations may delay facts but cannot fabricate or invalidate
     them.
-17. Removal governs current publication and access without rewriting validated
+18. Removal governs current publication and access without rewriting validated
     history.
-18. Authority proof evaluation is database-free. FullPeer SQLite, caches,
+19. Authority proof evaluation is database-free. FullPeer SQLite, caches,
     cursors, hints, queues, and Iroh identities are non-authoritative.
-19. Provider adapters add no semantic branch.
-20. FullPeer reuses the complete core gate, writer, mirror, and consume paths.
-21. Every optional recency hint is repairable by a complete stable-head scan.
-22. No publication path deletes heads, logs, or canonical objects. Separate
+20. Provider adapters add no semantic branch.
+21. FullPeer reuses the complete core gate, writer, mirror, and consume paths.
+22. Every optional recency hint is repairable by a complete stable-head scan.
+23. No publication path deletes heads, logs, or canonical objects. Separate
     reachability collection may remove only superseded, unpinned head and
     internal-page versions, never signed piles or current reachable objects.
-23. A directory slot's recorded removal root is the certificate for replay
+24. A directory slot's recorded removal root is the certificate for replay
     of that accepted writer binding; replay never substitutes current removal
     state or stores a historical validation chain.
-24. One device root secret plus invite-derived facts is the complete protocol
+25. One device root secret plus invite-derived facts is the complete protocol
     identity bootstrap for a node.
-25. No workspace-global mutable content root exists.
-26. Removal-root/page bytes are non-enumerable private verifier state; a caller
+26. No workspace-global mutable content root exists.
+27. Removal-root/page bytes are non-enumerable private verifier state; a caller
     can obtain only its authenticated member/device point witness through the
     historical-membership gate.
