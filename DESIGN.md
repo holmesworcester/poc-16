@@ -572,7 +572,9 @@ responsibility until another peer consumes the log.
 That opacity is an explicit hosted trust boundary. The hosted owner gate trusts
 the writer's signed classification of its own log; omitting a control pile can
 only leave that writer's opaque hosted log unusable to a consuming peer, which
-recomputes the classification and rejects the head. An omission cannot name
+recomputes the classification and rejects the head. Hosted storage never
+performs that recomputation itself; detection happens only where a log is
+consumed, and until then a misdeclared log is merely unusable. An omission cannot name
 another writer's slot or inject an undeclared removal effect, because only the
 exact signed control-tree delta can enter permit evaluation.
 
@@ -774,8 +776,8 @@ only the authenticated permit fields and performs no fact-family dispatch.
 ### 7.1 Historical membership reveals only the caller's path
 
 A client that does not have current removal evidence first pushes the weaker
-historical-membership request. Its device signature authenticates the live
-request. Its closed dependencies must also contain:
+historical-membership request to `POST /removal/path`. Its device signature
+authenticates the live request. Its closed dependencies must also contain:
 
 1. the member's valid historical workspace admission;
 2. a device-ownership or device-join fact signed by that same member, naming
@@ -788,7 +790,10 @@ whether that member signed ownership of this requesting device. Current
 removal, leave, or self-removal does not erase those historical facts. If the
 query succeeds, the recipient returns the bounded authenticated path for
 exactly that member and device from the recipient's current removal tree,
-together with the root identity needed to verify it.
+together with the identity of the root that binds it. The recipient never
+discloses the root bytes, so the caller cannot independently re-verify the
+path; only the recipient judges it, at the next request, against the root it
+then pins. Withholding root bytes also keeps the tree's population private.
 
 This response is not a content grant, head-write grant, bearer token, authority
 snapshot, or workspace-wide removal dump. It cannot reveal another member's
@@ -814,7 +819,8 @@ removal tree.
 
 ### 7.2 Current membership mints access or one exact write
 
-The client then pushes the stronger request. This second closed pile is also
+The client then pushes the stronger request — to `POST /mint` for a grant, or
+to the head and permit routes for one exact write. This second closed pile is also
 signed by the requesting member device. It contains the request fact, the
 historical membership and member-signed device-ownership chain, and the exact
 removal-path evidence returned by the recipient.
