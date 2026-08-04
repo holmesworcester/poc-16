@@ -20,26 +20,31 @@ git status --short
 
 ## Authority and data flow
 
-Ordinary content is a forest of independently advancing device logs. There is
-no workspace-global mutable content root.
+Ordinary content is a forest of independently advancing dense device logs.
+Facts are the log leaves and the only semantic storage unit; there is no
+workspace-global mutable content root.  Signed closed piles survive only as
+ephemeral gate-proof requests and are never stored in writer logs.
 
 ```text
 local command
-  -> PileSender closes dependencies
-  -> WriterLog signs one independently closed pile leaf
-  -> immutable pile/tree/head objects
+  -> family command emits canonical facts
+  -> WriterLog assigns a contiguous writer sequence
+  -> deterministic fact/tree/queue objects
+  -> signed head authenticates the log root and control subsequence
   -> current access proof binds one exact proposed head
   -> CAS heads/<workspace>/<device>
 
-peer pull
-  -> list/open changed writer slots
-  -> verify signed head and Merkle extension
-  -> fetch each complete signed pile
-  -> ClosedPileEvaluator
+P2P initiator
+  -> one-sided GET/PUT RBSR over its peer-local (ts, fid) treap
+  -> symmetric difference moves news both ways; responder never walks
+  -> fetch/push contiguous writer-sequence runs with one head + boundary paths
+  -> verify each complete run atomically
+  -> file facts into local per-writer log copies
+  -> fold accepted control facts into the recipient's private removal tree
   -> optional FactConsumer
 
 hosted owner publication
-  -> direct create-only immutable object PUTs
+  -> append to the writer-owned queue layout with create-only immutable PUTs
   -> ordinary head: the same exact owner-head proof
   -> control head: POST /head/<oid>/permit with proof + exact controls
   -> POST /head/<oid>/commit joins private removal state before its bound CAS
@@ -73,16 +78,31 @@ responses contain only the requested member/device values and non-disclosing
 sibling commitments; dense leaves with neighboring members are forbidden.
 
 Cloud publication is owner-confined. A device may create immutable objects and
-advance only its own writer slot. Hosted storage need not inspect its content
-piles. Full-peer replication is validate-first peer sync: a full peer may
-relay any original writer tree it has consumed successfully, preserving the
-writer's pile signature, signed head, and identity. It may not rewrite a
-relayed pile into its own or another writer's cloud log.
+advance only its own writer slot. The passive store never maintains a shared
+fact index: it exposes the writer forest through GET/PUT and clients consume it
+by head/sequence diff plus a demand-driven dependency pump. The target queue
+layout is a create-only micro-tail, a client-folded binary ladder below the
+provider's multipart threshold, and server-side part-copy mono-log segments
+above it; deterministic tree summaries ride in object footers. This cloud
+layout is phase 2 (`poc-16-6j4.31`) and follows the P2P cut.
 
-P2P exchanges the per-device directory and runs range-based set
-reconciliation only for changed writer roots. Do not add a combined P2P
-content log, a workspace content root, a second publication algorithm, or one
-sync session per pile without measurements that invalidate the forest.
+P2P deliberately restores the previously tested one-sided Merkle RBSR walk
+over a peer-local, history-independent `(ts, fid)` treap. The session initiator
+drives; simultaneous dials collapse by endpoint ID. Leaf exchange reveals the
+symmetric difference, so that one driver both pulls missing facts and pushes
+facts missing at the responder while the responder serves stable self-addressed
+pages and verifies PUT runs. A peer fingerprints only timestamp ranges it
+holds completely; partial islands are exchanged as exact sets. Transfers are
+closed contiguous writer-sequence runs and are accepted all-or-nothing. The
+treap is derived discovery state, never canonical residence and never a cloud
+object; received facts are filed into their original writers' local log copies.
+
+Every peer also exposes the passive writer-forest interface, so ordinary
+clients use the same sequence-diff recipes against a peer and the cloud. Do not
+add a canonical combined P2P content log, a workspace content root, a shared
+cloud treap, one sync session per fact, or a compatibility reader for stored
+closed piles. The governing decision is `poc-16-6j4.29`; implement
+`poc-16-6j4.30` before `poc-16-6j4.31`.
 
 ## Read the code in this order
 
@@ -91,20 +111,25 @@ sync session per pile without measurements that invalidate the forest.
 2. `core/kernel.py` and `core/close.py`: closed-pile judgment and the signed
    pile boundary.
 3. `core/writer_tree.py`, `core/writer_head.py`, and
-   `core/writer_repository.py`: writer logs, owner publication, mirroring, and
-   optional consumption.
-4. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
+   `core/writer_repository.py`: the current writer forest, owner publication,
+   mirroring, and optional consumption.
+4. `peerlog/`: the hybrid target's facts-as-leaves writer logs, peer-local
+   RBSR index, coverage honesty, closed-run proofs, and one-sided walk. Reuse
+   the pre-forest implementation from git history where its shape still fits;
+   do not revive its passive-store mutable manifest or stored pile format.
+5. `core/access.py`, `core/removal_path.py`, `core/removal_state.py`, and
    `core/suppression_tree.py`: the two discarded proof purposes and bounded
-   verification against the recipient's private pinned removal tree.
-5. `core/http.py`: the one route and grant gate used by every runtime.
-6. `full_peer/pile_sender.py`, `full_peer/node.py`, and
+   verification against the recipient's private pinned removal tree. P2P peers
+   and cloud gates use the same ACI fold but never synchronize these trees.
+6. `core/http.py`: the one route and grant gate used by every runtime.
+7. `full_peer/pile_sender.py`, `full_peer/node.py`, and
    `full_peer/sql_store.py`: stateful authorship, composition, and the sole SQL
    boundary.
-7. `full_peer/daemon.py`, `full_peer/iroh_process.py`, and `full_peer/iroh/`:
+8. `full_peer/daemon.py`, `full_peer/iroh_process.py`, and `full_peer/iroh/`:
    process ownership and the connection-only Iroh byte wrapper.
-8. `adapters/` and `deploy/`: object-store adaptation and isolated provider
+9. `adapters/` and `deploy/`: object-store adaptation and isolated provider
    packaging.
-9. `notifications/`: post-publication scanning, durable cursor state,
+10. `notifications/`: post-publication scanning, durable cursor state,
    disposable wakes, current-authority delivery, and provider effects.
 
 `FullPeer` is a composition root, not a policy owner. It combines every core
@@ -112,34 +137,52 @@ path with identities, local scheduling, Bao I/O, and disposable SQL. It must
 not duplicate head validation, pile admission, grants, suppression, HTTP
 routes, or sync logic.
 
-## Closed piles and residence
+## Facts, closed requests, and residence
 
-Every semantic input is one bounded, topologically ordered, device-signed
-closed pile. Heads, Merkle pages, pack indexes, SQL rows, and provider metadata
-can locate bytes but cannot introduce a fact.
+Canonical writer logs contain facts as leaves, not stored piles. Heads, Merkle
+pages, queue objects, pack indexes, SQL rows, and provider metadata can locate
+or authenticate bytes but cannot introduce a fact. A signed head authenticates
+ordinary facts by residence and inclusion. Control families that must travel
+outside their home log carry companion signature facts; do not add one
+signature fact per ordinary message.
+
+Signed closed piles remain the bounded, topologically ordered format only for
+ephemeral mint, path, and control gate requests. They are judged against the
+recipient's current private state and discarded. Reuse their codec for those
+requests only; never put them back into writer leaves, RBSR pages, or the cloud
+queue.
 
 ```text
-wire:             complete signed closed pile
-accepted content: original signed pile in one writer-tree leaf
+gate wire:         complete signed closed request pile, discarded after judgment
+P2P wire:          contiguous fact run + signed head + boundary inclusion paths
+accepted content: canonical facts in one original writer's dense sequence
 local query state: fid -> canonical fact bytes plus generic current indexes
 ```
 
-If one member of a pulled pile fails, its entire candidate writer suffix
-fails and no prefix becomes resident. Once a receiver accepts and CASes a
-writer slot, that slot and its reachable immutable objects are the durable
-admission certificate. Projection replay must not consult present-day
-membership or retain a historical validation chain.
+If one member or proof component of a pulled run fails, the complete run fails
+and no prefix becomes resident. Once a receiver accepts the run and advances
+its local writer copy, that writer residence and its reachable immutable
+objects are the durable admission certificate. Projection replay must not
+consult present-day membership or retain a historical validation chain.
 
 Do not store selected dependency edges, proof DAGs, ranks, winners, dormant
 candidates, eligibility labels, or a second settlement state. Validated facts
 are monotone; current suppression and authority affect visibility and future
 operations, not historical residence.
 
-Writer-tree leaves are independently closed. Range and diff pagination may
-stop only between leaves. Source-local layout pages and concat packs are
-replaceable locators, never log authority. A cold receiver verifies the pile
-signature, signed head, inclusion, content address, and full closure without
-an adjacent leaf or prior cache.
+Writer-sequence runs are independently authenticated and accepted atomically.
+Range and diff pagination may stop only between facts and may transfer only
+complete proved runs. Queue pages, footers, spans, and packs are replaceable
+locators, never log authority. A cold receiver verifies canonical fact bytes,
+the signed head, boundary inclusion paths, sequence density, and control
+signatures without trusting an adjacent range or prior cache.
+
+Refs on the passive path are located `(writer, seq)` addresses. A target at or
+below the stored target head is fetchable; one above it is a pending interval,
+not a failed-GET event. Validity-critical control refs cite visible targets or
+carry exact proof material inline beside the citing fact (Rule 2); render refs
+may remain pending. Handoff facts are explicitly parked and require a separate
+decision before the cloud phase closes.
 
 Bao descriptors and slices are ordinary facts. Large pile and pack bodies use
 the streaming/direct-object path and must not widen buffered semantic-object
@@ -174,7 +217,7 @@ these rules; core and `FullPeer` do not special-case them.
 `full_peer/sql_store.py` contains only canonical fact blobs, one combined
 generic index, and per-writer projection checkpoints. It is never receiving
 authority and may be deleted at any time. Startup replays accepted local
-writer slots through the same `FactConsumer` used for network pulls.
+writer sequences through the same `FactConsumer` used for network pulls.
 
 `facts.APP_VERSION` is the application projection version. A mismatch deletes
 the disposable database and replays exact source events through the running
