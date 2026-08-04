@@ -229,7 +229,6 @@ def device_spec(forest, ordinal):
         grant = device_invite(
             forest.root.fid,
             forest.founder,
-            forest.founder,
             public,
             f"device-{ordinal:04d}",
             ordinal + 2,

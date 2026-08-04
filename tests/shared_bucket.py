@@ -271,7 +271,7 @@ class ScriptedBucket:
             event = self._record(
                 actor, "cas", key, value, expected,
                 before, result, after)
-            if isinstance(result, Applied) and key == "root":
+            if isinstance(result, Applied) and key == "authority":
                 objects = tuple(sorted(
                     (name[4:], raw)
                     for name, raw in self._data.items()

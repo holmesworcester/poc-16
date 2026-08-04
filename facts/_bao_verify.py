@@ -8,7 +8,7 @@ caller to supply bounded canonical bytes. It is offered under the same
 ``CC0-1.0 OR Apache-2.0`` terms.
 
 The module deliberately has no native or third-party dependency. Hosted
-RepositoryAppliers import fact families and therefore run this exact verifier
+Database-free evaluators import fact families and therefore run this verifier
 when admitting a file slice; the optional Rust binding remains an authoring
 and cross-test accelerator only.
 """

@@ -247,9 +247,6 @@ def test_later_provider_cannot_prune_a_valid_descendant(tmp_path):
     assert all_fids(source, workspace) \
         == all_fids(peers[0], workspace) \
         == all_fids(peers[1], workspace)
-    assert source.store(workspace).get("root") \
-        == peers[0].store(workspace).get("root") \
-        == peers[1].store(workspace).get("root")
 
 
 def test_later_provider_cannot_change_stored_owner_or_delete_authority(

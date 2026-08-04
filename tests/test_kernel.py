@@ -146,7 +146,8 @@ def test_member_can_invite_but_nonmember_cannot(anchor_chain):
     assert not judge(base + [forged_sig, forged], root.fid)
 
 
-def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
+def test_only_the_owning_member_can_directly_grant_known_device_keys(
+        anchor_chain):
     founder_sk, founder_pk, root = anchor_chain
     ts = now_ms()
     primary = device(root.fid, founder_pk, "phone", ts + 1)
@@ -154,20 +155,27 @@ def test_device_set_peers_can_directly_grant_known_keys(anchor_chain):
 
     sibling_sk, sibling_pk = keypair()
     sibling = device_invite(
-        root.fid, founder_pk, founder_pk, sibling_pk, "laptop", ts + 2)
+        root.fid, founder_pk, sibling_pk, "laptop", ts + 2)
     sibling_sig = signature(founder_sk, founder_pk, sibling, ts + 2)
     first = [root, primary_sig, primary, sibling_sig, sibling]
     assert judge(first, root.fid)
 
     _, third_pk = keypair()
     third = device_invite(
-        root.fid, sibling_pk, founder_pk, third_pk, "tablet", ts + 3)
-    third_sig = signature(sibling_sk, sibling_pk, third, ts + 3)
+        root.fid, founder_pk, third_pk, "tablet", ts + 3)
+    third_sig = signature(founder_sk, founder_pk, third, ts + 3)
     assert judge(first + [third_sig, third], root.fid)
+
+    _, delegated_pk = keypair()
+    delegated = device_invite(
+        root.fid, founder_pk, delegated_pk, "delegated", ts + 4)
+    delegated_sig = signature(
+        sibling_sk, sibling_pk, delegated, ts + 4)
+    assert not judge(first + [delegated_sig, delegated], root.fid)
 
     outsider_sk, outsider_pk = keypair()
     forged = device_invite(
-        root.fid, outsider_pk, founder_pk, third_pk, "forged", ts + 3)
+        root.fid, founder_pk, third_pk, "forged", ts + 5)
     forged_sig = signature(outsider_sk, outsider_pk, forged, ts + 3)
     assert not judge(first + [forged_sig, forged], root.fid)
 
@@ -245,13 +253,14 @@ def test_mutual_authority_grants_still_close_to_an_acyclic_pile(
     primary_sig = signature(founder_secret, founder, primary, ts + 1)
     laptop_secret, laptop = keypair()
     laptop_grant = device_invite(
-        root.fid, founder, founder, laptop, "laptop", ts + 2)
+        root.fid, founder, laptop, "laptop", ts + 2)
     laptop_grant_sig = signature(
         founder_secret, founder, laptop_grant, ts + 2)
+    _, tablet = keypair()
     founder_back_grant = device_invite(
-        root.fid, laptop, founder, founder, "founder-again", ts + 3)
+        root.fid, founder, tablet, "tablet", ts + 3)
     founder_back_grant_sig = signature(
-        laptop_secret, laptop, founder_back_grant, ts + 3)
+        founder_secret, founder, founder_back_grant, ts + 3)
     device_stream = [
         root,
         primary_sig,

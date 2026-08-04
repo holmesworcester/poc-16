@@ -84,6 +84,82 @@ class Fact:
         return {"e": self.env, "b": self.body}
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentFact:
+    """Current application form with the immutable source identity.
+
+    Re-extraction may change a retained fact's type/body/atoms vocabulary, but
+    refs and signatures still name the source fid. This wrapper is a semantic
+    view only; :func:`encode` deliberately accepts wire ``Fact`` values alone.
+    """
+
+    source: Fact
+    current: Fact
+
+    def __post_init__(self):
+        if not isinstance(self.source, Fact) \
+                or not isinstance(self.current, Fact) \
+                or self.current.ts != self.source.ts \
+                or self.current.ws != self.source.ws:
+            raise ValueError("current fact")
+
+    @property
+    def fid(self):
+        return self.source.fid
+
+    @property
+    def key(self):
+        return key(self)
+
+    @property
+    def t(self):
+        return self.current.t
+
+    @property
+    def ts(self):
+        return self.current.ts
+
+    @property
+    def atoms(self):
+        return self.current.atoms
+
+    @property
+    def body(self):
+        return self.current.body
+
+    @property
+    def ws(self):
+        return self.current.ws
+
+    @property
+    def bh(self):
+        return self.current.bh
+
+    def refs(self):
+        return self.current.refs()
+
+    def offers(self):
+        return self.current.offers()
+
+
+def source_fact(fact):
+    """Return the exact signed wire value behind a current semantic view."""
+    if isinstance(fact, CurrentFact):
+        return fact.source
+    if isinstance(fact, Fact):
+        return fact
+    raise TypeError("fact")
+
+
+def current_fact(fact):
+    """Return the ordinary current-shape value behind either representation."""
+    if isinstance(fact, CurrentFact):
+        return fact.current
+    if isinstance(fact, Fact):
+        return fact
+    raise TypeError("fact")
+
+
 def _atoms_ok(atoms) -> bool:
     """Atom shape, checked at the door so refs()/offers() cannot crash the
     kernel — a malformed atom is litter, never poison."""

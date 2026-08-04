@@ -41,6 +41,7 @@ class ValidatedView:
         self._source_fetch = fetch
         self._objects = {} if cache_objects else None
         self._facts = {}
+        self._sources = {}
         self._oids = {}
 
     def fetch(self, oid):
@@ -72,14 +73,21 @@ class ValidatedView:
         if fid in self._facts:
             return self._facts[fid]
         raw = verified_object(self.fact_oid(fid), self.fetch)
-        fact = decode(raw)
+        source = decode(raw)
+        fact = facts.hydrate(source)
         if fact.fid != fid or not bound_to(fact, self.root.anchor):
             raise ValueError("validated fact identity")
         family = facts.family_for(fact.t)
         if family is None or not family.DURABLE:
             raise ValueError("validated fact durability")
         self._facts[fid] = fact
+        self._sources[fid] = source
         return fact
+
+    def source_fact(self, fid):
+        """Return the exact retained wire fact behind the current view."""
+        self.fact(fid)
+        return self._sources[fid]
 
     def fact_ids(self):
         """Enumerate exactly one residence row per validated fact."""
@@ -181,7 +189,7 @@ class ValidatedView:
                     rollback(mark)
                     return False
                 done.add(fid)
-                out.append(fact)
+                out.append(self.source_fact(fid))
                 return True
             finally:
                 visiting.remove(fid)

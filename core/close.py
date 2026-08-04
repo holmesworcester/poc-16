@@ -13,7 +13,6 @@ from itertools import islice
 
 from .crypto import h, sign, verify
 from .fact import Fact, bound_to, canon, encode, from_json
-from .ingress import InvalidPile, KernelRejected
 from .limits import (
     MIN_HOSTED_MEMORY_BYTES,
     InvalidEncoding,
@@ -32,14 +31,22 @@ SIGNED_PILE_SIGNATURE_DOMAIN = "poc16-signed-pile-signature-v1"
 SIGNATURE_HEX_CHARS = 128
 
 
+class InvalidPile(ValueError):
+    """Pile bytes fail the bounded canonical wire codec."""
+
+
+class KernelRejected(ValueError):
+    """Decoded facts fail the shared closed-pile kernel."""
+
+
 def check_pile_bounds(raw):
     """Reject byte/count amplification before reserving untrusted work.
 
     The small lexical scanner finds a root ``facts`` key under any JSON
     whitespace/key order and counts arbitrary top-level array values without
     decoding their bodies. Malformed input that cannot amplify that array
-    continues to the exact decoder, where the RepositoryApplier returns the
-    typed result for that one retained source.
+    continues to the exact decoder, where the shared evaluator returns the
+    verdict for that one wire value.
     """
     if not isinstance(raw, bytes):
         raise InvalidEncoding("pile bytes")
@@ -217,7 +224,8 @@ def _signed_document(workspace, writer, facts):
             or not isinstance(facts, tuple) \
             or len(facts) > MAX_PILE_FACTS \
             or not all(isinstance(fact, Fact) for fact in facts) \
-            or not all(bound_to(fact, workspace) for fact in facts):
+            or not all(bound_to(fact, workspace) for fact in facts) \
+            or len({fact.fid for fact in facts}) != len(facts):
         raise ValueError("signed pile")
     for fact in facts:
         encode(fact)
@@ -363,6 +371,8 @@ class ClosedPileEvaluator:
 __all__ = (
     "ClosedPileEvaluator",
     "EvaluatedPile",
+    "InvalidPile",
+    "KernelRejected",
     "SIGNED_PILE_FORMAT",
     "SIGNED_PILE_SIGNATURE_DOMAIN",
     "SignedPile",

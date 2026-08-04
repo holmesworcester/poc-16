@@ -10,6 +10,7 @@ from core.limits import (
     DIRECT_STREAM_CHUNK_BYTES,
     MAX_DIRECT_OBJECT_BYTES,
     MAX_OBJECT_BYTES,
+    MAX_ROOT_BYTES,
     PayloadTooLarge,
 )
 from core.object_store import (
@@ -161,19 +162,33 @@ def test_native_r2_preserves_opaque_tokens_and_conditional_outcomes():
     bucket, store = Bucket(), R2BindingStore(Bucket())
     bucket = store.bucket
 
-    assert run(store.read_versioned("root")) is ABSENT
-    created = run(store.cas("root", ABSENT, b"root-1"))
+    assert run(store.read_versioned("authority")) is ABSENT
+    created = run(store.cas("authority", ABSENT, b"authority-1"))
     assert isinstance(created, Applied)
     assert created.token.value == "opaque-r2-1"
-    pair = run(store.read_versioned("root"))
-    assert pair.value == b"root-1"
+    pair = run(store.read_versioned("authority"))
+    assert pair.value == b"authority-1"
     assert pair.token == created.token
     assert pair.token.value != h(pair.value)
 
-    assert run(store.cas("root", ABSENT, b"loser")) is STALE
-    replaced = run(store.cas("root", pair.token, b"root-2"))
+    assert run(store.cas("authority", ABSENT, b"loser")) is STALE
+    replaced = run(store.cas("authority", pair.token, b"authority-2"))
     assert isinstance(replaced, Applied)
-    assert run(store.get("root")) == b"root-2"
+    assert run(store.get("authority")) == b"authority-2"
+
+
+def test_native_r2_layout_reads_use_the_semantic_object_limit():
+    bucket, store = Bucket(), R2BindingStore(Bucket())
+    bucket = store.bucket
+    key = "layouts/" + "/".join(
+        ("0" * 64, "1" * 64, "0000000000000001"))
+    value = b"l" * (MAX_ROOT_BYTES + 1)
+    physical = key
+    bucket.data[physical] = value
+    bucket.etags[physical] = bucket._token()
+
+    assert run(store.get(key)) == value
+    assert run(store.read_versioned(key)).value == value
 
 
 def test_native_r2_immutable_create_collision_is_verified():
@@ -284,14 +299,14 @@ def test_native_r2_list_rejects_unbounded_unique_cursors():
 
 @pytest.mark.parametrize(
     "etag", (None, "", 'W/"weak"', 7, False, object()))
-def test_native_r2_rejects_unusable_root_etag(etag):
+def test_native_r2_rejects_unusable_authority_etag(etag):
     bucket = Bucket()
-    bucket.data["root"] = b"root"
-    bucket.etags["root"] = etag
+    bucket.data["authority"] = b"authority"
+    bucket.etags["authority"] = etag
     store = R2BindingStore(bucket)
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
-        run(store.read_versioned("root"))
+        run(store.read_versioned("authority"))
 
     class ResultWithoutToken(Bucket):
         async def put(self, key, value, **options):
@@ -299,7 +314,7 @@ def test_native_r2_rejects_unusable_root_etag(etag):
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
         run(R2BindingStore(ResultWithoutToken()).cas(
-            "root", ABSENT, b"candidate"))
+            "authority", ABSENT, b"candidate"))
 
 
 def test_native_r2_never_maps_throttle_or_transport_to_stale():
@@ -311,17 +326,17 @@ def test_native_r2_never_maps_throttle_or_transport_to_stale():
     bucket = store.bucket
     bucket.fail = Error(429)
     with pytest.raises(RetryableStoreError):
-        run(store.cas("root", ABSENT, b"x"))
+        run(store.cas("authority", ABSENT, b"x"))
 
     bucket.fail = Error(503)
     with pytest.raises(OutcomeUnknown):
-        run(store.cas("root", ABSENT, b"x"))
+        run(store.cas("authority", ABSENT, b"x"))
 
 
 def test_native_r2_guards_authoritative_mutations_and_prefixes():
     store = R2BindingStore(Bucket(), "tenant")
     with pytest.raises(ValueError, match="conditional"):
-        run(store.put("root", b"x"))
+        run(store.put("authority", b"x"))
     with pytest.raises(ValueError, match="not deletable"):
         run(store.delete("obj/" + "0" * 64))
     with pytest.raises(ValueError, match="key"):

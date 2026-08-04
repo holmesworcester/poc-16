@@ -55,6 +55,12 @@ recipient to synchronize an authority repository. A head proof can authorize
 only the proposed head OID named in the request and never validates the
 advertised content tree.
 
+Removal state is private point-read state. Never store or serve its roots/pages
+through generic `obj/`, pack, direct-open, or public LIST paths. A writer slot's
+recorded removal-root hash is audit identity, not a read capability. Path
+responses contain only the requested member/device values and non-disclosing
+sibling commitments; dense leaves with neighboring members are forbidden.
+
 Cloud publication is owner-confined. A device may create immutable objects and
 advance only its own writer slot. Hosted storage need not inspect its content
 piles. Full-peer replication is validate-first peer sync: a full peer may

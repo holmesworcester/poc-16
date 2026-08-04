@@ -116,7 +116,7 @@ class Bucket:
         )
 
     async def delete(self, *args, **kwargs):
-        raise AssertionError("read-only Worker attempted R2 delete")
+        raise AssertionError("owner Worker attempted R2 delete")
 
 
 class Request:
@@ -546,7 +546,7 @@ def test_runtime_fails_closed_for_scope_config_and_malformed_content_length(
     _, workspace, _, _, environment = worker_world(tmp_path, monkeypatch)
 
     wrong = run(runtime.handle(Request(
-        "GET", "https://worker.example/root?ws=wrong"), environment))
+        "GET", "https://worker.example/heads?ws=wrong"), environment))
     malformed = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={workspace}",
         headers={"Content-Length": "not-an-integer"},
@@ -752,9 +752,9 @@ def test_runtime_bounds_query_bytes_and_field_count_before_gateway_io(
 
     exact_query = "ws=" + "a" * 77
     exact = run(runtime.handle(Request(
-        "GET", f"https://worker.example/root?{exact_query}"), environment))
+        "GET", f"https://worker.example/heads?{exact_query}"), environment))
     over = run(runtime.handle(Request(
-        "GET", f"https://worker.example/root?{exact_query}a"), environment))
+        "GET", f"https://worker.example/heads?{exact_query}a"), environment))
     fields = run(runtime.handle(Request(
         "GET", "https://worker.example/healthz?a=1&b=2&c=3"),
         environment))
@@ -781,7 +781,7 @@ def test_runtime_rejects_malformed_query_encoding_before_gateway_io(
     before = list(bucket.calls)
 
     response = run(runtime.handle(Request(
-        "GET", f"https://worker.example/root?{query}"), environment))
+        "GET", f"https://worker.example/heads?{query}"), environment))
 
     assert response.status == 400
     assert bucket.calls == before

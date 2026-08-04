@@ -258,7 +258,7 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
     assert asyncio.run(state.complete(h(initial_body))) == PENDING_NONCURRENT
     preference.set_global(node, workspace, preference.NONE, ts=5)
 
-    store._delete("root")
+    store._delete("cursor")
     old_carrier = MemoryCarrier()
     old_scanner = NotificationDiscovery(
         node.store(workspace), store, workspace, old_carrier,
@@ -275,7 +275,7 @@ def test_rebootstrap_generation_prevents_paused_muted_worker_aba(tmp_path):
         await paused.entered.wait()
         assert provider.requests == []
 
-        store._delete("root")
+        store._delete("cursor")
         fresh_carrier = MemoryCarrier()
         fresh_scanner = NotificationDiscovery(
             node.store(workspace), store, workspace, fresh_carrier,

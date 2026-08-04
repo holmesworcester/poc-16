@@ -19,6 +19,10 @@ The implementation is deliberately strict about authority and direction:
   return only that member/device pair's current removal path, then accepts a
   second device-signed current-member proof carrying that path. Both judgments
   are discarded; neither synchronizes or mutates recipient authority state.
+- Removal roots and proof nodes are private authenticated point-read state,
+  never generic `obj/` or pack objects. A slot may record a root hash for audit,
+  but only the self-confined path endpoint can read the private tree, and its
+  witness does not contain neighboring members.
 - `FullPeer` composes the complete core with identity, scheduling, Bao I/O,
   and disposable SQL; it owns no parallel admission or sync implementation.
 

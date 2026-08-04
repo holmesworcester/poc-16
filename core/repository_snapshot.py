@@ -12,7 +12,7 @@ import facts
 
 from . import indexes, merkle_map, snapshot
 from .crypto import h
-from .fact import bound_to, decode, encode
+from .fact import bound_to, decode, encode, source_fact
 from .shape import valid_fid
 
 
@@ -65,9 +65,12 @@ def _checked_facts(anchor, facts_by_fid):
     if not valid_fid(anchor) or not isinstance(facts_by_fid, dict):
         raise ValueError("validated fact set")
     checked = {}
-    for fid, fact in sorted(facts_by_fid.items()):
+    for fid, supplied in sorted(facts_by_fid.items()):
+        source = source_fact(supplied)
+        fact = facts.hydrate(source)
         family = facts.family_for(getattr(fact, "t", None))
-        if getattr(fact, "fid", None) != fid \
+        if source.fid != fid or fact.fid != fid \
+                or not bound_to(source, anchor) \
                 or not bound_to(fact, anchor) \
                 or family is None or not family.DURABLE:
             raise ValueError("validated fact")
@@ -112,7 +115,7 @@ def logical_rows(anchor, facts_by_fid):
     """Return every logical row from the monotone validated set."""
     checked = _checked_facts(anchor, facts_by_fid)
     objects = {
-        fid: h(encode(fact))
+        fid: h(encode(source_fact(fact)))
         for fid, fact in checked.items()
     }
     actions = action_bindings(checked)
@@ -142,9 +145,11 @@ def logical_rows(anchor, facts_by_fid):
 def _existing_fact(anchor, fid, oid, raw):
     if not isinstance(raw, bytes) or h(raw) != oid:
         raise ValueError("repository object integrity")
-    fact = decode(raw)
+    source = decode(raw)
+    fact = facts.hydrate(source)
     family = facts.family_for(fact.t)
-    if fact.fid != fid or not bound_to(fact, anchor) \
+    if source.fid != fid or fact.fid != fid \
+            or not bound_to(source, anchor) or not bound_to(fact, anchor) \
             or family is None or not family.DURABLE:
         raise ValueError("repository fact identity")
     return fact
@@ -153,7 +158,9 @@ def _existing_fact(anchor, fid, oid, raw):
 def _extension_program(anchor, base_root, facts_by_fid):
     """Yield semantic reads, immutable establishes, and three map batches."""
     checked = _checked_facts(anchor, facts_by_fid)
-    encoded = {fid: encode(fact) for fid, fact in checked.items()}
+    encoded = {
+        fid: encode(source_fact(fact)) for fid, fact in checked.items()
+    }
     object_ids = {fid: h(raw) for fid, raw in encoded.items()}
     if base_root is None:
         seed = snapshot.layout_seed(anchor)
@@ -191,8 +198,8 @@ def _extension_program(anchor, base_root, facts_by_fid):
         oid = indexes.checked_fact_oid(incumbent)
         raw = yield _Object(oid)
         if oid != object_ids[fid] \
-                or encode(_existing_fact(
-                    anchor, fid, oid, raw)) != encoded[fid]:
+                or encode(source_fact(_existing_fact(
+                    anchor, fid, oid, raw))) != encoded[fid]:
             raise ValueError("repository fact conflict")
 
     for fid in fresh:
@@ -417,7 +424,7 @@ def compile_snapshot(anchor, facts_by_fid):
         return oid
 
     for fact in facts_by_fid.values():
-        emit(encode(fact))
+        emit(encode(source_fact(fact)))
     seed = snapshot.layout_seed(anchor)
     maps = {}
     for name in snapshot.MAP_NAMES:

@@ -17,18 +17,27 @@ class PileSender:
         node, workspace = self.node, self.workspace
         with node.lock:
             node._ensure_projection(workspace)
+            return self._close_projected(news, deps_new)
+
+    def _close_projected(self, news, deps_new):
+        """Close against SQL already replayed under the owning node lock."""
+        node, workspace = self.node, self.workspace
+        with node.lock:
             context = node.sql(workspace)
             newmap = {fact.fid: fact for fact in news}
 
-            def fact_of(fid):
+            def source_of(fid):
+                return newmap.get(fid) or context.source_fact_of(fid)
+
+            def form_of(fid):
                 return newmap.get(fid) or context.fact_of(fid)
 
             def deps_of(fid):
                 if fid in deps_new:
                     return deps_new[fid]
-                return resolve_deps(fact_of(fid), context) or ()
+                return resolve_deps(form_of(fid), context) or ()
 
-            return tuple(close(news, deps_of, fact_of))
+            return tuple(close(news, deps_of, source_of))
 
     def pack(self, closed):
         """Sign and encode one already-closed portable unit."""

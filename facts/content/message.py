@@ -1,5 +1,5 @@
 """facts/content/message.py — a member-signed channel message."""
-from core.fact import Fact, Need
+from core.fact import Fact, Need, current_fact
 from core.shape import valid_fid
 from .._notification import NotificationTrigger
 from .._policy import (
@@ -8,14 +8,12 @@ from .._policy import (
     Self,
     author_selectors,
 )
-from .._commands import (
-    direct_upload,
-    member_source,
-    publish,
-)
+from .._commands import member_source, publish
 from ..auth import signature
 
 TAG = "msg"
+LEGACY_TAG = "msg.v0"
+SHAPES = (TAG, LEGACY_TAG)
 MAX_MENTIONS = 32
 POLICY = FamilyPolicy(
     suppression=(Self(),),
@@ -48,6 +46,47 @@ def message(workspace, pk, channel, text, ts, owner=None, mentions=()):
     )
 
 
+def legacy_message(workspace, pk, channel, text, ts, owner=None):
+    """Version-story fixture: the prior tag and field vocabulary."""
+    owner = pk if owner is None else owner
+    return Fact(
+        LEGACY_TAG, ts, author_selectors(POLICY, {}),
+        {
+            "author": pk,
+            "channel": channel,
+            "message": text,
+            "principal": owner,
+        },
+        workspace,
+    )
+
+
+def reextract(source):
+    """Normalize an exact legacy source without consulting arrival context."""
+    try:
+        body = source.body
+        expected = legacy_message(
+            source.ws,
+            body["author"],
+            body["channel"],
+            body["message"],
+            source.ts,
+            body["principal"],
+        )
+        if source != expected:
+            raise ValueError("noncanonical legacy message")
+        return message(
+            source.ws,
+            body["author"],
+            body["channel"],
+            body["message"],
+            source.ts,
+            body["principal"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("legacy message shape") from error
+
+
 # NEEDS
 def needs(f):
     pk = f.body.get("pk", "")
@@ -61,6 +100,7 @@ def needs(f):
 # VALIDATE
 def validate(f, ctx):
     try:
+        f = current_fact(f)
         body = f.body
         return set(body) in (
                 {"pk", "owner", "chan", "text"},
@@ -95,24 +135,6 @@ def post(node, workspace, channel, text, ts=None, mentions=()):
     item, signed = _author(
         node, workspace, channel, text, ts, mentions)
     return publish(node, workspace, item, signed)
-
-
-def upload(
-        node, workspace, channel, text, broker_url, provider_origin,
-        ts=None, mentions=()):
-    """Author one message and send its closed pile directly to ingress."""
-    item, signed = _author(
-        node, workspace, channel, text, ts, mentions)
-    public = item.body["pk"]
-    member, _ = member_source(
-        node, workspace, public, item.body["owner"])
-    if member is None:
-        raise ValueError("publishing identity is not a workspace member")
-    deps = {item.fid: [signed.fid, member], signed.fid: []}
-    source = node.create_upload(
-        workspace, node.sender(workspace).pile([signed, item], deps))
-    return {"fid": item.fid, **direct_upload(
-        node, workspace, source, broker_url, provider_origin)}
 
 
 # QUERIES
@@ -151,5 +173,4 @@ def notification_trigger(fact):
 CLI = {
     "content.message.list": messages,
     "content.message.post": post,
-    "content.message.upload": upload,
 }

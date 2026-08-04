@@ -19,6 +19,7 @@ from .util import (
     replay_random,
     suppression_world,
     visible_fids,
+    writer_slots,
 )
 
 
@@ -66,13 +67,14 @@ def test_suppression_facts_not_suppressible(tmp_path):
     assert node.fact_of(workspace, recursive.fid) is None
 
 
-def test_reader_rebuilds_missing_reference_projection_without_root_write(
+def test_reader_rebuilds_missing_reference_projection_without_slot_write(
         tmp_path):
-    """The pinned root restores missing projection rows without a root CAS."""
+    """Accepted writer slots restore SQL rows without another slot CAS."""
     node, workspace, targets, deletions = suppression_world(tmp_path / "node")
     referenced = {targets[index] for index in (1, 4, 6)}
     expected = query_state(node)
-    root = node.store(workspace).get("root")
+    slots = writer_slots(node, workspace)
+    assert slots
     index = node.idx(workspace)
     index.executemany(
         "DELETE FROM fact_index WHERE src=?",
@@ -88,7 +90,7 @@ def test_reader_rebuilds_missing_reference_projection_without_root_write(
 
     node.rebuild(workspace)
 
-    assert node.store(workspace).get("root") == root
+    assert writer_slots(node, workspace) == slots
     assert referenced <= node.sql(workspace).fact_ids()
     assert all(node.fact_of(workspace, fid) is not None
                for fid in deletions)

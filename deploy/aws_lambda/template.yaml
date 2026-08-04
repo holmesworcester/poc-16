@@ -37,6 +37,10 @@ Parameters:
     Type: Number
     Default: 100000
     MinValue: 1
+  HeadPageKeys:
+    Type: Number
+    Default: 256
+    AllowedValues: [256]
   KmsKeyArn:
     Type: String
     Default: ""
@@ -71,7 +75,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: ReadOneWorkspace
+        - PolicyName: ServeOneWriterForest
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -83,18 +87,25 @@ Resources:
                 Condition:
                   StringLike:
                     s3:prefix:
-                      - !Sub "${StorePrefix}/root"
+                      - !Sub "${StorePrefix}/authority"
                       - !Sub "${StorePrefix}/obj/*"
                       - !Sub "${StorePrefix}/invite/*"
+                      - !Sub "${StorePrefix}/heads/${WorkspaceId}/*"
                   NumericLessThanEquals:
-                    s3:max-keys: 1
-              - Sid: ReadRoot
+                    s3:max-keys: !Ref HeadPageKeys
+              - Sid: ReadAuthorityAndWriterHeads
                 Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub
-                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/root"
-                  - Bucket: !Ref BucketName
-                    Prefix: !Ref StorePrefix
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/heads/${Workspace}/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                      Workspace: !Ref WorkspaceId
               - Sid: ReadImmutableObjects
                 Effect: Allow
                 Action: s3:GetObject
@@ -120,18 +131,23 @@ Resources:
                   StringEquals:
                     s3:authType: REST-QUERY-STRING
                     s3:signatureversion: AWS4-HMAC-SHA256
-              - Sid: CreateImmutableObjectsByScopedRequest
+              - Sid: CreateImmutableObjects
                 Effect: Allow
                 Action: s3:PutObject
-                Resource:
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
-                  - !Sub
-                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
-                    - Bucket: !Ref BucketName
-                      Prefix: !Ref StorePrefix
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
+                Condition:
+                  Null:
+                    s3:if-none-match: "false"
+              - Sid: CreateImmutablePacksByScopedRequest
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/pack/*"
+                  - Bucket: !Ref BucketName
+                    Prefix: !Ref StorePrefix
                 Condition:
                   Null:
                     s3:if-none-match: "false"
@@ -140,6 +156,19 @@ Resources:
                   StringEquals:
                     s3:authType: REST-QUERY-STRING
                     s3:signatureversion: AWS4-HMAC-SHA256
+              - Sid: AdvanceAuthorityAndOwnerHeads
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/heads/${Workspace}/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                      Workspace: !Ref WorkspaceId
               - Sid: ReadGrantSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue

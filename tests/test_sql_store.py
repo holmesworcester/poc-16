@@ -5,11 +5,13 @@ import sqlite3
 import facts
 
 from core import fact_index
-from core.fact import Fact, decode, encode
+from core.fact import CurrentFact, Fact, current_fact, decode, encode
 from full_peer import sql_store
 from full_peer.node import FullPeer
 from core.repository_snapshot import action_bindings
 from core.writer_repository import FactConsumer, RepositoryMirror
+from facts.auth.signature import signature
+from facts.content.message import legacy_message
 
 
 OBSOLETE_TABLES = {
@@ -45,12 +47,13 @@ def _expected_projection(node, workspace):
         consumer,
     ).replay_local())
     assert result.errors == ()
-    facts_by_fid = {
+    source_by_fid = {
         fid: consumer.fact_bytes(fid)
         for fid in consumer.fact_ids()
     }
     decoded = {
-        fid: decode(raw) for fid, raw in facts_by_fid.items()
+        fid: facts.hydrate(decode(raw))
+        for fid, raw in source_by_fid.items()
     }
     rows = {
         row
@@ -61,7 +64,10 @@ def _expected_projection(node, workspace):
         (fact_index.ACTION_INDEX, sid, "", fid)
         for sid, fid in action_bindings(decoded).items()
     )
-    return facts_by_fid, rows
+    return {
+        fid: sql_store._encode_current(decode(raw))
+        for fid, raw in source_by_fid.items()
+    }, rows
 
 
 def _durable_heads(node, workspace):
@@ -85,9 +91,8 @@ def _assert_exact_projection(node, workspace):
     assert actual_rows == expected_rows
     assert _tables(db) == {"facts", "fact_index", "projected_heads"}
     for fid, raw in actual_facts.items():
-        fact = decode(raw)
+        _source, fact = sql_store._decode_current(raw)
         assert fact.fid == fid
-        assert encode(fact) == raw
 
 
 def test_sql_store_has_one_blob_table_and_one_exact_combined_index(tmp_path):
@@ -154,41 +159,33 @@ def test_public_queries_restart_from_the_same_disposable_rows(tmp_path):
     assert not (directory / "app.db").exists()
 
 
-def test_outdated_projection_schema_is_discarded_then_writer_trees_replayed(
+def test_app_version_replays_legacy_source_into_current_serialized_form(
         tmp_path):
     directory = tmp_path / "node"
     node = FullPeer(str(directory))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
-    message_fid = facts.content.message.post(
-        node, workspace, "general", "survives cut", ts=2)
+    secret, writer = node.identity(workspace)
+    root = node.fact_of(workspace, workspace)
+    legacy = legacy_message(
+        workspace, writer, "general", "survives cut", 2, writer)
+    node.publish_closed(workspace, ((
+        root,
+        signature(secret, writer, legacy, 2),
+        legacy,
+    ),))
+    message_fid = legacy.fid
     heads = _durable_heads(node, workspace)
     path = directory / "ws" / f"{workspace}.idx.db"
     node.idx(workspace).close()
 
+    # This is the disposable projection an older application left behind.
+    # Durable writer-pile bytes already contain the exact legacy source.
     db = sqlite3.connect(path)
-    db.executescript("""
-        DROP TABLE facts;
-        DROP TABLE fact_index;
-        DROP TABLE projected_heads;
-        CREATE TABLE facts(
-            fid TEXT PRIMARY KEY, ts INT, t TEXT, j TEXT, admitted INT);
-        CREATE TABLE fact_index(
-            kind TEXT, k0 TEXT, k1 TEXT, src TEXT);
-        CREATE TABLE action_proposals(value TEXT);
-        CREATE TABLE action_targets(value TEXT);
-        CREATE TABLE actions(value TEXT);
-        CREATE TABLE admission_receipts(value TEXT);
-        CREATE TABLE edges(value TEXT);
-        CREATE TABLE log(value TEXT);
-        CREATE TABLE offers(value TEXT);
-        CREATE TABLE proofs(value TEXT);
-        CREATE TABLE staged(value TEXT);
-        CREATE TABLE supp(value TEXT);
-        CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
-        CREATE INDEX fact_keys ON fact_index(k0,src);
-        CREATE INDEX fact_boundaries ON fact_index(k0,src);
-        PRAGMA user_version=0;
-    """)
+    db.execute(f"PRAGMA user_version={facts.APP_VERSION - 1}")
+    db.execute(
+        "UPDATE facts SET blob=? WHERE fid=?",
+        (encode(legacy), legacy.fid),
+    )
     local_only = Fact(
         "obsolete_local",
         3,
@@ -197,38 +194,64 @@ def test_outdated_projection_schema_is_discarded_then_writer_trees_replayed(
         workspace,
     )
     db.execute(
-        "INSERT INTO facts VALUES(?,?,?,?,?)",
-        (
-            local_only.fid,
-            local_only.ts,
-            local_only.t,
-                encode(local_only).decode(),
-            1,
-        ),
-    )
-    db.execute(
-        "INSERT OR REPLACE INTO meta VALUES('obsolete',?)",
-        ("discard-this-projection",),
+        "INSERT INTO facts VALUES(?,?)",
+        (local_only.fid, encode(local_only)),
     )
     db.commit()
     db.close()
 
     reopened = FullPeer(str(directory))
     upgraded = reopened.idx(workspace)
+    stored = reopened.sql(workspace).stored_bytes(message_fid)
+    source, form = sql_store._decode_current(stored)
 
     assert _durable_heads(reopened, workspace) == heads
-    assert reopened.fact_of(workspace, message_fid) is not None
+    assert isinstance(form, CurrentFact)
+    assert source == legacy
+    assert current_fact(form).t == "msg"
+    assert current_fact(form).body == {
+        "pk": writer,
+        "owner": writer,
+        "chan": "general",
+        "text": "survives cut",
+    }
+    assert form.fid == message_fid
+    assert stored != encode(legacy)
+    assert reopened.sql(workspace).fact_bytes(message_fid) == encode(legacy)
+    assert reopened.sql(workspace).source_fact_of(message_fid) == legacy
     assert reopened.fact_of(
         workspace, local_only.fid) is None
     assert _tables(upgraded) == {
         "facts", "fact_index", "projected_heads"}
-    assert _tables(upgraded).isdisjoint(OBSOLETE_TABLES)
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] \
+        == facts.APP_VERSION
     assert upgraded.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type='index' AND name IN "
-        "('fact_keys','fact_boundaries')"
+        "SELECT 1 FROM facts WHERE fid=?", (local_only.fid,)
     ).fetchone() is None
-    _assert_exact_projection(reopened, workspace)
+    assert upgraded.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? AND k0='msg' AND src=?",
+        (fact_index.TYPE_INDEX, message_fid),
+    ).fetchone() == (1,)
+    assert upgraded.execute(
+        "SELECT 1 FROM fact_index WHERE kind=? AND k0='msg.v0' AND src=?",
+        (fact_index.TYPE_INDEX, message_fid),
+    ).fetchone() is None
+    assert facts.content.message.messages(reopened, workspace) == [{
+        "chan": "general",
+        "from": "alice",
+        "text": "survives cut",
+        "mentions": [],
+        "ts": 2,
+        "fid": message_fid,
+    }]
+
+    # A current dependent closes over and republishes the exact legacy source;
+    # only the disposable semantic view is current.
+    facts.content.delete.remove(reopened, workspace, message_fid, ts=3)
+    assert facts.content.message.messages(reopened, workspace) == []
+    current_blob = reopened.sql(workspace).stored_bytes(message_fid)
+    reopened.rebuild(workspace)
+    assert reopened.sql(workspace).stored_bytes(message_fid) == current_blob
 
 
 def test_projection_rebuild_replaces_stale_missing_and_extra_rows(tmp_path):

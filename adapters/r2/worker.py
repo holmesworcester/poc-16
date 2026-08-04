@@ -14,6 +14,7 @@ from core.object_store import (
     EXISTS,
     Applied,
     MAX_PROVIDER_KEY_BYTES,
+    SINGLETON_CAS_KEYS,
     OutcomeUnknown,
     RetryableStoreError,
     STALE,
@@ -147,7 +148,8 @@ class R2BindingStore:
                 release()
 
     async def get(self, key):
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        limit = MAX_ROOT_BYTES \
+            if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         return await self.get_bounded(key, limit)
 
     async def get_bounded(self, key, max_bytes):
@@ -186,7 +188,8 @@ class R2BindingStore:
             obj = await self.bucket.get(self._key(key))
             if obj is None:
                 return ABSENT
-            limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+            limit = MAX_ROOT_BYTES \
+                if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
             return Versioned(
                 await self._bounded_bytes(obj, limit), self._token(obj))
         except (PayloadTooLarge, StoreError):

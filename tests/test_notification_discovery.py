@@ -192,7 +192,7 @@ def _discovery(node, workspace, cursor, carrier, **kwargs):
 
 def _cursor(store):
     store = getattr(store, "store", store)
-    return decode_cursor(store.read_versioned("root").value)
+    return decode_cursor(store.read_versioned("cursor").value)
 
 
 def _slot(node, workspace, device=None):
@@ -327,7 +327,7 @@ def test_bootstrap_mode_owner_and_state_loss_fail_closed(tmp_path):
         owner="d" * 64)
     with pytest.raises(ValueError, match="bootstrap conflict"):
         asyncio.run(foreign.bootstrap_current())
-    store._delete("root")
+    store._delete("cursor")
     with pytest.raises(CursorNotInitialized):
         asyncio.run(discovery.run_once())
 
@@ -534,7 +534,7 @@ def test_rebootstrap_generation_makes_old_delivery_noncurrent(tmp_path):
     assert old_reference.facts == (event,)
     assert asyncio.run(old.state.pending(h(old_raw))) == PENDING_CURRENT
 
-    store._delete("root")
+    store._delete("cursor")
     fresh_carrier = MemoryCarrier([])
     fresh = NotificationDiscovery(
         node.store(workspace), store, workspace, fresh_carrier,

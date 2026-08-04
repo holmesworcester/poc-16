@@ -1,12 +1,10 @@
-"""The sole exact-pile to repository-root state transition.
+"""Database-free closed-pile projection into one authenticated CAS root.
 
-``RepositoryApplier`` is database-free and provider-neutral.  Its caller
-names one create-only source object.  The applier exact-reads and validates
-that complete closed pile, establishes immutable fact and Merkle objects,
-advances the one mutable root by CAS, and returns. It never discovers or
-deletes work. Inline Bao slices are ordinary facts, so there is no secondary
-object-completion path. Retrying the same immutable source is idempotent
-because the authenticated repository is a monotone set.
+Ordinary content lives in per-writer trees.  This smaller engine remains for
+the shared authority/removal projection: it receives exact bytes already in
+hand, validates one complete closed pile, joins its durable authority facts,
+and advances ``authority``.  It has no ingress namespace, queue, discovery,
+deletion, or workspace-global content root.
 """
 from dataclasses import dataclass
 
@@ -15,13 +13,6 @@ import facts
 from .close import ClosedPileEvaluator, check_pile_bounds
 from .crypto import h
 from .fact import encode
-from .ingress import (
-    InvalidPile,
-    KernelRejected,
-    PermanentIngressRejection,
-    ingress_key,
-    parse_ingress_key,
-)
 from .limits import (
     InvalidEncoding,
     MAX_BUFFERED_PILE_BYTES,
@@ -30,12 +21,10 @@ from .limits import (
 )
 from .object_store import (
     ABSENT,
-    CREATED,
-    EXISTS,
+    AUTHORITY_ROOT_KEY,
     STALE,
     Applied,
     OutcomeUnknown,
-    REPOSITORY_ROOT_KEYS,
     Versioned,
     async_store,
     ensure_object_async,
@@ -54,14 +43,14 @@ class ApplyResult:
 
 
 class RepositoryApplier:
-    """One database-free receiving engine over an object-store CAS register."""
+    """One database-free authority projection over its fixed CAS register."""
 
     def __init__(
-            self, workspace, store, *, root_key="root",
+            self, workspace, store, *, root_key,
             evaluate=None, accept_fact=None):
         if not valid_fid(workspace):
             raise ValueError("repository workspace")
-        if root_key not in REPOSITORY_ROOT_KEYS:
+        if root_key != AUTHORITY_ROOT_KEY:
             raise ValueError("repository root key")
         if evaluate is not None and not callable(evaluate):
             raise TypeError("repository evaluator")
@@ -82,48 +71,6 @@ class RepositoryApplier:
             raise PayloadTooLarge("repository read exceeds byte limit")
         return value
 
-    async def _put_exact(self, store, key, raw):
-        """Create one immutable source and reconcile an unknown response."""
-        unknown = None
-        for _ in range(2):
-            try:
-                result = await store.put_if_absent(key, raw)
-            except OutcomeUnknown as error:
-                unknown = error
-            else:
-                if result not in {CREATED, EXISTS}:
-                    raise TypeError("immutable create result")
-            incumbent = await self._get_bounded(
-                store, key, max(1, len(raw)))
-            if incumbent == raw:
-                return
-            if incumbent is not None:
-                raise ValueError("immutable value conflict")
-        raise unknown or OSError("immutable value was not preserved")
-
-    async def _stage(self, member, raw):
-        """Store raw receiving bytes before they can influence publication."""
-        if not isinstance(raw, bytes):
-            raise TypeError("exact ingress bytes required")
-        if len(raw) > MAX_BUFFERED_PILE_BYTES:
-            raise InvalidPile("pile too large")
-        if not valid_fid(member):
-            raise ValueError("ingress member")
-        try:
-            check_pile_bounds(raw)
-        except (InvalidEncoding, PayloadTooLarge) as error:
-            raise InvalidPile(str(error) or "pile encoding") from error
-        payload = h(raw)
-        source = ingress_key(
-            self.workspace, payload[:32], member, payload)
-        await self._put_exact(self.store, source, raw)
-        return source
-
-    async def receive_pile(self, member, raw):
-        """Persist one HTTP/P2P body, then apply only its exact stored bytes."""
-        source = await self._stage(member, raw)
-        return await self.apply_exact(self.store, source, h(raw))
-
     async def apply_pile(self, raw):
         """Apply one exact in-hand pile without manufacturing ingress state."""
         if not isinstance(raw, bytes) or len(raw) > MAX_BUFFERED_PILE_BYTES:
@@ -131,7 +78,7 @@ class RepositoryApplier:
         try:
             check_pile_bounds(raw)
             facts_by_fid, admitted = self._validated_facts(raw)
-        except (InvalidEncoding, PayloadTooLarge, PermanentIngressRejection):
+        except (InvalidEncoding, PayloadTooLarge, ValueError):
             return ApplyResult("rejected", None)
         return await self._apply_validated(facts_by_fid, admitted)
 
@@ -161,16 +108,16 @@ class RepositoryApplier:
         """Return the durable subset of one database-free closed-pile turn."""
         judgment = self._evaluate(raw)
         if not judgment.ok:
-            if judgment.failure is not None:
-                raise judgment.failure
-            raise KernelRejected("ingress rejected")
+            raise ValueError(
+                str(judgment.failure) if judgment.failure is not None
+                else "closed pile rejected")
 
         facts_by_fid, durable = {}, []
         for receipt in judgment.valids:
             family = facts.family_for(receipt.fact.t)
             if self._accept_fact is not None \
                     and not self._accept_fact(receipt.fact):
-                raise KernelRejected("fact is outside repository policy")
+                raise ValueError("fact is outside repository policy")
             if family is None or not family.DURABLE:
                 continue
             fid = receipt.fact.fid
@@ -180,34 +127,8 @@ class RepositoryApplier:
                 raise ValueError("repository fact conflict")
         return facts_by_fid, tuple(sorted(set(durable)))
 
-    async def apply_exact(self, source_store, source, payload):
-        """Apply one caller-named create-only object with its key digest."""
-        source_store = async_store(source_store)
-        try:
-            address = parse_ingress_key(source)
-        except ValueError as error:
-            raise ValueError("exact ingress address") from error
-        if not valid_fid(payload) or address.workspace != self.workspace \
-                or address.digest != payload:
-            raise ValueError("exact ingress address")
-        try:
-            raw = await self._get_bounded(
-                source_store, source, MAX_BUFFERED_PILE_BYTES)
-        except PayloadTooLarge:
-            return ApplyResult("rejected", None)
-        if raw is None:
-            return ApplyResult("retryable", None)
-        if h(raw) != payload:
-            return ApplyResult("rejected", None)
-
-        try:
-            facts_by_fid, admitted = self._validated_facts(raw)
-        except PermanentIngressRejection:
-            return ApplyResult("rejected", None)
-        return await self._apply_validated(facts_by_fid, admitted)
-
     async def _apply_validated(self, facts_by_fid, admitted):
-        """Join one already-judged durable set through the sole root CAS."""
+        """Join one already-judged durable set through the authority CAS."""
         versioned = await self.store.read_versioned(self.root_key)
         if versioned is ABSENT:
             base_root, base_token = None, ABSENT
@@ -253,7 +174,7 @@ class RepositoryApplier:
         if result is STALE:
             return ApplyResult("retryable", base_root, admitted)
         if not isinstance(result, Applied):
-            raise TypeError("root CAS result")
+            raise TypeError("authority CAS result")
         return ApplyResult("applied", compiled.root, admitted)
 
 

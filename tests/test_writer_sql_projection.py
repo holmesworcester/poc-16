@@ -8,7 +8,7 @@ from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
 from core.fact import encode
 from core.store import FsStore
-from core.writer_head import WriterBinding
+from core.writer_head import WriterBinding, writer_store_binding
 from core.writer_repository import (
     FactConsumer,
     OpaqueHeadGate,
@@ -52,7 +52,7 @@ def test_sql_checkpoint_restart_and_wipe_replay_the_accepted_tree(tmp_path):
         root = workspace_fact(secret, public, "alice", 1)
         device = device_fact(root.fid, public, "laptop", 2)
         device_signature = signature_fact(secret, public, device, 2)
-        binding = h(b"store")
+        binding = writer_store_binding(root.fid, public)
         authority_root = h(b"authority")
         source = FsStore(str(tmp_path / "source"))
         local = FsStore(str(tmp_path / "local"))

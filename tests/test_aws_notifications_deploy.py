@@ -538,9 +538,9 @@ def test_template_keeps_roles_narrow_and_traffic_switches_non_destructive():
         "ReadExactNotificationSecret", 1)[0]
     historical = historical.split("CompleteNotificationCursor", 1)[0]
     assert "s3:PutObject" not in historical
-    assert "${NotificationStatePrefix}/root" not in historical
+    assert "${NotificationStatePrefix}/cursor" not in historical
     assert "s3:PutObject" in completion
-    assert "${NotificationStatePrefix}/root" in completion
+    assert "${NotificationStatePrefix}/cursor" in completion
     assert "${NotificationStatePrefix}/obj/*" not in completion
 
 
@@ -1955,9 +1955,9 @@ def test_direct_smoke_and_production_defaults_are_separate():
         "deploy", "--stack-name", "stack", "--deployment-id", "deploy-id",
         "--workspace", WORKSPACE,
         "--canonical-bucket", "canonical-bucket",
-        "--canonical-prefix", "canonical/root",
+        "--canonical-prefix", "canonical/data",
         "--state-bucket", "state-bucket",
-        "--state-prefix", "notification/root",
+        "--state-prefix", "notification/state",
         "--expected-owner", ACCOUNT,
         "--notification-secret-arn", SECRET_ARN,
         "--notification-secret-version-id", SECRET_VERSION,

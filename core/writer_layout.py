@@ -9,10 +9,9 @@ recovered pile is checked against the tree-selected OID and its own signature.
 from dataclasses import dataclass, field
 from itertools import islice
 
-from .close import decode_signed_pile
+from .close import InvalidPile, decode_signed_pile
 from .crypto import h
 from .fact import canon
-from .ingress import InvalidPile
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_WRITER_PACK_BYTES,

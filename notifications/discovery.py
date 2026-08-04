@@ -31,6 +31,7 @@ from core.object_store import (
     Applied,
     ListPage,
     OutcomeUnknown,
+    OPERATIONAL_CURSOR_KEY,
     Versioned,
     VersionToken,
     async_store,
@@ -264,7 +265,7 @@ class NotificationState:
         return raw
 
     async def _read(self):
-        current = await self.store.read_versioned("root")
+        current = await self.store.read_versioned(OPERATIONAL_CURSOR_KEY)
         if current is ABSENT:
             return None, ABSENT
         if not isinstance(current, Versioned):
@@ -297,7 +298,7 @@ class NotificationState:
             return PENDING_NONCURRENT
         try:
             result = await self.store.cas(
-                "root", token, encode_cursor(cursor.advance()))
+                OPERATIONAL_CURSOR_KEY, token, encode_cursor(cursor.advance()))
         except OutcomeUnknown:
             pass
         else:
@@ -487,9 +488,11 @@ class NotificationDiscovery:
     async def _cas_exact(self, token, cursor):
         desired = encode_cursor(cursor)
         try:
-            result = await self.cursor_store.cas("root", token, desired)
+            result = await self.cursor_store.cas(
+                OPERATIONAL_CURSOR_KEY, token, desired)
         except OutcomeUnknown:
-            current = await self.cursor_store.read_versioned("root")
+            current = await self.cursor_store.read_versioned(
+                OPERATIONAL_CURSOR_KEY)
             if isinstance(current, Versioned) and current.value == desired:
                 return current.token
             return None
@@ -564,7 +567,8 @@ class NotificationDiscovery:
         return tuple(out)
 
     async def _bootstrap(self, mode):
-        current = await self.cursor_store.read_versioned("root")
+        current = await self.cursor_store.read_versioned(
+            OPERATIONAL_CURSOR_KEY)
         if isinstance(current, Versioned):
             cursor = decode_cursor(current.value)
             if cursor.workspace != self.workspace \

@@ -9,7 +9,6 @@ import pytest
 from adapters import host
 import facts
 
-from core import ingress
 from core.crypto import keypair
 from core.object_store import (
     MAX_INVITE_ID_BYTES,
@@ -21,6 +20,7 @@ from full_peer import cli, daemon
 from full_peer.node import FullPeer
 from core.store import FsStore
 from tests.provider_fakes import FakeS3Bucket
+from tests.util import writer_slots
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,22 +155,15 @@ def test_every_logical_namespace_fits_before_provider_client_creation():
         {**S3, "base_prefix": maximum_base},
         client_factory=lambda *args: clients.append(args) or object())
     store = factory("0" * 64)
-    ingress_address = ingress.ingress_key(
-        "0" * 64,
-        "0" * ingress.SESSION_HEX_CHARS,
-        "0" * ingress.MEMBER_HEX_CHARS,
-        "0" * 64,
-    )
     invite = "invite/" + "i" * MAX_INVITE_ID_BYTES
     assert MAX_LOGICAL_KEY_BYTES == len(invite)
-    assert ingress.MAX_INGRESS_KEY_BYTES < MAX_LOGICAL_KEY_BYTES
     assert len(store._physical(invite).encode("ascii")) \
         == MAX_PROVIDER_KEY_BYTES
     for key in (
-            "root",
+            "authority",
+            "cursor",
             "obj/" + "0" * 64,
-            invite,
-            ingress_address):
+            invite):
         assert len(store._physical(key).encode("ascii")) \
             <= MAX_PROVIDER_KEY_BYTES
     assert len(clients) == 1
@@ -285,8 +278,9 @@ def test_real_cli_daemon_path_passes_only_the_generic_factory(
     ]) is None
 
     selected = seen["peer"]
-    assert selected.store(workspace).get("root") \
-        == bootstrap.store(workspace).get("root")
+    assert writer_slots(selected, workspace) \
+        == writer_slots(bootstrap, workspace)
+    assert writer_slots(selected, workspace)
     assert seen["arguments"][1:3] == (0, "127.0.0.1")
     assert seen["arguments"][6].grant_ttl_ms == 60_000
     assert seen["arguments"][7:] == (

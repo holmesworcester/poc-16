@@ -17,9 +17,6 @@ from core.close import (
 )
 from core.crypto import h, keypair, load_sk
 from core.fact import workspace_of
-from core.ingress import ingress_key, parse_ingress_key
-from core.object_store import CREATED, EXISTS
-from core.object_store import async_store
 from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.auth.user import user
@@ -27,6 +24,7 @@ from facts.auth.user_invite import user_invite
 from facts.content.message import message
 from core.kernel import resolve_deps
 from core.writer_repository import FactConsumer, HeadGrant
+from core.writer_head import head_slot_prefix
 from full_peer.node import FullPeer, now_ms
 
 
@@ -97,31 +95,6 @@ def invoke_mint_value(node, workspace, value):
     ))
     body = json.loads(response.body) if response.body else None
     return gate, (response.status, body)
-
-
-async def plant_exact(store, workspace, member, raw, session=None):
-    """Test-fixture upload: create one exact source without applying it."""
-    digest = h(raw)
-    key = ingress_key(
-        workspace, digest[:32] if session is None else session,
-        member, digest)
-    store = async_store(store)
-    result = await store.put_if_absent(key, raw)
-    assert result in {CREATED, EXISTS}
-    assert await store.get_bounded(key, max(1, len(raw))) == raw
-    return key
-
-
-async def plant_for(applier, member, raw, session=None):
-    return await plant_exact(
-        applier.store, applier.workspace, member, raw, session)
-
-
-async def apply_planted(applier, source, source_store=None):
-    """Invoke only the public exact-source boundary in tests."""
-    source_store = applier.store if source_store is None else source_store
-    return await applier.apply_exact(
-        source_store, source, parse_ingress_key(source).digest)
 
 
 def invoke_mint(node, workspace, pile):
@@ -319,6 +292,15 @@ def all_fids(n, ws):
             for fid in n.sql(ws).fact_ids()
         ]
     return [fact.fid for fact in sorted(facts, key=lambda fact: fact.key)]
+
+
+def writer_slots(node, workspace):
+    """Exact accepted writer-slot bytes for a realistic mutation ratchet."""
+    store = node.store(workspace)
+    return tuple(
+        (key, store.get(key))
+        for key in store.list(head_slot_prefix(workspace))
+    )
 
 
 def send_bytes(node, workspace, name, data, channel="general", ts=None):

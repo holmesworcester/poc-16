@@ -224,7 +224,7 @@ def generated_config(environment=os.environ, *, smoke=False):
         ttl,
     )
     config["name"] = environment.get(
-        "CF_WORKER_NAME", "poc-16-readonly-gateway")
+        "CF_WORKER_NAME", "poc-16-owner-gateway")
     if not WORKER_NAME.fullmatch(config["name"]):
         raise ValueError("CF_WORKER_NAME is not a safe Worker script name")
     config["r2_buckets"][0].update({
@@ -271,6 +271,9 @@ def _verify_bundle(directory):
         "crypto_compat.py",
         "core/validated_set.py",
         "core/repository_reader.py",
+        "core/authority.py",
+        "core/repository_applier.py",
+        "core/writer_repository.py",
         "core/worker.py",
         "facts/auth/request.py",
         "adapters/r2/worker.py",
@@ -289,12 +292,9 @@ def _verify_bundle(directory):
         "full_peer/node.py",
         "full_peer/daemon.py",
         "core/runtime.py",
-        "core/writer_repository.py",
         "adapters/r2/s3.py",
         "adapters/s3/store.py",
         "deploy/aws_lambda/app.py",
-        "deploy/cloudflare_upload/signer.py",
-        "deploy/upload_broker.py",
     } & paths
     if forbidden:
         raise RuntimeError(f"dry-run included host modules: {sorted(forbidden)}")

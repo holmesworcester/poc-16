@@ -115,7 +115,7 @@ def _store(bucket_name, prefix_name, *, state):
         connect_timeout=SDK_CONNECT_TIMEOUT_SECONDS,
         read_timeout=SDK_READ_TIMEOUT_SECONDS,
         read_total_max_attempts=SDK_TOTAL_ATTEMPTS,
-        # State writes are exclusively immutable create or root CAS.  A 403
+        # State writes are exclusively immutable create or cursor CAS. A 403
         # for a missing key may be treated as absent without permitting an
         # overwrite; canonical read-only storage must fail closed instead.
         conditional_write_403_is_absent=state,

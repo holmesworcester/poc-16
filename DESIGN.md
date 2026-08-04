@@ -673,6 +673,22 @@ snapshot, or workspace-wide removal dump. It cannot reveal another member's
 path. A removed member can therefore learn that it was removed without
 retaining workspace access.
 
+That confinement is enforced by storage shape, not endpoint etiquette.
+Removal-root and page bytes live under a private removal namespace that generic
+`/obj`, `/pack`, direct-object grants, and writer-store LIST cannot address.
+Recording the removal-root hash in a writer slot makes the decision auditable;
+it does not make the root fetchable. Only the historical-membership handler may
+read the private tree, and it performs authenticated point reads for the exact
+member/device scopes selected by the valid request.
+
+The returned witness contains those requested values and non-disclosing
+sibling commitments only. Logical removal keys are hashed before placement,
+and a proof leaf commits to one requested value (or uses an equivalent
+zero-knowledge-of-neighbors shape); it must not serialize an ordinary dense
+Merkle leaf containing adjacent members. Thus possession of an ordinary member
+grant, a recorded root OID, or a sibling path never permits enumeration of the
+removal tree.
+
 ### 7.2 Current membership mints access or one exact write
 
 The client then pushes the stronger request. This second closed pile is also
@@ -872,6 +888,8 @@ The portable store contract becomes:
 - create-only immutable write with collision verification;
 - conditional replace of one exact per-device head slot;
 - conditional replace of the separate removal-tree root;
+- private bounded reads of removal proof nodes, unavailable to generic object
+  GET, direct-object grants, and public prefix LIST;
 - strongly consistent, lexicographically ordered, bounded prefix LIST with an
   opaque continuation cursor;
 - no correctness dependence on delete, rename, ETag content semantics, object
@@ -1111,3 +1129,6 @@ existing `fid`. Unknown predecessor protocol values remain rejected.
 24. One device root secret plus invite-derived facts is the complete protocol
     identity bootstrap for a node.
 25. No workspace-global mutable content root exists.
+26. Removal-root/page bytes are non-enumerable private verifier state; a caller
+    can obtain only its authenticated member/device point witness through the
+    historical-membership gate.

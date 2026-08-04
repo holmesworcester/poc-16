@@ -127,7 +127,6 @@ CONFIG_PATHS = {
 CORE_MODULES = (
     "__init__.py",
     "crypto.py",
-    "ingress.py",
     "limits.py",
     "object_store.py",
     "shape.py",
@@ -1429,7 +1428,7 @@ def _require_retained_notification_objects(
         reader, "CANONICAL_PREFIX", "canonical notification history",
         environment)
     _require_prefix_synchronously_readable(
-        scanner, "NOTIFICATION_STATE_PREFIX", "notification cursor/root",
+        scanner, "NOTIFICATION_STATE_PREFIX", "notification cursor",
         environment)
 
 

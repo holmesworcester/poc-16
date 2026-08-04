@@ -168,7 +168,6 @@ def fixture(count):
             grant = device_invite(
                 root.fid,
                 founder,
-                founder,
                 public,
                 f"device-{ordinal:03d}",
                 ordinal + 2,

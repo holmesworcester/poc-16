@@ -9,33 +9,20 @@ Commands:
       POC16_R2_ACCESS_KEY_ID=... POC16_R2_SECRET_ACCESS_KEY=... \
       python3 -m pytest -q -m live_r2 tests/test_provider_live.py
 
-    POC16_LIVE_R2_UPLOAD=1 POC16_R2_ACCOUNT_ID=... \
-      POC16_R2_BUCKET=... POC16_R2_ACCESS_KEY_ID=... \
-      POC16_R2_SECRET_ACCESS_KEY=... \
-      python3 -m pytest -q -m live_r2 \
-        tests/test_provider_live.py::test_live_r2_presigned_staging_put
-
 These tests reject endpoint overrides.  Emulator runs can exercise SDK wiring
 elsewhere but are not provider evidence.
 """
 import os
-import hashlib
 import re
 import secrets
 import time
-from urllib.error import HTTPError
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 import pytest
 
 from adapters.r2 import R2S3Config, R2S3Store
 from adapters.s3 import S3Config, S3Store
 from core.object_store import Applied, OutcomeUnknown
-from core.ingress import ingress_key, parse_ingress_key
-from deploy.cloudflare_upload.boundary import Deployment
-from deploy.cloudflare_upload.signer import R2UploadSigner
-from deploy.upload_broker import AuthorizedPilePut
 from tests.provider_conformance import (
     ConformanceRun,
     exercise_sync_store,
@@ -144,15 +131,15 @@ def _require_endpoint(store, provider):
 def _prove_recovery_after_discarded_response(store, run, pace):
     """Simulate the client losing an acknowledged conditional response."""
     pace()
-    before = store.read_versioned("root")
+    before = store.read_versioned("authority")
     candidate = run.value("discarded-response-candidate")
-    applied = store.cas("root", before.token, candidate)
+    applied = store.cas("authority", before.token, candidate)
     if not isinstance(applied, Applied):
         raise AssertionError(run.diagnostic())
     try:
         raise OutcomeUnknown("test discarded the applied response")
     except OutcomeUnknown:
-        recovered = store.read_versioned("root")
+        recovered = store.read_versioned("authority")
     assert recovered.value == candidate, run.diagnostic()
     assert recovered.token == applied.token, run.diagnostic()
     run.record("discard applied response/read recovery", recovered)
@@ -266,115 +253,3 @@ def test_live_r2_direct_api_conformance(live_r2_store):
     exercise_sync_store(live_r2_store, run, pace=pace)
     _prove_recovery_after_discarded_response(
         live_r2_store(), run, pace)
-
-
-def _live_put(capability, body, *, url=None, headers=None):
-    request = Request(
-        capability.url if url is None else url,
-        data=body,
-        method="PUT",
-        headers=dict(capability.headers)
-        if headers is None else dict(headers),
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            response.read()
-            return response.status
-    except HTTPError as error:
-        error.close()
-        return error.code
-
-
-@pytest.mark.live
-@pytest.mark.live_r2
-def test_live_r2_presigned_staging_put():
-    required = (
-        "POC16_R2_ACCOUNT_ID",
-        "POC16_R2_BUCKET",
-        "POC16_R2_ACCESS_KEY_ID",
-        "POC16_R2_SECRET_ACCESS_KEY",
-    )
-    _required_opt_in("POC16_LIVE_R2_UPLOAD", required)
-    try:
-        import boto3  # noqa: F401
-    except ImportError:
-        pytest.skip("boto3 is required for the privileged R2 observer")
-
-    account = os.environ["POC16_R2_ACCOUNT_ID"]
-    bucket = os.environ["POC16_R2_BUCKET"]
-    access = os.environ["POC16_R2_ACCESS_KEY_ID"]
-    secret = os.environ["POC16_R2_SECRET_ACCESS_KEY"]
-    workspace = secrets.token_hex(32)
-    member = secrets.token_hex(32)
-    session = secrets.token_hex(16)
-    body = b"poc16 live direct R2 staging upload"
-    digest = hashlib.sha256(body).hexdigest()
-    other_digest = hashlib.sha256(body + b"!").hexdigest()
-    canonical = "poc16-live-unused-canonical"
-    if bucket == canonical:
-        canonical += "-other"
-    candidate = Deployment(
-        account_id=account,
-        workspace=workspace,
-        canonical_bucket=canonical,
-        ingress_bucket=bucket,
-        owner="live-provider-conformance",
-        broker_name="poc16-live-upload-broker",
-        applier_name="poc16-live-repository-applier",
-        read_permission_group_id="c" * 32,
-        write_permission_group_id="d" * 32,
-        broker_domain="uploads.example.com",
-        presign_ttl_seconds=30,
-    )
-    key = ingress_key(
-        workspace, session, member, digest)
-    other_key = ingress_key(
-        workspace, session, member, other_digest)
-    observer = R2S3Store(
-        R2S3Config(account_id=account, bucket=bucket),
-        access_key_id=access,
-        secret_access_key=secret,
-    )
-    _require_endpoint(observer, "r2")
-    capability = R2UploadSigner(
-        candidate, access, secret).sign(AuthorizedPilePut(
-            workspace,
-            member,
-            session,
-            digest,
-            len(body),
-            time.time_ns() // 1_000_000 + 30_000,
-        ))
-    parsed = urlsplit(capability.url)
-    wrong_url = urlunsplit((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path.removesuffix(digest) + other_digest,
-        parsed.query,
-        parsed.fragment,
-    ))
-    cleanup = (key, other_key)
-    print(f"live R2 presigned staging key: {key}", flush=True)
-    try:
-        wrong_headers = {
-            **dict(capability.headers),
-            "content-type": "text/plain",
-        }
-        assert _live_put(
-            capability, body, headers=wrong_headers) == 403
-        assert _live_put(capability, body, url=wrong_url) == 403
-        assert observer.get(key) is None
-        assert observer.get(other_key) is None
-
-        assert _live_put(capability, body) in {200, 201}
-        assert observer.get(key) == body
-        assert _live_put(capability, body) == 412
-        assert observer.get(key) == body
-        assert observer.get(other_key) is None
-    finally:
-        for staged in cleanup:
-            address = parse_ingress_key(staged)
-            if address.workspace != workspace:
-                raise ValueError("refusing unsafe live R2 cleanup")
-            observer._mutation_client.delete_object(
-                Bucket=bucket, Key=staged)

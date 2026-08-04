@@ -742,8 +742,8 @@ def test_sealed_scanner_requires_explicit_bootstrap_and_detects_state_loss(
     assert decode_hint(queue.bodies[0].encode()).facts == (new,)
     assert old not in decode_hint(queue.bodies[0].encode()).facts
 
-    state.data.pop(f"notifications/v1/{workspace}/root")
-    state.etags.pop(f"notifications/v1/{workspace}/root")
+    state.data.pop(f"notifications/v1/{workspace}/cursor")
+    state.etags.pop(f"notifications/v1/{workspace}/cursor")
     with pytest.raises(CursorNotInitialized):
         run(scanner.scan(env))
 
@@ -773,9 +773,9 @@ def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
     preference.set_global(node, workspace, preference.NONE, ts=5)
     _copy_repository(
         node, workspace, canonical, f"workspaces/{workspace}")
-    root_key = f"notifications/v1/{workspace}/root"
-    state.data.pop(root_key)
-    state.etags.pop(root_key)
+    cursor_key = f"notifications/v1/{workspace}/cursor"
+    state.data.pop(cursor_key)
+    state.etags.pop(cursor_key)
     queue.bodies.clear()
     assert run(_bootstrap(state_service.env, "backfill")) \
         == "bootstrapped-backfill"
@@ -792,8 +792,8 @@ def test_bootstrap_generation_blocks_paused_muted_worker_aba(tmp_path):
         await paused.entered.wait()
         assert fcm.documents == []
 
-        state.data.pop(root_key)
-        state.etags.pop(root_key)
+        state.data.pop(cursor_key)
+        state.etags.pop(cursor_key)
         queue.bodies.clear()
         assert await _bootstrap(state_service.env, "backfill") \
             == "bootstrapped-backfill"
@@ -881,7 +881,7 @@ def test_different_deployments_cannot_steal_one_shared_cursor(tmp_path):
 
     with pytest.raises(ValueError, match="release skew"):
         run(scanner.scan(foreign))
-    assert any(key.endswith("/root") for key in state.data)
+    assert any(key.endswith("/cursor") for key in state.data)
     assert queue_b.bodies == []
 
 
@@ -1320,11 +1320,11 @@ def test_r2_reader_checks_the_actual_body_after_provider_metadata():
     bucket = R2Bucket()
 
     async def malicious_get(_key):
-        return R2Object("root", b"too large", "opaque")
+        return R2Object("cursor", b"too large", "opaque")
 
     bucket.get = malicious_get
     with pytest.raises(PayloadTooLarge):
-        run(R2ReadBindingStore(bucket).get_bounded("root", 3))
+        run(R2ReadBindingStore(bucket).get_bounded("cursor", 3))
 
 
 def test_binding_inventory_segregates_effects_and_has_no_applier():

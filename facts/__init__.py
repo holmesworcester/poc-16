@@ -14,7 +14,7 @@ MODULES = auth.MODULES + content.MODULES
 # Bump for any change in family extraction, policy, or query interpretation
 # that must rebuild the disposable full-peer projection.  Canonical fact
 # bytes and writer trees are never migrated; current code replays them.
-APP_VERSION = 2
+APP_VERSION = 3
 
 
 def _principal_namespaces(modules):

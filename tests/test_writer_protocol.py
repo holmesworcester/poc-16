@@ -5,14 +5,17 @@ import pytest
 
 from core.close import (
     ClosedPileEvaluator,
+    InvalidPile,
+    KernelRejected,
+    SIGNED_PILE_FORMAT,
+    SIGNED_PILE_SIGNATURE_DOMAIN,
     decode_signed_pile,
     encode_signed_pile,
     make_signed_pile,
     signed_pile_oid,
 )
-from core.crypto import h, keypair
+from core.crypto import h, keypair, sign
 from core.fact import canon
-from core.ingress import InvalidPile, KernelRejected
 from core.writer_head import (
     HeadSlot,
     InvalidWriterHead,
@@ -101,6 +104,26 @@ def test_signed_pile_rejects_noncanonical_and_nonclosed_content():
         secret, root.fid, public, (dangling,)))
     with pytest.raises(KernelRejected, match="closed pile rejected"):
         ClosedPileEvaluator(root.fid).evaluate(nonclosed)
+
+
+def test_signed_pile_rejects_duplicate_facts_even_when_outer_signature_valid():
+    secret, public, root, _pile, _raw = signed_workspace_pile()
+    document = {
+        "facts": [root.to_json(), root.to_json()],
+        "format": SIGNED_PILE_FORMAT,
+        "workspace": root.fid,
+        "writer": public,
+    }
+    raw = canon({
+        **document,
+        "signature": sign(secret, h(canon([
+            SIGNED_PILE_SIGNATURE_DOMAIN,
+            document,
+        ]))),
+    })
+
+    with pytest.raises(InvalidPile, match="signed pile"):
+        decode_signed_pile(raw)
 
 
 def test_writer_head_and_slot_round_trip_without_predecessor_chain():

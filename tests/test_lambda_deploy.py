@@ -14,10 +14,12 @@ import facts
 import pytest
 
 from adapters.s3 import S3Config
+from core import peer_capability
+from core.authority import AuthorityRepository
 from .util import signed_pile_bytes
 from core.crypto import h, unseal
 from core.grants import check_token
-from core.limits import MAX_MINT_REQUEST_BYTES
+from core.limits import MAX_MINT_REQUEST_BYTES, PAGE_BATCH
 from full_peer.node import FullPeer
 from deploy.aws_lambda import app
 from deploy.aws_lambda.config import (
@@ -115,12 +117,31 @@ def world(tmp_path):
     node = FullPeer(str(tmp_path / "node"))
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     now = 100
-    pile = signed_pile_bytes(request.payload(
-        node, workspace, "sync", now + 60_000, now))
-    app._gateway_cache = HttpGate(
-        AsyncFromSyncReader(node.store(workspace)),
-        workspace, b"s" * 32, lambda: now)
+    pile = signed_pile_bytes(
+        request.payload(node, workspace, "sync", now + 60_000, now),
+        secret=node.identity(workspace)[0],
+    )
+    app._gateway_cache = local_gateway(node, workspace, now)
     return node, workspace, now, pile
+
+
+def local_gateway(node, workspace, now):
+    store = AsyncFromSyncReader(node.store(workspace))
+    authority = AuthorityRepository(workspace, store)
+
+    async def authorize(proof, purpose):
+        return await authority.authorize_access(
+            proof, now, purpose=purpose)
+
+    return HttpGate(
+        store,
+        workspace,
+        b"s" * 32,
+        lambda: now,
+        authority_publish=authority.publish,
+        mint_authorize=authorize,
+        sync_profile=peer_capability.OWNER,
+    )
 
 
 def mint(node, workspace, pile):
@@ -177,24 +198,31 @@ def test_lambda_bootstraps_authority_then_advances_one_owner_head(
         world.root.fid, proof), None))[0] == 403
 
 
-def test_lambda_mints_and_serves_authenticated_snapshot_objects(tmp_path):
+def test_lambda_mints_and_serves_writer_directory_objects(tmp_path):
     node, workspace, now, pile = world(tmp_path)
     status, body, token = mint(node, workspace, pile)
 
     assert status == 200
-    assert body["cap"] == "sync-v1/read"
+    assert body["cap"] == "sync-v1/owner"
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
         trusted_now=now) == node.identity_id(workspace)
     assert check_token(
         b"s" * 32, "Bearer " + token, workspace,
         trusted_now=now, require_push=True) is None
+    assert check_token(
+        b"s" * 32, "Bearer " + token, workspace,
+        trusted_now=now, require_object_put=True) \
+        == node.identity_id(workspace)
 
     headers = {"authorization": "Bearer " + token}
-    status, root_headers, root = response(app.handler(
-        event("GET", "/root", workspace, headers=headers), None))
+    status, root_headers, raw_heads = response(app.handler(
+        event("GET", "/heads", workspace, headers=headers), None))
     assert status == 200
-    assert root == node.store(workspace).get("root")
+    heads = json.loads(raw_heads)
+    assert len(heads["heads"]) == 1
+    assert heads["heads"][0][0].startswith(
+        f"heads/{workspace}/")
     assert root_headers["Cache-Control"] == "no-store"
 
     raw = b"served through the function URL"
@@ -218,10 +246,9 @@ def test_lambda_rejects_a_request_pile_from_another_workspace(tmp_path):
     pile = signed_pile_bytes(
         request.payload(node, first, "sync", now + 60_000, now),
         workspace=first,
+        secret=node.identity(first)[0],
     )
-    app._gateway_cache = HttpGate(
-        AsyncFromSyncReader(node.store(second)),
-        second, b"s" * 32, lambda: now)
+    app._gateway_cache = local_gateway(node, second, now)
     request_body = json.dumps({
         "ws": second,
         "pile": base64.b64encode(pile).decode(),
@@ -254,11 +281,11 @@ def test_lambda_bounds_query_bytes_and_fields_before_parsing(tmp_path):
     _, workspace, _, _ = world(tmp_path)
 
     byte_over = event(
-        "GET", "/root", raw_query="x" * (MAX_QUERY_BYTES + 1))
+        "GET", "/heads", raw_query="x" * (MAX_QUERY_BYTES + 1))
     assert response(app.handler(byte_over, None))[0] == 413
 
     fields_over = event(
-        "GET", "/root",
+        "GET", "/heads",
         raw_query="&".join(
             [f"ws={workspace}"]
             + [f"k{index}=v" for index in range(MAX_QUERY_FIELDS)]))
@@ -283,13 +310,13 @@ def test_lambda_rejects_malformed_query_encoding_before_gateway_io(
     app._gateway_cache = Probe()
     for malformed in ("%", "%2", "%GG", "%FF"):
         request_event = event(
-            "GET", "/root",
+            "GET", "/heads",
             raw_query=f"ws={workspace}&bad={malformed}")
         assert response(app.handler(request_event, None))[0] == 400
     assert calls == []
 
     valid = event(
-        "GET", "/root",
+        "GET", "/heads",
         raw_query=f"ws={workspace}&ok=%E2%9C%93")
     assert response(app.handler(valid, None))[0] == 200
     assert calls[0][2]["ok"] == ["✓"]
@@ -487,11 +514,13 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert "CodeUri: stage/" in template
     assert "secretsmanager:GetSecretValue" in template
     assert "s3:GetObject" in template
-    assert template.count("Action: s3:PutObject") == 1
+    assert template.count("Action: s3:PutObject") == 3
     assert "s3:DeleteObject" not in template
     assert "Action: s3:ListBucket" in template
     assert "s3:prefix:" in template
-    assert '${StorePrefix}/root' in template
+    assert '${StorePrefix}/authority' in template
+    assert '${StorePrefix}/heads/${WorkspaceId}/*' in template
+    assert '${StorePrefix}/root' not in template
     assert '${StorePrefix}/obj/*' in template
     assert '${StorePrefix}/invite/*' in template
     assert template.count('${Prefix}/obj/*') == 2
@@ -572,21 +601,26 @@ def test_cloudformation_bucket_and_prefix_constraints_refine_s3_config():
 
 def test_list_permission_is_limited_to_gateway_read_namespaces():
     template = (LAMBDA / "template.yaml").read_text()
+    parameter = template.split("HeadPageKeys:", 1)[1].split(
+        "KmsKeyArn:", 1)[0]
     block = template.split(
         "- Sid: DistinguishMissingWorkspaceKeys", 1)[1].split(
-            "- Sid: ReadRoot", 1)[0]
+        "- Sid: ReadAuthorityAndWriterHeads", 1)[0]
 
+    assert f"Default: {PAGE_BATCH}" in parameter
+    assert f"AllowedValues: [{PAGE_BATCH}]" in parameter
     assert "Action: s3:ListBucket" in block
     assert '"arn:${AWS::Partition}:s3:::${BucketName}"' in block
-    assert block.count("!Sub") == 4
-    assert '${StorePrefix}/root' in block
+    assert block.count("!Sub") == 5
+    assert '${StorePrefix}/authority' in block
+    assert '${StorePrefix}/heads/${WorkspaceId}/*' in block
     assert '${StorePrefix}/obj/*' in block
     assert '${StorePrefix}/invite/*' in block
     assert '${StorePrefix}/*' not in block
-    assert "s3:max-keys: 1" in block
+    assert "s3:max-keys: !Ref HeadPageKeys" in block
 
 
-def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
+def test_gateway_bucket_guard_denies_deletes_and_unconditional_writes():
     document = policy(
         "workspace-bucket", "tenant", profile="bucket-wide")
     statements = {
@@ -598,7 +632,8 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
     assert set(deletion["Action"]) == {
         "s3:DeleteObject", "s3:DeleteObjectVersion"}
     authoritative_resources = [
-        "arn:aws:s3:::workspace-bucket/tenant/root",
+        "arn:aws:s3:::workspace-bucket/tenant/authority",
+        "arn:aws:s3:::workspace-bucket/tenant/heads/*",
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
     ]
     assert deletion["Resource"] == authoritative_resources
@@ -624,7 +659,7 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
         "arn:aws:s3:::workspace-bucket/tenant/pack/*",
     ]
-    assert statements["RequireRootCompareAndSwap"]["Condition"] == {
+    assert statements["RequireMutableCompareAndSwap"]["Condition"] == {
         "Null": {
             "s3:if-match": "true",
             "s3:if-none-match": "true",
@@ -649,23 +684,23 @@ def test_applier_bucket_guard_denies_deletes_and_unconditional_writes():
     assert guarded_actions.isdisjoint(trusted_replication_actions)
 
 
-def test_single_applier_policy_names_its_residual_trust_boundary():
-    principal = "arn:aws:iam::123456789012:role/poc16-applier"
+def test_single_gateway_policy_names_its_residual_trust_boundary():
+    principal = "arn:aws:iam::123456789012:role/poc16-gateway"
     document = policy(
         "workspace-bucket", "tenant", principal,
-        profile="single-applier")
+        profile="single-gateway")
 
     assert all(
         statement["Principal"] == {"AWS": principal}
         for statement in document["Statement"])
-    with pytest.raises(ValueError, match="does not accept one applier"):
+    with pytest.raises(ValueError, match="does not accept one gateway"):
         policy(
             "workspace-bucket", "tenant", principal,
             profile="bucket-wide")
     with pytest.raises(ValueError, match="principal"):
         policy(
             "workspace-bucket", "tenant",
-            profile="single-applier")
+            profile="single-gateway")
 
 
 def test_deploy_validates_inputs_and_requires_readiness(monkeypatch):

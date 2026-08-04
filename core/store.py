@@ -1,20 +1,19 @@
 """Bounded ObjectStore for authenticated metadata and semantic objects.
 
-Layout: root and authority (distinct CAS'd composite snapshots), obj/<hash>
-(map pages, fact blobs, heads, and independently closed writer piles —
-immutable),
+Layout: authority (the shared authenticated projection), cursor (isolated
+operational state), obj/<hash> (map pages, fact blobs, heads, and
+independently closed writer piles — immutable),
 heads/<workspace>/<device> and layouts/<workspace>/<device>/<window>
 (independent CAS registers),
-ingress/v1/workspaces/<ws>/piles/<session>/<uploader>/<hash> (exact ingress),
 and invite/<id> (public reads).
 
 Large signed-pile and pack/<hash> bodies use the direct streaming data plane.
 The namespace rules here still protect them from unconditional replacement or
 deletion when the same backing directory or bucket is used.
 
-The public mutation contract rejects unconditional root/object replacement
-and authoritative deletion. Objects and retained piles use atomic
-put-if-absent; repository roots use CAS.
+The public mutation contract rejects unconditional CAS/object replacement and
+authoritative deletion. Immutable values use atomic put-if-absent; mutable
+cells use CAS.
 """
 import asyncio
 import fcntl
@@ -32,7 +31,7 @@ from .object_store import (
     Versioned,
     VersionToken,
     ListPage,
-    REPOSITORY_ROOT_KEYS,
+    SINGLETON_CAS_KEYS,
     authoritative_key,
     mutable_key,
     validate_create,
@@ -55,7 +54,7 @@ class FsStore:
     def __init__(self, root):
         self.root = root
         os.makedirs(root, exist_ok=True)
-        self._root_lock = os.path.join(root, ".root.lock")
+        self._cas_lock = os.path.join(root, ".cas.lock")
 
     def namespace_id(self):
         return "filesystem", os.path.realpath(os.path.abspath(self.root))
@@ -113,11 +112,11 @@ class FsStore:
         """Read one atomic value/token pair.
 
         A content digest is a valid opaque token for this local implementation
-        because replacement is serialized by ``_root_lock``. Provider
+        because replacement is serialized by ``_cas_lock``. Provider
         implementations return their own conditional-write token instead.
         """
         limit = MAX_ROOT_BYTES \
-            if key in REPOSITORY_ROOT_KEYS else MAX_OBJECT_BYTES
+            if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         value = self.get_bounded(key, limit)
         return ABSENT if value is None else Versioned(
             value, VersionToken(h(value)))
@@ -185,7 +184,7 @@ class FsStore:
     def cas(self, key, token, b):
         if not mutable_key(key):
             raise ValueError("key is not a CAS register")
-        with open(self._root_lock, "a+b") as lock:
+        with open(self._cas_lock, "a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             current = self.read_versioned(key)
             current_token = current.token \
@@ -204,7 +203,7 @@ class FsStore:
         base = self._p(prefix) if prefix else self.root
         for dirpath, _, names in os.walk(base):
             for n in names:
-                if not n.endswith(".tmp") and n != ".root.lock":
+                if not n.endswith(".tmp") and n != ".cas.lock":
                     out.append(os.path.relpath(os.path.join(dirpath, n), self.root))
         return sorted(out)
 
@@ -223,7 +222,7 @@ class FsStore:
         def candidates():
             for dirpath, _, names in os.walk(base):
                 for name in names:
-                    if name.endswith(".tmp") or name == ".root.lock":
+                    if name.endswith(".tmp") or name == ".cas.lock":
                         continue
                     key = os.path.relpath(
                         os.path.join(dirpath, name), self.root)
@@ -387,7 +386,7 @@ class RemoteStore:
         raise ValueError("remote immutable create")
 
     async def cas(self, key, token, value):
-        if not mutable_key(key) or key == "root":
+        if not key.startswith("heads/") or not mutable_key(key):
             raise ValueError("remote CAS is writer-slot-only")
         _workspace, device = parse_head_slot_key(key)
         applied, returned = await asyncio.to_thread(

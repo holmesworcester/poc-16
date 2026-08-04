@@ -26,17 +26,11 @@ EXPECTED = {
     "auth.user_invite.create",
     "auth.workspace.create",
     "content.delete.remove",
-    "content.file.abandon_upload",
-    "content.file.collect_upload",
     "content.file.list",
-    "content.file.resume_upload",
     "content.file.save",
     "content.file.send",
-    "content.file.upload",
-    "content.file.uploads",
     "content.message.list",
     "content.message.post",
-    "content.message.upload",
     "content.notification.list",
     "content.notification.set_channel",
     "content.notification.set_global",
@@ -83,7 +77,7 @@ def test_ephemeral_proof_constructors_are_family_owned_and_purpose_keyed():
         for purpose, command in getattr(module, "PROOF_COMMANDS", {}).items()
     }
     assert facts.PROOF_COMMANDS == declared
-    assert set(facts.PROOF_COMMANDS) == {"sync", "upload"}
+    assert set(facts.PROOF_COMMANDS) == {"sync"}
     assert all(
         command.__module__.startswith("facts.")
         for command in facts.PROOF_COMMANDS.values()

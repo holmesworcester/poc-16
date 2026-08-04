@@ -339,7 +339,6 @@ def test_shuffled_device_publication_orders_converge_by_paginated_directory(
             grant = device_invite(
                 root.fid,
                 owner,
-                owner,
                 device,
                 f"sibling-{ordinal}",
                 10 + ordinal,

@@ -155,7 +155,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/root"
+                  - !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/cursor"
                   - !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/obj/*"
               - Sid: PublishNotificationHints
                 Effect: Allow
@@ -222,7 +222,7 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/root"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${NotificationStateBucketName}/${NotificationStatePrefix}/cursor"
               - Sid: ReadExactNotificationSecret
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue

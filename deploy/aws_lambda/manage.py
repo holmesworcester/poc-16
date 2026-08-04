@@ -328,8 +328,8 @@ def bucket_policy(args):
         "--profile", args.policy_profile,
         "--partition", args.partition,
         *(
-            ["--applier-principal", args.applier_principal]
-            if args.applier_principal else []
+            ["--gateway-principal", args.gateway_principal]
+            if args.gateway_principal else []
         ),
     ])
 
@@ -339,8 +339,9 @@ def test(_args):
         "python3", "-m", "pytest", "-q",
         "tests/test_aws_pack_issuer.py",
         "tests/test_lambda_deploy.py",
-        "tests/test_gateway.py",
+        "tests/test_authority_http.py",
         "tests/test_s3_adapter.py",
+        "tests/test_writer_repository.py",
     ])
 
 
@@ -393,11 +394,12 @@ def _readiness(url):
 
 
 def _smoke_endpoint(url, state, workspace):
-    """Exercise the deployed database-free gate using a client identity."""
-    from core import snapshot
+    """Publish one owner log and read its head through the live gateway."""
     from core.crypto import h
-    from core.limits import MAX_REPOSITORY_OBJECT_BYTES, MAX_ROOT_BYTES
+    from core.limits import MAX_REPOSITORY_OBJECT_BYTES
+    from core.writer_head import decode_slot, head_slot_key
     from full_peer.node import FullPeer, now_ms
+    from full_peer.sync import sync
     from full_peer.walk import Peer
 
     state = Path(state).resolve()
@@ -406,26 +408,21 @@ def _smoke_endpoint(url, state, workspace):
     node = FullPeer(str(state))
     if workspace not in node.workspaces():
         raise ValueError("smoke workspace is not present in client state")
+    sync(node, workspace, url)
     peer = Peer(node, workspace, url)
     peer.mint()
-    if peer.accepts_push:
-        raise RuntimeError("serverless peer advertised write acceptance")
-    got = peer.root(response_limit=MAX_ROOT_BYTES)
-    if got is None or not got[0]:
-        raise RuntimeError("serverless peer returned no root")
-    root, etag = got
-    committed = snapshot.decode_root(root)
-    if committed.anchor != workspace or etag != h(root):
-        raise RuntimeError("serverless root identity mismatch")
-    oid = next(
-        (descriptor["root"] for descriptor in committed.maps.values()
-         if descriptor["root"]),
-        "",
-    )
+    if peer.accepts_push or not peer.accepts_owner_publish:
+        raise RuntimeError("serverless peer advertised the wrong capability")
+    device = node.identity_id(workspace)
+    got = peer.head(device)
+    if got is None:
+        raise RuntimeError("serverless peer returned no owner head")
+    raw_slot, _token = got
+    slot = decode_slot(raw_slot, workspace=workspace, device=device)
     raw = peer.obj(
-        oid, response_limit=MAX_REPOSITORY_OBJECT_BYTES) if oid else None
-    if raw is None or h(raw) != oid:
-        raise RuntimeError("serverless immutable-object read failed")
+        slot.head, response_limit=MAX_REPOSITORY_OBJECT_BYTES)
+    if raw is None or h(raw) != slot.head:
+        raise RuntimeError("serverless writer-head read failed")
 
     bad = json.dumps({
         "pile": base64.b64encode(b"not a valid pile").decode(),
@@ -442,14 +439,14 @@ def _smoke_endpoint(url, state, workspace):
     else:
         raise RuntimeError("invalid proof was accepted")
     return {
-        "object": oid,
-        "root": h(root),
+        "head": slot.head,
+        "slot": head_slot_key(workspace, device),
         "tested_at": now_ms(),
     }
 
 
 def live_smoke(args):
-    """Deploy a generated read-only stack, test it, and always remove it."""
+    """Deploy a generated owner-gateway stack, test it, and remove it."""
     random_id = secrets.token_hex(16)
     args.stack = "poc16-smoke-" + random_id
     args.deployment_id = "smoke-" + random_id
@@ -502,7 +499,7 @@ def parser():
         help="build and execute the artifact in Lambda Python 3.13")
     smoke_cmd.set_defaults(run=package_smoke)
     deploy_cmd = sub.add_parser(
-        "deploy", help="build and deploy the read-only Function URL")
+        "deploy", help="build and deploy the owner-gateway Function URL")
     deploy_cmd.add_argument("--stack", required=True)
     deploy_cmd.add_argument("--deployment-id", required=True)
     deploy_cmd.add_argument("--workspace", required=True)
@@ -549,9 +546,9 @@ def parser():
     policy_cmd.add_argument("--prefix", required=True)
     policy_cmd.add_argument(
         "--profile", dest="policy_profile",
-        choices=("bucket-wide", "single-applier"),
+        choices=("bucket-wide", "single-gateway"),
         default="bucket-wide")
-    policy_cmd.add_argument("--applier-principal")
+    policy_cmd.add_argument("--gateway-principal")
     policy_cmd.add_argument(
         "--partition", choices=("aws", "aws-us-gov", "aws-cn"),
         default="aws")

@@ -1,6 +1,6 @@
 """Pure object-store contract shared by local and remote implementations.
 
-The root-authoritative snapshot uses only two namespaces:
+The protocol uses these namespaces:
 
 ``obj/<sha256>``
     A grow-only content-addressed map of facts, Merkle pages, signed writer
@@ -8,11 +8,12 @@ The root-authoritative snapshot uses only two namespaces:
     were created or that identical bytes already existed. Large signed piles
     use the direct streaming HTTP path rather than buffered semantic reads.
 
-``root``, ``authority``
-    Distinct linearizable value-CAS registers for content and shared control
-    state. A version token is an opaque comparison capability for the exact
-    bytes returned by the same read; it is not a content digest or a globally
-    unique generation.
+``authority``
+    The linearizable shared authority/removal projection.
+
+``cursor``
+    A generic operational CAS cell used only by isolated subsystems such as
+    notification delivery. It is never workspace fact authority.
 
 ``heads/<workspace>/<device>``, ``layouts/<workspace>/<device>/<window>``
     Independent linearizable CAS registers. Heads are signed logical history;
@@ -22,10 +23,6 @@ The root-authoritative snapshot uses only two namespaces:
     Immutable large transfer objects. Their keys share this namespace and
     mutation policy, but their bodies use the separate streaming data plane
     rather than the bounded semantic-object methods in this trait.
-
-The same local store may retain exact ``ingress/v1/`` sources. Hosted uploads
-put that namespace in a separate provider compartment. It is retry input,
-never a repository answer or part of ``RepositoryReader``.
 
 Provider and POSIX implementations live outside this module so the
 database-free authorization path can import integrity helpers in runtimes
@@ -38,7 +35,6 @@ import re
 from typing import Protocol
 
 from .crypto import h
-from .ingress import MAX_INGRESS_KEY_BYTES
 from .limits import (
     MAX_OBJECT_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
@@ -47,9 +43,12 @@ from .limits import (
 )
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
-CONTENT_ROOT_KEY = "root"
 AUTHORITY_ROOT_KEY = "authority"
-REPOSITORY_ROOT_KEYS = frozenset((CONTENT_ROOT_KEY, AUTHORITY_ROOT_KEY))
+OPERATIONAL_CURSOR_KEY = "cursor"
+SINGLETON_CAS_KEYS = frozenset((
+    AUTHORITY_ROOT_KEY,
+    OPERATIONAL_CURSOR_KEY,
+))
 
 # S3 and R2 both cap one complete object key at 1,024 bytes. A configured
 # prefix must leave room for every logical namespace the shared store may
@@ -58,11 +57,10 @@ REPOSITORY_ROOT_KEYS = frozenset((CONTENT_ROOT_KEY, AUTHORITY_ROOT_KEY))
 MAX_PROVIDER_KEY_BYTES = 1024
 MAX_INVITE_ID_BYTES = 256
 MAX_LOGICAL_KEY_BYTES = max(
-    len("root"),
+    len(OPERATIONAL_CURSOR_KEY),
     len("obj/") + 64,
     len("heads/") + 64 + 1 + 64,
     len("invite/") + MAX_INVITE_ID_BYTES,
-    MAX_INGRESS_KEY_BYTES,
 )
 MAX_STORE_PREFIX_BYTES = (
     MAX_PROVIDER_KEY_BYTES - 1 - MAX_LOGICAL_KEY_BYTES)
@@ -74,8 +72,8 @@ def validate_key(key):
         raise ValueError(f"bad key {key!r}")
     parts = key.split("/")
     if any(not part or part in {".", ".."} for part in parts) \
-            or parts[0] == ".root.lock" \
-            or key.startswith("root/"):
+            or parts[0] in {".cas.lock", ".root.lock"} \
+            or key == "root" or key.startswith("root/"):
         raise ValueError(f"reserved key {key!r}")
     return key
 
@@ -94,8 +92,8 @@ def validate_store_prefix(prefix):
 
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
-    return key in REPOSITORY_ROOT_KEYS \
-        or key.startswith("root/") or key.startswith("authority/") \
+    return key in SINGLETON_CAS_KEYS \
+        or key.startswith("cursor/") or key.startswith("authority/") \
         or key == "obj" or key.startswith("obj/") \
         or key == "heads" or key.startswith("heads/") \
         or key == "layouts" or key.startswith("layouts/") \
@@ -105,7 +103,7 @@ def authoritative_key(key):
 def mutable_key(key):
     """Whether ``key`` is one exact protocol CAS register."""
     key = validate_key(key)
-    if key in REPOSITORY_ROOT_KEYS:
+    if key in SINGLETON_CAS_KEYS:
         return True
     parts = key.split("/")
     if len(parts) == 3 and parts[0] == "heads":

@@ -24,6 +24,7 @@ from .util import (
     inject_device_claim,
     member_src,
     visible_fids,
+    writer_slots,
 )
 
 
@@ -85,7 +86,8 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
     workspace = facts.auth.workspace.create(node, "alice", ts=1)
     target = facts.content.message.post(node, workspace, "general", "doomed", ts=10)
     facts.content.delete.remove(node, workspace, target, ts=20)
-    expected_root = node.store(workspace).get("root")
+    expected_slots = writer_slots(node, workspace)
+    assert expected_slots
     expected_actions = _action_rows(node, workspace)
 
     node.idx(workspace).close()
@@ -93,7 +95,7 @@ def test_action_reverse_index_rebuilds_from_the_trees(tmp_path):
 
     rebuilt = FullPeer(str(directory))
     assert _action_rows(rebuilt, workspace) == expected_actions
-    assert rebuilt.store(workspace).get("root") == expected_root
+    assert writer_slots(rebuilt, workspace) == expected_slots
     assert target not in visible_fids(rebuilt, workspace)
 
 
@@ -118,13 +120,13 @@ def test_historical_fact_survives_but_removed_member_cannot_author_now(
     assert [row["fid"] for row in facts.content.message.messages(
         node, workspace)] == [item.fid]
 
-    root = node.store(workspace).get("root")
+    slots = writer_slots(node, workspace)
     node.keychain.add_identity(bob_secret)
     node.bind_identity(workspace, bob)
     with pytest.raises(ValueError, match="not a workspace member"):
         facts.content.message.post(
             node, workspace, "general", "cannot share now", ts=ts + 1)
-    assert node.store(workspace).get("root") == root
+    assert writer_slots(node, workspace) == slots
 
 
 def test_historical_admin_action_survives_but_removed_admin_cannot_author(
@@ -219,9 +221,8 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
             workspace, facts.principal_sid("member", bob))
         for peer in peers
     )
-    assert peers[0].store(workspace).get("root") \
-        == peers[1].store(workspace).get("root") \
-        == source.store(workspace).get("root")
+    assert all_fids(peers[0], workspace) \
+        == all_fids(peers[1], workspace)
 
 
 def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
@@ -261,7 +262,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
         },
     )
 
-    roots = []
+    states = []
     for name, order in (
             ("early-first", (first_pile, later_pile)),
             ("late-first", (later_pile, first_pile))):
@@ -278,8 +279,11 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
             == (first.fid,)
         assert peer.fact_of(workspace, posted.fid) == posted
         assert peer.fact_of(workspace, posted.fid) == posted
-        roots.append(peer.store(workspace).get("root"))
-    assert roots[0] == roots[1]
+        states.append((
+            tuple(all_fids(peer, workspace)),
+            tuple(_action_rows(peer, workspace)),
+        ))
+    assert states[0] == states[1]
 
 
 def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):

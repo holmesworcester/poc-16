@@ -87,7 +87,7 @@ def _wait(predicate, timeout=5):
 
 
 def _cursor(service, workspace):
-    current = service.state_store(workspace).read_versioned("root")
+    current = service.state_store(workspace).read_versioned("cursor")
     assert isinstance(current, Versioned)
     return decode_cursor(current.value)
 

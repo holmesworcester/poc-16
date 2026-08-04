@@ -117,7 +117,12 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             now_ms,
             mirror=self.peer.mirror(workspace),
             mint_authorize=lambda pile, purpose: self.peer.authorize_access(
-                workspace, pile, purpose),
+                workspace,
+                pile,
+                purpose,
+                max_unique_fetches=self.gate_options.max_mint_fetches,
+                max_fetch_bytes=self.gate_options.max_mint_fetch_bytes,
+            ),
             authority_publish=self.peer.authority(workspace).publish,
             sync_profile=self.sync_profile,
             grant_ttl_ms=self.gate_options.grant_ttl_ms,

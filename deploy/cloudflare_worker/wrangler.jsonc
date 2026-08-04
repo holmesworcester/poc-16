@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "poc-16-readonly-gateway",
+  "name": "poc-16-owner-gateway",
   "main": "build/worker/entry.py",
   "base_dir": "build/worker",
   "compatibility_date": "2026-07-29",

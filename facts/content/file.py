@@ -6,7 +6,7 @@ from core.fact_index import REF_INDEX, TYPE_INDEX
 from core.fact import Fact, Need
 from core.shape import valid_fid
 from .._policy import DELETE_SELF, FamilyPolicy, Self, author_selectors
-from .._commands import direct_upload, member_source
+from .._commands import member_source
 from ..auth import signature
 from .. import _bao as bao
 from . import file_slice as slices
@@ -88,8 +88,7 @@ def _author(node, workspace, channel, path, name, ts, emit):
 
     Every call to ``emit(closure, fid)`` receives one independently valid
     closure: first the signed descriptor, then exactly one Bao slice plus that
-    descriptor closure.  The caller chooses local writer publication or a
-    direct-upload encoding; there is still only one signed-pile wire format.
+    descriptor closure. Each unit becomes an ordinary writer-tree leaf.
     """
     native = node.attachment_io()
     timestamp = node.now_ms() if ts is None else ts
@@ -142,55 +141,6 @@ def send(node, workspace, channel, path, name=None, ts=None):
 
     return _author(
         node, workspace, channel, path, name, ts, receive).fid
-
-
-def upload(
-        node, workspace, channel, path, broker_url, provider_origin,
-        name=None, ts=None):
-    """Upload and collect each pile before authoring the next Bao slice."""
-    count = 0
-
-    def deliver(closed, _expected):
-        nonlocal count
-        raw = node.sender(workspace).pack(closed)
-        source = node.create_upload(workspace, raw)
-        result = direct_upload(
-            node, workspace, source, broker_url, provider_origin)
-        count += 1
-        if result["status"] == "rejected":
-            raise ValueError(
-                f"upload rejected; retained source {source.source_id}")
-
-    descriptor = _author(
-        node, workspace, channel, path, name, ts, deliver)
-    return {"fid": descriptor.fid, "piles": count}
-
-
-def resume_upload(
-        node, workspace, upload_id, broker_url, provider_origin):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return direct_upload(
-        node, workspace, node.load_upload(upload_id),
-        broker_url, provider_origin)
-
-
-def uploads(node, workspace, cursor=None):
-    if cursor is not None and not valid_fid(cursor):
-        raise ValueError("upload cursor")
-    return node.upload_status(workspace, cursor)
-
-
-def abandon_upload(node, workspace, upload_id):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return node.abandon_upload(workspace, upload_id)
-
-
-def collect_upload(node, workspace, upload_id):
-    if not valid_fid(upload_id):
-        raise ValueError("upload id")
-    return node.collect_upload(workspace, upload_id)
 
 
 # QUERIES
@@ -327,12 +277,7 @@ def save(node, workspace, selector, out_path):
 
 
 CLI = {
-    "content.file.abandon_upload": abandon_upload,
-    "content.file.collect_upload": collect_upload,
     "content.file.list": files,
-    "content.file.resume_upload": resume_upload,
     "content.file.save": save,
     "content.file.send": send,
-    "content.file.upload": upload,
-    "content.file.uploads": uploads,
 }

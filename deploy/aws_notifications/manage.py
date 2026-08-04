@@ -104,7 +104,6 @@ NOTIFICATION_CORE_MODULES = (
     "fact_index.py",
     "http_body.py",
     "indexes.py",
-    "ingress.py",
     "kernel.py",
     "limits.py",
     "merkle_map.py",
@@ -407,7 +406,7 @@ def _lifecycle_prefix(rule, label):
 
 def _prefixes_overlap(rule_prefix, authoritative_prefix):
     targets = (
-        authoritative_prefix + "/root",
+        authoritative_prefix + "/cursor",
         authoritative_prefix + "/obj/",
     )
     return any(target.startswith(rule_prefix) or rule_prefix.startswith(target)

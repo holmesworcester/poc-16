@@ -1,12 +1,12 @@
 """facts/auth/request.py — ephemeral proof of workspace access."""
-from core.fact import Fact, Need
+from core.fact import Fact, Need, source_fact
 from .._commands import member_source
 from .._policy import FamilyPolicy
 from . import signature
 
 TAG = "req"
 POLICY = FamilyPolicy()
-PURPOSES = frozenset({"sync", "upload"})
+PURPOSES = frozenset({"sync"})
 
 
 # SHAPE
@@ -67,7 +67,8 @@ def authorize(view, valid, stream, trusted_now, *, purpose="sync"):
         current = view.fact_of(provider.fid)
     except ValueError:
         return None
-    if current != provider or not view.fact_active(provider.fid):
+    if source_fact(current) != source_fact(provider) \
+            or not view.fact_active(provider.fid):
         return None
     return body["pk"], body["verb"]
 

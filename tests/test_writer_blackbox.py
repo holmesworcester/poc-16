@@ -49,7 +49,7 @@ def test_three_peer_relay_offline_catchup_and_second_device(tmp_path):
         primary_sig = signature_fact(
             alice_secret, alice, primary, 2)
         sibling = device_invite(
-            root.fid, alice, alice, bob, "alice-laptop", 3)
+            root.fid, alice, bob, "alice-laptop", 3)
         sibling_sig = signature_fact(
             alice_secret, alice, sibling, 3)
         authority = (

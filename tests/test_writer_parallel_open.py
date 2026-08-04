@@ -69,7 +69,6 @@ async def make_forest(path, count=3, published=None):
         grant = device_invite(
             root.fid,
             founder,
-            founder,
             public,
             f"device-{ordinal}",
             ordinal,

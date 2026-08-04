@@ -75,8 +75,9 @@ def test_scripted_bucket_runs_the_shared_contract_with_atomic_opaque_pairs():
         lambda: bucket.handle(f"handle-{next(actors)}"),
         ConformanceRun("scripted-bucket", seed=0x5C71))
 
-    assert result["root"].token.value.startswith("opaque:")
-    assert result["root"].token.value != h(result["root"].value)
+    assert result["authority"].token.value.startswith("opaque:")
+    assert result["authority"].token.value != h(
+        result["authority"].value)
     assert bucket.assert_valid_history()
 
 
@@ -89,7 +90,7 @@ def test_s3_adapter_runs_the_shared_contract_with_opaque_aba_tokens():
 
     result = exercise_sync_store(
         store, ConformanceRun("fake-s3", seed=0x53))
-    assert result["root"].token.value.startswith('"opaque-value-')
+    assert result["authority"].token.value.startswith('"opaque-value-')
     assert len([
         event for event in bucket.history if event[1] == "list"
     ]) >= 4
@@ -104,7 +105,7 @@ def test_r2_host_adapter_runs_the_same_shared_contract():
 
     result = exercise_sync_store(
         store, ConformanceRun("fake-r2-s3", seed=0x5232))
-    assert result["root"].token.value.startswith('"opaque-value-')
+    assert result["authority"].token.value.startswith('"opaque-value-')
 
 
 def test_native_r2_binding_runs_the_awaited_shared_contract():
@@ -115,7 +116,7 @@ def test_native_r2_binding_runs_the_awaited_shared_contract():
             bucket, "poc16-conformance/run-fixed"),
         ConformanceRun("fake-r2-binding", seed=0xB1D1)))
 
-    assert result["root"].token.value.startswith("opaque-r2-value-")
+    assert result["authority"].token.value.startswith("opaque-r2-value-")
     assert len([
         event for event in bucket.history if event[0] == "list"
     ]) >= 4
@@ -126,9 +127,9 @@ def test_native_r2_binding_runs_the_awaited_shared_contract():
 def test_atomic_s3_response_keeps_body_and_token_from_one_version():
     bucket = FakeS3Bucket()
     store = S3Store(_s3_config(), client=bucket.client("reader"))
-    first = store.cas("root", ABSENT, b"version-a")
+    first = store.cas("authority", ABSENT, b"version-a")
     assert isinstance(first, Applied)
-    physical = "poc16-conformance/run-fixed/root"
+    physical = "poc16-conformance/run-fixed/authority"
 
     def body(value):
         def advance_after_response():
@@ -138,24 +139,24 @@ def test_atomic_s3_response_keeps_body_and_token_from_one_version():
         return AtomicBody(value, advance_after_response)
 
     bucket.body_factory = body
-    paired = store.read_versioned("root")
+    paired = store.read_versioned("authority")
 
     assert paired.value == b"version-a"
     assert paired.token == first.token
     bucket.body_factory = None
-    assert store.read_versioned("root").value == b"version-b"
+    assert store.read_versioned("authority").value == b"version-b"
 
 
 def test_s3_applied_response_loss_is_unknown_and_recoverable_by_direct_read():
     bucket = FakeS3Bucket()
     store = S3Store(_s3_config(), client=bucket.client("applier"))
-    first = store.cas("root", ABSENT, b"base")
+    first = store.cas("authority", ABSENT, b"base")
     bucket.drop_after_apply = 1
 
     with pytest.raises(OutcomeUnknown, match="ConnectionError"):
-        store.cas("root", first.token, b"candidate")
+        store.cas("authority", first.token, b"candidate")
 
-    recovered = store.read_versioned("root")
+    recovered = store.read_versioned("authority")
     assert recovered.value == b"candidate"
     assert recovered.token.value != first.token.value
 
@@ -179,16 +180,16 @@ def test_no_list_bucket_403_and_broken_body_never_become_absence():
     bucket.deny_missing_get = True
     store = S3Store(_s3_config(), client=bucket.client("restricted-reader"))
     with pytest.raises(StoreError) as denied:
-        store.read_versioned("root")
+        store.read_versioned("authority")
     assert type(denied.value) is StoreError
 
-    physical = "poc16-conformance/run-fixed/root"
-    bucket.data[physical] = b"root"
+    physical = "poc16-conformance/run-fixed/authority"
+    bucket.data[physical] = b"authority"
     bucket.tokens[physical] = '"quoted-non-content-etag"'
     broken = BrokenBody()
     bucket.body_factory = lambda value: broken
     with pytest.raises(RetryableStoreError, match="ConnectionError"):
-        store.read_versioned("root")
+        store.read_versioned("authority")
     assert broken.closed
 
 
@@ -207,7 +208,7 @@ def test_provider_fault_classes_do_not_collapse_to_stale(
 
     store = S3Store(_s3_config(), client=FailingClient())
     with pytest.raises(expected) as caught:
-        store.cas("root", VersionToken('"old"'), b"new")
+        store.cas("authority", VersionToken('"old"'), b"new")
     assert type(caught.value) is expected
 
 
@@ -256,8 +257,8 @@ def test_live_cleanup_removes_only_generated_current_keys_and_versions():
             assert request["Prefix"] == prefix + "/"
             return {
                 "Versions": [{
-                    "Key": prefix + "/root",
-                    "VersionId": "root-v1",
+                    "Key": prefix + "/authority",
+                    "VersionId": "authority-v1",
                 }],
                 "DeleteMarkers": [{
                     "Key": prefix + "/obj/dead",
@@ -279,7 +280,8 @@ def test_live_cleanup_removes_only_generated_current_keys_and_versions():
 
         def list(self, logical):
             self.list_calls += 1
-            return ["root", "obj/dead"] if self.list_calls == 1 else []
+            return ["authority", "obj/dead"] \
+                if self.list_calls == 1 else []
 
         def _read_args(self, key):
             return {
@@ -297,7 +299,7 @@ def test_live_cleanup_removes_only_generated_current_keys_and_versions():
     assert store._mutation_client.deleted == [
         {
             "Bucket": "dedicated-test-bucket",
-            "Key": prefix + "/root",
+            "Key": prefix + "/authority",
         },
         {
             "Bucket": "dedicated-test-bucket",
@@ -305,8 +307,8 @@ def test_live_cleanup_removes_only_generated_current_keys_and_versions():
         },
         {
             "Bucket": "dedicated-test-bucket",
-            "Key": prefix + "/root",
-            "VersionId": "root-v1",
+            "Key": prefix + "/authority",
+            "VersionId": "authority-v1",
         },
         {
             "Bucket": "dedicated-test-bucket",

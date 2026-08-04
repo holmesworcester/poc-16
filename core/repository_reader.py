@@ -27,7 +27,7 @@ class RepositoryRootError(ValueError):
 class RepositoryReader:
     """Read authenticated state without LIST, SQL, turns, or mutations.
 
-    Provider and daemon adapters fetch ``root`` once, then construct this
+    Provider and daemon adapters fetch one named root register, then construct this
     object with an immutable-object callback.  Every answer from the instance
     is therefore explainable by the same pinned root even if another applier
     commits concurrently.

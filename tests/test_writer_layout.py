@@ -8,12 +8,12 @@ import pytest
 
 from core.close import (
     ClosedPileEvaluator,
+    KernelRejected,
     encode_signed_pile,
     make_signed_pile,
 )
 from core.crypto import h, keypair
 from core.fact import canon
-from core.ingress import KernelRejected
 from core.limits import PayloadTooLarge
 from core.object_store import OutcomeUnknown
 from core.store import FsStore

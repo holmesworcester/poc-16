@@ -1,1 +1,1 @@
-"""Cloudflare Python Worker host package for the read-only gateway."""
+"""Cloudflare Python Worker host package for the owner gateway."""

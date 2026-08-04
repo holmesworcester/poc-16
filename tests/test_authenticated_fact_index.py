@@ -3,10 +3,14 @@
 import facts
 
 from core import indexes
+from core.crypto import h
+from core.fact import CurrentFact, current_fact, encode
 from core.fact_index import TYPE_INDEX
 from full_peer.node import FullPeer
 from core.repository_reader import RepositoryReader
 from core.repository_snapshot import compile_snapshot
+from facts.auth.signature import signature
+from facts.content.message import legacy_message
 
 
 def _compiled_reader(node, workspace):
@@ -95,3 +99,44 @@ def test_current_scopes_are_one_mechanical_definition(tmp_path):
     for sid in facts.current_scopes(fact):
         assert view.suppression(sid) == {
             "state": "clear"}
+
+
+def test_database_free_snapshot_indexes_current_form_and_keeps_source(tmp_path):
+    """The passive compiler replays app forms without rewriting wire facts."""
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    secret, writer = node.identity(workspace)
+    root = node.fact_of(workspace, workspace)
+    legacy = legacy_message(
+        workspace, writer, "general", "from the old form", 2, writer)
+    node.publish_closed(workspace, ((
+        root,
+        signature(secret, writer, legacy, 2),
+        legacy,
+    ),))
+    projection = node.sql(workspace)
+    sources = {
+        fid: projection.source_fact_of(fid)
+        for fid in projection.fact_ids()
+    }
+
+    compiled = compile_snapshot(workspace, sources)
+    objects = dict(compiled.objects)
+    reader = RepositoryReader(workspace, compiled.root, objects.get)
+    form = reader.validated().fact(legacy.fid)
+
+    assert isinstance(form, CurrentFact)
+    assert form.fid == legacy.fid
+    assert current_fact(form).t == "msg"
+    assert current_fact(form).body == {
+        "pk": writer,
+        "owner": writer,
+        "chan": "general",
+        "text": "from the old form",
+    }
+    assert reader.validated().source_fact(legacy.fid) == legacy
+    assert compiled.fact_oids[legacy.fid] == h(encode(legacy))
+    assert objects[compiled.fact_oids[legacy.fid]] == encode(legacy)
+    assert [row.fid for row in reader.worker().postings(
+        TYPE_INDEX, "msg").rows] == [legacy.fid]
+    assert reader.worker().postings(TYPE_INDEX, "msg.v0").rows == ()

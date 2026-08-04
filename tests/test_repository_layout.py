@@ -165,6 +165,9 @@ def test_authority_bootstrap_is_only_self_confined_removal_path():
     assert "a device-ownership or device-join fact signed by that same " \
         "member" in flat["DESIGN.md"]
     assert "proof_refresh_required" in documents["DESIGN.md"]
+    assert "Removal-root and page bytes live under a private removal " \
+        "namespace" in flat["DESIGN.md"]
+    assert "non-disclosing sibling commitments" in flat["DESIGN.md"]
     assert "Neither turn installs authority facts" in flat["AGENTS.md"]
     assert "neither synchronizes or mutates recipient authority state" \
         in flat["README.md"]

@@ -486,7 +486,7 @@ class HttpGate:
                     key, base64.b64encode(value).decode(), h(value)]
                 for key, value in zip(page.keys, normalized)
             ],
-        })
+        }, {"Cache-Control": "no-store"})
 
     async def _head(self, device, headers):
         try:

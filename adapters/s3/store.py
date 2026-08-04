@@ -34,6 +34,7 @@ from core.object_store import (
     VersionToken,
     KEY_RE,
     MAX_PROVIDER_KEY_BYTES,
+    SINGLETON_CAS_KEYS,
     authoritative_key,
     mutable_key,
     validate_create,
@@ -540,7 +541,8 @@ class S3Store:
         return True
 
     def get(self, key):
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        limit = MAX_ROOT_BYTES \
+            if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         return self.get_bounded(key, limit)
 
     def get_bounded(self, key, max_bytes):
@@ -568,7 +570,8 @@ class S3Store:
         if response is None:
             return ABSENT
         etag = self._response_etag(response, "GetObject", mutation=False)
-        limit = MAX_ROOT_BYTES if key == "root" else MAX_OBJECT_BYTES
+        limit = MAX_ROOT_BYTES \
+            if key in SINGLETON_CAS_KEYS else MAX_OBJECT_BYTES
         value = self._response_body(
             response, "GetObject", limit,
             self.config.max_body_read_calls)

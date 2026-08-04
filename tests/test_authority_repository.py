@@ -137,7 +137,8 @@ def test_never_resident_denied_then_publication_grants_without_sql(
         (world.root,),
     )
     assert bootstrap.status == "applied"
-    assert store.get("root") is None
+    with pytest.raises(ValueError, match="reserved key"):
+        store.get("root")
     assert store.get(AUTHORITY_ROOT_KEY) == bootstrap.root
 
     # This closure is cryptographically valid, but its selected user provider

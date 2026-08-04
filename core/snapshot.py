@@ -1,7 +1,7 @@
 """Composite snapshot and the direct validated-fact order map.
 
-One mutable ``root`` value atomically names three immutable bounded Merkle
-maps:
+One mutable authority register atomically names three immutable bounded
+Merkle maps:
 
 ``fact_order``
     Validated ``fact.key -> fact object oid`` rows.  This is an ordering and
@@ -31,7 +31,7 @@ MAP_NAMES = (FACT_ORDER, *TREE_NAMES)
 
 
 class Root(NamedTuple):
-    """One fully checked snapshot named by the mutable ``root`` key."""
+    """One fully checked snapshot named by an explicit CAS register."""
 
     anchor: str
     layout_seed: str
@@ -76,7 +76,7 @@ def _maps_ok(maps):
 
 
 def encode_root(anchor, maps=None, *, seed=None):
-    """Encode the exact three-map snapshot advanced by one root CAS."""
+    """Encode the exact three-map snapshot advanced by the authority CAS."""
     seed = layout_seed(anchor) if seed is None else seed
     if seed != layout_seed(anchor):
         raise ValueError("snapshot layout seed")

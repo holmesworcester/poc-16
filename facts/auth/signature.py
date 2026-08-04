@@ -32,6 +32,31 @@ def validate(f, ctx):
         return False
 
 
+def project_authority(f, fact_of):
+    """Keep authorship evidence only when its exact target is authority."""
+    try:
+        name, target, _public = f.offers()[0]
+        target_fact = fact_of(target)
+        if name != "author" or target_fact is None:
+            return False
+        from facts import family_for
+
+        family = family_for(target_fact.t)
+        return family is not None and family.DURABLE \
+            and family.POLICY.authority_resident
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def authority_context(f):
+    """Carry the signed target so projection can classify this evidence."""
+    try:
+        name, target, _public = f.offers()[0]
+        return (target,) if name == "author" else ()
+    except (IndexError, TypeError, ValueError):
+        return ()
+
+
 # MODE
 DURABLE = True
 

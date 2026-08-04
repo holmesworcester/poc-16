@@ -1,5 +1,5 @@
 """facts/auth/head_request.py — an exact writer-head update request."""
-from core.fact import Fact, Need
+from core.fact import Fact, Need, source_fact
 from core.shape import valid_fid
 from .._policy import FamilyPolicy
 
@@ -97,7 +97,8 @@ def authorize_head(view, valid, stream, writer, proposed_head, trusted_now):
             current = view.fact_of(provider.fid)
         except ValueError:
             return None
-        if current != provider or not view.fact_active(provider.fid):
+        if source_fact(current) != source_fact(provider) \
+                or not view.fact_active(provider.fid):
             return None
     return (
         body["device"],

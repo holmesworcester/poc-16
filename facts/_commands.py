@@ -86,27 +86,3 @@ def publish(node, workspace, fact, signature, role="member"):
         workspace, [signature, fact], deps,
         owner=None if need is None else need.a1)
     return fact.fid
-
-
-def direct_upload(
-        node, workspace, source, broker_url, provider_origin):
-    """Run the one provider-neutral direct uploader with a fresh auth proof."""
-    import facts
-
-    if source.workspace != workspace \
-            or source.member != node.member_for(workspace):
-        raise ValueError("upload source authority")
-
-    def proof():
-        now = node.now_ms()
-        return node.sender(workspace).pack(facts.proof_payload(
-            node, workspace, "upload", now + 120_000, now))
-
-    result = node.run_upload(
-        source, broker_url, provider_origin, proof)
-    answer = {"status": result.status, "session": result.session}
-    if result.status in {"applied", "noop"}:
-        node.collect_upload(workspace, source.source_id)
-    else:
-        answer["upload"] = source.source_id
-    return answer

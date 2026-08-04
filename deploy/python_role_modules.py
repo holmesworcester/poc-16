@@ -11,7 +11,6 @@ REPOSITORY_READER_CORE_MODULES = (
     "http.py",
     "http_body.py",
     "indexes.py",
-    "ingress.py",
     "kernel.py",
     "limits.py",
     "merkle_map.py",
@@ -39,7 +38,3 @@ HOSTED_GATE_CORE_MODULES = tuple(dict.fromkeys((
     "repository_applier.py",
     "writer_repository.py",
 )))
-
-UPLOAD_BROKER_CORE_MODULES = (
-    *REPOSITORY_READER_CORE_MODULES,
-)
