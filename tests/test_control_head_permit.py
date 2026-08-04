@@ -54,6 +54,56 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
+class OverlapCasStore:
+    """Awaited store that fails unless two selected CAS calls really overlap."""
+
+    def __init__(self, backing):
+        self.backing = backing
+        self.selected = None
+        self.expected = []
+        self.failure = None
+        self.release = asyncio.Event()
+
+    def overlap(self, key):
+        self.selected = key
+
+    async def get_bounded(self, key, maximum):
+        return self.backing.get_bounded(key, maximum)
+
+    async def copy_pile_object(self, oid, maximum, write):
+        return self.backing.copy_pile_object(oid, maximum, write)
+
+    async def has(self, key):
+        return self.backing.has(key)
+
+    async def read_versioned(self, key):
+        return self.backing.read_versioned(key)
+
+    async def put_if_absent(self, key, value):
+        return self.backing.put_if_absent(key, value)
+
+    async def cas(self, key, token, value):
+        if key == self.selected and not self.release.is_set():
+            self.expected.append(token)
+            if len(self.expected) == 1:
+                asyncio.get_running_loop().call_soon(self._check_overlap)
+            elif len(self.expected) == 2:
+                self.release.set()
+            await self.release.wait()
+            if self.failure is not None:
+                raise self.failure
+        return self.backing.cas(key, token, value)
+
+    def _check_overlap(self):
+        if len(self.expected) != 2:
+            self.failure = AssertionError(
+                "same-base control commits serialized before slot CAS")
+            self.release.set()
+
+    async def list_page(self, prefix, cursor=None, limit=256):
+        return self.backing.list_page(prefix, cursor, limit)
+
+
 def signed(secret, writer, root, closure):
     return encode_signed_pile(make_signed_pile(
         secret, root.fid, writer, closure))
@@ -448,7 +498,7 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
         members = tuple(
             joined_member(secret, founder, root, index)
             for index in range(2))
-        store = FsStore(str(tmp_path / "competing"))
+        store = OverlapCasStore(FsStore(str(tmp_path / "competing")))
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
@@ -482,6 +532,8 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
         heads = tuple(heads)
 
         head_gate = OpaqueHeadGate(store, gate.authorize_head)
+        key = head_slot_key(root.fid, founder)
+        store.overlap(key)
         results = await asyncio.gather(*(
             gate.commit_head_permit(
                 head_gate, permit, head, PERMIT_SECRET)
@@ -489,6 +541,8 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
         ))
         assert sorted(result.status for result in results) \
             == ["applied", "conflict"]
+        assert len(store.expected) == 2
+        assert store.expected[0] == store.expected[1] is ABSENT
         winner = next(
             index for index, result in enumerate(results)
             if result.status == "applied")
@@ -499,8 +553,8 @@ def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
             actions[winner].fid)
         assert await value_at(gate, loser_sid) is None
         slot = decode_slot_at(
-            head_slot_key(root.fid, founder),
-            store.get(head_slot_key(root.fid, founder)),
+            key,
+            store.backing.get(key),
         )
         assert slot.head == heads[winner]
 
