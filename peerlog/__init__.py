@@ -14,4 +14,10 @@ writer's head signs its log's tree root, and any single fact is provable
 with (bytes, signed head, inclusion path) — proof.py. RBSR is discovery
 and transfer, never a storage model: received runs are filed back into
 per-writer log copies (ingest.py).
+
+Implementation reuses previously tested code where the shape fits
+(owner directive on .30/.31): the pre-forest treap+walk from git
+history, the Iroh connection wrapper and its tests, the writer_p2p
+bench harness, existing fact/authenticator code. Reuse components and
+their tests — never old formats.
 """
