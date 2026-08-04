@@ -10,12 +10,15 @@ from core.crypto import h
 from core.fact import canon
 from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
-from core.indexes import principal_sid, suppression_slot
+from core.indexes import principal_sid
 from core.limits import (
+    MAX_REGISTERED_SUPPRESSION_ROUTES,
+    MAX_REMOVAL_UPDATES,
     MAX_REMOVAL_PROOF_STEPS,
     PayloadTooLarge,
 )
 from core.object_store import (
+    OutcomeUnknown,
     REMOVAL_NODE_PREFIX,
     REMOVAL_ROOT_KEY,
 )
@@ -26,6 +29,7 @@ from core.pack_access import (
     encode_object_open,
 )
 from core.store import FsStore
+from core.suppression import suppression_slot
 from core import suppression_tree as tree
 
 from .shared_bucket import ScriptedBucket
@@ -68,6 +72,13 @@ def update_from(workspace, root, changes, objects):
         return objects.get(oid)
 
     return run(tree._update(workspace, root, changes, fetch))
+
+
+def lose_response(bucket, actor, operation, key, when):
+    gate = bucket.pause(actor, operation, key, when=when)
+    gate.error = OutcomeUnknown(
+        f"lost {operation} response {when} linearization")
+    gate.release.set()
 
 
 def test_path_reveals_exactly_one_hashed_sid_and_value():
@@ -134,7 +145,7 @@ def test_build_update_retries_and_permutations_are_one_aci_join():
             workspace, current.root, (event,), objects)
         objects.update(updated.nodes)
         current = updated
-    assert current.root == tree._build(workspace, events).root
+    assert current.root == tree._build(workspace, events[:5]).root
     assert tree.verify(
         current.root,
         workspace,
@@ -164,6 +175,52 @@ def test_slot_join_is_associative_commutative_idempotent_with_absence():
     assert tree.join_slots(
         suppression_slot(), suppression_slot(h(b"active"))) \
         == suppression_slot(h(b"active"))
+
+
+def test_tiny_batch_exact_bound_prunes_nodes_and_one_over_stops_early():
+    assert MAX_REMOVAL_UPDATES == MAX_REGISTERED_SUPPRESSION_ROUTES == 5
+    workspace, member, _device = ids("tiny batch")
+    initial = (principal_sid("member", member), suppression_slot())
+    additions = tuple(
+        (principal_sid("member", h(f"member {index}".encode())),
+         suppression_slot())
+        for index in range(MAX_REMOVAL_UPDATES)
+    )
+    bucket = ScriptedBucket()
+    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    assert run(state.apply((initial,))).status == "applied"
+    before = len(bucket.history)
+
+    assert run(state.apply(iter(additions))).status == "applied"
+    mutations = tuple(
+        event for event in bucket.history[before:]
+        if event.op in {"put_if_absent", "cas"})
+    node_puts = tuple(
+        event for event in mutations
+        if event.op == "put_if_absent"
+        and event.key.startswith(REMOVAL_NODE_PREFIX))
+    # Five new leaves plus five new branches; superseded path-copy nodes are
+    # not sent to the provider.
+    assert len(node_puts) == 2 * MAX_REMOVAL_UPDATES
+    assert sum(event.op == "cas" for event in mutations) == 1
+
+    consumed = []
+
+    def one_over():
+        for index in range(MAX_REMOVAL_UPDATES + 100):
+            consumed.append(index)
+            yield additions[index % len(additions)]
+
+    before = len(bucket.history)
+    with pytest.raises(PayloadTooLarge, match="too many"):
+        run(state.apply(one_over()))
+    assert consumed == list(range(MAX_REMOVAL_UPDATES + 1))
+    assert len(bucket.history) == before
+
+    assert len(tree._build(workspace, iter(additions)).nodes) \
+        == 2 * MAX_REMOVAL_UPDATES - 1
+    with pytest.raises(PayloadTooLarge, match="too many"):
+        tree._build(workspace, iter((*additions, initial)))
 
 
 def test_missing_forged_duplicate_truncated_stale_and_relabels_fail_closed():
@@ -376,6 +433,49 @@ def test_apply_at_stale_validation_pin_performs_no_mutation():
         suppression_slot(action)
     assert bucket.handle("reader").get(REMOVAL_ROOT_KEY) == \
         current.root_bytes
+    assert bucket.assert_valid_history()
+
+
+def test_private_node_create_recovers_after_unknown_applied_outcome():
+    workspace, member, _device = ids("node outcome unknown")
+    sid = principal_sid("member", member)
+    row = (sid, suppression_slot())
+    built = tree._build(workspace, (row,))
+    node_oid, = (oid for oid, _raw in built.nodes)
+    bucket = ScriptedBucket()
+    lose_response(
+        bucket, "writer", "put_if_absent",
+        tree.private_node_key(node_oid), "after")
+
+    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+    assert run(state.apply((row,))).status == "applied"
+    restarted = tree.SuppressionTree(
+        workspace, bucket.handle("restarted"))
+    pin = run(restarted.pin())
+    assert pin.verify(sid, run(pin.proof(sid))) == suppression_slot()
+    assert bucket.assert_valid_history()
+
+
+@pytest.mark.parametrize("unknown_when", ("before", "after"))
+def test_root_cas_unknown_outcome_is_restart_safe(unknown_when):
+    workspace, member, _device = ids(f"root unknown {unknown_when}")
+    sid = principal_sid("member", member)
+    row = (sid, suppression_slot())
+    bucket = ScriptedBucket()
+    lose_response(
+        bucket, "writer", "cas", REMOVAL_ROOT_KEY, unknown_when)
+    state = tree.SuppressionTree(workspace, bucket.handle("writer"))
+
+    first = run(state.apply((row,)))
+    assert first.status == (
+        "retryable" if unknown_when == "before" else "applied")
+    restarted = tree.SuppressionTree(
+        workspace, bucket.handle("restarted"))
+    if first.status == "retryable":
+        assert run(restarted.pin()) is None
+        assert run(restarted.apply((row,))).status == "applied"
+    pin = run(restarted.pin())
+    assert pin.verify(sid, run(pin.proof(sid))) == suppression_slot()
     assert bucket.assert_valid_history()
 
 

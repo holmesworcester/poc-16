@@ -4,6 +4,7 @@ import facts
 import pytest
 
 from core import indexes, merkle_map, snapshot
+from core.suppression import suppression_slot
 from core.crypto import h
 from core.fact import encode
 from core.repository_snapshot import compile_snapshot, extend_snapshot
@@ -112,7 +113,7 @@ def test_incremental_action_checks_suppression_named_fact_evidence(tmp_path):
         built = merkle_map.update(
             descriptor["root"],
             decoded.layout_seed,
-            ((sid, indexes.suppression_slot(forged_action)),),
+            ((sid, suppression_slot(forged_action)),),
             objects.get,
             emit,
             expected_count=descriptor["count"],

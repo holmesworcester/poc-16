@@ -9,6 +9,7 @@ import pytest
 import facts
 from core import indexes
 from core.repository_snapshot import extend_snapshot
+from core.suppression import suppression_slot
 from tests import repository_compiler_fuzzer as fuzzer
 
 
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.unit
 
 
 def _active(action):
-    return indexes.suppression_slot(action)
+    return suppression_slot(action)
 
 
 @pytest.mark.parametrize("seed", fuzzer.FIXED_SEEDS)
@@ -27,7 +28,7 @@ def test_fixed_stateful_histories_match_after_every_transition(seed):
     mark, state = corpus.landmarks, result.suppression
 
     assert state["single-target-before-action"][
-        mark["target_first_sid"]] == indexes.suppression_slot()
+        mark["target_first_sid"]] == suppression_slot()
     assert state["action-after-target"][
         mark["target_first_sid"]] == _active(mark["action_after"])
     assert state["action-before-target"][
@@ -37,11 +38,13 @@ def test_fixed_stateful_histories_match_after_every_transition(seed):
     assert state["competing-action-late"][
         mark["competing_sid"]] == _active(mark["competing_late"])
     assert state["competing-action-earlier"][
-        mark["competing_sid"]] == _active(mark["competing_early"])
+        mark["competing_sid"]] == _active(min(
+            mark["competing_early"], mark["competing_late"]))
     assert state["removal-late"][
         mark["member_sid"]] == _active(mark["removal_late"])
     assert state["removal-earlier"][
-        mark["member_sid"]] == _active(mark["removal_early"])
+        mark["member_sid"]] == _active(min(
+            mark["removal_early"], mark["removal_late"]))
     assert result.roots["removal-late"] \
         == result.roots["duplicate-existing"] \
         == result.roots["empty-noop"]

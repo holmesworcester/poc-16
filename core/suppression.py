@@ -23,6 +23,27 @@ def scoped_id(namespace, value):
     return f"{namespace}:{value}"
 
 
+def suppression_slot(action_fid=None):
+    """Construct one canonical current suppression value."""
+    if action_fid is None:
+        return {"state": "clear"}
+    if not shape.valid_fid(action_fid):
+        raise ValueError("suppression action")
+    return {"state": "active", "action": action_fid}
+
+
+def checked_suppression_slot(value):
+    """Validate one authenticated SuppTree value."""
+    if value == {"state": "clear"}:
+        return value
+    if isinstance(value, dict) \
+            and set(value) == {"state", "action"} \
+            and value.get("state") == "active" \
+            and shape.valid_fid(value.get("action")):
+        return value
+    raise ValueError("missing SuppSlot")
+
+
 def self_selector():
     """Non-circular SELF placeholder; readers expand it after fid integrity."""
     return [ATOM, SELF]

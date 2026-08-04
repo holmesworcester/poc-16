@@ -74,8 +74,9 @@ MAX_REGISTERED_FACT_ROUTES = 17
 MAX_REGISTERED_FACT_ROWS = 11
 MAX_REGISTERED_SUPPRESSION_ROUTES = 5
 MAX_RESOLVED_EDGES = 64
-MAX_REMOVAL_UPDATES = (
-    MAX_PILE_FACTS * MAX_REGISTERED_SUPPRESSION_ROUTES)
+# Recipient removal state advances once per state-affecting fact, never once
+# per whole pile. One fact cannot contribute more than this many slots.
+MAX_REMOVAL_UPDATES = MAX_REGISTERED_SUPPRESSION_ROUTES
 
 # A 512-page adversarial path is accepted; a deeper canonical map is outside
 # the protocol even though a 384-byte key could theoretically select more

@@ -62,27 +62,6 @@ def checked_fact_oid(value):
     return value
 
 
-def suppression_slot(action=None):
-    """Construct one canonical current suppression value."""
-    if action is None:
-        return {"state": "clear"}
-    if not valid_fid(action):
-        raise ValueError("suppression action")
-    return {"state": "active", "action": action}
-
-
-def checked_suppression_slot(value):
-    """Validate one authenticated SuppTree value."""
-    if value == {"state": "clear"}:
-        return value
-    if isinstance(value, dict) \
-            and set(value) == {"state", "action"} \
-            and value.get("state") == "active" \
-            and valid_fid(value.get("action")):
-        return value
-    raise ValueError("missing SuppSlot")
-
-
 def _component(value):
     if not isinstance(value, str):
         raise ValueError("fact index component")
@@ -197,7 +176,6 @@ __all__ = (
     "SUPP",
     "TREE_NAMES",
     "checked_fact_oid",
-    "checked_suppression_slot",
     "decode_posting_key",
     "fact_key",
     "is_posting_key",
@@ -207,5 +185,4 @@ __all__ = (
     "posting_prefix",
     "principal_sid",
     "record_postings",
-    "suppression_slot",
 )

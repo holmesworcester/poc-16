@@ -14,6 +14,7 @@ from . import indexes, merkle_map, snapshot
 from .crypto import h
 from .fact import bound_to, decode, encode, source_fact
 from .shape import valid_fid
+from .suppression import checked_suppression_slot, suppression_slot
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +80,11 @@ def _checked_facts(anchor, facts_by_fid):
 
 
 def action_bindings(facts_by_fid):
-    """Select the first immutable action for each typed suppression id."""
+    """ACI-join every typed suppression id by minimum action fid."""
     selected = {}
-    for fact in sorted(
-            facts_by_fid.values(), key=lambda item: (item.key, item.fid)):
-        for sid in sorted(facts.action_sids(fact)):
-            selected.setdefault(sid, fact.fid)
+    for fact in facts_by_fid.values():
+        for sid in facts.action_sids(fact):
+            selected[sid] = min(selected.get(sid, fact.fid), fact.fid)
     return selected
 
 
@@ -119,7 +119,7 @@ def logical_rows(anchor, facts_by_fid):
         for fid, fact in checked.items()
     }
     actions = action_bindings(checked)
-    slot = lambda sid: indexes.suppression_slot(actions.get(sid))
+    slot = lambda sid: suppression_slot(actions.get(sid))
     fact_rows, supp_rows = {}, {}
     for fid, fact in checked.items():
         rows, _, _ = _fact_routes(fact, objects[fid])
@@ -130,7 +130,7 @@ def logical_rows(anchor, facts_by_fid):
         fact = checked.get(fid)
         if fact is None or sid not in facts.action_sids(fact):
             raise ValueError("action evidence binding")
-        supp_rows[sid] = indexes.suppression_slot(fid)
+        supp_rows[sid] = suppression_slot(fid)
 
     return {
         snapshot.FACT_ORDER: {
@@ -218,9 +218,8 @@ def _extension_program(anchor, base_root, facts_by_fid):
             raise ValueError("conflicting repository row")
         affected_sids.update(scopes)
         affected_sids.update(action_sids)
-        candidate = (fact.key, fact.fid)
         for sid in action_sids:
-            actions[sid] = min(actions.get(sid, candidate), candidate)
+            actions[sid] = min(actions.get(sid, fact.fid), fact.fid)
 
     ordered_sids = tuple(sorted(affected_sids))
     previous_slots = yield _Points(
@@ -232,7 +231,7 @@ def _extension_program(anchor, base_root, facts_by_fid):
         value["action"]
         for value in (
             None if raw is None
-            else indexes.checked_suppression_slot(raw)
+            else checked_suppression_slot(raw)
             for raw in previous_slots.values()
         )
         if value is not None and value["state"] == "active"
@@ -258,29 +257,21 @@ def _extension_program(anchor, base_root, facts_by_fid):
             incumbent_oid,
             (yield _Object(incumbent_oid)),
         )
-        incumbents[fid] = (
-            incumbent.key,
-            incumbent.fid,
-            facts.action_sids(incumbent),
-        )
+        incumbents[fid] = facts.action_sids(incumbent)
 
     next_slots = {}
     for sid in ordered_sids:
         previous = previous_slots[sid]
         previous = None if previous is None \
-            else indexes.checked_suppression_slot(previous)
+            else checked_suppression_slot(previous)
         selected = actions.get(sid)
         if previous is not None and previous["state"] == "active":
             action_fid = previous["action"]
-            incumbent_key, incumbent_fid, incumbent_sids = \
-                incumbents[action_fid]
-            if sid not in incumbent_sids:
+            if sid not in incumbents[action_fid]:
                 raise ValueError("action evidence binding")
-            candidate = (incumbent_key, incumbent_fid)
-            selected = min(selected, candidate) \
-                if selected is not None else candidate
-        next_slots[sid] = indexes.suppression_slot(
-            None if selected is None else selected[1])
+            selected = min(selected, action_fid) \
+                if selected is not None else action_fid
+        next_slots[sid] = suppression_slot(selected)
 
     changes = {
         snapshot.FACT_ORDER: order_changes,

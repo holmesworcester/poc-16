@@ -4,6 +4,7 @@ import facts
 from . import indexes, merkle_map
 from .close import ClosedPileEvaluator
 from .crypto import h
+from .suppression import checked_suppression_slot
 from .validated_set import ValidatedView
 
 MAX_PROOF_FACTS = 64
@@ -52,7 +53,7 @@ class WorkerView:
 
     def suppression(self, sid):
         row = self._reader(indexes.SUPP).get(sid)
-        return indexes.checked_suppression_slot(row)
+        return checked_suppression_slot(row)
 
     def scopes_active(self, scopes):
         return all(self.suppression(sid)["state"] == "clear" for sid in scopes)

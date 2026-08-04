@@ -225,7 +225,7 @@ def test_admitted_post_removal_fact_converges_in_both_delivery_orders(
         == all_fids(peers[1], workspace)
 
 
-def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
+def test_duplicate_action_uses_minimum_fid_in_every_arrival_order(tmp_path):
     source, workspace, bob_secret, bob = _ordered_action_world(
         tmp_path / "source")
     base = closed_subset(source, workspace, all_fids(source, workspace))
@@ -235,7 +235,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     later = removal(
         workspace, source.identity_id(workspace), bob, 41)
     assert later.key > first.key
-    assert later.fid < first.fid  # deliberately opposes key order
+    assert later.fid < first.fid  # minimum FID deliberately opposes key order
     secret, public = source.identity(workspace)
     later_sig = signature(secret, public, later, later.ts)
     source.ingest_new(
@@ -276,8 +276,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
             "SELECT src FROM fact_index WHERE kind=? AND k0=?",
             (fact_index.ACTION_INDEX, sid),
         ).fetchone() \
-            == (first.fid,)
-        assert peer.fact_of(workspace, posted.fid) == posted
+            == (later.fid,)
         assert peer.fact_of(workspace, posted.fid) == posted
         states.append((
             tuple(all_fids(peer, workspace)),
@@ -286,7 +285,7 @@ def test_duplicate_action_uses_earliest_key_in_every_arrival_order(tmp_path):
     assert states[0] == states[1]
 
 
-def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
+def test_fact_sync_joins_actions_by_minimum_fid(tmp_path):
     source, workspace, _, bob = _ordered_action_world(
         tmp_path / "source")
     founder_secret, founder = source.identity(workspace)
@@ -315,7 +314,7 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
         },
     ))
     assert later.key > first.key
-    assert later.fid < first.fid  # the obsolete tuple-order shortcut
+    assert later.fid < first.fid  # minimum FID opposes timestamp order
 
     result = asyncio.run(destination.mirror(workspace).sync_from(
         source.store(workspace)))
@@ -327,7 +326,7 @@ def test_fact_sync_joins_actions_without_fact_id_shortcuts(tmp_path):
         "SELECT src FROM fact_index WHERE kind=? AND k0=?",
         (fact_index.ACTION_INDEX, sid),
     ).fetchone() \
-        == (first.fid,)
+        == (later.fid,)
 
 
 def test_child_device_admin_inherits_user_liveness(tmp_path):

@@ -353,9 +353,8 @@ class SqlStore:
                     )
                     additions.append(fid)
                     for sid in facts.action_sids(fact):
-                        candidate = (fact.key, fact.fid)
                         candidates[sid] = min(
-                            candidates.get(sid, candidate), candidate)
+                            candidates.get(sid, fact.fid), fact.fid)
 
             for sid, candidate in sorted(candidates.items()):
                 row = self.db.execute(
@@ -364,9 +363,7 @@ class SqlStore:
                     (ACTION_INDEX, sid),
                 ).fetchone()
                 if row is not None:
-                    incumbent = self.fact_of(row[0])
-                    candidate = min(
-                        candidate, (incumbent.key, incumbent.fid))
+                    candidate = min(candidate, row[0])
                 self.db.execute(
                     "DELETE FROM fact_index "
                     "WHERE kind=? AND k0=? AND k1=''",
@@ -374,7 +371,7 @@ class SqlStore:
                 )
                 self.db.execute(
                     "INSERT INTO fact_index VALUES(?,?,?,?)",
-                    (ACTION_INDEX, sid, "", candidate[1]),
+                    (ACTION_INDEX, sid, "", candidate),
                 )
             self.db.execute(
                 "INSERT OR REPLACE INTO projected_heads VALUES(?,?)",

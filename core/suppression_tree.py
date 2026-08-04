@@ -14,10 +14,11 @@ cannot turn a root commitment into a traversal capability.
 """
 
 from dataclasses import dataclass, field
+from itertools import islice
 
 from .crypto import h
 from .fact import canon
-from .indexes import checked_suppression_slot
+from .suppression import checked_suppression_slot
 from .limits import (
     MAX_REMOVAL_NODE_BYTES,
     MAX_REMOVAL_PROOF_BYTES,
@@ -314,15 +315,19 @@ def _different_bit(left, right):
     return KEY_BITS - (int(left, 16) ^ int(right, 16)).bit_length()
 
 
-def _materialize(workspace, rows, maximum=None):
-    if isinstance(rows, dict):
-        rows = rows.items()
+def _bounded_rows(rows, maximum=MAX_REMOVAL_UPDATES):
+    source = rows.items() if isinstance(rows, dict) else rows
     try:
-        rows = tuple(rows)
+        rows = tuple(islice(iter(source), maximum + 1))
     except TypeError as error:
         raise ValueError("private suppression rows") from error
-    if maximum is not None and len(rows) > maximum:
+    if len(rows) > maximum:
         raise PayloadTooLarge("too many private suppression updates")
+    return rows
+
+
+def _materialize(workspace, rows, maximum=MAX_REMOVAL_UPDATES):
+    rows = _bounded_rows(rows, maximum)
     by_sid, keys = {}, {}
     for row in rows:
         if not isinstance(row, (tuple, list)) or len(row) != 2:
@@ -355,6 +360,21 @@ def _collector():
     return pending, emit
 
 
+def _reachable_pending(workspace, root, pending):
+    """Discard path-copy nodes superseded later in the same tiny batch."""
+    reachable, stack = {}, [root]
+    while stack:
+        oid = stack.pop()
+        raw = pending.get(oid)
+        if raw is None or oid in reachable:
+            continue
+        reachable[oid] = raw
+        node = _opened_node(oid, raw, workspace)
+        if isinstance(node, _Branch):
+            stack.extend((node.left, node.right))
+    return tuple(sorted(reachable.items()))
+
+
 def _build(workspace, rows):
     """Build the canonical history-independent private tree from rows."""
     if not valid_fid(workspace):
@@ -379,7 +399,7 @@ def _build(workspace, rows):
     root = "" if not checked else subtree(0, len(checked))
     return Built(
         encode_root(workspace, root, len(checked)),
-        tuple(sorted(pending.items())),
+        _reachable_pending(workspace, root, pending),
     )
 
 
@@ -460,7 +480,7 @@ async def _update(workspace, root_bytes, changes, fetch):
         count += int(added)
     return Built(
         encode_root(workspace, current, count),
-        tuple(sorted(pending.items())),
+        _reachable_pending(workspace, current, pending),
     )
 
 
@@ -583,6 +603,7 @@ class SuppressionTree:
 
     async def apply(self, changes):
         """Convenience turn that pins current state, then calls ``apply_at``."""
+        changes = _bounded_rows(changes)
         pin = await self.pin()
         return await self.apply_at(ABSENT if pin is None else pin, changes)
 
@@ -594,15 +615,7 @@ class SuppressionTree:
         retryable; it can never be silently rebased onto authority the caller
         did not validate.
         """
-        if isinstance(changes, dict):
-            changes = tuple(changes.items())
-        else:
-            try:
-                changes = tuple(changes)
-            except TypeError as error:
-                raise ValueError("private suppression updates") from error
-        if len(changes) > MAX_REMOVAL_UPDATES:
-            raise PayloadTooLarge("too many private suppression updates")
+        changes = _bounded_rows(changes)
         if pin is ABSENT:
             base_root, token = None, ABSENT
         elif isinstance(pin, SuppressionPin) \
