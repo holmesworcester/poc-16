@@ -73,7 +73,7 @@ SHAPE_FAMILIES = {
     for module in MODULES
     for tag in getattr(module, "SHAPES", (module.TAG,))
 }
-MAX_AUTHORITY_SCOPES = 64
+MAX_CURRENT_SCOPES = 64
 
 
 PRINCIPAL_NAMESPACES = _principal_namespaces(MODULES)
@@ -183,8 +183,8 @@ def hydrate(source):
     return CurrentFact(source, current)
 
 
-def authority_projection(stream):
-    """Select the fact-declared durable authority subset of one closure.
+def control_projection(stream):
+    """Select the fact-declared durable control subset of one closure.
 
     Families may narrow replay residence when a generic evidence fact is
     useful only for a particular target.  The signature family uses this to
@@ -195,39 +195,17 @@ def authority_projection(stream):
     current = tuple(hydrate(fact) for fact in sources)
     by_fid = {fact.fid: fact for fact in current}
     if len(by_fid) != len(current):
-        raise ValueError("authority projection duplicate")
+        raise ValueError("control projection duplicate")
     selected = []
     for source, fact in zip(sources, current):
         family = family_for(fact.t)
         if family is None or not family.DURABLE \
-                or not family.POLICY.authority_resident:
+                or not family.POLICY.control_fact:
             continue
-        refine = getattr(family, "project_authority", None)
+        refine = getattr(family, "project_control", None)
         if refine is None or refine(fact, by_fid.get):
             selected.append(source)
     return tuple(selected)
-
-
-def authority_context(fact):
-    """Name facts that must accompany one refined authority resident.
-
-    A family with ``project_authority`` must make its selection context
-    explicit so a stateful peer can reconstruct bounded portable authority
-    units without guessing family semantics.  The returned facts are context,
-    not historical validation evidence; the ordinary closure walk still
-    supplies every semantic dependency.
-    """
-    family = family_for(fact.t)
-    context = getattr(family, "authority_context", None)
-    if not callable(context):
-        return ()
-    values = tuple(context(fact))
-    from core.shape import valid_fid
-
-    if len(set(values)) != len(values) \
-            or not all(valid_fid(fid) for fid in values):
-        raise ValueError("authority context")
-    return values
 
 
 def semantic_evaluation(judgment, stream):
@@ -266,7 +244,7 @@ def control_evaluation(judgment, stream):
             (family := family_for(fact.t)) is None or not family.DURABLE
             for fact in current):
         raise ValueError("control pile contains non-durable fact")
-    selected = authority_projection(current_stream)
+    selected = control_projection(current_stream)
     if tuple(fact.fid for fact in selected) != tuple(
             fact.fid for fact in current):
         raise ValueError("control pile contains ordinary content")
@@ -417,7 +395,7 @@ def authority_scopes(fact):
         # the concrete signing key. Direct users have the same value in both
         # positions; devices thereby inherit their owner's liveness.
         out.add(principal_sid(namespace, need.a1 or need.a0))
-    if len(out) > MAX_AUTHORITY_SCOPES:
+    if len(out) > MAX_CURRENT_SCOPES:
         raise ValueError("authority liveness scope budget")
     return frozenset(out)
 

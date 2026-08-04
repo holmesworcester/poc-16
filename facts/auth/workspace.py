@@ -7,7 +7,7 @@ from ._display import display
 TAG = "workspace"
 GENESIS = True
 POLICY = FamilyPolicy(
-    authority_resident=True,
+    control_fact=True,
     principal_offers=(SidOffer("member", "member"),),
 )
 

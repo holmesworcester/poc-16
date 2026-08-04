@@ -6,7 +6,7 @@ from . import signature
 
 TAG = "evict"
 POLICY = FamilyPolicy(
-    authority_resident=True,
+    control_fact=True,
     action_offers=(SidOffer("removed", "member"),),
 )
 

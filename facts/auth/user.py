@@ -14,7 +14,7 @@ from ._display import display
 
 TAG = "user"
 POLICY = FamilyPolicy(
-    authority_resident=True,
+    control_fact=True,
     suppression=(Self(),),
     principal_offers=(SidOffer("member", "member"),),
 )

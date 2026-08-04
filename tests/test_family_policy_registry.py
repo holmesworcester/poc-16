@@ -24,7 +24,7 @@ def compile_policy(policy):
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     (
-        ("authority_resident", 1, "residence must be bool"),
+        ("control_fact", 1, "control fact must be bool"),
         ("suppression", [], "nonempty tuple"),
         ("suppression", (), "nonempty tuple"),
         ("suppression", ("self",), "selector policy"),
@@ -235,7 +235,7 @@ def test_registry_rejects_cross_family_principal_namespace_conflict():
 
 def test_registry_accepts_complete_distinct_policy_and_production_inventory():
     policy = _policy.FamilyPolicy(
-        authority_resident=True,
+        control_fact=True,
         suppression=(
             _policy.Self(),
             _policy.Parent("parent"),
