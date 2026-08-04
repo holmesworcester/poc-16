@@ -20,13 +20,13 @@ import pytest
 import facts
 from .util import signed_pile_bytes
 from core.crypto import h, unseal
+from core.authority import AuthorityRepository
+from core.http import AsyncFromSyncReader
 from core.limits import (
     MAX_MINT_FETCHES,
     MAX_MINT_FETCH_BYTES,
-    MAX_ROOT_BYTES,
 )
 from core.pack_access import MAX_OBJECT_OPEN_BYTES
-from core.repository_reader import RepositoryReader
 from facts.auth import request
 from full_peer import walk as walk_module
 from full_peer.daemon import FullPeerService
@@ -250,7 +250,7 @@ def repository_bytes(node_dir, workspace):
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
-        and path.name != ".root.lock"
+        and path.name != ".cas.lock"
         and not path.name.endswith((".idx.db", ".idx.db-shm", ".idx.db-wal"))
     }
 
@@ -344,7 +344,8 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
     pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
+        bootstrap, workspace, "sync", issued + 300_000, issued),
+        secret=identity_secret)
     bootstrap.sql(workspace).db.close()
 
     service = FullPeerService(
@@ -364,7 +365,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
         expected = call(
             direct,
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=token,
         )
         assert expected[0] == 200
@@ -418,7 +419,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
                 lambda: overflow_results.append(call(
                     forward_targets[2],
                     "GET",
-                    f"/root?ws={workspace}",
+                    f"/heads?ws={workspace}",
                     token=token,
                 )),
             ),
@@ -451,7 +452,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
         recovered = call(
             forward_targets[2],
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=token,
         )
         assert time.monotonic() - recovered_at < 2
@@ -474,7 +475,8 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     identity_secret = bootstrap.identity(workspace)[0]
     issued = now_ms()
     pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
+        bootstrap, workspace, "sync", issued + 300_000, issued),
+        secret=identity_secret)
     published = repository_bytes(state, workspace)
     object_key, raw = next(
         (key, value) for key, value in published.items()
@@ -559,14 +561,14 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
 
         assert parity(
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
         )[0] == 401
         token, _ = mint(
             through_iroh[0], workspace, pile, identity_secret)
         tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
         assert parity(
             "GET",
-            f"/root?ws={workspace}",
+            f"/heads?ws={workspace}",
             token=tampered,
         )[0] == 401
 
@@ -574,12 +576,12 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             direct, workspace, pile, identity_secret)
         assert parity(
             "GET",
-            "/root?ws=" + "0" * 64,
+            "/heads?ws=" + "0" * 64,
             token=token,
         )[0] == 404
 
         for method, path in (
-                ("POST", f"/root?ws={workspace}"),
+                ("POST", f"/heads?ws={workspace}"),
                 ("GET", f"/unknown?ws={workspace}")):
             route_token, _ = mint(
                 through_iroh[0], workspace, pile, identity_secret)
@@ -1036,6 +1038,210 @@ def test_two_supervised_full_peers_schedule_only_through_iroh_and_reap(
             )
 
 
+def test_four_supervised_full_peers_gossip_independent_writers_over_iroh(
+        tmp_path, iroh_binary):
+    """A line topology relays four writer trees without a direct HTTP peer."""
+    names = ("alice", "bob", "carol", "dave")
+    states = {name: tmp_path / name for name in names}
+    processes, ready = {}, {}
+    descendants = set()
+
+    def start(name):
+        process, service = start_full_peer(
+            states[name], iroh_binary, cadence=".1")
+        processes[name], ready[name] = process, service
+        descendants.add(int(service["pid"]))
+
+    def status(name):
+        return control_command(ready[name], "peer.status")
+
+    def workspace_row(name, workspace):
+        return status(name)["workspaces"][workspace]
+
+    def peer_endpoints(name, workspace):
+        return {
+            peer["endpoint"]
+            for peer in workspace_row(name, workspace)["peers"]
+        }
+
+    def remember_forwarders(workspace):
+        for name in names:
+            for connection in workspace_row(
+                    name, workspace)["iroh_connections"]:
+                if connection["pid"] is not None:
+                    descendants.add(connection["pid"])
+
+    try:
+        for name in names:
+            start(name)
+
+        workspace = control_command(
+            ready["alice"], "auth.workspace.create", "alice")
+        for name in names[1:]:
+            link = control_command(
+                ready["alice"], "auth.user_invite.create", workspace)
+            assert control_command(
+                ready[name], "auth.user.join", link, name) == workspace
+
+        expected_devices = {
+            status(name)["pk"]
+            for name in names
+        }
+
+        def bootstrap_converged():
+            rows = [workspace_row(name, workspace) for name in names]
+            return len({row["forest_fingerprint"] for row in rows}) == 1 \
+                and all(len(row["writers"]) == len(names) for row in rows) \
+                and all(
+                    {writer["device"] for writer in row["writers"]}
+                    == expected_devices
+                    for row in rows
+                )
+
+        wait_until(
+            bootstrap_converged,
+            timeout=45,
+            message="four invitees to converge through the bootstrap star",
+        )
+
+        # Invitations initially give every joiner Alice's locator. Rewire to
+        # one directed line. Each dial still reconciles in both directions:
+        # Bob <-> Alice, Carol <-> Bob, and Dave <-> Carol.
+        for name, upstream in (("carol", "bob"), ("dave", "carol")):
+            assert control_command(
+                ready[name],
+                "peer.iroh.set",
+                workspace,
+                ready[upstream]["endpoint_id"],
+                ready[upstream]["peer"],
+            ) == {"ok": True}
+            assert control_command(
+                ready[name],
+                "peer.iroh.remove",
+                workspace,
+                ready["alice"]["endpoint_id"],
+            ) == {"ok": True}
+
+        assert peer_endpoints("alice", workspace) == set()
+        assert peer_endpoints("bob", workspace) == {
+            ready["alice"]["endpoint_id"]}
+        assert peer_endpoints("carol", workspace) == {
+            ready["bob"]["endpoint_id"]}
+        assert peer_endpoints("dave", workspace) == {
+            ready["carol"]["endpoint_id"]}
+
+        # Restart the tail after rewiring. Its only durable remote locator is
+        # an Iroh endpoint/ticket; the private HTTP loopback and child process
+        # must be replaced rather than persisted.
+        def dave_forwarder_ready():
+            rows = workspace_row(
+                "dave", workspace)["iroh_connections"]
+            return len(rows) == 1 \
+                and rows[0]["state"] == "ready" \
+                and rows[0]["pid"] is not None
+
+        wait_until(
+            dave_forwarder_ready,
+            timeout=20,
+            message="Dave's line forwarder",
+        )
+        old_server_pid = int(ready["dave"]["pid"])
+        old_endpoint = ready["dave"]["endpoint_id"]
+        old_forwarder = workspace_row(
+            "dave", workspace)["iroh_connections"][0]
+        descendants.add(old_forwarder["pid"])
+        assert stop(processes.pop("dave")) == 0
+        wait_until(
+            lambda: _pid_absent(old_server_pid)
+            and _pid_absent(old_forwarder["pid"]),
+            timeout=20,
+            message="Dave's pre-restart Iroh children to exit",
+        )
+        start("dave")
+        assert ready["dave"]["endpoint_id"] == old_endpoint
+        assert peer_endpoints("dave", workspace) == {
+            ready["carol"]["endpoint_id"]}
+        wait_until(
+            dave_forwarder_ready,
+            timeout=20,
+            message="Dave's restarted line forwarder",
+        )
+        restarted_forwarder = workspace_row(
+            "dave", workspace)["iroh_connections"][0]
+        assert restarted_forwarder["pid"] != old_forwarder["pid"]
+        descendants.add(restarted_forwarder["pid"])
+
+        authored = {
+            control_command(
+                ready[name],
+                "content.message.post",
+                workspace,
+                "general",
+                f"independent writer: {name}",
+            )
+            for name in names
+        }
+        assert len(authored) == len(names)
+
+        def line_converged():
+            snapshots = {name: status(name) for name in names}
+            rows = {
+                name: snapshots[name]["workspaces"][workspace]
+                for name in names
+            }
+            if len({
+                    row["forest_fingerprint"]
+                    for row in rows.values()}) != 1:
+                return False
+            if any(
+                    len(row["writers"]) != len(names)
+                    or any(
+                        writer["head"] != writer["projected_head"]
+                        for writer in row["writers"])
+                    for row in rows.values()):
+                return False
+            return all(
+                authored <= {
+                    message["fid"]
+                    for message in control_command(
+                        ready[name],
+                        "content.message.list",
+                        workspace,
+                    )
+                }
+                for name in names
+            )
+
+        wait_until(
+            line_converged,
+            timeout=45,
+            message="four writers to converge across the Iroh line",
+        )
+        remember_forwarders(workspace)
+
+        # The local control ports drove authoring and observation. Inter-peer
+        # configuration contains only Iroh locators, so every scheduled pull,
+        # reverse mirror, grant, and multi-hop relay above crossed real Iroh.
+        for name in names:
+            row = workspace_row(name, workspace)
+            assert all(peer["kind"] == "iroh" for peer in row["peers"])
+            configured = {
+                f"iroh:{peer['endpoint']}" for peer in row["peers"]
+            }
+            assert configured.isdisjoint({
+                failure["peer"] for failure in row["sync_failures"]
+            })
+    finally:
+        for process in tuple(processes.values()):
+            stop(process)
+        for pid in descendants:
+            wait_until(
+                lambda pid=pid: _pid_absent(pid),
+                timeout=20,
+                message=f"four-peer Iroh child {pid} cleanup",
+            )
+
+
 def test_changed_private_iroh_urls_discard_each_superseded_sync_walk(tmp_path):
     class CyclingForwarders:
         def __init__(self):
@@ -1103,7 +1309,7 @@ def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
             pass
 
         def read(self, _maximum):
-            return b"root"
+            return b'{"cursor":null,"heads":[]}'
 
     class BarrierCache(dict):
         def __init__(self):
@@ -1141,7 +1347,7 @@ def test_set_and_remove_detach_cache_without_mutating_an_active_http_walk(
         thread = threading.Thread(
             target=lambda: _capture_error(
                 errors,
-                lambda: client.root(response_limit=MAX_ROOT_BYTES),
+                lambda: client.heads(limit=1),
             ),
         )
         thread.start()
@@ -1221,24 +1427,32 @@ def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
     issued = now_ms()
     pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued))
+        bootstrap, workspace, "sync", issued + 300_000, issued),
+        secret=bootstrap.identity(workspace)[0])
     store = bootstrap.store(workspace)
-    root = store.get("root")
+    authority_root = store.get("authority")
 
     async def measure():
         fetched = {}
 
-        async def fetch(oid):
-            raw = store.get("obj/" + oid)
-            fetched.setdefault(oid, raw)
-            return raw
+        class CountingStore:
+            def __init__(self):
+                self.base = AsyncFromSyncReader(store)
 
-        decision = await RepositoryReader.mint_awaited(
-            workspace,
-            root,
-            fetch,
+            async def read_versioned(self, key):
+                return await self.base.read_versioned(key)
+
+            async def get_bounded(self, key, maximum):
+                raw = await self.base.get_bounded(key, maximum)
+                if raw is not None:
+                    fetched.setdefault(key, raw)
+                return raw
+
+        decision = await AuthorityRepository(
+            workspace, CountingStore()).authorize_access(
             pile,
             issued,
+            purpose="sync",
             max_unique_fetches=MAX_MINT_FETCHES,
             max_fetch_bytes=MAX_MINT_FETCH_BYTES,
         )
@@ -1274,7 +1488,7 @@ def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
                 body=body,
                 headers={"Content-Type": "application/json"},
             )[0] == 403
-            assert store.get("root") == root
+            assert store.get("authority") == authority_root
         finally:
             assert stop(daemon) == 0
 
