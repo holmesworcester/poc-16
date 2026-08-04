@@ -23,21 +23,10 @@ _HTTP_REPOSITORY_CORE_MODULES = (
     "writer_tree.py",
 )
 
-REPOSITORY_READER_CORE_MODULES = (
-    *_HTTP_REPOSITORY_CORE_MODULES,
-    "indexes.py",
-    "kernel.py",
-    "repository_reader.py",
-    "repository_snapshot.py",
-    "snapshot.py",
-    "validated_set.py",
-    "worker.py",
-)
-
 # The public hosted gateway reads the writer forest and owns only private
 # recipient-removal projection plus owner-confined writer-head CAS.  This is
-# the exact database-free import closure for that role; no shared authority
-# repository or detached upload/applier deployment is included.
+# the exact database-free import closure for that role; no shared aggregate
+# repository or detached compiler deployment is included.
 HOSTED_GATE_CORE_MODULES = (
     *_HTTP_REPOSITORY_CORE_MODULES,
     "access.py",

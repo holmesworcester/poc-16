@@ -43,12 +43,12 @@ def _run_python(script, *arguments, timeout=PROCESS_TIMEOUT_SECONDS):
 
 
 def _aba_schedule(seed):
-    bucket = AdversarialBucket({"authority": b"A"}, seed=seed)
+    bucket = AdversarialBucket({"removal": b"A"}, seed=seed)
     store = bucket.handle("writer")
-    first = store.read_versioned("authority")
-    to_b = store.cas("authority", first.token, b"B")
-    to_a = store.cas("authority", to_b.token, b"A")
-    final = store.read_versioned("authority")
+    first = store.read_versioned("removal")
+    to_b = store.cas("removal", first.token, b"B")
+    to_a = store.cas("removal", to_b.token, b"A")
+    final = store.read_versioned("removal")
     assert bucket.assert_valid_history()
     return bucket, first, to_b, to_a, final
 
@@ -72,24 +72,24 @@ def test_seed_replays_opaque_value_aba_without_content_hash_tokens():
     assert opened.token != other[1].token
 
 
-def test_versioned_read_keeps_one_atomic_pair_while_authority_advances():
-    bucket = AdversarialBucket({"authority": b"old"}, seed=7)
+def test_versioned_read_keeps_one_atomic_pair_while_removal_advances():
+    bucket = AdversarialBucket({"removal": b"old"}, seed=7)
     reader = bucket.handle("reader")
     writer = bucket.handle("writer")
-    old = writer.read_versioned("authority")
+    old = writer.read_versioned("removal")
     paused = bucket.pause(
-        "reader", "read_versioned", "authority", when="after")
+        "reader", "read_versioned", "removal", when="after")
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        reading = pool.submit(reader.read_versioned, "authority")
+        reading = pool.submit(reader.read_versioned, "removal")
         paused.wait()
-        advanced = writer.cas("authority", old.token, b"new")
+        advanced = writer.cas("removal", old.token, b"new")
         assert isinstance(advanced, Applied)
         paused.release.set()
         paired = reading.result(timeout=5)
 
     assert paired == old
-    assert writer.read_versioned("authority").value == b"new"
+    assert writer.read_versioned("removal").value == b"new"
     assert bucket.assert_valid_history()
 
 
@@ -104,16 +104,16 @@ def test_versioned_read_keeps_one_atomic_pair_while_authority_advances():
 )
 def test_prelinearization_failures_have_typed_results_and_no_mutation(
         fault, expected):
-    bucket = AdversarialBucket({"authority": b"base"}, seed=11)
+    bucket = AdversarialBucket({"removal": b"base"}, seed=11)
     store = bucket.handle("writer")
-    token = bucket._tokens["authority"]
-    bucket.fail("writer", "cas", "authority", fault, when="before")
+    token = bucket._tokens["removal"]
+    bucket.fail("writer", "cas", "removal", fault, when="before")
 
     with pytest.raises(expected) as caught:
-        store.cas("authority", token, b"candidate")
+        store.cas("removal", token, b"candidate")
 
     assert type(caught.value) is expected
-    assert bucket._data["authority"] == b"base"
+    assert bucket._data["removal"] == b"base"
     assert bucket.history == []
     assert bucket.assert_valid_history()
 
@@ -121,14 +121,14 @@ def test_prelinearization_failures_have_typed_results_and_no_mutation(
 @pytest.mark.parametrize("operation", ["read_versioned", "has"])
 def test_read_transport_failure_is_retryable_not_a_mutation_outcome(
         operation):
-    bucket = AdversarialBucket({"authority": b"base"}, seed=12)
+    bucket = AdversarialBucket({"removal": b"base"}, seed=12)
     store = bucket.handle("reader")
     bucket.fail(
-        "reader", operation, "authority",
+        "reader", operation, "removal",
         Fault.TRANSPORT, when="before")
 
     with pytest.raises(RetryableStoreError) as caught:
-        getattr(store, operation)("authority")
+        getattr(store, operation)("removal")
 
     assert type(caught.value) is RetryableStoreError
     assert bucket.history == []
@@ -139,15 +139,15 @@ def test_read_transport_failure_is_retryable_not_a_mutation_outcome(
 @pytest.mark.parametrize("operation", ["create", "cas"])
 def test_applied_response_loss_is_unknown_but_present_in_history(
         fault, operation):
-    initial = {"authority": b"base"} if operation == "cas" else {}
+    initial = {"removal": b"base"} if operation == "cas" else {}
     bucket = AdversarialBucket(initial, seed=13)
     store = bucket.handle("writer")
     if operation == "create":
         op, key, value = "put_if_absent", "probe/item", b"created"
         invoke = lambda: store.put_if_absent(key, value)
     else:
-        op, key, value = "cas", "authority", b"candidate"
-        token = bucket._tokens["authority"]
+        op, key, value = "cas", "removal", b"candidate"
+        token = bucket._tokens["removal"]
         invoke = lambda: store.cas(key, token, value)
     bucket.fail("writer", op, key, fault, when="after")
 
@@ -185,22 +185,22 @@ def test_unknown_before_then_unknown_after_replays_both_create_outcomes():
 
 
 def test_pending_cas_becomes_definitively_stale_after_another_writer_wins():
-    bucket = AdversarialBucket({"authority": b"base"}, seed=17)
+    bucket = AdversarialBucket({"removal": b"base"}, seed=17)
     alice, bob = bucket.handle("alice"), bucket.handle("bob")
-    base = alice.read_versioned("authority")
-    paused = bucket.pause("alice", "cas", "authority", when="before")
+    base = alice.read_versioned("removal")
+    paused = bucket.pause("alice", "cas", "removal", when="before")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = pool.submit(
-            alice.cas, "authority", base.token, b"alice")
+            alice.cas, "removal", base.token, b"alice")
         paused.wait()
         winner = pool.submit(
-            bob.cas, "authority", base.token, b"bob")
+            bob.cas, "removal", base.token, b"bob")
         assert isinstance(winner.result(timeout=5), Applied)
         paused.release.set()
         assert pending.result(timeout=5) is STALE
 
-    assert bucket._data["authority"] == b"bob"
+    assert bucket._data["removal"] == b"bob"
     assert bucket.assert_valid_history()
 
 
@@ -271,12 +271,12 @@ def test_list_page_budget_is_a_bounded_failure():
 @pytest.mark.parametrize(
     ("op", "key"),
     [
-        ("get", "authority"),
-        ("read_versioned", "authority"),
-        ("has", "authority"),
+        ("get", "removal"),
+        ("read_versioned", "removal"),
+        ("has", "removal"),
         ("put", "invite/item"),
         ("put_if_absent", "probe/item"),
-        ("cas", "authority"),
+        ("cas", "removal"),
         ("list_page", "pile/"),
         ("delete", "pile/member/item"),
     ],
@@ -285,7 +285,7 @@ def test_list_page_budget_is_a_bounded_failure():
 def test_actor_crash_is_available_on_both_sides_of_every_linearization(
         op, key, when):
     initial = {
-        "authority": b"base",
+        "removal": b"base",
         "pile/member/item": b"ingress",
     }
     bucket = AdversarialBucket(initial, seed=31)
@@ -305,7 +305,7 @@ def test_actor_crash_is_available_on_both_sides_of_every_linearization(
             return store.put_if_absent(key, b"conditional")
         if op == "cas":
             return store.cas(
-                key, bucket.initial_tokens["authority"], b"candidate")
+                key, bucket.initial_tokens["removal"], b"candidate")
         if op == "list_page":
             return store.list(key)
         if op == "delete":
@@ -321,7 +321,7 @@ def test_actor_crash_is_available_on_both_sides_of_every_linearization(
     elif op == "put_if_absent":
         assert ("probe/item" in bucket._data) is (when == "after")
     elif op == "cas":
-        assert bucket._data["authority"] == (
+        assert bucket._data["removal"] == (
             b"candidate" if when == "after" else b"base")
     elif op == "delete":
         assert ("pile/member/item" in bucket._data) is (when == "before")
@@ -342,26 +342,26 @@ def test_acknowledged_creation_invisibility_is_a_failing_control():
 
 def test_stale_successful_direct_read_is_a_failing_control():
     bucket = AdversarialBucket(
-        {"authority": b"old"},
+        {"removal": b"old"},
         nonconforming=Nonconforming(stale_successful_reads=True))
     store = bucket.handle("writer")
-    old = store.read_versioned("authority")
-    assert isinstance(store.cas("authority", old.token, b"new"), Applied)
+    old = store.read_versioned("removal")
+    assert isinstance(store.cas("removal", old.token, b"new"), Applied)
 
-    assert store.read_versioned("authority") == old
+    assert store.read_versioned("removal") == old
     with pytest.raises(AssertionError):
         bucket.assert_valid_history()
 
 
 def test_two_replacements_of_one_precondition_are_a_failing_control():
     bucket = AdversarialBucket(
-        {"authority": b"base"},
+        {"removal": b"base"},
         nonconforming=Nonconforming(reused_cas_precondition=True))
     store = bucket.handle("writer")
-    base = store.read_versioned("authority")
+    base = store.read_versioned("removal")
 
-    assert isinstance(store.cas("authority", base.token, b"one"), Applied)
-    assert isinstance(store.cas("authority", base.token, b"two"), Applied)
+    assert isinstance(store.cas("removal", base.token, b"one"), Applied)
+    assert isinstance(store.cas("removal", base.token, b"two"), Applied)
     with pytest.raises(AssertionError):
         bucket.assert_valid_history()
 
@@ -370,10 +370,10 @@ def test_token_alias_across_distinct_bytes_is_a_failing_control():
     bucket = AdversarialBucket(
         nonconforming=Nonconforming(token_alias=True))
     store = bucket.handle("writer")
-    first = store.cas("authority", ABSENT, b"one")
+    first = store.cas("removal", ABSENT, b"one")
     assert isinstance(first, Applied)
     assert isinstance(store.cas(
-        "authority", first.token, b"two"), Applied)
+        "removal", first.token, b"two"), Applied)
 
     with pytest.raises(AssertionError) as caught:
         with bucket.capture():
@@ -414,17 +414,17 @@ def test_repeated_opaque_list_cursor_is_a_bounded_failing_control():
 
 
 def test_cached_reader_is_explicitly_stale_while_direct_store_stays_strong():
-    bucket = AdversarialBucket({"authority": b"old"}, seed=37)
+    bucket = AdversarialBucket({"removal": b"old"}, seed=37)
     direct = bucket.handle("direct")
     cached = LaggedReader(direct)
-    opened = cached.read_versioned("authority")
-    advanced = direct.cas("authority", opened.token, b"new")
+    opened = cached.read_versioned("removal")
+    advanced = direct.cas("removal", opened.token, b"new")
     assert isinstance(advanced, Applied)
 
-    assert cached.read_versioned("authority") == opened
-    assert direct.read_versioned("authority").value == b"new"
-    cached.refresh("authority")
-    assert cached.read_versioned("authority").value == b"new"
+    assert cached.read_versioned("removal") == opened
+    assert direct.read_versioned("removal").value == b"new"
+    cached.refresh("removal")
+    assert cached.read_versioned("removal").value == b"new"
     assert bucket.assert_valid_history()
 
 
@@ -432,15 +432,15 @@ def test_async_replica_reader_is_separate_from_strong_r2_binding():
     async def scenario():
         bucket = FakeR2Bucket()
         direct = R2BindingStore(bucket)
-        created = await direct.cas("authority", ABSENT, b"old")
+        created = await direct.cas("removal", ABSENT, b"old")
         replica = AsyncLaggedReader(direct)
-        opened = await replica.read_versioned("authority")
-        advanced = await direct.cas("authority", created.token, b"new")
+        opened = await replica.read_versioned("removal")
+        advanced = await direct.cas("removal", created.token, b"new")
         assert isinstance(advanced, Applied)
-        assert await replica.read_versioned("authority") == opened
-        assert (await direct.read_versioned("authority")).value == b"new"
+        assert await replica.read_versioned("removal") == opened
+        assert (await direct.read_versioned("removal")).value == b"new"
         replica.refresh()
-        assert (await replica.read_versioned("authority")).value == b"new"
+        assert (await replica.read_versioned("removal")).value == b"new"
 
     asyncio.run(scenario())
 
@@ -472,10 +472,10 @@ def test_shared_conformance_catches_a_hidden_retry_after_apply():
             store, ConformanceRun("hidden-retry", seed=41))
 
     assert "provider=hidden-retry" in str(caught.value)
-    assert bucket._data["authority"].startswith(b"authority-a:")
+    assert bucket._data["removal"].startswith(b"removal-a:")
 
 
-@pytest.mark.parametrize("operation", ["object-link", "authority-replace"])
+@pytest.mark.parametrize("operation", ["object-link", "removal-replace"])
 @pytest.mark.parametrize("when", ["before", "after"])
 def test_real_process_exit_brackets_fs_linearization(
         tmp_path, operation, when):
@@ -495,12 +495,12 @@ if operation == "object-link":
         os._exit(71)
     store.put_if_absent("obj/" + h(value), value)
 else:
-    if store.read_versioned("authority") is ABSENT:
-        store.cas("authority", ABSENT, b"base")
-    current = store.read_versioned("authority")
+    if store.read_versioned("removal") is ABSENT:
+        store.cas("removal", ABSENT, b"base")
+    current = store.read_versioned("removal")
     if when == "before":
         os._exit(71)
-    store.cas("authority", current.token, b"replacement")
+    store.cas("removal", current.token, b"replacement")
 os._exit(72)
 """
     completed = _run_python(script, store_dir, operation, when)
@@ -513,7 +513,7 @@ os._exit(72)
         assert store.get("obj/" + h(raw)) == (
             raw if when == "after" else None)
     else:
-        assert store.get("authority") == (
+        assert store.get("removal") == (
             b"replacement" if when == "after" else b"base")
 
 

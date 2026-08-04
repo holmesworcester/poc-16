@@ -167,26 +167,6 @@ def query_state(node, workspace=None):
     )
 
 
-def compiled_repository(node, workspace, objects=None):
-    """Compile current projected facts into an explicit test-only snapshot.
-
-    The writer-log FullPeer deliberately has no aggregate content root. Tests
-    for pure RepositoryReader queries construct that disposable value
-    explicitly instead of reviving ``FullPeer.reader``.
-    """
-    from core.repository_snapshot import compile_snapshot
-
-    with node.lock:
-        projection = node.sql(workspace)
-        compiled = compile_snapshot(workspace, {
-            fid: projection.fact_of(fid)
-            for fid in projection.fact_ids()
-        })
-    target = {} if objects is None else objects
-    target.update(compiled.objects)
-    return compiled.root, target
-
-
 def visible_fids(node, workspace):
     """Eligible facts not masked by their explicit suppression ids."""
     with node.lock:

@@ -136,11 +136,11 @@ WRITER_CONSUMER_CORE_MODULES = (
     "fact.py",
     "fact_index.py",
     "http_body.py",
-    "indexes.py",
     "kernel.py",
     "merkle_map.py",
-    "snapshot.py",
+    "removal_path.py",
     "suppression.py",
+    "suppression_tree.py",
     "writer_head.py",
     "writer_repository.py",
     "writer_tree.py",
@@ -199,7 +199,7 @@ def _copy(source, destination):
 
 
 def stage():
-    """Stage exact role import trees without RepositoryApplier."""
+    """Stage exact role import trees without an aggregate compiler."""
     patch_pynacl(VENDORED)
     pending = BUILD / "pending"
     if pending.exists():

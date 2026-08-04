@@ -91,16 +91,16 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
     """
     with run.capture():
         first, second = make_store(), make_store()
-        assert first.read_versioned("authority") is ABSENT, run.diagnostic()
-        run.record("read authority", "absent")
+        assert first.read_versioned("removal") is ABSENT, run.diagnostic()
+        run.record("read removal", "absent")
 
-        authority_a = run.value("authority-a")
-        created = first.cas("authority", ABSENT, authority_a)
+        removal_a = run.value("removal-a")
+        created = first.cas("removal", ABSENT, removal_a)
         assert _applied(created), run.diagnostic()
-        run.observe(created.token, authority_a)
-        run.record("create authority", created)
-        pair = second.read_versioned("authority")
-        assert pair == Versioned(authority_a, created.token), run.diagnostic()
+        run.observe(created.token, removal_a)
+        run.record("create removal", created)
+        pair = second.read_versioned("removal")
+        assert pair == Versioned(removal_a, created.token), run.diagnostic()
         run.observe(pair.token, pair.value)
         run.record("paired read", pair)
 
@@ -118,14 +118,14 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
         run.record("immutable create/collision", oid)
 
         pace()
-        authority_b = run.value("authority-b")
-        authority_c = run.value("authority-c")
+        removal_b = run.value("removal-b")
+        removal_c = run.value("removal-c")
         start = threading.Barrier(2)
 
         def replace(store, value):
             start.wait(timeout=10)
             try:
-                return store.cas("authority", pair.token, value)
+                return store.cas("removal", pair.token, value)
             except RetryableStoreError as error:
                 return error
 
@@ -133,8 +133,8 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
             results = [
                 future.result(timeout=30)
                 for future in (
-                    pool.submit(replace, first, authority_b),
-                    pool.submit(replace, second, authority_c),
+                    pool.submit(replace, first, removal_b),
+                    pool.submit(replace, second, removal_c),
                 )
             ]
         winners = [result for result in results if _applied(result)]
@@ -144,8 +144,8 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
             or isinstance(result, RetryableStoreError)
             for result in results
         ), run.diagnostic()
-        winner = first.read_versioned("authority")
-        assert winner.value in {authority_b, authority_c}, run.diagnostic()
+        winner = first.read_versioned("removal")
+        assert winner.value in {removal_b, removal_c}, run.diagnostic()
         assert winner.token == winners[0].token, run.diagnostic()
         run.observe(winner.token, winner.value)
         run.record("concurrent replace", results)
@@ -163,19 +163,19 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
         # bytes are A again; global generation uniqueness is not required.
         pace()
         aba_a = run.value("aba-a")
-        to_a = first.cas("authority", winner.token, aba_a)
+        to_a = first.cas("removal", winner.token, aba_a)
         assert _applied(to_a), run.diagnostic()
         run.observe(to_a.token, aba_a)
         pace()
         aba_b = run.value("aba-b")
-        to_b = second.cas("authority", to_a.token, aba_b)
+        to_b = second.cas("removal", to_a.token, aba_b)
         assert _applied(to_b), run.diagnostic()
         run.observe(to_b.token, aba_b)
         pace()
-        back_to_a = first.cas("authority", to_b.token, aba_a)
+        back_to_a = first.cas("removal", to_b.token, aba_a)
         assert _applied(back_to_a), run.diagnostic()
         run.observe(back_to_a.token, aba_a)
-        final = second.read_versioned("authority")
+        final = second.read_versioned("removal")
         assert final == Versioned(aba_a, back_to_a.token), run.diagnostic()
         run.observe(final.token, final.value)
         if back_to_a.token == to_a.token:
@@ -183,7 +183,7 @@ def exercise_sync_store(make_store, run, *, pace=lambda: None, list_count=7):
         run.record("A->B->A", (to_a.token, to_b.token, back_to_a.token))
 
         return {
-            "authority": final,
+            "removal": final,
             "objects": ("obj/" + oid,),
             "listed": tuple(listed),
         }
@@ -199,18 +199,18 @@ async def exercise_async_store(
     with run.capture():
         first, second = make_store(), make_store()
         assert await first.read_versioned(
-            "authority") is ABSENT, run.diagnostic()
-        run.record("read authority", "absent")
+            "removal") is ABSENT, run.diagnostic()
+        run.record("read removal", "absent")
 
-        authority_a = run.value("authority-a")
-        created = await first.cas("authority", ABSENT, authority_a)
+        removal_a = run.value("removal-a")
+        created = await first.cas("removal", ABSENT, removal_a)
         assert _applied(created), run.diagnostic()
-        run.observe(created.token, authority_a)
-        pair = await second.read_versioned("authority")
+        run.observe(created.token, removal_a)
+        pair = await second.read_versioned("removal")
         assert pair == Versioned(
-            authority_a, created.token), run.diagnostic()
+            removal_a, created.token), run.diagnostic()
         run.observe(pair.token, pair.value)
-        run.record("create/read authority", pair)
+        run.record("create/read removal", pair)
 
         ordinary = run.value("ordinary-put")
         assert await first.put("probe/put", ordinary) is None
@@ -225,17 +225,17 @@ async def exercise_async_store(
         run.record("immutable create/collision", oid)
 
         await pace()
-        authority_b = run.value("authority-b")
-        authority_c = run.value("authority-c")
+        removal_b = run.value("removal-b")
+        removal_c = run.value("removal-c")
 
         async def replace(store, value):
             try:
-                return await store.cas("authority", pair.token, value)
+                return await store.cas("removal", pair.token, value)
             except RetryableStoreError as error:
                 return error
 
         results = await asyncio.gather(
-            replace(first, authority_b), replace(second, authority_c))
+            replace(first, removal_b), replace(second, removal_c))
         winners = [result for result in results if _applied(result)]
         assert len(winners) == 1, run.diagnostic()
         assert all(
@@ -243,8 +243,8 @@ async def exercise_async_store(
             or isinstance(result, RetryableStoreError)
             for result in results
         ), run.diagnostic()
-        winner = await first.read_versioned("authority")
-        assert winner.value in {authority_b, authority_c}, run.diagnostic()
+        winner = await first.read_versioned("removal")
+        assert winner.value in {removal_b, removal_c}, run.diagnostic()
         assert winner.token == winners[0].token, run.diagnostic()
         run.observe(winner.token, winner.value)
         run.record("concurrent replace", results)
@@ -260,25 +260,25 @@ async def exercise_async_store(
 
         await pace()
         aba_a = run.value("aba-a")
-        to_a = await first.cas("authority", winner.token, aba_a)
+        to_a = await first.cas("removal", winner.token, aba_a)
         assert _applied(to_a), run.diagnostic()
         run.observe(to_a.token, aba_a)
         await pace()
         aba_b = run.value("aba-b")
-        to_b = await second.cas("authority", to_a.token, aba_b)
+        to_b = await second.cas("removal", to_a.token, aba_b)
         assert _applied(to_b), run.diagnostic()
         run.observe(to_b.token, aba_b)
         await pace()
-        back_to_a = await first.cas("authority", to_b.token, aba_a)
+        back_to_a = await first.cas("removal", to_b.token, aba_a)
         assert _applied(back_to_a), run.diagnostic()
         run.observe(back_to_a.token, aba_a)
-        final = await second.read_versioned("authority")
+        final = await second.read_versioned("removal")
         assert final == Versioned(aba_a, back_to_a.token), run.diagnostic()
         run.observe(final.token, final.value)
         run.record("A->B->A", (to_a.token, to_b.token, back_to_a.token))
 
         return {
-            "authority": final,
+            "removal": final,
             "objects": ("obj/" + oid,),
             "listed": tuple(listed),
         }

@@ -8,12 +8,9 @@ The protocol uses these namespaces:
     were created or that identical bytes already existed. Large signed piles
     use the direct streaming HTTP path rather than buffered semantic reads.
 
-``authority``
-    The linearizable shared authority/removal projection.
-
 ``removal``, ``removal-node/<sha256>``
     One private suppression-root CAS cell and its immutable proof nodes.
-    These names are available only to the authority engine; they are never
+    These names are available only to the access engine; they are never
     mapped into generic object, pack, grant, or public LIST routes.
 
 ``cursor``
@@ -48,12 +45,10 @@ from .limits import (
 )
 
 KEY_RE = re.compile(r"^[a-z0-9:._/-]+$")
-AUTHORITY_ROOT_KEY = "authority"
 REMOVAL_ROOT_KEY = "removal"
 REMOVAL_NODE_PREFIX = "removal-node/"
 OPERATIONAL_CURSOR_KEY = "cursor"
 SINGLETON_CAS_KEYS = frozenset((
-    AUTHORITY_ROOT_KEY,
     REMOVAL_ROOT_KEY,
     OPERATIONAL_CURSOR_KEY,
 ))
@@ -102,7 +97,7 @@ def validate_store_prefix(prefix):
 def authoritative_key(key):
     """Whether a public unconditional mutation must reject this key."""
     return key in SINGLETON_CAS_KEYS \
-        or key.startswith("cursor/") or key.startswith("authority/") \
+        or key.startswith("cursor/") \
         or key.startswith(REMOVAL_NODE_PREFIX) \
         or key == "obj" or key.startswith("obj/") \
         or key == "heads" or key.startswith("heads/") \
@@ -141,9 +136,8 @@ def validate_create(key, value):
     if not isinstance(value, bytes):
         raise TypeError("object value must be bytes")
     if mutable_key(key) \
-            or key == "authority" or key.startswith("authority/") \
             or key == "heads" or key.startswith("heads/"):
-        raise ValueError("mutable authority requires compare-and-swap")
+        raise ValueError("mutable register requires compare-and-swap")
     for prefix in ("obj/", "pack/", REMOVAL_NODE_PREFIX):
         if key == prefix[:-1] or key.startswith(prefix) and (
                 len(key) != len(prefix) + 64
@@ -241,7 +235,7 @@ class OutcomeUnknown(StoreError):
 
 
 class ObjectStore(Protocol):
-    """The complete bounded mutation surface used by RepositoryApplier."""
+    """The complete bounded mutation surface used by every repository role."""
 
     def get_bounded(
             self, key: str, max_bytes: int) -> bytes | None: ...

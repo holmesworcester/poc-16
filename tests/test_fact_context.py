@@ -2,7 +2,6 @@
 
 import facts
 
-from core import indexes
 from .util import signed_pile_facts
 from core.crypto import keypair
 from core.fact import Fact, encode
@@ -150,7 +149,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
             len(fact.offers()),
             len(facts.current_scopes(fact)),
             len(facts.action_sids(fact)),
-            2 + len(indexes.record_postings(fact))
+            2 + len(index_rows(fact))
             + len(facts.current_scopes(fact) | facts.action_sids(fact)),
         )
         for fact in corpus
@@ -177,7 +176,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
     assert max(row[-1] for row in routes.values()) \
         == MAX_REGISTERED_FACT_ROUTES
     assert max(
-        1 + len(indexes.record_postings(fact))
+        1 + len(index_rows(fact))
         for fact in corpus
     ) == MAX_REGISTERED_FACT_ROWS
     assert max(

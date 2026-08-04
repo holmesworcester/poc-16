@@ -754,7 +754,7 @@ class HttpGate:
             return Response(405)
         if path == "/removal/apply" and method == "POST":
             writer = self._member(
-                headers, trusted_now, require_push=True)
+                headers, trusted_now, require_object_put=True)
             if writer is None:
                 return Response(401)
             return await self._apply_removal(body, writer)

@@ -20,7 +20,7 @@ from .limits import (
     MAX_PILE_FACTS,
     MAX_PILE_JSON_VALUES,
     PayloadTooLarge,
-    applier_peak_bound,
+    evaluator_peak_bound,
     decode_json,
 )
 from .shape import valid_fid
@@ -54,7 +54,7 @@ def check_pile_bounds(raw):
         raise PayloadTooLarge("pile too large")
     values = _scan_json_values(raw)
     facts = _scan_root_facts(raw)
-    if applier_peak_bound(len(raw), values, facts) \
+    if evaluator_peak_bound(len(raw), values, facts) \
             > MIN_HOSTED_MEMORY_BYTES:
         raise PayloadTooLarge("pile exceeds hosted memory budget")
 

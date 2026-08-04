@@ -131,15 +131,15 @@ def _require_endpoint(store, provider):
 def _prove_recovery_after_discarded_response(store, run, pace):
     """Simulate the client losing an acknowledged conditional response."""
     pace()
-    before = store.read_versioned("authority")
+    before = store.read_versioned("removal")
     candidate = run.value("discarded-response-candidate")
-    applied = store.cas("authority", before.token, candidate)
+    applied = store.cas("removal", before.token, candidate)
     if not isinstance(applied, Applied):
         raise AssertionError(run.diagnostic())
     try:
         raise OutcomeUnknown("test discarded the applied response")
     except OutcomeUnknown:
-        recovered = store.read_versioned("authority")
+        recovered = store.read_versioned("removal")
     assert recovered.value == candidate, run.diagnostic()
     assert recovered.token == applied.token, run.diagnostic()
     run.record("discard applied response/read recovery", recovered)

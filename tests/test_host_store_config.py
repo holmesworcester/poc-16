@@ -160,7 +160,7 @@ def test_every_logical_namespace_fits_before_provider_client_creation():
     assert len(store._physical(invite).encode("ascii")) \
         == MAX_PROVIDER_KEY_BYTES
     for key in (
-            "authority",
+            "removal",
             "cursor",
             "obj/" + "0" * 64,
             invite):

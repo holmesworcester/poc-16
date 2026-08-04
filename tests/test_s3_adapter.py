@@ -144,7 +144,7 @@ def test_config_rejects_ambiguous_or_unsupported_provider_settings(changes):
 
 
 def test_read_versioned_and_cas_preserve_the_same_response_opaque_etags():
-    old, new = b"old authority", b"new authority"
+    old, new = b"old removal", b"new removal"
     body = Body(old)
     client = ScriptedClient(
         get_object=[{"Body": body, "ETag": '"opaque:old-7"'}],
@@ -154,22 +154,22 @@ def test_read_versioned_and_cas_preserve_the_same_response_opaque_etags():
         sse_kms_key_id="arn:aws:kms:us-west-2:123456789012:key/test",
         bucket_key_enabled=True), client=client)
 
-    versioned = store.read_versioned("authority")
+    versioned = store.read_versioned("removal")
     assert versioned == Versioned(
         old, VersionToken('"opaque:old-7"'))
     assert body.reads == 2
     assert body.closes == 1
     assert client.calls[0] == ("get_object", {
         "Bucket": "test-bucket",
-        "Key": "tenant/workspace/authority",
+        "Key": "tenant/workspace/removal",
         "ExpectedBucketOwner": "123456789012",
     })
 
-    assert store.cas("authority", versioned.token, new) == Applied(
+    assert store.cas("removal", versioned.token, new) == Applied(
         VersionToken('"opaque:new-11"'))
     assert client.calls[1] == ("put_object", {
         "Bucket": "test-bucket",
-        "Key": "tenant/workspace/authority",
+        "Key": "tenant/workspace/removal",
         "ExpectedBucketOwner": "123456789012",
         "Body": new,
         "ChecksumAlgorithm": "SHA256",
@@ -197,19 +197,19 @@ def test_layout_reads_use_the_semantic_object_limit_not_root_limit():
         value, VersionToken('"layout-1"'))
 
 
-def test_absent_read_and_first_authority_cas_use_if_none_match():
-    raw = b"first authority"
+def test_absent_read_and_first_removal_cas_use_if_none_match():
+    raw = b"first removal"
     client = ScriptedClient(
         get_object=[ServiceError(404, "NoSuchKey")],
         put_object=[{"ETag": '"first"'}])
     store = S3Store(config(), client=client)
 
-    assert store.read_versioned("authority") is ABSENT
-    assert store.cas("authority", ABSENT, raw) == Applied(
+    assert store.read_versioned("removal") is ABSENT
+    assert store.cas("removal", ABSENT, raw) == Applied(
         VersionToken('"first"'))
     assert client.calls[-1] == ("put_object", {
         "Bucket": "test-bucket",
-        "Key": "tenant/workspace/authority",
+        "Key": "tenant/workspace/removal",
         "ExpectedBucketOwner": "123456789012",
         "Body": raw,
         "ChecksumAlgorithm": "SHA256",
@@ -297,7 +297,7 @@ def test_get_failure_classification_never_turns_403_into_absence(
         config(), client=ScriptedClient(get_object=[error]))
 
     with pytest.raises(expected) as caught:
-        store.get("authority")
+        store.get("removal")
     assert type(caught.value) is expected
 
 
@@ -373,7 +373,7 @@ def test_streaming_body_transport_failure_is_retryable_and_still_closes():
     }]))
 
     with pytest.raises(RetryableStoreError, match="ConnectionError"):
-        store.read_versioned("authority")
+        store.read_versioned("removal")
     assert body.closed
 
 
@@ -594,19 +594,19 @@ def test_precondition_results_are_definitive_only_in_their_context():
         ServiceError(412, "PreconditionFailed"),
         ServiceError(404, "NoSuchKey"),
     ]))
-    assert stale.cas("authority", token, b"new") is STALE
-    assert stale.cas("authority", token, b"newer") is STALE
+    assert stale.cas("removal", token, b"new") is STALE
+    assert stale.cas("removal", token, b"newer") is STALE
 
     absent = S3Store(config(), client=ScriptedClient(
         put_object=[ServiceError(404, "NoSuchKey")]))
     with pytest.raises(StoreError) as caught:
-        absent.cas("authority", ABSENT, b"first")
+        absent.cas("removal", ABSENT, b"first")
     assert type(caught.value) is StoreError
 
     missing_bucket = S3Store(config(), client=ScriptedClient(
         put_object=[ServiceError(404, "NoSuchBucket")]))
     with pytest.raises(StoreError) as caught:
-        missing_bucket.cas("authority", token, b"new")
+        missing_bucket.cas("removal", token, b"new")
     assert type(caught.value) is StoreError
 
 
@@ -615,22 +615,22 @@ def test_successful_cas_without_etag_is_an_unknown_applied_mutation():
         config(), client=ScriptedClient(put_object=[{}]))
 
     with pytest.raises(OutcomeUnknown, match="without a usable strong ETag"):
-        store.cas("authority", ABSENT, b"authority")
+        store.cas("removal", ABSENT, b"removal")
 
 
-def test_weak_etags_are_never_accepted_as_authority_cas_tokens():
+def test_weak_etags_are_never_accepted_as_removal_cas_tokens():
     read = S3Store(config(), client=ScriptedClient(get_object=[{
-        "Body": Body(b"authority"),
+        "Body": Body(b"removal"),
         "ETag": 'W/"weak-read"',
     }]))
     with pytest.raises(StoreError, match="no usable strong ETag"):
-        read.read_versioned("authority")
+        read.read_versioned("removal")
 
     mutation = S3Store(config(), client=ScriptedClient(put_object=[{
         "ETag": 'W/"weak-write"',
     }]))
     with pytest.raises(OutcomeUnknown, match="without a usable strong ETag"):
-        mutation.cas("authority", ABSENT, b"candidate")
+        mutation.cas("removal", ABSENT, b"candidate")
 
 
 def test_non_authoritative_put_and_delete_use_direct_scoped_requests():
@@ -679,19 +679,19 @@ def test_authoritative_guards_fail_before_any_sdk_request():
     raw = b"value"
 
     for key in (
-            "authority", "authority/child", "obj", "obj/" + h(raw)):
+            "removal", "removal-node/child", "obj", "obj/" + h(raw)):
         with pytest.raises(ValueError):
             store.put(key, raw)
         with pytest.raises(ValueError):
             store.delete(key)
     with pytest.raises(ValueError, match="compare-and-swap"):
-        store.put_if_absent("authority", raw)
+        store.put_if_absent("removal", raw)
     with pytest.raises(ValueError, match="address"):
         store.put_if_absent("obj/" + "0" * 64, raw)
     with pytest.raises(ValueError, match="CAS register"):
         store.cas("obj/" + h(raw), ABSENT, raw)
     with pytest.raises(TypeError, match="version token"):
-        store.cas("authority", "not-a-token", raw)
+        store.cas("removal", "not-a-token", raw)
     for key in ("/outside", "../outside", "pile//key", "Authority"):
         with pytest.raises(ValueError):
             store.put(key, raw)
@@ -839,7 +839,7 @@ class RaceClient:
         return self.bucket.put(**args)
 
 
-def test_independent_adapter_handles_admit_one_absent_authority_winner():
+def test_independent_adapter_handles_admit_one_absent_removal_winner():
     bucket = ConditionalBucket(2)
     stores = [
         S3Store(config(), client=RaceClient(bucket)),
@@ -849,14 +849,14 @@ def test_independent_adapter_handles_admit_one_absent_authority_winner():
         results = [
             result.result(timeout=5)
             for result in (
-                pool.submit(stores[0].cas, "authority", ABSENT, b"alice"),
-                pool.submit(stores[1].cas, "authority", ABSENT, b"bob"),
+                pool.submit(stores[0].cas, "removal", ABSENT, b"alice"),
+                pool.submit(stores[1].cas, "removal", ABSENT, b"bob"),
             )
         ]
 
     assert sum(isinstance(result, Applied) for result in results) == 1
     assert results.count(STALE) == 1
-    assert bucket.values["tenant/workspace/authority"][0] in {
+    assert bucket.values["tenant/workspace/removal"][0] in {
         b"alice", b"bob"}
 
 

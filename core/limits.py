@@ -17,7 +17,7 @@ MAX_FACT_BYTES = 4 * MIB
 MAX_PILE_BYTES = 95 * MIB
 MAX_WRITER_PACK_BYTES = MAX_PILE_BYTES
 
-# Discarded authority proofs and the remaining buffered pile door use the same
+# Discarded access proofs and the remaining buffered pile door use the same
 # deliberately small budget. Content pull is the only path that needs the full
 # writer-pile ceiling, and it must use the direct data plane.
 MAX_BUFFERED_PILE_BYTES = 5 * MIB
@@ -93,21 +93,10 @@ MAX_REMOVAL_PATH_BYTES = MAX_MINT_REQUEST_BYTES
 # deliberately generous implementation allowances, ratcheted in tests and
 # still subject to live workerd/Pyodide conformance.
 MIN_HOSTED_MEMORY_BYTES = 128_000_000
-APPLIER_RUNTIME_RESERVE_BYTES = 64 * MIB
+EVALUATOR_RUNTIME_RESERVE_BYTES = 64 * MIB
 _PILE_BUFFER_COPIES = 5
 _JSON_VALUE_BYTES = 256
 _FACT_DECODE_BYTES = 1024
-_FACT_ROUTE_BYTES = 512
-_FACT_COMPILE_BYTES = (
-    MAX_REGISTERED_FACT_ROUTES * _FACT_ROUTE_BYTES)
-_MERKLE_FRONTIER_BYTES = (
-    MAX_MERKLE_PAGE_DEPTH * MAX_MERKLE_PAGE_BYTES)
-_SUPPRESSION_EVIDENCE_BYTES = (
-    MAX_PILE_FACTS
-    * MAX_REGISTERED_SUPPRESSION_ROUTES
-    * (2 + MAX_REGISTERED_SUPPRESSION_ROUTES)
-    * _FACT_ROUTE_BYTES
-)
 
 
 def closure_bitset_bound(fact_count):
@@ -118,56 +107,19 @@ def closure_bitset_bound(fact_count):
     return (bits + 7) // 8 + 64 * fact_count
 
 
-def applier_peak_bound(pile_bytes, json_values, fact_count):
-    """Conservative live-byte ceiling for one RepositoryApplier pile turn."""
+def evaluator_peak_bound(pile_bytes, json_values, fact_count):
+    """Conservative live-byte ceiling for one closed-pile evaluation."""
     if not all(
             type(value) is int and value >= 0
             for value in (pile_bytes, json_values, fact_count)):
-        raise ValueError("applier memory inputs")
-    decode = (
-        APPLIER_RUNTIME_RESERVE_BYTES
+        raise ValueError("evaluator memory inputs")
+    return (
+        EVALUATOR_RUNTIME_RESERVE_BYTES
         + _PILE_BUFFER_COPIES * pile_bytes
         + _JSON_VALUE_BYTES * json_values
         + _FACT_DECODE_BYTES * fact_count
         + closure_bitset_bound(fact_count)
     )
-    compile_ = (
-        APPLIER_RUNTIME_RESERVE_BYTES
-        + 2 * pile_bytes
-        + _JSON_VALUE_BYTES * json_values
-        + _FACT_COMPILE_BYTES * fact_count
-        + _FACT_DECODE_BYTES * fact_count
-        + closure_bitset_bound(fact_count)
-        + _MERKLE_FRONTIER_BYTES
-        + _SUPPRESSION_EVIDENCE_BYTES
-    )
-    return max(decode, compile_)
-
-
-# Worst-case provider calls for one accepted hosted pile. Multi-point reads
-# visit at most one union of bounded paths; the intentionally smaller updater
-# charges one complete path per logical change. Immutable Ensure is charged
-# twice (conditional PUT plus collision GET).
-MAX_APPLIER_ROUTE_CHANGES = (
-    MAX_PILE_FACTS * MAX_REGISTERED_FACT_ROUTES)
-MAX_APPLIER_SUPPRESSION_POINTS = (
-    MAX_PILE_FACTS * MAX_REGISTERED_SUPPRESSION_ROUTES)
-MAX_APPLIER_PAGE_READS = (
-    MAX_PILE_FACTS
-    + 2 * MAX_APPLIER_SUPPRESSION_POINTS
-    + MAX_APPLIER_ROUTE_CHANGES
-) * MAX_MERKLE_PAGE_DEPTH
-MAX_APPLIER_PAGE_WRITES = (
-    MAX_APPLIER_ROUTE_CHANGES * MAX_MERKLE_PAGE_DEPTH)
-MAX_APPLIER_SUBREQUESTS = (
-    MAX_APPLIER_PAGE_READS
-    + 2 * MAX_APPLIER_PAGE_WRITES
-    + 4 * MAX_PILE_FACTS
-    + 10_000
-)
-# Per exact hosted invocation. Provider adapters may choose a lower limit.
-MAX_HOSTED_CPU_MS = 30_000
-MAX_HOSTED_SUBREQUESTS = 10_000_000
 
 # Clear-envelope names become authenticated index vocabulary; values may
 # become authenticated map keys. Bound both before family dispatch so malformed

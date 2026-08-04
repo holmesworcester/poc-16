@@ -10,10 +10,10 @@ from types import MappingProxyType
 
 import facts
 
-from core import indexes, merkle_map
+from core import merkle_map
 from core.crypto import h
 from core.fact import bound_to, decode
-from core.fact_index import index_rows
+from core.fact_index import IndexPosting, PostingPage, index_rows
 from core.limits import MAX_DIRECT_OBJECT_BYTES, PayloadTooLarge
 from core.object_store import (
     ABSENT,
@@ -125,7 +125,7 @@ class CurrentView:
                 raise ValueError("notification current fact")
             checked[fid] = fact
         postings = {
-            indexes.IndexPosting(kind, k0, k1, fid)
+            IndexPosting(kind, k0, k1, fid)
             for fid, fact in checked.items()
             for kind, k0, k1, _source in index_rows(fact)
         }
@@ -174,7 +174,7 @@ class CurrentView:
             raise ValueError("notification posting cursor")
         selected = rows[start:start + limit]
         end = start + len(selected)
-        return indexes.PostingPage(
+        return PostingPage(
             selected,
             str(end) if end < len(rows) else None,
             0,

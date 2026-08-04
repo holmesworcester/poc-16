@@ -162,19 +162,19 @@ def test_native_r2_preserves_opaque_tokens_and_conditional_outcomes():
     bucket, store = Bucket(), R2BindingStore(Bucket())
     bucket = store.bucket
 
-    assert run(store.read_versioned("authority")) is ABSENT
-    created = run(store.cas("authority", ABSENT, b"authority-1"))
+    assert run(store.read_versioned("removal")) is ABSENT
+    created = run(store.cas("removal", ABSENT, b"removal-1"))
     assert isinstance(created, Applied)
     assert created.token.value == "opaque-r2-1"
-    pair = run(store.read_versioned("authority"))
-    assert pair.value == b"authority-1"
+    pair = run(store.read_versioned("removal"))
+    assert pair.value == b"removal-1"
     assert pair.token == created.token
     assert pair.token.value != h(pair.value)
 
-    assert run(store.cas("authority", ABSENT, b"loser")) is STALE
-    replaced = run(store.cas("authority", pair.token, b"authority-2"))
+    assert run(store.cas("removal", ABSENT, b"loser")) is STALE
+    replaced = run(store.cas("removal", pair.token, b"removal-2"))
     assert isinstance(replaced, Applied)
-    assert run(store.get("authority")) == b"authority-2"
+    assert run(store.get("removal")) == b"removal-2"
 
 
 def test_native_r2_layout_reads_use_the_semantic_object_limit():
@@ -299,14 +299,14 @@ def test_native_r2_list_rejects_unbounded_unique_cursors():
 
 @pytest.mark.parametrize(
     "etag", (None, "", 'W/"weak"', 7, False, object()))
-def test_native_r2_rejects_unusable_authority_etag(etag):
+def test_native_r2_rejects_unusable_removal_etag(etag):
     bucket = Bucket()
-    bucket.data["authority"] = b"authority"
-    bucket.etags["authority"] = etag
+    bucket.data["removal"] = b"removal"
+    bucket.etags["removal"] = etag
     store = R2BindingStore(bucket)
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
-        run(store.read_versioned("authority"))
+        run(store.read_versioned("removal"))
 
     class ResultWithoutToken(Bucket):
         async def put(self, key, value, **options):
@@ -314,7 +314,7 @@ def test_native_r2_rejects_unusable_authority_etag(etag):
 
     with pytest.raises(StoreError, match="no usable strong ETag"):
         run(R2BindingStore(ResultWithoutToken()).cas(
-            "authority", ABSENT, b"candidate"))
+            "removal", ABSENT, b"candidate"))
 
 
 def test_native_r2_never_maps_throttle_or_transport_to_stale():
@@ -326,17 +326,17 @@ def test_native_r2_never_maps_throttle_or_transport_to_stale():
     bucket = store.bucket
     bucket.fail = Error(429)
     with pytest.raises(RetryableStoreError):
-        run(store.cas("authority", ABSENT, b"x"))
+        run(store.cas("removal", ABSENT, b"x"))
 
     bucket.fail = Error(503)
     with pytest.raises(OutcomeUnknown):
-        run(store.cas("authority", ABSENT, b"x"))
+        run(store.cas("removal", ABSENT, b"x"))
 
 
 def test_native_r2_guards_authoritative_mutations_and_prefixes():
     store = R2BindingStore(Bucket(), "tenant")
     with pytest.raises(ValueError, match="conditional"):
-        run(store.put("authority", b"x"))
+        run(store.put("removal", b"x"))
     with pytest.raises(ValueError, match="not deletable"):
         run(store.delete("obj/" + "0" * 64))
     with pytest.raises(ValueError, match="key"):

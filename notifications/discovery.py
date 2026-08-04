@@ -13,7 +13,7 @@ import secrets
 
 import facts
 
-from core import merkle_map, snapshot
+from core import merkle_map
 from core.crypto import h
 from core.fact import canon, decode
 from core.limits import (
@@ -71,6 +71,20 @@ BOOTSTRAP_BACKFILL = "backfill"
 PENDING_CURRENT = "current"
 PENDING_NONCURRENT = "noncurrent"
 PENDING_RETRY = "retry"
+
+
+def empty_descriptor():
+    """Canonical empty state for one notification cursor map."""
+    return {"root": "", "count": 0, "depth": 0}
+
+
+def built_descriptor(value):
+    """Reduce one generic Merkle build result to cursor state."""
+    return {
+        "root": value.root,
+        "count": value.count,
+        "depth": value.page_depth,
+    }
 
 
 class CursorNotInitialized(RuntimeError):
@@ -145,9 +159,9 @@ class Cursor:
         object.__setattr__(self, "rejected", _descriptor(self.rejected))
         object.__setattr__(self, "seen", _descriptor(self.seen))
         if not self.initialized and (
-                self.heads != snapshot.empty_descriptor()
-                or self.rejected != snapshot.empty_descriptor()
-                or self.seen != snapshot.empty_descriptor()
+                self.heads != empty_descriptor()
+                or self.rejected != empty_descriptor()
+                or self.seen != empty_descriptor()
                 or self.scan is not None or self.pending is not None):
             raise ValueError("notification cursor initialization")
         if self.pending is not None and self.pending.heads != self.heads:
@@ -540,7 +554,7 @@ class NotificationDiscovery:
             expected_count=descriptor["count"],
             expected_depth=descriptor["depth"],
         )
-        return snapshot.descriptor(built)
+        return built_descriptor(built)
 
     @staticmethod
     def _trigger_rows(state):
@@ -584,8 +598,8 @@ class NotificationDiscovery:
                 raise ValueError("notification bootstrap generation")
             cursor = Cursor(
                 self.workspace, self.owner, generation, mode, False,
-                snapshot.empty_descriptor(), snapshot.empty_descriptor(),
-                snapshot.empty_descriptor())
+                empty_descriptor(), empty_descriptor(),
+                empty_descriptor())
             token = await self._cas_exact(ABSENT, cursor)
             if token is None:
                 incumbent, _token = await self.state._read()
@@ -786,5 +800,6 @@ __all__ = (
     "Pending",
     "Scan",
     "decode_cursor",
+    "empty_descriptor",
     "encode_cursor",
 )

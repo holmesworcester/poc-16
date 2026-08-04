@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 
 import facts
-from core import indexes
 from core.crypto import keypair
 from core.fact import Fact
 from full_peer.node import FullPeer
@@ -12,6 +11,7 @@ from core.suppression import (
     PARENT,
     SELF,
     parent_selector,
+    scoped_id,
     self_selector,
 )
 from facts import _policy
@@ -334,7 +334,7 @@ def test_admin_deletes_every_registered_direct_delete_family(tmp_path):
             "owner": bob,
             "pk": founder,
         }
-        assert node.sql(workspace).active(indexes.fact_key(target))
+        assert node.sql(workspace).active(scoped_id("fact", target))
 
 
 def test_removed_writer_cannot_reuse_its_historical_bootstrap_closure(

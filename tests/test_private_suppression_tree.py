@@ -10,7 +10,6 @@ from core.crypto import h
 from core.fact import canon
 from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
-from core.indexes import principal_sid
 from core.limits import (
     MAX_REGISTERED_SUPPRESSION_ROUTES,
     MAX_REMOVAL_UPDATES,
@@ -31,6 +30,7 @@ from core.pack_access import (
 from core.store import FsStore
 from core.suppression import suppression_slot
 from core import suppression_tree as tree
+from facts import principal_sid
 
 from .shared_bucket import ScriptedBucket
 

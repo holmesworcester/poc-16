@@ -1,7 +1,7 @@
 """Bounded ObjectStore for authenticated metadata and semantic objects.
 
-Layout: authority (the shared authenticated projection), cursor (isolated
-operational state), obj/<hash> (map pages, fact blobs, heads, and
+Layout: removal (the private authenticated access projection), cursor
+(isolated operational state), obj/<hash> (map pages, fact blobs, heads, and
 independently closed writer piles — immutable),
 heads/<workspace>/<device> and layouts/<workspace>/<device>/<window>
 (independent CAS registers),

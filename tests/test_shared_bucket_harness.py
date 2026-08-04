@@ -17,21 +17,21 @@ from core.writer_layout import layout_page_key
 from .shared_bucket import InjectedCrash, ScriptedBucket
 
 
-def test_two_authority_cas_attempts_have_one_linearization_winner():
-    bucket = ScriptedBucket({"authority": b"authority-0"})
+def test_two_removal_cas_attempts_have_one_linearization_winner():
+    bucket = ScriptedBucket({"removal": b"removal-0"})
     alice, bob = bucket.handle("alice"), bucket.handle("bob")
-    base = alice.read_versioned("authority").token
-    paused = bucket.pause("alice", "cas", "authority", when="before")
+    base = alice.read_versioned("removal").token
+    paused = bucket.pause("alice", "cas", "removal", when="before")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(alice.cas, "authority", base, b"authority-a")
+        a = pool.submit(alice.cas, "removal", base, b"removal-a")
         paused.wait()
-        b = pool.submit(bob.cas, "authority", base, b"authority-b")
+        b = pool.submit(bob.cas, "removal", base, b"removal-b")
         assert isinstance(b.result(), Applied)
         paused.release.set()
         assert a.result() is STALE
 
-    assert alice.get("authority") == b"authority-b"
+    assert alice.get("removal") == b"removal-b"
     assert bucket.assert_valid_history()
 
 
@@ -77,7 +77,7 @@ def test_same_object_race_is_idempotent_and_replayable():
 def test_crash_boundaries_preserve_completed_atomic_operations_only():
     raw = b"orphan is harmless"
     key = "obj/" + h(raw)
-    bucket = ScriptedBucket({"authority": b"authority-0"})
+    bucket = ScriptedBucket({"removal": b"removal-0"})
     writer = bucket.handle("writer")
     bucket.crash(
         "writer", "put_if_absent", key, when="after")
@@ -85,14 +85,14 @@ def test_crash_boundaries_preserve_completed_atomic_operations_only():
     with pytest.raises(InjectedCrash, match="after put_if_absent"):
         writer.put_if_absent(key, raw)
     assert writer.get(key) == raw
-    assert writer.get("authority") == b"authority-0"
+    assert writer.get("removal") == b"removal-0"
 
-    bucket.crash("writer", "cas", "authority", when="before")
+    bucket.crash("writer", "cas", "removal", when="before")
     with pytest.raises(InjectedCrash, match="before cas"):
         writer.cas(
-            "authority", writer.read_versioned("authority").token,
-            b"authority-1")
-    assert writer.get("authority") == b"authority-0"
+            "removal", writer.read_versioned("removal").token,
+            b"removal-1")
+    assert writer.get("removal") == b"removal-0"
     assert bucket.assert_valid_history()
 
 
@@ -103,7 +103,7 @@ def test_authoritative_keys_reject_unconditional_or_bad_address_writes():
     layout = layout_page_key(workspace, device, 1)
 
     with pytest.raises(ValueError, match="conditional"):
-        writer.put("authority", b"clobber")
+        writer.put("removal", b"clobber")
     with pytest.raises(ValueError, match="conditional"):
         writer.put("obj/" + "0" * 64, b"clobber")
     with pytest.raises(ValueError, match="conditional"):

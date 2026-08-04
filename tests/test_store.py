@@ -113,7 +113,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
         tmp_path, monkeypatch):
     store = FsStore(str(tmp_path))
     store.put("pile/member/value", b"12345")
-    store.cas("authority", ABSENT, b"authority")
+    store.cas("removal", ABSENT, b"removal")
 
     assert store.get_bounded("pile/member/value", 5) == b"12345"
     assert store.get_bounded("pile/member/missing", 5) is None
@@ -129,7 +129,7 @@ def test_fs_get_bounded_never_accepts_a_whole_oversized_value(
         lambda _key: pytest.fail("bounded read called whole-object get"),
     )
     assert store.get_bounded("pile/member/value", 5) == b"12345"
-    assert store.read_versioned("authority").value == b"authority"
+    assert store.read_versioned("removal").value == b"removal"
 
 
 def test_immutable_create_reconciles_ambiguity_and_verifies_collision():
@@ -195,9 +195,9 @@ def test_verified_repository_object_enforces_the_hosted_reader_ceiling():
 
 def test_fs_cas_lock_is_shared_by_independent_handles(tmp_path):
     first, second = FsStore(str(tmp_path)), FsStore(str(tmp_path))
-    result = first.cas("authority", ABSENT, b"base")
+    result = first.cas("removal", ABSENT, b"base")
     assert result == Applied(VersionToken(h(b"base")))
-    base = first.read_versioned("authority").token
+    base = first.read_versioned("removal").token
 
     # Holding the bucket's stable lock prevents another handle from even
     # comparing the cell. This distinguishes a shared CAS from two per-object
@@ -208,18 +208,18 @@ def test_fs_cas_lock_is_shared_by_independent_handles(tmp_path):
         with pytest.raises(ValueError, match="reserved"):
             first.delete(".cas.lock")
         attempt = pool.submit(
-            second.cas, "authority", base, b"after-lock")
+            second.cas, "removal", base, b"after-lock")
         with pytest.raises(TimeoutError):
             attempt.result(timeout=0.1)
         fcntl.flock(held, fcntl.LOCK_UN)
         assert isinstance(attempt.result(timeout=5), Applied)
 
-    expected = first.read_versioned("authority").token
+    expected = first.read_versioned("removal").token
     start = threading.Barrier(2)
 
     def advance(store, value):
         start.wait(timeout=5)
-        return store.cas("authority", expected, value)
+        return store.cas("removal", expected, value)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = [
@@ -231,23 +231,23 @@ def test_fs_cas_lock_is_shared_by_independent_handles(tmp_path):
         ]
     assert sum(isinstance(result, Applied) for result in results) == 1
     assert sum(result is STALE for result in results) == 1
-    assert first.get("authority") in {b"alice", b"bob"}
+    assert first.get("removal") in {b"alice", b"bob"}
     assert ".cas.lock" not in first.list("")
     for key in (
             ".cas.lock", ".cas.lock/child", "./.cas.lock",
-            "authority/child", "/outside", "../outside"):
+            "removal-node/child", "/outside", "../outside"):
         with pytest.raises(ValueError, match="key"):
             first.put(key, b"clobber")
     with pytest.raises(ValueError, match="CAS register"):
         first.cas("obj/" + h(b"x"), ABSENT, b"x")
     with pytest.raises(ValueError, match="conditional"):
-        first.put("authority", b"clobber")
+        first.put("removal", b"clobber")
     with pytest.raises(ValueError, match="compare-and-swap"):
-        first.put_if_absent("authority", b"clobber")
+        first.put_if_absent("removal", b"clobber")
     with pytest.raises(ValueError, match="conditional"):
         first.put("obj/" + h(b"x"), b"x")
     with pytest.raises(ValueError, match="not deletable"):
-        first.delete("authority")
+        first.delete("removal")
     with pytest.raises(ValueError, match="not deletable"):
         first.delete("obj/" + h(b"x"))
 
@@ -298,7 +298,7 @@ def test_remote_store_object_existence_maps_http_missing_to_false():
     assert asyncio.run(store.has("obj/" + h(body)))
     assert not asyncio.run(store.has("obj/" + h(b"missing")))
     with pytest.raises(TypeError, match="object-only"):
-        asyncio.run(store.has("authority"))
+        asyncio.run(store.has("removal"))
 
 
 def test_remote_store_batches_object_gets_in_bounded_order():

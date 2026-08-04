@@ -6,7 +6,6 @@ import pytest
 
 import facts
 from adapters.s3 import S3Config, S3Store
-from core import snapshot
 from core.crypto import h, keypair
 from core.fact import canon, encode
 from core.object_store import OutcomeUnknown
@@ -29,6 +28,7 @@ from notifications.discovery import (
     Pending,
     Scan,
     decode_cursor,
+    empty_descriptor,
     encode_cursor,
 )
 from notifications.hints import (
@@ -572,7 +572,7 @@ def test_hint_and_cursor_codecs_are_canonical_and_reject_old_shape():
             "a" * 64, "b" * 64, "c" * 64, "d" * 64,
             None, "e" * 64, events + (EventRef("f" * 64, "f" * 64),))
 
-    empty = snapshot.empty_descriptor()
+    empty = empty_descriptor()
     cursor = Cursor(
         "a" * 64, "b" * 64, "c" * 64, BOOTSTRAP_BACKFILL,
         True, empty, empty, empty,

@@ -5,6 +5,7 @@ import base64
 import json
 
 from core.access import AccessGate
+from core import peer_capability
 from core.crypto import h
 from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
@@ -174,6 +175,7 @@ def test_authenticated_exact_control_apply_precedes_head_publication(tmp_path):
         b"removal-http-secret" * 2,
         member,
         root.fid,
+        capability=peer_capability.OWNER,
         issued_at=0,
         ttl_ms=1_000,
     )
@@ -181,6 +183,18 @@ def test_authenticated_exact_control_apply_precedes_head_publication(tmp_path):
 
     assert run(http.handle(
         "POST", "/removal/apply", {"ws": root.fid}, {},
+        control)).status == 401
+    read_only = make_token(
+        b"removal-http-secret" * 2,
+        member,
+        root.fid,
+        capability=peer_capability.READ_ONLY,
+        issued_at=0,
+        ttl_ms=1_000,
+    )
+    assert run(http.handle(
+        "POST", "/removal/apply", {"ws": root.fid},
+        {"Authorization": "Bearer " + read_only},
         control)).status == 401
     assert run(http.handle(
         "POST", "/removal/apply", {"ws": root.fid}, headers,
