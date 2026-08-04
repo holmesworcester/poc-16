@@ -88,6 +88,8 @@ Resources:
                   StringLike:
                     s3:prefix:
                       - !Sub "${StorePrefix}/authority"
+                      - !Sub "${StorePrefix}/removal"
+                      - !Sub "${StorePrefix}/removal-node/*"
                       - !Sub "${StorePrefix}/obj/*"
                       - !Sub "${StorePrefix}/invite/*"
                       - !Sub "${StorePrefix}/heads/${WorkspaceId}/*"
@@ -99,6 +101,10 @@ Resources:
                 Resource:
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
                   - !Sub
@@ -118,6 +124,10 @@ Resources:
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/invite/*"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
               - Sid: ReadImmutablePacksByScopedRequest
                 Effect: Allow
                 Action: s3:GetObject
@@ -134,10 +144,15 @@ Resources:
               - Sid: CreateImmutableObjects
                 Effect: Allow
                 Action: s3:PutObject
-                Resource: !Sub
-                  - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
-                  - Bucket: !Ref BucketName
-                    Prefix: !Ref StorePrefix
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/obj/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal-node/*"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
                 Condition:
                   Null:
                     s3:if-none-match: "false"
@@ -162,6 +177,10 @@ Resources:
                 Resource:
                   - !Sub
                     - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/authority"
+                    - Bucket: !Ref BucketName
+                      Prefix: !Ref StorePrefix
+                  - !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/removal"
                     - Bucket: !Ref BucketName
                       Prefix: !Ref StorePrefix
                   - !Sub

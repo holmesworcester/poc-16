@@ -519,11 +519,15 @@ def test_lambda_template_bounds_direct_immutable_writes_to_obj_and_pack():
     assert "Action: s3:ListBucket" in template
     assert "s3:prefix:" in template
     assert '${StorePrefix}/authority' in template
+    assert '${StorePrefix}/removal' in template
+    assert '${StorePrefix}/removal-node/*' in template
     assert '${StorePrefix}/heads/${WorkspaceId}/*' in template
     assert '${StorePrefix}/root' not in template
     assert '${StorePrefix}/obj/*' in template
     assert '${StorePrefix}/invite/*' in template
     assert template.count('${Prefix}/obj/*') == 2
+    assert template.count('${Prefix}/removal"') == 2
+    assert template.count('${Prefix}/removal-node/*') == 2
     assert template.count('${Prefix}/pack/*') == 2
     assert "s3:authType: REST-QUERY-STRING" in template
     assert "s3:signatureversion: AWS4-HMAC-SHA256" in template
@@ -611,13 +615,45 @@ def test_list_permission_is_limited_to_gateway_read_namespaces():
     assert f"AllowedValues: [{PAGE_BATCH}]" in parameter
     assert "Action: s3:ListBucket" in block
     assert '"arn:${AWS::Partition}:s3:::${BucketName}"' in block
-    assert block.count("!Sub") == 5
+    assert block.count("!Sub") == 7
     assert '${StorePrefix}/authority' in block
+    assert '${StorePrefix}/removal' in block
+    assert '${StorePrefix}/removal-node/*' in block
     assert '${StorePrefix}/heads/${WorkspaceId}/*' in block
     assert '${StorePrefix}/obj/*' in block
     assert '${StorePrefix}/invite/*' in block
     assert '${StorePrefix}/*' not in block
     assert "s3:max-keys: !Ref HeadPageKeys" in block
+
+
+def test_lambda_private_removal_permissions_are_internal_and_conditional():
+    template = (LAMBDA / "template.yaml").read_text()
+    reads = template.split(
+        "- Sid: ReadAuthorityAndWriterHeads", 1)[1].split(
+        "- Sid: ReadImmutablePacksByScopedRequest", 1)[0]
+    immutable_writes = template.split(
+        "- Sid: CreateImmutableObjects", 1)[1].split(
+        "- Sid: CreateImmutablePacksByScopedRequest", 1)[0]
+    mutable_writes = template.split(
+        "- Sid: AdvanceAuthorityAndOwnerHeads", 1)[1].split(
+        "- Sid: ReadGrantSecret", 1)[0]
+    public_pack_grants = "\n".join((
+        template.split(
+            "- Sid: ReadImmutablePacksByScopedRequest", 1)[1].split(
+            "- Sid: CreateImmutableObjects", 1)[0],
+        template.split(
+            "- Sid: CreateImmutablePacksByScopedRequest", 1)[1].split(
+            "- Sid: AdvanceAuthorityAndOwnerHeads", 1)[0],
+    ))
+
+    assert reads.count('${Prefix}/removal"') == 1
+    assert reads.count('${Prefix}/removal-node/*') == 1
+    assert immutable_writes.count('${Prefix}/removal-node/*') == 1
+    assert 's3:if-none-match: "false"' in immutable_writes
+    assert mutable_writes.count('${Prefix}/removal"') == 1
+    assert '${Prefix}/removal-node/*' not in mutable_writes
+    assert "s3:if-match" not in immutable_writes
+    assert "removal" not in public_pack_grants
 
 
 def test_gateway_bucket_guard_denies_deletes_and_unconditional_writes():
@@ -633,8 +669,10 @@ def test_gateway_bucket_guard_denies_deletes_and_unconditional_writes():
         "s3:DeleteObject", "s3:DeleteObjectVersion"}
     authoritative_resources = [
         "arn:aws:s3:::workspace-bucket/tenant/authority",
+        "arn:aws:s3:::workspace-bucket/tenant/removal",
         "arn:aws:s3:::workspace-bucket/tenant/heads/*",
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
+        "arn:aws:s3:::workspace-bucket/tenant/removal-node/*",
     ]
     assert deletion["Resource"] == authoritative_resources
     metadata = statements["DenyAuthoritativeMetadataMutation"]
@@ -658,12 +696,18 @@ def test_gateway_bucket_guard_denies_deletes_and_unconditional_writes():
     assert statements["RequireImmutableObjectCreate"]["Resource"] == [
         "arn:aws:s3:::workspace-bucket/tenant/obj/*",
         "arn:aws:s3:::workspace-bucket/tenant/pack/*",
+        "arn:aws:s3:::workspace-bucket/tenant/removal-node/*",
     ]
     assert statements["RequireMutableCompareAndSwap"]["Condition"] == {
         "Null": {
             "s3:if-match": "true",
             "s3:if-none-match": "true",
         }}
+    assert statements["RequireMutableCompareAndSwap"]["Resource"] == [
+        "arn:aws:s3:::workspace-bucket/tenant/authority",
+        "arn:aws:s3:::workspace-bucket/tenant/removal",
+        "arn:aws:s3:::workspace-bucket/tenant/heads/*",
+    ]
     assert statements["DenyLifecycleMutation"]["Action"] \
         == "s3:PutLifecycleConfiguration"
     guarded_actions = {
