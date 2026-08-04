@@ -1,4 +1,4 @@
-"""Owner- or admin-authorized removal of one enrolled device key.
+"""facts/auth/device_removal.py — removal of one enrolled device key.
 
 Device authority is an ordinary fact relation: a direct member owns itself,
 and ``device_invite`` offers ``device_key(device, owner)`` for a secondary

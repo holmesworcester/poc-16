@@ -11,7 +11,12 @@ from bench.writer_cloud_cost import CostVector, CountingStore
 from core.close import encode_signed_pile, make_signed_pile
 from core.crypto import h, keypair
 from core.store import FsStore
-from core.writer_head import WriterBinding, encode_slot, head_slot_key
+from core.writer_head import (
+    WriterBinding,
+    decode_slot_at,
+    encode_slot,
+    head_slot_key,
+)
 from core.writer_repository import (
     FactConsumer,
     OpaqueHeadGate,
@@ -189,13 +194,13 @@ async def exercise(kind, tmp_path, values):
     mirrored_objects = tuple(
         (key, receiver.get(key)) for key in receiver.list("obj/"))
     mirrored_bytes = sum(len(raw) for _key, raw in mirrored_objects)
-    # Two signed piles, one final tree page, and one signed head: every
-    # established immutable is reachable, with no intermediate path-copy
-    # page uploaded to either provider.
+    # Two signed piles, their final content/control pages, and one signed
+    # head: every established immutable is reachable, with no intermediate
+    # path-copy page uploaded to either provider.
     expected_objects = tuple(sorted(
         ("obj/" + oid, raw) for oid, raw in prepared.objects))
     assert mirrored_objects == expected_objects
-    assert len(prepared.objects) == len(mirrored_objects) == 4
+    assert len(prepared.objects) == len(mirrored_objects) == 5
     assert immutable_bytes == mirrored_bytes
     assert cloud.snapshot() == CostVector(
         lists=1,
@@ -226,7 +231,9 @@ async def exercise(kind, tmp_path, values):
 
     facts = tuple(
         (fid, consumer.fact_bytes(fid)) for fid in consumer.fact_ids())
-    assert receiver.get(slot_key) == slot_raw
+    assert decode_slot_at(
+        slot_key, receiver.get(slot_key)).head == decode_slot_at(
+            slot_key, slot_raw).head
     return EndState(facts, slot_raw, mirrored_objects)
 
 

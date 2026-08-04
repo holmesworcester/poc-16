@@ -6,12 +6,25 @@ from dataclasses import dataclass
 
 from core.close import encode_signed_pile, make_signed_pile, signed_pile_oid
 from core.crypto import h, keypair
-from core.object_store import REMOVAL_ROOT_KEY
+from core.limits import MAX_MIRROR_CONTROL_ATTEMPTS
+from core.object_store import ABSENT, REMOVAL_ROOT_KEY
 from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.suppression_tree import SuppressionTree
-from core.writer_head import WriterBinding, writer_store_binding
+from core.writer_head import (
+    HeadSlot,
+    PendingHeadSlot,
+    WriterBinding,
+    decode_slot_at,
+    decode_slot_state_at,
+    encode_head,
+    encode_slot,
+    head_oid,
+    head_slot_key,
+    make_head,
+    writer_store_binding,
+)
 from core.writer_repository import (
     FactConsumer,
     HeadGrant,
@@ -19,6 +32,7 @@ from core.writer_repository import (
     RepositoryMirror,
     WriterLog,
 )
+from core.writer_tree import build_tree, leaf_row
 from facts.auth.device import device as device_fact
 from facts.auth.device_invite import device_invite
 from facts.auth.removal import removal
@@ -93,7 +107,7 @@ async def accept_one(store, secret, writer, owner, root, closure):
         return HeadGrant(
             root.fid,
             writer,
-            None,
+            update.base_head,
             proposed_head,
             h(b"accepted removal view"),
         )
@@ -304,8 +318,9 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
         (*value.membership, primary_sig, primary),
     )
 
+    # One whole control plan performs one aggregate root CAS.
     paused = bucket.pause(
-        "recipient", "cas", REMOVAL_ROOT_KEY, nth=2)
+        "recipient", "cas", REMOVAL_ROOT_KEY, nth=1)
     other_sid = scoped_id("member", h(b"concurrent member"))
     with ThreadPoolExecutor(max_workers=2) as pool:
         advancing = pool.submit(
@@ -321,10 +336,12 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
 
     assert outcome.status == "retryable"
     assert outcome.root_oid == run(recipient.pin()).root_oid
+    # The aggregate plan is all-or-nothing at the recipient root.  A stale
+    # root CAS publishes none of this pile's cells; retry applies them all.
     assert run(value_at(
         recipient,
         scoped_id("member", value.member),
-    )) == suppression_slot()
+    )) is None
     assert run(value_at(
         recipient,
         scoped_id("device", value.member),
@@ -342,7 +359,7 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
     assert bucket.assert_valid_history()
 
 
-def test_mirror_retries_pre_cas_control_application_without_a_cursor(
+def test_mirror_retries_pre_cas_control_application_in_the_same_turn(
         tmp_path):
     value = world()
     source = FsStore(str(tmp_path / "source"))
@@ -369,11 +386,15 @@ def test_mirror_retries_pre_cas_control_application_without_a_cursor(
     consumer = FactConsumer(value.root.fid)
     calls = []
 
-    async def interrupted(raw, device):
-        calls.append((signed_pile_oid(raw), device))
-        if len(calls) == 1:
-            return type("Retryable", (), {"status": "retryable"})()
-        return await state.apply_control(raw, device)
+    class InterruptedState:
+        def plan_control(self, raws, device):
+            return state.plan_control(raws, device)
+
+        async def apply_plan(self, plan):
+            calls.append((plan.writer, plan.updates))
+            if len(calls) == 1:
+                return type("Retryable", (), {"status": "retryable"})()
+            return await state.apply_plan(plan)
 
     def exact_binding(workspace_id, device, _removal_root, candidate):
         return WriterBinding(
@@ -384,30 +405,393 @@ def test_mirror_retries_pre_cas_control_application_without_a_cursor(
         target,
         exact_binding,
         consumer,
-        apply_control=interrupted,
+        control_state=InterruptedState(),
     )
-
-    first = run(mirror.sync_from(source))
-    assert first.changed == 0
-    assert first.errors and "control application" in first.errors[0][1]
-    assert consumer.projected_head(value.founder) is None
-    assert run(value_at(
-        state, scoped_id("member", value.member))) == suppression_slot()
 
     replay = run(mirror.sync_from(source))
     assert replay.errors == ()
-    control_oid = signed_pile_oid(signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (*value.membership, evicted_sig, evicted),
-    ))
-    assert calls == [
-        (control_oid, value.founder),
-        (control_oid, value.founder),
-    ]
+    assert replay.changed == 1
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0][0] == value.founder
     assert consumer.projected_head(value.founder) is not None
     assert run(value_at(
         state,
         scoped_id("member", value.member),
     )) == suppression_slot(evicted.fid)
+
+
+def test_mirror_finishes_pending_head_before_newer_source_head(tmp_path):
+    """A crashed H1 control turn cannot wedge a later H2 sync."""
+    value = world()
+    source = FsStore(str(tmp_path / "source"))
+    target = FsStore(str(tmp_path / "target"))
+    state = RecipientRemovalState(value.root.fid, target)
+    assert run(state.bootstrap(signed(
+        value.member_secret,
+        value.member,
+        value.root,
+        value.membership,
+    ))).status == "applied"
+
+    evicted = removal(
+        value.root.fid, value.founder, value.member, 4)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 4)
+    first = run(accept_one(
+        source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*value.membership, evicted_sig, evicted),
+    ))
+    calls = []
+
+    class ContendedState:
+        def plan_control(self, raws, device):
+            return state.plan_control(raws, device)
+
+        async def apply_plan(self, plan):
+            calls.append(plan)
+            return type("Retryable", (), {"status": "retryable"})()
+
+    def exact_binding(workspace_id, device, _removal_root, candidate):
+        return WriterBinding(
+            workspace_id, device, candidate.owner, candidate.store)
+
+    interrupted = RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        FactConsumer(value.root.fid),
+        control_state=ContendedState(),
+    )
+    stalled = run(interrupted.sync_from(source))
+
+    slot_key = head_slot_key(value.root.fid, value.founder)
+    pending = decode_slot_state_at(slot_key, target.get(slot_key))
+    assert isinstance(pending, PendingHeadSlot)
+    assert pending.head == first.head_oid
+    assert stalled.changed == stalled.piles == stalled.facts == 0
+    assert stalled.errors and "control application" in stalled.errors[0][1]
+    assert len(calls) == MAX_MIRROR_CONTROL_ATTEMPTS
+
+    later = message(
+        value.root.fid, value.founder, "general", "after H1", 5)
+    later_sig = signature(
+        value.founder_secret, value.founder, later, 5)
+    second = run(accept_one(
+        source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (value.root, later_sig, later),
+    ))
+    assert second.base_head == first.head_oid
+
+    # Model a process restart: neither the interrupted consumer nor its
+    # control wrapper survives. The durable pending slot plus immutable local
+    # objects must be enough to complete H1 before considering source H2.
+    restarted_state = RecipientRemovalState(value.root.fid, target)
+    restarted_consumer = FactConsumer(value.root.fid)
+    caught_up = run(RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        restarted_consumer,
+        control_state=restarted_state,
+    ).sync_from(source))
+
+    assert caught_up.errors == ()
+    assert caught_up.changed == 1
+    assert decode_slot_at(slot_key, target.get(slot_key)).head \
+        == second.head_oid
+    assert restarted_consumer.projected_head(value.founder) \
+        == second.head_oid
+    assert restarted_consumer.fact_bytes(later.fid) is not None
+    assert run(value_at(
+        restarted_state,
+        scoped_id("member", value.member),
+    )) == suppression_slot(evicted.fid)
+
+
+def test_local_replay_finishes_pending_head_without_source(tmp_path):
+    """Crash recovery uses copied bytes, not a source-retained old head."""
+    value = world()
+    source = FsStore(str(tmp_path / "source"))
+    target = FsStore(str(tmp_path / "target"))
+    state = RecipientRemovalState(value.root.fid, target)
+    assert run(state.bootstrap(signed(
+        value.member_secret,
+        value.member,
+        value.root,
+        value.membership,
+    ))).status == "applied"
+    evicted = removal(
+        value.root.fid, value.founder, value.member, 4)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 4)
+    update = run(accept_one(
+        source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*value.membership, evicted_sig, evicted),
+    ))
+
+    class ContendedState:
+        def plan_control(self, raws, device):
+            return state.plan_control(raws, device)
+
+        async def apply_plan(self, _plan):
+            return type("Retryable", (), {"status": "retryable"})()
+
+    def exact_binding(workspace_id, device, _removal_root, candidate):
+        return WriterBinding(
+            workspace_id, device, candidate.owner, candidate.store)
+
+    stalled = run(RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        FactConsumer(value.root.fid),
+        control_state=ContendedState(),
+    ).sync_from(source))
+    assert stalled.errors
+
+    restarted_state = RecipientRemovalState(value.root.fid, target)
+    restarted_consumer = FactConsumer(value.root.fid)
+    recovered = run(RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        restarted_consumer,
+        control_state=restarted_state,
+    ).replay_local())
+
+    slot_key = head_slot_key(value.root.fid, value.founder)
+    assert recovered.errors == ()
+    assert recovered.changed == 1
+    assert decode_slot_at(slot_key, target.get(slot_key)).head \
+        == update.head_oid
+    assert restarted_consumer.projected_head(value.founder) \
+        == update.head_oid
+    assert run(value_at(
+        restarted_state,
+        scoped_id("member", value.member),
+    )) == suppression_slot(evicted.fid)
+
+
+def test_same_base_mirrors_reserve_before_effects_and_only_winner_projects(
+        tmp_path):
+    """Two relays of a fork cannot publish both branches' removals."""
+    value = world()
+
+    invite_secret, invite_public = keypair()
+    second_invite = user_invite(
+        value.root.fid, value.founder, invite_public, 4)
+    second_invite_sig = signature(
+        value.founder_secret, value.founder, second_invite, 4)
+    second_secret, second = keypair()
+    second_user = user(
+        second_invite, invite_secret, second, "second", 5)
+    second_user_sig = signature(
+        second_secret, second, second_user, 5)
+    second_membership = (
+        value.root,
+        second_invite_sig,
+        second_invite,
+        second_user_sig,
+        second_user,
+    )
+
+    first_action = removal(
+        value.root.fid, value.founder, value.member, 6)
+    first_signature = signature(
+        value.founder_secret, value.founder, first_action, 6)
+    second_action = removal(
+        value.root.fid, value.founder, second, 7)
+    second_signature = signature(
+        value.founder_secret, value.founder, second_action, 7)
+
+    first_source = FsStore(str(tmp_path / "first"))
+    second_source = FsStore(str(tmp_path / "second"))
+    first_update = run(accept_one(
+        first_source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*value.membership, first_signature, first_action),
+    ))
+    second_update = run(accept_one(
+        second_source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*second_membership, second_signature, second_action),
+    ))
+    assert first_update.head_oid != second_update.head_oid
+
+    bucket = ScriptedBucket()
+    target = PileHandle(bucket.handle("target"))
+    state = RecipientRemovalState(value.root.fid, target)
+    assert run(state.bootstrap(signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root,),
+    ))).status == "applied"
+    consumer = FactConsumer(value.root.fid)
+
+    def exact_binding(workspace_id, device, _removal_root, candidate):
+        return WriterBinding(
+            workspace_id, device, candidate.owner, candidate.store)
+
+    mirrors = tuple(
+        RepositoryMirror(
+            value.root.fid,
+            target,
+            exact_binding,
+            consumer,
+            control_state=state,
+        )
+        for _ in range(2)
+    )
+    slot_key = head_slot_key(value.root.fid, value.founder)
+    first_reservation = bucket.pause(
+        "target", "cas", slot_key, nth=1)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run, mirrors[0].sync_from(first_source))
+        first_reservation.wait()
+        second_result = pool.submit(
+            run, mirrors[1].sync_from(second_source)).result()
+        first_reservation.release.set()
+        first_result = first.result()
+
+    results = (first_result, second_result)
+    assert sum(result.changed for result in results) == 1
+    assert sum(bool(result.errors) for result in results) == 1
+    assert any(
+        "concurrent local writer-slot update" in result.errors[0][1]
+        for result in results if result.errors
+    )
+
+    installed = decode_slot_at(slot_key, target.get(slot_key)).head
+    assert installed in {first_update.head_oid, second_update.head_oid}
+    winner, loser = (
+        (first_action, second_action)
+        if installed == first_update.head_oid
+        else (second_action, first_action)
+    )
+    winner_member = winner.offers()[0][1]
+    loser_member = loser.offers()[0][1]
+    assert run(value_at(
+        state,
+        scoped_id("member", winner_member),
+    )) == suppression_slot(winner.fid)
+    assert run(value_at(
+        state,
+        scoped_id("member", loser_member),
+    )) is None
+    assert consumer.projected_head(value.founder) == installed
+    assert bucket.assert_valid_history()
+
+
+def test_mirror_rejects_signed_mixed_control_and_content_before_state(
+        tmp_path):
+    """An action cannot hide inside a pile classified as ordinary content."""
+    value = world()
+    action = removal(
+        value.root.fid, value.founder, value.member, 8)
+    action_signature = signature(
+        value.founder_secret, value.founder, action, 8)
+    ordinary = message(
+        value.root.fid, value.founder, "general", "mixed", 9)
+    ordinary_signature = signature(
+        value.founder_secret, value.founder, ordinary, 9)
+    source = FsStore(str(tmp_path / "source"))
+    mixed = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (*value.membership,
+         action_signature, action,
+         ordinary_signature, ordinary),
+    )
+    pile_oid = signed_pile_oid(mixed)
+    source.put_if_absent("obj/" + pile_oid, mixed)
+
+    def emit(raw):
+        oid = h(raw)
+        source.put_if_absent("obj/" + oid, raw)
+        return oid
+
+    # Model a malicious but correctly signed writer implementation which
+    # omits the action from the head's control tree. A validating peer must
+    # still reject the mixed semantic sinks before publishing any local state.
+    tree = build_tree(
+        value.root.fid,
+        value.founder,
+        (leaf_row(1, pile_oid),),
+        emit,
+    )
+    head = make_head(
+        value.founder_secret,
+        value.root.fid,
+        value.founder,
+        value.founder,
+        1,
+        tree,
+        writer_store_binding(value.root.fid, value.founder),
+    )
+    head_raw = encode_head(head)
+    candidate = head_oid(head_raw)
+    source.put_if_absent("obj/" + candidate, head_raw)
+    source.cas(
+        head_slot_key(value.root.fid, value.founder),
+        ABSENT,
+        encode_slot(HeadSlot(
+            value.root.fid,
+            value.founder,
+            candidate,
+            h(b"untrusted source removal root"),
+        )),
+    )
+
+    target = FsStore(str(tmp_path / "target"))
+    state = RecipientRemovalState(value.root.fid, target)
+    assert run(state.bootstrap(signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root,),
+    ))).status == "applied"
+    consumer = FactConsumer(value.root.fid)
+
+    def exact_binding(workspace_id, device, _removal_root, candidate):
+        return WriterBinding(
+            workspace_id, device, candidate.owner, candidate.store)
+
+    result = run(RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        consumer,
+        control_state=state,
+    ).sync_from(source))
+
+    assert result.changed == result.piles == result.facts == 0
+    assert result.errors and "control material needs one control-only sink" \
+        in result.errors[0][1]
+    assert target.get(head_slot_key(
+        value.root.fid, value.founder)) is None
+    assert run(value_at(
+        state,
+        scoped_id("member", value.member),
+    )) is None
+    assert consumer.fact_ids() == ()

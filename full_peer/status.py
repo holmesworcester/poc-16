@@ -4,8 +4,8 @@ from core.fact import canon
 from core.limits import PAGE_BATCH
 from core.object_store import Versioned
 from core.writer_head import (
-    decode_slot_at,
     head_slot_prefix,
+    visible_slot_at,
 )
 
 
@@ -21,7 +21,9 @@ def _writer_state(node, workspace):
             opened = store.read_versioned(key)
             if not isinstance(opened, Versioned):
                 raise ValueError("listed writer slot disappeared")
-            slot = decode_slot_at(key, opened.value)
+            slot = visible_slot_at(key, opened.value)
+            if slot is None:
+                continue
             accepted.append((
                 slot.device, slot.head, slot.removal_root))
         if page.cursor is None:
@@ -38,8 +40,14 @@ def _writer_state(node, workspace):
             "projected_head": projected.pop(device, None),
             "removal_root": removal_root,
         })
+    # Removal roots are recipient-local acceptance metadata. Two peers with
+    # the same signed writer heads may have different private removal roots
+    # and permit hashes, so convergence is exactly the portable (device, head)
+    # forest rather than byte-identical directory slots.
+    portable = tuple(
+        (device, head) for device, head, _removal_root in accepted)
     return (
-        h(canon(["poc16-status-writer-forest-v1", accepted])),
+        h(canon(["poc16-status-writer-forest-v1", portable])),
         writers,
         projected,
     )

@@ -48,7 +48,7 @@ def claim(valid, stream, writer):
     scopes = tuple(sorted({
         sid for provider in providers
         for sid in facts.current_scopes(provider)
-    }))
+    } | {facts.principal_sid("device", device)}))
     if len(scopes) > MAX_REMOVAL_PATH_SCOPES:
         raise PayloadTooLarge("identity has too many removal scopes")
     return IdentityClaim(device, owner, tuple(providers), scopes)

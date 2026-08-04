@@ -89,9 +89,17 @@ class Keychain:
         if initialize:
             if raw:
                 raise ValueError("new keyring must start empty")
-            raw = {"keys": {}, "workspaces": {}}
-        elif set(raw) != {"keys", "workspaces"}:
+            raw = {
+                "keys": {},
+                "permit_secret": os.urandom(32).hex(),
+                "workspaces": {},
+            }
+        elif set(raw) != {"keys", "permit_secret", "workspaces"}:
             raise ValueError("keyring schema")
+        permit_secret = raw["permit_secret"]
+        if not isinstance(permit_secret, str) \
+                or not re.fullmatch(r"[0-9a-f]{64}", permit_secret):
+            raise ValueError("keyring permit secret")
         workspaces = raw["workspaces"]
         if not isinstance(workspaces, dict):
             raise ValueError("keyring workspaces must be an object")
@@ -132,7 +140,11 @@ class Keychain:
             normalized_workspaces[workspace] = normalized
         if iroh_count > MAX_IROH_PEERS:
             raise ValueError("too many Iroh peers")
-        return {"keys": keys, "workspaces": normalized_workspaces}
+        return {
+            "keys": keys,
+            "permit_secret": permit_secret,
+            "workspaces": normalized_workspaces,
+        }
 
     def commit(self, proposed):
         """Atomically replace the complete durable value, then publish it live."""

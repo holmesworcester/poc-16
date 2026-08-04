@@ -11,6 +11,7 @@ from core.fact import canon
 from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
 from core.limits import (
+    MAX_HEAD_REMOVAL_UPDATES,
     MAX_REGISTERED_SUPPRESSION_ROUTES,
     MAX_REMOVAL_UPDATES,
     MAX_REMOVAL_PROOF_STEPS,
@@ -60,6 +61,11 @@ def object_map(built):
     return dict(built.nodes)
 
 
+def build_turn(workspace, source):
+    return tree._build(
+        workspace, source, maximum=MAX_HEAD_REMOVAL_UPDATES)
+
+
 def proof_for(root, sid, objects):
     async def fetch(oid):
         return objects.get(oid)
@@ -83,7 +89,7 @@ def lose_response(bucket, actor, operation, key, when):
 
 def test_path_reveals_exactly_one_hashed_sid_and_value():
     workspace, source = rows()
-    built = tree._build(workspace, source)
+    built = build_turn(workspace, source)
     objects = object_map(built)
     target_sid, target_value = source[0]
     hidden_sid, hidden_value = source[2]
@@ -132,7 +138,7 @@ def test_build_update_retries_and_permutations_are_one_aci_join():
     from itertools import permutations
 
     for order in permutations(events[:4]):
-        built = tree._build(workspace, order)
+        built = build_turn(workspace, order)
         proof = proof_for(built.root, sid, object_map(built))
         assert tree.verify(built.root, workspace, sid, proof) == expected
         roots.add(built.root)
@@ -145,7 +151,7 @@ def test_build_update_retries_and_permutations_are_one_aci_join():
             workspace, current.root, (event,), objects)
         objects.update(updated.nodes)
         current = updated
-    assert current.root == tree._build(workspace, events[:4]).root
+    assert current.root == build_turn(workspace, events[:4]).root
     assert tree.verify(
         current.root,
         workspace,
@@ -178,7 +184,7 @@ def test_slot_join_is_associative_commutative_idempotent_with_absence():
 
 
 def test_tiny_batch_exact_bound_prunes_nodes_and_one_over_stops_early():
-    assert MAX_REMOVAL_UPDATES == MAX_REGISTERED_SUPPRESSION_ROUTES == 4
+    assert MAX_REMOVAL_UPDATES == MAX_REGISTERED_SUPPRESSION_ROUTES == 3
     workspace, member, _device = ids("tiny batch")
     initial = (principal_sid("member", member), suppression_slot())
     additions = tuple(
@@ -225,7 +231,7 @@ def test_tiny_batch_exact_bound_prunes_nodes_and_one_over_stops_early():
 
 def test_missing_forged_duplicate_truncated_stale_and_relabels_fail_closed():
     workspace, source = rows()
-    built = tree._build(workspace, source)
+    built = build_turn(workspace, source)
     objects = object_map(built)
     sid, _value = source[0]
     proof = proof_for(built.root, sid, objects)
@@ -313,7 +319,8 @@ def test_private_nodes_and_root_are_not_object_or_grant_addressable(tmp_path):
     workspace, source = rows()
     store = FsStore(tmp_path / "store")
     state = tree.SuppressionTree(workspace, store)
-    assert run(state.apply(source)).status == "applied"
+    assert run(state.apply(
+        source, maximum=MAX_HEAD_REMOVAL_UPDATES)).status == "applied"
     pin = run(state.pin())
     proof = run(pin.proof(source[0][0]))
     assert pin.verify(source[0][0], proof) == source[0][1]

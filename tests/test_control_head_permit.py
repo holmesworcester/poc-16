@@ -1,20 +1,35 @@
 """Crash-safe exact permits for control-bearing writer-head transitions."""
 
 import asyncio
+
 import pytest
 
+import facts
 from core.access import AccessGate
-from core.close import encode_signed_pile, make_signed_pile
+from core.close import (
+    decode_signed_pile,
+    encode_signed_pile,
+    make_signed_pile,
+)
 from core.crypto import h, keypair
+from core.head_permit import decode as decode_permit
+from core.limits import (
+    MAX_HEAD_CONTROL_FACTS,
+    MAX_HEAD_REMOVAL_UPDATES,
+    PayloadTooLarge,
+)
 from core.object_store import ABSENT
 from core.removal_path import ProofRefreshRequired, RemovalDenied
-from core.removal_state import ControlHeadPlan, ControlPilePlan
+from core.removal_state import ControlHeadPlan
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.writer_head import (
+    PendingHeadSlot,
     WriterBinding,
     decode_slot_at,
+    decode_slot_state_at,
     head_slot_key,
+    visible_slot_at,
     writer_store_binding,
 )
 from core.writer_repository import (
@@ -74,6 +89,21 @@ def self_removal_pile(secret, writer, root, *, ts=30):
         secret, writer, root, (root, action_signature, action))
 
 
+def joined_member(founder_secret, founder, root, index):
+    invite_secret, invite_public = keypair()
+    invite = user_invite(
+        root.fid, founder, invite_public, 100 + 3 * index)
+    invite_signature = signature(
+        founder_secret, founder, invite, invite.ts)
+    member_secret, member = keypair()
+    joined = user(
+        invite, invite_secret, member, f"member {index}", invite.ts + 1)
+    joined_signature = signature(
+        member_secret, member, joined, joined.ts)
+    return member_secret, member, (
+        root, invite_signature, invite, joined_signature, joined)
+
+
 def establish_opaque_head(store, label):
     raw = label.encode()
     oid = h(raw)
@@ -81,20 +111,28 @@ def establish_opaque_head(store, label):
     return oid
 
 
+async def establish_control_head(
+        tmp_path, store, secret, writer, root, controls, label):
+    """Build the real signed dual-tree head declared by exact control piles."""
+    source = FsStore(str(tmp_path / (label + "-writer")))
+    log = WriterLog(
+        root.fid,
+        writer,
+        writer,
+        writer_store_binding(root.fid, writer),
+        secret,
+        source,
+    )
+    closures = tuple(decode_signed_pile(raw).facts for raw in controls)
+    update = await log.prepare(closures)
+    await log.establish(update, store)
+    return update.head_oid
+
+
 async def value_at(gate, sid):
     pin = await gate.state.pin()
     proof = None if pin is None else await pin.proof(sid)
     return None if proof is None else pin.verify(sid, proof)
-
-
-def test_zero_effect_plan_cannot_mint_an_alternate_ordinary_head_permit():
-    with pytest.raises(ValueError, match="control head plan"):
-        ControlHeadPlan(
-            h(b"workspace"),
-            h(b"writer"),
-            (ControlPilePlan(h(b"evidence-only pile"), ()),),
-            1,
-        )
 
 
 async def issued_terminal(tmp_path, label="terminal"):
@@ -105,50 +143,52 @@ async def issued_terminal(tmp_path, label="terminal"):
     assert (await gate.state.bootstrap(bootstrap)).status == "applied"
     path = await gate.removal_path(
         historical_proof(secret, founder, root, (root,)), 10)
-    proposed = establish_opaque_head(store, label + " head")
+    action, control = self_removal_pile(secret, founder, root)
+    proposed = await establish_control_head(
+        tmp_path, store, secret, founder, root, (control,), label)
     proof = exact_head_proof(
         secret, founder, root, (root,), path, proposed)
-    action, control = self_removal_pile(secret, founder, root)
     permit = await gate.issue_head_permit(
         proof, proposed, (control,), 10, PERMIT_SECRET)
-    return secret, founder, root, store, gate, proposed, action, control, permit
+    head_gate = OpaqueHeadGate(store, gate.authorize_head)
+    return (
+        secret, founder, root, store, gate, head_gate,
+        proposed, action, control, permit,
+    )
+
+
+def test_zero_effect_plan_cannot_mint_an_alternate_ordinary_head_permit():
+    with pytest.raises(ValueError, match="control head plan"):
+        ControlHeadPlan(
+            h(b"workspace"), h(b"writer"), (), 1, 1, 1)
 
 
 def test_self_removal_is_applied_before_one_final_head(tmp_path):
     async def scenario():
-        (_secret, founder, root, store, gate, proposed,
-         action, control, permit) = await issued_terminal(tmp_path)
+        (secret, founder, root, store, gate, head_gate,
+         proposed, action, _control, permit) = await issued_terminal(tmp_path)
         member_sid = scoped_id("member", founder)
-
-        assert isinstance(permit, bytes)
-        assert (await value_at(gate, member_sid)) == suppression_slot()
         key = head_slot_key(root.fid, founder)
+        assert isinstance(permit, bytes)
         assert store.read_versioned(key) is ABSENT
 
-        grant = await gate.authorize_permitted_head(
-            permit, proposed, (control,), PERMIT_SECRET)
-        assert grant is not None
+        result = await gate.commit_head_permit(
+            head_gate, permit, proposed, PERMIT_SECRET)
+
+        assert result.status == "applied"
         assert (await value_at(gate, member_sid)) == suppression_slot(
             action.fid)
-        # Returning the typed grant is still effect-free with respect to the
-        # writer slot: removal necessarily precedes its separate CAS.
-        assert store.read_versioned(key) is ABSENT
-
-        advanced = await OpaqueHeadGate(
-            store, gate.authorize_head).advance_grant(grant)
-        assert advanced.status == "applied"
         slot = decode_slot_at(key, store.get(key))
         assert (slot.head, slot.removal_root) == (
-            proposed, grant.removal_root)
+            proposed, result.slot.removal_root)
 
         fresh = await gate.removal_path(
-            historical_proof(
-                _secret, founder, root, (root,)), 40)
+            historical_proof(secret, founder, root, (root,)), 40)
         later = establish_opaque_head(store, "later")
         with pytest.raises(RemovalDenied):
             await gate.authorize_head(
                 exact_head_proof(
-                    _secret, founder, root, (root,), fresh,
+                    secret, founder, root, (root,), fresh,
                     later, base=proposed),
                 later,
                 40,
@@ -157,40 +197,72 @@ def test_self_removal_is_applied_before_one_final_head(tmp_path):
     run(scenario())
 
 
-def test_held_permit_recovers_crash_and_same_head_preserves_first_root(
+def test_signed_control_tree_requires_permit_and_exact_declared_piles(
         tmp_path):
     async def scenario():
-        (_secret, founder, root, store, gate, proposed,
-         _action, control, permit) = await issued_terminal(
+        (secret, founder, root, _store, gate, _head_gate,
+         proposed, _action, control, permit) = await issued_terminal(
+             tmp_path, "declared-controls")
+        path = await gate.removal_path(
+            historical_proof(secret, founder, root, (root,)), 10)
+        proof = exact_head_proof(
+            secret, founder, root, (root,), path, proposed)
+
+        # The signed secondary tree makes the ordinary route fail closed.
+        assert await gate.authorize_head(proof, proposed, 10) is None
+        # A valid but unrelated control closure cannot be attached to this
+        # head: permit issuance must match its exact declared suffix.
+        unrelated = signed(secret, founder, root, (root,))
+        assert await gate.issue_head_permit(
+            proof, proposed, (unrelated,), 10, PERMIT_SECRET) is None
+        assert isinstance(permit, bytes)
+        assert h(control) != h(unrelated)
+
+    run(scenario())
+
+
+def test_exact_permit_resumes_a_reserved_removal_after_process_loss(tmp_path):
+    async def scenario():
+        (_secret, founder, root, store, gate, head_gate,
+         proposed, action, _control, raw) = await issued_terminal(
              tmp_path, "crash")
+        permit = decode_permit(raw, PERMIT_SECRET)
         key = head_slot_key(root.fid, founder)
+        reservation = await head_gate.reserve_control(HeadGrant(
+            root.fid,
+            founder,
+            permit.base_head,
+            proposed,
+            permit.removal_root,
+        ), h(raw))
+        assert isinstance(
+            decode_slot_state_at(key, store.get(key)), PendingHeadSlot)
+        assert visible_slot_at(key, store.get(key)) is None
 
-        # Simulate a process dying after the removal CAS but before head CAS.
-        abandoned = await gate.authorize_permitted_head(
-            permit, proposed, (control,), PERMIT_SECRET)
-        first_root = abandoned.removal_root
-        assert store.read_versioned(key) is ABSENT
+        # Model loss after the irreversible ACI join but before final CAS.
+        assert (await gate.state.apply_updates(permit.updates)).status \
+            == "applied"
+        joined_root = (await gate.state.pin()).root_oid
+        assert (await value_at(
+            gate, scoped_id("member", founder))) == suppression_slot(
+                action.fid)
 
-        recovered = await gate.authorize_permitted_head(
-            permit, proposed, (control,), PERMIT_SECRET)
-        head_gate = OpaqueHeadGate(store, gate.authorize_head)
-        assert (await head_gate.advance_grant(recovered)).status == "applied"
+        recovered = await gate.commit_head_permit(
+            head_gate, raw, proposed, PERMIT_SECRET)
+        assert recovered.status == "applied"
         accepted = decode_slot_at(key, store.get(key))
-        assert accepted.removal_root == first_root
+        assert accepted.removal_root == joined_root
 
-        # An unrelated later tree update changes the fresh grant's audit root.
-        # Exact replay remains noop and preserves the original accepted slot.
+        # A later unrelated root advance does not rewrite the accepted slot.
         assert (await gate.state.tree.apply(((
             scoped_id("member", h(b"unrelated member")),
             suppression_slot(),
         ),))).status == "applied"
-        replay_grant = await gate.authorize_permitted_head(
-            permit, proposed, (control,), PERMIT_SECRET)
-        assert replay_grant.removal_root != first_root
-        replay = await head_gate.advance_grant(replay_grant)
+        replay = await gate.commit_head_permit(
+            head_gate, raw, proposed, PERMIT_SECRET)
         assert replay.status == "noop"
-        assert replay.slot == accepted
         assert decode_slot_at(key, store.get(key)) == accepted
+        assert reservation.slot.permit == accepted.permit
 
     run(scenario())
 
@@ -202,8 +274,7 @@ def test_removed_writer_cannot_issue_a_new_control_head_permit(tmp_path):
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
-        historical = historical_proof(
-            secret, founder, root, (root,))
+        historical = historical_proof(secret, founder, root, (root,))
         stale_path = await gate.removal_path(historical, 10)
         proposed = establish_opaque_head(store, "stale proposed")
         proof = exact_head_proof(
@@ -228,215 +299,272 @@ def test_removed_writer_cannot_issue_a_new_control_head_permit(tmp_path):
     run(scenario())
 
 
-def test_permit_binds_mac_head_and_exact_ordered_control_effects(tmp_path):
+def test_permit_binds_rows_head_secret_and_not_app_projection(
+        tmp_path, monkeypatch):
     async def scenario():
-        (_secret, founder, _root, _store, gate, proposed,
-         _action, control, permit) = await issued_terminal(
+        (_secret, founder, _root, _store, gate, head_gate,
+         proposed, action, _control, permit) = await issued_terminal(
              tmp_path, "binding")
         changed = bytearray(permit)
         changed[len(changed) // 2] ^= 1
         with pytest.raises(ValueError):
-            await gate.authorize_permitted_head(
-                bytes(changed), proposed, (control,), PERMIT_SECRET)
+            await gate.commit_head_permit(
+                head_gate, bytes(changed), proposed, PERMIT_SECRET)
         with pytest.raises(ValueError):
-            await gate.authorize_permitted_head(
-                permit, proposed, (control,), b"wrong" * 8)
-        assert await gate.authorize_permitted_head(
-            permit, h(b"different head"), (control,), PERMIT_SECRET) is None
-
-        # A second valid pile has different bytes and effects; neither may be
-        # substituted or appended after issuance.
-        other_action, other = self_removal_pile(
-            _secret, founder, _root, ts=31)
-        assert other_action.fid != _action.fid
-        assert await gate.authorize_permitted_head(
-            permit, proposed, (other,), PERMIT_SECRET) is None
-        assert await gate.authorize_permitted_head(
-            permit, proposed, (control, other), PERMIT_SECRET) is None
+            await gate.commit_head_permit(
+                head_gate, permit, proposed, b"wrong" * 8)
+        assert await gate.commit_head_permit(
+            head_gate, permit, h(b"different head"), PERMIT_SECRET) is None
         assert (await value_at(
             gate, scoped_id("member", founder))) == suppression_slot()
+
+        # Closed-pile semantics run only during issuance. Neither a replay
+        # version bump nor a disabled evaluator can change an issued permit.
+        monkeypatch.setattr(facts, "APP_VERSION", facts.APP_VERSION + 1)
+        monkeypatch.setattr(
+            gate.state,
+            "plan_control",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("commit re-evaluated control piles")),
+        )
+        result = await gate.commit_head_permit(
+            head_gate, permit, proposed, PERMIT_SECRET)
+        assert result.status == "applied"
+        assert (await value_at(
+            gate, scoped_id("member", founder))) == suppression_slot(
+                action.fid)
 
     run(scenario())
 
 
-def test_generic_permit_applies_multiple_admin_controls_and_stays_current(
-        tmp_path):
+def test_generic_permit_joins_multiple_control_sinks_once(tmp_path):
     async def scenario():
         founder_secret, founder, root = founder_world()
-        invite_secret, invite_public = keypair()
-        invite = user_invite(root.fid, founder, invite_public, 2)
-        invite_signature = signature(
-            founder_secret, founder, invite, 2)
-        member_secret, member = keypair()
-        joined = user(invite, invite_secret, member, "member", 3)
-        joined_signature = signature(member_secret, member, joined, 3)
-        membership = (
-            root, invite_signature, invite, joined_signature, joined)
+        _member_secret, member, membership = joined_member(
+            founder_secret, founder, root, 1)
         store = FsStore(str(tmp_path / "generic"))
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             founder_secret, founder, root, (root,)))).status == "applied"
-
         path = await gate.removal_path(historical_proof(
             founder_secret, founder, root, (root,)), 10)
-        proposed = establish_opaque_head(store, "generic head")
-        proof = exact_head_proof(
-            founder_secret, founder, root, (root,), path, proposed)
-        # First reserve the joined member's CLEAR state, then activate it in a
-        # separately closed admin pile under one exact head permit.
-        action = removal(root.fid, founder, member, 30)
+        action = removal(root.fid, founder, member, 300)
         action_signature = signature(
-            founder_secret, founder, action, 30)
+            founder_secret, founder, action, action.ts)
+        membership_pile = signed(
+            founder_secret, founder, root, membership)
         removal_pile = signed(
+            founder_secret, founder, root,
+            (*membership, action_signature, action))
+        proposed = await establish_control_head(
+            tmp_path,
+            store,
             founder_secret,
             founder,
             root,
-            (*membership, action_signature, action),
+            (membership_pile, removal_pile),
+            "generic",
         )
-        # Every control pile in a hosted owner suffix has the same outer
-        # writer. Repackage the joined member closure under the publishing
-        # admin's outer pile signature without changing fact authorship.
-        membership_pile = signed(
-            founder_secret, founder, root, membership)
-        piles = (membership_pile, removal_pile)
+        proof = exact_head_proof(
+            founder_secret, founder, root, (root,), path, proposed)
         permit = await gate.issue_head_permit(
-            proof, proposed, piles, 10, PERMIT_SECRET)
-        grant = await gate.authorize_permitted_head(
-            permit, proposed, piles, PERMIT_SECRET)
+            proof, proposed, (membership_pile, removal_pile),
+            10, PERMIT_SECRET)
 
-        assert grant is not None
+        result = await gate.commit_head_permit(
+            OpaqueHeadGate(store, gate.authorize_head),
+            permit,
+            proposed,
+            PERMIT_SECRET,
+        )
+
+        assert result.status == "applied"
         assert (await value_at(
             gate, scoped_id("member", founder))) == suppression_slot()
         assert (await value_at(
             gate, scoped_id("member", member))) == suppression_slot(
                 action.fid)
-        assert (await OpaqueHeadGate(
-            store, gate.authorize_head).advance_grant(grant)).status \
-            == "applied"
 
     run(scenario())
 
 
-def test_concurrent_caller_removal_after_issue_does_not_revoke_exact_permit(
+def test_concurrent_removal_after_issue_does_not_revoke_exact_permit(
         tmp_path):
     async def scenario():
         founder_secret, founder, root = founder_world()
-        invite_secret, invite_public = keypair()
-        invite = user_invite(root.fid, founder, invite_public, 2)
-        invite_signature = signature(
-            founder_secret, founder, invite, 2)
-        member_secret, member = keypair()
-        joined = user(invite, invite_secret, member, "member", 3)
-        joined_signature = signature(member_secret, member, joined, 3)
-        membership = (
-            root, invite_signature, invite, joined_signature, joined)
+        _member_secret, member, membership = joined_member(
+            founder_secret, founder, root, 1)
         store = FsStore(str(tmp_path / "concurrent-removal"))
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             founder_secret, founder, root, (root,)))).status == "applied"
         path = await gate.removal_path(historical_proof(
             founder_secret, founder, root, (root,)), 10)
-        proposed = establish_opaque_head(store, "preauthorized admin head")
-        proof = exact_head_proof(
-            founder_secret, founder, root, (root,), path, proposed)
-        action = removal(root.fid, founder, member, 30)
+        action = removal(root.fid, founder, member, 300)
         action_signature = signature(
-            founder_secret, founder, action, 30)
+            founder_secret, founder, action, action.ts)
         control = signed(
+            founder_secret, founder, root,
+            (*membership, action_signature, action))
+        proposed = await establish_control_head(
+            tmp_path,
+            store,
             founder_secret,
             founder,
             root,
-            (*membership, action_signature, action),
+            (control,),
+            "preauthorized-admin",
         )
+        proof = exact_head_proof(
+            founder_secret, founder, root, (root,), path, proposed)
         permit = await gate.issue_head_permit(
             proof, proposed, (control,), 10, PERMIT_SECRET)
 
-        # Authorization linearized above. A later removal cannot amplify this
-        # exact capability, nor may it strand its already bound operation.
         concurrent_action = h(b"concurrent founder removal")
         assert (await gate.state.tree.apply(((
             scoped_id("member", founder),
             suppression_slot(concurrent_action),
         ),))).status == "applied"
-        grant = await gate.authorize_permitted_head(
-            permit, proposed, (control,), PERMIT_SECRET)
-        assert grant is not None
+        result = await gate.commit_head_permit(
+            OpaqueHeadGate(store, gate.authorize_head),
+            permit,
+            proposed,
+            PERMIT_SECRET,
+        )
+        assert result.status == "applied"
         assert (await value_at(
             gate, scoped_id("member", founder))) == suppression_slot(
                 concurrent_action)
         assert (await value_at(
             gate, scoped_id("member", member))) == suppression_slot(
                 action.fid)
-        assert (await OpaqueHeadGate(
-            store, gate.authorize_head).advance_grant(grant)).status \
-            == "applied"
 
     run(scenario())
 
 
-def test_two_preissued_terminal_heads_share_base_but_only_one_cas_wins(
-        tmp_path):
+def test_two_same_base_permits_fence_loser_before_any_removal(tmp_path):
     async def scenario():
         secret, founder, root = founder_world()
+        members = tuple(
+            joined_member(secret, founder, root, index)
+            for index in range(2))
         store = FsStore(str(tmp_path / "competing"))
         gate = AccessGate(root.fid, store)
         assert (await gate.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
         path = await gate.removal_path(historical_proof(
             secret, founder, root, (root,)), 10)
-        _action, control = self_removal_pile(secret, founder, root)
-        heads = tuple(
-            establish_opaque_head(store, f"candidate {index}")
-            for index in range(2))
-        proofs = tuple(
-            exact_head_proof(
+        heads, permits, actions = [], [], []
+        for index, (_member_secret, member, closure) in enumerate(members):
+            action = removal(root.fid, founder, member, 400 + index)
+            action_signature = signature(
+                secret, founder, action, action.ts)
+            controls = (
+                signed(secret, founder, root, closure),
+                signed(secret, founder, root,
+                       (*closure, action_signature, action)),
+            )
+            head = await establish_control_head(
+                tmp_path,
+                store,
+                secret,
+                founder,
+                root,
+                controls,
+                f"candidate-{index}",
+            )
+            heads.append(head)
+            proof = exact_head_proof(
                 secret, founder, root, (root,), path, head)
-            for head in heads)
-        permits = tuple([
-            await gate.issue_head_permit(
-                proof, head, (control,), 10, PERMIT_SECRET)
-            for proof, head in zip(proofs, heads)
-        ])
-        grants = tuple([
-            await gate.authorize_permitted_head(
-                permit, head, (control,), PERMIT_SECRET)
-            for permit, head in zip(permits, heads)
-        ])
-        head_gate = OpaqueHeadGate(store, gate.authorize_head)
-        first = await head_gate.advance_grant(grants[0])
-        second = await head_gate.advance_grant(grants[1])
+            permits.append(await gate.issue_head_permit(
+                proof, head, controls, 10, PERMIT_SECRET))
+            actions.append(action)
+        heads = tuple(heads)
 
-        assert first.status == "applied"
-        assert second.status == "conflict"
+        head_gate = OpaqueHeadGate(store, gate.authorize_head)
+        results = await asyncio.gather(*(
+            gate.commit_head_permit(
+                head_gate, permit, head, PERMIT_SECRET)
+            for permit, head in zip(permits, heads)
+        ))
+        assert sorted(result.status for result in results) \
+            == ["applied", "conflict"]
+        winner = next(
+            index for index, result in enumerate(results)
+            if result.status == "applied")
+        loser = 1 - winner
+        winner_sid = scoped_id("member", members[winner][1])
+        loser_sid = scoped_id("member", members[loser][1])
+        assert await value_at(gate, winner_sid) == suppression_slot(
+            actions[winner].fid)
+        assert await value_at(gate, loser_sid) is None
         slot = decode_slot_at(
             head_slot_key(root.fid, founder),
             store.get(head_slot_key(root.fid, founder)),
         )
-        assert slot.head == heads[0]
+        assert slot.head == heads[winner]
 
     run(scenario())
 
 
-def test_owner_publisher_reuses_one_permit_after_terminal_commit_409(
+def test_pending_control_reservation_blocks_an_ordinary_same_base_head(
         tmp_path):
     async def scenario():
+        (_secret, founder, root, store, gate, head_gate,
+         proposed, _action, _control, raw) = await issued_terminal(
+             tmp_path, "ordinary-race")
+        permit = decode_permit(raw, PERMIT_SECRET)
+        reservation = await head_gate.reserve_control(HeadGrant(
+            root.fid, founder, None, proposed, permit.removal_root), h(raw))
+        ordinary = establish_opaque_head(store, "ordinary loser")
+        lost = await head_gate.advance_grant(HeadGrant(
+            root.fid, founder, None, ordinary, permit.removal_root))
+        assert lost.status == "conflict"
+        assert isinstance(reservation.slot, PendingHeadSlot)
+        assert (await gate.commit_head_permit(
+            head_gate, raw, proposed, PERMIT_SECRET)).status == "applied"
+
+    run(scenario())
+
+
+def test_aggregate_control_fact_and_row_bounds_are_exact(tmp_path):
+    secret, founder, root = founder_world()
+    store = FsStore(str(tmp_path / "bounds"))
+    gate = AccessGate(root.fid, store)
+    root_pile = signed(secret, founder, root, (root,))
+    _action, removal_pile = self_removal_pile(secret, founder, root)
+
+    # 84 three-fact removals plus four one-fact roots is exactly 256 facts.
+    exact = (removal_pile,) * 84 + (root_pile,) * 4
+    plan = gate.state.plan_control(exact, founder)
+    assert plan.fact_count == MAX_HEAD_CONTROL_FACTS
+    with pytest.raises(PayloadTooLarge, match="control facts"):
+        gate.state.plan_control(
+            (removal_pile,) * 85 + (root_pile,) * 2, founder)
+
+    membership_piles = tuple(
+        signed(secret, founder, root, joined_member(
+            secret, founder, root, index)[2])
+        for index in range(MAX_HEAD_REMOVAL_UPDATES + 1)
+    )
+    exact_rows = (root_pile, *membership_piles[:2])
+    assert len(gate.state.plan_control(exact_rows, founder).updates) \
+        == MAX_HEAD_REMOVAL_UPDATES
+    with pytest.raises(PayloadTooLarge, match="removal updates"):
+        gate.state.plan_control(
+            (*exact_rows, membership_piles[2]), founder)
+
+
+def test_owner_publisher_reuses_only_the_issued_permit_after_retry(tmp_path):
+    async def scenario():
         secret, founder, root = founder_world()
-        local = FsStore(str(tmp_path / "terminal-publisher-local"))
-        remote = FsStore(str(tmp_path / "terminal-publisher-remote"))
+        local = FsStore(str(tmp_path / "publisher-local"))
+        remote = FsStore(str(tmp_path / "publisher-remote"))
         binding = WriterBinding(
-            root.fid,
-            founder,
-            founder,
-            writer_store_binding(root.fid, founder),
-        )
+            root.fid, founder, founder,
+            writer_store_binding(root.fid, founder))
         writer = WriterLog(
-            root.fid,
-            founder,
-            founder,
-            binding.store,
-            secret,
-            local,
-        )
+            root.fid, founder, founder, binding.store, secret, local)
         action, _raw = self_removal_pile(secret, founder, root)
         action_signature = signature(secret, founder, action, action.ts)
         update = await writer.prepare(((root, action_signature, action),))
@@ -454,8 +582,7 @@ def test_owner_publisher_reuses_one_permit_after_terminal_commit_409(
         assert (await access.state.bootstrap(signed(
             secret, founder, root, (root,)))).status == "applied"
         head_gate = OpaqueHeadGate(remote, access.authorize_head)
-        issues = []
-        commits = []
+        issues, commits = [], []
 
         async def make_proof(base, proposed):
             path = await access.removal_path(historical_proof(
@@ -469,22 +596,12 @@ def test_owner_publisher_reuses_one_permit_after_terminal_commit_409(
             issues.append(permit)
             return permit
 
-        async def commit(permit, proposed, controls):
-            commits.append((permit, controls))
-            grant = await access.authorize_permitted_head(
-                permit, proposed, controls, PERMIT_SECRET)
-            assert (await value_at(
-                access, scoped_id("member", founder))) == suppression_slot(
-                    action.fid)
-            if len(commits) == 1:
-                # Model the typed HTTP 409/lost response after removal CAS.
-                # A fresh issuance is now impossible, so only the held exact
-                # permit can finish this terminal head.
-                return "retryable"
-            return await head_gate.advance_grant(grant, proposed)
-
-        async def ordinary_advance(_proof, _proposed):
-            raise AssertionError("control head used ordinary authorization")
+        async def commit(permit, proposed):
+            commits.append(permit)
+            result = await access.commit_head_permit(
+                head_gate, permit, proposed, PERMIT_SECRET)
+            # Model a lost first response after the exact operation completed.
+            return "retryable" if len(commits) == 1 else result
 
         published = await OwnerPublisher(
             root.fid,
@@ -495,19 +612,17 @@ def test_owner_publisher_reuses_one_permit_after_terminal_commit_409(
             make_proof,
             issue,
             commit,
-            ordinary_advance,
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("control head used ordinary authorization")),
             lambda _attempt: None,
         ).publish()
 
-        assert published.status == "applied"
+        assert published.status == "noop"
         assert len(issues) == 1
-        assert len(commits) == 2
-        assert commits[0][0] is commits[1][0] is issues[0]
-        assert commits[0][1] is commits[1][1]
-        slot = decode_slot_at(
+        assert commits[0] is commits[1] is issues[0]
+        assert decode_slot_at(
             head_slot_key(root.fid, founder),
             remote.get(head_slot_key(root.fid, founder)),
-        )
-        assert slot.head == update.head_oid
+        ).head == update.head_oid
 
     run(scenario())

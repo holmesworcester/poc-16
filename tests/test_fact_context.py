@@ -114,6 +114,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         ts=timestamp + 3)
     facts.content.delete.remove(
         node, workspace, message, ts=timestamp + 4)
+    facts.auth.device_removal.remove(node, workspace, sibling)
     facts.auth.removal.evict(node, workspace, member)
     ephemeral = facts.auth.request.payload(
         node, workspace, "sync", timestamp + 10_000, timestamp + 6,
@@ -158,8 +159,9 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "admin": (0, 1, 1, 0, 7),
         "file_slice": (1, 1, 1, 0, 8),
         "delete": (1, 0, 0, 1, 6),
-        "device": (0, 2, 3, 0, 12),
-        "device_invite": (0, 2, 4, 0, 14),
+        "device": (0, 2, 2, 0, 10),
+        "device_invite": (0, 2, 2, 0, 10),
+        "device_removal": (0, 1, 0, 1, 6),
         "evict": (0, 1, 0, 1, 6),
         "file_bao": (0, 1, 1, 0, 7),
         "head_request": (0, 0, 0, 0, 4),
@@ -169,7 +171,7 @@ def test_every_family_accepts_against_the_same_complete_context(tmp_path):
         "removal_path_request": (0, 0, 0, 0, 4),
         "req": (0, 0, 0, 0, 4),
         "signature": (0, 1, 0, 0, 5),
-        "user": (1, 1, 2, 0, 10),
+        "user": (1, 1, 1, 0, 8),
         "user_invite": (0, 1, 0, 0, 5),
         "workspace": (0, 2, 1, 0, 8),
     }

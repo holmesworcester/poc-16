@@ -22,7 +22,7 @@ MODULES = auth.MODULES + content.MODULES
 # Bump for any change in family extraction, policy, or query interpretation
 # that must rebuild the disposable full-peer projection.  Canonical fact
 # bytes and writer trees are never migrated; current code replays them.
-APP_VERSION = 3
+APP_VERSION = 4
 
 
 def _principal_namespaces(modules):
@@ -231,13 +231,8 @@ def semantic_evaluation(judgment, stream):
     return receipts, current_stream
 
 
-def control_evaluation(judgment, stream):
-    """Require one evaluated pile to contain only declared control facts.
-
-    This is a classification of the same kernel judgment, not a second
-    validator. Generic signatures qualify only when their exact target in the
-    closure is itself family-declared control material.
-    """
+def _control_receipts(judgment, stream):
+    """Return current receipts for one all-control kernel judgment."""
     valids, current_stream = semantic_evaluation(judgment, stream)
     current = tuple(valid.fact for valid in valids)
     if len(current) != len(current_stream) or any(
@@ -252,39 +247,93 @@ def control_evaluation(judgment, stream):
     if tuple(fact.fid for fact in selected) != tuple(
             fact.fid for fact in current):
         raise ValueError("control pile contains ordinary content")
+    return valids, current
+
+
+def control_evaluation(judgment, stream):
+    """Require one evaluated pile to contain only declared control facts.
+
+    This is a classification of the same kernel judgment, not a second
+    validator. Generic signatures qualify only when their exact target in the
+    closure is itself family-declared control material.
+    """
+    _valids, current = _control_receipts(judgment, stream)
     return current
 
 
-def removal_state_groups(judgment, stream):
-    """Derive tiny deterministic ACI updates, one state-affecting fact each."""
-    groups = []
-    for fact in control_evaluation(judgment, stream):
-        rows = {
-            sid: suppression_slot()
-            for sid in current_scopes(fact)
-        }
-        rows.update(
-            (sid, suppression_slot(fact.fid))
-            for sid in action_sids(fact)
-        )
-        if len(rows) > MAX_REMOVAL_UPDATES:
-            raise ValueError("fact exceeds removal-state route budget")
-        if rows:
-            groups.append(tuple(sorted(rows.items())))
-    return tuple(groups)
+def has_control_action_sink(judgment, stream):
+    """Whether an evaluated pile hides an independent suppressing action.
+
+    Ordinary content closures repeat membership and signature facts as named
+    dependencies, and may also repeat a device proof as a harmless independent
+    CLEAR sink.  Neither is a new suppressing turn.  An independent sink with
+    an ACTIVE route is state-changing and may not hide beside ordinary
+    content or another sink.
+    """
+    valids, _current_stream = semantic_evaluation(judgment, stream)
+    dependencies = {
+        edge.fid
+        for valid in valids
+        for edge in valid.edges
+    }
+    return any(
+        valid.fact.fid not in dependencies
+        and (family := family_for(valid.fact.t)) is not None
+        and family.DURABLE
+        and family.POLICY.control_fact
+        and action_sids(valid.fact)
+        for valid in valids
+    )
+
+
+def control_sink(judgment, stream):
+    """Select the one semantic mutation whose dependencies close this pile.
+
+    Closed piles carry a complete validation closure. Replaying every provider
+    as a new removal mutation makes work grow with delegation depth and with
+    repeated evidence. The semantic sink is the sole fact not consumed as a
+    named dependency by another receipt. A caller with several independent
+    mutations must send several independently closed piles.
+    """
+    valids, current = _control_receipts(judgment, stream)
+    dependencies = {
+        edge.fid
+        for valid in valids
+        for edge in valid.edges
+    }
+    sinks = tuple(
+        fact for fact in current
+        if fact.fid not in dependencies
+    )
+    if len(sinks) != 1:
+        raise ValueError("control pile needs one semantic sink")
+    return sinks[0]
+
+
+def removal_state_updates(judgment, stream):
+    """Derive the one sink fact's tiny deterministic ACI update."""
+    fact = control_sink(judgment, stream)
+    rows = {
+        sid: suppression_slot()
+        for sid in current_scopes(fact) | clear_sids(fact)
+    }
+    rows.update(
+        (sid, suppression_slot(fact.fid))
+        for sid in action_sids(fact)
+    )
+    if len(rows) > MAX_REMOVAL_UPDATES:
+        raise ValueError("fact exceeds removal-state route budget")
+    return tuple(sorted(rows.items()))
 
 
 def bootstrap_member(judgment, stream, writer):
     """Select the one direct member fact naming a bootstrap pile's writer."""
     if not valid_fid(writer):
         raise ValueError("bootstrap writer")
-    providers = tuple(
-        fact for fact in control_evaluation(judgment, stream)
-        if ("member", writer, writer) in fact.offers()
-    )
-    if len(providers) != 1:
+    sink = control_sink(judgment, stream)
+    if ("member", writer, writer) not in sink.offers():
         raise ValueError("bootstrap direct member")
-    return providers[0]
+    return sink
 
 
 def authorize_writer_head(
@@ -371,6 +420,13 @@ def principal_sids(fact):
     family = family_for(fact.t)
     return frozenset() if family is None else frozenset(
         _offer_sids(fact, family.POLICY.principal_offers))
+
+
+def clear_sids(fact):
+    """Extra family-declared cells reserved without guarding this fact."""
+    family = family_for(fact.t)
+    return frozenset() if family is None else frozenset(
+        _offer_sids(fact, family.POLICY.clear_offers))
 
 
 def authority_scopes(fact):

@@ -128,13 +128,17 @@ def _forest_fixture(tmp_path):
     # Each new member starts with a self-contained authority closure in its
     # own signed writer tree.  Network sync below never reaches into another
     # peer's SQL database to make the fixture valid.
-    authority = alice.sender(workspace).close(
-        (bob_join, carol_join), {})
+    # Independent semantic sinks stay in independent closed piles. Each new
+    # writer bootstraps from the pile whose sink is its own membership fact.
+    authority = {
+        "bob": alice.sender(workspace).close((bob_join,), {}),
+        "carol": alice.sender(workspace).close((carol_join,), {}),
+    }
     bob = FullPeer(str(tmp_path / "bob"), initial_secret=bob_secret)
     carol = FullPeer(str(tmp_path / "carol"), initial_secret=carol_secret)
     for peer, name in ((bob, "bob"), (carol, "carol")):
         peer.add_workspace(workspace, name, peers=[])
-        peer.publish_closed(workspace, (authority,))
+        peer.publish_closed(workspace, (authority[name],))
 
     facts.content.message.post(
         alice, workspace, "general", "from alice", ts=30)
@@ -170,6 +174,7 @@ class _HostedEndpoint:
         self._opened = None
         self._observed = {}
         self._complete = False
+        self._permit_controls = {}
 
     @property
     def accepts_push(self):
@@ -255,19 +260,22 @@ class _HostedEndpoint:
         )
         self.events.append((
             "permit", self.node.identity_id(self.ws), proposed))
+        self._permit_controls[permit] = tuple(control_piles)
         return permit
 
-    async def commit_head_permit(self, permit, proposed, control_piles):
-        grant = await self.access.authorize_permitted_head(
-            permit, proposed, control_piles, _HOSTED_PERMIT_SECRET)
+    async def commit_head_permit(self, permit, proposed):
         writer = self.node.identity_id(self.ws)
-        self.events.extend(
-            ("control", writer, h(raw), "applied")
-            for raw in control_piles)
-        self.events.append(("head", writer, proposed))
-        result = await OpaqueHeadGate(
-            self.store, self.access.authorize_head).advance_grant(
-                grant, proposed)
+        result = await self.access.commit_head_permit(
+            OpaqueHeadGate(self.store, self.access.authorize_head),
+            permit,
+            proposed,
+            _HOSTED_PERMIT_SECRET,
+        )
+        if result.status in {"applied", "noop"}:
+            self.events.extend(
+                ("control", writer, h(raw), result.status)
+                for raw in self._permit_controls.get(permit, ()))
+            self.events.append(("head", writer, proposed))
         return result.status
 
 
@@ -540,10 +548,14 @@ def test_bundled_head_page_isolates_one_oversized_slot(tmp_path):
     assert result.listed == 2
     assert result.changed == 1
     assert result.piles == 2
-    assert result.errors == ((bad_key, "listed writer slot disappeared"),)
+    assert result.errors == ((bad_key, "listed writer slot unreadable"),)
     good_key = head_slot_key(workspace, bob.identity_id(workspace))
-    assert carol.store(workspace).get(good_key) \
-        == alice.store(workspace).get(good_key)
+    # The signed writer head is portable; recipient-owned removal/permit
+    # metadata in its directory slot is intentionally not byte-identical.
+    assert decode_slot_at(
+        good_key, carol.store(workspace).get(good_key)).head \
+        == decode_slot_at(
+            good_key, alice.store(workspace).get(good_key)).head
 
 
 def test_reverse_noop_reuses_the_directory_tops_from_the_pull(tmp_path):
@@ -620,22 +632,22 @@ def test_hosted_owner_http_uses_exact_permit_only_for_control_head(
     workspace, alice, _bob, carol = _forest_fixture(tmp_path)
     requests = []
     access = carol.access_gate(workspace)
-    original_commit = access.authorize_permitted_head
+    original_commit = access.commit_head_permit
     commit_attempts = 0
 
-    async def retry_first_commit(permit, proposed, controls, secret):
+    async def retry_first_commit(head_gate, permit, proposed, secret):
         nonlocal commit_attempts
         commit_attempts += 1
-        grant = await original_commit(
-            permit, proposed, controls, secret)
+        result = await original_commit(
+            head_gate, permit, proposed, secret)
         if commit_attempts == 1:
             # The removal turn completed, but its typed response says the
             # exact outcome still needs reconciliation.
             raise ControlHeadRetry("injected post-removal contention")
-        return grant
+        return result
 
     monkeypatch.setattr(
-        access, "authorize_permitted_head", retry_first_commit)
+        access, "commit_head_permit", retry_first_commit)
 
     class CountingPeer(Peer):
         def _http(self, method, path, *args, **kwargs):
@@ -691,7 +703,7 @@ def test_hosted_owner_same_base_loser_gets_412_and_stops_for_rebase(
         async def advance(self, proof, candidate, trusted_now):
             return await original.advance(proof, candidate, trusted_now)
 
-        async def advance_grant(self, grant, candidate):
+        async def reserve_control(self, grant, permit_oid):
             nonlocal winner_installed
             if not winner_installed:
                 winner_installed = True
@@ -705,7 +717,10 @@ def test_hosted_owner_same_base_loser_gets_412_and_stops_for_rebase(
                     grant.removal_root,
                 ))
                 assert competing.status == "applied"
-            return await original.advance_grant(grant, candidate)
+            return await original.reserve_control(grant, permit_oid)
+
+        async def finish_control(self, reservation, removal_root):
+            return await original.finish_control(reservation, removal_root)
 
     monkeypatch.setattr(
         carol, "head_gate", lambda candidate: CompetingGate())
@@ -747,7 +762,6 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
     peer = Peer(object(), h(b"workspace"), "http://peer.invalid")
     proposed = h(b"proposed head")
     permit = b"exact permit"
-    controls = (b"exact control pile",)
     bodies = []
 
     def unavailable_then_applied(
@@ -761,10 +775,8 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
         return 201, b"", {}
 
     peer._http = unavailable_then_applied
-    assert peer.commit_head_permit(
-        permit, proposed, controls) == "retryable"
-    assert peer.commit_head_permit(
-        permit, proposed, controls) == "applied"
+    assert peer.commit_head_permit(permit, proposed) == "retryable"
+    assert peer.commit_head_permit(permit, proposed) == "applied"
     assert len(bodies) == 2 and bodies[0] == bodies[1]
 
     bodies.clear()
@@ -780,10 +792,8 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
         return 201, b"", {}
 
     peer._http = dropped_then_applied
-    assert peer.commit_head_permit(
-        permit, proposed, controls) == "retryable"
-    assert peer.commit_head_permit(
-        permit, proposed, controls) == "applied"
+    assert peer.commit_head_permit(permit, proposed) == "retryable"
+    assert peer.commit_head_permit(permit, proposed) == "applied"
     assert len(bodies) == 2 and bodies[0] == bodies[1]
 
     def competing_head(*_args, **_kwargs):
@@ -791,8 +801,7 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
             "http://peer.invalid", 412, "rebase required", {}, None)
 
     peer._http = competing_head
-    assert peer.commit_head_permit(
-        permit, proposed, controls) == "conflict"
+    assert peer.commit_head_permit(permit, proposed) == "conflict"
     assert peer.advance_head(b"ordinary proof", proposed) == "conflict"
 
     def ordinary_contention(*_args, **_kwargs):
@@ -808,7 +817,7 @@ def test_peer_control_commit_replays_503_and_dropped_response_but_not_4xx():
 
     peer._http = permanent_denial
     with pytest.raises(urllib.error.HTTPError) as denied:
-        peer.commit_head_permit(permit, proposed, controls)
+        peer.commit_head_permit(permit, proposed)
     assert denied.value.code == 403
 
 
@@ -864,8 +873,8 @@ def test_local_publish_applies_exact_control_before_head_and_skips_content(
     workspace, alice, _bob, carol = _forest_fixture(tmp_path)
     access = alice.access_gate(workspace)
     original_issue = access.issue_head_permit
-    original_authorize = access.authorize_permitted_head
     original_head_gate = alice.head_gate(workspace)
+    original_apply = access.state.apply_updates
     events = []
 
     async def issue_permit(
@@ -875,13 +884,10 @@ def test_local_publish_applies_exact_control_before_head_and_skips_content(
         events.append(("permit", alice.identity_id(workspace), proposed))
         return permit
 
-    async def authorize_permit(permit, proposed, controls, secret):
-        grant = await original_authorize(
-            permit, proposed, controls, secret)
-        events.extend(
-            ("control", alice.identity_id(workspace), raw)
-            for raw in controls)
-        return grant
+    async def apply_updates(updates):
+        events.append((
+            "control", alice.identity_id(workspace), tuple(updates)))
+        return await original_apply(updates)
 
     class RecordingHeadGate:
         async def advance(self, proof, proposed, trusted_now):
@@ -889,13 +895,18 @@ def test_local_publish_applies_exact_control_before_head_and_skips_content(
             return await original_head_gate.advance(
                 proof, proposed, trusted_now)
 
-        async def advance_grant(self, grant, proposed):
+        async def reserve_control(self, grant, permit_oid):
+            return await original_head_gate.reserve_control(
+                grant, permit_oid)
+
+        async def finish_control(self, reservation, removal_root):
+            proposed = reservation.slot.head
             events.append(("head", alice.identity_id(workspace), proposed))
-            return await original_head_gate.advance_grant(grant, proposed)
+            return await original_head_gate.finish_control(
+                reservation, removal_root)
 
     monkeypatch.setattr(access, "issue_head_permit", issue_permit)
-    monkeypatch.setattr(
-        access, "authorize_permitted_head", authorize_permit)
+    monkeypatch.setattr(access.state, "apply_updates", apply_updates)
     monkeypatch.setattr(
         alice, "head_gate", lambda candidate: RecordingHeadGate())
 
@@ -909,7 +920,8 @@ def test_local_publish_applies_exact_control_before_head_and_skips_content(
     head = decode_head(alice.store(workspace).get("obj/" + slot.head))
     exact = _run(open_accepted_pile(
         alice.store(workspace), workspace, device, head.sequence))
-    assert events[1][1:] == (device, exact)
+    evaluated = access.state.plan_control((exact,), device)
+    assert events[1][1:] == (device, evaluated.updates)
 
     events.clear()
     facts.content.message.post(

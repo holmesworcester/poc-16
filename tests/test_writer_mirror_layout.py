@@ -27,6 +27,7 @@ from core.writer_fetch import fetch_layout_piles
 from core.writer_head import (
     HeadSlot,
     WriterBinding,
+    decode_slot_at,
     encode_head,
     encode_slot,
     head_oid,
@@ -236,7 +237,12 @@ async def sync_receiver(tmp_path, name, fixture, source, consumer=True):
     store = FsStore(str(tmp_path / name))
     sink = FactConsumer(root.fid) if consumer else None
     result = await RepositoryMirror(
-        root.fid, store, resolver(binding), sink).sync_from(source)
+        root.fid,
+        store,
+        resolver(binding),
+        sink,
+        observe_controls=not consumer,
+    ).sync_from(source)
     return store, sink, result
 
 
@@ -269,9 +275,12 @@ def test_cold_mirror_uses_one_whole_pack_and_matches_opaque_peer(tmp_path):
 
         pile_keys = tuple("obj/" + signed_pile_oid(raw) for raw in raws)
         key = head_slot_key(root.fid, public)
-        for object_key in (*pile_keys, key, "obj/" + update.head_oid):
+        for object_key in (*pile_keys, "obj/" + update.head_oid):
             assert consuming_store.get(object_key) \
                 == opaque_store.get(object_key)
+        assert decode_slot_at(
+            key, consuming_store.get(key)).head == decode_slot_at(
+                key, opaque_store.get(key)).head
 
     run(scenario())
 

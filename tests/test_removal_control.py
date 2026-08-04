@@ -34,24 +34,27 @@ def judged(stream, anchor):
     return judgment
 
 
-def test_founder_and_joined_member_control_closures_derive_clear_groups():
+def test_founder_and_joined_member_closures_project_only_the_semantic_sink():
     _founder_secret, founder, root, _member_secret, member, membership = world()
     founder_judgment = judged((root,), root.fid)
     assert facts.bootstrap_member(
         founder_judgment, (root,), founder) == root
-    assert facts.removal_state_groups(founder_judgment, (root,)) == ((
-        (scoped_id("member", founder), suppression_slot()),
-    ),)
+    assert dict(facts.removal_state_updates(
+        founder_judgment, (root,))) == {
+            scoped_id("device", founder): suppression_slot(),
+            scoped_id("member", founder): suppression_slot(),
+        }
 
     joined_judgment = judged(membership, root.fid)
     assert facts.control_evaluation(joined_judgment, membership) == membership
     assert facts.bootstrap_member(
         joined_judgment, membership, member) == membership[-1]
-    flattened = dict(
-        row for group in facts.removal_state_groups(
-            joined_judgment, membership) for row in group)
-    assert flattened[scoped_id("member", founder)] == suppression_slot()
-    assert flattened[scoped_id("member", member)] == suppression_slot()
+    assert facts.control_sink(joined_judgment, membership) == membership[-1]
+    assert dict(facts.removal_state_updates(
+        joined_judgment, membership)) == {
+            scoped_id("device", member): suppression_slot(),
+            scoped_id("member", member): suppression_slot(),
+        }
 
 
 def test_valid_removal_activates_its_exact_member_sid():
@@ -60,10 +63,9 @@ def test_valid_removal_activates_its_exact_member_sid():
     item_sig = signature(founder_secret, founder, item, 4)
     stream = (*membership, item_sig, item)
     judgment = judged(stream, root.fid)
-    groups = facts.removal_state_groups(judgment, stream)
-
-    assert any(dict(group).get(scoped_id("member", member)) ==
-               suppression_slot(item.fid) for group in groups)
+    assert dict(facts.removal_state_updates(judgment, stream)) == {
+        scoped_id("member", member): suppression_slot(item.fid),
+    }
 
 
 def test_content_ephemeral_and_content_target_signature_reject_whole_control_pile():
@@ -93,10 +95,8 @@ def test_bootstrap_relabel_active_delta_and_route_overflow_fail(monkeypatch):
     item_sig = signature(founder_secret, founder, item, 7)
     active_stream = (*membership, item_sig, item)
     active = judged(active_stream, root.fid)
-    assert any(
-        value["state"] == "active"
-        for group in facts.removal_state_groups(active, active_stream)
-        for _sid, value in group)
+    assert any(value["state"] == "active" for _sid, value in
+               facts.removal_state_updates(active, active_stream))
 
     original = facts.current_scopes
     monkeypatch.setattr(
@@ -105,7 +105,20 @@ def test_bootstrap_relabel_active_delta_and_route_overflow_fail(monkeypatch):
         lambda fact: frozenset(
             scoped_id("member", h(f"overflow {index}".encode()))
             for index in range(6)
-        ) if fact.fid == root.fid else original(fact),
+        ) if fact.fid == membership[-1].fid else original(fact),
     )
     with pytest.raises(ValueError, match="route budget"):
-        facts.removal_state_groups(judgment, membership)
+        facts.removal_state_updates(judgment, membership)
+
+
+def test_independent_control_sinks_require_independent_closed_piles():
+    founder_secret, founder, root, _member_secret, member, membership = world()
+    first = removal(root.fid, founder, member, 7)
+    first_sig = signature(founder_secret, founder, first, 7)
+    second = removal(root.fid, founder, founder, 8)
+    second_sig = signature(founder_secret, founder, second, 8)
+    stream = (*membership, first_sig, first, second_sig, second)
+    judgment = judged(stream, root.fid)
+
+    with pytest.raises(ValueError, match="one semantic sink"):
+        facts.removal_state_updates(judgment, stream)

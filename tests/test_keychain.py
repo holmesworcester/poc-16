@@ -26,7 +26,9 @@ def test_new_keychain_holds_equal_identities_and_workspace_bindings(tmp_path):
 
     assert default_secret.verify_key.encode().hex() == default_id == node.pk
     assert other_secret.verify_key.encode().hex() == other_public == other_id
-    assert set(node.keyring) == {"keys", "workspaces"}
+    assert set(node.keyring) == {
+        "keys", "permit_secret", "workspaces"}
+    assert len(bytes.fromhex(node.keyring["permit_secret"])) == 32
 
     workspace = facts.auth.workspace.create(node, "alice")
     assert node.identity_id(workspace) == default_id

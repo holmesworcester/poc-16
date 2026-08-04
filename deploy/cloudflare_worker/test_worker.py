@@ -40,7 +40,13 @@ from core.pack_access import (
     encode_pack_open,
 )
 from core.suppression_tree import decode_root
-from core.writer_head import head_slot_key, visible_slot_at
+from core.writer_head import (
+    head_slot_key,
+    visible_slot_at,
+    writer_store_binding,
+)
+from core.writer_repository import WriterLog
+from adapters.r2.worker import R2BindingStore
 from full_peer.node import FullPeer
 from deploy.cloudflare_worker import crypto_compat, manage, runtime
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
@@ -354,9 +360,29 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         headers,
     ), environment, clock=lambda: 10)).status == 404
 
-    proposed = h(b"cloudflare terminal self-removal head")
-    bucket.data[f"{prefix}/obj/{proposed}"] = (
-        b"cloudflare terminal self-removal head")
+    evicted = removal(
+        value.root.fid, value.founder, value.founder, 8)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 8)
+    control = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, evicted_sig, evicted),
+    )
+    writer = WriterLog(
+        value.root.fid,
+        value.founder,
+        value.founder,
+        writer_store_binding(value.root.fid, value.founder),
+        value.founder_secret,
+        R2BindingStore(bucket, prefix),
+    )
+    update = run(writer.prepare(((
+        value.root, evicted_sig, evicted),
+    )))
+    run(writer.establish(update))
+    proposed = update.head_oid
     proof = current_head_proof(
         value.founder_secret, value.founder,
         value.root, (value.root,), path, proposed)
@@ -391,16 +417,6 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
         proof_body(value.root.fid, forged),
     ), environment, clock=lambda: 10)).status == 403
 
-    evicted = removal(
-        value.root.fid, value.founder, value.founder, 8)
-    evicted_sig = signature(
-        value.founder_secret, value.founder, evicted, 8)
-    control = signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (value.root, evicted_sig, evicted),
-    )
     ordinary = message(
         value.root.fid, value.founder,
         "general", "not removal control", 9)
@@ -504,11 +520,13 @@ def test_runtime_permit_commits_one_terminal_self_removal_head():
     ), environment, clock=lambda: 10)).status == 204
     assert bucket.data[slot_key] == accepted_slot
     assert not any(operation == "list" for operation, _key in bucket.calls)
+    update_keys = {
+        f"{prefix}/obj/{oid}" for oid, _raw in update.objects}
     assert all(
         key == removal_key
         or key.startswith(f"{prefix}/removal-node/")
         or key == slot_key
-        or key == f"{prefix}/obj/{proposed}"
+        or key in update_keys
         for _operation, key in bucket.calls)
     assert not any("cursor" in key for key in bucket.data)
 

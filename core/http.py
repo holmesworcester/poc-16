@@ -53,8 +53,10 @@ from .shape import valid_fid
 from .writer_head import (
     MAX_HEAD_SLOT_BYTES,
     decode_slot,
+    encode_slot,
     head_slot_key,
     head_slot_prefix,
+    visible_slot_at,
 )
 
 OID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -138,9 +140,12 @@ def encode_head_permit_request(proof, control_piles):
         proof, control_piles, MAX_MINT_REQUEST_BYTES)
 
 
-def encode_head_commit_request(permit, control_piles):
-    return _encode_head_control(
-        permit, control_piles, MAX_HEAD_PERMIT_BYTES)
+def encode_head_commit_request(permit):
+    """Commit carries only the issue-time authenticated capability."""
+    if not isinstance(permit, bytes) \
+            or not 0 < len(permit) <= MAX_HEAD_PERMIT_BYTES:
+        raise ValueError("control-head permit")
+    return permit
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,7 @@ class HttpGate:
             head_advance=None,
             head_permit_issue=None,
             head_permit_commit=None,
+            permit_secret=None,
             mint_authorize=None,
             path_authorize=None,
             removal_bootstrap=None,
@@ -244,6 +250,11 @@ class HttpGate:
                 if value is not None and not callable(value)))
         self.head_permit_issue = head_permit_issue
         self.head_permit_commit = head_permit_commit
+        if (head_permit_issue is not None or head_permit_commit is not None) \
+                and (not isinstance(permit_secret, bytes)
+                     or len(permit_secret) < 32):
+            raise ValueError("control-head permit secret")
+        self.permit_secret = permit_secret
         self.path_authorize = path_authorize
         self.removal_bootstrap = removal_bootstrap
         if object_open is not None and not callable(object_open):
@@ -454,12 +465,12 @@ class HttpGate:
             if inspect.iscoroutinefunction(self.head_permit_issue):
                 permit = await self.head_permit_issue(
                     proof, proposed_head, controls,
-                    trusted_now, self.secret)
+                    trusted_now, self.permit_secret)
             else:
                 permit = await _to_thread(
                     self.head_permit_issue,
                     proof, proposed_head, controls,
-                    trusted_now, self.secret,
+                    trusted_now, self.permit_secret,
                 )
                 if inspect.isawaitable(permit):
                     permit = await permit
@@ -467,7 +478,9 @@ class HttpGate:
             return self._json(409, {"error": "proof_refresh_required"})
         except RemovalDenied:
             return Response(403)
-        except (PayloadTooLarge, StoreError):
+        except PayloadTooLarge:
+            return Response(413)
+        except StoreError:
             return Response(503)
         except ValueError:
             return Response(403)
@@ -486,20 +499,18 @@ class HttpGate:
         if self.head_permit_commit is None:
             return Response(405)
         if not isinstance(body, bytes) \
-                or len(body) > MAX_HEAD_CONTROL_REQUEST_BYTES:
+                or not 0 < len(body) <= MAX_HEAD_PERMIT_BYTES:
             return Response(413)
         if not OID_RE.fullmatch(proposed_head):
             return Response(400)
         try:
-            permit, controls = _decode_head_control(
-                body, MAX_HEAD_PERMIT_BYTES)
             if inspect.iscoroutinefunction(self.head_permit_commit):
                 result = await self.head_permit_commit(
-                    permit, proposed_head, controls, self.secret)
+                    body, proposed_head, self.permit_secret)
             else:
                 result = await _to_thread(
                     self.head_permit_commit,
-                    permit, proposed_head, controls, self.secret,
+                    body, proposed_head, self.permit_secret,
                 )
                 if inspect.isawaitable(result):
                     result = await result
@@ -701,20 +712,29 @@ class HttpGate:
                 or len(opened) != len(page.keys):
             return Response(503)
         normalized = []
-        for value in opened:
-            if isinstance(value, ValueError) or value is None:
+        for key, value in zip(page.keys, opened):
+            if isinstance(value, ValueError):
+                normalized.append("unreadable")
+            elif value is None:
                 normalized.append(None)
             elif isinstance(value, BaseException) \
                     or not isinstance(value, bytes) \
                     or len(value) > MAX_HEAD_SLOT_BYTES:
                 return Response(503)
             else:
-                normalized.append(value)
+                try:
+                    slot = visible_slot_at(key, value)
+                    normalized.append(
+                        None if slot is None else encode_slot(slot))
+                except ValueError:
+                    return Response(503)
         return self._json(200, {
             "cursor": page.cursor,
             "heads": [
                 [key, None, None]
                 if value is None else [
+                    key, None, "unreadable"]
+                if value == "unreadable" else [
                     key, base64.b64encode(value).decode(), h(value)]
                 for key, value in zip(page.keys, normalized)
             ],
@@ -732,10 +752,17 @@ class HttpGate:
             return Response(404)
         if not isinstance(opened, Versioned):
             return Response(503)
-        etag = opened.token.value
+        try:
+            visible = visible_slot_at(key, opened.value)
+            if visible is None:
+                return Response(404)
+            raw = encode_slot(visible)
+        except ValueError:
+            return Response(503)
+        etag = h(raw)
         if self._header(headers, "If-None-Match") == etag:
             return Response(304)
-        return Response(200, opened.value, {
+        return Response(200, raw, {
             "Cache-Control": "no-store",
             "Content-Type": "application/octet-stream",
             "ETag": etag,
@@ -800,19 +827,23 @@ class HttpGate:
             return Response(400)
         # A cached directory observation may be stale by the time a reverse
         # sync reaches this receiver.  ``changed == 0`` can mean either exact
-        # no-op or "receiver is already newer"; only the exact installed slot
-        # is CAS success for the caller's proposed value.
+        # no-op or "receiver is already newer".  Compare the accepted signed
+        # head, not the raw slot: removal roots and control-permit identities
+        # are recipient-owned metadata and therefore legitimately differ on
+        # two peers that accepted the same writer head.
         try:
+            key = head_slot_key(slot.workspace, slot.device)
             current = await self.store.get_bounded(
-                head_slot_key(slot.workspace, slot.device),
-                MAX_HEAD_SLOT_BYTES,
-            )
+                key, MAX_HEAD_SLOT_BYTES)
+            visible = None if current is None else visible_slot_at(
+                key, current)
         except Exception:
             return Response(503)
-        if current != body:
+        if visible is None or visible.head != slot.head:
             return Response(409)
+        public = encode_slot(visible)
         return Response(204 if not result.changed else 201, headers={
-            "ETag": h(current),
+            "ETag": h(public),
         })
 
     @staticmethod
@@ -835,8 +866,10 @@ class HttpGate:
             return MAX_CONTROL_PILE_BYTES
         if method == "POST" and path.startswith("/head/"):
             parts = path.strip("/").split("/")
-            if len(parts) == 3 and parts[2] in {"permit", "commit"}:
+            if len(parts) == 3 and parts[2] == "permit":
                 return MAX_HEAD_CONTROL_REQUEST_BYTES
+            if len(parts) == 3 and parts[2] == "commit":
+                return MAX_HEAD_PERMIT_BYTES
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/obj":
             return MAX_PAGE_REQUEST_BYTES

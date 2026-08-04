@@ -75,11 +75,11 @@ MAX_PILE_FACTS = MAX_CLOSURE_FACTS
 MAX_STORE_READ_BYTES = max(
     MAX_REPOSITORY_OBJECT_BYTES, MAX_BUFFERED_PILE_BYTES)
 MAX_PILE_JSON_VALUES = 48 * MAX_PILE_FACTS + 16
-# device_invite is the current maximum: FactOrder + Fact residence + eight
-# mechanical postings + four current suppression slots.
-MAX_REGISTERED_FACT_ROUTES = 14
-MAX_REGISTERED_FACT_ROWS = 9
-MAX_REGISTERED_SUPPRESSION_ROUTES = 4
+# push_endpoint is the current maximum: FactOrder + Fact residence, seven
+# mechanical postings, and three current suppression slots.
+MAX_REGISTERED_FACT_ROUTES = 11
+MAX_REGISTERED_FACT_ROWS = 7
+MAX_REGISTERED_SUPPRESSION_ROUTES = 3
 MAX_RESOLVED_EDGES = 64
 # Recipient removal state advances once per state-affecting fact, never once
 # per whole pile. One fact cannot contribute more than this many slots.
@@ -89,6 +89,37 @@ MAX_REMOVAL_UPDATES = MAX_REGISTERED_SUPPRESSION_ROUTES
 # suppression-route ceiling.
 MAX_REMOVAL_PATH_SCOPES = 2 * MAX_REGISTERED_SUPPRESSION_ROUTES
 MAX_REMOVAL_PATH_BYTES = MAX_MINT_REQUEST_BYTES
+
+# A control head may carry several independently closed semantic mutations,
+# but their complete turn is no larger than one ordinary closure. Dependency
+# facts count even when repeated because each supplied pile is evaluated. The
+# sink rows then ACI-join into one private-root CAS turn.
+MAX_HEAD_CONTROL_FACTS = MAX_PILE_FACTS
+MAX_HEAD_REMOVAL_UPDATES = MAX_REMOVAL_PATH_SCOPES
+# A consuming mirror may absorb one ordinary concurrent removal-root winner
+# in the active turn. Further contention leaves its exact slot reservation
+# durable for the next turn instead of multiplying provider work without a
+# bound inside one HTTP request.
+MAX_MIRROR_CONTROL_ATTEMPTS = 2
+
+# Worst-case object-store calls for one self-contained control permit commit.
+# A 256-bit Patricia walk reads at most D+1 nodes per update. Each reachable
+# path-copy node gets one conditional PUT and, only for an unknown outcome,
+# one exact reconciliation GET. The fixed terms cover root pin/CAS/reconcile,
+# the result pins, terminal point proofs, proposed-head existence, and the
+# pending/final writer-slot CAS pair with exact rereads.
+_REMOVAL_DEPTH = MAX_REMOVAL_PROOF_STEPS
+MAX_HEAD_COMMIT_SUBREQUESTS = (
+    4
+    + MAX_HEAD_REMOVAL_UPDATES * (
+        (_REMOVAL_DEPTH + 1) + 2 * (_REMOVAL_DEPTH + 2))
+    + 2
+    + MAX_HEAD_REMOVAL_UPDATES * (_REMOVAL_DEPTH + 1)
+    + 6
+)
+CLOUDFLARE_SUBREQUEST_LIMIT = 10_000
+if MAX_HEAD_COMMIT_SUBREQUESTS > CLOUDFLARE_SUBREQUEST_LIMIT:
+    raise RuntimeError("control-head provider-call envelope")
 
 # A 512-page adversarial path is accepted; a deeper canonical map is outside
 # the protocol even though a 384-byte key could theoretically select more

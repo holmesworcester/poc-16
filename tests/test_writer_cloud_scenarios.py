@@ -37,38 +37,38 @@ TRUSTED_NOW = 8_500_000
 # and transfer volumes, not a price sheet; provider rates remain external.
 SCALE_BYTES = {
     1: {
-        "publication": 4_070,
-        "cold": 4_070,
-        "noop": 349,
-        "changed_publication_read": 349,
-        "changed_publication_write": 4_163,
-        "one_changed": 4_163,
+        "publication": 4_124,
+        "cold": 4_124,
+        "noop": 377,
+        "changed_publication_read": 377,
+        "changed_publication_write": 4_217,
+        "one_changed": 4_217,
     },
     10: {
-        "publication": 51_189,
-        "cold": 51_189,
-        "noop": 3_490,
-        "changed_publication_read": 349,
-        "changed_publication_write": 5_330,
-        "one_changed": 8_471,
+        "publication": 51_585,
+        "cold": 51_585,
+        "noop": 3_770,
+        "changed_publication_read": 377,
+        "changed_publication_write": 5_368,
+        "one_changed": 8_761,
     },
     100: {
-        "publication": 522_613,
-        "cold": 522_613,
-        "noop": 34_900,
-        "changed_publication_read": 349,
-        "changed_publication_write": 5_332,
-        "one_changed": 39_883,
+        "publication": 526_429,
+        "cold": 526_429,
+        "noop": 37_700,
+        "changed_publication_read": 377,
+        "changed_publication_write": 5_370,
+        "one_changed": 42_693,
     },
 }
 
 RACE_BYTES = {
-    "candidate_upload": 7_625,
-    "contention_read": 1_047,
-    "contention_write": 698,
-    "rebase_read": 3_223,
-    "rebase_write": 4_254,
-    "cold": 10_006,
+    "candidate_upload": 7_677,
+    "contention_read": 1_131,
+    "contention_write": 754,
+    "rebase_read": 3_235,
+    "rebase_write": 4_308,
+    "cold": 10_028,
 }
 
 

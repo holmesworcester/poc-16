@@ -82,6 +82,10 @@ class FamilyPolicy:
     owner_field: str | None = None
     authority_liveness_guards: tuple[str, ...] = ()
     principal_offers: tuple[SidOffer, ...] = ()
+    # Extra cells reserved CLEAR without making the fact itself depend on
+    # them. A direct member can reserve its primary device cell while member
+    # liveness remains independent of removal of that one device.
+    clear_offers: tuple[SidOffer, ...] = ()
     action_offers: tuple[SidOffer, ...] = ()
 
 
@@ -173,9 +177,10 @@ def validate_family_policy(policy):
         "authority liveness guards",
     )
     principal = _offers(policy.principal_offers, "principal offers")
+    clear = _offers(policy.clear_offers, "clear offers")
     actions = _offers(policy.action_offers, "action offers")
-    if principal & actions:
-        raise ValueError("principal/action offer name conflict")
+    if (principal | clear) & actions:
+        raise ValueError("clear/action offer name conflict")
     return policy
 
 

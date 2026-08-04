@@ -1,81 +1,56 @@
-"""Stateless exact permits for control-bearing writer heads.
+"""Self-contained exact capabilities for control-bearing writer heads.
 
-A permit is the recipient's durable-to-the-caller certificate that one exact
-head transition was authorized against a current removal pin before any of
-its control effects were applied.  The recipient stores no permit row, cursor,
-or cache: an HMAC binds the exact base/head, control pile OIDs, derived effect
-digest, and caller scopes.  The permit deliberately has no wall-clock expiry;
-otherwise a crash after self-removal could make the one terminal head
-impossible to finish.
+Issuance is the sole closed-pile semantic evaluation. The HMAC authenticates
+the resulting canonical ACI rows; commit therefore needs only these bounded
+permit bytes and remains stable across ordinary application-projection replay.
+The permit key is separate from short-lived bearer-grant material.
 """
 
 from dataclasses import dataclass
 import hashlib
 import hmac
 
+from .crypto import h
 from .fact import canon
-from .limits import (
-    MAX_HEAD_CONTROL_PILES,
-    MAX_HEAD_PERMIT_BYTES,
-    MAX_REMOVAL_PATH_SCOPES,
-    MAX_SUPPRESSION_ID_BYTES,
-    decode_json,
-    valid_bounded_text,
-)
+from .limits import MAX_HEAD_PERMIT_BYTES, decode_json
+from .removal_state import checked_updates
 from .shape import valid_fid
 
 
-FORMAT = "poc16-control-head-permit-v1"
-MAC_DOMAIN = "poc16-control-head-permit-mac-v1"
+FORMAT = "poc16-control-head-permit-v2"
+MAC_DOMAIN = "poc16-control-head-permit-mac-v2"
 
 
 @dataclass(frozen=True, slots=True)
 class ControlHeadPermit:
-    """One exact, non-amplifying control-head authorization."""
+    """One exact issue-time authorization and its bounded removal rows."""
 
     workspace: str
     device: str
-    owner: str
     base_head: str | None
     head: str
     removal_root: str
-    proof_oid: str
-    control_oids: tuple[str, ...]
-    effects_oid: str
-    caller_scopes: tuple[str, ...]
-    terminal_scopes: tuple[str, ...]
+    updates: tuple[tuple[str, dict], ...]
+    terminal_sids: tuple[str, ...]
 
     def __post_init__(self):
-        identities = (
-            self.workspace,
-            self.device,
-            self.owner,
-            self.head,
-            self.removal_root,
-            self.proof_oid,
-            self.effects_oid,
-        )
-        if not all(valid_fid(value) for value in identities) \
+        if not all(valid_fid(value) for value in (
+                self.workspace, self.device, self.head,
+                self.removal_root)) \
                 or self.base_head is not None \
                 and not valid_fid(self.base_head) \
-                or not isinstance(self.control_oids, tuple) \
-                or not 0 < len(self.control_oids) \
-                <= MAX_HEAD_CONTROL_PILES \
-                or len(set(self.control_oids)) != len(self.control_oids) \
-                or not all(valid_fid(oid) for oid in self.control_oids):
+                or checked_updates(self.updates) != self.updates \
+                or not self.updates:
             raise ValueError("control head permit identity")
-        for label, scopes in (
-                ("caller", self.caller_scopes),
-                ("terminal", self.terminal_scopes)):
-            if not isinstance(scopes, tuple) \
-                    or len(scopes) > MAX_REMOVAL_PATH_SCOPES \
-                    or scopes != tuple(sorted(set(scopes))) \
-                    or not all(valid_bounded_text(
-                        sid, MAX_SUPPRESSION_ID_BYTES) for sid in scopes):
-                raise ValueError(f"control head permit {label} scopes")
-        if not self.caller_scopes \
-                or not set(self.terminal_scopes) <= set(self.caller_scopes):
-            raise ValueError("control head permit terminal scopes")
+        active = {
+            sid for sid, value in self.updates
+            if value.get("state") == "active"
+        }
+        if not isinstance(self.terminal_sids, tuple) \
+                or self.terminal_sids != tuple(
+                    sorted(set(self.terminal_sids))) \
+                or not set(self.terminal_sids) <= active:
+            raise ValueError("control head permit terminal ids")
 
 
 def _claims(permit):
@@ -83,15 +58,13 @@ def _claims(permit):
         raise TypeError("control head permit")
     return {
         "base_head": "" if permit.base_head is None else permit.base_head,
-        "caller_scopes": list(permit.caller_scopes),
-        "control_oids": list(permit.control_oids),
         "device": permit.device,
-        "effects_oid": permit.effects_oid,
         "head": permit.head,
-        "owner": permit.owner,
-        "proof_oid": permit.proof_oid,
         "removal_root": permit.removal_root,
-        "terminal_scopes": list(permit.terminal_scopes),
+        "terminal_sids": list(permit.terminal_sids),
+        "updates": [
+            [sid, value] for sid, value in permit.updates
+        ],
         "workspace": permit.workspace,
     }
 
@@ -102,10 +75,15 @@ def _secret(secret):
     return secret
 
 
-def _mac(secret, claims):
+def key_id(secret):
+    """Name verifier material without disclosing it."""
+    return h(_secret(secret))
+
+
+def _mac(secret, kid, claims):
     return hmac.new(
         _secret(secret),
-        canon([MAC_DOMAIN, claims]),
+        canon([MAC_DOMAIN, kid, claims]),
         hashlib.sha256,
     ).hexdigest()
 
@@ -113,10 +91,12 @@ def _mac(secret, claims):
 def encode(permit, secret):
     """Authenticate one permit as bounded canonical bytes."""
     claims = _claims(permit)
+    kid = key_id(secret)
     raw = canon({
         "claims": claims,
         "format": FORMAT,
-        "mac": _mac(secret, claims),
+        "kid": kid,
+        "mac": _mac(secret, kid, claims),
     })
     if len(raw) > MAX_HEAD_PERMIT_BYTES:
         raise ValueError("control head permit too large")
@@ -126,36 +106,39 @@ def encode(permit, secret):
 def decode(raw, secret):
     """Open and fully canonicalize one authenticated permit."""
     value = decode_json(raw, MAX_HEAD_PERMIT_BYTES, "control head permit")
+    kid = key_id(secret)
     if not isinstance(value, dict) or set(value) != {
-            "claims", "format", "mac"} \
+            "claims", "format", "kid", "mac"} \
             or value.get("format") != FORMAT \
+            or value.get("kid") != kid \
             or not isinstance(value.get("claims"), dict) \
             or not isinstance(value.get("mac"), str) \
             or not hmac.compare_digest(
-                value["mac"], _mac(secret, value["claims"])):
+                value["mac"], _mac(secret, kid, value["claims"])):
         raise ValueError("control head permit")
     claims = value["claims"]
     if set(claims) != {
-            "base_head", "caller_scopes", "control_oids", "device",
-            "effects_oid", "head", "owner", "proof_oid", "removal_root",
-            "terminal_scopes", "workspace"} \
-            or not isinstance(claims["control_oids"], list) \
-            or not isinstance(claims["caller_scopes"], list) \
-            or not isinstance(claims["terminal_scopes"], list):
+            "base_head", "device", "head", "terminal_sids", "updates",
+            "removal_root", "workspace"} \
+            or not isinstance(claims["terminal_sids"], list) \
+            or not isinstance(claims["updates"], list):
         raise ValueError("control head permit claims")
-    permit = ControlHeadPermit(
-        claims["workspace"],
-        claims["device"],
-        claims["owner"],
-        claims["base_head"] or None,
-        claims["head"],
-        claims["removal_root"],
-        claims["proof_oid"],
-        tuple(claims["control_oids"]),
-        claims["effects_oid"],
-        tuple(claims["caller_scopes"]),
-        tuple(claims["terminal_scopes"]),
-    )
+    try:
+        updates = tuple(
+            tuple(row) if isinstance(row, list) else row
+            for row in claims["updates"]
+        )
+        permit = ControlHeadPermit(
+            claims["workspace"],
+            claims["device"],
+            claims["base_head"] or None,
+            claims["head"],
+            claims["removal_root"],
+            checked_updates(updates),
+            tuple(claims["terminal_sids"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("control head permit claims") from error
     if _claims(permit) != claims or encode(permit, secret) != raw:
         raise ValueError("control head permit encoding")
     return permit
@@ -165,4 +148,5 @@ __all__ = (
     "ControlHeadPermit",
     "decode",
     "encode",
+    "key_id",
 )

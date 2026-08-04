@@ -1,6 +1,7 @@
 """Black-box per-device repository behavior in normal and cloud modes."""
 import asyncio
 
+import facts
 import pytest
 
 from core.close import (
@@ -19,6 +20,7 @@ from core.limits import (
     PayloadTooLarge,
 )
 from core.object_store import ABSENT, STALE, OutcomeUnknown
+from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.writer_head import (
     HeadSlot,
@@ -375,11 +377,25 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
 
         normal_consumer = FactConsumer(root.fid)
         cloud_consumer = FactConsumer(root.fid)
+        normal_removals = RecipientRemovalState(
+            root.fid, normal_store)
+        cloud_removals = RecipientRemovalState(
+            root.fid, cloud_receiver_store)
         resolve = binding_for(root.fid, public, store_binding)
         normal = RepositoryMirror(
-            root.fid, normal_store, resolve, normal_consumer)
+            root.fid,
+            normal_store,
+            resolve,
+            normal_consumer,
+            control_state=normal_removals,
+        )
         via_cloud = RepositoryMirror(
-            root.fid, cloud_receiver_store, resolve, cloud_consumer)
+            root.fid,
+            cloud_receiver_store,
+            resolve,
+            cloud_consumer,
+            control_state=cloud_removals,
+        )
 
         normal_result = await normal.sync_from(writer_store)
         cloud_result = await via_cloud.sync_from(cloud_store)
@@ -397,6 +413,72 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
         # Equal directories are a no-op and fetch no pile for semantic work.
         again = await via_cloud.sync_from(cloud_store)
         assert again.changed == again.piles == again.facts == 0
+
+    run(scenario())
+
+
+def test_accepting_mirror_composes_recipient_removal_state(tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        source = FsStore(str(tmp_path / "source"))
+        target = FsStore(str(tmp_path / "target"))
+        binding = writer_store_binding(root.fid, public)
+        writer = WriterLog(
+            root.fid, public, public, binding, secret, source)
+        update = await writer.prepare(((root, device_signature, device),))
+        await writer.establish(update)
+        async def authorize(_proof, proposed, _trusted_now):
+            return HeadGrant(
+                root.fid,
+                public,
+                None,
+                proposed,
+                h(b"source removal"),
+            )
+
+        assert (await OpaqueHeadGate(
+            source, authorize,
+        ).advance(b"proof", update.head_oid, 10)).status == "applied"
+
+        consumer = FactConsumer(root.fid)
+        mirror = RepositoryMirror(
+            root.fid,
+            target,
+            binding_for(root.fid, public, binding),
+            consumer,
+        )
+        result = await mirror.sync_from(source)
+
+        assert result.errors == ()
+        assert result.changed == result.piles == 1
+        assert target.get(head_slot_key(root.fid, public)) is not None
+        pin = await mirror.control_state.pin()
+        assert pin is not None
+        proof = await pin.proof(facts.principal_sid("member", public))
+        assert pin.verify(
+            facts.principal_sid("member", public), proof,
+        )["state"] == "clear"
+        assert root.fid in consumer.fact_ids()
+
+    run(scenario())
+
+
+def test_listed_but_invisible_pending_head_is_delayed_not_corrupt(tmp_path):
+    async def scenario():
+        workspace = h(b"pending workspace")
+        device = h(b"pending device")
+        store = FsStore(str(tmp_path / "recipient"))
+        mirror = RepositoryMirror(
+            workspace,
+            store,
+            lambda *_args: None,
+            None,
+        )
+        assert await mirror._sync_slot(
+            store,
+            head_slot_key(workspace, device),
+            ABSENT,
+        ) == (0, 0, False)
 
     run(scenario())
 
@@ -552,11 +634,10 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
             permitted[permit] = proof, proposed, control_piles
             return permit
 
-        async def commit_permit(permit, proposed, control_piles):
+        async def commit_permit(permit, proposed):
             expected_proof, expected_head, expected_piles = permitted[permit]
-            assert (proposed, control_piles) == (
-                expected_head, expected_piles)
-            for raw in control_piles:
+            assert proposed == expected_head
+            for raw in expected_piles:
                 result = await apply_control(raw, public)
                 assert result.status in {"applied", "noop"}
             return await advance(expected_proof, proposed)
@@ -617,11 +698,13 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         assert (noop.status, noop.objects, noop.piles) == ("noop", 0, 0)
 
         consumer = FactConsumer(root.fid)
+        removals = RecipientRemovalState(root.fid, receiver)
         mirrored = await RepositoryMirror(
             root.fid,
             receiver,
             binding_for(root.fid, public, store_binding),
             consumer,
+            control_state=removals,
         ).sync_from(cloud)
         assert mirrored.errors == ()
         assert mirrored.piles == 2
@@ -681,13 +764,12 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
             held_proof = proof, proposed, control_piles
             return held_permit
 
-        async def commit_permit(permit, proposed, control_piles):
-            commits.append((permit, control_piles))
+        async def commit_permit(permit, proposed):
+            commits.append(permit)
             assert permit == held_permit
             proof, expected_head, expected_piles = held_proof
-            assert (proposed, control_piles) == (
-                expected_head, expected_piles)
-            for raw in control_piles:
+            assert proposed == expected_head
+            for raw in expected_piles:
                 applied = await apply_control(raw, public)
                 if applied.status == "retryable":
                     return applied
@@ -713,8 +795,7 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
         assert decode_slot_at(key, cloud.get(key)).head == update.head_oid
         assert issues == 1
         assert len(commits) == 2
-        assert commits[0][0] is commits[1][0]
-        assert commits[0][1] is commits[1][1]
+        assert commits[0] is commits[1] is held_permit
         assert pauses == [0]
         assert attempts == [
             (update.pile_oids[0], public),
@@ -770,8 +851,8 @@ def test_owner_publisher_stops_on_same_base_competing_control_head(
             issues.append((exact_proof, proposed, control_piles))
             return b"one exact losing permit"
 
-        async def commit_permit(permit, proposed, control_piles):
-            commits.append((permit, proposed, control_piles))
+        async def commit_permit(permit, proposed):
+            commits.append((permit, proposed))
             cloud.put_if_absent("obj/" + winner, winner_raw)
             won = await cloud_gate.advance_grant(HeadGrant(
                 root.fid,

@@ -5,7 +5,7 @@ then sign live requests itself; sibling devices never acquire ambient power to
 assert another device's ownership on the member's behalf.
 """
 from core.fact import Fact, Need
-from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
+from .._policy import FamilyPolicy, SidOffer, author_selectors
 from .._commands import offer_source
 from . import signature
 from ._display import display
@@ -13,8 +13,10 @@ from ._display import display
 TAG = "device_invite"
 POLICY = FamilyPolicy(
     control_fact=True,
-    suppression=(Self(),),
-    authority_liveness_guards=("member", "device"),
+    # A member removal disables every owned device. Removing the owner's
+    # primary device does not disable an independently enrolled sibling;
+    # each access claim checks the exact requesting device separately.
+    authority_liveness_guards=("member",),
     principal_offers=(SidOffer("device_key", "device"),),
 )
 

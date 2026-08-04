@@ -122,6 +122,7 @@ def sync(node, workspace, url):
             remote,
             node.writer_binding,
             None,
+            observe_controls=True,
         )
         pushed = _run(outbound.sync_from(node.store(workspace)))
         if pushed.errors:

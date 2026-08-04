@@ -116,6 +116,39 @@ def test_an_owned_secondary_device_can_remove_itself(tmp_path):
             node, workspace, "general", "removed device")
 
 
+def test_primary_removal_denies_only_that_device_and_keeps_siblings_live(
+        tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    owner = node.identity_id(workspace)
+    bind(node, workspace, "alice-phone")
+    _, laptop = _add_secondary(
+        node, workspace, owner, "alice-laptop")
+    _, tablet = _add_secondary(
+        node, workspace, owner, "alice-tablet")
+
+    remove(node, workspace, "alice-phone")
+
+    assert node.suppression_active(
+        workspace, facts.principal_sid("device", owner))
+    assert not node.suppression_active(
+        workspace, facts.principal_sid("device", laptop))
+    assert not node.suppression_active(
+        workspace, facts.principal_sid("device", tablet))
+    assert not node.suppression_active(
+        workspace, facts.principal_sid("member", owner))
+    assert {row["pk"] for row in devices(node, workspace)} == {
+        laptop, tablet}
+
+    with pytest.raises(ValueError, match="owner mismatch"):
+        facts.content.message.post(
+            node, workspace, "general", "removed primary")
+    node.bind_identity(workspace, laptop)
+    posted = facts.content.message.post(
+        node, workspace, "general", "live sibling")
+    assert node.fact_of(workspace, posted).body["text"] == "live sibling"
+
+
 def test_admin_may_remove_any_device_but_another_member_may_not(
         tmp_path):
     node = FullPeer(str(tmp_path / "node"))

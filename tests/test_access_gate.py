@@ -11,6 +11,8 @@ from core.crypto import h, keypair
 from core.removal_path import ProofRefreshRequired, RemovalDenied
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
+from core.writer_head import writer_store_binding
+from core.writer_repository import WriterLog
 from facts.auth.head_request import head_request
 from facts.auth.removal_path_request import removal_path_request
 from facts.auth.request import request
@@ -18,6 +20,7 @@ from facts.auth.signature import signature
 from facts.auth.user import user
 from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
+from facts.content.message import message
 
 
 def run(awaitable):
@@ -67,7 +70,8 @@ def head_proof(secret, member, root, membership, path, proposed):
 
 def test_two_discarded_phases_mint_and_bind_head_without_mutating_state(tmp_path):
     root, secret, member, membership = world()
-    gate = AccessGate(root.fid, FsStore(tmp_path / "store"))
+    store = FsStore(tmp_path / "store")
+    gate = AccessGate(root.fid, store)
     assert run(gate.state.bootstrap(
         signed(secret, member, root, membership))).status == "applied"
     initial = run(gate.state.pin()).root_oid
@@ -81,7 +85,21 @@ def test_two_discarded_phases_mint_and_bind_head_without_mutating_state(tmp_path
         access_proof(secret, member, root, membership, path),
         10,
     )) == (member, "sync")
-    proposed = h(b"proposed head")
+    content = message(root.fid, member, "general", "ordinary", 7)
+    content_signature = signature(secret, member, content, 7)
+    writer = WriterLog(
+        root.fid,
+        member,
+        member,
+        writer_store_binding(root.fid, member),
+        secret,
+        store,
+    )
+    update = run(writer.prepare((
+        (*membership, content_signature, content),
+    )))
+    run(writer.establish(update))
+    proposed = update.head_oid
     grant = run(gate.authorize_head(
         head_proof(secret, member, root, membership, path, proposed),
         proposed,

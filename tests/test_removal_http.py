@@ -5,7 +5,9 @@ import base64
 import json
 
 from core.access import AccessGate
-from core.crypto import h
+from core.crypto import h, keypair
+from core.grants import make_token
+from core.head_permit import decode as decode_permit
 from core.http import (
     MAX_HEAD_CONTROL_REQUEST_BYTES,
     AsyncFromSyncReader,
@@ -16,9 +18,14 @@ from core.http import (
 from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
-from core.writer_head import decode_slot_at, head_slot_key
-from core.writer_repository import OpaqueHeadGate
+from core.writer_head import (
+    decode_slot_at,
+    head_slot_key,
+    writer_store_binding,
+)
+from core.writer_repository import HeadGrant, OpaqueHeadGate, WriterLog
 from facts.auth.device import device
+from facts.auth.device_invite import device_invite
 from facts.auth.signature import signature
 from facts.content.message import message
 from tests.test_access_gate import (
@@ -28,6 +35,9 @@ from tests.test_access_gate import (
     signed,
     world,
 )
+
+
+PERMIT_SECRET = b"removal-http-permit-secret" * 2
 
 
 def run(awaitable):
@@ -45,10 +55,9 @@ def gateway(root, store):
     access = AccessGate(root.fid, store)
     head_gate = OpaqueHeadGate(store, access.authorize_head)
 
-    async def commit_permit(permit, proposed, controls, secret):
-        grant = await access.authorize_permitted_head(
-            permit, proposed, controls, secret)
-        return await head_gate.advance_grant(grant, proposed)
+    async def commit_permit(permit, proposed, secret):
+        return await access.commit_head_permit(
+            head_gate, permit, proposed, secret)
 
     return access, HttpGate(
         AsyncFromSyncReader(store),
@@ -61,7 +70,22 @@ def gateway(root, store):
         head_advance=head_gate.advance,
         head_permit_issue=access.issue_head_permit,
         head_permit_commit=commit_permit,
+        permit_secret=PERMIT_SECRET,
     )
+
+
+def prepared_head(store, secret, member, root, closure):
+    writer = WriterLog(
+        root.fid,
+        member,
+        member,
+        writer_store_binding(root.fid, member),
+        secret,
+        store,
+    )
+    update = run(writer.prepare((closure,)))
+    run(writer.establish(update))
+    return update
 
 
 def test_two_public_proof_phases_mint_and_advance_only_bound_head(tmp_path):
@@ -94,8 +118,15 @@ def test_two_public_proof_phases_mint_and_advance_only_bound_head(tmp_path):
     assert minted.status == 200
     assert run(access.state.pin()).root_oid == initial
 
-    proposed = h(b"opaque writer head")
-    store.put_if_absent("obj/" + proposed, b"opaque writer head")
+    item = message(root.fid, member, "general", "ordinary", 7)
+    item_signature = signature(secret, member, item, 7)
+    proposed = prepared_head(
+        store,
+        secret,
+        member,
+        root,
+        (*membership, item_signature, item),
+    ).head_oid
     proof = head_proof(
         secret, member, root, membership, path_response.body, proposed)
     route = "/head/" + proposed
@@ -179,13 +210,29 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
         secret, member, root, membership))).status == "applied"
     primary = device(root.fid, member, "phone", 7)
     primary_signature = signature(secret, member, primary, 7)
+    _secondary_secret, secondary = keypair()
+    secondary_grant = device_invite(
+        root.fid, member, secondary, "tablet", 8)
+    secondary_signature = signature(
+        secret, member, secondary_grant, 8)
+    closure = (
+        *membership,
+        primary_signature,
+        primary,
+        secondary_signature,
+        secondary_grant,
+    )
     control = signed(
-        secret, member, root,
-        (*membership, primary_signature, primary))
+        secret, member, root, closure)
     path = run(access.removal_path(
         path_proof(secret, member, root, membership), 10))
-    proposed = h(b"control-bearing writer head")
-    store.put_if_absent("obj/" + proposed, b"control-bearing writer head")
+    proposed = prepared_head(
+        store,
+        secret,
+        member,
+        root,
+        closure,
+    ).head_oid
     proof = head_proof(
         secret, member, root, membership, path, proposed)
     permit_route = f"/head/{proposed}/permit"
@@ -199,11 +246,11 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
     assert run(access.state.pin()).root_oid == before
     assert run(http.handle(
         "POST", commit_route, {"ws": root.fid}, {},
-        encode_head_commit_request(issued.body, (control,)))).status == 201
+        encode_head_commit_request(issued.body))).status == 201
     assert run(access.state.pin()).root_oid != before
     assert run(http.handle(
         "POST", commit_route, {"ws": root.fid}, {},
-        encode_head_commit_request(issued.body, (control,)))).status == 204
+        encode_head_commit_request(issued.body))).status == 204
 
     assert HttpGate.request_limit("POST", "/removal/apply") == 0
     assert run(http.handle(
@@ -215,3 +262,74 @@ def test_exact_control_permit_commits_removal_before_head(tmp_path):
     assert run(http.handle(
         "POST", permit_route, {"ws": root.fid}, {},
         b"x" * (MAX_HEAD_CONTROL_REQUEST_BYTES + 1))).status == 413
+
+
+def test_pending_control_head_is_not_visible_through_directory_routes(
+        tmp_path):
+    root, secret, member, membership = world()
+    store = FsStore(str(tmp_path / "repository"))
+    access, http = gateway(root, store)
+    assert run(access.state.bootstrap(signed(
+        secret, member, root, membership))).status == "applied"
+    path = run(access.removal_path(
+        path_proof(secret, member, root, membership), 10))
+    primary = device(root.fid, member, "phone", 7)
+    primary_signature = signature(secret, member, primary, 7)
+    control = signed(
+        secret, member, root,
+        (*membership, primary_signature, primary))
+    update = prepared_head(
+        store,
+        secret,
+        member,
+        root,
+        (*membership, primary_signature, primary),
+    )
+    proposed = update.head_oid
+    proof = head_proof(
+        secret, member, root, membership, path, proposed)
+    issued = run(http.handle(
+        "POST", f"/head/{proposed}/permit", {"ws": root.fid}, {},
+        encode_head_permit_request(proof, (control,))))
+    assert issued.status == 200
+
+    permit = decode_permit(issued.body, PERMIT_SECRET)
+    head_gate = OpaqueHeadGate(store, access.authorize_head)
+    reservation = run(head_gate.reserve_control(HeadGrant(
+        root.fid,
+        member,
+        permit.base_head,
+        proposed,
+        permit.removal_root,
+    ), h(issued.body)))
+    assert reservation.slot.head == proposed
+
+    token = make_token(
+        b"removal-http-secret" * 2,
+        member,
+        root.fid,
+        issued_at=1,
+        ttl_ms=1_000,
+    )
+    headers = {"Authorization": "Bearer " + token}
+    hidden = run(http.handle(
+        "GET", f"/head/{member}", {"ws": root.fid}, headers))
+    assert hidden.status == 404
+    directory = run(http.handle(
+        "GET", "/heads", {"ws": root.fid}, headers))
+    assert directory.status == 200
+    document = json.loads(directory.body)
+    assert document["heads"] == [[
+        head_slot_key(root.fid, member), None, None]]
+    assert proposed.encode() not in directory.body
+    assert h(issued.body).encode() not in directory.body
+
+    committed = run(http.handle(
+        "POST", f"/head/{proposed}/commit", {"ws": root.fid}, {},
+        encode_head_commit_request(issued.body)))
+    assert committed.status == 201
+    visible = run(http.handle(
+        "GET", f"/head/{member}", {"ws": root.fid}, headers))
+    assert visible.status == 200
+    assert decode_slot_at(
+        head_slot_key(root.fid, member), visible.body).head == proposed

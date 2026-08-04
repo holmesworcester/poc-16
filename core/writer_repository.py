@@ -22,9 +22,9 @@ from .close import (
 from .crypto import h
 from .fact import canon, encode
 from .limits import (
-    MAX_HEAD_CONTROL_BYTES,
     MAX_HEAD_CONTROL_PILES,
     MAX_HEAD_PERMIT_BYTES,
+    MAX_MIRROR_CONTROL_ATTEMPTS,
     MAX_PILE_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
     PAGE_BATCH,
@@ -45,10 +45,12 @@ from .object_store import (
 from .shape import valid_fid
 from .writer_head import (
     HeadSlot,
+    PendingHeadSlot,
     WriterBinding,
     decode_head,
     decode_slot,
     decode_slot_at,
+    decode_slot_state_at,
     encode_head,
     encode_slot,
     head_oid,
@@ -58,6 +60,7 @@ from .writer_head import (
     parse_head_slot_key,
     require_bound_head,
     validate_advance,
+    visible_slot_at,
     writer_store_binding,
 )
 from .writer_tree import (
@@ -117,6 +120,19 @@ class SlotResult:
             raise ValueError("head slot result")
 
 
+@dataclass(frozen=True, slots=True)
+class ControlReservation:
+    """Exact pending writer-slot value held across removal application."""
+
+    slot: PendingHeadSlot
+    token: VersionToken
+
+    def __post_init__(self):
+        if not isinstance(self.slot, PendingHeadSlot) \
+                or not isinstance(self.token, VersionToken):
+            raise ValueError("control head reservation")
+
+
 def _reconcile_head_cas(opened, grant, proposed, exact_status):
     """Classify one failed/unknown CAS from an exact register reread."""
     if exact_status not in {"applied", "noop"}:
@@ -126,8 +142,11 @@ def _reconcile_head_cas(opened, grant, proposed, exact_status):
         return SlotResult(status, proposed)
     if not isinstance(opened, Versioned):
         raise TypeError("writer slot read")
-    current = decode_slot_at(
+    state = decode_slot_state_at(
         head_slot_key(grant.workspace, grant.device), opened.value)
+    if isinstance(state, PendingHeadSlot):
+        return SlotResult("conflict", state.previous or proposed)
+    current = state
     if opened.value == encode_slot(proposed):
         return SlotResult(exact_status, current)
     if current.head == grant.head:
@@ -170,18 +189,11 @@ class _PendingControlHead:
 
     permit: bytes
     head: str
-    controls: tuple[bytes, ...]
 
     def __post_init__(self):
         if not isinstance(self.permit, bytes) or not self.permit \
                 or len(self.permit) > MAX_HEAD_PERMIT_BYTES \
-                or not valid_fid(self.head) \
-                or not isinstance(self.controls, tuple) \
-                or not self.controls \
-                or len(self.controls) > MAX_HEAD_CONTROL_PILES \
-                or not all(isinstance(raw, bytes) and raw
-                           for raw in self.controls) \
-                or sum(map(len, self.controls)) > MAX_HEAD_CONTROL_BYTES:
+                or not valid_fid(self.head):
             raise ValueError("pending control head")
 
 
@@ -197,7 +209,6 @@ class ValidatedBatch:
         if any(not valid_fid(oid) for oid in self.piles) \
                 or any(not valid_fid(fid) or not isinstance(raw, bytes)
                        for fid, raw in self.facts) \
-                or any(oid not in self.piles for oid in self.control_piles) \
                 or tuple(sorted(set(self.control_piles))) \
                 != self.control_piles:
             raise ValueError("validated consumer batch")
@@ -209,6 +220,19 @@ async def _maybe_await(value):
 
 def _no_retry_pause(_attempt):
     """Keep the provider-neutral core free of scheduler dependencies."""
+
+
+def _mirror_reservation_oid(
+        workspace, device, base_head, head, updates):
+    """Name one locally reconstructable mirror control transition."""
+    return h(canon([
+        "poc16-mirror-control-reservation-v1",
+        workspace,
+        device,
+        "" if base_head is None else base_head,
+        head,
+        updates,
+    ]))
 
 
 async def _object(store, oid, maximum=MAX_REPOSITORY_OBJECT_BYTES):
@@ -246,6 +270,46 @@ async def _pile_object(store, oid, maximum=MAX_PILE_BYTES):
     return raw
 
 
+async def control_extension(
+        store, binding, base_head_oid, proposed_head_oid):
+    """Open one signed head pair and prove its bounded control-tree suffix.
+
+    Hosted gates deliberately do not inspect ordinary pile bytes.  The
+    writer-signed secondary tree is therefore the exact, cheap declaration of
+    control piles that must use the fenced permit path for this transition.
+    """
+    if not isinstance(binding, WriterBinding) \
+            or base_head_oid is not None and not valid_fid(base_head_oid) \
+            or not valid_fid(proposed_head_oid):
+        raise ValueError("control extension binding")
+    store = async_store(store)
+    candidate_raw = await _object(store, proposed_head_oid)
+    candidate = require_bound_head(decode_head(candidate_raw), binding)
+    if base_head_oid is None:
+        accepted, accepted_control = None, EMPTY_TREE
+    else:
+        accepted_raw = await _object(store, base_head_oid)
+        accepted = require_bound_head(decode_head(accepted_raw), binding)
+        validate_advance(accepted, candidate, binding)
+        accepted_control = accepted.control
+    delta = candidate.control.count - accepted_control.count
+    if not 0 <= delta <= MAX_HEAD_CONTROL_PILES:
+        raise PayloadTooLarge("too many control piles in one head advance")
+
+    async def fetch(oid):
+        return await _object(store, oid)
+
+    additions = await validate_extension_awaited(
+        accepted_control,
+        candidate.control,
+        binding.workspace,
+        binding.device,
+        fetch,
+        fetch,
+    )
+    return candidate, tuple(oid for _key, oid in additions)
+
+
 async def open_accepted_pile(
         store, workspace, device, sequence, *, max_bytes=MAX_PILE_BYTES):
     """Open one original pile through the recipient's current accepted head."""
@@ -257,7 +321,9 @@ async def open_accepted_pile(
     opened = await store.read_versioned(key)
     if not isinstance(opened, Versioned):
         raise ValueError("accepted writer slot is missing")
-    slot = decode_slot_at(key, opened.value)
+    slot = visible_slot_at(key, opened.value)
+    if slot is None:
+        raise ValueError("accepted writer transition is pending")
     head_raw = await _object(store, slot.head)
     decoded = decode_head(head_raw)
     head = require_bound_head(decoded, WriterBinding(
@@ -427,7 +493,9 @@ class WriterLog:
             return None, EMPTY_TREE
         if not isinstance(versioned, Versioned):
             raise TypeError("writer slot read")
-        slot = decode_slot_at(key, versioned.value)
+        slot = visible_slot_at(key, versioned.value)
+        if slot is None:
+            raise ValueError("writer transition is pending")
         raw = await _object(self.store, slot.head)
         head = require_bound_head(decode_head(raw), self.binding)
         if head_oid(raw) != slot.head:
@@ -442,6 +510,7 @@ class WriterLog:
         base_head, base_tree = await self._base()
         pending = {}
         signed = []
+        control_oids = []
         for closure in closures:
             pile = make_signed_pile(
                 self.secret,
@@ -454,6 +523,17 @@ class WriterLog:
             _require_writer_proof(
                 evaluated, self.device, self.owner)
             oid = signed_pile_oid(raw)
+            try:
+                updates = facts.removal_state_updates(
+                    evaluated.judgment, evaluated.pile.facts)
+            except ValueError:
+                if facts.has_control_action_sink(
+                        evaluated.judgment, evaluated.pile.facts):
+                    raise ValueError(
+                        "control material needs one control-only sink")
+            else:
+                if updates:
+                    control_oids.append(oid)
             pending[oid] = raw
             signed.append(pile)
 
@@ -476,11 +556,23 @@ class WriterLog:
             fetch,
             emit,
         )
+        control = EMPTY_TREE if base_head is None else base_head.control
+        if control_oids:
+            control = await append_piles_awaited(
+                control,
+                self.workspace,
+                self.device,
+                tuple(control_oids),
+                fetch,
+                emit,
+            )
         # The generic bounded updater yields every intermediate path-copy
         # page.  A writer can batch locally and establish only the pages its
         # final signed head can reach, avoiding immediate cloud orphans.
         keep = set(pile_oids) | set(reachable_staged_pages(
-            tree, self.workspace, self.device, pending))
+            tree, self.workspace, self.device, pending)) | set(
+                reachable_staged_pages(
+                    control, self.workspace, self.device, pending))
         pending = {
             oid: raw for oid, raw in pending.items()
             if oid in keep
@@ -493,6 +585,7 @@ class WriterLog:
             tree.count,
             tree,
             self.store_binding,
+            control,
         )
         raw_head = encode_head(head)
         pending[head_oid(raw_head)] = raw_head
@@ -541,7 +634,7 @@ class OpaqueHeadGate:
         return await self.advance_grant(grant, proposed_head)
 
     async def advance_grant(self, grant, proposed_head=None):
-        """CAS one already typed grant, including a permitted control turn."""
+        """CAS one ordinary already-typed grant."""
         proposed_head = grant.head \
             if isinstance(grant, HeadGrant) and proposed_head is None \
             else proposed_head
@@ -565,7 +658,10 @@ class OpaqueHeadGate:
         elif isinstance(opened, Versioned):
             if opened.value == raw:
                 return SlotResult("noop", slot)
-            current = decode_slot_at(key, opened.value)
+            state = decode_slot_state_at(key, opened.value)
+            if isinstance(state, PendingHeadSlot):
+                return SlotResult("conflict", state.previous or slot)
+            current = state
             # The same immutable head is already the exact successful turn.
             # A later removal-root advance must not turn a lost-response retry
             # into a conflict or rewrite the root recorded at acceptance.
@@ -595,6 +691,122 @@ class OpaqueHeadGate:
         if not isinstance(result, Applied):
             raise TypeError("writer slot CAS")
         return SlotResult("applied", slot)
+
+    @staticmethod
+    def _reservation_reconcile(
+            opened, key, grant, pending, exact_status):
+        desired = HeadSlot(
+            grant.workspace, grant.device, grant.head,
+            grant.removal_root, pending.permit)
+        if opened is ABSENT:
+            status = "retryable" if grant.base_head is None else "conflict"
+            return SlotResult(status, desired)
+        if not isinstance(opened, Versioned):
+            raise TypeError("writer slot read")
+        state = decode_slot_state_at(key, opened.value)
+        if state == pending:
+            return ControlReservation(state, opened.token)
+        if isinstance(state, HeadSlot) \
+                and state.head == grant.head \
+                and state.permit == pending.permit:
+            return SlotResult(exact_status, state)
+        if isinstance(state, HeadSlot) and state.head == grant.base_head:
+            return SlotResult("retryable", desired)
+        visible = state.previous \
+            if isinstance(state, PendingHeadSlot) else state
+        return SlotResult("conflict", visible or desired)
+
+    async def reserve_control(self, grant, permit_oid):
+        """Win one exact base transition before any irreversible ACI effect."""
+        if not isinstance(grant, HeadGrant) or not valid_fid(permit_oid):
+            raise ValueError("control head reservation")
+        if not await self.store.has("obj/" + grant.head):
+            raise ValueError("proposed writer head object is missing")
+        key = head_slot_key(grant.workspace, grant.device)
+        desired = HeadSlot(
+            grant.workspace, grant.device, grant.head,
+            grant.removal_root, permit_oid)
+        opened = await self.store.read_versioned(key)
+        if opened is ABSENT:
+            if grant.base_head is not None:
+                return SlotResult("conflict", desired)
+            previous, token = None, ABSENT
+        elif isinstance(opened, Versioned):
+            state = decode_slot_state_at(key, opened.value)
+            if isinstance(state, PendingHeadSlot):
+                pending = PendingHeadSlot(
+                    grant.workspace, grant.device, state.previous,
+                    grant.head, permit_oid)
+                if state == pending:
+                    return ControlReservation(state, opened.token)
+                return SlotResult("conflict", state.previous or desired)
+            if state.head == grant.head:
+                return SlotResult(
+                    "noop" if state.permit == permit_oid else "conflict",
+                    state,
+                )
+            if state.head != grant.base_head:
+                return SlotResult("conflict", state)
+            previous, token = state, opened.token
+        else:
+            raise TypeError("writer slot read")
+
+        pending = PendingHeadSlot(
+            grant.workspace, grant.device, previous,
+            grant.head, permit_oid)
+        raw = encode_slot(pending)
+        try:
+            result = await self.store.cas(key, token, raw)
+        except OutcomeUnknown:
+            return self._reservation_reconcile(
+                await self.store.read_versioned(key),
+                key, grant, pending, "applied")
+        if result is STALE:
+            return self._reservation_reconcile(
+                await self.store.read_versioned(key),
+                key, grant, pending, "noop")
+        if not isinstance(result, Applied):
+            raise TypeError("writer reservation CAS")
+        return ControlReservation(pending, result.token)
+
+    async def finish_control(self, reservation, removal_root):
+        """Publish a reserved head only after its authenticated rows joined."""
+        if not isinstance(reservation, ControlReservation) \
+                or not valid_fid(removal_root):
+            raise ValueError("control head finalization")
+        pending = reservation.slot
+        key = head_slot_key(pending.workspace, pending.device)
+        final = HeadSlot(
+            pending.workspace,
+            pending.device,
+            pending.head,
+            removal_root,
+            pending.permit,
+        )
+        raw = encode_slot(final)
+
+        def reconcile(opened, exact_status):
+            if not isinstance(opened, Versioned):
+                return SlotResult("conflict", final)
+            state = decode_slot_state_at(key, opened.value)
+            if state == final:
+                return SlotResult(exact_status, final)
+            if state == pending:
+                return SlotResult("retryable", final)
+            visible = state.previous \
+                if isinstance(state, PendingHeadSlot) else state
+            return SlotResult("conflict", visible or final)
+
+        try:
+            result = await self.store.cas(
+                key, reservation.token, raw)
+        except OutcomeUnknown:
+            return reconcile(await self.store.read_versioned(key), "applied")
+        if result is STALE:
+            return reconcile(await self.store.read_versioned(key), "noop")
+        if not isinstance(result, Applied):
+            raise TypeError("writer finalization CAS")
+        return SlotResult("applied", final)
 
 
 class OwnerPublisher:
@@ -640,7 +852,9 @@ class OwnerPublisher:
             return OwnerPublishResult("noop", None, 0, 0)
         if not isinstance(local_opened, Versioned):
             raise TypeError("local writer slot read")
-        local_slot = decode_slot_at(key, local_opened.value)
+        local_slot = visible_slot_at(key, local_opened.value)
+        if local_slot is None:
+            raise ValueError("local writer transition is pending")
         candidate_raw = await _object(self.source, local_slot.head)
         candidate = require_bound_head(
             decode_head(candidate_raw), self.binding)
@@ -649,19 +863,25 @@ class OwnerPublisher:
 
         remote_opened = await self.target.read_versioned(key)
         if remote_opened is ABSENT:
-            base_head, accepted_tree = None, EMPTY_TREE
+            base_head, accepted_tree, accepted_control = (
+                None, EMPTY_TREE, EMPTY_TREE)
         elif isinstance(remote_opened, Versioned):
-            remote_slot = decode_slot_at(key, remote_opened.value)
-            if remote_slot.head == local_slot.head:
+            remote_slot = visible_slot_at(key, remote_opened.value)
+            if remote_slot is None:
+                base_head, accepted_tree, accepted_control = (
+                    None, EMPTY_TREE, EMPTY_TREE)
+            elif remote_slot.head == local_slot.head:
                 return OwnerPublishResult(
                     "noop", local_slot.head, 0, 0)
-            accepted_raw = await _object(self.target, remote_slot.head)
-            accepted = require_bound_head(
-                decode_head(accepted_raw), self.binding)
-            if head_oid(accepted_raw) != remote_slot.head:
-                raise ValueError("remote writer head integrity")
-            validate_advance(accepted, candidate, self.binding)
-            base_head, accepted_tree = remote_slot.head, accepted.tree
+            else:
+                accepted_raw = await _object(self.target, remote_slot.head)
+                accepted = require_bound_head(
+                    decode_head(accepted_raw), self.binding)
+                if head_oid(accepted_raw) != remote_slot.head:
+                    raise ValueError("remote writer head integrity")
+                validate_advance(accepted, candidate, self.binding)
+                base_head, accepted_tree, accepted_control = (
+                    remote_slot.head, accepted.tree, accepted.control)
         else:
             raise TypeError("remote writer slot read")
 
@@ -683,6 +903,20 @@ class OwnerPublisher:
             candidate_fetch,
             accepted_fetch,
         )
+        control_delta = candidate.control.count - accepted_control.count
+        if not 0 <= control_delta <= MAX_HEAD_CONTROL_PILES:
+            raise PayloadTooLarge(
+                "too many control piles in one head advance")
+        declared_controls = tuple(
+            oid for _key, oid in await validate_extension_awaited(
+                accepted_control,
+                candidate.control,
+                self.workspace,
+                self.device,
+                candidate_fetch,
+                accepted_fetch,
+            )
+        )
         for oid, raw in sorted(pages.items()):
             await ensure_object_async(self.target, oid, raw)
         added_piles = []
@@ -694,41 +928,46 @@ class OwnerPublisher:
         await ensure_object_async(
             self.target, local_slot.head, candidate_raw)
 
-        # One recipient-issued exact permit linearizes every control-bearing
-        # head while this writer is current. Commit revalidates and applies
-        # the complete bounded control tuple before its slot CAS. A caller
-        # must retain the returned non-expiring permit until commit finishes;
-        # retry needs no recipient cursor, cache, or scan.
+        # One recipient-issued exact permit evaluates every state-affecting
+        # pile while this writer is current. Commit carries only that bounded
+        # capability; the recipient reserves the slot before applying rows.
         control_piles = []
-        for _oid, raw in added_piles:
+        for oid, raw in added_piles:
             evaluated = self.evaluator.evaluate(raw, writer=self.device)
             try:
-                facts.control_evaluation(
+                updates = facts.removal_state_updates(
                     evaluated.judgment, evaluated.pile.facts)
             except ValueError:
+                if facts.has_control_action_sink(
+                        evaluated.judgment, evaluated.pile.facts):
+                    raise ValueError(
+                        "control material needs one control-only sink")
                 continue
-            control_piles.append(raw)
+            if updates:
+                control_piles.append((oid, raw))
+
+        if tuple(oid for oid, _raw in control_piles) != declared_controls:
+            raise ValueError("writer head control declaration")
 
         proof = await _maybe_await(
             self.make_proof(base_head, local_slot.head))
         if not isinstance(proof, bytes):
             raise TypeError("owner head proof")
         if control_piles:
-            control_piles = tuple(control_piles)
+            control_piles = tuple(raw for _oid, raw in control_piles)
             permit = await _maybe_await(self.issue_permit(
                 proof, local_slot.head, control_piles))
             if not isinstance(permit, bytes):
                 raise TypeError("owner control-head permit")
-            pending = _PendingControlHead(
-                permit, local_slot.head, control_piles)
+            pending = _PendingControlHead(permit, local_slot.head)
             retry = 0
             while True:
                 outcome = await _maybe_await(self.commit_permit(
-                    pending.permit, pending.head, pending.controls))
+                    pending.permit, pending.head))
                 status = getattr(outcome, "status", outcome)
                 if status != "retryable":
                     break
-                # Retain the exact capability and bytes in this active turn;
+                # Retain the exact capability in this active turn;
                 # bounded full jitter prevents a hot contention loop. Caller
                 # cancellation is the explicit process-local abort boundary.
                 await _maybe_await(self.retry_pause(retry))
@@ -776,19 +1015,26 @@ class FactConsumer:
         batch_facts, batch_piles, control_piles = {}, [], []
         for raw, writer in values:
             oid = h(raw)
-            if oid in staged_piles or self.state is None \
-                    and oid in self._piles:
+            if oid in staged_piles:
                 continue
+            known = self.state is None and oid in self._piles
             evaluated = self.evaluator.evaluate(raw, writer=writer)
             if owner is not None:
                 _require_writer_proof(evaluated, writer, owner)
             try:
-                facts.control_evaluation(
+                updates = facts.removal_state_updates(
                     evaluated.judgment, evaluated.pile.facts)
             except ValueError:
-                pass
+                if facts.has_control_action_sink(
+                        evaluated.judgment, evaluated.pile.facts):
+                    raise ValueError(
+                        "control material needs one control-only sink")
             else:
-                control_piles.append(oid)
+                if updates:
+                    control_piles.append(oid)
+            if known:
+                staged_piles.add(oid)
+                continue
             for valid in evaluated.judgment.valids:
                 family = facts.family_for(valid.fact.t)
                 if family is None or not family.DURABLE:
@@ -872,7 +1118,8 @@ class RepositoryMirror:
 
     def __init__(
             self, workspace, store, binding_for, consumer,
-            *, current_binding_for=None, apply_control=None):
+            *, current_binding_for=None, control_state=None,
+            observe_controls=False):
         consumer_ok = consumer is None or (
             getattr(consumer, "workspace", None) == workspace
             and all(callable(getattr(consumer, method, None))
@@ -883,28 +1130,201 @@ class RepositoryMirror:
                 or not consumer_ok \
                 or current_binding_for is not None \
                 and not callable(current_binding_for) \
-                or apply_control is not None \
-                and not callable(apply_control):
+                or control_state is not None and not all(callable(
+                    getattr(control_state, method, None))
+                    for method in ("plan_control", "apply_plan")) \
+                or type(observe_controls) is not bool \
+                or control_state is not None and observe_controls:
             raise ValueError("repository mirror")
         self.workspace = workspace
         self.store = async_store(store)
         self.binding_for = binding_for
         self.current_binding_for = current_binding_for or binding_for
         self.consumer = consumer
-        self.apply_control = apply_control
+        if control_state is None and not observe_controls \
+                and consumer is not None:
+            from .removal_state import RecipientRemovalState
 
-    async def _apply_control(self, batch, device, pile_values):
-        """Join exact control piles before acceptance/projection commits."""
-        if self.apply_control is None or batch is None:
-            return
+            control_state = RecipientRemovalState(workspace, self.store)
+        self.control_state = control_state
+        self.observe_controls = observe_controls
+
+    def _control_plan(self, batch, device, pile_values):
+        """Evaluate all accepted control sinks into one bounded local turn."""
+        if batch is None or not batch.control_piles:
+            return None
+        if self.control_state is None:
+            # Explicit read-only scanners and relays observe a source whose
+            # recipient already fenced these effects. They never expose their
+            # target store as an access gate. Every accepting FullPeer supplies
+            # recipient-owned state instead.
+            return None
         control = set(batch.control_piles)
-        for oid, raw in pile_values:
-            if oid not in control:
+        by_oid = {
+            oid: raw for oid, raw in pile_values if oid in control
+        }
+        raws = tuple(by_oid[oid] for oid in sorted(by_oid))
+        if set(by_oid) != control:
+            raise ValueError("recipient control pile set")
+        return self.control_state.plan_control(raws, device)
+
+    async def _finish_reserved_control(self, reservation, plan):
+        """Try one bounded mirror turn, leaving pending state on contention."""
+        gate = OpaqueHeadGate(self.store, lambda *_args: None)
+        for _attempt in range(MAX_MIRROR_CONTROL_ATTEMPTS):
+            applied = await _maybe_await(
+                self.control_state.apply_plan(plan))
+            status = getattr(applied, "status", None)
+            if status == "retryable":
                 continue
-            result = await _maybe_await(
-                self.apply_control(raw, device))
-            if getattr(result, "status", None) not in {"applied", "noop"}:
+            if status not in {"applied", "noop"} \
+                    or not valid_fid(getattr(applied, "root_oid", None)):
                 raise ValueError("recipient control application")
+            finalized = await gate.finish_control(
+                reservation, applied.root_oid)
+            if finalized.status == "retryable":
+                return False
+            if finalized.status not in {"applied", "noop"}:
+                raise ValueError(
+                    "concurrent local writer-slot finalization")
+            return True
+        return False
+
+    async def _pending_transition(self, key, opened):
+        """Rebuild one durable pending plan from already-copied local bytes."""
+        if self.consumer is None or self.control_state is None \
+                or not isinstance(opened, Versioned):
+            raise ValueError("recipient pending control state")
+        workspace, device = parse_head_slot_key(key)
+        pending = decode_slot_state_at(key, opened.value)
+        if not isinstance(pending, PendingHeadSlot):
+            raise ValueError("recipient pending control slot")
+
+        candidate_raw = await _object(self.store, pending.head)
+        decoded_candidate = decode_head(candidate_raw)
+        binding = WriterBinding(
+            workspace,
+            device,
+            decoded_candidate.owner,
+            writer_store_binding(workspace, device),
+        )
+        candidate = require_bound_head(decoded_candidate, binding)
+        if head_oid(candidate_raw) != pending.head:
+            raise ValueError("writer head slot integrity")
+
+        if pending.previous is None:
+            accepted = None
+            accepted_tree = accepted_control = EMPTY_TREE
+            base_head = None
+        else:
+            base_head = pending.previous.head
+            accepted_raw = await _object(self.store, base_head)
+            accepted = require_bound_head(
+                decode_head(accepted_raw), binding)
+            if head_oid(accepted_raw) != base_head:
+                raise ValueError("writer head slot integrity")
+            validate_advance(accepted, candidate, binding)
+            accepted_tree = accepted.tree
+            accepted_control = accepted.control
+
+        async def fetch(oid):
+            return await _object(self.store, oid)
+
+        additions = await validate_extension_awaited(
+            accepted_tree,
+            candidate.tree,
+            workspace,
+            device,
+            fetch,
+            fetch,
+        )
+        control_delta = candidate.control.count - accepted_control.count
+        if not 0 < control_delta <= MAX_HEAD_CONTROL_PILES:
+            raise ValueError("pending control-tree delta")
+        declared_controls = tuple(sorted({
+            oid for _leaf, oid in await validate_extension_awaited(
+                accepted_control,
+                candidate.control,
+                workspace,
+                device,
+                fetch,
+                fetch,
+            )
+        }))
+        pile_values = []
+        for _leaf, oid in additions:
+            pile_values.append((
+                oid, await _pile_object(self.store, oid)))
+        batch = self.consumer.prepare_batch(
+            ((raw, device) for _oid, raw in pile_values),
+            owner=candidate.owner,
+        )
+        if batch.control_piles != declared_controls:
+            raise ValueError("writer head control declaration")
+        plan = self._control_plan(batch, device, pile_values)
+        if plan is None or _mirror_reservation_oid(
+                workspace,
+                device,
+                base_head,
+                pending.head,
+                plan.updates,
+        ) != pending.permit:
+            raise ValueError("pending control reservation")
+        return (
+            ControlReservation(pending, opened.token),
+            plan,
+            batch,
+            len(additions),
+        )
+
+    async def _resume_pending(self, key, opened):
+        """Finish one local pending head without consulting its source."""
+        reservation, plan, batch, pile_count = \
+            await self._pending_transition(key, opened)
+        if not await self._finish_reserved_control(reservation, plan):
+            return False, 0, 0
+        facts = self.consumer.commit(
+            batch, device=reservation.slot.device,
+            head=reservation.slot.head)
+        return True, pile_count, len(facts)
+
+    async def _repair_local_slot(self, key, opened):
+        """Recover pending acceptance and lagging projection before new work."""
+        piles = fact_count = 0
+        accepted = False
+        if not isinstance(opened, Versioned):
+            return opened, piles, fact_count, accepted, True
+        state = decode_slot_state_at(key, opened.value)
+        if isinstance(state, PendingHeadSlot):
+            if self.consumer is None or self.control_state is None:
+                raise ValueError("recipient pending control state")
+            if state.previous is not None \
+                    and self.consumer.projected_head(state.device) \
+                    != state.previous.head:
+                got_piles, got_facts = await self._replay_slot(key, opened)
+                piles += got_piles
+                fact_count += got_facts
+            complete, got_piles, got_facts = await self._resume_pending(
+                key, opened)
+            piles += got_piles
+            fact_count += got_facts
+            if not complete:
+                return opened, piles, fact_count, accepted, False
+            accepted = True
+            opened = await self.store.read_versioned(key)
+            if not isinstance(opened, Versioned) \
+                    or not isinstance(
+                        decode_slot_state_at(key, opened.value), HeadSlot):
+                raise ValueError("pending control finalization")
+
+        visible = visible_slot_at(key, opened.value)
+        if self.consumer is not None and visible is not None \
+                and self.consumer.projected_head(visible.device) \
+                != visible.head:
+            got_piles, got_facts = await self._replay_slot(key, opened)
+            piles += got_piles
+            fact_count += got_facts
+        return opened, piles, fact_count, accepted, True
 
     async def _binding(
             self, workspace, device, removal_root, head, *, current=False):
@@ -920,7 +1340,9 @@ class RepositoryMirror:
             return opened, None
         if not isinstance(opened, Versioned):
             raise TypeError("writer slot read")
-        slot = decode_slot_at(key, opened.value)
+        slot = visible_slot_at(key, opened.value)
+        if slot is None:
+            return opened, None
         raw = await _object(self.store, slot.head)
         return opened, require_bound_head(decode_head(raw), binding)
 
@@ -930,17 +1352,47 @@ class RepositoryMirror:
             raise ValueError("writer slot workspace")
         opened = await source.read_versioned(key) \
             if opened is None else opened
+        local_opened = await self.store.read_versioned(key)
+        (local_opened, recovered_piles, recovered_facts,
+         recovered_head, complete) = await self._repair_local_slot(
+             key, local_opened)
+        if not complete:
+            raise ValueError("concurrent recipient control application")
+        if opened is ABSENT:
+            # LIST and the bundled slot read are not one transaction. A
+            # first-head reservation is intentionally invisible, and a key
+            # may also disappear from a lagging directory view. Retry it on
+            # the next scan instead of diagnosing repository corruption.
+            return recovered_piles, recovered_facts, recovered_head
         if not isinstance(opened, Versioned):
             raise ValueError("listed writer slot disappeared")
-        slot = decode_slot_at(key, opened.value)
-        local_opened = await self.store.read_versioned(key)
-        if isinstance(local_opened, Versioned) \
-                and local_opened.value == opened.value:
-            if self.consumer is None \
-                    or self.consumer.projected_head(device) == slot.head:
-                return 0, 0, False
-            piles, facts = await self._replay_slot(key, local_opened)
-            return piles, facts, False
+        slot = visible_slot_at(key, opened.value)
+        if slot is None:
+            return recovered_piles, recovered_facts, recovered_head
+        source_slot_raw = encode_slot(slot)
+        if isinstance(local_opened, Versioned):
+            # Directory slots carry recipient-owned removal roots and permit
+            # identities.  The portable synchronization top is the signed
+            # writer head, so equal head OIDs are an exact no-op even when
+            # those local audit fields differ.  This check must precede any
+            # object fetch so unchanged reverse sync remains a zero-request
+            # operation after the directory read phase.
+            local_visible = visible_slot_at(key, local_opened.value)
+            if local_visible is not None \
+                    and local_visible.head == slot.head:
+                if self.consumer is None \
+                        or self.consumer.projected_head(device) == slot.head:
+                    return (
+                        recovered_piles,
+                        recovered_facts,
+                        recovered_head,
+                    )
+                piles, facts = await self._replay_slot(key, local_opened)
+                return (
+                    recovered_piles + piles,
+                    recovered_facts + facts,
+                    recovered_head,
+                )
         source_cache = {}
 
         async def source_fetch(oid):
@@ -986,10 +1438,18 @@ class RepositoryMirror:
             # request to roll the local slot back; leave it unchanged so the
             # reverse pass can advertise the newer accepted head.
             if candidate.sequence < accepted.sequence:
-                return 0, 0, False
+                return (
+                    recovered_piles,
+                    recovered_facts,
+                    recovered_head,
+                )
             delta = validate_advance(accepted, candidate, binding)
             if delta == 0:
-                return 0, 0, False
+                return (
+                    recovered_piles,
+                    recovered_facts,
+                    recovered_head,
+                )
             accepted_tree = accepted.tree
         else:
             accepted_tree = EMPTY_TREE
@@ -1002,6 +1462,22 @@ class RepositoryMirror:
             source_fetch,
             local_fetch,
         )
+        accepted_control = EMPTY_TREE if accepted is None \
+            else accepted.control
+        control_delta = candidate.control.count - accepted_control.count
+        if not 0 <= control_delta <= MAX_HEAD_CONTROL_PILES:
+            raise PayloadTooLarge(
+                "too many control piles in one head advance")
+        declared_controls = tuple(sorted({
+            oid for _key, oid in await validate_extension_awaited(
+                accepted_control,
+                candidate.control,
+                workspace,
+                device,
+                source_fetch,
+                local_fetch,
+            )
+        }))
         pile_oids = tuple(pile_oid for _leaf, pile_oid in additions)
         # Do not publish a candidate pile into the local object store before
         # the complete candidate suffix passes semantic judgment.  A peer may
@@ -1017,6 +1493,14 @@ class RepositoryMirror:
                 ((raw, device) for _oid, raw in pile_values),
                 owner=candidate.owner,
             )
+        observed_controls = declared_controls \
+            if batch is None and self.observe_controls \
+            else () if batch is None else batch.control_piles
+        if observed_controls != declared_controls:
+            raise ValueError("writer head control declaration")
+        if declared_controls and self.control_state is None \
+                and not self.observe_controls:
+            raise ValueError("recipient control state is required")
         if bootstrapping:
             # No auxiliary pre-sync may make an incoming head
             # valid.  The consumer just proved the exact member/device binding
@@ -1026,18 +1510,50 @@ class RepositoryMirror:
         for pile_oid, raw in pile_values:
             await ensure_pile_async(self.store, pile_oid, raw)
 
-        await self._apply_control(batch, device, pile_values)
-
-        token = ABSENT if local_slot is ABSENT else local_slot.token
-        result = await self.store.cas(key, token, opened.value)
-        if result is STALE:
-            raise ValueError("concurrent local writer-slot update")
-        if not isinstance(result, Applied):
-            raise TypeError("writer slot CAS")
+        plan = self._control_plan(batch, device, pile_values)
+        changed = True
+        if plan is not None:
+            base_head = None if accepted is None else head_oid(accepted)
+            reservation_oid = _mirror_reservation_oid(
+                workspace, device, base_head, slot.head, plan.updates)
+            gate = OpaqueHeadGate(self.store, lambda *_args: None)
+            reservation = await gate.reserve_control(HeadGrant(
+                workspace,
+                device,
+                base_head,
+                slot.head,
+                slot.removal_root,
+            ), reservation_oid)
+            if isinstance(reservation, SlotResult):
+                if reservation.status != "noop":
+                    raise ValueError(
+                        "concurrent local writer-slot update")
+                changed = False
+            else:
+                if not await self._finish_reserved_control(
+                        reservation, plan):
+                    raise ValueError(
+                        "concurrent recipient control application")
+                changed = True
+        else:
+            if isinstance(local_slot, Versioned) and isinstance(
+                    decode_slot_state_at(key, local_slot.value),
+                    PendingHeadSlot):
+                raise ValueError("concurrent local control-head reservation")
+            token = ABSENT if local_slot is ABSENT else local_slot.token
+            result = await self.store.cas(key, token, source_slot_raw)
+            if result is STALE:
+                raise ValueError("concurrent local writer-slot update")
+            if not isinstance(result, Applied):
+                raise TypeError("writer slot CAS")
         fact_count = 0 if self.consumer is None else len(
             self.consumer.commit(
                 batch, device=device, head=slot.head))
-        return len(additions), fact_count, True
+        return (
+            recovered_piles + len(additions),
+            recovered_facts + fact_count,
+            recovered_head or changed,
+        )
 
     async def _replay_slot(self, key, opened=None):
         """Repair SQL from one slot whose acceptance is already durable.
@@ -1055,7 +1571,9 @@ class RepositoryMirror:
             if opened is None else opened
         if not isinstance(opened, Versioned):
             raise ValueError("accepted writer slot disappeared")
-        slot = decode_slot_at(key, opened.value)
+        slot = visible_slot_at(key, opened.value)
+        if slot is None:
+            return 0, 0
         candidate_raw = await _object(self.store, slot.head)
         decoded_candidate = decode_head(candidate_raw)
         # The slot was installed only after this exact immutable head passed
@@ -1102,13 +1620,14 @@ class RepositoryMirror:
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
         )
-        await self._apply_control(batch, device, pile_values)
+        # The accepted slot already certifies that recipient control effects
+        # preceded visibility. Projection rebuild replays SQL only.
         facts = self.consumer.commit(
             batch, device=device, head=slot.head)
         return len(additions), len(facts)
 
     async def replay_local(self, *, page_limit=256):
-        """Replay every projection checkpoint lagging its accepted slot."""
+        """Resume pending heads, then replay every lagging projection."""
         if self.consumer is None:
             return MirrorResult(0, 0, 0, 0, ())
         prefix = head_slot_prefix(self.workspace)
@@ -1124,14 +1643,18 @@ class RepositoryMirror:
                     opened = await self.store.read_versioned(key)
                     if not isinstance(opened, Versioned):
                         raise ValueError("accepted writer slot disappeared")
-                    slot = decode_slot_at(key, opened.value)
-                    if self.consumer.projected_head(device) == slot.head:
-                        continue
-                    got_piles, got_facts = await self._replay_slot(
-                        key, opened)
+                    prior = self.consumer.projected_head(device)
+                    (opened, got_piles, got_facts,
+                     accepted, complete) = await self._repair_local_slot(
+                         key, opened)
+                    if not complete:
+                        raise ValueError(
+                            "concurrent recipient control application")
                     piles += got_piles
                     fact_count += got_facts
-                    changed += 1
+                    changed += int(
+                        accepted
+                        or self.consumer.projected_head(device) != prior)
                 except ValueError as error:
                     errors.append((key, str(error)))
             if page.cursor is None:

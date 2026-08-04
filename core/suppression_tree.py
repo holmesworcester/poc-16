@@ -24,6 +24,7 @@ from .limits import (
     MAX_REMOVAL_PROOF_BYTES,
     MAX_REMOVAL_PROOF_STEPS,
     MAX_REMOVAL_ROOT_BYTES,
+    MAX_HEAD_REMOVAL_UPDATES,
     MAX_REMOVAL_UPDATES,
     MAX_SUPPRESSION_ID_BYTES,
     PayloadTooLarge,
@@ -316,6 +317,9 @@ def _different_bit(left, right):
 
 
 def _bounded_rows(rows, maximum=MAX_REMOVAL_UPDATES):
+    if type(maximum) is not int or not 0 <= maximum \
+            <= MAX_HEAD_REMOVAL_UPDATES:
+        raise ValueError("private suppression update bound")
     source = rows.items() if isinstance(rows, dict) else rows
     try:
         rows = tuple(islice(iter(source), maximum + 1))
@@ -375,11 +379,11 @@ def _reachable_pending(workspace, root, pending):
     return tuple(sorted(reachable.items()))
 
 
-def _build(workspace, rows):
+def _build(workspace, rows, maximum=MAX_REMOVAL_UPDATES):
     """Build the canonical history-independent private tree from rows."""
     if not valid_fid(workspace):
         raise ValueError("suppression workspace")
-    checked = _materialize(workspace, rows)
+    checked = _materialize(workspace, rows, maximum)
     pending, emit = _collector()
 
     def subtree(start, stop):
@@ -456,10 +460,12 @@ def _rewrite(workspace, key, value, root_oid, walked, emit):
     return current, added
 
 
-async def _update(workspace, root_bytes, changes, fetch):
+async def _update(
+        workspace, root_bytes, changes, fetch,
+        maximum=MAX_REMOVAL_UPDATES):
     """Path-copy one bounded deterministic batch against a pinned root."""
     root = decode_root(root_bytes, workspace)
-    checked = _materialize(workspace, changes, MAX_REMOVAL_UPDATES)
+    checked = _materialize(workspace, changes, maximum)
     pending, emit = _collector()
     current, count = root.root, root.count
 
@@ -525,28 +531,26 @@ async def _ensure_node(store, oid, raw):
             or h(raw) != oid:
         raise ValueError("private suppression node address")
     key = private_node_key(oid)
-    unknown = None
-    for _ in range(2):
-        try:
-            result = await store.put_if_absent(key, raw)
-        except OutcomeUnknown as error:
-            unknown = error
-            incumbent = await store.get_bounded(key, MAX_REMOVAL_NODE_BYTES)
-            if incumbent == raw:
-                return EXISTS
-            if incumbent is not None:
-                raise ValueError("private suppression node conflict") \
-                    from error
-            continue
-        if result is CREATED:
-            return CREATED
-        if result is not EXISTS:
-            raise TypeError("private node conditional-create result")
+    try:
+        result = await store.put_if_absent(key, raw)
+    except OutcomeUnknown as error:
         incumbent = await store.get_bounded(key, MAX_REMOVAL_NODE_BYTES)
-        if incumbent != raw:
-            raise ValueError("private suppression node conflict")
-        return EXISTS
-    raise unknown
+        if incumbent == raw:
+            return EXISTS
+        if incumbent is not None:
+            raise ValueError("private suppression node conflict") from error
+        # The exact outer permit is retained by its caller. Do not spend a
+        # second provider write inside an already bounded commit; replay the
+        # whole idempotent turn after this typed unknown outcome instead.
+        raise
+    if result is CREATED:
+        return CREATED
+    if result is not EXISTS:
+        raise TypeError("private node conditional-create result")
+    incumbent = await store.get_bounded(key, MAX_REMOVAL_NODE_BYTES)
+    if incumbent != raw:
+        raise ValueError("private suppression node conflict")
+    return EXISTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,13 +605,15 @@ class SuppressionTree:
             self.store,
         )
 
-    async def apply(self, changes):
+    async def apply(self, changes, *, maximum=MAX_REMOVAL_UPDATES):
         """Convenience turn that pins current state, then calls ``apply_at``."""
-        changes = _bounded_rows(changes)
+        changes = _bounded_rows(changes, maximum)
         pin = await self.pin()
-        return await self.apply_at(ABSENT if pin is None else pin, changes)
+        return await self.apply_at(
+            ABSENT if pin is None else pin, changes, maximum=maximum)
 
-    async def apply_at(self, pin, changes):
+    async def apply_at(
+            self, pin, changes, *, maximum=MAX_REMOVAL_UPDATES):
         """Join changes only if ``pin`` is still the exact current root.
 
         Authority validation can read through one :class:`SuppressionPin` and
@@ -615,7 +621,7 @@ class SuppressionTree:
         retryable; it can never be silently rebased onto authority the caller
         did not validate.
         """
-        changes = _bounded_rows(changes)
+        changes = _bounded_rows(changes, maximum)
         if pin is ABSENT:
             base_root, token = None, ABSENT
         elif isinstance(pin, SuppressionPin) \
@@ -638,11 +644,10 @@ class SuppressionTree:
             return await self.store.get_bounded(
                 private_node_key(oid), MAX_REMOVAL_NODE_BYTES)
 
-        built = _build(self.workspace, changes) if base_root is None \
+        built = _build(
+            self.workspace, changes, maximum) if base_root is None \
             else await _update(
-                self.workspace, base_root, changes, fetch)
-        for oid, raw in built.nodes:
-            await _ensure_node(self.store, oid, raw)
+                self.workspace, base_root, changes, fetch, maximum)
 
         if built.root == base_root:
             current = await self.store.read_versioned(REMOVAL_ROOT_KEY)
@@ -650,6 +655,8 @@ class SuppressionTree:
                     or current.token != token or current.value != base_root:
                 return ApplyResult("retryable", base_root)
             return ApplyResult("noop", built.root)
+        for oid, raw in built.nodes:
+            await _ensure_node(self.store, oid, raw)
         try:
             result = await self.store.cas(
                 REMOVAL_ROOT_KEY, token, built.root)

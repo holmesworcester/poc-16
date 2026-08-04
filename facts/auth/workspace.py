@@ -9,6 +9,7 @@ GENESIS = True
 POLICY = FamilyPolicy(
     control_fact=True,
     principal_offers=(SidOffer("member", "member"),),
+    clear_offers=(SidOffer("member", "device"),),
 )
 
 

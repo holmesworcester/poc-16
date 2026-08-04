@@ -69,8 +69,12 @@ from core.object_store import (
 )
 from deploy.python_role_modules import HOSTED_GATE_CORE_MODULES
 from core.suppression_tree import decode_root
-from core.writer_head import PendingHeadSlot, decode_slot_state
-from core.writer_repository import OpaqueHeadGate
+from core.writer_head import (
+    PendingHeadSlot,
+    decode_slot_state,
+    writer_store_binding,
+)
+from core.writer_repository import OpaqueHeadGate, WriterLog
 from facts.auth.removal import removal
 from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature
@@ -290,9 +294,29 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
         "POST", "/authority", value.root.fid, bootstrap,
         headers=headers), None))[0] == 404
 
-    proposed = h(b"lambda terminal self-removal head")
-    store.put_if_absent(
-        "obj/" + proposed, b"lambda terminal self-removal head")
+    evicted = removal(
+        value.root.fid, value.founder, value.founder, 8)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 8)
+    control = signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (value.root, evicted_sig, evicted),
+    )
+    writer = WriterLog(
+        value.root.fid,
+        value.founder,
+        value.founder,
+        writer_store_binding(value.root.fid, value.founder),
+        value.founder_secret,
+        store,
+    )
+    update = run(writer.prepare(((
+        value.root, evicted_sig, evicted),
+    )))
+    run(writer.establish(update))
+    proposed = update.head_oid
     proof = current_head_proof(
         value.founder_secret, value.founder,
         value.root, (value.root,), path, proposed)
@@ -321,16 +345,6 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
         "POST", "/removal/path", value.root.fid,
         proof_body(value.root.fid, forged)), None))[0] == 403
 
-    evicted = removal(
-        value.root.fid, value.founder, value.founder, 8)
-    evicted_sig = signature(
-        value.founder_secret, value.founder, evicted, 8)
-    control = signed(
-        value.founder_secret,
-        value.founder,
-        value.root,
-        (value.root, evicted_sig, evicted),
-    )
     ordinary = message(
         value.root.fid, value.founder,
         "general", "not removal control", 9)
@@ -417,9 +431,11 @@ def test_lambda_permit_commits_one_terminal_self_removal_head(
     assert store.get(
         f"heads/{value.root.fid}/{value.founder}") == accepted_slot
     assert store.page_reads == []
+    update_keys = {"obj/" + oid for oid, _raw in update.objects}
     assert all(
         key == REMOVAL_ROOT_KEY or key.startswith("removal-node/")
         or key == f"heads/{value.root.fid}/{value.founder}"
+        or key in update_keys
         for _operation, key in store.calls)
     assert not any("cursor" in key for key in store.list(""))
 

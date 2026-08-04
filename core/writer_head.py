@@ -19,9 +19,9 @@ from .writer_tree import (
     tree_from_document,
 )
 
-HEAD_FORMAT = "poc16-writer-head-v1"
-HEAD_SIGNATURE_DOMAIN = "poc16-writer-head-signature-v1"
-SLOT_FORMAT = "poc16-writer-head-slot-v1"
+HEAD_FORMAT = "poc16-writer-head-v2"
+HEAD_SIGNATURE_DOMAIN = "poc16-writer-head-signature-v2"
+SLOT_FORMAT = "poc16-writer-head-slot-v2"
 STORE_BINDING_DOMAIN = "poc16-writer-store-binding-v1"
 
 HEAD_SLOT_PREFIX = "heads"
@@ -72,6 +72,7 @@ class WriterHead:
     owner: str
     sequence: int
     tree: WriterTree
+    control: WriterTree
     store: str
     signature: str
 
@@ -81,6 +82,8 @@ class WriterHead:
                 or type(self.sequence) is not int \
                 or not 0 <= self.sequence <= MAX_WRITER_SEQUENCE \
                 or not isinstance(self.tree, WriterTree) \
+                or not isinstance(self.control, WriterTree) \
+                or self.control.count > self.tree.count \
                 or self.tree.count != self.sequence \
                 or not _lower_hex(self.signature, SIGNATURE_HEX_CHARS):
             raise ValueError("writer head")
@@ -94,21 +97,46 @@ class HeadSlot:
     device: str
     head: str
     removal_root: str
+    permit: str | None = None
 
     def __post_init__(self):
         if not all(valid_fid(value) for value in (
                 self.workspace, self.device,
-                self.head, self.removal_root)):
+                self.head, self.removal_root)) \
+                or self.permit is not None and not valid_fid(self.permit):
             raise ValueError("head slot")
 
 
-def _unsigned_document(workspace, device, owner, sequence, tree, store):
+@dataclass(frozen=True, slots=True)
+class PendingHeadSlot:
+    """Private reservation whose previous final value remains observable."""
+
+    workspace: str
+    device: str
+    previous: HeadSlot | None
+    head: str
+    permit: str
+
+    def __post_init__(self):
+        if not all(valid_fid(value) for value in (
+                self.workspace, self.device, self.head, self.permit)) \
+                or self.previous is not None and (
+                    not isinstance(self.previous, HeadSlot)
+                    or (self.previous.workspace, self.previous.device) != (
+                        self.workspace, self.device)
+                    or self.previous.head == self.head):
+            raise ValueError("pending head slot")
+
+
+def _unsigned_document(
+        workspace, device, owner, sequence, tree, control, store):
     return {
         "device": device,
         "format": HEAD_FORMAT,
         "owner": owner,
         "sequence": sequence,
         "store": store,
+        "control": tree_document(control),
         "tree": tree_document(tree),
         "workspace": workspace,
     }
@@ -123,26 +151,31 @@ def unsigned_head_document(head):
         head.owner,
         head.sequence,
         head.tree,
+        head.control,
         head.store,
     )
 
 
-def head_signing_message(workspace, device, owner, sequence, tree, store):
+def head_signing_message(
+        workspace, device, owner, sequence, tree, control, store):
     document = _unsigned_document(
-        workspace, device, owner, sequence, tree, store)
+        workspace, device, owner, sequence, tree, control, store)
     return h(canon([HEAD_SIGNATURE_DOMAIN, document]))
 
 
-def make_head(secret, workspace, device, owner, sequence, tree, store):
+def make_head(
+        secret, workspace, device, owner, sequence, tree, store,
+        control=EMPTY_TREE):
     """Construct and sign one exact immutable head."""
     message = head_signing_message(
-        workspace, device, owner, sequence, tree, store)
+        workspace, device, owner, sequence, tree, control, store)
     return WriterHead(
         workspace,
         device,
         owner,
         sequence,
         tree,
+        control,
         store,
         sign(secret, message),
     )
@@ -169,8 +202,8 @@ def decode_head(raw):
     try:
         value = decode_json(raw, MAX_WRITER_HEAD_BYTES, "writer head")
         if not isinstance(value, dict) or set(value) != {
-                "device", "format", "owner", "sequence", "signature",
-                "store", "tree", "workspace"} \
+                "control", "device", "format", "owner", "sequence",
+                "signature", "store", "tree", "workspace"} \
                 or value.get("format") != HEAD_FORMAT:
             raise ValueError
         head = WriterHead(
@@ -179,6 +212,7 @@ def decode_head(raw):
             value["owner"],
             value["sequence"],
             tree_from_document(value["tree"]),
+            tree_from_document(value["control"]),
             value["store"],
             value["signature"],
         )
@@ -208,6 +242,7 @@ def verify_head(head, public_key):
         head.owner,
         head.sequence,
         head.tree,
+        head.control,
         head.store,
     )
     return verify(public_key, message, head.signature)
@@ -280,15 +315,33 @@ MAX_HEAD_SLOT_KEY_BYTES = len(head_slot_key(
 
 
 def slot_document(slot):
-    if not isinstance(slot, HeadSlot):
-        raise TypeError("head slot")
-    return {
-        "device": slot.device,
-        "format": SLOT_FORMAT,
-        "head": slot.head,
-        "removal_root": slot.removal_root,
-        "workspace": slot.workspace,
-    }
+    if isinstance(slot, HeadSlot):
+        return {
+            "device": slot.device,
+            "format": SLOT_FORMAT,
+            "head": slot.head,
+            "permit": "" if slot.permit is None else slot.permit,
+            "removal_root": slot.removal_root,
+            "state": "final",
+            "workspace": slot.workspace,
+        }
+    if isinstance(slot, PendingHeadSlot):
+        previous = None if slot.previous is None else {
+            "head": slot.previous.head,
+            "permit": "" if slot.previous.permit is None \
+                else slot.previous.permit,
+            "removal_root": slot.previous.removal_root,
+        }
+        return {
+            "device": slot.device,
+            "format": SLOT_FORMAT,
+            "head": slot.head,
+            "permit": slot.permit,
+            "previous": previous,
+            "state": "pending",
+            "workspace": slot.workspace,
+        }
+    raise TypeError("head slot")
 
 
 def encode_slot(slot):
@@ -301,16 +354,36 @@ def encode_slot(slot):
     return raw
 
 
-def decode_slot(raw, *, workspace=None, device=None):
+def decode_slot_state(raw, *, workspace=None, device=None):
     try:
         value = decode_json(raw, MAX_HEAD_SLOT_BYTES, "head slot")
-        if not isinstance(value, dict) or set(value) != {
-                "device", "format", "head", "removal_root", "workspace"} \
-                or value.get("format") != SLOT_FORMAT:
+        if not isinstance(value, dict) or value.get("format") != SLOT_FORMAT:
             raise ValueError
-        slot = HeadSlot(
-            value["workspace"], value["device"],
-            value["head"], value["removal_root"])
+        if value.get("state") == "final" and set(value) == {
+                "device", "format", "head", "permit", "removal_root", "state",
+                "workspace"}:
+            slot = HeadSlot(
+                value["workspace"], value["device"],
+                value["head"], value["removal_root"],
+                value["permit"] or None)
+        elif value.get("state") == "pending" and set(value) == {
+                "device", "format", "head", "permit", "previous", "state",
+                "workspace"}:
+            previous = value["previous"]
+            if previous is not None and (
+                    not isinstance(previous, dict)
+                    or set(previous) != {
+                        "head", "permit", "removal_root"}):
+                raise ValueError
+            prior = None if previous is None else HeadSlot(
+                value["workspace"], value["device"],
+                previous["head"], previous["removal_root"],
+                previous["permit"] or None)
+            slot = PendingHeadSlot(
+                value["workspace"], value["device"], prior,
+                value["head"], value["permit"])
+        else:
+            raise ValueError
         if encode_slot(slot) != raw \
                 or workspace is not None and slot.workspace != workspace \
                 or device is not None and slot.device != device:
@@ -323,9 +396,33 @@ def decode_slot(raw, *, workspace=None, device=None):
         raise InvalidHeadSlot("head slot encoding") from error
 
 
+def decode_slot(raw, *, workspace=None, device=None):
+    """Decode one final slot; peer-proposed pending values are invalid."""
+    slot = decode_slot_state(raw, workspace=workspace, device=device)
+    if not isinstance(slot, HeadSlot):
+        raise InvalidHeadSlot("pending head slot is private")
+    return slot
+
+
+def visible_slot(raw, *, workspace=None, device=None):
+    """Project the last final slot without disclosing pending metadata."""
+    state = decode_slot_state(raw, workspace=workspace, device=device)
+    return state if isinstance(state, HeadSlot) else state.previous
+
+
 def decode_slot_at(key, raw):
     workspace, device = parse_head_slot_key(key)
     return decode_slot(raw, workspace=workspace, device=device)
+
+
+def decode_slot_state_at(key, raw):
+    workspace, device = parse_head_slot_key(key)
+    return decode_slot_state(raw, workspace=workspace, device=device)
+
+
+def visible_slot_at(key, raw):
+    workspace, device = parse_head_slot_key(key)
+    return visible_slot(raw, workspace=workspace, device=device)
 
 
 __all__ = (
@@ -333,6 +430,7 @@ __all__ = (
     "HEAD_SIGNATURE_DOMAIN",
     "HEAD_SLOT_PREFIX",
     "HeadSlot",
+    "PendingHeadSlot",
     "InvalidHeadSlot",
     "InvalidWriterAddress",
     "InvalidWriterHead",
@@ -346,6 +444,8 @@ __all__ = (
     "decode_head",
     "decode_slot",
     "decode_slot_at",
+    "decode_slot_state",
+    "decode_slot_state_at",
     "encode_head",
     "encode_slot",
     "head_document",
@@ -360,5 +460,7 @@ __all__ = (
     "unsigned_head_document",
     "validate_advance",
     "verify_head",
+    "visible_slot",
+    "visible_slot_at",
     "writer_store_binding",
 )

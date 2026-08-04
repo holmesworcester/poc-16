@@ -213,6 +213,7 @@ async def current_repository(source, workspace):
     consumer = FactConsumer(workspace)
     result = await RepositoryMirror(
         workspace, local, claimed_writer_binding, consumer,
+        observe_controls=True,
     ).sync_from(source)
     if result.errors:
         raise ValueError("notification current writer forest")

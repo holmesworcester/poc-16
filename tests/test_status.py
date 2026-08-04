@@ -3,7 +3,13 @@ import asyncio
 
 import facts
 
-from core.crypto import keypair
+from core.crypto import h, keypair
+from core.writer_head import (
+    HeadSlot,
+    decode_slot_at,
+    encode_slot,
+    head_slot_key,
+)
 from full_peer.node import FullPeer
 from full_peer.status import describe
 from tests.util import add_member
@@ -75,3 +81,27 @@ def test_status_replays_a_wiped_disposable_projection(tmp_path):
     assert all(
         writer["head"] == writer["projected_head"]
         for writer in replayed["writers"])
+
+
+def test_forest_fingerprint_ignores_recipient_local_slot_metadata(tmp_path):
+    node = FullPeer(str(tmp_path / "node"))
+    workspace = facts.auth.workspace.create(node, "alice", ts=1)
+    device = node.identity_id(workspace)
+    key = head_slot_key(workspace, device)
+    before = describe(node)["workspaces"][workspace]
+    slot = decode_slot_at(key, node.store(workspace).get(key))
+
+    changed = HeadSlot(
+        workspace,
+        device,
+        slot.head,
+        h(b"different recipient removal root"),
+        h(b"different recipient permit"),
+    )
+    node.store(workspace)._replace(key, encode_slot(changed))
+    after = describe(node)["workspaces"][workspace]
+
+    assert after["forest_fingerprint"] == before["forest_fingerprint"]
+    assert after["writers"][0]["head"] == before["writers"][0]["head"]
+    assert after["writers"][0]["removal_root"] != \
+        before["writers"][0]["removal_root"]

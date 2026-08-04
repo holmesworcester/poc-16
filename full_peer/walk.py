@@ -276,9 +276,9 @@ class Peer:
             raise ValueError("control-head permit issuance")
         return permit
 
-    def commit_head_permit(self, permit, proposed_head, control_piles):
+    def commit_head_permit(self, permit, proposed_head):
         """Hold and replay one permit until its removal-first CAS completes."""
-        body = encode_head_commit_request(permit, control_piles)
+        body = encode_head_commit_request(permit)
         try:
             status, _, _ = self._http(
                 "POST",
@@ -351,9 +351,17 @@ class Peer:
                 key, encoded, digest = entry
                 if not isinstance(key, str):
                     raise ValueError
-                if encoded is None and digest is None:
-                    entries.append((key, ABSENT))
-                    continue
+                if encoded is None:
+                    if digest is None:
+                        entries.append((key, ABSENT))
+                        continue
+                    if digest == "unreadable":
+                        entries.append((
+                            key,
+                            ValueError("listed writer slot unreadable"),
+                        ))
+                        continue
+                    raise ValueError
                 if not isinstance(encoded, str) \
                         or not isinstance(digest, str):
                     raise ValueError

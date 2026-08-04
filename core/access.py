@@ -2,7 +2,7 @@
 
 import facts
 
-from .close import ClosedPileEvaluator
+from .close import ClosedPileEvaluator, signed_pile_oid
 from .crypto import h
 from .head_permit import (
     ControlHeadPermit,
@@ -13,7 +13,8 @@ from .limits import MAX_MINT_REQUEST_BYTES
 from .removal_path import build as build_path, encode as encode_path
 from .removal_state import RecipientRemovalState
 from .shape import valid_fid
-from .writer_repository import HeadGrant
+from .writer_head import WriterBinding, writer_store_binding
+from .writer_repository import HeadGrant, control_extension
 
 
 class ControlHeadRetry(ValueError):
@@ -27,6 +28,7 @@ class AccessGate:
         if not valid_fid(workspace):
             raise ValueError("access workspace")
         self.workspace = workspace
+        self.store = store
         self.state = RecipientRemovalState(workspace, store)
         self.evaluator = ClosedPileEvaluator(
             workspace, max_bytes=MAX_MINT_REQUEST_BYTES)
@@ -71,7 +73,20 @@ class AccessGate:
             proof, proposed_head, trusted_now)
         if decision is None:
             return None
-        pin, device, _owner, base_head, _scopes = decision
+        pin, device, owner, base_head, _scopes = decision
+        _head, controls = await control_extension(
+            self.store,
+            WriterBinding(
+                self.workspace,
+                device,
+                owner,
+                writer_store_binding(self.workspace, device),
+            ),
+            base_head,
+            proposed_head,
+        )
+        if controls:
+            return None
         return HeadGrant(
             self.workspace,
             device,
@@ -117,20 +132,34 @@ class AccessGate:
         if decision is None:
             return None
         pin, device, owner, base_head, scopes = decision
+        try:
+            control_piles = tuple(control_piles)
+        except TypeError:
+            return None
+        _head, declared = await control_extension(
+            self.store,
+            WriterBinding(
+                self.workspace,
+                device,
+                owner,
+                writer_store_binding(self.workspace, device),
+            ),
+            base_head,
+            proposed_head,
+        )
+        supplied = tuple(signed_pile_oid(raw) for raw in control_piles)
+        if supplied != declared:
+            return None
         plan = self.state.plan_control(control_piles, device)
         terminal = tuple(sorted(
             set(scopes) & set(plan.active_sids)))
         return encode_permit(ControlHeadPermit(
             self.workspace,
             device,
-            owner,
             base_head,
             proposed_head,
             pin.root_oid,
-            h(proof),
-            plan.oids,
-            plan.effects_oid,
-            tuple(sorted(set(scopes))),
+            plan.updates,
             terminal,
         ), secret)
 
@@ -144,17 +173,27 @@ class AccessGate:
             states[sid] = pin.verify(sid, proof).get("state")
         return states
 
-    async def authorize_permitted_head(
-            self, permit_raw, proposed_head, control_piles, secret):
-        """Apply every exact effect before authorizing the bound head CAS."""
+    async def commit_head_permit(
+            self, head_gate, permit_raw, proposed_head, secret):
+        """Reserve, apply authenticated rows, then finalize one exact head."""
+        if not callable(getattr(head_gate, "reserve_control", None)) \
+                or not callable(getattr(head_gate, "finish_control", None)):
+            raise TypeError("control head gate")
         permit = decode_permit(permit_raw, secret)
         if permit.workspace != self.workspace or permit.head != proposed_head:
             return None
-        plan = self.state.plan_control(control_piles, permit.device)
-        if plan.oids != permit.control_oids \
-                or plan.effects_oid != permit.effects_oid:
-            return None
-        result = await self.state.apply_plan(plan)
+        grant = HeadGrant(
+            permit.workspace,
+            permit.device,
+            permit.base_head,
+            permit.head,
+            permit.removal_root,
+        )
+        reservation = await head_gate.reserve_control(grant, h(permit_raw))
+        if getattr(reservation, "status", None) is not None:
+            return reservation
+
+        result = await self.state.apply_updates(permit.updates)
         if result.status == "retryable":
             raise ControlHeadRetry("control head removal CAS")
         if result.status not in {"applied", "noop"}:
@@ -162,18 +201,12 @@ class AccessGate:
         pin = await self.state.pin()
         if pin is None:
             return None
-        if permit.terminal_scopes:
-            states = await self._states(pin, permit.terminal_scopes)
+        if permit.terminal_sids:
+            states = await self._states(pin, permit.terminal_sids)
             if any(states.get(sid) != "active"
-                   for sid in permit.terminal_scopes):
+                   for sid in permit.terminal_sids):
                 return None
-        return HeadGrant(
-            permit.workspace,
-            permit.device,
-            permit.base_head,
-            permit.head,
-            pin.root_oid,
-        )
+        return await head_gate.finish_control(reservation, pin.root_oid)
 
 
 __all__ = ("AccessGate", "ControlHeadRetry")

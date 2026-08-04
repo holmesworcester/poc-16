@@ -139,6 +139,9 @@ class AsyncStoreProxy:
     async def get_bounded(self, key, maximum):
         return self.backing.get_bounded(key, maximum)
 
+    async def has(self, key):
+        return self.backing.has(key)
+
     async def copy_pile_object(self, oid, maximum, write):
         return self.backing.copy_pile_object(oid, maximum, write)
 
@@ -559,7 +562,9 @@ def test_competing_syncs_for_one_local_slot_cannot_corrupt_it(tmp_path):
 
         repaired = await mirror.sync_from(forest.source)
         assert repaired.errors == ()
-        assert local.backing.get(key) == new_slot
+        assert decode_slot_at(
+            key, local.backing.get(key)).head == decode_slot_at(
+                key, new_slot).head
         assert consumer.projected_head(device) == update.head_oid
 
     run(scenario())

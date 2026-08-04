@@ -5,7 +5,7 @@ is the poc-13 device authority edge with poc-10 transport atoms omitted; all
 devices are equal peers and the fact carries no endpoint policy.
 """
 from core.fact import Fact, Need
-from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
+from .._policy import FamilyPolicy, SidOffer, author_selectors
 from .._commands import offer_source, publish
 from . import signature
 from ._display import display
@@ -13,7 +13,6 @@ from ._display import display
 TAG = "device"
 POLICY = FamilyPolicy(
     control_fact=True,
-    suppression=(Self(),),
     authority_liveness_guards=("member",),
     principal_offers=(SidOffer("device_key", "device"),),
 )
@@ -58,7 +57,7 @@ DURABLE = True
 def bind(node, workspace, label):
     secret, public = node.identity(workspace)
     if offer_source(
-            node, workspace, "device_key", public) is not None:
+            node, workspace, "device", public, public) is not None:
         raise ValueError("local identity is already in a device set")
     ts = node.now_ms()
     item = device(workspace, public, label, ts)

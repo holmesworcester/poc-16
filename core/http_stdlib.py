@@ -115,15 +115,15 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             access = self.peer.access_gate(workspace)
             head_gate = self.peer.head_gate(workspace)
 
-            async def commit_permit(permit, proposed, controls, secret):
-                grant = await access.authorize_permitted_head(
-                    permit, proposed, controls, secret)
-                return await head_gate.advance_grant(grant, proposed)
+            async def commit_permit(permit, proposed, secret):
+                return await access.commit_head_permit(
+                    head_gate, permit, proposed, secret)
 
             callbacks = {
                 "head_advance": head_gate.advance,
                 "head_permit_issue": access.issue_head_permit,
                 "head_permit_commit": commit_permit,
+                "permit_secret": self.peer.permit_secret,
                 "mint_authorize": access.authorize_access,
                 "path_authorize": access.removal_path,
                 "removal_bootstrap": access.state.bootstrap,

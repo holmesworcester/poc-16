@@ -32,14 +32,14 @@ def test_required_writer_scales_ratchet_bundled_head_costs():
     measured = asyncio.run(scenario())
     expected = {
         100: (
-            (100, 0, 0, 1, 1, 0, 67_825),
-            (100, 2, 1, 4, 4, 0, 72_827),
-            (101, 4, 1, 4, 4, 0, 73_401),
+            (100, 0, 0, 1, 1, 0, 71_425),
+            (100, 2, 1, 4, 4, 0, 76_437),
+            (101, 4, 1, 4, 4, 0, 77_047),
         ),
         1_000: (
-            (1_000, 0, 0, 4, 4, 0, 678_499),
-            (1_000, 2, 1, 7, 7, 0, 683_506),
-            (1_001, 4, 1, 7, 7, 0, 684_080),
+            (1_000, 0, 0, 4, 4, 0, 714_499),
+            (1_000, 2, 1, 7, 7, 0, 719_516),
+            (1_001, 4, 1, 7, 7, 0, 720_126),
         ),
     }
     for writers, results in measured.items():
@@ -132,7 +132,7 @@ def test_small_directory_change_and_new_writer_accounting():
         changed.response_bytes,
         new_writer.request_bytes,
         new_writer.response_bytes,
-    ) == (0, 2_895, 0, 7_892, 0, 8_623)
+    ) == (0, 3_039, 0, 8_046, 0, 8_813)
 
 
 def test_exact_durable_fact_catchup_accounting():
@@ -148,7 +148,7 @@ def test_exact_durable_fact_catchup_accounting():
     assert (
         result.request_bytes,
         result.response_bytes,
-    ) == (0, 178_940)
+    ) == (0, 178_004)
     assert result.messages_per_pile == 1
     assert result.scenario == "large-catchup-normal"
     assert result.request_breakdown == (

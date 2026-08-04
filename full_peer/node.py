@@ -9,7 +9,6 @@ import facts
 from core import fact_index
 from core.access import AccessGate
 from core.close import encode_signed_pile
-from core.crypto import kdf
 from core.fact import Fact
 from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
@@ -60,6 +59,8 @@ class FullPeer:
         self._kr_path = os.path.join(dir, "keyring.json")
         self.keychain = Keychain(self._kr_path, initial_secret)
         self.sk, self.pk = self.keychain.default()
+        self.permit_secret = bytes.fromhex(
+            self.keychain.data["permit_secret"])
         self._stores, self._sql, self._senders = {}, {}, {}
         self._consumers, self._mirrors, self._writers = {}, {}, {}
         self._access_gates = {}
@@ -127,7 +128,7 @@ class FullPeer:
                     self.writer_binding,
                     self.consumer(workspace),
                     current_binding_for=self.current_writer_binding,
-                    apply_control=access.state.apply_control,
+                    control_state=access.state,
                 )
             return self._mirrors[workspace]
 
@@ -391,6 +392,10 @@ class FullPeer:
     def _projected_writer_binding(self, workspace, device, owner=None):
         """Read one live local authoring identity from disposable SQL."""
         projection = self.sql(workspace)
+        # Direct membership proves ownership, not continuing liveness of this
+        # concrete device. The database-free gate checks the same typed cell.
+        if not projection.principal_active("device", device):
+            return None
         owners = set()
         if any(
                 not projection.suppresses(fact)
@@ -511,7 +516,7 @@ class FullPeer:
             binding = self._projected_writer_binding(
                 workspace, device)
             if owner is not None:
-                if binding is not None and binding.owner != owner:
+                if binding is None or binding.owner != owner:
                     raise ValueError("publishing identity owner mismatch")
             elif binding is not None:
                 owner = binding.owner
@@ -567,21 +572,21 @@ class FullPeer:
             )
             head_gate = self.head_gate(workspace)
             if control_piles:
-                permit_secret = kdf(
-                    secret.encode(), "control-head-permit")
                 permit = _run_core(access.issue_head_permit(
                     proof,
                     update.head_oid,
                     control_piles,
                     now_ms(),
-                    permit_secret,
+                    self.permit_secret,
                 ))
                 if not isinstance(permit, bytes):
                     raise ValueError("control-head permit rejected")
-                grant = _run_core(access.authorize_permitted_head(
-                    permit, update.head_oid, control_piles, permit_secret))
-                outcome = _run_core(head_gate.advance_grant(
-                    grant, update.head_oid))
+                outcome = _run_core(access.commit_head_permit(
+                    head_gate,
+                    permit,
+                    update.head_oid,
+                    self.permit_secret,
+                ))
             else:
                 outcome = _run_core(head_gate.advance(
                     proof, update.head_oid, now_ms()))

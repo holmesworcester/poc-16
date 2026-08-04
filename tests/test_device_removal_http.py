@@ -18,8 +18,12 @@ from core.http import (
 )
 from core.removal_path import decode as decode_path
 from core.store import FsStore
-from core.writer_head import decode_slot_at, head_slot_key
-from core.writer_repository import OpaqueHeadGate
+from core.writer_head import (
+    decode_slot_at,
+    head_slot_key,
+    writer_store_binding,
+)
+from core.writer_repository import OpaqueHeadGate, WriterLog
 from facts._policy import OWNER
 from facts.auth.device import device
 from facts.auth.device_invite import device_invite
@@ -29,6 +33,7 @@ from facts.auth.removal_path_request import removal_path_request
 from facts.auth.request import request
 from facts.auth.signature import signature
 from facts.auth.workspace import workspace
+from facts.content.message import message
 
 
 PERMIT_SECRET = b"device-removal-http-permit-secret" * 2
@@ -171,7 +176,21 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         founder_secret, founder, founder, root, (root,), 5)
     founder_path = path_response(
         http, root, founder_historical).body
-    authority_head = put_head(store, "founder device grants")
+    founder_writer = WriterLog(
+        root.fid,
+        founder,
+        founder,
+        writer_store_binding(root.fid, founder),
+        founder_secret,
+        store,
+    )
+    authority_update = run(founder_writer.prepare((
+        primary_identity,
+        target_identity,
+        sibling_identity,
+    )))
+    run(founder_writer.establish(authority_update))
+    authority_head = authority_update.head_oid
     authority_proof = exact_head_proof(
         founder_secret,
         founder,
@@ -221,7 +240,23 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         target_identity, stale_path, 8)
     assert mint_response(http, root, stale_current).status == 200
 
-    first_head = put_head(store, "target ordinary head")
+    target_writer = WriterLog(
+        root.fid,
+        target,
+        founder,
+        writer_store_binding(root.fid, target),
+        target_secret,
+        store,
+    )
+    ordinary = message(
+        root.fid, target, "general", "ordinary", 9, owner=founder)
+    ordinary_signature = signature(
+        target_secret, target, ordinary, 9)
+    first_update = run(target_writer.prepare((
+        (*target_identity, ordinary_signature, ordinary),
+    )))
+    run(target_writer.establish(first_update))
+    first_head = first_update.head_oid
     first_head_proof = exact_head_proof(
         target_secret, target, founder, root, target_identity,
         stale_path, first_head, 9)
@@ -242,7 +277,11 @@ def test_secondary_self_removal_refreshes_and_denies_only_that_device(
         root,
         (*target_identity, action_signature, action),
     )
-    terminal_head = put_head(store, "target terminal removal head")
+    terminal_update = run(target_writer.prepare((
+        (*target_identity, action_signature, action),
+    )))
+    run(target_writer.establish(terminal_update))
+    terminal_head = terminal_update.head_oid
     terminal_proof = exact_head_proof(
         target_secret,
         target,

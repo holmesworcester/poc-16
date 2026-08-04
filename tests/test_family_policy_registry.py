@@ -159,6 +159,21 @@ def compile_policy(policy):
             ),
             "duplicate principal",
         ),
+        ("clear_offers", [], "must be a tuple"),
+        ("clear_offers", ("member",), "declaration"),
+        (
+            "clear_offers",
+            (_policy.SidOffer("", "device"),),
+            "declaration",
+        ),
+        (
+            "clear_offers",
+            (
+                _policy.SidOffer("member", "device"),
+                _policy.SidOffer("member", "other"),
+            ),
+            "duplicate clear",
+        ),
         ("action_offers", [], "must be a tuple"),
         ("action_offers", ("removed",), "declaration"),
         (
@@ -205,8 +220,17 @@ def test_registry_rejects_offer_role_ambiguity():
         action_offers=(_policy.SidOffer("member", "member"),),
     )
 
-    with pytest.raises(ValueError, match="principal/action"):
+    with pytest.raises(ValueError, match="clear/action"):
         compile_policy(policy)
+
+
+def test_clear_offer_may_share_a_source_without_guarding_the_fact():
+    policy = _policy.FamilyPolicy(
+        principal_offers=(_policy.SidOffer("member", "member"),),
+        clear_offers=(_policy.SidOffer("member", "device"),),
+    )
+
+    assert compile_policy(policy)["synthetic"].POLICY is policy
 
 
 def test_registry_rejects_wrong_policy_type():

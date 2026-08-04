@@ -8,15 +8,15 @@ from core.fact import Fact, Need, workspace_of
 from core.http_body import read_bounded
 from core.limits import MAX_INVITE_BYTES
 from core.suppression import scoped_id
-from .._policy import FamilyPolicy, Self, SidOffer, author_selectors
+from .._policy import FamilyPolicy, SidOffer, author_selectors
 from . import signature, user_invite
 from ._display import display
 
 TAG = "user"
 POLICY = FamilyPolicy(
     control_fact=True,
-    suppression=(Self(),),
     principal_offers=(SidOffer("member", "member"),),
+    clear_offers=(SidOffer("member", "device"),),
 )
 
 

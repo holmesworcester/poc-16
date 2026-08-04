@@ -6,10 +6,9 @@ database-free authority, object, head, and HTTP core. A hosted owner target
 needs an object store but no database. SQLite exists only as a disposable
 full-client query and authorship accelerator.
 
-The writer forest is the running publication protocol. Section 7's two-phase
-self-confined removal-path gate is the accepted target while
-`poc-16-6j4.16` remains open; no predecessor authority repository or
-compatibility route is retained behind the cut.
+The writer forest and section 7's two-phase, self-confined removal-path gate
+are the running publication and access protocol. No predecessor authority
+repository or compatibility route is retained behind the cut.
 
 The implementation is deliberately strict about authority and direction:
 
@@ -27,6 +26,15 @@ The implementation is deliberately strict about authority and direction:
 - A control head is evaluated once at `/permit`. Its stable-secret HMAC permit
   carries the bounded aggregate removal plan; `/commit` reserves an invisible
   pending writer slot, applies that plan, and exposes the final slot afterward.
+- Every writer head signs both its complete pile tree and an append-only
+  control-only pile subsequence. The ordinary route requires an empty control
+  delta; `/permit` accepts exactly the declared delta; a consuming peer
+  independently recomputes and checks that control declaration from validated
+  piles. A consuming mirror reserves the local head before control effects,
+  retries removal-root contention only a named bounded number of times, and
+  can resume that pending head from already-copied local objects before it
+  reads a newer source head. It needs no cursor, retry journal, or retained old
+  source head.
 - Removal roots and proof nodes are private authenticated point-read state,
   never generic `obj/` or pack objects. A slot may record a root hash for audit,
   but only the self-confined path endpoint can read the private tree, and its
@@ -698,12 +706,20 @@ that binds the observed base and proposed head. A retry rereads the one slot;
 an exact repeat is a no-op, and a same-writer race requires rebase. Different
 writers never share a mutable content key.
 
+Control publication is deliberately smaller than content transfer: the named
+`MAX_HEAD_*` constants bound piles, facts, distinct removal rows, permit bytes,
+and provider calls before mutation. The current prototype rejects an offline
+cumulative control delta above one turn; `poc-16-6j4.26` tracks resumable signed
+control checkpoints rather than weakening the Worker bound.
+
 In the accepted section 7 flow, the hosted gate validates membership,
 member-signed device ownership, non-removal, expiry, and the exact proposed
-head against its pinned removal root. It checks that the proposed head object
-exists, but deliberately does not parse or validate the writer's content tree.
-A consuming peer does that later through `RepositoryMirror` and
-`FactConsumer`.
+head against its pinned removal root. It verifies the small signed head pair
+and secondary control-tree extension so ordinary publication cannot bypass the
+permit route, but deliberately does not parse or validate the main content
+tree. The opaque hosted gate trusts the writer's signed classification; a
+consuming peer later recomputes it from validated piles through
+`RepositoryMirror` and `FactConsumer` and rejects any mismatch.
 
 There is no ingress namespace, upload session, journal, broker, finalize call,
 bucket event, content queue, or hosted pile compiler. File descriptors and Bao
