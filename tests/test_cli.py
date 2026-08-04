@@ -20,6 +20,7 @@ EXPECTED = {
     "auth.push_endpoint.register",
     "auth.push_endpoint.remove",
     "auth.push_endpoint.replace",
+    "auth.device_removal.remove",
     "auth.removal.evict",
     "auth.user.join",
     "auth.user.list",
