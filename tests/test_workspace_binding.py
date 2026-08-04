@@ -14,15 +14,12 @@ from .util import signed_pile_facts, signed_pile_bytes
 from core.crypto import h, keypair
 from core.fact import Fact, canon
 from core.grants import make_token
-from core.ingress import InvalidPile
+from core.close import ClosedPileEvaluator, InvalidPile
 from core.limits import MAX_INVITE_BYTES, PayloadTooLarge
 from full_peer.node import FullPeer
-from core.repository_applier import RepositoryApplier
-from core.store import FsStore
 from full_peer import sql_store
 from facts.auth import user as user_family
 from facts.auth import user_invite as user_invite_family
-from .util import apply_planted, plant_for
 from facts.auth.signature import signature
 from facts.auth.user_invite import user_invite
 from facts.content.message import message
@@ -64,7 +61,7 @@ def test_same_author_and_form_have_distinct_workspace_bound_ids(tmp_path):
         assert "ws" not in genesis.env
 
 
-def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
+def test_foreign_and_mixed_piles_stop_before_family_dispatch(
         tmp_path, monkeypatch):
     node, first, second = two_workspaces(tmp_path)
     public = node.identity_id(first)
@@ -94,18 +91,9 @@ def test_foreign_and_mixed_piles_stop_before_family_dispatch_or_root_cas(
         return real_family_for(tag)
 
     monkeypatch.setattr(facts, "family_for", observed_family)
-    store = FsStore(str(tmp_path / "receiver"))
-    applier = RepositoryApplier(second, store)
-    source = run(plant_for(
-        applier, node.member_for(second), hostile))
-
-    result = run(apply_planted(applier, source))
-
+    with pytest.raises(InvalidPile, match="signed pile"):
+        ClosedPileEvaluator(second).evaluate(hostile)
     assert family_calls == []
-    assert result.status == "rejected"
-    assert result.admitted == ()
-    assert store.get("root") is None
-    assert store.get(source) == hostile
 
 
 def test_foreign_signed_pile_has_one_typed_rejection_door(tmp_path):
@@ -199,6 +187,93 @@ def test_invite_bootstrap_is_workspace_complete_before_keyring_mutation(
 
     assert node.workspaces() == []
     assert json.dumps(node.keyring, sort_keys=True) == before
+
+
+def test_invite_redemption_selects_current_form_but_retains_source_fid(
+        tmp_path, monkeypatch):
+    """Invite command semantics hydrate after the source pile is judged."""
+    from types import SimpleNamespace
+
+    from core.fact import CurrentFact, current_fact, source_fact
+    from facts._policy import FamilyPolicy
+
+    node = FullPeer(str(tmp_path / "joiner"))
+    workspace, inviter = "0" * 64, "1" * 64
+    invite_secret, invite_public = keypair()
+    source = Fact(
+        "test_user_invite.v0", 1, [],
+        {"inviter": inviter, "invitee": invite_public}, workspace)
+    current = user_invite(
+        workspace, inviter, invite_public, source.ts)
+
+    def reextract(candidate):
+        if candidate != source:
+            raise ValueError("synthetic invite source")
+        return current
+
+    family = SimpleNamespace(
+        TAG=user_invite_family.TAG,
+        POLICY=FamilyPolicy(),
+        DURABLE=True,
+        needs=lambda _fact: (),
+        validate=lambda fact, _context: current_fact(fact) == current,
+        reextract=reextract,
+    )
+    real_family_for = facts.family_for
+    monkeypatch.setattr(
+        facts,
+        "family_for",
+        lambda tag: family if tag in {source.t, current.t}
+        else real_family_for(tag),
+    )
+
+    pile = signed_pile_bytes((source,), workspace=workspace)
+    blob = canon({
+        "pile": base64.b64encode(pile).decode(),
+        "isk": invite_secret.encode().hex(),
+        "ws": workspace,
+    })
+    link = base64.urlsafe_b64encode(canon({
+        "p": "https://invite.invalid",
+        "ws": workspace,
+        "s": "01" * 32,
+    })).decode()
+
+    class Response:
+        headers = {}
+
+        @staticmethod
+        def read(maximum):
+            assert maximum == MAX_INVITE_BYTES + 1
+            return b"encrypted"
+
+        @staticmethod
+        def close():
+            pass
+
+    class SelectedInvite(RuntimeError):
+        pass
+
+    observed = []
+
+    def select(invitation, *_args):
+        observed.append(invitation)
+        raise SelectedInvite
+
+    monkeypatch.setattr(user_family, "_open_invite", lambda _url: Response())
+    monkeypatch.setattr(
+        user_family, "box_decrypt", lambda *_args, **_kwargs: blob)
+    monkeypatch.setattr(user_family, "user", select)
+
+    with pytest.raises(SelectedInvite):
+        user_family.accept(node, link, "new member")
+
+    assert len(observed) == 1
+    assert isinstance(observed[0], CurrentFact)
+    assert source_fact(observed[0]) == source
+    assert current_fact(observed[0]) == current
+    assert observed[0].fid == source.fid != current.fid
+    assert node.workspaces() == []
 
 
 @pytest.mark.parametrize("declared", [True, False])

@@ -22,6 +22,7 @@ from core.writer_head import (
     head_oid,
     head_slot_key,
     make_head,
+    writer_store_binding,
 )
 from core.writer_repository import (
     FactConsumer,
@@ -76,6 +77,58 @@ def binding_for(workspace, public, store_binding):
         return WriterBinding(
             workspace, public, public, store_binding)
     return resolve
+
+
+def test_writer_binding_proof_reads_current_form_offers(monkeypatch):
+    """A retained source tag cannot hide its current writer authority."""
+    from types import SimpleNamespace
+
+    import facts
+    from core.close import ClosedPileEvaluator
+    from core.fact import CurrentFact, Fact, current_fact
+    from core import writer_repository
+    from facts._policy import FamilyPolicy
+
+    workspace = "0" * 64
+    secret, writer = keypair()
+    source = Fact(
+        "test_writer_member.v0", 1, [],
+        {"legacy_writer": writer}, workspace)
+    current = Fact(
+        "test_writer_member", 1,
+        [["offer", "member", writer, writer]],
+        {"writer": writer}, workspace)
+
+    def reextract(candidate):
+        if candidate != source:
+            raise ValueError("synthetic writer source")
+        return current
+
+    family = SimpleNamespace(
+        TAG=current.t,
+        POLICY=FamilyPolicy(),
+        DURABLE=True,
+        needs=lambda _fact: (),
+        validate=lambda fact, _context: current_fact(fact) == current,
+        reextract=reextract,
+    )
+    real_family_for = facts.family_for
+    monkeypatch.setattr(
+        facts,
+        "family_for",
+        lambda tag: family if tag in {source.t, current.t}
+        else real_family_for(tag),
+    )
+    raw = encode_signed_pile(make_signed_pile(
+        secret, workspace, writer, (source,)))
+
+    evaluated = ClosedPileEvaluator(workspace).evaluate(raw, writer=writer)
+
+    assert evaluated.judgment.valids[0].fact == source
+    assert source.offers() == []
+    assert isinstance(facts.hydrate(source), CurrentFact)
+    assert writer_repository._require_writer_proof(
+        evaluated, writer, writer) is None
 
 
 def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
@@ -404,7 +457,7 @@ def test_projection_crash_after_slot_cas_replays_from_durable_head(tmp_path):
         secret, public, root, device_signature, device = world()
         source = FsStore(str(tmp_path / "source"))
         receiver = FsStore(str(tmp_path / "receiver"))
-        binding = h(b"store")
+        binding = writer_store_binding(root.fid, public)
         log = WriterLog(
             root.fid, public, public, binding, secret, source)
         probe = message_fact(

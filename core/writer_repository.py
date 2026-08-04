@@ -275,9 +275,11 @@ async def _writer_piles(source, workspace, device, rows):
 
 def _require_writer_proof(evaluated, writer, owner):
     """Require one pile to carry the exact member/device writer binding."""
+    valids, _current_stream = facts.semantic_evaluation(
+        evaluated.judgment, evaluated.pile.facts)
     offers = {
         offer
-        for valid in evaluated.judgment.valids
+        for valid in valids
         for offer in valid.fact.offers()
     }
     if ("member", writer, owner) not in offers or (
@@ -843,7 +845,12 @@ class RepositoryMirror:
         return len(additions), fact_count, True
 
     async def _replay_slot(self, key, opened=None):
-        """Repair a projection checkpoint from one durable accepted slot."""
+        """Repair SQL from one slot whose acceptance is already durable.
+
+        The local slot is the admission certificate.  Rebuild must not need
+        a historical authority root (or current membership) to replay content
+        that this repository already accepted.
+        """
         if self.consumer is None:
             return 0, 0
         workspace, device = parse_head_slot_key(key)
@@ -856,10 +863,17 @@ class RepositoryMirror:
         slot = decode_slot_at(key, opened.value)
         candidate_raw = await _object(self.store, slot.head)
         decoded_candidate = decode_head(candidate_raw)
-        binding = await self._binding(
-            workspace, device, slot.authority_root, decoded_candidate)
-        if not isinstance(binding, WriterBinding):
-            raise ValueError("unknown writer binding")
+        # The slot was installed only after this exact immutable head passed
+        # the normal authority and extension checks.  Its signed binding is
+        # therefore part of the durable accepted value; reconstruction uses
+        # the protocol-derived store address and must not consult mutable
+        # present-day authority.
+        binding = WriterBinding(
+            workspace,
+            device,
+            decoded_candidate.owner,
+            writer_store_binding(workspace, device),
+        )
         candidate = require_bound_head(decoded_candidate, binding)
         if head_oid(candidate_raw) != slot.head:
             raise ValueError("writer head slot integrity")

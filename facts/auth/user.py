@@ -74,6 +74,7 @@ def _open_invite(url):
 
 def accept(node, link, name):
     """Redeem a self-contained invite and commit the authored join locally."""
+    from facts import semantic_evaluation
     from core.kernel import drain
 
     link_data = json.loads(base64.urlsafe_b64decode(link))
@@ -101,11 +102,15 @@ def accept(node, link, name):
         bootstrap = decode_signed_pile(
             base64.b64decode(blob["pile"], validate=True), workspace).facts
         judgment = drain(bootstrap, workspace)
+        if not judgment.ok:
+            raise ValueError("invite bootstrap")
+        valids, _current_bootstrap = semantic_evaluation(
+            judgment, bootstrap)
         invitations = [
-            valid.fact for valid in judgment.valids
+            valid.fact for valid in valids
             if valid.fact.t == user_invite.TAG
         ]
-        if not judgment.ok or len(invitations) != 1:
+        if len(invitations) != 1:
             raise ValueError("invite bootstrap")
         invitation = invitations[0]
         ts = node.now_ms()

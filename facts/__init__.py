@@ -11,6 +11,11 @@ from ._policy import validate_fact_policy, validate_family_policy
 
 MODULES = auth.MODULES + content.MODULES
 
+# Bump for any change in family extraction, policy, or query interpretation
+# that must rebuild the disposable full-peer projection.  Canonical fact
+# bytes and writer trees are never migrated; current code replays them.
+APP_VERSION = 2
+
 
 def _principal_namespaces(modules):
     """Map each globally resolved principal offer to one namespace."""
@@ -36,6 +41,18 @@ def compile_families(modules):
         raise ValueError("every fact family must own its policy")
     for module in modules:
         validate_family_policy(module.POLICY)
+    shapes = {}
+    for module in modules:
+        declared = getattr(module, "SHAPES", (module.TAG,))
+        if not isinstance(declared, tuple) or not declared \
+                or module.TAG not in declared \
+                or len(set(declared)) != len(declared) \
+                or not all(isinstance(tag, str) and tag for tag in declared):
+            raise ValueError("bad fact family shapes")
+        for tag in declared:
+            if tag in shapes:
+                raise ValueError("duplicate fact shape tag")
+            shapes[tag] = module
     _principal_namespaces(modules)
     if sum(bool(getattr(module, "GENESIS", False)) for module in modules) != 1:
         raise ValueError("exactly one genesis family required")
@@ -43,6 +60,11 @@ def compile_families(modules):
 
 
 FAMILIES = compile_families(MODULES)
+SHAPE_FAMILIES = {
+    tag: module
+    for module in MODULES
+    for tag in getattr(module, "SHAPES", (module.TAG,))
+}
 MAX_AUTHORITY_SCOPES = 64
 
 
@@ -131,19 +153,110 @@ def invoke_command(node, path, argv):
 
 def family_for(tag):
     """The one checked dispatch table: behavior and policy travel together."""
-    return FAMILIES.get(tag)
+    return FAMILIES.get(tag) or SHAPE_FAMILIES.get(tag)
+
+
+def hydrate(source):
+    """Purely re-extract one retained source into current family vocabulary."""
+    from core.fact import CurrentFact, Fact
+
+    if not isinstance(source, Fact):
+        raise TypeError("source fact")
+    family = family_for(source.t)
+    if family is None or source.t == family.TAG:
+        return source
+    reextract = getattr(family, "reextract", None)
+    if not callable(reextract):
+        raise ValueError("legacy fact shape has no re-extractor")
+    current = reextract(source)
+    if not isinstance(current, Fact) or current.t != family.TAG \
+            or current.ts != source.ts or current.ws != source.ws:
+        raise ValueError("fact re-extraction")
+    return CurrentFact(source, current)
+
+
+def authority_projection(stream):
+    """Select the fact-declared durable authority subset of one closure.
+
+    Families may narrow replay residence when a generic evidence fact is
+    useful only for a particular target.  The signature family uses this to
+    retain signatures of authority facts without growing the authority tree
+    with signatures of every message or file slice.
+    """
+    sources = tuple(stream)
+    current = tuple(hydrate(fact) for fact in sources)
+    by_fid = {fact.fid: fact for fact in current}
+    if len(by_fid) != len(current):
+        raise ValueError("authority projection duplicate")
+    selected = []
+    for source, fact in zip(sources, current):
+        family = family_for(fact.t)
+        if family is None or not family.DURABLE \
+                or not family.POLICY.authority_resident:
+            continue
+        refine = getattr(family, "project_authority", None)
+        if refine is None or refine(fact, by_fid.get):
+            selected.append(source)
+    return tuple(selected)
+
+
+def authority_context(fact):
+    """Name facts that must accompany one refined authority resident.
+
+    A family with ``project_authority`` must make its selection context
+    explicit so a stateful peer can reconstruct bounded portable authority
+    units without guessing family semantics.  The returned facts are context,
+    not historical validation evidence; the ordinary closure walk still
+    supplies every semantic dependency.
+    """
+    family = family_for(fact.t)
+    context = getattr(family, "authority_context", None)
+    if not callable(context):
+        return ()
+    values = tuple(context(fact))
+    from core.shape import valid_fid
+
+    if len(set(values)) != len(values) \
+            or not all(valid_fid(fid) for fid in values):
+        raise ValueError("authority context")
+    return values
+
+
+def semantic_evaluation(judgment, stream):
+    """Return current-form receipts and stream for post-kernel policy.
+
+    Kernel receipts deliberately retain exact source facts for durable
+    storage.  Family authorization is semantic work and must never fall back
+    to an old source vocabulary after the kernel already hydrated it.
+    """
+    if getattr(judgment, "ok", None) is not True:
+        raise ValueError("semantic evaluation judgment")
+    current_stream = tuple(hydrate(source) for source in stream)
+    by_fid = {fact.fid: fact for fact in current_stream}
+    if len(by_fid) != len(current_stream):
+        raise ValueError("semantic evaluation duplicate")
+    try:
+        receipts = tuple(
+            valid._replace(fact=by_fid[valid.fact.fid])
+            for valid in judgment.valids
+        )
+    except KeyError as error:
+        raise ValueError("semantic evaluation receipt") from error
+    return receipts, current_stream
 
 
 def authorize_writer_head(
         judgment, stream, view, writer, proposed_head, trusted_now):
     """Dispatch one pinned-current exact-head decision through its family."""
     decisions = []
-    for valid in judgment.valids:
+    valids, current_stream = semantic_evaluation(judgment, stream)
+    for valid in valids:
         family = family_for(valid.fact.t)
         authorize = getattr(family, "authorize_head", None)
         if callable(authorize):
             decision = authorize(
-                view, valid, stream, writer, proposed_head, trusted_now)
+                view, valid, current_stream,
+                writer, proposed_head, trusted_now)
             if decision is not None:
                 decisions.append(decision)
     return decisions[0] if len(decisions) == 1 else None
@@ -156,8 +269,9 @@ def authorize_access(judgment, stream, view, trusted_now, *, purpose):
     supplies its complete historical membership closure, while the view
     decides whether the exact selected provider is still current and clear.
     """
+    valids, current_stream = semantic_evaluation(judgment, stream)
     ephemeral = []
-    for valid in judgment.valids:
+    for valid in valids:
         family = family_for(valid.fact.t)
         if family is not None and not family.DURABLE:
             ephemeral.append((family, valid))
@@ -168,7 +282,7 @@ def authorize_access(judgment, stream, view, trusted_now, *, purpose):
     return authorize(
         view,
         valid,
-        stream,
+        current_stream,
         trusted_now,
         purpose=purpose,
     ) if callable(authorize) else None
