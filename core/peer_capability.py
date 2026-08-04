@@ -10,8 +10,9 @@ import json
 
 
 FULL = "sync-v1/full"
+OWNER = "sync-v1/owner"
 READ_ONLY = "sync-v1/read"
-_KNOWN = frozenset((FULL, READ_ONLY))
+_KNOWN = frozenset((FULL, OWNER, READ_ONLY))
 _INVALID = object()
 
 
@@ -43,4 +44,10 @@ def negotiate(token, mint_response):
 
 
 def allows_push(profile):
+    """Whether a peer accepts validate-first gossip for every writer."""
     return profile == FULL
+
+
+def allows_object_put(profile):
+    """Whether a peer accepts immutable bytes before a confined head write."""
+    return profile in {FULL, OWNER}

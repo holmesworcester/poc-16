@@ -74,12 +74,20 @@ class Peer:
 
     @property
     def accepts_push(self):
+        """Whether this peer accepts validate-first all-writer gossip."""
         return peer_capability.allows_push(
+            self.cache.get("sync_profile"))
+
+    @property
+    def accepts_owner_publish(self):
+        """Whether this peer accepts immutable owner-log publication."""
+        return peer_capability.allows_object_put(
             self.cache.get("sync_profile"))
 
     def _http(
             self, method, path, data=None, etag=None, auth=True, retry=True,
-            require_push=False, response_limit=MAX_CONTROL_BYTES,
+            require_push=False, require_object_put=False,
+            response_limit=MAX_CONTROL_BYTES,
             query=None):
         encoded_query = urllib.parse.urlencode({
             "ws": self.ws,
@@ -95,6 +103,9 @@ class Peer:
                 self.mint()
             if require_push and not self.accepts_push:
                 raise PushUnsupported("peer advertises pull-only sync")
+            if require_object_put and not self.accepts_owner_publish:
+                raise PushUnsupported(
+                    "peer does not accept immutable publication")
             req.add_header("Authorization", "Bearer " + self.cache["token"])
         if etag:
             req.add_header("If-None-Match", etag)
@@ -112,6 +123,7 @@ class Peer:
                 return self._http(
                     method, path, data, etag, auth, retry=False,
                     require_push=require_push,
+                    require_object_put=require_object_put,
                     response_limit=response_limit, query=query)
             raise
 
@@ -152,6 +164,25 @@ class Peer:
         if status not in {201, 204}:
             raise ValueError("authority publication")
         return status
+
+    def advance_head(self, proof, proposed_head):
+        """Submit one exact owner proof to the public mechanical CAS route."""
+        if not isinstance(proof, bytes) or not isinstance(
+                proposed_head, str):
+            raise ValueError("owner head publication")
+        try:
+            status, _, _ = self._http(
+                "POST", "/head/" + proposed_head, proof, auth=False,
+                response_limit=MAX_CONTROL_BYTES)
+        except urllib.error.HTTPError as error:
+            if error.code == 409:
+                return "retryable"
+            raise
+        if status == 201:
+            return "applied"
+        if status == 204:
+            return "noop"
+        raise ValueError("owner head publication")
 
     def heads(self, cursor=None, limit=256):
         query = {"limit": limit}
@@ -379,7 +410,8 @@ class Peer:
         opened = ObjectOpen("PUT", oid, len(raw))
         _, encoded, _ = self._http(
             "POST", "/obj/open", data=encode_object_open(opened),
-            require_push=True, response_limit=MAX_SCOPED_REQUEST_BYTES)
+            require_object_put=True,
+            response_limit=MAX_SCOPED_REQUEST_BYTES)
         scoped = confine_object_request(
             opened, decode_scoped_request(encoded), now_ms())
         parsed = urllib.parse.urlsplit(scoped.url)

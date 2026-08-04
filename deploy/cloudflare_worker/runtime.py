@@ -212,11 +212,15 @@ def gateway(settings, clock=None):
 
     async def authorize_head(proof, proposed):
         return await authority.authorize_head(
-            proof, proposed, clock())
+            proof, proposed, clock(),
+            max_unique_fetches=settings.max_mint_fetches,
+            max_fetch_bytes=settings.max_mint_fetch_bytes)
 
     async def authorize_access(proof, purpose):
         return await authority.authorize_access(
-            proof, clock(), purpose=purpose)
+            proof, clock(), purpose=purpose,
+            max_unique_fetches=settings.max_mint_fetches,
+            max_fetch_bytes=settings.max_mint_fetch_bytes)
 
     return HttpGate(
         store,
@@ -228,7 +232,7 @@ def gateway(settings, clock=None):
         mint_authorize=authorize_access,
         object_open=issuer.open_object,
         pack_open=issuer.open_pack,
-        sync_profile=peer_capability.READ_ONLY,
+        sync_profile=peer_capability.OWNER,
         max_request_bytes=settings.max_request_bytes,
         max_object_bytes=settings.max_object_bytes,
         max_batch_count=settings.max_batch_count,

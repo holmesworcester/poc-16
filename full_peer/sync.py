@@ -2,7 +2,7 @@
 import asyncio
 
 from core.store import RemoteStore
-from core.writer_repository import RepositoryMirror
+from core.writer_repository import OwnerPublisher, RepositoryMirror
 
 from .walk import Peer
 
@@ -21,6 +21,10 @@ def sync(node, workspace, url):
     authority of its own.
     """
     peer = Peer(node, workspace, url)
+    authority_oid, authority_pile = node.authority_publication(workspace)
+    if peer.cache.get("authority_root") != authority_oid:
+        peer.publish_authority(authority_pile)
+        peer.cache["authority_root"] = authority_oid
     remote = RemoteStore(peer)
 
     pulled = _run(node.mirror(workspace).sync_from(remote))
@@ -43,6 +47,34 @@ def sync(node, workspace, url):
                 "unresolved local writer difference") from ValueError(
                     pushed.errors[0][1])
         pushed_count = pushed.piles
+    elif peer.accepts_owner_publish:
+        _secret, device = node.identity(workspace)
+        binding = _run(node.authority(workspace).writer_binding(device))
+        if binding is None:
+            raise ValueError("local writer has no current authority binding")
+
+        async def make_proof(base, proposed):
+            return await asyncio.to_thread(
+                node.head_proof,
+                workspace,
+                binding.owner,
+                base,
+                proposed,
+            )
+
+        publisher = OwnerPublisher(
+            workspace,
+            device,
+            binding,
+            node.store(workspace),
+            remote,
+            make_proof,
+            peer.advance_head,
+        )
+        published = _run(publisher.publish())
+        if published.status == "retryable":
+            raise ValueError("concurrent owner-head publication")
+        pushed_count = published.piles
 
     node._ensure_projection(workspace)
     return int(bool(pulled.changed)), pushed_count

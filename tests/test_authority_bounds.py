@@ -218,7 +218,6 @@ def test_maximum_authority_labels_fit_cloudflare_mint_budgets(tmp_path):
             sync_profile=peer_capability.READ_ONLY,
             mint_authorize=authorize,
             max_request_bytes=cloudflare.MAX_REQUEST_BYTES,
-            max_root_bytes=cloudflare.MAX_ROOT_BYTES,
             max_object_bytes=cloudflare.MAX_OBJECT_BYTES,
             max_batch_count=cloudflare.MAX_BATCH_COUNT,
             max_batch_bytes=cloudflare.MAX_BATCH_BYTES,

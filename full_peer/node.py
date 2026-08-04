@@ -153,19 +153,6 @@ class FullPeer:
                 raise ValueError("authority publication rejected")
         raise RuntimeError("authority publication contention")
 
-    def _announce_authority(self, workspace, raws):
-        """Push bootstrap authority to configured peers before mint/sync."""
-        from .walk import Peer
-
-        for peer in tuple(self.keyring["workspaces"][workspace]["peers"]):
-            url = self.resolve_peer(workspace, peer)
-            try:
-                sender = Peer(self, workspace, url)
-                for raw in raws:
-                    sender.publish_authority(raw)
-            finally:
-                self.release_peer(workspace, peer)
-
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
         with self.lock:
@@ -550,13 +537,69 @@ class FullPeer:
             raise ValueError("head authority closure")
         return tuple(out)
 
+    def head_proof(
+            self, workspace, owner, base_head, proposed_head, *,
+            closures=()):
+        """Build one disposable proof for this device's exact head update."""
+        secret, device = self.identity(workspace)
+        timestamp = now_ms()
+        request = head_request(
+            workspace,
+            device,
+            owner,
+            base_head,
+            proposed_head,
+            timestamp + 120_000,
+            timestamp,
+        )
+        request_signature = signature_fact(
+            secret, device, request, timestamp)
+        authority = self._head_proof_closure(
+            workspace,
+            tuple(tuple(closure) for closure in closures),
+            request,
+            request_signature,
+        )
+        return encode_signed_pile(make_signed_pile(
+            secret, workspace, device, authority))
+
+    def authority_publication(self, workspace):
+        """Reclose current durable authority for idempotent peer bootstrap.
+
+        The authority repository stores facts, not historical validation
+        paths.  A stateful peer can therefore rebuild one ordinary closed
+        pile from its disposable projection whenever a peer needs bootstrap
+        or retry; no upload journal or admission witness is required.
+        """
+        with self.lock:
+            self._ensure_projection(workspace)
+            pin = _run_core(self.authority(workspace).pin())
+            if pin is None:
+                raise ValueError("workspace has no authority root")
+            projection = self.sql(workspace)
+            current = tuple(sorted(
+                (
+                    fact
+                    for fid in projection.fact_ids()
+                    if (fact := projection.fact_of(fid)) is not None
+                    and authority_resident(fact)
+                ),
+                key=lambda fact: (fact.key, fact.fid),
+            ))
+            if not current:
+                raise ValueError("workspace has no authority facts")
+            closed = self.sender(workspace).close(current, {})
+            if any(not authority_resident(fact) for fact in closed):
+                raise ValueError("authority closure escaped its repository")
+            return pin.root_oid, self.sender(workspace).pack(closed)
+
     def publish_closed(self, workspace, closures, *, owner=None):
         """Publish and consume one batch through the same core as a pull."""
         closures = tuple(tuple(closure) for closure in closures)
         if not closures:
             return []
         with self.lock:
-            secret, device = self.identity(workspace)
+            _secret, device = self.identity(workspace)
             binding = _run_core(
                 self.authority(workspace).writer_binding(device))
             if owner is not None:
@@ -581,23 +624,13 @@ class FullPeer:
             update = _run_core(writer.prepare(closures))
             _run_core(writer.establish(update))
 
-            # Head authorization has an operational expiry and is not an
-            # authored application fact.  Keep that clock separate from the
-            # family command's single user-visible timestamp observation.
-            timestamp = now_ms()
-            request = head_request(
-                workspace, device, owner, update.base_head,
-                update.head_oid, timestamp + 120_000, timestamp)
-            request_signature = signature_fact(
-                secret, device, request, timestamp)
-            authority = self._head_proof_closure(
-                workspace, closures, request, request_signature)
-            proof = encode_signed_pile(make_signed_pile(
-                secret,
+            proof = self.head_proof(
                 workspace,
-                device,
-                authority,
-            ))
+                owner,
+                update.base_head,
+                update.head_oid,
+                closures=closures,
+            )
             authority_repository = self.authority(workspace)
             publications = tuple(
                 encode_signed_pile(pile)
@@ -615,7 +648,7 @@ class FullPeer:
 
             async def authorize(raw, proposed):
                 return await authority_repository.authorize_head(
-                    raw, proposed, timestamp)
+                    raw, proposed, now_ms())
 
             grant = _run_core(authorize(proof, update.head_oid))
             published_first = grant is None and bool(publications)
@@ -628,8 +661,6 @@ class FullPeer:
                 raise RuntimeError("writer head advance requires rebase")
             if not published_first:
                 _run_core(publish_authority())
-            if publications:
-                self._announce_authority(workspace, publications)
             replay = _run_core(self.mirror(workspace).replay_local())
             if replay.errors:
                 raise ValueError(

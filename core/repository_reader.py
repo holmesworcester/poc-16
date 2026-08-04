@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 from . import snapshot
 from .crypto import h
-from .object_store import verified_object
-from .limits import MAX_OBJECT_BYTES
+from .object_store import StoreError, verified_object
+from .limits import MAX_OBJECT_BYTES, PayloadTooLarge
 from .validated_set import ValidatedView, reconstruct
 from .worker import WorkerView
 
@@ -108,6 +108,11 @@ class RepositoryReader:
                 return None
             try:
                 raw = await fetch(oid)
+            except (PayloadTooLarge, StoreError):
+                # Provider failure is not an authorization denial.  Let the
+                # request boundary report it as unavailable; semantic misses
+                # still fail closed below.
+                raise
             except Exception:
                 return None
             if raw is not None and not isinstance(raw, bytes):

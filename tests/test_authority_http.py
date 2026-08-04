@@ -136,6 +136,7 @@ def test_public_head_request_advances_only_the_proof_bound_writer_slot(
     )).status == 201
 
     proposed = h(b"opaque writer head")
+    store.put_if_absent("obj/" + proposed, b"opaque writer head")
     proof = head_proof(world, proposed)
     route = "/head/" + proposed
     assert run(gateway.handle(

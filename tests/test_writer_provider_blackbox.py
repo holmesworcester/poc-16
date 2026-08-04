@@ -110,14 +110,13 @@ async def exercise(kind, tmp_path, values):
     proof = authority_proof(
         secret, public, root, device_signature, device,
         prepared.head_oid)
-    authority = AuthorityGate(
-        root.fid, authority_root, lambda: 10)
-
     cloud.clear()
     physical_start = len(bucket.history)
     with pytest.raises(ValueError, match="head object is missing"):
         await OpaqueHeadGate(
-            cloud, authority.authorize).advance(
+            cloud,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10)).advance(
                 proof, prepared.head_oid)
     assert cloud.snapshot() == CostVector(object_gets=1)
     assert f"{PREFIX}/{slot_key}" not in bucket.data

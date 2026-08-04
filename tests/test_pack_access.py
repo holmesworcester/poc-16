@@ -234,7 +234,7 @@ def test_gate_requires_push_only_for_object_put_and_never_buffers_body():
         service, body=put_body,
         headers=bearer(peer_capability.READ_ONLY)).status == 401
     put_response = call_object(
-        service, body=put_body, headers=bearer(peer_capability.FULL))
+        service, body=put_body, headers=bearer(peer_capability.OWNER))
     assert put_response.status == 200
     assert decode_scoped_request(put_response.body) == object_scoped(put)
     assert calls[-1] == (MEMBER, put, NOW)
@@ -525,6 +525,7 @@ def test_gate_uses_normal_grants_and_requires_push_only_for_put():
     get = PackOpen("GET", OID, 100, 10, 20)
     put = PackOpen("PUT", OID, 100)
     readonly = bearer(peer_capability.READ_ONLY)
+    owner = bearer(peer_capability.OWNER)
     full = bearer(peer_capability.FULL)
 
     response = call(service, body=encode_pack_open(get), headers=readonly)
@@ -540,8 +541,10 @@ def test_gate_uses_normal_grants_and_requires_push_only_for_put():
         service, body=encode_pack_open(put), headers=readonly).status == 401
     assert calls == [(MEMBER, get, NOW)]
     assert call(
-        service, body=encode_pack_open(put), headers=full).status == 200
+        service, body=encode_pack_open(put), headers=owner).status == 200
     assert calls[-1] == (MEMBER, put, NOW)
+    assert call(
+        service, body=encode_pack_open(put), headers=full).status == 200
 
     assert call(service, body=encode_pack_open(get)).status == 401
     assert call(

@@ -18,10 +18,12 @@ from .limits import (
     MAX_MINT_FETCH_BYTES,
     MAX_MINT_REQUEST_BYTES,
     MAX_REPOSITORY_OBJECT_BYTES,
+    PayloadTooLarge,
 )
 from .object_store import (
     ABSENT,
     AUTHORITY_ROOT_KEY,
+    StoreError,
     Versioned,
     VersionToken,
     async_store,
@@ -148,6 +150,8 @@ class AuthorityPin:
                 max_unique_fetches=max_unique_fetches,
                 max_fetch_bytes=max_fetch_bytes,
             )
+        except (PayloadTooLarge, StoreError):
+            raise
         except Exception:
             return None
 
@@ -189,6 +193,8 @@ class AuthorityPin:
                 proposed_head,
                 self.root_oid,
             )
+        except (PayloadTooLarge, StoreError):
+            raise
         except Exception:
             return None
 
@@ -228,6 +234,8 @@ class AuthorityPin:
                 max_unique_fetches=max_unique_fetches,
                 max_fetch_bytes=max_fetch_bytes,
             )
+        except (PayloadTooLarge, StoreError):
+            raise
         except Exception:
             return None
 

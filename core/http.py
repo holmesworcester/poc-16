@@ -31,6 +31,7 @@ from .limits import (
 from .object_store import (
     ABSENT,
     MAX_INVITE_ID_BYTES,
+    StoreError,
     Versioned,
     mutable_key,
 )
@@ -81,6 +82,9 @@ class AsyncFromSyncReader:
 
     async def read_versioned(self, key):
         return await _to_thread(self.reader.read_versioned, key)
+
+    async def has(self, key):
+        return await _to_thread(self.reader.has, key)
 
     async def put_if_absent(self, key, value):
         return await _to_thread(
@@ -196,13 +200,16 @@ class HttpGate:
             value = value[0] if len(value) == 1 else None
         return value == self.workspace
 
-    def _member(self, headers, trusted_now, *, require_push=False):
+    def _member(
+            self, headers, trusted_now, *, require_push=False,
+            require_object_put=False):
         return check_token(
             self.secret,
             self._header(headers, "Authorization"),
             self.workspace,
             trusted_now=trusted_now,
             require_push=require_push,
+            require_object_put=require_object_put,
         )
 
     async def _get(self, key, max_bytes):
@@ -239,6 +246,8 @@ class HttpGate:
                         self.mint_authorize, pile, "sync")
                     if inspect.isawaitable(grant):
                         grant = await grant
+            except (PayloadTooLarge, StoreError):
+                return Response(503)
             except Exception:
                 return Response(403)
             if grant is None:
@@ -299,6 +308,8 @@ class HttpGate:
                     self.head_advance, body, proposed_head)
                 if inspect.isawaitable(result):
                     result = await result
+        except (PayloadTooLarge, StoreError):
+            return Response(503)
         except ValueError:
             return Response(403)
         except Exception:
@@ -369,7 +380,8 @@ class HttpGate:
         except ValueError:
             return Response(400)
         member = self._member(
-            headers, trusted_now, require_push=opened.method == "PUT")
+            headers, trusted_now,
+            require_object_put=opened.method == "PUT")
         if not member:
             return Response(401)
         try:
@@ -403,7 +415,8 @@ class HttpGate:
         except ValueError:
             return Response(400)
         member = self._member(
-            headers, trusted_now, require_push=opened.method == "PUT")
+            headers, trusted_now,
+            require_object_put=opened.method == "PUT")
         if not member:
             return Response(401)
         try:

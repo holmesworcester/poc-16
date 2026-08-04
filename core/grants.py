@@ -35,7 +35,7 @@ def make_token(
 
 def check_token(
         secret, authorization, workspace, verb="sync", *,
-        trusted_now=None, require_push=False):
+        trusted_now=None, require_push=False, require_object_put=False):
     """Return the authenticated member id, or fail closed with ``None``."""
     trusted_now = now_ms() if trusted_now is None else trusted_now
     try:
@@ -50,7 +50,9 @@ def check_token(
         capability = grant.get("cap")
         if not peer_capability.known(capability):
             return None
-        if require_push and not peer_capability.allows_push(capability):
+        if require_push and not peer_capability.allows_push(capability) \
+                or require_object_put \
+                and not peer_capability.allows_object_put(capability):
             return None
         return grant["m"] if grant["ws"] == workspace \
             and grant["v"] == verb \

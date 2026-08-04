@@ -5,7 +5,6 @@ validates writer content. A consuming peer uses :class:`RepositoryMirror` with
 one :class:`FactConsumer`. Both store the same immutable objects and stable
 per-device slots through the same object-store contract.
 """
-import asyncio
 from dataclasses import dataclass
 import hashlib
 import inspect
@@ -113,6 +112,23 @@ class MirrorResult:
     piles: int
     facts: int
     errors: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerPublishResult:
+    """One owner-confined cloud publication attempt."""
+
+    status: str
+    head: str | None
+    objects: int
+    piles: int
+
+    def __post_init__(self):
+        if self.status not in {"applied", "noop", "retryable"} \
+                or self.head is not None and not valid_fid(self.head) \
+                or type(self.objects) is not int or self.objects < 0 \
+                or type(self.piles) is not int or self.piles < 0:
+            raise ValueError("owner publication result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +462,109 @@ class OpaqueHeadGate:
         if not isinstance(result, Applied):
             raise TypeError("writer slot CAS")
         return SlotResult("applied", slot)
+
+
+class OwnerPublisher:
+    """Copy one local writer suffix, then advertise it through its owner gate.
+
+    The target does not validate writer content.  This writer-side helper
+    compares the two signed Merkle roots, establishes only the immutable
+    candidate pages and closed piles needed by the suffix, establishes the
+    signed head last, and finally submits a discarded authority proof.  It
+    never lists or mutates another writer's slot.
+    """
+
+    def __init__(
+            self, workspace, device, binding, source, target,
+            make_proof, advance):
+        if not valid_fid(workspace) or not valid_fid(device) \
+                or not isinstance(binding, WriterBinding) \
+                or (binding.workspace, binding.device) != (
+                    workspace, device) \
+                or not callable(make_proof) or not callable(advance):
+            raise ValueError("owner publisher")
+        self.workspace = workspace
+        self.device = device
+        self.binding = binding
+        self.source = async_store(source)
+        self.target = async_store(target)
+        self.make_proof = make_proof
+        self.advance = advance
+
+    async def publish(self):
+        key = head_slot_key(self.workspace, self.device)
+        local_opened = await self.source.read_versioned(key)
+        if local_opened is ABSENT:
+            return OwnerPublishResult("noop", None, 0, 0)
+        if not isinstance(local_opened, Versioned):
+            raise TypeError("local writer slot read")
+        local_slot = decode_slot_at(key, local_opened.value)
+        candidate_raw = await _object(self.source, local_slot.head)
+        candidate = require_bound_head(
+            decode_head(candidate_raw), self.binding)
+        if head_oid(candidate_raw) != local_slot.head:
+            raise ValueError("local writer head integrity")
+
+        remote_opened = await self.target.read_versioned(key)
+        if remote_opened is ABSENT:
+            base_head, accepted_tree = None, EMPTY_TREE
+        elif isinstance(remote_opened, Versioned):
+            remote_slot = decode_slot_at(key, remote_opened.value)
+            if remote_slot.head == local_slot.head:
+                return OwnerPublishResult(
+                    "noop", local_slot.head, 0, 0)
+            accepted_raw = await _object(self.target, remote_slot.head)
+            accepted = require_bound_head(
+                decode_head(accepted_raw), self.binding)
+            if head_oid(accepted_raw) != remote_slot.head:
+                raise ValueError("remote writer head integrity")
+            validate_advance(accepted, candidate, self.binding)
+            base_head, accepted_tree = remote_slot.head, accepted.tree
+        else:
+            raise TypeError("remote writer slot read")
+
+        pages = {}
+
+        async def candidate_fetch(oid):
+            raw = await _object(self.source, oid)
+            pages.setdefault(oid, raw)
+            return raw
+
+        async def accepted_fetch(oid):
+            return await _object(self.target, oid)
+
+        additions = await validate_extension_awaited(
+            accepted_tree,
+            candidate.tree,
+            self.workspace,
+            self.device,
+            candidate_fetch,
+            accepted_fetch,
+        )
+        for oid, raw in sorted(pages.items()):
+            await ensure_object_async(self.target, oid, raw)
+        for _leaf, oid in additions:
+            await ensure_pile_async(
+                self.target, oid, await _pile_object(self.source, oid))
+        # A head can be visible only after every object it names is durable.
+        await ensure_object_async(
+            self.target, local_slot.head, candidate_raw)
+
+        proof = await _maybe_await(
+            self.make_proof(base_head, local_slot.head))
+        if not isinstance(proof, bytes):
+            raise TypeError("owner head proof")
+        outcome = await _maybe_await(
+            self.advance(proof, local_slot.head))
+        status = getattr(outcome, "status", outcome)
+        if status not in {"applied", "noop", "retryable"}:
+            raise ValueError("owner head advance result")
+        return OwnerPublishResult(
+            status,
+            local_slot.head,
+            len(pages) + 1,
+            len(additions),
+        )
 
 
 class FactConsumer:
@@ -864,7 +983,9 @@ class RepositoryMirror:
         if callable(read_many):
             opened = await _maybe_await(read_many(keys))
         else:
-            opened = await asyncio.gather(*(
+            from asyncio import gather
+
+            opened = await gather(*(
                 source.read_versioned(key) for key in keys),
                 return_exceptions=True)
         if not isinstance(opened, (tuple, list)) \
@@ -913,6 +1034,8 @@ __all__ = (
     "HeadGrant",
     "MirrorResult",
     "OpaqueHeadGate",
+    "OwnerPublishResult",
+    "OwnerPublisher",
     "PreparedUpdate",
     "RepositoryMirror",
     "SlotResult",

@@ -18,13 +18,15 @@ from urllib.parse import urlencode, urlsplit
 import facts
 
 from core import peer_capability
+from core.authority import AuthorityRepository
 from core.crypto import h, keypair
 from core.fact import canon
 from core.grants import make_token
 from core.limits import MAX_FACT_BYTES, MAX_OBJECT_BYTES
-from core.store import RemoteStore
+from core.object_store import ABSENT, CREATED, Versioned
+from core.store import FsStore, RemoteStore
 from core.writer_head import decode_slot_at, head_slot_key
-from core.writer_repository import RepositoryMirror
+from core.writer_repository import OpaqueHeadGate, RepositoryMirror
 from full_peer.node import FullPeer
 from full_peer.pack_http import handler_for
 from full_peer import sync as sync_module
@@ -144,6 +146,97 @@ def _canonical_store(peer, workspace):
         key: store.get(key)
         for key in store.list("")
     }
+
+
+class _HostedEndpoint:
+    """In-process hosted peer implementing the exact RemoteStore surface."""
+
+    def __init__(self, node, workspace, url, store, authority):
+        self.node = node
+        self.ws = workspace
+        self.cache = node.sync_state(workspace, url)
+        self.cache["sync_profile"] = peer_capability.OWNER
+        self.store = store
+        self.authority = authority
+        self._opened = None
+        self._observed = {}
+        self._complete = False
+
+    @property
+    def accepts_push(self):
+        return False
+
+    @property
+    def accepts_owner_publish(self):
+        return True
+
+    def publish_authority(self, raw):
+        result = _run(self.authority.publish(raw))
+        if result.status not in {"applied", "noop"}:
+            raise ValueError("hosted authority publication")
+        return 201 if result.status == "applied" else 204
+
+    def heads(self, cursor=None, limit=256):
+        page = self.store.list_page(
+            f"heads/{self.ws}/", cursor, limit)
+        opened = tuple(
+            self.store.read_versioned(key) for key in page.keys)
+        self._opened = page.keys, opened
+        self._observed.update(zip(page.keys, opened))
+        if page.cursor is None:
+            self._complete = True
+        return page
+
+    def opened_heads(self, keys):
+        if self._opened is None or self._opened[0] != tuple(keys):
+            raise ValueError("hosted head page")
+        return self._opened[1]
+
+    def observed_head(self, key):
+        if key in self._observed:
+            return True, self._observed[key]
+        return self._complete, ABSENT
+
+    def head(self, device, etag=None):
+        opened = self.store.read_versioned(head_slot_key(self.ws, device))
+        if opened is ABSENT:
+            return None
+        assert isinstance(opened, Versioned)
+        if etag is not None and opened.token.value == etag:
+            return None
+        return opened.value, opened.token
+
+    def obj(self, oid, *, response_limit):
+        return self.store.get_bounded("obj/" + oid, response_limit)
+
+    def objs(self, oids):
+        return tuple(self.obj(
+            oid, response_limit=MAX_OBJECT_BYTES) for oid in oids)
+
+    def copy_obj(self, oid, *, response_limit, write):
+        return self.store.copy_pile_object(oid, response_limit, write)
+
+    def put_obj(self, oid, raw):
+        if h(raw) != oid:
+            raise ValueError("hosted immutable object")
+        result = self.store.put_if_absent("obj/" + oid, raw)
+        if result is CREATED:
+            return 201
+        if self.store.get_bounded("obj/" + oid, len(raw)) != raw:
+            raise ValueError("hosted immutable collision")
+        return 204
+
+    def layout(self, _key, *, response_limit):
+        return None
+
+    async def advance_head(self, proof, proposed):
+        async def authorize(raw, head):
+            return await self.authority.authorize_head(
+                raw, head, int(time.time() * 1000))
+
+        result = await OpaqueHeadGate(
+            self.store, authorize).advance(proof, proposed)
+        return result.status
 
 
 def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
@@ -492,3 +585,43 @@ def test_read_only_peer_pulls_writer_forest_without_any_reverse_put(
     assert not [request for request in requests if request[0] == "PUT"]
     assert bob.sync_state(workspace, url)["sync_profile"] \
         == peer_capability.READ_ONLY
+
+
+def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
+        tmp_path, monkeypatch):
+    workspace, alice, bob, carol = _forest_fixture(tmp_path)
+    # Alice has consumed Bob and may gossip him to a full peer.  A hosted
+    # owner publication must nevertheless leave Bob's independently mutable
+    # slot alone.
+    mirrored = _run(alice.mirror(workspace).sync_from(bob.store(workspace)))
+    assert mirrored.errors == ()
+
+    cloud = FsStore(str(tmp_path / "hosted-cloud"))
+    authority = AuthorityRepository(workspace, cloud)
+    url = "memory://hosted-owner-cloud"
+
+    def endpoint(node, candidate_workspace, candidate_url):
+        assert candidate_workspace == workspace and candidate_url == url
+        return _HostedEndpoint(
+            node, workspace, url, cloud, authority)
+
+    monkeypatch.setattr(sync_module, "Peer", endpoint)
+
+    assert sync_module.sync(alice, workspace, url)[1] >= 1
+    assert cloud.list(f"heads/{workspace}") == [
+        head_slot_key(workspace, alice.identity_id(workspace))]
+
+    assert sync_module.sync(bob, workspace, url)[1] >= 1
+    assert set(cloud.list(f"heads/{workspace}")) == {
+        head_slot_key(workspace, alice.identity_id(workspace)),
+        head_slot_key(workspace, bob.identity_id(workspace)),
+    }
+
+    pulled, _published = sync_module.sync(carol, workspace, url)
+    assert pulled == 1
+    assert {"from alice", "from bob"} <= _messages(carol, workspace)
+    # Carol advertises only her own accepted writer log after that pull.
+    assert set(cloud.list(f"heads/{workspace}")) == {
+        head_slot_key(workspace, peer.identity_id(workspace))
+        for peer in (alice, bob, carol)
+    }

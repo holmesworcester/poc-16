@@ -165,6 +165,8 @@ def test_lambda_bootstraps_authority_then_advances_one_owner_head(
         "POST", "/authority", world.root.fid, authority), None))[0] == 201
 
     proposed = h(b"lambda opaque writer head")
+    store.put_if_absent(
+        "obj/" + proposed, b"lambda opaque writer head")
     proof = head_proof(world, proposed)
     assert response(app.handler(event(
         "POST", "/head/" + proposed,

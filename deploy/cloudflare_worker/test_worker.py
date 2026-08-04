@@ -279,6 +279,8 @@ def test_runtime_bootstraps_authority_then_advances_one_owner_head():
     assert published.status == 201
 
     proposed = h(b"cloudflare opaque writer head")
+    bucket.data[f"{prefix}/obj/{proposed}"] = (
+        b"cloudflare opaque writer head")
     advanced = run(runtime.handle(Request(
         "POST",
         f"https://worker.example/head/{proposed}?ws={world.root.fid}",
@@ -311,7 +313,7 @@ def test_runtime_mints_and_reads_the_writer_directory_from_r2(
 
     assert minted.status == 200
     value = json.loads(minted.body)
-    assert value["cap"] == "sync-v1/read"
+    assert value["cap"] == "sync-v1/owner"
     token = native_unseal(
         node.identity(workspace)[0],
         base64.b64decode(value["grant"]),
@@ -337,16 +339,16 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
     pack_bucket = PackBucket(bucket.data)
     environment.BUCKET = pack_bucket
     service = deployed_entry(monkeypatch, environment)
-    # This is exactly the capability advertised by this gateway's /mint.
-    # It can open reads, but it deliberately cannot authorize pack creation.
+    # This is exactly the capability advertised by this hosted gateway: it
+    # may establish immutable owner objects but cannot invoke /mirror gossip.
     assert runtime.gateway(runtime.Settings.from_env(
-        environment)).sync_profile == peer_capability.READ_ONLY
+        environment)).sync_profile == peer_capability.OWNER
     member = h(b"pack reader")
     token = make_token(
         b"s" * runtime.EDGE_SECRET_BYTES,
         member,
         workspace,
-        capability=peer_capability.READ_ONLY,
+        capability=peer_capability.OWNER,
         issued_at=100,
         ttl_ms=runtime.MAX_GRANT_TTL_MS,
     )
@@ -395,13 +397,13 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
         assert response.status == 200
         issued.append(decode_scoped_request(response.body))
 
-    denied = run(service.fetch(Request(
+    opened_put = run(service.fetch(Request(
         "POST",
         f"https://worker.example/pack/open?ws={workspace}",
         encode_pack_open(put),
         headers,
     )))
-    assert denied.status == 401
+    assert opened_put.status == 200
 
     whole_request, range_request = issued
     assert whole_request.method == "GET" and whole_request.headers == ()
@@ -411,10 +413,7 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
         f"/poc16-packs/{environment.STORE_PREFIX}/pack/{oid}")
     assert urlsplit(range_request.url).path == urlsplit(
         whole_request.url).path
-    # Pack creation authority belongs to the upload-purpose front door. This
-    # read-only gateway deliberately cannot mint a push-capable grant.
-    put_request = runtime.Settings.from_env(environment).issue_packs(
-        lambda: 100).open_pack(h(b"upload broker member"), put, 100)
+    put_request = decode_scoped_request(opened_put.body)
     assert put_request.method == "PUT"
     assert urlsplit(put_request.url).path == f"/pack/{oid}"
 
@@ -437,9 +436,14 @@ def test_deployed_entry_issues_direct_object_and_pack_requests(
 
     object_put = ObjectOpen(
         "PUT", object_oid, limits.MAX_DIRECT_OBJECT_BYTES)
-    object_request = runtime.Settings.from_env(environment).issue_packs(
-        lambda: 100).open_object(
-            h(b"upload broker member"), object_put, 100)
+    opened_object_put = run(service.fetch(Request(
+        "POST",
+        f"https://worker.example/obj/open?ws={workspace}",
+        encode_object_open(object_put),
+        headers,
+    )))
+    assert opened_object_put.status == 200
+    object_request = decode_scoped_request(opened_object_put.body)
     object_body = SentinelPackBody()
     direct_object = Request(
         "PUT",
@@ -599,7 +603,6 @@ def test_runtime_bounds_and_authenticates_r2_object_reads(
     assert missing.status == 404
     assert corrupt.status == 503
     assert retired.status == 404
-    assert not hasattr(runtime.ReadOnlyStore(bucket, prefix), "put")
 
 
 def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
@@ -630,15 +633,17 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
             raise AssertionError("oversized R2 body was allocated")
 
     class OversizedBucket:
-        def __init__(self, healthy_root=None):
-            self.healthy_root = healthy_root
+        def __init__(self, healthy_authority=None):
+            self.healthy_authority = healthy_authority
             self.objects = []
 
         async def get(self, key):
-            if self.healthy_root is not None and key.endswith("/root"):
-                return R2Object(self.healthy_root)
-            limit = runtime.MAX_ROOT_BYTES \
-                if key.endswith("/root") else runtime.MAX_OBJECT_BYTES
+            if self.healthy_authority is not None \
+                    and key.endswith("/authority"):
+                return R2Object(self.healthy_authority)
+            limit = limits.MAX_ROOT_BYTES \
+                if key.endswith("/authority") \
+                else runtime.MAX_OBJECT_BYTES
             obj = OversizedObject(limit + 1)
             self.objects.append(obj)
             return obj
@@ -647,10 +652,6 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
     environment.BUCKET = oversized
     oid = "0" * 64
     results = [
-        run(runtime.handle(Request(
-            "GET", f"https://worker.example/root?ws={workspace}",
-            headers=headers,
-        ), environment)),
         run(runtime.handle(Request(
             "GET", f"https://worker.example/invite/code?ws={workspace}",
         ), environment)),
@@ -664,12 +665,12 @@ def test_runtime_rejects_route_oversize_before_r2_arraybuffer(
         ), environment)),
     ]
 
-    assert [result.status for result in results] == [503, 413, 413, 413]
+    assert [result.status for result in results] == [413, 413, 413]
     assert len(oversized.objects) == len(results)
     assert all(obj.array_calls == 0 for obj in oversized.objects)
 
     prefix = environment.STORE_PREFIX
-    selective = OversizedBucket(healthy.data[f"{prefix}/root"])
+    selective = OversizedBucket(healthy.data[f"{prefix}/authority"])
     environment.BUCKET = selective
     mint_oversize = run(runtime.handle(Request(
         "POST", f"https://worker.example/mint?ws={workspace}",
@@ -982,7 +983,6 @@ def test_worker_budget_bindings_match_runtime_and_core_ceilings():
         for name in runtime._BUDGETS
     } == runtime._BUDGETS
     assert runtime.MAX_REQUEST_BYTES <= limits.MAX_MINT_REQUEST_BYTES
-    assert runtime.MAX_ROOT_BYTES <= limits.MAX_ROOT_BYTES
     # Bao slice payloads are inline ordinary facts. Authenticated repository
     # reads apply their narrower page/fact bound at the gate call site rather
     # than shrinking this shared object-response ceiling.

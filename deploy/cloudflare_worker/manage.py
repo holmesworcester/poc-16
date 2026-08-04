@@ -556,7 +556,7 @@ def smoke():
         with urlopen(request, timeout=30) as response:
             value = json.loads(response.read())
             if response.status != 200 \
-                    or value.get("cap") != "sync-v1/read":
+                    or value.get("cap") != "sync-v1/owner":
                 raise RuntimeError("live mint smoke failed")
     except Exception as error:
         primary = error

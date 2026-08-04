@@ -44,6 +44,33 @@ def test_read_only_grant_cannot_authorize_push():
         trusted_now=101, require_push=True) is None
 
 
+def test_owner_grant_can_establish_objects_but_cannot_gossip_slots():
+    token = make_token(
+        b"s" * 32,
+        "member",
+        "workspace",
+        capability=peer_capability.OWNER,
+        issued_at=100,
+        ttl_ms=50,
+    )
+    authorization = "Bearer " + token
+
+    assert check_token(
+        b"s" * 32,
+        authorization,
+        "workspace",
+        trusted_now=101,
+        require_object_put=True,
+    ) == "member"
+    assert check_token(
+        b"s" * 32,
+        authorization,
+        "workspace",
+        trusted_now=101,
+        require_push=True,
+    ) is None
+
+
 def test_grant_rejects_wrong_scheme_mac_and_shape():
     secret = b"k" * 32
     token = make_token(secret, "m", "w", issued_at=1, ttl_ms=100)

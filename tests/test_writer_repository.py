@@ -27,6 +27,7 @@ from core.writer_repository import (
     FactConsumer,
     HeadGrant,
     OpaqueHeadGate,
+    OwnerPublisher,
     RepositoryMirror,
     WriterLog,
 )
@@ -140,6 +141,95 @@ def test_same_writer_objects_converge_through_normal_and_opaque_cloud_modes(
         # Equal directories are a no-op and fetch no pile for semantic work.
         again = await via_cloud.sync_from(cloud_store)
         assert again.changed == again.piles == again.facts == 0
+
+    run(scenario())
+
+
+def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        store_binding = h(b"owner-publisher-store")
+        authority_root = h(b"owner-publisher-authority")
+        local = FsStore(str(tmp_path / "local"))
+        cloud = FsStore(str(tmp_path / "cloud"))
+        receiver = FsStore(str(tmp_path / "receiver"))
+        binding = WriterBinding(
+            root.fid, public, public, store_binding)
+        writer = WriterLog(
+            root.fid, public, public, store_binding, secret, local)
+        local_gate = OpaqueHeadGate(
+            local,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10),
+        )
+        cloud_gate = OpaqueHeadGate(
+            cloud,
+            mechanical_head_authorizer(
+                root.fid, authority_root, 10),
+        )
+
+        async def advance(proof, proposed):
+            return await cloud_gate.advance(proof, proposed)
+
+        def make_proof(base, proposed):
+            return proof_for(
+                secret,
+                public,
+                root,
+                device_signature,
+                device,
+                proposed,
+                base,
+            )
+
+        publisher = OwnerPublisher(
+            root.fid,
+            public,
+            binding,
+            local,
+            cloud,
+            make_proof,
+            advance,
+        )
+
+        first = await writer.prepare(((root, device_signature, device),))
+        await writer.establish(first)
+        assert (await local_gate.advance(
+            make_proof(None, first.head_oid), first.head_oid
+        )).status == "applied"
+        published = await publisher.publish()
+        assert (published.status, published.piles) == ("applied", 1)
+        first_objects = set(cloud.list("obj"))
+        key = head_slot_key(root.fid, public)
+        assert decode_slot_at(key, cloud.get(key)).head == first.head_oid
+
+        item = message_fact(
+            root.fid, public, "general", "incremental", 20)
+        item_signature = signature_fact(secret, public, item, 20)
+        second = await writer.prepare(((*first.piles[0].facts,
+                                        item_signature, item),))
+        await writer.establish(second)
+        assert (await local_gate.advance(
+            make_proof(first.head_oid, second.head_oid), second.head_oid
+        )).status == "applied"
+        advanced = await publisher.publish()
+        assert (advanced.status, advanced.piles) == ("applied", 1)
+        assert first_objects < set(cloud.list("obj"))
+        assert decode_slot_at(key, cloud.get(key)).head == second.head_oid
+
+        noop = await publisher.publish()
+        assert (noop.status, noop.objects, noop.piles) == ("noop", 0, 0)
+
+        consumer = FactConsumer(root.fid)
+        mirrored = await RepositoryMirror(
+            root.fid,
+            receiver,
+            binding_for(root.fid, public, store_binding),
+            consumer,
+        ).sync_from(cloud)
+        assert mirrored.errors == ()
+        assert mirrored.piles == 2
+        assert item.fid in consumer.fact_ids()
 
     run(scenario())
 
