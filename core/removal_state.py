@@ -3,7 +3,7 @@
 This module is deliberately only composition.  Fact families classify one
 ordinary closed-pile judgment and derive bounded CLEAR/ACTIVE groups;
 ``SuppressionTree`` owns the private authenticated map and its root CAS.
-Neither bootstrap nor an accepted-leaf poke retains fact bytes, accepts a
+Neither bootstrap nor control application retains fact bytes, accepts a
 caller root, scans the writer forest, or constructs another validation path.
 """
 
@@ -15,7 +15,6 @@ from .close import ClosedPileEvaluator
 from .limits import MAX_CONTROL_PILE_BYTES
 from .shape import valid_fid
 from .suppression_tree import SuppressionTree
-from .writer_repository import open_accepted_pile
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,19 +88,15 @@ class RecipientRemovalState:
             return RemovalStateResult("rejected", None)
         return await self._apply(groups)
 
-    async def advance_leaf(self, device, sequence):
-        """Join one exact already-accepted writer leaf, then discard it."""
+    async def apply_control(self, raw_signed_pile, writer):
+        """Join one exact writer-signed control closure, then discard it."""
+        if not valid_fid(writer):
+            return await self._result("rejected")
         try:
-            raw = await open_accepted_pile(
-                self.store,
-                self.workspace,
-                device,
-                sequence,
-                max_bytes=MAX_CONTROL_PILE_BYTES,
-            )
-            _evaluated, groups = self._groups(raw, writer=device)
+            _evaluated, groups = self._groups(
+                raw_signed_pile, writer=writer)
         except ValueError:
-            return RemovalStateResult("rejected", None)
+            return await self._result("rejected")
         return await self._apply(groups)
 
 

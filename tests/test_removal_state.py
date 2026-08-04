@@ -1,4 +1,4 @@
-"""Recipient removal state from original and accepted signed control piles."""
+"""Recipient removal state from exact original signed control piles."""
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +29,6 @@ from facts.auth.user_invite import user_invite
 from facts.auth.workspace import workspace
 from facts.content.message import message
 from tests.shared_bucket import ScriptedBucket
-from tests.test_writer_repository import _install_candidate
 
 
 def run(awaitable):
@@ -209,16 +208,14 @@ def test_accepted_historical_admin_removal_restarts_and_replays(tmp_path):
         value.root.fid, value.founder, value.member, 4)
     evicted_sig = signature(
         value.founder_secret, value.founder, evicted, 4)
-    run(accept_one(
-        store,
+    removal_pile = signed(
         value.founder_secret,
-        value.founder,
         value.founder,
         value.root,
         (*value.membership, evicted_sig, evicted),
-    ))
+    )
 
-    applied = run(state.advance_leaf(value.founder, 1))
+    applied = run(state.apply_control(removal_pile, value.founder))
     assert applied.status == "applied"
     assert run(value_at(
         state,
@@ -228,8 +225,10 @@ def test_accepted_historical_admin_removal_restarts_and_replays(tmp_path):
     restarted = RecipientRemovalState(value.root.fid, FsStore(
         str(tmp_path / "recipient")))
     assert run(restarted.pin()).root_oid == applied.root_oid
-    assert run(restarted.advance_leaf(value.founder, 1)).status == "noop"
-    assert run(restarted.advance_leaf(value.founder, 2)).status == "rejected"
+    assert run(restarted.apply_control(
+        removal_pile, value.founder)).status == "noop"
+    assert run(restarted.apply_control(
+        b"not a pile", value.founder)).status == "rejected"
     assert run(restarted.pin()).root_oid == applied.root_oid
 
 
@@ -238,17 +237,10 @@ def test_forged_accepted_pile_binding_is_rejected_without_state(tmp_path):
     attacker_secret, attacker = keypair()
     hostile = signed(
         attacker_secret, attacker, value.root, (value.root,))
-    store = _install_candidate(
-        tmp_path / "forged",
-        value.founder_secret,
-        value.root.fid,
-        value.founder,
-        signed_pile_oid(hostile),
-        pile_raw=hostile,
-    )
+    store = FsStore(str(tmp_path / "forged"))
     state = RecipientRemovalState(value.root.fid, store)
 
-    outcome = run(state.advance_leaf(value.founder, 1))
+    outcome = run(state.apply_control(hostile, value.founder))
 
     assert outcome.status == "rejected"
     assert outcome.root_oid is None
@@ -292,7 +284,6 @@ def test_access_like_pile_is_discarded_without_mutating_existing_state(
 def test_partial_stale_advance_is_retryable_and_idempotent():
     value = world()
     bucket = ScriptedBucket()
-    publisher_store = PileHandle(bucket.handle("publisher"))
     recipient_store = PileHandle(bucket.handle("recipient"))
     recipient = RecipientRemovalState(value.root.fid, recipient_store)
     assert run(recipient.bootstrap(signed(
@@ -306,21 +297,19 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
         value.root.fid, value.member, "member primary", 4)
     primary_sig = signature(
         value.member_secret, value.member, primary, 4)
-    run(accept_one(
-        publisher_store,
+    primary_pile = signed(
         value.member_secret,
-        value.member,
         value.member,
         value.root,
         (*value.membership, primary_sig, primary),
-    ))
+    )
 
     paused = bucket.pause(
         "recipient", "cas", REMOVAL_ROOT_KEY, nth=2)
     other_sid = scoped_id("member", h(b"concurrent member"))
     with ThreadPoolExecutor(max_workers=2) as pool:
         advancing = pool.submit(
-            run, recipient.advance_leaf(value.member, 1))
+            run, recipient.apply_control(primary_pile, value.member))
         paused.wait()
         concurrent = SuppressionTree(
             value.root.fid, PileHandle(bucket.handle("concurrent")))
@@ -342,8 +331,10 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
     )) is None
     assert run(value_at(recipient, other_sid)) == suppression_slot()
 
-    assert run(recipient.advance_leaf(value.member, 1)).status == "applied"
-    assert run(recipient.advance_leaf(value.member, 1)).status == "noop"
+    assert run(recipient.apply_control(
+        primary_pile, value.member)).status == "applied"
+    assert run(recipient.apply_control(
+        primary_pile, value.member)).status == "noop"
     assert run(value_at(
         recipient,
         scoped_id("device", value.member),
@@ -351,7 +342,7 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
     assert bucket.assert_valid_history()
 
 
-def test_mirror_replays_post_cas_control_advancement_without_a_cursor(
+def test_mirror_retries_pre_cas_control_application_without_a_cursor(
         tmp_path):
     value = world()
     source = FsStore(str(tmp_path / "source"))
@@ -378,11 +369,11 @@ def test_mirror_replays_post_cas_control_advancement_without_a_cursor(
     consumer = FactConsumer(value.root.fid)
     calls = []
 
-    async def interrupted(device, sequence):
-        calls.append((device, sequence))
+    async def interrupted(raw, device):
+        calls.append((signed_pile_oid(raw), device))
         if len(calls) == 1:
             return type("Retryable", (), {"status": "retryable"})()
-        return await state.advance_leaf(device, sequence)
+        return await state.apply_control(raw, device)
 
     def exact_binding(workspace_id, device, _removal_root, candidate):
         return WriterBinding(
@@ -393,19 +384,28 @@ def test_mirror_replays_post_cas_control_advancement_without_a_cursor(
         target,
         exact_binding,
         consumer,
-        advance_removal=interrupted,
+        apply_control=interrupted,
     )
 
     first = run(mirror.sync_from(source))
     assert first.changed == 0
-    assert first.errors and "removal advancement" in first.errors[0][1]
+    assert first.errors and "control application" in first.errors[0][1]
     assert consumer.projected_head(value.founder) is None
     assert run(value_at(
         state, scoped_id("member", value.member))) == suppression_slot()
 
     replay = run(mirror.sync_from(source))
     assert replay.errors == ()
-    assert calls == [(value.founder, 1), (value.founder, 1)]
+    control_oid = signed_pile_oid(signed(
+        value.founder_secret,
+        value.founder,
+        value.root,
+        (*value.membership, evicted_sig, evicted),
+    ))
+    assert calls == [
+        (control_oid, value.founder),
+        (control_oid, value.founder),
+    ]
     assert consumer.projected_head(value.founder) is not None
     assert run(value_at(
         state,

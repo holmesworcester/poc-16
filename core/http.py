@@ -122,7 +122,7 @@ class HttpGate:
             mint_authorize=None,
             path_authorize=None,
             removal_bootstrap=None,
-            removal_advance=None,
+            removal_apply=None,
             object_open=None,
             pack_open=None,
             max_request_bytes=MAX_MINT_REQUEST_BYTES,
@@ -148,7 +148,7 @@ class HttpGate:
         callbacks = (
             ("path authorizer", path_authorize),
             ("removal bootstrap", removal_bootstrap),
-            ("removal advancer", removal_advance),
+            ("removal control applier", removal_apply),
         )
         if any(value is not None and not callable(value)
                for _label, value in callbacks):
@@ -157,7 +157,7 @@ class HttpGate:
                 if value is not None and not callable(value)))
         self.path_authorize = path_authorize
         self.removal_bootstrap = removal_bootstrap
-        self.removal_advance = removal_advance
+        self.removal_apply = removal_apply
         if object_open is not None and not callable(object_open):
             raise ValueError("object OPEN issuer")
         if pack_open is not None and not callable(pack_open):
@@ -337,22 +337,18 @@ class HttpGate:
             return Response(403)
         return self._removal_result(result)
 
-    async def _advance_removal(self, device, encoded_sequence, body):
-        """Poke one already accepted writer leaf; caller supplies no state."""
-        if self.removal_advance is None:
+    async def _apply_removal(self, body, writer):
+        """Evaluate one exact authenticated control pile, then discard it."""
+        if self.removal_apply is None:
             return Response(405)
-        if body != b"" or not valid_fid(device) \
-                or not encoded_sequence.isdigit():
-            return Response(400)
+        if not isinstance(body, bytes) or len(body) > MAX_CONTROL_PILE_BYTES:
+            return Response(413)
         try:
-            sequence = int(encoded_sequence)
-            if sequence <= 0 or str(sequence) != encoded_sequence:
-                return Response(400)
-            if inspect.iscoroutinefunction(self.removal_advance):
-                result = await self.removal_advance(device, sequence)
+            if inspect.iscoroutinefunction(self.removal_apply):
+                result = await self.removal_apply(body, writer=writer)
             else:
                 result = await _to_thread(
-                    self.removal_advance, device, sequence)
+                    self.removal_apply, body, writer=writer)
                 if inspect.isawaitable(result):
                     result = await result
         except (PayloadTooLarge, StoreError):
@@ -688,8 +684,8 @@ class HttpGate:
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/removal/bootstrap":
             return MAX_CONTROL_PILE_BYTES
-        if method == "POST" and path.startswith("/removal/advance/"):
-            return 0
+        if method == "POST" and path == "/removal/apply":
+            return MAX_CONTROL_PILE_BYTES
         if method == "POST" and path.startswith("/head/"):
             return MAX_MINT_REQUEST_BYTES
         if method == "POST" and path == "/obj":
@@ -725,11 +721,6 @@ class HttpGate:
             return await self._removal_path(body, trusted_now)
         if path == "/removal/bootstrap" and method == "POST":
             return await self._bootstrap_removal(body)
-        if path.startswith("/removal/advance/") and method == "POST":
-            parts = path.strip("/").split("/")
-            if len(parts) != 4:
-                return Response(404)
-            return await self._advance_removal(parts[2], parts[3], body)
         if path.startswith("/head/") and method == "POST":
             return await self._advance_head(
                 path.removeprefix("/head/"), body, trusted_now)
@@ -761,6 +752,12 @@ class HttpGate:
             return await self._open_object(body, headers, trusted_now)
         if path.startswith("/ctl"):
             return Response(405)
+        if path == "/removal/apply" and method == "POST":
+            writer = self._member(
+                headers, trusted_now, require_push=True)
+            if writer is None:
+                return Response(401)
+            return await self._apply_removal(body, writer)
         if method == "PUT" and path.startswith("/mirror/"):
             if not self._member(
                     headers, trusted_now, require_push=True):

@@ -61,7 +61,6 @@ from .writer_tree import (
     EMPTY_TREE,
     append_piles_awaited,
     leaf_key,
-    parse_leaf_key,
     reachable_staged_pages,
     validate_extension_awaited,
     writer_tree_seed,
@@ -537,12 +536,13 @@ class OwnerPublisher:
 
     def __init__(
             self, workspace, device, binding, source, target,
-            make_proof, advance):
+            make_proof, apply_control, advance):
         if not valid_fid(workspace) or not valid_fid(device) \
                 or not isinstance(binding, WriterBinding) \
                 or (binding.workspace, binding.device) != (
                     workspace, device) \
-                or not callable(make_proof) or not callable(advance):
+                or not callable(make_proof) \
+                or not callable(apply_control) or not callable(advance):
             raise ValueError("owner publisher")
         self.workspace = workspace
         self.device = device
@@ -550,7 +550,9 @@ class OwnerPublisher:
         self.source = async_store(source)
         self.target = async_store(target)
         self.make_proof = make_proof
+        self.apply_control = apply_control
         self.advance = advance
+        self.evaluator = ClosedPileEvaluator(workspace)
 
     async def publish(self):
         key = head_slot_key(self.workspace, self.device)
@@ -604,12 +606,34 @@ class OwnerPublisher:
         )
         for oid, raw in sorted(pages.items()):
             await ensure_object_async(self.target, oid, raw)
+        added_piles = []
         for _leaf, oid in additions:
-            await ensure_pile_async(
-                self.target, oid, await _pile_object(self.source, oid))
+            raw = await _pile_object(self.source, oid)
+            await ensure_pile_async(self.target, oid, raw)
+            added_piles.append((oid, raw))
         # A head can be visible only after every object it names is durable.
         await ensure_object_async(
             self.target, local_slot.head, candidate_raw)
+
+        # Removal state is an ACI join of independently valid control piles.
+        # Apply each exact original pile before advertising the head: a crash
+        # can leave valid control state slightly ahead of content, but can
+        # never leave an accepted head whose removals were missed.  A retry
+        # replays the same idempotent joins without a cursor or cache.
+        for _oid, raw in added_piles:
+            evaluated = self.evaluator.evaluate(raw, writer=self.device)
+            try:
+                facts.control_evaluation(
+                    evaluated.judgment, evaluated.pile.facts)
+            except ValueError:
+                continue
+            applied = await _maybe_await(
+                self.apply_control(raw, self.device))
+            if getattr(applied, "status", applied) not in {
+                    "applied", "noop"}:
+                return OwnerPublishResult(
+                    "retryable", local_slot.head,
+                    len(pages) + 1, len(additions))
 
         proof = await _maybe_await(
             self.make_proof(base_head, local_slot.head))
@@ -753,7 +777,7 @@ class RepositoryMirror:
 
     def __init__(
             self, workspace, store, binding_for, consumer,
-            *, current_binding_for=None, advance_removal=None):
+            *, current_binding_for=None, apply_control=None):
         consumer_ok = consumer is None or (
             getattr(consumer, "workspace", None) == workspace
             and all(callable(getattr(consumer, method, None))
@@ -764,28 +788,28 @@ class RepositoryMirror:
                 or not consumer_ok \
                 or current_binding_for is not None \
                 and not callable(current_binding_for) \
-                or advance_removal is not None \
-                and not callable(advance_removal):
+                or apply_control is not None \
+                and not callable(apply_control):
             raise ValueError("repository mirror")
         self.workspace = workspace
         self.store = async_store(store)
         self.binding_for = binding_for
         self.current_binding_for = current_binding_for or binding_for
         self.consumer = consumer
-        self.advance_removal = advance_removal
+        self.apply_control = apply_control
 
-    async def _advance_removal(self, batch, device, rows):
-        """Advance only accepted control leaves before projection commits."""
-        if self.advance_removal is None or batch is None:
+    async def _apply_control(self, batch, device, pile_values):
+        """Join exact control piles before acceptance/projection commits."""
+        if self.apply_control is None or batch is None:
             return
         control = set(batch.control_piles)
-        for leaf, oid in rows:
+        for oid, raw in pile_values:
             if oid not in control:
                 continue
             result = await _maybe_await(
-                self.advance_removal(device, parse_leaf_key(leaf)))
+                self.apply_control(raw, device))
             if getattr(result, "status", None) not in {"applied", "noop"}:
-                raise ValueError("recipient removal advancement")
+                raise ValueError("recipient control application")
 
     async def _binding(
             self, workspace, device, removal_root, head, *, current=False):
@@ -907,13 +931,14 @@ class RepositoryMirror:
         for pile_oid, raw in pile_values:
             await ensure_pile_async(self.store, pile_oid, raw)
 
+        await self._apply_control(batch, device, pile_values)
+
         token = ABSENT if local_slot is ABSENT else local_slot.token
         result = await self.store.cas(key, token, opened.value)
         if result is STALE:
             raise ValueError("concurrent local writer-slot update")
         if not isinstance(result, Applied):
             raise TypeError("writer slot CAS")
-        await self._advance_removal(batch, device, additions)
         fact_count = 0 if self.consumer is None else len(
             self.consumer.commit(
                 batch, device=device, head=slot.head))
@@ -982,7 +1007,7 @@ class RepositoryMirror:
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
         )
-        await self._advance_removal(batch, device, additions)
+        await self._apply_control(batch, device, pile_values)
         facts = self.consumer.commit(
             batch, device=device, head=slot.head)
         return len(additions), len(facts)

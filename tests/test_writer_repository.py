@@ -427,6 +427,12 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         async def advance(proof, proposed):
             return await cloud_gate.advance(proof, proposed, 10)
 
+        controls = []
+
+        async def apply_control(raw, writer):
+            controls.append((signed_pile_oid(raw), writer))
+            return type("Applied", (), {"status": "applied"})()
+
         def make_proof(base, proposed):
             return proof_for(
                 secret,
@@ -445,6 +451,7 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
             local,
             cloud,
             make_proof,
+            apply_control,
             advance,
         )
 
@@ -455,6 +462,7 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         )).status == "applied"
         published = await publisher.publish()
         assert (published.status, published.piles) == ("applied", 1)
+        assert controls == [(first.pile_oids[0], public)]
         first_objects = set(cloud.list("obj"))
         key = head_slot_key(root.fid, public)
         assert decode_slot_at(key, cloud.get(key)).head == first.head_oid
@@ -470,6 +478,9 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         )).status == "applied"
         advanced = await publisher.publish()
         assert (advanced.status, advanced.piles) == ("applied", 1)
+        # The second original leaf deliberately mixes ordinary content with
+        # repeated control dependencies, so it is not a control application.
+        assert controls == [(first.pile_oids[0], public)]
         assert first_objects < set(cloud.list("obj"))
         assert decode_slot_at(key, cloud.get(key)).head == second.head_oid
 
@@ -486,6 +497,72 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
         assert mirrored.errors == ()
         assert mirrored.piles == 2
         assert item.fid in consumer.fact_ids()
+
+    run(scenario())
+
+
+def test_owner_publisher_retries_control_before_head_without_a_cursor(
+        tmp_path):
+    async def scenario():
+        secret, public, root, device_signature, device = world()
+        store_binding = h(b"control-before-head-store")
+        removal_root = h(b"control-before-head-removal")
+        local = FsStore(str(tmp_path / "local"))
+        cloud = FsStore(str(tmp_path / "cloud"))
+        binding = WriterBinding(
+            root.fid, public, public, store_binding)
+        writer = WriterLog(
+            root.fid, public, public, store_binding, secret, local)
+        update = await writer.prepare(((root, device_signature, device),))
+        await writer.establish(update)
+        local_gate = OpaqueHeadGate(
+            local, mechanical_head_authorizer(root.fid, removal_root))
+        assert (await local_gate.advance(
+            proof_for(
+                secret, public, root, device_signature,
+                device, update.head_oid),
+            update.head_oid,
+            10,
+        )).status == "applied"
+        cloud_gate = OpaqueHeadGate(
+            cloud, mechanical_head_authorizer(root.fid, removal_root))
+        attempts = []
+        allow = False
+
+        async def apply_control(raw, writer_id):
+            attempts.append((signed_pile_oid(raw), writer_id))
+            return type("Result", (), {
+                "status": "applied" if allow else "retryable",
+            })()
+
+        async def advance(proof, proposed):
+            return await cloud_gate.advance(proof, proposed, 10)
+
+        publisher = OwnerPublisher(
+            root.fid,
+            public,
+            binding,
+            local,
+            cloud,
+            lambda base, proposed: proof_for(
+                secret, public, root, device_signature,
+                device, proposed, base),
+            apply_control,
+            advance,
+        )
+        first = await publisher.publish()
+        assert first.status == "retryable"
+        key = head_slot_key(root.fid, public)
+        assert cloud.read_versioned(key) is ABSENT
+
+        allow = True
+        second = await publisher.publish()
+        assert second.status == "applied"
+        assert decode_slot_at(key, cloud.get(key)).head == update.head_oid
+        assert attempts == [
+            (update.pile_oids[0], public),
+            (update.pile_oids[0], public),
+        ]
 
     run(scenario())
 

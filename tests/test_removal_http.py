@@ -6,12 +6,14 @@ import json
 
 from core.access import AccessGate
 from core.crypto import h
+from core.grants import make_token
 from core.http import AsyncFromSyncReader, HttpGate
 from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.writer_head import decode_slot_at, head_slot_key
 from core.writer_repository import OpaqueHeadGate
+from facts.auth.device import device
 from facts.auth.signature import signature
 from facts.content.message import message
 from tests.test_access_gate import (
@@ -44,7 +46,7 @@ def gateway(root, store):
         path_authorize=access.removal_path,
         mint_authorize=access.authorize_access,
         removal_bootstrap=access.state.bootstrap,
-        removal_advance=access.state.advance_leaf,
+        removal_apply=access.state.apply_control,
         head_advance=OpaqueHeadGate(
             store, access.authorize_head).advance,
     )
@@ -157,17 +159,35 @@ def test_bootstrap_rejects_content_and_bounds_before_provider_work(tmp_path):
     assert store.list("") == []
 
 
-def test_advancement_poke_is_bodyless_and_canonically_addressed(tmp_path):
-    root, _secret, member, _membership = world()
+def test_authenticated_exact_control_apply_precedes_head_publication(tmp_path):
+    root, secret, member, membership = world()
     store = FsStore(str(tmp_path / "repository"))
-    _access, http = gateway(root, store)
-    route = f"/removal/advance/{member}/1"
+    access, http = gateway(root, store)
+    assert run(access.state.bootstrap(signed(
+        secret, member, root, membership))).status == "applied"
+    primary = device(root.fid, member, "phone", 7)
+    primary_signature = signature(secret, member, primary, 7)
+    control = signed(
+        secret, member, root,
+        (*membership, primary_signature, primary))
+    token = make_token(
+        b"removal-http-secret" * 2,
+        member,
+        root.fid,
+        issued_at=0,
+        ttl_ms=1_000,
+    )
+    headers = {"Authorization": "Bearer " + token}
 
     assert run(http.handle(
-        "POST", route, {"ws": root.fid}, {}, b"caller state")).status == 400
+        "POST", "/removal/apply", {"ws": root.fid}, {},
+        control)).status == 401
     assert run(http.handle(
-        "POST", f"/removal/advance/{member}/01",
-        {"ws": root.fid}, {}, b"")).status == 400
+        "POST", "/removal/apply", {"ws": root.fid}, headers,
+        control)).status == 201
     assert run(http.handle(
-        "POST", route, {"ws": root.fid}, {}, b"")).status == 403
-    assert store.list("") == []
+        "POST", "/removal/apply", {"ws": root.fid}, headers,
+        control)).status == 204
+    assert run(http.handle(
+        "POST", "/removal/apply", {"ws": root.fid}, headers,
+        b"x" * (MAX_CONTROL_PILE_BYTES + 1))).status == 413
