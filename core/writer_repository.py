@@ -61,6 +61,7 @@ from .writer_tree import (
     EMPTY_TREE,
     append_piles_awaited,
     leaf_key,
+    parse_leaf_key,
     reachable_staged_pages,
     validate_extension_awaited,
     writer_tree_seed,
@@ -141,11 +142,15 @@ class ValidatedBatch:
 
     piles: tuple[str, ...]
     facts: tuple[tuple[str, bytes], ...]
+    control_piles: tuple[str, ...] = ()
 
     def __post_init__(self):
         if any(not valid_fid(oid) for oid in self.piles) \
                 or any(not valid_fid(fid) or not isinstance(raw, bytes)
-                       for fid, raw in self.facts):
+                       for fid, raw in self.facts) \
+                or any(oid not in self.piles for oid in self.control_piles) \
+                or tuple(sorted(set(self.control_piles))) \
+                != self.control_piles:
             raise ValueError("validated consumer batch")
 
 
@@ -649,7 +654,7 @@ class FactConsumer:
         """
         staged_facts = {}
         staged_piles = set()
-        batch_facts, batch_piles = {}, []
+        batch_facts, batch_piles, control_piles = {}, [], []
         for raw, writer in values:
             oid = h(raw)
             if oid in staged_piles or self.state is None \
@@ -658,6 +663,13 @@ class FactConsumer:
             evaluated = self.evaluator.evaluate(raw, writer=writer)
             if owner is not None:
                 _require_writer_proof(evaluated, writer, owner)
+            try:
+                facts.control_evaluation(
+                    evaluated.judgment, evaluated.pile.facts)
+            except ValueError:
+                pass
+            else:
+                control_piles.append(oid)
             for valid in evaluated.judgment.valids:
                 family = facts.family_for(valid.fact.t)
                 if family is None or not family.DURABLE:
@@ -674,7 +686,10 @@ class FactConsumer:
             staged_piles.add(oid)
             batch_piles.append(oid)
         return ValidatedBatch(
-            tuple(batch_piles), tuple(sorted(batch_facts.items())))
+            tuple(batch_piles),
+            tuple(sorted(batch_facts.items())),
+            tuple(sorted(control_piles)),
+        )
 
     def commit(self, batch, *, device, head):
         """Atomically join one accepted head's already-validated suffix."""
@@ -738,7 +753,7 @@ class RepositoryMirror:
 
     def __init__(
             self, workspace, store, binding_for, consumer,
-            *, current_binding_for=None):
+            *, current_binding_for=None, advance_removal=None):
         consumer_ok = consumer is None or (
             getattr(consumer, "workspace", None) == workspace
             and all(callable(getattr(consumer, method, None))
@@ -748,13 +763,29 @@ class RepositoryMirror:
         if not valid_fid(workspace) or not callable(binding_for) \
                 or not consumer_ok \
                 or current_binding_for is not None \
-                and not callable(current_binding_for):
+                and not callable(current_binding_for) \
+                or advance_removal is not None \
+                and not callable(advance_removal):
             raise ValueError("repository mirror")
         self.workspace = workspace
         self.store = async_store(store)
         self.binding_for = binding_for
         self.current_binding_for = current_binding_for or binding_for
         self.consumer = consumer
+        self.advance_removal = advance_removal
+
+    async def _advance_removal(self, batch, device, rows):
+        """Advance only accepted control leaves before projection commits."""
+        if self.advance_removal is None or batch is None:
+            return
+        control = set(batch.control_piles)
+        for leaf, oid in rows:
+            if oid not in control:
+                continue
+            result = await _maybe_await(
+                self.advance_removal(device, parse_leaf_key(leaf)))
+            if getattr(result, "status", None) not in {"applied", "noop"}:
+                raise ValueError("recipient removal advancement")
 
     async def _binding(
             self, workspace, device, removal_root, head, *, current=False):
@@ -882,6 +913,7 @@ class RepositoryMirror:
             raise ValueError("concurrent local writer-slot update")
         if not isinstance(result, Applied):
             raise TypeError("writer slot CAS")
+        await self._advance_removal(batch, device, additions)
         fact_count = 0 if self.consumer is None else len(
             self.consumer.commit(
                 batch, device=device, head=slot.head))
@@ -950,6 +982,7 @@ class RepositoryMirror:
             ((raw, device) for _oid, raw in pile_values),
             owner=candidate.owner,
         )
+        await self._advance_removal(batch, device, additions)
         facts = self.consumer.commit(
             batch, device=device, head=slot.head)
         return len(additions), len(facts)

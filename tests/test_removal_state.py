@@ -11,10 +11,12 @@ from core.removal_state import RecipientRemovalState
 from core.store import FsStore
 from core.suppression import scoped_id, suppression_slot
 from core.suppression_tree import SuppressionTree
-from core.writer_head import writer_store_binding
+from core.writer_head import WriterBinding, writer_store_binding
 from core.writer_repository import (
+    FactConsumer,
     HeadGrant,
     OpaqueHeadGate,
+    RepositoryMirror,
     WriterLog,
 )
 from facts.auth.device import device as device_fact
@@ -94,7 +96,7 @@ async def accept_one(store, secret, writer, owner, root, closure):
             writer,
             None,
             proposed_head,
-            h(b"accepted authority view"),
+            h(b"accepted removal view"),
         )
 
     advanced = await OpaqueHeadGate(store, authorize).advance(
@@ -347,3 +349,65 @@ def test_partial_stale_advance_is_retryable_and_idempotent():
         scoped_id("device", value.member),
     )) == suppression_slot()
     assert bucket.assert_valid_history()
+
+
+def test_mirror_replays_post_cas_control_advancement_without_a_cursor(
+        tmp_path):
+    value = world()
+    source = FsStore(str(tmp_path / "source"))
+    target = FsStore(str(tmp_path / "target"))
+    state = RecipientRemovalState(value.root.fid, target)
+    assert run(state.bootstrap(signed(
+        value.member_secret,
+        value.member,
+        value.root,
+        value.membership,
+    ))).status == "applied"
+    evicted = removal(
+        value.root.fid, value.founder, value.member, 4)
+    evicted_sig = signature(
+        value.founder_secret, value.founder, evicted, 4)
+    run(accept_one(
+        source,
+        value.founder_secret,
+        value.founder,
+        value.founder,
+        value.root,
+        (*value.membership, evicted_sig, evicted),
+    ))
+    consumer = FactConsumer(value.root.fid)
+    calls = []
+
+    async def interrupted(device, sequence):
+        calls.append((device, sequence))
+        if len(calls) == 1:
+            return type("Retryable", (), {"status": "retryable"})()
+        return await state.advance_leaf(device, sequence)
+
+    def exact_binding(workspace_id, device, _removal_root, candidate):
+        return WriterBinding(
+            workspace_id, device, candidate.owner, candidate.store)
+
+    mirror = RepositoryMirror(
+        value.root.fid,
+        target,
+        exact_binding,
+        consumer,
+        advance_removal=interrupted,
+    )
+
+    first = run(mirror.sync_from(source))
+    assert first.changed == 0
+    assert first.errors and "removal advancement" in first.errors[0][1]
+    assert consumer.projected_head(value.founder) is None
+    assert run(value_at(
+        state, scoped_id("member", value.member))) == suppression_slot()
+
+    replay = run(mirror.sync_from(source))
+    assert replay.errors == ()
+    assert calls == [(value.founder, 1), (value.founder, 1)]
+    assert consumer.projected_head(value.founder) is not None
+    assert run(value_at(
+        state,
+        scoped_id("member", value.member),
+    )) == suppression_slot(evicted.fid)
