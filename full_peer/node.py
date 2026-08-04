@@ -7,19 +7,21 @@ import time
 import facts
 
 from core import fact_index
-from core.close import encode_signed_pile, make_signed_pile
+from core.access import AccessGate
+from core.close import ClosedPileEvaluator, encode_signed_pile, make_signed_pile
 from core.fact import Fact
-from core.authority import AuthorityRepository, authority_resident
-from core.limits import MAX_MINT_FETCHES, MAX_MINT_FETCH_BYTES
+from core.limits import MAX_CONTROL_PILE_BYTES
 from core.store import FsStore
-from core.writer_head import WriterBinding, writer_store_binding
+from core.writer_head import WriterBinding, decode_head, writer_store_binding
 from core.writer_repository import (
     FactConsumer,
     OpaqueHeadGate,
     RepositoryMirror,
     WriterLog,
+    open_accepted_pile,
 )
 from facts.auth.head_request import head_request
+from facts.auth.removal_path_request import removal_path_request
 from facts.auth.signature import signature as signature_fact
 
 from . import bao_native, sql_store
@@ -33,6 +35,9 @@ from .keychain import (
     normalize_peers,
 )
 from .pile_sender import PileSender
+
+
+ACCESS_PROOF_TTL_MS = 120_000
 
 
 def now_ms():
@@ -57,7 +62,7 @@ class FullPeer:
         self.sk, self.pk = self.keychain.default()
         self._stores, self._sql, self._senders = {}, {}, {}
         self._consumers, self._mirrors, self._writers = {}, {}, {}
-        self._authorities = {}
+        self._access_gates = {}
         self._iroh_peer_urls = {}  # (ws, endpoint) -> disposable loopback URL
         self._sync_errors = {}
         for ws in self.workspaces():
@@ -115,22 +120,71 @@ class FullPeer:
         """Return the exact directory/RBSR receiver shared with cloud peers."""
         with self.lock:
             if workspace not in self._mirrors:
+                access = self.access_gate(workspace)
                 self._mirrors[workspace] = RepositoryMirror(
                     workspace,
                     self.store(workspace),
                     self.writer_binding,
                     self.consumer(workspace),
                     current_binding_for=self.current_writer_binding,
+                    advance_removal=access.state.advance_leaf,
                 )
             return self._mirrors[workspace]
 
-    def authority(self, workspace):
-        """Return the shared database-free authority repository."""
+    def access_gate(self, workspace):
+        """Return the database-free two-phase gate for one recipient."""
         with self.lock:
-            if workspace not in self._authorities:
-                self._authorities[workspace] = AuthorityRepository(
+            if workspace not in self._access_gates:
+                self._access_gates[workspace] = AccessGate(
                     workspace, self.store(workspace))
-            return self._authorities[workspace]
+            return self._access_gates[workspace]
+
+    def head_gate(self, workspace):
+        """Compose exact-head CAS with the same database-free access gate."""
+        return OpaqueHeadGate(
+            self.store(workspace),
+            self.access_gate(workspace).authorize_head,
+        )
+
+    def removal_bootstrap_pile(self, workspace):
+        """Open this device's original signed control leaf without reclosure."""
+        _secret, device = self.identity(workspace)
+        return _run_core(open_accepted_pile(
+            self.store(workspace),
+            workspace,
+            device,
+            1,
+            max_bytes=MAX_CONTROL_PILE_BYTES,
+        ))
+
+    def control_leaves(self, workspace, device, head_oid, count):
+        """Classify only the exact suffix just copied to a hosted recipient."""
+        if type(count) is not int or count < 0:
+            raise ValueError("published pile count")
+        raw_head = self.store(workspace).get("obj/" + head_oid)
+        head = decode_head(raw_head)
+        if head.workspace != workspace or head.device != device \
+                or count > head.sequence:
+            raise ValueError("published writer head")
+        evaluator = ClosedPileEvaluator(
+            workspace, max_bytes=MAX_CONTROL_PILE_BYTES)
+        selected = []
+        for sequence in range(head.sequence - count + 1, head.sequence + 1):
+            try:
+                raw = _run_core(open_accepted_pile(
+                    self.store(workspace),
+                    workspace,
+                    device,
+                    sequence,
+                    max_bytes=MAX_CONTROL_PILE_BYTES,
+                ))
+                evaluated = evaluator.evaluate(raw, writer=device)
+                facts.control_evaluation(
+                    evaluated.judgment, evaluated.pile.facts)
+            except ValueError:
+                continue
+            selected.append(sequence)
+        return tuple(selected)
 
     def add_workspace(self, workspace, name, peers, identity=None):
         """Record the locally trusted anchor before its first pile is opened."""
@@ -364,22 +418,36 @@ class FullPeer:
         return self.sender(ws).send(news, deps_new, owner=owner)
 
     def _projected_writer_binding(self, workspace, device, owner=None):
-        """Read one live writer identity from already-validated local facts."""
+        """Read one live local authoring identity from disposable SQL."""
         projection = self.sql(workspace)
-        owners = {
+        owners = set()
+        if any(
+                not projection.suppresses(fact)
+                and ("member", device, device) in fact.offers()
+                for fact in projection.indexed(
+                    "member", device, device)):
+            owners.add(device)
+        owners.update(
             offered_owner
-            for fact in projection.indexed("member", device)
+            for fact in projection.indexed("device_key", device)
             if not projection.suppresses(fact)
             for name, key, offered_owner in fact.offers()
-            if name == "member" and key == device and offered_owner
+            if name == "device_key" and key == device and offered_owner
             and (owner is None or offered_owner == owner)
-        }
+        )
+        if owner is not None:
+            owners.intersection_update((owner,))
         if len(owners) > 1:
             raise ValueError("ambiguous writer ownership")
         if not owners:
             return None
         selected = next(iter(owners))
-        if device != selected and not any(
+        if not any(
+                not projection.suppresses(fact)
+                and ("member", selected, selected) in fact.offers()
+                for fact in projection.indexed(
+                    "member", selected, selected)) \
+                or device != selected and not any(
                 not projection.suppresses(fact)
                 and ("device_key", device, selected) in fact.offers()
                 for fact in projection.indexed(
@@ -393,20 +461,23 @@ class FullPeer:
         )
 
     async def writer_binding(
-            self, workspace, device, _authority_root, candidate):
-        """Resolve an accepted writer from the validated local projection."""
-        owner = None if candidate is None else candidate.owner
-        with self.lock:
-            return self._projected_writer_binding(
-                workspace, device, owner)
+            self, workspace, device, _removal_root, candidate):
+        """Bind a signed-head claim; its closed piles must prove the claim."""
+        if getattr(candidate, "workspace", None) != workspace \
+                or getattr(candidate, "device", None) != device:
+            raise ValueError("writer head claim")
+        return WriterBinding(
+            workspace,
+            device,
+            candidate.owner,
+            writer_store_binding(workspace, device),
+        )
 
     async def current_writer_binding(
-            self, workspace, device, _authority_root, candidate):
-        """Resolve an incoming head through current validated local facts."""
-        owner = None if candidate is None else candidate.owner
-        with self.lock:
-            return self._projected_writer_binding(
-                workspace, device, owner)
+            self, workspace, device, removal_root, candidate):
+        """Use the same claim binding for new suffixes; core validates piles."""
+        return await self.writer_binding(
+            workspace, device, removal_root, candidate)
 
     def local_writer_binding(self, workspace):
         """Return this peer's live owner binding for one publication turn."""
@@ -427,14 +498,32 @@ class FullPeer:
                 secret, self.store(workspace))
         return self._writers[key]
 
-    def _head_proof_closure(
-            self, workspace, closures, request, request_signature):
-        """Close a head request over only its member/device authority.
+    def _historical_owner(self, workspace, device):
+        """Resolve this device's immutable owner relation, including removed."""
+        projection = self.sql(workspace)
+        owners = {
+            offered_owner
+            for fact in projection.indexed("device_key", device)
+            for name, key, offered_owner in fact.offers()
+            if name == "device_key" and key == device and offered_owner
+        }
+        if any(
+                ("member", device, device) in fact.offers()
+                for fact in projection.indexed(
+                    "member", device, device)):
+            owners.add(device)
+        if len(owners) != 1:
+            raise ValueError("device has no unique historical owner")
+        return next(iter(owners))
 
-        Content closures are useful for discovering a bootstrap provider, but
-        message, file, and other payload facts must never be copied into the
-        discarded authority request merely because they shared a publication
-        batch.
+    def _identity_proof_closure(
+            self, workspace, closures, request, request_signature):
+        """Close one discarded request over its exact identity providers.
+
+        The first local publication reuses providers from its original closed
+        writer pile. Later requests close the same canonical facts from the
+        disposable SQL authoring index. Neither path creates a retained
+        authority repository or validation-history object.
         """
         from core.kernel import drain
 
@@ -446,24 +535,24 @@ class FullPeer:
             for fact in closure
         }
 
-        def candidates(name):
+        def candidates(name, key, value):
             values = {
                 fact.fid: fact
                 for fact in supplied.values()
-                if (name, device, owner) in fact.offers()
+                if (name, key, value) in fact.offers()
             }
             values.update({
                 fact.fid: fact
                 for fact in self.sql(workspace).indexed(
-                    name, device, owner)
-                if not self.sql(workspace).suppresses(fact)
+                    name, key, value)
             })
             return tuple(sorted(
                 values.values(), key=lambda fact: (fact.key, fact.fid)))
 
-        roles = (("member", candidates("member")),)
+        roles = (("member", candidates("member", owner, owner)),)
         if device != owner:
-            roles += (("device", candidates("device_key")),)
+            roles += ((
+                "device", candidates("device_key", device, owner)),)
         providers = []
         for role, choices in roles:
             if not choices:
@@ -490,12 +579,37 @@ class FullPeer:
                     out.append(fact)
         out.extend((request_signature, request))
         if not drain(out, workspace).ok:
-            raise ValueError("head authority closure")
+            raise ValueError("identity proof closure")
         return tuple(out)
+
+    def removal_path_proof(
+            self, workspace, *, owner=None, closures=()):
+        """Build the historical-member phase signed by this exact device."""
+        secret, device = self.identity(workspace)
+        if owner is None:
+            owner = self._historical_owner(workspace, device)
+        timestamp = now_ms()
+        request = removal_path_request(
+            workspace,
+            device,
+            owner,
+            timestamp + ACCESS_PROOF_TTL_MS,
+            timestamp,
+        )
+        request_signature = signature_fact(
+            secret, device, request, timestamp)
+        closed = self._identity_proof_closure(
+            workspace,
+            tuple(tuple(closure) for closure in closures),
+            request,
+            request_signature,
+        )
+        return encode_signed_pile(make_signed_pile(
+            secret, workspace, device, closed))
 
     def head_proof(
             self, workspace, owner, base_head, proposed_head, *,
-            closures=()):
+            removal_path, closures=()):
         """Build one disposable proof for this device's exact head update."""
         secret, device = self.identity(workspace)
         timestamp = now_ms()
@@ -505,19 +619,20 @@ class FullPeer:
             owner,
             base_head,
             proposed_head,
-            timestamp + 120_000,
+            timestamp + ACCESS_PROOF_TTL_MS,
+            removal_path,
             timestamp,
         )
         request_signature = signature_fact(
             secret, device, request, timestamp)
-        authority = self._head_proof_closure(
+        closed = self._identity_proof_closure(
             workspace,
             tuple(tuple(closure) for closure in closures),
             request,
             request_signature,
         )
         return encode_signed_pile(make_signed_pile(
-            secret, workspace, device, authority))
+            secret, workspace, device, closed))
 
     def publish_closed(self, workspace, closures, *, owner=None):
         """Publish and consume one batch through the same core as a pull."""
@@ -549,72 +664,40 @@ class FullPeer:
             writer = self._writer(workspace, owner)
             update = _run_core(writer.prepare(closures))
             _run_core(writer.establish(update))
+            access = self.access_gate(workspace)
+            if _run_core(access.state.pin()) is None:
+                for pile in update.piles:
+                    result = _run_core(access.state.bootstrap(
+                        encode_signed_pile(pile)))
+                    if result.status in {"applied", "noop"}:
+                        break
+                if _run_core(access.state.pin()) is None:
+                    raise ValueError(
+                        "first writer update needs a clear control pile")
 
+            path_proof = self.removal_path_proof(
+                workspace, owner=owner, closures=closures)
+            removal_path = _run_core(access.removal_path(
+                path_proof, now_ms()))
+            if removal_path is None:
+                raise ValueError("historical membership proof rejected")
             proof = self.head_proof(
                 workspace,
                 owner,
                 update.base_head,
                 update.head_oid,
+                removal_path=removal_path,
                 closures=closures,
             )
-            authority_repository = self.authority(workspace)
-            publications = tuple(
-                encode_signed_pile(pile)
-                for closure, pile in zip(closures, update.piles)
-                if all(
-                    authority_resident(fact)
-                    for fact in closure
-                    if facts.family_for(fact.t).DURABLE
-                )
-            )
-
-            async def join_local_authority():
-                for raw in publications:
-                    for _ in range(8):
-                        result = await authority_repository.publish(raw)
-                        if result.status in {"applied", "noop"}:
-                            break
-                        if result.status != "retryable":
-                            raise ValueError(
-                                "authority publication rejected")
-                    else:
-                        raise RuntimeError(
-                            "authority publication contention")
-
-            async def authorize(raw, proposed):
-                return await authority_repository.authorize_head(
-                    raw, proposed, now_ms())
-
-            grant = _run_core(authorize(proof, update.head_oid))
-            published_first = grant is None and bool(publications)
-            if published_first:
-                _run_core(join_local_authority())
-            outcome = _run_core(OpaqueHeadGate(
-                self.store(workspace), authorize).advance(
-                    proof, update.head_oid))
+            outcome = _run_core(self.head_gate(workspace).advance(
+                proof, update.head_oid, now_ms()))
             if outcome.status not in {"applied", "noop"}:
                 raise RuntimeError("writer head advance requires rebase")
-            if not published_first:
-                _run_core(join_local_authority())
             replay = _run_core(self.mirror(workspace).replay_local())
             if replay.errors:
                 raise ValueError(
                     f"writer projection failed: {replay.errors[0][1]}")
             return sorted(self.sql(workspace).fact_ids() - before)
-
-    def authorize_access(
-            self, workspace, proof_raw, purpose, *,
-            max_unique_fetches=MAX_MINT_FETCHES,
-            max_fetch_bytes=MAX_MINT_FETCH_BYTES):
-        """Run one signed access proof through the shared discarded gate."""
-        with self.lock:
-            return _run_core(self.authority(workspace).authorize_access(
-                proof_raw,
-                now_ms(),
-                purpose=purpose,
-                max_unique_fetches=max_unique_fetches,
-                max_fetch_bytes=max_fetch_bytes,
-            ))
 
     # ---- rebuild: the store's own units through the same kernel --------------
 

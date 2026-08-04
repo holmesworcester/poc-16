@@ -110,20 +110,18 @@ class StdlibPeerHandler(BaseHTTPRequestHandler):
             return self._send(public)
         if not self.peer.has_workspace(workspace):
             return self._send(Response(404))
+        access = self.peer.access_gate(workspace)
         gate = HttpGate(
             AsyncFromSyncReader(self.peer.store(workspace)),
             workspace,
             self.secret,
             now_ms,
             mirror=self.peer.mirror(workspace),
-            mint_authorize=lambda pile, purpose: self.peer.authorize_access(
-                workspace,
-                pile,
-                purpose,
-                max_unique_fetches=self.gate_options.max_mint_fetches,
-                max_fetch_bytes=self.gate_options.max_mint_fetch_bytes,
-            ),
-            authority_publish=self.peer.authority(workspace).publish,
+            head_advance=self.peer.head_gate(workspace).advance,
+            mint_authorize=access.authorize_access,
+            path_authorize=access.removal_path,
+            removal_bootstrap=access.state.bootstrap,
+            removal_advance=access.state.advance_leaf,
             sync_profile=self.sync_profile,
             grant_ttl_ms=self.gate_options.grant_ttl_ms,
             max_mint_fetches=self.gate_options.max_mint_fetches,

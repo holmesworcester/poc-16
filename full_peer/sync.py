@@ -50,13 +50,17 @@ def sync(node, workspace, url):
         device = binding.device
 
         async def make_proof(base, proposed):
-            return await asyncio.to_thread(
-                node.head_proof,
-                workspace,
-                binding.owner,
-                base,
-                proposed,
-            )
+            def build():
+                path = peer.removal_path()
+                return node.head_proof(
+                    workspace,
+                    binding.owner,
+                    base,
+                    proposed,
+                    removal_path=path,
+                )
+
+            return await asyncio.to_thread(build)
 
         publisher = OwnerPublisher(
             workspace,
@@ -70,6 +74,15 @@ def sync(node, workspace, url):
         published = _run(publisher.publish())
         if published.status == "retryable":
             raise ValueError("concurrent owner-head publication")
+        control = () if published.head is None else node.control_leaves(
+            workspace,
+            device,
+            published.head,
+            published.piles,
+        )
+        for sequence in control:
+            if peer.advance_removal(device, sequence) == "retryable":
+                raise ValueError("concurrent recipient removal advancement")
         pushed_count = published.piles
 
     node._ensure_projection(workspace)

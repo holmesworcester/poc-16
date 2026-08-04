@@ -20,15 +20,19 @@ import facts
 import pytest
 
 from core import peer_capability
-from core.authority import AuthorityRepository
+from core.access import AccessGate
 from core.crypto import h, keypair
 from core.fact import canon
 from core.grants import make_token
 from core.limits import MAX_FACT_BYTES, MAX_OBJECT_BYTES
-from core.object_store import ABSENT, AUTHORITY_ROOT_KEY, CREATED, Versioned
+from core.object_store import ABSENT, CREATED, Versioned
 from core.store import FsStore, RemoteStore
-from core.writer_head import decode_slot_at, head_slot_key
-from core.writer_repository import OpaqueHeadGate, RepositoryMirror
+from core.writer_head import decode_head, decode_slot_at, head_slot_key
+from core.writer_repository import (
+    OpaqueHeadGate,
+    RepositoryMirror,
+    open_accepted_pile,
+)
 from full_peer.node import FullPeer
 from full_peer.pack_http import handler_for
 from full_peer import sync as sync_module
@@ -153,11 +157,12 @@ def _canonical_store(peer, workspace):
 class _HostedEndpoint:
     """In-process hosted peer implementing the exact RemoteStore surface."""
 
-    def __init__(self, node, workspace, url, store, authority):
+    def __init__(self, node, workspace, url, store, access, advances):
         self.node = node
         self.ws = workspace
         self.store = store
-        self.authority = authority
+        self.access = access
+        self.advances = advances
         self._opened = None
         self._observed = {}
         self._complete = False
@@ -223,14 +228,20 @@ class _HostedEndpoint:
     def layout(self, _key, *, response_limit):
         return None
 
-    async def advance_head(self, proof, proposed):
-        async def authorize(raw, head):
-            return await self.authority.authorize_head(
-                raw, head, int(time.time() * 1000))
+    def removal_path(self):
+        proof = self.node.removal_path_proof(self.ws)
+        return _run(self.access.removal_path(
+            proof, int(time.time() * 1000)))
 
+    async def advance_head(self, proof, proposed):
         result = await OpaqueHeadGate(
-            self.store, authorize).advance(proof, proposed)
+            self.store, self.access.authorize_head).advance(
+                proof, proposed, int(time.time() * 1000))
         return result.status
+
+    def advance_removal(self, device, sequence):
+        self.advances.append((device, sequence))
+        return _run(self.access.state.advance_leaf(device, sequence)).status
 
 
 def test_full_peer_http_exposes_writer_directory_and_exact_transfer(tmp_path):
@@ -593,10 +604,11 @@ def test_each_sync_turn_mints_fresh_and_never_publishes_authority(
         sync_module.sync(bob, workspace, url)
 
     assert requests.count(("POST", "/mint")) == 2
+    assert requests.count(("POST", "/removal/path")) == 2
     assert not [request for request in requests if request[1] == "/authority"]
 
 
-def test_lost_remote_authority_fails_without_a_recovery_state_machine(
+def test_missing_remote_state_attempts_one_original_bootstrap_without_cache(
         tmp_path):
     workspace, _alice, bob, _carol = _forest_fixture(tmp_path)
     calls = []
@@ -612,7 +624,10 @@ def test_lost_remote_authority_fails_without_a_recovery_state_machine(
         peer.mint()
 
     assert denied.value.code == 403
-    assert calls == [("POST", "/mint")]
+    assert calls == [
+        ("POST", "/removal/path"),
+        ("POST", "/removal/bootstrap"),
+    ]
     assert peer._token is peer._sync_profile is None
     assert not hasattr(peer, "authority_recover")
     assert not hasattr(peer, "publish_authority")
@@ -628,30 +643,29 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
     assert mirrored.errors == ()
 
     cloud = FsStore(str(tmp_path / "hosted-cloud"))
-    # Provider enrollment is a separate authority-plane operation.  Seed the
-    # disposable hosted fixture explicitly; an ordinary content sync must not
-    # mutate this repository as a side effect.
-    for key in alice.store(workspace).list("obj/"):
-        cloud.put_if_absent(key, alice.store(workspace).get(key))
-    authority_value = alice.store(workspace).read_versioned(
-        AUTHORITY_ROOT_KEY)
-    assert isinstance(authority_value, Versioned)
-    cloud.cas(AUTHORITY_ROOT_KEY, ABSENT, authority_value.value)
-    authority = AuthorityRepository(workspace, cloud)
+    access = AccessGate(workspace, cloud)
+    advances = []
+    # Hosted enrollment consumes original signed clear-only control piles,
+    # never an aggregate authority snapshot or SQL-derived reclosure.
+    for source in (alice, bob):
+        original = _run(open_accepted_pile(
+            source.store(workspace),
+            workspace,
+            source.identity_id(workspace),
+            1,
+        ))
+        assert _run(access.state.bootstrap(original)).status in {
+            "applied", "noop"}
     url = "memory://hosted-owner-cloud"
 
     def endpoint(node, candidate_workspace, candidate_url):
         assert candidate_workspace == workspace and candidate_url == url
         return _HostedEndpoint(
-            node, workspace, url, cloud, authority)
+            node, workspace, url, cloud, access, advances)
 
     monkeypatch.setattr(sync_module, "Peer", endpoint)
 
-    def no_retained_authority(*_args, **_kwargs):
-        raise AssertionError(
-            "owner publication must derive its binding from validated SQL")
-
-    monkeypatch.setattr(alice, "authority", no_retained_authority)
+    assert not hasattr(alice, "authority")
 
     assert sync_module.sync(alice, workspace, url)[1] >= 1
     assert cloud.list(f"heads/{workspace}") == [
@@ -671,3 +685,18 @@ def test_hosted_mode_pulls_all_writers_but_publishes_only_the_dialer(
         head_slot_key(workspace, peer.identity_id(workspace))
         for peer in (alice, bob, carol)
     }
+    assert advances
+    for source in (alice, bob, carol):
+        device = source.identity_id(workspace)
+        key = head_slot_key(workspace, device)
+        slot = decode_slot_at(key, source.store(workspace).get(key))
+        head = decode_head(source.store(workspace).get("obj/" + slot.head))
+        assert [
+            sequence for writer, sequence in advances
+            if writer == device
+        ] == list(source.control_leaves(
+            workspace,
+            device,
+            slot.head,
+            head.sequence,
+        ))

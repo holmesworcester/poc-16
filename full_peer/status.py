@@ -23,7 +23,7 @@ def _writer_state(node, workspace):
                 raise ValueError("listed writer slot disappeared")
             slot = decode_slot_at(key, opened.value)
             accepted.append((
-                slot.device, slot.head, slot.authority_root))
+                slot.device, slot.head, slot.removal_root))
         if page.cursor is None:
             break
         cursor = page.cursor
@@ -31,12 +31,12 @@ def _writer_state(node, workspace):
     projected = dict(node.idx(workspace).execute(
         "SELECT device, head_oid FROM projected_heads ORDER BY device"))
     writers = []
-    for device, head, authority_root in accepted:
+    for device, head, removal_root in accepted:
         writers.append({
-            "authority_root": authority_root,
             "device": device,
             "head": head,
             "projected_head": projected.pop(device, None),
+            "removal_root": removal_root,
         })
     return (
         h(canon(["poc16-status-writer-forest-v1", accepted])),

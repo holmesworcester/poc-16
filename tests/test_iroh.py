@@ -18,21 +18,13 @@ from urllib.parse import urlparse
 import pytest
 
 import facts
-from .util import signed_pile_bytes
-from core.crypto import h, unseal
-from core.authority import AuthorityRepository
-from core.http import AsyncFromSyncReader
-from core.limits import (
-    MAX_MINT_FETCHES,
-    MAX_MINT_FETCH_BYTES,
-)
+from core.crypto import h
 from core.pack_access import MAX_OBJECT_OPEN_BYTES
-from facts.auth import request
 from full_peer.daemon import FullPeerService
 from full_peer.iroh_forwarders import IrohForwarders
 from full_peer.iroh_process import STOP_SECONDS
 from full_peer.keychain import iroh_peer
-from full_peer.node import FullPeer, now_ms
+from full_peer.node import FullPeer
 from full_peer.walk import Peer
 
 
@@ -166,41 +158,6 @@ def control_command(ready, path, *argv):
     return value
 
 
-def start_plain_full_peer(state, environment):
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "full_peer",
-            "daemon",
-            str(state),
-            "--port", "0",
-            "--control-port", "0",
-            "--cadence", "3600",
-        ],
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env={**os.environ, **environment},
-    )
-    service = next_line(process)
-    match = re.fullmatch(
-        r"full peer [^:]+: data (http://[^;]+); "
-        r"control (http://[^ ]+) \(.*\)",
-        service,
-    )
-    if match is None:
-        stop(process)
-        raise AssertionError(f"bad full-peer readiness: {service!r}")
-    return process, {
-        "data": match.group(1),
-        "control": match.group(2),
-    }
-
-
 def address(url):
     parsed = urlparse(url)
     return parsed.hostname, parsed.port
@@ -263,26 +220,11 @@ def http_request_threads():
     }
 
 
-def mint(target, workspace, pile, identity_secret):
-    status, body, _ = call(
-        target,
-        "POST",
-        f"/mint?ws={workspace}",
-        body=json.dumps({
-            "ws": workspace,
-            "pile": base64.b64encode(pile).decode(),
-        }).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    assert status == 200
-    value = json.loads(body)
-    return (
-        unseal(
-            identity_secret,
-            base64.b64decode(value["grant"]),
-        ).decode(),
-        value["cap"],
-    )
+def mint(target, node, workspace):
+    """Exercise the production historical-path and current-proof handshake."""
+    peer = Peer(node, workspace, f"http://{target[0]}:{target[1]}")
+    peer.mint()
+    return peer._token, peer._sync_profile
 
 
 @pytest.fixture(scope="module")
@@ -340,12 +282,6 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     state = tmp_path / "peer"
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
-    identity_secret = bootstrap.identity(workspace)[0]
-    issued = now_ms()
-    pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued),
-        secret=identity_secret)
-    bootstrap.sql(workspace).db.close()
 
     service = FullPeerService(
         str(state),
@@ -358,8 +294,7 @@ def test_saturated_real_iroh_sessions_recover_without_repository_mutation(
     try:
         service.start()
         direct = address(service.data_address)
-        token, capability = mint(
-            direct, workspace, pile, identity_secret)
+        token, capability = mint(direct, bootstrap, workspace)
         assert capability == "sync-v1/full"
         expected = call(
             direct,
@@ -471,17 +406,11 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
     bootstrap = FullPeer(str(state))
     workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
     member = bootstrap.member_for(workspace)
-    identity_secret = bootstrap.identity(workspace)[0]
-    issued = now_ms()
-    pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued),
-        secret=identity_secret)
     published = repository_bytes(state, workspace)
     object_key, raw = next(
         (key, value) for key, value in published.items()
         if key.startswith("obj/"))
     oid = object_key.removeprefix("obj/")
-    bootstrap.sql(workspace).db.close()
 
     daemon, ready = start_full_peer(
         state,
@@ -528,8 +457,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             for target in through_iroh
         )
 
-        token, capability = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, capability = mint(through_iroh[0], bootstrap, workspace)
         assert capability == "sync-v1/full"
         baseline = repository_bytes(state, workspace)
         # An unknown route cannot mutate repository state through either
@@ -542,8 +470,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         )[0] == 404
         assert repository_bytes(state, workspace) == baseline
 
-        token, _ = mint(
-            through_iroh[1], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[1], bootstrap, workspace)
         assert parity(
             "GET",
             f"/obj/{oid}?ws={workspace}",
@@ -562,8 +489,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             "GET",
             f"/heads?ws={workspace}",
         )[0] == 401
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
         assert parity(
             "GET",
@@ -571,8 +497,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             token=tampered,
         )[0] == 401
 
-        token, _ = mint(
-            direct, workspace, pile, identity_secret)
+        token, _ = mint(direct, bootstrap, workspace)
         assert parity(
             "GET",
             "/heads?ws=" + "0" * 64,
@@ -583,7 +508,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
                 ("POST", f"/heads?ws={workspace}"),
                 ("GET", f"/unknown?ws={workspace}")):
             route_token, _ = mint(
-                through_iroh[0], workspace, pile, identity_secret)
+                through_iroh[0], bootstrap, workspace)
             assert parity(
                 method,
                 path,
@@ -591,8 +516,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             )[0] == 404
 
         control_request = b'{"path":"peer.status","argv":[]}'
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         peer_control = parity(
             "POST",
             f"/ctl/command?ws={workspace}",
@@ -601,8 +525,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
         )
         assert peer_control[0] == 405
 
-        token, _ = mint(
-            direct, workspace, pile, identity_secret)
+        token, _ = mint(direct, bootstrap, workspace)
         retired_put = (
             f"PUT /obj/{h(b'never lands')}?"
             f"ws={workspace} HTTP/1.1\r\n"
@@ -633,8 +556,7 @@ def test_supervised_iroh_is_the_same_authorized_http_gate_and_restarts(
             oversized_results[:1] * (len(oversized_results) - 1)
         assert oversized_results[0][0] == 413
 
-        token, _ = mint(
-            through_iroh[0], workspace, pile, identity_secret)
+        token, _ = mint(through_iroh[0], bootstrap, workspace)
         malformed = (
             "POST /obj/open?"
             f"ws={workspace} HTTP/1.1\r\n"
@@ -1351,78 +1273,6 @@ def test_forwarder_maintenance_attempts_only_one_due_start_per_turn(
     forwarders.maintain()
     assert len(starts) == 2
     forwarders.close()
-
-
-def test_full_peer_mint_fails_at_exactly_one_under_each_fetch_budget(tmp_path):
-    state = tmp_path / "peer"
-    bootstrap = FullPeer(str(state))
-    workspace = facts.auth.workspace.create(bootstrap, "alice", ts=1)
-    issued = now_ms()
-    pile = signed_pile_bytes(request.payload(
-        bootstrap, workspace, "sync", issued + 300_000, issued),
-        secret=bootstrap.identity(workspace)[0])
-    store = bootstrap.store(workspace)
-    authority_root = store.get("authority")
-
-    async def measure():
-        fetched = {}
-
-        class CountingStore:
-            def __init__(self):
-                self.base = AsyncFromSyncReader(store)
-
-            async def read_versioned(self, key):
-                return await self.base.read_versioned(key)
-
-            async def get_bounded(self, key, maximum):
-                raw = await self.base.get_bounded(key, maximum)
-                if raw is not None:
-                    fetched.setdefault(key, raw)
-                return raw
-
-        decision = await AuthorityRepository(
-            workspace, CountingStore()).authorize_access(
-            pile,
-            issued,
-            purpose="sync",
-            max_unique_fetches=MAX_MINT_FETCHES,
-            max_fetch_bytes=MAX_MINT_FETCH_BYTES,
-        )
-        assert decision is not None
-        return len(fetched), sum(len(raw) for raw in fetched.values())
-
-    fetches, fetched_bytes = asyncio.run(measure())
-    assert fetches > 0
-    assert fetched_bytes > 0
-    bootstrap.sql(workspace).db.close()
-    body = json.dumps({
-        "ws": workspace,
-        "pile": base64.b64encode(pile).decode(),
-    }).encode()
-
-    configurations = (
-        {
-            "TINYP2P_MINT_MAX_FETCHES": str(fetches - 1),
-            "TINYP2P_MINT_MAX_FETCH_BYTES": str(MAX_MINT_FETCH_BYTES),
-        },
-        {
-            "TINYP2P_MINT_MAX_FETCHES": str(MAX_MINT_FETCHES),
-            "TINYP2P_MINT_MAX_FETCH_BYTES": str(fetched_bytes - 1),
-        },
-    )
-    for environment in configurations:
-        daemon, ready = start_plain_full_peer(state, environment)
-        try:
-            assert call(
-                address(ready["data"]),
-                "POST",
-                f"/mint?ws={workspace}",
-                body=body,
-                headers={"Content-Type": "application/json"},
-            )[0] == 403
-            assert store.get("authority") == authority_root
-        finally:
-            assert stop(daemon) == 0
 
 
 def _pid_absent(pid):

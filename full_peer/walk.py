@@ -50,7 +50,7 @@ from core.writer_layout import (
     MAX_LAYOUT_PAGE_BYTES,
     parse_layout_page_key,
 )
-from .node import now_ms
+from .node import ACCESS_PROOF_TTL_MS, now_ms
 
 
 class PushUnsupported(RuntimeError):
@@ -174,30 +174,111 @@ class Peer:
             raise ValueError("unknown scoped request peer profile")
         return scoped
 
-    def mint(self):
-        """The handshake: a small closed pile — request fact + its auth
-        closure — judged by the responder's kernel; the grant comes back
-        encrypted to our key."""
-        n = self.node
-        with n.lock:
-            ts = now_ms()
-            facts = families.proof_payload(
-                n, self.ws, "sync", ts + 120_000, ts)
+    def _proof_body(self, pile):
+        if not isinstance(pile, bytes):
+            raise TypeError("access proof pile")
         body = json.dumps({
             "ws": self.ws,
-            "pile": base64.b64encode(
-                n.sender(self.ws).pack(facts)).decode(),
+            "pile": base64.b64encode(pile).decode(),
         }).encode()
         if len(body) > MAX_MINT_REQUEST_BYTES:
-            raise ValueError("mint request too large")
-        _, resp, _ = self._http(
-            "POST", "/mint", body, auth=False,
-            response_limit=MAX_CONTROL_BYTES)
+            raise ValueError("access proof request too large")
+        return body
+
+    def removal_path(self):
+        """Fetch only this device/member's path after historical proof."""
+        with self.node.lock:
+            proof = self.node.removal_path_proof(self.ws)
+        body = self._proof_body(proof)
+        try:
+            _, path, _ = self._http(
+                "POST",
+                "/removal/path",
+                body,
+                auth=False,
+                response_limit=MAX_MINT_REQUEST_BYTES,
+            )
+        except urllib.error.HTTPError as error:
+            if error.code != 403:
+                raise
+            # A new recipient may not know this member yet. Reuse only the
+            # writer's original signed clear-only control leaf; the gate
+            # evaluates and discards it, then owns all subsequent state.
+            bootstrap = self.node.removal_bootstrap_pile(self.ws)
+            self._http(
+                "POST",
+                "/removal/bootstrap",
+                bootstrap,
+                auth=False,
+                response_limit=MAX_CONTROL_BYTES,
+            )
+            _, path, _ = self._http(
+                "POST",
+                "/removal/path",
+                body,
+                auth=False,
+                response_limit=MAX_MINT_REQUEST_BYTES,
+            )
+        return path
+
+    def mint(self):
+        """Run historical-path then current-membership proof phases."""
+        n = self.node
+        for attempt in range(2):
+            path = self.removal_path()
+            with n.lock:
+                ts = now_ms()
+                closed = families.proof_payload(
+                    n,
+                    self.ws,
+                    "sync",
+                    ts + ACCESS_PROOF_TTL_MS,
+                    ts,
+                    removal_path=path,
+                )
+                proof = n.sender(self.ws).pack(closed)
+            try:
+                _, resp, _ = self._http(
+                    "POST",
+                    "/mint",
+                    self._proof_body(proof),
+                    auth=False,
+                    response_limit=MAX_CONTROL_BYTES,
+                )
+                break
+            except urllib.error.HTTPError as error:
+                if error.code != 409 or attempt:
+                    raise
+        else:  # pragma: no cover - the bounded loop either breaks or raises.
+            raise RuntimeError("mint proof refresh")
         o = decode_json(resp, MAX_CONTROL_BYTES, "mint response")
         secret, _ = self.node.identity(self.ws)
         token = unseal(secret, base64.b64decode(o["grant"])).decode()
         self._token = token
         self._sync_profile = peer_capability.negotiate(token, o)
+
+    def advance_removal(self, device, sequence):
+        """Poke one already accepted control leaf without supplying state."""
+        if not isinstance(device, str) or type(sequence) is not int \
+                or sequence <= 0:
+            raise ValueError("removal leaf")
+        try:
+            status, _, _ = self._http(
+                "POST",
+                f"/removal/advance/{device}/{sequence}",
+                b"",
+                auth=False,
+                response_limit=MAX_CONTROL_BYTES,
+            )
+        except urllib.error.HTTPError as error:
+            if error.code == 409:
+                return "retryable"
+            raise
+        if status == 201:
+            return "applied"
+        if status == 204:
+            return "noop"
+        raise ValueError("removal leaf advance")
 
     def advance_head(self, proof, proposed_head):
         """Submit one exact owner proof to the public mechanical CAS route."""
