@@ -85,4 +85,9 @@ def authorize_head(view, valid, stream, writer, proposed_head, trusted_now):
         return None
     path = base64.b64decode(body["path"], validate=True)
     verify_clear(view, path, identity.scopes)
-    return identity.device, identity.owner, body["base_head"] or None
+    return (
+        identity.device,
+        identity.owner,
+        body["base_head"] or None,
+        identity.scopes,
+    )

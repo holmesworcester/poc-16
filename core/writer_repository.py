@@ -484,6 +484,13 @@ class OpaqueHeadGate:
             raise ValueError("trusted head time")
         grant = await _maybe_await(
             self.authorize(proof_raw, proposed_head, trusted_now))
+        return await self.advance_grant(grant, proposed_head)
+
+    async def advance_grant(self, grant, proposed_head=None):
+        """CAS one already typed grant, including a permitted control turn."""
+        proposed_head = grant.head \
+            if isinstance(grant, HeadGrant) and proposed_head is None \
+            else proposed_head
         if not isinstance(grant, HeadGrant) or grant.head != proposed_head:
             raise ValueError("authority decision did not bind proposed head")
         if not await self.store.has("obj/" + proposed_head):
@@ -505,6 +512,11 @@ class OpaqueHeadGate:
             if opened.value == raw:
                 return SlotResult("noop", slot)
             current = decode_slot_at(key, opened.value)
+            # The same immutable head is already the exact successful turn.
+            # A later removal-root advance must not turn a lost-response retry
+            # into a conflict or rewrite the root recorded at acceptance.
+            if current.head == grant.head:
+                return SlotResult("noop", current)
             if current.head != grant.base_head:
                 return SlotResult("retryable", slot)
             token = opened.token
@@ -536,13 +548,15 @@ class OwnerPublisher:
 
     def __init__(
             self, workspace, device, binding, source, target,
-            make_proof, apply_control, advance):
+            make_proof, issue_permit, commit_permit, advance):
         if not valid_fid(workspace) or not valid_fid(device) \
                 or not isinstance(binding, WriterBinding) \
                 or (binding.workspace, binding.device) != (
                     workspace, device) \
                 or not callable(make_proof) \
-                or not callable(apply_control) or not callable(advance):
+                or not callable(issue_permit) \
+                or not callable(commit_permit) \
+                or not callable(advance):
             raise ValueError("owner publisher")
         self.workspace = workspace
         self.device = device
@@ -550,7 +564,8 @@ class OwnerPublisher:
         self.source = async_store(source)
         self.target = async_store(target)
         self.make_proof = make_proof
-        self.apply_control = apply_control
+        self.issue_permit = issue_permit
+        self.commit_permit = commit_permit
         self.advance = advance
         self.evaluator = ClosedPileEvaluator(workspace)
 
@@ -615,11 +630,12 @@ class OwnerPublisher:
         await ensure_object_async(
             self.target, local_slot.head, candidate_raw)
 
-        # Removal state is an ACI join of independently valid control piles.
-        # Apply each exact original pile before advertising the head: a crash
-        # can leave valid control state slightly ahead of content, but can
-        # never leave an accepted head whose removals were missed.  A retry
-        # replays the same idempotent joins without a cursor or cache.
+        # One recipient-issued exact permit linearizes every control-bearing
+        # head while this writer is current. Commit revalidates and applies
+        # the complete bounded control tuple before its slot CAS. A caller
+        # must retain the returned non-expiring permit until commit finishes;
+        # retry needs no recipient cursor, cache, or scan.
+        control_piles = []
         for _oid, raw in added_piles:
             evaluated = self.evaluator.evaluate(raw, writer=self.device)
             try:
@@ -627,20 +643,23 @@ class OwnerPublisher:
                     evaluated.judgment, evaluated.pile.facts)
             except ValueError:
                 continue
-            applied = await _maybe_await(
-                self.apply_control(raw, self.device))
-            if getattr(applied, "status", applied) not in {
-                    "applied", "noop"}:
-                return OwnerPublishResult(
-                    "retryable", local_slot.head,
-                    len(pages) + 1, len(additions))
+            control_piles.append(raw)
 
         proof = await _maybe_await(
             self.make_proof(base_head, local_slot.head))
         if not isinstance(proof, bytes):
             raise TypeError("owner head proof")
-        outcome = await _maybe_await(
-            self.advance(proof, local_slot.head))
+        if control_piles:
+            control_piles = tuple(control_piles)
+            permit = await _maybe_await(self.issue_permit(
+                proof, local_slot.head, control_piles))
+            if not isinstance(permit, bytes):
+                raise TypeError("owner control-head permit")
+            outcome = await _maybe_await(self.commit_permit(
+                permit, local_slot.head, control_piles))
+        else:
+            outcome = await _maybe_await(
+                self.advance(proof, local_slot.head))
         status = getattr(outcome, "status", outcome)
         if status not in {"applied", "noop", "retryable"}:
             raise ValueError("owner head advance result")

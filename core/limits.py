@@ -22,6 +22,14 @@ MAX_WRITER_PACK_BYTES = MAX_PILE_BYTES
 # writer-pile ceiling, and it must use the direct data plane.
 MAX_BUFFERED_PILE_BYTES = 5 * MIB
 MAX_CONTROL_PILE_BYTES = MAX_BUFFERED_PILE_BYTES
+PAGE_BATCH = 256
+# One control-bearing head may collect several small independently closed
+# piles, but the complete semantic turn must still fit the ordinary discarded
+# control budget.  The count independently bounds framing and repeated
+# evaluator setup for a head made from many tiny piles.
+MAX_HEAD_CONTROL_PILES = PAGE_BATCH
+MAX_HEAD_CONTROL_BYTES = MAX_CONTROL_PILE_BYTES
+MAX_HEAD_PERMIT_BYTES = 32 * 1024
 
 # Writer-log physical layout and streaming bounds. Keep these provider-neutral
 # so codecs, stores, FullPeer, Lambda, R2, and benchmarks cannot drift by
@@ -30,7 +38,6 @@ WRITER_LAYOUT_WINDOW_PILES = 16_384
 DIRECT_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_DIRECT_STREAM_FRAGMENTS = 4_096
 
-PAGE_BATCH = 256
 MAX_ROOT_BYTES = MIB
 MAX_CONTROL_BYTES = MIB
 MAX_MINT_REQUEST_BYTES = 512 * 1024

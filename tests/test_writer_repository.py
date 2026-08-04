@@ -433,6 +433,22 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
             controls.append((signed_pile_oid(raw), writer))
             return type("Applied", (), {"status": "applied"})()
 
+        permitted = {}
+
+        async def issue_permit(proof, proposed, control_piles):
+            permit = h(proof + proposed.encode()).encode()
+            permitted[permit] = proof, proposed, control_piles
+            return permit
+
+        async def commit_permit(permit, proposed, control_piles):
+            expected_proof, expected_head, expected_piles = permitted[permit]
+            assert (proposed, control_piles) == (
+                expected_head, expected_piles)
+            for raw in control_piles:
+                result = await apply_control(raw, public)
+                assert result.status in {"applied", "noop"}
+            return await advance(expected_proof, proposed)
+
         def make_proof(base, proposed):
             return proof_for(
                 secret,
@@ -451,7 +467,8 @@ def test_owner_publisher_diffs_then_advances_cloud_head_last(tmp_path):
             local,
             cloud,
             make_proof,
-            apply_control,
+            issue_permit,
+            commit_permit,
             advance,
         )
 
@@ -538,6 +555,25 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
         async def advance(proof, proposed):
             return await cloud_gate.advance(proof, proposed, 10)
 
+        held_permit = b"held exact control-head permit"
+        held_proof = None
+
+        async def issue_permit(proof, proposed, control_piles):
+            nonlocal held_proof
+            held_proof = proof, proposed, control_piles
+            return held_permit
+
+        async def commit_permit(permit, proposed, control_piles):
+            assert permit == held_permit
+            proof, expected_head, expected_piles = held_proof
+            assert (proposed, control_piles) == (
+                expected_head, expected_piles)
+            for raw in control_piles:
+                applied = await apply_control(raw, public)
+                if applied.status == "retryable":
+                    return applied
+            return await advance(proof, proposed)
+
         publisher = OwnerPublisher(
             root.fid,
             public,
@@ -547,7 +583,8 @@ def test_owner_publisher_retries_control_before_head_without_a_cursor(
             lambda base, proposed: proof_for(
                 secret, public, root, device_signature,
                 device, proposed, base),
-            apply_control,
+            issue_permit,
+            commit_permit,
             advance,
         )
         first = await publisher.publish()
